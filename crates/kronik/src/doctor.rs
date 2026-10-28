@@ -122,7 +122,11 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
     };
     checks.push(kernel());
     checks.push(runsc(&config.foreign.runsc_path));
-    checks.push(kvm(config.foreign.platform));
+    let dev_kvm = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm");
+    checks.push(kvm(config.foreign.platform, dev_kvm.map(drop)));
     checks.push(cgroup());
     checks.push(root());
     checks.push(runc());
@@ -241,19 +245,33 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-fn kvm(platform: Platform) -> Check {
-    let usable = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm");
+/// `usable`: opening `/dev/kvm` read-write, as runsc's kvm platform does.
+/// It exists but can't be opened on hosts where only the kvm group may
+/// (CI runners): that is reported as such, not as a missing device.
+fn kvm(platform: Platform, usable: std::io::Result<()>) -> Check {
     match (usable, platform) {
-        (Ok(_), _) => check("kvm", Status::Pass, "/dev/kvm is usable: platforms kvm and systrap"),
-        (Err(e), Platform::Kvm) => check("kvm", Status::Fail, format!("/dev/kvm: {e}"))
-            .code("KVM_UNAVAILABLE")
-            .hint("[foreign] platform = \"kvm\" needs /dev/kvm; set platform = \"auto\" or \"systrap\""),
-        (Err(e), _) => check("kvm", Status::Warn, format!("/dev/kvm: {e}; platform systrap only"))
-            .code("KVM_UNAVAILABLE")
-            .hint("fine for most hosts: foreign actors use systrap without KVM"),
+        (Ok(()), _) => check(
+            "kvm",
+            Status::Pass,
+            "/dev/kvm is usable: platforms kvm and systrap",
+        ),
+        (Err(e), Platform::Kvm) => {
+            let mut hint =
+                "[foreign] platform = \"kvm\" needs /dev/kvm; set platform = \"auto\" or \"systrap\"".to_owned();
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                hint.push_str(", or give this user access to /dev/kvm (the kvm group)");
+            }
+            check("kvm", Status::Fail, format!("/dev/kvm: {e}"))
+                .code("KVM_UNAVAILABLE")
+                .hint(hint)
+        }
+        (Err(e), _) => check(
+            "kvm",
+            Status::Warn,
+            format!("/dev/kvm: {e}; platform systrap only"),
+        )
+        .code("KVM_UNAVAILABLE")
+        .hint("fine for most hosts: foreign actors use systrap without KVM"),
     }
 }
 
@@ -693,6 +711,26 @@ fn ship(config: &Config) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_inaccessible_dev_kvm_fails_only_when_the_configuration_asks_for_kvm() {
+        let denied = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        for platform in [Platform::Auto, Platform::Systrap] {
+            let c = kvm(platform, denied());
+            assert_eq!((c.status, c.code), (Status::Warn, Some("KVM_UNAVAILABLE")));
+        }
+        let c = kvm(Platform::Kvm, denied());
+        assert_eq!((c.status, c.code), (Status::Fail, Some("KVM_UNAVAILABLE")));
+        assert!(c.hint.unwrap().contains("kvm group"));
+        let missing = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(
+            !kvm(Platform::Kvm, missing)
+                .hint
+                .unwrap()
+                .contains("kvm group")
+        );
+        assert_eq!(kvm(Platform::Kvm, Ok(())).status, Status::Pass);
+    }
 
     #[test]
     fn parses_what_the_host_reports() {
