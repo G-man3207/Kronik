@@ -79,7 +79,27 @@ jobs:
         run: scripts/ci.sh dst
       - name: deny
         run: scripts/ci.sh deny
+      # scripts/install.sh's pinned gVisor release, checked against its
+      # SHA-512. install.sh installs kronik first: it gets this build's binary
+      # (built by the test step) from a file:// release, into a throwaway
+      # directory. It writes only those two binaries: no user, unit or config.
+      - name: Install gVisor
+        run: |
+          release=$(mktemp -d)
+          cp target/debug/kronik "$release/kronik-x86_64-unknown-linux-musl"
+          (cd "$release" && sha256sum kronik-x86_64-unknown-linux-musl >SHA256SUMS)
+          sudo KRONIK_BASE_URL="file://$release" KRONIK_INSTALL_DIR="$release/bin" \
+            KRONIK_INSTALL_RUNSC=yes sh scripts/install.sh </dev/null
+          runsc --version
+      # The foreign step needs root: it runs as root with this user's
+      # toolchain, then gives the build files back for the later steps and the
+      # cache. KRONIK_FOREIGN_TESTS=require makes any skip a failure.
       - name: foreign
-        run: scripts/ci.sh foreign
+        run: |
+          status=0
+          sudo -E env "PATH=$PATH" "HOME=$HOME" KRONIK_FOREIGN_TESTS=require \
+            scripts/ci.sh foreign || status=$?
+          sudo chown -R "$(id -u):$(id -g)" target examples "$HOME/.cargo" "$HOME/.rustup"
+          exit "$status"
       - name: identity
         run: scripts/ci.sh identity
