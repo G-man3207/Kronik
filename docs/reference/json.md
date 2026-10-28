@@ -57,12 +57,21 @@ against both.
 | `kronik propose` | [`ProposeResponse`](#proposeresponse) (`POST /v1/proposals`) |
 | `kronik proposals list` | [`ProposalsResponse`](#proposalsresponse) (`GET /v1/proposals`) |
 | `kronik proposals show` | [`ProposalInfo`](#proposalinfo) (`GET /v1/proposals/{id}`) |
+| `kronik proposal status` | [`ProposalInfo`](#proposalinfo) (`GET /v1/proposals/{id}`) |
+| `kronik proposal wait` | [`ProposalInfo`](#proposalinfo) (`GET /v1/proposals/{id}`) |
 | `kronik approve` | [`ApproveResponse`](#approveresponse) (`POST /v1/proposals/{id}/approve`) |
 | `kronik promote` | [`PromoteResponse`](#promoteresponse) (`POST /v1/proposals/{id}/promote`) |
 | `kronik rollback` | [`RollbackResponse`](#rollbackresponse) (`POST /v1/deployments/{epoch}/rollback`) |
+| `kronik watch` | [`WatchInfo`](#watchinfo) (`GET /v1/watches/{id}`); with with --async or --dry-run: [`WatchResponse`](#watchresponse) (`POST /v1/deployments/{epoch}/watch`) |
+| `kronik watches list` | [`WatchesResponse`](#watchesresponse) (`GET /v1/watches`) |
+| `kronik watches show` | [`WatchInfo`](#watchinfo) (`GET /v1/watches/{id}`) |
+| `kronik watches stop` | [`WatchResponse`](#watchresponse) (`POST /v1/watches/{id}/stop`) |
 | `kronik policy show` | [`PolicyResponse`](#policyresponse) (`GET /v1/policy`) |
 | `kronik policy set` | [`PolicySetResponse`](#policysetresponse) (`PUT /v1/policy`) |
 | `kronik policy test` | [`PolicyEvaluation`](#policyevaluation) (`POST /v1/policy/test`) |
+| `kronik preview create` | [`PreviewCreateResponse`](#previewcreateresponse) (`POST /v1/previews`) |
+| `kronik preview list` | [`PreviewsResponse`](#previewsresponse) (`GET /v1/previews`) |
+| `kronik preview delete` | [`PreviewDeleteResponse`](#previewdeleteresponse) (`DELETE /v1/previews/{id}`) |
 | `kronik token create` | [`TokenCreateResponse`](#tokencreateresponse) (`POST /v1/tokens`) |
 | `kronik token list` | [`TokensResponse`](#tokensresponse) (`GET /v1/tokens`) |
 | `kronik token revoke` | [`TokenRevokeResponse`](#tokenrevokeresponse) (`POST /v1/tokens/{name}/revoke`) |
@@ -315,7 +324,7 @@ against both.
       "type": "string"
     },
     "name": {
-      "description": "Stable: config, kernel, runsc, kvm, cgroup, root, disk, clock, tls,\nship.",
+      "description": "Stable: config, kernel, runsc, kvm, cgroup, root, disk, clock, tls,\ndns01_hook, ship.",
       "type": "string"
     },
     "status": {
@@ -1556,6 +1565,44 @@ against both.
 }
 ```
 
+### DiffPreviewInput
+
+```json
+{
+  "additionalProperties": false,
+  "description": "A request a preview fork took (M11): its root turn, the method and route pattern (never the path), the HTTP status of its answer (null when it answered with a reply or not at all) and its outcome.",
+  "properties": {
+    "method": {
+      "type": "string"
+    },
+    "outcome": {
+      "description": "committed, rejected, failed, trap, fuel_exhausted, memory_limit, effect_outcome_unknown or unspecified.",
+      "type": "string"
+    },
+    "route": {
+      "type": "string"
+    },
+    "status": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "turn": {
+      "$ref": "#/components/schemas/DiffTurnId"
+    }
+  },
+  "required": [
+    "turn",
+    "method",
+    "route",
+    "status",
+    "outcome"
+  ],
+  "type": "object"
+}
+```
+
 ### DiffProdForkPercentiles
 
 ```json
@@ -1779,6 +1826,14 @@ against both.
     "pii_masked": {
       "$ref": "#/components/schemas/DiffSampleList",
       "description": "Turns counted in `summary.pii_masked`. Absent when empty."
+    },
+    "preview": {
+      "description": "Requests counted in `summary.preview_inputs`, in log order, at most 20. Absent when empty.",
+      "items": {
+        "$ref": "#/components/schemas/DiffPreviewInput"
+      },
+      "maxItems": 20,
+      "type": "array"
     },
     "responses_changed": {
       "$ref": "#/components/schemas/DiffSampleList"
@@ -2005,6 +2060,10 @@ against both.
       "$ref": "#/components/schemas/DiffCount",
       "description": "In a fork without personal data: turns of a kind whose code changed that read pseudonyms and came out identical to production. They did not run on the real values either, so they count for the approval floor (ADR 0031). 0 in identity replays. Always written; diffs written before v0.1 lack it."
     },
+    "preview_inputs": {
+      "$ref": "#/components/schemas/DiffCount",
+      "description": "In a preview fork (M11): the requests it took at its URL, root inputs of their own. They and their turns are never compared with production: not in `turns_fork`, divergence, effects, grounding or errors; their state changes are in `state.continuous`. Absent when 0."
+    },
     "replayed": {
       "$ref": "#/components/schemas/DiffCount",
       "description": "Root inputs replayed in isolated mode."
@@ -2224,10 +2283,15 @@ against both.
             "KVM_UNAVAILABLE",
             "MASTER_KEY_MISMATCH",
             "MASTER_KEY_MISSING",
+            "NOTHING_TO_PROPOSE",
             "NOT_IMPLEMENTED",
             "PAYLOAD_TOO_LARGE",
             "POLICY_DENIED",
+            "PREVIEW_FULL",
+            "PREVIEW_LIMIT",
+            "PREVIEW_NOT_FOUND",
             "PROPOSAL_NOT_FOUND",
+            "PROPOSAL_RUNNING",
             "PROPOSAL_STALE",
             "REASON_REQUIRED",
             "REPLAY_DIVERGED",
@@ -2245,7 +2309,8 @@ against both.
             "TURN_NOT_FOUND",
             "UNAUTHENTICATED",
             "UNAVAILABLE",
-            "VERIFY_REQUIRED"
+            "VERIFY_REQUIRED",
+            "WATCH_NOT_FOUND"
           ],
           "type": "string"
         },
@@ -2832,6 +2897,93 @@ against both.
 }
 ```
 
+### GuardMetrics
+
+```json
+{
+  "description": "What a guard sees: the deployment's kinds' turns after it and in the\nequally long window before it.",
+  "properties": {
+    "after": {
+      "$ref": "#/components/schemas/GuardWindowMetrics"
+    },
+    "before": {
+      "$ref": "#/components/schemas/GuardWindowMetrics"
+    },
+    "epoch": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "kinds": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "observed_ms": {
+      "description": "Logical time of the window after the deployment seen so far.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "schema_changed": {
+      "description": "A rollback would move a schema version back: guards alert instead.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "epoch",
+    "kinds",
+    "schema_changed",
+    "observed_ms",
+    "before",
+    "after"
+  ],
+  "type": "object"
+}
+```
+
+### GuardWindowMetrics
+
+```json
+{
+  "properties": {
+    "error_rate": {
+      "description": "`failed / turns`; 0 without turns.",
+      "format": "double",
+      "type": "number"
+    },
+    "failed": {
+      "description": "Turns whose outcome is not committed.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "latency_p50_ms": {
+      "format": "double",
+      "type": "number"
+    },
+    "latency_p99_ms": {
+      "format": "double",
+      "type": "number"
+    },
+    "turns": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "turns",
+    "failed",
+    "error_rate",
+    "latency_p50_ms",
+    "latency_p99_ms"
+  ],
+  "type": "object"
+}
+```
+
 ### HistoryResponse
 
 ```json
@@ -3349,6 +3501,31 @@ against both.
 }
 ```
 
+### PolicyGuard
+
+```json
+{
+  "properties": {
+    "action": {
+      "description": "`alert` or `rollback`.",
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "when": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "when",
+    "action"
+  ],
+  "type": "object"
+}
+```
+
 ### PolicyResponse
 
 ```json
@@ -3357,10 +3534,21 @@ against both.
     "default": {
       "type": "boolean"
     },
+    "default_guards": {
+      "description": "`guards` are the default guards: the policy has no `guard` key.",
+      "type": "boolean"
+    },
     "epoch": {
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
+    },
+    "guards": {
+      "description": "The guards `kronik watch` evaluates (M11). The policy's own when its\nfile has a `guard` key (`guard = []`: none), else the defaults.",
+      "items": {
+        "$ref": "#/components/schemas/PolicyGuard"
+      },
+      "type": "array"
     },
     "rules_toml": {
       "type": "string"
@@ -3369,7 +3557,9 @@ against both.
   "required": [
     "rules_toml",
     "epoch",
-    "default"
+    "default",
+    "guards",
+    "default_guards"
   ],
   "type": "object"
 }
@@ -3398,6 +3588,109 @@ against both.
     "dry_run",
     "epoch",
     "lsn"
+  ],
+  "type": "object"
+}
+```
+
+### PreviewCreateResponse
+
+```json
+{
+  "properties": {
+    "dry_run": {
+      "type": "boolean"
+    },
+    "preview": {
+      "$ref": "#/components/schemas/PreviewInfo"
+    }
+  },
+  "required": [
+    "dry_run",
+    "preview"
+  ],
+  "type": "object"
+}
+```
+
+### PreviewDeleteResponse
+
+```json
+{
+  "properties": {
+    "deleted": {
+      "type": "string"
+    },
+    "dry_run": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "dry_run",
+    "deleted"
+  ],
+  "type": "object"
+}
+```
+
+### PreviewInfo
+
+```json
+{
+  "description": "A preview fork: where its requests go and when it expires.",
+  "properties": {
+    "expires_ms": {
+      "description": "Wall-clock Unix milliseconds after which it is deleted.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "fork_lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "id": {
+      "description": "The fork's name, `v-<12 hex>`.",
+      "type": "string"
+    },
+    "no_pii": {
+      "type": "boolean"
+    },
+    "proposal": {
+      "type": "string"
+    },
+    "url": {
+      "description": "`<scheme>://<id>.<preview_domain>/` with `[gateway] preview_domain`,\nelse `<scheme>://<gateway host>/__preview/<id>/`; `https` when the\ngateway serves TLS, else `http`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "proposal",
+    "url",
+    "fork_lsn",
+    "no_pii",
+    "expires_ms"
+  ],
+  "type": "object"
+}
+```
+
+### PreviewsResponse
+
+```json
+{
+  "properties": {
+    "previews": {
+      "items": {
+        "$ref": "#/components/schemas/PreviewInfo"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "previews"
   ],
   "type": "object"
 }
@@ -3558,6 +3851,10 @@ against both.
     "diff_hash": {
       "type": "string"
     },
+    "error": {
+      "$ref": "#/components/schemas/Error",
+      "description": "When `failed`: why, as the error JSON (M10)."
+    },
     "fork": {
       "type": "string"
     },
@@ -3577,15 +3874,41 @@ against both.
       "type": "array"
     },
     "policy": {
-      "$ref": "#/components/schemas/PolicyEvaluation",
-      "description": "The policy evaluation (§7)."
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/PolicyEvaluation"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The policy evaluation (§7); null while `running`."
+    },
+    "progress": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/ProposalProgress"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "While `running`: how far the replay has come (M10)."
     },
     "status": {
+      "description": "`running`, `evaluated`, `approved`, `promoted`, `rejected`, `stale`\nor `failed`.",
       "type": "string"
     },
     "summary": {
-      "$ref": "#/components/schemas/DiffSummary",
-      "description": "The diff's summary (§5.1)."
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/DiffSummary"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The diff's summary (§5.1); null while `running`."
     },
     "unchanged": {
       "default": [],
@@ -3618,6 +3941,43 @@ against both.
     "policy",
     "summary",
     "kinds"
+  ],
+  "type": "object"
+}
+```
+
+### ProposalProgress
+
+```json
+{
+  "description": "Root inputs replayed so far and to replay, per replay mode (0 and 0 for\na mode that does not run, or has not counted its inputs yet).",
+  "properties": {
+    "continuous_done": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "continuous_total": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "isolated_done": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "isolated_total": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "isolated_done",
+    "isolated_total",
+    "continuous_done",
+    "continuous_total"
   ],
   "type": "object"
 }
@@ -4956,6 +5316,215 @@ against both.
     "passed",
     "checked_wall_ms",
     "dry_run"
+  ],
+  "type": "object"
+}
+```
+
+### WatchInfo
+
+```json
+{
+  "description": "A watch of a deployment (M11).",
+  "properties": {
+    "created_ms": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "deployment_lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "deployment_time_ms": {
+      "description": "Logical time where the window after the deployment starts.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "epoch": {
+      "description": "The watched deployment's epoch and the LSN of its record.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "error": {
+      "$ref": "#/components/schemas/Error",
+      "description": "When `failed`: why, as the error JSON."
+    },
+    "for_ms": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "id": {
+      "description": "`w-` and 12 hex characters.",
+      "type": "string"
+    },
+    "metrics": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/GuardMetrics"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The metrics of the last evaluation (the CEL variable `guard`);\nnull before the first."
+    },
+    "reason": {
+      "type": "string"
+    },
+    "status": {
+      "description": "`watching`, `done` (the window passed), `rolled_back`, `superseded`\n(a later deployment of its kinds replaced the watched one; nothing\nacted), `stopped` or `failed`.",
+      "type": "string"
+    },
+    "stopped": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/WatchStopped"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "When `stopped`: who stopped it and why."
+    },
+    "token_id": {
+      "type": "string"
+    },
+    "triggered": {
+      "description": "The guards that fired, in order. Each fires once; a guard that could\nnot be evaluated also alerts once, with a reason starting \"the\nguard could not be evaluated: \".",
+      "items": {
+        "$ref": "#/components/schemas/WatchTriggered"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "id",
+    "epoch",
+    "deployment_lsn",
+    "for_ms",
+    "deployment_time_ms",
+    "status",
+    "reason",
+    "token_id",
+    "created_ms",
+    "triggered"
+  ],
+  "type": "object"
+}
+```
+
+### WatchResponse
+
+```json
+{
+  "properties": {
+    "dry_run": {
+      "type": "boolean"
+    },
+    "watch": {
+      "$ref": "#/components/schemas/WatchInfo",
+      "description": "In a dry run: the current metrics, and in `triggered` (with `lsn`\n0) the guards that would fire now."
+    }
+  },
+  "required": [
+    "dry_run",
+    "watch"
+  ],
+  "type": "object"
+}
+```
+
+### WatchStopped
+
+```json
+{
+  "description": "`kronik watches stop`'s audit.",
+  "properties": {
+    "reason": {
+      "type": "string"
+    },
+    "token_id": {
+      "type": "string"
+    },
+    "wall_time_ms": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "token_id",
+    "reason",
+    "wall_time_ms"
+  ],
+  "type": "object"
+}
+```
+
+### WatchTriggered
+
+```json
+{
+  "description": "A guard that fired: its `GuardTriggered` record.",
+  "properties": {
+    "action": {
+      "description": "`alert` or `rollback`.",
+      "type": "string"
+    },
+    "guard": {
+      "type": "string"
+    },
+    "lsn": {
+      "description": "The `GuardTriggered` record's LSN.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "outcome": {
+      "description": "`alerted`, `rolled_back`, `rollback_refused_schema` or\n`rollback_failed`.",
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "rollback_epoch": {
+      "description": "The rollback deployment's epoch; 0 without one.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "guard",
+    "action",
+    "outcome",
+    "lsn",
+    "rollback_epoch",
+    "reason"
+  ],
+  "type": "object"
+}
+```
+
+### WatchesResponse
+
+```json
+{
+  "properties": {
+    "watches": {
+      "items": {
+        "$ref": "#/components/schemas/WatchInfo"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "watches"
   ],
   "type": "object"
 }

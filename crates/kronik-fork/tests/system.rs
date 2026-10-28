@@ -20,7 +20,7 @@ use kronik_proto::log::v1 as pb;
 use kronik_sched::{NodeConfig, SwitchHold, TurnResult};
 use serde_json::Value;
 
-fn try_propose(p: &Proc, props: &Proposals, guests: &[&str]) -> Result<Proposal, ApiError> {
+fn try_propose(p: &Proc, props: &Arc<Proposals>, guests: &[&str]) -> Result<Proposal, ApiError> {
     let wasm = guests
         .iter()
         .map(|g| std::fs::read(guest(g)).unwrap())
@@ -107,7 +107,7 @@ fn a_caller_and_its_new_callee_verify_together_and_fail_apart() {
     let p = system(dir.path(), None);
     p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false))
         .unwrap();
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
 
     let together = try_propose(&p, &props, &["counter-calls-tally", "notes-tally"]).unwrap();
     let d = diff(&p, &props, &together.id);
@@ -201,7 +201,7 @@ fn a_caller_and_its_new_callee_verify_together_and_fail_apart() {
 fn unchanged_components_are_skipped_and_nothing_changed_is_refused() {
     let dir = tempdir();
     let p = system(dir.path(), None);
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
 
     let prop = try_propose(&p, &props, &["counter-step2", "notes"]).unwrap();
     assert_eq!(prop.kinds.len(), 1, "notes is already deployed");
@@ -222,7 +222,7 @@ fn unchanged_components_are_skipped_and_nothing_changed_is_refused() {
     assert_eq!(kind(&d, "notes")["code"], "unchanged");
 
     let err = try_propose(&p, &props, &["counter", "notes"]).unwrap_err();
-    assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
+    assert_eq!(err.code, ErrorCode::NothingToPropose, "{err}");
     assert!(err.message.contains("nothing to propose"), "{err}");
     assert!(
         err.hint
@@ -244,7 +244,7 @@ fn a_component_promoted_inside_the_window_is_not_skipped() {
     let p = system(dir.path(), None);
     p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false))
         .unwrap();
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     // notes-tally goes live inside the window, after the fork point.
     let callee = try_propose(&p, &props, &["notes-tally"]).unwrap();
     p.rt.block_on(props.promote(&callee.id, audit(), false))
@@ -273,7 +273,7 @@ fn promote_refuses_when_a_skipped_kind_changed_code() {
     let p = system(dir.path(), None);
     p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false))
         .unwrap();
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let prop = try_propose(&p, &props, &["counter-step2", "notes"]).unwrap();
     assert_eq!(prop.unchanged.len(), 1, "notes is skipped");
     // Another proposal changes notes in between.
@@ -309,7 +309,7 @@ fn promote_refuses_when_a_changed_kind_changed_code_since_the_fork() {
     let p = system(dir.path(), None);
     p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false))
         .unwrap();
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let p1 = try_propose(&p, &props, &["counter-step2"]).unwrap();
     let p2 = try_propose(&p, &props, &["counter-body-v2"]).unwrap();
     p.rt.block_on(props.promote(&p2.id, audit(), false))
@@ -374,7 +374,7 @@ fn a_rerun_across_a_schema_raising_switch_keeps_its_code_version() {
         },
     );
     p.http("a", "increment", "");
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let prop = try_propose(&p, &props, &["counter-schema1"]).unwrap();
     // counter/c begins under schema 0 and holds after its call answered.
     p.http_detached("c", "call", "counter/b increment");
@@ -517,7 +517,7 @@ fn no_turn_starts_with_old_code_after_a_set_switch() {
 fn rolling_back_a_set_restores_every_kind_at_one_lsn() {
     let dir = tempdir();
     let p = system(dir.path(), None);
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let prop = try_propose(&p, &props, &["counter-calls-tally", "notes-tally"]).unwrap();
     let promoted =
         p.rt.block_on(props.promote(&prop.id, audit(), false))
@@ -594,7 +594,7 @@ fn rolling_back_a_set_that_added_a_kind_is_refused() {
     for _ in 0..3 {
         p.http("a", "increment", "");
     }
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let prop = try_propose(&p, &props, &["counter-step2", "notes"]).unwrap();
     assert_eq!(kind(&diff(&p, &props, &prop.id), "notes")["code"], "new");
     let promoted =
@@ -663,7 +663,7 @@ fn proposal_dirs(dir: &std::path::Path) -> usize {
 fn two_kinds_of_a_set_cannot_claim_one_route() {
     let dir = tempdir();
     let p = system(dir.path(), None);
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let deployments = p.node.store().db().deployments().unwrap().len();
     let set = ["counter-route-tally", "notes-route-tally"];
     for dry_run in [true, false] {
@@ -739,7 +739,7 @@ fn a_set_can_move_a_route_from_one_kind_to_another() {
     p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false))
         .unwrap();
     assert_eq!(tally_route(&p).as_deref(), Some("counter"));
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
 
     // The notes kind alone cannot take a route the counter serves...
     let err = try_propose(&p, &props, &["notes-route-tally"]).unwrap_err();

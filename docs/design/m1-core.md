@@ -73,8 +73,9 @@ enforcement in CI.
 | 12 | `Erasure` | privacy erase (M8) |
 | 13 | `EngineUpgrade` | upgrade (M6) |
 | 14 | `SnapshotMarker` | snapshot (M6) |
+| 17 | `GuardTriggered` | a `kronik watch` guard that fired (M11) |
 
-0 and any other value are `STORAGE_CORRUPT`, except kind 255, the footer readers skip. The messages are in
+0 and any other value (15 and 16 are reserved) are `STORAGE_CORRUPT`, except kind 255, the footer readers skip. The messages are in
 `proto/kronik/log/v1/` (`common`, `input`, `turn`, `config`, `branch`).
 Decisions beyond the brief:
 

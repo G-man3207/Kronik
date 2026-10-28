@@ -62,6 +62,7 @@ pub enum Record {
     Erasure(pb::Erasure),
     EngineUpgrade(pb::EngineUpgrade),
     SnapshotMarker(pb::SnapshotMarker),
+    GuardTriggered(pb::GuardTriggered),
 }
 
 /// Envelope kind bytes. 0 and every value not listed here are invalid.
@@ -80,8 +81,10 @@ pub mod kind {
     pub const ERASURE: u8 = 12;
     pub const ENGINE_UPGRADE: u8 = 13;
     pub const SNAPSHOT_MARKER: u8 = 14;
+    // 15 and 16 are reserved for other milestones.
+    pub const GUARD_TRIGGERED: u8 = 17;
     /// All valid kinds, in order.
-    pub const ALL: [u8; 14] = [
+    pub const ALL: [u8; 15] = [
         TURN_BEGIN,
         EFFECT_RESULT,
         TURN_RECORD,
@@ -96,6 +99,7 @@ pub mod kind {
         ERASURE,
         ENGINE_UPGRADE,
         SNAPSHOT_MARKER,
+        GUARD_TRIGGERED,
     ];
 }
 
@@ -117,6 +121,7 @@ impl Record {
             Record::Erasure(_) => kind::ERASURE,
             Record::EngineUpgrade(_) => kind::ENGINE_UPGRADE,
             Record::SnapshotMarker(_) => kind::SNAPSHOT_MARKER,
+            Record::GuardTriggered(_) => kind::GUARD_TRIGGERED,
         }
     }
 
@@ -137,6 +142,7 @@ impl Record {
             Record::Erasure(m) => m.encode_to_vec(),
             Record::EngineUpgrade(m) => m.encode_to_vec(),
             Record::SnapshotMarker(m) => m.encode_to_vec(),
+            Record::GuardTriggered(m) => m.encode_to_vec(),
         }
     }
 
@@ -160,6 +166,7 @@ impl Record {
             kind::ERASURE => Record::Erasure(de(kind, bytes)?),
             kind::ENGINE_UPGRADE => Record::EngineUpgrade(de(kind, bytes)?),
             kind::SNAPSHOT_MARKER => Record::SnapshotMarker(de(kind, bytes)?),
+            kind::GUARD_TRIGGERED => Record::GuardTriggered(de(kind, bytes)?),
             other => return Err(DecodeError::UnknownKind(other)),
         };
         record.validate()?;
@@ -209,6 +216,10 @@ impl Record {
             | Record::Erasure(_)
             | Record::EngineUpgrade(_)
             | Record::SnapshotMarker(_) => Ok(()),
+            Record::GuardTriggered(m) => {
+                enum_value::<pb::GuardAction>(m.action, "GuardTriggered.action")?;
+                enum_value::<pb::GuardOutcome>(m.outcome, "GuardTriggered.outcome")
+            }
         }
     }
 }
@@ -496,5 +507,71 @@ mod tests {
             http(None, empty),
             Err(DecodeError::Invalid { .. })
         ));
+    }
+
+    fn unhex(hex: &str) -> Vec<u8> {
+        let hex = hex.trim();
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// A TurnRecord written before `duration_us` existed decodes with 0.
+    /// Fixture: `tests/fixtures/turn-record-v1.hex`.
+    #[test]
+    fn turn_records_from_before_duration_decode_with_zero() {
+        let bytes = unhex(include_str!("../tests/fixtures/turn-record-v1.hex"));
+        let Record::TurnRecord(t) = Record::decode(kind::TURN_RECORD, &bytes).unwrap() else {
+            panic!("not a TurnRecord");
+        };
+        assert_eq!(t, turn_record());
+        assert_eq!(t.duration_us, 0);
+    }
+
+    fn guard_triggered() -> pb::GuardTriggered {
+        let window = |from_lsn, to_lsn, from_time_ms, turns, failed| pb::GuardWindow {
+            from_lsn,
+            to_lsn,
+            from_time_ms,
+            to_time_ms: from_time_ms + 600_000,
+            turns,
+            failed,
+            error_rate: failed as f64 / turns as f64,
+            latency_p50_us: 1_200,
+            latency_p99_us: 9_800,
+        };
+        pb::GuardTriggered {
+            deployment_epoch: 7,
+            deployment_lsn: 120,
+            watch_id: "w-3k9x2a7b1c0d".into(),
+            guard: "error-rate-up".into(),
+            action: pb::GuardAction::Rollback as i32,
+            outcome: pb::GuardOutcome::RolledBack as i32,
+            before: Some(window(20, 119, 1_000, 40, 0)),
+            after: Some(window(121, 180, 601_000, 20, 10)),
+            observed_lsn: 181,
+            rollback_epoch: 8,
+            reason: "guard.after.error_rate > guard.before.error_rate + 0.05".into(),
+            audit: Some(pb::Audit {
+                token_id: "kronik".into(),
+                reason: "watch w-3k9x2a7b1c0d".into(),
+                wall_time_ms: 1_700_000_000_000,
+            }),
+        }
+    }
+
+    /// The first GuardTriggered format stays readable.
+    /// Fixture: `tests/fixtures/guard-triggered-v1.hex`.
+    #[test]
+    fn guard_triggered_v1_decodes() {
+        let bytes = unhex(include_str!("../tests/fixtures/guard-triggered-v1.hex"));
+        let record = Record::decode(kind::GUARD_TRIGGERED, &bytes).unwrap();
+        assert_eq!(record, Record::GuardTriggered(guard_triggered()));
+
+        let mut g = guard_triggered();
+        g.outcome = 0;
+        let err = Record::decode(kind::GUARD_TRIGGERED, &Record::GuardTriggered(g).encode());
+        assert!(matches!(err, Err(DecodeError::Invalid { .. })));
     }
 }

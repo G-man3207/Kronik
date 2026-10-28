@@ -7,6 +7,7 @@
 mod common;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::{Proc, audit, guest, tempdir};
@@ -97,8 +98,8 @@ fn two_turns(dir: &Path, history: Option<Duration>) -> (Proc, Lsn) {
     (p, early)
 }
 
-fn open_props(p: &Proc, dir: &Path) -> Proposals {
-    Proposals::open(p.node.clone(), dir.to_path_buf()).unwrap()
+fn open_props(p: &Proc, dir: &Path) -> Arc<Proposals> {
+    Arc::new(Proposals::open(p.node.clone(), dir.to_path_buf()).unwrap())
 }
 
 #[test]
@@ -333,7 +334,7 @@ fn fork_create_refuses_a_point_the_log_no_longer_covers() {
     );
 }
 
-fn propose_window(p: &Proc, props: &Proposals) -> kronik_fork::proposal::Proposal {
+fn propose_window(p: &Proc, props: &Arc<Proposals>) -> kronik_fork::proposal::Proposal {
     let wasm = std::fs::read(guest("counter-step2")).unwrap();
     p.rt.block_on(props.propose(ProposeRequest {
         wasm: vec![wasm],

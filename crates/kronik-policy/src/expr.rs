@@ -65,12 +65,12 @@ impl Expr {
         Ok(Self { ast })
     }
 
-    /// Evaluates the expression with `diff` bound to the variable `diff`.
-    /// `Err` holds the reason it could not: a missing field, a type error, a
-    /// result that is not a `bool`.
-    pub(crate) fn eval(&self, diff: &serde_json::Value) -> Result<bool, String> {
+    /// Evaluates the expression with `value` bound to the variable `var`
+    /// (`diff` for rules, `guard` for guards). `Err` holds the reason it
+    /// could not: a missing field, a type error, a result that is not a `bool`.
+    pub(crate) fn eval(&self, var: &str, value: &serde_json::Value) -> Result<bool, String> {
         let mut context = Context::with_env(Arc::clone(&ENV));
-        context.add_variable_as_val("diff", json::to_val(diff));
+        context.add_variable_as_val(var, json::to_val(value));
         // As in `compile`: a panic in the interpreter fails this rule only.
         panic::catch_unwind(AssertUnwindSafe(|| {
             let value = Value::resolve_val(&self.ast, &context).map_err(|e| e.to_string())?;
@@ -83,6 +83,33 @@ impl Expr {
             }
         }))
         .unwrap_or_else(|_| Err("the CEL interpreter failed on this expression".to_owned()))
+    }
+
+    /// The expression names the identifier `ident` (a variable, or a
+    /// comprehension's own variable of that name). The tree is at most
+    /// [`MAX_WHEN_DEPTH`] deep, checked by `compile`.
+    pub(crate) fn mentions(&self, ident: &str) -> bool {
+        let mut pending = vec![&self.ast];
+        while let Some(node) = pending.pop() {
+            match &node.expr {
+                Node::Ident(name) if name == ident => return true,
+                Node::Select(select) => pending.push(&select.operand),
+                Node::Call(call) => {
+                    pending.extend(call.target.iter().map(|target| &**target));
+                    pending.extend(call.args.iter());
+                }
+                Node::List(list) => pending.extend(list.elements.iter()),
+                Node::Comprehension(c) => pending.extend([
+                    &c.iter_range,
+                    &c.accu_init,
+                    &c.loop_cond,
+                    &c.loop_step,
+                    &c.result,
+                ]),
+                _ => {}
+            }
+        }
+        false
     }
 }
 

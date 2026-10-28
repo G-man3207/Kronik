@@ -251,12 +251,14 @@ mod tests {
 
     #[test]
     fn names_are_unique_and_texts_are_complete() {
-        const V01: [&str; 8] = ["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8"];
+        const MILESTONES: [&str; 11] = [
+            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11",
+        ];
         let mut seen = HashSet::new();
         for t in list() {
             assert!(seen.insert(t.name.to_ascii_lowercase()), "{} twice", t.name);
             assert!(!t.title.is_empty() && !t.title.contains('\n'), "{}", t.name);
-            assert!(V01.contains(&t.milestone), "{}", t.name);
+            assert!(MILESTONES.contains(&t.milestone), "{}", t.name);
             assert!(!t.text.is_empty(), "{}", t.name);
             assert_eq!(t.text, t.text.trim(), "{}", t.name);
         }

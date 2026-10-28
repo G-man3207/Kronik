@@ -608,6 +608,59 @@ pub struct ForkDeleteResponse {
     pub deleted: String,
 }
 
+/// `POST /v1/previews` (M11).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PreviewCreateRequest {
+    /// The proposal whose code the preview runs.
+    pub proposal: String,
+    /// How long the preview lives, in milliseconds [default: `[fork]
+    /// preview_ttl`, 24 h].
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+    /// A preview without access to personal data; always so for a caller
+    /// without pii:read, and when the proposal has it.
+    #[serde(default)]
+    pub no_pii: bool,
+    /// Required: missing or blank answers REASON_REQUIRED.
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// A preview fork: where its requests go and when it expires.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PreviewInfo {
+    /// The fork's name, `v-<12 hex>`.
+    pub id: String,
+    pub proposal: String,
+    /// `<scheme>://<id>.<preview_domain>/` with `[gateway] preview_domain`,
+    /// else `<scheme>://<gateway host>/__preview/<id>/`; `https` when the
+    /// gateway serves TLS, else `http`.
+    pub url: String,
+    pub fork_lsn: u64,
+    pub no_pii: bool,
+    /// Wall-clock Unix milliseconds after which it is deleted.
+    pub expires_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PreviewCreateResponse {
+    pub dry_run: bool,
+    pub preview: PreviewInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PreviewsResponse {
+    pub previews: Vec<PreviewInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PreviewDeleteResponse {
+    pub dry_run: bool,
+    pub deleted: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ForkDeployResponse {
     pub dry_run: bool,
@@ -653,21 +706,27 @@ pub struct ProposeRequest {
     pub reason: String,
     #[serde(default)]
     pub dry_run: bool,
+    /// Return at once with the `running` proposal; the replay runs on in
+    /// the daemon (M10). Not with `dry_run`.
+    #[serde(default, rename = "async")]
+    pub run_async: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ProposalInfo {
     pub id: String,
     pub fork: String,
+    /// `running`, `evaluated`, `approved`, `promoted`, `rejected`, `stale`
+    /// or `failed`.
     pub status: String,
     pub fork_lsn: u64,
     pub verified_through_lsn: u64,
     pub diff_hash: String,
-    /// The policy evaluation (§7).
-    #[schemars(schema_with = "crate::openapi::policy_evaluation")]
+    /// The policy evaluation (§7); null while `running`.
+    #[schemars(schema_with = "crate::openapi::policy_evaluation_or_null")]
     pub policy: serde_json::Value,
-    /// The diff's summary (§5.1).
-    #[schemars(schema_with = "crate::openapi::diff_summary")]
+    /// The diff's summary (§5.1); null while `running`.
+    #[schemars(schema_with = "crate::openapi::diff_summary_or_null")]
     pub summary: serde_json::Value,
     /// The code the proposal switches: one entry per changed actor kind.
     pub kinds: Vec<DeploymentKind>,
@@ -681,6 +740,23 @@ pub struct ProposalInfo {
     /// that retention cut its window short.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// While `running`: how far the replay has come (M10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<ProposalProgress>,
+    /// When `failed`: why, as the error JSON (M10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::openapi::error_schema")]
+    pub error: Option<serde_json::Value>,
+}
+
+/// Root inputs replayed so far and to replay, per replay mode (0 and 0 for
+/// a mode that does not run, or has not counted its inputs yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProposalProgress {
+    pub isolated_done: u64,
+    pub isolated_total: u64,
+    pub continuous_done: u64,
+    pub continuous_total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -734,10 +810,136 @@ pub struct RollbackResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WatchRequest {
+    /// How long to watch after the deployment, and how long the window
+    /// before it is that the metrics are compared with, in milliseconds:
+    /// more than 0 and at most 86400000 (24h).
+    pub for_ms: u64,
+    /// Required: missing or blank answers REASON_REQUIRED.
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Return at once with the `watching` watch; it runs on in the daemon.
+    /// Not with `dry_run`.
+    #[serde(default, rename = "async")]
+    pub run_async: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WatchResponse {
+    pub dry_run: bool,
+    /// In a dry run: the current metrics, and in `triggered` (with `lsn`
+    /// 0) the guards that would fire now.
+    pub watch: WatchInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WatchesResponse {
+    pub watches: Vec<WatchInfo>,
+}
+
+/// A watch of a deployment (M11).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WatchInfo {
+    /// `w-` and 12 hex characters.
+    pub id: String,
+    /// The watched deployment's epoch and the LSN of its record.
+    pub epoch: u64,
+    pub deployment_lsn: u64,
+    pub for_ms: u64,
+    /// Logical time where the window after the deployment starts.
+    pub deployment_time_ms: u64,
+    /// `watching`, `done` (the window passed), `rolled_back`, `superseded`
+    /// (a later deployment of its kinds replaced the watched one; nothing
+    /// acted), `stopped` or `failed`.
+    pub status: String,
+    pub reason: String,
+    pub token_id: String,
+    pub created_ms: u64,
+    /// The guards that fired, in order. Each fires once; a guard that could
+    /// not be evaluated also alerts once, with a reason starting "the
+    /// guard could not be evaluated: ".
+    pub triggered: Vec<WatchTriggered>,
+    /// The metrics of the last evaluation (the CEL variable `guard`);
+    /// null before the first.
+    pub metrics: Option<GuardMetrics>,
+    /// When `failed`: why, as the error JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::openapi::error_schema")]
+    pub error: Option<serde_json::Value>,
+    /// When `stopped`: who stopped it and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<WatchStopped>,
+}
+
+/// `kronik watches stop`'s audit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WatchStopped {
+    pub token_id: String,
+    pub reason: String,
+    pub wall_time_ms: u64,
+}
+
+/// A guard that fired: its `GuardTriggered` record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WatchTriggered {
+    pub guard: String,
+    /// `alert` or `rollback`.
+    pub action: String,
+    /// `alerted`, `rolled_back`, `rollback_refused_schema` or
+    /// `rollback_failed`.
+    pub outcome: String,
+    /// The `GuardTriggered` record's LSN.
+    pub lsn: u64,
+    /// The rollback deployment's epoch; 0 without one.
+    pub rollback_epoch: u64,
+    pub reason: String,
+}
+
+/// What a guard sees: the deployment's kinds' turns after it and in the
+/// equally long window before it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct GuardMetrics {
+    pub epoch: u64,
+    pub kinds: Vec<String>,
+    /// A rollback would move a schema version back: guards alert instead.
+    pub schema_changed: bool,
+    /// Logical time of the window after the deployment seen so far.
+    pub observed_ms: u64,
+    pub before: GuardWindowMetrics,
+    pub after: GuardWindowMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct GuardWindowMetrics {
+    pub turns: u64,
+    /// Turns whose outcome is not committed.
+    pub failed: u64,
+    /// `failed / turns`; 0 without turns.
+    pub error_rate: f64,
+    pub latency_p50_ms: f64,
+    pub latency_p99_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PolicyResponse {
     pub rules_toml: String,
     pub epoch: u64,
     pub default: bool,
+    /// The guards `kronik watch` evaluates (M11). The policy's own when its
+    /// file has a `guard` key (`guard = []`: none), else the defaults.
+    pub guards: Vec<PolicyGuard>,
+    /// `guards` are the default guards: the policy has no `guard` key.
+    pub default_guards: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PolicyGuard {
+    pub name: String,
+    pub when: String,
+    /// `alert` or `rollback`.
+    pub action: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

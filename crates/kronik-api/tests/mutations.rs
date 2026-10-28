@@ -53,6 +53,16 @@ fn cases() -> Vec<Case> {
         },
         Case {
             method: "POST",
+            path: "/v1/deployments/{epoch}/watch",
+            extra: json!({"for_ms": 60_000}),
+        },
+        Case {
+            method: "POST",
+            path: "/v1/watches/{id}/stop",
+            extra: json!({}),
+        },
+        Case {
+            method: "POST",
             path: "/v1/actors/{kind}/{key}/messages",
             extra: json!({"name": "increment"}),
         },
@@ -115,6 +125,16 @@ fn cases() -> Vec<Case> {
             method: "POST",
             path: "/v1/forks/{name}/actors/{kind}/{key}/messages",
             extra: json!({"name": "increment"}),
+        },
+        Case {
+            method: "POST",
+            path: "/v1/previews",
+            extra: json!({"proposal": "p-000000000000"}),
+        },
+        Case {
+            method: "DELETE",
+            path: "/v1/previews/{id}",
+            extra: json!({}),
         },
         Case {
             method: "POST",
@@ -244,9 +264,21 @@ async fn every_mutation_requires_a_reason_and_a_dry_run_writes_nothing() {
     )
     .await
     .unwrap();
-    let proposals =
-        kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf()).unwrap();
-    let api = Arc::new(Api::new(node).with_proposals(Arc::new(proposals)));
+    let proposals = Arc::new(
+        kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf()).unwrap(),
+    );
+    let watches = kronik_fork::watch::Watches::open(
+        node.clone(),
+        proposals.clone(),
+        dir.path().to_path_buf(),
+    )
+    .unwrap()
+    .start();
+    let api = Arc::new(
+        Api::new(node)
+            .with_proposals(proposals)
+            .with_watches(watches),
+    );
     let start = applied(&api).await;
 
     for case in &cases {

@@ -679,7 +679,9 @@ impl StateDb {
                     epoch = epoch.max(u.epoch);
                     engine = Some(&u.to_engine_version);
                 }
-                Record::BranchCreated(_) | Record::SnapshotMarker(_) => {}
+                Record::BranchCreated(_)
+                | Record::SnapshotMarker(_)
+                | Record::GuardTriggered(_) => {}
             }
             applied = c.lsn;
             segments.insert(c.pos.segment, (c.lsn, hwm));

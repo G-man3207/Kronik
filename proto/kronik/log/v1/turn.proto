@@ -58,6 +58,10 @@ message TurnRecord {
   uint64 memory_peak_bytes = 21;
   // The actor's SQL schema version after this turn (set by migrate turns).
   uint32 schema_version = 22;
+  // Wall time of the turn in microseconds as the node measured it, from the
+  // turn's start to its record (M11, for `kronik watch` latency guards).
+  // 0 in records from before M11 and in turns a fork recomputes.
+  uint64 duration_us = 23;
 }
 
 message EffectRecord {

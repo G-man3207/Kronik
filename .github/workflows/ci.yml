@@ -20,7 +20,7 @@ env:
 
 jobs:
   ci:
-    name: fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny, foreign, identity
+    name: fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny, foreign, identity, action
     runs-on: ubuntu-24.04
     steps:
       # The runner's preinstalled SDKs that this job does not use, for disk.
@@ -103,3 +103,5 @@ jobs:
           exit "$status"
       - name: identity
         run: scripts/ci.sh identity
+      - name: action
+        run: scripts/ci.sh action

@@ -12,6 +12,7 @@ blake3 = { workspace = true }
 kronik-core = { workspace = true }
 kronik-metrics = { workspace = true }
 kronik-effects = { workspace = true }
+kronik-gateway = { workspace = true }
 kronik-log = { workspace = true }
 kronik-policy = { workspace = true }
 kronik-privacy = { workspace = true }
@@ -25,6 +26,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+# Proposal jobs run on their own task (M10); their failures are logged.
+tracing = { workspace = true }
 
 [dev-dependencies]
 kronik-core = { workspace = true, features = ["real"] }

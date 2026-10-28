@@ -5,7 +5,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_fork::diff::{DiffOptions, Mode};
-use kronik_fork::proposal::{Proposal, ProposeRequest as Propose};
+use kronik_fork::proposal::{Proposal, Proposals, ProposeRequest as Propose};
+use kronik_fork::watch::{Watch, Watches};
 use kronik_policy::{DEFAULT_RULES_TOML, RuleSet};
 use kronik_proto::log::v1 as pb;
 use prost::Message as _;
@@ -61,7 +62,7 @@ fn kinds_json(list: &[String]) -> Vec<DeploymentKind> {
         .collect()
 }
 
-fn proposal_info(p: &Proposal) -> ProposalInfo {
+fn proposal_info(p: &Proposal, props: &Proposals) -> ProposalInfo {
     ProposalInfo {
         approval_requests: Vec::new(),
         id: p.id.clone(),
@@ -75,6 +76,13 @@ fn proposal_info(p: &Proposal) -> ProposalInfo {
         kinds: kinds_json(&p.kinds),
         unchanged: kinds_json(&p.unchanged),
         warnings: p.warnings(),
+        progress: props.progress(&p.id).map(|g| ProposalProgress {
+            isolated_done: g.isolated_done,
+            isolated_total: g.isolated_total,
+            continuous_done: g.continuous_done,
+            continuous_total: g.continuous_total,
+        }),
+        error: p.error.as_ref().map(ApiError::to_json),
     }
 }
 
@@ -87,6 +95,13 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+/// The API's view of a watch: the same JSON as `watches/<id>.json`.
+fn watch_info(w: &Watch) -> Result<WatchInfo> {
+    serde_json::to_value(w)
+        .and_then(serde_json::from_value)
+        .map_err(internal)
 }
 
 /// `2026-10-25T10:00:00Z`, with optional fraction and `±hh:mm` offset, as
@@ -142,8 +157,8 @@ pub(crate) fn parse_rfc3339(s: &str) -> Option<u64> {
 }
 
 impl Api {
-    fn proposals(&self) -> Result<&kronik_fork::proposal::Proposals> {
-        self.proposals.as_deref().ok_or_else(|| {
+    pub(crate) fn proposals(&self) -> Result<&std::sync::Arc<Proposals>> {
+        self.proposals.as_ref().ok_or_else(|| {
             ApiError::new(
                 ErrorCode::Unavailable,
                 "forks and proposals are not available in this process",
@@ -194,6 +209,10 @@ impl Api {
             ("POST", ["v1", "proposals", id, "approve"]) => self.approve(req, id).await,
             ("POST", ["v1", "proposals", id, "promote"]) => self.promote(req, id).await,
             ("POST", ["v1", "deployments", epoch, "rollback"]) => self.rollback(req, epoch).await,
+            ("POST", ["v1", "deployments", epoch, "watch"]) => self.watch(req, epoch).await,
+            ("GET", ["v1", "watches"]) => self.watches_list(),
+            ("GET", ["v1", "watches", id]) => self.watch_get(id),
+            ("POST", ["v1", "watches", id, "stop"]) => self.watch_stop(req, id).await,
             ("GET", ["v1", "policy"]) => self.policy(),
             ("PUT", ["v1", "policy"]) => self.policy_set(req).await,
             ("POST", ["v1", "policy", "test"]) => self.policy_test(req, caller).await,
@@ -319,13 +338,18 @@ impl Api {
     }
 
     async fn diff(&self, name: &str, q: &Query, caller: &Caller) -> Result<ApiResponse> {
-        let md = match q.get("format") {
-            None | Some("json") => false,
-            Some("md") => true,
-            Some(other) => return Err(bad(format!("format must be json or md, not {other:?}"))),
-        };
+        let props = self.proposals()?;
         let hide_credentials = !caller.has(Scope::PiiRead);
-        let body = self.proposals()?.diff(name, md, hide_credentials).await?;
+        let (body, md) = match q.get("format") {
+            None | Some("json") => (props.diff(name, false, hide_credentials).await?, false),
+            Some("md") => (props.diff(name, true, hide_credentials).await?, true),
+            Some("summary") => (props.diff_summary(name).await?, true),
+            Some(other) => {
+                return Err(bad(format!(
+                    "format must be json, md or summary, not {other:?}"
+                )));
+            }
+        };
         Ok(ApiResponse {
             status: 200,
             content_type: if md {
@@ -356,40 +380,49 @@ impl Api {
                     .map_err(|e| bad(format!("wasm_base64 is not valid base64: {e}")))
             })
             .collect::<Result<Vec<_>>>()?;
-        let (p, dry_run) = self
-            .proposals()?
-            .propose(Propose {
-                wasm,
-                names: r.names,
-                window_ms: r.window_ms,
-                at: r.at,
-                options,
-                workers: r.options.threads,
-                audit: self.audit(req, r.reason.clone()),
-                dry_run: r.dry_run,
-            })
+        if r.run_async && r.dry_run {
+            return Err(bad(
+                "async and dry_run do not go together: a dry run keeps nothing to follow",
+            )
+            .with_hint("Leave out --async for a dry run."));
+        }
+        let props = self.proposals()?;
+        let (p, dry_run) = props
+            .propose_job(
+                Propose {
+                    wasm,
+                    names: r.names,
+                    window_ms: r.window_ms,
+                    at: r.at,
+                    options,
+                    workers: r.options.threads,
+                    audit: self.audit(req, r.reason.clone()),
+                    dry_run: r.dry_run,
+                },
+                !r.run_async,
+            )
             .await?;
         ok(&ProposeResponse {
             dry_run,
-            proposal: proposal_info(&p),
+            proposal: proposal_info(&p, props),
         })
     }
 
     async fn proposals_list(&self) -> Result<ApiResponse> {
-        let proposals = self
-            .proposals()?
+        let props = self.proposals()?;
+        let proposals = props
             .list()
             .await
             .iter()
             .filter(|p| !p.plain_fork)
-            .map(proposal_info)
+            .map(|p| proposal_info(p, props))
             .collect();
         ok(&ProposalsResponse { proposals })
     }
 
     async fn proposal(&self, id: &str) -> Result<ApiResponse> {
         let props = self.proposals()?;
-        let mut info = proposal_info(&props.get(id).await?);
+        let mut info = proposal_info(&props.get(id).await?, props);
         info.approval_requests = props
             .approval_requests(id)?
             .into_iter()
@@ -738,19 +771,98 @@ impl Api {
         })
     }
 
-    fn policy(&self) -> Result<ApiResponse> {
-        match self.node.store().db().policy().map_err(internal)? {
-            Some((_, p)) => ok(&PolicyResponse {
-                rules_toml: p.rules_toml,
-                epoch: p.epoch,
-                default: false,
-            }),
-            None => ok(&PolicyResponse {
-                rules_toml: DEFAULT_RULES_TOML.to_owned(),
-                epoch: 0,
-                default: true,
-            }),
+    fn watches(&self) -> Result<&std::sync::Arc<Watches>> {
+        self.watches.as_ref().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::Unavailable,
+                "watches are not available in this process",
+            )
+        })
+    }
+
+    async fn watch(&self, req: &ApiRequest, epoch: &str) -> Result<ApiResponse> {
+        let r: WatchRequest = json(&req.body)?;
+        reason(&r.reason)?;
+        let epoch: u64 = epoch
+            .parse()
+            .map_err(|_| bad(format!("{epoch:?} is not an epoch")))?;
+        if r.run_async && r.dry_run {
+            return Err(bad(
+                "async and dry_run do not go together: a dry run keeps nothing to follow",
+            )
+            .with_hint("Leave out --async for a dry run."));
         }
+        let w = self
+            .watches()?
+            .watch(
+                epoch,
+                r.for_ms,
+                self.audit(req, r.reason.clone()),
+                r.dry_run,
+                !r.run_async,
+            )
+            .await?;
+        ok(&WatchResponse {
+            dry_run: r.dry_run,
+            watch: watch_info(&w)?,
+        })
+    }
+
+    fn watches_list(&self) -> Result<ApiResponse> {
+        let watches = self
+            .watches()?
+            .list()
+            .iter()
+            .map(watch_info)
+            .collect::<Result<_>>()?;
+        ok(&WatchesResponse { watches })
+    }
+
+    fn watch_get(&self, id: &str) -> Result<ApiResponse> {
+        ok(&watch_info(&self.watches()?.get(id)?)?)
+    }
+
+    async fn watch_stop(&self, req: &ApiRequest, id: &str) -> Result<ApiResponse> {
+        let r: ResendRequest = json(&req.body)?;
+        reason(&r.reason)?;
+        let w = self
+            .watches()?
+            .stop(id, self.audit(req, r.reason.clone()), r.dry_run)
+            .await?;
+        ok(&WatchResponse {
+            dry_run: r.dry_run,
+            watch: watch_info(&w)?,
+        })
+    }
+
+    fn policy(&self) -> Result<ApiResponse> {
+        let policy = self.node.store().db().policy().map_err(internal)?;
+        let (rules_toml, epoch, default) = match policy {
+            Some((_, p)) => (p.rules_toml, p.epoch, false),
+            None => (DEFAULT_RULES_TOML.to_owned(), 0, true),
+        };
+        let rules = if default {
+            RuleSet::defaults()
+        } else {
+            RuleSet::parse_toml(&rules_toml)
+                .map_err(|e| internal(format!("the recorded policy no longer parses: {e}")))?
+        };
+        let guards = rules
+            .effective_guards()
+            .iter()
+            .map(|g| PolicyGuard {
+                name: g.name.clone(),
+                when: g.when.clone(),
+                action: g.action.as_str().to_owned(),
+            })
+            .collect();
+        ok(&PolicyResponse {
+            rules_toml,
+            epoch,
+            default,
+            guards,
+            default_guards: !rules.has_guard_key,
+        })
     }
 
     async fn policy_set(&self, req: &ApiRequest) -> Result<ApiResponse> {

@@ -123,6 +123,14 @@ const COMMANDS: &[(&str, Output)] = &[
         Output::Api(&[("", "GET", "/v1/proposals/{id}")]),
     ),
     (
+        "proposal status",
+        Output::Api(&[("", "GET", "/v1/proposals/{id}")]),
+    ),
+    (
+        "proposal wait",
+        Output::Api(&[("", "GET", "/v1/proposals/{id}")]),
+    ),
+    (
         "approve",
         Output::Api(&[("", "POST", "/v1/proposals/{id}/approve")]),
     ),
@@ -134,11 +142,40 @@ const COMMANDS: &[(&str, Output)] = &[
         "rollback",
         Output::Api(&[("", "POST", "/v1/deployments/{epoch}/rollback")]),
     ),
+    (
+        "watch",
+        Output::Api(&[
+            ("", "GET", "/v1/watches/{id}"),
+            (
+                "with --async or --dry-run",
+                "POST",
+                "/v1/deployments/{epoch}/watch",
+            ),
+        ]),
+    ),
+    ("watches list", Output::Api(&[("", "GET", "/v1/watches")])),
+    (
+        "watches show",
+        Output::Api(&[("", "GET", "/v1/watches/{id}")]),
+    ),
+    (
+        "watches stop",
+        Output::Api(&[("", "POST", "/v1/watches/{id}/stop")]),
+    ),
     ("policy show", Output::Api(&[("", "GET", "/v1/policy")])),
     ("policy set", Output::Api(&[("", "PUT", "/v1/policy")])),
     (
         "policy test",
         Output::Api(&[("", "POST", "/v1/policy/test")]),
+    ),
+    (
+        "preview create",
+        Output::Api(&[("", "POST", "/v1/previews")]),
+    ),
+    ("preview list", Output::Api(&[("", "GET", "/v1/previews")])),
+    (
+        "preview delete",
+        Output::Api(&[("", "DELETE", "/v1/previews/{id}")]),
     ),
     ("token create", Output::Api(&[("", "POST", "/v1/tokens")])),
     ("token list", Output::Api(&[("", "GET", "/v1/tokens")])),

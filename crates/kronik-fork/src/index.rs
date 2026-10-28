@@ -32,8 +32,7 @@ pub struct RootInput {
 pub fn input_label(input: Option<&pb::Input>) -> String {
     match input.and_then(|i| i.kind.as_ref()) {
         Some(pb::input::Kind::Http(h)) => {
-            // Never the path: it can hold user data (only the gateway builds
-            // HTTP inputs, and it always sets the route).
+            // Never the raw path: it can hold user data (ADR 0023).
             let route = if h.route.is_empty() {
                 "(no route)"
             } else {

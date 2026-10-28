@@ -1,4 +1,5 @@
-//! Policy: rules in CEL evaluated against behavior diffs (`kronik.diff/v1`).
+//! Policy: rules in CEL evaluated against behavior diffs (`kronik.diff/v1`),
+//! and guards evaluated by `kronik watch` after a deployment.
 //!
 //! A rule set is a TOML file, set with `kronik policy set rules.toml`:
 //!
@@ -7,11 +8,18 @@
 //! name = "payments-must-be-exact"      # unique, [a-z0-9-]+
 //! when = "diff.grounding.exists(t, t.host.endsWith('payments.internal') && t.approximate + t.synthetic > 0)"
 //! action = "require_approval"         # allow | require_approval | deny
+//!
+//! [[guard]]
+//! name = "error-rate-up"               # unique among guards, [a-z0-9-]+
+//! when = "guard.after.turns >= 20 && guard.after.failed >= 3 && guard.after.error_rate > guard.before.error_rate + 0.05"
+//! action = "rollback"                  # alert | rollback
 //! ```
 //!
 //! [`RuleSet::evaluate`] binds a diff to the variable `diff` and evaluates
 //! every rule; the outcome is the strictest action among the rules that fire.
-//! The contract is `docs/design/m3-fork.md` §7. ADR 0007 records the CEL
+//! [`RuleSet::evaluate_guards`] binds a watch's metrics to the variable
+//! `guard`. The contract is `docs/design/m3-fork.md` §7 and
+//! `docs/design/m11-watch.md`. ADR 0007 records the CEL
 //! engine, the limits on a `when` ([`MAX_WHEN_BYTES`], [`MAX_WHEN_NESTING`],
 //! [`MAX_WHEN_DEPTH`], no map literals) and how evaluation is kept
 //! deterministic.
@@ -69,14 +77,56 @@ pub struct Rule {
     pub action: Action,
 }
 
+/// What a guard does when it fires: `alert < rollback`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardAction {
+    Alert,
+    Rollback,
+}
+
+impl GuardAction {
+    /// The name in rules files and JSON: `alert`, `rollback`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GuardAction::Alert => "alert",
+            GuardAction::Rollback => "rollback",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<GuardAction> {
+        [GuardAction::Alert, GuardAction::Rollback]
+            .into_iter()
+            .find(|action| action.as_str() == name)
+    }
+}
+
+/// A guard: when the CEL expression `when` is true for a watch's metrics
+/// (the variable `guard`), the guard fires with `action`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Guard {
+    pub name: String,
+    pub when: String,
+    pub action: GuardAction,
+}
+
 /// Rules, evaluated in order. Made by [`RuleSet::parse_toml`] or
 /// [`RuleSet::defaults`], which compile every `when` once.
 #[derive(Clone)]
 pub struct RuleSet {
     pub rules: Vec<Rule>,
+    /// The `[[guard]]` tables. Used only when the file has a `guard` key
+    /// ([`RuleSet::has_guard_key`]); without one, [`DEFAULT_GUARDS_TOML`]
+    /// applies.
+    pub guards: Vec<Guard>,
+    /// The file has a `guard` key, even an empty `guard = []`: its guards
+    /// (possibly none) are the guards in force, not the defaults.
+    pub has_guard_key: bool,
     /// The `when` of each rule compiled, with the text it was compiled from:
     /// a rule changed after parsing is compiled again when evaluated.
     compiled: Vec<(String, Arc<Expr>)>,
+    /// The same for `guards`.
+    compiled_guards: Vec<(String, Arc<Expr>)>,
 }
 
 /// A rule that fired, with the action it counts with.
@@ -117,31 +167,53 @@ pub struct Evaluation {
     pub errors: Vec<RuleError>,
 }
 
+/// A guard that fired, with the action it counts with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FiredGuard {
+    pub name: String,
+    pub action: GuardAction,
+}
+
+/// The result of evaluating the guards against a watch's metrics.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardEvaluation {
+    /// The guards that fired, in file order.
+    pub fired: Vec<FiredGuard>,
+    /// The guards that could not be evaluated. They do not fire: a watch
+    /// reports them and evaluates them again next time.
+    pub errors: Vec<RuleError>,
+}
+
 /// A rules file that can't be used. The API reports it as `BAD_REQUEST`.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{}{}", rule_prefix(.name), .message)]
+#[error("{}{}", entry_prefix(.table, .name), .message)]
 pub struct PolicyError {
-    /// The rule the error is about, as named in the file, when it has a name.
+    /// What the error is about: `rule` or `guard`.
+    pub table: &'static str,
+    /// The rule or guard the error is about, as named in the file, when it
+    /// has a name.
     pub name: Option<String>,
     pub message: String,
 }
 
-fn rule_prefix(name: &Option<String>) -> String {
+fn entry_prefix(table: &str, name: &Option<String>) -> String {
     name.as_ref()
-        .map(|name| format!("rule `{name}`: "))
+        .map(|name| format!("{table} `{name}`: "))
         .unwrap_or_default()
 }
 
 impl PolicyError {
     fn file(message: impl Into<String>) -> Self {
         Self {
+            table: "rule",
             name: None,
             message: message.into(),
         }
     }
 
-    fn rule(name: &str, message: impl Into<String>) -> Self {
+    fn entry(table: &'static str, name: &str, message: impl Into<String>) -> Self {
         Self {
+            table,
             name: Some(name.to_owned()),
             message: message.into(),
         }
@@ -226,96 +298,215 @@ static DEFAULTS: LazyLock<RuleSet> = LazyLock::new(|| {
         .iter()
         .filter_map(|rule| Some((rule.when.clone(), Arc::new(Expr::compile(&rule.when).ok()?))))
         .collect();
-    RuleSet { rules, compiled }
+    RuleSet {
+        rules,
+        guards: Vec::new(),
+        has_guard_key: false,
+        compiled,
+        compiled_guards: Vec::new(),
+    }
 });
 
+/// The guards `kronik watch` uses while the policy has no `guard` key: a
+/// rollback when the error rate rises by more than 5 points with at least
+/// 20 turns and 3 failures after the deployment (one failure in a quiet
+/// window is not a breach), and an alert when the p99 latency more than
+/// doubles and rises by over 50 ms, with 10 turns on both sides and a
+/// measured p99 before (records from before M11 have no duration).
+pub const DEFAULT_GUARDS_TOML: &str = r#"[[guard]]
+name = "error-rate-up"
+when = "guard.after.turns >= 20 && guard.after.failed >= 3 && guard.after.error_rate > guard.before.error_rate + 0.05"
+action = "rollback"
+
+[[guard]]
+name = "latency-p99-up"
+when = "guard.after.turns >= 10 && guard.before.turns >= 10 && guard.before.latency_p99_ms > 0.0 && guard.after.latency_p99_ms > 2.0 * guard.before.latency_p99_ms + 50.0"
+action = "alert"
+"#;
+
+/// [`DEFAULT_GUARDS_TOML`] parsed; a test checks that it parses.
+static DEFAULT_GUARDS: LazyLock<RuleSet> =
+    LazyLock::new(|| RuleSet::parse_toml(DEFAULT_GUARDS_TOML).unwrap_or_else(|_| RuleSet::empty()));
+
+/// One checked `[[rule]]` or `[[guard]]` table: name, `when`, action name.
+type Entry<'f> = (&'f str, &'f str, &'f str);
+
+/// The `[[table]]` entries of a rules file, each with exactly `name`, `when`
+/// and `action`; names unique and `[a-z0-9-]+`.
+fn entries<'f>(file: &'f toml::Table, table: &'static str) -> Result<Vec<Entry<'f>>, PolicyError> {
+    let entries = match file.get(table) {
+        None => &[][..],
+        Some(toml::Value::Array(entries)) => entries.as_slice(),
+        Some(_) => {
+            return Err(PolicyError::file(format!(
+                "`{table}` must be an array of tables ([[{table}]])"
+            )));
+        }
+    };
+    let mut out = Vec::with_capacity(entries.len());
+    let mut names = BTreeSet::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let number = index + 1;
+        let toml::Value::Table(fields) = entry else {
+            return Err(PolicyError::file(format!(
+                "{table} {number} is not a table"
+            )));
+        };
+        let name = match fields.get("name") {
+            Some(toml::Value::String(name)) => name.as_str(),
+            Some(_) => {
+                return Err(PolicyError::file(format!(
+                    "{table} {number}: `name` must be a string"
+                )));
+            }
+            None => return Err(PolicyError::file(format!("{table} {number} has no `name`"))),
+        };
+        if let Some(key) = fields
+            .keys()
+            .find(|key| !matches!(key.as_str(), "name" | "when" | "action"))
+        {
+            return Err(PolicyError::entry(
+                table,
+                name,
+                format!("unknown key `{key}`: a {table} has only `name`, `when` and `action`"),
+            ));
+        }
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(PolicyError::entry(
+                table,
+                name,
+                "invalid name: use lowercase letters, digits and `-` ([a-z0-9-]+)",
+            ));
+        }
+        if !names.insert(name) {
+            return Err(PolicyError::entry(
+                table,
+                name,
+                format!("duplicate name: an earlier {table} has the same name"),
+            ));
+        }
+        let when = string_field(fields, table, name, "when")?;
+        let action = string_field(fields, table, name, "action")?;
+        out.push((name, when, action));
+    }
+    Ok(out)
+}
+
+/// `when` compiled, or the parse error for the entry `name`.
+fn compile(
+    table: &'static str,
+    name: &str,
+    when: &str,
+) -> Result<(String, Arc<Expr>), PolicyError> {
+    let expr = Expr::compile(when)
+        .map_err(|message| PolicyError::entry(table, name, format!("invalid `when`: {message}")))?;
+    // A guard sees only `guard`; `diff` would fail at every evaluation.
+    if table == "guard" && expr.mentions("diff") {
+        return Err(PolicyError::entry(
+            table,
+            name,
+            "invalid `when`: a guard sees the variable `guard`, not `diff`",
+        ));
+    }
+    Ok((when.to_owned(), Arc::new(expr)))
+}
+
+/// Evaluates `when` with `value` bound to `var`, using `compiled` when it
+/// was compiled from the same text.
+fn eval_when(
+    compiled: Option<&(String, Arc<Expr>)>,
+    when: &str,
+    var: &str,
+    value: &serde_json::Value,
+) -> Result<bool, String> {
+    match compiled {
+        Some((text, expr)) if text == when => expr.eval(var, value),
+        _ => Expr::compile(when)
+            .map_err(|message| format!("invalid `when`: {message}"))
+            .and_then(|expr| expr.eval(var, value)),
+    }
+}
+
 impl RuleSet {
-    /// Parses a rules file: `[[rule]]` tables with exactly `name`, `when` and
-    /// `action`. Names are unique and match `[a-z0-9-]+`; every `when` is
-    /// compiled, so a CEL syntax error is an error here.
+    fn empty() -> RuleSet {
+        RuleSet {
+            rules: Vec::new(),
+            guards: Vec::new(),
+            has_guard_key: false,
+            compiled: Vec::new(),
+            compiled_guards: Vec::new(),
+        }
+    }
+
+    /// Parses a rules file: `[[rule]]` and `[[guard]]` tables with exactly
+    /// `name`, `when` and `action`. Names are unique per table and match
+    /// `[a-z0-9-]+`; every `when` is compiled, so a CEL syntax error is an
+    /// error here.
     pub fn parse_toml(text: &str) -> Result<RuleSet, PolicyError> {
         let file: toml::Table =
             toml::from_str(text).map_err(|e| PolicyError::file(toml_error(text, &e)))?;
-        if let Some(key) = file.keys().find(|key| *key != "rule") {
+        if let Some(key) = file
+            .keys()
+            .find(|key| !matches!(key.as_str(), "rule" | "guard"))
+        {
             return Err(PolicyError::file(format!(
-                "unknown key `{key}`: a rules file has only [[rule]] tables"
+                "unknown key `{key}`: a rules file has only [[rule]] and [[guard]] tables"
             )));
         }
-        let entries = match file.get("rule") {
-            None => &[][..],
-            Some(toml::Value::Array(entries)) => entries.as_slice(),
-            Some(_) => {
-                return Err(PolicyError::file(
-                    "`rule` must be an array of tables ([[rule]])",
-                ));
-            }
-        };
-        let mut rules = Vec::with_capacity(entries.len());
-        let mut compiled = Vec::with_capacity(entries.len());
-        let mut names = BTreeSet::new();
-        for (index, entry) in entries.iter().enumerate() {
-            let number = index + 1;
-            let toml::Value::Table(table) = entry else {
-                return Err(PolicyError::file(format!("rule {number} is not a table")));
-            };
-            let name = match table.get("name") {
-                Some(toml::Value::String(name)) => name.as_str(),
-                Some(_) => {
-                    return Err(PolicyError::file(format!(
-                        "rule {number}: `name` must be a string"
-                    )));
-                }
-                None => return Err(PolicyError::file(format!("rule {number} has no `name`"))),
-            };
-            if let Some(key) = table
-                .keys()
-                .find(|key| !matches!(key.as_str(), "name" | "when" | "action"))
-            {
-                return Err(PolicyError::rule(
-                    name,
-                    format!("unknown key `{key}`: a rule has only `name`, `when` and `action`"),
-                ));
-            }
-            if name.is_empty()
-                || !name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            {
-                return Err(PolicyError::rule(
-                    name,
-                    "invalid name: use lowercase letters, digits and `-` ([a-z0-9-]+)",
-                ));
-            }
-            if !names.insert(name) {
-                return Err(PolicyError::rule(
-                    name,
-                    "duplicate name: an earlier rule has the same name",
-                ));
-            }
-            let when = string_field(table, name, "when")?;
-            let action = string_field(table, name, "action")?;
+        let mut set = RuleSet::empty();
+        for (name, when, action) in entries(&file, "rule")? {
             let action = Action::from_name(action).ok_or_else(|| {
-                PolicyError::rule(
+                PolicyError::entry(
+                    "rule",
                     name,
                     format!("unknown action `{action}`: use allow, require_approval or deny"),
                 )
             })?;
-            let expr = Expr::compile(when)
-                .map_err(|message| PolicyError::rule(name, format!("invalid `when`: {message}")))?;
-            compiled.push((when.to_owned(), Arc::new(expr)));
-            rules.push(Rule {
+            set.compiled.push(compile("rule", name, when)?);
+            set.rules.push(Rule {
                 name: name.to_owned(),
                 when: when.to_owned(),
                 action,
             });
         }
-        Ok(RuleSet { rules, compiled })
+        set.has_guard_key = file.contains_key("guard");
+        for (name, when, action) in entries(&file, "guard")? {
+            let action = GuardAction::from_name(action).ok_or_else(|| {
+                PolicyError::entry(
+                    "guard",
+                    name,
+                    format!("unknown action `{action}`: use alert or rollback"),
+                )
+            })?;
+            set.compiled_guards.push(compile("guard", name, when)?);
+            set.guards.push(Guard {
+                name: name.to_owned(),
+                when: when.to_owned(),
+                action,
+            });
+        }
+        Ok(set)
     }
 
     /// The default rules ([`DEFAULT_RULES_TOML`]), which apply while no
-    /// `Policy` record exists.
+    /// `Policy` record exists. Their guards are the default guards.
     pub fn defaults() -> RuleSet {
         DEFAULTS.clone()
+    }
+
+    /// The guards a watch evaluates: [`RuleSet::guards`] when the file has
+    /// a `guard` key (`guard = []` means none), else the default guards
+    /// ([`DEFAULT_GUARDS_TOML`]).
+    pub fn effective_guards(&self) -> &[Guard] {
+        if self.has_guard_key {
+            &self.guards
+        } else {
+            &DEFAULT_GUARDS.guards
+        }
     }
 
     /// Evaluates every rule against `diff`, in order. A rule fires when its
@@ -328,13 +519,7 @@ impl RuleSet {
         let mut fired = Vec::new();
         let mut errors = Vec::new();
         for (index, rule) in self.rules.iter().enumerate() {
-            let result = match self.compiled.get(index) {
-                Some((when, expr)) if *when == rule.when => expr.eval(diff),
-                _ => Expr::compile(&rule.when)
-                    .map_err(|message| format!("invalid `when`: {message}"))
-                    .and_then(|expr| expr.eval(diff)),
-            };
-            match result {
+            match eval_when(self.compiled.get(index), &rule.when, "diff", diff) {
                 Ok(false) => {}
                 Ok(true) => fired.push(Fired {
                     name: rule.name.clone(),
@@ -384,11 +569,41 @@ impl RuleSet {
             errors,
         }
     }
+
+    /// Evaluates the [effective guards](RuleSet::effective_guards) against a
+    /// watch's metrics, bound to the variable `guard`, in order. A guard
+    /// whose expression can't be evaluated does not fire and is listed in
+    /// `errors`. Pure, like [`RuleSet::evaluate`].
+    pub fn evaluate_guards(&self, guard: &serde_json::Value) -> GuardEvaluation {
+        let (guards, compiled) = if self.has_guard_key {
+            (&self.guards, &self.compiled_guards)
+        } else {
+            (&DEFAULT_GUARDS.guards, &DEFAULT_GUARDS.compiled_guards)
+        };
+        let mut fired = Vec::new();
+        let mut errors = Vec::new();
+        for (index, g) in guards.iter().enumerate() {
+            match eval_when(compiled.get(index), &g.when, "guard", guard) {
+                Ok(false) => {}
+                Ok(true) => fired.push(FiredGuard {
+                    name: g.name.clone(),
+                    action: g.action,
+                }),
+                Err(message) => errors.push(RuleError {
+                    name: g.name.clone(),
+                    message,
+                }),
+            }
+        }
+        GuardEvaluation { fired, errors }
+    }
 }
 
 impl PartialEq for RuleSet {
     fn eq(&self, other: &Self) -> bool {
         self.rules == other.rules
+            && self.guards == other.guards
+            && self.has_guard_key == other.has_guard_key
     }
 }
 
@@ -398,16 +613,26 @@ impl fmt::Debug for RuleSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RuleSet")
             .field("rules", &self.rules)
+            .field("guards", &self.guards)
             .finish_non_exhaustive()
     }
 }
 
-/// The string at `key` of the rule `name`.
-fn string_field<'t>(table: &'t toml::Table, name: &str, key: &str) -> Result<&'t str, PolicyError> {
-    match table.get(key) {
+/// The string at `key` of the rule or guard `name`.
+fn string_field<'t>(
+    fields: &'t toml::Table,
+    table: &'static str,
+    name: &str,
+    key: &str,
+) -> Result<&'t str, PolicyError> {
+    match fields.get(key) {
         Some(toml::Value::String(value)) => Ok(value),
-        Some(_) => Err(PolicyError::rule(name, format!("`{key}` must be a string"))),
-        None => Err(PolicyError::rule(name, format!("missing `{key}`"))),
+        Some(_) => Err(PolicyError::entry(
+            table,
+            name,
+            format!("`{key}` must be a string"),
+        )),
+        None => Err(PolicyError::entry(table, name, format!("missing `{key}`"))),
     }
 }
 

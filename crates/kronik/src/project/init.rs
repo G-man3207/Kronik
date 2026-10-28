@@ -220,48 +220,7 @@ pub fn run(name: &str, lang: Lang) -> Result<Created, Failure> {
             "{name}/ already exists and is not empty"
         )));
     }
-    // The Rust type for the actor: the name in CamelCase, `my-app` -> `MyApp`.
-    let type_name: String = name
-        .split('-')
-        .map(|part| {
-            let mut chars = part.chars();
-            chars
-                .next()
-                .map(|c| c.to_ascii_uppercase().to_string() + chars.as_str())
-                .unwrap_or_default()
-        })
-        .collect();
-    let fill = |template: &str| {
-        template
-            .replace("{name}", name)
-            .replace("{type}", &type_name)
-            .replace("{jco}", JCO)
-            .replace("{componentize_js}", COMPONENTIZE_JS)
-            .replace("{typescript}", TYPESCRIPT)
-            .replace("{rust}", RUST)
-    };
-    let (files, sdk): (Vec<(&str, String)>, _) = match lang {
-        Lang::Ts => (
-            vec![
-                ("package.json", fill(TS_PACKAGE)),
-                ("tsconfig.json", TS_CONFIG.to_string()),
-                ("src/actor.ts", fill(TS_ACTOR)),
-                ("test/actor.test.ts", fill(TS_TEST)),
-                (".gitignore", TS_GITIGNORE.to_string()),
-            ],
-            TS_SDK,
-        ),
-        Lang::Rust => (
-            vec![
-                ("Cargo.toml", fill(RUST_CARGO)),
-                ("rust-toolchain.toml", fill(RUST_TOOLCHAIN)),
-                ("src/lib.rs", fill(RUST_ACTOR)),
-                ("tests/actor.rs", fill(RUST_TEST)),
-                (".gitignore", RUST_GITIGNORE.to_string()),
-            ],
-            RUST_SDK,
-        ),
-    };
+    let (files, sdk) = templates(name, lang);
     for (path, contents) in &files {
         write(&dir.join(path), contents)?;
     }
@@ -295,9 +254,78 @@ pub fn run(name: &str, lang: Lang) -> Result<Created, Failure> {
     })
 }
 
+/// The project's files for `name` (path, contents), and the SDK's files.
+fn templates(
+    name: &str,
+    lang: Lang,
+) -> (Vec<(&'static str, String)>, &'static [super::embed::File]) {
+    // The Rust type for the actor: the name in CamelCase, `my-app` -> `MyApp`.
+    let type_name: String = name
+        .split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|c| c.to_ascii_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect();
+    let fill = |template: &str| {
+        template
+            .replace("{name}", name)
+            .replace("{type}", &type_name)
+            .replace("{jco}", JCO)
+            .replace("{componentize_js}", COMPONENTIZE_JS)
+            .replace("{typescript}", TYPESCRIPT)
+            .replace("{rust}", RUST)
+    };
+    match lang {
+        Lang::Ts => (
+            vec![
+                ("package.json", fill(TS_PACKAGE)),
+                ("tsconfig.json", TS_CONFIG.to_string()),
+                ("src/actor.ts", fill(TS_ACTOR)),
+                ("test/actor.test.ts", fill(TS_TEST)),
+                (".gitignore", TS_GITIGNORE.to_string()),
+            ],
+            TS_SDK,
+        ),
+        Lang::Rust => (
+            vec![
+                ("Cargo.toml", fill(RUST_CARGO)),
+                ("rust-toolchain.toml", fill(RUST_TOOLCHAIN)),
+                ("src/lib.rs", fill(RUST_ACTOR)),
+                ("tests/actor.rs", fill(RUST_TEST)),
+                (".gitignore", RUST_GITIGNORE.to_string()),
+            ],
+            RUST_SDK,
+        ),
+    }
+}
+
 fn write(path: &Path, contents: &str) -> Result<(), Failure> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, contents).map_err(|e| Failure::new(format!("{}: {e}", path.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    /// examples/github-flow holds `kronik init --lang rust counter`'s files
+    /// (without vendor/), for a repository that runs the GitHub Action.
+    #[test]
+    fn the_github_flow_example_is_the_rust_template() {
+        let example =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/github-flow");
+        let (files, _) = super::templates("counter", super::Lang::Rust);
+        for (path, contents) in files {
+            let on_disk = std::fs::read_to_string(example.join(path))
+                .unwrap_or_else(|e| panic!("examples/github-flow/{path}: {e}"));
+            assert_eq!(
+                on_disk, contents,
+                "examples/github-flow/{path}: rerun the template"
+            );
+        }
+    }
 }

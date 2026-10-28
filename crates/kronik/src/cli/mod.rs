@@ -8,6 +8,7 @@
 mod foreign;
 mod fork;
 mod http;
+mod preview;
 mod privacy;
 mod render;
 #[cfg(test)]
@@ -45,8 +46,16 @@ pub struct Global {
     /// The daemon's API socket [default: $KRONIK_API_SOCKET, else
     /// server.api_socket in /etc/kronik/kronik.toml, else
     /// /run/kronik/api.sock]. Not for `serve`, which takes --api-socket.
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH", conflicts_with = "url")]
     pub socket: Option<PathBuf>,
+    /// A remote API, `https://host:port` [default: $KRONIK_URL]; plain
+    /// `http://` only to this machine. Needs a token.
+    #[arg(long, global = true, value_name = "URL")]
+    pub url: Option<String>,
+    /// The bearer token [default: $KRONIK_TOKEN, which is preferred: a flag
+    /// shows in the shell history and the process list].
+    #[arg(long, global = true, value_name = "TOKEN")]
+    pub token: Option<String>,
     /// Print JSON: the API's response unchanged for a client command, the
     /// result of init, build, doctor, restore, upgrade check and explain,
     /// and the error JSON on failure (docs/reference/json.md has every
@@ -58,7 +67,22 @@ pub struct Global {
 impl Global {
     /// Whether any client option was given, which `serve` does not take.
     pub fn given(&self) -> bool {
-        self.socket.is_some() || self.json
+        self.socket.is_some() || self.url.is_some() || self.token.is_some() || self.json
+    }
+
+    /// Refuses `--url` and `--token` for a command that does not talk to
+    /// the daemon's API, rather than ignoring them: 2, like a usage error.
+    pub fn refuse_remote(&self, command: &str) -> Option<ExitCode> {
+        let flag = match (&self.url, &self.token) {
+            (Some(_), _) => "--url",
+            (None, Some(_)) => "--token",
+            (None, None) => return None,
+        };
+        eprintln!(
+            "error: kronik {command} does not talk to the daemon's API, so it takes no {flag}; \
+             --url and --token are for the client commands (see kronik --help)"
+        );
+        Some(ExitCode::from(2))
     }
 }
 
@@ -114,15 +138,29 @@ pub enum Command {
     /// List proposals, or show one.
     #[command(subcommand)]
     Proposals(fork::ProposalsCommand),
+    /// Follow a proposal whose replay runs in the daemon: its status, or
+    /// wait until it is done (M10).
+    #[command(subcommand)]
+    Proposal(fork::ProposalCommand),
     /// Approve a proposal's diff when the policy requires an approval.
     Approve(fork::ProposalArgs),
     /// Switch to a proposal's code, after replaying the traffic since it.
     Promote(fork::ProposalArgs),
     /// Switch back to the code in force before a deployment.
     Rollback(fork::RollbackArgs),
+    /// Watch a deployment's error rate and latency against the window
+    /// before it; the policy's guards alert or roll back (M11).
+    Watch(fork::WatchArgs),
+    /// List the watches, or show one.
+    #[command(subcommand)]
+    Watches(fork::WatchesCommand),
     /// Show, set or test the policy rules.
     #[command(subcommand)]
     Policy(fork::PolicyCommand),
+    /// Preview a proposal: a fork of HEAD with its code that takes new
+    /// requests at its own URL, without live effects, until it expires.
+    #[command(subcommand)]
+    Preview(preview::PreviewCommand),
     /// Create, list or revoke API tokens: bearer credentials with scopes.
     #[command(subcommand)]
     Token(token::TokenCommand),
@@ -408,20 +446,15 @@ pub enum SecretCommand {
 /// Runs a client command and returns the process exit code: 0 on success,
 /// 1 on an error or a failed turn.
 pub fn run(command: Command, global: &Global) -> ExitCode {
+    let endpoint = client_endpoint(global);
     let ctx = Ctx {
-        // A broken configuration file fails the commands that need the
-        // daemon; `explain` still works.
-        socket: crate::config::client_api_socket(global.socket.clone()).map_err(|e| {
-            ApiError::new(
-                ErrorCode::BadRequest,
-                format!("the configuration file is invalid: {e}"),
-            )
-            .with_hint(
-                "Fix the file, or name the socket with --socket <path> or $KRONIK_API_SOCKET.",
-            )
-        }),
+        url_flag: global
+            .url
+            .as_ref()
+            .and_then(|_| endpoint.as_ref().ok().map(http::Endpoint::shown)),
+        endpoint,
         json: global.json,
-        token: client_token(),
+        token: client_token_from(global.token.as_deref()),
     };
     let result = match command {
         Command::Deploy(a) => deploy(&ctx, a),
@@ -454,10 +487,14 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
         Command::Diff(c) => fork::diff(&ctx, c),
         Command::Propose(a) => fork::propose(&ctx, a),
         Command::Proposals(c) => fork::proposals(&ctx, c),
+        Command::Proposal(c) => fork::proposal(&ctx, c),
         Command::Approve(a) => fork::approve(&ctx, a),
         Command::Promote(a) => fork::promote(&ctx, a),
         Command::Rollback(a) => fork::rollback(&ctx, a),
+        Command::Watch(a) => fork::watch(&ctx, a),
+        Command::Watches(c) => fork::watches(&ctx, c),
         Command::Policy(c) => fork::policy(&ctx, c),
+        Command::Preview(c) => preview::preview(&ctx, c),
         Command::Privacy(c) => privacy::privacy(&ctx, c),
         Command::Token(c) => token::token(&ctx, c),
         Command::Foreign(c) => foreign::foreign(&ctx, c),
@@ -486,31 +523,82 @@ impl From<ApiError> for Error {
 }
 
 struct Ctx {
-    /// The API socket, or why the configuration does not give one.
-    socket: Result<PathBuf, ApiError>,
+    /// The API, or why the options and the configuration do not give one.
+    endpoint: Result<http::Endpoint, ApiError>,
     json: bool,
-    /// `$KRONIK_TOKEN`, sent as `Authorization: Bearer`, or why it is not a
-    /// token.
+    /// `--token` or `$KRONIK_TOKEN`, sent as `Authorization: Bearer`, or why
+    /// it is not a token.
     token: Result<Option<String>, ApiError>,
+    /// The endpoint as shown when it came from `--url`, for the reminder
+    /// under the next commands.
+    url_flag: Option<String>,
 }
 
-/// `$KRONIK_TOKEN`: absent or empty means none; anything but printable
-/// ASCII is refused rather than sent as a header.
-pub(crate) fn client_token() -> Result<Option<String>, ApiError> {
-    let Some(value) = std::env::var_os("KRONIK_TOKEN") else {
+/// The API to talk to: `--url`, else `--socket`, else `$KRONIK_URL`, else
+/// the socket of `$KRONIK_API_SOCKET` or the configuration file.
+fn client_endpoint(global: &Global) -> Result<http::Endpoint, ApiError> {
+    let url = global.url.clone().or_else(|| {
+        if global.socket.is_some() {
+            return None;
+        }
+        std::env::var("KRONIK_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+    });
+    if let Some(url) = url {
+        return http::Endpoint::parse_url(url.trim()).map_err(|m| {
+            ApiError::new(ErrorCode::BadRequest, m).with_hint(
+                "Use https://<host>:<port> of the daemon's api_listen (plain http:// only to localhost), in --url or $KRONIK_URL.",
+            )
+        });
+    }
+    // A broken configuration file fails the commands that need the
+    // daemon; `explain` still works.
+    crate::config::client_api_socket(global.socket.clone())
+        .map(http::Endpoint::Unix)
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!("the configuration file is invalid: {e}"),
+            )
+            .with_hint(
+                "Fix the file, or name the socket with --socket <path> or $KRONIK_API_SOCKET.",
+            )
+        })
+}
+
+/// `--token` when given, else `$KRONIK_TOKEN`: an absent or empty variable
+/// means none, but a blank `--token` is refused (an unset variable in a
+/// client's config, say): over the socket no token means every scope.
+/// Anything but printable ASCII is refused rather than sent as a header.
+pub(crate) fn client_token_from(flag: Option<&str>) -> Result<Option<String>, ApiError> {
+    let (value, source, hint) = match flag {
+        Some(t) => (
+            Some(t.to_owned()),
+            "--token",
+            "Pass the token that `kronik token create` printed to --token (or better, in $KRONIK_TOKEN).",
+        ),
+        None => (
+            std::env::var_os("KRONIK_TOKEN").map(|v| v.to_string_lossy().into_owned()),
+            "$KRONIK_TOKEN",
+            "Set KRONIK_TOKEN to the token that `kronik token create` printed, or unset it.",
+        ),
+    };
+    let Some(value) = value else {
         return Ok(None);
     };
-    let value = value.to_str().map(str::trim);
-    match value {
-        Some("") => Ok(None),
-        Some(token) if token.bytes().all(|b| b.is_ascii_graphic()) => Ok(Some(token.to_owned())),
+    match value.trim() {
+        "" if flag.is_some() => Err(ApiError::new(ErrorCode::BadRequest, "--token is empty")
+            .with_hint("Pass the token that `kronik token create` printed, or omit --token.")),
+        "" => Ok(None),
+        token if token.bytes().all(|b| b.is_ascii_graphic()) => Ok(Some(token.to_owned())),
         _ => Err(ApiError::new(
             ErrorCode::BadRequest,
-            "$KRONIK_TOKEN is not a token: it has spaces, control characters or non-ASCII bytes",
+            format!(
+                "{source} is not a token: it has spaces, control characters or non-ASCII bytes"
+            ),
         )
-        .with_hint(
-            "Set KRONIK_TOKEN to the token that `kronik token create` printed, or unset it.",
-        )),
+        .with_hint(hint)),
     }
 }
 
@@ -542,22 +630,46 @@ impl Ctx {
     /// Sends a request; a 2xx response gives its body, any other status an
     /// [`Error::Remote`].
     fn request(&self, method: &str, target: &str, body: Option<&[u8]>) -> Result<Vec<u8>, Error> {
-        let socket = self.socket.as_ref().map_err(|e| Error::Local(e.clone()))?;
+        self.request_within(method, target, body, REQUEST_TIMEOUT)
+    }
+
+    /// [`Ctx::request`] with the daemon silent for at most `timeout`.
+    fn request_within(
+        &self,
+        method: &str,
+        target: &str,
+        body: Option<&[u8]>,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<u8>, Error> {
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .map_err(|e| Error::Local(e.clone()))?;
         let token = self.token.as_ref().map_err(|e| Error::Local(e.clone()))?;
-        let r =
-            http::request(socket, method, target, body, token.as_deref()).map_err(|f| match f {
-                http::Failure::Connect(e) => connect_error(socket, &e),
+        let shown = endpoint.shown();
+        let r = http::request(endpoint, method, target, body, token.as_deref(), timeout).map_err(
+            |f| match f {
+                http::Failure::Connect(e) => connect_error(endpoint, &e),
+                http::Failure::Tls(m) => ApiError::new(
+                    ErrorCode::Unavailable,
+                    format!("TLS to {shown} failed: {m}"),
+                )
+                .with_hint(TLS_HINT),
                 http::Failure::Io(e) => ApiError::new(
                     ErrorCode::Unavailable,
+                    format!("the connection to the daemon on {shown} broke: {e}"),
+                ),
+                http::Failure::Timeout => ApiError::new(
+                    ErrorCode::Unavailable,
                     format!(
-                        "the connection to the daemon on {} broke: {e}",
-                        socket.display()
+                        "the daemon on {shown} did not answer within {}",
+                        units::duration(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
                     ),
                 ),
-                http::Failure::Malformed(m) => ApiError::new(ErrorCode::Internal, m).with_hint(
-                    format!("Check that {} is a Kronik API socket.", socket.display()),
-                ),
-            })?;
+                http::Failure::Malformed(m) => ApiError::new(ErrorCode::Internal, m)
+                    .with_hint(format!("Check that {shown} is a Kronik API.")),
+            },
+        )?;
         if (200..300).contains(&r.status) {
             Ok(r.body)
         } else {
@@ -592,26 +704,32 @@ impl Ctx {
         let _ = out.flush();
     }
 
+    /// Prints human output; when the command was given `--url`, its `Next`
+    /// commands get a reminder that they need it too.
     fn print(&self, text: &str) {
         let mut out = io::stdout().lock();
         let _ = out.write_all(text.as_bytes());
+        if let Some(url) = &self.url_flag
+            && text.lines().any(|l| l.starts_with("Next "))
+        {
+            let _ = writeln!(
+                out,
+                "         (each with --url {url}, or export KRONIK_URL={url})"
+            );
+        }
         let _ = out.flush();
     }
 
     /// Reports an error: the error JSON on stdout with `--json`, otherwise
-    /// code, message, hint and docs on stderr.
+    /// code, message, hint and docs on stderr. As under `Next`, when the
+    /// command was given `--url` and the hint names a command, a reminder
+    /// that it needs `--url` too.
     fn fail(&self, e: &Error) {
         if self.json {
-            match e {
-                Error::Local(e) => match serde_json::to_vec(e) {
-                    Ok(body) => self.print_raw(&body),
-                    Err(_) => self.print_raw(e.to_json().to_string().as_bytes()),
-                },
-                Error::Remote { body, .. } => self.print_raw(body),
-            }
+            self.print_raw(&error_json(e));
             return;
         }
-        let text = match e {
+        let mut text = match e {
             Error::Local(e) => render::error(e),
             Error::Remote { status, body } => match serde_json::from_slice::<ApiError>(body) {
                 Ok(e) => render::error(&e),
@@ -621,15 +739,74 @@ impl Ctx {
                 ),
             },
         };
+        if let Some(url) = &self.url_flag
+            && text
+                .lines()
+                .any(|l| l.starts_with("hint:") && l.contains("kronik "))
+        {
+            text.push_str(&format!(
+                "       (the hint's command with --url {url}, or export KRONIK_URL={url})\n"
+            ));
+        }
         let mut err = io::stderr().lock();
         let _ = err.write_all(text.as_bytes());
         let _ = err.flush();
     }
 }
 
-/// The error for a socket that cannot be connected to.
-fn connect_error(socket: &Path, e: &io::Error) -> ApiError {
-    let shown = socket.display();
+/// How long a request may wait for the daemon to say anything: long
+/// enough for a sync replay or a promote's catch-up, short enough that a
+/// dead connection does not hang a CI job for hours.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The error JSON for `--json`: the daemon's error as it sent it, and an
+/// UNAVAILABLE error for an answer that is not the API's (a proxy's HTML
+/// page, an empty body), so stdout is always the error JSON.
+fn error_json(e: &Error) -> Vec<u8> {
+    let local = match e {
+        Error::Local(e) => e.clone(),
+        Error::Remote { body, .. } if serde_json::from_slice::<ApiError>(body).is_ok() => {
+            return body.clone();
+        }
+        Error::Remote { status, .. } => ApiError::new(
+            ErrorCode::Unavailable,
+            format!("the API answered HTTP {status} without a Kronik error"),
+        )
+        .with_hint(
+            "Something between the CLI and the daemon (a proxy or a load balancer) answered; check that the URL is the daemon's server.api_listen.",
+        ),
+    };
+    serde_json::to_vec(&local).unwrap_or_else(|_| local.to_json().to_string().into_bytes())
+}
+
+/// Whether a failed request may succeed when repeated: the daemon was not
+/// reached or did not answer, or a proxy said it is down (502, 503, 504).
+/// A TLS failure (a certificate not trusted or for another name) is not.
+fn transient(e: &Error) -> bool {
+    match e {
+        Error::Local(e) => e.code == ErrorCode::Unavailable && e.hint.as_deref() != Some(TLS_HINT),
+        Error::Remote { status, .. } => matches!(status, 502..=504),
+    }
+}
+
+/// The hint of a TLS failure, which also marks it as not [`transient`].
+const TLS_HINT: &str = "Check the URL's host against the daemon's certificate; for a private CA, point SSL_CERT_FILE at its bundle.";
+
+/// The error for an API that cannot be connected to.
+fn connect_error(endpoint: &http::Endpoint, e: &io::Error) -> ApiError {
+    let shown = endpoint.shown();
+    let socket = match endpoint {
+        http::Endpoint::Unix(socket) => socket,
+        http::Endpoint::Tcp { .. } => {
+            return ApiError::new(
+                ErrorCode::Unavailable,
+                format!("cannot connect to the Kronik API at {shown}: {e}"),
+            )
+            .with_hint(
+                "Check --url or $KRONIK_URL against the daemon's server.api_listen, and that a firewall lets it through.",
+            );
+        }
+    };
     let start = format!(
         "Start the daemon with `kronik serve --api-socket {}`, or pass its socket with `--socket <path>`.",
         shell_quote(&socket.to_string_lossy())
@@ -1369,3 +1546,53 @@ pub(crate) fn report_error(json: bool, e: &kronik_core::error::ApiError) -> Exit
 
 pub(crate) use render::{field, next, shell_quote};
 pub(crate) use units::parse_duration_ms;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// L2: with --json, stdout is the error JSON even when a proxy answered.
+    #[test]
+    fn a_non_api_error_answer_becomes_unavailable_json() {
+        for body in [&b"<html>502 Bad Gateway</html>"[..], b""] {
+            let e = Error::Remote {
+                status: 502,
+                body: body.to_vec(),
+            };
+            let v: serde_json::Value = serde_json::from_slice(&error_json(&e)).unwrap();
+            assert_eq!(v["error"]["code"], "UNAVAILABLE", "{v}");
+            assert!(
+                v["error"]["message"].as_str().unwrap().contains("HTTP 502"),
+                "{v}"
+            );
+            assert!(transient(&e));
+        }
+        let api = ApiError::new(ErrorCode::ScopeMissing, "no")
+            .to_json()
+            .to_string();
+        let e = Error::Remote {
+            status: 403,
+            body: api.clone().into_bytes(),
+        };
+        assert_eq!(error_json(&e), api.into_bytes());
+        assert!(!transient(&e));
+    }
+
+    #[test]
+    fn a_bad_token_flag_is_named_in_the_hint() {
+        let e = client_token_from(Some("bad token")).unwrap_err();
+        assert!(e.message.starts_with("--token "), "{e:?}");
+        assert!(e.hint.unwrap().contains("--token"));
+    }
+
+    /// N2: a blank --token is refused, not taken as no token (every scope
+    /// over the socket).
+    #[test]
+    fn a_blank_token_flag_is_refused() {
+        for blank in ["", "  "] {
+            let e = client_token_from(Some(blank)).unwrap_err();
+            assert_eq!(e.code, ErrorCode::BadRequest);
+            assert_eq!(e.message, "--token is empty");
+        }
+    }
+}

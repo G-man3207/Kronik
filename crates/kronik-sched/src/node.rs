@@ -1101,6 +1101,7 @@ impl Node {
         epoch: u64,
         rerun: Option<Rerun>,
     ) -> Result<TurnResult, ApiError> {
+        let started = self.env.clock.monotonic();
         let clock = self.env.clock.clone();
         let _timer = kronik_metrics::timer(
             "kronik_turn_duration_seconds",
@@ -1323,6 +1324,14 @@ impl Node {
             config_epoch: epoch,
             memory_peak_bytes: out.memory_peak_bytes,
             schema_version: if committed { schema_version } else { 0 },
+            duration_us: u64::try_from(
+                self.env
+                    .clock
+                    .monotonic()
+                    .saturating_sub(started)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX),
         };
         let lsn = self.commit(Record::TurnRecord(record)).await?;
         for m in messages {
@@ -1544,7 +1553,8 @@ impl Node {
     /// Admits new work: refused when the node has stopped, or when its
     /// log's file system is below `[log] disk_reserve`. Actions that free
     /// space or are needed in an incident (rollback, promote, approvals,
-    /// `foreign remove`, revoke, limits, erasure) use [`Node::check_alive`].
+    /// guard records, `foreign remove`, revoke, limits, erasure) use
+    /// [`Node::check_alive`].
     pub fn check_running(&self) -> Result<(), ApiError> {
         self.check_alive()?;
         if let Some(free) = self.disk_below_reserve() {
@@ -2172,6 +2182,14 @@ impl Node {
         self.commit(Record::Approval(approval)).await
     }
 
+    /// Writes a `GuardTriggered` record (`kronik watch`, M11) in this
+    /// branch's log. Allowed below `[log] disk_reserve`: it records an
+    /// incident (a rollback that already happened, or an alert).
+    pub async fn record_guard(&self, guard: pb::GuardTriggered) -> Result<Lsn, ApiError> {
+        self.check_alive()?;
+        self.commit(Record::GuardTriggered(guard)).await
+    }
+
     /// `kronik policy set`: a `Policy` record at the next epoch (the rules
     /// are validated by the caller). Returns (epoch, lsn); lsn is 0 for a
     /// dry run.
@@ -2772,7 +2790,8 @@ async fn timer_loop(node: Weak<Node>) {
     }
 }
 
-const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+/// The HTTP methods a route may declare (and the gateway accepts).
+pub const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 
 /// `{name}` segments become `{}` so that patterns differing only in
 /// parameter names compare equal.

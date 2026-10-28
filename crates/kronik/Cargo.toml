@@ -31,6 +31,10 @@ kronik-testhost = { workspace = true }
 # `kronik mcp`: an MCP stdio server proxying to the daemon's /mcp over the
 # API socket (ADR 0008).
 rmcp = { workspace = true, features = ["server", "transport-io", "client", "transport-streamable-http-client-unix-socket"] }
+# The CLI's client to a remote API over TLS (M10, ADR 0021): rustls with
+# ring, as the gateway, and the system's root certificates.
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
 # The JSON Schemas of the local commands' --json output (docs/reference/json.md).
 rustix = { workspace = true }
 schemars = { workspace = true }
@@ -50,7 +54,6 @@ kronik-proto = { workspace = true }
 rcgen = { workspace = true }
 # privacy_mode.rs reads a copy of keys/keystore.db.
 rusqlite = { workspace = true }
-rustls = { workspace = true }
 sha2 = { workspace = true }
 
 [lints]

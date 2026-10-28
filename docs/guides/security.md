@@ -82,7 +82,9 @@ Secrets arrive with M2.
   (brief): the key stays on the host, but code deployed into a fork (scope
   `fork`) can obtain HMACs and signatures under production keys over data it
   chooses, which is as good as the key for webhooks and tokens signed with
-  it. Grant `fork` only to callers you would trust with that.
+  it. Grant `fork` only to callers you would trust with that. A preview
+  (M11) answers whoever has its URL, so it gets no production key at all:
+  its `crypto.*` calls answer `no recording`.
 - **Scrubbing.** When a turn used or revealed a secret, exact occurrences of
   the value are replaced by `[secret:<name>]` in the turn's state writes,
   SQL text values, messages, timers, compensations, output, effect
@@ -203,6 +205,23 @@ caller's token, so an agent has exactly its token's scopes. A token without
 fork's actors read each value tagged with a subject as a pseudonym (see
 [forks without personal data](privacy.md#forks-without-personal-data)).
 Policy and approvals for proposals exist since M3.
+
+**Previews (M11)** run unapproved proposal code for anyone who reaches the
+gateway, with only the `fork` scope behind them. With `[gateway]
+preview_domain` they answer only at `<id>.<preview_domain>`; the domain
+must not be, or be a parent of, a `[tls] domains` name (refused at start).
+Make it a separate registrable domain (`example-preview.com`, not
+`preview.example.com`): a subdomain of the production site shares its
+site, so cookies set for `Domain=example.com` reach preview code, and
+SameSite defences treat the two as one. Without a preview domain previews
+answer under `/__preview/<id>/` on the production origin; there Kronik
+drops the request's `Cookie`, `Authorization` and `Proxy-Authorization` headers before the
+preview's code and log see them, keeps only an allowlist of response
+headers (no `Set-Cookie`, HSTS, `Clear-Site-Data`, NEL/Report-To or
+`Location`), and adds `Content-Security-Policy: sandbox`, so a preview
+page runs in an opaque origin and cannot read or use the production
+site's cookies.
+Prefer a preview domain wherever previews take traffic from browsers.
 
 ## Root
 

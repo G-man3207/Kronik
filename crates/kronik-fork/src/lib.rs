@@ -11,6 +11,7 @@ pub mod replay;
 pub mod sample;
 pub mod stubs;
 pub mod upgrade;
+pub mod watch;
 
 use std::collections::BTreeMap;
 use std::path::Path;

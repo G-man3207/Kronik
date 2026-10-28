@@ -903,6 +903,12 @@ fn m3_commands_against_a_daemon() {
             .starts_with("The default policy rules (no policy has been set):\n\n[[rule]]\n"),
         "{o:?}"
     );
+    // Review W-M5: the guards in force, here the defaults.
+    assert!(
+        o.stdout
+            .contains("The default guards apply (the policy has no `guard` key):\n\n[[guard]]\nname = \"error-rate-up\"\n"),
+        "{o:?}"
+    );
     assert!(
         d.run(&["policy", "test", "try"])
             .stdout
@@ -1122,10 +1128,11 @@ fn propose_takes_a_directory_of_components() {
         .json();
     assert_eq!(diff["kinds"].as_array().unwrap().len(), 3, "{diff}");
 
-    // Nothing changed: refused. An empty directory: refused before sending.
+    // Nothing changed: NOTHING_TO_PROPOSE. An empty directory: refused
+    // before sending.
     assert_error(
         &d.run(&["propose", COUNTER, NOTES, "--reason", "same"]),
-        "BAD_REQUEST",
+        "NOTHING_TO_PROPOSE",
     );
     let empty = d.dir.path().join("empty");
     std::fs::create_dir(&empty).unwrap();
@@ -1801,4 +1808,74 @@ fn replay_and_propose_take_stub_rules() {
 /// The directory of the test guests.
 fn guests() -> String {
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests").to_owned()
+}
+
+/// M11 criterion 1 through the CLI against a daemon: `kronik watch` on a
+/// promoted build that fails, under the default guards, prints the guard
+/// as it fires, rolls back (a rollback deployment of the watched epoch)
+/// and exits non-zero, as a rolled-back watch does.
+#[test]
+#[allow(clippy::disallowed_methods)] // the CLI waits in a thread while the test sends traffic
+fn watch_rolls_back_a_failing_build_against_a_daemon() {
+    const FAIL_GET: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/guests/counter-fail-get.wasm"
+    );
+    let d = Daemon::start();
+    assert_eq!(d.run(&["deploy", COUNTER, "--reason", "v1"]).code, 0);
+    let send = |op: &str| d.run(&["send", "counter/a", op, "--reason", "traffic"]);
+    for _ in 0..25 {
+        assert_eq!(send("increment").code, 0);
+    }
+    let o = d.run(&["propose", FAIL_GET, "--reason", "get is broken"]);
+    assert_eq!(o.code, 0, "{o:?}");
+    let id = d.run(&["--json", "proposals", "list"]).json()["proposals"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let o = d.run(&["promote", &id, "--reason", "ship it"]);
+    let first = o.stdout.lines().next().unwrap_or_default().to_owned();
+    assert!(first.starts_with("Promoted proposal "), "{o:?}");
+    let epoch = first.rsplit(' ').next().unwrap().to_owned();
+
+    let (socket, http) = (d.socket.clone(), d.http.clone());
+    let watch = std::thread::spawn({
+        let epoch = epoch.clone();
+        move || {
+            kronik(
+                &socket,
+                &[
+                    "watch",
+                    &epoch,
+                    "--for",
+                    "5m",
+                    "--reason",
+                    "watch the release",
+                ],
+                Some(&http),
+            )
+        }
+    });
+    // 25 failing turns after the deployment: the default error-rate-up
+    // guard needs 20 turns and 3 failures.
+    std::thread::sleep(Duration::from_secs(1));
+    for _ in 0..25 {
+        send("get");
+    }
+    let o = watch.join().unwrap();
+    assert_eq!(o.code, 1, "a rolled-back watch exits 1: {o:?}\n{}", d.log());
+    assert!(o.stdout.contains(": rolled_back\n"), "{o:?}");
+    assert!(
+        o.stdout
+            .contains("Fired         error-rate-up (rollback): rolled_back at lsn "),
+        "{o:?}"
+    );
+    let v = d.run(&["--json", "deployments", "list"]).json();
+    let last = v["deployments"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["cause"], "rollback", "{v}");
+    assert_eq!(last["token_id"], "kronik", "{v}");
+    assert_eq!(
+        last["kinds"], v["deployments"][0]["kinds"],
+        "back to the code before epoch {epoch}: {v}"
+    );
 }

@@ -159,6 +159,23 @@ pub fn diff_summary(g: &mut SchemaGenerator) -> Schema {
     Schema::new_ref("#/components/schemas/DiffSummary".into())
 }
 
+/// `schema`, or null.
+fn or_null(schema: Schema) -> Schema {
+    let mut map = serde_json::Map::new();
+    map.insert("anyOf".into(), json!([schema.to_value(), {"type": "null"}]));
+    Schema::from(map)
+}
+
+/// [`policy_evaluation`], or null while a proposal is running (M10).
+pub fn policy_evaluation_or_null(g: &mut SchemaGenerator) -> Schema {
+    or_null(policy_evaluation(g))
+}
+
+/// [`diff_summary`], or null while a proposal is running (M10).
+pub fn diff_summary_or_null(g: &mut SchemaGenerator) -> Schema {
+    or_null(diff_summary(g))
+}
+
 const LIMIT: Param = Param {
     name: "limit",
     kind: "integer",
@@ -172,7 +189,7 @@ const KIND: Param = Param {
 const FORMAT: Param = Param {
     name: "format",
     kind: "string",
-    description: "`json` (the default) or `md` for Markdown.",
+    description: "`json` (the default), `md` for Markdown, or `summary` for the short Markdown summary without bodies or state values (M10).",
 };
 
 /// Every `/v1` operation, in the order of the API reference.
@@ -216,6 +233,38 @@ pub const OPERATIONS: &[Operation] = &[
         query: &[],
         request: Some(schema::<ResendRequest>),
         answer: Answer::Json(schema::<RollbackResponse>),
+    },
+    Operation {
+        method: "POST",
+        path: "/v1/deployments/{epoch}/watch",
+        summary: "Watch a deployment's error rate and latency; alert or roll back on a guard",
+        query: &[],
+        request: Some(schema::<WatchRequest>),
+        answer: Answer::Json(schema::<WatchResponse>),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/watches",
+        summary: "List the watches",
+        query: &[],
+        request: None,
+        answer: Answer::Json(schema::<WatchesResponse>),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/watches/{id}",
+        summary: "A watch: its status, the guards that fired and the last metrics",
+        query: &[],
+        request: None,
+        answer: Answer::Json(schema::<WatchInfo>),
+    },
+    Operation {
+        method: "POST",
+        path: "/v1/watches/{id}/stop",
+        summary: "Stop a watch: it alerts and rolls back no more",
+        query: &[],
+        request: Some(schema::<ResendRequest>),
+        answer: Answer::Json(schema::<WatchResponse>),
     },
     Operation {
         method: "POST",
@@ -469,6 +518,30 @@ pub const OPERATIONS: &[Operation] = &[
     },
     Operation {
         method: "POST",
+        path: "/v1/previews",
+        summary: "Create a preview: a fork of HEAD with a proposal's code that takes new requests",
+        query: &[],
+        request: Some(schema::<PreviewCreateRequest>),
+        answer: Answer::Json(schema::<PreviewCreateResponse>),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/previews",
+        summary: "The previews that have not expired",
+        query: &[],
+        request: None,
+        answer: Answer::Json(schema::<PreviewsResponse>),
+    },
+    Operation {
+        method: "DELETE",
+        path: "/v1/previews/{id}",
+        summary: "Delete a preview and its state",
+        query: &[],
+        request: Some(schema::<ResendRequest>),
+        answer: Answer::Json(schema::<PreviewDeleteResponse>),
+    },
+    Operation {
+        method: "POST",
         path: "/v1/proposals",
         summary: "Propose new code: fork, replay recent traffic, diff and evaluate the policy",
         query: &[],
@@ -651,7 +724,7 @@ pub const OPERATIONS: &[Operation] = &[
 
 /// The stable error JSON (docs/errors.md), registered as the component
 /// `Error`.
-fn error_schema(g: &mut SchemaGenerator) -> Schema {
+pub fn error_schema(g: &mut SchemaGenerator) -> Schema {
     let codes: Vec<&str> = ErrorCode::ALL.iter().map(|c| c.as_str()).collect();
     let error = json!({
         "description": "The stable error JSON, the same from the API, the CLI's --json and MCP.",
@@ -733,7 +806,7 @@ fn operation(op: &Operation, g: &mut SchemaGenerator, error: &Schema) -> Value {
     let ok = match &op.answer {
         Answer::Json(body) => json!({"description": "Success.", "content": json_content(body(g))}),
         Answer::Diff => json!({
-            "description": "The behavior diff: `kronik.diff/v1` JSON, or Markdown with `format=md`.",
+            "description": "The behavior diff: `kronik.diff/v1` JSON, or Markdown with `format=md` or `format=summary`.",
             "content": {
                 "application/json": {"schema": diff(g).to_value()},
                 "text/markdown": {"schema": {"type": "string"}}

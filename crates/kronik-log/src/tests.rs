@@ -115,6 +115,11 @@ fn samples() -> Vec<Record> {
         Record::Erasure(pb::Erasure::default()),
         Record::EngineUpgrade(pb::EngineUpgrade::default()),
         Record::SnapshotMarker(pb::SnapshotMarker::default()),
+        Record::GuardTriggered(pb::GuardTriggered {
+            action: pb::GuardAction::Rollback as i32,
+            outcome: pb::GuardOutcome::RolledBack as i32,
+            ..Default::default()
+        }),
     ]
 }
 
@@ -182,13 +187,13 @@ async fn lsn_strictly_increases_across_all_record_kinds() {
         lsns.push(t.await.unwrap());
     }
     lsns.sort_unstable();
-    assert_eq!(lsns, (1..=28).collect::<Vec<_>>());
+    assert_eq!(lsns, (1..=30).collect::<Vec<_>>());
     // The applier stream is in LSN order.
     let mut streamed = Vec::new();
-    for _ in 0..28 {
+    for _ in 0..30 {
         streamed.push(rx.recv().await.unwrap().lsn);
     }
-    assert_eq!(streamed, (1..=28).collect::<Vec<_>>());
+    assert_eq!(streamed, (1..=30).collect::<Vec<_>>());
     drop(log);
 
     let all = h.read_all().await.unwrap();
@@ -205,13 +210,13 @@ async fn lsn_strictly_increases_across_all_record_kinds() {
         assert_eq!(again.lsn, c.lsn);
         assert_eq!(again.record, c.record);
     }
-    assert_eq!(all.len(), 28);
+    assert_eq!(all.len(), 30);
     assert_eq!(
         kinds.into_iter().collect::<Vec<_>>(),
         kronik_proto::kind::ALL
     );
     let (_log, opened, _rx) = h.open().await.unwrap();
-    assert_eq!(opened.next_lsn, 29);
+    assert_eq!(opened.next_lsn, 31);
 }
 
 /// A nonzero group-commit window — the production default, while every
@@ -315,7 +320,7 @@ async fn segments_roll_and_closed_segment_damage_is_corrupt() {
     let all = h.read_all().await.unwrap();
     assert_eq!(
         all.iter().map(|c| c.lsn).collect::<Vec<_>>(),
-        (1..=14).collect::<Vec<_>>()
+        (1..=15).collect::<Vec<_>>()
     );
     let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
     let mut from_ten = Vec::new();
@@ -504,10 +509,10 @@ async fn rolled_segment_ends_with_a_footer_index() {
     let all = h.read_all().await.unwrap();
     assert_eq!(
         all.iter().map(|c| c.lsn).collect::<Vec<_>>(),
-        (1..=14).collect::<Vec<_>>()
+        (1..=15).collect::<Vec<_>>()
     );
     let (log, opened, _rx) = h.open().await.unwrap();
-    assert_eq!(opened.next_lsn, 15);
+    assert_eq!(opened.next_lsn, 16);
     drop(log);
 
     // A crash after the footer, before the next segment existed: do not

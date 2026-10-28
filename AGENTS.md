@@ -33,7 +33,7 @@ The full list is in `CONTRIBUTING.md`. In short:
 ## Running CI locally
 
 ```sh
-scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny, foreign and identity, as in CI
+scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny, foreign, identity and action, as in CI
 scripts/ci.sh clippy test    # selected steps
 ```
 
@@ -41,4 +41,5 @@ It needs rustup, which installs the toolchain pinned in `rust-toolchain.toml`,
 `cargo-deny`, and Node.js 22.20 or later with npm for the `ts` step. The `book`
 step downloads the pinned mdBook with `curl` on first use. The `foreign` step
 needs root and `runsc` and is skipped with a message otherwise; without
-libfaketime, `identity` skips `todo-ts` the same way.
+libfaketime, `identity` skips `todo-ts` the same way. The `action` step skips
+its YAML checks without PyYAML, and actionlint when it is not installed.

@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 use common::*;
 use kronik_core::ids::Lsn;
 use kronik_fork::diff::{DiffOptions, Mode};
+use kronik_fork::replay::Progress;
 use kronik_fork::{ForkKind, ProductionIndex, ReplayOutput, ReplaySetup, config_at, fork_kinds};
 use kronik_runtime::TurnLimits;
 use serde_json::Value;
@@ -23,10 +24,11 @@ fn replay(
     options: &DiffOptions,
     workers: usize,
 ) -> ReplayOutput {
-    replay_with(p, wasm, fork_lsn, options, workers, None)
+    replay_with(p, wasm, fork_lsn, options, workers, None, None)
 }
 
-/// `replay`, reading production from a base snapshot when given.
+/// `replay`, reading production from a base snapshot when given and
+/// counting into `progress`.
 fn replay_with(
     p: &Proc,
     wasm: Option<&str>,
@@ -34,6 +36,7 @@ fn replay_with(
     options: &DiffOptions,
     workers: usize,
     base: Option<kronik_fork::index::Base>,
+    progress: Option<Arc<Progress>>,
 ) -> ReplayOutput {
     let to = p.settle();
     let node = p.node.clone();
@@ -78,6 +81,7 @@ fn replay_with(
             hosts: options.live_allowlist.clone(),
             env: node.env().clone(),
         });
+        setup.progress = progress;
         let setup = Arc::new(setup);
         kronik_fork::run(
             node.env(),
@@ -103,6 +107,36 @@ fn opts(mode: Mode) -> DiffOptions {
         mode,
         ..DiffOptions::default()
     }
+}
+
+/// The progress counters of `kronik proposal status` advance in both modes
+/// and end equal to their totals (review L7).
+#[test]
+fn progress_counters_end_at_their_totals() {
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    let fork_lsn = p.settle();
+    for i in 0..6 {
+        p.http("a", "increment", "");
+        p.send(&format!("counter/m{}", i % 2), "increment", "");
+    }
+    let progress = Arc::new(Progress::default());
+    let out = replay_with(
+        &p,
+        Some("counter-step2"),
+        fork_lsn,
+        &opts(Mode::Both),
+        2,
+        None,
+        Some(progress.clone()),
+    );
+    let roots = out.diff.summary.root_inputs;
+    let n = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
+    assert_eq!(roots, 12);
+    assert_eq!(n(&progress.isolated_total), roots);
+    assert_eq!(n(&progress.isolated_done), roots);
+    assert_eq!(n(&progress.continuous_total), roots);
+    assert_eq!(n(&progress.continuous_done), roots);
 }
 
 #[test]
@@ -715,6 +749,7 @@ fn replay_from_a_snapshot_equals_replay_from_the_start() {
         &opts(Mode::Both),
         2,
         Some(base),
+        None,
     );
     assert!(full.diff.summary.changed);
     assert_eq!(

@@ -28,6 +28,8 @@ use crate::index::ProductionIndex;
 use crate::replay::{self, Continuous, ForkKind, ReplaySetup, TreeResult};
 use crate::{CodeEntry, fork_kinds, markdown, sample};
 
+pub mod preview;
+
 /// Catch-up converges when the newest root input is at most this far (in
 /// logical time) ahead of the verified one (`[promote] max_gap`).
 pub const MAX_GAP: Duration = Duration::from_secs(2);
@@ -58,7 +60,9 @@ pub struct Promoted {
 pub struct Proposal {
     pub id: String,
     pub fork: String,
-    /// `evaluated`, `approved`, `promoted`, `rejected` or `stale`.
+    /// `running` (the replay is under way, M10), `evaluated`, `approved`,
+    /// `promoted`, `rejected`, `stale` or `failed` (the run ended with
+    /// [`Proposal::error`]).
     pub status: String,
     pub fork_lsn: Lsn,
     pub created_lsn: Lsn,
@@ -87,6 +91,37 @@ pub struct Proposal {
     /// `base.window_cut`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_cut: Option<diff::WindowCut>,
+    /// Why a `failed` proposal failed (M10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ApiError>,
+    /// Set on a preview fork (M11): a plain fork with status `preview`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<preview::Preview>,
+}
+
+/// The error for an operation that needs a finished proposal.
+fn unfinished(meta: &Proposal) -> Option<ApiError> {
+    match meta.status.as_str() {
+        "running" => Some(
+            ApiError::new(
+                ErrorCode::ProposalRunning,
+                format!("proposal {} is still running its replay", meta.id),
+            )
+            .with_hint(format!("kronik proposal wait {}", meta.id)),
+        ),
+        "failed" => Some(
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "proposal {} failed: {}",
+                    meta.id,
+                    meta.error.as_ref().map_or("", |e| e.message.as_str())
+                ),
+            )
+            .with_hint("Propose again: kronik propose <wasm>... --reason \"...\""),
+        ),
+        _ => None,
+    }
 }
 
 fn encode_kind(k: &pb::KindVersion) -> String {
@@ -174,6 +209,18 @@ struct Live {
     logged_to: Lsn,
     /// Set when retention cut the proposal's window short.
     window_cut: Option<diff::WindowCut>,
+    /// The fork log's LSN the saved diff covers (previews rebuild it on
+    /// read).
+    diffed_to: Lsn,
+    /// Preview requests no longer held in memory (P-F3): the diff counts
+    /// them on top of the ones it sees.
+    preview_dropped: u64,
+    /// Preview requests this state took (N1): capped at
+    /// [`preview::MAX_PREVIEW_REQUESTS`], since each leaves rows in memory.
+    preview_requests: u64,
+    /// The erasure count this state was built at (N4): a preview drops it
+    /// when an erasure happened since.
+    erasure: u64,
 }
 
 struct Entry {
@@ -190,7 +237,47 @@ pub struct Proposals {
     live_allowlist: Vec<String>,
     max_gap: Duration,
     catch_up_timeout: Duration,
+    /// `[fork] preview_ttl` (M11).
+    preview_ttl: Duration,
     entries: tokio::sync::Mutex<BTreeMap<String, Entry>>,
+    /// Erasures so far (N4): previews compare it with their state's.
+    erasures: std::sync::atomic::AtomicU64,
+    /// Requests a preview's state takes ([`preview::MAX_PREVIEW_REQUESTS`]).
+    max_preview_requests: u64,
+    /// Live previews' serving state (M11), outside `entries` (P-F4).
+    previews: std::sync::Mutex<BTreeMap<String, Arc<preview::Served>>>,
+    /// Proposals whose replay runs as a job (M10), by id.
+    jobs: std::sync::Mutex<BTreeMap<String, Job>>,
+    /// Test hook: each isolated root input of a job's replay takes a permit.
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+/// A proposal's replay running on its own task: it outlives the request
+/// that started it (M10, ADR 0022).
+struct Job {
+    progress: Arc<replay::Progress>,
+}
+
+/// What `propose` checked and chose before the replay.
+struct Prepared {
+    id: String,
+    fork_lsn: Lsn,
+    head: Lsn,
+    kinds: Vec<pb::KindVersion>,
+    unchanged: Vec<pb::KindVersion>,
+    options: DiffOptions,
+    workers: usize,
+    reason: String,
+    window_cut: Option<diff::WindowCut>,
+}
+
+/// How far a running proposal's replay has come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct JobProgress {
+    pub isolated_done: u64,
+    pub isolated_total: u64,
+    pub continuous_done: u64,
+    pub continuous_total: u64,
 }
 
 fn internal(m: impl std::fmt::Display) -> ApiError {
@@ -208,6 +295,10 @@ fn replay_error(e: replay::ReplayError) -> ApiError {
         }
         e => internal(e),
     }
+}
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn not_found(id: &str) -> ApiError {
@@ -256,16 +347,46 @@ impl Proposals {
                 }
                 let path = e.path().join("proposal.json");
                 let Ok(bytes) = std::fs::read(&path) else {
+                    // A preview whose creation stopped before its record
+                    // was written (P-F7).
+                    if name.starts_with(preview::ID_PREFIX)
+                        && let Err(err) = std::fs::remove_dir_all(e.path())
+                    {
+                        tracing::warn!(preview = %name, error = %err, "deleting an unfinished preview");
+                    }
                     continue;
                 };
-                let meta: Proposal = serde_json::from_slice(&bytes)
+                let mut meta: Proposal = serde_json::from_slice(&bytes)
                     .map_err(|err| internal(format!("{}: {err}", path.display())))?;
+                // A job does not survive the daemon: its proposal failed.
+                if meta.status == "running" {
+                    meta.status = "failed".into();
+                    meta.error = Some(
+                        ApiError::new(
+                            ErrorCode::Unavailable,
+                            "the daemon restarted while the proposal's replay was running",
+                        )
+                        .with_hint("Propose again: kronik propose <wasm>... --reason \"...\""),
+                    );
+                    let bytes = serde_json::to_vec_pretty(&meta).map_err(internal)?;
+                    write_atomic(&path, &bytes)?;
+                }
                 entries.insert(meta.id.clone(), Entry { meta, live: None });
             }
         }
         let workers = std::thread::available_parallelism()
             .map_or(2, |n| n.get())
             .clamp(1, 16);
+        let previews = entries
+            .values()
+            .filter(|e| e.meta.preview.is_some())
+            .map(|e| {
+                (
+                    e.meta.id.clone(),
+                    preview::Served::new(e.meta.clone(), None),
+                )
+            })
+            .collect();
         Ok(Proposals {
             node,
             data,
@@ -273,8 +394,22 @@ impl Proposals {
             live_allowlist: Vec::new(),
             max_gap: MAX_GAP,
             catch_up_timeout: CATCH_UP_TIMEOUT,
+            preview_ttl: preview::PREVIEW_TTL,
             entries: tokio::sync::Mutex::new(entries),
+            previews: std::sync::Mutex::new(previews),
+            jobs: std::sync::Mutex::new(BTreeMap::new()),
+            erasures: std::sync::atomic::AtomicU64::new(0),
+            max_preview_requests: preview::MAX_PREVIEW_REQUESTS,
+            gate: None,
         })
+    }
+
+    /// Test hook: each isolated root input of a proposal job's replay waits
+    /// for a permit of `gate`, so a test can hold a job at a known point.
+    #[doc(hidden)]
+    pub fn with_test_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Proposals {
+        self.gate = Some(gate);
+        self
     }
 
     /// `[fork] live_allowlist`: hosts whose unrecorded GETs (without
@@ -506,21 +641,24 @@ impl Proposals {
         index: Arc<ProductionIndex>,
         kinds: BTreeMap<String, ForkKind>,
         options: &DiffOptions,
+        progress: Option<Arc<replay::Progress>>,
     ) -> Arc<ReplaySetup> {
         let config = crate::config_at_with(&index, index.fork_lsn, self.node.sql_bytes_per_actor());
-        let mut setup = ReplaySetup::new(
-            id.to_owned(),
-            index,
-            kinds,
-            config,
-            self.node.secrets().cloned(),
-        );
+        // A preview answers whoever has its URL: no production key computes
+        // for it, so its HMACs and signatures are `no recording` (P-F10).
+        let secrets = if id.starts_with(preview::ID_PREFIX) {
+            None
+        } else {
+            self.node.secrets().cloned()
+        };
+        let mut setup = ReplaySetup::new(id.to_owned(), index, kinds, config, secrets);
         setup.stubs = options.stubs.clone();
         setup.privacy = self.privacy(options.no_pii);
         setup.live = (!options.live_allowlist.is_empty()).then(|| crate::LiveAccess {
             hosts: options.live_allowlist.clone(),
             env: self.node.env().clone(),
         });
+        setup.progress = progress;
         Arc::new(setup)
     }
 
@@ -568,12 +706,14 @@ impl Proposals {
         .map_err(internal)?;
         let mut d = d;
         d.base.window_cut = live.window_cut.clone();
+        d.summary.preview_inputs += live.preview_dropped;
         let bytes = d.to_bytes();
         let hash = diff::diff_hash(&bytes);
         Ok((d, bytes, hash))
     }
 
     /// Replays `(fork_lsn, to]` for a proposal.
+    #[allow(clippy::too_many_arguments)]
     async fn replay(
         &self,
         id: &str,
@@ -582,6 +722,7 @@ impl Proposals {
         kinds: &[pb::KindVersion],
         options: &DiffOptions,
         workers: usize,
+        progress: Option<Arc<replay::Progress>>,
     ) -> Result<Live, ApiError> {
         crate::ensure_fork_retained(&self.node, &self.data, fork_lsn).await?;
         let index = Arc::new(self.index(fork_lsn, to, options.no_pii).await?);
@@ -607,7 +748,7 @@ impl Proposals {
             &new,
         )
         .map_err(internal)?;
-        let setup = self.setup(id, index.clone(), fc.kinds.clone(), options);
+        let setup = self.setup(id, index.clone(), fc.kinds.clone(), options, progress);
         let head = [
             Record::BranchCreated(pb::BranchCreated {
                 branch: id.to_owned(),
@@ -640,6 +781,10 @@ impl Proposals {
             head: head.to_vec(),
             logged_to: 0,
             window_cut: None,
+            diffed_to: 0,
+            preview_dropped: 0,
+            preview_requests: 0,
+            erasure: 0,
         })
     }
 
@@ -723,8 +868,144 @@ impl Proposals {
         Ok(out)
     }
 
-    /// `kronik propose`.
-    pub async fn propose(&self, req: ProposeRequest) -> Result<(Proposal, bool), ApiError> {
+    /// `kronik propose` that returns the finished proposal: the job of
+    /// [`Proposals::propose_job`], waited for.
+    pub async fn propose(
+        self: &Arc<Self>,
+        req: ProposeRequest,
+    ) -> Result<(Proposal, bool), ApiError> {
+        self.propose_job(req, true).await
+    }
+
+    /// `kronik propose` as a job (M10, ADR 0022): the checks run now, the
+    /// replay on a task of its own that outlives the caller. With `wait`,
+    /// returns when the job is done (the finished proposal, or its error);
+    /// without, at once with the `running` proposal. A dry run keeps
+    /// nothing, so it always waits.
+    pub async fn propose_job(
+        self: &Arc<Self>,
+        req: ProposeRequest,
+        wait: bool,
+    ) -> Result<(Proposal, bool), ApiError> {
+        let dry_run = req.dry_run;
+        let p = self.prepare(req).await?;
+        if dry_run {
+            let this = self.clone();
+            let meta = self
+                .node
+                .env()
+                .spawn("propose-dry-run", async move {
+                    this.execute(&p, None, true).await
+                })
+                .await
+                .ok_or_else(|| internal("the dry run was dropped"))??;
+            return Ok((meta, true));
+        }
+        let running = Proposal {
+            id: p.id.clone(),
+            fork: p.id.clone(),
+            status: "running".into(),
+            fork_lsn: p.fork_lsn,
+            created_lsn: p.head,
+            verified_through_lsn: p.fork_lsn,
+            diff_hash: String::new(),
+            policy: Value::Null,
+            summary: Value::Null,
+            options: p.options.clone(),
+            kinds: p.kinds.iter().map(encode_kind).collect(),
+            reason: p.reason.clone(),
+            approved: None,
+            promoted: None,
+            plain_fork: false,
+            unchanged: p.unchanged.iter().map(encode_kind).collect(),
+            window_cut: p.window_cut.clone(),
+            error: None,
+            preview: None,
+        };
+        // Save, insert and spawn under the entries lock with no await in
+        // between: a caller dropped while queued on the lock leaves nothing.
+        let mut entries = self.entries.lock().await;
+        self.save(&running, None)?;
+        entries.insert(
+            p.id.clone(),
+            Entry {
+                meta: running.clone(),
+                live: None,
+            },
+        );
+        let progress = Arc::new(replay::Progress {
+            gate: self.gate.clone(),
+            ..Default::default()
+        });
+        let done = Arc::new(tokio::sync::Semaphore::new(0));
+        lock(&self.jobs).insert(
+            p.id.clone(),
+            Job {
+                progress: progress.clone(),
+            },
+        );
+        let this = self.clone();
+        let id = p.id.clone();
+        let finished = done.clone();
+        // The handle is dropped: the job runs to its end whoever waits.
+        drop(self.node.env().spawn("propose-job", async move {
+            let job = this.clone();
+            let id = p.id.clone();
+            // An inner task, so a panic in the replay fails the proposal
+            // instead of leaving it `running` and its waiters waiting.
+            let result = this
+                .node
+                .env()
+                .spawn("propose-replay", async move {
+                    job.execute(&p, Some(progress), false).await
+                })
+                .await
+                .unwrap_or_else(|| {
+                    Err(internal(
+                        "the proposal's replay stopped unexpectedly; see the daemon log",
+                    ))
+                });
+            if let Err(e) = result {
+                tracing::warn!(proposal = %id, error = %e, "proposal failed");
+                let mut entries = this.entries.lock().await;
+                if let Some(entry) = entries.get_mut(&id) {
+                    entry.meta.status = "failed".into();
+                    entry.meta.error = Some(e);
+                    if let Err(e) = this.save(&entry.meta, None) {
+                        tracing::error!(proposal = %id, error = %e, "saving the failed proposal");
+                    }
+                }
+            }
+            lock(&this.jobs).remove(&id);
+            finished.close();
+        }));
+        drop(entries);
+        if !wait {
+            return Ok((running, false));
+        }
+        let _ = done.acquire().await;
+        let meta = self.get(&id).await?;
+        match (meta.status.as_str(), &meta.error) {
+            ("failed", Some(e)) => Err(e.clone()),
+            _ => Ok((meta, false)),
+        }
+    }
+
+    /// How far a running proposal's replay has come; `None` when it is not
+    /// running.
+    pub fn progress(&self, id: &str) -> Option<JobProgress> {
+        use std::sync::atomic::Ordering::Relaxed;
+        lock(&self.jobs).get(id).map(|j| JobProgress {
+            isolated_done: j.progress.isolated_done.load(Relaxed),
+            isolated_total: j.progress.isolated_total.load(Relaxed),
+            continuous_done: j.progress.continuous_done.load(Relaxed),
+            continuous_total: j.progress.continuous_total.load(Relaxed),
+        })
+    }
+
+    /// The checks of `propose` and its choices: the fork point, the set,
+    /// the proposal id.
+    async fn prepare(&self, req: ProposeRequest) -> Result<Prepared, ApiError> {
         diff::check_options(&req.options).map_err(|m| ApiError::new(ErrorCode::BadRequest, m))?;
         let options = self.with_allowlist(&req.options);
         if req.wasm.is_empty() {
@@ -796,7 +1077,7 @@ impl Proposals {
                 .map(|u| format!("{} {}", u.kind, short(&u.code_hash)))
                 .collect();
             return Err(ApiError::new(
-                ErrorCode::BadRequest,
+                ErrorCode::NothingToPropose,
                 format!(
                     "nothing to propose: main already runs every component ({})",
                     names.join(", ")
@@ -810,46 +1091,72 @@ impl Proposals {
         self.node.check_set_routes(&kinds)?;
         let id = format!("p-{}", &random_id(self.node.env())[..12]);
         let workers = req.workers.unwrap_or(self.workers).clamp(1, 64);
+        Ok(Prepared {
+            id,
+            fork_lsn,
+            head,
+            kinds,
+            unchanged,
+            options,
+            workers,
+            reason: req.audit.reason,
+            window_cut,
+        })
+    }
+
+    /// Replays, builds the diff, evaluates the policy and (unless a dry
+    /// run) keeps the proposal.
+    async fn execute(
+        &self,
+        p: &Prepared,
+        progress: Option<Arc<replay::Progress>>,
+        dry_run: bool,
+    ) -> Result<Proposal, ApiError> {
+        let id = &p.id;
         let mut live = self
-            .replay(&id, fork_lsn, head, &kinds, &options, workers)
+            .replay(
+                id, p.fork_lsn, p.head, &p.kinds, &p.options, p.workers, progress,
+            )
             .await?;
-        live.window_cut = window_cut.clone();
-        let (d, bytes, hash) = self.build(&id, &live, &options)?;
+        live.window_cut = p.window_cut.clone();
+        let (d, bytes, hash) = self.build(id, &live, &p.options)?;
         let policy = self.evaluate(&bytes)?;
         let denied = policy["outcome"] == "deny";
         let meta = Proposal {
             id: id.clone(),
             fork: id.clone(),
             status: if denied { "rejected" } else { "evaluated" }.into(),
-            fork_lsn,
-            created_lsn: head,
+            fork_lsn: p.fork_lsn,
+            created_lsn: p.head,
             verified_through_lsn: d.summary.verified_through_lsn,
             diff_hash: hash,
             policy,
             summary: serde_json::to_value(&d.summary).map_err(internal)?,
-            options,
-            kinds: kinds.iter().map(encode_kind).collect(),
-            reason: req.audit.reason.clone(),
+            options: p.options.clone(),
+            kinds: p.kinds.iter().map(encode_kind).collect(),
+            reason: p.reason.clone(),
             approved: None,
             promoted: None,
             plain_fork: false,
-            unchanged: unchanged.iter().map(encode_kind).collect(),
-            window_cut,
+            unchanged: p.unchanged.iter().map(encode_kind).collect(),
+            window_cut: p.window_cut.clone(),
+            error: None,
+            preview: None,
         };
-        if req.dry_run {
-            return Ok((meta, true));
+        if dry_run {
+            return Ok(meta);
         }
-        self.write_log(&id, &mut live).await?;
+        self.write_log(id, &mut live).await?;
         self.save(&meta, Some(&bytes))?;
-        self.save_samples(&id, &live, &d)?;
+        self.save_samples(id, &live, &d)?;
         self.entries.lock().await.insert(
-            id,
+            id.clone(),
             Entry {
                 meta: meta.clone(),
                 live: Some(live),
             },
         );
-        Ok((meta, false))
+        Ok(meta)
     }
 
     pub async fn list(&self) -> Vec<Proposal> {
@@ -952,15 +1259,7 @@ impl Proposals {
         markdown_format: bool,
         hide_credentials: bool,
     ) -> Result<Vec<u8>, ApiError> {
-        let meta = self.get_any(id).await?;
-        let path = self.dir(id).join("diff.json");
-        if !path.exists() {
-            return Err(ApiError::new(
-                ErrorCode::BadRequest,
-                format!("{id} has no diff yet; run: kronik replay {id}"),
-            ));
-        }
-        let bytes = std::fs::read(path).map_err(internal)?;
+        let (meta, bytes) = self.diff_bytes(id).await?;
         if !markdown_format && !hide_credentials {
             return Ok(bytes);
         }
@@ -973,6 +1272,38 @@ impl Proposals {
         }
         let policy = (!meta.policy.is_null()).then_some(&meta.policy);
         Ok(markdown::render(&d, policy).into_bytes())
+    }
+
+    /// The short Markdown summary of a fork's or proposal's diff, without
+    /// bodies, state values or URL paths ([`markdown::summary`], M10); hosts
+    /// show as the current `http:` grant patterns that match them.
+    pub async fn diff_summary(&self, id: &str) -> Result<Vec<u8>, ApiError> {
+        let (meta, bytes) = self.diff_bytes(id).await?;
+        let d: diff::Diff = serde_json::from_slice(&bytes).map_err(internal)?;
+        let policy = (!meta.policy.is_null()).then_some(&meta.policy);
+        let config = self.node.config_now();
+        let grants: Vec<&str> = config
+            .grants()
+            .filter_map(|g| g.capability.strip_prefix("http:"))
+            .collect();
+        Ok(markdown::summary(&d, policy, &grants).into_bytes())
+    }
+
+    async fn diff_bytes(&self, id: &str) -> Result<(Proposal, Vec<u8>), ApiError> {
+        self.refresh_preview_diff(id).await?;
+        let meta = self.get_any(id).await?;
+        if let Some(e) = unfinished(&meta) {
+            return Err(e);
+        }
+        let path = self.dir(id).join("diff.json");
+        if !path.exists() {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                format!("{id} has no diff yet; run: kronik replay {id}"),
+            ));
+        }
+        let bytes = std::fs::read(path).map_err(internal)?;
+        Ok((meta, bytes))
     }
 
     /// `kronik approve`: an `Approval` for the current diff.
@@ -988,6 +1319,9 @@ impl Proposals {
             .filter(|e| !e.meta.plain_fork)
             .ok_or_else(|| not_found(id))?;
         let meta = &mut entry.meta;
+        if let Some(e) = unfinished(meta) {
+            return Err(e);
+        }
         self.reconcile(meta)?;
         if meta.status == "promoted" {
             return Err(ApiError::new(
@@ -1040,6 +1374,9 @@ impl Proposals {
             .get_mut(id)
             .filter(|e| !e.meta.plain_fork)
             .ok_or_else(|| not_found(id))?;
+        if let Some(e) = unfinished(&entry.meta) {
+            return Err(e);
+        }
         self.reconcile(&mut entry.meta)?;
         if entry.meta.status == "promoted" {
             return Err(ApiError::new(
@@ -1077,6 +1414,7 @@ impl Proposals {
                     &kinds,
                     &options,
                     self.workers,
+                    None,
                 )
                 .await?;
             live.window_cut = entry.meta.window_cut.clone();
@@ -1261,7 +1599,7 @@ impl Proposals {
         .map_err(internal)?;
         index.reveal(&self.privacy(options.no_pii));
         let index = Arc::new(index);
-        let setup = self.setup(id, index.clone(), live.kinds.clone(), options);
+        let setup = self.setup(id, index.clone(), live.kinds.clone(), options, None);
         if options.mode.isolated() {
             let fresh: Vec<_> = index
                 .roots
@@ -1309,12 +1647,13 @@ impl Proposals {
                     && n.chars()
                         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
                     && !n.starts_with("p-")
+                    && !n.starts_with(preview::ID_PREFIX)
                     && n != "main";
                 if !ok {
                     return Err(ApiError::new(
                         ErrorCode::BadRequest,
                         format!(
-                            "{n:?} is not a valid fork name ([a-z][a-z0-9-]*, not main or p-...)"
+                            "{n:?} is not a valid fork name ([a-z][a-z0-9-]*, not main, p-... or v-...)"
                         ),
                     ));
                 }
@@ -1348,6 +1687,8 @@ impl Proposals {
             approved: None,
             promoted: None,
             plain_fork: true,
+            error: None,
+            preview: None,
             unchanged: Vec::new(),
             window_cut: None,
         };
@@ -1365,11 +1706,13 @@ impl Proposals {
         Ok((meta, false))
     }
 
+    /// A plain fork that is not a preview (P-F9: a preview's code, options
+    /// and log are its proposal's for its whole life).
     fn fork_entry<'a>(
         entries: &'a mut BTreeMap<String, Entry>,
         name: &str,
     ) -> Result<&'a mut Entry, ApiError> {
-        entries
+        let entry = entries
             .get_mut(name)
             .filter(|e| e.meta.plain_fork)
             .ok_or_else(|| {
@@ -1377,7 +1720,11 @@ impl Proposals {
                     ErrorCode::ForkNotFound,
                     format!("no fork {name:?}; run: kronik fork list"),
                 )
-            })
+            })?;
+        if entry.meta.preview.is_some() {
+            return Err(preview::not_a_fork(name));
+        }
+        Ok(entry)
     }
 
     /// `kronik deploy --fork`: code for one kind in the fork (allowed over
@@ -1437,7 +1784,15 @@ impl Proposals {
         let kinds = entry.meta.kind_versions()?;
         let workers = workers.unwrap_or(self.workers).clamp(1, 64);
         let mut live = self
-            .replay(name, entry.meta.fork_lsn, to, &kinds, &options, workers)
+            .replay(
+                name,
+                entry.meta.fork_lsn,
+                to,
+                &kinds,
+                &options,
+                workers,
+                None,
+            )
             .await?;
         self.write_log(name, &mut live).await?;
         let (d, bytes, hash) = self.build(name, &live, &options)?;
@@ -1467,8 +1822,37 @@ impl Proposals {
                 format!("no fork {name:?}; run: kronik fork list"),
             )
         })?;
-        let needs_state = entry.live.as_ref().is_none_or(|l| l.continuous.is_none());
-        if needs_state {
+        if let Some(e) = unfinished(&entry.meta) {
+            return Err(e);
+        }
+        // Its state is the preview's, behind the preview's own lock.
+        if entry.meta.preview.is_some() {
+            return Err(preview::not_a_fork(name));
+        }
+        let env = self.node.env();
+        let root = random_id(env);
+        let time = env.clock.wall_ms();
+        let live = self.continuous_for(name, entry, &actor.kind).await?;
+        let Some(c) = live.continuous.as_mut() else {
+            return Err(internal("fork state missing"));
+        };
+        let mut turn = c.send(actor, msg, root, time).await.map_err(internal)?;
+        // The reply leaves the fork: no real SQL rows in it (M5).
+        turn.record = shown_record(&turn);
+        self.write_log(name, live).await?;
+        Ok(turn)
+    }
+
+    /// The fork's live state with its continuous store, started at the fork
+    /// point when it has none; `ACTOR_NOT_FOUND` when the fork has no code
+    /// for `kind`.
+    async fn continuous_for<'e>(
+        &self,
+        name: &str,
+        entry: &'e mut Entry,
+        kind: &str,
+    ) -> Result<&'e mut Live, ApiError> {
+        if entry.live.as_ref().is_none_or(|l| l.continuous.is_none()) {
             let kinds = entry.meta.kind_versions()?;
             let options = DiffOptions {
                 mode: diff::Mode::Continuous,
@@ -1479,29 +1863,21 @@ impl Proposals {
             };
             let fork_lsn = entry.meta.fork_lsn;
             let live = self
-                .replay(name, fork_lsn, fork_lsn, &kinds, &options, 1)
+                .replay(name, fork_lsn, fork_lsn, &kinds, &options, 1, None)
                 .await?;
             entry.live = Some(live);
         }
-        let Some(c) = entry.live.as_mut().and_then(|l| l.continuous.as_mut()) else {
-            return Err(internal("fork state missing"));
-        };
-        if !c.has_kind(&actor.kind) {
+        let live = entry
+            .live
+            .as_mut()
+            .ok_or_else(|| internal("fork state missing"))?;
+        if !live.continuous.as_ref().is_some_and(|c| c.has_kind(kind)) {
             return Err(ApiError::new(
                 ErrorCode::ActorNotFound,
-                format!("kind {:?} is not deployed in fork {name}", actor.kind),
+                format!("kind {kind:?} is not deployed in fork {name}"),
             ));
         }
-        let env = self.node.env();
-        let root = random_id(env);
-        let time = env.clock.wall_ms();
-        let mut turn = c.send(actor, msg, root, time).await.map_err(internal)?;
-        // The reply leaves the fork: no real SQL rows in it (M5).
-        turn.record = shown_record(&turn);
-        if let Some(live) = entry.live.as_mut() {
-            self.write_log(name, live).await?;
-        }
-        Ok(turn)
+        Ok(live)
     }
 
     /// MCP `request_approval`: an `Approval` record with `request` set and
@@ -1513,6 +1889,9 @@ impl Proposals {
         dry_run: bool,
     ) -> Result<(Lsn, String, Proposal), ApiError> {
         let meta = self.get(id).await?;
+        if let Some(e) = unfinished(&meta) {
+            return Err(e);
+        }
         if meta.status == "promoted" {
             return Err(ApiError::new(
                 ErrorCode::BadRequest,
@@ -1591,6 +1970,60 @@ impl Proposals {
         audit: pb::Audit,
         dry_run: bool,
     ) -> Result<(u64, Lsn, Vec<pb::KindVersion>), ApiError> {
+        self.switch_back(epoch, false, audit, dry_run).await
+    }
+
+    /// A watch's rollback of `epoch` (M11): pins the deployment's kinds at
+    /// its code, which the switch checks under the deploy lock, so the
+    /// rollback never undoes a later deployment of them: `PROPOSAL_STALE`
+    /// then. The plan read outside the lock holds while the pins do.
+    pub async fn rollback_watched(
+        &self,
+        epoch: u64,
+        audit: pb::Audit,
+    ) -> Result<(u64, Lsn, Vec<pb::KindVersion>), ApiError> {
+        self.switch_back(epoch, true, audit, false).await
+    }
+
+    async fn switch_back(
+        &self,
+        epoch: u64,
+        pin: bool,
+        audit: pb::Audit,
+        dry_run: bool,
+    ) -> Result<(u64, Lsn, Vec<pb::KindVersion>), ApiError> {
+        let (target, kinds) = self.plan_rollback(epoch)?;
+        let (new_epoch, lsn) = self
+            .node
+            .switch_code(
+                CodeSwitch {
+                    kinds: kinds.clone(),
+                    pinned: if pin { target } else { Vec::new() },
+                    cause: pb::DeploymentCause::Rollback,
+                    verified_through_lsn: 0,
+                    unverified_inputs: 0,
+                    proposal_id: String::new(),
+                    rollback_of_epoch: epoch,
+                },
+                audit,
+                dry_run,
+            )
+            .await?;
+        Ok((new_epoch, lsn, kinds))
+    }
+
+    /// The kinds a rollback of `epoch` would deploy, from the deployments
+    /// in the log; `ROLLBACK_SCHEMA_CHANGED` when one of them would move a
+    /// schema version back.
+    pub fn rollback_plan(&self, epoch: u64) -> Result<Vec<pb::KindVersion>, ApiError> {
+        Ok(self.plan_rollback(epoch)?.1)
+    }
+
+    /// The deployment `epoch`'s kinds, and [`Proposals::rollback_plan`].
+    fn plan_rollback(
+        &self,
+        epoch: u64,
+    ) -> Result<(Vec<pb::KindVersion>, Vec<pb::KindVersion>), ApiError> {
         let deployments = self.node.store().db().deployments().map_err(internal)?;
         let Some((_, target)) = deployments.iter().find(|(_, d)| d.epoch == epoch) else {
             return Err(ApiError::new(
@@ -1636,23 +2069,7 @@ impl Proposals {
             }
             kinds.push(prev.clone());
         }
-        let (new_epoch, lsn) = self
-            .node
-            .switch_code(
-                CodeSwitch {
-                    kinds: kinds.clone(),
-                    pinned: Vec::new(),
-                    cause: pb::DeploymentCause::Rollback,
-                    verified_through_lsn: 0,
-                    unverified_inputs: 0,
-                    proposal_id: String::new(),
-                    rollback_of_epoch: epoch,
-                },
-                audit,
-                dry_run,
-            )
-            .await?;
-        Ok((new_epoch, lsn, kinds))
+        Ok((target.kinds.clone(), kinds))
     }
 }
 
@@ -1767,7 +2184,7 @@ fn targets_of_value(d: &Value) -> Vec<String> {
     out.into_iter().collect()
 }
 
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), ApiError> {
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), ApiError> {
     use std::io::Write as _;
     let tmp = path.with_extension("tmp");
     let mut f = std::fs::File::create(&tmp).map_err(internal)?;

@@ -7,11 +7,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kronik_core::env::Env;
+use kronik_core::env::{BoxFuture, Env};
+use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::ids::{ActorRef, TurnId};
 use kronik_gateway::subject::SubjectFrom;
-use kronik_gateway::{Gateway, GatewayConfig, HttpRequest, HttpResponse, TURN_ID_HEADER};
+use kronik_gateway::{
+    Gateway, GatewayConfig, HttpRequest, HttpResponse, PreviewRouter, TURN_ID_HEADER,
+};
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{Node, NodeConfig, start_local};
+use kronik_sched::{Node, NodeConfig, RouteEntry, TurnResult, start_local};
 
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -360,4 +364,156 @@ async fn a_configured_idempotency_header_is_the_only_one_read() {
             .turns
             > turns
     );
+}
+
+fn plain(b: &[u8]) -> Option<pb::Sealable> {
+    Some(pb::Sealable {
+        subject: None,
+        value: Some(pb::sealable::Value::Plain(b.to_vec())),
+    })
+}
+
+/// One preview, `v-1`, whose code answers every request with a cookie and
+/// headers acting on the origin; it keeps the inputs it gets.
+#[derive(Default)]
+struct CookiePreview(std::sync::Mutex<Vec<pb::HttpInput>>);
+
+impl PreviewRouter for CookiePreview {
+    fn routes(&self, id: &str) -> BoxFuture<'_, Result<Vec<RouteEntry>, ApiError>> {
+        let found = id == "v-1";
+        Box::pin(async move {
+            if !found {
+                return Err(ApiError::new(ErrorCode::PreviewNotFound, "no preview"));
+            }
+            Ok(vec![RouteEntry {
+                kind: "counter".into(),
+                method: "POST".into(),
+                pattern: "/counter/{key}/{op}".into(),
+            }])
+        })
+    }
+
+    fn send(
+        self: Arc<Self>,
+        id: String,
+        _actor: ActorRef,
+        http: pb::HttpInput,
+        _subject: Option<String>,
+    ) -> BoxFuture<'static, Result<TurnResult, ApiError>> {
+        self.0.lock().unwrap().push(http);
+        let h = |n: &str, v: &[u8]| pb::Header {
+            name: n.into(),
+            value: plain(v),
+        };
+        Box::pin(async move {
+            Ok(TurnResult {
+                turn_id: TurnId { branch: id, lsn: 1 },
+                outcome: pb::Outcome {
+                    kind: pb::OutcomeKind::Committed as i32,
+                    output: Some(pb::outcome::Output::Http(pb::HttpResponse {
+                        status: 200,
+                        headers: vec![
+                            h("Set-Cookie", b"session=preview"),
+                            h("Strict-Transport-Security", b"max-age=0"),
+                            h("Clear-Site-Data", b"\"*\""),
+                            h("Location", b"https://evil.example/"),
+                            h("Content-Type", b"text/html"),
+                            h("ETag", b"\"1\""),
+                        ],
+                        body: Some(pb::Body {
+                            value: plain(b"from the preview").map(pb::body::Value::Inline),
+                        }),
+                    })),
+                    ..Default::default()
+                },
+            })
+        })
+    }
+}
+
+/// P-F1, P-F6, N1-N3: without a preview domain the prefix serves previews,
+/// sandboxed, keeping only safe response headers and receiving neither
+/// main's cookies nor its authorization; with one, only hosts under it do
+/// (any case, port, trailing dot), and the prefix is main's path. No
+/// preview input carries an idempotency key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn previews_answer_on_the_prefix_only_without_a_preview_domain() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(dir.path()).await;
+    let at = |path: &str, host: &str| {
+        let mut r = post(path, Some("k1"), b"");
+        r.headers.push(("Host".into(), host.into()));
+        r.headers.push(("Cookie".into(), "main=secret".into()));
+        r.headers.push(("AUTHORIZATION".into(), "Bearer t".into()));
+        r.headers.push(("cookie".into(), "other=1".into()));
+        r.headers
+            .push(("Proxy-Authorization".into(), "Basic cA==".into()));
+        r
+    };
+    let prefix = "/__preview/v-1/counter/a/increment";
+
+    let seen = Arc::new(CookiePreview::default());
+    let gw = Gateway::new(node.clone(), GatewayConfig::default()).with_preview(seen.clone());
+    let r = gw.handle(at(prefix, "app.example")).await;
+    assert_eq!(
+        (r.status, r.body.as_slice()),
+        (200, b"from the preview".as_slice())
+    );
+    for dropped in [
+        "set-cookie",
+        "strict-transport-security",
+        "clear-site-data",
+        "location",
+    ] {
+        assert_eq!(header(&r, dropped), None, "{dropped}");
+    }
+    assert_eq!(header(&r, "content-type"), Some("text/html"));
+    assert_eq!(header(&r, "etag"), Some("\"1\""));
+    assert!(header(&r, "kronik-turn-id").is_some());
+    assert_eq!(header(&r, "content-security-policy"), Some("sandbox"));
+    {
+        let inputs = seen.0.lock().unwrap();
+        let names: Vec<String> = inputs[0]
+            .headers
+            .iter()
+            .map(|h| h.name.to_lowercase())
+            .collect();
+        assert!(names.contains(&"host".to_owned()), "{names:?}");
+        assert!(!names.contains(&"cookie".to_owned()), "{names:?}");
+        assert!(!names.contains(&"authorization".to_owned()), "{names:?}");
+        assert!(
+            !names.contains(&"proxy-authorization".to_owned()),
+            "{names:?}"
+        );
+        assert_eq!(inputs[0].idempotency_key, "");
+        assert!(inputs[0].request_hash.is_empty());
+    }
+
+    let gw = Gateway::new(
+        node.clone(),
+        GatewayConfig {
+            preview_domain: Some("p.example".into()),
+            ..GatewayConfig::default()
+        },
+    )
+    .with_preview(seen.clone());
+    let r = gw.handle(at(prefix, "app.example")).await;
+    assert_eq!((r.status, code(&r).as_str()), (404, "ROUTE_NOT_FOUND"));
+    let r = gw
+        .handle(at("/counter/a/increment", "V-1.P.Example.:8443"))
+        .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(header(&r, "set-cookie"), Some("session=preview"));
+    assert_eq!(header(&r, "content-security-policy"), None);
+    // Its own origin: credentials for it reach it.
+    let last = seen.0.lock().unwrap().last().cloned().unwrap();
+    assert!(last.headers.iter().any(|h| h.name == "Cookie"));
+    assert!(last.headers.iter().any(|h| h.name == "AUTHORIZATION"));
+    assert_eq!(last.idempotency_key, "");
+    let r = gw
+        .handle(at("/counter/a/increment", "x.v-1.p.example"))
+        .await;
+    assert_eq!((r.status, code(&r).as_str()), (404, "PREVIEW_NOT_FOUND"));
+    // None of it reached main.
+    assert!(node.store().db().actor("counter", "a").unwrap().is_none());
 }
