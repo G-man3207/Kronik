@@ -391,7 +391,14 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
         "{report}"
     );
     let kvm = status(&report, "kvm");
-    if Path::new("/dev/kvm").exists() {
+    // Usable, as doctor judges it: CI runners have a /dev/kvm only the kvm
+    // group may open.
+    let usable = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok();
+    if usable {
         assert_eq!(kvm["status"], "pass", "{report}");
     } else {
         assert_eq!(kvm["status"], "fail", "{report}");

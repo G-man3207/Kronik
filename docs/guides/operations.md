@@ -174,7 +174,7 @@ release still parses; unknown keys are errors.
 | Key | Default | Meaning |
 |---|---|---|
 | `runsc_path` | `"/usr/local/bin/runsc"` | gVisor's `runsc` |
-| `platform` | `"auto"` | `"auto"`, `"systrap"` or `"kvm"`: gVisor's platform. `auto` uses KVM when `/dev/kvm` works, else systrap |
+| `platform` | `"auto"` | `"auto"`, `"systrap"` or `"kvm"`: gVisor's platform. `auto` is systrap; `kvm` needs a `/dev/kvm` the daemon can open |
 | `run_dir` | `"/run/kronik"` | Runtime state of the sandboxes: runsc's root, network namespaces and bridge sockets. Best on a tmpfs; nothing in it survives a reboot. One daemon per directory: a second daemon runs without foreign actors |
 | `layout_dirs` | `[]` | Absolute directories whose `oci-layout:` images an `operate` token may add; any other directory needs `admin` |
 | `pull_timeout` | `"10m"` | How long an image pull or layout import may take |
@@ -317,7 +317,7 @@ rather than fail, unless `kronik.toml` asks for what is missing
 | `config` | The file has an unknown key or a bad value (`BAD_REQUEST`). Without a file it passes and says that the defaults apply | Fix the line it names; `kronik serve --init` writes a file |
 | `kernel` | Linux older than 5.6 (warning) | Only foreign actors need 5.6 |
 | `runsc` | `runsc` is missing, not executable, lacks gVisor's `gvisor-bin`/`gvisor_sentry` next to it, or is older than the tested `release-20261019.0` (`RUNSC_MISSING`, warning) | Install or upgrade gVisor with `install.sh`; only foreign actors need it |
-| `kvm` | `/dev/kvm` is not usable (`KVM_UNAVAILABLE`): a warning, or a failure with `platform = "kvm"` | Most hosts are fine with systrap: set `platform = "auto"` |
+| `kvm` | `/dev/kvm` is missing or can't be opened read-write (`KVM_UNAVAILABLE`): a warning, or a failure with `platform = "kvm"` | Most hosts are fine with systrap: set `platform = "auto"`. For `kvm` when it exists but is denied, give the daemon's user access (the `kvm` group) |
 | `cgroup` | cgroup v2 or its `cpu`, `memory` or `pids` controllers are missing (warning) | Foreign actors' resource limits need them |
 | `root` | Not running as root (warning) | The daemon runs as root under systemd; run doctor with `sudo` for the root-only checks |
 | `runc` | `runc` is missing (`RUNC_MISSING`, warning) | Only foreign actors with `--isolation trusted` need it: `apt install runc` |
