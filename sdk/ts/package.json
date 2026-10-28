@@ -12,7 +12,7 @@
   "types": "./src/index.ts",
   "scripts": {
     "check": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p testkit/tsconfig.json",
-    "test": "node --test test/",
+    "test": "node --test test/*.test.ts",
     "types": "jco guest-types wit/kronik-actor.wit --world-name actor -o types -q"
   },
   "devDependencies": {
