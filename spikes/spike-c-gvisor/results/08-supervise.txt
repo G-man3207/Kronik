@@ -1,0 +1,64 @@
+# 08-supervise on travelfiesta at 2026-10-25T00:15:08Z, runsc version release-20261019.0, bridge pf
+
+=== 1. Foreground: runsc run blocks and exits with the container's exit status
+--- 1a. the app exits with status 3
+container running
+exiting
+runsc run exited with status 3
+--- 1b. runsc kill KILL
+container running
+runsc run exited with status 137
+--- 1c. the sandbox process is killed on the host (kill -9)
+container running
+runsc run exited with status 137
+
+=== 2. Detached: the app exits with status 42; what runsc wait and runsc state report
+status=200
+{"id":"kronik-echo","exitStatus":42}
+runsc wait exit status 0
+runsc state: {"status":"stopped","pid":-1}
+container output (what kronik foreign logs would show):
+echo-server: listening on tcp 0.0.0.0:8080
+echo-server: exiting with status 42 as requested
+
+=== 3. Detached: runsc kill (Kronik stopping the actor), observed through runsc wait and runsc state
+$ rs kill kronik-echo KILL
+{"id":"kronik-echo","exitStatus":137}
+runsc wait exit status 0
+runsc state: {"status":"stopped","pid":-1}
+
+=== 4. Detached: the sandbox process is killed on the host (kill -9)
+$ kill -9 472923
+waiting on container "kronik-echo": sandbox no longer running and its exit status is unavailable
+runsc wait exit status 128
+runsc state: {"status":"stopped","pid":-1}
+bridge-bench: Broken pipe (os error 32)
+
+=== 5. Stats for monitoring: runsc events --stats
+{"type":"stats","id":"kronik-echo","cpu_total_ns":91588000,"memory_usage":655360,"pids":2}
+
+=== 6. Only with the uds bridge: the shim (a runsc exec child) dies
+UID       PID       PPID      PGID      C         TTY       STIME     TIME      CMD
+65534     1         0         1         18        ?         00:15     0s        echo-server
+0         3         0         3         78        ?         00:15     0s        uds-shim
+$ rs kill --pid 3 kronik-echo KILL
+the shim's runsc exec exited with status 137
+the socket file is still there, but nobody accepts on it any more:
+total 0
+srwxr-xr-x 1 root root 0 Oct 25 00:15 http.sock
+bridge-bench: Resource temporarily unavailable (os error 11)
+(request failed after 10114 ms, by the client's 10 s timeout)
+remedy: remove the stale socket file, then exec the shim again
+ready_ms=9.4 attempts=3 target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock
+status=200
+
+=== 7. Teardown of the pf configuration
+network namespaces: kronik-echo 
+$ rs delete --force kronik-echo
+$ rs list
+ID          PID         STATUS      BUNDLE      CREATED     OWNER
+state dir /run/kronik-spike-c/runsc: null-netns 
+cgroup /sys/fs/cgroup/kronik/foreign-echo removed
+network namespaces after runsc delete: kronik-echo 
+$ ip netns del kronik-echo
+no runsc processes left

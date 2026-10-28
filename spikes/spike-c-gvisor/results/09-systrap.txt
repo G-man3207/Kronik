@@ -1,0 +1,17 @@
+# 09-systrap on travelfiesta at 2026-10-25T00:15:20Z, runsc version release-20261019.0, bridge pf
+
+=== runsc flags: (defaults)
+idle sandbox used 3 ms of CPU in 5000 ms
+cgroup cpu.stat: usage_usec 116337 nr_periods 3 nr_throttled 0 throttled_usec 0 
+label=pf target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 mode=keepalive n=1000 errors=0 body=64B min_us=136 p50_us=425 p90_us=741 p99_us=1397 p999_us=17914 max_us=24371 mean_us=555
+cgroup cpu.stat: usage_usec 791358 nr_periods 10 nr_throttled 6 throttled_usec 115107 
+label=pf target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 mode=newconn n=1000 errors=0 body=64B min_us=7609 p50_us=13012 p90_us=18574 p99_us=24974 p999_us=32604 max_us=37518 mean_us=13765
+cgroup cpu.stat: usage_usec 8502470 nr_periods 162 nr_throttled 6 throttled_usec 115107 
+
+=== runsc flags: --systrap-disable-fast-path
+idle sandbox used 1 ms of CPU in 5000 ms
+cgroup cpu.stat: usage_usec 127996 nr_periods 5 nr_throttled 0 throttled_usec 0 
+label=pf-nofastpath target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 mode=keepalive n=1000 errors=0 body=64B min_us=185 p50_us=424 p90_us=791 p99_us=1787 p999_us=17263 max_us=19563 mean_us=581
+cgroup cpu.stat: usage_usec 809545 nr_periods 12 nr_throttled 6 throttled_usec 130331 
+label=pf-nofastpath target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 mode=newconn n=1000 errors=0 body=64B min_us=7760 p50_us=13061 p90_us=18702 p99_us=24049 p999_us=32153 max_us=38160 mean_us=13769
+cgroup cpu.stat: usage_usec 7613800 nr_periods 162 nr_throttled 6 throttled_usec 130331 

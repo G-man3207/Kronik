@@ -1,0 +1,3 @@
+Grounding says how well a fork's effects rest on recordings. An effect is exact when causal key, ordinal, type and fingerprint match a recording; the recorded response is used. It is approximate when causal key, ordinal, type and target (method, host and route pattern) match but the request differs; the recorded response is reused, and the request difference is shown in the diff. It is synthetic when nothing matches: a stub rule answers, or `FailClosed` gives the guest `denied`, and the turn is marked divergent. Grounding is reported in total and per target, because thousands of exact calls can hide a few approximate payments, and policy judges it per target.
+
+See also: `behavior-diff`, `effect`, `proposal`.

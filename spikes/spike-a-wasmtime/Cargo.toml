@@ -1,0 +1,28 @@
+[package]
+name = "spike-a-wasmtime"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Kronik M0 spike A: deterministic Wasmtime host harness for the kronik:actor world"
+license = "Elastic-License-2.0"
+
+# Standalone project: the root workspace excludes spikes/.
+[workspace]
+exclude = ["guest"]
+
+[dependencies]
+wasmtime = { version = "=50.0.0", default-features = false, features = ["runtime", "cranelift", "component-model", "async", "pooling-allocator", "parallel-compilation", "std", "addr2line", "demangle"] }
+wasmtime-environ = { version = "=50.0.0", default-features = false }
+wasmtime-wasi = { version = "=50.0.0", default-features = false, features = ["p2"] }
+# Same versions wasmtime-wasi 50 links, to avoid duplicates.
+wasmtime-wasi-io = { version = "=50.0.0", default-features = false, features = ["std"] }
+wasmparser = { version = "0.261.0", default-features = false, features = ["std", "component-model"] }
+wat = "1"
+chacha20 = { version = "0.10.2", default-features = false, features = ["rng"] }
+blake3 = "1"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "time", "io-util"] }
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+debug = "line-tables-only"

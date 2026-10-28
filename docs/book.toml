@@ -1,0 +1,14 @@
+# The Kronik book: `scripts/ci.sh book` builds it with the pinned mdBook
+# (scripts/install-mdbook.sh) into target/book and checks its links.
+# docs/ itself is the source, so existing paths such as docs/errors.md stay
+# where they are; docs/SUMMARY.md lists the chapters.
+
+[book]
+title = "Kronik"
+description = "Kronik: a runtime where a system is a deterministic function of its history."
+language = "en"
+src = "."
+
+[build]
+build-dir = "../target/book"
+create-missing = false

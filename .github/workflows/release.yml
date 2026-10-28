@@ -1,0 +1,71 @@
+name: Release
+
+# Builds a release with scripts/release.sh: static musl binaries for x86_64
+# and aarch64, a CycloneDX SBOM, install.sh with the release's base URL, and
+# SHA256SUMS. It runs only when started by hand (Actions, Release, Run
+# workflow): publishing waits for the owner's decision. The files are kept as
+# the run's artifact; with `draft` set, the run also creates a draft GitHub
+# release with them, which the owner reviews and publishes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Where the release's files will be served; install.sh downloads from there"
+        required: true
+        type: string
+      draft:
+        description: "Create a draft GitHub release with the files"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: build the release
+    runs-on: ubuntu-24.04
+    permissions:
+      # Only the draft release writes.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Installs the toolchain pinned in rust-toolchain.toml; release.sh adds
+      # the musl targets and its pinned tools (zig, cargo-zigbuild,
+      # cargo-cyclonedx).
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Build
+        env:
+          KRONIK_BASE_URL: ${{ inputs.base_url }}
+        run: scripts/release.sh
+
+      - name: Check the x86_64 binary
+        run: dist/release/kronik-x86_64-unknown-linux-musl --version
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kronik-release
+          path: dist/release/
+          if-no-files-found: error
+
+      - name: Draft release
+        if: inputs.draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(dist/release/kronik-x86_64-unknown-linux-musl --version | head -n 1 | cut -d ' ' -f 2)"
+          gh release create "v$version" --draft --target "$GITHUB_SHA" \
+            --title "kronik $version" \
+            --notes "Static binaries for x86_64 and aarch64 Linux (musl), a CycloneDX SBOM, install.sh and SHA256SUMS." \
+            dist/release/*

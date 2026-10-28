@@ -1,0 +1,35 @@
+[package]
+name = "kronik-fork"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+blake3 = { workspace = true }
+kronik-core = { workspace = true }
+kronik-metrics = { workspace = true }
+kronik-effects = { workspace = true }
+kronik-log = { workspace = true }
+kronik-policy = { workspace = true }
+kronik-privacy = { workspace = true }
+kronik-proto = { workspace = true }
+kronik-runtime = { workspace = true }
+kronik-sched = { workspace = true }
+kronik-store = { workspace = true }
+prost = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+kronik-core = { workspace = true, features = ["real"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

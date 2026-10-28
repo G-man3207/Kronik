@@ -1,0 +1,24 @@
+[package]
+name = "spike-d-guest"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Kronik M0 spike D: counter actor with one external effect per turn"
+license = "Elastic-License-2.0"
+
+# Standalone project: built for wasm32-wasip2.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.63.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+strip = true
+panic = "abort"

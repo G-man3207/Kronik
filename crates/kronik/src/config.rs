@@ -1,0 +1,862 @@
+//! The server's basic settings: `/etc/kronik/kronik.toml` (SPEC.md,
+//! "Operator configuration and policy"). Only what the server needs to start
+//! lives in the file; everything that affects behavior (grants, limits,
+//! policy, privacy mode, foreign actors) is history set through the API (I5).
+//!
+//! Every section and key of the brief's file is accepted, with the brief's
+//! value as the default, except the values that only make sense for one
+//! installation: `tls.domains`, `tls.acme_email`, `ship.url`, `ship.endpoint`
+//! and `privacy.subject_from` default to empty and `tls.mode` to `off`.
+//! `server.http_listen` defaults to `0.0.0.0:443` with TLS and to
+//! `127.0.0.1:8080` without, and `keys.master_key_file` to
+//! `<data_dir>/keys/master.key`, so that a bare `kronik serve` touches no
+//! system port or path; `kronik serve --init` writes the brief's values.
+//! Four keys complete `[tls]`: `cert_file` and `key_file` for `mode =
+//! "files"`, `acme_directory` (Let's Encrypt by default) and `acme_ca_file`,
+//! a CA to trust for a private ACME server. Unknown keys are errors,
+//! reported with the file and line.
+
+use std::fmt;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde::de::{self, Deserializer};
+
+use kronik_gateway::subject::SubjectFrom;
+
+/// Where `kronik serve` and the CLI look for the file.
+pub const DEFAULT_PATH: &str = "/etc/kronik/kronik.toml";
+
+/// Let's Encrypt's production ACME directory.
+pub const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Config {
+    pub server: Server,
+    pub tls: Tls,
+    pub gateway: Gateway,
+    pub log: Log,
+    pub retention: Retention,
+    pub sql: Sql,
+    pub ship: Ship,
+    pub keys: Keys,
+    pub privacy: Privacy,
+    pub replay: Replay,
+    pub fork: Fork,
+    pub promote: Promote,
+    pub foreign: Foreign,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Server {
+    pub data_dir: PathBuf,
+    pub api_socket: PathBuf,
+    /// The gateway; see [`Config::http_listen`] for the default.
+    pub http_listen: Option<SocketAddr>,
+    /// `/metrics` and `/healthz`.
+    pub admin_listen: SocketAddr,
+    /// The JSON API (and MCP) over TCP, where every request needs a bearer
+    /// token (M5); off when absent. See [`Config::api_listen`].
+    pub api_listen: Option<SocketAddr>,
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Server {
+            data_dir: "/var/lib/kronik".into(),
+            api_socket: "/run/kronik/api.sock".into(),
+            http_listen: None,
+            admin_listen: SocketAddr::from(([127, 0, 0, 1], 9464)),
+            api_listen: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsMode {
+    #[default]
+    Off,
+    Files,
+    Acme,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Tls {
+    pub mode: TlsMode,
+    pub domains: Vec<String>,
+    pub acme_email: Option<String>,
+    pub acme_directory: String,
+    /// A CA certificate (PEM) to trust for the ACME server, besides the
+    /// system's roots.
+    pub acme_ca_file: Option<PathBuf>,
+    /// The certificate chain (PEM) for `mode = "files"`.
+    pub cert_file: Option<PathBuf>,
+    /// The private key (PEM) for `mode = "files"`.
+    pub key_file: Option<PathBuf>,
+}
+
+impl Default for Tls {
+    fn default() -> Self {
+        Tls {
+            mode: TlsMode::Off,
+            domains: Vec::new(),
+            acme_email: None,
+            acme_directory: LETS_ENCRYPT.into(),
+            acme_ca_file: None,
+            cert_file: None,
+            key_file: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Gateway {
+    pub timeout: Dur,
+    pub idempotency_header: String,
+    pub idempotency_ttl: Dur,
+    /// Reverse proxies, as addresses or CIDR blocks: their connections are
+    /// exempt from the per-client connection cap.
+    pub trusted_proxies: Vec<String>,
+}
+
+impl Default for Gateway {
+    fn default() -> Self {
+        Gateway {
+            timeout: Dur::secs(30),
+            idempotency_header: "Idempotency-Key".into(),
+            idempotency_ttl: Dur::secs(24 * 3600),
+            trusted_proxies: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Log {
+    pub group_commit_ms: u64,
+    pub segment_max_mb: u64,
+    pub segment_max_age_s: u64,
+    /// Below this much free space on the log's file system, new root inputs
+    /// and changes are refused (UNAVAILABLE) so that the disk never fills
+    /// up under a log write, which would stop the daemon. "0B" turns the
+    /// check off.
+    pub disk_reserve: Size,
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Log {
+            group_commit_ms: 2,
+            segment_max_mb: 64,
+            segment_max_age_s: 60,
+            disk_reserve: Size(512 << 20),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Retention {
+    /// How far back the log reaches; forks and replay must start within it.
+    pub history: Dur,
+    pub snapshot_interval: Dur,
+    pub snapshots_kept: u32,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Retention {
+            history: Dur::secs(7 * 86_400),
+            snapshot_interval: Dur::secs(3600),
+            snapshots_kept: 48,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Sql {
+    pub max_size_per_actor: Size,
+}
+
+impl Default for Sql {
+    fn default() -> Self {
+        Sql {
+            max_size_per_actor: Size(1 << 30),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Ship {
+    pub enabled: bool,
+    pub url: Option<String>,
+    pub endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Keys {
+    /// The secret store's and the privacy keystore's master key; see
+    /// [`Config::master_key_file`] for the default. The
+    /// `KRONIK_MASTER_KEY` environment variable, when set, holds the key
+    /// material itself (64 hex characters) and no file is read or created;
+    /// setting both is refused.
+    pub master_key_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Privacy {
+    pub keystore_backup_retention: Dur,
+    /// Where a request's subject comes from, such as `header:x-user-id`.
+    pub subject_from: Option<String>,
+}
+
+impl Default for Privacy {
+    fn default() -> Self {
+        Privacy {
+            keystore_backup_retention: Dur::secs(30 * 86_400),
+            subject_from: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayMode {
+    Isolated,
+    Continuous,
+    #[default]
+    Both,
+}
+
+impl ReplayMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplayMode::Isolated => "isolated",
+            ReplayMode::Continuous => "continuous",
+            ReplayMode::Both => "both",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Replay {
+    pub default_mode: ReplayMode,
+    /// The share of root inputs isolated replay runs, stratified per route
+    /// and actor type.
+    pub sample: Percent,
+}
+
+impl Default for Replay {
+    fn default() -> Self {
+        Replay {
+            default_mode: ReplayMode::Both,
+            sample: Percent(100.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Fork {
+    pub live_allowlist: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Promote {
+    pub max_gap: Dur,
+    pub catch_up_timeout: Dur,
+}
+
+impl Default for Promote {
+    fn default() -> Self {
+        Promote {
+            max_gap: Dur::secs(2),
+            catch_up_timeout: Dur::secs(300),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Platform {
+    #[default]
+    Auto,
+    Systrap,
+    Kvm,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Foreign {
+    pub runsc_path: PathBuf,
+    pub platform: Platform,
+    /// Runtime state of the sandboxes: runsc's root, network namespaces and
+    /// bridge sockets (docs/design/m7-foreign.md §3). A tmpfs, so nothing
+    /// survives a reboot.
+    pub run_dir: PathBuf,
+    /// Directories whose local OCI layouts (`oci-layout:<dir>`) a token
+    /// with `operate` may add; any other directory needs `admin`, because
+    /// the daemon reads it as root (docs/design/m7-foreign.md §4).
+    pub layout_dirs: Vec<PathBuf>,
+    /// The longest one image pull from a registry may take.
+    pub pull_timeout: Dur,
+}
+
+impl Default for Foreign {
+    fn default() -> Self {
+        Foreign {
+            runsc_path: "/usr/local/bin/runsc".into(),
+            platform: Platform::Auto,
+            run_dir: "/run/kronik".into(),
+            layout_dirs: Vec::new(),
+            pull_timeout: Dur::secs(600),
+        }
+    }
+}
+
+/// A duration written with a unit: `500ms`, `30s`, `60m`, `24h`, `7d`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dur(pub Duration);
+
+impl Dur {
+    const fn secs(s: u64) -> Dur {
+        Dur(Duration::from_secs(s))
+    }
+}
+
+impl std::str::FromStr for Dur {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Dur, String> {
+        let (number, unit) = split_unit(s);
+        let n: u64 = number.parse().map_err(|_| {
+            format!("invalid duration {s:?}: use a whole number and a unit, as in \"30s\"")
+        })?;
+        let ms_per = match unit {
+            "ms" => 1,
+            "s" => 1_000,
+            "m" => 60_000,
+            "h" => 3_600_000,
+            "d" => 86_400_000,
+            _ => {
+                return Err(format!(
+                    "invalid duration {s:?}: the unit must be ms, s, m, h or d"
+                ));
+            }
+        };
+        n.checked_mul(ms_per)
+            .map(|ms| Dur(Duration::from_millis(ms)))
+            .ok_or_else(|| format!("duration {s:?} is too long"))
+    }
+}
+
+/// A size written with a binary unit: `512B`, `64KiB`, `64MiB`, `1GiB`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Size(pub u64);
+
+impl std::str::FromStr for Size {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Size, String> {
+        let (number, unit) = split_unit(s);
+        let n: u64 = number.parse().map_err(|_| {
+            format!("invalid size {s:?}: use a whole number and a unit, as in \"64MiB\"")
+        })?;
+        let shift = match unit {
+            "B" => 0,
+            "KiB" => 10,
+            "MiB" => 20,
+            "GiB" => 30,
+            "TiB" => 40,
+            _ => {
+                return Err(format!(
+                    "invalid size {s:?}: the unit must be B, KiB, MiB, GiB or TiB"
+                ));
+            }
+        };
+        n.checked_mul(1u64 << shift)
+            .map(Size)
+            .ok_or_else(|| format!("size {s:?} is too large"))
+    }
+}
+
+/// A percentage above 0 and at most 100: `"10%"`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Percent(pub f64);
+
+impl std::str::FromStr for Percent {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Percent, String> {
+        let p: f64 = s
+            .strip_suffix('%')
+            .and_then(|n| n.trim().parse().ok())
+            .ok_or_else(|| format!("invalid percentage {s:?}: write it as \"10%\""))?;
+        if p > 0.0 && p <= 100.0 {
+            Ok(Percent(p))
+        } else {
+            Err(format!(
+                "percentage {s:?} must be above 0% and at most 100%"
+            ))
+        }
+    }
+}
+
+fn split_unit(s: &str) -> (&str, &str) {
+    let s = s.trim();
+    let at = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    (&s[..at], s[at..].trim_start())
+}
+
+/// Deserializes the `FromStr` types above from TOML strings.
+macro_rules! from_string {
+    ($($ty:ty),*) => {$(
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(deserializer)?;
+                s.parse().map_err(de::Error::custom)
+            }
+        }
+    )*};
+}
+
+from_string!(Dur, Size, Percent);
+
+/// A file that can't be used: where, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError {
+    pub path: PathBuf,
+    /// 1-based, when the error has a place in the file.
+    pub line: Option<usize>,
+    pub message: String,
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.line {
+            Some(line) => write!(f, "{}:{line}: {}", self.path.display(), self.message),
+            None => write!(f, "{}: {}", self.path.display(), self.message),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl Config {
+    /// Parses and checks a file's text; `path` only names it in errors.
+    pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
+        let config: Config = toml::from_str(text).map_err(|e| ConfigError {
+            path: path.to_owned(),
+            line: e.span().map(|span| line_of(text, span.start)),
+            message: e.message().to_owned(),
+        })?;
+        config.check().map_err(|message| ConfigError {
+            path: path.to_owned(),
+            line: None,
+            message,
+        })?;
+        Ok(config)
+    }
+
+    /// Reads `path`, which must exist.
+    pub fn load(path: &Path) -> Result<Config, ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|e| ConfigError {
+            path: path.to_owned(),
+            line: None,
+            message: format!("cannot read the configuration: {e}"),
+        })?;
+        Config::parse(&text, path)
+    }
+
+    /// The configuration `kronik serve` starts with: `explicit` (which must
+    /// exist), else [`DEFAULT_PATH`] if it exists, else the defaults. Also
+    /// returns the file it read.
+    pub fn find(explicit: Option<&Path>) -> Result<(Config, Option<PathBuf>), ConfigError> {
+        let path = match explicit {
+            Some(path) => path.to_owned(),
+            None if Path::new(DEFAULT_PATH).exists() => PathBuf::from(DEFAULT_PATH),
+            None => return Ok((Config::default(), None)),
+        };
+        Config::load(&path).map(|config| (config, Some(path)))
+    }
+
+    /// Requirements across keys that the types can't express.
+    fn check(&self) -> Result<(), String> {
+        match self.tls.mode {
+            TlsMode::Acme if self.tls.domains.is_empty() => {
+                return Err(
+                    "[tls] mode = \"acme\" needs domains, the names to get a certificate for"
+                        .into(),
+                );
+            }
+            TlsMode::Acme if self.tls.acme_email.as_deref().unwrap_or("").is_empty() => {
+                return Err(
+                    "[tls] mode = \"acme\" needs acme_email, where the CA sends expiry notices"
+                        .into(),
+                );
+            }
+            TlsMode::Files if self.tls.cert_file.is_none() || self.tls.key_file.is_none() => {
+                return Err("[tls] mode = \"files\" needs cert_file and key_file (PEM)".into());
+            }
+            _ => {}
+        }
+        if self.ship.enabled && self.ship.url.as_deref().unwrap_or("").is_empty() {
+            return Err("[ship] enabled = true needs url, such as \"s3://bucket/kronik\"".into());
+        }
+        if self.gateway.idempotency_header.trim().is_empty() {
+            return Err(
+                "BAD_REQUEST: [gateway] idempotency_header is empty; name the header clients send"
+                    .into(),
+            );
+        }
+        if let Some(e) = self
+            .gateway
+            .trusted_proxies
+            .iter()
+            .find_map(|p| kronik_gateway::IpNet::parse(p).err())
+        {
+            return Err(format!("[gateway] trusted_proxies: {e}"));
+        }
+        if let Some(from) = &self.privacy.subject_from
+            && SubjectFrom::parse(from).is_none()
+        {
+            return Err(format!(
+                "[privacy] subject_from = {from:?}: use \"header:<name>\" or \"jwt:sub\""
+            ));
+        }
+        if let Some(d) = self.foreign.layout_dirs.iter().find(|d| !d.is_absolute()) {
+            return Err(format!(
+                "[foreign] layout_dirs: {} is not an absolute directory",
+                d.display()
+            ));
+        }
+        self.api_listen()?;
+        Ok(())
+    }
+
+    /// `server.api_listen`. Without TLS it must be a loopback address, so
+    /// that bearer tokens never cross a network in the clear; with TLS the
+    /// API uses the gateway's certificate.
+    pub fn api_listen(&self) -> Result<Option<SocketAddr>, String> {
+        match self.server.api_listen {
+            Some(addr) if !addr.ip().is_loopback() && self.tls.mode == TlsMode::Off => {
+                Err(format!(
+                    "server.api_listen = \"{addr}\" is not a loopback address and [tls] is off: \
+                     bearer tokens would cross the network in the clear; turn TLS on or listen \
+                     on 127.0.0.1"
+                ))
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// The gateway's address: `server.http_listen`, else `0.0.0.0:443` with
+    /// TLS and `127.0.0.1:8080` without.
+    pub fn http_listen(&self) -> SocketAddr {
+        self.server.http_listen.unwrap_or(match self.tls.mode {
+            TlsMode::Off => SocketAddr::from(([127, 0, 0, 1], 8080)),
+            TlsMode::Files | TlsMode::Acme => SocketAddr::from(([0, 0, 0, 0], 443)),
+        })
+    }
+
+    /// The master key file: `keys.master_key_file`, else
+    /// `<data_dir>/keys/master.key`. The `KRONIK_MASTER_KEY` environment
+    /// variable, when set, is the key itself and no file is used.
+    pub fn master_key_file(&self) -> PathBuf {
+        self.keys
+            .master_key_file
+            .clone()
+            .unwrap_or_else(|| self.server.data_dir.join("keys/master.key"))
+    }
+
+    /// Where HTTP root inputs get their subject; checked by [`Config::check`].
+    pub fn subject_from(&self) -> Option<SubjectFrom> {
+        self.privacy
+            .subject_from
+            .as_deref()
+            .and_then(SubjectFrom::parse)
+    }
+
+    /// Where the gateway's certificate comes from; `None` without TLS. The
+    /// ACME cache is `<data_dir>/tls/acme`.
+    pub fn certificates(&self) -> Option<kronik_gateway::tls::Certificates> {
+        use kronik_gateway::tls::{Acme, Certificates};
+        match self.tls.mode {
+            TlsMode::Off => None,
+            TlsMode::Files => Some(Certificates::Files {
+                cert: self.tls.cert_file.clone().unwrap_or_default(),
+                key: self.tls.key_file.clone().unwrap_or_default(),
+            }),
+            TlsMode::Acme => Some(Certificates::Acme(Acme {
+                domains: self.tls.domains.clone(),
+                email: self.tls.acme_email.clone().unwrap_or_default(),
+                directory: self.tls.acme_directory.clone(),
+                cache_dir: self.server.data_dir.join("tls/acme"),
+                ca_file: self.tls.acme_ca_file.clone(),
+            })),
+        }
+    }
+}
+
+/// `kronik serve` flags (and their environment variables), which override
+/// the file.
+#[derive(Debug, Default)]
+pub struct Overrides {
+    pub data_dir: Option<PathBuf>,
+    pub api_socket: Option<PathBuf>,
+    pub http_listen: Option<SocketAddr>,
+    pub admin_listen: Option<SocketAddr>,
+    pub api_listen: Option<SocketAddr>,
+    pub gateway_timeout: Option<Duration>,
+    pub master_key_file: Option<PathBuf>,
+    pub disk_reserve: Option<Size>,
+}
+
+impl Config {
+    /// The file's values with every given override in their place.
+    pub fn with(mut self, o: Overrides) -> Config {
+        if let Some(v) = o.data_dir {
+            self.server.data_dir = v;
+        }
+        if let Some(v) = o.api_socket {
+            self.server.api_socket = v;
+        }
+        if let Some(v) = o.http_listen {
+            self.server.http_listen = Some(v);
+        }
+        if let Some(v) = o.admin_listen {
+            self.server.admin_listen = v;
+        }
+        if let Some(v) = o.api_listen {
+            self.server.api_listen = Some(v);
+        }
+        if let Some(v) = o.gateway_timeout {
+            self.gateway.timeout = Dur(v);
+        }
+        if let Some(v) = o.master_key_file {
+            self.keys.master_key_file = Some(v);
+        }
+        if let Some(v) = o.disk_reserve {
+            self.log.disk_reserve = v;
+        }
+        self
+    }
+}
+
+/// The API socket a client command uses: `given` (`--socket`), else
+/// `$KRONIK_API_SOCKET`, else `server.api_socket` from [`DEFAULT_PATH`] if it
+/// exists, else `/run/kronik/api.sock`.
+pub fn client_api_socket(given: Option<PathBuf>) -> Result<PathBuf, ConfigError> {
+    if let Some(socket) = given.or_else(|| std::env::var_os("KRONIK_API_SOCKET").map(PathBuf::from))
+    {
+        return Ok(socket);
+    }
+    Config::find(None).map(|(config, _)| config.server.api_socket)
+}
+
+/// The file a client command shares with `kronik serve`: `$KRONIK_CONFIG`
+/// when set, else [`DEFAULT_PATH`] if it exists, else the defaults.
+pub fn client_config() -> Result<Config, ConfigError> {
+    if let Some(path) = std::env::var_os("KRONIK_CONFIG") {
+        return Config::load(Path::new(&path));
+    }
+    Config::find(None).map(|(config, _)| config)
+}
+
+/// `--data-dir`, else `server.data_dir` from the configuration file, else
+/// `/var/lib/kronik`. An explicit `--data-dir` without `--config` does not
+/// read the default configuration file, so a broken system file does not
+/// block a command that already named its directory.
+pub fn resolve_data_dir(
+    config: Option<&Path>,
+    data_dir: Option<PathBuf>,
+) -> Result<PathBuf, ConfigError> {
+    match (config, data_dir) {
+        (None, Some(dir)) => Ok(dir),
+        (config, data_dir) => {
+            let (cfg, _) = Config::find(config)?;
+            Ok(data_dir.unwrap_or(cfg.server.data_dir))
+        }
+    }
+}
+
+fn line_of(text: &str, offset: usize) -> usize {
+    text.get(..offset).unwrap_or(text).matches('\n').count() + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(text: &str) -> Result<Config, ConfigError> {
+        Config::parse(text, Path::new("kronik.toml"))
+    }
+
+    /// The file in SPEC.md, "Operator configuration and policy".
+    fn brief_file() -> String {
+        let spec = include_str!("../../../SPEC.md");
+        let start = spec.find("`/etc/kronik/kronik.toml`:").unwrap();
+        let block = &spec[start..];
+        let block = &block[block.find("```toml\n").unwrap() + 8..];
+        block[..block.find("```").unwrap()].to_owned()
+    }
+
+    #[test]
+    fn the_brief_file_parses_to_its_values() {
+        let config = parse(&brief_file()).unwrap();
+        assert_eq!(config.server.data_dir, PathBuf::from("/var/lib/kronik"));
+        assert_eq!(config.http_listen(), "0.0.0.0:443".parse().unwrap());
+        assert_eq!(
+            config.server.admin_listen,
+            "127.0.0.1:9464".parse().unwrap()
+        );
+        assert_eq!(config.tls.mode, TlsMode::Acme);
+        assert_eq!(config.tls.domains, ["app.example.com"]);
+        assert_eq!(config.gateway.timeout, Dur::secs(30));
+        assert_eq!(config.gateway.idempotency_ttl, Dur::secs(86_400));
+        assert_eq!(config.retention.history, Dur::secs(7 * 86_400));
+        assert_eq!(config.sql.max_size_per_actor, Size(1 << 30));
+        assert_eq!(
+            config.master_key_file(),
+            PathBuf::from("/etc/kronik/master.key")
+        );
+        assert_eq!(
+            config.privacy.subject_from.as_deref(),
+            Some("header:x-user-id")
+        );
+        assert_eq!(config.replay.sample, Percent(100.0));
+        assert_eq!(config.promote.catch_up_timeout, Dur::secs(300));
+        assert_eq!(config.foreign.platform, Platform::Auto);
+    }
+
+    #[test]
+    fn omitted_keys_take_the_brief_defaults() {
+        let brief = parse(&brief_file()).unwrap();
+        let empty = parse("").unwrap();
+        assert_eq!(empty, Config::default());
+        assert_eq!(empty.gateway, brief.gateway);
+        assert_eq!(empty.log, brief.log);
+        assert_eq!(empty.retention, brief.retention);
+        assert_eq!(empty.sql, brief.sql);
+        assert_eq!(empty.replay, brief.replay);
+        assert_eq!(empty.fork, brief.fork);
+        assert_eq!(empty.promote, brief.promote);
+        assert_eq!(empty.foreign, brief.foreign);
+        assert_eq!(empty.server.admin_listen, brief.server.admin_listen);
+        // Values for one installation are empty, and nothing points at a
+        // system port or path without TLS.
+        assert_eq!(empty.tls.mode, TlsMode::Off);
+        assert_eq!(empty.http_listen(), "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(
+            empty.master_key_file(),
+            PathBuf::from("/var/lib/kronik/keys/master.key")
+        );
+        assert!(!empty.ship.enabled);
+    }
+
+    #[test]
+    fn an_empty_idempotency_header_is_a_bad_request() {
+        let e = parse("[gateway]\nidempotency_header = \"\"\n").unwrap_err();
+        let shown = e.to_string();
+        assert!(shown.contains("BAD_REQUEST"), "{shown}");
+        assert!(shown.contains("idempotency_header"), "{shown}");
+        assert!(shown.contains("kronik.toml"), "{shown}");
+    }
+
+    #[test]
+    fn trusted_proxies_are_addresses_or_cidr_blocks() {
+        let c = parse("[gateway]\ntrusted_proxies = [\"127.0.0.1\", \"10.0.0.0/8\", \"::1\"]\n")
+            .unwrap();
+        assert_eq!(c.gateway.trusted_proxies.len(), 3);
+        let e = parse("[gateway]\ntrusted_proxies = [\"10.0.0.0/33\"]\n").unwrap_err();
+        assert!(e.to_string().contains("trusted_proxies"), "{e}");
+    }
+
+    #[test]
+    fn unknown_keys_are_errors_with_their_line() {
+        let e = parse("[server]\ndata_dir = \"/d\"\nhttp_lisen = \"0.0.0.0:80\"\n").unwrap_err();
+        assert_eq!(e.line, Some(3), "{e}");
+        assert!(e.message.contains("unknown field `http_lisen`"), "{e}");
+        assert!(e.to_string().starts_with("kronik.toml:3: "), "{e}");
+        let e = parse("\n[telemetry]\nenabled = true\n").unwrap_err();
+        assert_eq!(e.line, Some(2), "{e}");
+        assert!(e.message.contains("unknown field `telemetry`"), "{e}");
+    }
+
+    #[test]
+    fn durations_sizes_and_percentages_need_units() {
+        assert_eq!("30s".parse(), Ok(Dur::secs(30)));
+        assert_eq!("500ms".parse(), Ok(Dur(Duration::from_millis(500))));
+        assert_eq!("60m".parse(), Ok(Dur::secs(3600)));
+        assert_eq!("7d".parse(), Ok(Dur::secs(604_800)));
+        assert_eq!("64MiB".parse(), Ok(Size(64 << 20)));
+        assert_eq!("1GiB".parse(), Ok(Size(1 << 30)));
+        assert_eq!("10%".parse(), Ok(Percent(10.0)));
+        for bad in ["30", "30 sec", "1.5h", "-1s", "s"] {
+            assert!(bad.parse::<Dur>().is_err(), "{bad}");
+        }
+        for bad in ["64", "64MB", "1G", "GiB"] {
+            assert!(bad.parse::<Size>().is_err(), "{bad}");
+        }
+        for bad in ["0%", "101%", "50", "x%"] {
+            assert!(bad.parse::<Percent>().is_err(), "{bad}");
+        }
+        let e = parse("[gateway]\ntimeout = \"30\"\n").unwrap_err();
+        assert_eq!(e.line, Some(2), "{e}");
+        assert!(e.message.contains("the unit must be"), "{e}");
+    }
+
+    #[test]
+    fn keys_that_need_each_other_are_checked() {
+        let cases = [
+            ("[tls]\nmode = \"acme\"\n", "needs domains"),
+            (
+                "[tls]\nmode = \"acme\"\ndomains = [\"a.example\"]\n",
+                "needs acme_email",
+            ),
+            (
+                "[tls]\nmode = \"files\"\ncert_file = \"/c.pem\"\n",
+                "needs cert_file and key_file",
+            ),
+            ("[ship]\nenabled = true\n", "needs url"),
+            (
+                "[privacy]\nsubject_from = \"cookie:id\"\n",
+                "\"header:<name>\" or \"jwt:sub\"",
+            ),
+            ("[tls]\nmode = \"ftp\"\n", "unknown variant `ftp`"),
+            (
+                "[server]\napi_listen = \"0.0.0.0:7443\"\n",
+                "not a loopback address and [tls] is off",
+            ),
+        ];
+        for (text, message) in cases {
+            let e = parse(text).unwrap_err();
+            assert!(e.message.contains(message), "{text}: {e}");
+        }
+        let local = parse("[server]\napi_listen = \"127.0.0.1:7443\"\n").unwrap();
+        assert_eq!(
+            local.api_listen(),
+            Ok(Some("127.0.0.1:7443".parse().unwrap()))
+        );
+        let tls = parse(
+            "[server]\napi_listen = \"0.0.0.0:7443\"\n[tls]\nmode = \"files\"\n\
+             cert_file = \"/c.pem\"\nkey_file = \"/k.pem\"\n",
+        )
+        .unwrap();
+        assert_eq!(tls.api_listen(), Ok(Some("0.0.0.0:7443".parse().unwrap())));
+        assert_eq!(parse("").unwrap().api_listen(), Ok(None));
+    }
+}

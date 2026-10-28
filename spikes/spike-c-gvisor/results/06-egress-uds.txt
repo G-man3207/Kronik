@@ -1,0 +1,62 @@
+# 06-egress-uds on travelfiesta at 2026-10-25T00:14:49Z, runsc version release-20261019.0, bridge uds
+runsc flags: --platform=systrap --network=none --host-uds=create
+
+=== netprobe in the sandbox: external IPs, DNS, and this host's own addresses (<public-ip>:22 172.17.0.1:22 <tailscale-ip>:22)
+== network interfaces (/proc/net/dev)
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo:     746      11    0    0    0     0          0         0      900      11    0    0    0     0       0          0
+== IPv4 routes (/proc/net/route)
+Iface	Destination	Gateway	Flags	RefCnt	Use	Metric	Mask	MTU	Window	IRTT                                                         
+== IPv6 addresses (/proc/net/if_inet6)
+00000000000000000000000000000001 01 80 00 00       lo
+== /etc/resolv.conf: <No such file or directory (os error 2)>
+== outbound TCP
+tcp 1.1.1.1:443: blocked after 708.372µs: Network unreachable (os error 101)
+tcp 8.8.8.8:53: blocked after 463.829µs: Network unreachable (os error 101)
+tcp [2606:4700:4700::1111]:443: blocked after 380.356µs: Network unreachable (os error 101)
+tcp <public-ip>:22: blocked after 481.408µs: Network unreachable (os error 101)
+tcp 172.17.0.1:22: blocked after 423.951µs: Network unreachable (os error 101)
+tcp <tailscale-ip>:22: blocked after 118.274µs: Network unreachable (os error 101)
+== outbound UDP DNS query for example.com
+udp 8.8.8.8:53: blocked after 512.609µs: Network unreachable (os error 101)
+udp 1.1.1.1:53: blocked after 207.763µs: Network unreachable (os error 101)
+udp 100.100.100.100:53: blocked after 134.475µs: Network unreachable (os error 101)
+== resolver lookup of example.com:443
+lookup failed after 5.0026093s: failed to lookup address information: Try again
+RESULT: egress blocked (0 of 10 attempts succeeded)
+
+=== busybox in the sandbox
+$ ip addr
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65522 
+    link/loopback 00:00:00:00:00:00 brd ff:ff:ff:ff:ff:ff
+    inet 127.0.0.1/8 scope host dynamic lo
+    inet6 ::1/128 scope host dynamic lo
+(exit 0)
+$ ip route
+::1 dev lo scope link 
+127.0.0.0/8 dev lo scope link 
+(exit 0)
+$ nslookup example.com 8.8.8.8
+nslookup: can't connect to remote host (8.8.8.8): Network is unreachable
+(exit 1)
+$ wget -T 3 -qO- http://1.1.1.1/
+wget: can't connect to remote host (1.1.1.1): Network is unreachable
+(exit 1)
+$ ping -c 1 -W 2 1.1.1.1
+PING 1.1.1.1 (1.1.1.1): 56 data bytes
+ping: permission denied (are you root?)
+(exit 1)
+
+=== Host view: the sandbox processes run in their own network namespace
+host netns:    net:[4026531840]
+sandbox netns: net:[4026532718]
+lo               DOWN           00:00:00:00:00:00 <LOOPBACK> 
+
+=== --host-uds=create lets the sandbox create sockets, not connect to host sockets
+total 0
+srwxr-xr-x 1 root root 0 Oct 25 00:14 host.sock
+srwxr-xr-x 1 root root 0 Oct 25 00:14 http.sock
+bridge-bench: Connection refused (os error 111)
+(exit 1)
+host listener: no connection within 5 s

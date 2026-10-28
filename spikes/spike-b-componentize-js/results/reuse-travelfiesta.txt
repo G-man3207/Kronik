@@ -1,0 +1,16 @@
+# reuse-travelfiesta on travelfiesta at 2026-10-25T01:47:53Z, kronik-0.0.0+wasmtime-50.0.0
+
+=== out/counter.wasm --msg counter
+[counter] fresh instance per turn: fuel 1587545, whole turn p50     1.8ms  p99     2.9ms  mean     1.9ms
+[counter] one instance, call 1:     fuel 1587515, 1.710781ms
+[counter] one instance, calls 2..:   fuel 479906..2689186, call p50   129.6µs  p99   251.4µs  mean   145.5µs
+
+=== out/actor.wasm --msg noop
+[noop] fresh instance per turn: fuel 954692, whole turn p50     1.3ms  p99     1.6ms  mean     1.3ms
+[noop] one instance, call 1:     fuel 954662, 1.156776ms
+[noop] one instance, calls 2..:   fuel 145919..1041596, call p50    36.8µs  p99    79.6µs  mean    40.5µs
+
+=== out/actor.wasm --msg json
+[json] fresh instance per turn: fuel 28779575, whole turn p50     6.9ms  p99    11.2ms  mean     7.3ms
+[json] one instance, call 1:     fuel 28779545, 6.837709ms
+[json] one instance, calls 2..:   fuel 27635269..34260073, call p50     4.8ms  p99     8.2ms  mean     5.1ms

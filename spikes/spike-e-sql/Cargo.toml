@@ -1,0 +1,22 @@
+[package]
+name = "spike-e-sql"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Kronik M0 spike E: per-actor SQL state with sessions and changesets"
+license = "Elastic-License-2.0"
+
+# Standalone project: the root workspace excludes spikes/.
+[workspace]
+
+[dependencies]
+# Pinned: the bundled SQLite version (3.54.0 via libsqlite3-sys 0.39.0) is
+# part of the engine version, like Wasmtime.
+rusqlite = { version = "=0.41.0", features = ["bundled", "hooks", "functions", "limits", "backup"] }
+libsqlite3-sys = { version = "=0.39.0" }
+chacha20 = { version = "0.10.2", default-features = false, features = ["rng"] }
+blake3 = "1"
+libc = "0.2"
+
+[profile.release]
+debug = "line-tables-only"

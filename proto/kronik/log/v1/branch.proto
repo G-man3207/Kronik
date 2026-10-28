@@ -1,0 +1,42 @@
+// Kronik log format v1: branches, erasure and snapshots. See common.proto for
+// the format rules.
+syntax = "proto3";
+
+package kronik.log.v1;
+
+import "kronik/log/v1/common.proto";
+
+// Written in the new branch's log as its first record.
+message BranchCreated {
+  string branch = 1;
+  string parent_branch = 2;
+  // The last parent LSN the branch inherits.
+  uint64 fork_lsn = 3;
+  // Forks without access to the privacy keys (pseudonymized values).
+  bool no_pii = 4;
+  // Set when the branch belongs to a proposal.
+  string proposal_id = 5;
+  Audit audit = 6;
+}
+
+// Privacy-mode erasure of one subject (M8). The subject's key is deleted;
+// sealed values become unreadable everywhere. On apply, rows with
+// `_subject = subject` are deleted from every actor's SQL tables that have a
+// `_subject` column (recorded as this operation, not as a changeset, because
+// the changeset's old values would be the erased data).
+message Erasure {
+  uint64 epoch = 1;
+  string subject = 2;
+  // The last key version that existed for the subject.
+  uint32 key_version = 3;
+  Audit audit = 4;
+}
+
+// A consistent snapshot was taken at `lsn` (M6).
+message SnapshotMarker {
+  string snapshot_id = 1;
+  uint64 lsn = 2;
+  // BLAKE3 of manifest.json.
+  bytes manifest_hash = 3;
+  string engine_version = 4;
+}

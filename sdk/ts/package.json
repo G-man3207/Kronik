@@ -1,0 +1,24 @@
+{
+  "name": "@kronik/sdk",
+  "version": "0.1.0-dev",
+  "description": "Kronik's TypeScript SDK: write actors for the kronik:actor world",
+  "license": "Elastic-2.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./testkit": "./testkit/index.ts"
+  },
+  "types": "./src/index.ts",
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p testkit/tsconfig.json",
+    "test": "node --test test/",
+    "types": "jco guest-types wit/kronik-actor.wit --world-name actor -o types -q"
+  },
+  "devDependencies": {
+    "@bytecodealliance/componentize-js": "0.23.0",
+    "@bytecodealliance/jco": "1.39.0",
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2"
+  }
+}

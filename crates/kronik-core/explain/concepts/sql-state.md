@@ -1,0 +1,3 @@
+SQL state is one SQLite database per actor, owned by the host. A turn's statements run in a savepoint and are captured as a changeset, which the turn record carries and which is applied at commit, so the database is built the same way in production, at recovery and in replay. `random()`, `datetime('now')` and the like are deterministic. Extensions, `ATTACH`, `VACUUM`, `ANALYZE` and pragmas that affect storage are denied, and DDL is allowed only in `migrate`, before the first DML statement. The `_subject` column ties rows to a subject. The size is limited per actor, 1 GiB by default.
+
+See also: `subject`, `turn`.

@@ -1,0 +1,93 @@
+# keep-resident-dev on the dev machine at 2026-10-25T02:02:14Z, kronik-0.0.0+wasmtime-50.0.0
+
+=== keep resident 0 MiB: 5 fresh instances in one process
+probe: fuel 2924988, digest b3:e4a90adf74c061b7d386e2b1d382112b3fb835cb9123d3d87f01d0cb887f5365, identical yes
+counter: fuel 1637701, digest b3:b069d652dc46bcfb875c6db16cd2902a441dfe2c2016bc3a2c0f36ed972c95d6, identical yes
+json: fuel 28779575, digest b3:aea38281cc7b7f040c41a959e4230610cc8960245e370f7f53646a7e040105c8, identical yes
+
+=== keep resident 0 MiB: bench out/actor.wasm --msg noop
+[pooling] 2000 turns of "noop", fuel/turn 954692
+  instantiate p50    27.2µs  p99    40.1µs  mean    27.1µs
+  call        p50   878.8µs  p99     1.1ms  mean   883.8µs
+  whole turn  p50     1.0ms  p99     1.3ms  mean     1.1ms  (~952 turns/s single-threaded)
+
+=== keep resident 0 MiB: bench out/counter.wasm --msg counter
+[pooling] 2000 turns of "counter", fuel/turn 1587545
+  instantiate p50    27.8µs  p99    43.1µs  mean    27.5µs
+  call        p50     1.1ms  p99     1.3ms  mean     1.1ms
+  whole turn  p50     1.3ms  p99     1.5ms  mean     1.3ms  (~772 turns/s single-threaded)
+
+=== keep resident 0 MiB: bench out/actor.wasm --msg json
+[pooling] 2000 turns of "json", fuel/turn 28779575
+  instantiate p50    35.2µs  p99    59.7µs  mean    36.4µs
+  call        p50     4.2ms  p99     5.9ms  mean     4.3ms
+  whole turn  p50     4.4ms  p99     6.2ms  mean     4.5ms  (~221 turns/s single-threaded)
+
+=== keep resident 2 MiB: 5 fresh instances in one process
+probe: fuel 2924988, digest b3:e4a90adf74c061b7d386e2b1d382112b3fb835cb9123d3d87f01d0cb887f5365, identical yes
+counter: fuel 1637701, digest b3:b069d652dc46bcfb875c6db16cd2902a441dfe2c2016bc3a2c0f36ed972c95d6, identical yes
+json: fuel 28779575, digest b3:aea38281cc7b7f040c41a959e4230610cc8960245e370f7f53646a7e040105c8, identical yes
+
+=== keep resident 2 MiB: bench out/actor.wasm --msg noop
+[pooling] 2000 turns of "noop", fuel/turn 954692
+  instantiate p50    21.1µs  p99    33.4µs  mean    21.5µs
+  call        p50   797.0µs  p99   978.7µs  mean   807.3µs
+  whole turn  p50   974.3µs  p99     1.2ms  mean   984.9µs  (~1015 turns/s single-threaded)
+
+=== keep resident 2 MiB: bench out/counter.wasm --msg counter
+[pooling] 2000 turns of "counter", fuel/turn 1587545
+  instantiate p50    22.0µs  p99    42.2µs  mean    22.8µs
+  call        p50   997.7µs  p99     5.2ms  mean     1.1ms
+  whole turn  p50     1.2ms  p99     5.5ms  mean     1.3ms  (~771 turns/s single-threaded)
+
+=== keep resident 2 MiB: bench out/actor.wasm --msg json
+[pooling] 2000 turns of "json", fuel/turn 28779575
+  instantiate p50    43.6µs  p99    85.9µs  mean    48.1µs
+  call        p50     4.9ms  p99    15.9ms  mean     5.5ms
+  whole turn  p50     5.3ms  p99    19.1ms  mean     6.0ms  (~168 turns/s single-threaded)
+
+=== keep resident 4 MiB: 5 fresh instances in one process
+probe: fuel 2924988, digest b3:e4a90adf74c061b7d386e2b1d382112b3fb835cb9123d3d87f01d0cb887f5365, identical yes
+counter: fuel 1637701, digest b3:b069d652dc46bcfb875c6db16cd2902a441dfe2c2016bc3a2c0f36ed972c95d6, identical yes
+json: fuel 28779575, digest b3:aea38281cc7b7f040c41a959e4230610cc8960245e370f7f53646a7e040105c8, identical yes
+
+=== keep resident 4 MiB: bench out/actor.wasm --msg noop
+[pooling] 2000 turns of "noop", fuel/turn 954692
+  instantiate p50    22.8µs  p99    59.0µs  mean    28.6µs
+  call        p50   725.7µs  p99     4.8ms  mean   839.0µs
+  whole turn  p50   989.9µs  p99     5.3ms  mean     1.1ms  (~873 turns/s single-threaded)
+
+=== keep resident 4 MiB: bench out/counter.wasm --msg counter
+[pooling] 2000 turns of "counter", fuel/turn 1587545
+  instantiate p50    24.9µs  p99    61.4µs  mean    25.8µs
+  call        p50   963.8µs  p99     4.9ms  mean     1.1ms
+  whole turn  p50     1.2ms  p99     5.9ms  mean     1.4ms  (~716 turns/s single-threaded)
+
+=== keep resident 4 MiB: bench out/actor.wasm --msg json
+[pooling] 2000 turns of "json", fuel/turn 28779575
+  instantiate p50    48.3µs  p99   148.3µs  mean    81.4µs
+  call        p50     4.8ms  p99    60.6ms  mean     7.9ms
+  whole turn  p50     5.3ms  p99    63.3ms  mean     8.8ms  (~114 turns/s single-threaded)
+
+=== keep resident 16 MiB: 5 fresh instances in one process
+probe: fuel 2924988, digest b3:e4a90adf74c061b7d386e2b1d382112b3fb835cb9123d3d87f01d0cb887f5365, identical yes
+counter: fuel 1637701, digest b3:b069d652dc46bcfb875c6db16cd2902a441dfe2c2016bc3a2c0f36ed972c95d6, identical yes
+json: fuel 28779575, digest b3:aea38281cc7b7f040c41a959e4230610cc8960245e370f7f53646a7e040105c8, identical yes
+
+=== keep resident 16 MiB: bench out/actor.wasm --msg noop
+[pooling] 2000 turns of "noop", fuel/turn 954692
+  instantiate p50    29.4µs  p99    84.9µs  mean    71.9µs
+  call        p50   229.8µs  p99     6.6ms  mean   519.7µs
+  whole turn  p50   817.4µs  p99     9.7ms  mean     1.8ms  (~562 turns/s single-threaded)
+
+=== keep resident 16 MiB: bench out/counter.wasm --msg counter
+[pooling] 2000 turns of "counter", fuel/turn 1587545
+  instantiate p50    27.4µs  p99    52.1µs  mean    27.4µs
+  call        p50   368.0µs  p99   534.1µs  mean   364.0µs
+  whole turn  p50   818.4µs  p99     1.2ms  mean   820.7µs  (~1218 turns/s single-threaded)
+
+=== keep resident 16 MiB: bench out/actor.wasm --msg json
+[pooling] 2000 turns of "json", fuel/turn 28779575
+  instantiate p50    41.9µs  p99    72.9µs  mean    43.6µs
+  call        p50     3.3ms  p99     7.9ms  mean     3.5ms
+  whole turn  p50     4.1ms  p99     9.0ms  mean     4.4ms  (~228 turns/s single-threaded)

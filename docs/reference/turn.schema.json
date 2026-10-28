@@ -1,0 +1,786 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Turn",
+  "description": "A turn record as JSON (`GET /v1/turns/{id}`): what one actor did with one input, as the log holds it. A caller without the `pii:read` scope sees a sealed value as `[sealed]`, every `subject` as null, and gets SCOPE_MISSING for a turn of a fork made without `--no-pii`; an erased value reads `[erased]`; secret values never appear.",
+  "type": "object",
+  "required": [
+    "turn_id",
+    "lsn",
+    "actor",
+    "code_hash",
+    "engine_version",
+    "causal_id",
+    "causal_key",
+    "logical_time_ms",
+    "config_epoch",
+    "input",
+    "outcome",
+    "output",
+    "writes",
+    "messages",
+    "sql_schema",
+    "sql_changes",
+    "fuel_used",
+    "memory_peak_bytes",
+    "schema_version",
+    "effects",
+    "timers",
+    "compensations"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "turn_id": {
+      "description": "`main:<lsn>`; in a fork `<fork>:<lsn>` (continuous replay) or `<fork>:r<root_lsn>.<n>` (the n-th turn of an isolated tree).",
+      "type": "string",
+      "pattern": "^[^:]+:(r[0-9]+\\.)?[0-9]+$"
+    },
+    "lsn": {
+      "description": "The log position; 0 for a turn of an isolated tree.",
+      "$ref": "#/$defs/TurnCount"
+    },
+    "actor": {
+      "$ref": "#/$defs/TurnActor"
+    },
+    "code_hash": {
+      "description": "The component's hash, shortened: `b3:<12 hex>`.",
+      "type": "string"
+    },
+    "engine_version": {
+      "description": "The versions of Kronik and Wasmtime that ran it: `kronik-<version>+wasmtime-<version>`.",
+      "type": "string"
+    },
+    "causal_id": {
+      "description": "The causal key in short, as the guest sees it: 32 hex characters.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "causal_key": {
+      "description": "The root input and the path of messages that led here.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnCausalKey"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "logical_time_ms": {
+      "description": "The turn's logical clock, in Unix milliseconds.",
+      "$ref": "#/$defs/TurnCount"
+    },
+    "config_epoch": {
+      "description": "The epoch of the configuration (code, grants, secrets) the turn ran under.",
+      "$ref": "#/$defs/TurnCount"
+    },
+    "input": {
+      "description": "What started the turn, by `type`.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/TurnHttpInput"
+        },
+        {
+          "$ref": "#/$defs/TurnMessageInput"
+        },
+        {
+          "$ref": "#/$defs/TurnTimerInput"
+        },
+        {
+          "$ref": "#/$defs/TurnMigrateInput"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "outcome": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnOutcome"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "output": {
+      "description": "The reply to a message or the HTTP response; null when there is none.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "reply"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "reply": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TurnMessage"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "http"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "http": {
+              "$ref": "#/$defs/TurnHttpOutput"
+            }
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "writes": {
+      "description": "State writes, in order.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TurnWrite"
+      }
+    },
+    "messages": {
+      "description": "Messages sent, delivered after the commit.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TurnOutboundMessage"
+      }
+    },
+    "sql_schema": {
+      "description": "DDL statements, as executed.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "sql_changes": {
+      "description": "SQL changesets, one per subject.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "subject",
+          "bytes"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "subject": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bytes": {
+            "description": "The changeset's size.",
+            "$ref": "#/$defs/TurnCount"
+          }
+        }
+      }
+    },
+    "fuel_used": {
+      "$ref": "#/$defs/TurnCount"
+    },
+    "memory_peak_bytes": {
+      "$ref": "#/$defs/TurnCount"
+    },
+    "schema_version": {
+      "description": "The actor's state schema version after the turn.",
+      "$ref": "#/$defs/TurnCount"
+    },
+    "effects": {
+      "description": "Effects in call order.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TurnEffect"
+      }
+    },
+    "timers": {
+      "description": "Timers scheduled or cancelled.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TurnTimerOp"
+      }
+    },
+    "compensations": {
+      "description": "Messages delivered because the turn failed after a successful call.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "to",
+          "message_id",
+          "msg"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "to": {
+            "$ref": "#/$defs/TurnActor"
+          },
+          "message_id": {
+            "type": "string"
+          },
+          "msg": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/TurnMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "TurnCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "TurnActor": {
+      "description": "`<kind>/<key>`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "TurnPayload": {
+      "description": "Bytes: always `base64`, and `text` when they are UTF-8.",
+      "type": "object",
+      "required": [
+        "base64"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "base64": {
+          "type": "string",
+          "contentEncoding": "base64"
+        }
+      }
+    },
+    "TurnSealable": {
+      "description": "A value that may belong to a data subject.",
+      "type": "object",
+      "required": [
+        "subject",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "subject": {
+          "description": "The data subject (`user:1`), or null.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "$ref": "#/$defs/TurnPayload"
+        }
+      }
+    },
+    "TurnMessage": {
+      "type": "object",
+      "required": [
+        "name",
+        "content_type",
+        "body"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "body": {
+          "$ref": "#/$defs/TurnSealable"
+        }
+      }
+    },
+    "TurnHeader": {
+      "type": "object",
+      "required": [
+        "name",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "$ref": "#/$defs/TurnSealable"
+        }
+      }
+    },
+    "TurnCausalKey": {
+      "type": "object",
+      "required": [
+        "root",
+        "path"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "root": {
+          "description": "The root input's id: 32 hex characters.",
+          "type": "string"
+        },
+        "path": {
+          "description": "One step per message from the root input to this turn.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "actor",
+              "ordinal"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "actor": {
+                "$ref": "#/$defs/TurnActor"
+              },
+              "ordinal": {
+                "$ref": "#/$defs/TurnCount"
+              }
+            }
+          }
+        }
+      }
+    },
+    "TurnHttpInput": {
+      "description": "A request through the gateway.",
+      "type": "object",
+      "required": [
+        "type",
+        "method",
+        "path",
+        "query",
+        "route",
+        "params",
+        "headers",
+        "body",
+        "idempotency_key"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "http"
+        },
+        "method": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "query": {
+          "description": "Without the `?`; empty when there is none.",
+          "type": "string"
+        },
+        "route": {
+          "description": "The route pattern that matched: `/counter/{key}/{op}`.",
+          "type": "string"
+        },
+        "params": {
+          "description": "The route's parameters, as `[name, value]` pairs.",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "minItems": 2,
+            "items": false
+          }
+        },
+        "headers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnHeader"
+          }
+        },
+        "body": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnSealable"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idempotency_key": {
+          "description": "The `Idempotency-Key` header; empty when there is none.",
+          "type": "string"
+        }
+      }
+    },
+    "TurnMessageInput": {
+      "description": "A message: from another actor, `kronik send`, a dead-letter resend, a compensation or a call.",
+      "type": "object",
+      "required": [
+        "type",
+        "source",
+        "sender",
+        "message_id",
+        "sent_logical_time_ms",
+        "resend_of",
+        "msg",
+        "reason",
+        "token_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "message"
+        },
+        "source": {
+          "enum": [
+            "MESSAGE_SOURCE_ACTOR",
+            "MESSAGE_SOURCE_OPERATOR",
+            "MESSAGE_SOURCE_DEAD_LETTER_RESEND",
+            "MESSAGE_SOURCE_COMPENSATION",
+            "MESSAGE_SOURCE_CALL",
+            "MESSAGE_SOURCE_UNSPECIFIED",
+            "unspecified"
+          ]
+        },
+        "sender": {
+          "description": "The sending actor; null for operator messages and resends.",
+          "$ref": "#/$defs/TurnActor"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "sent_logical_time_ms": {
+          "$ref": "#/$defs/TurnCount"
+        },
+        "resend_of": {
+          "description": "For a dead-letter resend, the message id it resends; else empty.",
+          "type": "string"
+        },
+        "msg": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnMessage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "description": "For an operator message: the `--reason` given.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token_id": {
+          "description": "For an operator message: who sent it, an API token's id or `unix:uid=<uid>` for the Unix socket.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TurnTimerInput": {
+      "description": "A timer that came due.",
+      "type": "object",
+      "required": [
+        "type",
+        "timer_id",
+        "due_ms",
+        "msg"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "timer"
+        },
+        "timer_id": {
+          "$ref": "#/$defs/TurnCount"
+        },
+        "due_ms": {
+          "$ref": "#/$defs/TurnCount"
+        },
+        "msg": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnMessage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "TurnMigrateInput": {
+      "description": "A state migration after a deploy with a new schema version.",
+      "type": "object",
+      "required": [
+        "type",
+        "from",
+        "to"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "migrate"
+        },
+        "from": {
+          "$ref": "#/$defs/TurnCount"
+        },
+        "to": {
+          "$ref": "#/$defs/TurnCount"
+        }
+      }
+    },
+    "TurnOutcome": {
+      "type": "object",
+      "required": [
+        "kind",
+        "error_code",
+        "message"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "committed",
+            "rejected",
+            "failed",
+            "trap",
+            "fuel_exhausted",
+            "memory_limit",
+            "effect_outcome_unknown",
+            "unspecified"
+          ]
+        },
+        "error_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TurnHttpOutput": {
+      "type": "object",
+      "required": [
+        "status",
+        "headers",
+        "body"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/TurnCount"
+        },
+        "headers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnHeader"
+          }
+        },
+        "body": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnSealable"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "TurnWrite": {
+      "type": "object",
+      "required": [
+        "op",
+        "key",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "op": {
+          "enum": [
+            "set",
+            "delete"
+          ]
+        },
+        "key": {
+          "type": "string"
+        },
+        "value": {
+          "description": "Null for a delete.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnSealable"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "TurnOutboundMessage": {
+      "type": "object",
+      "required": [
+        "to",
+        "ordinal",
+        "message_id",
+        "msg"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "to": {
+          "$ref": "#/$defs/TurnActor"
+        },
+        "ordinal": {
+          "$ref": "#/$defs/TurnCount"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "msg": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnMessage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "TurnEffect": {
+      "description": "An effect: what it called and how it ended. Requests and responses are not shown.",
+      "type": "object",
+      "required": [
+        "ordinal",
+        "kind",
+        "target",
+        "status",
+        "delivery",
+        "error",
+        "hint"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "ordinal": {
+          "$ref": "#/$defs/TurnCount"
+        },
+        "kind": {
+          "description": "`http.fetch`, `foreign.http`, `actor.call`, `crypto.hmac-sha256`, `crypto.sign-ed25519`, `secret.reveal`.",
+          "type": "string"
+        },
+        "target": {
+          "description": "The capability it used: `http:api.example.com`, ...",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "denied",
+            "network",
+            "timeout",
+            "too_large",
+            "outcome_unknown",
+            "not_found",
+            "rejected",
+            "failed",
+            "reentrant",
+            "unspecified"
+          ]
+        },
+        "delivery": {
+          "description": "`replay-safe`, `idempotency-keyed` or `unsafe`; null for internal kinds.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hint": {
+          "description": "For a denied effect: the command that grants the capability.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TurnTimerOp": {
+      "type": "object",
+      "required": [
+        "op",
+        "id",
+        "due_ms",
+        "name"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "op": {
+          "enum": [
+            "schedule",
+            "cancel"
+          ]
+        },
+        "id": {
+          "description": "Decimal: the u64 does not fit a JSON number exactly.",
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "due_ms": {
+          "$ref": "#/$defs/TurnCount"
+        },
+        "name": {
+          "description": "The message the timer delivers; null for a cancel.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

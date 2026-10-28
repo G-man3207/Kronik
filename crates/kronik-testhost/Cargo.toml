@@ -1,0 +1,32 @@
+[package]
+name = "kronik-testhost"
+description = "An in-memory Kronik node for actor tests: manual clock, stubbed and recorded HTTP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+kronik-api = { workspace = true }
+kronik-core = { workspace = true }
+kronik-gateway = { workspace = true }
+kronik-log = { workspace = true }
+kronik-privacy = { workspace = true }
+kronik-runtime = { workspace = true }
+kronik-sched = { workspace = true }
+kronik-store = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

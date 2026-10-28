@@ -1,0 +1,13 @@
+{
+  "name": "spike-b-componentize-js",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Kronik M0 spike B: a TypeScript actor componentized with ComponentizeJS for the kronik:actor world",
+  "license": "Elastic-2.0",
+  "type": "module",
+  "dependencies": {
+    "@bytecodealliance/componentize-js": "0.23.0",
+    "@bytecodealliance/jco": "1.39.0",
+    "typescript": "7.0.2"
+  }
+}

@@ -1,0 +1,41 @@
+[package]
+name = "spike-d-dst"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Kronik M0 spike D: deterministic simulation testing of a mini daemon"
+license = "Elastic-License-2.0"
+
+# Standalone project: the root workspace excludes spikes/.
+[workspace]
+exclude = ["guest"]
+
+[dependencies]
+wasmtime = { version = "=50.0.0", default-features = false, features = ["runtime", "cranelift", "component-model", "async", "pooling-allocator", "parallel-compilation", "std"] }
+wasmtime-wasi = { version = "=50.0.0", default-features = false, features = ["p2"] }
+wasmtime-wasi-io = { version = "=50.0.0", default-features = false, features = ["std"] }
+# Daemon code may use only executor-agnostic tokio APIs (`sync`, `macros`
+# with `biased;`). `rt-multi-thread`, `time`, `fs` and `process` are used by
+# the real environment implementations only.
+tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time", "process"] }
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
+bytes = "1"
+chacha20 = { version = "0.10.2", default-features = false, features = ["rng"] }
+getrandom = { version = "0.4", features = ["std"] }
+crc32c = "0.6"
+blake3 = "1"
+rusqlite = { version = "0.41", features = ["bundled", "serialize"] }
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(madsim)'.dependencies]
+madsim = "0.2.34"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
+
+[[test]]
+name = "dst"
+harness = false
+
+[profile.release]
+debug = "line-tables-only"

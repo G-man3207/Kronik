@@ -1,0 +1,27 @@
+[package]
+name = "kronik-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+chacha20 = { workspace = true }
+kronik-core = { workspace = true }
+kronik-log = { workspace = true }
+kronik-privacy = { workspace = true }
+kronik-proto = { workspace = true }
+libc = { workspace = true }
+prost = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

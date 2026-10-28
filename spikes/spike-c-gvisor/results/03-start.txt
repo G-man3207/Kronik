@@ -1,0 +1,63 @@
+# 03-start on travelfiesta at 2026-10-25T00:10:54Z, runsc version release-20261019.0, bridge pf
+
+=== No /dev/kvm on this host
+ls: cannot access '/dev/kvm': No such file or directory
+
+=== The kvm platform cannot start here (kronik doctor: KVM_UNAVAILABLE)
+running container: creating container: cannot create sandbox: cannot create sandbox process: opening device file for platform "kvm": error opening /dev/kvm: no such file or directory
+
+=== systrap with --network=none
+$ runsc --root /run/kronik-spike-c/runsc --platform=systrap --network=none run --detach --bundle /var/lib/kronik-spike-c/foreign/echo/bundle kronik-echo
+runsc run --detach returned after 85 ms with status 0
+$ rs list
+ID            PID         STATUS      BUNDLE                                        CREATED                          OWNER
+kronik-echo   420436      running     /var/lib/kronik-spike-c/foreign/echo/bundle   2026-10-25T00:10:54.227946506Z   root
+$ rs state kronik-echo
+{
+  "ociVersion": "1.2.1",
+  "id": "kronik-echo",
+  "status": "running",
+  "pid": 420436,
+  "bundle": "/var/lib/kronik-spike-c/foreign/echo/bundle"
+}
+$ rs ps kronik-echo
+UID       PID       PPID      PGID      C         TTY       STIME     TIME      CMD
+65534     1         0         1         28        ?         00:10     0s        echo-server
+
+=== Host processes of the sandbox
+    PID    PPID USER       RSS COMMAND
+ 420432       1 root     15992 runsc-gofer --root=/run/kronik-spike-c/runsc --network=none --platform=systrap gofer --bundle /var/lib/kronik-spike-c/foreign/echo/bundle --gofer-mount-confs=lisafs:self
+ 420436       1 root     35488 runsc-sandbox --root=/run/kronik-spike-c/runsc --network=none --platform=systrap boot --bundle=/var/lib/kronik-spike-c/foreign/echo/bundle --gofer-mount-confs=lisafs:sel
+
+=== Inside: GET /info on the sandbox's own loopback (runsc exec busybox wget)
+pid=1
+uid=65534 65534 65534 65534
+gid=65534 65534 65534 65534
+cwd=/srv
+hostname=echo
+greeting=hello-from-the-image-config
+available_parallelism=2
+MemTotal:         524288 kB
+etc_stale_conf_exists=false
+srv_old=["c.txt"]
+
+=== Container stdout and stderr: runsc run --detach hands the caller's stdio to the container
+echo-server: listening on tcp 0.0.0.0:8080
+
+=== systrap with --network=sandbox in a network namespace that has only lo (the configuration ADR 0003 picks)
+$ ip netns add kronik-echo && ip -n kronik-echo link set lo up
+$ runsc --root /run/kronik-spike-c/runsc --platform=systrap --network=sandbox run --detach --bundle /var/lib/kronik-spike-c/foreign/echo-pf/bundle kronik-echo
+netns setup and runsc run --detach took 110 ms
+[{"type":"pid"},{"path":"/var/run/netns/kronik-echo","type":"network"},{"type":"ipc"},{"type":"uts"},{"type":"mount"}]
+ready_ms=17.0 attempts=1 target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080
+status=200
+pid=1
+uid=65534 65534 65534 65534
+gid=65534 65534 65534 65534
+cwd=/srv
+hostname=echo
+greeting=hello-from-the-image-config
+available_parallelism=2
+MemTotal:         524288 kB
+etc_stale_conf_exists=false
+srv_old=["c.txt"]

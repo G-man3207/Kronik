@@ -1,0 +1,146 @@
+# determinism-travelfiesta on travelfiesta at 2026-10-25T01:33:21Z, kronik-0.0.0+wasmtime-50.0.0
+
+=== describe
+code       b3:7194b807a941 (kronik-0.0.0+wasmtime-50.0.0)
+kind       spike-b
+schema     1
+route      POST /spike-b/{key}/{mode}
+call       wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call       wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call       wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call       wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call       wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call       wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call       wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call       wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+
+=== HTTP input: POST /spike-b/acme/probe, 3 fresh instances
+code       b3:7194b807a941 (CacheHit, compile None, load 2.814346ms)
+engine     kronik-0.0.0+wasmtime-50.0.0
+outcome OK Committed("http status=200 headers=[(\"content-type\", \"application/json\")]\n{\"turnsSeenByThisInstance\":1,\"n\":1,\"self\":{\"kind\":\"spike-a\",\"key\":\"acme\"},\"causalId\":\"root-1/0\",\"nowMs\":\"1761300000000\",\"dateNow\":1761300000000,\"dateIso\":\"2025-10-24T10:00:00.000Z\",\"performanceNow\":0,\"mathRandom\":[0.4369854542892426,0.8196430183015764,0.034064691979438066],\"cryptoGetRandomValues\":[92,91,186,80,252,118,192,116],\"randomUUID\":\"1128f133-f949-45c5-a063-a250ff23dfd0\",\"randomBytes\":[158,230,23,200,107,198,97,216],\"buildTime\":{\"dateNow\":1792891469823}}")
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call state.get("n") -> none
+call state.set("n", "1")
+call wasi:random/random.get-random-bytes(8) -> 0x5c5bba50fc76c074
+call context.self-ref() -> spike-a/acme
+call context.causal-id() -> "root-1/0"
+call context.now-ms() -> 1761300000000
+call wasi:clocks/wall-clock.now() -> 1761300000000ms
+call wasi:clocks/wall-clock.now() -> 1761300000000ms
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:random/random.get-random-u64() -> 6352788130568750939
+call wasi:random/random.get-random-u64() -> 14566980933410627574
+call wasi:random/random.get-random-u64() -> 2524997070007858866
+call wasi:random/random.get-random-bytes(16) -> 0x33f1281149f9c5252063a250ff23dfd0
+call context.random-bytes(8) -> 0x9ee617c86bc661d8
+call log.emit(Level::Info, "probe", [("n", "1"), ("turns", "1")])
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+write "n" = "1"
+fuel 2982758
+memory     peak 9280 KiB
+timing     instantiate 1.561085ms, call 4.326126ms (not part of the outcome)
+digest 0   b3:6d7bd00b63a39b272f63bdabb658b450ea436de3532d0e2a2189a70ffc3f58df
+digest 1   b3:6d7bd00b63a39b272f63bdabb658b450ea436de3532d0e2a2189a70ffc3f58df
+digest 2   b3:6d7bd00b63a39b272f63bdabb658b450ea436de3532d0e2a2189a70ffc3f58df
+identical  yes
+
+=== Message input: probe with starting state n=41, 3 fresh instances
+code       b3:7194b807a941 (CacheHit, compile None, load 2.880671ms)
+engine     kronik-0.0.0+wasmtime-50.0.0
+outcome OK Committed("reply name=\"probe-result\" content-type=\"application/json\"\n{\"turnsSeenByThisInstance\":1,\"n\":42,\"self\":{\"kind\":\"spike-a\",\"key\":\"acme\"},\"causalId\":\"root-1/0\",\"nowMs\":\"1761300000000\",\"dateNow\":1761300000000,\"dateIso\":\"2025-10-24T10:00:00.000Z\",\"performanceNow\":0,\"mathRandom\":[0.4369854542892426,0.8196430183015764,0.034064691979438066],\"cryptoGetRandomValues\":[92,91,186,80,252,118,192,116],\"randomUUID\":\"1128f133-f949-45c5-a063-a250ff23dfd0\",\"randomBytes\":[158,230,23,200,107,198,97,216],\"buildTime\":{\"dateNow\":1792891469823}}")
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call state.get("n") -> "41"
+call state.set("n", "42")
+call wasi:random/random.get-random-bytes(8) -> 0x5c5bba50fc76c074
+call context.self-ref() -> spike-a/acme
+call context.causal-id() -> "root-1/0"
+call context.now-ms() -> 1761300000000
+call wasi:clocks/wall-clock.now() -> 1761300000000ms
+call wasi:clocks/wall-clock.now() -> 1761300000000ms
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:random/random.get-random-u64() -> 6352788130568750939
+call wasi:random/random.get-random-u64() -> 14566980933410627574
+call wasi:random/random.get-random-u64() -> 2524997070007858866
+call wasi:random/random.get-random-bytes(16) -> 0x33f1281149f9c5252063a250ff23dfd0
+call context.random-bytes(8) -> 0x9ee617c86bc661d8
+call log.emit(Level::Info, "probe", [("n", "42"), ("turns", "1")])
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1761300000000000000ns
+write "n" = "42"
+fuel 2953348
+memory     peak 9280 KiB
+timing     instantiate 721.602µs, call 3.662521ms (not part of the outcome)
+digest 0   b3:c53ec6b1a41b90dd09eb39209dc9f9a1b6d9e8df5d462c2a013ccbf587cfa99d
+digest 1   b3:c53ec6b1a41b90dd09eb39209dc9f9a1b6d9e8df5d462c2a013ccbf587cfa99d
+digest 2   b3:c53ec6b1a41b90dd09eb39209dc9f9a1b6d9e8df5d462c2a013ccbf587cfa99d
+identical  yes
+
+=== Same input in two more processes (default seed and time)
+digest 0   b3:e4a90adf74c061b7d386e2b1d382112b3fb835cb9123d3d87f01d0cb887f5365
+digest 0   b3:e4a90adf74c061b7d386e2b1d382112b3fb835cb9123d3d87f01d0cb887f5365
+
+=== Another seed: every JavaScript random source changes
+outcome OK Committed("reply name=\"probe-result\" content-type=\"application/json\"\n{\"turnsSeenByThisInstance\":1,\"n\":1,\"self\":{\"kind\":\"spike-a\",\"key\":\"acme\"},\"causalId\":\"root-1/0\",\"nowMs\":\"1761300000000\",\"dateNow\":1761300000000,\"dateIso\":\"2025-10-24T10:00:00.000Z\",\"performanceNow\":0,\"mathRandom\":[0.19573326595127583,0.39984584716148674,0.7729236697778106],\"cryptoGetRandomValues\":[144,131,122,224,81,94,231,24],\"randomUUID\":\"feaf5479-631f-40db-aac3-2671ca5effc5\",\"randomBytes\":[2,63,55,32,58,36,118,196],\"buildTime\":{\"dateNow\":1792891469823}}")
+call wasi:random/random.get-random-bytes(8) -> 0x90837ae0515ee718
+call wasi:random/random.get-random-u64() -> 14759243333555163976
+call wasi:random/random.get-random-u64() -> 7304993147415448613
+call wasi:random/random.get-random-u64() -> 4000495390794077020
+call wasi:random/random.get-random-bytes(16) -> 0x7954affe1f63db20eac32671ca5effc5
+call context.random-bytes(8) -> 0x023f37203a2476c4
+digest 0   b3:6247455d64f987b4d7cc699248cfe146c4babb547220a1070d89e9438d40fe95
+
+=== Another logical time: Date and now-ms follow it
+outcome OK Committed("reply name=\"probe-result\" content-type=\"application/json\"\n{\"turnsSeenByThisInstance\":1,\"n\":1,\"self\":{\"kind\":\"spike-a\",\"key\":\"acme\"},\"causalId\":\"root-1/0\",\"nowMs\":\"1800000000000\",\"dateNow\":1800000000000,\"dateIso\":\"2027-01-15T08:00:00.000Z\",\"performanceNow\":0,\"mathRandom\":[0.4369854542892426,0.8196430183015764,0.034064691979438066],\"cryptoGetRandomValues\":[92,91,186,80,252,118,192,116],\"randomUUID\":\"1128f133-f949-45c5-a063-a250ff23dfd0\",\"randomBytes\":[158,230,23,200,107,198,97,216],\"buildTime\":{\"dateNow\":1792891469823}}")
+call wasi:clocks/monotonic-clock.now() -> 1800000000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1800000000000000000ns
+call context.now-ms() -> 1800000000000
+call wasi:clocks/wall-clock.now() -> 1800000000000ms
+call wasi:clocks/wall-clock.now() -> 1800000000000ms
+call wasi:clocks/monotonic-clock.now() -> 1800000000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1800000000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1800000000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1800000000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1800000000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1800000000000000000ns
+call wasi:clocks/monotonic-clock.now() -> 1800000000000000000ns
+digest 0   b3:33d37084887a4da4594614fb6b198e581eaca88f8e8c8b84d76b9ce88301ca23
+
+=== How Math.random draws randomness: host calls per N calls
+Math.random() x 1: 1 get-random-u64 calls, fuel 1528068
+Math.random() x 10: 10 get-random-u64 calls, fuel 1546197
+Math.random() x 100: 100 get-random-u64 calls, fuel 1727908
+Math.random() x 1000: 1000 get-random-u64 calls, fuel 3534101
+
+=== Fuel of JSON work: build N objects, JSON.stringify, JSON.parse (fuel limit raised to 2e9)
+json 100: 6093 bytes of JSON text, fuel 4250653, memory peak 9280 KiB
+json 1000: 63893 bytes of JSON text, fuel 28782181, memory peak 9280 KiB
+json 10000: 668893 bytes of JSON text, fuel 295423606, memory peak 15424 KiB
+
+=== Turn outcomes for errors and limits
+--msg throw: outcome TURN_FAILED Trap("wasm trap: wasm `unreachable` instruction executed"); fuel 1320083; memory peak 9280 KiB; identical yes
+--msg reject: outcome TURN_FAILED HandlerError("rejected: not today"); fuel 1338417; memory peak 9280 KiB; identical yes
+--msg spin: outcome FUEL_EXHAUSTED FuelExhausted; fuel 50000000; memory peak 9280 KiB; identical yes
+--msg alloc --body 16: outcome OK Committed("reply name=\"probe-result\" content-type=\"application/json\"\n{\"allocatedMiB\":16,\"touched\":16777216}"); fuel 27475864; memory peak 25664 KiB; identical yes
+--msg alloc --body 100: outcome TURN_FAILED MemoryLimit("memory limit reached, then trap: wasm trap: wasm `unreachable` instruction executed"); fuel 1496267; memory peak 9280 KiB; identical yes
+
+=== Two builds of the same source: out/counter.wasm and out/counter-rebuild.wasm
+counter: b3:3ed342e6bc41, fuel 1587545, digest b3:82e6ba2b61685e110bee056057a21daa65ffbeb67ae76695b3096daaf41830f8
+counter-rebuild: b3:6db41367f9ff, fuel 1587590, digest b3:3f1538484ded6f84e0da8d6c00d28e15e296cd53927ac5a8e5a05ee9c50848f6
+
+=== Digest summary (compare across machines)
+probe, message:   b3:e4a90adf74c061b7d386e2b1d382112b3fb835cb9123d3d87f01d0cb887f5365
+probe, HTTP:      b3:6d7bd00b63a39b272f63bdabb658b450ea436de3532d0e2a2189a70ffc3f58df
+counter, message: b3:b069d652dc46bcfb875c6db16cd2902a441dfe2c2016bc3a2c0f36ed972c95d6
+noop, message:    b3:2cdcaace52bad7b445661030c2fddbfbfe63603b346a8d880b6613fa90a6c4be
+json 1000:        b3:54c9c4b1cf52c61bf068cfbcb4838bba2967ec2fa37e1d1b978f1417fa790a1b

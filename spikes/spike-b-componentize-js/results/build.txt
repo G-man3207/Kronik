@@ -1,0 +1,20 @@
+# build on the dev machine at 2026-10-25T01:24:25Z, node v26.10.0, jco 1.39.0, componentize-js 0.23.0, tsc 7.0.2
+WIT: wit/kronik-actor.wit at 5a8d400, sha256 890850523e5fccaefb9128015150ef6cacd6528e00a6a9a315c245210218fd19
+543 ms  npx jco guest-types generated/wit/kronik-actor.wit --world-name actor -o generated/types -q
+696 ms  npx tsc -p tsconfig.json
+3774 ms  npx jco componentize src/actor.ts --wit generated/wit/kronik-actor.wit --world-name actor --disable http fetch-event stdio -o out/actor.wasm
+9204 ms  npx jco componentize src/actor.ts --wit generated/wit/kronik-actor.wit --world-name actor --disable http fetch-event stdio --aot -o out/actor-aot.wasm
+3667 ms  npx jco componentize src/counter.ts --wit generated/wit/kronik-actor.wit --world-name actor --disable http fetch-event stdio -o out/counter.wasm
+8610 ms  npx jco componentize src/counter.ts --wit generated/wit/kronik-actor.wit --world-name actor --disable http fetch-event stdio --aot -o out/counter-aot.wasm
+3640 ms  npx jco componentize src/actor.ts --wit generated/wit/kronik-actor.wit --world-name actor -o out/actor-default.wasm
+3731 ms  npx jco componentize src/actor.ts --wit generated/wit/kronik-actor.wit --world-name actor --disable http fetch-event -o out/actor-no-http.wasm
+expected failure for src/build-time-random.ts: attempted to call an unknown imported function: 'wasi:random/random@0.2.10' 'get-random-u64'
+4176 ms  npx jco componentize src/counter.ts --wit generated/wit/kronik-actor.wit --world-name actor --disable http fetch-event stdio -o out/counter-rebuild.wasm
+NOT reproducible: two builds of src/counter.ts differ in 2401514 bytes (sizes 12786333 and 12786318)
+12843811 bytes  out/actor.wasm
+19010443 bytes  out/actor-aot.wasm
+12873878 bytes  out/actor-default.wasm
+12859932 bytes  out/actor-no-http.wasm
+12786333 bytes  out/counter.wasm
+18834668 bytes  out/counter-aot.wasm
+12786318 bytes  out/counter-rebuild.wasm

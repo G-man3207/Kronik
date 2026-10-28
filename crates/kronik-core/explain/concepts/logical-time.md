@@ -1,0 +1,3 @@
+Logical time is the turn's time as the guest sees it via `now-ms`. It is constant within a turn, recorded, and never lower than the logical time of the message or timer that started the turn (I15). It is the largest of the host's clock at turn start, the largest logical time already handed out, and the logical time of the message or timer that started the turn. At startup the largest time in the log plus 1 ms seeds the second value, so neither a host clock that jumps backwards nor a restart moves time backwards (ADR 0006). Several turns may share a millisecond: unique ids come from the causal id or the turn id, not from `now-ms`. A matched turn in replay (M3) reuses the recorded logical time.
+
+See also: `turn`, `causal-key`.

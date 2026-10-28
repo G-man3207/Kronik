@@ -1,0 +1,136 @@
+diff -r a/src/checks.rs b/src/checks.rs
+--- a/src/checks.rs	2026-10-25 00:49:16.732390804 +0000
++++ b/src/checks.rs	2026-10-25 00:49:53.632473174 +0000
+@@ -362,6 +362,40 @@
+     )
+ }
+ 
++/// Spike B experiment: the same turn on a fresh instance each time (what
++/// Kronik does) versus repeated calls on one instance (what I3 forbids).
++pub async fn reuse(bytes: &[u8], iterations: u32, msg_name: &str) -> wasmtime::Result<()> {
++    let engine = engine::build_engine()?;
++    let component = wasmtime::component::Component::new(&engine, bytes)?;
++    let runner = Runner::new(&engine, &component)?;
++    let spec: TurnSpec = TurnOpts::default_spec();
++    let input = msg(msg_name, "");
++    for _ in 0..50 {
++        runner.handle(&spec, &input).await?;
++    }
++    let mut fresh = Vec::with_capacity(iterations as usize);
++    let mut fresh_fuel = 0;
++    for _ in 0..iterations {
++        let t = Instant::now();
++        let r = runner.handle(&spec, &input).await?;
++        fresh.push(t.elapsed());
++        fresh_fuel = r.fuel_used;
++    }
++    let calls = runner.handle_reuse(&spec, &input, iterations + 1).await?;
++    let first = calls[0];
++    let later: Vec<Duration> = calls[1..].iter().map(|c| c.1).collect();
++    let later_fuel: Vec<u64> = calls[1..].iter().map(|c| c.0).collect();
++    println!("[{msg_name}] fresh instance per turn: fuel {fresh_fuel}, whole turn {}", fmt(&stats(fresh)));
++    println!("[{msg_name}] one instance, call 1:     fuel {}, {:?}", first.0, first.1);
++    println!(
++        "[{msg_name}] one instance, calls 2..:   fuel {}..{}, call {}",
++        later_fuel.iter().min().unwrap_or(&0),
++        later_fuel.iter().max().unwrap_or(&0),
++        fmt(&stats(later))
++    );
++    Ok(())
++}
++
+ pub async fn bench(bytes: &[u8], iterations: u32, msg_name: &str) -> wasmtime::Result<()> {
+     println!("engine      {}", engine::engine_version());
+     println!(
+diff -r a/src/engine.rs b/src/engine.rs
+--- a/src/engine.rs	2026-10-25 00:49:16.732390804 +0000
++++ b/src/engine.rs	2026-10-25 01:08:26.295399196 +0000
+@@ -86,6 +86,16 @@
+     pool.max_memory_size(POOL_MAX_MEMORY_BYTES);
+     pool.max_core_instance_size(4 << 20);
+     pool.max_component_instance_size(4 << 20);
++    // Spike B experiment: keep this much of each linear memory and table
++    // resident when a pool slot is reused, instead of madvise-resetting it.
++    if let Ok(mib) = std::env::var("SPIKE_B_KEEP_RESIDENT_MIB") {
++        let bytes = mib
++            .parse::<usize>()
++            .map_err(|e| wasmtime::format_err!("SPIKE_B_KEEP_RESIDENT_MIB: {e}"))?
++            << 20;
++        pool.linear_memory_keep_resident(bytes);
++        pool.table_keep_resident(bytes);
++    }
+     cfg.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
+ 
+     Engine::new(&cfg)
+diff -r a/src/main.rs b/src/main.rs
+--- a/src/main.rs	2026-10-25 00:49:16.732390804 +0000
++++ b/src/main.rs	2026-10-25 00:49:45.176454295 +0000
+@@ -71,6 +71,14 @@
+         #[arg(long, default_value = "noop")]
+         msg: String,
+     },
++    /// Spike B experiment: fresh instance per turn versus calls on one instance.
++    Reuse {
++        component: PathBuf,
++        #[arg(long, default_value_t = 1000)]
++        iterations: u32,
++        #[arg(long, default_value = "noop")]
++        msg: String,
++    },
+ }
+ 
+ #[derive(Args, Clone)]
+@@ -369,6 +377,15 @@
+             checks::bench(&bytes, iterations, &msg).await.map_err(e)?;
+             Ok(ExitCode::SUCCESS)
+         }
++        Cmd::Reuse {
++            component,
++            iterations,
++            msg,
++        } => {
++            let bytes = read(&component)?;
++            checks::reuse(&bytes, iterations, &msg).await.map_err(e)?;
++            Ok(ExitCode::SUCCESS)
++        }
+     }
+ }
+ 
+diff -r a/src/turn.rs b/src/turn.rs
+--- a/src/turn.rs	2026-10-25 00:49:16.732390804 +0000
++++ b/src/turn.rs	2026-10-25 00:49:35.860433498 +0000
+@@ -141,6 +141,34 @@
+         self.handle_at_depth(spec, input, 0).await
+     }
+ 
++    /// Spike B experiment: calls `handle` `calls` times on ONE instance, to
++    /// see how much of a turn is per-instance work. Kronik never does this
++    /// (I3); returns fuel and wall time per call.
++    pub async fn handle_reuse(
++        &self,
++        spec: &TurnSpec,
++        input: &Input,
++        calls: u32,
++    ) -> wasmtime::Result<Vec<(u64, Duration)>> {
++        let mut store = self.store(spec, false, 0)?;
++        store.set_fuel(u64::MAX / 4)?;
++        let actor = self.pre.instantiate_async(&mut store).await?;
++        let mut out = Vec::with_capacity(calls as usize);
++        for _ in 0..calls {
++            let before = store.get_fuel()?;
++            let t = Instant::now();
++            if let Err(e) = actor
++                .kronik_actor_handler()
++                .call_handle(&mut store, input)
++                .await?
++            {
++                wasmtime::bail!("handler error: {e:?}");
++            }
++            out.push((before - store.get_fuel()?, t.elapsed()));
++        }
++        Ok(out)
++    }
++
+     pub async fn handle_at_depth(
+         &self,
+         spec: &TurnSpec,

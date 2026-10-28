@@ -1,0 +1,19 @@
+# no-wasi on the dev machine at 2026-10-25T02:38:54Z, kronik-0.0.0+wasmtime-50.0.0
+
+=== jco componentize src/actor.ts --disable all
+OK Successfully written <scratch>/actor-no-wasi.wasm.
+12833032 bytes
+imports    11
+allowlist  OK
+
+=== handle --msg noop
+outcome OK Committed("none")
+fuel 953600
+
+=== handle --msg counter
+outcome OK Committed("reply name=\"probe-result\" content-type=\"application/json\"\n{\"n\":1}")
+fuel 1636609
+
+=== handle --msg probe
+outcome TURN_FAILED Trap("wasm trap: wasm `unreachable` instruction executed")
+fuel 1334454

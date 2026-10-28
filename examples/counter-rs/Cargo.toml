@@ -1,0 +1,23 @@
+[package]
+name = "counter-rs"
+description = "The smallest Kronik actor: a counter per key"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# Increments by 2 instead of 1, for the M3 behavior-diff tests:
+# examples/dist/counter-step2.wasm.
+step2 = []
+
+[dependencies]
+kronik-sdk.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

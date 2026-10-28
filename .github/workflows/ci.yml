@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Full debuginfo made `cargo test --workspace` 17 GB, more than the runner's
+  # disk; line tables keep file:line in panics at 7.4 GB.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  ci:
+    name: fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny, foreign, identity
+    runs-on: ubuntu-24.04
+    steps:
+      # The runner's preinstalled SDKs that this job does not use, for disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            examples -> target
+
+      # Node.js for the TypeScript SDK and examples (the ts step); the pinned
+      # toolchain's packages need Node.js 22.20 or later, as kronik build checks.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            sdk/ts/package-lock.json
+            examples/package-lock.json
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-deny@0.20.2
+
+      # Each step runs the same command as scripts/ci.sh does locally.
+      - name: fmt
+        run: scripts/ci.sh fmt
+      - name: clippy
+        run: scripts/ci.sh clippy
+      - name: hygiene
+        run: scripts/ci.sh hygiene
+      - name: test
+        run: scripts/ci.sh test
+      - name: docs
+        run: scripts/ci.sh docs
+      - name: book
+        run: scripts/ci.sh book
+      - name: examples
+        run: scripts/ci.sh examples
+      - name: ts
+        run: scripts/ci.sh ts
+      - name: dst
+        run: scripts/ci.sh dst
+      - name: deny
+        run: scripts/ci.sh deny
+      - name: foreign
+        run: scripts/ci.sh foreign
+      - name: identity
+        run: scripts/ci.sh identity

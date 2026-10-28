@@ -1,0 +1,16 @@
+# reuse-dev on the dev machine at 2026-10-25T01:29:43Z, kronik-0.0.0+wasmtime-50.0.0
+
+=== out/counter.wasm --msg counter
+[counter] fresh instance per turn: fuel 1587545, whole turn p50     1.2ms  p99     1.5ms  mean     1.2ms
+[counter] one instance, call 1:     fuel 1587515, 1.056542ms
+[counter] one instance, calls 2..:   fuel 479906..2689186, call p50    89.3µs  p99   148.3µs  mean    95.6µs
+
+=== out/actor.wasm --msg noop
+[noop] fresh instance per turn: fuel 954692, whole turn p50   980.5µs  p99     1.2ms  mean     1.0ms
+[noop] one instance, call 1:     fuel 954662, 710.271µs
+[noop] one instance, calls 2..:   fuel 145919..1041596, call p50    21.0µs  p99    56.3µs  mean    24.2µs
+
+=== out/actor.wasm --msg json
+[json] fresh instance per turn: fuel 28779575, whole turn p50     4.1ms  p99     5.9ms  mean     4.3ms
+[json] one instance, call 1:     fuel 28779545, 4.471256ms
+[json] one instance, calls 2..:   fuel 27635269..34260073, call p50     2.7ms  p99     4.6ms  mean     2.8ms

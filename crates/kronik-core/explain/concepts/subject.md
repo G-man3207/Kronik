@@ -1,0 +1,3 @@
+A subject is the person that data belongs to, for example `user:123`. Every value carries its own subject tag, recorded even when privacy mode is off, so that reseal, erasure and audit (M8) work per value instead of per turn. Guest code sets the default subject for the rest of the turn (`privacy.set-subject`) or a subject for a single write (`state.set-for`), and from M8 the gateway can take the subject of HTTP root inputs from a header or a JWT claim (`privacy.subject_from`). A value has at most one subject in v0.1, and the `_subject` column ties rows in SQL state to a subject.
+
+See also: `privacy-mode`, `sealed-value`, `sql-state`.

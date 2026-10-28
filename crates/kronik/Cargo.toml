@@ -1,0 +1,57 @@
+[package]
+name = "kronik"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+kronik-api = { workspace = true, features = ["server"] }
+kronik-core = { workspace = true, features = ["real"] }
+kronik-fork = { workspace = true }
+kronik-foreign = { workspace = true }
+kronik-effects = { workspace = true }
+kronik-gateway = { workspace = true, features = ["server"] }
+kronik-mcp = { workspace = true }
+kronik-metrics = { workspace = true }
+kronik-privacy = { workspace = true }
+kronik-runtime = { workspace = true }
+kronik-sched = { workspace = true }
+kronik-ship = { workspace = true }
+kronik-testhost = { workspace = true }
+# `kronik mcp`: an MCP stdio server proxying to the daemon's /mcp over the
+# API socket (ADR 0008).
+rmcp = { workspace = true, features = ["server", "transport-io", "client", "transport-streamable-http-client-unix-socket"] }
+# The JSON Schemas of the local commands' --json output (docs/reference/json.md).
+rustix = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "time", "io-std", "io-util", "sync"] }
+toml = { workspace = true, features = ["std", "parse", "serde"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# kronik doctor: temporary directories for the namespace and sandbox checks.
+tempfile = { workspace = true }
+
+[dev-dependencies]
+boon = { workspace = true }
+kronik-log = { workspace = true }
+kronik-proto = { workspace = true }
+rcgen = { workspace = true }
+# privacy_mode.rs reads a copy of keys/keystore.db.
+rusqlite = { workspace = true }
+rustls = { workspace = true }
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

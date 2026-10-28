@@ -1,0 +1,190 @@
+// Kronik log format v1: turn records. See common.proto for the format rules.
+// Field numbers 1-19 of TurnBegin/EffectResult/TurnRecord/EffectRecord and the
+// BlobRefOp/SqlChangeset/SqlSchemaChange messages follow the brief exactly.
+syntax = "proto3";
+
+package kronik.log.v1;
+
+import "kronik/log/v1/common.proto";
+import "kronik/log/v1/input.proto";
+
+// Opens a turn. Fsynced before the turn's first external effect or call
+// (I14); turns without either write no TurnBegin.
+message TurnBegin {
+  // 32 lowercase hex characters from the entropy source. Never guest-visible.
+  string execution_id = 1;
+  ActorRef actor = 2;
+  // BLAKE3 of the component bytes (32 bytes).
+  bytes code_hash = 3;
+  // "kronik-<semver>+wasmtime-<semver>" (ADR 0001).
+  string engine_version = 4;
+  CausalKey causal_key = 5;
+  uint64 logical_time_ms = 6;
+  // 32 bytes from the OS CSPRNG.
+  bytes random_seed = 7;
+  Input input = 8;
+  // Configuration epoch the turn runs under (deployment, grants, limits).
+  uint64 config_epoch = 9;
+}
+
+// An external effect's result, fsynced before the guest sees it.
+message EffectResult {
+  string execution_id = 1;
+  EffectRecord effect = 2;
+}
+
+message TurnRecord {
+  reserved 1;               // the lsn lives in the log entry envelope
+  string execution_id = 2;
+  ActorRef actor = 3;
+  bytes code_hash = 4;
+  string engine_version = 5;
+  CausalKey causal_key = 6;
+  uint64 logical_time_ms = 7;
+  bytes random_seed = 8;
+  Input input = 9;
+  repeated EffectRecord effects = 10;
+  repeated StateWrite writes = 11;
+  repeated OutboundMessage messages = 12;
+  repeated TimerOp timers = 13;
+  Outcome outcome = 14;
+  uint64 fuel_used = 15;
+  repeated SqlChangeset sql_changes = 16;
+  repeated OutboundMessage compensations = 17;  // delivered when the turn failed after a successful call
+  repeated SqlSchemaChange sql_schema = 18;      // DDL, applied before sql_changes on rebuild
+  repeated BlobRefOp blob_refs = 19;             // from M26; buffered and committed with the turn
+  uint64 config_epoch = 20;
+  // Peak linear memory of the instance, for the diff's resource section.
+  uint64 memory_peak_bytes = 21;
+  // The actor's SQL schema version after this turn (set by migrate turns).
+  uint32 schema_version = 22;
+}
+
+message EffectRecord {
+  uint32 ordinal = 1;
+  string kind = 2;          // http.fetch, foreign.http, actor.call, crypto.hmac-sha256, crypto.sign-ed25519, secret.reveal
+  bytes fingerprint = 3;    // normalized request hash, secret values excluded
+  Sealable request = 4;     // secret headers stored as name + version hash, never the value
+  Sealable response = 5;
+  string idempotency_key = 6;
+  uint64 duration_us = 7;
+  string delivery = 8;      // replay-safe, idempotency-keyed or unsafe; empty for internal kinds
+  EffectStatus status = 9;
+  // How the result was obtained (live, or matched in a fork, M3).
+  Grounding grounding = 10;
+  // http:<host>, actor:<kind>/<key>, secret:<name> or secret-reveal:<name>.
+  string target = 11;
+  // The guest-visible error for statuses other than OK.
+  string error = 12;
+}
+
+enum EffectStatus {
+  EFFECT_STATUS_UNSPECIFIED = 0;
+  EFFECT_STATUS_OK = 1;
+  EFFECT_STATUS_DENIED = 2;
+  EFFECT_STATUS_NETWORK = 3;
+  EFFECT_STATUS_TIMEOUT = 4;
+  EFFECT_STATUS_TOO_LARGE = 5;
+  EFFECT_STATUS_OUTCOME_UNKNOWN = 6;
+  // actor.call results.
+  EFFECT_STATUS_NOT_FOUND = 7;
+  EFFECT_STATUS_REJECTED = 8;
+  EFFECT_STATUS_FAILED = 9;
+  EFFECT_STATUS_REENTRANT = 10;
+}
+
+enum Grounding {
+  GROUNDING_UNSPECIFIED = 0;
+  GROUNDING_LIVE = 1;
+  GROUNDING_EXACT = 2;
+  GROUNDING_APPROXIMATE = 3;
+  GROUNDING_SYNTHETIC = 4;
+}
+
+enum StateOp {
+  STATE_OP_UNSPECIFIED = 0;
+  STATE_OP_SET = 1;
+  STATE_OP_DELETE = 2;
+}
+
+message StateWrite {
+  StateOp op = 1;
+  string key = 2;
+  // Set for STATE_OP_SET; carries the write's subject.
+  Sealable value = 3;
+}
+
+message OutboundMessage {
+  ActorRef to = 1;
+  Message msg = 2;
+  // The producing turn's operation ordinal.
+  uint32 ordinal = 3;
+  // hex(blake3(causal key + ordinal)), the receiver's dedup id.
+  string message_id = 4;
+}
+
+enum TimerOpKind {
+  TIMER_OP_KIND_UNSPECIFIED = 0;
+  TIMER_OP_KIND_SCHEDULE = 1;
+  TIMER_OP_KIND_CANCEL = 2;
+}
+
+message TimerOp {
+  TimerOpKind kind = 1;
+  // Per-actor timer id as returned to the guest.
+  uint64 timer_id = 2;
+  // Logical due time (turn time + delay); SCHEDULE only.
+  uint64 due_ms = 3;
+  Message msg = 4;
+  uint32 ordinal = 5;
+}
+
+enum OutcomeKind {
+  OUTCOME_KIND_UNSPECIFIED = 0;
+  // `handle` returned ok: writes, SQL, messages and timers are applied.
+  OUTCOME_KIND_COMMITTED = 1;
+  // handler-error::rejected (the input is invalid; not dead-lettered for HTTP).
+  OUTCOME_KIND_REJECTED = 2;
+  // handler-error::failed.
+  OUTCOME_KIND_FAILED = 3;
+  // A Wasm trap or a host-raised trap.
+  OUTCOME_KIND_TRAP = 4;
+  OUTCOME_KIND_FUEL_EXHAUSTED = 5;
+  OUTCOME_KIND_MEMORY_LIMIT = 6;
+  // An unsafe effect's outcome was unknown and the guest did not handle it.
+  OUTCOME_KIND_EFFECT_OUTCOME_UNKNOWN = 7;
+}
+
+message Outcome {
+  OutcomeKind kind = 1;
+  // Stable error code for failed turns (TURN_FAILED, FUEL_EXHAUSTED,
+  // EFFECT_OUTCOME_UNKNOWN); empty when committed.
+  string error_code = 2;
+  // Guest error text or trap description; never contains backtraces.
+  string message = 3;
+  oneof output {
+    // output::reply
+    Message reply = 4;
+    // output::http
+    HttpResponse http = 5;
+  }
+  // Neither reply nor http set means output::none.
+}
+
+message SqlChangeset {
+  Sealable changeset = 1;   // one changeset per subject
+}
+
+message SqlSchemaChange {
+  string statement = 1;     // DDL exactly as executed
+}
+
+message BlobRefOp {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;   // never written; apply fails with STORAGE_CORRUPT
+    RETAIN = 1;             // blobs.put and blobs.retain
+    RELEASE = 2;            // blobs.release
+  }
+  Kind kind = 1;
+  BlobRef blob = 2;
+}

@@ -1,0 +1,17 @@
+# 11-overhead on travelfiesta at 2026-10-25T00:16:02Z, runsc version release-20261019.0, bridge pf
+
+=== Idle sandbox with the echo server (--platform=systrap --network=sandbox)
+cgroup memory.current: 18 MiB
+  pid 485171 exe: 15.8 MiB RSS
+  pid 485176 gvisor_sentry: 34.1 MiB RSS
+  pid 485187 gvisor_sentry: 0.0 MiB RSS
+  pid 485188 gvisor_sentry: 0.6 MiB RSS
+  pid 485189 gvisor_sentry: 0.6 MiB RSS
+  pid 485205 gvisor_sentry: 0.6 MiB RSS
+sum of RSS (shared pages counted per process): 51 MiB
+gofer pid 485171: 15.8 MiB RSS
+
+=== One open runsc port-forward --stream connection
+helper right after connecting: running, 15 MiB RSS
+helper 1 s later, connection still open: exited with status 0
+request on the kept-alive connection after that: HTTP/1.1 200 OK

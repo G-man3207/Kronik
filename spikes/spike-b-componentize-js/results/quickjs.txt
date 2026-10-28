@@ -1,0 +1,43 @@
+# quickjs on the dev machine at 2026-10-25T01:33:14Z, kronik-0.0.0+wasmtime-50.0.0
+
+=== jco componentize src/counter.ts --backend quickjs --backend-qjs-disable-async
+warning Jco added generated WIT import jco:node/console@0.1.0 to <scratch>/kronik-actor.wit because bundled source uses a host-backed Node API. Review and commi
+warning Jco added the required WIT dependency at <scratch>/deps/jco-node-0.1.0/console.wit.
+OK Successfully written <scratch>/counter-qjs.wasm.
+build 1393 ms, 2351191 bytes
+WIT lines jco added: 2
+import wasi:cli/environment@0.2.12;
+import wasi:cli/exit@0.2.12;
+import wasi:io/error@0.2.12;
+import wasi:io/poll@0.2.12;
+import wasi:io/streams@0.2.12;
+import wasi:cli/stdin@0.2.12;
+import wasi:cli/stdout@0.2.12;
+import wasi:cli/stderr@0.2.12;
+import wasi:cli/terminal-input@0.2.12;
+import wasi:cli/terminal-output@0.2.12;
+import wasi:cli/terminal-stdin@0.2.12;
+import wasi:cli/terminal-stdout@0.2.12;
+import wasi:cli/terminal-stderr@0.2.12;
+import wasi:clocks/monotonic-clock@0.2.12;
+import wasi:clocks/wall-clock@0.2.12;
+import wasi:filesystem/types@0.2.12;
+import wasi:filesystem/preopens@0.2.12;
+import wasi:random/insecure-seed@0.2.12;
+import jco:node/console@0.1.0;
+  DENIED   wasi:filesystem/types@0.2.12
+  DENIED   wasi:filesystem/preopens@0.2.12
+  DENIED   jco:node/console@0.1.0
+IMPORT_NOT_ALLOWED: the component imports interfaces outside the allowlist: wasi:filesystem/types@0.2.12, wasi:filesystem/preopens@0.2.12, jco:node/console@0.1.0
+(exit 2)
+
+=== jco componentize src/counter.ts --backend quickjs --backend-qjs-disable-async --backend-qjs-stub-wasi
+warning Jco added generated WIT import jco:node/console@0.1.0 to <scratch>/kronik-actor.wit because bundled source uses a host-backed Node API. Review and commi
+warning Jco added the required WIT dependency at <scratch>/deps/jco-node-0.1.0/console.wit.
+OK Successfully written <scratch>/counter-qjs.wasm.
+build 1415 ms, 2384015 bytes
+WIT lines jco added: 2
+import jco:node/console@0.1.0;
+  DENIED   jco:node/console@0.1.0
+IMPORT_NOT_ALLOWED: the component imports interfaces outside the allowlist: jco:node/console@0.1.0
+(exit 2)

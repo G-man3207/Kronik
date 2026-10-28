@@ -1,0 +1,1262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "kronik.diff/v1",
+  "description": "A behavior diff: how a fork's code behaves on main's root inputs, next to production (docs/design/m3-fork.md §5). The same fork, code and options always give the same bytes. `kronik diff show --md` and `format=md` render the same diff as Markdown.",
+  "type": "object",
+  "required": [
+    "schema",
+    "fork",
+    "proposal_id",
+    "base",
+    "code",
+    "options",
+    "summary",
+    "causes",
+    "grounding",
+    "responses",
+    "effects",
+    "state",
+    "cumulative",
+    "errors",
+    "resources",
+    "samples"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "kronik.diff/v1"
+    },
+    "fork": {
+      "description": "The fork: `p-<12 hex>` for a proposal, else the name it was created with.",
+      "type": "string"
+    },
+    "proposal_id": {
+      "description": "The id the daemon keeps the diff under: the proposal's, or the plain fork's name.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "base": {
+      "$ref": "#/$defs/DiffBase"
+    },
+    "code": {
+      "description": "The code of every changed actor kind, before (production) and after (the fork).",
+      "type": "object",
+      "required": [
+        "before",
+        "after"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "before": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffCodeEntry"
+          }
+        },
+        "after": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffCodeEntry"
+          }
+        }
+      }
+    },
+    "options": {
+      "$ref": "#/$defs/DiffOptions"
+    },
+    "summary": {
+      "$ref": "#/$defs/DiffSummary"
+    },
+    "kinds": {
+      "description": "Each actor kind on its own, sorted by kind: every kind of the fork's code and every kind a replayed turn ran as (M9). Absent from diffs written before M9.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DiffKind"
+      }
+    },
+    "causes": {
+      "description": "Sorted by origins descending, then kind, then input.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DiffCause"
+      }
+    },
+    "grounding": {
+      "description": "One entry per external target, sorted by kind, host and route.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DiffGroundingRow"
+      }
+    },
+    "responses": {
+      "$ref": "#/$defs/DiffResponses"
+    },
+    "effects": {
+      "$ref": "#/$defs/DiffEffects"
+    },
+    "state": {
+      "$ref": "#/$defs/DiffState"
+    },
+    "cumulative": {
+      "$ref": "#/$defs/DiffCumulative"
+    },
+    "errors": {
+      "$ref": "#/$defs/DiffErrors"
+    },
+    "resources": {
+      "$ref": "#/$defs/DiffResources"
+    },
+    "samples": {
+      "$ref": "#/$defs/DiffSamples"
+    }
+  },
+  "$defs": {
+    "DiffCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "DiffRatio": {
+      "description": "A share from 0 to 1, with at most 6 decimals.",
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "DiffTurnId": {
+      "description": "A turn: `main:<lsn>` in production; in the fork `<fork>:<lsn>` (continuous replay) or `<fork>:r<root_lsn>.<n>` (the n-th turn of an isolated tree).",
+      "type": "string",
+      "pattern": "^[^:]+:(r[0-9]+\\.)?[0-9]+$"
+    },
+    "DiffValue": {
+      "description": "A value on one side: a state value, a header, a body or part of one, an SQL row; null when that side has none. A value with a subject is never shown, nor is the subject id: a state value, body or header value is `{\"redacted\": true, \"subject\": \"s:<12 hex>\", \"hash\": \"k:<16 hex>\"}`, a value in an SQL row `\"[redacted:s:<12 hex>:k:<16 hex>]\"`. `s:` is a keyed hash of the subject id (equal subjects give equal ones), `k:` a keyed hash of the subject and the value; both are `-` when the diff was built without the master key (`kronik upgrade check`). In a `--no-pii` fork, what a turn that used SQL produced is redacted under the subject `[sql]`, shown as is."
+    },
+    "DiffBase": {
+      "description": "Where the fork starts and which root inputs ran.",
+      "type": "object",
+      "required": [
+        "branch",
+        "fork_lsn",
+        "from_lsn",
+        "to_lsn"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "branch": {
+          "description": "The branch the fork was taken from: `main`.",
+          "type": "string"
+        },
+        "fork_lsn": {
+          "description": "The fork point.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "from_lsn": {
+          "description": "The first main LSN of the window.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "to_lsn": {
+          "description": "The last main LSN of the window.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "window_cut": {
+          "description": "Present when retention cut the proposal's window short: the window reaches back before the oldest point the log and snapshots still hold, so only the root inputs after `kept_from_lsn` were replayed.",
+          "type": "object",
+          "required": [
+            "window_ms",
+            "kept_from_lsn"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "window_ms": {
+              "description": "The logical time the proposal asked to replay, back from the newest root input.",
+              "$ref": "#/$defs/DiffCount"
+            },
+            "kept_from_lsn": {
+              "description": "The oldest snapshot the log continues; the fork starts there.",
+              "$ref": "#/$defs/DiffCount"
+            }
+          }
+        }
+      }
+    },
+    "DiffCodeEntry": {
+      "type": "object",
+      "required": [
+        "kind",
+        "code_hash",
+        "schema_version"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "description": "The actor kind.",
+          "type": "string"
+        },
+        "code_hash": {
+          "description": "The component's hash, shortened: `b3:<12 hex>`.",
+          "type": "string",
+          "pattern": "^b3:[0-9a-f]+$"
+        },
+        "schema_version": {
+          "$ref": "#/$defs/DiffCount"
+        }
+      }
+    },
+    "DiffOptions": {
+      "description": "The replay options the diff was made with.",
+      "type": "object",
+      "required": [
+        "mode",
+        "sample",
+        "ignore_headers",
+        "ignore_json_paths",
+        "fuel_threshold",
+        "stubs",
+        "live_allowlist",
+        "no_pii"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "description": "Isolated replay (each root input on production's state at its LSN), continuous replay (the fork's state evolves), or both.",
+          "enum": [
+            "isolated",
+            "continuous",
+            "both"
+          ]
+        },
+        "sample": {
+          "description": "The share of root inputs replayed in isolated mode, in (0, 1].",
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "ignore_headers": {
+          "description": "Response and effect headers left out of the comparison.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ignore_json_paths": {
+          "description": "Parts of JSON bodies left out of the comparison, as JSONPath (`$.a.b[*].c`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "fuel_threshold": {
+          "description": "A fuel change below this share is not a change.",
+          "type": "number",
+          "minimum": 0
+        },
+        "stubs": {
+          "description": "Canned answers for effects without a recording, tried in order (synthetic grounding).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffStubRule"
+          }
+        },
+        "live_allowlist": {
+          "description": "The `[fork] live_allowlist` hosts in force: a GET without a recording to one of them went out live.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "no_pii": {
+          "description": "A fork without access to personal data: it ran on pseudonyms (M8).",
+          "type": "boolean"
+        }
+      }
+    },
+    "DiffStubRule": {
+      "description": "Requests whose method (when given) and URL prefix match get this response, or this error.",
+      "type": "object",
+      "required": [
+        "url_prefix",
+        "status",
+        "headers",
+        "body"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "description": "GET, POST, ...; any method when absent.",
+          "type": "string"
+        },
+        "url_prefix": {
+          "type": "string"
+        },
+        "status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 999
+        },
+        "headers": {
+          "description": "`[name, value]` pairs.",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "minItems": 2,
+            "items": false
+          }
+        },
+        "body": {
+          "description": "The response body as text.",
+          "type": "string"
+        },
+        "error": {
+          "description": "Instead of a response.",
+          "enum": [
+            "network",
+            "timeout",
+            "too-large",
+            "denied"
+          ]
+        }
+      }
+    },
+    "DiffSummary": {
+      "description": "A behavior diff in numbers (kronik.diff/v1 `summary`).",
+      "type": "object",
+      "required": [
+        "root_inputs",
+        "replayed",
+        "sample",
+        "turns_prod",
+        "turns_fork",
+        "divergent_turns",
+        "origins",
+        "consequences",
+        "exact",
+        "approximate",
+        "synthetic",
+        "live",
+        "confidence",
+        "verified_through_lsn",
+        "changed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "root_inputs": {
+          "description": "Root inputs in the window.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "replayed": {
+          "description": "Root inputs replayed in isolated mode.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "sample": {
+          "description": "replayed / root_inputs; 1.0 for an empty window.",
+          "$ref": "#/$defs/DiffRatio"
+        },
+        "turns_prod": {
+          "description": "Production turns of the replayed trees.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "turns_fork": {
+          "description": "Fork turns of the replayed trees.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "divergent_turns": {
+          "description": "Turns that behave differently, both modes counted once by causal key.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "origins": {
+          "description": "Differing turns whose input is the same as production's.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "consequences": {
+          "description": "Every other difference in the same causal trees.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "exact": {
+          "description": "Fork effects answered by an identical recording.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "approximate": {
+          "description": "Fork effects answered by a similar recording (same target, different request).",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "synthetic": {
+          "description": "Fork effects with no recording: a stub rule answered, or the effect failed closed.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "live": {
+          "description": "Allowlisted GETs that went out live from the fork.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "confidence": {
+          "description": "exact / (exact + approximate + synthetic + live); 1.0 without effects.",
+          "$ref": "#/$defs/DiffRatio"
+        },
+        "verified_through_lsn": {
+          "description": "The last main LSN whose root inputs ran through the fork's code.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "changed": {
+          "description": "Any difference anywhere in the diff.",
+          "type": "boolean"
+        },
+        "pii_masked": {
+          "description": "In a fork without personal data: differing turns that read pseudonyms instead of personal data, and production turns missing below them. They are not verified: not counted as divergent, errors or causes (M8), and the policy needs at least an approval while pii_masked + pii_unverified is above 0 (pii-masked-needs-approval, ADR 0031). Always written (0 when none); diffs written before v0.1 lack it when 0.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "pii_unverified": {
+          "description": "In a fork without personal data: turns of a kind whose code changed that read pseudonyms and came out identical to production. They did not run on the real values either, so they count for the approval floor (ADR 0031). 0 in identity replays. Always written; diffs written before v0.1 lack it.",
+          "$ref": "#/$defs/DiffCount"
+        }
+      }
+    },
+    "DiffKind": {
+      "description": "One actor kind's share of the diff: the counts of `summary`, `responses`, `effects`, `state` and `errors` over that kind's turns and actors.",
+      "type": "object",
+      "required": [
+        "kind",
+        "code",
+        "root_inputs",
+        "turns_prod",
+        "turns_fork",
+        "divergent_turns",
+        "origins",
+        "consequences",
+        "responses",
+        "effects",
+        "actors_changed",
+        "errors"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "description": "The actor kind.",
+          "type": "string"
+        },
+        "code": {
+          "description": "The kind's code in the fork against production's at the fork point; `absent` when neither has code for it (only turns that found no deployed kind ran as it).",
+          "enum": [
+            "changed",
+            "unchanged",
+            "new",
+            "absent"
+          ]
+        },
+        "root_inputs": {
+          "description": "Root inputs of the window addressed to an actor of this kind.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "turns_prod": {
+          "description": "Production turns of this kind in the replayed trees.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "turns_fork": {
+          "description": "Fork turns of this kind in the replayed trees.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "divergent_turns": {
+          "description": "This kind's turns that behave differently, both modes counted once by causal key. The kinds' counts add up to `summary.divergent_turns`.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "origins": {
+          "description": "This kind's differing turns whose input is the same as production's.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "consequences": {
+          "description": "This kind's other differing turns.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "responses": {
+          "description": "HTTP root inputs served by this kind.",
+          "type": "object",
+          "required": [
+            "unchanged",
+            "changed"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "unchanged": {
+              "$ref": "#/$defs/DiffCount"
+            },
+            "changed": {
+              "$ref": "#/$defs/DiffCount"
+            }
+          }
+        },
+        "effects": {
+          "description": "External effect differences of this kind's turns.",
+          "type": "object",
+          "required": [
+            "added",
+            "removed",
+            "changed"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "added": {
+              "$ref": "#/$defs/DiffCount"
+            },
+            "removed": {
+              "$ref": "#/$defs/DiffCount"
+            },
+            "changed": {
+              "$ref": "#/$defs/DiffCount"
+            }
+          }
+        },
+        "actors_changed": {
+          "description": "Actors of this kind whose state differs, in isolated or continuous replay.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "errors": {
+          "description": "Errors of this kind's turns, as in `errors`.",
+          "type": "object",
+          "required": [
+            "introduced",
+            "fixed",
+            "new_orphans",
+            "outcome_unknown"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "introduced": {
+              "$ref": "#/$defs/DiffCount"
+            },
+            "fixed": {
+              "$ref": "#/$defs/DiffCount"
+            },
+            "new_orphans": {
+              "$ref": "#/$defs/DiffCount"
+            },
+            "outcome_unknown": {
+              "$ref": "#/$defs/DiffCount"
+            }
+          }
+        }
+      }
+    },
+    "DiffCause": {
+      "description": "The differences of one actor kind and input.",
+      "type": "object",
+      "required": [
+        "kind",
+        "input",
+        "origins",
+        "consequences",
+        "root_inputs",
+        "samples"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "description": "The actor kind.",
+          "type": "string"
+        },
+        "input": {
+          "description": "The method and route pattern for HTTP (`POST /counter/{key}/{op}`), else `message <name>` or `timer <name>`.",
+          "type": "string"
+        },
+        "origins": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "consequences": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "root_inputs": {
+          "description": "Root inputs whose trees differ here.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "samples": {
+          "description": "Fork turns, at most 5.",
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "$ref": "#/$defs/DiffTurnId"
+          }
+        }
+      }
+    },
+    "DiffGroundingRow": {
+      "description": "How the fork's effects to one target were answered. For crypto and secret reveals `method` and `route` are empty and `host` is the secret's name.",
+      "type": "object",
+      "required": [
+        "kind",
+        "method",
+        "host",
+        "route",
+        "exact",
+        "approximate",
+        "synthetic",
+        "live",
+        "confidence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "description": "The effect kind: `http.fetch`, `foreign.http`, ...",
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "route": {
+          "description": "The path with ids replaced by `{}`.",
+          "type": "string"
+        },
+        "exact": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "approximate": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "synthetic": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "live": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "confidence": {
+          "$ref": "#/$defs/DiffRatio"
+        }
+      }
+    },
+    "DiffResponses": {
+      "description": "HTTP root inputs in isolated replay.",
+      "type": "object",
+      "required": [
+        "unchanged",
+        "changed",
+        "items"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "unchanged": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "changed": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "items": {
+          "description": "The changed responses in root LSN order, at most 200.",
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "$ref": "#/$defs/DiffResponseItem"
+          }
+        }
+      }
+    },
+    "DiffResponseItem": {
+      "type": "object",
+      "required": [
+        "root_lsn",
+        "route",
+        "turn_prod",
+        "turn_fork",
+        "status",
+        "headers",
+        "body"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "root_lsn": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "route": {
+          "description": "The method and route pattern.",
+          "type": "string"
+        },
+        "turn_prod": {
+          "$ref": "#/$defs/DiffTurnId"
+        },
+        "turn_fork": {
+          "description": "Null when the fork gave no response.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiffTurnId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "type": "object",
+          "required": [
+            "prod",
+            "fork"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "prod": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "fork": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        },
+        "headers": {
+          "description": "Headers that differ.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "prod",
+              "fork"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "prod": {
+                "$ref": "#/$defs/DiffValue"
+              },
+              "fork": {
+                "$ref": "#/$defs/DiffValue"
+              }
+            }
+          }
+        },
+        "body": {
+          "description": "When both bodies are JSON, the operations from production's body to the fork's, by JSON Pointer; otherwise one `replace` at the path `\"\"` with each body as text (or base64).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffBodyOp"
+          }
+        }
+      }
+    },
+    "DiffBodyOp": {
+      "type": "object",
+      "required": [
+        "op",
+        "path",
+        "prod",
+        "fork"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "op": {
+          "enum": [
+            "add",
+            "remove",
+            "replace"
+          ]
+        },
+        "path": {
+          "description": "A JSON Pointer (`/a/0/b`); `\"\"` is the whole body.",
+          "type": "string"
+        },
+        "prod": {
+          "$ref": "#/$defs/DiffValue"
+        },
+        "fork": {
+          "$ref": "#/$defs/DiffValue"
+        }
+      }
+    },
+    "DiffEffects": {
+      "description": "External effects that differ.",
+      "type": "object",
+      "required": [
+        "added",
+        "removed",
+        "changed",
+        "items"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "added": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "removed": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "changed": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "items": {
+          "description": "Sorted by kind, host, route, then turn; at most 200.",
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "$ref": "#/$defs/DiffEffectItem"
+          }
+        }
+      }
+    },
+    "DiffEffectItem": {
+      "type": "object",
+      "required": [
+        "change",
+        "kind",
+        "method",
+        "host",
+        "route",
+        "grounding",
+        "turn_prod",
+        "turn_fork",
+        "fields"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "change": {
+          "enum": [
+            "added",
+            "removed",
+            "changed"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "route": {
+          "type": "string"
+        },
+        "grounding": {
+          "description": "How the fork's effect was answered.",
+          "enum": [
+            "exact",
+            "approximate",
+            "synthetic",
+            "live"
+          ]
+        },
+        "turn_prod": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiffTurnId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "turn_fork": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiffTurnId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fields": {
+          "description": "The parts that differ. Secret header values never appear, only their names and version hashes. When the request was recorded under a subject, its url, header and body values appear as `{redacted, subject, hash}` (see DiffValue), like state values.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "field",
+              "prod",
+              "fork"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "field": {
+                "description": "`url`, `method`, `header:<name>` or `body`.",
+                "type": "string"
+              },
+              "prod": {
+                "$ref": "#/$defs/DiffValue"
+              },
+              "fork": {
+                "$ref": "#/$defs/DiffValue"
+              }
+            }
+          }
+        }
+      }
+    },
+    "DiffState": {
+      "type": "object",
+      "required": [
+        "isolated",
+        "continuous"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "isolated": {
+          "description": "The writes of each root input's tree that differ, at most 200 entries.",
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "required": [
+              "root_lsn",
+              "actor",
+              "keys",
+              "sql"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "root_lsn": {
+                "$ref": "#/$defs/DiffCount"
+              },
+              "actor": {
+                "description": "`<kind>/<key>`.",
+                "type": "string"
+              },
+              "keys": {
+                "type": "array",
+                "maxItems": 200,
+                "items": {
+                  "$ref": "#/$defs/DiffKeyChange"
+                }
+              },
+              "sql": {
+                "type": "array",
+                "maxItems": 200,
+                "items": {
+                  "$ref": "#/$defs/DiffSqlChange"
+                }
+              }
+            }
+          }
+        },
+        "continuous": {
+          "description": "Each actor's final state that differs: the fork's store against production at `to_lsn`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffActorState"
+          }
+        }
+      }
+    },
+    "DiffActorState": {
+      "type": "object",
+      "required": [
+        "actor",
+        "keys",
+        "sql"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "actor": {
+          "description": "`<kind>/<key>`.",
+          "type": "string"
+        },
+        "keys": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "$ref": "#/$defs/DiffKeyChange"
+          }
+        },
+        "sql": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "$ref": "#/$defs/DiffSqlChange"
+          }
+        }
+      }
+    },
+    "DiffKeyChange": {
+      "type": "object",
+      "required": [
+        "key",
+        "op",
+        "prod",
+        "fork"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "op": {
+          "description": "What the fork did to the key; `unchanged-missing` when it did not write a key that production wrote.",
+          "enum": [
+            "set",
+            "delete",
+            "unchanged-missing"
+          ]
+        },
+        "prod": {
+          "$ref": "#/$defs/DiffValue"
+        },
+        "fork": {
+          "$ref": "#/$defs/DiffValue"
+        }
+      }
+    },
+    "DiffSqlChange": {
+      "description": "A row change. The values of a subject's row (a changeset with a subject, or a `_subject` column in the final state) appear as `[redacted:s:<12 hex>:k:<16 hex>]` (see DiffValue).",
+      "type": "object",
+      "required": [
+        "table",
+        "op",
+        "pk",
+        "prod",
+        "fork"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "table": {
+          "type": "string"
+        },
+        "op": {
+          "enum": [
+            "insert",
+            "update",
+            "delete"
+          ]
+        },
+        "pk": {
+          "description": "The primary key's values.",
+          "type": "array"
+        },
+        "prod": {
+          "$ref": "#/$defs/DiffValue"
+        },
+        "fork": {
+          "$ref": "#/$defs/DiffValue"
+        }
+      }
+    },
+    "DiffCumulative": {
+      "description": "Differences only continuous replay shows: actors whose final state differs although no single isolated tree explains it, or whose drift grows.",
+      "type": "object",
+      "required": [
+        "actors_changed",
+        "items"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "actors_changed": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "items": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "$ref": "#/$defs/DiffActorState"
+          }
+        }
+      }
+    },
+    "DiffErrors": {
+      "type": "object",
+      "required": [
+        "introduced",
+        "fixed",
+        "new_orphans",
+        "outcome_unknown",
+        "items"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "introduced": {
+          "description": "Fork turns that fail where production committed, and new turns that fail.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "fixed": {
+          "description": "Turns that committed in the fork but failed in production.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "new_orphans": {
+          "description": "Orphaned calls the fork created and production did not.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "outcome_unknown": {
+          "description": "Fork effects matched to a production effect whose outcome was unknown.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "items": {
+          "description": "At most 20 per kind.",
+          "type": "array",
+          "maxItems": 80,
+          "items": {
+            "$ref": "#/$defs/DiffErrorItem"
+          }
+        }
+      }
+    },
+    "DiffErrorItem": {
+      "type": "object",
+      "required": [
+        "kind",
+        "error_code",
+        "message",
+        "turn_prod",
+        "turn_fork",
+        "input"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "introduced",
+            "fixed",
+            "new_orphan",
+            "outcome_unknown"
+          ]
+        },
+        "error_code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "turn_prod": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiffTurnId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "turn_fork": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiffTurnId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "input": {
+          "description": "The turn's input, as in `causes`.",
+          "type": "string"
+        }
+      }
+    },
+    "DiffResources": {
+      "description": "Fuel and memory of matched turns.",
+      "type": "object",
+      "required": [
+        "fuel",
+        "memory",
+        "fuel_p99_change",
+        "memory_p99_change"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "fuel": {
+          "$ref": "#/$defs/DiffProdForkPercentiles"
+        },
+        "memory": {
+          "$ref": "#/$defs/DiffProdForkPercentiles"
+        },
+        "fuel_p99_change": {
+          "description": "(fork - prod) / prod at p99; 0.0 when prod is 0.",
+          "type": "number"
+        },
+        "memory_p99_change": {
+          "description": "(fork - prod) / prod at p99; 0.0 when prod is 0.",
+          "type": "number"
+        }
+      }
+    },
+    "DiffProdForkPercentiles": {
+      "type": "object",
+      "required": [
+        "prod",
+        "fork"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "prod": {
+          "$ref": "#/$defs/DiffPercentiles"
+        },
+        "fork": {
+          "$ref": "#/$defs/DiffPercentiles"
+        }
+      }
+    },
+    "DiffPercentiles": {
+      "type": "object",
+      "required": [
+        "p50",
+        "p95",
+        "p99"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "p50": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "p95": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "p99": {
+          "$ref": "#/$defs/DiffCount"
+        }
+      }
+    },
+    "DiffSamples": {
+      "description": "Fork turns per category, at most 20 each, for `kronik trace`.",
+      "type": "object",
+      "required": [
+        "origins",
+        "consequences",
+        "responses_changed",
+        "effects_changed",
+        "errors_introduced",
+        "synthetic"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "origins": {
+          "$ref": "#/$defs/DiffSampleList"
+        },
+        "consequences": {
+          "$ref": "#/$defs/DiffSampleList"
+        },
+        "responses_changed": {
+          "$ref": "#/$defs/DiffSampleList"
+        },
+        "effects_changed": {
+          "$ref": "#/$defs/DiffSampleList"
+        },
+        "errors_introduced": {
+          "$ref": "#/$defs/DiffSampleList"
+        },
+        "synthetic": {
+          "$ref": "#/$defs/DiffSampleList"
+        },
+        "pii_masked": {
+          "description": "Turns counted in `summary.pii_masked`. Absent when empty.",
+          "$ref": "#/$defs/DiffSampleList"
+        }
+      }
+    },
+    "DiffSampleList": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "$ref": "#/$defs/DiffTurnId"
+      }
+    }
+  }
+}

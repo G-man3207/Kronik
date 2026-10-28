@@ -1,0 +1,22 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# Determinism hygiene for daemon code (ADR 0004 §3 and §6). The production
+# Env implementations, the hyper servers, the binary and test harnesses opt
+# out per module with a justified #[allow]. `allow-invalid`: tokio's runtime
+# items only exist in crates that enable those features.
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "daemon code reads time from Env::clock (ADR 0004)" },
+    { path = "std::time::Instant::now", reason = "daemon code reads time from Env::clock (ADR 0004)" },
+    { path = "std::thread::spawn", reason = "use Env::spawn or Env::blocking (ADR 0004)" },
+    { path = "tokio::spawn", reason = "use Env::spawn (ADR 0004)", allow-invalid = true },
+    { path = "tokio::task::spawn", reason = "use Env::spawn (ADR 0004)", allow-invalid = true },
+    { path = "tokio::task::spawn_blocking", reason = "use Env::blocking (ADR 0004)", allow-invalid = true },
+    { path = "tokio::time::sleep", reason = "use Env::clock (ADR 0004)", allow-invalid = true },
+    { path = "tokio::time::timeout", reason = "use Env::timeout (ADR 0004)", allow-invalid = true },
+    { path = "getrandom::fill", reason = "use Env::entropy (ADR 0004)" },
+]
+disallowed-types = [
+    { path = "tokio::sync::watch::Sender", reason = "watch wakes in an order chosen by tokio's thread-local RNG (ADR 0004)", allow-invalid = true },
+    { path = "tokio::sync::watch::Receiver", reason = "watch wakes in an order chosen by tokio's thread-local RNG (ADR 0004)", allow-invalid = true },
+]

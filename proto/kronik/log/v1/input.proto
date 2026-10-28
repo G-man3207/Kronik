@@ -1,0 +1,104 @@
+// Kronik log format v1: turn inputs. See common.proto for the format rules.
+syntax = "proto3";
+
+package kronik.log.v1;
+
+import "kronik/log/v1/common.proto";
+
+// The input of a turn (`input` in the WIT). Exactly one case must be set.
+message Input {
+  oneof kind {
+    HttpInput http = 1;
+    MessageInput message = 2;
+    TimerInput timer = 3;
+    MigrateInput migrate = 4;
+  }
+}
+
+// A root input from the gateway.
+message HttpInput {
+  string method = 1;
+  // For a request with a subject these three are empty and the request's
+  // path, query and parameter values are in the sealable fields below
+  // (I9: the subject's data can be sealed and erased). Records from before
+  // those fields have them here, plain.
+  string path = 2;
+  string query = 3;
+  // Route parameters, in pattern order.
+  repeated Param params = 4;
+  repeated Header headers = 5;
+  Body body = 6;
+  // The matched route pattern, e.g. "/counter/{key}/increment".
+  string route = 7;
+  // Ingress `Idempotency-Key`, empty when absent. The dedup state in
+  // `ingress_keys` is derived from this field (it is history, I5).
+  string idempotency_key = 8;
+  // Set when `idempotency_key` is set, to detect IDEMPOTENCY_KEY_REUSED.
+  // A version byte and a hash, keyed with a master-derived key, of the
+  // method, path, query, body and requester (a saved response is replayed
+  // only to the same requester). v3: the requester is the subject, else the
+  // `Authorization` value. Saved rows of v2 (also cookie values) and v1
+  // (32 bytes, no requester) count as expired.
+  bytes request_hash = 9;
+  // The path and query of a request with a subject (tagged like its
+  // headers and body), instead of `path` and `query`.
+  Sealable sealed_path = 10;
+  Sealable sealed_query = 11;
+}
+
+message Param {
+  string name = 1;
+  // Empty for a request with a subject: the value is in `sealed_value`.
+  string value = 2;
+  Sealable sealed_value = 3;
+}
+
+enum MessageSource {
+  MESSAGE_SOURCE_UNSPECIFIED = 0;
+  // `send` from another actor's committed turn.
+  MESSAGE_SOURCE_ACTOR = 1;
+  // `kronik send` (root input).
+  MESSAGE_SOURCE_OPERATOR = 2;
+  // `kronik dead-letters resend` (root input).
+  MESSAGE_SOURCE_DEAD_LETTER_RESEND = 3;
+  // A compensation for a successful `call` whose caller failed (M2).
+  MESSAGE_SOURCE_COMPENSATION = 4;
+  // The callee side of `call` (M2).
+  MESSAGE_SOURCE_CALL = 5;
+}
+
+message MessageInput {
+  MessageSource source = 1;
+  // Unset for operator messages and resends.
+  ActorRef sender = 2;
+  Message msg = 3;
+  // Dedup id: hex(blake3(sender causal key + ordinal)); for root inputs the
+  // root id. `deliveries` and the mailbox are keyed by it.
+  string message_id = 4;
+  // Logical time of the producing turn (I15: the receiver never runs earlier).
+  uint64 sent_logical_time_ms = 5;
+  // For resends: the turn id ("<branch>:<lsn>") of the failed turn.
+  string resend_of = 6;
+  // Who sent it, for operator messages and resends.
+  Audit audit = 7;
+  // Actors waiting in `call` on this causal chain (source CALL), for cycle
+  // detection.
+  repeated ActorRef call_chain = 8;
+  // For compensations and their resends: the message id of the call being
+  // compensated.
+  string compensates = 9;
+}
+
+message TimerInput {
+  uint64 timer_id = 1;
+  Message msg = 2;
+  // Logical due time; the turn's logical time is at least this (I15).
+  uint64 due_ms = 3;
+  // The turn id of the turn that scheduled it.
+  string scheduled_by = 4;
+}
+
+message MigrateInput {
+  uint32 from_schema_version = 1;
+  uint32 to_schema_version = 2;
+}

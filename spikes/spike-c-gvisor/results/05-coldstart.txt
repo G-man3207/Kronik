@@ -1,0 +1,37 @@
+# 05-coldstart on travelfiesta at 2026-10-25T00:14:38Z, runsc version release-20261019.0, bridge pf
+bridge=hostuds-shim iter=1 run_ms=117 ready_ms=162.8 attempts=1 target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock delete_ms=22
+bridge=portforward-local iter=1 run_ms=126 ready_ms=146.1 attempts=9 target=tcp:127.0.0.1:18080 delete_ms=26
+bridge=portforward-stream iter=1 run_ms=99 ready_ms=117.4 attempts=1 target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 delete_ms=18
+bridge=hostuds-shim iter=2 run_ms=90 ready_ms=128.6 attempts=1 target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock delete_ms=19
+bridge=portforward-local iter=2 run_ms=113 ready_ms=147.0 attempts=9 target=tcp:127.0.0.1:18080 delete_ms=24
+bridge=portforward-stream iter=2 run_ms=102 ready_ms=140.2 attempts=1 target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 delete_ms=16
+bridge=hostuds-shim iter=3 run_ms=87 ready_ms=130.5 attempts=4 target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock delete_ms=29
+bridge=portforward-local iter=3 run_ms=94 ready_ms=112.4 attempts=10 target=tcp:127.0.0.1:18080 delete_ms=11
+bridge=portforward-stream iter=3 run_ms=106 ready_ms=122.7 attempts=1 target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 delete_ms=13
+bridge=hostuds-shim iter=4 run_ms=128 ready_ms=173.0 attempts=1 target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock delete_ms=22
+bridge=portforward-local iter=4 run_ms=93 ready_ms=116.5 attempts=11 target=tcp:127.0.0.1:18080 delete_ms=16
+bridge=portforward-stream iter=4 run_ms=96 ready_ms=111.6 attempts=1 target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 delete_ms=16
+bridge=hostuds-shim iter=5 run_ms=115 ready_ms=160.5 attempts=4 target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock delete_ms=20
+bridge=portforward-local iter=5 run_ms=114 ready_ms=134.6 attempts=9 target=tcp:127.0.0.1:18080 delete_ms=17
+bridge=portforward-stream iter=5 run_ms=101 ready_ms=121.5 attempts=1 target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 delete_ms=19
+bridge=hostuds-shim iter=6 run_ms=70 ready_ms=101.6 attempts=1 target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock delete_ms=15
+bridge=portforward-local iter=6 run_ms=136 ready_ms=160.9 attempts=7 target=tcp:127.0.0.1:18080 delete_ms=16
+bridge=portforward-stream iter=6 run_ms=95 ready_ms=107.6 attempts=1 target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 delete_ms=20
+bridge=hostuds-shim iter=7 run_ms=89 ready_ms=124.3 attempts=1 target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock delete_ms=18
+bridge=portforward-local iter=7 run_ms=110 ready_ms=129.0 attempts=9 target=tcp:127.0.0.1:18080 delete_ms=21
+bridge=portforward-stream iter=7 run_ms=107 ready_ms=123.2 attempts=1 target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 delete_ms=15
+bridge=hostuds-shim iter=8 run_ms=98 ready_ms=152.8 attempts=1 target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock delete_ms=22
+bridge=portforward-local iter=8 run_ms=114 ready_ms=130.2 attempts=6 target=tcp:127.0.0.1:18080 delete_ms=12
+bridge=portforward-stream iter=8 run_ms=126 ready_ms=150.4 attempts=1 target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 delete_ms=23
+bridge=hostuds-shim iter=9 run_ms=107 ready_ms=159.8 attempts=1 target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock delete_ms=18
+bridge=portforward-local iter=9 run_ms=82 ready_ms=97.0 attempts=7 target=tcp:127.0.0.1:18080 delete_ms=17
+bridge=portforward-stream iter=9 run_ms=111 ready_ms=125.0 attempts=1 target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 delete_ms=13
+bridge=hostuds-shim iter=10 run_ms=96 ready_ms=130.7 attempts=3 target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock delete_ms=18
+bridge=portforward-local iter=10 run_ms=130 ready_ms=155.0 attempts=7 target=tcp:127.0.0.1:18080 delete_ms=21
+bridge=portforward-stream iter=10 run_ms=115 ready_ms=135.1 attempts=1 target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 delete_ms=18
+
+=== Summary over 10 starts, milliseconds (run_ms: runsc run --detach incl. netns setup; ready_ms: until the first 200)
+bridge                run p50  ready min  ready p50  ready max  delete p50
+hostuds-shim               97      101.6      141.8      173.0          20
+portforward-local         114       97.0      132.4      160.9          17
+portforward-stream        104      107.6      123.0      150.4          17

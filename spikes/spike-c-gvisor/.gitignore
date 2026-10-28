@@ -1,0 +1,2 @@
+# Built binaries, staged layers and the OCI layout (scripts/build.sh).
+/out/

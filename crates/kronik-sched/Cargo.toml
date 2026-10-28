@@ -1,0 +1,35 @@
+[package]
+name = "kronik-sched"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+bytes = { workspace = true }
+kronik-core = { workspace = true }
+kronik-metrics = { workspace = true }
+kronik-effects = { workspace = true }
+kronik-privacy = { workspace = true }
+kronik-log = { workspace = true }
+kronik-proto = { workspace = true }
+kronik-runtime = { workspace = true }
+kronik-store = { workspace = true }
+prost = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+kronik-effects = { workspace = true }
+kronik-core = { workspace = true, features = ["real"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

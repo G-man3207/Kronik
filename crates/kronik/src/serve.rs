@@ -1,0 +1,488 @@
+//! `kronik serve`: opens the data directory, recovers from the log, and
+//! serves the gateway on TCP and the API on the Unix socket. Settings come
+//! from `kronik.toml` ([`crate::config`]); the flags override it.
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context as _;
+use clap::Args;
+use kronik_api::Api;
+use kronik_core::env::Env;
+use kronik_gateway::{Gateway, GatewayConfig};
+use kronik_sched::{NodeConfig, start_local};
+
+use crate::config::{Config, Overrides};
+
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// The configuration file [default: /etc/kronik/kronik.toml if it
+    /// exists]. The flags below override it.
+    #[arg(long, value_name = "PATH", env = "KRONIK_CONFIG")]
+    config: Option<PathBuf>,
+    /// Data directory (code, logs, materialized state) [file: server.data_dir].
+    #[arg(long, env = "KRONIK_DATA_DIR")]
+    data_dir: Option<PathBuf>,
+    /// Address of the HTTP gateway [file: server.http_listen].
+    #[arg(long, env = "KRONIK_HTTP_LISTEN")]
+    http_listen: Option<SocketAddr>,
+    /// Address of /metrics and /healthz [file: server.admin_listen].
+    #[arg(long, env = "KRONIK_ADMIN_LISTEN")]
+    admin_listen: Option<SocketAddr>,
+    /// Unix socket of the JSON API, mode 0660 [file: server.api_socket].
+    #[arg(long, env = "KRONIK_API_SOCKET")]
+    api_socket: Option<PathBuf>,
+    /// Address of the JSON API and MCP over TCP, where every request needs a
+    /// bearer token; off when absent. Without TLS only a loopback address
+    /// [file: server.api_listen].
+    #[arg(long, env = "KRONIK_API_LISTEN")]
+    api_listen: Option<SocketAddr>,
+    /// Gateway timeout in milliseconds; a slower turn gives 504 and still
+    /// completes [file: gateway.timeout].
+    #[arg(long)]
+    gateway_timeout_ms: Option<u64>,
+    /// Turns running at once.
+    #[arg(long, default_value_t = 64)]
+    concurrency: usize,
+    /// Master key of the secret store, created with mode 0600 if missing
+    /// [file: keys.master_key_file]. `KRONIK_MASTER_KEY`, when set, holds
+    /// the key itself (64 hex characters) and no file is read or created;
+    /// setting both is an error.
+    #[arg(long, env = "KRONIK_MASTER_KEY_FILE")]
+    master_key_file: Option<PathBuf>,
+    /// Below this much free space on the log's file system, new inputs and
+    /// changes are refused, e.g. `512MiB`; `0B` turns it off [file:
+    /// log.disk_reserve].
+    #[arg(long, value_name = "SIZE", env = "KRONIK_DISK_RESERVE")]
+    disk_reserve: Option<crate::config::Size>,
+    /// Test hook: callers stop after the callee answered and before the
+    /// result is recorded, so a crash test can kill the daemon there.
+    #[arg(long, hide = true)]
+    test_hold_after_call: bool,
+    /// Test hook: a registry (`host:port`) that foreign images are pulled
+    /// from over plain HTTP. Repeatable.
+    #[arg(long, hide = true, value_name = "HOST:PORT")]
+    test_insecure_registry: Vec<String>,
+    /// Log lines as text or as JSON objects (one per line).
+    #[arg(long, value_enum, default_value_t = LogFormat::Text, env = "KRONIK_LOG_FORMAT")]
+    log_format: LogFormat,
+    #[command(flatten)]
+    init: crate::init::InitArgs,
+}
+
+impl ServeArgs {
+    /// The configuration file, if any, with the flags in place.
+    fn config(&self) -> anyhow::Result<Config> {
+        let (config, _file) = Config::find(self.config.as_deref())?;
+        Ok(config.with(Overrides {
+            data_dir: self.data_dir.clone(),
+            api_socket: self.api_socket.clone(),
+            http_listen: self.http_listen,
+            admin_listen: self.admin_listen,
+            api_listen: self.api_listen,
+            gateway_timeout: self.gateway_timeout_ms.map(Duration::from_millis),
+            master_key_file: self.master_key_file.clone(),
+            disk_reserve: self.disk_reserve,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+/// KRONIK_LOG's filter, `info` without one.
+fn log_filter(spec: Option<&str>) -> tracing_subscriber::EnvFilter {
+    spec.and_then(|s| tracing_subscriber::EnvFilter::try_new(s).ok())
+        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info"))
+}
+
+/// `rmcp` at info at most, whatever KRONIK_LOG says: it logs MCP arguments
+/// and results at debug, unsealed values for a `pii:read` caller included.
+/// A layer of its own, so that no KRONIK_LOG directive can override it.
+fn rmcp_at_info(meta: &tracing::Metadata<'_>) -> bool {
+    !(meta.target().starts_with("rmcp") && *meta.level() > tracing::Level::INFO)
+}
+
+/// The subscriber `kronik serve` logs through: KRONIK_LOG's filter (`spec`),
+/// then [`rmcp_at_info`] over it.
+fn log_subscriber(
+    format: LogFormat,
+    spec: Option<&str>,
+) -> Box<dyn tracing::Subscriber + Send + Sync> {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(log_filter(spec))
+        .with_writer(std::io::stderr);
+    let cap = tracing_subscriber::filter::filter_fn(rmcp_at_info);
+    match format {
+        LogFormat::Text => Box::new(builder.finish().with(cap)),
+        LogFormat::Json => Box::new(builder.json().finish().with(cap)),
+    }
+}
+
+fn init_tracing(format: LogFormat) {
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    log_subscriber(format, std::env::var("KRONIK_LOG").ok().as_deref()).init();
+}
+
+pub fn run(args: ServeArgs) -> anyhow::Result<()> {
+    init_tracing(args.log_format);
+    if args.init.init {
+        return crate::init::run_init(&args.init, args.config.as_deref());
+    }
+    let config = args.config()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("kronik")
+        .build()
+        .context("starting the tokio runtime")?;
+    rt.block_on(serve(args, config))
+}
+
+/// The foreign actors' settings of `config` (serve and `foreign cleanup`).
+pub(crate) fn foreign_config(
+    config: &Config,
+    data_dir: PathBuf,
+    insecure_registries: Vec<String>,
+) -> kronik_foreign::ForeignConfig {
+    kronik_foreign::ForeignConfig {
+        data_dir,
+        run_dir: config.foreign.run_dir.clone(),
+        runsc_path: config.foreign.runsc_path.clone(),
+        platform: match config.foreign.platform {
+            crate::config::Platform::Auto => kronik_foreign::Platform::Auto,
+            crate::config::Platform::Systrap => kronik_foreign::Platform::Systrap,
+            crate::config::Platform::Kvm => kronik_foreign::Platform::Kvm,
+        },
+        insecure_registries,
+        layout_dirs: config.foreign.layout_dirs.clone(),
+        pull_timeout: config.foreign.pull_timeout.0,
+    }
+}
+
+/// The data directory is the daemon's alone (0700). With the API socket
+/// inside it, the group may pass through to the socket (0710), whose own
+/// mode (0660) then decides.
+fn restrict_data_dir(data_dir: &Path, api_socket: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating {}", data_dir.display()))?;
+    // The socket's directory may not exist yet: then its absolute path, so
+    // that a relative --api-socket still compares with the data directory.
+    let canonical = |p: &Path| {
+        std::fs::canonicalize(p)
+            .or_else(|_| std::path::absolute(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    let inside = api_socket
+        .parent()
+        .is_some_and(|dir| canonical(dir).starts_with(canonical(data_dir)));
+    let mode = if inside { 0o710 } else { 0o700 };
+    std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting the mode of {}", data_dir.display()))
+}
+
+/// Raises the soft limit on open files to the hard one, and returns the
+/// limit in force.
+fn raise_open_files() -> usize {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    if let Rlimit {
+        current: Some(soft),
+        maximum: Some(hard),
+    } = getrlimit(Resource::Nofile)
+        && soft < hard
+    {
+        let raised = Rlimit {
+            current: Some(hard),
+            maximum: Some(hard),
+        };
+        if let Err(e) = setrlimit(Resource::Nofile, raised) {
+            tracing::warn!(error = %e, soft, hard, "could not raise the limit on open files");
+        }
+    }
+    let limit = getrlimit(Resource::Nofile).current.unwrap_or(u64::MAX);
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
+/// The gateway's and the TCP API's connection caps under a limit of
+/// `open_files`. Half the limit, at most 1 024, stays with the node: log
+/// segments, `state.db`, open actor databases with their WAL files, the
+/// key stores, snapshots and foreign actors. Of the rest the gateway gets
+/// three quarters, at most 1 024, and the TCP API a quarter, at most 256;
+/// at least 16 and 4. Connections then cannot take the descriptors the log
+/// needs to roll a segment.
+fn connection_caps(open_files: usize) -> (usize, usize) {
+    let reserved = (open_files / 2).min(1024);
+    let spare = open_files.saturating_sub(reserved) / 4;
+    ((spare * 3).clamp(16, 1024), spare.clamp(4, 256))
+}
+
+async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
+    // No core dumps or ptrace by other users: the process holds the master
+    // key, secrets and plain subject data (PR_SET_DUMPABLE 0).
+    if let Err(e) =
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+    {
+        tracing::warn!(error = %e, "could not make the process non-dumpable");
+    }
+    let open_files = raise_open_files();
+    let (gateway_connections, api_connections) = connection_caps(open_files);
+    // A flag can set it too, so the file's check is not enough.
+    let api_listen = config.api_listen().map_err(anyhow::Error::msg)?;
+    // The master key is the KRONIK_MASTER_KEY material, or a key file (the
+    // flag, KRONIK_MASTER_KEY_FILE or [keys] master_key_file). Both set is
+    // ambiguous, so refuse to start rather than silently pick one.
+    if config.keys.master_key_file.is_some()
+        && std::env::var_os(kronik_privacy::MASTER_KEY_ENV).is_some()
+    {
+        anyhow::bail!(
+            "KRONIK_MASTER_KEY and a master key file (--master-key-file, \
+             KRONIK_MASTER_KEY_FILE or [keys] master_key_file) are both \
+             set; remove one of them"
+        );
+    }
+    let env = Env::real(tokio::runtime::Handle::current());
+    let data_dir = config.server.data_dir.clone();
+    restrict_data_dir(&data_dir, &config.server.api_socket)?;
+    // Foreign actors (M7): the node starts them after recovering the log and
+    // before re-running open turns; they stop when the daemon stops.
+    let foreign = kronik_foreign::Foreign::new(
+        env.clone(),
+        foreign_config(
+            &config,
+            data_dir.clone(),
+            args.test_insecure_registry.clone(),
+        ),
+    );
+    let node_config = NodeConfig {
+        foreign: kronik_effects::foreign::ForeignSlot(Some(Arc::new(kronik_foreign::Host(
+            foreign.clone(),
+        )))),
+        concurrency: args.concurrency.max(1),
+        master_key_file: Some(config.master_key_file()),
+        storage: Some(kronik_sched::snapshots::StorageConfig {
+            data_dir: data_dir.clone(),
+            snapshot_interval: config.retention.snapshot_interval.0,
+            snapshots_kept: config.retention.snapshots_kept as usize,
+            history: config.retention.history.0,
+        }),
+        ingress_ttl: config.gateway.idempotency_ttl.0,
+        segment_max_bytes: Some(config.log.segment_max_mb * 1024 * 1024),
+        segment_max_age: Some(Duration::from_secs(config.log.segment_max_age_s)),
+        group_commit_window: Some(Duration::from_millis(config.log.group_commit_ms)),
+        test_hold_after_call: args.test_hold_after_call,
+        keystore_backup_retention: config.privacy.keystore_backup_retention.0,
+        sql_bytes_per_actor: config.sql.max_size_per_actor.0,
+        disk_reserve: config.log.disk_reserve.0,
+        ..NodeConfig::default()
+    };
+    let node = start_local(env.clone(), &data_dir, node_config)
+        .await
+        .with_context(|| format!("recovering {}", data_dir.display()))?;
+    // Shipping to object storage (m6-storage §4), when enabled.
+    if config.ship.enabled {
+        let url = config
+            .ship
+            .url
+            .as_deref()
+            .context("[ship] enabled needs url = \"s3://bucket/prefix\"")?;
+        let remote = kronik_ship::Remote::open(url, config.ship.endpoint.as_deref())?;
+        tracing::info!(url, "shipping to object storage");
+        drop(env.spawn(
+            "ship",
+            kronik_ship::ship_loop(
+                env.clone(),
+                remote,
+                data_dir.clone(),
+                "main".into(),
+                kronik_ship::SHIP_INTERVAL,
+                config.master_key_file(),
+            ),
+        ));
+    }
+    let gateway = Arc::new(Gateway::new(
+        node.clone(),
+        GatewayConfig {
+            timeout: config.gateway.timeout.0,
+            subject_from: config.subject_from(),
+            idempotency_header: config.gateway.idempotency_header.clone(),
+            // Checked when the configuration was read.
+            trusted_proxies: config
+                .gateway
+                .trusted_proxies
+                .iter()
+                .filter_map(|p| kronik_gateway::IpNet::parse(p).ok())
+                .collect(),
+            ..GatewayConfig::default()
+        },
+    ));
+    let tls = config
+        .certificates()
+        .map(kronik_gateway::tls::start)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("gateway TLS: {e}"))?;
+    let http_listen = config.http_listen();
+    let tcp = tokio::net::TcpListener::bind(http_listen)
+        .await
+        .with_context(|| format!("binding the gateway on {http_listen}"))?;
+    let bound = tcp.local_addr().unwrap_or(http_listen);
+    let proposals = kronik_fork::proposal::Proposals::open(node.clone(), data_dir.clone())
+        .map_err(|e| anyhow::anyhow!("loading proposals: {}", e.message))?
+        .with_live_allowlist(config.fork.live_allowlist.clone())
+        .with_promote(config.promote.max_gap.0, config.promote.catch_up_timeout.0);
+    let tokens_db = data_dir.join("keys").join("tokens.db");
+    let tokens =
+        kronik_api::tokens::TokenStore::open_file(&tokens_db).map_err(anyhow::Error::msg)?;
+    let api = Arc::new(
+        Api::new(node.clone())
+            .with_http_listen(bound.to_string())
+            .with_proposals(Arc::new(proposals))
+            .with_tokens(Arc::new(tokens))
+            .with_foreign(foreign.clone()),
+    );
+    let api_socket = &config.server.api_socket;
+    let unix = kronik_api::server::bind(api_socket)
+        .with_context(|| format!("binding the API on {}", api_socket.display()))?;
+    let api_tcp = match api_listen {
+        Some(addr) => Some(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding the API on {addr}"))?,
+        ),
+        None => None,
+    };
+    let api_tcp_bound = api_tcp
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok());
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
+    tracing::info!(
+        http = %bound,
+        api = %api_socket.display(),
+        api_tcp = ?api_tcp_bound,
+        data = %data_dir.display(),
+        engine = kronik_runtime::ENGINE_VERSION,
+        applied_lsn = node.applied_lsn(),
+        open_files,
+        gateway_connections,
+        api_connections,
+        "kronik is serving"
+    );
+    let mcp = kronik_mcp::mount(api.clone());
+    let api_tcp = {
+        let (api, mcp, tls) = (
+            api.clone(),
+            kronik_mcp::mount_for_tcp(api.clone()),
+            tls.clone(),
+        );
+        async move {
+            match api_tcp {
+                Some(listener) => {
+                    kronik_api::server::serve_tcp(listener, api, Some(mcp), tls, api_connections)
+                        .await
+                }
+                None => std::future::pending().await,
+            }
+        }
+    };
+    // /metrics and /healthz are auxiliary: without the port, Kronik serves
+    // anyway and says why.
+    let admin_listen = config.server.admin_listen;
+    let admin = match tokio::net::TcpListener::bind(admin_listen).await {
+        Ok(listener) => Some(listener),
+        Err(e) => {
+            tracing::warn!(admin = %admin_listen, error = %e, "no /metrics and /healthz: cannot bind the admin listener");
+            None
+        }
+    };
+    let admin = async {
+        match admin {
+            Some(listener) => crate::admin::serve(listener, node.clone()).await,
+            None => std::future::pending().await,
+        }
+    };
+    let mut stopping = false;
+    let served = tokio::select! {
+        biased;
+        msg = node.wait_fatal() => Err(anyhow::anyhow!("storage failure: {msg}")),
+        r = kronik_gateway::server::serve_with_tls(tcp, gateway, tls, gateway_connections) => r.context("gateway listener failed"),
+        r = kronik_api::server::serve_with(unix, api, Some(mcp)) => r.context("API listener failed"),
+        r = api_tcp => r.context("TCP API listener failed"),
+        r = admin => r.context("admin listener failed"),
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("interrupted; stopping");
+            stopping = true;
+            Ok(())
+        }
+        _ = term.recv() => {
+            tracing::info!("SIGTERM; stopping");
+            stopping = true;
+            Ok(())
+        }
+    };
+    // A controlled shutdown leaves a snapshot when something happened since
+    // the newest one (the listeners are closed: their futures were dropped
+    // with the select).
+    if stopping {
+        match node.shutdown_snapshot().await {
+            Ok(Some(m)) => tracing::info!(lsn = m.lsn, "shutdown snapshot taken"),
+            Ok(None) => tracing::info!("no shutdown snapshot: nothing new since the newest one"),
+            Err(e) => tracing::warn!(error = %e.message, "shutdown snapshot failed"),
+        }
+    }
+    // Sandboxes never outlive the daemon (docs/design/m7-foreign.md §5).
+    foreign.shutdown().await;
+    served
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing::Level;
+
+    /// Runs `f` with each subscriber `kronik serve` can make for
+    /// KRONIK_LOG=`spec`.
+    fn with_filter(spec: &str, f: impl Fn()) {
+        for format in [super::LogFormat::Text, super::LogFormat::Json] {
+            tracing::subscriber::with_default(super::log_subscriber(format, Some(spec)), &f);
+        }
+    }
+
+    #[test]
+    fn rmcp_logs_at_info_at_most_whatever_kronik_log_says() {
+        for spec in [
+            "debug",
+            "trace",
+            "info",
+            "debug,rmcp::service=debug",
+            "rmcp=trace",
+        ] {
+            with_filter(spec, || {
+                assert!(
+                    !tracing::enabled!(target: "rmcp::service", Level::DEBUG),
+                    "{spec}"
+                );
+                assert!(
+                    tracing::enabled!(target: "rmcp::service", Level::INFO),
+                    "{spec}"
+                );
+            });
+        }
+        with_filter("debug", || {
+            assert!(tracing::enabled!(target: "kronik_api::server", Level::DEBUG));
+        });
+    }
+
+    #[test]
+    fn connections_leave_the_node_its_descriptors() {
+        assert_eq!(super::connection_caps(65_536), (1024, 256));
+        assert_eq!(super::connection_caps(2048), (768, 256));
+        assert_eq!(super::connection_caps(1024), (384, 128));
+        assert_eq!(super::connection_caps(256), (96, 32));
+        assert_eq!(super::connection_caps(32), (16, 4));
+    }
+}

@@ -1,0 +1,41 @@
+# 13-alternatives on travelfiesta at 2026-10-25T00:21:13Z, runsc version release-20261019.0, bridge pf
+
+=== port-forward with --network=none
+response: (connection closed without a response)
+runsc port-forward --stream exit 128: doStream: PortForward: port forwarding to sandbox: unsupported network type "none" for container "kronik-echo"
+W1025 00:21:13.820940       1 urpc.go:385] urpc: RPC call for method containerManager.PortForward failed: unsupported network type "none" for container "kronik-echo"
+
+=== port-forward with --network=sandbox in a namespace that runsc creates (lo down)
+lo               DOWN           00:00:00:00:00:00 <LOOPBACK> 
+response: (connection closed without a response)
+runsc port-forward --stream exit 128: doStream: PortForward: port forwarding to sandbox: creating netstack port forward connection: connecting endpoint: network is unreachable
+W1025 00:21:14.086454       1 urpc.go:385] urpc: RPC call for method containerManager.PortForward failed: creating netstack port forward connection: connecting endpoint: network is unreachable
+
+=== port-forward with --network=sandbox in a namespace with lo up (chosen)
+response: HTTP/1.1 200 OK
+runsc port-forward --stream exit 0
+
+=== --host-uds modes: where the shim's socket ends up
+--host-uds=none: host sees [], bridge-bench: No such file or directory (os error 2)
+--host-uds=open: host sees [], bridge-bench: No such file or directory (os error 2)
+--host-uds=create: host sees [http.sock ], status=200
+
+=== The shim as the image's user (65534) cannot bind in the 0700 socket directory
+uds-shim: bind /.kronik/sock/http.sock: Permission denied (os error 13)
+
+=== Passing a listening host socket into the sandbox (runsc exec --pass-fd)
+shim: uds-shim: accept: Invalid argument (os error 22)
+
+=== Checkpoint with the shim's bound host socket (--host-uds=create)
+checkpoint failed: checkpointing container "kronik-echo": encoding error: Cannot save endpoint with bound host socket:
+exit 128; container afterwards: {"status":"stopped"}
+
+=== Checkpoint after serving port-forward connections (chosen)
+response: HTTP/1.1 200 OK
+runsc port-forward --stream exit 0
+exit 0; image files: checkpoint.img pages.img pages_meta.img 
+
+=== Writes inside the sandbox: rootfs overlay (--overlay2 root:self by default) versus the data bind mount
+rootfs on the host: srv/written-inside.txt absent
+data dir on the host: written-inside.txt present
+files runsc added to the rootfs directory: /var/lib/kronik-spike-c/foreign/echo-pf/bundle/rootfs /var/lib/kronik-spike-c/foreign/echo-pf/bundle/rootfs/data /var/lib/kronik-spike-c/foreign/echo-pf/bundle/rootfs/.kronik /var/lib/kronik-spike-c/foreign/echo-pf/bundle/rootfs/.gvisor.filestore.kronik-echo 

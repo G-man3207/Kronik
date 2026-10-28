@@ -1,0 +1,6 @@
+# rusqlite's `session` feature forces libsqlite3-sys's `buildtime_bindgen`,
+# which needs libclang on every build machine. The pre-generated bundled
+# bindings already declare the session API, so instead compile the bundled
+# SQLite with the session extension enabled and call it through `ffi.rs`.
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK"

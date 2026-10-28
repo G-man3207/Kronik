@@ -1,0 +1,245 @@
+# imports on the dev machine at 2026-10-25T01:25:13Z, kronik-0.0.0+wasmtime-50.0.0
+
+=== actor (12843811 bytes): --disable http fetch-event stdio
+$ wasm-tools component wit out/actor.wasm | grep -E '^ *(import|export) '
+import kronik:actor/state@0.1.0;
+import kronik:actor/sql@0.1.0;
+import kronik:actor/types@0.1.0;
+import kronik:actor/context@0.1.0;
+import kronik:actor/messaging@0.1.0;
+import kronik:actor/timers@0.1.0;
+import kronik:actor/http-client@0.1.0;
+import kronik:actor/crypto@0.1.0;
+import kronik:actor/secrets@0.1.0;
+import kronik:actor/log@0.1.0;
+import kronik:actor/privacy@0.1.0;
+import wasi:io/poll@0.2.12;
+import wasi:clocks/monotonic-clock@0.2.12;
+import wasi:io/error@0.2.12;
+import wasi:io/streams@0.2.12;
+import wasi:cli/stderr@0.2.12;
+import wasi:clocks/wall-clock@0.2.12;
+import wasi:random/random@0.2.12;
+export kronik:actor/handler@0.1.0;
+$ spike-a-wasmtime imports out/actor.wasm
+component  b3:7194b807a941
+imports    18
+  allowed  wasi:io/poll@0.2.12
+  allowed  wasi:clocks/monotonic-clock@0.2.12
+  allowed  wasi:io/error@0.2.12
+  allowed  wasi:io/streams@0.2.12
+  allowed  wasi:cli/stderr@0.2.12
+  allowed  wasi:clocks/wall-clock@0.2.12
+  allowed  wasi:random/random@0.2.12
+export     kronik:actor/handler@0.1.0
+allowlist  OK
+(exit 0)
+
+=== actor-aot (19010443 bytes): --disable http fetch-event stdio --aot
+$ wasm-tools component wit out/actor-aot.wasm | grep -E '^ *(import|export) '
+import kronik:actor/state@0.1.0;
+import kronik:actor/sql@0.1.0;
+import kronik:actor/types@0.1.0;
+import kronik:actor/context@0.1.0;
+import kronik:actor/messaging@0.1.0;
+import kronik:actor/timers@0.1.0;
+import kronik:actor/http-client@0.1.0;
+import kronik:actor/crypto@0.1.0;
+import kronik:actor/secrets@0.1.0;
+import kronik:actor/log@0.1.0;
+import kronik:actor/privacy@0.1.0;
+import wasi:io/poll@0.2.12;
+import wasi:clocks/monotonic-clock@0.2.12;
+import wasi:io/error@0.2.12;
+import wasi:io/streams@0.2.12;
+import wasi:cli/stderr@0.2.12;
+import wasi:clocks/wall-clock@0.2.12;
+import wasi:random/random@0.2.12;
+export kronik:actor/handler@0.1.0;
+$ spike-a-wasmtime imports out/actor-aot.wasm
+component  b3:8119788aeff1
+imports    18
+  allowed  wasi:io/poll@0.2.12
+  allowed  wasi:clocks/monotonic-clock@0.2.12
+  allowed  wasi:io/error@0.2.12
+  allowed  wasi:io/streams@0.2.12
+  allowed  wasi:cli/stderr@0.2.12
+  allowed  wasi:clocks/wall-clock@0.2.12
+  allowed  wasi:random/random@0.2.12
+export     kronik:actor/handler@0.1.0
+allowlist  OK
+(exit 0)
+
+=== counter (12786333 bytes): --disable http fetch-event stdio
+$ wasm-tools component wit out/counter.wasm | grep -E '^ *(import|export) '
+import kronik:actor/state@0.1.0;
+import kronik:actor/sql@0.1.0;
+import kronik:actor/types@0.1.0;
+import kronik:actor/context@0.1.0;
+import kronik:actor/messaging@0.1.0;
+import kronik:actor/timers@0.1.0;
+import kronik:actor/http-client@0.1.0;
+import kronik:actor/crypto@0.1.0;
+import kronik:actor/secrets@0.1.0;
+import kronik:actor/log@0.1.0;
+import kronik:actor/privacy@0.1.0;
+import wasi:io/poll@0.2.12;
+import wasi:clocks/monotonic-clock@0.2.12;
+import wasi:io/error@0.2.12;
+import wasi:io/streams@0.2.12;
+import wasi:cli/stderr@0.2.12;
+import wasi:clocks/wall-clock@0.2.12;
+import wasi:random/random@0.2.12;
+export kronik:actor/handler@0.1.0;
+$ spike-a-wasmtime imports out/counter.wasm
+component  b3:3ed342e6bc41
+imports    18
+  allowed  wasi:io/poll@0.2.12
+  allowed  wasi:clocks/monotonic-clock@0.2.12
+  allowed  wasi:io/error@0.2.12
+  allowed  wasi:io/streams@0.2.12
+  allowed  wasi:cli/stderr@0.2.12
+  allowed  wasi:clocks/wall-clock@0.2.12
+  allowed  wasi:random/random@0.2.12
+export     kronik:actor/handler@0.1.0
+allowlist  OK
+(exit 0)
+
+=== actor-no-http (12859932 bytes): --disable http fetch-event
+$ wasm-tools component wit out/actor-no-http.wasm | grep -E '^ *(import|export) '
+import kronik:actor/state@0.1.0;
+import kronik:actor/sql@0.1.0;
+import kronik:actor/types@0.1.0;
+import kronik:actor/context@0.1.0;
+import kronik:actor/messaging@0.1.0;
+import kronik:actor/timers@0.1.0;
+import kronik:actor/http-client@0.1.0;
+import kronik:actor/crypto@0.1.0;
+import kronik:actor/secrets@0.1.0;
+import kronik:actor/log@0.1.0;
+import kronik:actor/privacy@0.1.0;
+import wasi:io/poll@0.2.12;
+import wasi:clocks/monotonic-clock@0.2.12;
+import wasi:io/error@0.2.12;
+import wasi:io/streams@0.2.12;
+import wasi:cli/stdin@0.2.12;
+import wasi:cli/stdout@0.2.12;
+import wasi:cli/stderr@0.2.12;
+import wasi:cli/terminal-input@0.2.12;
+import wasi:cli/terminal-output@0.2.12;
+import wasi:cli/terminal-stdin@0.2.12;
+import wasi:cli/terminal-stdout@0.2.12;
+import wasi:cli/terminal-stderr@0.2.12;
+import wasi:clocks/wall-clock@0.2.12;
+import wasi:filesystem/types@0.2.12;
+import wasi:filesystem/preopens@0.2.12;
+import wasi:random/random@0.2.12;
+export kronik:actor/handler@0.1.0;
+$ spike-a-wasmtime imports out/actor-no-http.wasm
+component  b3:7cccfc3cc0f0
+imports    27
+  allowed  wasi:io/poll@0.2.12
+  allowed  wasi:clocks/monotonic-clock@0.2.12
+  allowed  wasi:io/error@0.2.12
+  allowed  wasi:io/streams@0.2.12
+  allowed  wasi:cli/stdin@0.2.12
+  allowed  wasi:cli/stdout@0.2.12
+  allowed  wasi:cli/stderr@0.2.12
+  allowed  wasi:cli/terminal-input@0.2.12
+  allowed  wasi:cli/terminal-output@0.2.12
+  allowed  wasi:cli/terminal-stdin@0.2.12
+  allowed  wasi:cli/terminal-stdout@0.2.12
+  allowed  wasi:cli/terminal-stderr@0.2.12
+  allowed  wasi:clocks/wall-clock@0.2.12
+  DENIED   wasi:filesystem/types@0.2.12
+  DENIED   wasi:filesystem/preopens@0.2.12
+  allowed  wasi:random/random@0.2.12
+export     kronik:actor/handler@0.1.0
+IMPORT_NOT_ALLOWED: the component imports interfaces outside the allowlist: wasi:filesystem/types@0.2.12, wasi:filesystem/preopens@0.2.12
+hint: only kronik:actor/*, wasi:clocks, wasi:random, wasi:cli and wasi:io (0.2.x) may be imported
+(exit 2)
+
+=== actor-default (12873878 bytes): (no features disabled)
+$ wasm-tools component wit out/actor-default.wasm | grep -E '^ *(import|export) '
+import kronik:actor/state@0.1.0;
+import kronik:actor/sql@0.1.0;
+import kronik:actor/types@0.1.0;
+import kronik:actor/context@0.1.0;
+import kronik:actor/messaging@0.1.0;
+import kronik:actor/timers@0.1.0;
+import kronik:actor/http-client@0.1.0;
+import kronik:actor/crypto@0.1.0;
+import kronik:actor/secrets@0.1.0;
+import kronik:actor/log@0.1.0;
+import kronik:actor/privacy@0.1.0;
+import wasi:io/poll@0.2.12;
+import wasi:clocks/monotonic-clock@0.2.12;
+import wasi:io/error@0.2.12;
+import wasi:io/streams@0.2.12;
+import wasi:http/types@0.2.10;
+import wasi:http/outgoing-handler@0.2.10;
+import wasi:cli/stdin@0.2.12;
+import wasi:cli/stdout@0.2.12;
+import wasi:cli/stderr@0.2.12;
+import wasi:cli/terminal-input@0.2.12;
+import wasi:cli/terminal-output@0.2.12;
+import wasi:cli/terminal-stdin@0.2.12;
+import wasi:cli/terminal-stdout@0.2.12;
+import wasi:cli/terminal-stderr@0.2.12;
+import wasi:clocks/wall-clock@0.2.12;
+import wasi:filesystem/types@0.2.12;
+import wasi:filesystem/preopens@0.2.12;
+import wasi:random/random@0.2.12;
+export kronik:actor/handler@0.1.0;
+$ spike-a-wasmtime imports out/actor-default.wasm
+component  b3:1e3b27634c13
+imports    29
+  allowed  wasi:io/poll@0.2.12
+  allowed  wasi:clocks/monotonic-clock@0.2.12
+  allowed  wasi:io/error@0.2.12
+  allowed  wasi:io/streams@0.2.12
+  DENIED   wasi:http/types@0.2.10
+  DENIED   wasi:http/outgoing-handler@0.2.10
+  allowed  wasi:cli/stdin@0.2.12
+  allowed  wasi:cli/stdout@0.2.12
+  allowed  wasi:cli/stderr@0.2.12
+  allowed  wasi:cli/terminal-input@0.2.12
+  allowed  wasi:cli/terminal-output@0.2.12
+  allowed  wasi:cli/terminal-stdin@0.2.12
+  allowed  wasi:cli/terminal-stdout@0.2.12
+  allowed  wasi:cli/terminal-stderr@0.2.12
+  allowed  wasi:clocks/wall-clock@0.2.12
+  DENIED   wasi:filesystem/types@0.2.12
+  DENIED   wasi:filesystem/preopens@0.2.12
+  allowed  wasi:random/random@0.2.12
+export     kronik:actor/handler@0.1.0
+IMPORT_NOT_ALLOWED: the component imports interfaces outside the allowlist: wasi:http/types@0.2.10, wasi:http/outgoing-handler@0.2.10, wasi:filesystem/types@0.2.12, wasi:filesystem/preopens@0.2.12
+hint: only kronik:actor/*, wasi:clocks, wasi:random, wasi:cli and wasi:io (0.2.x) may be imported
+(exit 2)
+
+=== WebAssembly features: validation with SIMD, relaxed SIMD and threads disabled
+out/actor.wasm: exit 0
+out/actor-aot.wasm: exit 0
+
+=== Tables and memories in out/actor.wasm (main module first)
+(table (;0;) 7708 7708 funcref)
+(memory (;0;) 145)
+(memory (;0;) 0)
+(table (;0;) 28 28 funcref)
+(table (;0;) 28 28 funcref)
+
+=== Producers metadata of out/actor.wasm (component, then its core modules)
+│ language ┆ JavaScript │
+│ processed-by ┆ wit-component [0.259.0] │
+│ processed-by ┆ ComponentizeJS [0.23.0] │
+│ language ┆ C11 │
+│ language ┆ Rust │
+│ language ┆ C_plus_plus_14 │
+│ processed-by ┆ clang [21.1.4-wasi-sdk (https://github.com/llvm/llvm-project │
+│ processed-by ┆ rustc [1.88.0 (6b00bc388 2025-06-23)] │
+│ processed-by ┆ wit-component [0.244.0] │
+│ processed-by ┆ wit-bindgen-c [0.52.0] │
+│ language ┆ Rust │
+│ processed-by ┆ rustc [1.98.0 (88d9e12ae 2026-08-18)] │
+│ processed-by ┆ wit-component [0.259.0] │
+│ processed-by ┆ wit-component [0.259.0] │

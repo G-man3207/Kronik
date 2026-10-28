@@ -1,0 +1,29 @@
+[package]
+name = "spike-a-guest"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Kronik M0 spike A: Rust guest component for the kronik:actor world"
+license = "Elastic-License-2.0"
+
+# Standalone project: built for wasm32-wasip2, not part of any host workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.63.0"
+
+[features]
+# Adds a `read-file` mode using std::fs, to show which imports std::fs drags in
+# (the resulting component must be rejected with IMPORT_NOT_ALLOWED).
+fs-probe = []
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+strip = true
+panic = "abort"

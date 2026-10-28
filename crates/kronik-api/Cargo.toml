@@ -1,0 +1,46 @@
+[package]
+name = "kronik-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# The hyper server on the Unix socket and, with a bearer token, on TCP
+# (optionally TLS); the service function and the types need only the node.
+server = ["dep:bytes", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:tracing", "tokio/net", "tokio/rt", "tokio/time"]
+
+[dependencies]
+base64 = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+kronik-core = { workspace = true }
+kronik-effects = { workspace = true }
+kronik-fork = { workspace = true }
+kronik-foreign = { workspace = true }
+kronik-policy = { workspace = true }
+kronik-privacy = { workspace = true }
+kronik-proto = { workspace = true }
+kronik-runtime = { workspace = true }
+kronik-sched = { workspace = true }
+kronik-store = { workspace = true }
+prost = { workspace = true }
+rusqlite = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tokio-rustls = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+kronik-core = { workspace = true, features = ["real"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

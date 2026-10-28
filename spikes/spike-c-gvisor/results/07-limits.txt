@@ -1,0 +1,42 @@
+# 07-limits on travelfiesta at 2026-10-25T00:15:00Z, runsc version release-20261019.0, bridge pf
+
+=== cgroup that runsc created for cgroupsPath /kronik/foreign-echo
+sandbox pid 472303: 0::/kronik/foreign-echo
+cpu.max: 100000 100000
+memory.max: 536870912
+memory.swap.max: 0
+pids.max: 256
+host processes in the cgroup:
+ 472299 exe
+ 472303 gvisor_sentry
+ 472316 gvisor_sentry
+ 472323 gvisor_sentry
+ 472325 gvisor_sentry
+ 472330 gvisor_sentry
+
+=== What the app sees (GET /info through the bridge)
+available_parallelism=2
+MemTotal:         524288 kB
+
+=== CPU: 2 busy threads for 3 s with cpu.max = 100000 100000
+burned 2 threads for 3000 ms in 3.010010997s
+cgroup CPU time 3034 ms over 3034 ms wall = 1.00 CPUs; throttled periods +30
+
+=== Control: the same with the quota lifted in place (cpu.max = max)
+burned 2 threads for 3000 ms in 3.00290376s
+cgroup CPU time 5956 ms over 3029 ms wall = 1.97 CPUs; throttled periods +0
+
+=== Memory: touch 300 MiB under memory.max = 536870912
+allocated and touched 300 MiB (76800 pages) in 363.46892ms
+memory.peak: 323 MiB
+
+=== Memory: touch 700 MiB
+bridge-bench: EOF before response
+runsc wait: waiting on container "kronik-echo": sandbox no longer running and its exit status is unavailable
+runsc state: {"status":"stopped","pid":-1}
+memory.events: low 0 high 0 max 23 oom 1 oom_kill 1 oom_group_kill 0 
+container output:
+echo-server: listening on tcp 0.0.0.0:8080
+[640435.969164] [  pid  ]   uid  tgid total_vm      rss rss_anon rss_file rss_shmem pgtables_bytes swapents oom_score_adj name
+[640435.995977] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=foreign-echo,mems_allowed=0,oom_memcg=/kronik/foreign-echo,task_memcg=/kronik/foreign-echo,task=gvisor_sentry,pid=472303,uid=0
+[640436.000821] Memory cgroup out of memory: Killed process 472303 (gvisor_sentry) total-vm:3596236kB, anon-rss:9716kB, file-rss:26284kB, shmem-rss:128kB, UID:0 pgtables:216kB oom_score_adj:0

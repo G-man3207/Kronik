@@ -1,0 +1,77 @@
+# 04-bridges-cpu-off on travelfiesta at 2026-10-25T00:12:58Z, runsc version release-20261019.0, bridge pf
+
+=== Baseline: echo-server as a plain host process, no sandbox
+ready_ms=0.7 attempts=1 target=tcp:127.0.0.1:18090
+label=host-tcp target=tcp:127.0.0.1:18090 mode=keepalive n=1000 errors=0 body=64B min_us=50 p50_us=104 p90_us=159 p99_us=227 p999_us=351 max_us=371 mean_us=111
+label=host-tcp target=tcp:127.0.0.1:18090 mode=keepalive n=1000 errors=0 body=64B min_us=31 p50_us=110 p90_us=166 p99_us=269 p999_us=406 max_us=467 mean_us=110
+label=host-tcp target=tcp:127.0.0.1:18090 mode=keepalive n=1000 errors=0 body=64B min_us=36 p50_us=112 p90_us=163 p99_us=255 p999_us=394 max_us=403 mean_us=116
+label=host-tcp target=tcp:127.0.0.1:18090 mode=newconn n=1000 errors=0 body=64B min_us=159 p50_us=408 p90_us=703 p99_us=1882 p999_us=4033 max_us=4140 mean_us=480
+label=host-tcp target=tcp:127.0.0.1:18090 mode=newconn n=1000 errors=0 body=64B min_us=207 p50_us=400 p90_us=616 p99_us=893 p999_us=1445 max_us=3261 mean_us=428
+label=host-tcp target=tcp:127.0.0.1:18090 mode=newconn n=1000 errors=0 body=64B min_us=186 p50_us=353 p90_us=591 p99_us=1095 p999_us=1869 max_us=1954 mean_us=393
+label=host-unix target=unix:/run/kronik-spike-c/baseline.sock mode=keepalive n=1000 errors=0 body=64B min_us=21 p50_us=40 p90_us=68 p99_us=111 p999_us=178 max_us=310 mean_us=45
+label=host-unix target=unix:/run/kronik-spike-c/baseline.sock mode=keepalive n=1000 errors=0 body=64B min_us=22 p50_us=47 p90_us=90 p99_us=163 p999_us=272 max_us=2679 mean_us=58
+label=host-unix target=unix:/run/kronik-spike-c/baseline.sock mode=keepalive n=1000 errors=0 body=64B min_us=18 p50_us=45 p90_us=87 p99_us=186 p999_us=342 max_us=373 mean_us=54
+label=host-unix target=unix:/run/kronik-spike-c/baseline.sock mode=newconn n=1000 errors=0 body=64B min_us=116 p50_us=235 p90_us=391 p99_us=696 p999_us=1410 max_us=3094 mean_us=267
+label=host-unix target=unix:/run/kronik-spike-c/baseline.sock mode=newconn n=1000 errors=0 body=64B min_us=136 p50_us=274 p90_us=425 p99_us=651 p999_us=1110 max_us=1141 mean_us=293
+label=host-unix target=unix:/run/kronik-spike-c/baseline.sock mode=newconn n=1000 errors=0 body=64B min_us=128 p50_us=267 p90_us=416 p99_us=737 p999_us=1170 max_us=1177 mean_us=287
+
+=== (b) --network=none --host-uds=create: host -> unix socket -> uds-shim in the sandbox -> 127.0.0.1:8080
+ready_ms=7.7 attempts=1 target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock
+total 0
+srwxr-xr-x 1 root root 0 Oct 25 00:13 http.sock
+bridge-bench: EOF before response
+cgroup cpu.stat: usage_usec 169909 nr_periods 1 nr_throttled 0 throttled_usec 0 
+label=hostuds-shim target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock mode=keepalive n=1000 errors=0 body=64B min_us=155 p50_us=481 p90_us=893 p99_us=1479 p999_us=2818 max_us=5911 mean_us=547
+label=hostuds-shim target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock mode=keepalive n=1000 errors=0 body=64B min_us=191 p50_us=513 p90_us=924 p99_us=1476 p999_us=2836 max_us=2992 mean_us=570
+label=hostuds-shim target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock mode=keepalive n=1000 errors=0 body=64B min_us=199 p50_us=557 p90_us=908 p99_us=1484 p999_us=3330 max_us=4806 mean_us=608
+label=hostuds-shim target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock mode=newconn n=1000 errors=0 body=64B min_us=2243 p50_us=5356 p90_us=8535 p99_us=14182 p999_us=22703 max_us=23046 mean_us=5861
+label=hostuds-shim target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock mode=newconn n=1000 errors=0 body=64B min_us=2728 p50_us=5854 p90_us=9013 p99_us=13146 p999_us=19407 max_us=19891 mean_us=6298
+label=hostuds-shim target=unix:/run/kronik-spike-c/foreign/echo/sock/http.sock mode=newconn n=1000 errors=0 body=64B min_us=2706 p50_us=5828 p90_us=9398 p99_us=14400 p999_us=20946 max_us=26039 mean_us=6396
+cgroup cpu.stat: usage_usec 34439057 nr_periods 1 nr_throttled 0 throttled_usec 0 
+
+=== (b') same sandbox, the app itself listens on a unix socket in the shared directory (no shim)
+ready_ms=9.7 attempts=3 target=unix:/run/kronik-spike-c/foreign/echo/sock/direct.sock
+label=hostuds-direct target=unix:/run/kronik-spike-c/foreign/echo/sock/direct.sock mode=keepalive n=1000 errors=0 body=64B min_us=65 p50_us=123 p90_us=285 p99_us=553 p999_us=940 max_us=1074 mean_us=165
+label=hostuds-direct target=unix:/run/kronik-spike-c/foreign/echo/sock/direct.sock mode=keepalive n=1000 errors=0 body=64B min_us=87 p50_us=122 p90_us=209 p99_us=448 p999_us=599 max_us=642 mean_us=144
+label=hostuds-direct target=unix:/run/kronik-spike-c/foreign/echo/sock/direct.sock mode=keepalive n=1000 errors=0 body=64B min_us=58 p50_us=112 p90_us=229 p99_us=484 p999_us=931 max_us=976 mean_us=141
+label=hostuds-direct target=unix:/run/kronik-spike-c/foreign/echo/sock/direct.sock mode=newconn n=1000 errors=0 body=64B min_us=729 p50_us=1754 p90_us=3354 p99_us=5181 p999_us=10495 max_us=11410 mean_us=2070
+label=hostuds-direct target=unix:/run/kronik-spike-c/foreign/echo/sock/direct.sock mode=newconn n=1000 errors=0 body=64B min_us=715 p50_us=1526 p90_us=2734 p99_us=4409 p999_us=6236 max_us=7493 mean_us=1773
+label=hostuds-direct target=unix:/run/kronik-spike-c/foreign/echo/sock/direct.sock mode=newconn n=1000 errors=0 body=64B min_us=710 p50_us=1504 p90_us=2947 p99_us=5570 p999_us=8824 max_us=10422 mean_us=1815
+cgroup cpu.stat: usage_usec 43856174 nr_periods 1 nr_throttled 0 throttled_usec 0 
+
+=== (a) --network=sandbox in netns kronik-echo (only lo): runsc port-forward kronik-echo 18080:8080
+ready_ms=17.3 attempts=9 target=tcp:127.0.0.1:18080
+the port-forward listener (note the address):
+LISTEN 0      4096                                        *:18080            *:*    users:(("runsc",pid=452301,fd=7))      
+cgroup cpu.stat: usage_usec 101569 nr_periods 1 nr_throttled 0 throttled_usec 0 
+label=portforward-local target=tcp:127.0.0.1:18080 mode=keepalive n=1000 errors=0 body=64B min_us=233 p50_us=518 p90_us=881 p99_us=1358 p999_us=2980 max_us=4998 mean_us=587
+label=portforward-local target=tcp:127.0.0.1:18080 mode=keepalive n=1000 errors=0 body=64B min_us=209 p50_us=495 p90_us=903 p99_us=1346 p999_us=2576 max_us=2655 mean_us=567
+label=portforward-local target=tcp:127.0.0.1:18080 mode=keepalive n=1000 errors=0 body=64B min_us=175 p50_us=374 p90_us=671 p99_us=1136 p999_us=1470 max_us=2785 mean_us=432
+label=portforward-local target=tcp:127.0.0.1:18080 mode=newconn n=1000 errors=0 body=64B min_us=2217 p50_us=4277 p90_us=7283 p99_us=11192 p999_us=20949 max_us=21186 mean_us=4824
+label=portforward-local target=tcp:127.0.0.1:18080 mode=newconn n=1000 errors=0 body=64B min_us=1911 p50_us=4352 p90_us=7553 p99_us=13674 p999_us=23049 max_us=26014 mean_us=4984
+label=portforward-local target=tcp:127.0.0.1:18080 mode=newconn n=1000 errors=0 body=64B min_us=2024 p50_us=4443 p90_us=7891 p99_us=13079 p999_us=36714 max_us=39974 mean_us=5105
+cgroup cpu.stat: usage_usec 18192315 nr_periods 1 nr_throttled 0 throttled_usec 0 
+
+=== (a') same sandbox, runsc port-forward --stream: one runsc process per connection
+label=portforward-stream target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 mode=keepalive n=1000 errors=0 body=64B min_us=147 p50_us=376 p90_us=740 p99_us=1292 p999_us=4025 max_us=4581 mean_us=448
+label=portforward-stream target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 mode=keepalive n=1000 errors=0 body=64B min_us=133 p50_us=480 p90_us=821 p99_us=1211 p999_us=2099 max_us=2829 mean_us=509
+label=portforward-stream target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 mode=keepalive n=1000 errors=0 body=64B min_us=153 p50_us=337 p90_us=707 p99_us=1530 p999_us=2677 max_us=4627 mean_us=414
+label=portforward-stream target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 mode=newconn n=1000 errors=0 body=64B min_us=7562 p50_us=13441 p90_us=18785 p99_us=24155 p999_us=28949 max_us=28953 mean_us=14147
+label=portforward-stream target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 mode=newconn n=1000 errors=0 body=64B min_us=7501 p50_us=13473 p90_us=19001 p99_us=26082 p999_us=32687 max_us=50709 mean_us=14209
+label=portforward-stream target=pfstream:/run/kronik-spike-c/runsc:kronik-echo:8080 mode=newconn n=1000 errors=0 body=64B min_us=7357 p50_us=13007 p90_us=17972 p99_us=25307 p999_us=33830 max_us=37565 mean_us=13681
+cgroup cpu.stat: usage_usec 43044943 nr_periods 1 nr_throttled 0 throttled_usec 0 
+
+=== Summary: median over 3 rounds of each percentile, microseconds
+bridge              mode            p50     p90     p99   p99.9     max  errors
+host-tcp            keepalive       110     163     255     394     403  0
+host-tcp            newconn         400     616    1095    1869    3261  0
+host-unix           keepalive        45      87     163     272     373  0
+host-unix           newconn         267     416     696    1170    1177  0
+hostuds-shim        keepalive       513     908    1479    2836    4806  0
+hostuds-shim        newconn        5828    9013   14182   20946   23046  0
+hostuds-direct      keepalive       122     229     484     931     976  0
+hostuds-direct      newconn        1526    2947    5181    8824   10422  0
+portforward-local   keepalive       495     881    1346    2576    2785  0
+portforward-local   newconn        4352    7553   13079   23049   26014  0
+portforward-stream  keepalive       376     740    1292    2677    4581  0
+portforward-stream  newconn       13441   18785   25307   32687   37565  0

@@ -1,0 +1,159 @@
+# 02-bundle on travelfiesta at 2026-10-25T00:10:53Z, runsc version release-20261019.0, bridge pf
+
+=== Bundle for --network=none (host-uds bridge)
+$ /root/kronik-spike-c/bin/oci-tool bundle --layout /root/kronik-spike-c/foreign-echo-layout --ref foreign-echo:spike --replace --cpu 1 --memory 512Mi --pids 256 --bind /run/kronik-spike-c/foreign/echo/sock:/.kronik/sock --bind /root/kronik-spike-c/bin:/.kronik/bin:ro --bind /var/lib/kronik-spike-c/foreign/echo/data:/data --cgroups-path /kronik/foreign-echo --hostname echo --bundle /var/lib/kronik-spike-c/foreign/echo/bundle
+image: manifest sha256:d2f3f1a5b667c3f7aeb674c97a40cde7e7a678d3b91a06c427160dbccd3589e4 config sha256:514fa4868176ae2f41ca94c549dd469393f3f0e7bf9bc0d1675db0ac09b2fa45
+  layer application/vnd.oci.image.layer.v1.tar+gzip sha256:54dae59c757cca5daccca3f2d66fbb46ec7f59ed36612ba661e210ffda23c9df (1714943 bytes), diff_id sha256:26ea6182f439b397f5f4bfe306a2bd3f5d2e21c8480c8cab247020c520b18b72
+  layer application/vnd.oci.image.layer.v1.tar sha256:f85e39d92ecd8fb4b70baac80a378deef7ed366c721ff4bba842a7eb9f199c16 (6879744 bytes), diff_id sha256:f85e39d92ecd8fb4b70baac80a378deef7ed366c721ff4bba842a7eb9f199c16
+unpacked: 2 layers verified (blob digest and diff_id), 21 entries, 1 whiteouts, 1 opaque dirs, 0 skipped
+bundle /var/lib/kronik-spike-c/foreign/echo/bundle ready in 220.704265ms: args ["/bin/echo-server","--listen","0.0.0.0:8080"] user 65534:65534 cwd "/srv"
+
+=== Bundle for --network=sandbox in netns kronik-echo (port-forward bridge)
+$ /root/kronik-spike-c/bin/oci-tool bundle --layout /root/kronik-spike-c/foreign-echo-layout --ref foreign-echo:spike --replace --cpu 1 --memory 512Mi --pids 256 --bind /run/kronik-spike-c/foreign/echo/sock:/.kronik/sock --bind /root/kronik-spike-c/bin:/.kronik/bin:ro --bind /var/lib/kronik-spike-c/foreign/echo/data:/data --cgroups-path /kronik/foreign-echo --hostname echo --bundle /var/lib/kronik-spike-c/foreign/echo-pf/bundle --netns /var/run/netns/kronik-echo
+image: manifest sha256:d2f3f1a5b667c3f7aeb674c97a40cde7e7a678d3b91a06c427160dbccd3589e4 config sha256:514fa4868176ae2f41ca94c549dd469393f3f0e7bf9bc0d1675db0ac09b2fa45
+  layer application/vnd.oci.image.layer.v1.tar+gzip sha256:54dae59c757cca5daccca3f2d66fbb46ec7f59ed36612ba661e210ffda23c9df (1714943 bytes), diff_id sha256:26ea6182f439b397f5f4bfe306a2bd3f5d2e21c8480c8cab247020c520b18b72
+  layer application/vnd.oci.image.layer.v1.tar sha256:f85e39d92ecd8fb4b70baac80a378deef7ed366c721ff4bba842a7eb9f199c16 (6879744 bytes), diff_id sha256:f85e39d92ecd8fb4b70baac80a378deef7ed366c721ff4bba842a7eb9f199c16
+unpacked: 2 layers verified (blob digest and diff_id), 21 entries, 1 whiteouts, 1 opaque dirs, 0 skipped
+bundle /var/lib/kronik-spike-c/foreign/echo-pf/bundle ready in 234.201972ms: args ["/bin/echo-server","--listen","0.0.0.0:8080"] user 65534:65534 cwd "/srv"
+
+=== Layout
+{
+  "manifests": [
+    {
+      "annotations": {
+        "org.opencontainers.image.ref.name": "foreign-echo:spike"
+      },
+      "digest": "sha256:d2f3f1a5b667c3f7aeb674c97a40cde7e7a678d3b91a06c427160dbccd3589e4",
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "size": 558
+    }
+  ],
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "schemaVersion": 2
+}
+total 8404
+-rw-r--r-- 1 root root     430 Oct 24 23:53 514fa4868176ae2f41ca94c549dd469393f3f0e7bf9bc0d1675db0ac09b2fa45
+-rw-r--r-- 1 root root 1714943 Oct 24 23:53 54dae59c757cca5daccca3f2d66fbb46ec7f59ed36612ba661e210ffda23c9df
+-rw-r--r-- 1 root root     558 Oct 24 23:53 d2f3f1a5b667c3f7aeb674c97a40cde7e7a678d3b91a06c427160dbccd3589e4
+-rw-r--r-- 1 root root 6879744 Oct 24 23:53 f85e39d92ecd8fb4b70baac80a378deef7ed366c721ff4bba842a7eb9f199c16
+
+=== Rootfs
+rootfs
+rootfs/bin
+rootfs/bin/busybox
+rootfs/bin/echo-server
+rootfs/bin/netprobe
+rootfs/etc
+rootfs/etc/group
+rootfs/etc/passwd
+rootfs/srv
+rootfs/srv/old
+rootfs/srv/old/c.txt
+rootfs/tmp
+whiteout files left in the rootfs: 0
+/etc/stale.conf (whited out in layer 2): absent
+/srv/old (opaque in layer 2): c.txt
+drwxrwxrwt root:root rootfs/tmp
+-rwxr-xr-x root:root rootfs/bin/echo-server
+
+=== config.json
+{
+  "process": {
+    "user": {
+      "gid": 65534,
+      "uid": 65534
+    },
+    "args": [
+      "/bin/echo-server",
+      "--listen",
+      "0.0.0.0:8080"
+    ],
+    "env": [
+      "PATH=/bin",
+      "GREETING=hello-from-the-image-config"
+    ],
+    "cwd": "/srv",
+    "noNewPrivileges": true
+  },
+  "root": {
+    "path": "rootfs",
+    "readonly": false
+  },
+  "hostname": "echo",
+  "mounts": [
+    {
+      "destination": "/.kronik/sock",
+      "options": [
+        "rbind",
+        "rw",
+        "nosuid",
+        "nodev"
+      ],
+      "source": "/run/kronik-spike-c/foreign/echo/sock",
+      "type": "bind"
+    },
+    {
+      "destination": "/.kronik/bin",
+      "options": [
+        "rbind",
+        "ro",
+        "nosuid",
+        "nodev"
+      ],
+      "source": "/root/kronik-spike-c/bin",
+      "type": "bind"
+    },
+    {
+      "destination": "/data",
+      "options": [
+        "rbind",
+        "rw",
+        "nosuid",
+        "nodev"
+      ],
+      "source": "/var/lib/kronik-spike-c/foreign/echo/data",
+      "type": "bind"
+    }
+  ],
+  "linux": {
+    "namespaces": [
+      {
+        "type": "pid"
+      },
+      {
+        "type": "network"
+      },
+      {
+        "type": "ipc"
+      },
+      {
+        "type": "uts"
+      },
+      {
+        "type": "mount"
+      }
+    ],
+    "resources": {
+      "cpu": {
+        "period": 100000,
+        "quota": 100000
+      },
+      "memory": {
+        "limit": 536870912,
+        "swap": 536870912
+      },
+      "pids": {
+        "limit": 256
+      }
+    },
+    "cgroupsPath": "/kronik/foreign-echo"
+  }
+}
+port-forward bundle differs in: > "path": "/var/run/netns/kronik-echo",
+
+=== Tampered layout is rejected
+image: manifest sha256:d2f3f1a5b667c3f7aeb674c97a40cde7e7a678d3b91a06c427160dbccd3589e4 config sha256:514fa4868176ae2f41ca94c549dd469393f3f0e7bf9bc0d1675db0ac09b2fa45
+  layer application/vnd.oci.image.layer.v1.tar+gzip sha256:54dae59c757cca5daccca3f2d66fbb46ec7f59ed36612ba661e210ffda23c9df (1714943 bytes), diff_id sha256:26ea6182f439b397f5f4bfe306a2bd3f5d2e21c8480c8cab247020c520b18b72
+  layer application/vnd.oci.image.layer.v1.tar sha256:f85e39d92ecd8fb4b70baac80a378deef7ed366c721ff4bba842a7eb9f199c16 (6879744 bytes), diff_id sha256:f85e39d92ecd8fb4b70baac80a378deef7ed366c721ff4bba842a7eb9f199c16
+oci-tool: layer blob sha256:54dae59c757cca5daccca3f2d66fbb46ec7f59ed36612ba661e210ffda23c9df failed verification: 1714944 bytes, sha256:b2b6aef153a88e8ff8a30cae316144ea716f9863813066b2e86da9961dc0a836
+(rejected as expected, exit 1)

@@ -1,0 +1,136 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# Spikes are standalone Cargo projects with their own lockfiles.
+exclude = ["spikes"]
+
+[workspace.package]
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.99.1"
+license = "Elastic-2.0"
+publish = false
+
+[workspace.dependencies]
+kronik-api = { path = "crates/kronik-api" }
+kronik-core = { path = "crates/kronik-core" }
+kronik-gateway = { path = "crates/kronik-gateway" }
+kronik-log = { path = "crates/kronik-log" }
+kronik-foreign = { path = "crates/kronik-foreign" }
+kronik-effects = { path = "crates/kronik-effects" }
+kronik-fork = { path = "crates/kronik-fork" }
+kronik-mcp = { path = "crates/kronik-mcp" }
+kronik-metrics = { path = "crates/kronik-metrics" }
+kronik-policy = { path = "crates/kronik-policy" }
+kronik-privacy = { path = "crates/kronik-privacy" }
+kronik-proto = { path = "crates/kronik-proto" }
+kronik-runtime = { path = "crates/kronik-runtime" }
+kronik-sched = { path = "crates/kronik-sched" }
+kronik-ship = { path = "crates/kronik-ship" }
+kronik-store = { path = "crates/kronik-store" }
+kronik-testhost = { path = "crates/kronik-testhost" }
+
+# Wasmtime is pinned exactly: its version is part of the engine version and
+# therefore of replay identity. `wasmtime-environ` provides the Wasmtime
+# version constant and must stay at the same exact version as `wasmtime`.
+# Features are enabled by the crates that use them.
+wasmtime = { version = "=50.0.0", default-features = false }
+wasmtime-environ = { version = "=50.0.0", default-features = false }
+# Same version as Wasmtime 50 uses, for the deploy-time import check.
+wasmparser = { version = "0.261.0", default-features = false, features = ["std", "component-model"] }
+wasmtime-wasi = { version = "=50.0.0", default-features = false, features = ["p2"] }
+wasmtime-wasi-io = { version = "=50.0.0", default-features = false, features = ["std"] }
+
+clap = { version = "4.6.7", features = ["derive", "env"] }
+anyhow = "1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "json"] }
+
+prost = "0.14.4"
+prost-build = "0.14.4"
+# Pure-Rust protobuf compiler for build scripts: no `protoc` on build hosts.
+protox = "0.10.0"
+thiserror = "2"
+blake3 = "1.8"
+chacha20 = { version = "0.10.2", default-features = false, features = ["rng"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
+bytes = "1"
+crc32c = "0.6"
+base64 = "0.22"
+ed25519-dalek = { version = "3.0", default-features = false, features = ["fast", "zeroize"] }
+getrandom = "0.4"
+hmac = "0.13"
+http = "1"
+http-body-util = "0.1.3"
+hyper = { version = "1.7", features = ["server", "http1"] }
+hyper-util = { version = "0.1.17", features = ["tokio"] }
+# Outbound HTTPS for effects: rustls with ring (no C toolchain needed beyond
+# what ring builds) and the system's root certificates.
+hyper-rustls = { version = "0.27.7", default-features = false, features = ["http1", "native-tokio", "tls12", "ring"] }
+libc = "0.2"
+# SQLite 3.54.0 compiled from source; the session extension is enabled via
+# LIBSQLITE3_FLAGS in .cargo/config.toml (ADR 0005).
+rusqlite = { version = "=0.41.0", features = ["bundled", "hooks", "functions", "limits", "backup"] }
+# statvfs(2) without unsafe (free space for [log] disk_reserve); already in
+# the tree through tempfile, pure Rust on Linux.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
+# CEL for policy rules (ADR 0007). Pinned exactly: its evaluation semantics
+# decide policy outcomes, so an upgrade is a reviewed change. Features are
+# enabled by the crates that use them.
+cel = { version = "=0.15.0", default-features = false }
+# Policy rules files (`kronik policy set rules.toml`).
+toml = { version = "1.1", default-features = false }
+# The official MCP SDK (ADR 0008). Pinned exactly: it implements the protocol
+# revisions agents speak, and it changes quickly. Features are enabled by the
+# crates that use them.
+rmcp = { version = "=3.7.0", default-features = false }
+tower-service = "0.3"
+# JSON Schema for the API's types, from which the OpenAPI document and the
+# CLI's --json schemas are generated (docs/reference/openapi.json). Already in
+# the tree through rmcp; pinned exactly because the committed document
+# depends on its output.
+schemars = { version = "=1.2.3", default-features = false, features = ["derive", "std"] }
+# A JSON Schema 2020-12 validator, for tests only: real diffs and turns are
+# checked against the hand-written docs/reference/*.schema.json.
+boon = "=0.6.1"
+# Gateway TLS (ADR 0009): rustls with ring, certificates from files or from
+# an ACME CA by TLS-ALPN-01.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+instant-acme = { version = "=0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+x509-parser = { version = "0.18", default-features = false }
+# Shipping (m6-storage §4): S3-compatible object storage, and zstd for the
+# objects. The S3 client's crypto and TLS use ring, like the gateway's
+# (object_store's `aws` feature would add aws-lc-rs, and with two rustls
+# providers compiled in rustls cannot pick a default): `aws-base` + `ring`,
+# and reqwest's rustls without a bundled provider (kronik-ship installs
+# ring's).
+object_store = { version = "0.14", default-features = false, features = ["aws-base", "reqwest", "ring", "fs"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
+zstd = { version = "0.14", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+# Secret scrubbing: one pass over a payload for every stored secret value.
+# Already in the tree (regex).
+aho-corasick = "1.1"
+tempfile = "3"
+tracing = "0.1"
+# Daemon crates enable only `sync` and `macros` (ADR 0004); runtime features
+# are enabled by `kronik-core/real`, the binary and tests.
+tokio = { version = "1.47", default-features = false }
+
+[workspace.lints.rust]
+# Modules that need `unsafe` must be allowlisted explicitly with
+# `#![allow(unsafe_code)]` and a comment that justifies it.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# A panic in the daemon is a bug. Tests may unwrap, see clippy.toml.
+unwrap_used = "deny"
+expect_used = "deny"
+# A std Mutex guard across .await deadlocks the single-threaded simulator.
+await_holding_lock = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"

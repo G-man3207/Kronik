@@ -1,0 +1,54 @@
+# 06-egress-pf on travelfiesta at 2026-10-25T00:14:44Z, runsc version release-20261019.0, bridge pf
+runsc flags: --platform=systrap --network=sandbox
+
+=== netprobe in the sandbox: external IPs, DNS, and this host's own addresses (<public-ip>:22 172.17.0.1:22 <tailscale-ip>:22)
+== network interfaces (/proc/net/dev)
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo:     746      11    0    0    0     0          0         0      900      11    0    0    0     0       0          0
+== IPv4 routes (/proc/net/route)
+Iface	Destination	Gateway	Flags	RefCnt	Use	Metric	Mask	MTU	Window	IRTT                                                         
+== IPv6 addresses (/proc/net/if_inet6)
+00000000000000000000000000000001 01 80 00 00       lo
+== /etc/resolv.conf: <No such file or directory (os error 2)>
+== outbound TCP
+tcp 1.1.1.1:443: blocked after 216.412µs: Network unreachable (os error 101)
+tcp 8.8.8.8:53: blocked after 391.34µs: Network unreachable (os error 101)
+tcp [2606:4700:4700::1111]:443: blocked after 363.068µs: Network unreachable (os error 101)
+tcp <public-ip>:22: blocked after 375.835µs: Network unreachable (os error 101)
+tcp 172.17.0.1:22: blocked after 360.99µs: Network unreachable (os error 101)
+tcp <tailscale-ip>:22: blocked after 366.499µs: Network unreachable (os error 101)
+== outbound UDP DNS query for example.com
+udp 8.8.8.8:53: blocked after 678.485µs: Network unreachable (os error 101)
+udp 1.1.1.1:53: blocked after 363.724µs: Network unreachable (os error 101)
+udp 100.100.100.100:53: blocked after 362.929µs: Network unreachable (os error 101)
+== resolver lookup of example.com:443
+lookup failed after 5.002972085s: failed to lookup address information: Try again
+RESULT: egress blocked (0 of 10 attempts succeeded)
+
+=== busybox in the sandbox
+$ ip addr
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65522 
+    link/loopback 00:00:00:00:00:00 brd ff:ff:ff:ff:ff:ff
+    inet 127.0.0.1/8 scope host dynamic lo
+    inet6 ::1/128 scope host dynamic lo
+(exit 0)
+$ ip route
+::1 dev lo scope link 
+127.0.0.0/8 dev lo scope link 
+(exit 0)
+$ nslookup example.com 8.8.8.8
+nslookup: can't connect to remote host (8.8.8.8): Network is unreachable
+(exit 1)
+$ wget -T 3 -qO- http://1.1.1.1/
+wget: can't connect to remote host (1.1.1.1): Network is unreachable
+(exit 1)
+$ ping -c 1 -W 2 1.1.1.1
+PING 1.1.1.1 (1.1.1.1): 56 data bytes
+ping: permission denied (are you root?)
+(exit 1)
+
+=== Host view: the sandbox processes run in their own network namespace
+host netns:    net:[4026531840]
+sandbox netns: net:[4026532649]
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 

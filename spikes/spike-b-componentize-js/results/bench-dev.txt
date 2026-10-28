@@ -1,0 +1,85 @@
+# bench-dev on the dev machine at 2026-10-25T01:25:51Z, kronik-0.0.0+wasmtime-50.0.0
+
+=== Machine
+model name	: AMD EPYC 9354P 32-Core Processor
+cpus 8, load 3.92 4.76 4.20
+
+=== Linear memory declared by the components (64 KiB pages)
+actor: (memory (;0;) 145) (memory (;0;) 0) 
+actor-aot: (memory (;0;) 158) (memory (;0;) 0) 
+counter: (memory (;0;) 145) (memory (;0;) 0) 
+
+=== Fuel and peak memory per turn (handle, default limits)
+actor/noop: outcome OK, fuel 954692, memory peak 9280 KiB
+actor/counter: outcome OK, fuel 1637701, memory peak 9280 KiB
+actor/probe: outcome OK, fuel 2924988, memory peak 9280 KiB
+actor/json: outcome OK, fuel 28779575, memory peak 9280 KiB
+counter/counter: outcome OK, fuel 1587545, memory peak 9280 KiB
+actor-aot/noop: outcome OK, fuel 971363, memory peak 10112 KiB
+actor-aot/json: outcome OK, fuel 25966816, memory peak 10112 KiB
+counter-aot/counter: outcome OK, fuel 1629797, memory peak 10048 KiB
+
+=== bench out/counter.wasm --msg counter --iterations 2000
+component   b3:3ed342e6bc41 (12786333 bytes)
+compile     p50      5.4s  p99      6.5s  mean      5.0s (5 runs)
+deserialize p50     1.1ms  p99     1.2ms  mean     1.1ms (cache hit, 20 runs)
+[pooling] 2000 turns of "counter", fuel/turn 1587545
+  instantiate p50    27.5µs  p99    80.4µs  mean    28.8µs
+  call        p50     1.1ms  p99     2.2ms  mean     1.2ms
+  whole turn  p50     1.3ms  p99     2.5ms  mean     1.4ms  (~737 turns/s single-threaded)
+[on-demand] 2000 turns of "counter", fuel/turn 1587545
+  instantiate p50    55.6µs  p99    96.3µs  mean    57.1µs
+  call        p50     1.1ms  p99     1.4ms  mean     1.1ms
+  whole turn  p50     1.4ms  p99     1.7ms  mean     1.4ms  (~730 turns/s single-threaded)
+
+=== bench out/actor.wasm --msg noop --iterations 2000
+component   b3:7194b807a941 (12843811 bytes)
+compile     p50      2.8s  p99      3.1s  mean      2.8s (5 runs)
+deserialize p50     1.1ms  p99     1.3ms  mean     1.1ms (cache hit, 20 runs)
+[pooling] 2000 turns of "noop", fuel/turn 954692
+  instantiate p50    23.1µs  p99    40.4µs  mean    24.6µs
+  call        p50   835.4µs  p99     1.1ms  mean   846.5µs
+  whole turn  p50   988.5µs  p99     1.2ms  mean     1.0ms  (~997 turns/s single-threaded)
+[on-demand] 2000 turns of "noop", fuel/turn 954692
+  instantiate p50    52.6µs  p99    73.3µs  mean    53.3µs
+  call        p50   833.0µs  p99     1.1ms  mean   845.6µs
+  whole turn  p50     1.0ms  p99     1.4ms  mean     1.0ms  (~953 turns/s single-threaded)
+
+=== bench out/actor.wasm --msg json --iterations 1000
+component   b3:7194b807a941 (12843811 bytes)
+compile     p50      2.7s  p99      3.3s  mean      2.8s (5 runs)
+deserialize p50     1.0ms  p99     1.2ms  mean     1.1ms (cache hit, 20 runs)
+[pooling] 1000 turns of "json", fuel/turn 28779575
+  instantiate p50    35.1µs  p99    58.2µs  mean    36.4µs
+  call        p50     4.1ms  p99     6.0ms  mean     4.2ms
+  whole turn  p50     4.3ms  p99     6.3ms  mean     4.5ms  (~224 turns/s single-threaded)
+[on-demand] 1000 turns of "json", fuel/turn 28779575
+  instantiate p50    63.4µs  p99    96.5µs  mean    64.5µs
+  call        p50     4.0ms  p99     5.8ms  mean     4.1ms
+  whole turn  p50     4.2ms  p99     6.1ms  mean     4.4ms  (~228 turns/s single-threaded)
+
+=== bench out/counter-aot.wasm --msg counter --iterations 2000
+component   b3:da890f7a8877 (18834668 bytes)
+compile     p50      3.8s  p99      4.1s  mean      3.8s (5 runs)
+deserialize p50     1.9ms  p99     2.1ms  mean     1.9ms (cache hit, 20 runs)
+[pooling] 2000 turns of "counter", fuel/turn 1629797
+  instantiate p50    27.8µs  p99    41.7µs  mean    27.7µs
+  call        p50     1.2ms  p99     1.4ms  mean     1.2ms
+  whole turn  p50     1.4ms  p99     1.7ms  mean     1.4ms  (~711 turns/s single-threaded)
+[on-demand] 2000 turns of "counter", fuel/turn 1629797
+  instantiate p50    57.9µs  p99   102.7µs  mean    58.2µs
+  call        p50     1.2ms  p99     1.7ms  mean     1.2ms
+  whole turn  p50     1.4ms  p99     2.0ms  mean     1.4ms  (~693 turns/s single-threaded)
+
+=== bench out/actor-aot.wasm --msg json --iterations 1000
+component   b3:8119788aeff1 (19010443 bytes)
+compile     p50      3.9s  p99      4.0s  mean      3.8s (5 runs)
+deserialize p50     2.0ms  p99     2.2ms  mean     2.0ms (cache hit, 20 runs)
+[pooling] 1000 turns of "json", fuel/turn 25966816
+  instantiate p50    32.7µs  p99    57.5µs  mean    34.0µs
+  call        p50     3.9ms  p99     5.7ms  mean     4.0ms
+  whole turn  p50     4.1ms  p99     6.0ms  mean     4.3ms  (~235 turns/s single-threaded)
+[on-demand] 1000 turns of "json", fuel/turn 25966816
+  instantiate p50    63.6µs  p99   100.0µs  mean    65.7µs
+  call        p50     3.9ms  p99     5.5ms  mean     4.0ms
+  whole turn  p50     4.1ms  p99     5.9ms  mean     4.3ms  (~235 turns/s single-threaded)

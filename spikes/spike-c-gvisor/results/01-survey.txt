@@ -1,0 +1,49 @@
+# 01-survey on travelfiesta at 2026-10-25T00:10:53Z, runsc version release-20261019.0, bridge pf
+
+=== OS and kernel
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+VERSION_ID="13"
+Linux 6.12.111+deb13-cloud-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.111-1 (2026-09-28) x86_64
+
+=== CPU and memory
+2
+Model name:                              Intel Xeon Processor (Skylake, IBRS, no TSX)
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+vmx/svm flags: 0
+               total        used        free      shared  buff/cache   available
+Mem:           3.7Gi       961Mi       526Mi        29Mi       2.6Gi       2.8Gi
+Swap:          4.0Gi       256Ki       4.0Gi
+
+=== Disk
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1        38G   11G   25G  31% /
+tmpfs           383M  2.2M  381M   1% /run
+
+=== KVM
+ls: cannot access '/dev/kvm': No such file or directory
+
+=== cgroups
+filesystem: cgroup2fs
+controllers: cpuset cpu io memory hugetlb pids rdma misc
+cgroup2 on /sys/fs/cgroup type cgroup2 (rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot)
+systemd 257 (257.13-1~deb13u1)
+
+=== Docker (present, not used by the spike)
+server 29.8.1
+
+=== gVisor
+$ runsc --version
+runsc version release-20261019.0
+spec: 1.2.1
+-rwxr-xr-x 1 root root 18605915 Jan  1  2000 /usr/local/bin/runsc
+
+/usr/local/bin/gvisor-bin/:
+total 119420
+-rwxr-xr-x 1 root root 48438588 Jan  1  2000 checkpointgofer
+-rwxr-xr-x 1 root root     1280 Jan  1  2000 gvisor-proc-umounter
+-rwxr-xr-x 1 root root 52831883 Jan  1  2000 gvisor_sentry
+-rwxr-xr-x 1 root root     1416 Jan  1  2000 gvisor-sentry-prewarmer
+-rwxr-xr-x 1 root root     1320 Jan  1  2000 runsc-fd-parking
+-rwxr-xr-x 1 root root 20994414 Jan  1  2000 runsc-metric-server

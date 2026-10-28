@@ -1,0 +1,6 @@
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+# Static binaries for the scratch image and for the test host.
+targets = ["x86_64-unknown-linux-musl"]
+profile = "minimal"

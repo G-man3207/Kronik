@@ -1,0 +1,39 @@
+# 10-buildkit-check at 2026-10-25T00:18:06Z, github.com/docker/buildx v0.38.0
+FROM busybox:1.37-musl
+RUN mkdir -p /srv/old/sub && echo a > /srv/old/a.txt && echo b > /srv/old/sub/b.txt \
+ && echo stale > /etc/stale.conf && ln -s /srv /opt-link
+RUN rm /etc/stale.conf && rm -rf /srv/old && mkdir /srv/old && echo c > /srv/old/c.txt \
+ && echo via-link > /opt-link/via-link.txt
+--- entries of layer sha256:d3abb4765b8d020aa75f0af49a3081ea2ddfceda8970c53e570edf76c0eac634
+drwxr-xr-x 0/0               0 2026-10-24 23:24 etc/
+-rw-r--r-- 0/0               6 2026-10-24 23:24 etc/stale.conf
+lrwxrwxrwx 0/0               0 2026-10-24 23:24 opt-link -> /srv
+drwxr-xr-x 0/0               0 2026-10-24 23:24 proc/
+drwxr-xr-x 0/0               0 2026-10-24 23:24 srv/
+drwxr-xr-x 0/0               0 2026-10-24 23:24 srv/old/
+-rw-r--r-- 0/0               2 2026-10-24 23:24 srv/old/a.txt
+drwxr-xr-x 0/0               0 2026-10-24 23:24 srv/old/sub/
+-rw-r--r-- 0/0               2 2026-10-24 23:24 srv/old/sub/b.txt
+drwxr-xr-x 0/0               0 2026-10-24 23:24 sys/
+--- entries of layer sha256:cbbd3b15129460cfdc1ec26abdab3c5037d6e7ad523f36c84dd264742e5f537e
+drwxr-xr-x 0/0               0 2026-10-24 23:24 etc/
+---------- 0/0               0 1970-01-01 00:00 etc/.wh.stale.conf
+drwxr-xr-x 0/0               0 2026-10-24 23:24 srv/
+drwxr-xr-x 0/0               0 2026-10-24 23:24 srv/old/
+---------- 0/0               0 1970-01-01 00:00 srv/old/.wh.a.txt
+-rw-r--r-- 0/0               2 2026-10-24 23:24 srv/old/c.txt
+---------- 0/0               0 1970-01-01 00:00 srv/old/.wh.sub
+-rw-r--r-- 0/0               9 2026-10-24 23:24 srv/via-link.txt
+--- oci-tool bundle
+image: manifest sha256:759536353c441fa2ecb1916d872299c17a6b13bfd2de89a8af7fa1f1aed07606 config sha256:f13d559d1c5e4b231ef2eb4fdde072c7dec29dba5f14afd09f7dd400daeeb136
+  layer application/vnd.oci.image.layer.v1.tar+gzip sha256:f4255029a25bc97fe31c78724f2972e1ad162354163517d2bf202005a1c3c906 (871090 bytes), diff_id sha256:cdb90b3acfad4e427a5bb3dc46cef97d9b63942f7c572d385ac61eb545a7cef2
+  layer application/vnd.oci.image.layer.v1.tar+gzip sha256:d3abb4765b8d020aa75f0af49a3081ea2ddfceda8970c53e570edf76c0eac634 (283 bytes), diff_id sha256:59ff26eed7205dd888f987baf6e0b2f1c1a14f99d0364bf11770b3138a1cc14a
+  layer application/vnd.oci.image.layer.v1.tar+gzip sha256:cbbd3b15129460cfdc1ec26abdab3c5037d6e7ad523f36c84dd264742e5f537e (257 bytes), diff_id sha256:8fe45fc5caca695c065b746a616525d5aa19dbb7480c68592c6d59a01491ca37
+unpacked: 3 layers verified (blob digest and diff_id), 443 entries, 3 whiteouts, 0 opaque dirs, 0 skipped
+bundle /tmp/tmp.zAM9Glwmkx/bundle ready in 24.564421ms: args ["sh"] user 0:0 cwd "/"
+--- result
+/etc/stale.conf: absent
+/srv/old: c.txt
+/opt-link: /srv
+/srv/via-link.txt: via-link
+whiteout files left: 0

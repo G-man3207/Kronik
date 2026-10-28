@@ -1,0 +1,5 @@
+# Components, logs, the precompiled cache and the patched harness copy
+# (scripts/build.sh, scripts/reuse-wasmtime.sh), and the generated WIT copy
+# and TypeScript declarations.
+/out/
+/generated/

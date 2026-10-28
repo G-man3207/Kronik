@@ -1,0 +1,36 @@
+# 12-wait-race on travelfiesta at 2026-10-25T00:17:36Z, runsc version release-20261019.0, bridge pf
+iter=1 cause=exit foreground=3 detached_wait=3
+iter=1 cause=kill foreground=137 detached_wait=unavailable
+iter=1 cause=kill9 foreground=137 detached_wait=unavailable
+iter=2 cause=exit foreground=3 detached_wait=3
+iter=2 cause=kill foreground=137 detached_wait=unavailable
+iter=2 cause=kill9 foreground=137 detached_wait=unavailable
+iter=3 cause=exit foreground=3 detached_wait=3
+iter=3 cause=kill foreground=137 detached_wait=unavailable
+iter=3 cause=kill9 foreground=137 detached_wait=unavailable
+iter=4 cause=exit foreground=3 detached_wait=3
+iter=4 cause=kill foreground=137 detached_wait=unavailable
+iter=4 cause=kill9 foreground=137 detached_wait=unavailable
+iter=5 cause=exit foreground=3 detached_wait=3
+iter=5 cause=kill foreground=137 detached_wait=unavailable
+iter=5 cause=kill9 foreground=137 detached_wait=unavailable
+iter=6 cause=exit foreground=3 detached_wait=3
+iter=6 cause=kill foreground=137 detached_wait=unavailable
+iter=6 cause=kill9 foreground=137 detached_wait=unavailable
+iter=7 cause=exit foreground=3 detached_wait=3
+iter=7 cause=kill foreground=137 detached_wait=unavailable
+iter=7 cause=kill9 foreground=137 detached_wait=unavailable
+iter=8 cause=exit foreground=3 detached_wait=3
+iter=8 cause=kill foreground=137 detached_wait=unavailable
+iter=8 cause=kill9 foreground=137 detached_wait=unavailable
+iter=9 cause=exit foreground=3 detached_wait=3
+iter=9 cause=kill foreground=137 detached_wait=unavailable
+iter=9 cause=kill9 foreground=137 detached_wait=unavailable
+iter=10 cause=exit foreground=3 detached_wait=3
+iter=10 cause=kill foreground=137 detached_wait=137
+iter=10 cause=kill9 foreground=137 detached_wait=unavailable
+
+=== Tally over 10 runs (expected: exit 3, kill 137, kill9 137)
+exit   runsc run (foreground): {'3': 10}   runsc run --detach + runsc wait: {'3': 10}
+kill   runsc run (foreground): {'137': 10}   runsc run --detach + runsc wait: {'unavailable': 9, '137': 1}
+kill9  runsc run (foreground): {'137': 10}   runsc run --detach + runsc wait: {'unavailable': 10}

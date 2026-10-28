@@ -1,0 +1,13 @@
+[package]
+name = "kronik-loadgen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "HTTP load generator for Kronik performance measurements (docs/perf.md)"
+license = "Elastic-2.0"
+
+# Standalone tool without dependencies; not part of the daemon workspace.
+[workspace]
+
+[profile.release]
+debug = false
