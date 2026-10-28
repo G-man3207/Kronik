@@ -2,13 +2,17 @@
 
 Last updated: 2026-10-28
 
-The repository history was squashed on 2026-10-28; commit ids in this file and in the ADRs refer to the earlier history, which the owner keeps.
+The history was squashed on 2026-10-28 into `Kronik v0.1` (0c3c266) and
+force-pushed. Commit ids from before the squash, here and in the ADRs,
+refer to the earlier history, which the owner keeps; so do the milestone
+tags `v0.0.0` to `v0.0.8`.
 
 ## Current milestone
 
-v0.1 is done at e3fb81a, the release candidate; publishing it is the
-owner's (Open questions). M0 to M8 are closed and tagged, `v0.0.0` to
-`v0.0.8`, M2 to M8 on 927c80a. After those tags main gained five v0.1 fixes:
+v0.1 is done; publishing it is the owner's (Open questions). M0 to M8 are
+closed and tagged, `v0.0.0` to `v0.0.8`, M2 to M8 on 927c80a. On main, v0.1
+ends at 4353863: `Kronik v0.1` (0c3c266), main's CI fixes and the keystore
+restore fix. After the milestone tags v0.1 gained six fixes:
 
 - Promote pins the code of changed kinds (`PROPOSAL_STALE`): 24fef29, and
   07bdeae, which pins it at the proposal's creation head instead of its
@@ -26,12 +30,23 @@ owner's (Open questions). M0 to M8 are closed and tagged, `v0.0.0` to
   no new key over existing stores (`MASTER_KEY_MISSING`,
   `MASTER_KEY_MISMATCH`; ffea125); a restore fails before writing when the
   bucket's keystore backup can't be installed (2ebae98).
+- Restore and the keystore: restore installs the newest keystore backup and
+  checks that it holds every key the restored data needs
+  (`KEYSTORE_INCOMPLETE`, `--allow-missing-keys`), installs by renames only,
+  and the shipper's keystore stamp includes the WAL: eb60bab and 4353863,
+  verified as 329da48 before their rebase onto d80e52a. Quickstart walk 4
+  found the bug: restore installed an older keystore backup, so sealed
+  values were unreadable; a restore without the master key succeeded, and
+  replay answered that privacy mode arrives later.
 
 Also since the tags: test and crash-test ports below the ephemeral range
-(0cf94d7, 2491abc), the quickstart walk 3 follow-ups (a7234ab, ba188e7) and
-a regenerated `openapi.json` (49d811a).
+(0cf94d7, 2491abc), the quickstart walk 3 follow-ups (a7234ab, ba188e7), a
+regenerated `openapi.json` (49d811a), and fixes for GitHub Actions: the ops
+test's KVM check (de7b696), the TS test glob (64ae700),
+`identity-examples.sh` (eb1218e), and the foreign step as root with gVisor
+and the musl target (d80e52a).
 
-The release candidate's evidence, 2026-10-28:
+v0.1's evidence, 2026-10-28:
 
 - `scripts/ci.sh`, every step (`foreign` and `identity` included), passed at
   e3fb81a on dev.
@@ -43,10 +58,27 @@ The release candidate's evidence, 2026-10-28:
   They carry over to e3fb81a, whose changes since 2491abc touch only the
   unit, `init`, `doctor`, kronik-foreign's runtime directories and image
   packer, `openapi.json` and docs.
+- At 329da48, the keystore fix: `scripts/ci.sh`, every step, passed on dev,
+  and the testbench rows M6, M8, `identity` and `M7/foreign-unit` passed,
+  19 of 19 suites, 18:31 to 19:01 UTC. The fix touches restore, the
+  keystore, shipping, CLI messages and docs, and gives a sealed value
+  without its key its own error; the crash test and DST meet none of that,
+  so their results carry over.
+- Quickstart walk 4, 13:47 to 14:09 UTC on travelfiesta in a fresh
+  ubuntu:24.04 container with e3fb81a's release, passed steps 1 to 8 (in
+  5 min 51 s) and step 10 on the source node; its step 9 found the bug
+  above. The re-check of step 9, 19:05 to 19:14 UTC with 329da48's
+  release: the restore with the right key installed the keystore
+  (`integrity` lists no missing keys, sealed state readable), and restores
+  without a key, or with a wrong one (`MASTER_KEY_MISMATCH`), were refused.
+  The refused wrong-key restore still created the absent directory and an
+  empty `keys/`; 6b0e1a7 (`fix-restore-empty-dirs`) fixes that after v0.2.
+  MCP on a restored node is checked at that head.
+- GitHub Actions CI passed on main at eb1218e, d80e52a and 4353863.
 
-v0.2 (`v02-integration-3`, c626ede) and v0.3 (`m12-simulators` to
-`m15-sdks`) land next; after v0.3 the owner decides what follows. Other work
-is parked (Parked work).
+v0.2 landed with f957475 (v0.2 section). v0.3 (`m12-simulators` to
+`m15-sdks`) lands next; after v0.3 the owner decides what follows. Other
+work is parked (Parked work).
 
 The testbench is `travelfiesta`: Debian 13, 2 vCPU Skylake, 3.7 GiB, no
 `/dev/kvm`, gVisor `release-20261019.0` with systrap. The batch
@@ -55,8 +87,8 @@ repository) runs its suites one at a time under the testbench lock, with
 release binaries built on dev from one commit; a row of M9 or later runs
 only at a commit that has its milestone. Logs are in
 `/var/tmp/kronik-batch/logs/` on the testbench. The whole batch passed at
-68008f9 and at 927c80a (52 of 52 suites, 2026-10-27) and at e3fb81a (56 of
-56, 2026-10-28).
+68008f9 and at 927c80a (52 of 52 suites, 2026-10-27), at e3fb81a (56 of 56)
+and, with v0.2's rows, at c626ede (67 of 67, 2026-10-28).
 
 ## M0: repository and spikes (closed, `v0.0.0` on 89a8b34)
 
@@ -66,8 +98,8 @@ only at a commit that has its milestone. Logs are in
       record is `scripts/ci.sh` (12 steps), which passed every step on dev
       at a3dce8f (537 s), adddce8 (606 s) and 0403ac2 (659 s) on 2026-10-26
       and at 927c80a (664 s) on 2026-10-27, with `foreign` and `identity`
-      run (`todo-ts` included). GitHub Actions is not green yet (Known
-      gaps).
+      run (`todo-ts` included). GitHub Actions CI is green on main since
+      eb1218e (2026-10-28).
 - [x] `LICENSE` (ELv2), `NOTICE`, `CONTRIBUTING.md` with `CLA.md`,
       `SECURITY.md`, `STATUS.md`, `docs/adr/0000-template.md`.
 - [x] `kronik --version` prints Kronik's, Wasmtime's (50.0.0) and the
@@ -307,9 +339,9 @@ compare fixed builds and do not change with the batch's commit.
 
 - [x] M0 to M8 closed with green CI: tagged `v0.0.0` to `v0.0.8`, M2 to M8
       on 927c80a after the final batch. `scripts/ci.sh` passed every step at
-      0403ac2, 68008f9, 927c80a and, for the release candidate, at e3fb81a
-      (2026-10-28). GitHub Actions is not green, and main is not pushed
-      (Known gaps, Open questions).
+      0403ac2, 68008f9, 927c80a, e3fb81a and, with the keystore fix, at
+      329da48 (2026-10-28). GitHub Actions CI is green on main since eb1218e
+      (2026-10-28).
 - [x] A 15-minute quickstart carried out in a fresh environment by someone
       who did not write the code. A fresh agent walked
       `docs/guides/quickstart.md` on 2026-10-26 in a clean container with
@@ -320,8 +352,12 @@ compare fixed builds and do not change with the batch's commit.
       travelfiesta in a fresh ubuntu:24.04 container with the release from
       927c80a, by an agent that did not write the code, passed all 10
       steps, steps 1 to 8 in 3 min 53 s; it found the restore gap (Known
-      gaps). The walks serve on a local port: there is no public install
-      URL, and ACME needs a DNS name.
+      gaps). The fourth, on 2026-10-28 with e3fb81a's release, passed steps
+      1 to 8 in 5 min 51 s and step 10; its step 9 found the keystore bug
+      fixed in eb60bab and 4353863, and the re-check of step 9 with
+      329da48's release passed apart from one empty directory (Current
+      milestone). The walks serve on a local port: there is no public
+      install URL, and ACME needs a DNS name.
 - [ ] GitHub release with static musl binaries for x86_64 and aarch64,
       checksums and an SBOM. `scripts/release.sh` builds all of it and the
       Release workflow runs by hand; publishing is the owner's action.
@@ -331,7 +367,7 @@ compare fixed builds and do not change with the batch's commit.
       the generated pages and the links).
 - [x] Identity replay empty for all eight example apps, isolated and
       continuous (`scripts/identity-examples.sh`, the `identity` CI step;
-      on travelfiesta at 162b08d, 68008f9, 927c80a and e3fb81a).
+      on travelfiesta at 162b08d, 68008f9, 927c80a, e3fb81a and 329da48).
 - [x] DST: 10 000 seeds plus a long run of at least 1 000 000 steps,
       without violations: on dev at 2e3740f (`docs/perf.md`); in the GitHub
       nightly at b47780d; and on dev with the nightly's commands at adddce8,
@@ -407,18 +443,89 @@ Checked and sound:
   environment values are written 0600 and deleted on stop (a partial
   code-read).
 
+## v0.2: whole systems in CI (M9 to M11)
+
+v0.2 landed on main with 2a2545e, one commit with v0.2's code, and
+f957475, which pins the reference workflow's action to 2a2545e. M9 and M11
+are closed; M10 is open on its criterion 4. ADRs 0012 and 0013 (M9), 0021
+to 0023 (M10) and 0024 to 0026 (M11).
+
+M9: system proposals (closed).
+
+- [x] A proposal with several components gives one fork, one replay and one
+      diff in which each actor kind is reported separately
+      (`crates/kronik-fork/tests/system.rs`, `kronik propose <dir>` in
+      `cli.rs`, a two-kind diff in `schemas.rs`).
+- [x] A caller and a new route on its callee verify together and fail
+      apart, and the test shows the difference (`system.rs`).
+- [x] After `effective_lsn`, no turn of any kind in the set starts with old
+      code (`system.rs`).
+- [x] Rollback of a set restores every kind at one LSN (`system.rs`).
+
+M10: remote control from CI (open).
+
+- [x] The CLI against a remote API with `KRONIK_URL` and `KRONIK_TOKEN`;
+      plain HTTP is refused except to this machine
+      (`crates/kronik/tests/remote.rs`, unit tests in `cli/http.rs`).
+- [x] A 30-minute replay survives its client disconnecting, and `proposal
+      wait` shows progress (`remote.rs`; held 31 minutes with no client in
+      the batch's `M10/remote-30min` at c626ede).
+- [x] `diff show --summary` holds no bodies and no state values, checked
+      against a diff with personal data (`privacy_mode.rs`, unit tests in
+      `markdown.rs`).
+- [ ] An example repository runs the whole flow in GitHub Actions. The
+      action (`action/`) and the reference workflow are tested against a
+      fake `kronik` and a fake GitHub API (`scripts/ci.sh action`, 48
+      tests); `examples/github-flow` holds the repository's content. A run
+      on GitHub needs a public repository and a daemon its runners reach
+      (Open questions).
+- [x] Pull requests from forks don't run propose by default (the action's
+      tests).
+
+M11: guard after promote and preview forks (closed).
+
+- [x] `watch` rolls back when the error rate after promote breaks a guard,
+      and `GuardTriggered` holds the measurements
+      (`crates/kronik-fork/tests/watch.rs`).
+- [x] With a schema change, `watch` alerts instead of rolling back
+      (`watch.rs`).
+- [x] A preview fork takes new requests on the new code without live
+      effects, and they show as preview inputs in the diff
+      (`crates/kronik/tests/preview.rs`, kronik-fork's `preview.rs`).
+- [x] Preview forks are deleted after their TTL, 24 hours by default
+      (`preview.rs`, the configuration's unit test).
+- `preview_domain` gets its wildcard certificate by ACME DNS-01 through a
+  hook, tested against Pebble (`scripts/e2e-acme-pebble.sh`); a public
+  domain is the owner's.
+
+Evidence, 2026-10-28:
+
+- At c626ede (v0.2 merged with main at e3fb81a): `scripts/ci.sh`, every
+  step, `action` included; the crash test (1 000 cycles, 20 rebuild checks,
+  an empty identity replay of 125 540 root inputs) and DST (30 000 runs,
+  10 000 webhook runs with `webhook-relay-ts`, 10 000 `rebuild` runs,
+  1 000 000 steps twice), all without a failure; and the testbench batch,
+  67 of 67 suites in the rows M1 to M11 and `identity`, 15:01 to 16:24 UTC,
+  `M10/remote-30min` included.
+- At f957475: `scripts/ci.sh`, every step, `action` included, and the
+  testbench rows M3, M6, M8, M10 (without `remote-30min`), M11 and
+  `identity`, 33 of 33 suites, 19:35 to 20:09 UTC. Its diff from c626ede is
+  v0.1's changes since e3fb81a, unchanged in 44 of 49 files and the same in
+  `ci.sh`, the CI workflow and `proposal.rs` (the keystore fix's error
+  mapping next to v0.2's code), plus the action's pin. The crash test, DST
+  and the other rows carry over from c626ede.
+
 ## Next
 
-1. v0.2: the dev chain and the testbench batch at `v02-integration-3`
-   (c626ede); then main moves there, and `v0.0.9` (M9) and `v0.0.11` (M11)
-   are tagged. M10 stays open: its criterion 4 needs a public repository
+1. Push this commit to main (v0.2) and tag `v0.0.9` (M9) and `v0.0.11`
+   (M11) on it. M10 stays open: its criterion 4 needs a public repository
    (Open questions).
-2. v0.3: `m12-simulators` to `m15-sdks`. Then the owner decides what
+2. Land 6b0e1a7 (`fix-restore-empty-dirs`): a refused restore leaves its
+   directory as it was. Then check MCP on a restored node at that head.
+3. v0.3: `m12-simulators` to `m15-sdks`. Then the owner decides what
    follows.
-3. When the owner decides (Open questions): push main and the tags, so that
-   GitHub Actions runs CI with 9da9e55's disk fix and the nightly runs the
-   fixed crash test; then the v0.1.0 release.
-4. Add the testbench privacy overhead to `docs/perf.md`.
+4. Publishing, when the owner decides (Open questions).
+5. Add the testbench privacy overhead to `docs/perf.md`.
 
 ## Parked work
 
@@ -454,12 +561,13 @@ Each branch's last commit message carries its handoff.
   erasure deletes only rows with `_subject = subject`, so such rows survive
   erasure in plain text. M1 implements the brief as written (ADR 0005,
   `subjects/gap-without-column`).
-- **Publishing.** Pushing main and the tags to GitHub, GitHub Actions
-  minutes for CI and the nightly, the v0.1.0 GitHub release, and a public
-  install URL and domain, for `install.sh` and for ACME with a real
-  certificate.
-- M10's GitHub Action and its example-repository criterion need a public
-  repository and GitHub Actions minutes.
+- **Publishing.** The v0.1.0 GitHub release; the milestone tags, whose
+  `v0.0.0` to `v0.0.8` point into the earlier history (push that history
+  with them, or tag this one instead); GitHub Actions minutes for CI and
+  the nightly; and a public install URL and domain, for `install.sh` and
+  for ACME with a real certificate.
+- M10's criterion 4 needs a public repository with `examples/github-flow`,
+  a daemon GitHub's runners can reach, and GitHub Actions minutes.
 - **Crypto in forks is a signing oracle.** As the brief's effect table
   says, a fork's `crypto.hmac-sha256` or `crypto.sign-ed25519` call that
   matches no recording is computed on the host with the production key.
@@ -496,14 +604,12 @@ Each branch's last commit message carries its handoff.
   checkpoint, at the same length and within one mtime tick, is missed until
   the next change or the daily backup (review F7 on fix-v01-keystore-restore).
   A change counter kept in the keystore itself would close it.
-
-- GitHub Actions has not been green yet. CI failed at fmt on 19eb9d0,
-  43bc314 and cfb9a86, in the tests on 0891be7, and ran out of runner disk
-  during the tests on b47780d (fixed in 9da9e55, not pushed). The nightly at
-  b47780d passed both DST seed runs, the long run and the musl release
-  build, and failed the crash test (fixed, see the Definition of done).
-  `scripts/ci.sh` runs on dev (Debian 13), not on the workflow's Ubuntu
-  24.04.
+- The nightly has not run on the pushed history yet; its runs on the
+  earlier main (b47780d) failed the crash test, which is fixed since.
+  GitHub Actions CI is green on main since eb1218e (2026-10-28), after
+  fixes to the ops test's KVM check, the TS test glob and
+  `identity-examples.sh`. `scripts/ci.sh` runs on dev (Debian 13), CI on
+  the workflow's Ubuntu 24.04.
 - One actor commits 180 to 210 turns/s: each turn waits for the 2 ms
   group-commit window and an fsync before the actor's next turn. Across
   actors the counter commits about 7 900 turns/s on dev and 2 770 on
@@ -521,10 +627,10 @@ Each branch's last commit message carries its handoff.
   an hour for `N/h`): rate windows start full and are not persisted.
 - `kronik upgrade check` has not seen a real engine change: there is one
   engine version, `kronik-0.1.0-dev+wasmtime-50.0.0`.
-- The daemon does not set `PR_SET_DUMPABLE`, which needs a new unsafe call
-  or dependency: `LimitCORE=0` in the systemd unit is the only protection
-  against core dumps, and outside systemd the operations guide says to use
-  `ulimit -c 0`.
+- The daemon did not set `PR_SET_DUMPABLE`. Fixed: `kronik serve` makes
+  itself non-dumpable at start through rustix (6bf2f60 in the earlier
+  history), besides the unit's `LimitCORE=0`; if the call fails it logs a
+  warning.
 - `kronik serve --test-insecure-registry <host:port>`, a hidden test hook
   for pulling foreign images over plain HTTP, is in release builds too.
 - A foreign actor's `/data` has no quota. The operations guide says to put
