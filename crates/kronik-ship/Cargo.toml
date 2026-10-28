@@ -11,6 +11,7 @@ blake3 = { workspace = true }
 kronik-core = { workspace = true }
 kronik-log = { workspace = true }
 kronik-privacy = { workspace = true }
+kronik-proto = { workspace = true }
 kronik-sched = { workspace = true }
 kronik-store = { workspace = true }
 object_store = { workspace = true }
@@ -24,7 +25,6 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 kronik-core = { workspace = true, features = ["real"] }
-kronik-proto = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 

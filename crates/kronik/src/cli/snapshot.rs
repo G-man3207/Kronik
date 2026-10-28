@@ -36,11 +36,17 @@ pub(super) fn snapshot(ctx: &Ctx, command: SnapshotCommand) -> Result<ExitCode, 
 
 pub(super) fn integrity(ctx: &Ctx) -> Result<ExitCode, Error> {
     let body = ctx.get("/v1/integrity")?;
+    let r: IntegrityResponse = ctx.decode(&body)?;
+    // Sealed values nobody can read are a failed check, not a detail.
+    let status = if r.keys_missing.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    };
     if ctx.json {
         ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
+        return Ok(status);
     }
-    let r: IntegrityResponse = ctx.decode(&body)?;
     let mut out = String::new();
     let _ = writeln!(out, "Applied LSN   {}", r.applied_lsn);
     let _ = writeln!(out, "State hash    {}", r.state_hash);
@@ -53,9 +59,18 @@ pub(super) fn integrity(ctx: &Ctx) -> Result<ExitCode, Error> {
         r.newest_logical_time_ms,
         r.retention_cutoff_ms
     );
-    out.push_str(&next(&["kronik snapshot list".to_owned()]));
+    if r.keys_missing.is_empty() {
+        out.push_str(&next(&["kronik snapshot list".to_owned()]));
+    } else {
+        let _ = writeln!(
+            out,
+            "Keystore      KEYSTORE_INCOMPLETE: no key for the sealed values of {}",
+            r.keys_missing.join(", ")
+        );
+        out.push_str(&next(&["kronik explain KEYSTORE_INCOMPLETE".to_owned()]));
+    }
     ctx.print(&out);
-    Ok(ExitCode::SUCCESS)
+    Ok(status)
 }
 
 fn list(ctx: &Ctx) -> Result<ExitCode, Error> {

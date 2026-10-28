@@ -276,10 +276,14 @@ fn render(
         &[o.components.unwrap_or(0).to_string()],
         "",
     );
-    let _ = writeln!(
-        out,
-        "The master key is not in the bucket. Copy it into place before serving if secrets must be readable."
-    );
+    let keystore = match o.keystore.as_deref() {
+        Some("installed") => "installed with the master key, which serve will use too".to_owned(),
+        Some("skipped") => {
+            "not installed (--without-keystore): sealed values stay unreadable".to_owned()
+        }
+        _ => "none in the bucket, and none needed".to_owned(),
+    };
+    field(&mut out, "Keystore", &[keystore], "");
     out.push_str(&next(&[format!("kronik serve --data-dir {dir}")]));
     out
 }
@@ -349,6 +353,15 @@ fn ship_error(e: ShipError) -> ApiError {
             )
         }
         ShipError::Key(e) => ApiError::new(ErrorCode::BadRequest, format!("restore: {e}")),
+        ShipError::KeystoreIncomplete(m) => ApiError::new(
+            ErrorCode::KeystoreIncomplete,
+            format!("restore: KEYSTORE_INCOMPLETE: {m}"),
+        )
+        .with_hint(
+            "Let the source node ship again (it uploads a keystore backup within a minute of a \
+             change) and restore again; or pass --without-keystore to restore without those \
+             values. Nothing was written.",
+        ),
         ShipError::Io(e) => ApiError::new(ErrorCode::BadRequest, format!("restore I/O: {e}"))
             .with_hint("Check that the data directory is writable and the bucket is readable."),
     }

@@ -96,9 +96,10 @@ impl Api {
         let applied = self.node.applied_lsn();
         let mut first = None;
         let mut h = blake3::Hasher::new();
+        let mut needed = kronik_store::db::SubjectKeys::new();
         self.node
             .reader()
-            .read(1, applied, |c| {
+            .read(1, applied, |mut c| {
                 first.get_or_insert(c.lsn);
                 if c.lsn > applied {
                     return Ok(());
@@ -106,6 +107,10 @@ impl Api {
                 h.update(&c.lsn.to_le_bytes());
                 h.update(&[c.record.kind()]);
                 h.update(&c.record.encode());
+                kronik_proto::sealables::record_mut(
+                    &mut c.record,
+                    &mut kronik_store::db::note_sealed(&mut needed),
+                );
                 Ok(())
             })
             .await
@@ -127,7 +132,24 @@ impl Api {
                 // `start_local` and `kronik serve` always install a config.
                 None => (0, 0, 0),
             };
+        // Sealed values whose subject key the keystore lacks (a restore
+        // with --without-keystore, a lost keystore.db): unreadable data.
+        needed.extend(kronik_store::db::sealed_keys(store.db().conn()).map_err(internal)?);
+        let mut keys_missing: Vec<String> = Vec::new();
+        if let Some(ks) = self.node.sealer().keystore() {
+            for (subject, version) in &needed {
+                if !ks.covers(subject, *version).map_err(internal)?
+                    && keys_missing.last() != Some(subject)
+                {
+                    keys_missing.push(subject.clone());
+                }
+            }
+        } else {
+            keys_missing.extend(needed.iter().map(|(s, _)| s.clone()));
+            keys_missing.dedup();
+        }
         ok(&IntegrityResponse {
+            keys_missing,
             applied_lsn: applied,
             state_hash,
             log_first_lsn: first.unwrap_or(1),

@@ -212,12 +212,19 @@ in the bucket. Put it in place before restoring, where `kronik serve` will
 look for it: `--master-key-file` (or `KRONIK_MASTER_KEY_FILE`), else
 `[keys] master_key_file` in the configuration file, else
 `<data-dir>/keys/master.key`; or set `KRONIK_MASTER_KEY`. Restore uses it
-to install the bucket's privacy keystore backup, and checks it before it
-writes anything: when the bucket holds a backup and the key is missing or
-another one, restore fails with `MASTER_KEY_MISSING` or
-`MASTER_KEY_MISMATCH` and the directory stays as it was.
-`--without-keystore` restores without that backup; sealed values then stay
-unreadable. The JSON's `keystore` says `installed`, `none_in_bucket` or
+to install the bucket's newest privacy keystore backup, applies the
+erasures the log records after it, and checks that the keystore holds the
+key of every sealed value in the restored state and log. Everything is
+downloaded and checked in `<data-dir>/.restore` first, so a failure leaves
+the directory as it was:
+- a backup in the bucket and the key missing or another one:
+  `MASTER_KEY_MISSING` or `MASTER_KEY_MISMATCH`;
+- a sealed value whose key no backup provides (or sealed values and no
+  backup at all): `KEYSTORE_INCOMPLETE`.
+
+`--without-keystore` restores without the backup and without that check;
+sealed values then stay unreadable, and `kronik integrity` lists their
+subjects. The JSON's `keystore` says `installed`, `none_in_bucket` or
 `skipped`.
 
 `--from` is `s3://bucket/prefix` or `file:///path`. Credentials and region
@@ -237,7 +244,7 @@ Restored snapshot main-00000000000000000012 at lsn 12 into /var/lib/kronik
   Segments      2
   Log first LSN 1
   Components    1
-The master key is not in the bucket. Copy it into place before serving if secrets must be readable.
+  Keystore      installed with the master key, which serve will use too
 Next     kronik serve --data-dir /var/lib/kronik
 ```
 

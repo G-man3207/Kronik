@@ -255,7 +255,15 @@ too. `Keystore::import_backup(conn, master, blob)` restores it.
 The M6 shipper uploads a backup after keystore changes (debounced, at most
 once a minute) and daily, as `keystore/<wall_ms>.bin`. It deletes backups
 older than `privacy.keystore_backup_retention` and always keeps the newest.
-A restore takes the newest backup not newer than the restore point. This
+A restore takes the **newest** backup, not the newest before the snapshot:
+keys are only ever added, so a backup shipped after the snapshot holds every
+key its values need, while one from before the snapshot can lack the keys of
+the newest subjects (v0.1 quickstart walk 4). The erasures the restored log
+records after that backup are applied again to it, through their key
+version, and every sealed value in the restored state and log must then
+have its key or be erased, or the restore fails with `KEYSTORE_INCOMPLETE`
+before it writes. The shipper's change stamp covers the keystore's WAL, so
+a new key ships within a minute rather than after the next checkpoint. This
 retention is what makes erasure complete (§6.7).
 
 ## 11. Gateway subject (now)
@@ -490,11 +498,11 @@ sections above:
   `keystore/<wall_ms>.bin` (the `export_backup` bytes, not zstd) after a
   keystore change, at most once a minute, and once a day. Backups older
   than the published retention are deleted; the newest is kept. The
-  master key is never uploaded. `restore` installs the newest backup
-  whose wall time is not newer than the snapshot into `keys/keystore.db`
-  when the master key is already in the data directory, and still
-  succeeds without one (`RestoreReport.keystore_backup_ms` is then
-  null). `serve` passes `[privacy] keystore_backup_retention` to
+  master key is never uploaded. `restore` installs the newest backup into
+  `keys/keystore.db`, with the log's later erasures applied again, after
+  checking it holds every key the restored data needs; a backup it can't
+  install, or a missing key, fails the restore before it writes (see the
+  operations guide; `--without-keystore` opts out). `serve` passes `[privacy] keystore_backup_retention` to
   `NodeConfig.keystore_backup_retention`, so a configured window is what
   both erasure completion and the shipper use.
 - **Redaction.** `kronik_api::redact::render_sealable` renders state values

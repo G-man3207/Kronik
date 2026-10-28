@@ -2220,6 +2220,7 @@ against both.
             "IMAGE_INVALID",
             "IMPORT_NOT_ALLOWED",
             "INTERNAL",
+            "KEYSTORE_INCOMPLETE",
             "KVM_UNAVAILABLE",
             "MASTER_KEY_MISMATCH",
             "MASTER_KEY_MISSING",
@@ -2922,6 +2923,14 @@ against both.
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
+    },
+    "keys_missing": {
+      "default": [],
+      "description": "Subjects with sealed values (in the state or the log) whose key the\nprivacy keystore lacks and that were not erased: those values can't\nbe read (`KEYSTORE_INCOMPLETE`). Empty on a healthy node.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     },
     "log_first_lsn": {
       "description": "The first LSN the log still holds (retention deletes older segments).",

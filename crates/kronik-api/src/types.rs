@@ -966,4 +966,9 @@ pub struct IntegrityResponse {
     /// the window. Zero when the node has no storage config.
     #[serde(default)]
     pub retention_cutoff_ms: u64,
+    /// Subjects with sealed values (in the state or the log) whose key the
+    /// privacy keystore lacks and that were not erased: those values can't
+    /// be read (`KEYSTORE_INCOMPLETE`). Empty on a healthy node.
+    #[serde(default)]
+    pub keys_missing: Vec<String>,
 }
