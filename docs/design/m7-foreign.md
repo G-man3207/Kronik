@@ -162,8 +162,8 @@ never share a cgroup. Shutdown and `kronik foreign cleanup` remove the empty
   rootfs. Device nodes and FIFOs are skipped. An image that unpacks to more
   than 8 GiB or 1 000 000 entries is rejected. Owners and modes come from
   the tar headers, without setuid and setgid (the sticky bit stays): a
-  foreign actor needs neither, and the unit's `RestrictSUIDSGID` makes the
-  kernel refuse them (ADR 0027).
+  foreign actor needs neither, and no setid file comes from an image
+  (ADR 0027).
 - **`config.json`** from the image config plus the record: `Entrypoint` +
   `Cmd`, `Env` (secrets override image variables of the same name; a
   default `PATH` if missing), `WorkingDir` (created if missing), `User`
@@ -373,6 +373,10 @@ the sandbox's memory, and is lost when the sandbox stops (ADR 0003).
 - **The foreign actor is never started in a fork, and no fork sends it
   anything** (I7): the replay gate has no transport, and `[fork]
   live_allowlist` never applies to `foreign://`. Forks get no `ForeignHost`.
+- Since M14 an actor declared with `fork_mode = "sandbox"` gets a copy per
+  continuous fork, started from a checkpoint, with no network and its own
+  disk; production's actor still never hears from a fork. See
+  [m14-foreign-forks.md](m14-foreign-forks.md).
 - The diff counts `foreign.http` as an external effect; its grounding entry
   has `kind = "foreign.http"`, `host` = the name, `route` = the route
   pattern, so `t.host.endsWith('payments.internal')` works in policies.

@@ -5,6 +5,7 @@
 //! forks and the test host have none, so foreign calls there are never live
 //! (I7).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use kronik_core::env::{BoxFuture, HttpRequest, HttpResponse, NetError};
@@ -32,6 +33,68 @@ pub trait ForeignHost: Send + Sync + 'static {
         name: &str,
         req: HttpRequest,
     ) -> BoxFuture<'static, Result<HttpResponse, NetError>>;
+
+    /// Checkpoints the running actor `name` at main's LSN `lsn` (M14, ADR
+    /// 0019). `hold` keeps main's turns drained: the host drops it as soon
+    /// as main's calls to `name` wait in the daemon, so main is not held
+    /// for the copy of the data directory and the runsc steps. `budget`:
+    /// the bytes free above `[log] disk_reserve` (None: no reserve); a
+    /// checkpoint whose data would not fit is refused.
+    fn checkpoint(
+        &self,
+        name: &str,
+        lsn: u64,
+        hold: Box<dyn std::any::Any + Send>,
+        budget: Option<u64>,
+    ) -> BoxFuture<'static, Result<Checkpoint, String>> {
+        let _ = budget;
+        drop(hold);
+        let name = name.to_owned();
+        Box::pin(async move { Err(format!("{name}: this host takes no checkpoints ({lsn})")) })
+    }
+
+    /// The checkpoints of `name`, oldest first.
+    fn checkpoints(&self, _name: &str) -> Vec<Checkpoint> {
+        Vec::new()
+    }
+
+    /// Starts a fork's copy of an actor from a checkpoint (M14).
+    fn start_copy(
+        &self,
+        spec: CopySpec,
+    ) -> BoxFuture<'static, Result<Arc<dyn ForeignCopy>, String>> {
+        Box::pin(async move { Err(format!("{}: this host runs no copies", spec.name)) })
+    }
+}
+
+/// One checkpoint of a foreign actor: the sandbox's memory, its data
+/// directory and its runtime spec at main's LSN `lsn` (M14, ADR 0019).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub name: String,
+    pub lsn: u64,
+    pub dir: PathBuf,
+    pub at_ms: u64,
+    pub bytes: u64,
+}
+
+/// A fork's copy to start: the actor, the checkpoint, and the directory the
+/// copy's disk lives in (deleted with the copy).
+#[derive(Debug, Clone)]
+pub struct CopySpec {
+    pub fork: String,
+    pub name: String,
+    pub checkpoint: Checkpoint,
+    pub dir: PathBuf,
+}
+
+/// A running copy of a foreign actor in a fork: no network out, its own
+/// disk (M14).
+pub trait ForeignCopy: Send + Sync + 'static {
+    /// As [`ForeignHost::http`], to the copy.
+    fn http(&self, req: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>>;
+    /// Stops the copy and deletes its disk.
+    fn stop(&self) -> BoxFuture<'static, ()>;
 }
 
 /// The error text of a call that cannot reach a foreign actor.

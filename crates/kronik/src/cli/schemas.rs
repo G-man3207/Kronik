@@ -140,7 +140,10 @@ const COMMANDS: &[(&str, Output)] = &[
     ),
     (
         "rollback",
-        Output::Api(&[("", "POST", "/v1/deployments/{epoch}/rollback")]),
+        Output::Api(&[
+            ("", "POST", "/v1/deployments/{epoch}/rollback"),
+            ("--by-replay", "POST", "/v1/deployments/{epoch}/rebase"),
+        ]),
     ),
     (
         "watch",
@@ -196,6 +199,14 @@ const COMMANDS: &[(&str, Output)] = &[
     (
         "foreign cleanup",
         Output::Local(super::foreign::cleanup_schema),
+    ),
+    (
+        "stubs set",
+        Output::Api(&[("", "PUT", "/v1/simulators/{target}")]),
+    ),
+    (
+        "simulators list",
+        Output::Api(&[("", "GET", "/v1/simulators")]),
     ),
     (
         "privacy mode",

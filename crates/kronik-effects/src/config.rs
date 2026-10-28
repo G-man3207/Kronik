@@ -227,7 +227,7 @@ impl KindLimits {
 
 /// Grants, limits, declared foreign actors and the privacy mode as of one
 /// epoch.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Config {
     pub epoch: u64,
     grants: BTreeMap<(String, String), Grant>,
@@ -237,6 +237,9 @@ pub struct Config {
     /// The latest `PrivacyMode` record's epoch and mode
     /// (docs/design/m8-privacy.md §3).
     privacy: Option<(u64, pb::PrivacyState)>,
+    /// Simulator configuration by target (M12): the latest
+    /// `SimulatorConfig` record of each.
+    simulators: BTreeMap<String, pb::SimulatorConfig>,
     /// Installation default for `sql_bytes_per_actor` when a kind has no
     /// value in a `Limits` record. `None` keeps [`KindLimits::default`]
     /// (1 GiB), which DST and tests rely on.
@@ -287,6 +290,14 @@ impl Config {
                     self.foreign.remove(&f.name);
                 } else {
                     self.foreign.insert(f.name.clone(), f.clone());
+                }
+            }
+            Record::SimulatorConfig(m) => {
+                self.epoch = self.epoch.max(m.epoch);
+                if simulator_config_empty(m) {
+                    self.simulators.remove(&m.target);
+                } else {
+                    self.simulators.insert(m.target.clone(), m.clone());
                 }
             }
             _ => {}
@@ -351,9 +362,19 @@ impl Config {
     }
 
     /// Every declared foreign actor, by name.
+    /// The simulator configuration of every target that has one (M12).
+    pub fn simulators(&self) -> &BTreeMap<String, pb::SimulatorConfig> {
+        &self.simulators
+    }
+
     pub fn foreign_actors(&self) -> impl Iterator<Item = &pb::ForeignActor> {
         self.foreign.values()
     }
+}
+
+/// Whether a `SimulatorConfig` record clears its target.
+pub fn simulator_config_empty(m: &pb::SimulatorConfig) -> bool {
+    m.stubs.is_empty() && m.contract.is_empty() && !m.neighbor && !m.model
 }
 
 /// Every configuration record with its epoch, so the configuration of any
@@ -402,6 +423,7 @@ impl ConfigHistory {
                 Record::Deployment(d) => d.epoch,
                 Record::ForeignActor(f) => f.epoch,
                 Record::PrivacyMode(p) => p.epoch,
+                Record::SimulatorConfig(m) => m.epoch,
                 _ => continue,
             };
             if e <= epoch {

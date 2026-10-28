@@ -12,9 +12,10 @@
 # in tests/guests; `examples` runs the Rust SDK examples counter-rs and
 # notes-rs from examples/dist (build them with scripts/build-examples.sh);
 # `ts` runs their TypeScript twins counter-ts and notes-ts (build them with
-# scripts/build-examples-ts.sh).
+# scripts/build-examples-ts.sh); `py` and `go` the Python and Go twins
+# (scripts/build-examples-py.sh, scripts/build-examples-go.sh; M15).
 #
-# Usage: [M1_GUESTS=test|examples|ts] [KRONIK_BIN=path] scripts/acceptance-m1.sh [WORKDIR] [PORT] [N]
+# Usage: [M1_GUESTS=test|examples|ts|py|go] [KRONIK_BIN=path] scripts/acceptance-m1.sh [WORKDIR] [PORT] [N]
 # Defaults: /var/tmp/kronik-m1 (a real disk, not tmpfs), port 47812, N 10000,
 # KRONIK_BIN target/release/kronik.
 set -euo pipefail
@@ -40,13 +41,13 @@ case "$guests" in
         notes=examples/dist/notes.wasm
         note_body='{"title":"note","body":"a note"}'
         ;;
-    ts)
-        counter=examples/dist/counter-ts.wasm
-        notes=examples/dist/notes-ts.wasm
+    ts | py | go)
+        counter=examples/dist/counter-$guests.wasm
+        notes=examples/dist/notes-$guests.wasm
         note_body='{"title":"note","body":"a note"}'
         ;;
     *)
-        echo "M1_GUESTS must be test, examples or ts, not '$guests'" >&2
+        echo "M1_GUESTS must be test, examples, ts, py or go, not '$guests'" >&2
         exit 2
         ;;
 esac

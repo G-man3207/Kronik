@@ -35,7 +35,8 @@ Markdown (`kronik_fork::markdown::summary`, `format=summary`):
   counts; an HTTP input without a pattern shows as `(no route)`, never its
   path;
 - grounding per effect kind, method and host, with exact, approximate,
-  synthetic and live counts and the confidence, the first 10 targets and
+  synthetic and live counts (and forked ones when a fork has any, M14) and
+  the confidence, the first 10 targets and
   "… N more". A method is shown only if a route may declare it (`GET`,
   `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`), else as `(other)`:
   the guest passes any string, and a fork sends nothing that would reject

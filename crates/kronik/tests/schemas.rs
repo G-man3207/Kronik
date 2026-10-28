@@ -541,4 +541,33 @@ fn real_diffs_and_turns_match_their_schemas() {
     let mut missing = turns[0].clone();
     missing.as_object_mut().unwrap().remove("effects");
     assert!(s.compiled.validate(&missing, s.turn).is_err());
+
+    // A rollback via replay's diff (M13): promote the counter +2, then
+    // roll it back by replay.
+    d.api(
+        "POST",
+        &format!("/v1/proposals/{step2}/approve"),
+        json!({"reason": "schemas"}),
+    );
+    let promoted = d.api(
+        "POST",
+        &format!("/v1/proposals/{step2}/promote"),
+        json!({"reason": "schemas"}),
+    );
+    d.send("counter/a", "increment", "", None);
+    let epoch = promoted["deployment"]["epoch"].as_u64().unwrap();
+    let rebase = d.api(
+        "POST",
+        &format!("/v1/deployments/{epoch}/rebase"),
+        json!({"reason": "schemas"}),
+    );
+    s.check(
+        s.summary,
+        "a rebase's summary",
+        &rebase["proposal"]["summary"],
+    );
+    let id = rebase["proposal"]["id"].as_str().unwrap();
+    let diff = d.api("GET", &format!("/v1/proposals/{id}/diff"), Value::Null);
+    s.check(s.diff, "a rollback via replay's diff", &diff);
+    assert!(diff["irreversible"]["count"].is_u64(), "{diff}");
 }

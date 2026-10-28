@@ -320,13 +320,18 @@ Next     kronik serve --data-dir /var/lib/kronik
 
 ## kronik init
 
-`kronik init [--lang ts|rust] <NAME>`
+`kronik init [--lang ts|rust|python|go] <NAME>`
 
 Creates the directory `<NAME>` with an actor project in TypeScript (the
-default) or Rust: one actor type named `<NAME>`, with the route
-`POST /<NAME>/{key}/increment`, and a test (`test/actor.test.ts` or
-`tests/actor.rs`). The SDK and the WIT are copied from the binary into
-`vendor/kronik-sdk`. The name may have lowercase letters, digits and dashes
+default), Rust, Python or Go: one actor type named `<NAME>`, with the route
+`POST /<NAME>/{key}/increment`, and a test (`test/actor.test.ts`,
+`tests/actor.rs`, `tests/test_actor.py` or `test/actor_test.go`). The SDK
+and the WIT are copied from the binary into `vendor/kronik-sdk`, for Go into
+`kronik-sdk` (Go reserves `vendor/` for its own vendoring; `go.mod` replaces
+`kronik.dev/sdk` with it). A Python project is tested with `python3 -m
+unittest discover -s tests`, a Go project with `go test ./test`; both test
+and build with the pinned tools of `scripts/install-sdk-tools.sh` (from a
+Kronik checkout), which the next steps name first. The name may have lowercase letters, digits and dashes
 and starts with a letter; an existing directory must be empty. See
 [Writing actors](../guides/actors.md).
 
@@ -343,7 +348,7 @@ next:
 
 ## kronik build
 
-`kronik build [--dir <DIR>] [--force] [--entry <FILE>]`
+`kronik build [--dir <DIR>] [--force] [--entry <ENTRY>]`
 
 Builds the project in `<DIR>` (default `.`) into `dist/<name>.wasm` and checks
 the component's imports against the allowlist, failing with
@@ -354,9 +359,18 @@ build, the component is kept, unless `--force`. `--entry` builds another
 entry than `package.json`'s `kronik.entry` as a variant:
 `--entry src/step2.ts` gives `dist/<name>-step2.wasm`. A Rust project (it has
 a `Cargo.toml`) is built with `cargo build --release --target wasm32-wasip2`,
-and the same sources give the same component wherever they are. Progress
-goes to stderr. A TypeScript build needs Node.js 22.20 or later on `PATH`,
-and checks for it before it runs the toolchain.
+and the same sources give the same component wherever they are. A Python
+project (`pyproject.toml`) is built with componentize-py from the module in
+`[tool.kronik] entry` (default `actor`, in `src/`), a Go project (`go.mod`)
+with TinyGo from the package `.`; both are then composed with WASI-Virt's
+adapter, which keeps the filesystem and sockets out of the component, and
+keep the previous component when no input changed (ADR 0030). `--entry
+step2` (Python) or `--entry ./step2` (Go) builds a variant
+`dist/<name>-step2.wasm`. Their tools come from `$KRONIK_SDK_TOOLS/bin`
+(default `~/.cache/kronik/sdk-tools/bin`, `scripts/install-sdk-tools.sh`)
+and must be the pinned versions. Progress goes to stderr. A TypeScript
+build needs Node.js 22.20 or later on `PATH`, and checks for it before it
+runs the toolchain.
 
 ```text
 $ kronik build
@@ -900,7 +914,7 @@ Next     kronik fork list
 
 ## kronik replay
 
-`kronik replay <FORK> [--to <LSN>] [--mode isolated|continuous|both] [--sample <SHARE>] [--ignore-header <NAME>]... [--ignore-json-path <PATH>]... [--threads <N>] [--stub <FILE>]... --reason <REASON>`
+`kronik replay <FORK> [--to <LSN>] [--mode isolated|continuous|both] [--sample <SHARE>] [--ignore-header <NAME>]... [--ignore-json-path <PATH>]... [--threads <N>] [--stub <FILE>]... [--simulators <TARGET=FILE>]... --reason <REASON>`
 
 Runs main's root inputs after the fork point, up to `--to` or HEAD, through
 the fork's code, and writes the fork's behavior diff. Isolated replay runs
@@ -924,6 +938,13 @@ response (`status`, 200 by default; `headers`, as `[name, value]` pairs;
 first rule whose method and URL prefix match answers. A stubbed effect
 counts as synthetic grounding, and the diff records the rules in
 `options.stubs`. The flag repeats, and its rules apply in order.
+
+`--simulators TARGET=FILE` gives one target the simulator configuration in
+FILE (the rules file of `kronik stubs set`: stub rules, a contract,
+`neighbor`, `model`) for this replay only. It replaces main's configuration
+of TARGET as of the fork point, which is what a fork uses otherwise (I5),
+and the diff records it in `options.simulator_overrides`. The flag repeats,
+one per target.
 
 ```text
 $ kronik replay try --reason "see the diff"
@@ -1300,7 +1321,7 @@ Next     kronik rollback 3 --reason "..."
 
 ## kronik rollback
 
-`kronik rollback <EPOCH> --reason <REASON> [--dry-run]`
+`kronik rollback <EPOCH> [--by-replay [--mode continuous|both] [--threads <N>]] --reason <REASON> [--dry-run]`
 
 Writes a new deployment with the code that was in force before the
 deployment with this epoch (`kronik deployments list` shows the epochs).
@@ -1315,6 +1336,56 @@ added one (a system proposal with a new actor kind) is refused with
 kinds, propose their earlier components together, `kronik propose
 <earlier components> --reason "..."`, and promote that; the added kind
 keeps running, and a later proposal can change its code.
+`--by-replay` (M13, [design](../design/m13-rebase.md)) rolls back also
+after a schema change, without losing data: it creates a rebase proposal
+`r-<12 hex>` whose fork starts just before the deployment (before any
+migration) and replays every root input since then through the old code.
+Its diff shows the state the old code would have produced
+(`state.continuous`) and, under `Irreversible`, the external effects the
+rolled-back code made that the old code would not have made, which no
+rollback can undo. Nothing changes on main yet: `kronik approve` (always
+required) and `kronik promote` switch main to that state and the old code
+in one `StateRebase` record, holding new requests for at most `[rebase]
+max_pause`. Main's history stays. Creating it needs `propose` and `pii:read` (the
+rebase replays on full data), and below `[log] disk_reserve` neither the
+creation nor its promote is allowed (use plain `kronik rollback`). Only
+main's newest deployment can be
+rolled back this way, and only when every kind of it existed before;
+`--mode isolated` alone is refused. Needs `propose`; the promote needs
+`promote`.
+
+```text
+$ kronik rollback 4 --by-replay --reason "undo the schema change"
+Rebase proposal r-470545e1b8f2 rolls back epoch 4: replayed main since lsn 8 through the old code, verified through lsn 16
+
+  Causes        1 origin, 2 consequences
+                counter on message fetch-ok: 1 origin (1 roots)
+                counter on message increment: 0 origins (1 roots)
+  Responses     no HTTP root inputs
+  Effects       0 changed, 0 added, 1 removed
+                http.fetch GET 127.0.0.1/v1/charges/{}/extra: 1 change
+  State         2 actors changed
+                2 actors drifting over the window (cumulative)
+  Errors        0 introduced, 0 fixed, 0 new orphaned calls
+  Resources     fuel p99 -52.1%, memory p99 +0.0%
+  Grounding     1 exact, 0 approximate, 0 synthetic (confidence 1.00)
+  Irreversible  1 external effect of the rolled-back code the old code would not have made (cannot be undone)
+                http.fetch GET 127.0.0.1/v1/charges/{}/extra (ok, replay-safe) in main:16
+
+Policy   ALLOW
+Next     kronik diff show r-470545e1b8f2 --md
+         kronik approve r-470545e1b8f2 --reason "..."
+         kronik promote r-470545e1b8f2 --reason "..."   (switches main's state and code)
+
+$ kronik approve r-470545e1b8f2 --reason "read the diff"
+...
+$ kronik promote r-470545e1b8f2 --reason "undo the schema change"
+Rebased main at lsn 20, epoch 5: the state is the old code's from lsn 8 on, and the old code runs
+  Code          counter b3:e06fea7099d7 (schema 0)
+  Rebased       2 replayed turns, verified through lsn 19; 1 irreversible effect
+Next     kronik diff show r-470545e1b8f2 --md
+         kronik actors list
+```
 
 ```text
 $ kronik rollback 3 --reason "back to steps of 1"
@@ -1522,7 +1593,7 @@ Next     kronik preview list
 
 ## kronik foreign add
 
-`kronik foreign add <NAME> --image <REF> --port <PORT> [--cpu <CPUS>] [--memory <SIZE>] [--isolation gvisor|trusted|microvm] [--secret [VAR=]<SECRET>]... --reason <REASON> [--dry-run]`
+`kronik foreign add <NAME> --image <REF> --port <PORT> [--cpu <CPUS>] [--memory <SIZE>] [--isolation gvisor|trusted|microvm] [--secret [VAR=]<SECRET>]... [--fork-mode recorded|sandbox] --reason <REASON> [--dry-run]`
 
 Declares a foreign actor (M7) and starts it: a Linux program from an OCI
 image, pinned by digest (`<registry>/<repo>@sha256:<digest>`, or a local
@@ -1535,13 +1606,19 @@ as root); symbolic links inside a layout are refused. Pulls stop after
 `--secret` passes a secret as an environment variable at every start (the
 program sees the value). `trusted` runs plain runc with a warning, a
 seccomp filter and no user namespace: it is not a security boundary;
-`microvm` is `NOT_IMPLEMENTED`. Errors: `FOREIGN_EXISTS`, `IMAGE_INVALID`,
-`RUNSC_MISSING`, `RUNC_MISSING`, `SECRET_NOT_FOUND`, `SCOPE_MISSING`,
-`UNAVAILABLE` when the image's new layers do not fit above `[log]
-disk_reserve`, and `FOREIGN_UNAVAILABLE` when another daemon holds
-`[foreign] run_dir` or the registry (or layout directory) did not answer
-within `[foreign] pull_timeout`. See
-[the M7 design](../design/m7-foreign.md).
+`microvm` is `NOT_IMPLEMENTED`. `--fork-mode` (M14) says how forks answer
+calls to it: `recorded` (the default) matches production's recordings;
+`sandbox` (gVisor only) checkpoints the actor with every snapshot, and each
+continuous fork gets a copy from the nearest checkpoint, with no network
+and its own disk, deleted with the fork; its answers are graded `forked`.
+To change the mode, remove and add the actor again. Errors:
+`FOREIGN_EXISTS`, `IMAGE_INVALID`, `RUNSC_MISSING`, `RUNC_MISSING`,
+`SECRET_NOT_FOUND`, `SCOPE_MISSING`, `UNAVAILABLE` when the image's new
+layers do not fit above `[log] disk_reserve`, and `FOREIGN_UNAVAILABLE`
+when another daemon holds `[foreign] run_dir` or the registry (or layout
+directory) did not answer within `[foreign] pull_timeout`. See
+[the M7 design](../design/m7-foreign.md) and
+[the M14 design](../design/m14-foreign-forks.md).
 
 ```text
 $ kronik foreign add echo --image oci-layout:examples/dist/foreign-echo.oci --port 8080 --reason "echo for tests"
@@ -1558,7 +1635,9 @@ Next     kronik grant <kind> foreign:echo --reason "..."   (then call foreign://
 `kronik foreign list`
 
 The declared foreign actors with their state (`starting`, `running`,
-`backoff`, `stopping`), restarts, the last exit and limits.
+`backoff`, `stopping`), restarts, the last exit, limits and fork mode
+(`FORKS`: `recorded`, `sandbox`, or `sandbox (lsn N)` with the newest
+checkpoint).
 
 ## kronik foreign cleanup
 
@@ -1567,8 +1646,9 @@ The declared foreign actors with their state (`starting`, `running`,
 Run on the host while the daemon is stopped (the systemd unit's
 `ExecStopPost=`): deletes what the sandboxes of a daemon that stopped,
 crashed or was killed left behind: runsc containers, network namespaces,
-bridge sockets, every `bundle/config.json` (they hold secret values) and
-the cgroup parent, and unmounts runsc's `null-netns`. Refused with
+bridge sockets, every `bundle/config.json` (they hold secret values),
+including those of fork copies (M14), partial checkpoints, and the cgroup
+parent, and unmounts runsc's `null-netns`. Refused with
 `UNAVAILABLE` while a daemon holds `[foreign] run_dir`, and without root.
 The data directory comes from `--data-dir`, `KRONIK_DATA_DIR` or the
 configuration, as for `serve`. What it could not remove or list is printed
@@ -1587,7 +1667,71 @@ secrets are replaced by `[secret:<name>]`. Needs `operate`.
 `kronik foreign remove <NAME> --reason <REASON> [--dry-run]`
 
 Stops the sandbox and writes a `ForeignActor` remove record; the data
-directory `foreign/actors/<NAME>/data` is kept. Needs `operate`.
+directory `foreign/actors/<NAME>/data` is kept, its checkpoints are
+deleted. Needs `operate`.
+
+## kronik stubs set
+
+`kronik stubs set <TARGET> <RULES.toml> --reason <REASON> [--dry-run]`
+
+Replaces how forks answer effects to `TARGET` (`http:<host>` or
+`foreign:<name>`) that have no recording (M12): writes one
+`SimulatorConfig` record, so the configuration is history, and every
+replay uses the one in force at its fork point (I5), plus the overrides its
+request carries (`--simulators`; an override can turn the model off for a
+target, never on). Needs `operate`. The
+file holds `[[stub]]` rules (as for `kronik replay --stub`; each
+`url_prefix` must be on the target), `contract = "<file>.json"` (an OpenAPI
+3 document in JSON, at most 1 MiB, path relative to the rules file),
+`neighbor = true` (reuse the most similar recorded request to the same
+route) and `model = true` (allow the model simulator, see
+`[simulators.model]` in [operations](../guides/operations.md)). Unknown keys
+are an error; an empty file clears the target. See
+[the M12 design](../design/m12-simulators.md).
+
+```text
+$ cat charges.toml
+contract = "charges.openapi.json"
+neighbor = true
+
+[[stub]]
+method = "GET"
+url_prefix = "https://api.example.com/v1/health"
+body = "ok"
+
+$ kronik stubs set http:api.example.com charges.toml --reason "fake the charges API in forks"
+http:api.example.com now has 1 stub rule, a contract, neighbor (epoch 5, LSN 42).
+Next     kronik simulators list
+```
+
+A fork effect without a recording tries, in order: request stub rules
+(`--stub`), the target's stub rules, the `[fork] live_allowlist`, the
+contract, the neighbor, the model, and else fails closed. Every answer
+except a live one is synthetic and labeled with its simulator: the diff's
+effect items say `grounding: synthetic` with `simulator` `stub`,
+`contract`, `neighbor`, `model` or `fail-closed`,
+`grounding[*].synthetic_by` and `summary.synthetic_by` count them, and
+`kronik trace` shows the label on fork turns. A fork uses the target's
+configuration as of its fork point (I5): configuration set later applies to
+forks and proposals created after it, or to a replay that carries it with
+`--simulators TARGET=FILE` (the same rules file). A policy rule can forbid
+synthetic answers per target, for example:
+
+```toml
+[[rule]]
+name = "no-model-for-payments"
+when = "diff.grounding.exists(t, t.host.endsWith('payments.internal') && has(t.synthetic_by) && has(t.synthetic_by.model))"
+action = "deny"
+```
+
+## kronik simulators list
+
+`kronik simulators list`
+
+The simulators in the order they are tried, whether the model simulator is
+configured (endpoint host and model, never the key), and each target's
+configuration: stub rules, contract title, neighbor, model, epoch and
+reason.
 
 ## kronik privacy mode
 
@@ -1719,6 +1863,8 @@ Takes a snapshot now (`POST /v1/snapshots`, scope `operate`). The reason is
 required, as for every mutation; the snapshot record itself is marked
 `manual`. `--dry-run` reports the LSN it would capture and writes nothing.
 Nothing is taken when nothing has been applied since the last snapshot.
+Every snapshot also checkpoints the `--fork-mode sandbox` foreign actors
+(M14); `kronik foreign list` shows the newest checkpoint.
 
 ```text
 $ kronik snapshot create --reason "before the deploy" --dry-run

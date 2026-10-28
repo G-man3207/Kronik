@@ -1,9 +1,10 @@
 # 0027. systemd unit hardening and runsc
 
 - **Status:** Accepted. Amended 2026-10-28 for v0.1: `RestrictSUIDSGID`
-  stays, because v0.1 never runs `runsc restore`. The M14 branch drops it
-  when it lands (see "When M14 lands").
-- **Date:** 2026-10-27, amended 2026-10-28
+  stayed while nothing ran `runsc restore`. Amended for v0.3: M14's sandbox
+  copies run `runsc restore`, so the unit drops it (see "Without
+  `RestrictSUIDSGID` (M14)").
+- **Date:** 2026-10-27, amended 2026-10-28 (v0.1 and v0.3)
 
 ## Context
 
@@ -19,7 +20,7 @@ failed in two ways.
    Turning off one setting at a time, only `NoNewPrivileges=no` cures it.
 2. **`runsc restore` fails.** With `RestrictSUIDSGID=yes` it stops at
    "opening state file …/checkpoint.img failed: function not implemented".
-   M14's sandbox copies (v0.3, parked) need restore; v0.1 never calls it.
+   M14's sandbox copies (v0.3) need restore; v0.1 never called it.
 
 Both were measured on travelfiesta (Debian 13.7, kernel
 6.12.111+deb13-cloud-amd64, systemd 257.13-1~deb13u1, runsc
@@ -72,16 +73,17 @@ filter, so Kronik cannot work around it.
   without one, itself) without `CAP_SETUID`, with this ADR as the hint, so
   a drop-in that brings `User=` back is named instead of surfacing as the
   gofer's EPERM.
-- **`RestrictSUIDSGID=true` stays in v0.1.** Its one cost, `openat2`
-  failing, hits only `runsc restore`, which v0.1 never runs; `runsc run`
-  and `runsc checkpoint` pass with it (Evidence). With it the kernel
-  refuses any setuid or setgid bit from every process of the service: the
-  daemon, runsc and a sandbox's host processes, so a program in a sandbox
-  cannot leave a setid file on the host either.
+- **No `RestrictSUIDSGID` from v0.3 (M14).** Its one cost, `openat2`
+  failing, hits `runsc restore`, which M14's sandbox copies run; `runsc run`
+  and `runsc checkpoint` pass with it (Evidence). v0.1, which never
+  restored a sandbox, kept it. Without it a sandbox's host side applies a
+  setuid or setgid bit a guest sets: the residual risk below.
   - Image unpacking clears setuid and setgid bits (`mode & 0o1777`, the
-    sticky bit kept; 2858e0b), so images with such entries, such as
-    postgres:17-alpine's `run/postgresql` (2777), start under the setting.
-    The image builder (`tar_dir`) masks modes the same way.
+    sticky bit kept; 2858e0b), so no setid file comes from an image, and
+    images with such entries, such as postgres:17-alpine's
+    `run/postgresql` (2777), start under any unit. The image builder
+    (`tar_dir`) masks modes the same way, and so does `copy_tree`, which
+    makes M14's checkpoints and copies of an actor's `/data`.
 - **The runtimes' state directories are private.** Under the run lock and
   before any runtime call, the daemon makes `<run_dir>/runsc` and
   `<run_dir>/runc` mode 0700, also when a runtime made them (under the unit
@@ -94,16 +96,15 @@ filter, so Kronik cannot work around it.
   left out: `MemoryDenyWriteExecute`, `ProtectHostname`,
   `ProtectKernelTunables`, `ProtectControlGroups` and a
   `CapabilityBoundingSet`.
-- A unit test (`init.rs`) fails if the unit gains a `User=` line, loses
-  `RestrictSUIDSGID=true` or loses `NoNewPrivileges=true`.
+- A unit test (`init.rs`) fails if the unit gains a `User=` or
+  `RestrictSUIDSGID=` line, or loses `NoNewPrivileges=true`.
 
-## When M14 lands
+## Without `RestrictSUIDSGID` (M14)
 
-M14 (`m14-foreign-forks`) needs `runsc restore` for its sandbox copies, so
-that branch drops `RestrictSUIDSGID` and amends this ADR with its own
-restore evidence: the toggle test below with the restore step, under the
-unit it ships. It must then name this residual risk, which is wider than a
-compromised process:
+M14 needs `runsc restore` for its sandbox copies: with the setting, every
+restore fails with ENOSYS from `openat2` (root cause 2; the transient-unit
+toggle test under Evidence). The unit therefore leaves it out, and this is
+the residual risk, which is wider than a compromised process:
 
 - **Guest code, not only a compromise.** Without the setting, ordinary
   code in an untrusted image that runs as root in its sandbox can
@@ -117,10 +118,11 @@ compromised process:
   backup restored elsewhere) or loosening a parent's mode exposes them.
   `/run/kronik` is not root-only: it is mode 0750 for the `kronik` group.
 - **What remains.** `NoNewPrivileges` means executing such a file inside
-  the service gains nothing. Unpacking and the M14 copies (`copy_tree`)
-  clear setid bits, but nothing clears bits a guest sets in `/data`. M14
-  should either clear them where it copies or checkpoints `/data`, or
-  document this for operators.
+  the service gains nothing. Unpacking clears setid bits, and so does
+  `copy_tree`, which makes every checkpoint and copy of `/data`: a setid
+  file a guest made never reaches a checkpoint or a fork's copy. The
+  actor's own `/data` keeps it; the operations guide tells operators not
+  to copy that tree with modes kept.
 
 ## Evidence
 
@@ -213,8 +215,8 @@ exactly these):
   does not need, and it reads as if the daemon wanted an extra capability.
   Rejected for leaving out `User=`.
 - **Keep `RestrictSUIDSGID` and give up M14's sandbox copies under
-  systemd.** That loses a v0.3 feature on the target platform. Not taken
-  for M14; v0.1, which has no copies, keeps the setting.
+  systemd.** That loses a v0.3 feature on the target platform. Rejected
+  for v0.3; v0.1, which had no copies, kept the setting.
 - **Ask gVisor to fall back to `openat` on ENOSYS.** Worth reporting
   upstream. It does not help the pinned release, and it would leave the
   unit depending on a future runsc.
@@ -228,8 +230,8 @@ exactly these):
 - M21 replaces this unit with a non-root one (`User=kronik`, a user
   namespace for the sandboxes). The `User=` trap does not apply there: a
   non-root daemon gets its capabilities inside its own user namespace, not
-  from systemd. Whether `RestrictSUIDSGID` stays follows M14: in only while
-  nothing runs `runsc restore`.
+  from systemd. `RestrictSUIDSGID` stays out while `runsc restore` needs
+  `openat2`.
 - To revisit: a systemd that keeps `CAP_SETUID` for `User=root`, or a runsc
   whose restore falls back from `openat2`. Either would let a setting come
   back, after the toggle test above passes.

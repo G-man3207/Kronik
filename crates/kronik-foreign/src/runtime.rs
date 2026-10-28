@@ -106,6 +106,58 @@ impl Runtime {
         spec
     }
 
+    /// `runsc --version` into `out` (a checkpoint's `meta.json`).
+    pub fn version(&self, out: &Path) -> ProcessSpec {
+        self.spec(vec!["--version".into()], Stdio::Append(out.to_path_buf()))
+    }
+
+    /// `runsc pause` / `runsc resume` (a checkpoint, ADR 0019).
+    pub fn pause(&self, id: &str, resume: bool, log: &Path) -> ProcessSpec {
+        let verb = if resume { "resume" } else { "pause" };
+        self.spec(
+            vec![verb.into(), id.into()],
+            Stdio::Append(log.to_path_buf()),
+        )
+    }
+
+    /// `runsc checkpoint --leave-running`: the sandbox's memory and overlay
+    /// into `image`; the container keeps running.
+    pub fn checkpoint(&self, id: &str, image: &Path, log: &Path) -> ProcessSpec {
+        self.spec(
+            vec![
+                "checkpoint".into(),
+                format!("--image-path={}", image.display()),
+                "--leave-running".into(),
+                id.into(),
+            ],
+            Stdio::Append(log.to_path_buf()),
+        )
+    }
+
+    /// `runsc restore --detach`: a new container `id` from the checkpoint
+    /// `image` with the bundle `bundle` (a fork's copy, ADR 0019). The
+    /// rootfs is production's: the copy's writes to it go to an overlay in
+    /// the copy's memory, as production's do (`run`; a restore needs the
+    /// overlay medium of the checkpointed sandbox), never into production's
+    /// rootfs directory.
+    pub fn restore(&self, bundle: &Path, id: &str, image: &Path, log: &Path) -> ProcessSpec {
+        let mut args = Vec::new();
+        if let Engine::Runsc { platform } = &self.engine {
+            args.push(format!("--platform={platform}"));
+            args.push("--network=sandbox".to_owned());
+            args.push("--overlay2=root:memory".to_owned());
+        }
+        args.extend([
+            "restore".to_owned(),
+            "--detach".to_owned(),
+            format!("--image-path={}", image.display()),
+            "--bundle".to_owned(),
+            bundle.display().to_string(),
+            id.to_owned(),
+        ]);
+        self.spec(args, Stdio::Append(log.to_path_buf()))
+    }
+
     /// `runsc port-forward --stream`: connects the Unix socket `sock` to
     /// `port` inside the sandbox, then exits (0 once the connection is
     /// handed over, non-zero when nothing listens on the port).

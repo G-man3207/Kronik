@@ -1,0 +1,6 @@
+package kronik:go@0.1.0;
+
+world actor-go {
+  include kronik:actor/actor@0.1.0;
+  include wasi:cli/imports@0.2.0;
+}

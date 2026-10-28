@@ -115,6 +115,29 @@ fn samples() -> Vec<Record> {
         Record::Erasure(pb::Erasure::default()),
         Record::EngineUpgrade(pb::EngineUpgrade::default()),
         Record::SnapshotMarker(pb::SnapshotMarker::default()),
+        Record::SimulatorConfig(pb::SimulatorConfig {
+            epoch: 5,
+            target: "http:payments.internal".into(),
+            neighbor: true,
+            ..Default::default()
+        }),
+        Record::StateRebase(pb::StateRebase {
+            rebase_id: "r-1".into(),
+            part: Some(pb::state_rebase::Part::Turn(pb::RebasedTurn {
+                fork_lsn: 9,
+                record: Some(pb::TurnRecord {
+                    execution_id: "f".into(),
+                    actor: actor(),
+                    causal_key: causal(),
+                    input: input(),
+                    outcome: Some(pb::Outcome {
+                        kind: pb::OutcomeKind::Committed as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            })),
+        }),
         Record::GuardTriggered(pb::GuardTriggered {
             action: pb::GuardAction::Rollback as i32,
             outcome: pb::GuardOutcome::RolledBack as i32,
@@ -187,13 +210,16 @@ async fn lsn_strictly_increases_across_all_record_kinds() {
         lsns.push(t.await.unwrap());
     }
     lsns.sort_unstable();
-    assert_eq!(lsns, (1..=30).collect::<Vec<_>>());
+    assert_eq!(lsns, (1..=2 * samples().len() as u64).collect::<Vec<_>>());
     // The applier stream is in LSN order.
     let mut streamed = Vec::new();
-    for _ in 0..30 {
+    for _ in 0..2 * samples().len() {
         streamed.push(rx.recv().await.unwrap().lsn);
     }
-    assert_eq!(streamed, (1..=30).collect::<Vec<_>>());
+    assert_eq!(
+        streamed,
+        (1..=2 * samples().len() as u64).collect::<Vec<_>>()
+    );
     drop(log);
 
     let all = h.read_all().await.unwrap();
@@ -210,13 +236,13 @@ async fn lsn_strictly_increases_across_all_record_kinds() {
         assert_eq!(again.lsn, c.lsn);
         assert_eq!(again.record, c.record);
     }
-    assert_eq!(all.len(), 30);
+    assert_eq!(all.len(), 2 * samples().len());
     assert_eq!(
         kinds.into_iter().collect::<Vec<_>>(),
         kronik_proto::kind::ALL
     );
     let (_log, opened, _rx) = h.open().await.unwrap();
-    assert_eq!(opened.next_lsn, 31);
+    assert_eq!(opened.next_lsn, 2 * samples().len() as u64 + 1);
 }
 
 /// A nonzero group-commit window — the production default, while every
@@ -320,7 +346,7 @@ async fn segments_roll_and_closed_segment_damage_is_corrupt() {
     let all = h.read_all().await.unwrap();
     assert_eq!(
         all.iter().map(|c| c.lsn).collect::<Vec<_>>(),
-        (1..=15).collect::<Vec<_>>()
+        (1..=samples().len() as u64).collect::<Vec<_>>()
     );
     let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
     let mut from_ten = Vec::new();
@@ -509,10 +535,10 @@ async fn rolled_segment_ends_with_a_footer_index() {
     let all = h.read_all().await.unwrap();
     assert_eq!(
         all.iter().map(|c| c.lsn).collect::<Vec<_>>(),
-        (1..=15).collect::<Vec<_>>()
+        (1..=samples().len() as u64).collect::<Vec<_>>()
     );
     let (log, opened, _rx) = h.open().await.unwrap();
-    assert_eq!(opened.next_lsn, 16);
+    assert_eq!(opened.next_lsn, samples().len() as u64 + 1);
     drop(log);
 
     // A crash after the footer, before the next segment existed: do not

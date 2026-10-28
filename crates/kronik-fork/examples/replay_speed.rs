@@ -130,6 +130,7 @@ fn main() {
             options: &DiffOptions { mode: Mode::Isolated, ..DiffOptions::default() },
             isolated: Some(&trees),
             continuous: None,
+            rebase: false,
         })
         .unwrap();
         println!("diff build: {:.3} s (changed {})", t.elapsed().as_secs_f64(), d.summary.changed);

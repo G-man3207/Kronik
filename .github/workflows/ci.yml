@@ -20,7 +20,7 @@ env:
 
 jobs:
   ci:
-    name: fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny, foreign, identity, action
+    name: fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, foreign, identity, action
     runs-on: ubuntu-24.04
     steps:
       # The runner's preinstalled SDKs that this job does not use, for disk.
@@ -75,6 +75,10 @@ jobs:
         run: scripts/ci.sh examples
       - name: ts
         run: scripts/ci.sh ts
+      # The Python and Go SDKs: installs their pinned toolchains, builds and
+      # tests the examples the identity step replays.
+      - name: sdks
+        run: scripts/ci.sh sdks
       - name: dst
         run: scripts/ci.sh dst
       - name: deny

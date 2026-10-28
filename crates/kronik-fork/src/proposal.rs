@@ -28,7 +28,10 @@ use crate::index::ProductionIndex;
 use crate::replay::{self, Continuous, ForkKind, ReplaySetup, TreeResult};
 use crate::{CodeEntry, fork_kinds, markdown, sample};
 
+mod copies;
 pub mod preview;
+mod rebase;
+pub use rebase::{RebaseDone, RebaseInfo, RebaseRequest};
 
 /// Catch-up converges when the newest root input is at most this far (in
 /// logical time) ahead of the verified one (`[promote] max_gap`).
@@ -97,6 +100,9 @@ pub struct Proposal {
     /// Set on a preview fork (M11): a plain fork with status `preview`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<preview::Preview>,
+    /// A rollback via replay (M13): what it rolls back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebase: Option<RebaseInfo>,
 }
 
 /// The error for an operation that needs a finished proposal.
@@ -197,6 +203,8 @@ pub struct ProposeRequest {
 
 /// The replay state kept for catch-up.
 struct Live {
+    /// A rebase proposal (M13): the diff lists irreversible effects.
+    rebase: bool,
     index: Arc<ProductionIndex>,
     kinds: BTreeMap<String, ForkKind>,
     before: Vec<CodeEntry>,
@@ -221,6 +229,11 @@ struct Live {
     /// The erasure count this state was built at (N4): a preview drops it
     /// when an erasure happened since.
     erasure: u64,
+    /// Copies of `fork_mode = "sandbox"` foreign actors (M14); stopped when
+    /// this state is dropped.
+    copies: Option<copies::Copies>,
+    /// What the diff says about each `sandbox` actor (`options.foreign`).
+    foreign: Vec<crate::diff::ForeignFork>,
 }
 
 struct Entry {
@@ -235,10 +248,14 @@ pub struct Proposals {
     workers: usize,
     /// `[fork] live_allowlist`.
     live_allowlist: Vec<String>,
+    /// `[simulators.model]` (M12, ADR 0015).
+    model: Option<crate::simulators::ModelConfig>,
     max_gap: Duration,
     catch_up_timeout: Duration,
     /// `[fork] preview_ttl` (M11).
     preview_ttl: Duration,
+    /// `[rebase] max_pause` (M13).
+    rebase_max_pause: Duration,
     entries: tokio::sync::Mutex<BTreeMap<String, Entry>>,
     /// Erasures so far (N4): previews compare it with their state's.
     erasures: std::sync::atomic::AtomicU64,
@@ -371,6 +388,8 @@ impl Proposals {
                     let bytes = serde_json::to_vec_pretty(&meta).map_err(internal)?;
                     write_atomic(&path, &bytes)?;
                 }
+                // Copies of foreign actors never survive the daemon (M14).
+                let _ = std::fs::remove_dir_all(e.path().join("foreign"));
                 entries.insert(meta.id.clone(), Entry { meta, live: None });
             }
         }
@@ -392,9 +411,11 @@ impl Proposals {
             data,
             workers,
             live_allowlist: Vec::new(),
+            model: None,
             max_gap: MAX_GAP,
             catch_up_timeout: CATCH_UP_TIMEOUT,
             preview_ttl: preview::PREVIEW_TTL,
+            rebase_max_pause: Duration::from_secs(2),
             entries: tokio::sync::Mutex::new(entries),
             previews: std::sync::Mutex::new(previews),
             jobs: std::sync::Mutex::new(BTreeMap::new()),
@@ -424,6 +445,16 @@ impl Proposals {
         self.max_gap = max_gap;
         self.catch_up_timeout = catch_up_timeout;
         self
+    }
+
+    /// `[simulators.model]`: the model simulator for targets that allow it.
+    pub fn with_model(mut self, model: Option<crate::simulators::ModelConfig>) -> Proposals {
+        self.model = model;
+        self
+    }
+
+    pub fn model_config(&self) -> Option<&crate::simulators::ModelConfig> {
+        self.model.as_ref()
     }
 
     fn dir(&self, id: &str) -> PathBuf {
@@ -564,7 +595,8 @@ impl Proposals {
         to: Lsn,
         no_pii: bool,
     ) -> Result<ProductionIndex, ApiError> {
-        let base = crate::pick_base(&self.data, self.node.branch(), fork_lsn, false)
+        let rebase = self.node.last_rebase()?;
+        let base = crate::pick_base(&self.data, self.node.branch(), fork_lsn, false, rebase)
             .map_err(|m| ApiError::new(ErrorCode::BadRequest, m))?;
         let mut index = ProductionIndex::load_from(self.node.reader(), base, fork_lsn, to)
             .await
@@ -591,7 +623,8 @@ impl Proposals {
         window_ms: u64,
     ) -> Result<(Lsn, Option<diff::WindowCut>), ApiError> {
         // Every root input the log (or its oldest usable snapshot) holds.
-        let base = crate::pick_base(&self.data, self.node.branch(), head, true)
+        let rebase = self.node.last_rebase()?;
+        let base = crate::pick_base(&self.data, self.node.branch(), head, true, rebase)
             .map_err(|m| ApiError::new(ErrorCode::BadRequest, m))?;
         let from = base.as_ref().map_or(0, |b| b.lsn);
         // The logical time of the base: its snapshot's turn-time mark.
@@ -635,6 +668,12 @@ impl Proposals {
         Ok(out)
     }
 
+    /// The replay setup of fork `id`. A dry run's model simulator answers
+    /// from the saved cache only: it calls nothing and writes nothing (I12).
+    /// A rebase's setup (`rebase`) answers from production's recordings
+    /// only: no simulators, no model, no live GETs (m13-rebase §8), since
+    /// its turns become main's state.
+    #[allow(clippy::too_many_arguments)]
     fn setup(
         &self,
         id: &str,
@@ -642,7 +681,10 @@ impl Proposals {
         kinds: BTreeMap<String, ForkKind>,
         options: &DiffOptions,
         progress: Option<Arc<replay::Progress>>,
-    ) -> Arc<ReplaySetup> {
+        dry_run: bool,
+        rebase: bool,
+        copies: Option<crate::replay::ForkCopies>,
+    ) -> Result<Arc<ReplaySetup>, ApiError> {
         let config = crate::config_at_with(&index, index.fork_lsn, self.node.sql_bytes_per_actor());
         // A preview answers whoever has its URL: no production key computes
         // for it, so its HMACs and signatures are `no recording` (P-F10).
@@ -652,14 +694,63 @@ impl Proposals {
             self.node.secrets().cloned()
         };
         let mut setup = ReplaySetup::new(id.to_owned(), index, kinds, config, secrets);
+        setup.simulators = Arc::new(crate::simulators::Simulators::new(
+            &setup.index,
+            &options.simulator_overrides,
+        ));
         setup.stubs = options.stubs.clone();
         setup.privacy = self.privacy(options.no_pii);
+        if rebase {
+            setup.rebase = true;
+            setup.simulators = Arc::default();
+            return Ok(Arc::new(setup));
+        }
         setup.live = (!options.live_allowlist.is_empty()).then(|| crate::LiveAccess {
             hosts: options.live_allowlist.clone(),
             env: self.node.env().clone(),
         });
         setup.progress = progress;
-        Arc::new(setup)
+        // Model answers are cached per proposal (ADR 0015).
+        if let Some(config) = self.model.clone() {
+            // On now, at the fork point (the base snapshot's configuration
+            // may predate the window), or switched in the window.
+            let privacy = self.node.privacy_mode().0 == pb::PrivacyState::On
+                || setup.config.privacy().0 == pb::PrivacyState::On
+                || setup
+                    .index
+                    .records
+                    .iter()
+                    .any(|c| matches!(c.record, Record::PrivacyMode(_)));
+            let path = self.dir(id).join("simulator-cache.json");
+            setup.model = Some(crate::simulators::ModelAccess {
+                config,
+                env: self.node.env().clone(),
+                cache: Arc::new(
+                    if dry_run {
+                        crate::simulators::ModelCache::read_only(&path)
+                    } else {
+                        crate::simulators::ModelCache::open(&path)
+                    }
+                    .map_err(internal)?,
+                ),
+                privacy,
+                secrets: self.node.secrets().cloned(),
+                offline: dry_run,
+            });
+        }
+        setup.copies = copies;
+        Ok(Arc::new(setup))
+    }
+
+    /// Writes the model answers a replay obtained.
+    fn save_model_cache(&self, setup: &ReplaySetup) -> Result<(), ApiError> {
+        match &setup.model {
+            Some(m) if !m.offline && !m.cache.is_empty() => {
+                std::fs::create_dir_all(self.dir(&setup.fork)).map_err(internal)?;
+                m.cache.save().map_err(internal)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Request options with the operator's live allowlist in force.
@@ -693,6 +784,10 @@ impl Proposals {
             }),
             _ => None,
         };
+        let options = &DiffOptions {
+            foreign: live.foreign.clone(),
+            ..options.clone()
+        };
         let d = diff::build(diff::DiffInput {
             fork: id,
             proposal_id: Some(id),
@@ -702,6 +797,7 @@ impl Proposals {
             options,
             isolated: options.mode.isolated().then_some(live.trees.as_slice()),
             continuous: view,
+            rebase: live.rebase,
         })
         .map_err(internal)?;
         let mut d = d;
@@ -712,7 +808,9 @@ impl Proposals {
         Ok((d, bytes, hash))
     }
 
-    /// Replays `(fork_lsn, to]` for a proposal.
+    /// Replays `(fork_lsn, to]` for a proposal (a rebase's when `rebase`);
+    /// a dry run calls no model. `no_copies`: why this replay starts no
+    /// copies of foreign actors (M14).
     #[allow(clippy::too_many_arguments)]
     async fn replay(
         &self,
@@ -723,6 +821,9 @@ impl Proposals {
         options: &DiffOptions,
         workers: usize,
         progress: Option<Arc<replay::Progress>>,
+        dry_run: bool,
+        rebase: bool,
+        no_copies: Option<&str>,
     ) -> Result<Live, ApiError> {
         crate::ensure_fork_retained(&self.node, &self.data, fork_lsn).await?;
         let index = Arc::new(self.index(fork_lsn, to, options.no_pii).await?);
@@ -748,7 +849,23 @@ impl Proposals {
             &new,
         )
         .map_err(internal)?;
-        let setup = self.setup(id, index.clone(), fc.kinds.clone(), options, progress);
+        // Copies of foreign actors answer the continuous fork (M14).
+        let (copies, foreign) = if options.mode.continuous() {
+            self.start_copies(id, &index, fork_lsn, options.no_pii, no_copies)
+                .await?
+        } else {
+            (None, Vec::new())
+        };
+        let setup = self.setup(
+            id,
+            index.clone(),
+            fc.kinds.clone(),
+            options,
+            progress,
+            dry_run,
+            rebase,
+            copies.as_ref().map(copies::Copies::fork),
+        )?;
         let head = [
             Record::BranchCreated(pb::BranchCreated {
                 branch: id.to_owned(),
@@ -766,12 +883,20 @@ impl Proposals {
                 ..Default::default()
             }),
         ];
-        let (trees, continuous) =
-            replay::both(self.node.env(), setup, options, workers, Some(id), &head)
-                .await
-                .map_err(replay_error)?;
+        let (trees, continuous) = replay::both(
+            self.node.env(),
+            setup.clone(),
+            options,
+            workers,
+            Some(id),
+            &head,
+        )
+        .await
+        .map_err(replay_error)?;
+        self.save_model_cache(&setup)?;
         let trees = trees.unwrap_or_default();
         Ok(Live {
+            rebase,
             index,
             kinds: fc.kinds,
             before: fc.before,
@@ -785,6 +910,8 @@ impl Proposals {
             preview_dropped: 0,
             preview_requests: 0,
             erasure: 0,
+            copies,
+            foreign,
         })
     }
 
@@ -921,6 +1048,7 @@ impl Proposals {
             window_cut: p.window_cut.clone(),
             error: None,
             preview: None,
+            rebase: None,
         };
         // Save, insert and spawn under the entries lock with no await in
         // between: a caller dropped while queued on the lock leaves nothing.
@@ -1019,10 +1147,21 @@ impl Proposals {
                     format!("at {at} is after HEAD ({head})"),
                 ));
             }
+            Some(at) if at < self.fork_floor()? => {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "at {at} is before main's state rebase at lsn {}",
+                        self.fork_floor()?
+                    ),
+                ));
+            }
             Some(at) => (at, None),
             None => {
-                self.fork_point(head, req.window_ms.unwrap_or(3_600_000))
-                    .await?
+                let (lsn, cut) = self
+                    .fork_point(head, req.window_ms.unwrap_or(3_600_000))
+                    .await?;
+                (lsn.max(self.fork_floor()?), cut)
             }
         };
         crate::ensure_fork_retained(&self.node, &self.data, fork_lsn).await?;
@@ -1113,15 +1252,23 @@ impl Proposals {
         dry_run: bool,
     ) -> Result<Proposal, ApiError> {
         let id = &p.id;
+        let dry = dry_run.then_some(copies::DRY_RUN);
         let mut live = self
             .replay(
-                id, p.fork_lsn, p.head, &p.kinds, &p.options, p.workers, progress,
+                id, p.fork_lsn, p.head, &p.kinds, &p.options, p.workers, progress, dry_run, false,
+                dry,
             )
             .await?;
         live.window_cut = p.window_cut.clone();
         let (d, bytes, hash) = self.build(id, &live, &p.options)?;
         let policy = self.evaluate(&bytes)?;
         let denied = policy["outcome"] == "deny";
+        if denied {
+            // A rejected proposal keeps no copies (review M13).
+            if let Some(c) = live.copies.take() {
+                c.stop().await;
+            }
+        }
         let meta = Proposal {
             id: id.clone(),
             fork: id.clone(),
@@ -1142,6 +1289,7 @@ impl Proposals {
             window_cut: p.window_cut.clone(),
             error: None,
             preview: None,
+            rebase: None,
         };
         if dry_run {
             return Ok(meta);
@@ -1194,7 +1342,14 @@ impl Proposals {
             .map_err(internal)?
             .into_iter()
             .find(|(_, d)| {
-                d.proposal_id == meta.id && d.cause == pb::DeploymentCause::Promote as i32
+                // A rollback via replay's switch carries cause Rollback
+                // (its StateRebase deployment), with the proposal's id.
+                let cause = if meta.rebase.is_some() {
+                    pb::DeploymentCause::Rollback
+                } else {
+                    pb::DeploymentCause::Promote
+                };
+                d.proposal_id == meta.id && d.cause == cause as i32
             });
         let mut changed = false;
         if let Some((lsn, d)) = promoted {
@@ -1203,6 +1358,14 @@ impl Proposals {
                 epoch: d.epoch,
                 lsn,
             });
+            if let Some(r) = meta.rebase.as_mut() {
+                r.switch_lsn = Some(lsn);
+                // The snapshot the cut-short promote did not take.
+                let node = self.node.clone();
+                drop(self.node.env().spawn("rebase-snapshot", async move {
+                    node.snapshot_after_rebase().await;
+                }));
+            }
             changed = true;
         } else if meta.approved.is_none()
             && let Ok(bytes) = std::fs::read(self.dir(&meta.id).join("diff.json"))
@@ -1392,6 +1555,7 @@ impl Proposals {
             if !dry_run {
                 entry.meta.status = "stale".into();
                 self.save(&entry.meta, None)?;
+                copies::retire(entry.live.take()).await;
             }
             let cutoff = self.node.retention_cutoff().ok().flatten();
             let message = match cutoff {
@@ -1403,9 +1567,23 @@ impl Proposals {
             return Err(ApiError::new(ErrorCode::ProposalStale, message)
                 .with_hint("kronik propose <wasm> --window 1h --reason \"...\""));
         }
+        if let Err(e) = self.check_fork_floor(fork_lsn) {
+            if !dry_run {
+                entry.meta.status = "stale".into();
+                self.save(&entry.meta, None)?;
+            }
+            return Err(e);
+        }
+        if entry.meta.rebase.is_some() {
+            return self.promote_rebase(entry, id, audit, dry_run).await;
+        }
         let kinds = entry.meta.kind_versions()?;
         let options = entry.meta.options.clone();
-        if entry.live.is_none() {
+        // A dry run (I12) works on its own replay state and a copy of the
+        // record: it writes nothing, calls no model and leaves the kept
+        // state as it was.
+        let mut dry_live = None;
+        if dry_run || entry.live.is_none() {
             let mut live = self
                 .replay(
                     id,
@@ -1415,12 +1593,24 @@ impl Proposals {
                     &options,
                     self.workers,
                     None,
+                    dry_run,
+                    false,
+                    dry_run.then_some(copies::DRY_RUN),
                 )
                 .await?;
             live.window_cut = entry.meta.window_cut.clone();
-            entry.live = Some(live);
+            if dry_run {
+                dry_live = Some(live);
+            } else {
+                entry.live = Some(live);
+            }
         }
-        let Some(live) = entry.live.as_mut() else {
+        let live = if dry_run {
+            dry_live.as_mut()
+        } else {
+            entry.live.as_mut()
+        };
+        let Some(live) = live else {
             return Err(internal("replay state missing"));
         };
         // Skipped kinds keep their code; changed kinds must still run the code
@@ -1460,41 +1650,33 @@ impl Proposals {
             return Err(e);
         }
         // 1. Catch-up.
-        let env = self.node.env().clone();
-        let started = env.clock.monotonic();
-        loop {
-            let head = self.node.applied_lsn();
-            if head > live.index.to_lsn {
-                self.catch_up(id, live, head, &options).await?;
-            }
-            let now = self.node.applied_lsn();
-            let pending = self.index(live.index.to_lsn, now, true).await?;
-            let verified_time = live.index.roots.last().map_or(0, |r| r.logical_time_ms);
-            let gap = pending
-                .roots
-                .last()
-                .map_or(0, |r| r.logical_time_ms.saturating_sub(verified_time));
-            if gap <= self.max_gap.as_millis() as u64 {
-                break;
-            }
-            if env.clock.monotonic().saturating_sub(started) > self.catch_up_timeout {
+        if !self.catch_up_to_gap(id, live, &options, dry_run).await? {
+            if !dry_run {
                 entry.meta.status = "stale".into();
                 self.save(&entry.meta, None)?;
-                return Err(ApiError::new(
-                    ErrorCode::ProposalStale,
-                    format!(
-                        "catch-up did not converge within {:?}",
-                        self.catch_up_timeout
-                    ),
-                ));
+                copies::retire(entry.live.take()).await;
             }
+            return Err(ApiError::new(
+                ErrorCode::ProposalStale,
+                format!(
+                    "catch-up did not converge within {:?}",
+                    self.catch_up_timeout
+                ),
+            ));
         }
-        self.write_log(id, live).await?;
+        if !dry_run {
+            self.write_log(id, live).await?;
+        }
         // 2. The policy on the whole diff.
         let (d, bytes, hash) = self.build(id, live, &options)?;
         let policy = self.evaluate(&bytes)?;
         let outcome = policy["outcome"].as_str().unwrap_or("deny").to_owned();
-        let meta = &mut entry.meta;
+        let mut dry_meta = None;
+        let meta = if dry_run {
+            dry_meta.insert(entry.meta.clone())
+        } else {
+            &mut entry.meta
+        };
         meta.verified_through_lsn = live.index.to_lsn;
         meta.diff_hash = hash.clone();
         meta.policy = policy.clone();
@@ -1504,6 +1686,7 @@ impl Proposals {
                 meta.status = "rejected".into();
                 self.save(meta, Some(&bytes))?;
                 self.save_samples(id, live, &d)?;
+                copies::retire(entry.live.take()).await;
             }
             return Err(ApiError::new(
                 ErrorCode::PolicyDenied,
@@ -1559,6 +1742,7 @@ impl Proposals {
                 if e.code == ErrorCode::ProposalStale && !dry_run {
                     meta.status = "stale".into();
                     self.save(meta, Some(&bytes))?;
+                    copies::retire(entry.live.take()).await;
                 }
                 return Err(e);
             }
@@ -1568,7 +1752,7 @@ impl Proposals {
             meta.promoted = Some(Promoted { epoch, lsn });
             self.save(meta, Some(&bytes))?;
             self.save_samples(id, live, &d)?;
-            entry.live = None;
+            copies::retire(entry.live.take()).await;
         }
         Ok(PromoteResult {
             epoch,
@@ -1577,29 +1761,69 @@ impl Proposals {
             unverified_inputs: unverified,
             kinds,
             policy,
+            rebase: None,
         })
     }
 
-    /// One catch-up round: replay the root inputs in `(to_lsn, head]`.
+    /// Catch-up rounds until the gap is at most `promote.max_gap`; false
+    /// when that did not happen within `promote.catch_up_timeout`.
+    async fn catch_up_to_gap(
+        &self,
+        id: &str,
+        live: &mut Live,
+        options: &DiffOptions,
+        dry_run: bool,
+    ) -> Result<bool, ApiError> {
+        let env = self.node.env().clone();
+        let started = env.clock.monotonic();
+        loop {
+            let head = self.node.applied_lsn();
+            if head > live.index.to_lsn {
+                self.catch_up(id, live, head, options, dry_run).await?;
+            }
+            let now = self.node.applied_lsn();
+            let pending = self.index(live.index.to_lsn, now, true).await?;
+            let verified_time = live.index.roots.last().map_or(0, |r| r.logical_time_ms);
+            let gap = pending
+                .roots
+                .last()
+                .map_or(0, |r| r.logical_time_ms.saturating_sub(verified_time));
+            if gap <= self.max_gap.as_millis() as u64 {
+                return Ok(true);
+            }
+            if env.clock.monotonic().saturating_sub(started) > self.catch_up_timeout {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// One catch-up round: replay the root inputs in `(to_lsn, head]`,
+    /// reading only main's records after `to_lsn`.
     async fn catch_up(
         &self,
         id: &str,
         live: &mut Live,
         head: Lsn,
         options: &DiffOptions,
+        dry_run: bool,
     ) -> Result<(), ApiError> {
         let old_to = live.index.to_lsn;
-        let mut index = ProductionIndex::load_from(
-            self.node.reader(),
-            live.index.base.clone(),
-            live.index.fork_lsn,
-            head,
-        )
-        .await
-        .map_err(internal)?;
-        index.reveal(&self.privacy(options.no_pii));
+        let index = live
+            .index
+            .extended(self.node.reader(), head, &self.privacy(options.no_pii))
+            .await
+            .map_err(internal)?;
         let index = Arc::new(index);
-        let setup = self.setup(id, index.clone(), live.kinds.clone(), options, None);
+        let setup = self.setup(
+            id,
+            index.clone(),
+            live.kinds.clone(),
+            options,
+            None,
+            dry_run,
+            live.rebase,
+            live.copies.as_ref().map(copies::Copies::fork),
+        )?;
         if options.mode.isolated() {
             let fresh: Vec<_> = index
                 .roots
@@ -1614,8 +1838,9 @@ impl Proposals {
             live.trees.extend(trees);
         }
         if let Some(c) = live.continuous.as_mut() {
-            c.extend(setup).await.map_err(internal)?;
+            c.extend(setup.clone()).await.map_err(internal)?;
         }
+        self.save_model_cache(&setup)?;
         live.index = index;
         Ok(())
     }
@@ -1635,6 +1860,13 @@ impl Proposals {
             return Err(ApiError::new(
                 ErrorCode::BadRequest,
                 format!("fork point {fork_lsn} is after HEAD ({head})"),
+            ));
+        }
+        let floor = self.fork_floor()?;
+        if fork_lsn < floor {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                format!("fork point {fork_lsn} is before main's state rebase at lsn {floor}"),
             ));
         }
         // Before a name is allocated or a directory is written, including
@@ -1691,6 +1923,7 @@ impl Proposals {
             preview: None,
             unchanged: Vec::new(),
             window_cut: None,
+            rebase: None,
         };
         if dry_run {
             return Ok((meta, true));
@@ -1755,7 +1988,7 @@ impl Proposals {
             .iter()
             .map(|k| base64::engine::general_purpose::STANDARD.encode(k.encode_to_vec()))
             .collect();
-        entry.live = None;
+        copies::retire(entry.live.take()).await;
         self.save(&entry.meta, None)?;
         Ok(version)
     }
@@ -1783,6 +2016,8 @@ impl Proposals {
         }
         let kinds = entry.meta.kind_versions()?;
         let workers = workers.unwrap_or(self.workers).clamp(1, 64);
+        // The old copies stop before the new ones start (review H11).
+        copies::retire(entry.live.take()).await;
         let mut live = self
             .replay(
                 name,
@@ -1791,6 +2026,9 @@ impl Proposals {
                 &kinds,
                 &options,
                 workers,
+                None,
+                false,
+                false,
                 None,
             )
             .await?;
@@ -1829,6 +2067,13 @@ impl Proposals {
         if entry.meta.preview.is_some() {
             return Err(preview::not_a_fork(name));
         }
+        if entry.meta.rebase.is_some() {
+            // Its continuous turns become main's state when promoted.
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                format!("{name} is a rollback via replay; messages into it are not allowed"),
+            ));
+        }
         let env = self.node.env();
         let root = random_id(env);
         let time = env.clock.wall_ms();
@@ -1837,6 +2082,7 @@ impl Proposals {
             return Err(internal("fork state missing"));
         };
         let mut turn = c.send(actor, msg, root, time).await.map_err(internal)?;
+        self.save_model_cache(c.setup())?;
         // The reply leaves the fork: no real SQL rows in it (M5).
         turn.record = shown_record(&turn);
         self.write_log(name, live).await?;
@@ -1857,13 +2103,17 @@ impl Proposals {
             let options = DiffOptions {
                 mode: diff::Mode::Continuous,
                 stubs: entry.meta.options.stubs.clone(),
+                simulator_overrides: entry.meta.options.simulator_overrides.clone(),
                 live_allowlist: self.live_allowlist.clone(),
                 no_pii: entry.meta.options.no_pii,
                 ..DiffOptions::default()
             };
             let fork_lsn = entry.meta.fork_lsn;
+            copies::retire(entry.live.take()).await;
             let live = self
-                .replay(name, fork_lsn, fork_lsn, &kinds, &options, 1, None)
+                .replay(
+                    name, fork_lsn, fork_lsn, &kinds, &options, 1, None, false, false, None,
+                )
                 .await?;
             entry.live = Some(live);
         }
@@ -1959,7 +2209,8 @@ impl Proposals {
         if dry_run {
             return Ok(());
         }
-        entries.remove(name);
+        // The copies stop and their disks go with the fork (M14).
+        copies::retire(entries.remove(name).and_then(|e| e.live)).await;
         std::fs::remove_dir_all(self.dir(name)).map_err(internal)
     }
 
@@ -2094,7 +2345,7 @@ pub struct ForkTree {
 
 /// A fork turn's record as it leaves the fork's memory (files, replies):
 /// concealed when it may hold real SQL rows (`--no-pii`, M5).
-fn shown_record(t: &crate::ForkTurn) -> pb::TurnRecord {
+pub(super) fn shown_record(t: &crate::ForkTurn) -> pb::TurnRecord {
     let mut r = t.record.clone();
     if t.sql {
         crate::privacy::conceal_turn(&mut r);
@@ -2143,6 +2394,8 @@ pub struct PromoteResult {
     pub unverified_inputs: u64,
     pub kinds: Vec<pb::KindVersion>,
     pub policy: Value,
+    /// A rollback via replay's switch (M13).
+    pub rebase: Option<RebaseDone>,
 }
 
 fn fired_names(policy: &Value) -> String {
@@ -2162,7 +2415,11 @@ fn fired_names(policy: &Value) -> String {
 fn targets_of_value(d: &Value) -> Vec<String> {
     let mut out = BTreeSet::new();
     for g in d["grounding"].as_array().into_iter().flatten() {
-        if g["approximate"].as_u64().unwrap_or(0) + g["synthetic"].as_u64().unwrap_or(0) > 0 {
+        let below_exact = ["approximate", "synthetic", "forked"]
+            .iter()
+            .map(|k| g[*k].as_u64().unwrap_or(0))
+            .sum::<u64>();
+        if below_exact > 0 {
             out.insert(format!(
                 "{} {} {}{}",
                 g["kind"].as_str().unwrap_or(""),
@@ -2185,11 +2442,5 @@ fn targets_of_value(d: &Value) -> Vec<String> {
 }
 
 pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), ApiError> {
-    use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
-    let mut f = std::fs::File::create(&tmp).map_err(internal)?;
-    f.write_all(bytes).map_err(internal)?;
-    f.sync_all().map_err(internal)?;
-    std::fs::rename(&tmp, path).map_err(internal)?;
-    Ok(())
+    crate::write_atomic(path, bytes).map_err(internal)
 }

@@ -9,6 +9,7 @@ pub mod privacy;
 pub mod proposal;
 pub mod replay;
 pub mod sample;
+pub mod simulators;
 pub mod stubs;
 pub mod upgrade;
 pub mod watch;
@@ -37,12 +38,15 @@ pub use replay::{
 /// that the log continues. `None` when the log still starts at LSN 1 and
 /// no snapshot qualifies, or for `oldest` whenever the log starts at LSN 1
 /// (it reaches further back than any snapshot); an error when the log was
-/// compacted past everything usable ("outside retention").
+/// compacted past everything usable ("outside retention"). `rebase`: the
+/// branch's newest StateRebase switch (its LSN, its base LSN), from the node
+/// (`Node::last_rebase`) or, offline, `snapshots::last_rebase_at`.
 pub fn pick_base(
     data: &std::path::Path,
     branch: &str,
     at_most: Lsn,
     oldest: bool,
+    rebase: Option<(Lsn, Lsn)>,
 ) -> Result<Option<index::Base>, String> {
     let log_dir = data.join("branches").join(branch).join("log");
     let log_first = kronik_log::segment_starts(&log_dir)
@@ -56,9 +60,17 @@ pub fn pick_base(
     // use a snapshot from before the erasure: that copy still has the
     // subject's rows.
     let floor = kronik_sched::snapshots::erasure_floor(data, branch);
+    // A replay through a rebase switch at R rebuilds the state at its base
+    // (ADR 0017): a snapshot between the base and R cannot start it
+    // (review M13-2); the one at or before the base, which retention keeps
+    // until a snapshot after R exists, can.
+    let rebase = rebase.filter(|(r, _)| at_most >= *r);
     let snaps = kronik_sched::snapshots::list(data, branch);
     let mut usable = snaps.iter().filter(|(_, m)| {
-        m.lsn <= at_most && m.lsn + 1 >= log_first && floor.is_none_or(|f| m.lsn >= f)
+        m.lsn <= at_most
+            && m.lsn + 1 >= log_first
+            && floor.is_none_or(|f| m.lsn >= f)
+            && rebase.is_none_or(|(r, base)| m.lsn <= base || m.lsn >= r)
     });
     let pick = if oldest {
         // A log that still starts at LSN 1 reaches further back than any
@@ -139,10 +151,26 @@ pub async fn ensure_fork_retained(node: &Node, data: &Path, fork_lsn: Lsn) -> Re
              cutoff {cutoff} (history {history})"
         )));
     }
-    if let Err(m) = pick_base(data, node.branch(), fork_lsn, false) {
+    let rebase = node.last_rebase()?;
+    if let Err(m) = pick_base(data, node.branch(), fork_lsn, false, rebase) {
         return Err(outside(format!(
             "{m} (fork point {fork_lsn}, cutoff logical time {cutoff}, history {history})"
         )));
+    }
+    Ok(())
+}
+
+/// Writes `bytes` to `path` through a synced temporary file and a rename,
+/// then syncs the directory so the rename survives a crash.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
     }
     Ok(())
 }
@@ -269,6 +297,7 @@ pub async fn run(
         options,
         isolated: trees.as_deref(),
         continuous: view,
+        rebase: false,
     })?;
     let bytes = d.to_bytes();
     let hash = diff::diff_hash(&bytes);

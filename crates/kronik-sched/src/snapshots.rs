@@ -229,6 +229,20 @@ pub fn prepare_state(data: &Path, branch: &str) -> Result<Option<Lsn>, String> {
 }
 /// The earliest applied erasure's LSN, if `state.db` records one. A fork
 /// or restore must not go back past it (docs/design/m8-privacy.md §6.6).
+/// The newest StateRebase switch of `branch` as its state database has it:
+/// (its LSN, its base LSN). Read-only, also while the node runs.
+pub fn last_rebase_at(data: &Path, branch: &str) -> Option<(Lsn, Lsn)> {
+    let state = data.join("branches").join(branch).join("state.db");
+    let conn =
+        rusqlite::Connection::open_with_flags(&state, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let get = |k: &str| -> Option<i64> {
+        conn.query_row("SELECT v FROM meta WHERE k = ?1", [k], |r| r.get(0))
+            .ok()
+    };
+    Some((get("rebase_lsn")? as Lsn, get("rebase_base")? as Lsn))
+}
+
 pub fn erasure_floor(data: &Path, branch: &str) -> Option<Lsn> {
     let state = data.join("branches").join(branch).join("state.db");
     let conn =
@@ -341,6 +355,8 @@ impl Node {
             "snapshot taken"
         );
         self.retain(&storage);
+        // Foreign actors for forks, in step with snapshots (M14).
+        self.checkpoint_foreign().await;
         Ok(manifest)
     }
 
@@ -448,6 +464,57 @@ impl Node {
         self.snapshot(reason).await.map(Some)
     }
 
+    /// Checkpoints every running `fork_mode = "sandbox"` foreign actor (M14,
+    /// ADR 0019), each at its own LSN. Main's turns are drained first, so no
+    /// foreign call is in flight and the applied LSN is an exact cut of the
+    /// boundary; the host releases the drain as soon as main's calls to the
+    /// actor wait in the daemon, so main is held only that long, not for the
+    /// copy and the runsc steps. When they do not pause in time, that
+    /// actor gets no checkpoint.
+    pub async fn checkpoint_foreign(
+        &self,
+    ) -> Vec<(String, Result<kronik_effects::foreign::Checkpoint, String>)> {
+        let Some(host) = self.foreign.clone() else {
+            return Vec::new();
+        };
+        let names: Vec<String> = self
+            .config_now()
+            .foreign_actors()
+            .filter(|f| f.fork_mode == "sandbox")
+            .map(|f| f.name.clone())
+            .collect();
+        let mut out = Vec::with_capacity(names.len());
+        // Below `[log] disk_reserve` (erasure and reseal snapshots run
+        // there too) no checkpoint is written: skipped with a warning,
+        // never failing the snapshot or the erasure.
+        if let Err(e) = self.check_running() {
+            for name in names {
+                tracing::warn!(foreign = %name, error = %e.message, "no foreign checkpoint");
+                out.push((name, Err(e.message.clone())));
+            }
+            return out;
+        }
+        for name in names {
+            // The gate's drain, without the deploy lock (crate::gate).
+            let pause = match self.drain(std::time::Duration::from_secs(2)).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(foreign = %name, error = %e.message, "no foreign checkpoint: main's turns did not pause");
+                    out.push((name, Err(e.message)));
+                    continue;
+                }
+            };
+            let lsn = self.applied_lsn();
+            let r = host
+                .checkpoint(&name, lsn, Box::new(pause), self.disk_budget())
+                .await;
+            if let Err(e) = &r {
+                tracing::warn!(foreign = %name, lsn, error = %e, "foreign checkpoint failed");
+            }
+            out.push((name, r));
+        }
+        out
+    }
     /// After an `Erasure` record is applied (docs/design/m8-privacy.md §6.6):
     /// take a snapshot, then delete local snapshots older than the erasure.
     /// The shipper deletes the matching remote snapshots on its next round
@@ -544,8 +611,22 @@ impl Node {
             .iter()
             .find(|(_, m)| log_first > 1 && m.lsn + 1 >= log_first)
             .map(|(_, m)| m.lsn);
+        // Until a snapshot at or after the newest rebase switch exists, a
+        // rebuild crosses it from a snapshot at or before its base (ADR 0017).
+        let newest = all.last().map(|(_, m)| m.lsn);
+        let rebase_base = self
+            .last_rebase()
+            .ok()
+            .flatten()
+            .filter(|(r, _)| newest.is_none_or(|n| n < *r))
+            .and_then(|(_, b)| {
+                all.iter()
+                    .rev()
+                    .find(|(_, m)| m.lsn <= b)
+                    .map(|(_, m)| m.lsn)
+            });
         for (dir, m) in &all[..all.len() - keep] {
-            if Some(m.lsn) == base {
+            if Some(m.lsn) == base || Some(m.lsn) == rebase_base {
                 continue;
             }
             if let Err(e) = std::fs::remove_dir_all(dir) {
@@ -582,8 +663,14 @@ impl Node {
             .last()
             .map(|(_, m)| m.lsn);
         let mut first = starts.first().copied().unwrap_or(1);
+        // A rebuild may still have to cross the newest rebase switch from
+        // before its base (ADR 0017): keep everything until a snapshot at or
+        // after the switch exists.
+        let rebase_hold = self
+            .last_rebase()?
+            .is_some_and(|(r, _)| newest_snapshot.is_none_or(|n| n < r));
         // Closed segments only: never the newest (active) one, oldest first.
-        for w in starts.windows(2) {
+        for w in starts.windows(2).take_while(|_| !rebase_hold) {
             let (start, next) = (w[0], w[1]);
             let last_lsn = next - 1;
             let Some(&(_, _, last_time)) = ranges.iter().find(|(s, _, _)| *s == start) else {

@@ -80,20 +80,31 @@ impl Proc {
     }
 
     pub fn start_with(dir: &Path, cfg: NodeConfig) -> Proc {
-        let p = Proc::open(dir, cfg);
+        Proc::start_env(dir, cfg, |_| {})
+    }
+
+    /// `start_with`, with `wrap` changing the node's environment first (a
+    /// test file system, say).
+    pub fn start_env(dir: &Path, cfg: NodeConfig, wrap: impl FnOnce(&mut Env)) -> Proc {
+        let p = Proc::open_env(dir, cfg, wrap);
         p.deploy("counter");
         p
     }
 
     /// A node over `dir` as it is: nothing deployed (a restart).
     pub fn open(dir: &Path, cfg: NodeConfig) -> Proc {
+        Proc::open_env(dir, cfg, |_| {})
+    }
+
+    fn open_env(dir: &Path, cfg: NodeConfig, wrap: impl FnOnce(&mut Env)) -> Proc {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
             .build()
             .unwrap();
         let node = rt.block_on(async {
-            let env = Env::real(tokio::runtime::Handle::current());
+            let mut env = Env::real(tokio::runtime::Handle::current());
+            wrap(&mut env);
             start_local(env, dir, cfg).await.unwrap()
         });
         Proc { rt, node }
@@ -139,8 +150,17 @@ impl Proc {
     }
 
     pub fn http(&self, key: &str, op: &str, body: &str) -> TurnResult {
+        self.http_as(key, op, body, None)
+    }
+
+    /// `http` on behalf of a data subject (privacy mode).
+    pub fn http_as(&self, key: &str, op: &str, body: &str, subject: Option<&str>) -> TurnResult {
         let (actor, input) = Proc::http_input(key, op, body);
-        match self.node.ingress(actor, input, None).unwrap() {
+        match self
+            .node
+            .ingress(actor, input, subject.map(str::to_owned))
+            .unwrap()
+        {
             Ingress::Started(w) | Ingress::Joined(w) => self.rt.block_on(w.wait()).unwrap(),
             Ingress::Done(r) => *r,
         }
@@ -250,5 +270,70 @@ fn serve(stream: TcpStream, hits: Arc<AtomicUsize>) {
         if w.write_all(resp.as_bytes()).is_err() {
             return;
         }
+    }
+}
+
+/// A fake OpenAI-compatible model: every call gets a different answer, so
+/// a second call would change the diff. Keeps every request body.
+pub fn model_server() -> (String, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let s = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut w = stream.try_clone().unwrap();
+            let mut r = BufReader::new(stream);
+            let mut len = 0usize;
+            loop {
+                let mut h = String::new();
+                if r.read_line(&mut h).unwrap_or(0) == 0 {
+                    break;
+                }
+                let h = h.trim_end().to_ascii_lowercase();
+                if h.is_empty() {
+                    break;
+                }
+                if let Some(v) = h.strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; len];
+            if r.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let n = {
+                let mut seen = s.lock().unwrap();
+                seen.push(body);
+                seen.len()
+            };
+            let content = serde_json::json!({"status": 200,
+                "headers": {"content-type": "text/plain"},
+                "body": format!("model answer {n}")})
+            .to_string();
+            let reply =
+                serde_json::json!({"choices": [{"message": {"role": "assistant", "content": content}}]})
+                    .to_string();
+            let _ = w.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (addr, seen)
+}
+
+/// The model simulator's configuration for `model_server`.
+pub fn model(addr: &str) -> kronik_fork::simulators::ModelConfig {
+    kronik_fork::simulators::ModelConfig {
+        endpoint: format!("http://{addr}/v1/chat/completions"),
+        model: "fake".into(),
+        api_key: None,
+        timeout: Duration::from_secs(10),
+        max_examples: 5,
+        examples_under_privacy: false,
     }
 }

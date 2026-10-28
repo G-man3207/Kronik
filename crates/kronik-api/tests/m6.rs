@@ -93,7 +93,14 @@ async fn snapshots_and_integrity() {
     assert_eq!(list["snapshots"][0], snap);
 
     // The integrity hashes: the state hash equals the snapshot's at its
-    // LSN; the snapshot marker moved the applied LSN by one.
+    // LSN; the snapshot marker moved the applied LSN by one (applied right
+    // after it is logged, so wait for it).
+    for _ in 0..500 {
+        if node.applied_lsn() > applied {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     let (s, i) = call(&api, "GET", "/v1/integrity", Value::Null).await;
     assert_eq!(s, 200, "{i}");
     assert_eq!(i["applied_lsn"], node.applied_lsn());

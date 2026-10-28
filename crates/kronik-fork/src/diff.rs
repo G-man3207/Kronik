@@ -68,6 +68,35 @@ pub struct DiffOptions {
     /// pseudonymized from M8 on).
     #[serde(default)]
     pub no_pii: bool,
+    /// The simulator configuration the replay used: main's as of the fork
+    /// point plus `simulator_overrides` (M12, I5, ADR 0014); set when the
+    /// diff is built.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub simulators: Vec<crate::simulators::SimulatorOption>,
+    /// Per-target simulator configuration the replay request carried; it
+    /// replaces main's for this fork, and catch-up and a replay after a
+    /// restart use it again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub simulator_overrides: Vec<crate::simulators::SimulatorOverride>,
+    /// The fork's `fork_mode = "sandbox"` foreign actors (M14, ADR 0019):
+    /// the checkpoint each copy started from, or why it stayed recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub foreign: Vec<ForeignFork>,
+}
+
+/// What a fork did with one `fork_mode = "sandbox"` foreign actor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignFork {
+    pub name: String,
+    /// `sandbox` (a copy answered) or `recorded` (no copy; see `why`).
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_lsn: Option<Lsn>,
+    /// Main's recorded calls sent to the copy to bring it to the fork point.
+    #[serde(default)]
+    pub replayed_calls: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
 }
 
 impl Default for DiffOptions {
@@ -81,6 +110,9 @@ impl Default for DiffOptions {
             stubs: Vec::new(),
             live_allowlist: Vec::new(),
             no_pii: false,
+            simulators: Vec::new(),
+            simulator_overrides: Vec::new(),
+            foreign: Vec::new(),
         }
     }
 }
@@ -144,9 +176,15 @@ pub struct Summary {
     pub exact: u64,
     pub approximate: u64,
     pub synthetic: u64,
+    /// Synthetic answers per simulator over all targets (M12).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub synthetic_by: BTreeMap<String, u64>,
     /// Live GETs from the fork (`[fork] live_allowlist`).
     #[serde(default)]
     pub live: u64,
+    /// Answers of the fork's copies of foreign actors (M14, ADR 0020).
+    #[serde(default)]
+    pub forked: u64,
     /// Fork turns that read a pseudonym or an erased value (`--no-pii`)
     /// and differ from production, and production turns missing below
     /// them: `pii-masked`, not divergent (M8 §9). Always present, so a rule
@@ -187,8 +225,15 @@ pub struct GroundingRow {
     pub exact: u64,
     pub approximate: u64,
     pub synthetic: u64,
+    /// Synthetic answers per simulator (`stub`, `contract`, `neighbor`,
+    /// `model`, `fail-closed`, `placeholder`), M12.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub synthetic_by: BTreeMap<String, u64>,
     #[serde(default)]
     pub live: u64,
+    /// Answers of a fork's copy of the foreign actor (M14).
+    #[serde(default)]
+    pub forked: u64,
     pub confidence: f64,
 }
 
@@ -245,7 +290,12 @@ pub struct EffectItem {
     pub method: String,
     pub host: String,
     pub route: String,
+    /// `exact`, `approximate`, `synthetic` or `live`, as in v0.1.
     pub grounding: Cow<'static, str>,
+    /// The simulator of a synthetic answer (`stub`, `contract`, `neighbor`,
+    /// `model`, `fail-closed`, `placeholder`; M12); absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulator: Option<String>,
     pub turn_prod: Option<String>,
     pub turn_fork: Option<String>,
     pub fields: Vec<FieldDiff>,
@@ -459,6 +509,95 @@ pub struct Diff {
     pub errors: Errors,
     pub resources: Resources,
     pub samples: Samples,
+    /// A rebase diff only (M13): main's external effects since the
+    /// rolled-back deployment that the old code would not have made the
+    /// same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub irreversible: Option<Irreversible>,
+}
+
+/// Effects that happened under the code a rebase rolls back and that the
+/// rebased state does not account for (docs/design/m13-rebase.md section 5).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Irreversible {
+    pub count: u64,
+    pub items: Vec<IrreversibleItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IrreversibleItem {
+    pub turn_prod: String,
+    pub kind: String,
+    pub method: String,
+    pub host: String,
+    pub route: String,
+    /// `ok`, `outcome_unknown`, `network`, `timeout`, ...
+    pub status: String,
+    /// `replay-safe`, `idempotency-keyed` or `unsafe`.
+    pub delivery: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub idempotency_key: String,
+}
+
+/// Main's effects that reached (or may have reached) the world: HTTP and
+/// foreign calls that were not denied before they left.
+fn reached_world(e: &pb::EffectRecord) -> bool {
+    (e.kind == "http.fetch" || e.kind == "foreign.http")
+        && e.status != pb::EffectStatus::Denied as i32
+        && e.status != pb::EffectStatus::Unspecified as i32
+}
+
+/// The irreversible effects of a rebase: each of main's effects in the
+/// window without an exact counterpart in the fork's continuous history.
+fn irreversible(index: &ProductionIndex, fork: &[ForkTurn]) -> Irreversible {
+    let by_prod: BTreeMap<Lsn, &pb::TurnRecord> = fork
+        .iter()
+        .filter_map(|f| f.prod_lsn.map(|l| (l, &f.record)))
+        .collect();
+    let mut out = Irreversible::default();
+    for c in index.records.iter() {
+        if c.lsn <= index.fork_lsn || c.lsn > index.to_lsn {
+            continue;
+        }
+        let Record::TurnRecord(t) = &c.record else {
+            continue;
+        };
+        for e in t.effects.iter().filter(|e| reached_world(e)) {
+            let exact = by_prod.get(&c.lsn).is_some_and(|f| {
+                f.effects.iter().any(|x| {
+                    x.ordinal == e.ordinal
+                        && x.kind == e.kind
+                        && x.grounding == pb::Grounding::Exact as i32
+                })
+            });
+            if exact {
+                continue;
+            }
+            out.count += 1;
+            let (kind, method, host, route) = target(e);
+            push_capped(
+                &mut out.items,
+                MAX_ITEMS,
+                IrreversibleItem {
+                    turn_prod: prod_id(c.lsn),
+                    kind,
+                    method,
+                    host,
+                    route,
+                    status: pb::EffectStatus::try_from(e.status)
+                        .map(|s| {
+                            s.as_str_name()
+                                .trim_start_matches("EFFECT_STATUS_")
+                                .to_ascii_lowercase()
+                        })
+                        .unwrap_or_default(),
+                    delivery: e.delivery.clone(),
+                    idempotency_key: e.idempotency_key.clone(),
+                },
+            );
+        }
+    }
+    out
 }
 
 impl Diff {
@@ -744,6 +883,14 @@ pub fn check_options(o: &DiffOptions) -> Result<(), String> {
         }
     }
     crate::stubs::check(&o.stubs)?;
+    let mut targets = BTreeSet::new();
+    for s in &o.simulator_overrides {
+        s.record()
+            .map_err(|e| format!("simulator_overrides: {e}"))?;
+        if !targets.insert(s.target.as_str()) {
+            return Err(format!("simulator_overrides: {} twice", s.target));
+        }
+    }
     if !(o.sample > 0.0 && o.sample <= 1.0) {
         return Err(format!("sample must be in (0, 1], got {}", o.sample));
     }
@@ -950,11 +1097,19 @@ fn external(kind: &str) -> bool {
         || kind == "secret.reveal"
 }
 
+/// The simulator label of a synthetic answer (M12); `None` otherwise, or
+/// for a record written before M12.
+fn simulator_label(e: &pb::EffectRecord) -> Option<&str> {
+    (e.grounding == pb::Grounding::Synthetic as i32 && !e.simulator.is_empty())
+        .then_some(e.simulator.as_str())
+}
+
 fn grounding_name(g: i32) -> &'static str {
     match pb::Grounding::try_from(g) {
         Ok(pb::Grounding::Exact) => "exact",
         Ok(pb::Grounding::Approximate) => "approximate",
         Ok(pb::Grounding::Synthetic) => "synthetic",
+        Ok(pb::Grounding::Forked) => "forked",
         _ => "live",
     }
 }
@@ -1221,7 +1376,9 @@ struct Acc {
     origins: u64,
     consequences: u64,
     causes: BTreeMap<(String, String), CauseAcc>,
-    grounding: BTreeMap<(String, String, String, String), [u64; 4]>,
+    grounding: BTreeMap<(String, String, String, String), [u64; 5]>,
+    /// Synthetic answers per target and simulator (M12).
+    synthetic_by: BTreeMap<(String, String, String, String), BTreeMap<String, u64>>,
     responses: Responses,
     effects: Effects,
     effect_items: Vec<EffectItem>,
@@ -1237,6 +1394,12 @@ struct Acc {
     isolated_actor_roots: BTreeMap<String, BTreeSet<Lsn>>,
     /// The per-kind counts (`kind` and `code` are set by `build`).
     by_kind: BTreeMap<String, KindReport>,
+    /// Targets of foreign actors with a copy (`foreign:<name>`), when both
+    /// views exist: their effects and the responses of the root inputs that
+    /// call them come from the continuous view, where the copy answered.
+    copied: BTreeSet<String>,
+    /// Root inputs whose response the continuous view gives.
+    deferred: BTreeSet<Lsn>,
 }
 
 /// The actor kind of a turn.
@@ -1263,6 +1426,7 @@ impl Acc {
             consequences: 0,
             causes: BTreeMap::new(),
             grounding: BTreeMap::new(),
+            synthetic_by: BTreeMap::new(),
             responses: Responses::default(),
             effects: Effects::default(),
             effect_items: Vec::new(),
@@ -1276,6 +1440,8 @@ impl Acc {
             isolated_state: Vec::new(),
             isolated_actor_roots: BTreeMap::new(),
             by_kind: BTreeMap::new(),
+            copied: BTreeSet::new(),
+            deferred: BTreeSet::new(),
         }
     }
 
@@ -1457,24 +1623,33 @@ impl Acc {
             host,
             route,
             grounding: f.map_or("live", |f| grounding_name(f.grounding)).into(),
+            simulator: f.and_then(simulator_label).map(str::to_owned),
             turn_prod: turn_prod.map(prod_id),
             turn_fork: turn_fork.map(str::to_owned),
             fields: effect_fields(&self.norm.sealer, p, f),
         });
     }
 
-    /// External effect differences of one turn pair.
-    fn turn_effects(&mut self, prod: Option<(Lsn, &pb::TurnRecord)>, fork: Option<&ForkTurn>) {
+    /// External effect differences of one turn pair: those to targets with
+    /// a copy when `copied`, else the others.
+    fn turn_effects(
+        &mut self,
+        prod: Option<(Lsn, &pb::TurnRecord)>,
+        fork: Option<&ForkTurn>,
+        copied: bool,
+    ) {
+        let pick =
+            |e: &&pb::EffectRecord| external(&e.kind) && self.copied.contains(&e.target) == copied;
         let pe: BTreeMap<u32, &pb::EffectRecord> = prod
             .iter()
             .flat_map(|(_, t)| t.effects.iter())
-            .filter(|e| external(&e.kind))
+            .filter(pick)
             .map(|e| (e.ordinal, e))
             .collect();
         let fe: BTreeMap<u32, &pb::EffectRecord> = fork
             .iter()
             .flat_map(|t| t.record.effects.iter())
-            .filter(|e| external(&e.kind))
+            .filter(pick)
             .map(|e| (e.ordinal, e))
             .collect();
         let pl = prod.map(|p| p.0);
@@ -1523,13 +1698,22 @@ impl Acc {
                     Ok(pb::Grounding::Approximate) => 1,
                     Ok(pb::Grounding::Synthetic) => {
                         synthetic = true;
+                        if let Some(sim) = simulator_label(e) {
+                            *self
+                                .synthetic_by
+                                .entry(target(e))
+                                .or_default()
+                                .entry(sim.to_owned())
+                                .or_insert(0) += 1;
+                        }
                         2
                     }
                     // Live and not denied by configuration: a live GET.
                     Ok(pb::Grounding::Live) if e.status != pb::EffectStatus::Denied as i32 => 3,
+                    Ok(pb::Grounding::Forked) => 4,
                     _ => continue,
                 };
-                self.grounding.entry(target(e)).or_insert([0; 4])[slot] += 1;
+                self.grounding.entry(target(e)).or_insert([0; 5])[slot] += 1;
             }
             if synthetic {
                 push_capped(&mut self.samples.synthetic, MAX_SAMPLES, f.id.clone());
@@ -1674,7 +1858,9 @@ impl Acc {
                         self.fuel.1.push(f.record.fuel_used);
                         self.memory.0.push(p.1.memory_peak_bytes);
                         self.memory.1.push(f.record.memory_peak_bytes);
-                        self.turn_effects(Some(p), Some(f));
+                    }
+                    if full || !self.copied.is_empty() {
+                        self.turn_effects(Some(p), Some(f), !full);
                     }
                     if view(p.1, &self.norm) != view(&f.record, &self.norm) {
                         let same_input = input_bytes(p.1) == input_bytes(&f.record);
@@ -1692,8 +1878,8 @@ impl Acc {
                     }
                 }
                 None => {
-                    if full {
-                        self.turn_effects(None, Some(f));
+                    if full || !self.copied.is_empty() {
+                        self.turn_effects(None, Some(f), !full);
                     }
                     changes.insert(key, Change::New { fork: f });
                 }
@@ -1701,8 +1887,8 @@ impl Acc {
         }
         for (key, p) in &pmap {
             if !fmap.contains_key(key) {
-                if full {
-                    self.turn_effects(Some(*p), None);
+                if full || !self.copied.is_empty() {
+                    self.turn_effects(Some(*p), None, !full);
                 }
                 changes.insert(key.clone(), Change::Missing { prod: *p });
             }
@@ -1740,15 +1926,28 @@ impl Acc {
                 self.divergent.insert(key.clone(), kind_of(t));
             }
         }
-        if !full {
-            return;
-        }
-        // Responses of the HTTP root inputs.
+        // Responses of the HTTP root inputs; an isolated tree that calls a
+        // copied actor leaves its response to the continuous view.
+        let calls_copy =
+            |effects: &[pb::EffectRecord]| effects.iter().any(|e| self.copied.contains(&e.target));
+        let defer = full
+            && root_lsn.is_some()
+            && (prod.iter().any(|(_, t)| calls_copy(&t.effects))
+                || fork.iter().any(|f| calls_copy(&f.record.effects)));
         for (key, p) in &pmap {
             let is_root = p.1.causal_key.as_ref().is_some_and(|k| k.path.is_empty());
-            if is_root {
-                self.response(root_lsn.unwrap_or(p.0), *p, fmap.get(key).copied());
+            let lsn = root_lsn.unwrap_or(p.0);
+            if !is_root {
+                continue;
             }
+            if defer {
+                self.deferred.insert(lsn);
+            } else if full || self.deferred.contains(&lsn) {
+                self.response(lsn, *p, fmap.get(key).copied());
+            }
+        }
+        if !full {
+            return;
         }
         // Causal grouping.
         let root_turns: BTreeMap<&str, (Lsn, &pb::TurnRecord)> = pmap
@@ -2216,6 +2415,8 @@ pub struct DiffInput<'a> {
     /// Isolated results, for the replayed (sampled) root inputs.
     pub isolated: Option<&'a [TreeResult]>,
     pub continuous: Option<ContinuousView<'a>>,
+    /// A rebase (M13): the diff lists the irreversible effects.
+    pub rebase: bool,
 }
 
 /// A kind's `code` in `kinds`: its code at the fork point against the
@@ -2235,6 +2436,15 @@ fn code_status(before: Option<&CodeEntry>, after: Option<&CodeEntry>) -> &'stati
 pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
     let index = input.index;
     let mut acc = Acc::new(input.options, index.sealer.clone());
+    if input.isolated.is_some() && input.continuous.is_some() {
+        acc.copied = input
+            .options
+            .foreign
+            .iter()
+            .filter(|f| f.mode == "sandbox")
+            .map(|f| format!("foreign:{}", f.name))
+            .collect();
+    }
     let roots: BTreeMap<Lsn, &RootInput> = index.roots.iter().map(|r| (r.lsn, r)).collect();
     let mut replayed = 0u64;
     if let Some(trees) = input.isolated {
@@ -2304,26 +2514,49 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
             .then(a.kind.cmp(&b.kind))
             .then(a.input.cmp(&b.input))
     });
+    let mut synthetic_by_target = acc.synthetic_by;
+    let mut synthetic_by: BTreeMap<String, u64> = BTreeMap::new();
+    for counts in synthetic_by_target.values() {
+        for (sim, n) in counts {
+            *synthetic_by.entry(sim.clone()).or_insert(0) += n;
+        }
+    }
     let grounding: Vec<GroundingRow> = acc
         .grounding
         .into_iter()
-        .map(|((kind, method, host, route), [e, a, s, l])| GroundingRow {
-            kind,
-            method,
-            host,
-            route,
-            exact: e,
-            approximate: a,
-            synthetic: s,
-            live: l,
-            confidence: r6(e as f64 / (e + a + s + l).max(1) as f64),
+        .map(|(key, [e, a, s, l, f])| {
+            let by = synthetic_by_target.remove(&key).unwrap_or_default();
+            (key, [e, a, s, l, f], by)
         })
+        .map(
+            |((kind, method, host, route), [e, a, s, l, f], by)| GroundingRow {
+                kind,
+                method,
+                host,
+                route,
+                exact: e,
+                approximate: a,
+                synthetic: s,
+                synthetic_by: by,
+                live: l,
+                forked: f,
+                confidence: r6(e as f64 / (e + a + s + l + f).max(1) as f64),
+            },
+        )
         .collect();
-    let (exact, approximate, synthetic, live) =
-        grounding.iter().fold((0, 0, 0, 0), |(e, a, s, l), g| {
-            (e + g.exact, a + g.approximate, s + g.synthetic, l + g.live)
-        });
-    let total = exact + approximate + synthetic + live;
+    let (exact, approximate, synthetic, live, forked) =
+        grounding
+            .iter()
+            .fold((0, 0, 0, 0, 0), |(e, a, s, l, f), g| {
+                (
+                    e + g.exact,
+                    a + g.approximate,
+                    s + g.synthetic,
+                    l + g.live,
+                    f + g.forked,
+                )
+            });
+    let total = exact + approximate + synthetic + live + forked;
     let mut effects = acc.effects;
     let mut items = acc.effect_items;
     items.sort_by(|a, b| {
@@ -2431,7 +2664,9 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
         exact,
         approximate,
         synthetic,
+        synthetic_by,
         live,
+        forked,
         confidence: if total == 0 {
             1.0
         } else {
@@ -2455,7 +2690,16 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
             before: input.before,
             after: input.after,
         },
-        options: input.options.clone(),
+        options: DiffOptions {
+            // A rebase uses none (m13-rebase §8).
+            simulators: if input.rebase {
+                Vec::new()
+            } else {
+                crate::simulators::Simulators::new(index, &input.options.simulator_overrides)
+                    .options()
+            },
+            ..input.options.clone()
+        },
         summary,
         kinds,
         causes,
@@ -2473,6 +2717,10 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
         errors,
         resources,
         samples: acc.samples,
+        irreversible: match (input.rebase, &input.continuous) {
+            (true, Some(c)) => Some(irreversible(index, c.turns)),
+            _ => None,
+        },
     })
 }
 
@@ -2592,6 +2840,7 @@ mod tests {
             masked: sql,
             pseudonyms: false,
             sql,
+            personal: sql,
         };
         let plain = [turn(false)];
         assert!(matches!(sql_tagged(&plain), Cow::Borrowed(_)));

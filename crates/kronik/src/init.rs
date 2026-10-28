@@ -237,9 +237,21 @@ sample = "100%"                       # isolated mode, stratified per route and 
 live_allowlist = []
 preview_ttl = "24h"                   # how long a preview fork lives
 
+# The model simulator for forks (M12): off unless configured, and only for
+# targets that allow it (`kronik stubs set`). It never sees personal data.
+# [simulators.model]
+# endpoint = "http://127.0.0.1:11434/v1/chat/completions"  # OpenAI-compatible
+# model = "llama3.1"
+# api_key_env = "KRONIK_MODEL_API_KEY"
+# timeout = "20s"
+# max_examples = 5
+
 [promote]
 max_gap = "2s"
 catch_up_timeout = "5m"
+
+[rebase]
+max_pause = "2s"                      # rollback --by-replay: the longest the switch holds requests
 
 [foreign]
 runsc_path = "/usr/local/bin/runsc"
@@ -247,6 +259,7 @@ platform = "auto"                     # auto, systrap or kvm
 run_dir = "/run/kronik"               # runsc state, namespaces, bridge sockets
 layout_dirs = []                      # oci-layout: images an operate token may add
 pull_timeout = "10m"
+checkpoints_kept = 3                  # per fork_mode = "sandbox" actor, one per snapshot
 "#
     )
 }
@@ -380,11 +393,11 @@ mod tests {
         assert!(unit.contains("ProtectSystem=strict"));
         assert!(!unit.contains("MemoryDenyWriteExecute=true"));
         // ADR 0027: an explicit User= costs runsc CAP_SETUID under the
-        // seccomp settings. RestrictSUIDSGID stays in v0.1, which never runs
-        // `runsc restore` (the one runsc step it breaks).
+        // seccomp settings, and RestrictSUIDSGID breaks `runsc restore`,
+        // which M14's sandbox copies run.
         let set = |key: &str| unit.lines().any(|l| l.starts_with(key));
         assert!(!set("User="));
-        assert!(set("RestrictSUIDSGID=true"));
+        assert!(!set("RestrictSUIDSGID="));
         assert!(set("NoNewPrivileges=true"));
     }
 }

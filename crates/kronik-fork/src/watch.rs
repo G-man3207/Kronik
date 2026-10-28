@@ -296,6 +296,19 @@ impl Scan {
 
     fn add(&mut self, w: &Watch, rollback_reason: &str, lsn: Lsn, record: Record) {
         let t_d = w.deployment_time_ms;
+        // A rebase switch changes code with its embedded deployment (M13):
+        // it ends the window as a `Deployment` does. Rebased turns are the
+        // fork's, not main's under the watched code.
+        let record = match record {
+            Record::StateRebase(pb::StateRebase {
+                part: Some(pb::state_rebase::Part::Switch(s)),
+                ..
+            }) => match s.deployment {
+                Some(d) => Record::Deployment(d),
+                None => return,
+            },
+            other => other,
+        };
         match record {
             Record::TurnRecord(t) => {
                 self.hwm = self.hwm.max(t.logical_time_ms);
@@ -934,6 +947,54 @@ mod tests {
         assert!(failed_turn(Some(&outcome(pb::OutcomeKind::Failed, None))));
         assert!(failed_turn(Some(&outcome(pb::OutcomeKind::Trap, None))));
         assert!(failed_turn(None));
+    }
+
+    /// Rebase watch list (M11 x M13): a rebase switch of a watched kind ends
+    /// the window after the deployment, as a `Deployment` does.
+    #[test]
+    fn a_rebase_switch_ends_the_window() {
+        let w = Watch {
+            id: "w-1".into(),
+            epoch: 2,
+            deployment_lsn: 10,
+            for_ms: 1_000,
+            deployment_time_ms: 5_000,
+            status: "watching".into(),
+            reason: String::new(),
+            token_id: String::new(),
+            created_ms: 0,
+            triggered: Vec::new(),
+            metrics: None,
+            error: None,
+            stopped: None,
+        };
+        let mut scan = Scan {
+            next: 1,
+            kinds: BTreeSet::from(["counter".to_owned()]),
+            before: Side::default(),
+            before_window: None,
+            after: Side::default(),
+            hwm: 0,
+            logged: Vec::new(),
+            end: None,
+            rollback: None,
+        };
+        let switch = Record::StateRebase(pb::StateRebase {
+            rebase_id: "r-1".into(),
+            part: Some(pb::state_rebase::Part::Switch(pb::RebaseSwitch {
+                deployment: Some(pb::Deployment {
+                    epoch: 3,
+                    kinds: vec![pb::KindVersion {
+                        kind: "counter".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        });
+        scan.add(&w, "watch w-1:", 20, switch);
+        assert_eq!(scan.end, Some(20));
     }
 
     /// Review W-M3: turns without a duration count as turns, not as 0 µs.

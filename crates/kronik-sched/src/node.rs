@@ -31,11 +31,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn internal(e: impl std::fmt::Display) -> ApiError {
+pub(crate) fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::new(ErrorCode::Internal, e.to_string())
 }
 
-fn store_err(e: StoreError) -> ApiError {
+pub(crate) fn store_err(e: StoreError) -> ApiError {
     match e {
         StoreError::Corrupt(m) => ApiError::new(ErrorCode::StorageCorrupt, m),
         other => internal(other),
@@ -132,6 +132,42 @@ struct Job {
     subject: Option<String>,
     reply: Option<Reply>,
     rerun: Option<Rerun>,
+}
+
+impl Job {
+    /// The callee turn of a `call` whose caller still waits for it: it runs
+    /// while the turn gate drains so that the calling turn can finish (ADR
+    /// 0018). One whose caller gave up waits for the drain to end.
+    fn is_call(&self) -> bool {
+        matches!(&self.input.kind, Some(pb::input::Kind::Message(m)) if m.source == pb::MessageSource::Call as i32)
+            && self.reply.as_ref().is_some_and(|r| !r.is_closed())
+    }
+
+    /// A resend of a dead letter: the dead letter's LSN.
+    fn resend_of(&self) -> Option<Lsn> {
+        match &self.input.kind {
+            Some(pb::input::Kind::Message(m))
+                if m.source == pb::MessageSource::DeadLetterResend as i32 =>
+            {
+                TurnId::parse(&m.resend_of).map(|t| t.lsn)
+            }
+            _ => None,
+        }
+    }
+
+    /// A message from the mailbox or a timer: replaced by the rebased
+    /// mailbox and timers at a rebase switch.
+    fn is_state_job(&self) -> bool {
+        self.rerun.is_none()
+            && match &self.input.kind {
+                Some(pb::input::Kind::Message(m)) => matches!(
+                    pb::MessageSource::try_from(m.source),
+                    Ok(pb::MessageSource::Actor | pb::MessageSource::Compensation)
+                ),
+                Some(pb::input::Kind::Timer(_)) => true,
+                _ => false,
+            }
+    }
 }
 
 /// A `TurnBegin` without a turn record, re-run at startup.
@@ -236,13 +272,11 @@ pub struct Node {
     permits: Semaphore,
     inflight: Mutex<HashMap<(ActorRef, String), Inflight>>,
     resending: Mutex<HashSet<Lsn>>,
+    /// Serializes configuration changes; first in the lock order (ADR 0013,
+    /// crate::gate). Shared so a rebase switch's drain can hold it.
     pub(crate) deploy_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Code switches (deploy, promote, rollback) hold it for writing from
-    /// their `Deployment`'s commit until every kind and the epoch are
-    /// swapped; a turn reads its code and epoch under it for reading, so a
-    /// turn either starts before the switch with the old code of every kind
-    /// or after its LSN with the new code of every kind (ADR 0013).
-    switch_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Where turns start: the switch gate and the drain (crate::gate).
+    pub(crate) gate: crate::gate::TurnGate,
     pub(crate) snapshot_lock: tokio::sync::Mutex<()>,
     group_commit_window: Duration,
     fatal: Arc<Fatal>,
@@ -259,6 +293,9 @@ pub struct Node {
     pub(crate) rates: RateLimiter,
     wheel: Mutex<Wheel>,
     wheel_notify: Arc<Notify>,
+    /// The shadow of the rebase being promoted (ADR 0017), shared with the
+    /// applier.
+    pub(crate) rebase: crate::rebase::RebaseCtx,
     pub probe: Probe,
     me: Weak<Node>,
 }
@@ -288,7 +325,7 @@ enum Decoded {
 /// next segments while one applies.
 async fn replay_unapplied(
     env: &Env,
-    reader: &LogReader,
+    rebase: &crate::rebase::RebaseCtx,
     store: &Store,
     applied: Lsn,
     upto: Lsn,
@@ -303,7 +340,7 @@ async fn replay_unapplied(
     } else {
         config.apply_batch
     };
-    let result = replay_segments(env, reader, store, applied + 1, upto, bulk, batch_cap).await;
+    let result = replay_segments(env, rebase, store, applied + 1, upto, bulk, batch_cap).await;
     match result {
         // Journaling was off: the file may hold part of a failed batch. Its
         // marker stays, so the next start rebuilds it.
@@ -321,13 +358,14 @@ async fn replay_unapplied(
 
 async fn replay_segments(
     env: &Env,
-    reader: &LogReader,
+    rebase: &crate::rebase::RebaseCtx,
     store: &Store,
     from: Lsn,
     upto: Lsn,
     bulk: bool,
     batch_cap: usize,
 ) -> Result<(), StartError> {
+    let reader = &rebase.reader;
     let starts = reader.starts().await?;
     let mut segs = Vec::new();
     for (i, &start) in starts.iter().enumerate() {
@@ -427,7 +465,7 @@ async fn replay_segments(
             Decoded::Rows(rows) => store.apply_catchup(*rows)?,
             Decoded::Records(records) => {
                 for batch in records.chunks(batch_cap) {
-                    store.apply(batch)?;
+                    rebase.apply(store, batch).await?;
                 }
             }
         }
@@ -473,6 +511,13 @@ impl Node {
                 "state.db has applied lsn {applied}, but the log ends at {last}"
             )));
         }
+        let rebase = crate::rebase::RebaseCtx::new(
+            reader.clone(),
+            config
+                .storage
+                .as_ref()
+                .map(|s| crate::snapshots::snapshots_dir(&s.data_dir, &config.branch)),
+        );
         let from = store.replay_from()?;
         if from < last && from + 1 < opened.first_lsn {
             return Err(StartError::Corrupt(format!(
@@ -483,7 +528,7 @@ impl Node {
         }
         if from < last {
             tracing::info!(from = from + 1, to = last, "replaying the log");
-            replay_unapplied(&env, &reader, &store, from, last, &config).await?;
+            replay_unapplied(&env, &rebase, &store, from, last, &config).await?;
         }
         if store.applied.get() != last {
             return Err(StartError::Corrupt(format!(
@@ -579,7 +624,7 @@ impl Node {
             inflight: Mutex::new(HashMap::new()),
             resending: Mutex::new(HashSet::new()),
             deploy_lock: Arc::new(tokio::sync::Mutex::new(())),
-            switch_gate: Arc::new(tokio::sync::RwLock::new(())),
+            gate: crate::gate::TurnGate::default(),
             snapshot_lock: tokio::sync::Mutex::new(()),
             group_commit_window,
             fatal: fatal.clone(),
@@ -590,6 +635,7 @@ impl Node {
             rates: RateLimiter::starting_full(env.clock.monotonic()),
             wheel: Mutex::new(Wheel::default()),
             wheel_notify: Arc::new(Notify::new()),
+            rebase: rebase.clone(),
             probe: Probe::default(),
             me: me.clone(),
             foreign: config.foreign.0.clone(),
@@ -611,7 +657,13 @@ impl Node {
         });
         env.spawn(
             "applier",
-            applier(store, committed_rx, node.cfg.apply_batch, fatal),
+            applier(
+                store,
+                node.rebase.clone(),
+                committed_rx,
+                node.cfg.apply_batch,
+                fatal,
+            ),
         );
         if let Some(u) = upgrade {
             tracing::info!(
@@ -679,25 +731,7 @@ impl Node {
             if rerun_messages.contains(&row.message_id) {
                 continue;
             }
-            let (parent_time, subject, causal_key) = match &row.input.kind {
-                Some(pb::input::Kind::Message(m)) => (
-                    m.sent_logical_time_ms,
-                    body_subject(m.msg.as_ref()),
-                    row.causal_key.clone(),
-                ),
-                _ => (0, None, row.causal_key.clone()),
-            };
-            node.enqueue(
-                row.to,
-                Job {
-                    input: row.input,
-                    causal_key,
-                    parent_time,
-                    subject,
-                    reply: None,
-                    rerun: None,
-                },
-            );
+            node.enqueue_mailbox(row);
         }
         {
             let mut w = lock(&node.wheel);
@@ -809,7 +843,12 @@ impl Node {
         let Some(me) = self.me() else { return };
         let mut actors = lock(&self.actors);
         let slot = actors.entry(actor.clone()).or_default();
+        let call = job.is_call();
         slot.queue.push_back(job);
+        if call {
+            // A drained worker runs callee turns.
+            self.gate.changed.notify_waiters();
+        }
         if !slot.running {
             slot.running = true;
             drop(actors);
@@ -820,15 +859,38 @@ impl Node {
 
     async fn worker(self: Arc<Self>, actor: ActorRef) {
         loop {
-            let job = {
+            let changed = self.gate.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let next = {
                 let mut actors = lock(&self.actors);
-                match actors.get_mut(&actor).and_then(|s| s.queue.pop_front()) {
-                    Some(j) => j,
-                    None => {
+                let mut drain = lock(&self.gate.drain);
+                let Some(slot) = actors.get_mut(&actor) else {
+                    return;
+                };
+                // While drained only callee turns start (ADR 0018).
+                let pick = if drain.drained {
+                    slot.queue.iter().position(Job::is_call)
+                } else if slot.queue.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+                match pick.and_then(|i| slot.queue.remove(i)) {
+                    Some(job) => {
+                        drain.running += 1;
+                        Some(job)
+                    }
+                    None if slot.queue.is_empty() => {
                         actors.remove(&actor);
                         return;
                     }
+                    None => None,
                 }
+            };
+            let Some(job) = next else {
+                changed.await;
+                continue;
             };
             let timer = match &job.input.kind {
                 Some(pb::input::Kind::Timer(t)) => Some(t.timer_id),
@@ -852,6 +914,167 @@ impl Node {
             }
             if let Some(reply) = job.reply {
                 let _ = reply.send(result);
+            }
+            self.gate.turn_ended();
+        }
+    }
+
+    /// Queues a pending message of the mailbox.
+    fn enqueue_mailbox(&self, row: kronik_store::db::MailboxRow) {
+        let (parent_time, subject) = match &row.input.kind {
+            Some(pb::input::Kind::Message(m)) => {
+                (m.sent_logical_time_ms, body_subject(m.msg.as_ref()))
+            }
+            _ => (0, None),
+        };
+        self.enqueue(
+            row.to,
+            Job {
+                input: row.input,
+                causal_key: row.causal_key,
+                parent_time,
+                subject,
+                reply: None,
+                rerun: None,
+            },
+        );
+    }
+
+    /// After a rebase switch (ADR 0018) has installed its code: the timer
+    /// wheel and the queued messages and timers from the rebased state.
+    /// Root inputs waiting in the queues stay, but resends of dead letters
+    /// the rebased state no longer has (m13-rebase §3).
+    pub(crate) fn reload_after_rebase(&self) -> Result<(), ApiError> {
+        let resends: Vec<Lsn> = lock(&self.actors)
+            .values()
+            .flat_map(|s| s.queue.iter().filter_map(Job::resend_of))
+            .collect();
+        let (timers, mailbox, gone_letters) = {
+            let db = self.store.db();
+            let mut gone = HashSet::new();
+            for lsn in resends {
+                if db.dead_letter(lsn).map_err(store_err)?.is_none() {
+                    gone.insert(lsn);
+                }
+            }
+            (
+                db.timers(None).map_err(store_err)?,
+                db.mailbox().map_err(store_err)?,
+                gone,
+            )
+        };
+        {
+            let mut w = lock(&self.wheel);
+            *w = Wheel::default();
+            for t in &timers {
+                w.add(t.actor.clone(), t.timer_id, t.due_ms);
+            }
+        }
+        self.wheel_notify.notify_one();
+        let mut gone = Vec::new();
+        for slot in lock(&self.actors).values_mut() {
+            for job in std::mem::take(&mut slot.queue) {
+                match job.resend_of() {
+                    _ if job.is_state_job() => {}
+                    Some(lsn) if gone_letters.contains(&lsn) => gone.push((lsn, job)),
+                    _ => slot.queue.push_back(job),
+                }
+            }
+        }
+        for (lsn, job) in gone {
+            if let Some(reply) = job.reply {
+                let _ = reply.send(Err(ApiError::new(
+                    ErrorCode::DeadLetterNotFound,
+                    format!(
+                        "dead letter {lsn} is gone: a rollback via replay switched main's state"
+                    ),
+                )));
+            }
+        }
+        for row in mailbox {
+            self.enqueue_mailbox(row);
+        }
+        Ok(())
+    }
+
+    /// Commits a switch's record and installs its code on a task of its
+    /// own that holds `held` (the deploy lock or the rebase pause) and
+    /// `gate`, the switch gate held for writing: a caller that goes away
+    /// (a client disconnect) never leaves a switch committed but not
+    /// installed. `hold`: park on `test_hold_switch` before the install. A rebase switch then reloads the queues and timers; when
+    /// that fails after the commit the node goes fatal.
+    pub(crate) async fn finish_switch<H: Send + 'static>(
+        &self,
+        held: H,
+        gate: tokio::sync::OwnedRwLockWriteGuard<()>,
+        record: Record,
+        installs: Vec<(pb::KindVersion, Arc<Program>, CodeHash)>,
+        epoch: u64,
+        hold: bool,
+    ) -> Result<Lsn, ApiError> {
+        let node = self
+            .me()
+            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let rebase = matches!(record, Record::StateRebase(_));
+        let task = self.env.spawn("switch", async move {
+            let _held = held;
+            let _gate = gate;
+            let lsn = node.commit(record).await?;
+            if hold {
+                node.hold_switch().await;
+            }
+            node.install_code(installs, epoch);
+            if rebase {
+                if let Err(e) = node.reload_after_rebase() {
+                    node.fatal.set(format!(
+                        "reloading after the rebase switch at lsn {lsn}: {e}"
+                    ));
+                    return Err(e);
+                }
+                node.rebase.clear_live();
+            }
+            Ok(lsn)
+        });
+        task.await.unwrap_or_else(|| {
+            Err(ApiError::new(
+                ErrorCode::Unavailable,
+                "the node is stopping",
+            ))
+        })
+    }
+
+    /// Installs the code of a switch's kinds and its epoch: the one install
+    /// path of deploy, promote, rollback and the rebase switch, called with
+    /// the switch gate held for writing after the record is applied.
+    pub(crate) fn install_code(
+        &self,
+        installs: Vec<(pb::KindVersion, Arc<Program>, CodeHash)>,
+        epoch: u64,
+    ) {
+        {
+            let mut kinds = lock(&self.kinds);
+            for (version, program, hash) in installs {
+                tracing::info!(kind = %version.kind, code = %hash.short(), epoch, "code installed");
+                kinds.insert(
+                    version.kind.clone(),
+                    Arc::new(Kind {
+                        version,
+                        program,
+                        hash,
+                    }),
+                );
+            }
+        }
+        self.epoch.store(epoch, Ordering::Release);
+    }
+
+    /// The test hook `NodeConfig::test_hold_switch`: parks a switch after
+    /// its record is applied and before its code is installed.
+    pub(crate) async fn hold_switch(&self) {
+        if let Some(hold) = &self.cfg.test_hold_switch {
+            hold.parked.fetch_add(1, Ordering::SeqCst);
+            if let Ok(permit) = hold.release.acquire().await {
+                permit.forget();
             }
         }
     }
@@ -1064,7 +1287,7 @@ impl Node {
     /// A turn's code and configuration epoch, taken together under the
     /// switch gate (ADR 0013).
     async fn start_code(&self, kind: &str) -> (Option<Arc<Kind>>, u64) {
-        let _start = self.switch_gate.read().await;
+        let _start = self.gate.start().await;
         (self.kind(kind), self.epoch.load(Ordering::Acquire))
     }
 
@@ -1518,6 +1741,32 @@ impl Node {
         rx
     }
 
+    /// Appends records in order (sealed) and resolves once the last is
+    /// applied; its LSN, 0 for none.
+    pub(crate) async fn commit_all(&self, records: Vec<Record>) -> Result<Lsn, ApiError> {
+        let mut sealed = Vec::with_capacity(records.len());
+        for mut r in records {
+            self.seal(&mut r)?;
+            sealed.push(r);
+        }
+        let last = match self.log.append_all(sealed).await {
+            Ok(last) => last.unwrap_or(0),
+            Err(e) => {
+                self.fatal.set(e.to_string());
+                return Err(ApiError::new(ErrorCode::Unavailable, e.to_string()));
+            }
+        };
+        tokio::select! {
+            biased;
+            () = self.store.applied.wait(last) => Ok(last),
+            msg = self.fatal.wait() => Err(ApiError::new(ErrorCode::Unavailable, msg)),
+        }
+    }
+
+    pub(crate) fn arc(&self) -> Option<Arc<Node>> {
+        self.me()
+    }
+
     /// Appends a record and resolves after its fsync (not its apply).
     pub(crate) async fn append(&self, mut record: Record) -> Result<Lsn, ApiError> {
         self.seal(&mut record)?;
@@ -1947,9 +2196,16 @@ impl Node {
             rollback_of_epoch: 0,
             audit: Some(audit),
         };
-        let gate = self.switch_gate.clone().write_owned().await;
+        let gate = self.gate.switch().await;
         let lsn = self
-            .finish_switch(guard, gate, record, vec![(version, program, hash)], false)
+            .finish_switch(
+                guard,
+                gate,
+                Record::Deployment(record),
+                vec![(version, program, hash)],
+                epoch,
+                false,
+            )
             .await?;
         tracing::info!(kind = %kind, code = %hash.short(), epoch, lsn, "deployed");
         Ok(DeployResult {
@@ -2118,62 +2374,19 @@ impl Node {
             rollback_of_epoch: switch.rollback_of_epoch,
             audit: Some(audit),
         };
-        let gate = self.switch_gate.clone().write_owned().await;
+        let gate = self.gate.switch().await;
         let lsn = self
-            .finish_switch(guard, gate, record, installs, true)
+            .finish_switch(
+                guard,
+                gate,
+                Record::Deployment(record),
+                installs,
+                epoch,
+                true,
+            )
             .await?;
         tracing::info!(epoch, lsn, "switched code");
         Ok((epoch, lsn))
-    }
-
-    /// Commits a code switch's `Deployment` and installs its kinds and
-    /// epoch on a task of its own that holds the deploy lock and the switch
-    /// gate (written): a caller that goes away (a client disconnect) never
-    /// leaves a switch committed but not installed. `hold`: park on
-    /// `test_hold_switch` before the install.
-    async fn finish_switch(
-        &self,
-        guard: tokio::sync::OwnedMutexGuard<()>,
-        gate: tokio::sync::OwnedRwLockWriteGuard<()>,
-        record: pb::Deployment,
-        installs: Vec<(pb::KindVersion, Arc<Program>, CodeHash)>,
-        hold: bool,
-    ) -> Result<Lsn, ApiError> {
-        let node = self
-            .me()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
-        let epoch = record.epoch;
-        let task = self.env.spawn("switch", async move {
-            let _guard = guard;
-            let _gate = gate;
-            let lsn = node.commit(Record::Deployment(record)).await?;
-            if hold && let Some(hold) = &node.cfg.test_hold_switch {
-                hold.parked.fetch_add(1, Ordering::SeqCst);
-                if let Ok(permit) = hold.release.acquire().await {
-                    permit.forget();
-                }
-            }
-            let mut kinds = lock(&node.kinds);
-            for (version, program, hash) in installs {
-                tracing::info!(kind = %version.kind, code = %hash.short(), epoch, lsn, "code installed");
-                kinds.insert(
-                    version.kind.clone(),
-                    Arc::new(Kind {
-                        version,
-                        program,
-                        hash,
-                    }),
-                );
-            }
-            node.epoch.store(epoch, Ordering::Release);
-            Ok(lsn)
-        });
-        task.await.unwrap_or_else(|| {
-            Err(ApiError::new(
-                ErrorCode::Unavailable,
-                "the node is stopping",
-            ))
-        })
     }
 
     /// Writes an `Approval` record in this branch's log.
@@ -2253,6 +2466,11 @@ impl Node {
     }
 
     /// The configuration of the current epoch.
+    /// The foreign actors' host (forks start copies through it, M14).
+    pub fn foreign_host(&self) -> Option<Arc<dyn kronik_effects::foreign::ForeignHost>> {
+        self.foreign.clone()
+    }
+
     pub fn config_now(&self) -> Arc<Config> {
         let epoch = self.epoch.load(Ordering::Acquire);
         self.config_at(epoch)
@@ -2361,6 +2579,33 @@ impl Node {
         });
         let lsn = self.commit_config(guard, epoch, record).await?;
         tracing::info!(kind, capability = %cap.render(), epoch, lsn, "granted");
+        Ok((epoch, lsn))
+    }
+
+    /// `kronik stubs set`: writes a `SimulatorConfig` record for one target
+    /// (docs/design/m12-simulators.md §2). Returns (epoch, lsn); lsn is 0
+    /// for a dry run.
+    pub async fn set_simulators(
+        &self,
+        mut record: pb::SimulatorConfig,
+        audit: pb::Audit,
+        dry_run: bool,
+    ) -> Result<(u64, Lsn), ApiError> {
+        self.check_running()?;
+        kronik_effects::simulator::check_config(&record)
+            .map_err(|m| ApiError::new(ErrorCode::BadRequest, m))?;
+        let guard = self.deploy_lock.clone().lock_owned().await;
+        let epoch = self.epoch() + 1;
+        if dry_run {
+            return Ok((epoch, 0));
+        }
+        record.epoch = epoch;
+        record.audit = Some(audit);
+        let target = record.target.clone();
+        let lsn = self
+            .commit_config(guard, epoch, Record::SimulatorConfig(record))
+            .await?;
+        tracing::info!(target, epoch, lsn, "simulators set");
         Ok((epoch, lsn))
     }
 
@@ -2848,6 +3093,7 @@ fn validate_manifest(m: &pb::Manifest) -> Result<(), ApiError> {
 
 async fn applier(
     store: Arc<Store>,
+    rebase: crate::rebase::RebaseCtx,
     mut rx: mpsc::UnboundedReceiver<Committed>,
     max: usize,
     fatal: Arc<Fatal>,
@@ -2860,7 +3106,7 @@ async fn applier(
                 Err(_) => break,
             }
         }
-        if let Err(e) = store.apply(&batch) {
+        if let Err(e) = rebase.apply(&store, &batch).await {
             fatal.set(format!("applying lsn {}: {e}", batch[0].lsn));
             return;
         }

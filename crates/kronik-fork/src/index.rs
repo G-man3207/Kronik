@@ -106,6 +106,22 @@ impl Base {
     }
 }
 
+/// A configuration record as replay sees it: a rebase switch counts as its
+/// deployment (M13).
+fn config_view(r: &Record) -> Option<Record> {
+    match r {
+        Record::Deployment(_)
+        | Record::Grant(_)
+        | Record::Limits(_)
+        | Record::ForeignActor(_)
+        | Record::SimulatorConfig(_) => Some(r.clone()),
+        _ => r
+            .rebase_switch()
+            .and_then(|(_, sw)| sw.deployment.clone())
+            .map(Record::Deployment),
+    }
+}
+
 /// Main's history for one replay.
 pub struct ProductionIndex {
     pub fork_lsn: Lsn,
@@ -285,6 +301,46 @@ impl ProductionIndex {
         }
     }
 
+    /// This index continued to `to_lsn`: only the records after its end
+    /// are read and revealed (a rebase's last round inside the pause,
+    /// m13-rebase §4). `self` must have been revealed with `privacy`.
+    pub async fn extended(
+        &self,
+        reader: &LogReader,
+        to_lsn: Lsn,
+        privacy: &crate::privacy::ForkPrivacy,
+    ) -> Result<ProductionIndex, LogError> {
+        let from = self.to_lsn + 1;
+        let mut more = Vec::new();
+        if to_lsn >= from {
+            reader
+                .read(from, to_lsn, |c| {
+                    more.push(c);
+                    Ok(())
+                })
+                .await?;
+        }
+        if let Some(c) = more.first()
+            && c.lsn != from
+        {
+            return Err(LogError::Corrupt(format!(
+                "replay needs the log from lsn {from}, but it continues at {}",
+                c.lsn
+            )));
+        }
+        let mut tail = ProductionIndex::from_records(more, self.fork_lsn, to_lsn);
+        tail.reveal(privacy);
+        // shortcut: copies the window's records once per extension; chunked
+        // records would avoid it if long windows make the last round slow.
+        let mut records = (*self.records).clone();
+        records.extend(std::sync::Arc::unwrap_or_clone(tail.records));
+        let mut index =
+            ProductionIndex::from_shared(std::sync::Arc::new(records), self.fork_lsn, to_lsn);
+        index.base = self.base.clone();
+        index.sealer = privacy.sealer.clone();
+        Ok(index)
+    }
+
     pub fn record(&self, lsn: Lsn) -> Option<&Committed> {
         lsn.checked_sub(self.first_lsn())
             .and_then(|i| self.records.get(i as usize))
@@ -344,20 +400,28 @@ impl ProductionIndex {
         base.chain(self.records_config(upto)).collect()
     }
 
+    /// Every configuration record with its LSN up to `upto`: the base
+    /// snapshot's, then the window's, in LSN order.
+    pub fn config_records_upto(&self, upto: Lsn) -> Vec<(Lsn, Record)> {
+        let base = self
+            .base
+            .iter()
+            .flat_map(|b| b.config.iter())
+            .filter(|(l, _)| *l <= upto)
+            .cloned();
+        let window = self
+            .records
+            .iter()
+            .filter(|c| c.lsn <= upto)
+            .filter_map(|c| config_view(&c.record).map(|r| (c.lsn, r)));
+        base.chain(window).collect()
+    }
+
     fn records_config(&self, upto: Lsn) -> Vec<Record> {
         self.records
             .iter()
             .filter(|c| c.lsn <= upto)
-            .filter(|c| {
-                matches!(
-                    c.record,
-                    Record::Deployment(_)
-                        | Record::Grant(_)
-                        | Record::Limits(_)
-                        | Record::ForeignActor(_)
-                )
-            })
-            .map(|c| c.record.clone())
+            .filter_map(|c| config_view(&c.record))
             .collect()
     }
 
@@ -374,9 +438,13 @@ impl ProductionIndex {
             .records
             .iter()
             .filter(|c| c.lsn <= upto)
-            .map(|c| &c.record);
-        for r in base.chain(after) {
-            if let Record::Deployment(d) = r {
+            .filter_map(|c| match c.record.rebase_switch() {
+                Some(_) => config_view(&c.record),
+                None => matches!(c.record, Record::Deployment(_)).then(|| c.record.clone()),
+            });
+        let base: Vec<Record> = base.cloned().collect();
+        for r in base.iter().cloned().chain(after) {
+            if let Record::Deployment(d) = &r {
                 for k in &d.kinds {
                     kinds.insert(k.kind.clone(), k.clone());
                 }

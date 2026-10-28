@@ -32,6 +32,12 @@ curl -fsSL <url>/install.sh | KRONIK_BASE_URL=<url> sh
 
 - rustup, only to build Rust actors; it installs the toolchain that the
   project pins.
+- For Python and Go actors (M15), the pinned toolchains of
+  [ADR 0030](../adr/0030-python-go-components.md): componentize-py, Go,
+  TinyGo, wasm-tools and WASI-Virt. `scripts/install-sdk-tools.sh` from a
+  Kronik checkout installs them into `~/.cache/kronik/sdk-tools` (or
+  `$KRONIK_SDK_TOOLS`), where `kronik build` looks; it needs Linux x86_64,
+  python3 with pip, and rustup for the two Rust tools.
 - gVisor's `runsc`, only for foreign actors; `install.sh` offers it.
 
 ## What install.sh does

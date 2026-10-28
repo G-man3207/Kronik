@@ -74,11 +74,11 @@ pub fn build_engine(pool: PoolSize) -> Result<Engine, CodeError> {
     let n = pool.concurrency.max(1);
     let mut p = PoolingAllocationConfig::new();
     p.total_component_instances(n);
-    p.total_core_instances(n * 8);
+    p.total_core_instances(n * 48);
     p.total_memories(n * 2);
     p.total_tables(n * 8);
     p.total_stacks(n);
-    p.max_core_instances_per_component(32);
+    p.max_core_instances_per_component(64);
     p.max_memories_per_component(8);
     p.max_tables_per_component(32);
     p.max_memories_per_module(2);

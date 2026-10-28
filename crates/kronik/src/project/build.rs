@@ -1,4 +1,5 @@
-//! `kronik build`: a TypeScript or Rust project to `dist/<name>.wasm`.
+//! `kronik build`: a TypeScript, Rust, Python or Go project to
+//! `dist/<name>.wasm` (Python and Go: `build_sdk.rs`, ADR 0030).
 //!
 //! TypeScript (ADR 0002): `tsc --noEmit`, then `jco componentize` with
 //! `--disable http fetch-event stdio` on an entry that exports the module's
@@ -26,13 +27,20 @@ use serde::Serialize;
 use super::Failure;
 
 /// The custom section that records the build's input hash.
-const INPUT_SECTION: &str = "kronik-build-input";
+pub(super) const INPUT_SECTION: &str = "kronik-build-input";
 
 /// ComponentizeJS features Kronik's allowlist needs off (ADR 0002).
 const DISABLED_FEATURES: [&str; 3] = ["http", "fetch-event", "stdio"];
 
 /// Directories whose contents are not build inputs.
-const SKIPPED_DIRS: [&str; 5] = ["node_modules", "dist", ".kronik", ".git", "target"];
+const SKIPPED_DIRS: [&str; 6] = [
+    "node_modules",
+    "dist",
+    ".kronik",
+    ".git",
+    "target",
+    "__pycache__",
+];
 
 /// The oldest Node.js that runs the pinned TypeScript toolchain: every
 /// package's `engines` admits it (the strictest, `@napi-rs/lzma`, asks for
@@ -106,12 +114,14 @@ pub fn component(dir: &Path, force: bool, entry: Option<&str>) -> Result<Built, 
         .canonicalize()
         .map_err(|e| Failure::new(format!("{}: {e}", dir.display())))?;
     let is_rust = dir.join("Cargo.toml").is_file();
-    if !is_rust && !dir.join("package.json").is_file() {
+    let is_python = dir.join("pyproject.toml").is_file();
+    let is_go = dir.join("go.mod").is_file();
+    if !is_rust && !is_python && !is_go && !dir.join("package.json").is_file() {
         return Err(Failure::new(format!(
-            "{} has neither a Cargo.toml nor a package.json",
+            "{} has no Cargo.toml, package.json, pyproject.toml or go.mod",
             dir.display()
         ))
-        .hint("create a project with: kronik init --lang ts <name>"));
+        .hint("create a project with: kronik init --lang ts|rust|python|go <name>"));
     }
     let work = dir.join(".kronik");
     std::fs::create_dir_all(&work)?;
@@ -119,15 +129,19 @@ pub fn component(dir: &Path, force: bool, entry: Option<&str>) -> Result<Built, 
     lock.lock()?;
     if is_rust {
         if let Some(entry) = entry {
-            return Err(
-                Failure::new(format!("--entry {entry} is for TypeScript projects"))
-                    .hint("build Rust variants with Cargo features"),
-            );
+            return Err(Failure::new(format!(
+                "--entry {entry} is for TypeScript, Python and Go projects"
+            ))
+            .hint("build Rust variants with Cargo features"));
         }
         rust(&dir).map(|path| Built {
             path,
             cached: false,
         })
+    } else if is_python {
+        super::build_sdk::python(&dir, force, entry)
+    } else if is_go {
+        super::build_sdk::go(&dir, force, entry)
     } else {
         typescript(&dir, force, entry)
     }
@@ -390,7 +404,7 @@ fn rust(dir: &Path) -> Result<PathBuf, Failure> {
 // `kronik build` is a CLI command, not daemon code: its wall-clock step
 // timings are only printed.
 #[allow(clippy::disallowed_methods)]
-fn step(what: &str, f: impl FnOnce() -> Result<(), Failure>) -> Result<(), Failure> {
+pub(super) fn step(what: &str, f: impl FnOnce() -> Result<(), Failure>) -> Result<(), Failure> {
     let start = Instant::now();
     f()?;
     eprintln!("  {what:<45} {:>6.1} s", start.elapsed().as_secs_f64());
@@ -398,7 +412,7 @@ fn step(what: &str, f: impl FnOnce() -> Result<(), Failure>) -> Result<(), Failu
 }
 
 /// Runs a tool and captures its output; on failure the output is printed.
-fn tool(command: &mut Command) -> Result<Output, Failure> {
+pub(super) fn tool(command: &mut Command) -> Result<Output, Failure> {
     let program = command.get_program().to_string_lossy().into_owned();
     let output = command
         .stdin(Stdio::null())
@@ -419,7 +433,7 @@ fn tool(command: &mut Command) -> Result<Output, Failure> {
 }
 
 /// The deploy-time import check (ADR 0001 §8).
-fn check_imports(bytes: &[u8]) -> Result<(), Failure> {
+pub(super) fn check_imports(bytes: &[u8]) -> Result<(), Failure> {
     let imports = allowlist::component_imports(bytes)
         .map_err(|e| Failure::new(format!("not a component: {e}")))?;
     let denied = allowlist::disallowed_imports(bytes)
@@ -438,7 +452,7 @@ fn check_imports(bytes: &[u8]) -> Result<(), Failure> {
     Ok(())
 }
 
-fn summary(out: &Path, bytes: &[u8]) {
+pub(super) fn summary(out: &Path, bytes: &[u8]) {
     let hash = blake3::hash(bytes).to_hex();
     // Relative to the current directory when the component is inside it.
     let cwd = std::env::current_dir()
@@ -453,7 +467,7 @@ fn summary(out: &Path, bytes: &[u8]) {
     );
 }
 
-fn write_output(out: &Path, bytes: &[u8]) -> Result<(), Failure> {
+pub(super) fn write_output(out: &Path, bytes: &[u8]) -> Result<(), Failure> {
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -470,7 +484,11 @@ fn find_up(dir: &Path, path: &str) -> Option<PathBuf> {
 
 /// Hashes every file under `dir` (sorted, by path relative to `root`),
 /// skipping dependencies and build output.
-fn hash_tree(hasher: &mut blake3::Hasher, root: &Path, dir: &Path) -> Result<(), Failure> {
+pub(super) fn hash_tree(
+    hasher: &mut blake3::Hasher,
+    root: &Path,
+    dir: &Path,
+) -> Result<(), Failure> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
@@ -519,7 +537,7 @@ fn read_leb128(bytes: &[u8], pos: &mut usize) -> Option<usize> {
 }
 
 /// Appends a custom section (id 0) to a component or module.
-fn append_custom_section(bytes: &mut Vec<u8>, name: &str, payload: &[u8]) {
+pub(super) fn append_custom_section(bytes: &mut Vec<u8>, name: &str, payload: &[u8]) {
     let mut body = Vec::new();
     leb128(name.len(), &mut body);
     body.extend_from_slice(name.as_bytes());
@@ -530,7 +548,7 @@ fn append_custom_section(bytes: &mut Vec<u8>, name: &str, payload: &[u8]) {
 }
 
 /// The payload of the top-level custom section `name`, if there is one.
-fn custom_section(bytes: &[u8], name: &str) -> Option<Vec<u8>> {
+pub(super) fn custom_section(bytes: &[u8], name: &str) -> Option<Vec<u8>> {
     let mut pos = 8; // magic and version
     while pos < bytes.len() {
         let id = bytes[pos];

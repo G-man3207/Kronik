@@ -14,11 +14,12 @@ effect answered from its recording (exact grounding).
 
 The traffic:
 
-- counter-rs, counter-ts: increments and reads over HTTP, a retry with the
-  same Idempotency-Key, and operator messages.
-- notes-rs, notes-ts: SQL writes (create, delete) and paged reads, invalid
-  input, and a message, which notes does not handle: a dead letter, resent.
-- webhook-relay-rs, webhook-relay-ts: webhooks forwarded to a local target.
+- counter-rs, -ts, -py, -go: increments and reads over HTTP, a retry with
+  the same Idempotency-Key, and operator messages.
+- notes-rs, -ts, -py, -go: SQL writes (create, delete) and paged reads,
+  invalid input, and a message, which notes does not handle: a dead
+  letter, resent.
+- webhook-relay-rs, -ts, -py, -go: webhooks forwarded to a local target.
   These are effects with recorded responses, signed, with a secret
   inserted by the host. Also: a 500 retried by timer, a 400, a host that
   is not granted, and a configure message with a bad target, which becomes
@@ -386,10 +387,16 @@ def billing_traffic(ex):
 EXAMPLES = {
     "counter-rs": (["counter.wasm"], None, counter_traffic),
     "counter-ts": (["counter-ts.wasm"], None, counter_traffic),
+    "counter-py": (["counter-py.wasm"], None, counter_traffic),
+    "counter-go": (["counter-go.wasm"], None, counter_traffic),
     "notes-rs": (["notes.wasm"], None, notes_traffic),
     "notes-ts": (["notes-ts.wasm"], None, notes_traffic),
+    "notes-py": (["notes-py.wasm"], None, notes_traffic),
+    "notes-go": (["notes-go.wasm"], None, notes_traffic),
     "webhook-relay-rs": (["webhook-relay.wasm"], relay_setup, relay_traffic),
     "webhook-relay-ts": (["webhook-relay-ts.wasm"], relay_setup, relay_traffic),
+    "webhook-relay-py": (["webhook-relay-py.wasm"], relay_setup, relay_traffic),
+    "webhook-relay-go": (["webhook-relay-go.wasm"], relay_setup, relay_traffic),
     "todo-ts": (["todo-ts.wasm"], None, todo_traffic),
     "billing-ts": (["billing-ts.wasm", "billing-ts-ledger.wasm"], billing_setup, billing_traffic),
 }
@@ -443,8 +450,8 @@ def main():
         sys.exit(f"error: unknown examples {unknown}; there are {', '.join(EXAMPLES)}")
     missing = [c for n in names for c in EXAMPLES[n][0] if not os.path.exists(os.path.join(args.dist, c))]
     if missing:
-        sys.exit(f"error: {', '.join(missing)} not in {args.dist}; build the examples with scripts/build-examples.sh "
-                 "and scripts/build-examples-ts.sh")
+        sys.exit(f"error: {', '.join(missing)} not in {args.dist}; build the examples with scripts/build-examples.sh, "
+                 "scripts/build-examples-ts.sh, -py.sh and -go.sh")
     if "billing-ts" in names and not args.fake_payments:
         sys.exit("error: billing-ts needs --fake-payments")
     if "todo-ts" in names and not args.faketime_lib:

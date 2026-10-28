@@ -1826,3 +1826,46 @@ fn the_diff_summary_shows_no_url_paths() {
         }
     }
 }
+
+/// Review N13-5: a rollback via replay runs on full data (its turns become
+/// main's state), so a token without pii:read, which only gets forks
+/// without personal data, may not create one (ADR 0018).
+#[test]
+fn a_rollback_via_replay_needs_pii_read() {
+    let tmp = tempfile::Builder::new()
+        .prefix("kronik-m13-pii-")
+        .tempdir_in("/var/tmp")
+        .unwrap();
+    let d = Daemon::start(tmp.path());
+    deploy(&d, "counter.wasm");
+    deploy(&d, "counter-step2.wasm");
+    d.send("counter/a", "increment", "", None);
+    let epoch = d.api("GET", "/v1/deployments", Value::Null)["deployments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| x["epoch"].as_u64())
+        .max()
+        .unwrap();
+    let agent = d.api(
+        "POST",
+        "/v1/tokens",
+        json!({"name": "agent", "scopes": ["read", "fork", "propose"], "reason": "privacy test"}),
+    )["secret"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let path = format!("/v1/deployments/{epoch}/rebase");
+    let body = json!({"reason": "privacy test", "dry_run": true});
+    let (status, v) = d
+        .try_api("POST", &path, body.clone(), Some(&agent))
+        .unwrap();
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (403, Some("SCOPE_MISSING")),
+        "{v}"
+    );
+    assert!(v.to_string().contains("pii:read"), "{v}");
+    let (status, v) = d.try_api("POST", &path, body, None).unwrap();
+    assert_eq!(status, 200, "{v}");
+}

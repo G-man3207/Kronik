@@ -21,9 +21,9 @@ pub struct TestHostArgs {
     /// A project to build (as kronik build does) and deploy.
     #[arg(long)]
     dir: Option<PathBuf>,
-    /// TypeScript: the entries of `--dir` to build and deploy, instead of
-    /// package.json's `kronik.entry`; repeat for more (such as a second
-    /// actor type, or a variant).
+    /// The entries of `--dir` to build and deploy instead of the project's
+    /// default (as `kronik build --entry`); repeat for more (such as a
+    /// second actor type, or a variant).
     #[arg(long, requires = "dir")]
     entry: Vec<String>,
     /// A component to deploy; repeat for more.

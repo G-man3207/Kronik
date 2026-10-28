@@ -373,7 +373,12 @@ fn effect_rows(effects: &[EffectSummary]) -> Vec<Vec<String>> {
                 e.kind.clone(),
                 e.target.clone(),
                 e.delivery.clone().unwrap_or_else(|| "-".to_owned()),
-                e.status.clone(),
+                // A fork effect also says how it was answered (M12).
+                match (&e.grounding, &e.simulator) {
+                    (Some(g), Some(s)) => format!("{} ({g}: {s})", e.status),
+                    (Some(g), None) => format!("{} ({g})", e.status),
+                    _ => e.status.clone(),
+                },
                 clip(e.error.as_deref().unwrap_or("-"), 60),
             ]
         })
@@ -1198,6 +1203,8 @@ mod tests {
             error: Some("CAPABILITY_NOT_GRANTED: http:api.example.com".into()),
             hint: Some("kronik grant billing http:api.example.com --reason '...'".into()),
             request: None,
+            grounding: None,
+            simulator: None,
         };
         let sent = kronik_api::types::EffectSummary {
             status: "ok".into(),

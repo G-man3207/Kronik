@@ -1,0 +1,139 @@
+package kronik:actor@0.1.0;
+
+interface types {
+  /// "kind/key", e.g. billing/acme
+  record actor-ref { kind: string, key: string }
+  /// identifies a blob; it does not grant access, the host's reference graph does; used from M25
+  record blob-ref { hash: string, size: u64 }
+  /// blobs travel next to the body, never hidden inside it; always empty before M26
+  record message { name: string, content-type: string, body: list<u8>, blobs: list<blob-ref> }
+  /// an HTTP body: inline bytes, or a blob from M25; only inline before M25
+  variant http-body { inline(list<u8>), blob(blob-ref) }
+  record header { name: string, value: string }
+  record incoming { sender: option<actor-ref>, msg: message }
+  record http-request {
+    method: string, path: string, query: string,
+    params: list<tuple<string, string>>, headers: list<header>, body: http-body,
+  }
+  record http-response { status: u16, headers: list<header>, body: http-body }
+  record timer-fired { id: u64, msg: message }
+  variant input { http(http-request), message(incoming), timer(timer-fired), migrate(u32) }
+  variant output { none, reply(message), http(http-response) }
+  variant handler-error { rejected(string), failed(string) }
+  record route { method: string, pattern: string }
+  record manifest {
+    kind: string, schema-version: u32,
+    routes: list<route>, capabilities: list<string>,
+  }
+}
+
+interface state {
+  /// values and messages are at most 1 MiB by default (per-kind limits)
+  get: func(key: string) -> option<list<u8>>;
+  /// tagged with the current default subject, see privacy
+  set: func(key: string, value: list<u8>);
+  /// tagged with an explicit subject (none = no subject), whatever the default
+  set-for: func(subject: option<string>, key: string, value: list<u8>);
+  delete: func(key: string);
+  keys: func(prefix: string) -> list<string>;
+}
+
+interface sql {
+  variant sql-value { null, integer(s64), real(f64), text(string), blob(list<u8>) }
+  record rows { columns: list<string>, values: list<list<sql-value>> }
+  variant sql-error { syntax(string), constraint(string), denied(string), too-large }
+  /// per-actor SQLite owned by the host; changes are recorded as changesets.
+  /// DDL is allowed only in a migrate turn, before its first DML statement.
+  /// A row's subject is its `_subject` column; tables without one use the
+  /// turn's default subject. The SQL function kronik_subject() returns the
+  /// current default subject (e.g. `_subject TEXT DEFAULT (kronik_subject())`).
+  query: func(statement: string, params: list<sql-value>) -> result<rows, sql-error>;
+  execute: func(statement: string, params: list<sql-value>) -> result<u64, sql-error>;
+}
+
+interface context {
+  use types.{actor-ref};
+  self-ref: func() -> actor-ref;
+  /// derived from the causal key: identical in production and replay
+  causal-id: func() -> string;
+  /// logical time of this turn: constant within the turn,
+  /// monotonic per branch and shard, never below the parent's
+  now-ms: func() -> u64;
+  /// deterministic per turn, seeded from the recorded seed
+  random-bytes: func(len: u32) -> list<u8>;
+}
+
+interface messaging {
+  use types.{actor-ref, message};
+  variant call-error { not-found, rejected(string), failed(string), reentrant, timeout }
+  /// buffered; delivered exactly once, and only if this turn commits
+  send: func(to: actor-ref, msg: message);
+  /// happens now; the callee commits its own turn; not atomic with this turn.
+  /// compensate is delivered exactly once to the callee if this turn fails afterwards
+  call: func(to: actor-ref, msg: message, compensate: option<message>) -> result<option<message>, call-error>;
+}
+
+interface timers {
+  use types.{message};
+  /// registered when this turn commits
+  schedule: func(delay-ms: u64, msg: message) -> u64;
+  cancel: func(id: u64) -> bool;
+}
+
+interface http-client {
+  use types.{http-body};
+  /// the host inserts the secret at the effect boundary, e.g. template "Bearer {}"
+  record secret-template { name: string, template: string }
+  variant header-value { text(string), secret(secret-template) }
+  record request-header { name: string, value: header-value }
+  record request { method: string, url: string, headers: list<request-header>, body: http-body }
+  record response { status: u16, headers: list<tuple<string, string>>, body: http-body }
+  variant fetch-error { denied(string), network(string), timeout, too-large, outcome-unknown }
+  /// url may be https://... or foreign://<name>/...
+  fetch: func(req: request) -> result<response, fetch-error>;
+}
+
+interface crypto {
+  variant crypto-error { denied(string), unsupported(string) }
+  /// secret is a name; the value never enters guest memory
+  hmac-sha256: func(secret: string, data: list<u8>) -> result<list<u8>, crypto-error>;
+  sign-ed25519: func(secret: string, data: list<u8>) -> result<list<u8>, crypto-error>;
+}
+
+interface secrets {
+  /// exception only: requires capability secret-reveal:<name>
+  reveal: func(name: string) -> result<string, string>;
+}
+
+interface log {
+  enum level { trace, debug, info, warn, error }
+  /// the host adds execution id and causal id to every event
+  emit: func(lvl: level, message: string, fields: list<tuple<string, string>>);
+}
+
+interface privacy {
+  /// default subject for values written from now on in this turn
+  set-subject: func(subject: option<string>);
+  /// the current default subject (initially set by the gateway or the sender)
+  current-subject: func() -> option<string>;
+}
+
+interface handler {
+  use types.{input, output, handler-error, manifest};
+  describe: func() -> manifest;
+  handle: func(input: input) -> result<output, handler-error>;
+}
+
+world actor {
+  import state;
+  import sql;
+  import context;
+  import messaging;
+  import timers;
+  import http-client;
+  import crypto;
+  import secrets;
+  import log;
+  import privacy;
+  export handler;
+}

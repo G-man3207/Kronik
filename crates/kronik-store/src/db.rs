@@ -218,6 +218,9 @@ pub struct StateDb {
     /// buffered `turn_index` load commits, so a crash replays.
     catchup_lsn: Option<Lsn>,
     overlay: std::cell::Cell<bool>,
+    /// A rebase shadow (ADR 0017) applies main's records with gaps: only
+    /// one rebase's turns and the erasures.
+    allow_gaps: bool,
 }
 
 fn corrupt(msg: impl Into<String>) -> StoreError {
@@ -260,6 +263,7 @@ impl StateDb {
             trees_pending: Vec::new(),
             catchup_lsn: None,
             overlay: std::cell::Cell::new(false),
+            allow_gaps: false,
         };
         if !db.file_path().is_empty() {
             // Actor history (`history`) on every node; in-memory replay
@@ -572,7 +576,7 @@ impl StateDb {
             if c.lsn <= applied {
                 continue;
             }
-            if c.lsn != applied + 1 {
+            if c.lsn != applied + 1 && !self.allow_gaps {
                 return Err(corrupt(format!(
                     "applier expected lsn {}, got {}",
                     applied + 1,
@@ -664,6 +668,10 @@ impl StateDb {
                     epoch = epoch.max(f.epoch);
                     config_insert(&tx, c.lsn, f.epoch, &c.record)?;
                 }
+                Record::SimulatorConfig(m) => {
+                    epoch = epoch.max(m.epoch);
+                    config_insert(&tx, c.lsn, m.epoch, &c.record)?;
+                }
                 Record::Erasure(e) => {
                     epoch = epoch.max(e.epoch);
                     // The erasure operation on state.db (§6.3): the
@@ -682,6 +690,16 @@ impl StateDb {
                 Record::BranchCreated(_)
                 | Record::SnapshotMarker(_)
                 | Record::GuardTriggered(_) => {}
+                // A rebased turn changes nothing until its switch (ADR 0017),
+                // which `Store::apply_with` applies with its shadow.
+                Record::StateRebase(r) => {
+                    if !matches!(r.part, Some(pb::state_rebase::Part::Turn(_))) {
+                        return Err(corrupt(format!(
+                            "the StateRebase switch at lsn {} needs its shadow",
+                            c.lsn
+                        )));
+                    }
+                }
             }
             applied = c.lsn;
             segments.insert(c.pos.segment, (c.lsn, hwm));
@@ -718,6 +736,158 @@ impl StateDb {
         }
         Ok(())
     }
+    /// The erasure operation on `kv` again, outside a record (a rebase
+    /// shadow after its staged turns, m13-rebase §3).
+    /// What an `Erasure` deletes from state.db (its kv values, ingress
+    /// keys, dead letters and saved call outcomes), applied again after a
+    /// rebase's staged turns (M13).
+    pub fn erase_subject_rows(&self, subject: &str) -> Result<(), StoreError> {
+        erase_rows(&self.conn, subject)
+    }
+
+    /// The LSN of the newest `Erasure` applied.
+    pub fn last_erasure_lsn(&self) -> Result<Option<Lsn>, StoreError> {
+        let v: Option<i64> = self
+            .conn
+            .query_row("SELECT max(lsn) FROM erasures", [], |r| r.get(0))?;
+        Ok(v.map(|v| v as Lsn))
+    }
+
+    /// A rebase shadow: records may skip LSNs (ADR 0017).
+    pub fn set_allow_gaps(&mut self) {
+        self.allow_gaps = true;
+    }
+
+    /// The newest StateRebase switch: (its LSN, its base LSN).
+    pub fn last_rebase(&self) -> Result<Option<(Lsn, Lsn)>, StoreError> {
+        let get = |k: &str| -> Result<Option<i64>, StoreError> {
+            Ok(self
+                .conn
+                .query_row("SELECT v FROM meta WHERE k = ?1", [k], |r| r.get(0))
+                .optional()?)
+        };
+        Ok(match (get("rebase_lsn")?, get("rebase_base")?) {
+            (Some(r), Some(b)) => Some((r as Lsn, b as Lsn)),
+            _ => None,
+        })
+    }
+
+    /// The actors with a turn in `turn_index` in `(base, before)`. After a
+    /// switch at `before` with base `base` these are the actors it replaced:
+    /// its rebased turns are in `turn_index` too.
+    pub fn turn_actors(&self, base: Lsn, before: Lsn) -> Result<Vec<(String, String)>, StoreError> {
+        let mut st = self
+            .conn
+            .prepare("SELECT DISTINCT kind, key FROM turn_index WHERE lsn > ?1 AND lsn < ?2")?;
+        let rows = st.query_map(params![i(base), i(before)], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The actors a switch replaces (docs/design/m13-rebase.md section 3):
+    /// main's turns in `(base, before)`, and the shadow's actors written
+    /// after `base`.
+    pub fn rebase_actors(
+        &self,
+        shadow: &StateDb,
+        base: Lsn,
+        before: Lsn,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let mut out: std::collections::BTreeSet<_> =
+            self.turn_actors(base, before)?.into_iter().collect();
+        let mut st = shadow
+            .conn
+            .prepare("SELECT kind, key FROM actors WHERE last_lsn > ?1")?;
+        let rows = st.query_map([i(base)], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            out.insert(r?);
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// Applies a StateRebase switch at `c` with `shadow` (ADR 0017): the
+    /// affected actors' rows, the mailbox, deliveries, dead letters and
+    /// orphans become the shadow's, the rebased turns join `turn_index`, and
+    /// the switch's deployment is recorded; in one transaction with
+    /// `applied_lsn`.
+    pub fn apply_switch(
+        &mut self,
+        c: &Committed,
+        sw: &pb::RebaseSwitch,
+        shadow: &StateDb,
+        actors: &[(String, String)],
+    ) -> Result<(), StoreError> {
+        let applied = self.applied_lsn()?;
+        if c.lsn <= applied {
+            return Ok(());
+        }
+        if c.lsn != applied + 1 {
+            return Err(corrupt(format!(
+                "applier expected lsn {}, got {}",
+                applied + 1,
+                c.lsn
+            )));
+        }
+        let deployment = sw
+            .deployment
+            .as_ref()
+            .ok_or_else(|| corrupt("a StateRebase switch without deployment"))?;
+        let hwm = self.time_hwm()?.max(shadow.time_hwm()?);
+        let base = i(sw.base_lsn);
+        let tx = self.conn.savepoint()?;
+        for (kind, key) in actors {
+            for table in ["actors", "kv", "timers"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE kind = ?1 AND key = ?2"),
+                    params![kind, key],
+                )?;
+                copy_rows(
+                    &shadow.conn,
+                    &tx,
+                    table,
+                    "kind = ?1 AND key = ?2",
+                    params![kind, key],
+                )?;
+            }
+        }
+        for table in ["mailbox", "dead_letters", "orphans"] {
+            tx.execute(&format!("DELETE FROM {table}"), [])?;
+            copy_rows(&shadow.conn, &tx, table, "1", [])?;
+        }
+        tx.execute("DELETE FROM deliveries WHERE lsn > ?1", [base])?;
+        copy_rows(&shadow.conn, &tx, "deliveries", "lsn > ?1", [base])?;
+        copy_rows(
+            &shadow.conn,
+            &tx,
+            "turn_index",
+            "lsn BETWEEN ?1 AND ?2",
+            params![i(sw.first_turn_lsn), i(sw.last_turn_lsn)],
+        )?;
+        apply_deployment(&tx, c.lsn, deployment)?;
+        {
+            let mut st = tx.prepare_cached("INSERT OR REPLACE INTO meta (k, v) VALUES (?1, ?2)")?;
+            st.execute(params!["applied_lsn", i(c.lsn)])?;
+            st.execute(params!["time_hwm", i(hwm)])?;
+            st.execute(params!["config_epoch", i(deployment.epoch)])?;
+            st.execute(params!["rebase_lsn", i(c.lsn)])?;
+            st.execute(params!["rebase_base", base])?;
+        }
+        tx.prepare_cached(
+            "INSERT INTO segments (start, last_lsn, last_time_ms) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (start) DO UPDATE SET last_lsn = excluded.last_lsn, \
+             last_time_ms = excluded.last_time_ms",
+        )?
+        .execute(params![i(c.pos.segment), i(c.lsn), i(hwm)])?;
+        tx.commit()?;
+        if self.bulk {
+            self.catchup_lsn = Some(self.catchup_lsn.map_or(c.lsn, |l| l.max(c.lsn)));
+        }
+        Ok(())
+    }
+
     /// The LSN a bulk replay has applied: the catch-up rows of an in-memory
     /// database reach `applied_lsn` only at the end.
     fn catchup_applied(&self) -> Result<Lsn, StoreError> {
@@ -1183,7 +1353,7 @@ impl StateDb {
         Ok(out)
     }
 
-    /// Grant, Limits and ForeignActor records in log order.
+    /// Grant, Limits, ForeignActor and SimulatorConfig records in log order.
     pub fn config_records(&self) -> Result<Vec<Record>, StoreError> {
         let mut st = self
             .conn
@@ -2090,6 +2260,29 @@ fn config_insert(tx: &Connection, lsn: Lsn, epoch: u64, record: &Record) -> Resu
         "INSERT INTO config_records (lsn, epoch, kind, record) VALUES (?1, ?2, ?3, ?4)",
     )?
     .execute(params![i(lsn), i(epoch), record.kind(), record.encode()])?;
+    Ok(())
+}
+
+/// Copies the rows of `table` matching `filter` from `src` into `dst` (same
+/// schema), replacing rows with the same key.
+fn copy_rows(
+    src: &Connection,
+    dst: &Connection,
+    table: &str,
+    filter: &str,
+    args: impl rusqlite::Params,
+) -> Result<(), StoreError> {
+    let mut read = src.prepare(&format!("SELECT * FROM {table} WHERE {filter}"))?;
+    let n = read.column_count();
+    let marks = vec!["?"; n].join(", ");
+    let mut write = dst.prepare(&format!("INSERT OR REPLACE INTO {table} VALUES ({marks})"))?;
+    let mut rows = read.query(args)?;
+    while let Some(row) = rows.next()? {
+        let values = (0..n)
+            .map(|k| row.get::<_, rusqlite::types::Value>(k))
+            .collect::<Result<Vec<_>, _>>()?;
+        write.execute(rusqlite::params_from_iter(values))?;
+    }
     Ok(())
 }
 

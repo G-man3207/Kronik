@@ -42,6 +42,10 @@ fn diff_options(o: &ReplayOptions) -> Result<DiffOptions> {
         stubs: o.stubs.clone(),
         live_allowlist: Vec::new(),
         no_pii: o.no_pii,
+        // Filled from the log when the diff is built (M12).
+        simulators: Vec::new(),
+        simulator_overrides: o.simulator_overrides.clone(),
+        foreign: Vec::new(),
     })
 }
 
@@ -83,6 +87,12 @@ fn proposal_info(p: &Proposal, props: &Proposals) -> ProposalInfo {
             continuous_total: g.continuous_total,
         }),
         error: p.error.as_ref().map(ApiError::to_json),
+        rebase: p.rebase.as_ref().map(|r| RebaseView {
+            rolled_back_epoch: r.rolled_back_epoch,
+            base_lsn: r.base_lsn,
+            irreversible_effects: r.irreversible_effects,
+            switch_lsn: r.switch_lsn,
+        }),
     }
 }
 
@@ -184,6 +194,9 @@ impl Api {
                 | ("POST", ["v1", "forks", _, "actors", _, _, "messages"])
                 | ("POST", ["v1", "proposals"])
                 | ("POST", ["v1", "proposals", _, "request-approval"])
+                // A rollback via replay replays a window and writes its own
+                // log, diff and samples (M13).
+                | ("POST", ["v1", "deployments", _, "rebase"])
         );
         if writes && let Err(e) = self.node.check_running() {
             return Some(Err(e));
@@ -213,6 +226,9 @@ impl Api {
             ("GET", ["v1", "watches"]) => self.watches_list(),
             ("GET", ["v1", "watches", id]) => self.watch_get(id),
             ("POST", ["v1", "watches", id, "stop"]) => self.watch_stop(req, id).await,
+            ("POST", ["v1", "deployments", epoch, "rebase"]) => {
+                self.rebase(req, epoch, caller).await
+            }
             ("GET", ["v1", "policy"]) => self.policy(),
             ("PUT", ["v1", "policy"]) => self.policy_set(req).await,
             ("POST", ["v1", "policy", "test"]) => self.policy_test(req, caller).await,
@@ -745,6 +761,43 @@ impl Api {
                 kinds: p.kinds.iter().map(kind_json).collect(),
             },
             policy: p.policy,
+            rebase: p.rebase.map(|r| RebaseSwitchInfo {
+                lsn: r.lsn,
+                base_lsn: r.base_lsn,
+                turns: r.turns,
+                irreversible_effects: r.irreversible_effects,
+            }),
+        })
+    }
+
+    /// `kronik rollback <epoch> --by-replay` (M13): a rebase proposal.
+    async fn rebase(&self, req: &ApiRequest, epoch: &str, caller: &Caller) -> Result<ApiResponse> {
+        // A rebase runs on full data (its turns become main's state), so it
+        // cannot be the --no-pii fork a token without pii:read gets: such a
+        // token may not create one (ADR 0018).
+        caller.require(Scope::PiiRead)?;
+        let r: RebaseRequest = json(&req.body)?;
+        reason(&r.reason)?;
+        let epoch: u64 = epoch
+            .parse()
+            .map_err(|_| bad(format!("{epoch:?} is not an epoch")))?;
+        let options = DiffOptions {
+            mode: mode(r.mode.as_deref().unwrap_or("continuous"))?,
+            ..DiffOptions::default()
+        };
+        let props = self.proposals()?;
+        let (p, dry_run) = props
+            .rebase(kronik_fork::proposal::RebaseRequest {
+                epoch,
+                options,
+                workers: r.threads,
+                audit: self.audit(req, r.reason.clone()),
+                dry_run: r.dry_run,
+            })
+            .await?;
+        ok(&ProposeResponse {
+            dry_run,
+            proposal: proposal_info(&p, props),
         })
     }
 

@@ -80,6 +80,9 @@ message EffectRecord {
   string target = 11;
   // The guest-visible error for statuses other than OK.
   string error = 12;
+  // For GROUNDING_SYNTHETIC: the simulator that answered ("stub",
+  // "contract", "neighbor", "model" or "fail-closed"); empty otherwise (M12).
+  string simulator = 13;
 }
 
 enum EffectStatus {
@@ -103,6 +106,8 @@ enum Grounding {
   GROUNDING_EXACT = 2;
   GROUNDING_APPROXIMATE = 3;
   GROUNDING_SYNTHETIC = 4;
+  // The answer of a fork's copy of a foreign actor (M14, ADR 0020).
+  GROUNDING_FORKED = 5;
 }
 
 enum StateOp {

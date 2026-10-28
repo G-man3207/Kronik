@@ -297,7 +297,10 @@ really does is not shown: a reviewer with `pii:read` sees it by
 re-running the proposal or fork on real data (a fork without `--no-pii`),
 before approving.
 
-Tokens without `pii:read` always get such forks, whatever they ask for.
+Tokens without `pii:read` always get such forks, whatever they ask for. A rollback via replay
+(`kronik rollback --by-replay`) is the exception: it runs on full data,
+because its turns become main's state, so creating one needs `pii:read`
+(`SCOPE_MISSING` otherwise).
 
 Diffs never show a subject's values, in any fork and to any caller: state
 values, bodies, response header values and the url, headers and body of an

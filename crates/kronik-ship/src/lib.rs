@@ -557,6 +557,8 @@ struct Staged {
     keystore: &'static str,
     keystore_backup_ms: Option<u64>,
     keys_missing: Vec<String>,
+    /// The snapshot at or before a later rebase switch's base (M13).
+    older: Option<Manifest>,
 }
 
 async fn stage_restore(
@@ -570,6 +572,7 @@ async fn stage_restore(
     // 1. The newest complete remote snapshot.
     let (_, lsns) = remote.list(&format!("{branch}/snapshots")).await?;
     let mut newest: Option<Manifest> = None;
+    let mut all: Vec<Manifest> = Vec::new();
     for l in lsns {
         let Ok(bytes) = remote
             .get(&format!("{branch}/snapshots/{l}/manifest.json"))
@@ -581,8 +584,9 @@ async fn stage_restore(
             continue;
         };
         if newest.as_ref().is_none_or(|n| m.lsn > n.lsn) {
-            newest = Some(m);
+            newest = Some(m.clone());
         }
+        all.push(m);
     }
     let m = newest.ok_or_else(|| ShipError::Restore("no snapshot in the bucket".into()))?;
     // The keystore backup is checked before anything is downloaded, so a
@@ -590,26 +594,7 @@ async fn stage_restore(
     let keystore =
         check_keystore_backup(remote, data, key_path, mode == KeystoreMode::Without).await?;
     let snap = stage.join("snapshot");
-    let base = format!("{branch}/snapshots/{:020}", m.lsn);
-    for f in &m.files {
-        let bytes = decompress(&remote.get(&format!("{base}/{}.zst", f.path)).await?)?;
-        let hash = blake3::hash(&bytes).to_hex().to_string();
-        if bytes.len() as u64 != f.size || hash != f.blake3 {
-            return Err(ShipError::Restore(format!(
-                "{} does not match the manifest",
-                f.path
-            )));
-        }
-        let dest = snap.join(&f.path);
-        if let Some(p) = dest.parent() {
-            std::fs::create_dir_all(p)?;
-        }
-        std::fs::write(dest, bytes)?;
-    }
-    std::fs::write(
-        snap.join("manifest.json"),
-        serde_json::to_vec_pretty(&m).unwrap_or_default(),
-    )?;
+    download_snapshot(remote, &snap, branch, &m).await?;
     // 2. Every remote segment, and the subject keys its sealed values need.
     let mut needed = kronik_store::db::SubjectKeys::new();
     let mut erasures: Vec<(String, u32, u64)> = Vec::new();
@@ -715,6 +700,20 @@ async fn stage_restore(
         }
         Err(status) => (status, None, Vec::new()),
     };
+    // A rebase switch after the snapshot whose base is before it: the first
+    // start rebuilds the shadow from a snapshot at or before that base
+    // (docs/design/m13-rebase.md section 6).
+    let older = match rebase_base_after(&log, branch, &local, m.lsn)? {
+        Some(base) => all
+            .iter()
+            .filter(|o| o.lsn <= base)
+            .max_by_key(|o| o.lsn)
+            .cloned(),
+        None => None,
+    };
+    if let Some(o) = &older {
+        download_snapshot(remote, &stage.join("older-snapshot"), branch, o).await?;
+    }
     // 4. Components.
     let code = stage.join("code");
     std::fs::create_dir_all(&code)?;
@@ -744,6 +743,7 @@ async fn stage_restore(
         keystore,
         keystore_backup_ms,
         keys_missing,
+        older,
     })
 }
 
@@ -816,6 +816,10 @@ fn install_staged(
     fault("snapshot")?;
     let snap_dir = snapshots::snapshots_dir(data, branch).join(format!("{:020}", s.m.lsn));
     replace_dir(&stage.join("snapshot"), &snap_dir)?;
+    if let Some(o) = &s.older {
+        let dir = snapshots::snapshots_dir(data, branch).join(format!("{:020}", o.lsn));
+        replace_dir(&stage.join("older-snapshot"), &dir)?;
+    }
     fault("code")?;
     let code = data.join("code");
     std::fs::create_dir_all(&code)?;
@@ -868,6 +872,64 @@ fn install_staged(
         keys_missing: s.keys_missing,
     })
 }
+/// Downloads and checks one remote snapshot into `snap_dir`.
+async fn download_snapshot(
+    remote: &Remote,
+    snap_dir: &Path,
+    branch: &str,
+    m: &Manifest,
+) -> Result<(), ShipError> {
+    let base = format!("{branch}/snapshots/{:020}", m.lsn);
+    for f in &m.files {
+        let bytes = decompress(&remote.get(&format!("{base}/{}.zst", f.path)).await?)?;
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        if bytes.len() as u64 != f.size || hash != f.blake3 {
+            return Err(ShipError::Restore(format!(
+                "{} does not match the manifest",
+                f.path
+            )));
+        }
+        let dest = snap_dir.join(&f.path);
+        if let Some(p) = dest.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::write(dest, bytes)?;
+    }
+    std::fs::write(
+        snap_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(m).unwrap_or_default(),
+    )?;
+    Ok(())
+}
+
+/// The lowest `base_lsn` of a `StateRebase` switch after `after` whose base
+/// is before `after`, in the restored log.
+fn rebase_base_after(
+    log_dir: &Path,
+    branch: &str,
+    starts: &[u64],
+    after: u64,
+) -> Result<Option<u64>, ShipError> {
+    let mut lowest: Option<u64> = None;
+    for (i, &start) in starts.iter().enumerate() {
+        if starts.get(i + 1).is_some_and(|n| *n <= after) {
+            continue;
+        }
+        let image = std::fs::read(log_dir.join(kronik_log::segment_name(start)))?;
+        let last = i + 1 == starts.len();
+        kronik_log::scan_segment_image(&image, branch, start, after + 1, u64::MAX, last, |c| {
+            if let Some((_, sw)) = c.record.rebase_switch()
+                && sw.base_lsn < after
+            {
+                lowest = Some(lowest.map_or(sw.base_lsn, |l| l.min(sw.base_lsn)));
+            }
+            Ok::<_, kronik_log::LogError>(())
+        })
+        .map_err(|e| ShipError::Restore(e.to_string()))?;
+    }
+    Ok(lowest)
+}
+
 /// A keystore backup that decrypted under the node's key, ready to install.
 struct KeystoreBackup {
     wall: u64,

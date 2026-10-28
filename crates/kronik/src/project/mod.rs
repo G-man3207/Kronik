@@ -1,5 +1,5 @@
 //! `kronik init`, `kronik build` and `kronik test-host`: actor projects in
-//! TypeScript and Rust.
+//! TypeScript, Rust, Python and Go.
 //!
 //! `init` writes a project with the SDK and the WIT vendored from sources
 //! embedded in this binary, so nothing needs a package registry except the
@@ -9,6 +9,7 @@
 //! a project in an in-memory node for the SDKs' testkits.
 
 mod build;
+mod build_sdk;
 mod embed;
 mod init;
 mod testhost;
@@ -29,6 +30,10 @@ pub enum Lang {
     Ts,
     /// Rust, built for wasm32-wasip2.
     Rust,
+    /// Python, built with componentize-py (ADR 0030).
+    Python,
+    /// Go, built with TinyGo (ADR 0030).
+    Go,
 }
 
 #[derive(Debug, Args)]
@@ -49,8 +54,10 @@ pub struct BuildArgs {
     /// Build even if the inputs are unchanged since the last build.
     #[arg(long)]
     force: bool,
-    /// TypeScript: build this entry instead of package.json's
-    /// `kronik.entry`, as the variant dist/<name>-<entry's file name>.wasm.
+    /// Build this entry instead of the project's default, as the variant
+    /// dist/<name>-<entry's name>.wasm: a TypeScript file (package.json's
+    /// `kronik.entry`), a Python module in src/ (`[tool.kronik] entry`) or
+    /// a Go package directory (`.`). Rust variants are Cargo features.
     #[arg(long)]
     entry: Option<String>,
 }

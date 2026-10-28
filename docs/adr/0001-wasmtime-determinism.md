@@ -59,7 +59,7 @@ turned on at all.
 | `epoch_interruption` | `false` | Epochs depend on wall-clock time. |
 | `fuel_async_yield_interval` (per store) | 1,000,000 | A CPU-heavy turn yields to the executor every 1M fuel, so one turn cannot starve a single-threaded executor (the DST executor in particular). The yield points depend only on fuel. |
 | Allocation strategy | Pooling | Slots are reset before reuse. 2-3x faster instantiation than on-demand (see measurements). |
-| Pool limits (spike values) | 64 component instances, 512 core instances, 128 memories, 512 tables, 64 stacks, 32 core instances / 8 memories / 32 tables per component, 100,000 table elements, 1 GiB max per linear memory | Generous enough for wasip2 and JS components. The daemon derives these from worker count × maximum call depth. |
+| Pool limits (spike values) | 64 component instances, 512 core instances, 128 memories, 512 tables, 64 stacks, 32 core instances / 8 memories / 32 tables per component, 100,000 table elements, 1 GiB max per linear memory | Generous enough for wasip2 and JS components. The daemon derives these from worker count × maximum call depth. Since M15 (ADR 0030) the per-component limit is 64 core instances and the pool holds 48 per turn slot: a Python component instantiates 38. |
 | `cranelift_opt_level` | `Speed` | |
 
 ### 3. Engine version

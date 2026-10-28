@@ -232,18 +232,21 @@ hardening that systemd allows. `kronik serve --init` (M6) installs the unit
 mode 0700 and the socket directory `/run/kronik` at mode 0750, and sets
 `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `NoNewPrivileges`,
 `ProtectClock`, `ProtectKernelModules`, `ProtectKernelLogs`,
-`RestrictSUIDSGID`, `RestrictRealtime`, `LockPersonality` and
-`SystemCallArchitectures=native`.
+`RestrictRealtime`, `LockPersonality` and `SystemCallArchitectures=native`.
 [ADR 0027](../adr/0027-systemd-unit-hardening.md) gives the evidence for
 each setting.
 
 The unit names no `User=` on purpose: root is the default, and with an
 explicit `User=` systemd drops `CAP_SETUID` from the daemon, which `runsc`
 needs to start a sandbox (`kronik doctor`'s `caps` check finds this).
-`RestrictSUIDSGID` makes the kernel refuse any setuid or setgid bit from
-the daemon, `runsc` and the sandboxes' host processes, so neither an image
-nor a program in a sandbox can leave a setid file on the host. Image
-unpacking clears those bits anyway, so such images still start.
+It also leaves out `RestrictSUIDSGID`, which makes `openat2` fail, and
+`runsc restore` needs it for the sandbox copies forks talk to (M14). Image
+unpacking clears setuid and setgid bits, so no setid file comes from an
+image, and checkpoints and copies of an actor's data clear them too. The
+risk that remains: a program in a sandbox that runs as root can set them
+on files in its own `/data`, which leaves root-owned setid files in the
+data directory. Only root can reach them there (mode 0700 parents), and
+executing one inside the service gains nothing under `NoNewPrivileges`.
 
 `/run/kronik` is mode 0750 with group `kronik`: whoever may use the API
 socket can list it. The runtime state of the sandboxes beneath it

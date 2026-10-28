@@ -26,9 +26,23 @@ pub struct ForeignAddRequest {
     pub isolation: Option<String>,
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// What forks do with calls to it: `recorded` (default) or `sandbox`
+    /// (a copy from the nearest checkpoint answers, M14).
+    #[serde(default)]
+    pub fork_mode: Option<String>,
     pub reason: String,
     #[serde(default)]
     pub dry_run: bool,
+}
+
+/// One checkpoint of a foreign actor (M14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CheckpointView {
+    /// Main's LSN the checkpoint is at.
+    pub lsn: u64,
+    pub at_ms: u64,
+    /// The size of its copy of the data directory.
+    pub bytes: u64,
 }
 
 /// How the last run of a foreign actor ended.
@@ -64,6 +78,10 @@ pub struct ForeignView {
     pub platform: String,
     /// `ENV=secret-name`; never values.
     pub secrets: Vec<String>,
+    /// `recorded` or `sandbox` (M14).
+    pub fork_mode: String,
+    /// Checkpoints for forks (`sandbox`), oldest first.
+    pub checkpoints: Vec<CheckpointView>,
     pub epoch: u64,
     /// 0 for a dry run.
     pub lsn: u64,
@@ -186,6 +204,23 @@ impl Api {
             isolation: isolation_name(r.isolation),
             platform: r.platform.clone(),
             secrets: r.secrets.clone(),
+            fork_mode: if r.fork_mode.is_empty() {
+                "recorded".into()
+            } else {
+                r.fork_mode.clone()
+            },
+            checkpoints: self
+                .foreign
+                .as_ref()
+                .map(|f| f.checkpoints(&r.name))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| CheckpointView {
+                    lsn: c.lsn,
+                    at_ms: c.at_ms,
+                    bytes: c.bytes,
+                })
+                .collect(),
             epoch: r.epoch,
             lsn,
             reason: r
@@ -226,6 +261,7 @@ impl Api {
                     any_layout_dir: self.caller(req)?.has(crate::auth::Scope::Admin),
                     // The image's new layers must fit above the reserve.
                     max_new_bytes: self.node.disk_budget(),
+                    fork_mode: r.fork_mode.clone(),
                 },
                 self.node.secrets().map(|s| s.as_ref()),
             )

@@ -24,12 +24,14 @@ pub mod oci;
 pub mod sys;
 
 mod bridge;
+mod checkpoint;
 mod layout;
 mod logs;
 mod manager;
 mod runtime;
 mod supervisor;
 
+pub use checkpoint::Copy;
 pub use image::{ImageError, ImageRef};
 pub use manager::{
     AddPlan, AddRequest, Cleaned, Foreign, ForeignConfig, Host, Isolation, LogTail, Platform,

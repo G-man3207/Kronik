@@ -166,12 +166,36 @@ release still parses; unknown keys are errors.
 | `live_allowlist` | `[]` | Hosts that forks may call live: an effect with no recording that is a `GET` without secret headers to a listed host goes out for real. Anything else never leaves a fork |
 | `preview_ttl` | `"24h"` | How long a preview fork lives unless `kronik preview create --ttl` says otherwise; see [previews](#previews) |
 
+### [simulators.model]
+
+The model simulator (M12, [ADR 0015](../adr/0015-model-simulator.md)): off
+when the table is absent, and even then it answers only for targets whose
+`kronik stubs set` file has `model = true`. It never sees personal data: a
+turn that touched a subject's data fails closed instead. Answers are cached
+per proposal (`branches/<id>/simulator-cache.json`), so a proposal's diff
+stays the same when it is replayed again.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `endpoint` | required | An OpenAI-compatible chat completions URL, e.g. `"http://127.0.0.1:11434/v1/chat/completions"` |
+| `model` | required | The model name sent with each request |
+| `api_key_env` | none | The environment variable holding the API key (sent as a bearer token); the key never appears in the file or the log. `kronik serve` refuses to start when the variable is unset |
+| `timeout` | `"20s"` | How long one call may take; a timeout is a refusal (the effect fails closed) |
+| `max_examples` | `5` | Recorded exchanges with the target (without personal data or secrets) sent as examples |
+| `examples_under_privacy` | `false` | Send recorded examples even while privacy mode is or was on in the replayed window. Off: no examples then, because a turn's state reads are not recorded and it may have copied personal data into an untagged request |
+
 ### [promote]
 
 | Key | Default | Meaning |
 |---|---|---|
 | `max_gap` | `"2s"` | Promotion first lets the fork's continuous replay catch up with production until it is at most this far behind, in logical time |
 | `catch_up_timeout` | `"300s"` | If it hasn't caught up by then, promotion fails with `PROPOSAL_STALE` |
+
+### [rebase]
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_pause` | `"2s"` | `kronik rollback --by-replay` ([M13](../design/m13-rebase.md)): the longest the switch holds new requests, messages and timers while it waits for running turns and replays the last root inputs. If that does not fit, nothing is switched and promote fails with `PROPOSAL_STALE` (run it again). The last round reloads the index of the whole window, so long windows may need more |
 
 ### [foreign]
 
@@ -182,6 +206,7 @@ release still parses; unknown keys are errors.
 | `run_dir` | `"/run/kronik"` | Runtime state of the sandboxes: runsc's root, network namespaces and bridge sockets. Best on a tmpfs; nothing in it survives a reboot. One daemon per directory: a second daemon runs without foreign actors |
 | `layout_dirs` | `[]` | Absolute directories whose `oci-layout:` images an `operate` token may add; any other directory needs `admin` |
 | `pull_timeout` | `"10m"` | How long an image pull or layout import may take |
+| `checkpoints_kept` | `3` | Checkpoints kept per `fork_mode = "sandbox"` actor ([M14](../design/m14-foreign-forks.md)); one is taken with every snapshot, and a fork's copy starts from the newest at or before its fork point |
 
 ### Other settings of kronik serve
 
@@ -243,12 +268,14 @@ the source):
   directory.
 - Hardening: `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
   `NoNewPrivileges`, `ProtectClock`, `ProtectKernelModules`,
-  `ProtectKernelLogs`, `RestrictSUIDSGID`, `RestrictRealtime`,
-  `LockPersonality`, `SystemCallArchitectures=native`.
+  `ProtectKernelLogs`, `RestrictRealtime`, `LockPersonality`,
+  `SystemCallArchitectures=native`.
 - Left out on purpose: `MemoryDenyWriteExecute`, because Wasmtime compiles
   code at run time; `ProtectHostname`, `ProtectKernelTunables`,
   `ProtectControlGroups` and a `CapabilityBoundingSet`, because `runsc`
-  creates namespaces and cgroups for foreign actors
+  creates namespaces and cgroups for foreign actors; and
+  `RestrictSUIDSGID`, because it also makes `openat2` fail, which
+  `runsc restore` needs for sandbox copies in forks
   ([ADR 0027](../adr/0027-systemd-unit-hardening.md)).
 
 `ProtectSystem=strict` makes the whole file system read-only for the daemon
@@ -753,6 +780,8 @@ Where things are:
 | `<data_dir>/foreign/blobs/` | Verified image layers, shared by all actors |
 | `<data_dir>/foreign/actors/<name>/data/` | The actor's persistent `/data`, never replayed |
 | `<data_dir>/foreign/actors/<name>/output.log` | The program's and runsc's stdout and stderr (`kronik foreign logs <name>`); the previous 8 MiB are in `output.log.1` |
+| `<data_dir>/foreign/actors/<name>/checkpoints/<lsn>/` | `fork_mode = "sandbox"`: the gVisor checkpoint and a copy of `/data` at a snapshot's LSN (0700; local, never shipped). It holds the secret values the actor was given (its memory and `config.json`); rotating a secret does not change kept checkpoints |
+| `<data_dir>/branches/<fork>/foreign/<name>/` | A fork's copy of the actor: its disk and runtime spec, deleted with the fork and at daemon start |
 | `<run_dir>/runsc/`, `<run_dir>/netns/`, `<run_dir>/sock/` | runsc's state, the network namespaces and the bridge sockets |
 
 The daemon starts every declared actor before it serves, and waits up to 30
@@ -775,9 +804,13 @@ system it only narrows the risk; `kronik foreign remove` still works below
 it. `--isolation trusted` is not a security boundary. An image's setuid and
 setgid bits are cleared when it is unpacked (the sticky bit stays): a
 program that needs another user's rights through them won't get them.
-Under the installed unit (`RestrictSUIDSGID`) a program in a sandbox can't
-set them on files in `/data` either; started by hand, without the unit, it
-can. The [M7 design](../design/m7-foreign.md) lists the rest.
+A program in a sandbox that runs as root can still set them on files in
+its `/data`, which lands them in `<data_dir>/foreign/actors/<name>/data`
+(owned by root, beneath mode 0700 directories). Checkpoints and fork
+copies clear them; the actor's own data keeps them, so don't copy that
+tree with modes kept (`cp -a`, `tar -p`) to where others can reach it
+([ADR 0027](../adr/0027-systemd-unit-hardening.md)). The
+[M7 design](../design/m7-foreign.md) lists the rest.
 
 ## Previews
 

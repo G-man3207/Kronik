@@ -175,7 +175,8 @@ missing in the fork) is a **consequence** of its nearest differing ancestor.
 Canonical JSON: object keys in the order listed here, arrays in the stated
 order, integers as JSON integers, ratios as JSON numbers with at most 6
 decimals (rounded half-even), no timestamps from the host clock. The same
-fork, code and options always give the same bytes; `diff_hash =
+fork, code and options always give the same bytes (except `forked` answers
+of copies of foreign actors, M14, ADR 0020); `diff_hash =
 blake3(bytes)`. The JSON Schema is
 [`docs/reference/diff-v1.schema.json`](../reference/diff-v1.schema.json),
 and tests validate real diffs against it. It includes the fields added as
@@ -428,6 +429,8 @@ This section is the contract for `kronik-policy`.
 - **`rollback <epoch>`**: a new `Deployment` (cause `ROLLBACK`,
   `rollback_of_epoch`) whose kinds are those in force *before* that epoch.
   If any kind's schema version would go down: `ROLLBACK_SCHEMA_CHANGED`.
+  From M13, `rollback <epoch> --by-replay` rolls back across a schema
+  change by replay instead ([m13-rebase.md](m13-rebase.md)).
 - New error codes: `PROPOSAL_NOT_FOUND` (404), `POLICY_DENIED` and
   `APPROVAL_REQUIRED` (exist), `PROPOSAL_STALE` (exists),
   `ROLLBACK_SCHEMA_CHANGED` (exists), `FORK_NOT_FOUND` (exists),

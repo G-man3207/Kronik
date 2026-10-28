@@ -13,6 +13,7 @@ mod privacy;
 mod render;
 #[cfg(test)]
 mod schemas;
+mod simulators;
 mod snapshot;
 mod token;
 mod units;
@@ -168,6 +169,13 @@ pub enum Command {
     /// with foreign://<name>/... (add, list, logs, remove).
     #[command(subcommand)]
     Foreign(foreign::ForeignCommand),
+    /// Set a target's effect simulators: stub rules, a contract, neighbor,
+    /// model (how forks answer effects without a recording).
+    #[command(subcommand)]
+    Stubs(simulators::StubsCommand),
+    /// List the effect simulators and each target's configuration.
+    #[command(subcommand)]
+    Simulators(simulators::SimulatorsCommand),
     /// Privacy mode: turn sealing of personal data on or off, or show it.
     #[command(subcommand)]
     Privacy(privacy::PrivacyCommand),
@@ -498,6 +506,8 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
         Command::Privacy(c) => privacy::privacy(&ctx, c),
         Command::Token(c) => token::token(&ctx, c),
         Command::Foreign(c) => foreign::foreign(&ctx, c),
+        Command::Stubs(c) => simulators::stubs(&ctx, c),
+        Command::Simulators(c) => simulators::simulators(&ctx, c),
         Command::Snapshot(c) => snapshot::snapshot(&ctx, c),
         Command::Integrity => snapshot::integrity(&ctx),
         Command::Explain(a) => explain_topic(&ctx, a),

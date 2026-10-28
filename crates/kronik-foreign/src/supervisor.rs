@@ -296,6 +296,13 @@ pub(crate) struct Actor {
     finished: Notify,
     done: AtomicBool,
     pub secrets: Mutex<Option<Arc<SecretStore>>>,
+    /// Calls hold it shared; a checkpoint holds it exclusively, so main's
+    /// calls wait in the daemon, not inside the paused sandbox (M14).
+    pub calls: tokio::sync::RwLock<()>,
+    /// The running sandbox's runtime spec, for its checkpoints (M14): the
+    /// bundle's `config.json` is deleted once the sandbox runs (it holds
+    /// the injected secret values).
+    pub spec: Mutex<Vec<u8>>,
 }
 
 impl Actor {
@@ -339,7 +346,9 @@ impl Actor {
             stopping: AtomicBool::new(false),
             finished: Notify::new(),
             done: AtomicBool::new(false),
+            spec: Mutex::new(Vec::new()),
             secrets: Mutex::new(secrets),
+            calls: tokio::sync::RwLock::new(()),
         })
     }
 
@@ -674,9 +683,11 @@ async fn start(ctx: &Arc<Ctx>, a: &Arc<Actor>) -> Result<Arc<dyn Process>, Strin
     {
         let ctx = ctx.clone();
         let decl = a.decl.clone();
-        env.blocking("foreign-prepare", move || prepare(&ctx, &decl, env_vars))
+        let spec = env
+            .blocking("foreign-prepare", move || prepare(&ctx, &decl, env_vars))
             .await
             .ok_or("the prepare task was dropped")??;
+        *lock(&a.spec) = spec;
     }
     let spawned = env
         .procs
@@ -828,7 +839,7 @@ fn prepare(
     ctx: &Ctx,
     decl: &pb::ForeignActor,
     env_vars: Vec<(String, String)>,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     let name = &decl.name;
     let p = &ctx.paths;
     let io = |what: &str, path: &Path, e: std::io::Error| format!("{what} {}: {e}", path.display());
@@ -894,7 +905,7 @@ fn prepare(
     let config = bundle.join("config.json");
     let bytes = serde_json::to_vec_pretty(&spec.json).map_err(|e| e.to_string())?;
     write_private(&config, &bytes).map_err(|e| io("writing", &config, e))?;
-    Ok(())
+    Ok(bytes)
 }
 
 /// Only root may enter an actor's directory: its bundle holds the image and

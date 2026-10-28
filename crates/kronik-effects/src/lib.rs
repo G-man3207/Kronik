@@ -3,6 +3,7 @@
 //! simulators (docs/design/m2-effects.md).
 
 pub mod config;
+pub mod contract;
 pub mod crypto;
 pub mod foreign;
 pub mod http;

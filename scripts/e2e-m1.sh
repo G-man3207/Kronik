@@ -8,9 +8,10 @@
 # and notes-rs from examples/dist (build them with scripts/build-examples.sh)
 # and also checks notes-rs's routes and a failed message turn; `ts` does the
 # same with their TypeScript twins counter-ts and notes-ts (build them with
-# scripts/build-examples-ts.sh).
+# scripts/build-examples-ts.sh); `py` and `go` with the Python and Go twins
+# (scripts/build-examples-py.sh, scripts/build-examples-go.sh; M15).
 #
-# Usage: [M1_GUESTS=test|examples|ts] [KRONIK_BIN=path] scripts/e2e-m1.sh [WORKDIR] [PORT]
+# Usage: [M1_GUESTS=test|examples|ts|py|go] [KRONIK_BIN=path] scripts/e2e-m1.sh [WORKDIR] [PORT]
 # Defaults: /var/tmp/kronik-e2e and port 47811, KRONIK_BIN
 # target/release/kronik. Needs curl and python3, and a release build (cargo
 # build --release -p kronik).
@@ -31,12 +32,12 @@ case "$guests" in
         counter=examples/dist/counter.wasm
         notes=examples/dist/notes.wasm
         ;;
-    ts)
-        counter=examples/dist/counter-ts.wasm
-        notes=examples/dist/notes-ts.wasm
+    ts | py | go)
+        counter=examples/dist/counter-$guests.wasm
+        notes=examples/dist/notes-$guests.wasm
         ;;
     *)
-        echo "M1_GUESTS must be test, examples or ts, not '$guests'" >&2
+        echo "M1_GUESTS must be test, examples, ts, py or go, not '$guests'" >&2
         exit 2
         ;;
 esac
