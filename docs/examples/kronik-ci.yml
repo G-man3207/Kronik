@@ -44,7 +44,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install kronik
-        uses: G-man3207/Kronik/action@99cb30c34b0e2a6fea2aa16a0855ac379e2f5a53 # the commit of your kronik release
+        uses: G-man3207/Kronik/action@2a2545eb0cc756aea63028a0239e36ee612a9ef7 # the commit of your kronik release
         with:
           command: install
           base-url: ${{ vars.KRONIK_BASE_URL }}
@@ -52,7 +52,7 @@ jobs:
         # Placeholder: build your actors into dist/.
         run: kronik build
       - name: Propose
-        uses: G-man3207/Kronik/action@99cb30c34b0e2a6fea2aa16a0855ac379e2f5a53 # the commit of your kronik release
+        uses: G-man3207/Kronik/action@2a2545eb0cc756aea63028a0239e36ee612a9ef7 # the commit of your kronik release
         env:
           KRONIK_URL: ${{ secrets.KRONIK_URL }}
           KRONIK_TOKEN: ${{ secrets.KRONIK_TOKEN }}
@@ -77,7 +77,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install kronik
-        uses: G-man3207/Kronik/action@99cb30c34b0e2a6fea2aa16a0855ac379e2f5a53 # the commit of your kronik release
+        uses: G-man3207/Kronik/action@2a2545eb0cc756aea63028a0239e36ee612a9ef7 # the commit of your kronik release
         with:
           command: install
           base-url: ${{ vars.KRONIK_BASE_URL }}
@@ -86,7 +86,7 @@ jobs:
         run: kronik build
       - name: Propose
         id: propose
-        uses: G-man3207/Kronik/action@99cb30c34b0e2a6fea2aa16a0855ac379e2f5a53 # the commit of your kronik release
+        uses: G-man3207/Kronik/action@2a2545eb0cc756aea63028a0239e36ee612a9ef7 # the commit of your kronik release
         env:
           KRONIK_URL: ${{ secrets.KRONIK_URL }}
           KRONIK_TOKEN: ${{ secrets.KRONIK_TOKEN }}
@@ -112,12 +112,12 @@ jobs:
       contents: read  # the branch's head: an older commit is not promoted
     steps:
       - name: Install kronik
-        uses: G-man3207/Kronik/action@99cb30c34b0e2a6fea2aa16a0855ac379e2f5a53 # the commit of your kronik release
+        uses: G-man3207/Kronik/action@2a2545eb0cc756aea63028a0239e36ee612a9ef7 # the commit of your kronik release
         with:
           command: install
           base-url: ${{ vars.KRONIK_BASE_URL }}
       - name: Promote
-        uses: G-man3207/Kronik/action@99cb30c34b0e2a6fea2aa16a0855ac379e2f5a53 # the commit of your kronik release
+        uses: G-man3207/Kronik/action@2a2545eb0cc756aea63028a0239e36ee612a9ef7 # the commit of your kronik release
         env:
           KRONIK_URL: ${{ secrets.KRONIK_URL }}
           KRONIK_TOKEN: ${{ secrets.KRONIK_TOKEN }}
