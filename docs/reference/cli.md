@@ -19,21 +19,53 @@ except where a sample names another address.
 
 | Option | Meaning |
 | --- | --- |
-| `--socket <PATH>` | The daemon's API socket. Default: `$KRONIK_API_SOCKET`, else `server.api_socket` in `/etc/kronik/kronik.toml` when that file exists, else `/run/kronik/api.sock` (the same as `kronik serve`). |
-| `--json` | Print one JSON object on stdout: the API's response body unchanged for a client command, the result of `init`, `build`, `doctor`, `restore`, `upgrade check` and `explain`, and the error JSON on failure. [JSON output](json.md) gives every command's schema; [openapi.json](openapi.json) describes the API (M5). `upgrade check` prints its report even when it exits 1. |
+| `--socket <PATH>` | The daemon's API socket. Default: `$KRONIK_API_SOCKET`, else `server.api_socket` in `/etc/kronik/kronik.toml` when that file exists, else `/run/kronik/api.sock` (the same as `kronik serve`). Not with `--url`. |
+| `--url <URL>` | A remote API (M10): `https://host:port`, the daemon's `server.api_listen` with TLS on. The port is required: 443 or 80 is usually the gateway, which would record the token with the request. Default: `$KRONIK_URL`. Plain `http://` is accepted only to `localhost` or a loopback address; anything else is refused before a connection is made, so a token never crosses a network in the clear. `localhost` is never looked up: the CLI dials `[::1]`, then `127.0.0.1` (RFC 6761), and over plain HTTP it dials only loopback addresses. The scheme is lower case. An error about the URL names only its scheme, host and port, never user info, a path or a query. |
+| `--token <TOKEN>` | The bearer token. Default: `$KRONIK_TOKEN`, which is preferred: a flag shows in the shell history and in the process list. An empty `$KRONIK_TOKEN` means no token; an empty or blank `--token` is refused (`BAD_REQUEST`), since over the socket no token means every scope. `kronik mcp` takes it too. |
+| `--json` | Print one JSON object on stdout: the API's response body unchanged for a client command, the result of `init`, `build`, `doctor`, `restore`, `upgrade check` and `explain`, and the error JSON on failure. An error answer that is not the API's (a proxy's HTML page, an empty body) becomes an `UNAVAILABLE` error JSON, so stdout is always JSON. [JSON output](json.md) gives every command's schema; [openapi.json](openapi.json) describes the API (M5). `upgrade check` prints its report even when it exits 1. |
 
-Both can go before or after the command: `kronik --json actors list` and
-`kronik actors list --json` are the same. `kronik serve` takes neither and
-refuses them; it has `--api-socket`.
+They can go before or after the command: `kronik --json actors list` and
+`kronik actors list --json` are the same. `kronik serve` takes none of
+them and refuses them; it has `--api-socket`. `init`, `build`, `doctor`,
+`restore` and `upgrade` do not talk to the API: they refuse `--url` and
+`--token` (exit 2) rather than ignore them. `kronik mcp` takes `--socket`
+and `--token` and refuses `--url`, and `$KRONIK_URL` without `--socket`
+(see [kronik mcp](#kronik-mcp)).
 
-`$KRONIK_TOKEN`, when set, is sent as `Authorization: Bearer <token>` with
-every request (M5): the command acts as that token, with its scopes, and the
-history records `token:<name>` with each change (see
-[kronik token create](#kronik-token-create)). Without it, the socket's
-caller has every scope and is recorded as `unix:uid=<n>`. A value with
-spaces, control characters or non-ASCII bytes is refused before anything is
-sent. There is no `--token` flag, so that tokens stay out of shell history
-and process lists.
+The CLI talks to `--url`, else `--socket`, else `$KRONIK_URL`, else the
+socket. Over TLS it trusts the system's root certificates; for a private
+CA, point `SSL_CERT_FILE` at its bundle. A certificate the CLI does not
+trust, or one for another name, fails with `UNAVAILABLE` ("TLS to … failed")
+before anything is sent ([ADR 0021](../adr/0021-remote-cli.md)). Plain
+HTTP to a loopback port authenticates nothing: on a host shared with other
+users, one of them can bind that port while the daemon is down and collect
+the tokens sent to it; prefer the socket or TLS there.
+
+Every request has timeouts: the connection must be made within 30
+seconds, and the daemon may stay silent for at most one hour (the longest
+a sync replay or a promote's catch-up may take), so a dead connection fails
+with `UNAVAILABLE` instead of hanging. [kronik proposal
+wait](#kronik-proposal-wait) bounds every poll by its `--timeout`.
+
+When a command was given `--url`, the commands under `Next` are printed
+without it, followed by one reminder line: `(each with --url <url>, or
+export KRONIK_URL=<url>)`. An error whose hint names a command gets the
+same reminder after it: `(the hint's command with --url <url>, or export
+KRONIK_URL=<url>)` (not with `--json`).
+
+```text
+$ export KRONIK_URL=https://kronik.example.com:7443 KRONIK_TOKEN=<token>
+$ kronik actors list
+```
+
+A token (`--token` or `$KRONIK_TOKEN`) is sent as `Authorization: Bearer
+<token>` with every request (M5): the command acts as that token, with its
+scopes, and the history records `token:<name>` with each change (see
+[kronik token create](#kronik-token-create)). The remote API needs one;
+without one, the socket's caller has every scope and is recorded as
+`unix:uid=<n>`. A value with spaces, control characters or non-ASCII bytes
+is refused before anything is sent. Prefer `$KRONIK_TOKEN` (or a CI secret
+in the environment) to `--token`.
 
 Every mutation (`deploy`, `send`, `dead-letters resend`, `grant`, `revoke`,
 `limits set`, `secret set`, `secret delete`, `fork create`, `fork deploy`,
@@ -150,6 +182,7 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_gateway_requests_total` | counter | HTTP requests answered by the gateway, by status code. |
 | `kronik_gateway_request_duration_seconds` | histogram | Time to answer an HTTP request at the gateway, by status code. |
 | `kronik_replay_runs_total` | counter | Replays run for forks and proposals, by mode. |
+| `kronik_guard_triggered_total` | counter | Guards of `kronik watch` that fired, by action and outcome. |
 
 `kronik serve --init [--domain <NAME>]... [--acme-email <EMAIL>] [--dry-run]`
 sets a host up, as root (M6): it writes the configuration file, creates the
@@ -933,13 +966,23 @@ Next     kronik diff show extra --md
 
 ## kronik diff show
 
-`kronik diff show <FORK|PROPOSAL> [--md]`
+`kronik diff show <FORK|PROPOSAL> [--md | --summary]`
 
 Shows a fork's or a proposal's behavior diff (`kronik.diff/v1`, see
 [M3 fork design](../design/m3-fork.md) §5): by default in short, with
 `--md` as Markdown for a review, with `--json` as the JSON diff, whose
-JSON Schema is [diff-v1.schema.json](diff-v1.schema.json). `--md` and
-`--json` exclude each other.
+JSON Schema is [diff-v1.schema.json](diff-v1.schema.json). `--summary`
+(M10) prints a short Markdown summary for public pull requests: counts
+from the diff's totals, the code per kind, the policy, causes by declared
+input pattern, error codes, and grounding per effect kind, method and host
+(at most 10 targets, then "… N more"), where an `http.fetch` host shows as
+the `http:` grant that matches it (`*.example.com` for a wildcard grant,
+`(no grant)` without one), a method no route may declare as `(other)` and a
+kind with no code as `(undeployed kind)`. It never shows a URL path or an effect's route,
+a body, a header, a state key or value, an SQL row, an effect's fields, an
+error message or an actor's key, whatever the privacy mode, and every
+interpolated name is inline code ([ADR 0023](../adr/0023-diff-summary.md)).
+`--md` and `--summary` exclude each other and `--json`.
 
 - **Causes**: the origins, the first turns whose outcome differs although
   their input is the same as production's, and their consequences further
@@ -982,7 +1025,7 @@ $ kronik diff show p-d8e829aa6c7a --md
 
 ## kronik propose
 
-`kronik propose <WASM_OR_DIR>... [--window <DURATION> | --at <LSN>] [replay options] --reason <REASON> [--dry-run]`
+`kronik propose <WASM_OR_DIR>... [--window <DURATION> | --at <LSN>] [replay options] [--async] --reason <REASON> [--dry-run]`
 
 Proposes new code (M3), one component per changed actor type: Kronik forks
 main, deploys the code in the fork, replays the root inputs of the window
@@ -999,6 +1042,26 @@ the replay starts at the oldest usable snapshot and the output says so in a
 `Warning: retention cut the window ...` line (`warnings` in the JSON,
 `base.window_cut` in the diff).
 
+The checks run at once; the replay runs as a job in the daemon (M10,
+[ADR 0022](../adr/0022-proposal-jobs.md)), so a long replay survives the
+CLI going away. The CLI always starts the job (`"async": true`) and then
+follows it as [kronik proposal wait](#kronik-proposal-wait) does, printing
+the progress to stderr, until the proposal is done; the output is then
+the same as a sync propose's (`ProposeResponse` with `--json`). If
+following it fails (a broken connection, a proxy's timeout), the error
+names the proposal and the hint is `kronik proposal wait <id>`; the job
+goes on. With `--async` the command returns as soon as the job has
+started, with the proposal's id and the status `running`. `--async` does
+not go with `--dry-run`, which keeps nothing to follow; a dry run is
+answered in the request.
+
+```text
+$ kronik propose dist/ --async --reason "notes learn tally"
+Proposal p-3c1f0e8a9b27 is running: its replay of main from lsn 1200 runs in the daemon
+Next     kronik proposal wait p-3c1f0e8a9b27
+         kronik proposal status p-3c1f0e8a9b27
+```
+
 Several components make a system proposal (M9,
 [design](../design/m9-system-proposals.md)): all of them go into one fork,
 one replay runs them together, so a kind that starts calling a new message
@@ -1008,7 +1071,7 @@ stands for every `.wasm` file directly in it. A component is skipped, and
 listed as `Skipped`, when main runs its code now and ran it at the fork
 point; promote then checks that its kind still runs it
 (`PROPOSAL_STALE` otherwise). When every component is skipped, nothing is
-proposed (`BAD_REQUEST`). Two components for one kind are refused with
+proposed (`NOTHING_TO_PROPOSE`). Two components for one kind are refused with
 both file names (a TypeScript project's `dist/` can hold `<name>.wasm`
 and `<name>-<entry>.wasm` builds of one kind: name the ones to propose),
 and so is a set in which two kinds would serve one route
@@ -1087,8 +1150,9 @@ Proposal p-998bf4826ae5   counter   b3:bf34162595e6 -> b3:06d907243ec0   (reject
 
 `kronik proposals list`
 
-Lists the proposals with their status (`evaluated`, `approved`,
-`promoted`, `rejected` or `stale`), the policy outcome and the code.
+Lists the proposals with their status (`running`, `failed`, `evaluated`,
+`approved`, `promoted`, `rejected` or `stale`), the policy outcome and the
+code. `running` and `failed` come from `kronik propose --async` (M10).
 
 ```text
 $ kronik proposals list
@@ -1101,7 +1165,10 @@ Next     kronik proposals show p-d8e829aa6c7a
 
 `kronik proposals show <PROPOSAL>`
 
-Shows a proposal as `kronik propose` did, with its current status.
+Shows a proposal as `kronik propose` did, with its current status; a
+`running` proposal's progress and a `failed` one's error (exit 1), as
+[kronik proposal status](#kronik-proposal-status) does: the two are the
+same.
 
 ```text
 $ kronik proposals show p-d8e829aa6c7a
@@ -1129,6 +1196,50 @@ before deciding.
 Approval requested at lsn 7 by token:agent-1 (pending):
   step 2 doubles the increment: every replayed response is n+2 instead of n+1,
   and no effect, error or other actor changed
+```
+
+## kronik proposal status
+
+`kronik proposal status <PROPOSAL>`
+
+Shows where a proposal is (M10). A proposal's replay runs as a job in the
+daemon ([ADR 0022](../adr/0022-proposal-jobs.md)): while it is `running`,
+this shows the root inputs replayed so far, per replay mode; afterwards the
+proposal as `kronik proposals show` does; for a `failed` one its error
+(exit 1). With `--json` it prints the proposal object in every case, and
+exits 1 for a `failed` one too.
+
+```text
+$ kronik proposal status p-3c1f0e8a9b27
+Proposal p-3c1f0e8a9b27 is running: its replay of main from lsn 1200 runs in the daemon
+  Progress      isolated 5 of 20, continuous 12 of 20 root inputs
+Next     kronik proposal wait p-3c1f0e8a9b27
+```
+
+## kronik proposal wait
+
+`kronik proposal wait <PROPOSAL> [--timeout <DURATION>]`
+
+Waits until a proposal's replay is done (M10), printing a progress line to
+stderr whenever it moves (also with `--json`: stdout stays one JSON
+object), then shows the proposal (with `--json`, the proposal object). It
+polls every half second. A poll that cannot reach the daemon, that the
+daemon leaves unanswered or cuts short, or that a proxy answers with 502,
+503 or 504 is retried with backoff (up to 5 seconds apart; one stderr line
+when the trouble starts); a TLS failure (a certificate not trusted or for
+another name) is not. `--timeout` (1 hour by default) bounds everything, a
+single stalled poll included. It exits 1 with the proposal's error when
+the job failed; with `PROPOSAL_RUNNING` when `--timeout` runs out after
+the proposal was seen running; and with the transport's error
+(`UNAVAILABLE`) when the daemon was never reached. The job goes on either
+way. CI runs `kronik propose --async` and then this.
+
+```text
+$ kronik proposal wait p-3c1f0e8a9b27 --timeout 45m
+p-3c1f0e8a9b27: isolated 5 of 20 root inputs
+p-3c1f0e8a9b27: isolated 12 of 20 root inputs
+Proposal p-3c1f0e8a9b27   counter   b3:d440473283f4 -> b3:9ae922b13c24   (evaluated)
+  ...
 ```
 
 ## kronik approve
@@ -1212,26 +1323,109 @@ Rolled back epoch 3 at lsn 8, epoch 4: the code before it runs again
 Next     kronik actors list
 ```
 
+## kronik watch
+
+`kronik watch <EPOCH> --for <DURATION> --reason <REASON> [--async] [--dry-run]`
+
+Watches a deployment (M11): compares the error rate and latency of its
+kinds' turns after it with the equally long window before it, and
+evaluates the policy's guards every 5 seconds, once a turn ran after the
+deployment, until `--for` (at most 24h) has passed. A `rollback` guard that
+fires rolls the deployment back (audit token `kronik`); a deployment that
+changed a schema version alerts instead. Each guard that fires is a
+`GuardTriggered` record in the log with the metrics it saw. Without a
+`guard` key in the policy the default guards apply (see
+[M11 watch design](../design/m11-watch.md) §2).
+
+Only the latest deployment of its kinds can be watched (`BAD_REQUEST`
+otherwise). A later deployment of any of them ends the watch `superseded`
+without any action, so a watch never rolls back newer code.
+
+The watch runs in the daemon and survives the CLI and a restart. Without
+`--async`, `kronik watch` follows it, prints the metrics and each guard
+that fires to stderr, and ends with the watch; it exits 1 when the watch
+rolled back or failed, or when a rollback guard fired and the rollback was
+refused or failed. With `--async` it prints the watch's id at once. With
+`--dry-run` it shows the metrics now and the guards that would fire. An
+unknown epoch gives `DEPLOYMENT_NOT_FOUND`.
+
+```text
+$ kronik watch 3 --for 10m --reason "after promote"
+w-3k9x2a7b1c0d: watching epoch 3 for 10m
+w-3k9x2a7b1c0d: after 25 turns, 25 failed (100.0%), p99 2.1 ms; before 20 turns, 0 failed (0.0%), p99 1.9 ms
+Watch w-3k9x2a7b1c0d of epoch 3: rolled_back
+  For           10m
+  Reason        after promote
+  Metrics       after 25 turns, 25 failed (100.0%), p99 2.1 ms; before 20 turns, 0 failed (0.0%), p99 1.9 ms
+  Fired         error-rate-up (rollback): rolled_back at lsn 61, epoch 4
+Next     kronik deployments list
+```
+
+## kronik watches list
+
+`kronik watches list`
+
+Lists the watches with their status (`watching`, `done`, `rolled_back`,
+`superseded`, `stopped`, `failed`) and the guards that fired.
+
+```text
+$ kronik watches list
+ID              EPOCH  FOR  STATUS       FIRED
+w-3k9x2a7b1c0d  3      10m  rolled_back  error-rate-up (rolled_back)
+```
+
+## kronik watches show
+
+`kronik watches show <ID>`
+
+Shows a watch: its status, the last metrics and the guards that fired. An
+unknown id gives `WATCH_NOT_FOUND`. Exits 1 when the watch rolled back or
+failed, or a rollback guard's rollback did not happen, also with `--json`.
+
+## kronik watches stop
+
+`kronik watches stop <ID> --reason <REASON> [--dry-run]`
+
+Stops a watch that is `watching`: it ends `stopped` and from then on
+writes no record and rolls nothing back. Needs the `promote` scope. A
+watch that is over gives `BAD_REQUEST`.
+
+```text
+$ kronik watches stop w-3k9x2a7b1c0d --reason "known slow migration"
+Stopped watch w-3k9x2a7b1c0d of epoch 3: it alerts and rolls back no more
+Next     kronik watches list
+```
+
 ## kronik policy show
 
 `kronik policy show`
 
 Shows the policy rules in force as TOML: the rules last set, or the
 default rules (see [M3 fork design](../design/m3-fork.md) §7 and
-[ADR 0007](../adr/0007-policy-cel.md)).
+[ADR 0007](../adr/0007-policy-cel.md)). Then the guards of `kronik watch`
+when they are not in the file: the default guards while the policy has no
+`guard` key, or a note that there are none (`guard = []`). The JSON has
+them in `guards`, with `default_guards`.
 
 ```text
 $ kronik policy show
 The policy rules set at epoch 2:
+
+guard = []
 
 [[rule]]
 name = "any-change"
 when = "diff.summary.changed"
 action = "require_approval"
 
+No guards: `kronik watch` measures and does not act.
+
 Next     kronik policy test <proposal> --rules <rules.toml>
          kronik policy set <rules.toml> --reason "..."
 ```
+
+The same file may hold `[[guard]]` tables for `kronik watch`; `policy
+show` prints them with the rules. A guard may not refer to `diff`.
 
 ## kronik policy set
 
@@ -1266,6 +1460,64 @@ $ kronik policy test try --rules strict.toml
 The rules in strict.toml for try
 Policy   any-change -> APPROVAL REQUIRED
 Next     kronik policy set strict.toml --reason "..."
+```
+
+## kronik preview create
+
+`kronik preview create <PROPOSAL> [--ttl <DURATION>] [--no-pii] --reason <REASON> [--dry-run]`
+
+Creates a preview of a proposal (M11): a fork of main's HEAD, named
+`v-<12 hex>`, that runs the proposal's code (its changed kinds and the ones
+it pins) on HEAD's state and takes new requests at its own URL. With
+`[gateway] preview_domain` the URL is `<scheme>://<id>.<preview_domain>/`
+and only that host reaches the preview; without it, the gateway's path
+prefix `<scheme>://<host>/__preview/<id>/`, where `<host>` is the first
+`[tls] domains` name, else the gateway's address (`0.0.0.0` shown as
+`127.0.0.1`). The scheme is `https` when the gateway serves TLS, else
+`http`. Each request is a root input of the fork, its turns go to the
+fork's log, and its diff lists them as preview inputs. A preview makes no
+live effects (I7) but one: a fetch without a stub is denied, except a GET
+without secret headers to a host in `[fork] live_allowlist`, which goes
+out live. A preview runs without personal data when the proposal does,
+with `--no-pii`, or for a token without `pii:read`. It is deleted after
+`--ttl` (default `[fork] preview_ttl`, 24 h). Creating one needs the
+`fork` scope; at most 16 previews live at once (`PREVIEW_LIMIT`).
+
+```text
+$ kronik preview create p-1a2b3c4d5e6f --reason "show the new checkout"
+Preview v-9f8e7d6c5b4a of proposal p-1a2b3c4d5e6f at lsn 12
+  URL           http://127.0.0.1:8080/__preview/v-9f8e7d6c5b4a/
+  Expires       2026-10-28T12:00:00Z
+  Effects       only allowlisted GETs go live ([fork] live_allowlist)
+Next     curl http://127.0.0.1:8080/__preview/v-9f8e7d6c5b4a/
+         kronik diff show v-9f8e7d6c5b4a --md
+         kronik preview delete v-9f8e7d6c5b4a --reason "..."
+```
+
+## kronik preview list
+
+`kronik preview list`
+
+Lists the previews that have not expired, with their URLs.
+
+```text
+$ kronik preview list
+PREVIEW         PROPOSAL        EXPIRES               URL
+v-9f8e7d6c5b4a  p-1a2b3c4d5e6f  2026-10-28T12:00:00Z  http://127.0.0.1:8080/__preview/v-9f8e7d6c5b4a/
+Next     kronik diff show v-9f8e7d6c5b4a --md
+```
+
+## kronik preview delete
+
+`kronik preview delete <ID> --reason <REASON> [--dry-run]`
+
+Deletes a preview before it expires: its state and directory go, and its
+URL answers `PREVIEW_NOT_FOUND`.
+
+```text
+$ kronik preview delete v-9f8e7d6c5b4a --reason "reviewed"
+Deleted preview v-9f8e7d6c5b4a
+Next     kronik preview list
 ```
 
 ## kronik foreign add
@@ -1576,14 +1828,19 @@ docs:  kronik explain UNAUTHENTICATED
 
 ## kronik mcp
 
-`kronik mcp`
+`kronik mcp [--socket <PATH>] [--token <TOKEN>]`
 
 Serves the Model Context Protocol on stdin and stdout for an agent's MCP
 client, and forwards each request to the daemon's MCP endpoint, `/mcp` on
 the API socket (`--socket` and `$KRONIK_API_SOCKET` apply; `--json` does
-not). With `$KRONIK_TOKEN` set, the agent acts as that token, with its
-scopes; an agent's token has `read`, `fork` and `propose`. The same
-endpoint answers over TCP with `--api-listen` and a bearer token. See
+not). With `--token` or `$KRONIK_TOKEN`, the agent acts as that token,
+with its scopes; an agent's token has `read`, `fork` and `propose`.
+Without a token, it acts as the socket's caller, with every scope. The same
+endpoint answers over TCP with `--api-listen` and a bearer token, so
+`kronik mcp --url` is refused (`BAD_REQUEST`, exit 1), as is a set
+`$KRONIK_URL` unless `--socket` is given, with the hint to
+point the agent's MCP client at `https://<host>:<port>/mcp` (Streamable
+HTTP) with `Authorization: Bearer <token>`. See
 [ADR 0008](../adr/0008-mcp-server.md) and the
 [agent guide](../guides/agent.md).
 

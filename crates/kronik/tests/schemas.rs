@@ -464,6 +464,30 @@ fn real_diffs_and_turns_match_their_schemas() {
         }
     }
     assert!(continuous > 0, "no continuous fork turn");
+    // A preview of step2 (M11): its request is a preview input of its diff.
+    let preview = d.api(
+        "POST",
+        "/v1/previews",
+        json!({"proposal": step2, "reason": "schemas"}),
+    )["preview"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let r = d.post(
+        &format!("/__preview/{preview}/counter/a/increment"),
+        "",
+        None,
+    );
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    let diff = d.api("GET", &format!("/v1/forks/{preview}/diff"), Value::Null);
+    s.check(s.diff, "a preview's diff", &diff);
+    assert_eq!(diff["summary"]["preview_inputs"], 1, "{diff}");
+    let turn = diff["samples"]["preview"][0]["turn"].as_str().unwrap();
+    s.check(
+        s.turn,
+        "a preview's turn",
+        &d.api("GET", &format!("/v1/turns/{turn}"), Value::Null),
+    );
 
     // A timer that fires and one that is cancelled, after the proposals, so
     // that the replays above do not depend on how replay treats timers.

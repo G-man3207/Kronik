@@ -58,10 +58,15 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`KVM_UNAVAILABLE`](#kvm_unavailable) | 503 | M7 | KVM is not available on this host |
 | [`MASTER_KEY_MISMATCH`](#master_key_mismatch) | 409 | M2 | The master key is not the key the stores were encrypted under |
 | [`MASTER_KEY_MISSING`](#master_key_missing) | 409 | M2 | The master key is missing, and the data directory holds encrypted stores |
+| [`NOTHING_TO_PROPOSE`](#nothing_to_propose) | 409 | M10 | Main already runs every component of the proposal |
 | [`NOT_IMPLEMENTED`](#not_implemented) | 501 | M1 | Not available in this version |
 | [`PAYLOAD_TOO_LARGE`](#payload_too_large) | 413 | M1 | The body or message is over the limit |
 | [`POLICY_DENIED`](#policy_denied) | 403 | M3 | A policy rule denies the change |
+| [`PREVIEW_FULL`](#preview_full) | 409 | M11 | The preview took as many requests as it can hold |
+| [`PREVIEW_LIMIT`](#preview_limit) | 409 | M11 | As many previews are live as there can be |
+| [`PREVIEW_NOT_FOUND`](#preview_not_found) | 404 | M11 | No such preview, or it expired |
 | [`PROPOSAL_NOT_FOUND`](#proposal_not_found) | 404 | M3 | No such proposal |
+| [`PROPOSAL_RUNNING`](#proposal_running) | 409 | M10 | The proposal is still running its replay |
 | [`PROPOSAL_STALE`](#proposal_stale) | 409 | M3 | The proposal can no longer be promoted |
 | [`REASON_REQUIRED`](#reason_required) | 400 | M1 | The mutation has no reason |
 | [`REPLAY_DIVERGED`](#replay_diverged) | 500 | M2 | Replay did not reproduce the recorded history |
@@ -80,6 +85,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`UNAUTHENTICATED`](#unauthenticated) | 401 | M5 | No valid token |
 | [`UNAVAILABLE`](#unavailable) | 503 | M1 | The daemon is not accepting requests |
 | [`VERIFY_REQUIRED`](#verify_required) | 409 | M1 | The actor type has history; verify the change first |
+| [`WATCH_NOT_FOUND`](#watch_not_found) | 404 | M11 | No such watch |
 
 ## ACTOR_NOT_FOUND
 
@@ -500,6 +506,26 @@ To fix it, put the original key back where the configuration points, or set `KRO
 
 See also: [`MASTER_KEY_MISMATCH`](#master_key_mismatch).
 
+## NOTHING_TO_PROPOSE
+
+HTTP status 409, milestone M10. Main already runs every component of the proposal.
+
+Default hint: Nothing changed: main already runs this code. Change a component and build it again.
+
+`kronik propose` skips a component when main runs its code now and ran it at the fork point too (M9). When that leaves nothing, there is no change to verify, and propose answers with this code and writes nothing: the message names each component with its kind and short code hash.
+
+Kronik uses its own code for this, not `BAD_REQUEST`, because a program depends on telling it apart (ADR 0012, amendment of M10): the GitHub Action reports a pull request that changes no actor code, or a re-run after the promote, as a neutral check with a notice instead of a failure. The request is well formed; there is just nothing new in it.
+
+Change a component and build it again, then propose:
+
+    kronik propose <wasm>... --reason "..."
+
+To replay the code main already runs, use a fork instead:
+
+    kronik fork create --reason "..." then kronik replay <fork> --reason "..."
+
+See also: [`proposal`](concepts/glossary.md#proposal).
+
 ## NOT_IMPLEMENTED
 
 HTTP status 501, milestone M1. Not available in this version.
@@ -542,6 +568,51 @@ To fix it, read the diff, change the code and propose again. To see the rules an
 
 See also: [`proposal`](concepts/glossary.md#proposal), [`behavior-diff`](concepts/glossary.md#behavior-diff).
 
+## PREVIEW_FULL
+
+HTTP status 409, milestone M11. The preview took as many requests as it can hold.
+
+Default hint: Delete it with `kronik preview delete <id>` and create a new one with `kronik preview create <proposal>`.
+
+A preview keeps every request's effect on its state in memory (an in-memory copy of production's state, plus each request's rows), and anyone with its URL can send it requests. So a preview takes at most 10,000 requests; the next one answers this code and changes nothing. The count starts again when the preview's state is rebuilt from its fork point (after a daemon restart or an erasure).
+
+Delete the preview and create a new one:
+
+    kronik preview delete <id> --reason "..."
+    kronik preview create <proposal>
+
+See also: [`PREVIEW_LIMIT`](#preview_limit), [`PREVIEW_NOT_FOUND`](#preview_not_found).
+
+## PREVIEW_LIMIT
+
+HTTP status 409, milestone M11. As many previews are live as there can be.
+
+Default hint: Delete one with `kronik preview delete <id>` (see `kronik preview list`), or wait until one expires.
+
+A daemon keeps at most 16 previews live at once. Each one holds a copy of production's state at its fork point in memory for its whole time to live, and anyone with its URL can send it requests, so the number is capped to keep the daemon's memory bounded. `kronik preview create` answers this code when 16 previews have not expired yet; nothing is created.
+
+Delete a preview you no longer need, or wait until one expires (`[fork] preview_ttl`, 24 h by default; `--ttl` sets it per preview):
+
+    kronik preview list
+    kronik preview delete <id> --reason "..."
+
+See also: [`PREVIEW_NOT_FOUND`](#preview_not_found), [`fork`](concepts/glossary.md#fork).
+
+## PREVIEW_NOT_FOUND
+
+HTTP status 404, milestone M11. No such preview, or it expired.
+
+Default hint: List the previews with `kronik preview list`; create one with `kronik preview create <proposal>`.
+
+No preview has this id, or its time to live ran out and the daemon deleted it. A preview id is `v-` followed by 12 hex characters; `kronik preview create` prints it with the preview's URL, and the preview's fork has the same name.
+
+A preview is a fork that takes new requests at its URL: any host under `[gateway] preview_domain` (`https://<id>.<preview_domain>/`), or, without a preview domain, `/__preview/<id>/...` on the gateway. Requests to an unknown or expired preview get this code instead of reaching main, so a stale preview link never runs against production.
+
+    kronik preview list
+    kronik preview create <proposal> --reason "..."
+
+See also: [`fork`](concepts/glossary.md#fork), [`proposal`](concepts/glossary.md#proposal), [`FORK_NOT_FOUND`](#fork_not_found).
+
 ## PROPOSAL_NOT_FOUND
 
 HTTP status 404, milestone M3. No such proposal.
@@ -555,6 +626,22 @@ Typical causes: a typo in the id, or an id from another data directory.
     kronik proposals list
 
 See also: [`proposal`](concepts/glossary.md#proposal), [`FORK_NOT_FOUND`](#fork_not_found).
+
+## PROPOSAL_RUNNING
+
+HTTP status 409, milestone M10. The proposal is still running its replay.
+
+Default hint: Follow it with `kronik proposal wait <proposal>`, then try again.
+
+A proposal's replay runs as a job in the daemon (M10): `kronik propose --async` returns at once, and a plain `kronik propose` whose connection breaks leaves the job running. Until the job has written the diff and evaluated the policy, the proposal has the status `running`, and what needs the finished proposal answers with this code: `approve`, `promote`, `request-approval`, `diff show`, `send --fork` into the proposal's fork (MCP `send_to_fork`), and `kronik proposal wait` when its `--timeout` runs out first.
+
+Kronik uses its own code for this, not `PROPOSAL_STALE` or `BAD_REQUEST`, because the request is right and only early: a client can wait and send it again unchanged.
+
+Follow the job until it is done, then repeat the command:
+
+    kronik proposal wait p-7h3k2a9c1d0e --timeout 45m
+
+See also: [`proposal`](concepts/glossary.md#proposal).
 
 ## PROPOSAL_STALE
 
@@ -815,3 +902,17 @@ To fix it, propose the new code and promote it after review:
     kronik promote p-7h3k --reason "Apply EU VAT"
 
 See also: [`proposal`](concepts/glossary.md#proposal), [`deployment`](concepts/glossary.md#deployment).
+
+## WATCH_NOT_FOUND
+
+HTTP status 404, milestone M11. No such watch.
+
+Default hint: List the watches with `kronik watches list`.
+
+No watch has this id. A watch id is `w-` followed by 12 hex characters; `kronik watch` prints it.
+
+Typical causes: a typo in the id, or an id from another data directory.
+
+    kronik watches list
+
+See also: [`deployment`](concepts/glossary.md#deployment), [`DEPLOYMENT_NOT_FOUND`](#deployment_not_found).

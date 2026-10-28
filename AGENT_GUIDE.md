@@ -123,6 +123,9 @@ code, evaluates the policy, and returns:
   A human with `pii:read` re-runs the proposal to see the real behaviour
   before approving.
 
+- `proposal.warnings`, when present: what you must know about how it was
+  verified. "retention cut the window" means less history was replayed
+  than `window_ms` asked for; say so when you ask for approval.
 - `next`: the exact commands that follow, in order.
 
 ### 5. Read the diff

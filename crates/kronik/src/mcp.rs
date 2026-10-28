@@ -2,17 +2,19 @@
 //! connects to the daemon's MCP endpoint (`/mcp` on the API socket) and
 //! forwards every request there, so stdio and Streamable HTTP serve the same
 //! tools and resources, answered by the same code (ADR 0008). With
-//! `$KRONIK_TOKEN` set, the agent acts as that token, with its scopes.
+//! `--token` or `$KRONIK_TOKEN`, the agent acts as that token, with its
+//! scopes. A remote daemon serves `/mcp` over TCP itself, so `--url` (and
+//! `$KRONIK_URL` without `--socket`) is refused.
 //!
 //! Stdio reads requests as long as the daemon accepts ([`MAX_REQUEST`]):
 //! rmcp's own stdio transport stops at 16 MiB and drops a longer line
 //! without an answer, below a TypeScript component in base64 (17.5 MB). A
 //! request over the limit gets a `PAYLOAD_TOO_LARGE` error with its id.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use kronik_core::error::{ApiError, ErrorCode};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, ClientJsonRpcMessage, ListResourceTemplatesResult,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
@@ -38,21 +40,37 @@ const ENDPOINT: &str = "http://localhost/mcp";
 #[derive(Debug, clap::Args)]
 pub struct McpArgs {}
 
-/// Serves MCP on stdin and stdout until the client closes stdin.
-pub fn run(_args: McpArgs, socket_path: Option<PathBuf>) -> ExitCode {
-    let socket = match crate::config::client_api_socket(socket_path) {
+/// Serves MCP on stdin and stdout until the client closes stdin. Takes
+/// `--socket` and `--token` from the global client options; `--url`, and
+/// `$KRONIK_URL` without `--socket`, are refused, since a remote daemon
+/// serves MCP itself.
+pub fn run(_args: McpArgs, global: &crate::cli::Global) -> ExitCode {
+    let env_url =
+        global.socket.is_none() && std::env::var("KRONIK_URL").is_ok_and(|u| !u.trim().is_empty());
+    if global.url.is_some() || env_url {
+        let e = ApiError::new(
+            ErrorCode::BadRequest,
+            if global.url.is_none() {
+                "kronik mcp bridges stdio to a local daemon's API socket; it does not use $KRONIK_URL (unset it, or pass --socket)"
+            } else {
+                "kronik mcp bridges stdio to a local daemon's API socket; it takes no --url"
+            },
+        )
+        .with_hint(
+            "For a remote daemon, point the agent's MCP client at https://<host>:<port>/mcp of its server.api_listen (Streamable HTTP) with the header `Authorization: Bearer <token>`.",
+        );
+        return crate::cli::report_error(false, &e);
+    }
+    let socket = match crate::config::client_api_socket(global.socket.clone()) {
         Ok(socket) => socket,
         Err(e) => {
             eprintln!("error: BAD_REQUEST: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let token = match crate::cli::client_token() {
+    let token = match crate::cli::client_token_from(global.token.as_deref()) {
         Ok(token) => token,
-        Err(e) => {
-            eprintln!("error: {}: {}", e.code, e.message);
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return crate::cli::report_error(false, &e),
     };
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -76,8 +94,8 @@ pub fn run(_args: McpArgs, socket_path: Option<PathBuf>) -> ExitCode {
 async fn bridge(socket: &std::path::Path, token: Option<String>) -> Result<(), String> {
     let client = UnixSocketHttpClient::new(&socket.to_string_lossy(), ENDPOINT);
     let hint = if token.is_some() {
-        "hint: check that `kronik serve` runs with that API socket, and that $KRONIK_TOKEN \
-         is a live token (`kronik token list`)"
+        "hint: check that `kronik serve` runs with that API socket, and that the token \
+         (--token or $KRONIK_TOKEN) is live (`kronik token list`)"
     } else {
         "hint: start the daemon with `kronik serve`, or pass its API socket with --socket"
     };

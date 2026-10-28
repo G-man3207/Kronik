@@ -1,0 +1,127 @@
+# The reference workflow for the Kronik GitHub Action
+# (docs/guides/github-action.md). Copy it to .github/workflows/kronik.yml in
+# the repository of your actors, then set:
+#
+# - the repository variable KRONIK_BASE_URL: where the files of one kronik
+#   release are (pinned to that release, not a "latest" URL);
+# - the repository secrets KRONIK_URL and KRONIK_TOKEN, a token with the
+#   scopes read and propose only;
+# - an environment named kronik-production, with required reviewers,
+#   "Prevent self-review" on, administrators not allowed to bypass it, and
+#   main as its only deployment branch, and environment secrets KRONIK_URL
+#   and KRONIK_TOKEN, a token with the scopes read, approve and promote.
+#
+# Every action is pinned to a full commit SHA. For the Kronik action, use the
+# commit of the release whose files KRONIK_BASE_URL points to.
+name: Kronik
+
+on:
+  # Not pull_request_target: that would run a fork's code with the secrets.
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  propose:
+    # Forks get no secrets; the action skips them by itself too.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # A new push to the pull request cancels the run of the older head.
+    concurrency:
+      group: kronik-propose-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install kronik
+        uses: G-man3207/Kronik/action@99cb30c34b0e2a6fea2aa16a0855ac379e2f5a53 # the commit of your kronik release
+        with:
+          command: install
+          base-url: ${{ vars.KRONIK_BASE_URL }}
+      - name: Build
+        # Placeholder: build your actors into dist/.
+        run: kronik build
+      - name: Propose
+        uses: G-man3207/Kronik/action@99cb30c34b0e2a6fea2aa16a0855ac379e2f5a53 # the commit of your kronik release
+        env:
+          KRONIK_URL: ${{ secrets.KRONIK_URL }}
+          KRONIK_TOKEN: ${{ secrets.KRONIK_TOKEN }}
+        with:
+          command: propose
+          components: dist
+
+  # After the merge: propose main's components, without the environment, so
+  # that the reviewers see this proposal's summary (in this job's summary)
+  # before they approve the promote job.
+  verify:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      checks: write
+    outputs:
+      proposal-id: ${{ steps.propose.outputs.proposal-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install kronik
+        uses: G-man3207/Kronik/action@99cb30c34b0e2a6fea2aa16a0855ac379e2f5a53 # the commit of your kronik release
+        with:
+          command: install
+          base-url: ${{ vars.KRONIK_BASE_URL }}
+      - name: Build
+        # Placeholder: the same build as in propose.
+        run: kronik build
+      - name: Propose
+        id: propose
+        uses: G-man3207/Kronik/action@99cb30c34b0e2a6fea2aa16a0855ac379e2f5a53 # the commit of your kronik release
+        env:
+          KRONIK_URL: ${{ secrets.KRONIK_URL }}
+          KRONIK_TOKEN: ${{ secrets.KRONIK_TOKEN }}
+        with:
+          command: propose
+          components: dist
+
+  # Promotes exactly the proposal verify made, after a required reviewer of
+  # the environment approved this run (nothing to promote: skipped).
+  promote:
+    needs: verify
+    if: needs.verify.outputs.proposal-id != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: kronik-production
+    # One promotion at a time. GitHub keeps at most one pending run in the
+    # group: a newer pending promotion cancels an older pending one.
+    concurrency:
+      group: kronik-production
+      cancel-in-progress: false
+    permissions:
+      actions: read  # the run's environment approvals
+      contents: read  # the branch's head: an older commit is not promoted
+    steps:
+      - name: Install kronik
+        uses: G-man3207/Kronik/action@99cb30c34b0e2a6fea2aa16a0855ac379e2f5a53 # the commit of your kronik release
+        with:
+          command: install
+          base-url: ${{ vars.KRONIK_BASE_URL }}
+      - name: Promote
+        uses: G-man3207/Kronik/action@99cb30c34b0e2a6fea2aa16a0855ac379e2f5a53 # the commit of your kronik release
+        env:
+          KRONIK_URL: ${{ secrets.KRONIK_URL }}
+          KRONIK_TOKEN: ${{ secrets.KRONIK_TOKEN }}
+        with:
+          command: promote
+          proposal: ${{ needs.verify.outputs.proposal-id }}
+          environment: kronik-production

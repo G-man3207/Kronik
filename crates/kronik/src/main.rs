@@ -68,12 +68,24 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let refused = match &cli.command {
+        Command::Serve(_) | Command::Mcp(_) | Command::Client(_) => None,
+        Command::Init(_) => cli.client.refuse_remote("init"),
+        Command::Build(_) => cli.client.refuse_remote("build"),
+        Command::TestHost(_) => cli.client.refuse_remote("test-host"),
+        Command::Doctor(_) => cli.client.refuse_remote("doctor"),
+        Command::Restore(_) => cli.client.refuse_remote("restore"),
+        Command::Upgrade(_) => cli.client.refuse_remote("upgrade"),
+    };
+    if let Some(code) = refused {
+        return code;
+    }
     let args = match cli.command {
         Command::Serve(args) => args,
         Command::Init(args) => return project::init(args, cli.client.json),
         Command::Build(args) => return project::build(args, cli.client.json),
         Command::TestHost(args) => return project::test_host(args),
-        Command::Mcp(args) => return mcp::run(args, cli.client.socket),
+        Command::Mcp(args) => return mcp::run(args, &cli.client),
         Command::Doctor(args) => return doctor::run(args, cli.client.json),
         Command::Restore(args) => return restore::run(args, cli.client.json),
         Command::Upgrade(upgrade::UpgradeCommand::Check(args)) => {
@@ -83,7 +95,7 @@ fn main() -> ExitCode {
     };
     if cli.client.given() {
         eprintln!(
-            "error: --socket and --json are for client commands; serve takes --api-socket (see kronik serve --help)"
+            "error: kronik serve takes none of --socket, --url, --token and --json, which are for the client commands; its own API socket is --api-socket (see kronik serve --help)"
         );
         return ExitCode::from(2);
     }

@@ -180,3 +180,58 @@ message EngineUpgrade {
   uint64 checked_through_lsn = 6;
   Audit audit = 7;
 }
+
+// A guard of `kronik watch` fired after a deployment (M11). Informational:
+// it creates no epoch. It holds exactly what the watch evaluated, so the
+// decision can be checked against the log.
+message GuardTriggered {
+  // The watched deployment's epoch and the LSN of its Deployment record.
+  uint64 deployment_epoch = 1;
+  uint64 deployment_lsn = 2;
+  string watch_id = 3;
+  // The guard's name in the policy (or a default guard's name).
+  string guard = 4;
+  GuardAction action = 5;
+  GuardOutcome outcome = 6;
+  GuardWindow before = 7;
+  GuardWindow after = 8;
+  // The windows count the turns with LSN <= observed_lsn.
+  uint64 observed_lsn = 9;
+  // The epoch of the rollback deployment, 0 if none was made.
+  uint64 rollback_epoch = 10;
+  // Why: the guard's condition, or the error that stopped the rollback.
+  string reason = 11;
+  Audit audit = 12;
+}
+
+enum GuardAction {
+  GUARD_ACTION_UNSPECIFIED = 0;
+  GUARD_ACTION_ALERT = 1;
+  GUARD_ACTION_ROLLBACK = 2;
+}
+
+enum GuardOutcome {
+  GUARD_OUTCOME_UNSPECIFIED = 0;
+  GUARD_OUTCOME_ALERTED = 1;
+  GUARD_OUTCOME_ROLLED_BACK = 2;
+  // The deployment changed a schema version: alerted instead.
+  GUARD_OUTCOME_ROLLBACK_REFUSED_SCHEMA = 3;
+  GUARD_OUTCOME_ROLLBACK_FAILED = 4;
+}
+
+// The deployment's kinds' turns in one window, by logical time in
+// [from_time_ms, to_time_ms). from_lsn and to_lsn are the first and last
+// counted turn's LSN (0 without turns).
+message GuardWindow {
+  uint64 from_lsn = 1;
+  uint64 to_lsn = 2;
+  uint64 from_time_ms = 3;
+  uint64 to_time_ms = 4;
+  uint64 turns = 5;
+  // Turns whose outcome is not COMMITTED.
+  uint64 failed = 6;
+  double error_rate = 7;
+  // Of TurnRecord.duration_us; 0 without turns.
+  uint64 latency_p50_us = 8;
+  uint64 latency_p99_us = 9;
+}

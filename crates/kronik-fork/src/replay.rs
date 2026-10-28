@@ -70,6 +70,8 @@ pub struct ReplaySetup {
     /// Production's live `state.db` when its actor and kv rows match a
     /// rebuilt store. `run` uses it instead of replaying the window again.
     pub prod_store: Option<Arc<Store>>,
+    /// Counts the root inputs replayed, when someone follows the replay.
+    pub progress: Option<Arc<Progress>>,
 }
 
 /// Live access from a fork: the allowlisted hosts and the environment
@@ -100,7 +102,27 @@ impl ReplaySetup {
             live: None,
             privacy: crate::privacy::ForkPrivacy::plain(),
             prod_store: None,
+            progress: None,
         }
+    }
+}
+
+/// How far a replay has come (M10: `kronik proposal status`): root inputs
+/// done and to do, per mode. Counters only; they never change a result.
+#[derive(Debug, Default)]
+pub struct Progress {
+    pub isolated_done: std::sync::atomic::AtomicU64,
+    pub isolated_total: std::sync::atomic::AtomicU64,
+    pub continuous_done: std::sync::atomic::AtomicU64,
+    pub continuous_total: std::sync::atomic::AtomicU64,
+    /// Test hook: each isolated root input waits for a permit first.
+    #[doc(hidden)]
+    pub gate: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+impl Progress {
+    fn add(counter: &std::sync::atomic::AtomicU64, n: u64) {
+        counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -322,17 +344,27 @@ impl Runner {
             };
             self.flush_leaves()?;
             self.catch_up(&p)?;
-            if let Some(pb::input::Kind::Timer(t)) = &p.input.kind {
-                lock(&self.timers).remove(&(p.actor.clone(), t.timer_id));
-                if !self
-                    .store
-                    .db()
-                    .timer_pending(&p.actor.kind, &p.actor.key, t.timer_id)?
-                {
-                    continue;
+            let root = p.key.path.is_empty();
+            // A timer the fork no longer has pending is skipped: still done.
+            let skip = match &p.input.kind {
+                Some(pb::input::Kind::Timer(t)) => {
+                    lock(&self.timers).remove(&(p.actor.clone(), t.timer_id));
+                    !self
+                        .store
+                        .db()
+                        .timer_pending(&p.actor.kind, &p.actor.key, t.timer_id)?
                 }
+                _ => false,
+            };
+            if !skip {
+                self.clone().run(p, order).await?;
             }
-            self.clone().run(p, order).await?;
+            if root
+                && !self.isolated
+                && let Some(progress) = &self.setup.progress
+            {
+                Progress::add(&progress.continuous_done, 1);
+            }
         }
     }
 
@@ -711,6 +743,8 @@ impl Runner {
             config_epoch: self.setup.epoch,
             memory_peak_bytes: out.memory_peak_bytes,
             schema_version: if committed { schema_version } else { 0 },
+            // A recomputed turn's wall time says nothing about production.
+            duration_us: 0,
         };
         // An isolated leaf's row is rolled back with the overlay, so it is
         // only buffered: if a later turn of the tree runs, it applies the
@@ -1519,6 +1553,11 @@ impl Shares {
         let mut out = Vec::new();
         while let Some(i) = self.next(&mut range) {
             let Some(r) = self.roots.get(i) else { break };
+            if let Some(gate) = setup.progress.as_ref().and_then(|p| p.gate.as_ref())
+                && let Ok(permit) = gate.acquire().await
+            {
+                permit.forget();
+            }
             // Production state before the tree's first record: a root
             // turn's callees commit before the root's own record.
             let before = r.start_lsn - 1;
@@ -1549,6 +1588,9 @@ impl Shares {
                 root_lsn: r.lsn,
                 turns,
             });
+            if let Some(progress) = &setup.progress {
+                Progress::add(&progress.isolated_done, 1);
+            }
         }
         Ok(out)
     }
@@ -1682,6 +1724,9 @@ impl Continuous {
                 .filter(|r| r.lsn > self.replayed_to)
             {
                 self.runner.push(vec![r.lsn], root_pending(r));
+                if let Some(progress) = &self.setup.progress {
+                    Progress::add(&progress.continuous_total, 1);
+                }
             }
             self.runner.clone().drain().await?;
             self.replayed_to = self.setup.index.to_lsn;
@@ -1720,6 +1765,17 @@ impl Continuous {
         lock(&self.runner.turns).clone()
     }
 
+    /// Keeps the turns `keep` returns true for; it may change them (a
+    /// preview forgets its logged requests, M11).
+    pub fn retain_turns(&self, keep: impl FnMut(&mut ForkTurn) -> bool) {
+        lock(&self.runner.turns).retain_mut(keep);
+    }
+
+    /// How many turns it holds in memory.
+    pub fn turn_count(&self) -> usize {
+        lock(&self.runner.turns).len()
+    }
+
     /// Whether the fork has code for `kind`.
     pub fn has_kind(&self, kind: &str) -> bool {
         self.setup.kinds.contains_key(kind)
@@ -1746,6 +1802,20 @@ impl Continuous {
                 ..Default::default()
             })),
         };
+        self.send_input(actor, input, key, time, subject).await
+    }
+
+    /// Any input into an actor of the fork as a new root input with `key`,
+    /// run under the fork's code after everything replayed so far; its
+    /// consequences run too. Returns the root turn.
+    pub async fn send_input(
+        &mut self,
+        actor: ActorRef,
+        input: pb::Input,
+        key: pb::CausalKey,
+        time: u64,
+        subject: Option<String>,
+    ) -> Result<ForkTurn, ReplayError> {
         let order = vec![
             u64::MAX,
             self.runner.timer_seq.fetch_add(1, Ordering::Relaxed),
@@ -1854,6 +1924,9 @@ pub async fn both(
         } else {
             workers
         };
+        if let Some(progress) = &setup.progress {
+            Progress::add(&progress.isolated_total, roots.len() as u64);
+        }
         Shares::new(roots, w, MIN_SPLIT)
     });
     let cont = if options.mode.continuous() {

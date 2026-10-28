@@ -414,6 +414,10 @@
         "pii_unverified": {
           "description": "In a fork without personal data: turns of a kind whose code changed that read pseudonyms and came out identical to production. They did not run on the real values either, so they count for the approval floor (ADR 0031). 0 in identity replays. Always written; diffs written before v0.1 lack it.",
           "$ref": "#/$defs/DiffCount"
+        },
+        "preview_inputs": {
+          "description": "In a preview fork (M11): the requests it took at its URL, root inputs of their own. They and their turns are never compared with production: not in `turns_fork`, divergence, effects, grounding or errors; their state changes are in `state.continuous`. Absent when 0.",
+          "$ref": "#/$defs/DiffCount"
         }
       }
     },
@@ -1248,6 +1252,47 @@
         "pii_masked": {
           "description": "Turns counted in `summary.pii_masked`. Absent when empty.",
           "$ref": "#/$defs/DiffSampleList"
+        },
+        "preview": {
+          "description": "Requests counted in `summary.preview_inputs`, in log order, at most 20. Absent when empty.",
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/DiffPreviewInput"
+          }
+        }
+      }
+    },
+    "DiffPreviewInput": {
+      "description": "A request a preview fork took (M11): its root turn, the method and route pattern (never the path), the HTTP status of its answer (null when it answered with a reply or not at all) and its outcome.",
+      "type": "object",
+      "required": [
+        "turn",
+        "method",
+        "route",
+        "status",
+        "outcome"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "turn": {
+          "$ref": "#/$defs/DiffTurnId"
+        },
+        "method": {
+          "type": "string"
+        },
+        "route": {
+          "type": "string"
+        },
+        "status": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "outcome": {
+          "description": "committed, rejected, failed, trap, fuel_exhausted, memory_limit, effect_outcome_unknown or unspecified.",
+          "type": "string"
         }
       }
     },

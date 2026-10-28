@@ -698,24 +698,24 @@ fn health(socket: &Path) -> String {
     response
 }
 
-/// Below `[log] disk_reserve`: health and metrics say so, and forks and
-/// `foreign add` are refused before they write anything (an add before it
-/// fetches the image).
+/// Below `[log] disk_reserve`: health and metrics say so, and forks,
+/// previews (create and requests) and `foreign add` are refused before
+/// they write anything (an add before it fetches the image).
 #[test]
 fn below_the_disk_reserve_health_says_so_and_forks_and_adds_wait() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("api.sock");
     let admin = format!("127.0.0.1:{}", free_port());
+    let gateway = format!("127.0.0.1:{}", free_port());
     let config = dir.path().join("kronik.toml");
     std::fs::write(
         &config,
         format!(
-            "[server]\ndata_dir = {:?}\napi_socket = {:?}\nhttp_listen = \"127.0.0.1:{}\"\n\
+            "[server]\ndata_dir = {:?}\napi_socket = {:?}\nhttp_listen = {gateway:?}\n\
              admin_listen = {admin:?}\n\n\
              [foreign]\nrun_dir = {:?}\n",
             dir.path().join("data"),
             socket,
-            free_port(),
             dir.path().join("run"),
         ),
     )
@@ -761,6 +761,10 @@ fn below_the_disk_reserve_health_says_so_and_forks_and_adds_wait() {
         assert!(text.contains("disk_reserve"), "{args:?}: {text}");
     };
     refused(&["fork", "create", "--at", "now", "--reason", "r"]);
+    refused(&["preview", "create", "p-000000000000", "--reason", "r"]);
+    let (code, body) = http_get(&gateway, "/__preview/v-000000000000/counter/x");
+    assert_eq!(code, 503, "{body}");
+    assert!(body.contains("disk_reserve"), "{body}");
     let layout = dir.path().join("layout");
     std::fs::create_dir_all(&layout).unwrap();
     refused(&[

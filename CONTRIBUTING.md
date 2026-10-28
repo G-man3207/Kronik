@@ -21,14 +21,15 @@ You need [rustup](https://rustup.rs) and
 Run the same checks as CI before you push:
 
 ```sh
-scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny, foreign and identity
+scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny, foreign, identity and action
 scripts/ci.sh clippy test    # selected steps
 ```
 
 `scripts/ci.sh` exits non-zero if any step fails. The `foreign` step needs
 root and `runsc` and is skipped with a message otherwise; without
-libfaketime, `identity` skips `todo-ts` the same way. Pull requests must
-keep it green.
+libfaketime, `identity` skips `todo-ts` the same way. The `action` step skips
+its YAML checks without PyYAML, and actionlint when it is not installed.
+Pull requests must keep it green.
 
 ## Conventions
 

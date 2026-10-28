@@ -1,0 +1,82 @@
+# The Kronik GitHub Action: docs/guides/github-action.md. The logic is in
+# kronik_action.py; action/tests/ tests it (scripts/ci.sh action).
+# KRONIK_URL and KRONIK_TOKEN come from the step's env (from secrets), never
+# from inputs, so the token never reaches a command line.
+name: Kronik
+description: Install kronik (needs python3 >= 3.9 on the runner), propose a pull request's or main's components to a Kronik daemon, and promote a verified proposal after a reviewer approved it.
+author: Kronik
+
+inputs:
+  command:
+    description: "install, propose (on pull_request, push or workflow_dispatch) or promote (the verify job's proposal, in a job with a protected environment)."
+    required: true
+  base-url:
+    description: "Where the release's files are (kronik-<arch>-unknown-linux-musl and SHA256SUMS): https://, file://, or http:// to a loopback IP. Pin it to one release's URL. The binary is installed after its SHA-256 is checked. Empty: use the kronik already on PATH."
+    required: false
+    default: ""
+  components:
+    description: "The components to propose: whitespace-separated .wasm files, globs or directories (searched for *.wasm)."
+    required: false
+    default: "dist"
+  proposal:
+    description: "promote: the proposal to promote, the verify job's proposal-id output. Empty: nothing to promote."
+    required: false
+    default: ""
+  environment:
+    description: "promote: the job's GitHub environment, whose approval of this run (by a required reviewer) the action requires before it approves a proposal that needs an approval."
+    required: false
+    default: "kronik-production"
+  reason:
+    description: "The reason recorded with the proposal and the promotion. Default: the pull request or commit, the GitHub actor and the run URL."
+    required: false
+    default: ""
+  window:
+    description: "The replay window (kronik propose --window), such as 1h. Default: kronik's."
+    required: false
+    default: ""
+  timeout:
+    description: "How long to wait for the proposal (kronik proposal wait --timeout), longer than the replay; every kronik call is also bounded by it."
+    required: false
+    default: "45m"
+  allow-forks:
+    description: "Run propose for pull requests from forks too. Off by default: a fork's code would run with this repository's Kronik token."
+    required: false
+    default: "false"
+  github-token:
+    description: "The token for the check run, the pull request comment and the run's approvals. Keep the default: only comments by github-actions[bot] are updated."
+    required: false
+    default: ${{ github.token }}
+  comment:
+    description: "Create or update one pull request comment with the proposal's summary."
+    required: false
+    default: "true"
+
+outputs:
+  proposal-id:
+    description: "The proposal's id (p-...)."
+    value: ${{ steps.kronik.outputs.proposal-id }}
+  outcome:
+    description: "The policy outcome: allow, require_approval or deny; none when there was nothing to propose; error when the proposal failed."
+    value: ${{ steps.kronik.outputs.outcome }}
+  status:
+    description: "The proposal's status: evaluated, approved, rejected or promoted; unchanged when there was nothing to propose; skipped when promote left it to a newer run because the branch moved on; failed when it failed."
+    value: ${{ steps.kronik.outputs.status }}
+
+runs:
+  using: composite
+  steps:
+    - id: kronik
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/kronik_action.py"
+      env:
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_BASE_URL: ${{ inputs.base-url }}
+        INPUT_COMPONENTS: ${{ inputs.components }}
+        INPUT_PROPOSAL: ${{ inputs.proposal }}
+        INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        INPUT_REASON: ${{ inputs.reason }}
+        INPUT_WINDOW: ${{ inputs.window }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_ALLOW_FORKS: ${{ inputs.allow-forks }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_COMMENT: ${{ inputs.comment }}

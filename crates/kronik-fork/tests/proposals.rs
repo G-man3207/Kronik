@@ -18,7 +18,7 @@ use kronik_proto::log::v1 as pb;
 
 fn propose(
     p: &Proc,
-    props: &Proposals,
+    props: &Arc<Proposals>,
     wasm: &str,
     options: DiffOptions,
 ) -> kronik_fork::proposal::Proposal {
@@ -51,7 +51,7 @@ fn promote_runs_catch_up_switches_code_and_rollback_restores_it() {
     for _ in 0..10 {
         p.http("a", "increment", "");
     }
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let prop = propose(&p, &props, "counter-step2", DiffOptions::default());
     assert_eq!(prop.status, "evaluated");
     assert_eq!(prop.policy["outcome"], "allow", "{}", prop.policy);
@@ -156,7 +156,7 @@ fn rollback_refuses_when_the_schema_version_was_raised() {
     for _ in 0..3 {
         p.http("a", "increment", "");
     }
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let prop = propose(&p, &props, "counter-schema1", DiffOptions::default());
     assert_eq!(prop.policy["outcome"], "allow", "{}", prop.policy);
     let r =
@@ -199,7 +199,7 @@ fn a_catch_up_that_finds_a_new_error_stops_promote() {
     for _ in 0..5 {
         p.http("a", "increment", "");
     }
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     // The new build breaks `get`, which the window does not contain.
     let prop = propose(&p, &props, "counter-fail-get", DiffOptions::default());
     assert_eq!(prop.policy["outcome"], "allow", "{}", prop.policy);
@@ -230,7 +230,7 @@ fn approximate_effects_need_an_approval_for_promote() {
         let spec = format!("POST http://{addr}/v1/charges/{i}\n\namount=10");
         p.http("pay", "fetch-ok", &spec);
     }
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let prop = propose(&p, &props, "counter-body-v2", DiffOptions::default());
     assert_eq!(
         prop.policy["outcome"], "require_approval",
@@ -273,7 +273,7 @@ fn payments_full_coverage_stops_promote_under_a_sample() {
             "POST http://payments.internal/v1/charges\n\namount=10",
         );
     }
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let sampled = DiffOptions {
         sample: 0.1,
         ..DiffOptions::default()
@@ -378,7 +378,7 @@ fn a_schema_change_migrates_in_catch_up_and_in_production_after_promote() {
     let p = Proc::start(dir.path());
     p.http("a", "increment", "");
     p.http("a", "increment", "");
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let prop = propose(&p, &props, "counter-schema1", DiffOptions::default());
     assert_eq!(prop.policy["outcome"], "allow", "{}", prop.policy);
     // A new actor after the proposal: catch-up migrates it in the fork.
@@ -429,9 +429,11 @@ fn inputs_inside_the_promote_gap_stay_unverified() {
     // An hour-wide gap: catch-up converges with the newest root input at
     // most an hour ahead of the verified head, so traffic that arrives
     // while promote runs is switched over without a re-run.
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
-        .unwrap()
-        .with_promote(Duration::from_secs(3600), Duration::from_secs(120));
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_promote(Duration::from_secs(3600), Duration::from_secs(120)),
+    );
     let prop = propose(&p, &props, "counter-step2", DiffOptions::default());
     assert_eq!(prop.policy["outcome"], "allow", "{}", prop.policy);
     // A backlog the catch-up has to replay, keeping promote busy, while
@@ -506,7 +508,7 @@ fn a_promote_or_approval_cut_short_is_recorded_on_the_proposal() {
     let dir = tempdir();
     let p = Proc::start(dir.path());
     p.http("a", "increment", "");
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
 
     // The approval record is committed, the proposal's metadata is not.
     let prop = propose(&p, &props, "counter-step2", DiffOptions::default());
@@ -549,4 +551,136 @@ fn a_promote_or_approval_cut_short_is_recorded_on_the_proposal() {
     let promoted = got.promoted.unwrap();
     assert_eq!((promoted.epoch, promoted.lsn), (epoch, lsn));
     assert_eq!(last_deployment(&p).0, lsn, "promoted once");
+}
+
+/// A proposal job held at its first isolated root input by the test gate.
+fn held_job(
+    p: &Proc,
+    dir: &std::path::Path,
+) -> (Arc<Proposals>, Arc<tokio::sync::Semaphore>, String) {
+    for _ in 0..3 {
+        p.http("a", "increment", "");
+    }
+    p.settle();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.to_path_buf())
+            .unwrap()
+            .with_test_gate(gate.clone()),
+    );
+    let (running, dry) =
+        p.rt.block_on(props.propose_job(
+            ProposeRequest {
+                wasm: vec![std::fs::read(guest("counter-step2")).unwrap()],
+                names: Vec::new(),
+                window_ms: None,
+                at: None,
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            false,
+        ))
+        .unwrap();
+    assert!(!dry);
+    assert_eq!(running.status, "running");
+    (props, gate, running.id)
+}
+
+/// Lets the held job run and waits until it is done.
+fn finish(props: &Proposals, gate: &tokio::sync::Semaphore, id: &str) {
+    gate.add_permits(1000);
+    for _ in 0..6000 {
+        if props.progress(id).is_none() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the job of {id} did not finish");
+}
+
+/// Review M4 and L7: what needs a finished proposal answers
+/// PROPOSAL_RUNNING while its job runs, `send` into its fork included.
+#[test]
+fn a_running_proposal_refuses_send_approve_request_approval_and_diff() {
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    let (props, gate, id) = held_job(&p, dir.path());
+    let msg = || pb::Message {
+        name: "increment".into(),
+        content_type: "text/plain".into(),
+        body: plain(""),
+        blobs: vec![],
+    };
+    let actor = || kronik_core::ids::ActorRef::parse("counter/a").unwrap();
+    let running = ErrorCode::ProposalRunning;
+    let r = p.rt.block_on(props.fork_send(&id, actor(), msg()));
+    assert_eq!(r.unwrap_err().code, running);
+    let r = p.rt.block_on(props.approve(&id, audit(), false));
+    assert_eq!(r.unwrap_err().code, running);
+    let r = p.rt.block_on(props.request_approval(&id, audit(), false));
+    assert_eq!(r.unwrap_err().code, running);
+    let r = p.rt.block_on(props.diff(&id, false, false));
+    assert_eq!(r.unwrap_err().code, running);
+    let r = p.rt.block_on(props.promote(&id, audit(), false));
+    assert_eq!(r.unwrap_err().code, running);
+    assert!(props.progress(&id).is_some());
+
+    finish(&props, &gate, &id);
+    assert_eq!(p.rt.block_on(props.get(&id)).unwrap().status, "evaluated");
+    p.rt.block_on(props.diff(&id, false, false)).unwrap();
+    p.rt.block_on(props.fork_send(&id, actor(), msg())).unwrap();
+}
+
+/// Review L7: a job does not survive the daemon. A proposal still
+/// `running` on disk is `failed` when the proposals load again, and what
+/// needs a finished proposal refuses it.
+#[test]
+fn a_proposal_running_at_a_restart_is_failed_and_refused() {
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    let (props, gate, id) = held_job(&p, dir.path());
+    let again = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let failed = p.rt.block_on(again.get(&id)).unwrap();
+    assert_eq!(failed.status, "failed");
+    let e = failed.error.expect("the failure is recorded");
+    assert_eq!(e.code, ErrorCode::Unavailable);
+    assert!(e.message.contains("the daemon restarted"), "{e}");
+    for err in [
+        p.rt.block_on(again.approve(&id, audit(), false))
+            .unwrap_err(),
+        p.rt.block_on(again.promote(&id, audit(), false))
+            .unwrap_err(),
+    ] {
+        assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
+        assert!(err.message.contains("the daemon restarted"), "{err}");
+    }
+    // The file says so too.
+    let file = dir.path().join("branches").join(&id).join("proposal.json");
+    let on_disk = std::fs::read_to_string(file).unwrap();
+    assert!(on_disk.contains("\"failed\""), "{on_disk}");
+    finish(&props, &gate, &id);
+}
+
+/// Review L7: a job whose replay fails (here the proposal's directory is a
+/// file by the time the replay writes its log) leaves the proposal
+/// `failed` with the error, ends the job, and what needs a finished
+/// proposal refuses it.
+#[test]
+fn a_job_that_fails_leaves_the_proposal_failed() {
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    let (props, gate, id) = held_job(&p, dir.path());
+    let branch = dir.path().join("branches").join(&id);
+    std::fs::remove_dir_all(&branch).unwrap();
+    std::fs::write(&branch, "not a directory").unwrap();
+    finish(&props, &gate, &id);
+    let failed = p.rt.block_on(props.get(&id)).unwrap();
+    assert_eq!(failed.status, "failed");
+    assert!(failed.error.is_some(), "{failed:?}");
+    let e =
+        p.rt.block_on(props.promote(&id, audit(), false))
+            .unwrap_err();
+    assert_eq!(e.code, ErrorCode::BadRequest, "{e}");
 }

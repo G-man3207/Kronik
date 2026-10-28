@@ -6,7 +6,8 @@
 # Steps: fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny,
 # foreign (needs root and runsc; skipped with a message otherwise, a failure
 # with KRONIK_FOREIGN_TESTS=require),
-# identity (without libfaketime, todo-ts is skipped with a message too).
+# identity (without libfaketime, todo-ts is skipped with a message too),
+# action.
 # Without arguments, all steps run in order.
 set -euo pipefail
 
@@ -297,15 +298,25 @@ step_identity() {
     KRONIK_BIN="$kronik" scripts/identity-examples.sh "${only[@]}"
 }
 
+# The GitHub Action (action/, docs/guides/github-action.md): its unit tests
+# run kronik_action.py against a fake kronik and a fake GitHub API, and lint
+# action.yml and the reference workflow (docs/examples/kronik-ci.yml): their
+# structure with PyYAML, their run: blocks with shellcheck, and both with
+# actionlint when it is installed; each check that lacks its tool is skipped
+# with a message.
+step_action() {
+    python3 -B -m unittest discover -v -s action/tests
+}
+
 if [ "$#" -eq 0 ]; then
-    set -- fmt clippy hygiene test docs book examples ts dst deny foreign identity
+    set -- fmt clippy hygiene test docs book examples ts dst deny foreign identity action
 fi
 
 for step in "$@"; do
     case "$step" in
-        fmt | clippy | hygiene | test | docs | book | examples | ts | dst | deny | foreign | identity) ;;
+        fmt | clippy | hygiene | test | docs | book | examples | ts | dst | deny | foreign | identity | action) ;;
         *)
-            echo "error: unknown step '$step'; expected fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny, foreign or identity" >&2
+            echo "error: unknown step '$step'; expected fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny, foreign, identity or action" >&2
             exit 2
             ;;
     esac

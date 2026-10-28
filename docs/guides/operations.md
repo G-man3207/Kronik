@@ -79,7 +79,7 @@ release still parses; unknown keys are errors.
 | `api_socket` | `"/run/kronik/api.sock"` | The Unix socket of the JSON API, for the CLI and `kronik mcp` | `--api-socket`, `KRONIK_API_SOCKET` |
 | `http_listen` | `"0.0.0.0:443"` with TLS, `"127.0.0.1:8080"` without | The gateway's address | `--http-listen`, `KRONIK_HTTP_LISTEN` |
 | `admin_listen` | `"127.0.0.1:9464"` | `/metrics` and `/healthz`. If the port can't be bound, the daemon logs a warning and runs without them | `--admin-listen`, `KRONIK_ADMIN_LISTEN` |
-| `api_listen` | none (off) | The JSON API and MCP over TCP, where every request needs a bearer token (`kronik token`). Without TLS only a loopback address is accepted, so tokens never cross a network in the clear; with TLS the API uses the gateway's certificate | `--api-listen`, `KRONIK_API_LISTEN` |
+| `api_listen` | none (off) | The JSON API and MCP over TCP, where every request needs a bearer token (`kronik token`). Without TLS only a loopback address is accepted, so tokens never cross a network in the clear; with TLS the API uses the gateway's certificate. A remote CLI (CI, the [GitHub Action](github-action.md)) reaches it with `--url https://<name>:<port>` or `KRONIK_URL`, and `KRONIK_TOKEN` | `--api-listen`, `KRONIK_API_LISTEN` |
 
 ### [tls]
 
@@ -92,9 +92,11 @@ release still parses; unknown keys are errors.
 | `acme_ca_file` | none | A PEM CA certificate to trust for the ACME server, besides the system's roots (a private ACME server) |
 | `cert_file` | none | The certificate chain, PEM (`files`) |
 | `key_file` | none | The private key, PEM (`files`) |
+| `dns01_hook` | none | The executable that publishes DNS-01 TXT records for the `*.<preview_domain>` certificate (`acme`); see [Preview forks: a wildcard certificate by DNS-01](#preview-forks-a-wildcard-certificate-by-dns-01) |
+| `dns01_propagation` | `"60s"` | How long to wait after the hook publishes a record before the CA checks it |
 
 `acme` needs `domains` and `acme_email`, and `files` needs `cert_file` and
-`key_file`.
+`key_file`. `dns01_hook` needs `acme` and `[gateway] preview_domain`.
 
 ### [gateway]
 
@@ -104,6 +106,7 @@ release still parses; unknown keys are errors.
 | `idempotency_header` | `"Idempotency-Key"` | The header the gateway reads as the idempotency key, compared without regard to case. An empty name is `BAD_REQUEST` at start | |
 | `idempotency_ttl` | `"24h"` | How long the gateway keeps a response for retries with the same `Idempotency-Key` | |
 | `trusted_proxies` | `[]` | Reverse proxies, as addresses or CIDR blocks (`["127.0.0.1", "10.0.0.0/8"]`). One client address may hold a quarter of the gateway's connections; a trusted proxy, which carries many users' traffic, may hold all of them. A connection over its client's share gets `503 UNAVAILABLE` with `connection: close`. When set, only these peers may set the request's subject (`privacy.subject_from`): a subject header or `jwt:` claim from any other peer gets `400 BAD_REQUEST`; IPv4-mapped entries (`::ffff:10.0.0.0/104`) mean their IPv4 block | |
+| `preview_domain` | none | The domain whose subdomains serve preview forks (`<id>.<domain>`), best a separate registrable domain; see [previews](#previews). With it, previews answer only there, not under `/__preview/`. With `[tls] mode = "acme"` it needs `dns01_hook` (the `*.<domain>` certificate); with `mode = "files"` the certificate must cover `*.<domain>`. It must not be, or be a parent of, a `[tls] domains` name. Lowercase, without scheme or port | |
 
 ### [log]
 
@@ -161,6 +164,7 @@ release still parses; unknown keys are errors.
 | Key | Default | Meaning |
 |---|---|---|
 | `live_allowlist` | `[]` | Hosts that forks may call live: an effect with no recording that is a `GET` without secret headers to a listed host goes out for real. Anything else never leaves a fork |
+| `preview_ttl` | `"24h"` | How long a preview fork lives unless `kronik preview create --ttl` says otherwise; see [previews](#previews) |
 
 ### [promote]
 
@@ -302,6 +306,91 @@ the order failed.
 `kronik doctor` fails when the certificate (from the files or the cache)
 has expired and warns 30 days before.
 
+### Preview forks: a wildcard certificate by DNS-01
+
+Preview forks answer at `<id>.<preview_domain>`. One certificate,
+`*.<preview_domain>`, covers them all, and ACME issues wildcards only by
+DNS-01: the CA looks up a TXT record at `_acme-challenge.<preview_domain>`.
+Kronik has no DNS provider built in. The owner provides a hook, a program
+that writes and deletes that TXT record through the DNS host's API (see
+[ADR 0026](../adr/0026-dns01-exec-hook.md)). Without a hook there is no
+wildcard certificate, so `mode = "acme"` with `preview_domain` and no hook
+is refused at start; leave `preview_domain` unset and preview forks use the
+path prefix `/__preview/<id>` on the main name.
+
+The owner provides:
+
+- a DNS zone they can write to through an API, with a wildcard record
+  `*.preview.example.com` (`A`, and `AAAA` with IPv6) pointing at this
+  host;
+- the hook, executable by the daemon's user, with its API credentials
+  wherever it reads them (not in `kronik.toml`);
+- `[tls] mode = "acme"` with the main certificate's `domains` as above.
+
+```toml
+[gateway]
+preview_domain = "preview.example.com"
+
+[tls]
+mode = "acme"
+domains = ["api.example.com"]
+acme_email = "ops@example.com"
+dns01_hook = "/usr/local/bin/kronik-dns01"
+dns01_propagation = "60s"
+```
+
+The gateway runs the hook as:
+
+```
+/usr/local/bin/kronik-dns01 present _acme-challenge.preview.example.com. <value>
+/usr/local/bin/kronik-dns01 cleanup _acme-challenge.preview.example.com. <value>
+```
+
+The name ends with a dot, and `value` is the TXT record's text. Exit 0 is
+success; a non-zero exit, or no exit within two minutes, is a failure. A
+failed `present` fails the order, which is retried like any ACME failure
+(after 1 minute, doubling up to 1 hour); a failed `cleanup` is a warning
+in the log. The hook's output goes to the daemon log. It runs in its own
+process group, and on timeout the whole group is killed, so whatever it
+started dies with it. It inherits the daemon's environment except
+`KRONIK_MASTER_KEY` and `KRONIK_TOKEN`. After a successful
+`present` the gateway waits `dns01_propagation` before the CA looks; a hook
+that waits for propagation itself can set `"0s"`. These are the arguments
+of lego's `exec` provider, so a lego script works with little or no change.
+
+A hook for Cloudflare's API, for example (it needs `curl` and `jq`), with a
+token allowed to edit the zone's DNS in `/etc/kronik/cloudflare.env`
+(`CF_API_TOKEN=...` and `CF_ZONE_ID=...`, mode 0600):
+
+```sh
+#!/bin/sh
+# /usr/local/bin/kronik-dns01 present|cleanup <fqdn> <value>
+set -eu
+. /etc/kronik/cloudflare.env
+api="https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records"
+auth="Authorization: Bearer $CF_API_TOKEN"
+name="${2%.}"
+case "$1" in
+present)
+    curl -fsS -X POST "$api" -H "$auth" -H "Content-Type: application/json" \
+        --data "{\"type\":\"TXT\",\"name\":\"$name\",\"content\":\"$3\",\"ttl\":60}" ;;
+cleanup)
+    # Every TXT record at the challenge name: only ACME challenges live there.
+    for id in $(curl -fsS -G "$api" -H "$auth" --data-urlencode "type=TXT" \
+        --data-urlencode "name=$name" | jq -r '.result[].id'); do
+        curl -fsS -X DELETE "$api/$id" -H "$auth"
+    done ;;
+*) echo "usage: $0 present|cleanup <fqdn> <value>" >&2; exit 2 ;;
+esac
+```
+
+The wildcard certificate is cached as `wildcard.<preview_domain>.pem` next
+to the main one and renewed the same way. The gateway serves it for every
+name exactly one label below `preview_domain`, and the main certificate for
+everything else. `kronik doctor`'s `dns01_hook` check fails when the hook is
+missing or not executable, and checks the cached wildcard certificate's
+expiry like `tls` does for the main one.
+
 ## kronik doctor
 
 `kronik doctor` checks what this host can run. It needs no running daemon
@@ -328,6 +417,7 @@ rather than fail, unless `kronik.toml` asks for what is missing
 | `disk` | Under 1 GiB free in the data directory (failure) or under 5 GiB (warning) | Free space or move `server.data_dir` |
 | `clock` | The clock is not synchronized by NTP (warning) | `timedatectl set-ntp true` |
 | `tls` | The certificate has expired or can't be read (failure), or expires within 30 days (warning). With `acme` and no certificate cached yet, it warns | Renew the files; for ACME see [TLS](#tls): the gateway orders a certificate when it starts |
+| `dns01_hook` | `[tls] dns01_hook` is set and is not an executable file (failure); the cached `*.<preview_domain>` certificate has expired (failure), expires within 30 days or isn't cached yet (warning) | `chmod +x` the hook, or fix the path; for the certificate, read the hook's output in the daemon log; see [Preview forks](#preview-forks-a-wildcard-certificate-by-dns-01) |
 | `ship` | `[ship] endpoint` is not reachable over TCP (failure); passes when shipping is off | Check the address and the network |
 
 ## Metrics and logs
@@ -357,6 +447,7 @@ firewall):
 | `kronik_gateway_requests_total` | counter | `status` | Gateway requests by HTTP status |
 | `kronik_gateway_request_duration_seconds` | histogram | `status` | Gateway request duration |
 | `kronik_replay_runs_total` | counter | `mode` | Fork replays by mode |
+| `kronik_guard_triggered_total` | counter | `action`, `outcome` | Guards of `kronik watch` that fired |
 
 A Prometheus scrape job:
 
@@ -384,6 +475,61 @@ Actors' own log lines come out with target `kronik::guest`, carrying
 actors should not log personal data or secrets. Exact occurrences of
 revealed secret values are replaced with `[secret:<name>]`.
 
+## Watching a deployment
+
+After `kronik promote`, watch the new code against the traffic before it:
+
+```sh
+kronik watch <epoch> --for 10m --reason "after promote"
+```
+
+The watch compares the error rate (turns the code or the host failed, and
+committed HTTP 5xx responses; not `REJECTED`, which is the client's bad
+input) and the p50 and p99 turn latency of the deployment's actor kinds
+in the `--for` window after it (at most 24h) with an equally long window
+before it, every 5 seconds. It runs in the daemon: the CLI can go away
+(`--async`), and a restart resumes it from the log
+(`<data_dir>/watches/<id>.json`). `kronik watches list` and
+`kronik watches show <id>` follow it; `kronik watches stop <id> --reason
+"..."` ends it without further alerts or rollbacks. `kronik watch
+--dry-run` shows the metrics now and which guards would fire.
+
+Only the latest deployment of its kinds can be watched. A later promote,
+deploy or rollback of any of them ends the watch `superseded`: nothing
+acts on code that no longer runs, so a hotfix is never rolled back by an
+older watch.
+
+The policy's guards decide what a breach does. Add `[[guard]]` tables to
+the rules file (`kronik policy set`):
+
+```toml
+[[guard]]
+name = "error-rate-up"
+when = "guard.after.turns >= 20 && guard.after.failed >= 3 && guard.after.error_rate > guard.before.error_rate + 0.05"
+action = "rollback"
+
+[[guard]]
+name = "slow"
+when = "guard.after.turns >= 50 && guard.after.latency_p99_ms > 500.0"
+action = "alert"
+```
+
+Without a `guard` key, two defaults apply: `error-rate-up` as above
+(rollback) and `latency-p99-up` (alert when p99 more than doubles and
+rises by over 50 ms, with at least 10 turns on both sides and a measured
+p99 before). `guard = []` means no guards: the watch only measures.
+`kronik policy show` prints the guards in force. Guards are evaluated once
+a turn ran after the deployment. A guard that fires writes a
+`GuardTriggered` record with the metrics, logs an error (`a guard fired
+after a deployment`) and counts in `kronik_guard_triggered_total`. A
+`rollback` guard rolls back like `kronik rollback` does, with audit token
+`kronik`; when the deployment raised a schema version it alerts instead
+(`rollback_refused_schema`). Each guard fires at most once per watch; a
+guard that cannot be evaluated alerts once (`the guard could not be
+evaluated: ...`) and is tried again. `kronik watch` exits 1 when a
+rollback guard fired but the rollback did not happen. Alert on the
+metric, or on the log line, to page someone.
+
 ## The master key
 
 The master key encrypts the secret store (`<data_dir>/keys/secrets.db`) and
@@ -406,7 +552,8 @@ silently win over the material; remove one of the two.
 - **Back it up separately**, somewhere offline, and not next to backups of
   the data directory. A copy of the data directory without the key reveals
   no secret values or sealed personal data, and that is the point.
-- **It is never shipped** or copied anywhere by Kronik.
+- **It is never shipped** or copied anywhere by Kronik: child processes,
+  the DNS-01 hook included, don't inherit `KRONIK_MASTER_KEY`.
 - **Losing it** loses every secret value and every sealed value: the stores
   can't be decrypted without it. There is no recovery.
 - **No new key over existing stores.** `kronik serve` makes a key only for a
@@ -631,6 +778,72 @@ program that needs another user's rights through them won't get them.
 Under the installed unit (`RestrictSUIDSGID`) a program in a sandbox can't
 set them on files in `/data` either; started by hand, without the unit, it
 can. The [M7 design](../design/m7-foreign.md) lists the rest.
+
+## Previews
+
+`kronik preview create <proposal>` starts a preview fork: main's HEAD with
+the proposal's code, taking new requests at its own URL
+([M11 design](../design/m11-preview.md),
+[ADR 0025](../adr/0025-preview-forks.md)). The gateway sends a request to
+a preview one way or the other, never both:
+
+- **Host**, with `[gateway] preview_domain = "example-preview.com"`:
+  `https://<id>.example-preview.com/<path>`, and only there. Point a
+  wildcard DNS record (`*.example-preview.com`) at the gateway and give it
+  a wildcard certificate for that name (ACME with `dns01_hook`, or a
+  `files` certificate that covers it). The paths are the app's own, so
+  absolute links in its pages work. Use a registrable domain of its own,
+  not a subdomain of the production site: a sibling such as
+  `preview.example.com` is the same site as `app.example.com`, so cookies
+  for `Domain=example.com` reach the preview's code (see the
+  [security model](security.md#api-access)). Host names match in any case,
+  with or without a trailing dot; any host under the domain that is not a
+  live preview answers `404 PREVIEW_NOT_FOUND`, never main.
+- **Path prefix**, only without `preview_domain`:
+  `<gateway>/__preview/<id>/<path>` goes to `<path>` of preview `<id>`.
+  Nothing to set up; the prefix shadows any route of the actors that
+  starts with `/__preview/`. The preview answers on the production origin,
+  so Kronik drops the request's `Cookie`, `Authorization` and `Proxy-Authorization` headers
+  (main's credentials) before the preview sees them, keeps only safe
+  response headers (content type and length, caching, the turn id; no
+  `Set-Cookie`, HSTS, `Clear-Site-Data`, NEL/Report-To or `Location`, so
+  no redirects), and adds `Content-Security-Policy: sandbox`, which also
+  blocks scripts and forms: single-page apps need a preview domain. Its
+  pages' absolute links point at main. The URL names the
+  first `[tls] domains` name, else the gateway's address (`0.0.0.0` as
+  `127.0.0.1`).
+
+An unknown or expired id answers `404 PREVIEW_NOT_FOUND`. A preview makes
+no live effects but one: a fetch without a stub is denied, except a `GET`
+without secret headers to a `[fork] live_allowlist` host, which goes out
+live. Its `crypto.*` calls answer `no recording` (it gets no production
+key), and `secrets.reveal` the placeholder. Its requests are not
+deduplicated by `Idempotency-Key`. Timers its requests set never fire, and
+neither do the timers pending at its fork point. The URL is reachable by
+whoever reaches the gateway, so a preview that may read personal data (the
+proposal's fork reads it, and the creator holds `pii:read`) shows the new
+code's answers on real data to them; use `--no-pii` when that matters.
+`kronik privacy erase` makes every preview start again from its fork
+point at its next request, without the erased values.
+
+Every request is a turn in `<data_dir>/branches/<id>/log/`, sealed like
+main's, and shows as a preview input in `kronik diff show <id>`. A preview
+takes one request at a time; requests to other previews and most operator
+commands do not wait for it, but `kronik diff show <id>` and `kronik
+preview delete <id>` wait for its request in flight. Once logged, a request's turns leave memory
+(the diff keeps its count and its first 20 samples). A preview takes at
+most 10,000 requests, then answers `409 PREVIEW_FULL` until it is deleted
+(or restarted from its fork point after a restart or an erasure). At most 16 previews
+live at once: the next `kronik preview create` answers `PREVIEW_LIMIT`.
+Preview create and requests are refused below `[log] disk_reserve`, like
+any new input. A preview is not a fork to change: `deploy --fork`,
+`replay`, `send --fork` and `fork delete` refuse it. The daemon deletes a
+preview (directory and routes) within a minute after `[fork] preview_ttl`
+or `--ttl`, also after a restart, and deletes at start the directory of a
+preview whose creation stopped half-way; `kronik preview delete` does it
+at once. After a restart a preview's state starts again from its fork
+point, and its next request replaces the log of the requests before the
+restart.
 
 ## Troubleshooting
 

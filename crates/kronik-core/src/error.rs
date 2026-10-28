@@ -173,6 +173,9 @@ codes! {
     MasterKeyMissing = "MASTER_KEY_MISSING", 409, "M2",
         "The master key is missing, and the data directory holds encrypted stores",
         "Put the key back where [keys] master_key_file points, or set KRONIK_MASTER_KEY; Kronik does not make a new key over existing stores.";
+    NothingToPropose = "NOTHING_TO_PROPOSE", 409, "M10",
+        "Main already runs every component of the proposal",
+        "Nothing changed: main already runs this code. Change a component and build it again.";
     NotImplemented = "NOT_IMPLEMENTED", 501, "M1",
         "Not available in this version",
         "Use what this version supports; `kronik --version` shows the version.";
@@ -182,9 +185,21 @@ codes! {
     PolicyDenied = "POLICY_DENIED", 403, "M3",
         "A policy rule denies the change",
         "Read the diff with `kronik diff show <proposal>`, change the code and propose again.";
+    PreviewFull = "PREVIEW_FULL", 409, "M11",
+        "The preview took as many requests as it can hold",
+        "Delete it with `kronik preview delete <id>` and create a new one with `kronik preview create <proposal>`.";
+    PreviewLimit = "PREVIEW_LIMIT", 409, "M11",
+        "As many previews are live as there can be",
+        "Delete one with `kronik preview delete <id>` (see `kronik preview list`), or wait until one expires.";
+    PreviewNotFound = "PREVIEW_NOT_FOUND", 404, "M11",
+        "No such preview, or it expired",
+        "List the previews with `kronik preview list`; create one with `kronik preview create <proposal>`.";
     ProposalNotFound = "PROPOSAL_NOT_FOUND", 404, "M3",
         "No such proposal",
         "List the proposals with `kronik proposals list`.";
+    ProposalRunning = "PROPOSAL_RUNNING", 409, "M10",
+        "The proposal is still running its replay",
+        "Follow it with `kronik proposal wait <proposal>`, then try again.";
     ProposalStale = "PROPOSAL_STALE", 409, "M3",
         "The proposal can no longer be promoted",
         "Propose again with `kronik propose <wasm> --reason '...'`.";
@@ -239,6 +254,9 @@ codes! {
     VerifyRequired = "VERIFY_REQUIRED", 409, "M1",
         "The actor type has history; verify the change first",
         "A kind with history changes through `kronik propose` and `kronik promote`.";
+    WatchNotFound = "WATCH_NOT_FOUND", 404, "M11",
+        "No such watch",
+        "List the watches with `kronik watches list`.";
 }
 
 impl ErrorCode {
@@ -499,10 +517,12 @@ mod tests {
 
     #[test]
     fn every_code_has_a_status_milestone_title_hint_and_explanation() {
-        const V01: [&str; 8] = ["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8"];
+        const MILESTONES: [&str; 11] = [
+            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11",
+        ];
         for &code in ErrorCode::ALL {
             assert!((400..600).contains(&code.http_status()), "{code}");
-            assert!(V01.contains(&code.milestone()), "{code}");
+            assert!(MILESTONES.contains(&code.milestone()), "{code}");
             for line in [code.title(), code.hint()] {
                 assert!(!line.is_empty() && !line.contains('\n'), "{code}");
             }

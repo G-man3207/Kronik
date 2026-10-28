@@ -43,7 +43,7 @@ enum Status {
 #[derive(Debug, Serialize, JsonSchema)]
 struct Check {
     /// Stable: config, kernel, runsc, kvm, cgroup, root, disk, clock, tls,
-    /// ship.
+    /// dns01_hook, ship.
     name: &'static str,
     status: Status,
     /// An error code from the catalog, when one applies.
@@ -137,6 +137,8 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
     checks.push(disk(&config.server.data_dir));
     checks.push(clock());
     checks.push(tls(&config));
+    checks.extend(dns01_hook(&config));
+    checks.extend(wildcard_certificate(&config));
     checks.push(ship(&config));
     let count = |s| checks.iter().filter(|c| c.status == s).count();
     let report = Report {
@@ -659,6 +661,62 @@ fn tls(config: &Config) -> Check {
     }
 }
 
+/// The DNS-01 hook, when `[tls] dns01_hook` is set: an executable file.
+fn dns01_hook(config: &Config) -> Option<Check> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let hook = config.tls.dns01_hook.as_ref()?;
+    let hint = "the hook publishes the wildcard certificate's TXT records: chmod +x it, \
+                and see docs/guides/operations.md, TLS";
+    Some(match std::fs::metadata(hook) {
+        Ok(m) if m.is_file() && m.permissions().mode() & 0o111 != 0 => check(
+            "dns01_hook",
+            Status::Pass,
+            format!("{} is the DNS-01 hook", hook.display()),
+        ),
+        Ok(_) => check(
+            "dns01_hook",
+            Status::Fail,
+            format!(
+                "{}: the DNS-01 hook is not an executable file",
+                hook.display()
+            ),
+        )
+        .hint(hint),
+        Err(e) => check(
+            "dns01_hook",
+            Status::Fail,
+            format!("{}: {e}", hook.display()),
+        )
+        .hint(hint),
+    })
+}
+
+/// The cached `*.<preview_domain>` certificate, when `[tls] dns01_hook` is
+/// set: renewal by DNS-01 fails quietly (an expired API token) while the
+/// hook itself stays executable.
+fn wildcard_certificate(config: &Config) -> Option<Check> {
+    config.tls.dns01_hook.as_ref()?;
+    let domain = config.gateway.preview_domain.as_deref()?;
+    let name = format!("wildcard.{domain}.pem");
+    let cached = std::fs::read_dir(config.server.data_dir.join("tls/acme"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path().join(&name))
+        .find_map(|path| std::fs::read(&path).ok().map(|pem| (path, pem)));
+    let mut c = match cached {
+        Some((path, pem)) => certificate_check(&path.display().to_string(), &pem, &pem),
+        None => check(
+            "dns01_hook",
+            Status::Warn,
+            format!("no wildcard certificate yet for *.{domain}"),
+        )
+        .hint("the gateway orders one when it starts; see the DNS-01 hook's output in the log"),
+    };
+    c.name = "dns01_hook";
+    Some(c)
+}
+
 /// `host:port` of an `https://` or `http://` endpoint.
 fn endpoint_authority(endpoint: &str) -> Option<String> {
     let (scheme, rest) = endpoint.split_once("://")?;
@@ -752,6 +810,47 @@ mod tests {
             Some("minio:9000".into())
         );
         assert_eq!(endpoint_authority("s3.example.com"), None);
+    }
+
+    #[test]
+    fn the_dns01_hook_must_be_an_executable_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        assert!(dns01_hook(&config).is_none());
+        let hook = dir.path().join("hook");
+        config.tls.dns01_hook = Some(hook.clone());
+        assert_eq!(dns01_hook(&config).unwrap().status, Status::Fail);
+        std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+        assert_eq!(dns01_hook(&config).unwrap().status, Status::Fail);
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(dns01_hook(&config).unwrap().status, Status::Pass);
+    }
+
+    #[test]
+    fn doctor_checks_the_wildcard_certificate_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_path_buf();
+        config.gateway.preview_domain = Some("p.example".into());
+        assert!(wildcard_certificate(&config).is_none());
+        config.tls.dns01_hook = Some(dir.path().join("hook"));
+        assert_eq!(wildcard_certificate(&config).unwrap().status, Status::Warn);
+        let ca = dir.path().join("tls/acme/ca");
+        std::fs::create_dir_all(&ca).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut expired = rcgen::CertificateParams::new(vec!["*.p.example".into()]).unwrap();
+        expired.not_before = rcgen::date_time_ymd(2019, 1, 1);
+        expired.not_after = rcgen::date_time_ymd(2020, 1, 1);
+        let pem = expired.self_signed(&key).unwrap().pem() + &key.serialize_pem();
+        std::fs::write(ca.join("wildcard.p.example.pem"), pem).unwrap();
+        let c = wildcard_certificate(&config).unwrap();
+        assert_eq!(
+            (c.name, c.status),
+            ("dns01_hook", Status::Fail),
+            "{}",
+            c.message
+        );
     }
 
     /// ADR 0027's measured values: the shipped unit with `User=root`

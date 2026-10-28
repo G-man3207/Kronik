@@ -88,3 +88,16 @@ additively.
   tests and docs that relied on it use a fork replay.
 - Revisit if reviewers need per-kind item lists, or if CI needs "nothing
   changed" to succeed instead of fail: then it gets its own code.
+
+## Amendment (2026-10-26, M10): `NOTHING_TO_PROPOSE`
+
+The "revisit" above happened. M10 adds a program that depends on telling
+this case apart: the GitHub Action proposes on every pull request and every
+push to main, and a pull request that changes no actor code, or a re-run
+after the promote, must give a neutral check with a notice, not a failure.
+Matching the message text is not a contract. So "nothing to propose" gets
+its own stable code, `NOTHING_TO_PROPOSE` (409, milestone M10), with the
+same message and hint; the request is well formed, there is just nothing
+new in it. `BAD_REQUEST` stays for the other refusals of propose (no
+components, two components for one kind, an empty directory, `at` after
+HEAD).

@@ -11,10 +11,13 @@
 //! `127.0.0.1:8080` without, and `keys.master_key_file` to
 //! `<data_dir>/keys/master.key`, so that a bare `kronik serve` touches no
 //! system port or path; `kronik serve --init` writes the brief's values.
-//! Four keys complete `[tls]`: `cert_file` and `key_file` for `mode =
+//! Six keys complete `[tls]`: `cert_file` and `key_file` for `mode =
 //! "files"`, `acme_directory` (Let's Encrypt by default) and `acme_ca_file`,
-//! a CA to trust for a private ACME server. Unknown keys are errors,
-//! reported with the file and line.
+//! a CA to trust for a private ACME server; `dns01_hook` and
+//! `dns01_propagation` get a wildcard certificate for `[gateway]
+//! preview_domain` by DNS-01 (M11). `[gateway] preview_domain` and
+//! `[fork] preview_ttl` (M11) set where preview forks answer and how long
+//! they live. Unknown keys are errors, reported with the file and line.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -99,6 +102,13 @@ pub struct Tls {
     pub cert_file: Option<PathBuf>,
     /// The private key (PEM) for `mode = "files"`.
     pub key_file: Option<PathBuf>,
+    /// The executable that publishes DNS-01 TXT records for the wildcard
+    /// certificate of `[gateway] preview_domain` (`mode = "acme"`); called
+    /// as `<hook> present|cleanup <fqdn> <value>`.
+    pub dns01_hook: Option<PathBuf>,
+    /// How long to wait after the hook publishes a record before the CA
+    /// checks it.
+    pub dns01_propagation: Dur,
 }
 
 impl Default for Tls {
@@ -111,6 +121,8 @@ impl Default for Tls {
             acme_ca_file: None,
             cert_file: None,
             key_file: None,
+            dns01_hook: None,
+            dns01_propagation: Dur::secs(60),
         }
     }
 }
@@ -124,6 +136,9 @@ pub struct Gateway {
     /// Reverse proxies, as addresses or CIDR blocks: their connections are
     /// exempt from the per-client connection cap.
     pub trusted_proxies: Vec<String>,
+    /// The domain whose subdomains serve preview forks (`<id>.<domain>`);
+    /// see M11.
+    pub preview_domain: Option<String>,
 }
 
 impl Default for Gateway {
@@ -133,6 +148,7 @@ impl Default for Gateway {
             idempotency_header: "Idempotency-Key".into(),
             idempotency_ttl: Dur::secs(24 * 3600),
             trusted_proxies: Vec::new(),
+            preview_domain: None,
         }
     }
 }
@@ -267,10 +283,21 @@ impl Default for Replay {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Fork {
     pub live_allowlist: Vec<String>,
+    /// How long a preview fork lives unless created with `--ttl` (M11).
+    pub preview_ttl: Dur,
+}
+
+impl Default for Fork {
+    fn default() -> Self {
+        Fork {
+            live_allowlist: Vec::new(),
+            preview_ttl: Dur::secs(24 * 3600),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -513,6 +540,74 @@ impl Config {
             }
             _ => {}
         }
+        if let Some(domain) = &self.gateway.preview_domain {
+            let label = |l: &str| {
+                (1..=63).contains(&l.len())
+                    && !l.starts_with('-')
+                    && !l.ends_with('-')
+                    && l.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            };
+            // An all-digit TLD is an IP address. 237: `_acme-challenge.` (16)
+            // plus the domain must fit in DNS's 253.
+            let tld_digits = domain
+                .rsplit('.')
+                .next()
+                .is_some_and(|tld| tld.chars().all(|c| c.is_ascii_digit()));
+            if !domain.contains('.')
+                || domain.len() > 237
+                || tld_digits
+                || !domain.split('.').all(label)
+            {
+                return Err(format!(
+                    "[gateway] preview_domain = {domain:?}: use a lowercase domain such as \
+                     \"preview.example.com\", without a scheme, port or leading dot \
+                     (labels of 1-63 letters, digits or inner hyphens, at most 237 characters)"
+                ));
+            }
+        }
+        if self.tls.dns01_hook.is_some() {
+            if self.tls.mode != TlsMode::Acme {
+                return Err(
+                    "[tls] dns01_hook needs mode = \"acme\": the wildcard certificate \
+                     for preview_domain comes from the ACME CA"
+                        .into(),
+                );
+            }
+            let domain = self.gateway.preview_domain.as_deref().unwrap_or("");
+            if domain.is_empty() {
+                return Err(
+                    "[tls] dns01_hook needs [gateway] preview_domain, the domain \
+                     whose wildcard certificate (*.<domain>) it publishes challenges for"
+                        .into(),
+                );
+            }
+        }
+        if let Some(domain) = &self.gateway.preview_domain {
+            // Previews answer only at <id>.<domain> then (P-F1), and with
+            // ACME only DNS-01 gets the *.<domain> certificate (P-F5).
+            if self.tls.mode == TlsMode::Acme && self.tls.dns01_hook.is_none() {
+                return Err(format!(
+                    "[gateway] preview_domain = {domain:?} with [tls] mode = \"acme\" needs \
+                     [tls] dns01_hook: previews answer only at <id>.{domain}, and without the \
+                     hook there is no *.{domain} certificate; set dns01_hook, or remove \
+                     preview_domain to serve previews under /__preview/<id>/"
+                ));
+            }
+            // The gateway's own names must not fall under it (P-F6).
+            let suffix = format!(".{domain}");
+            if let Some(name) = self.tls.domains.iter().find(|d| {
+                let d = d.to_ascii_lowercase();
+                d == *domain || d.ends_with(&suffix)
+            }) {
+                return Err(format!(
+                    "[gateway] preview_domain = {domain:?} covers the gateway's own name \
+                     {name:?} ([tls] domains): its requests would go to previews; use a \
+                     domain of its own, best a separate registrable domain such as \
+                     \"example-preview.com\""
+                ));
+            }
+        }
         if self.ship.enabled && self.ship.url.as_deref().unwrap_or("").is_empty() {
             return Err("[ship] enabled = true needs url, such as \"s3://bucket/kronik\"".into());
         }
@@ -543,6 +638,9 @@ impl Config {
                 d.display()
             ));
         }
+        if self.fork.preview_ttl.0.is_zero() {
+            return Err("[fork] preview_ttl must be more than zero, such as \"24h\"".into());
+        }
         self.api_listen()?;
         Ok(())
     }
@@ -572,6 +670,35 @@ impl Config {
         })
     }
 
+    /// The gateway's public host and port for preview URLs under the path
+    /// prefix (P-F5): the first `[tls] domains` name, else the bound
+    /// address with an unspecified IP (`0.0.0.0`, `::`) as loopback; the
+    /// port is left out when it is the scheme's default.
+    pub fn public_host(&self, bound: SocketAddr) -> String {
+        let mut addr = bound;
+        if addr.ip().is_unspecified() {
+            addr.set_ip(match addr {
+                SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+            });
+        }
+        let host = match (self.tls.domains.first(), addr) {
+            (Some(name), _) => name.clone(),
+            (None, SocketAddr::V6(a)) => format!("[{}]", a.ip()),
+            (None, SocketAddr::V4(a)) => a.ip().to_string(),
+        };
+        let default_port = if self.tls.mode == TlsMode::Off {
+            80
+        } else {
+            443
+        };
+        if addr.port() == default_port {
+            host
+        } else {
+            format!("{host}:{}", addr.port())
+        }
+    }
+
     /// The master key file: `keys.master_key_file`, else
     /// `<data_dir>/keys/master.key`. The `KRONIK_MASTER_KEY` environment
     /// variable, when set, is the key itself and no file is used.
@@ -591,9 +718,11 @@ impl Config {
     }
 
     /// Where the gateway's certificate comes from; `None` without TLS. The
-    /// ACME cache is `<data_dir>/tls/acme`.
+    /// ACME cache is `<data_dir>/tls/acme`. With `dns01_hook`, ACME also
+    /// gets `*.<preview_domain>`; the hook gets two minutes per call.
     pub fn certificates(&self) -> Option<kronik_gateway::tls::Certificates> {
-        use kronik_gateway::tls::{Acme, Certificates};
+        use kronik_gateway::tls::{Acme, Certificates, ExecHook, Wildcard};
+        use std::sync::Arc;
         match self.tls.mode {
             TlsMode::Off => None,
             TlsMode::Files => Some(Certificates::Files {
@@ -606,6 +735,16 @@ impl Config {
                 directory: self.tls.acme_directory.clone(),
                 cache_dir: self.server.data_dir.join("tls/acme"),
                 ca_file: self.tls.acme_ca_file.clone(),
+                wildcard: self.tls.dns01_hook.clone().and_then(|program| {
+                    Some(Wildcard {
+                        domain: self.gateway.preview_domain.clone()?,
+                        dns01: Arc::new(ExecHook {
+                            program,
+                            timeout: Duration::from_secs(120),
+                        }),
+                        propagation: self.tls.dns01_propagation.0,
+                    })
+                }),
             })),
         }
     }
@@ -786,6 +925,46 @@ mod tests {
     }
 
     #[test]
+    fn preview_keys_parse_and_bad_values_are_errors() {
+        let c = parse(
+            "[gateway]\npreview_domain = \"preview.example.com\"\n[fork]\npreview_ttl = \"2h\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.gateway.preview_domain.as_deref(),
+            Some("preview.example.com")
+        );
+        assert_eq!(c.fork.preview_ttl, Dur::secs(7200));
+        assert_eq!(Config::default().fork.preview_ttl, Dur::secs(86_400));
+        let long_label = format!("{}.example.com", "a".repeat(64));
+        let long_name = format!("{}example.com", "abcdefghi.".repeat(23));
+        for bad in [
+            "https://p.example.com",
+            ".p.example.com",
+            "localhost",
+            "P.example.com",
+            "-p.example.com",
+            "p-.example.com",
+            "10.0.0.1",
+            long_label.as_str(),
+            long_name.as_str(),
+        ] {
+            let e = parse(&format!("[gateway]\npreview_domain = {bad:?}\n")).unwrap_err();
+            assert!(e.to_string().contains("preview_domain"), "{bad}: {e}");
+        }
+        let max_label = format!("{}.example.com", "a".repeat(63));
+        for good in [
+            "p-1.example.com",
+            "xn--bcher-kva.example",
+            max_label.as_str(),
+        ] {
+            parse(&format!("[gateway]\npreview_domain = {good:?}\n")).unwrap();
+        }
+        let e = parse("[fork]\npreview_ttl = \"0s\"\n").unwrap_err();
+        assert!(e.to_string().contains("preview_ttl"), "{e}");
+    }
+
+    #[test]
     fn unknown_keys_are_errors_with_their_line() {
         let e = parse("[server]\ndata_dir = \"/d\"\nhttp_lisen = \"0.0.0.0:80\"\n").unwrap_err();
         assert_eq!(e.line, Some(3), "{e}");
@@ -838,6 +1017,20 @@ mod tests {
             ),
             ("[tls]\nmode = \"ftp\"\n", "unknown variant `ftp`"),
             (
+                "[gateway]\npreview_domain = \"p.example\"\n[tls]\ndns01_hook = \"/h\"\n",
+                "dns01_hook needs mode = \"acme\"",
+            ),
+            (
+                "[tls]\nmode = \"acme\"\ndomains = [\"a.example\"]\nacme_email = \"o@a.example\"\n\
+                 dns01_hook = \"/h\"\n",
+                "dns01_hook needs [gateway] preview_domain",
+            ),
+            (
+                "[tls]\nmode = \"acme\"\ndomains = [\"a.example\"]\nacme_email = \"o@a.example\"\n\
+                 dns01_hook = \"/h\"\n[gateway]\npreview_domain = \"../p\"\n",
+                "use a lowercase domain",
+            ),
+            (
                 "[server]\napi_listen = \"0.0.0.0:7443\"\n",
                 "not a loopback address and [tls] is off",
             ),
@@ -858,5 +1051,67 @@ mod tests {
         .unwrap();
         assert_eq!(tls.api_listen(), Ok(Some("0.0.0.0:7443".parse().unwrap())));
         assert_eq!(parse("").unwrap().api_listen(), Ok(None));
+    }
+
+    #[test]
+    fn a_dns01_hook_adds_the_preview_wildcard_to_acme() {
+        let acme =
+            "[tls]\nmode = \"acme\"\ndomains = [\"a.example\"]\nacme_email = \"o@a.example\"\n";
+        let wildcard = |text: &str| match parse(text).unwrap().certificates() {
+            Some(kronik_gateway::tls::Certificates::Acme(acme)) => acme.wildcard,
+            other => panic!("{other:?}"),
+        };
+        assert!(wildcard(acme).is_none());
+        let w = wildcard(&format!(
+            "{acme}dns01_hook = \"/usr/local/bin/kronik-dns01\"\ndns01_propagation = \"0s\"\n\
+             [gateway]\npreview_domain = \"preview.a.example\"\n"
+        ))
+        .unwrap();
+        assert_eq!(w.domain, "preview.a.example");
+        assert_eq!(w.propagation, Duration::ZERO);
+        assert!(format!("{:?}", w.dns01).contains("/usr/local/bin/kronik-dns01"));
+    }
+
+    /// P-F5, P-F6: previews need a name of their own that can get a
+    /// certificate; prefix URLs name the gateway's public host.
+    #[test]
+    fn previews_get_valid_urls_or_the_configuration_is_refused() {
+        let acme = "[tls]\nmode = \"acme\"\ndomains = [\"www.app.example\"]\n\
+                    acme_email = \"o@app.example\"\n";
+        let e = parse(&format!(
+            "{acme}[gateway]\npreview_domain = \"example-preview.net\"\n"
+        ))
+        .unwrap_err();
+        assert!(e.message.contains("needs [tls] dns01_hook"), "{e}");
+        for covering in ["app.example", "www.app.example"] {
+            let e = parse(&format!(
+                "{acme}dns01_hook = \"/h\"\n[gateway]\npreview_domain = {covering:?}\n"
+            ))
+            .unwrap_err();
+            assert!(e.message.contains("covers the gateway's own name"), "{e}");
+        }
+        // Files mode: the operator's certificate covers *.<domain>; no TLS:
+        // plain HTTP.
+        let files = "[tls]\nmode = \"files\"\ncert_file = \"/c.pem\"\nkey_file = \"/k.pem\"\n";
+        parse(&format!(
+            "{files}[gateway]\npreview_domain = \"p.example\"\n"
+        ))
+        .unwrap();
+        parse("[gateway]\npreview_domain = \"p.example\"\n").unwrap();
+
+        let at = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let off = parse("").unwrap();
+        assert_eq!(off.public_host(at("127.0.0.1:8080")), "127.0.0.1:8080");
+        assert_eq!(off.public_host(at("0.0.0.0:80")), "127.0.0.1");
+        assert_eq!(off.public_host(at("[::]:8080")), "[::1]:8080");
+        let files = parse(files).unwrap();
+        assert_eq!(files.public_host(at("0.0.0.0:443")), "127.0.0.1");
+        assert_eq!(files.public_host(at("0.0.0.0:8443")), "127.0.0.1:8443");
+        let acme = parse(&format!(
+            "{acme}dns01_hook = \"/h\"\n[gateway]\npreview_domain = \"p.example\"\n"
+        ))
+        .unwrap();
+        assert_eq!(acme.public_host(at("0.0.0.0:443")), "www.app.example");
+        assert_eq!(acme.public_host(at("0.0.0.0:8443")), "www.app.example:8443");
     }
 }

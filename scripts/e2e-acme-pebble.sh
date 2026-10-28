@@ -3,7 +3,9 @@
 # Pebble, Let's Encrypt's test CA, by TLS-ALPN-01 on its own port, serves
 # HTTPS with it, and after a restart serves the cached certificate without a
 # new order. pebble-challtestsrv answers DNS so that the test name resolves
-# to 127.0.0.1.
+# to 127.0.0.1. With `[gateway] preview_domain` and a `[tls] dns01_hook`
+# (ADR 0026) it also gets `*.preview.kronik.test` by DNS-01: the hook sets
+# the TXT records through challtestsrv's management API.
 #
 # Usage: scripts/e2e-acme-pebble.sh [path/to/kronik]   (Linux x86_64)
 # Downloads (pinned, checked) are cached in $KRONIK_PEBBLE_CACHE, by default
@@ -43,6 +45,7 @@ chmod +x "$pebble" "$challtestsrv"
 
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 acme_port=$(free_port); mgmt_port=$(free_port); dns_port=$(free_port); https_port=$(free_port)
+chall_port=$(free_port)
 
 work="$(mktemp -d /var/tmp/kronik-acme.XXXXXX)"
 pids=()
@@ -54,7 +57,7 @@ cleanup() {
 trap cleanup EXIT
 
 "$challtestsrv" -defaultIPv4 127.0.0.1 -defaultIPv6 "" -dnsserver "127.0.0.1:$dns_port" \
-    -http01 "" -https01 "" -tlsalpn01 "" -doh "" -management "127.0.0.1:$(free_port)" \
+    -http01 "" -https01 "" -tlsalpn01 "" -doh "" -management "127.0.0.1:$chall_port" \
     >"$work/challtestsrv.log" 2>&1 &
 pids+=($!)
 cat >"$work/pebble.json" <<EOF
@@ -73,6 +76,22 @@ PEBBLE_VA_NOSLEEP=1 PEBBLE_WFE_NONCEREJECT=0 \
     "$pebble" -config "$work/pebble.json" -dnsserver "127.0.0.1:$dns_port" >"$work/pebble.log" 2>&1 &
 pids+=($!)
 
+# The DNS-01 hook: `<hook> present|cleanup <fqdn> <value>`, here against
+# challtestsrv instead of a real DNS provider's API.
+cat >"$work/dns01-hook" <<EOF
+#!/bin/sh
+set -eu
+case "\$1" in
+present) path=set-txt; body="{\"host\":\"\$2\",\"value\":\"\$3\"}" ;;
+cleanup) path=clear-txt; body="{\"host\":\"\$2\"}" ;;
+*) echo "unknown action \$1" >&2; exit 2 ;;
+esac
+echo "\$1 \$2" >>"$work/dns01-calls"
+env >>"$work/hook-env"
+curl -fsS -d "\$body" "http://127.0.0.1:$chall_port/\$path"
+EOF
+chmod +x "$work/dns01-hook"
+
 cat >"$work/kronik.toml" <<EOF
 [server]
 data_dir = "$work/data"
@@ -80,16 +99,24 @@ api_socket = "$work/api.sock"
 http_listen = "127.0.0.1:$https_port"
 admin_listen = "127.0.0.1:$(free_port)"
 
+[gateway]
+preview_domain = "preview.kronik.test"
+
 [tls]
 mode = "acme"
 domains = ["kronik.test"]
 acme_email = "ops@kronik.test"
 acme_directory = "https://127.0.0.1:$acme_port/dir"
 acme_ca_file = "$cache/minica.pem"
+dns01_hook = "$work/dns01-hook"
+dns01_propagation = "0s"
 EOF
 
+# The master key comes from the environment, to check that the hook never
+# sees it; DNS_API_TOKEN stands in for the hook's DNS credentials.
 start_kronik() { # log file
-    KRONIK_LOG=info "$bin" serve --config "$work/kronik.toml" >"$1" 2>&1 &
+    KRONIK_LOG=info KRONIK_MASTER_KEY="$(printf '%064d' 7)" DNS_API_TOKEN=dns \
+        "$bin" serve --config "$work/kronik.toml" >"$1" 2>&1 &
     pids+=($!)
     kronik_pid=$!
 }
@@ -100,6 +127,14 @@ https_ok() {
     curl -sS --max-time 5 --cacert "$work/pebble-root.pem" \
         --resolve "kronik.test:$https_port:127.0.0.1" "https://kronik.test:$https_port/" 2>/dev/null |
         grep -q ROUTE_NOT_FOUND
+}
+
+# A preview name gets the wildcard certificate: curl checks that it chains to
+# Pebble's root and covers the name. Any HTTP answer will do.
+preview_tls_ok() {
+    curl -sS --max-time 5 --cacert "$work/pebble-root.pem" -o /dev/null \
+        --resolve "abc.preview.kronik.test:$https_port:127.0.0.1" \
+        "https://abc.preview.kronik.test:$https_port/" 2>/dev/null
 }
 
 wait_for() { # description command...
@@ -120,13 +155,28 @@ start_kronik "$work/kronik-1.log"
 wait_for "a certificate from Pebble" https_ok
 grep -q "ACME: installed a new certificate" "$work/kronik-1.log"
 echo "ok: the gateway got a certificate from Pebble by TLS-ALPN-01 and serves HTTPS"
+wait_for "the wildcard certificate from Pebble" preview_tls_ok
+grep -q "present _acme-challenge.preview.kronik.test." "$work/dns01-calls"
+grep -q "cleanup _acme-challenge.preview.kronik.test." "$work/dns01-calls"
+grep -q "^DNS_API_TOKEN=dns$" "$work/hook-env"
+if grep -q "^KRONIK_MASTER_KEY=" "$work/hook-env"; then
+    echo "error: the DNS-01 hook saw KRONIK_MASTER_KEY" >&2
+    exit 1
+fi
+echo "ok: the gateway got *.preview.kronik.test by DNS-01 through the hook and serves it by SNI"
+cp "$work/dns01-calls" "$work/dns01-calls-1"
 
 kill "$kronik_pid"
 wait "$kronik_pid" 2>/dev/null || true
 start_kronik "$work/kronik-2.log"
 wait_for "the restarted gateway" https_ok
+wait_for "the restarted gateway's wildcard certificate" preview_tls_ok
 if grep -q "ACME: installed a new certificate" "$work/kronik-2.log"; then
     echo "error: the restart ordered a new certificate instead of using the cached one" >&2
+    exit 1
+fi
+if ! cmp -s "$work/dns01-calls" "$work/dns01-calls-1"; then
+    echo "error: the restart ran the DNS-01 hook instead of using the cached wildcard" >&2
     exit 1
 fi
 echo "ok: after a restart the gateway serves the cached certificate without a new order"

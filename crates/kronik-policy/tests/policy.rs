@@ -5,7 +5,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use kronik_policy::{
-    Action, DEFAULT_RULES_TOML, Evaluation, Fired, PII_MASKED_RULE, PolicyError, Rule, RuleSet,
+    Action, DEFAULT_GUARDS_TOML, DEFAULT_RULES_TOML, Evaluation, Fired, FiredGuard, GuardAction,
+    PII_MASKED_RULE, PolicyError, Rule, RuleSet,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -458,7 +459,7 @@ fn unknown_keys_are_errors() {
     assert_eq!(error.name, None);
     assert_eq!(
         error.message,
-        "unknown key `rules`: a rules file has only [[rule]] tables"
+        "unknown key `rules`: a rules file has only [[rule]] and [[guard]] tables"
     );
 
     let error = parse_error("version = 1\n");
@@ -480,6 +481,171 @@ fn duplicate_names_are_errors() {
     assert_eq!(
         error.message,
         "duplicate name: an earlier rule has the same name"
+    );
+}
+
+fn guard_metrics(after_turns: u64, after_failed: u64, before_p99: f64, after_p99: f64) -> Value {
+    let window = |turns: u64, failed: u64, p99: f64| {
+        let rate = if turns == 0 {
+            0.0
+        } else {
+            failed as f64 / turns as f64
+        };
+        json!({"turns": turns, "failed": failed, "error_rate": rate,
+               "latency_p50_ms": p99 / 2.0, "latency_p99_ms": p99})
+    };
+    json!({"epoch": 3, "kinds": ["counter"], "schema_changed": false, "observed_ms": 60_000,
+           "before": window(20, 0, before_p99), "after": window(after_turns, after_failed, after_p99)})
+}
+
+#[test]
+fn guards_parse_next_to_rules_and_default_when_absent() {
+    let set = RuleSet::parse_toml(
+        "[[rule]]\nname = \"r\"\nwhen = \"true\"\naction = \"deny\"\n\n\
+         [[guard]]\nname = \"any-failure\"\nwhen = \"guard.after.failed > 0\"\naction = \"rollback\"\n\n\
+         [[guard]]\nname = \"r\"\nwhen = \"guard.after.latency_p99_ms > 100.0\"\naction = \"alert\"\n",
+    )
+    .unwrap();
+    assert_eq!(set.rules.len(), 1);
+    let names: Vec<_> = set
+        .effective_guards()
+        .iter()
+        .map(|g| (g.name.as_str(), g.action))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("any-failure", GuardAction::Rollback),
+            ("r", GuardAction::Alert)
+        ]
+    );
+    let eval = set.evaluate_guards(&guard_metrics(10, 1, 10.0, 200.0));
+    assert_eq!(
+        eval.fired,
+        [
+            FiredGuard {
+                name: "any-failure".into(),
+                action: GuardAction::Rollback
+            },
+            FiredGuard {
+                name: "r".into(),
+                action: GuardAction::Alert
+            },
+        ]
+    );
+    assert!(eval.errors.is_empty());
+
+    // No `guard` key: the defaults, which parse.
+    let defaults = RuleSet::parse_toml(DEFAULT_GUARDS_TOML).unwrap();
+    assert_eq!(
+        RuleSet::defaults().effective_guards(),
+        defaults.guards.as_slice()
+    );
+    let rules = RuleSet::defaults();
+    let fired = rules
+        .evaluate_guards(&guard_metrics(20, 5, 10.0, 10.0))
+        .fired;
+    assert_eq!(
+        fired,
+        [FiredGuard {
+            name: "error-rate-up".into(),
+            action: GuardAction::Rollback
+        }]
+    );
+    let fired = rules
+        .evaluate_guards(&guard_metrics(10, 0, 10.0, 100.0))
+        .fired;
+    assert_eq!(
+        fired,
+        [FiredGuard {
+            name: "latency-p99-up".into(),
+            action: GuardAction::Alert
+        }]
+    );
+}
+
+/// Review W-M4: one failure in a small window is not a breach; the default
+/// rollback needs 20 turns and 3 failures after the deployment.
+#[test]
+fn the_default_error_guard_needs_20_turns_and_3_failures() {
+    let rules = RuleSet::defaults();
+    for (turns, failed) in [(10, 1), (19, 1), (19, 9), (40, 2)] {
+        assert!(
+            rules
+                .evaluate_guards(&guard_metrics(turns, failed, 10.0, 10.0))
+                .fired
+                .is_empty(),
+            "{turns} turns, {failed} failed"
+        );
+    }
+    let fired = rules
+        .evaluate_guards(&guard_metrics(20, 3, 10.0, 10.0))
+        .fired;
+    assert_eq!(fired.len(), 1, "{fired:?}");
+}
+
+/// Review W-M3: before a measured p99 (records from before M11 have no
+/// duration), the default latency guard does not fire.
+#[test]
+fn the_default_latency_guard_needs_a_measured_p99_before() {
+    let rules = RuleSet::defaults();
+    assert!(
+        rules
+            .evaluate_guards(&guard_metrics(10, 0, 0.0, 100.0))
+            .fired
+            .is_empty()
+    );
+}
+
+/// Review W-M5: a `guard` key, even `guard = []`, replaces the defaults.
+#[test]
+fn an_empty_guard_list_means_no_guards() {
+    let set = RuleSet::parse_toml(
+        "guard = []\n\n[[rule]]\nname = \"r\"\nwhen = \"true\"\naction = \"allow\"\n",
+    )
+    .unwrap();
+    assert!(set.has_guard_key);
+    assert!(set.effective_guards().is_empty());
+    assert!(
+        set.evaluate_guards(&guard_metrics(100, 100, 10.0, 1000.0))
+            .fired
+            .is_empty()
+    );
+    // Rules only: the defaults still apply.
+    let set = RuleSet::parse_toml("[[rule]]\nname = \"r\"\nwhen = \"true\"\naction = \"allow\"\n")
+        .unwrap();
+    assert!(!set.has_guard_key);
+    assert_eq!(set.effective_guards().len(), 2);
+}
+
+#[test]
+fn a_guard_that_errors_does_not_fire_and_guard_errors_name_the_guard() {
+    let set = RuleSet::parse_toml(
+        "[[guard]]\nname = \"broken\"\nwhen = \"guard.after.nope > 0\"\naction = \"rollback\"\n",
+    )
+    .unwrap();
+    let eval = set.evaluate_guards(&guard_metrics(10, 0, 1.0, 1.0));
+    assert!(eval.fired.is_empty(), "{eval:?}");
+    assert_eq!(eval.errors.len(), 1);
+    assert_eq!(eval.errors[0].name, "broken");
+
+    // Review W-M2: a guard sees `guard`; one that names `diff` is refused.
+    let error = parse_error(
+        "[[guard]]\nname = \"g\"\nwhen = \"diff.summary.turns > 0\"\naction = \"alert\"\n",
+    );
+    assert_eq!(
+        error.to_string(),
+        "guard `g`: invalid `when`: a guard sees the variable `guard`, not `diff`"
+    );
+    let error = parse_error("[[guard]]\nname = \"g\"\nwhen = \"true\"\naction = \"deny\"\n");
+    assert_eq!(
+        error.to_string(),
+        "guard `g`: unknown action `deny`: use alert or rollback"
+    );
+    let error = parse_error("guard = 1\n");
+    assert_eq!(
+        error.message,
+        "`guard` must be an array of tables ([[guard]])"
     );
 }
 

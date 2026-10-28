@@ -180,8 +180,9 @@ blake3(bytes)`. The JSON Schema is
 [`docs/reference/diff-v1.schema.json`](../reference/diff-v1.schema.json),
 and tests validate real diffs against it. It includes the fields added as
 built: `live` (§11), `stubs`, `live_allowlist` and `no_pii` in `options`,
-`pii_masked` (M8), and `kinds`, each actor kind on its own, after `summary`
-(M9, [m9-system-proposals.md](m9-system-proposals.md) §3, ADR 0012).
+`pii_masked` (M8), `kinds`, each actor kind on its own, after `summary`
+(M9, [m9-system-proposals.md](m9-system-proposals.md) §3, ADR 0012), and
+`preview_inputs` and `samples.preview` (M11, §11).
 
 ```json
 {
@@ -223,6 +224,7 @@ built: `live` (§11), `stubs`, `live_allowlist` and `no_pii` in `options`,
 | `verified_through_lsn` | int | the last main LSN whose root inputs ran through the fork's code |
 | `changed` | bool | any difference anywhere in the diff |
 | `pii_masked` | int | in a `--no-pii` fork, differing turns that read pseudonyms, not counted as divergent (M8); absent when 0 |
+| `preview_inputs` | int | in a preview fork, the requests it took at its URL (M11, §11); absent when 0 |
 
 ### 5.2 `causes`
 
@@ -284,7 +286,9 @@ over matched turns; `*_change = (fork - prod) / prod` (0.0 when prod is 0).
 ### 5.10 `samples`
 
 Up to 20 fork turn ids per category, in order: `{"origins": [...], "consequences": [...], "responses_changed": [...], "effects_changed": [...], "errors_introduced": [...], "synthetic": [...]}`,
-and `"pii_masked": [...]` when there are any (M8).
+and `"pii_masked": [...]` when there are any (M8), and `"preview": [{"turn",
+"method", "route", "status", "outcome"}]` for a preview's requests (M11,
+§11).
 Fork turn ids: continuous turns `<fork>:<lsn>`; isolated turns
 `<fork>:r<root_lsn>.<n>` (n-th turn of that tree).
 
@@ -370,6 +374,14 @@ This section is the contract for `kronik-policy`.
   counter +2, approximate payments, sampled payments, introduced error)
   are committed with this design; for each, the expected default-rule
   outcome is in its `"expected_policy"` field (removed before evaluation).
+- **As built (M11): guards.** A rules file may also hold `[[guard]]`
+  tables (`name`, `when`, `action = "alert" | "rollback"`), evaluated by
+  `kronik watch` with the variable `guard` instead of `diff`
+  (`RuleSet::guards`, `RuleSet::evaluate_guards(&Value) -> GuardEvaluation
+  { fired, errors }`; an erroring guard does not fire and is listed in
+  `errors`; a guard naming `diff` is refused; a `guard` key, even
+  `guard = []`, replaces the default guards). Rule evaluation ignores
+  guards. Contract: `docs/design/m11-watch.md` §2.
 
 ## 8. Proposals, approval, promote, rollback
 
@@ -557,3 +569,12 @@ differs from it:
   nothing is sealed, so it changes no value.
 - **Codes**: unknown proposals answer `PROPOSAL_NOT_FOUND`, unknown epochs
   `DEPLOYMENT_NOT_FOUND`.
+- **Preview inputs (M11)**: a preview fork's requests run under causal
+  roots starting with `preview-`. The diff lifts their turns out of the
+  comparison before §4 runs: they count in `summary.preview_inputs` and
+  `samples.preview` (the root turns, with method, route pattern, HTTP
+  status and outcome), never in `turns_fork`, divergence, causes, effects,
+  grounding or errors; their writes show in `state.continuous` like any
+  continuous turn's. The Markdown adds a "Preview inputs" summary row
+  (counts only, also in `--summary`) and a section listing them. See
+  [M11 previews](m11-preview.md).

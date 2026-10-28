@@ -1,7 +1,10 @@
 //! The HTTP gateway: routes from the deployed manifests, root inputs,
 //! ingress `Idempotency-Key` and the turn timeout. The service function
 //! [`Gateway::handle`] uses only `Env` and the node, so the simulator calls
-//! it directly; [`server`] binds it to hyper on TCP (no TLS in M1).
+//! it directly; [`server`] binds it to hyper on TCP (no TLS in M1). With a
+//! [`PreviewRouter`] (M11), the host `<id>.<preview_domain>`, or
+//! `/__preview/<id>/...` when no preview domain is set, goes to preview
+//! forks instead of main.
 
 #[cfg(feature = "server")]
 pub mod server;
@@ -14,10 +17,31 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kronik_core::env::BoxFuture;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, valid_key};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Ingress, Node, RouteEntry, TurnResult};
+
+/// The path prefix of preview requests: `/__preview/<id>/...`.
+pub const PREVIEW_PREFIX: &str = "/__preview/";
+
+/// Preview forks (M11, ADR 0025): `kronik serve` sets one on the gateway;
+/// the simulator and the test host do not.
+pub trait PreviewRouter: Send + Sync {
+    /// The routes of preview `id`'s code; `PREVIEW_NOT_FOUND` for an
+    /// unknown or expired id.
+    fn routes(&self, id: &str) -> BoxFuture<'_, Result<Vec<RouteEntry>, ApiError>>;
+    /// Runs `http` as a new root input of preview `id` and returns the
+    /// finished turn. Runs to its end even when the caller stops waiting.
+    fn send(
+        self: Arc<Self>,
+        id: String,
+        actor: ActorRef,
+        http: pb::HttpInput,
+        subject: Option<String>,
+    ) -> BoxFuture<'static, Result<TurnResult, ApiError>>;
+}
 
 /// Gateway settings.
 #[derive(Debug, Clone)]
@@ -34,6 +58,9 @@ pub struct GatewayConfig {
     /// Reverse proxies (`gateway.trusted_proxies`): their connections are
     /// exempt from the per-client connection cap.
     pub trusted_proxies: Vec<IpNet>,
+    /// Requests for the host `<id>.<preview_domain>` go to preview `<id>`
+    /// (`gateway.preview_domain`, M11).
+    pub preview_domain: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -43,6 +70,7 @@ impl Default for GatewayConfig {
             max_body: 1 << 20,
             subject_from: None,
             idempotency_header: "Idempotency-Key".into(),
+            preview_domain: None,
             trusted_proxies: Vec::new(),
         }
     }
@@ -165,6 +193,124 @@ pub struct Gateway {
     node: Arc<Node>,
     cfg: GatewayConfig,
     routes: Mutex<(Option<u64>, Vec<Route>)>,
+    preview: Option<Arc<dyn PreviewRouter>>,
+}
+
+fn to_routes(entries: Vec<RouteEntry>) -> Vec<Route> {
+    entries
+        .into_iter()
+        .map(
+            |RouteEntry {
+                 kind,
+                 method,
+                 pattern,
+             }| Route {
+                segs: parse_pattern(&pattern),
+                kind,
+                method,
+                pattern,
+            },
+        )
+        .collect()
+}
+
+/// The most specific route for `method` and `path`: fewest parameters,
+/// literals first.
+fn find(routes: &[Route], method: &str, path: &str) -> Result<Matched, ApiError> {
+    let segs: Vec<&str> = path.split('/').skip(1).collect();
+    let mut best: Option<(Vec<bool>, &Route)> = None;
+    for r in routes.iter().filter(|r| r.method == method) {
+        if r.segs.len() != segs.len() {
+            continue;
+        }
+        let ok = r.segs.iter().zip(&segs).all(|(p, s)| match p {
+            Seg::Lit(l) => l == s,
+            Seg::Param(_) => !s.is_empty(),
+        });
+        if !ok {
+            continue;
+        }
+        let shape: Vec<bool> = r.segs.iter().map(|p| matches!(p, Seg::Param(_))).collect();
+        if best.as_ref().is_none_or(|(b, _)| shape < *b) {
+            best = Some((shape, r));
+        }
+    }
+    let Some((_, r)) = best else {
+        return Err(ApiError::new(
+            ErrorCode::RouteNotFound,
+            format!("no route for {method} {path}"),
+        ));
+    };
+    let mut params = Vec::new();
+    for (p, s) in r.segs.iter().zip(&segs) {
+        if let Seg::Param(name) = p {
+            let v = percent_decode(s).ok_or_else(|| {
+                ApiError::new(ErrorCode::BadRequest, format!("invalid path segment {s:?}"))
+            })?;
+            params.push((name.clone(), v));
+        }
+    }
+    Ok(Matched {
+        kind: r.kind.clone(),
+        pattern: r.pattern.clone(),
+        params,
+    })
+}
+
+/// The preview a request is for and its path within the preview. Without
+/// `domain`, the path `/__preview/<id>/rest` -> (`id`, `/rest`). With it,
+/// only the host: any host under `<domain>` (any case, port and one
+/// trailing dot ignored) -> (the labels before the domain, path), so a
+/// mistyped id answers `PREVIEW_NOT_FOUND` instead of reaching main, and
+/// the prefix stays main's (P-F1: proposal code never runs on main's origin
+/// when previews have their own).
+fn preview_target(req: &HttpRequest, domain: Option<&str>) -> Option<(String, String)> {
+    let Some(domain) = domain else {
+        let rest = req.path.strip_prefix(PREVIEW_PREFIX)?;
+        let (id, path) = rest
+            .find('/')
+            .map_or((rest, "/"), |i| (&rest[..i], &rest[i..]));
+        return Some((id.to_owned(), path.to_owned()));
+    };
+    let host = req
+        .headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("host"))?
+        .1
+        .to_ascii_lowercase();
+    let host = host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h);
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let id = host.strip_suffix(domain)?.strip_suffix('.')?;
+    (!id.is_empty()).then(|| (id.to_owned(), req.path.clone()))
+}
+
+/// The response headers a prefix preview keeps (N3): what a page needs to
+/// render and cache. Anything else could act on main's origin (HSTS,
+/// Clear-Site-Data, NEL/Report-To, Set-Cookie, a redirecting Location).
+const PREFIX_HEADERS: &[&str] = &[
+    "content-type",
+    "content-length",
+    "content-language",
+    "content-disposition",
+    "cache-control",
+    "expires",
+    "etag",
+    "last-modified",
+    "vary",
+    "retry-after",
+    TURN_ID_HEADER,
+];
+
+/// A preview answering through the path prefix is on main's origin: it
+/// keeps only [`PREFIX_HEADERS`], and its page runs sandboxed (an opaque
+/// origin), so its scripts can neither read main's cookies nor call main
+/// with them.
+fn sandboxed(mut resp: HttpResponse) -> HttpResponse {
+    resp.headers
+        .retain(|(n, _)| PREFIX_HEADERS.iter().any(|h| n.eq_ignore_ascii_case(h)));
+    resp.headers
+        .push(("content-security-policy".into(), "sandbox".into()));
+    resp
 }
 
 /// A route match: kind, actor key, pattern and parameters in order.
@@ -366,69 +512,25 @@ impl Gateway {
             node,
             cfg,
             routes: Mutex::new((None, Vec::new())),
+            preview: None,
         }
+    }
+
+    /// Routes `<id>.<preview_domain>`, or `/__preview/<id>/...` without a
+    /// preview domain, to `router` (M11).
+    pub fn with_preview(mut self, router: Arc<dyn PreviewRouter>) -> Gateway {
+        self.preview = Some(router);
+        self
     }
 
     fn matched(&self, method: &str, path: &str) -> Result<Matched, ApiError> {
         let (epoch, entries) = self.node.routes();
         let mut cache = self.routes.lock().unwrap_or_else(|e| e.into_inner());
         if cache.0 != Some(epoch) {
-            cache.1 = entries
-                .into_iter()
-                .map(
-                    |RouteEntry {
-                         kind,
-                         method,
-                         pattern,
-                     }| Route {
-                        segs: parse_pattern(&pattern),
-                        kind,
-                        method,
-                        pattern,
-                    },
-                )
-                .collect();
+            cache.1 = to_routes(entries);
             cache.0 = Some(epoch);
         }
-        let segs: Vec<&str> = path.split('/').skip(1).collect();
-        // The most specific match wins: fewest parameters, literals first.
-        let mut best: Option<(Vec<bool>, &Route)> = None;
-        for r in cache.1.iter().filter(|r| r.method == method) {
-            if r.segs.len() != segs.len() {
-                continue;
-            }
-            let ok = r.segs.iter().zip(&segs).all(|(p, s)| match p {
-                Seg::Lit(l) => l == s,
-                Seg::Param(_) => !s.is_empty(),
-            });
-            if !ok {
-                continue;
-            }
-            let shape: Vec<bool> = r.segs.iter().map(|p| matches!(p, Seg::Param(_))).collect();
-            if best.as_ref().is_none_or(|(b, _)| shape < *b) {
-                best = Some((shape, r));
-            }
-        }
-        let Some((_, r)) = best else {
-            return Err(ApiError::new(
-                ErrorCode::RouteNotFound,
-                format!("no route for {method} {path}"),
-            ));
-        };
-        let mut params = Vec::new();
-        for (p, s) in r.segs.iter().zip(&segs) {
-            if let Seg::Param(name) = p {
-                let v = percent_decode(s).ok_or_else(|| {
-                    ApiError::new(ErrorCode::BadRequest, format!("invalid path segment {s:?}"))
-                })?;
-                params.push((name.clone(), v));
-            }
-        }
-        Ok(Matched {
-            kind: r.kind.clone(),
-            pattern: r.pattern.clone(),
-            params,
-        })
+        find(&cache.1, method, path)
     }
 
     /// Serves one request: route, admit the root input, wait for the turn
@@ -458,7 +560,89 @@ impl Gateway {
                 ),
             ));
         }
+        if let Some(router) = &self.preview
+            && let Some((id, path)) = preview_target(&req, self.cfg.preview_domain.as_deref())
+        {
+            return self.serve_preview(router.clone(), id, path, req).await;
+        }
         let m = self.matched(&req.method, &req.path)?;
+        let (actor, http, subject) = self.input(req, m)?;
+        let (waiter, joined) = match self.node.ingress(actor, http, subject)? {
+            Ingress::Done(r) => return Ok(turn_response(&r)),
+            Ingress::Started(w) => (w, false),
+            Ingress::Joined(w) => (w, true),
+        };
+        match self
+            .node
+            .env()
+            .timeout(self.cfg.timeout, waiter.wait())
+            .await
+        {
+            Ok(r) => Ok(turn_response(&r?)),
+            Err(_) if joined => Err(ApiError::new(
+                ErrorCode::IdempotencyInFlight,
+                "the original request with this Idempotency-Key is still running",
+            )),
+            Err(_) => Err(self.timed_out()),
+        }
+    }
+
+    fn timed_out(&self) -> ApiError {
+        ApiError::new(
+            ErrorCode::GatewayTimeout,
+            format!(
+                "the turn did not finish within {} ms; it still completes",
+                self.cfg.timeout.as_millis()
+            ),
+        )
+    }
+
+    /// A request for preview `id`, at `path` within it: matched against the
+    /// preview's routes and run as a root input of the preview fork. No
+    /// ingress deduplication: its key and hash are cleared, so the fork
+    /// stores no `ingress_keys` row per request (N1).
+    async fn serve_preview(
+        &self,
+        router: Arc<dyn PreviewRouter>,
+        id: String,
+        path: String,
+        mut req: HttpRequest,
+    ) -> Result<HttpResponse, ApiError> {
+        // New input, refused like main's on a fatal node or a full disk.
+        self.node.check_running()?;
+        let routes = to_routes(router.routes(&id).await?);
+        req.path = path;
+        let m = find(&routes, &req.method, &req.path)?;
+        let (actor, mut http, subject) = self.input(req, m)?;
+        http.idempotency_key.clear();
+        http.request_hash.clear();
+        // On main's origin the browser sends main's credentials (N2): the
+        // proposal's code must not see them. The subject is already read.
+        if self.cfg.preview_domain.is_none() {
+            http.headers.retain(|h| {
+                !["cookie", "authorization", "proxy-authorization"]
+                    .iter()
+                    .any(|n| h.name.eq_ignore_ascii_case(n))
+            });
+        }
+        let turn = router.send(id, actor, http, subject);
+        let resp = match self.node.env().timeout(self.cfg.timeout, turn).await {
+            Ok(r) => turn_response(&r?),
+            Err(_) => return Err(self.timed_out()),
+        };
+        Ok(match self.cfg.preview_domain {
+            None => sandboxed(resp),
+            Some(_) => resp,
+        })
+    }
+
+    /// The root input of a matched request: its actor, the HTTP input and
+    /// its subject.
+    fn input(
+        &self,
+        req: HttpRequest,
+        m: Matched,
+    ) -> Result<(ActorRef, pb::HttpInput, Option<String>), ApiError> {
         let key = m
             .params
             .iter()
@@ -570,30 +754,7 @@ impl Gateway {
             sealed_path,
             sealed_query,
         };
-        let (waiter, joined) = match self.node.ingress(actor, http, subject)? {
-            Ingress::Done(r) => return Ok(turn_response(&r)),
-            Ingress::Started(w) => (w, false),
-            Ingress::Joined(w) => (w, true),
-        };
-        match self
-            .node
-            .env()
-            .timeout(self.cfg.timeout, waiter.wait())
-            .await
-        {
-            Ok(r) => Ok(turn_response(&r?)),
-            Err(_) if joined => Err(ApiError::new(
-                ErrorCode::IdempotencyInFlight,
-                "the original request with this Idempotency-Key is still running",
-            )),
-            Err(_) => Err(ApiError::new(
-                ErrorCode::GatewayTimeout,
-                format!(
-                    "the turn did not finish within {} ms; it still completes",
-                    self.cfg.timeout.as_millis()
-                ),
-            )),
-        }
+        Ok((actor, http, subject))
     }
 }
 
@@ -606,6 +767,63 @@ mod tests {
     use kronik_privacy::sealer::Sealer;
 
     use super::*;
+
+    fn req(path: &str, host: &str) -> HttpRequest {
+        HttpRequest {
+            method: "GET".into(),
+            path: path.into(),
+            query: String::new(),
+            headers: vec![("Host".into(), host.into())],
+            body: Vec::new(),
+            peer: None,
+        }
+    }
+
+    /// P-F1, P-F6: the prefix only without a preview domain; with one, any
+    /// host under it, in any case, with a port or a trailing dot.
+    #[test]
+    fn preview_targets_from_the_prefix_or_the_host() {
+        let t = |path, host, domain| preview_target(&req(path, host), domain);
+        let some = |id: &str, path: &str| Some((id.to_owned(), path.to_owned()));
+        assert_eq!(t("/__preview/v-1/a/b", "x", None), some("v-1", "/a/b"));
+        assert_eq!(t("/__preview/v-1", "x", None), some("v-1", "/"));
+        assert_eq!(t("/__preview/v-1/", "x", None), some("v-1", "/"));
+        assert_eq!(t("/a/b", "v-1.p.example", None), None);
+        let d = Some("p.example");
+        assert_eq!(t("/__preview/v-1/a", "app.example", d), None);
+        assert_eq!(
+            t("/__preview/v-1/a", "v-2.p.example", d),
+            some("v-2", "/__preview/v-1/a")
+        );
+        assert_eq!(t("/a", "V-1.P.Example:8443", d), some("v-1", "/a"));
+        assert_eq!(t("/a", "v-1.p.example.", d), some("v-1", "/a"));
+        assert_eq!(t("/a", "v-1.p.example.:80", d), some("v-1", "/a"));
+        assert_eq!(t("/a", "x.v-1.p.example", d), some("x.v-1", "/a"));
+        assert_eq!(t("/a", "p.example", d), None);
+        assert_eq!(t("/a", "v-1.xp.example", d), None);
+    }
+
+    /// P-F1: a response through the prefix drops Set-Cookie (any case) and
+    /// carries the sandbox policy.
+    #[test]
+    fn a_prefix_response_sets_no_cookie_and_is_sandboxed() {
+        let r = sandboxed(HttpResponse {
+            status: 200,
+            headers: vec![
+                ("Set-Cookie".into(), "s=1".into()),
+                ("set-cookie".into(), "t=2".into()),
+                ("content-type".into(), "text/html".into()),
+            ],
+            body: Vec::new(),
+        });
+        assert_eq!(
+            r.headers,
+            [
+                ("content-type".to_owned(), "text/html".to_owned()),
+                ("content-security-policy".to_owned(), "sandbox".to_owned()),
+            ]
+        );
+    }
 
     #[test]
     fn a_failure_inside_kronik_names_no_file() {

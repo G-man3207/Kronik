@@ -193,6 +193,13 @@ impl Api {
             .node
             .erase_subject(&r.subject, audit, r.dry_run)
             .await?;
+        // Previews hold the values they revealed when they started: they
+        // start again without the erased ones (P-F11).
+        if !r.dry_run
+            && let Some(proposals) = &self.proposals
+        {
+            proposals.forget_preview_states();
+        }
         ok(&ErasureResponse {
             dry_run: r.dry_run,
             subject: r.subject,

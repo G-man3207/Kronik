@@ -567,6 +567,10 @@ async fn m3_endpoints() {
     // Policy: defaults, test, set.
     let (_, v) = call(&api, "GET", "/v1/policy", Value::Null).await;
     assert_eq!(v["default"], true);
+    // Review W-M5: `policy show` shows the guards in force.
+    assert_eq!(v["default_guards"], true, "{v}");
+    assert_eq!(v["guards"][0]["name"], "error-rate-up", "{v}");
+    assert_eq!(v["guards"][0]["action"], "rollback", "{v}");
     let (s, v) = call(&api, "POST", "/v1/policy/test", json!({"proposal": "try"})).await;
     assert_eq!((s, &v["outcome"]), (200, &json!("allow")), "{v}");
     let strict = "[[rule]]\nname = \"any-change\"\nwhen = \"diff.summary.changed\"\naction = \"require_approval\"\n";
@@ -602,6 +606,26 @@ async fn m3_endpoints() {
     assert_eq!(
         (&v["default"], &v["rules_toml"]),
         (&json!(false), &json!(strict))
+    );
+    // Rules only: the default guards still apply. `guard = []`: none.
+    assert_eq!(
+        (&v["default_guards"], v["guards"].as_array().map(Vec::len)),
+        (&json!(true), Some(2))
+    );
+    let no_guards = format!("guard = []\n\n{strict}");
+    let (s, v) = call(
+        &api,
+        "PUT",
+        "/v1/policy",
+        json!({"rules_toml": no_guards, "reason": "r"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let (_, v) = call(&api, "GET", "/v1/policy", Value::Null).await;
+    assert_eq!(
+        (&v["default_guards"], &v["guards"]),
+        (&json!(false), &json!([])),
+        "{v}"
     );
 
     // Propose under the stricter policy: approval, then promote.

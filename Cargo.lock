@@ -1859,6 +1859,7 @@ dependencies = [
  "rusqlite",
  "rustix",
  "rustls",
+ "rustls-native-certs",
  "schemars",
  "serde",
  "serde_json",
@@ -1973,6 +1974,7 @@ dependencies = [
  "blake3",
  "kronik-core",
  "kronik-effects",
+ "kronik-gateway",
  "kronik-log",
  "kronik-metrics",
  "kronik-policy",
@@ -1988,6 +1990,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2007,6 +2010,7 @@ dependencies = [
  "kronik-proto",
  "kronik-sched",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "serde_json",

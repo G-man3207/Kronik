@@ -824,3 +824,94 @@ fn the_stdio_bridge_without_a_daemon_says_how_to_start_one() {
     assert!(stderr.contains("UNAVAILABLE"), "{stderr}");
     assert!(stderr.contains("kronik serve"), "{stderr}");
 }
+
+/// H2: `kronik mcp --token` acts as that token, not as the socket's caller
+/// with every scope; `--url` is refused with the way to a remote `/mcp`.
+#[test]
+fn the_stdio_bridge_takes_the_token_flag_and_refuses_a_url() {
+    let daemon = Daemon::start();
+    let reader = token(&daemon, "reader", "read");
+    let mut child = Command::new(KRONIK)
+        .arg("--socket")
+        .arg(&daemon.socket)
+        .args(["mcp", "--token", &reader])
+        .env_remove("KRONIK_API_SOCKET")
+        .env_remove("KRONIK_TOKEN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut bridge = Bridge {
+        stdin: child.stdin.take(),
+        stdout: BufReader::new(child.stdout.take().unwrap()),
+        child,
+    };
+    bridge.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "kronik-test", "version": "0"}
+        }),
+    );
+    bridge.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let fork = bridge.request(
+        2,
+        "tools/call",
+        json!({"name": "create_fork", "arguments": {"at": "now", "name": "f", "reason": "x", "dry_run": true}}),
+    );
+    assert_eq!(
+        fork["result"]["structuredContent"]["error"]["code"], "SCOPE_MISSING",
+        "{fork}"
+    );
+    drop(bridge.stdin.take());
+    assert!(bridge.child.wait().unwrap().success());
+
+    let out = Command::new(KRONIK)
+        .args(["mcp", "--url", "https://x:1"])
+        .env_remove("KRONIK_API_SOCKET")
+        .env_remove("KRONIK_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("BAD_REQUEST"), "{stderr}");
+    assert!(
+        stderr.contains("/mcp") && stderr.contains("Authorization: Bearer"),
+        "{stderr}"
+    );
+
+    // N3: $KRONIK_URL is refused the same way, not silently ignored.
+    let out = Command::new(KRONIK)
+        .arg("mcp")
+        .env("KRONIK_URL", "https://x:1")
+        .env_remove("KRONIK_API_SOCKET")
+        .env_remove("KRONIK_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("BAD_REQUEST") && stderr.contains("$KRONIK_URL") && stderr.contains("/mcp"),
+        "{stderr}"
+    );
+
+    // N2: a blank --token is refused, not taken as no token (every scope).
+    let out = Command::new(KRONIK)
+        .arg("--socket")
+        .arg(&daemon.socket)
+        .args(["mcp", "--token", " "])
+        .env_remove("KRONIK_API_SOCKET")
+        .env_remove("KRONIK_TOKEN")
+        .env_remove("KRONIK_URL")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("--token is empty"), "{stderr}");
+}

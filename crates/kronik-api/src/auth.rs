@@ -118,12 +118,18 @@ pub fn required_scope(method: &str, segs: &[&str]) -> Scope {
         ("GET" | "HEAD", _) => Scope::Read,
         ("PUT", ["v1", "policy"]) => Scope::Admin,
         ("POST", ["v1", "forks", ..]) | ("DELETE", ["v1", "forks", ..]) => Scope::Fork,
+        // A preview is a fork with a proposal's code: it changes nothing on
+        // main, and its requests never leave it (I7).
+        ("POST", ["v1", "previews"]) | ("DELETE", ["v1", "previews", _]) => Scope::Fork,
         ("POST", ["v1", "proposals"]) => Scope::Propose,
         ("POST", ["v1", "proposals", _, "request-approval"]) => Scope::Propose,
         ("POST", ["v1", "proposals", _, "approve"]) => Scope::Approve,
         ("POST", ["v1", "proposals", _, "promote"]) => Scope::Promote,
         ("POST", ["v1", "deployments"]) => Scope::Promote,
         ("POST", ["v1", "deployments", _, "rollback"]) => Scope::Promote,
+        ("POST", ["v1", "deployments", _, "watch"]) => Scope::Promote,
+        // Stopping a watch gives up its rollback: as much as starting one.
+        ("POST", ["v1", "watches", _, "stop"]) => Scope::Promote,
         // Grants, limits, secrets, messages and resends on main.
         _ => Scope::Operate,
     }
@@ -153,6 +159,7 @@ mod tests {
         assert!(agent.has(need("POST", "/v1/proposals")));
         assert!(!agent.has(need("POST", "/v1/proposals/p-1/approve")));
         assert!(!agent.has(need("POST", "/v1/proposals/p-1/promote")));
+        assert_eq!(need("POST", "/v1/watches/w-1/stop"), Scope::Promote);
         assert!(!agent.has(need("POST", "/v1/grants")));
         assert!(!agent.has(need("PUT", "/v1/policy")));
         assert!(agent.has(need("POST", "/v1/proposals/p-1/request-approval")));

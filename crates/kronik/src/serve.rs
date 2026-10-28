@@ -61,6 +61,14 @@ pub struct ServeArgs {
     /// result is recorded, so a crash test can kill the daemon there.
     #[arg(long, hide = true)]
     test_hold_after_call: bool,
+    /// Test hook: each isolated root input of a proposal job's replay waits
+    /// for a permit; the file holds how many have been given so far.
+    #[arg(long, hide = true, value_name = "FILE")]
+    test_replay_permits: Option<PathBuf>,
+    /// Test hook: delete expired previews this often (milliseconds)
+    /// instead of every minute.
+    #[arg(long, hide = true, value_name = "MS")]
+    test_preview_sweep_ms: Option<u64>,
     /// Test hook: a registry (`host:port`) that foreign images are pulled
     /// from over plain HTTP. Repeatable.
     #[arg(long, hide = true, value_name = "HOST:PORT")]
@@ -93,6 +101,23 @@ impl ServeArgs {
 enum LogFormat {
     Text,
     Json,
+}
+
+/// The `--test-replay-permits` file's count, polled: the permits it adds
+/// go to `gate`.
+async fn replay_permits(env: Env, path: PathBuf, gate: Arc<tokio::sync::Semaphore>) {
+    let mut given = 0usize;
+    loop {
+        let total = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if total > given {
+            gate.add_permits(total - given);
+            given = total;
+        }
+        env.clock.sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// KRONIK_LOG's filter, `info` without one.
@@ -130,8 +155,35 @@ fn init_tracing(format: LogFormat) {
     log_subscriber(format, std::env::var("KRONIK_LOG").ok().as_deref()).init();
 }
 
+impl ServeArgs {
+    /// The hidden `--test-*` flags that are set; each weakens the daemon, so
+    /// `run` warns about them. Every test hook belongs here.
+    fn test_flags(&self) -> Vec<&'static str> {
+        let set = [
+            (self.test_hold_after_call, "--test-hold-after-call"),
+            (self.test_replay_permits.is_some(), "--test-replay-permits"),
+            (
+                !self.test_insecure_registry.is_empty(),
+                "--test-insecure-registry",
+            ),
+            (
+                self.test_preview_sweep_ms.is_some(),
+                "--test-preview-sweep-ms",
+            ),
+        ];
+        set.into_iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, f)| f)
+            .collect()
+    }
+}
+
 pub fn run(args: ServeArgs) -> anyhow::Result<()> {
     init_tracing(args.log_format);
+    let test_flags = args.test_flags();
+    if !test_flags.is_empty() {
+        tracing::warn!(flags = ?test_flags, "test-only flags are set; never use them in production");
+    }
     if args.init.init {
         return crate::init::run_init(&args.init, args.config.as_deref());
     }
@@ -305,22 +357,52 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
             ),
         ));
     }
-    let gateway = Arc::new(Gateway::new(
-        node.clone(),
-        GatewayConfig {
-            timeout: config.gateway.timeout.0,
-            subject_from: config.subject_from(),
-            idempotency_header: config.gateway.idempotency_header.clone(),
-            // Checked when the configuration was read.
-            trusted_proxies: config
-                .gateway
-                .trusted_proxies
-                .iter()
-                .filter_map(|p| kronik_gateway::IpNet::parse(p).ok())
-                .collect(),
-            ..GatewayConfig::default()
-        },
-    ));
+    let mut proposals = kronik_fork::proposal::Proposals::open(node.clone(), data_dir.clone())
+        .map_err(|e| anyhow::anyhow!("loading proposals: {}", e.message))?
+        .with_live_allowlist(config.fork.live_allowlist.clone())
+        .with_promote(config.promote.max_gap.0, config.promote.catch_up_timeout.0)
+        .with_preview_ttl(config.fork.preview_ttl.0);
+    if let Some(path) = args.test_replay_permits.clone() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        proposals = proposals.with_test_gate(gate.clone());
+        drop(env.spawn(
+            "test-replay-permits",
+            replay_permits(env.clone(), path, gate),
+        ));
+    }
+    let proposals = Arc::new(proposals);
+    // Preview forks (M11): expired ones go, also those that expired while
+    // the daemon was down.
+    drop(
+        env.spawn(
+            "preview-expiry",
+            kronik_fork::proposal::preview::expire_loop(
+                proposals.clone(),
+                args.test_preview_sweep_ms
+                    .map_or(Duration::from_secs(60), Duration::from_millis),
+            ),
+        ),
+    );
+    let gateway = Arc::new(
+        Gateway::new(
+            node.clone(),
+            GatewayConfig {
+                timeout: config.gateway.timeout.0,
+                subject_from: config.subject_from(),
+                idempotency_header: config.gateway.idempotency_header.clone(),
+                preview_domain: config.gateway.preview_domain.clone(),
+                // Checked when the configuration was read.
+                trusted_proxies: config
+                    .gateway
+                    .trusted_proxies
+                    .iter()
+                    .filter_map(|p| kronik_gateway::IpNet::parse(p).ok())
+                    .collect(),
+                ..GatewayConfig::default()
+            },
+        )
+        .with_preview(proposals.clone()),
+    );
     let tls = config
         .certificates()
         .map(kronik_gateway::tls::start)
@@ -331,17 +413,24 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding the gateway on {http_listen}"))?;
     let bound = tcp.local_addr().unwrap_or(http_listen);
-    let proposals = kronik_fork::proposal::Proposals::open(node.clone(), data_dir.clone())
-        .map_err(|e| anyhow::anyhow!("loading proposals: {}", e.message))?
-        .with_live_allowlist(config.fork.live_allowlist.clone())
-        .with_promote(config.promote.max_gap.0, config.promote.catch_up_timeout.0);
     let tokens_db = data_dir.join("keys").join("tokens.db");
     let tokens =
         kronik_api::tokens::TokenStore::open_file(&tokens_db).map_err(anyhow::Error::msg)?;
+    // Unfinished watches resume here (M11).
+    let watches =
+        kronik_fork::watch::Watches::open(node.clone(), proposals.clone(), data_dir.clone())
+            .map_err(|e| anyhow::anyhow!("loading watches: {}", e.message))?
+            .start();
     let api = Arc::new(
         Api::new(node.clone())
             .with_http_listen(bound.to_string())
-            .with_proposals(Arc::new(proposals))
+            .with_preview_urls(
+                config.gateway.preview_domain.clone(),
+                tls.is_some(),
+                config.public_host(bound),
+            )
+            .with_proposals(proposals)
+            .with_watches(watches)
             .with_tokens(Arc::new(tokens))
             .with_foreign(foreign.clone()),
     );
@@ -442,7 +531,45 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser as _;
     use tracing::Level;
+
+    #[derive(clap::Parser)]
+    struct Serve {
+        #[command(flatten)]
+        args: super::ServeArgs,
+    }
+
+    #[test]
+    fn test_flags_lists_the_set_test_hooks() {
+        let flags = |argv: &[&str]| {
+            Serve::parse_from([&["kronik"], argv].concat())
+                .args
+                .test_flags()
+        };
+        assert!(flags(&[]).is_empty());
+        assert_eq!(
+            flags(&[
+                "--test-hold-after-call",
+                "--test-replay-permits",
+                "f",
+                "--test-insecure-registry",
+                "h:1",
+                "--test-preview-sweep-ms",
+                "50"
+            ]),
+            [
+                "--test-hold-after-call",
+                "--test-replay-permits",
+                "--test-insecure-registry",
+                "--test-preview-sweep-ms"
+            ]
+        );
+        assert_eq!(
+            flags(&["--test-replay-permits", "f"]),
+            ["--test-replay-permits"]
+        );
+    }
 
     /// Runs `f` with each subscriber `kronik serve` can make for
     /// KRONIK_LOG=`spec`.

@@ -31,8 +31,8 @@ use kronik_store::Store;
 use kronik_store::sql::{FileOpener, Limits, SqlPool};
 
 pub use node::{
-    CodeSwitch, DeployResult, Ingress, Node, NodeParts, Probe, RouteEntry, StartError, Waiter,
-    normalize_pattern,
+    CodeSwitch, DeployResult, Ingress, METHODS, Node, NodeParts, Probe, RouteEntry, StartError,
+    Waiter, normalize_pattern,
 };
 pub use privacy::{ErasureDone, PrivacyModeChange};
 pub use reseal::{

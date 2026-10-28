@@ -201,6 +201,7 @@ timeout = "30s"
 idempotency_header = "Idempotency-Key"
 idempotency_ttl = "24h"
 trusted_proxies = []                 # a reverse proxy here has no per-client connection cap
+# preview_domain = "example-preview.com"   # previews only at https://<id>.<domain>/; acme needs dns01_hook
 
 [log]
 group_commit_ms = 2
@@ -234,6 +235,7 @@ sample = "100%"                       # isolated mode, stratified per route and 
 
 [fork]
 live_allowlist = []
+preview_ttl = "24h"                   # how long a preview fork lives
 
 [promote]
 max_gap = "2s"

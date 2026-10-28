@@ -159,6 +159,10 @@ pub struct Summary {
     /// Always present; 0 in identity replays.
     #[serde(default)]
     pub pii_unverified: u64,
+    /// Requests sent to a preview fork (M11): root inputs of their own,
+    /// never compared with production nor counted as divergent.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub preview_inputs: u64,
     pub confidence: f64,
     pub verified_through_lsn: Lsn,
     pub changed: bool,
@@ -353,6 +357,36 @@ pub struct Samples {
     /// Fork turns whose difference is `pii-masked`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pii_masked: Vec<String>,
+    /// Requests sent to a preview fork (M11).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview: Vec<PreviewSample>,
+}
+
+/// A request sent to a preview fork: its root turn, method, route pattern
+/// (never the raw path, ADR 0023), HTTP status and outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewSample {
+    pub turn: String,
+    pub method: String,
+    pub route: String,
+    pub status: Option<u32>,
+    pub outcome: String,
+}
+
+/// The causal root of every preview request starts with this, so the diff
+/// tells them from replayed production inputs (M11).
+pub const PREVIEW_ROOT: &str = "preview-";
+
+/// Whether a fork turn belongs to a preview request's tree.
+fn is_preview(t: &ForkTurn) -> bool {
+    t.record
+        .causal_key
+        .as_ref()
+        .is_some_and(|k| k.root.starts_with(PREVIEW_ROOT))
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -1119,7 +1153,7 @@ fn body_ops(n: &Norm, p: Option<&pb::Sealable>, f: Option<&pb::Sealable>) -> Vec
     }]
 }
 
-fn percentiles(mut v: Vec<u64>) -> Percentiles {
+pub(crate) fn percentiles(mut v: Vec<u64>) -> Percentiles {
     if v.is_empty() {
         return Percentiles::default();
     }
@@ -1182,6 +1216,8 @@ struct Acc {
     pii_masked: BTreeSet<Vec<u8>>,
     /// Turns that read pseudonyms and came out identical, with their kind.
     pii_same: BTreeMap<Vec<u8>, String>,
+    /// Requests sent to a preview fork (M11).
+    preview_inputs: u64,
     origins: u64,
     consequences: u64,
     causes: BTreeMap<(String, String), CauseAcc>,
@@ -1222,6 +1258,7 @@ impl Acc {
             divergent: BTreeMap::new(),
             pii_masked: BTreeSet::new(),
             pii_same: BTreeMap::new(),
+            preview_inputs: 0,
             origins: 0,
             consequences: 0,
             causes: BTreeMap::new(),
@@ -1244,6 +1281,43 @@ impl Acc {
 
     fn kind(&mut self, kind: String) -> &mut KindReport {
         self.by_kind.entry(kind).or_default()
+    }
+
+    /// The root turns of preview requests (M11), in log order.
+    fn preview(&mut self, turns: &[ForkTurn]) {
+        for t in turns.iter().filter(|t| {
+            t.record
+                .causal_key
+                .as_ref()
+                .is_some_and(|k| k.path.is_empty())
+        }) {
+            self.preview_inputs += 1;
+            let (method, route) = match t.record.input.as_ref().and_then(|i| i.kind.as_ref()) {
+                Some(pb::input::Kind::Http(h)) => (h.method.clone(), h.route.clone()),
+                _ => (String::new(), String::new()),
+            };
+            let outcome = t.record.outcome.as_ref();
+            let status = match outcome.and_then(|o| o.output.as_ref()) {
+                Some(pb::outcome::Output::Http(r)) => Some(r.status),
+                _ => None,
+            };
+            let outcome = pb::OutcomeKind::try_from(outcome.map_or(0, |o| o.kind))
+                .unwrap_or(pb::OutcomeKind::Unspecified)
+                .as_str_name()
+                .trim_start_matches("OUTCOME_KIND_")
+                .to_ascii_lowercase();
+            push_capped(
+                &mut self.samples.preview,
+                MAX_SAMPLES,
+                PreviewSample {
+                    turn: t.id.clone(),
+                    method,
+                    route,
+                    status,
+                    outcome,
+                },
+            );
+        }
     }
 
     fn error(
@@ -2188,7 +2262,16 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
         if full {
             replayed = index.roots.len() as u64;
         }
-        acc.compare(&prod, &sql_tagged(c.turns), None, full);
+        // Preview requests (M11) have no production counterpart: listed on
+        // their own, never compared.
+        let mut own: Cow<'_, [ForkTurn]> = Cow::Borrowed(c.turns);
+        if c.turns.iter().any(is_preview) {
+            let (preview, rest): (Vec<ForkTurn>, Vec<ForkTurn>) =
+                c.turns.iter().cloned().partition(is_preview);
+            acc.preview(&preview);
+            own = Cow::Owned(rest);
+        }
+        acc.compare(&prod, &sql_tagged(&own), None, full);
         state_continuous = continuous_state(c.fork, c.prod, &index.sealer)?;
     }
     let cumulative: Vec<ActorState> = state_continuous
@@ -2342,6 +2425,7 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
         divergent_turns: acc.divergent.len() as u64,
         pii_masked: acc.pii_masked.len() as u64,
         pii_unverified,
+        preview_inputs: acc.preview_inputs,
         origins: acc.origins,
         consequences: acc.consequences,
         exact,

@@ -3,8 +3,10 @@
 //! docs/design/m3-fork.md §9.
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -14,10 +16,12 @@ use kronik_api::types::{
     ForkDeleteResponse, ForkDeployResponse, ForkPoint, ForksResponse, PolicyResponse,
     PolicySetRequest, PolicySetResponse, PolicyTestRequest, PromoteResponse, ProposalInfo,
     ProposalsResponse, ProposeRequest, ProposeResponse, ReplayOptions, ReplayRequest,
-    ReplayResponse, ResendRequest, RollbackResponse, SwitchInfo,
+    ReplayResponse, ResendRequest, RollbackResponse, SwitchInfo, WatchInfo, WatchRequest,
+    WatchResponse, WatchTriggered, WatchesResponse,
 };
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_fork::stubs::StubRule;
+use kronik_fork::watch::EVAL_ERROR;
 use serde_json::Value;
 
 use super::render::{clip, field, next, shell_quote, table};
@@ -249,8 +253,12 @@ pub enum DiffCommand {
         /// The fork or the proposal, e.g. p-7h3k2a9c1d0e.
         name: String,
         /// Print the diff as Markdown, for a review.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "summary")]
         md: bool,
+        /// Print a short Markdown summary without bodies, state values or
+        /// actor keys, for public pull requests (M10).
+        #[arg(long)]
+        summary: bool,
     },
 }
 
@@ -270,8 +278,36 @@ pub struct ProposeArgs {
     at: Option<u64>,
     #[command(flatten)]
     options: ReplayOptionArgs,
+    /// Return as soon as the replay has started in the daemon; follow it
+    /// with `kronik proposal wait` (M10). Without it, propose follows the
+    /// replay itself, printing its progress to stderr.
+    #[arg(long = "async", conflicts_with = "dry_run")]
+    run_async: bool,
     #[command(flatten)]
     mutation: Mutation,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProposalCommand {
+    /// Show where a proposal is: its replay's progress while it runs, else
+    /// the proposal as `kronik proposals show` does. Exits 1 for a failed
+    /// proposal, also with --json.
+    Status {
+        /// The proposal, e.g. p-7h3k2a9c1d0e.
+        id: String,
+    },
+    /// Wait until a proposal's replay is done, printing its progress to
+    /// stderr (also with --json), then show the proposal. A lost
+    /// connection or a proxy's 502, 503 or 504 is retried until the
+    /// timeout. Exits 1 when the proposal failed, the timeout runs out
+    /// (PROPOSAL_RUNNING), or the daemon was never reached (UNAVAILABLE).
+    Wait {
+        /// The proposal, e.g. p-7h3k2a9c1d0e.
+        id: String,
+        /// Give up after this long [default: 1h].
+        #[arg(long, value_name = "DURATION", value_parser = units::parse_duration_ms)]
+        timeout: Option<u64>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -279,7 +315,8 @@ pub enum ProposalsCommand {
     /// List the proposals.
     List,
     /// Show a proposal: its status, its code, the policy outcome and the
-    /// behavior diff in short.
+    /// behavior diff in short; a running proposal's progress, a failed
+    /// one's error (exit 1). The same as `kronik proposal status`.
     Show {
         /// The proposal, e.g. p-7h3k2a9c1d0e.
         id: String,
@@ -301,6 +338,41 @@ pub struct RollbackArgs {
     epoch: u64,
     #[command(flatten)]
     mutation: Mutation,
+}
+
+#[derive(Debug, Args)]
+pub struct WatchArgs {
+    /// The deployment to watch, by its epoch, which `kronik promote` prints.
+    epoch: u64,
+    /// How long to watch after the deployment, at most 24h; the window
+    /// before it that the metrics are compared with is as long.
+    #[arg(long = "for", value_name = "DURATION", value_parser = units::parse_duration_ms)]
+    for_ms: u64,
+    /// Return at once; the watch runs on in the daemon
+    /// (`kronik watches show <id>`).
+    #[arg(long = "async")]
+    run_async: bool,
+    #[command(flatten)]
+    mutation: Mutation,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WatchesCommand {
+    /// List the watches.
+    List,
+    /// Show a watch: its status, the guards that fired and the last
+    /// metrics.
+    Show {
+        /// The watch, e.g. w-3k9x2a7b1c0d.
+        id: String,
+    },
+    /// Stop a watch: it alerts and rolls back no more.
+    Stop {
+        /// The watch, e.g. w-3k9x2a7b1c0d.
+        id: String,
+        #[command(flatten)]
+        mutation: Mutation,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -559,16 +631,18 @@ pub fn replay(ctx: &Ctx, a: ReplayArgs) -> Result<ExitCode, Error> {
 }
 
 pub fn diff(ctx: &Ctx, c: DiffCommand) -> Result<ExitCode, Error> {
-    let DiffCommand::Show { name, md } = c;
-    if md && ctx.json {
-        return Err(
-            ApiError::new(ErrorCode::BadRequest, "--md and --json exclude each other")
-                .with_hint("Use --md for the Markdown diff or --json for the JSON diff.")
-                .into(),
-        );
+    let DiffCommand::Show { name, md, summary } = c;
+    if (md || summary) && ctx.json {
+        return Err(ApiError::new(
+            ErrorCode::BadRequest,
+            "--md and --summary print Markdown, not --json",
+        )
+        .with_hint("Use --md or --summary for Markdown, or --json for the JSON diff.")
+        .into());
     }
-    if md {
-        let body = ctx.get(&format!("{}/diff?format=md", fork_path(&name)))?;
+    if md || summary {
+        let format = if md { "md" } else { "summary" };
+        let body = ctx.get(&format!("{}/diff?format={format}", fork_path(&name)))?;
         ctx.print_raw(&body);
         return Ok(ExitCode::SUCCESS);
     }
@@ -651,7 +725,10 @@ pub fn propose(ctx: &Ctx, a: ProposeArgs) -> Result<ExitCode, Error> {
         .iter()
         .map(|p| read_file(p, "the component").map(|b| STANDARD.encode(b)))
         .collect::<Result<Vec<_>, _>>()?;
-    let body = ctx.post(
+    // Always a job (a dry run is the exception: the API answers it at
+    // once), followed here: a broken connection loses no replay and still
+    // names the proposal.
+    let mut body = ctx.post(
         "/v1/proposals",
         &ProposeRequest {
             wasm_base64: wasm,
@@ -664,8 +741,22 @@ pub fn propose(ctx: &Ctx, a: ProposeArgs) -> Result<ExitCode, Error> {
             options: a.options.api()?,
             reason: reason.to_owned(),
             dry_run: a.mutation.dry_run,
+            run_async: !a.mutation.dry_run,
         },
     )?;
+    if !a.run_async && !a.mutation.dry_run {
+        let started: ProposeResponse = ctx.decode(&body)?;
+        let (proposal, _) = wait_done(ctx, &started.proposal.id, None)?;
+        if proposal.status == "failed" {
+            return Err(failure(&proposal));
+        }
+        // The response a sync propose gives.
+        body = serde_json::to_vec(&ProposeResponse {
+            dry_run: false,
+            proposal,
+        })
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("encoding JSON failed: {e}")))?;
+    }
     if ctx.json {
         ctx.print_raw(&body);
         return Ok(ExitCode::SUCCESS);
@@ -699,6 +790,15 @@ pub fn propose(ctx: &Ctx, a: ProposeArgs) -> Result<ExitCode, Error> {
         ctx.print(&out);
         return Ok(ExitCode::SUCCESS);
     }
+    if p.status == "running" {
+        out.push_str(&running_lines(p));
+        out.push_str(&next(&[
+            format!("kronik proposal wait {}", shell_quote(&p.id)),
+            format!("kronik proposal status {}", shell_quote(&p.id)),
+        ]));
+        ctx.print(&out);
+        return Ok(ExitCode::SUCCESS);
+    }
     let diff = fetch_diff(ctx, &p.fork)?;
     let _ = writeln!(out, "Forked main at lsn {} -> fork {}", p.fork_lsn, p.fork);
     let s = &p.summary;
@@ -714,6 +814,222 @@ pub fn propose(ctx: &Ctx, a: ProposeArgs) -> Result<ExitCode, Error> {
     out.push_str(&proposal_report(p, &diff));
     ctx.print(&out);
     Ok(ExitCode::SUCCESS)
+}
+
+/// A running proposal: its fork point and how far its replay has come.
+fn running_lines(p: &ProposalInfo) -> String {
+    let mut out = format!(
+        "Proposal {} is running: its replay of main from lsn {} runs in the daemon\n",
+        p.id, p.fork_lsn
+    );
+    if let Some(line) = progress_line(p) {
+        let _ = writeln!(out, "  Progress      {line}");
+    }
+    out
+}
+
+/// `isolated 12 of 40, continuous 30 of 40 root inputs`, or `None` before
+/// the replay has counted its inputs.
+fn progress_line(p: &ProposalInfo) -> Option<String> {
+    let g = p.progress?;
+    let mut parts = Vec::new();
+    if g.isolated_total > 0 {
+        parts.push(format!(
+            "isolated {} of {}",
+            g.isolated_done, g.isolated_total
+        ));
+    }
+    if g.continuous_total > 0 {
+        parts.push(format!(
+            "continuous {} of {}",
+            g.continuous_done, g.continuous_total
+        ));
+    }
+    (!parts.is_empty()).then(|| format!("{} root inputs", parts.join(", ")))
+}
+
+/// The error a failed proposal ended with, as the daemon recorded it.
+fn failure(p: &ProposalInfo) -> Error {
+    match &p.error {
+        Some(e) => Error::Remote {
+            status: 409,
+            body: e.to_string().into_bytes(),
+        },
+        None => ApiError::new(ErrorCode::Internal, format!("proposal {} failed", p.id)).into(),
+    }
+}
+
+pub fn proposal(ctx: &Ctx, c: ProposalCommand) -> Result<ExitCode, Error> {
+    match c {
+        ProposalCommand::Status { id } => status(ctx, &id),
+        ProposalCommand::Wait { id, timeout } => {
+            let timeout = Duration::from_millis(timeout.unwrap_or(3_600_000));
+            let (p, body) = wait_done(ctx, &id, Some(timeout))?;
+            if p.status == "failed" {
+                return Err(failure(&p));
+            }
+            if ctx.json {
+                ctx.print_raw(&body);
+            } else {
+                ctx.print(&proposal_report(&p, &fetch_diff(ctx, &p.fork)?));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// `proposal status` and `proposals show`: a running proposal's progress,
+/// a failed one's error (exit 1, also with `--json`, which prints the
+/// proposal), else the proposal with its diff in short.
+fn status(ctx: &Ctx, id: &str) -> Result<ExitCode, Error> {
+    let body = ctx.get(&proposal_path(id))?;
+    if ctx.json {
+        let failed = ctx.decode::<Value>(&body)?["status"] == "failed";
+        ctx.print_raw(&body);
+        return Ok(if failed {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+    let p: ProposalInfo = ctx.decode(&body)?;
+    let out = match p.status.as_str() {
+        "running" => {
+            let mut out = running_lines(&p);
+            out.push_str(&next(&[format!(
+                "kronik proposal wait {}",
+                shell_quote(&p.id)
+            )]));
+            out
+        }
+        "failed" => return Err(failure(&p)),
+        _ => proposal_report(&p, &fetch_diff(ctx, &p.fork)?),
+    };
+    ctx.print(&out);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// How often a running proposal is polled, and the first retry's delay.
+const POLL: Duration = Duration::from_millis(500);
+/// The longest delay between retries of a failing poll.
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Polls a proposal until its replay is done (any status but `running`)
+/// and returns it with the API's body, printing its progress to stderr.
+///
+/// With a timeout (`proposal wait`), a daemon that cannot be reached or
+/// stays silent and a proxy's 502, 503 or 504 are retried with backoff;
+/// the timeout bounds everything, a single stalled poll included. Without
+/// one (`propose` following its own job), any error ends the wait with the
+/// proposal's id and how to follow it.
+// The CLI client, not daemon code: `--timeout` is wall time (ADR 0004
+// covers the daemon).
+#[allow(clippy::disallowed_methods)]
+fn wait_done(
+    ctx: &Ctx,
+    id: &str,
+    timeout: Option<Duration>,
+) -> Result<(ProposalInfo, Vec<u8>), Error> {
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let mut shown = None;
+    let mut polled = false;
+    let mut failing: Option<Error> = None;
+    let mut backoff = POLL;
+    loop {
+        let limit = deadline.map_or(super::REQUEST_TIMEOUT, |d| {
+            d.saturating_duration_since(Instant::now())
+                .min(super::REQUEST_TIMEOUT)
+        });
+        let delay = match ctx.request_within("GET", &proposal_path(id), None, limit) {
+            Ok(body) => {
+                let p: ProposalInfo = ctx.decode(&body)?;
+                if p.status != "running" {
+                    return Ok((p, body));
+                }
+                (polled, failing, backoff) = (true, None, POLL);
+                let line = progress_line(&p);
+                if line.is_some() && line != shown {
+                    if let Some(l) = &line {
+                        let _ = writeln!(std::io::stderr(), "{}: {l}", p.id);
+                    }
+                    shown = line;
+                }
+                POLL
+            }
+            Err(e) if deadline.is_none() => return Err(follow_hint(e, id)),
+            Err(e) if !super::transient(&e) => return Err(e),
+            Err(e) => {
+                if failing.is_none() {
+                    let _ = writeln!(std::io::stderr(), "{id}: {}; retrying", brief(&e));
+                }
+                failing = Some(e);
+                let delay = backoff;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                delay
+            }
+        };
+        let left = deadline.map_or(delay, |d| d.saturating_duration_since(Instant::now()));
+        std::thread::sleep(delay.min(left));
+        if let (Some(d), Some(t)) = (deadline, timeout)
+            && Instant::now() >= d
+        {
+            // Never reached: the transport's error. Reached before: it was
+            // still running then.
+            if let Some(e) = failing
+                && !polled
+            {
+                return Err(e);
+            }
+            return Err(ApiError::new(
+                ErrorCode::ProposalRunning,
+                format!(
+                    "proposal {id} is still running after {}",
+                    units::duration(u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
+                ),
+            )
+            .with_hint(format!(
+                "Wait longer: kronik proposal wait {} --timeout 2h",
+                shell_quote(id)
+            ))
+            .into());
+        }
+    }
+}
+
+/// A failed request in a few words, for the retry line.
+fn brief(e: &Error) -> String {
+    match e {
+        Error::Local(e) => e.message.clone(),
+        Error::Remote { status, .. } => format!("the API answered HTTP {status}"),
+    }
+}
+
+/// The error that ended `propose`'s wait for its own job, which runs on in
+/// the daemon: the proposal's id and how to follow it.
+fn follow_hint(e: Error, id: &str) -> Error {
+    let e = match e {
+        Error::Local(e) => e,
+        Error::Remote { status, body } => {
+            serde_json::from_slice::<ApiError>(&body).unwrap_or_else(|_| {
+                ApiError::new(
+                    ErrorCode::Unavailable,
+                    format!("the API answered HTTP {status} without a Kronik error"),
+                )
+            })
+        }
+    };
+    ApiError::new(
+        e.code,
+        format!(
+            "proposal {id} started, but following it failed: {}",
+            e.message
+        ),
+    )
+    .with_hint(format!(
+        "Its replay runs on in the daemon; follow it with: kronik proposal wait {}",
+        shell_quote(id)
+    ))
+    .into()
 }
 
 pub fn proposals(ctx: &Ctx, c: ProposalsCommand) -> Result<ExitCode, Error> {
@@ -752,17 +1068,7 @@ pub fn proposals(ctx: &Ctx, c: ProposalsCommand) -> Result<ExitCode, Error> {
                 out
             })
         }
-        ProposalsCommand::Show { id } => {
-            let body = ctx.get(&proposal_path(&id))?;
-            if ctx.json {
-                ctx.print_raw(&body);
-                return Ok(ExitCode::SUCCESS);
-            }
-            let p: ProposalInfo = ctx.decode(&body)?;
-            let diff = fetch_diff(ctx, &p.fork)?;
-            ctx.print(&proposal_report(&p, &diff));
-            Ok(ExitCode::SUCCESS)
-        }
+        ProposalsCommand::Show { id } => status(ctx, &id),
     }
 }
 
@@ -1283,6 +1589,277 @@ pub fn rollback(ctx: &Ctx, a: RollbackArgs) -> Result<ExitCode, Error> {
     })
 }
 
+/// `kronik watch <epoch> --for 10m`: starts a watch in the daemon and,
+/// without `--async`, follows it until it is over, printing its metrics and
+/// each guard that fires to stderr. Exits 1 when the watch rolled back or
+/// failed, or a rollback guard fired and the rollback did not happen.
+// The CLI client, not daemon code: it polls on wall time (ADR 0004 covers
+// the daemon).
+#[allow(clippy::disallowed_methods)]
+pub fn watch(ctx: &Ctx, a: WatchArgs) -> Result<ExitCode, Error> {
+    let reason = reason(&a.mutation)?;
+    let dry_run = a.mutation.dry_run;
+    let body = ctx.post(
+        &format!("/v1/deployments/{}/watch", a.epoch),
+        &WatchRequest {
+            for_ms: a.for_ms,
+            reason: reason.to_owned(),
+            dry_run,
+            run_async: !dry_run,
+        },
+    )?;
+    let r: WatchResponse = ctx.decode(&body)?;
+    if dry_run || a.run_async {
+        let rerun = format!(
+            "kronik watch {} --for {} --reason {}",
+            a.epoch,
+            units::duration(a.for_ms),
+            shell_quote(reason)
+        );
+        return show(ctx, &body, |r: WatchResponse| {
+            let w = &r.watch;
+            if r.dry_run {
+                let mut out = format!(
+                    "Dry run: epoch {} can be watched for {}; nothing was written\n",
+                    w.epoch,
+                    units::duration(w.for_ms),
+                );
+                field(
+                    &mut out,
+                    "Metrics",
+                    &w.metrics.iter().map(metrics_line).collect::<Vec<_>>(),
+                    "none",
+                );
+                let fire: Vec<String> = w
+                    .triggered
+                    .iter()
+                    .map(|t| format!("{} ({}): {}", t.guard, t.action, t.outcome))
+                    .collect();
+                field(&mut out, "Would fire", &fire, "no guard, now");
+                out.push_str(&next(&[rerun]));
+                out
+            } else {
+                format!(
+                    "Watching epoch {} as {} in the daemon\n{}",
+                    w.epoch,
+                    w.id,
+                    next(&[format!("kronik watches show {}", w.id)])
+                )
+            }
+        });
+    }
+    let id = r.watch.id;
+    let _ = writeln!(
+        std::io::stderr(),
+        "{id}: watching epoch {} for {}",
+        a.epoch,
+        units::duration(a.for_ms)
+    );
+    let mut shown = None;
+    let mut fired = 0;
+    loop {
+        let body = ctx.get(&format!("/v1/watches/{id}")).map_err(|e| {
+            let message = match &e {
+                Error::Local(e) => e.message.clone(),
+                Error::Remote { status, .. } => format!("the API answered HTTP {status}"),
+            };
+            Error::from(
+                ApiError::new(
+                    ErrorCode::Unavailable,
+                    format!("watch {id} started, but following it failed: {message}"),
+                )
+                .with_hint(format!(
+                    "It runs on in the daemon; see it with: kronik watches show {id}"
+                )),
+            )
+        })?;
+        let w: WatchInfo = ctx.decode(&body)?;
+        if w.status != "watching" {
+            if ctx.json {
+                ctx.print_raw(&body);
+            } else {
+                ctx.print(&watch_report(&w));
+            }
+            return Ok(watch_exit(&w));
+        }
+        let line = w.metrics.as_ref().map(metrics_line);
+        if line.is_some() && line != shown {
+            if let Some(l) = &line {
+                let _ = writeln!(std::io::stderr(), "{id}: {l}");
+            }
+            shown = line;
+        }
+        for t in w.triggered.iter().skip(fired) {
+            let _ = writeln!(std::io::stderr(), "{id}: {}", triggered_line(t));
+        }
+        fired = w.triggered.len();
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn watch_exit(w: &WatchInfo) -> ExitCode {
+    let rollback_missed = w.triggered.iter().any(|t| {
+        matches!(
+            t.outcome.as_str(),
+            "rollback_refused_schema" | "rollback_failed"
+        )
+    });
+    if rollback_missed || matches!(w.status.as_str(), "rolled_back" | "failed") {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+pub fn watches(ctx: &Ctx, c: WatchesCommand) -> Result<ExitCode, Error> {
+    match c {
+        WatchesCommand::List => {
+            let body = ctx.get("/v1/watches")?;
+            show(ctx, &body, |r: WatchesResponse| {
+                if r.watches.is_empty() {
+                    return format!(
+                        "No watches\n{}",
+                        next(&["kronik watch <epoch> --for 10m --reason \"...\"".to_owned()])
+                    );
+                }
+                let rows = r
+                    .watches
+                    .iter()
+                    .map(|w| {
+                        vec![
+                            w.id.clone(),
+                            w.epoch.to_string(),
+                            units::duration(w.for_ms),
+                            w.status.clone(),
+                            w.triggered
+                                .iter()
+                                .map(|t| match t.reason.strip_prefix(EVAL_ERROR) {
+                                    Some(_) => format!("{} (error)", t.guard),
+                                    None => format!("{} ({})", t.guard, t.outcome),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ]
+                    })
+                    .collect();
+                table(&["ID", "EPOCH", "FOR", "STATUS", "FIRED"], rows)
+            })
+        }
+        WatchesCommand::Show { id } => {
+            let body = ctx.get(&format!("/v1/watches/{id}"))?;
+            if ctx.json {
+                ctx.print_raw(&body);
+                let w: WatchInfo = ctx.decode(&body)?;
+                return Ok(watch_exit(&w));
+            }
+            let w: WatchInfo = ctx.decode(&body)?;
+            ctx.print(&watch_report(&w));
+            Ok(watch_exit(&w))
+        }
+        WatchesCommand::Stop { id, mutation } => {
+            let reason = reason(&mutation)?;
+            let body = ctx.post(
+                &format!("/v1/watches/{}/stop", http::encode(&id)),
+                &ResendRequest {
+                    reason: reason.to_owned(),
+                    dry_run: mutation.dry_run,
+                },
+            )?;
+            let rerun = format!("kronik watches stop {id} --reason {}", shell_quote(reason));
+            show(ctx, &body, |r: WatchResponse| {
+                if r.dry_run {
+                    format!(
+                        "Dry run: watch {id} of epoch {} can be stopped; nothing was written\n{}",
+                        r.watch.epoch,
+                        next(&[rerun])
+                    )
+                } else {
+                    format!(
+                        "Stopped watch {id} of epoch {}: it alerts and rolls back no more\n{}",
+                        r.watch.epoch,
+                        next(&["kronik watches list".to_owned()])
+                    )
+                }
+            })
+        }
+    }
+}
+
+/// The last metrics in one line: after against before.
+fn metrics_line(m: &kronik_api::types::GuardMetrics) -> String {
+    let side = |s: &kronik_api::types::GuardWindowMetrics| {
+        format!(
+            "{} turns, {} failed ({:.1}%), p99 {:.1} ms",
+            s.turns,
+            s.failed,
+            s.error_rate * 100.0,
+            s.latency_p99_ms
+        )
+    };
+    format!("after {}; before {}", side(&m.after), side(&m.before))
+}
+
+/// The streamed line of a guard that fired. A guard whose `when` could not
+/// be evaluated also alerts, but it did not fire: say so, with the error.
+fn triggered_line(t: &WatchTriggered) -> String {
+    match t.reason.strip_prefix(EVAL_ERROR) {
+        Some(e) => format!(
+            "guard {} ({}) could not be evaluated: {e}",
+            t.guard, t.action
+        ),
+        None => format!("guard {} ({}) fired: {}", t.guard, t.action, t.outcome),
+    }
+}
+
+fn watch_report(w: &WatchInfo) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "Watch {} of epoch {}: {}", w.id, w.epoch, w.status);
+    field(&mut out, "For", &[units::duration(w.for_ms)], "");
+    field(&mut out, "Reason", std::slice::from_ref(&w.reason), "");
+    field(
+        &mut out,
+        "Metrics",
+        &w.metrics.iter().map(metrics_line).collect::<Vec<_>>(),
+        "none yet",
+    );
+    let fired: Vec<String> = w
+        .triggered
+        .iter()
+        .map(|t| {
+            let epoch = if t.rollback_epoch == 0 {
+                String::new()
+            } else {
+                format!(", epoch {}", t.rollback_epoch)
+            };
+            match t.reason.strip_prefix(EVAL_ERROR) {
+                Some(e) => format!(
+                    "{} ({}) could not be evaluated at lsn {}: {e}",
+                    t.guard, t.action, t.lsn
+                ),
+                None => format!(
+                    "{} ({}): {} at lsn {}{epoch}",
+                    t.guard, t.action, t.outcome, t.lsn
+                ),
+            }
+        })
+        .collect();
+    field(&mut out, "Fired", &fired, "no guard");
+    if let Some(e) = &w.error {
+        field(
+            &mut out,
+            "Error",
+            &[e["error"]["message"].as_str().unwrap_or("").to_owned()],
+            "",
+        );
+    }
+    let cmd = match w.status.as_str() {
+        "watching" => format!("kronik watches show {}", w.id),
+        _ => "kronik deployments list".to_owned(),
+    };
+    out.push_str(&next(&[cmd]));
+    out
+}
+
 /// The code a deployment switches to.
 fn switch_fields(out: &mut String, d: &SwitchInfo) {
     let kinds: Vec<String> = d
@@ -1308,6 +1885,20 @@ pub fn policy(ctx: &Ctx, c: PolicyCommand) -> Result<ExitCode, Error> {
                     out.push('\n');
                 }
                 out.push('\n');
+                // The guards in force, also when the file does not name them.
+                if r.default_guards {
+                    out.push_str("The default guards apply (the policy has no `guard` key):\n\n");
+                    for g in &r.guards {
+                        // Debug quoting: a TOML basic string for this text.
+                        let _ = writeln!(
+                            out,
+                            "[[guard]]\nname = {:?}\nwhen = {:?}\naction = {:?}\n",
+                            g.name, g.when, g.action
+                        );
+                    }
+                } else if r.guards.is_empty() {
+                    out.push_str("No guards: `kronik watch` measures and does not act.\n\n");
+                }
                 out.push_str(&next(&[
                     "kronik policy test <proposal> --rules <rules.toml>".to_owned(),
                     "kronik policy set <rules.toml> --reason \"...\"".to_owned(),
@@ -1438,6 +2029,41 @@ fn plural(n: u64, word: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A guard that could not be evaluated is shown as an error, not as an
+    /// alert that fired (watch stream, report).
+    #[test]
+    fn a_guard_that_could_not_be_evaluated_is_shown_as_an_error() {
+        let w: WatchInfo = serde_json::from_value(json!({
+            "id": "w-1", "epoch": 3, "deployment_lsn": 9, "for_ms": 60000,
+            "deployment_time_ms": 0, "status": "watching", "reason": "r",
+            "token_id": "t", "created_ms": 0, "metrics": null,
+            "triggered": [
+                {"guard": "typo", "action": "rollback", "outcome": "alerted", "lsn": 12,
+                 "rollback_epoch": 0, "reason": format!("{EVAL_ERROR}no such key")},
+                {"guard": "slow", "action": "alert", "outcome": "alerted", "lsn": 13,
+                 "rollback_epoch": 0, "reason": "guard.after.p99 > 1"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            triggered_line(&w.triggered[0]),
+            "guard typo (rollback) could not be evaluated: no such key"
+        );
+        assert_eq!(
+            triggered_line(&w.triggered[1]),
+            "guard slow (alert) fired: alerted"
+        );
+        let report = watch_report(&w);
+        assert!(
+            report.contains("typo (rollback) could not be evaluated at lsn 12: no such key"),
+            "{report}"
+        );
+        assert!(
+            report.contains("slow (alert): alerted at lsn 13"),
+            "{report}"
+        );
+    }
 
     fn fixture(name: &str) -> Value {
         let path = format!(

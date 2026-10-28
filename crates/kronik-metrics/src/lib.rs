@@ -87,6 +87,11 @@ pub const METRICS: &[Def] = &[
         help: "Replays run for forks and proposals, by mode.",
         kind: Type::Counter,
     },
+    Def {
+        name: "kronik_guard_triggered_total",
+        help: "Guards of `kronik watch` that fired, by action and outcome.",
+        kind: Type::Counter,
+    },
 ];
 
 /// Histogram bucket bounds, in seconds.

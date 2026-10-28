@@ -574,4 +574,7 @@ fn below_the_disk_reserve_new_work_waits_and_the_node_stays_up() {
     assert_eq!(p.node.fatal(), None);
     p.rt.block_on(p.node.erase_subject("user:1", audit(), false))
         .unwrap();
+    // A watch's guard record is an incident record too (W-M1).
+    p.rt.block_on(p.node.record_guard(pb::GuardTriggered::default()))
+        .unwrap();
 }

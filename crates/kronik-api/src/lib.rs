@@ -8,6 +8,7 @@ mod m3;
 mod m6;
 pub mod m7;
 pub mod openapi;
+mod preview;
 pub mod privacy;
 pub mod redact;
 #[cfg(feature = "server")]
@@ -69,7 +70,14 @@ pub struct ApiResponse {
 pub struct Api {
     node: Arc<Node>,
     http_listen: Option<String>,
+    /// `[gateway] preview_domain` (M11).
+    preview_domain: Option<String>,
+    /// The gateway serves TLS: preview URLs are `https`.
+    gateway_tls: bool,
+    /// The gateway's public host (and port) for prefix preview URLs.
+    preview_host: Option<String>,
     proposals: Option<Arc<kronik_fork::proposal::Proposals>>,
+    watches: Option<Arc<kronik_fork::watch::Watches>>,
     auth: Arc<dyn auth::Authenticator>,
     tokens: Option<Arc<tokens::TokenStore>>,
     /// The foreign actors (M7), when this daemon runs them.
@@ -566,7 +574,11 @@ impl Api {
         Api {
             node,
             http_listen: None,
+            preview_domain: None,
+            gateway_tls: false,
+            preview_host: None,
             proposals: None,
+            watches: None,
             auth: Arc::new(auth::LocalAuthenticator),
             tokens: None,
             foreign: None,
@@ -605,9 +617,26 @@ impl Api {
         self
     }
 
+    /// Serves `kronik watch` (M11) from `watches`.
+    pub fn with_watches(mut self, watches: Arc<kronik_fork::watch::Watches>) -> Api {
+        self.watches = Some(watches);
+        self
+    }
+
     /// Reports the gateway's address in `/v1/health`.
     pub fn with_http_listen(mut self, addr: String) -> Api {
         self.http_listen = Some(addr);
+        self
+    }
+
+    /// How preview URLs look (M11): `<scheme>://<id>.<domain>/` with
+    /// `[gateway] preview_domain`, else `<scheme>://<host>/__preview/<id>/`;
+    /// `https` when the gateway serves TLS. `host` is the gateway's public
+    /// name and port, never an unspecified bind address (P-F5).
+    pub fn with_preview_urls(mut self, domain: Option<String>, tls: bool, host: String) -> Api {
+        self.preview_domain = domain;
+        self.gateway_tls = tls;
+        self.preview_host = Some(host);
         self
     }
 
@@ -713,10 +742,13 @@ impl Api {
                         Some(r) => r,
                         None => match self.route_m6(req, segs.as_slice()).await {
                             Some(r) => r,
-                            None => Err(ApiError::new(
-                                ErrorCode::NotImplemented,
-                                format!("no endpoint {} {}", req.method, req.path),
-                            )),
+                            None => match self.route_preview(req, segs.as_slice(), caller).await {
+                                Some(r) => r,
+                                None => Err(ApiError::new(
+                                    ErrorCode::NotImplemented,
+                                    format!("no endpoint {} {}", req.method, req.path),
+                                )),
+                            },
                         },
                     },
                 },
