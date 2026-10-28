@@ -161,6 +161,9 @@ codes! {
     Internal = "INTERNAL", 500, "M1",
         "An internal error in Kronik",
         "This is a bug in Kronik; please report it with the daemon log.";
+    KeystoreIncomplete = "KEYSTORE_INCOMPLETE", 409, "M8",
+        "A sealed value's subject key is not in the keystore",
+        "Restore from a bucket whose keystore backup holds the keys (it is shipped within a minute of a change), or pass --without-keystore to accept unreadable values.";
     KvmUnavailable = "KVM_UNAVAILABLE", 503, "M7",
         "KVM is not available on this host",
         "Set `platform = \"auto\"` or `\"systrap\"` under `[foreign]`, or enable `/dev/kvm`.";

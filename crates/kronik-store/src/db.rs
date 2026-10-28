@@ -2460,6 +2460,76 @@ fn build_trees_db(path: &str, rows: Vec<(String, i64)>) -> Result<(), StoreError
     Ok(())
 }
 
+/// The subject keys a sealed value holds: (subject, key version).
+pub type SubjectKeys = std::collections::BTreeSet<(String, u32)>;
+
+/// Adds the (subject, key version) of every sealed value in `s`.
+pub fn note_sealed(keys: &mut SubjectKeys) -> impl FnMut(&mut pb::Sealable) + '_ {
+    |s: &mut pb::Sealable| {
+        if let (Some(subject), Some(pb::sealable::Value::Sealed(x))) = (&s.subject, &s.value) {
+            keys.insert((subject.clone(), x.key_version));
+        }
+    }
+}
+
+/// Every subject key that a sealed value in this state database needs: kv
+/// values, call outcomes, saved responses, mailbox and dead-letter inputs,
+/// timer messages and open effects. A restore checks them against the
+/// keystore it installs, and `kronik integrity` against the live one
+/// (m8-privacy §10).
+pub fn sealed_keys(conn: &Connection) -> Result<SubjectKeys, StoreError> {
+    use kronik_proto::sealables;
+    let mut keys = SubjectKeys::new();
+    let mut st =
+        conn.prepare("SELECT subject, value FROM kv WHERE sealed AND subject IS NOT NULL")?;
+    let mut q = st.query([])?;
+    while let Some(r) = q.next()? {
+        let subject: String = r.get(0)?;
+        let bytes: Vec<u8> = r.get(1)?;
+        let s = pb::Sealed::decode(bytes.as_slice())
+            .map_err(|e| corrupt(format!("a sealed state value: {e}")))?;
+        keys.insert((subject, s.key_version));
+    }
+    for (sql, what) in [
+        (
+            "SELECT outcome FROM deliveries WHERE outcome IS NOT NULL",
+            "outcome",
+        ),
+        ("SELECT outcome FROM ingress_keys", "outcome"),
+        ("SELECT input FROM mailbox", "input"),
+        ("SELECT input FROM dead_letters", "input"),
+        ("SELECT msg FROM timers", "message"),
+        ("SELECT record FROM open_effects", "effect"),
+    ] {
+        let mut st = conn.prepare(sql)?;
+        let mut q = st.query([])?;
+        while let Some(r) = q.next()? {
+            let b: Vec<u8> = r.get(0)?;
+            let bad = |e: prost::DecodeError| corrupt(format!("a stored {what}: {e}"));
+            let f = &mut note_sealed(&mut keys);
+            match what {
+                "outcome" => sealables::outcome_mut(
+                    Some(&mut pb::Outcome::decode(b.as_slice()).map_err(bad)?),
+                    f,
+                ),
+                "input" => sealables::input_mut(
+                    Some(&mut pb::Input::decode(b.as_slice()).map_err(bad)?),
+                    f,
+                ),
+                "message" => sealables::message_mut(
+                    Some(&mut pb::Message::decode(b.as_slice()).map_err(bad)?),
+                    f,
+                ),
+                _ => sealables::effect_mut(
+                    &mut pb::EffectRecord::decode(b.as_slice()).map_err(bad)?,
+                    f,
+                ),
+            }
+        }
+    }
+    Ok(keys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

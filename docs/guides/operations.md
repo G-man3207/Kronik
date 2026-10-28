@@ -473,7 +473,13 @@ log still holds, the daemon installs the newest snapshot that the log
 continues and replays the log from there. A data directory therefore
 recovers from a lost or deleted `state.db`.
 
-The privacy keystore (`keys/keystore.db`) is not part of snapshots.
+The privacy keystore (`keys/keystore.db`) is not part of snapshots. The
+shipper uploads it separately, encrypted, within a minute of a change. A
+restore installs the newest of those backups and refuses
+(`KEYSTORE_INCOMPLETE`) when it lacks the key of a sealed value in the
+restored data, for example a restore made within a minute of a new
+subject's first value: wait for the source to ship again. `kronik
+integrity` lists subjects whose sealed values have no key, and exits 1.
 
 ## Shipping to object storage
 

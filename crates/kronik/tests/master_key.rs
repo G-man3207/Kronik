@@ -429,3 +429,165 @@ fn a_start_without_the_key_over_existing_stores_is_refused() {
     let n = Daemon::start(dir, "n", &default_cfg, KeyAt::File);
     drop(n);
 }
+
+/// `kronik restore` with `args`, from `bucket` into `config`'s directory.
+fn restore(bucket: &Path, config: &Path, key: KeyAt, args: &[&str]) -> (bool, Value, String) {
+    let out = command(key)
+        .args(["--json", "restore", "--from"])
+        .arg(format!("file://{}", bucket.display()))
+        .arg("--config")
+        .arg(config)
+        .args(args)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let v = serde_json::from_str(&text).unwrap_or(Value::Null);
+    (out.status.success(), v, text)
+}
+
+/// Waits until `ship.json` of `data` lists the snapshot at `lsn`.
+fn shipped(data: &Path, lsn: u64) -> bool {
+    wait(60, || {
+        std::fs::read_to_string(data.join("ship.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .is_some_and(|v| {
+                v["snapshots"]
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|n| n.as_u64() == Some(lsn)))
+            })
+    })
+}
+
+/// Quickstart walk 4: the bucket holds an empty keystore backup, shipped
+/// after an early snapshot, and a later one with the subject's key, shipped
+/// after the snapshot that holds the subject's sealed value. Restore must
+/// install the later one; without the key it must fail even when only the
+/// empty backup is there; and when no backup holds the key it must refuse.
+#[test]
+fn a_restore_installs_the_keystore_that_holds_every_needed_key() {
+    let key = KeyAt::File;
+    let tmp = tempfile::Builder::new()
+        .prefix("kronik-mk-")
+        .tempdir_in("/var/tmp")
+        .unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("etc")).unwrap();
+    std::fs::write(dir.join("etc/master.key"), format!("{KEY_HEX}\n")).unwrap();
+    let bucket = dir.join("bucket");
+    std::fs::create_dir_all(&bucket).unwrap();
+    let data = dir.join("a/data");
+
+    // An early snapshot, then shipping: the first keystore backup (no keys
+    // yet) is newer than that snapshot.
+    let plain = config(dir, "a", key, None);
+    let mut a = Daemon::start(dir, "a", &plain, key);
+    let wasm = base64::engine::general_purpose::STANDARD.encode(std::fs::read(COUNTER).unwrap());
+    a.api(
+        "POST",
+        "/v1/deployments",
+        json!({"wasm_base64": wasm, "reason": "master key test"}),
+    );
+    let early = a.api(
+        "POST",
+        "/v1/snapshots",
+        json!({"reason": "master key test"}),
+    );
+    let early = early["snapshot"]["lsn"].as_u64().unwrap();
+    a.stop();
+    let shipping = config(dir, "a", key, Some(&bucket));
+    let mut a = Daemon::start(dir, "a", &shipping, key);
+    assert!(shipped(&data, early), "the early snapshot was not shipped");
+    assert!(wait(60, || objects(&bucket, "keystore").len() == 1));
+
+    // Only the empty backup is there: without the key, restore still fails.
+    let keyless = config(dir, "k", key, None);
+    let (ok, v, text) = restore(
+        &bucket,
+        &keyless,
+        key,
+        &[
+            "--master-key-file",
+            dir.join("missing.key").to_str().unwrap(),
+        ],
+    );
+    assert!(!ok, "a keyless restore succeeded: {text}");
+    assert_eq!(v["error"]["code"], "MASTER_KEY_MISSING", "{text}");
+    assert!(!dir.join("k/data/branches").exists(), "it wrote state");
+
+    // The subject's first sealed value, and a snapshot right after it: the
+    // backup with its key ships later (one a minute at most).
+    a.api(
+        "POST",
+        "/v1/privacy/mode",
+        json!({"mode": "on", "reason": "master key test"}),
+    );
+    a.send("counter/on", "subject", "");
+    let snap = a.api(
+        "POST",
+        "/v1/snapshots",
+        json!({"reason": "master key test"}),
+    );
+    let lsn = snap["snapshot"]["lsn"].as_u64().unwrap();
+    assert!(shipped(&data, lsn), "snapshot {lsn} was not shipped");
+    assert!(
+        wait(120, || objects(&bucket, "keystore").len() == 2),
+        "the second keystore backup was not shipped: {:?}",
+        objects(&bucket, "keystore")
+    );
+    a.stop();
+
+    // With the right key: the newer backup, so the value reads.
+    let b_config = config(dir, "b", key, None);
+    let (ok, v, text) = restore(&bucket, &b_config, key, &[]);
+    assert!(ok, "restore: {text}");
+    assert_eq!(v["keystore"], "installed", "{text}");
+    assert_eq!(v["snapshot_lsn"], lsn, "{text}");
+    let mut b = Daemon::start(dir, "b", &b_config, key);
+    assert_eq!(
+        b.sealed_value(),
+        "personal",
+        "the subject's key was not restored"
+    );
+    let integrity = b.api("GET", "/v1/integrity", Value::Null);
+    assert_eq!(integrity["keys_missing"], json!([]), "{integrity}");
+    b.stop();
+
+    // No backup holds the key (the newer one is gone): refused, nothing written.
+    let mut walls = objects(&bucket, "keystore");
+    walls.sort();
+    std::fs::remove_file(bucket.join("keystore").join(&walls[1])).unwrap();
+    let c_config = config(dir, "c", key, None);
+    let (ok, v, text) = restore(&bucket, &c_config, key, &[]);
+    assert!(!ok, "an incomplete keystore was installed: {text}");
+    assert_eq!(v["error"]["code"], "KEYSTORE_INCOMPLETE", "{text}");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("user:1"),
+        "{text}"
+    );
+    assert!(!dir.join("c/data/branches").exists(), "it wrote state");
+    assert!(!dir.join("c/data/keys/keystore.db").exists());
+
+    // --without-keystore is the explicit opt-out, and integrity reports it.
+    let (ok, v, text) = restore(&bucket, &c_config, key, &["--without-keystore"]);
+    assert!(ok, "{text}");
+    assert_eq!(v["keystore"], "skipped", "{text}");
+    let c = Daemon::start(dir, "c", &c_config, key);
+    let integrity = c.api("GET", "/v1/integrity", Value::Null);
+    // counter's `subject` writes values of user:1 and user:2.
+    assert_eq!(
+        integrity["keys_missing"],
+        json!(["user:1", "user:2"]),
+        "{integrity}"
+    );
+    let out = command(key)
+        .args(["--socket", c.socket.to_str().unwrap(), "integrity"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "integrity passed with a missing key");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("KEYSTORE_INCOMPLETE"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

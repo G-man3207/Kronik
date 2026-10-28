@@ -194,7 +194,15 @@ pub struct Proposals {
 }
 
 fn internal(m: impl std::fmt::Display) -> ApiError {
-    ApiError::new(ErrorCode::Internal, m.to_string())
+    let m = m.to_string();
+    // A replay that met a sealed value without its key (the runtime says so).
+    if let Some(i) = m.find("KEYSTORE_INCOMPLETE: ") {
+        return ApiError::new(ErrorCode::KeystoreIncomplete, m[i..].to_owned()).with_hint(
+            "The node's privacy keystore lacks a subject's key; `kronik integrity` lists the \
+             subjects. Restore it from a keystore backup that holds the key.",
+        );
+    }
+    ApiError::new(ErrorCode::Internal, m)
 }
 
 fn not_found(id: &str) -> ApiError {

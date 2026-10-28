@@ -361,9 +361,13 @@ fn describe_error(e: &wasmtime::Error) -> String {
 fn sealed_bytes(s: Option<&pb::Sealable>) -> Result<Vec<u8>, RunError> {
     match s.and_then(|s| s.value.as_ref()) {
         Some(pb::sealable::Value::Plain(b)) => Ok(b.clone()),
-        Some(pb::sealable::Value::Sealed(_)) => Err(RunError::Input(
-            "sealed values need privacy mode, which arrives in a later version".into(),
-        )),
+        // The caller opens sealed values first; one still sealed here has no
+        // key in this node's keystore.
+        Some(pb::sealable::Value::Sealed(_)) => Err(RunError::Input(format!(
+            "KEYSTORE_INCOMPLETE: a sealed value of subject {} cannot be opened: its key is not \
+             in this node's privacy keystore",
+            s.and_then(|s| s.subject.as_deref()).unwrap_or("?")
+        ))),
         None => Ok(Vec::new()),
     }
 }

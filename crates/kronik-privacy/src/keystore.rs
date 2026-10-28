@@ -305,6 +305,48 @@ impl Keystore {
     /// last version erased (0 when the subject never had a key). Values sealed
     /// with those keys are unreadable from now on; copies of this keystore in
     /// backups keep them until the backups expire.
+    /// Re-applies a logged erasure of `subject`'s keys through `version`
+    /// (a restore whose keystore backup predates it). Newer keys of the
+    /// subject stay; already covered, it changes nothing.
+    pub fn erase_through(
+        &self,
+        subject: &str,
+        version: u32,
+        wall_ms: u64,
+    ) -> Result<(), PrivacyError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if Self::erased_through(&tx, subject)?.is_some_and(|v| v >= version) {
+            return Ok(());
+        }
+        tx.execute(
+            "DELETE FROM subject_keys WHERE subject = ?1 AND version <= ?2",
+            params![subject, version],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO erasures (subject, last_version, erased_wall_ms) VALUES (?1, ?2, ?3)",
+            params![subject, version, wall_ms as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether a value sealed under `subject`'s key `version` can be
+    /// accounted for: the key is here, or the subject was erased through
+    /// that version (its values are tombstones).
+    pub fn covers(&self, subject: &str, version: u32) -> Result<bool, PrivacyError> {
+        let conn = self.conn();
+        if Self::erased_through(&conn, subject)?.is_some_and(|v| v >= version) {
+            return Ok(true);
+        }
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM subject_keys WHERE subject = ?1 AND version = ?2",
+            params![subject, version],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn erase(&self, subject: &str, wall_ms: u64) -> Result<u32, PrivacyError> {
         if !valid_subject(subject) {
             return Err(PrivacyError::InvalidSubject(subject.to_owned()));
@@ -878,6 +920,23 @@ mod tests {
         found(replaced.key("user:1", 1).unwrap());
         drop(replaced);
         Keystore::open_file(&path, &MasterKey::from_bytes([1; 32])).unwrap();
+    }
+
+    #[test]
+    fn a_logged_erasure_is_applied_again_through_its_version_only() {
+        let ks = store(1);
+        ks.key_for_sealing("user:1", [1; 32], [1; 24], 0).unwrap();
+        ks.rotate("user:1", [2; 32], [2; 24], 1).unwrap();
+        assert!(ks.covers("user:1", 1).unwrap() && ks.covers("user:1", 2).unwrap());
+        assert!(!ks.covers("user:1", 3).unwrap() && !ks.covers("user:2", 1).unwrap());
+        // Erased through version 1 (a restore's backup predates it): the
+        // version-1 values are tombstones, version 2 still has its key.
+        ks.erase_through("user:1", 1, 5).unwrap();
+        assert!(matches!(ks.key("user:1", 1).unwrap(), KeyLookup::Erased));
+        found(ks.key("user:1", 2).unwrap());
+        assert!(ks.covers("user:1", 1).unwrap() && ks.covers("user:1", 2).unwrap());
+        ks.erase_through("user:1", 1, 6).unwrap();
+        found(ks.key("user:1", 2).unwrap());
     }
 
     #[test]
