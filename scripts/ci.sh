@@ -4,7 +4,8 @@
 #
 # Usage: scripts/ci.sh [STEP...]
 # Steps: fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny,
-# foreign (needs root and runsc; skipped with a message otherwise),
+# foreign (needs root and runsc; skipped with a message otherwise, a failure
+# with KRONIK_FOREIGN_TESTS=require),
 # identity (without libfaketime, todo-ts is skipped with a message too).
 # Without arguments, all steps run in order.
 set -euo pipefail
@@ -243,12 +244,18 @@ step_deny() {
 }
 
 # M7: foreign actors in real gVisor sandboxes. Needs root and runsc
-# (docs/design/m7-foreign.md §14); elsewhere it says why and skips. The tests
-# turn a skip into a failure with KRONIK_FOREIGN_TESTS=require.
+# (docs/design/m7-foreign.md §14); elsewhere it says why and skips, unless
+# KRONIK_FOREIGN_TESTS=require (as in CI), which makes every skip, here and
+# in the tests, a failure.
 step_foreign() {
     local runsc="${KRONIK_RUNSC:-/usr/local/bin/runsc}"
     if [ "$(id -u)" != 0 ] || [ ! -x "$runsc" ]; then
-        echo "skipped: the foreign step needs root and runsc at $runsc (scripts/install.sh installs gVisor)"
+        local why="the foreign step needs root and runsc at $runsc (scripts/install.sh installs gVisor)"
+        if [ "${KRONIK_FOREIGN_TESTS:-}" = require ]; then
+            echo "error: KRONIK_FOREIGN_TESTS=require, but $why" >&2
+            return 1
+        fi
+        echo "skipped: $why"
         return 0
     fi
     scripts/build-foreign-examples.sh

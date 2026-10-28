@@ -437,7 +437,8 @@ decimals (`0.5`). `--json` prints the response body unchanged.
   and tail; backoff.
 - **Integration** (`crates/kronik/tests/foreign.rs`, needs root and runsc;
   skipped with a message otherwise; `scripts/ci.sh foreign` runs it with
-  `KRONIK_FOREIGN_TESTS=require`, which turns a skip into a failure): a
+  `KRONIK_FOREIGN_TESTS=require`, which turns a skip into a failure; GitHub
+  CI installs gVisor with `scripts/install.sh` and runs it under `sudo`): a
   daemon with the `foreign-echo` layout (`examples/foreign-echo`,
   `scripts/build-foreign-examples.sh`) where a test actor calls
   `foreign://echo/...`; the calls are in the log as `foreign.http`; a fork
