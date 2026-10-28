@@ -10,7 +10,7 @@ use kronik_core::env::Env;
 use kronik_privacy::MasterKey;
 use kronik_privacy::keystore::{KeyLookup, Keystore};
 use kronik_sched::{NodeConfig, start_local};
-use kronik_ship::{Remote, ShipState, restore, ship_keystore, ship_once};
+use kronik_ship::{KeystoreMode, Remote, ShipState, restore, ship_keystore, ship_once};
 use tokio::runtime::Runtime;
 
 fn rt() -> Runtime {
@@ -131,7 +131,7 @@ fn a_keystore_change_is_shipped_pruned_and_restored() {
             "main",
             false,
             &dst.path().join("keys/master.key"),
-            false,
+            KeystoreMode::Require,
         ))
         .unwrap();
     assert_eq!(report.keystore_backup_ms, Some(wall));

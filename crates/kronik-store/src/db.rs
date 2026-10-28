@@ -2460,14 +2460,26 @@ fn build_trees_db(path: &str, rows: Vec<(String, i64)>) -> Result<(), StoreError
     Ok(())
 }
 
-/// The subject keys a sealed value holds: (subject, key version).
-pub type SubjectKeys = std::collections::BTreeSet<(String, u32)>;
+/// The subject keys sealed values need: (subject, key version), each with
+/// one value sealed under it, so a check can try the key on it.
+pub type SubjectKeys = std::collections::BTreeMap<(String, u32), pb::Sealed>;
 
-/// Adds the (subject, key version) of every sealed value in `s`.
+/// Notes `sealed` under (subject, version), keeping a value with
+/// ciphertext over a tombstone as the sample.
+pub fn note_key(keys: &mut SubjectKeys, subject: &str, sealed: &pb::Sealed) {
+    let slot = keys
+        .entry((subject.to_owned(), sealed.key_version))
+        .or_insert_with(|| sealed.clone());
+    if slot.ciphertext.is_empty() && !sealed.ciphertext.is_empty() {
+        *slot = sealed.clone();
+    }
+}
+
+/// Notes every sealed value in `s`.
 pub fn note_sealed(keys: &mut SubjectKeys) -> impl FnMut(&mut pb::Sealable) + '_ {
     |s: &mut pb::Sealable| {
         if let (Some(subject), Some(pb::sealable::Value::Sealed(x))) = (&s.subject, &s.value) {
-            keys.insert((subject.clone(), x.key_version));
+            note_key(keys, subject, x);
         }
     }
 }
@@ -2488,7 +2500,7 @@ pub fn sealed_keys(conn: &Connection) -> Result<SubjectKeys, StoreError> {
         let bytes: Vec<u8> = r.get(1)?;
         let s = pb::Sealed::decode(bytes.as_slice())
             .map_err(|e| corrupt(format!("a sealed state value: {e}")))?;
-        keys.insert((subject, s.key_version));
+        note_key(&mut keys, &subject, &s);
     }
     for (sql, what) in [
         (

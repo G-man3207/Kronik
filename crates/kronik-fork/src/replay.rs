@@ -38,6 +38,10 @@ pub enum ReplayError {
     Store(#[from] kronik_store::StoreError),
     #[error("replay failed: {0}")]
     Host(String),
+    /// A recorded input holds a sealed value whose subject key this node's
+    /// keystore lacks.
+    #[error("replay failed: {0}")]
+    KeyMissing(kronik_runtime::RunError),
 }
 
 /// One kind's code in the fork.
@@ -610,7 +614,10 @@ impl Runner {
             Ok(o) => o,
             Err(e) => {
                 let _ = lock(&sql).end(false, &[]);
-                return Err(ReplayError::Host(e.to_string()));
+                return Err(match e {
+                    e @ kronik_runtime::RunError::KeyMissing(_) => ReplayError::KeyMissing(e),
+                    e => ReplayError::Host(e.to_string()),
+                });
             }
         };
         drop(out.sql.take());

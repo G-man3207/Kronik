@@ -465,19 +465,52 @@ pub struct RestoreReport {
     pub keystore_backup_ms: Option<u64>,
     /// `installed`, `none_in_bucket`, or `skipped` (`--without-keystore`).
     pub keystore: &'static str,
+    /// With `--allow-missing-keys`: the subjects whose sealed values have
+    /// no key in the installed keystore and stay unreadable.
+    pub keys_missing: Vec<String>,
 }
 
 /// `kronik restore` (m6-storage §6): the newest remote snapshot, every
 /// remote segment and component into `data`, then the snapshot installed
 /// as the branch's state. The daemon must not run on `data`; an existing
 /// `state.db` is refused unless `force`.
+/// What a restore does with the bucket's privacy keystore backup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeystoreMode {
+    /// Install the newest backup; refuse when a sealed value's key is
+    /// missing from it (`KEYSTORE_INCOMPLETE`).
+    Require,
+    /// Install the newest backup even when it lacks some keys
+    /// (`--allow-missing-keys`): those subjects' sealed values stay
+    /// unreadable and are listed; every other subject's stay readable.
+    AllowMissingKeys,
+    /// Install no backup (`--without-keystore`): every sealed value of
+    /// every subject stays unreadable.
+    Without,
+}
+
 pub async fn restore(
     remote: &Remote,
     data: &Path,
     branch: &str,
     force: bool,
     key_path: &Path,
-    without_keystore: bool,
+    mode: KeystoreMode,
+) -> Result<RestoreReport, ShipError> {
+    restore_with_fault(remote, data, branch, force, key_path, mode, &|_| Ok(())).await
+}
+
+/// [`restore`] that calls `fault` before each step of moving the staged
+/// restore into place, so tests can interrupt it there.
+#[doc(hidden)]
+pub async fn restore_with_fault(
+    remote: &Remote,
+    data: &Path,
+    branch: &str,
+    force: bool,
+    key_path: &Path,
+    mode: KeystoreMode,
+    fault: &dyn Fn(&str) -> std::io::Result<()>,
 ) -> Result<RestoreReport, ShipError> {
     let branch_dir = data.join("branches").join(branch);
     if branch_dir.join("state.db").exists() && !force {
@@ -486,16 +519,16 @@ pub async fn restore(
             data.display()
         )));
     }
-    // Everything is downloaded and checked in a staging directory first,
-    // and moved into place only when complete: a failed restore leaves the
-    // data directory as it was.
+    // Everything is downloaded, checked and written in a staging directory
+    // first: a restore that fails there leaves the data directory as it was,
+    // and moving the result into place is only renames (install_staged).
     let stage = data.join(".restore");
     if stage.exists() {
         std::fs::remove_dir_all(&stage)?;
     }
-    let staged = stage_restore(remote, data, &stage, branch, key_path, without_keystore).await;
+    let staged = stage_restore(remote, data, &stage, branch, key_path, mode).await;
     let result = match staged {
-        Ok(s) => install_staged(data, &stage, branch, &branch_dir, s),
+        Ok(s) => install_staged(data, &stage, branch, &branch_dir, s, fault),
         Err(e) => Err(e),
     };
     let _ = std::fs::remove_dir_all(&stage);
@@ -509,6 +542,7 @@ struct Staged {
     components: Vec<String>,
     keystore: &'static str,
     keystore_backup_ms: Option<u64>,
+    keys_missing: Vec<String>,
 }
 
 async fn stage_restore(
@@ -517,7 +551,7 @@ async fn stage_restore(
     stage: &Path,
     branch: &str,
     key_path: &Path,
-    without_keystore: bool,
+    mode: KeystoreMode,
 ) -> Result<Staged, ShipError> {
     // 1. The newest complete remote snapshot.
     let (_, lsns) = remote.list(&format!("{branch}/snapshots")).await?;
@@ -539,7 +573,8 @@ async fn stage_restore(
     let m = newest.ok_or_else(|| ShipError::Restore("no snapshot in the bucket".into()))?;
     // The keystore backup is checked before anything is downloaded, so a
     // missing or wrong key fails fast (m8-privacy §10).
-    let keystore = check_keystore_backup(remote, data, key_path, without_keystore).await?;
+    let keystore =
+        check_keystore_backup(remote, data, key_path, mode == KeystoreMode::Without).await?;
     let snap = stage.join("snapshot");
     let base = format!("{branch}/snapshots/{:020}", m.lsn);
     for f in &m.files {
@@ -563,7 +598,7 @@ async fn stage_restore(
     )?;
     // 2. Every remote segment, and the subject keys its sealed values need.
     let mut needed = kronik_store::db::SubjectKeys::new();
-    let mut erasures: Vec<(String, u32)> = Vec::new();
+    let mut erasures: Vec<(String, u32, u64)> = Vec::new();
     let log = stage.join("log");
     std::fs::create_dir_all(&log)?;
     let (names, _) = remote.list(&format!("{branch}/segments")).await?;
@@ -579,7 +614,8 @@ async fn stage_restore(
             .ok_or_else(|| ShipError::Restore(format!("{n} is not a segment name")))?;
         kronik_log::scan_segment_image(&bytes, branch, start, 0, Lsn::MAX, true, |mut c| {
             if let kronik_proto::Record::Erasure(e) = &c.record {
-                erasures.push((e.subject.clone(), e.key_version));
+                let wall = e.audit.as_ref().map_or(0, |a| a.wall_time_ms);
+                erasures.push((e.subject.clone(), e.key_version, wall));
             }
             kronik_proto::sealables::record_mut(
                 &mut c.record,
@@ -600,13 +636,20 @@ async fn stage_restore(
         )));
     }
     // The snapshot's state: sealed values whose records retention deleted.
-    needed.extend(
-        kronik_store::snapshot::sealed_keys(&snap)
-            .map_err(|e| ShipError::Restore(format!("the snapshot's state.db: {e}")))?,
-    );
+    for ((subject, _), sample) in kronik_store::snapshot::sealed_keys(&snap)
+        .map_err(|e| ShipError::Restore(format!("the snapshot's state.db: {e}")))?
+    {
+        kronik_store::db::note_key(&mut needed, &subject, &sample);
+    }
     // 3. The keystore: the backup, with the log's erasures applied again,
     //    must hold every key a sealed value needs.
-    let (keystore, keystore_backup_ms) = match keystore {
+    let allow = mode == KeystoreMode::AllowMissingKeys;
+    let subjects_of = |pairs: &[(String, u32)]| {
+        let mut s: Vec<String> = pairs.iter().map(|(s, _)| s.clone()).collect();
+        s.dedup();
+        s
+    };
+    let (keystore, keystore_backup_ms, keys_missing) = match keystore {
         Ok(k) => {
             let ks = kronik_privacy::keystore::Keystore::import_backup_file(
                 &stage.join("keystore.db"),
@@ -614,37 +657,49 @@ async fn stage_restore(
                 &k.blob,
             )
             .map_err(ShipError::Key)?;
-            for (subject, version) in &erasures {
-                ks.erase_through(subject, *version, k.wall)
+            for (subject, version, wall) in &erasures {
+                ks.erase_through(subject, *version, *wall)
                     .map_err(ShipError::Key)?;
             }
             let mut missing = Vec::new();
-            for (subject, version) in &needed {
-                if !ks.covers(subject, *version).map_err(ShipError::Key)? {
-                    missing.push(format!("{subject} (key {version})"));
+            for ((subject, version), sample) in &needed {
+                if !ks
+                    .covers(subject, *version, sample)
+                    .map_err(ShipError::Key)?
+                {
+                    missing.push((subject.clone(), *version));
                 }
             }
-            if !missing.is_empty() {
+            if !missing.is_empty() && !allow {
+                let shown: Vec<String> = missing
+                    .iter()
+                    .map(|(s, v)| format!("{s} (key {v})"))
+                    .collect();
                 return Err(ShipError::KeystoreIncomplete(format!(
                     "the bucket's newest keystore backup ({}) lacks the keys of {}: their sealed \
                      values would be unreadable",
                     k.wall,
-                    list_some(&missing)
+                    list_some(&shown)
                 )));
             }
-            ("installed", Some(k.wall))
+            ("installed", Some(k.wall), subjects_of(&missing))
         }
         Err("none_in_bucket") if !needed.is_empty() => {
-            let subjects: Vec<String> = needed
-                .iter()
-                .map(|(s, v)| format!("{s} (key {v})"))
-                .collect();
-            return Err(ShipError::KeystoreIncomplete(format!(
-                "the restored data holds sealed values of {}, and the bucket has no keystore backup",
-                list_some(&subjects)
-            )));
+            let pairs: Vec<(String, u32)> = needed.keys().cloned().collect();
+            if !allow {
+                let shown: Vec<String> = pairs
+                    .iter()
+                    .map(|(s, v)| format!("{s} (key {v})"))
+                    .collect();
+                return Err(ShipError::KeystoreIncomplete(format!(
+                    "the restored data holds sealed values of {}, and the bucket has no keystore \
+                     backup",
+                    list_some(&shown)
+                )));
+            }
+            ("none_in_bucket", None, subjects_of(&pairs))
         }
-        Err(status) => (status, None),
+        Err(status) => (status, None, Vec::new()),
     };
     // 4. Components.
     let code = stage.join("code");
@@ -659,13 +714,40 @@ async fn stage_restore(
         std::fs::write(code.join(name), bytes)?;
         components.push(name.to_owned());
     }
+    // 5. The state and actor databases, copied now so that moving the
+    //    restore into place is only renames.
+    let state = stage.join("branch");
+    std::fs::create_dir_all(state.join("sql"))?;
+    std::fs::copy(snap.join("state.db"), state.join("state.db"))?;
+    copy_tree(&snap.join("sql"), &state.join("sql"))?;
+    if snap.join("secrets.db").exists() {
+        std::fs::copy(snap.join("secrets.db"), stage.join("secrets.db"))?;
+    }
     Ok(Staged {
         m,
         segments,
         components,
         keystore,
         keystore_backup_ms,
+        keys_missing,
     })
+}
+
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    if !from.exists() {
+        return Ok(());
+    }
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let dest = to.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            std::fs::create_dir_all(&dest)?;
+            copy_tree(&e.path(), &dest)?;
+        } else {
+            std::fs::copy(e.path(), dest)?;
+        }
+    }
+    Ok(())
 }
 
 /// "a, b, c and 4 more".
@@ -677,57 +759,85 @@ fn list_some(items: &[String]) -> String {
     }
 }
 
-/// Moves a checked staging directory into place.
+/// Moves a checked staging directory into place, with renames only. The
+/// old `state.db` goes first and the new one comes last: an interrupted
+/// install leaves no `state.db`, never the old state with the new log, and
+/// `kronik restore` can run again without `--force` (m6-storage §6).
 fn install_staged(
     data: &Path,
     stage: &Path,
     branch: &str,
     branch_dir: &Path,
     s: Staged,
+    fault: &dyn Fn(&str) -> std::io::Result<()>,
 ) -> Result<RestoreReport, ShipError> {
-    let snap_dir = snapshots::snapshots_dir(data, branch).join(format!("{:020}", s.m.lsn));
-    if snap_dir.exists() {
-        std::fs::remove_dir_all(&snap_dir)?;
-    }
-    if let Some(p) = snap_dir.parent() {
-        std::fs::create_dir_all(p)?;
-    }
-    std::fs::rename(stage.join("snapshot"), &snap_dir)?;
-    let log_dir = branch_dir.join("log");
-    if log_dir.exists() {
-        std::fs::remove_dir_all(&log_dir)?;
-    }
+    let replace_dir = |from: &Path, to: &Path| -> std::io::Result<()> {
+        if to.exists() {
+            std::fs::remove_dir_all(to)?;
+        }
+        if let Some(p) = to.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::rename(from, to)
+    };
+    let replace_file = |from: &Path, to: &Path| -> std::io::Result<()> {
+        if let Some(p) = to.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::rename(from, to)
+    };
     std::fs::create_dir_all(branch_dir)?;
-    std::fs::rename(stage.join("log"), &log_dir)?;
+    fault("state")?;
+    for f in ["state.db", "state.db-wal", "state.db-shm"] {
+        let p = branch_dir.join(f);
+        if p.exists() {
+            std::fs::remove_file(&p)?;
+        }
+    }
+    fault("log")?;
+    let log_dir = branch_dir.join("log");
+    replace_dir(&stage.join("log"), &log_dir)?;
+    fault("sql")?;
+    replace_dir(&stage.join("branch").join("sql"), &branch_dir.join("sql"))?;
+    fault("snapshot")?;
+    let snap_dir = snapshots::snapshots_dir(data, branch).join(format!("{:020}", s.m.lsn));
+    replace_dir(&stage.join("snapshot"), &snap_dir)?;
+    fault("code")?;
     let code = data.join("code");
     std::fs::create_dir_all(&code)?;
     for c in &s.components {
         std::fs::rename(stage.join("code").join(c), code.join(c))?;
     }
-    // The snapshot (state.db, actor databases, secrets.db).
-    kronik_store::snapshot::install(&snap_dir, branch_dir)
-        .map_err(|e| ShipError::Restore(e.to_string()))?;
+    fault("keys")?;
     let keys = data.join("keys");
-    let secrets = snap_dir.join("secrets.db");
-    if secrets.exists() {
-        std::fs::create_dir_all(&keys)?;
-        std::fs::copy(&secrets, keys.join("secrets.db"))?;
+    if stage.join("secrets.db").exists() {
+        replace_file(&stage.join("secrets.db"), &keys.join("secrets.db"))?;
     }
     if s.keystore == "installed" {
-        std::fs::create_dir_all(&keys)?;
         for suffix in ["", "-wal", "-shm"] {
             let from = stage.join(format!("keystore.db{suffix}"));
             let to = keys.join(format!("keystore.db{suffix}"));
             if from.exists() {
-                std::fs::rename(from, to)?;
+                replace_file(&from, &to)?;
             } else if to.exists() {
                 std::fs::remove_file(to)?;
             }
         }
         tracing::info!(wall = ?s.keystore_backup_ms, "restore: installed a keystore backup");
     }
+    if !s.keys_missing.is_empty() {
+        tracing::warn!(
+            subjects = ?s.keys_missing,
+            "restore: --allow-missing-keys: these subjects' sealed values stay unreadable"
+        );
+    }
     // Nothing was shipped from here yet.
     let _ = std::fs::remove_file(ShipState::path(data));
+    fault("commit")?;
+    std::fs::rename(
+        stage.join("branch").join("state.db"),
+        branch_dir.join("state.db"),
+    )?;
     let first = kronik_log::segment_starts(&log_dir)?
         .first()
         .copied()
@@ -741,6 +851,7 @@ fn install_staged(
         components: s.components.len(),
         keystore_backup_ms: s.keystore_backup_ms,
         keystore: s.keystore,
+        keys_missing: s.keys_missing,
     })
 }
 /// A keystore backup that decrypted under the node's key, ready to install.

@@ -424,23 +424,23 @@ To fix it, report the bug with the message, the request and the daemon log. Retr
 
 HTTP status 409, milestone M8. A sealed value's subject key is not in the keystore.
 
-Default hint: Restore from a bucket whose keystore backup holds the keys (it is shipped within a minute of a change), or pass --without-keystore to accept unreadable values.
+Default hint: Let the source ship its keystore again and restore again; if it is gone, `kronik restore --allow-missing-keys` keeps every other subject readable.
 
 A sealed value (privacy mode on, a value tagged with a subject) needs its subject's key from the privacy keystore, `keys/keystore.db`, and the keystore does not hold it. The subject was not erased either, so the value is not a tombstone: it is data that nobody can read on this node.
 
 Where it shows:
 
 - `kronik restore` checks every sealed value in the restored state and log against the keystore it would install (the bucket's newest keystore backup, with the log's later erasures applied again). If one has no key, the restore fails before it writes, and names the subjects.
-- `kronik integrity` lists such subjects on a running node, for example one restored with `--without-keystore`.
+- `kronik integrity` lists such subjects on a running node, for example one restored with `--allow-missing-keys` or `--without-keystore`, and exits 1.
 - Replay (a proposal, a fork) that meets such a value fails with this code instead of running the turn without it.
 
 Typical causes:
 
 - The keystore backup in the bucket is older than the subject's first sealed value: the shipper uploads one within a minute of a keystore change, so restoring right after a new subject appeared can come too early.
-- The restore ran with `--without-keystore`.
+- The restore ran with `--allow-missing-keys` (some keys) or `--without-keystore` (every key).
 - `keys/keystore.db` was deleted or replaced on this node.
 
-To fix it, let the source node ship again (or wait a minute while it runs) and restore again, or restore from another bucket that has a newer backup. If the keys are lost, the values cannot be recovered; `--without-keystore` restores the rest.
+To fix it, let the source node ship again (or wait a minute while it runs) and restore again, or restore from another bucket that has a newer backup. If the source is gone, `kronik restore --allow-missing-keys` installs the newest backup anyway: the listed subjects' sealed values stay unreadable, every other subject's stay readable. `--without-keystore` is not the way out here: it installs no backup and drops every subject's key.
 
 See also: [`MASTER_KEY_MISSING`](#master_key_missing), [`SUBJECT_ERASED`](#subject_erased).
 

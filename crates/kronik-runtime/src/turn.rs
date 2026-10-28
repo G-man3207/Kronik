@@ -55,6 +55,13 @@ pub enum RunError {
     Host(String),
     #[error("invalid input: {0}")]
     Input(String),
+    /// A sealed value reached the turn unopened: its subject's key is not
+    /// in this node's privacy keystore (`KEYSTORE_INCOMPLETE`).
+    #[error(
+        "KEYSTORE_INCOMPLETE: a sealed value of subject {0} cannot be opened: its key is not \
+         in this node's privacy keystore"
+    )]
+    KeyMissing(String),
 }
 
 /// A component linked once; every turn instantiates from it.
@@ -363,11 +370,10 @@ fn sealed_bytes(s: Option<&pb::Sealable>) -> Result<Vec<u8>, RunError> {
         Some(pb::sealable::Value::Plain(b)) => Ok(b.clone()),
         // The caller opens sealed values first; one still sealed here has no
         // key in this node's keystore.
-        Some(pb::sealable::Value::Sealed(_)) => Err(RunError::Input(format!(
-            "KEYSTORE_INCOMPLETE: a sealed value of subject {} cannot be opened: its key is not \
-             in this node's privacy keystore",
-            s.and_then(|s| s.subject.as_deref()).unwrap_or("?")
-        ))),
+        Some(pb::sealable::Value::Sealed(_)) => Err(RunError::KeyMissing(
+            s.and_then(|s| s.subject.clone())
+                .unwrap_or_else(|| "?".into()),
+        )),
         None => Ok(Vec::new()),
     }
 }

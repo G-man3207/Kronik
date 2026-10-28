@@ -568,8 +568,16 @@ fn a_restore_installs_the_keystore_that_holds_every_needed_key() {
     assert!(!dir.join("c/data/branches").exists(), "it wrote state");
     assert!(!dir.join("c/data/keys/keystore.db").exists());
 
-    // --without-keystore is the explicit opt-out, and integrity reports it.
-    let (ok, v, text) = restore(&bucket, &c_config, key, &["--without-keystore"]);
+    // Review F1: the source is gone, so --allow-missing-keys installs the
+    // newest backup anyway and names the subjects that stay unreadable.
+    let (ok, v, text) = restore(&bucket, &c_config, key, &["--allow-missing-keys"]);
+    assert!(ok, "{text}");
+    assert_eq!(v["keystore"], "installed", "{text}");
+    assert_eq!(v["keys_missing"], json!(["user:1", "user:2"]), "{text}");
+    assert!(dir.join("c/data/keys/keystore.db").exists());
+    // --without-keystore installs none at all.
+    let d_config = config(dir, "d", key, None);
+    let (ok, v, text) = restore(&bucket, &d_config, key, &["--without-keystore"]);
     assert!(ok, "{text}");
     assert_eq!(v["keystore"], "skipped", "{text}");
     let c = Daemon::start(dir, "c", &c_config, key);

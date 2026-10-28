@@ -37,11 +37,17 @@ pub struct RestoreArgs {
     /// set, is the key itself.
     #[arg(long, value_name = "PATH", env = "KRONIK_MASTER_KEY_FILE")]
     master_key_file: Option<PathBuf>,
-    /// Restore without the bucket's privacy keystore backup, when the key
-    /// it needs is not available: sealed values then stay unreadable.
-    /// Without this, such a backup fails the restore before it writes.
-    #[arg(long)]
+    /// Restore without the bucket's privacy keystore backup, when the
+    /// master key it needs is not available. This drops every subject key:
+    /// every sealed value of every subject stays unreadable.
+    #[arg(long, conflicts_with = "allow_missing_keys")]
     without_keystore: bool,
+    /// Install the bucket's newest keystore backup even when it lacks the
+    /// keys of some sealed values (a node lost within a minute of a new
+    /// subject's first value). Those subjects' values stay unreadable and
+    /// are listed; everyone else's stay readable.
+    #[arg(long)]
+    allow_missing_keys: bool,
     /// The branch to restore.
     #[arg(long, default_value = "main")]
     branch: String,
@@ -81,6 +87,10 @@ struct RestoreOutput {
     /// `skipped` (`--without-keystore`). Absent for a dry run.
     #[serde(skip_serializing_if = "Option::is_none")]
     keystore: Option<String>,
+    /// With `--allow-missing-keys`: subjects whose sealed values have no key
+    /// and stay unreadable. Absent when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    keys_missing: Vec<String>,
 }
 
 #[cfg(test)]
@@ -173,7 +183,13 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
     let branch = args.branch.clone();
     let force = args.force;
     let dry_run = args.dry_run;
-    let without_keystore = args.without_keystore;
+    let mode = if args.without_keystore {
+        kronik_ship::KeystoreMode::Without
+    } else if args.allow_missing_keys {
+        kronik_ship::KeystoreMode::AllowMissingKeys
+    } else {
+        kronik_ship::KeystoreMode::Require
+    };
     let report = rt.block_on(async {
         let remote = Remote::open(&from, endpoint.as_deref()).map_err(ship_error)?;
         if dry_run {
@@ -182,7 +198,7 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
             remote.check().await.map_err(ship_error)?;
             return Ok(None);
         }
-        kronik_ship::restore(&remote, &data, &branch, force, &key_path, without_keystore)
+        kronik_ship::restore(&remote, &data, &branch, force, &key_path, mode)
             .await
             .map(Some)
             .map_err(ship_error)
@@ -200,6 +216,10 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
         log_first_lsn: report.as_ref().map(|r| r.log_first_lsn),
         components: report.as_ref().map(|r| r.components as u64),
         keystore: report.as_ref().map(|r| r.keystore.to_owned()),
+        keys_missing: report
+            .as_ref()
+            .map(|r| r.keys_missing.clone())
+            .unwrap_or_default(),
     };
     Ok((
         render(&output, &from, endpoint.as_deref(), &data, force),
@@ -279,11 +299,23 @@ fn render(
     let keystore = match o.keystore.as_deref() {
         Some("installed") => "installed with the master key, which serve will use too".to_owned(),
         Some("skipped") => {
-            "not installed (--without-keystore): sealed values stay unreadable".to_owned()
+            "not installed (--without-keystore): every sealed value stays unreadable".to_owned()
         }
+        _ if !o.keys_missing.is_empty() => "none in the bucket".to_owned(),
         _ => "none in the bucket, and none needed".to_owned(),
     };
     field(&mut out, "Keystore", &[keystore], "");
+    if !o.keys_missing.is_empty() {
+        field(
+            &mut out,
+            "Unreadable",
+            &[format!(
+                "no key for the sealed values of {} (--allow-missing-keys; kronik integrity lists them)",
+                o.keys_missing.join(", ")
+            )],
+            "",
+        );
+    }
     out.push_str(&next(&[format!("kronik serve --data-dir {dir}")]));
     out
 }
@@ -358,9 +390,10 @@ fn ship_error(e: ShipError) -> ApiError {
             format!("restore: KEYSTORE_INCOMPLETE: {m}"),
         )
         .with_hint(
-            "Let the source node ship again (it uploads a keystore backup within a minute of a \
-             change) and restore again; or pass --without-keystore to restore without those \
-             values. Nothing was written.",
+            "If the source node still runs, let it ship again (it uploads a keystore backup \
+             within a minute of a change) and restore again. If it is gone, \
+             --allow-missing-keys installs the backup anyway: only the listed subjects' sealed \
+             values stay unreadable. (--without-keystore drops every key.) Nothing was written.",
         ),
         ShipError::Io(e) => ApiError::new(ErrorCode::BadRequest, format!("restore I/O: {e}"))
             .with_hint("Check that the data directory is writable and the bucket is readable."),

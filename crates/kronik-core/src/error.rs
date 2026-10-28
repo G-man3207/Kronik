@@ -163,7 +163,7 @@ codes! {
         "This is a bug in Kronik; please report it with the daemon log.";
     KeystoreIncomplete = "KEYSTORE_INCOMPLETE", 409, "M8",
         "A sealed value's subject key is not in the keystore",
-        "Restore from a bucket whose keystore backup holds the keys (it is shipped within a minute of a change), or pass --without-keystore to accept unreadable values.";
+        "Let the source ship its keystore again and restore again; if it is gone, `kronik restore --allow-missing-keys` keeps every other subject readable.";
     KvmUnavailable = "KVM_UNAVAILABLE", 503, "M7",
         "KVM is not available on this host",
         "Set `platform = \"auto\"` or `\"systrap\"` under `[foreign]`, or enable `/dev/kvm`.";

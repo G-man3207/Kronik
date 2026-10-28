@@ -134,18 +134,22 @@ impl Api {
             };
         // Sealed values whose subject key the keystore lacks (a restore
         // with --without-keystore, a lost keystore.db): unreadable data.
-        needed.extend(kronik_store::db::sealed_keys(store.db().conn()).map_err(internal)?);
+        for ((subject, _), sample) in
+            kronik_store::db::sealed_keys(store.db().conn()).map_err(internal)?
+        {
+            kronik_store::db::note_key(&mut needed, &subject, &sample);
+        }
         let mut keys_missing: Vec<String> = Vec::new();
         if let Some(ks) = self.node.sealer().keystore() {
-            for (subject, version) in &needed {
-                if !ks.covers(subject, *version).map_err(internal)?
+            for ((subject, version), sample) in &needed {
+                if !ks.covers(subject, *version, sample).map_err(internal)?
                     && keys_missing.last() != Some(subject)
                 {
                     keys_missing.push(subject.clone());
                 }
             }
         } else {
-            keys_missing.extend(needed.iter().map(|(s, _)| s.clone()));
+            keys_missing.extend(needed.keys().map(|(s, _)| s.clone()));
             keys_missing.dedup();
         }
         ok(&IntegrityResponse {
