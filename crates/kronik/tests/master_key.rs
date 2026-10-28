@@ -339,8 +339,8 @@ fn restore_round_trip(key: KeyAt) {
             assert!(!out.status.success(), "restore without the key: {stdout}");
             assert!(stdout.contains(code), "{code}: {stdout}");
             assert!(
-                !dir.join("b/data/keys").exists() && !dir.join("b/data/branches").exists(),
-                "a failed restore wrote into the data directory"
+                !dir.join("b").exists(),
+                "a refused restore created the destination"
             );
         }
     }
@@ -513,7 +513,10 @@ fn a_restore_installs_the_keystore_that_holds_every_needed_key() {
     );
     assert!(!ok, "a keyless restore succeeded: {text}");
     assert_eq!(v["error"]["code"], "MASTER_KEY_MISSING", "{text}");
-    assert!(!dir.join("k/data/branches").exists(), "it wrote state");
+    assert!(
+        !dir.join("k").exists(),
+        "a refused restore created the destination"
+    );
 
     // The subject's first sealed value, and a snapshot right after it: the
     // backup with its key ships later (one a minute at most).
@@ -536,6 +539,25 @@ fn a_restore_installs_the_keystore_that_holds_every_needed_key() {
         objects(&bucket, "keystore")
     );
     a.stop();
+
+    // Another key in KRONIK_MASTER_KEY (walk 4's step-9 re-check): refused,
+    // and the absent destination stays absent (no empty keys/ either).
+    let e_config = config(dir, "e", KeyAt::Env, None);
+    let out = command(KeyAt::File)
+        .env("KRONIK_MASTER_KEY", "7".repeat(64))
+        .args(["--json", "restore", "--from"])
+        .arg(format!("file://{}", bucket.display()))
+        .arg("--config")
+        .arg(&e_config)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("MASTER_KEY_MISMATCH"), "{text}");
+    assert!(
+        !dir.join("e").exists(),
+        "a refused restore created the destination"
+    );
 
     // With the right key: the newer backup, so the value reads.
     let b_config = config(dir, "b", key, None);
@@ -565,8 +587,10 @@ fn a_restore_installs_the_keystore_that_holds_every_needed_key() {
         v["error"]["message"].as_str().unwrap().contains("user:1"),
         "{text}"
     );
-    assert!(!dir.join("c/data/branches").exists(), "it wrote state");
-    assert!(!dir.join("c/data/keys/keystore.db").exists());
+    assert!(
+        !dir.join("c").exists(),
+        "a refused restore created the destination"
+    );
 
     // Review F1: the source is gone, so --allow-missing-keys installs the
     // newest backup anyway and names the subjects that stay unreadable.

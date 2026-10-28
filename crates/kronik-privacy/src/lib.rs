@@ -100,8 +100,10 @@ impl MasterKey {
     ) -> Result<(MasterKey, bool), PrivacyError> {
         if let Some(text) = material {
             // No key file is created, but the secret store and the privacy
-            // keystore live in the same directory, so make sure it exists.
-            if let Some(dir) = path.parent() {
+            // keystore live in the same directory, so make sure it exists;
+            // a caller that only reads the key (`fresh` is None: shipping,
+            // restore) creates nothing.
+            if let Some(dir) = path.parent().filter(|_| fresh.is_some()) {
                 std::fs::create_dir_all(dir).map_err(|source| PrivacyError::Io {
                     path: dir.display().to_string(),
                     source,
