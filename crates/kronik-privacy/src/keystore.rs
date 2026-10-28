@@ -301,10 +301,6 @@ impl Keystore {
             .map(|k| k.version)
     }
 
-    /// Deletes every key of the subject and records the erasure; returns the
-    /// last version erased (0 when the subject never had a key). Values sealed
-    /// with those keys are unreadable from now on; copies of this keystore in
-    /// backups keep them until the backups expire.
     /// Re-applies a logged erasure of `subject`'s keys through `version`
     /// (a restore whose keystore backup predates it). Newer keys of the
     /// subject stay; already covered, it changes nothing.
@@ -332,21 +328,37 @@ impl Keystore {
     }
 
     /// Whether a value sealed under `subject`'s key `version` can be
-    /// accounted for: the key is here, or the subject was erased through
-    /// that version (its values are tombstones).
-    pub fn covers(&self, subject: &str, version: u32) -> Result<bool, PrivacyError> {
-        let conn = self.conn();
-        if Self::erased_through(&conn, subject)?.is_some_and(|v| v >= version) {
+    /// accounted for: the subject was erased through that version (its
+    /// values are tombstones), or the key is here and opens `sample`, one
+    /// value sealed with it (a key of the same version from another lineage,
+    /// after a restore without the keystore, would not).
+    pub fn covers(
+        &self,
+        subject: &str,
+        version: u32,
+        sample: &kronik_proto::log::v1::Sealed,
+    ) -> Result<bool, PrivacyError> {
+        if Self::erased_through(&self.conn(), subject)?.is_some_and(|v| v >= version) {
             return Ok(true);
         }
-        let n: i64 = conn.query_row(
-            "SELECT count(*) FROM subject_keys WHERE subject = ?1 AND version = ?2",
-            params![subject, version],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
+        let Ok(nonce) = <[u8; 24]>::try_from(sample.nonce.as_slice()) else {
+            return Ok(false);
+        };
+        let sample = SealedValue {
+            key_version: version,
+            nonce,
+            ciphertext: sample.ciphertext.clone(),
+        };
+        match self.key(subject, version)? {
+            KeyLookup::Found(k) => Ok(unseal(subject, &k, &sample).is_ok()),
+            _ => Ok(false),
+        }
     }
 
+    /// Deletes every key of the subject and records the erasure; returns the
+    /// last version erased (0 when the subject never had a key). Values sealed
+    /// with those keys are unreadable from now on; copies of this keystore in
+    /// backups keep them until the backups expire.
     pub fn erase(&self, subject: &str, wall_ms: u64) -> Result<u32, PrivacyError> {
         if !valid_subject(subject) {
             return Err(PrivacyError::InvalidSubject(subject.to_owned()));
@@ -922,19 +934,51 @@ mod tests {
         Keystore::open_file(&path, &MasterKey::from_bytes([1; 32])).unwrap();
     }
 
+    /// Review F4: a key of the right version from another lineage (a new
+    /// keystore after a restore without one) does not cover old values.
+    #[test]
+    fn covers_tries_the_key_on_a_sealed_value() {
+        let old = store(1);
+        let k = old.key_for_sealing("user:1", [1; 32], [1; 24], 0).unwrap();
+        let v = seal("user:1", &k, [9; 24], b"kept").unwrap();
+        let sample = kronik_proto::log::v1::Sealed {
+            key_version: v.key_version,
+            nonce: v.nonce.to_vec(),
+            ciphertext: v.ciphertext.clone(),
+        };
+        assert!(old.covers("user:1", 1, &sample).unwrap());
+        let new = store(1);
+        new.key_for_sealing("user:1", [2; 32], [2; 24], 1).unwrap();
+        assert!(!new.covers("user:1", 1, &sample).unwrap());
+        new.erase("user:1", 2).unwrap();
+        assert!(new.covers("user:1", 1, &sample).unwrap());
+    }
+
     #[test]
     fn a_logged_erasure_is_applied_again_through_its_version_only() {
         let ks = store(1);
         ks.key_for_sealing("user:1", [1; 32], [1; 24], 0).unwrap();
         ks.rotate("user:1", [2; 32], [2; 24], 1).unwrap();
-        assert!(ks.covers("user:1", 1).unwrap() && ks.covers("user:1", 2).unwrap());
-        assert!(!ks.covers("user:1", 3).unwrap() && !ks.covers("user:2", 1).unwrap());
+        let sample = |version| {
+            let KeyLookup::Found(k) = ks.key("user:1", version).unwrap() else {
+                panic!("no key {version}")
+            };
+            let v = seal("user:1", &k, [9; 24], b"x").unwrap();
+            kronik_proto::log::v1::Sealed {
+                key_version: version,
+                nonce: v.nonce.to_vec(),
+                ciphertext: v.ciphertext,
+            }
+        };
+        let (s1, s2) = (sample(1), sample(2));
+        assert!(ks.covers("user:1", 1, &s1).unwrap() && ks.covers("user:1", 2, &s2).unwrap());
+        assert!(!ks.covers("user:1", 3, &s2).unwrap() && !ks.covers("user:2", 1, &s1).unwrap());
         // Erased through version 1 (a restore's backup predates it): the
         // version-1 values are tombstones, version 2 still has its key.
         ks.erase_through("user:1", 1, 5).unwrap();
         assert!(matches!(ks.key("user:1", 1).unwrap(), KeyLookup::Erased));
         found(ks.key("user:1", 2).unwrap());
-        assert!(ks.covers("user:1", 1).unwrap() && ks.covers("user:1", 2).unwrap());
+        assert!(ks.covers("user:1", 1, &s1).unwrap() && ks.covers("user:1", 2, &s2).unwrap());
         ks.erase_through("user:1", 1, 6).unwrap();
         found(ks.key("user:1", 2).unwrap());
     }

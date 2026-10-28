@@ -194,15 +194,20 @@ pub struct Proposals {
 }
 
 fn internal(m: impl std::fmt::Display) -> ApiError {
-    let m = m.to_string();
-    // A replay that met a sealed value without its key (the runtime says so).
-    if let Some(i) = m.find("KEYSTORE_INCOMPLETE: ") {
-        return ApiError::new(ErrorCode::KeystoreIncomplete, m[i..].to_owned()).with_hint(
-            "The node's privacy keystore lacks a subject's key; `kronik integrity` lists the \
-             subjects. Restore it from a keystore backup that holds the key.",
-        );
+    ApiError::new(ErrorCode::Internal, m.to_string())
+}
+
+/// A replay's error: a sealed value without its key has its own code.
+fn replay_error(e: replay::ReplayError) -> ApiError {
+    match e {
+        replay::ReplayError::KeyMissing(run) => {
+            ApiError::new(ErrorCode::KeystoreIncomplete, run.to_string()).with_hint(
+                "The node's privacy keystore lacks a subject's key; `kronik integrity` lists \
+                 the subjects. Restore it from a keystore backup that holds the key.",
+            )
+        }
+        e => internal(e),
     }
-    ApiError::new(ErrorCode::Internal, m)
 }
 
 fn not_found(id: &str) -> ApiError {
@@ -623,7 +628,7 @@ impl Proposals {
         let (trees, continuous) =
             replay::both(self.node.env(), setup, options, workers, Some(id), &head)
                 .await
-                .map_err(internal)?;
+                .map_err(replay_error)?;
         let trees = trees.unwrap_or_default();
         Ok(Live {
             index,

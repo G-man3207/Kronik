@@ -3864,6 +3864,13 @@ against both.
     "from": {
       "type": "string"
     },
+    "keys_missing": {
+      "description": "With `--allow-missing-keys`: subjects whose sealed values have no key\nand stay unreadable. Absent when there are none.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "keystore": {
       "description": "The privacy keystore backup: `installed`, `none_in_bucket`, or\n`skipped` (`--without-keystore`). Absent for a dry run.",
       "type": [
@@ -3913,7 +3920,8 @@ against both.
     "dry_run",
     "from",
     "data_dir",
-    "branch"
+    "branch",
+    "keys_missing"
   ],
   "type": "object"
 }

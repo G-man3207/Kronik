@@ -199,7 +199,7 @@ $ kronik doctor
 
 ## kronik restore
 
-`kronik restore --from <URL> [--endpoint <URL>] [--data-dir <DIR>] [--config <PATH>] [--master-key-file <PATH>] [--without-keystore] [--branch main] [--force] [--dry-run]`
+`kronik restore --from <URL> [--endpoint <URL>] [--data-dir <DIR>] [--config <PATH>] [--master-key-file <PATH>] [--allow-missing-keys | --without-keystore] [--branch main] [--force] [--dry-run]`
 
 Restores a data directory from object storage (M6). Offline: the daemon
 must not be running on the directory, and the command does not talk to
@@ -215,17 +215,26 @@ look for it: `--master-key-file` (or `KRONIK_MASTER_KEY_FILE`), else
 to install the bucket's newest privacy keystore backup, applies the
 erasures the log records after it, and checks that the keystore holds the
 key of every sealed value in the restored state and log. Everything is
-downloaded and checked in `<data-dir>/.restore` first, so a failure leaves
-the directory as it was:
+downloaded, checked and written in `<data-dir>/.restore` first, so a check
+that fails leaves the directory as it was:
 - a backup in the bucket and the key missing or another one:
   `MASTER_KEY_MISSING` or `MASTER_KEY_MISMATCH`;
 - a sealed value whose key no backup provides (or sealed values and no
   backup at all): `KEYSTORE_INCOMPLETE`.
 
-`--without-keystore` restores without the backup and without that check;
-sealed values then stay unreadable, and `kronik integrity` lists their
-subjects. The JSON's `keystore` says `installed`, `none_in_bucket` or
-`skipped`.
+Then the result is moved into place with renames: the old `state.db` is
+removed first and the new one put in place last. A restore interrupted
+there (a crash, a full disk) leaves no `state.db`, never the old state with
+the new log; run the restore again, without `--force`.
+
+When the source node is gone and its newest backup lacks a subject's key
+(it ships within a minute of a new subject's first value),
+`--allow-missing-keys` installs that backup anyway: only the listed
+subjects' sealed values stay unreadable, and the JSON's `keys_missing`
+names them. `--without-keystore` installs no backup at all, which drops
+**every** subject's key: every sealed value stays unreadable. After
+either, `kronik integrity` lists the subjects and exits 1. The JSON's
+`keystore` says `installed`, `none_in_bucket` or `skipped`.
 
 `--from` is `s3://bucket/prefix` or `file:///path`. Credentials and region
 come from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,

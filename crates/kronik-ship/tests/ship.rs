@@ -13,7 +13,7 @@ use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::snapshots::StorageConfig;
 use kronik_sched::{Node, NodeConfig, start_local};
-use kronik_ship::{Remote, ShipState, restore, ship_once};
+use kronik_ship::{KeystoreMode, Remote, ShipState, restore, ship_once};
 use tokio::runtime::Runtime;
 
 fn guest(name: &str) -> Vec<u8> {
@@ -161,7 +161,7 @@ fn ship_and_restore(remote: &Remote) {
             "main",
             false,
             &dst.path().join("keys/master.key"),
-            false,
+            KeystoreMode::Require,
         ))
         .unwrap();
     assert_eq!(r.snapshot_lsn, m.lsn);
@@ -175,7 +175,7 @@ fn ship_and_restore(remote: &Remote) {
             "main",
             false,
             &dst.path().join("keys/master.key"),
-            false,
+            KeystoreMode::Require,
         ))
         .unwrap_err();
     assert!(err.to_string().contains("--force"), "{err}");
@@ -193,6 +193,60 @@ fn ship_destroy_and_restore_from_a_directory_bucket() {
     let bucket = tempdir("ship-bucket-");
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     ship_and_restore(&remote);
+}
+
+/// Review F2: a restore interrupted while it moves into place leaves no
+/// `state.db` (never the old state with the new log), so it can simply run
+/// again; and nothing of the staging directory is left behind.
+#[test]
+fn an_interrupted_restore_leaves_a_consistent_directory() {
+    let bucket = tempdir("ship-int-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let src = tempdir("ship-int-src-");
+    let p = start(src.path(), None);
+    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false))
+        .unwrap();
+    p.send("counter/a", "increment", "");
+    p.rt.block_on(p.node.snapshot("manual")).unwrap();
+    p.ship(&remote, src.path());
+    let hash = p.node.store().state_hash().unwrap();
+    let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
+    drop(p);
+
+    let dst = tempdir("ship-int-dst-");
+    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
+    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
+    let key_path = dst.path().join("keys/master.key");
+    let rt = rt();
+    let run = |force: bool, at: Option<&'static str>| {
+        rt.block_on(kronik_ship::restore_with_fault(
+            &remote,
+            dst.path(),
+            "main",
+            force,
+            &key_path,
+            KeystoreMode::Require,
+            &|step| match at {
+                Some(s) if s == step => Err(std::io::Error::other(format!("injected at {step}"))),
+                _ => Ok(()),
+            },
+        ))
+    };
+    run(false, None).unwrap();
+    let state = dst.path().join("branches/main/state.db");
+    for step in ["state", "log", "sql", "snapshot", "code", "keys", "commit"] {
+        let err = run(true, Some(step)).unwrap_err();
+        assert!(err.to_string().contains("injected"), "{step}: {err}");
+        // "state" fails before anything moved: the old restore is intact.
+        assert_eq!(state.exists(), step == "state", "{step}");
+        assert!(!dst.path().join(".restore").exists(), "{step}: stage left");
+        // Without a state.db, a plain restore runs again and is complete.
+        run(step == "state", None).unwrap();
+        assert!(state.exists(), "{step}");
+    }
+    let q = start(dst.path(), None);
+    assert_eq!(q.node.store().state_hash().unwrap(), hash);
+    assert_eq!(q.send("counter/a", "increment", ""), "2");
 }
 
 #[test]

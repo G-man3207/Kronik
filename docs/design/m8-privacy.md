@@ -502,7 +502,8 @@ sections above:
   `keys/keystore.db`, with the log's later erasures applied again, after
   checking it holds every key the restored data needs; a backup it can't
   install, or a missing key, fails the restore before it writes (see the
-  operations guide; `--without-keystore` opts out). `serve` passes `[privacy] keystore_backup_retention` to
+  operations guide; `--allow-missing-keys` installs it anyway and lists
+  the subjects left without a key, `--without-keystore` installs none). `serve` passes `[privacy] keystore_backup_retention` to
   `NodeConfig.keystore_backup_retention`, so a configured window is what
   both erasure completion and the shipper use.
 - **Redaction.** `kronik_api::redact::render_sealable` renders state values

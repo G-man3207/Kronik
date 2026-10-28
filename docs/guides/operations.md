@@ -478,8 +478,12 @@ shipper uploads it separately, encrypted, within a minute of a change. A
 restore installs the newest of those backups and refuses
 (`KEYSTORE_INCOMPLETE`) when it lacks the key of a sealed value in the
 restored data, for example a restore made within a minute of a new
-subject's first value: wait for the source to ship again. `kronik
-integrity` lists subjects whose sealed values have no key, and exits 1.
+subject's first value. If the source still runs, let it ship again and
+restore again. If it is gone, `kronik restore --allow-missing-keys`
+installs the backup anyway and names the subjects whose sealed values stay
+unreadable; every other subject stays readable. (`--without-keystore`
+drops every key, so use it only without the master key.) `kronik integrity`
+lists subjects whose sealed values have no key, and exits 1.
 
 ## Shipping to object storage
 

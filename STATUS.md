@@ -491,6 +491,12 @@ Each branch's last commit message carries its handoff.
 
 ## Known gaps
 
+- The shipper notices a keystore change by the size and mtime of
+  `keystore.db` and its WAL. A write that reuses the WAL after a
+  checkpoint, at the same length and within one mtime tick, is missed until
+  the next change or the daily backup (review F7 on fix-v01-keystore-restore).
+  A change counter kept in the keystore itself would close it.
+
 - GitHub Actions has not been green yet. CI failed at fmt on 19eb9d0,
   43bc314 and cfb9a86, in the tests on 0891be7, and ran out of runner disk
   during the tests on b47780d (fixed in 9da9e55, not pushed). The nightly at

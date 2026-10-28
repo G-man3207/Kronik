@@ -271,9 +271,6 @@ impl Store {
     }
 }
 
-/// Installs a snapshot directory as a branch's state: `state.db` and the
-/// actor databases are copied into `branch_dir` (`state.db`, `sql/`),
-/// replacing what is there. The daemon must not run on it.
 /// The subject keys the snapshot's state needs ([`crate::db::sealed_keys`]),
 /// read without changing the snapshot.
 pub fn sealed_keys(snapshot: &Path) -> Result<crate::db::SubjectKeys, StoreError> {
@@ -284,6 +281,9 @@ pub fn sealed_keys(snapshot: &Path) -> Result<crate::db::SubjectKeys, StoreError
     crate::db::sealed_keys(&conn)
 }
 
+/// Installs a snapshot directory as a branch's state: `state.db` and the
+/// actor databases are copied into `branch_dir` (`state.db`, `sql/`),
+/// replacing what is there. The daemon must not run on it.
 pub fn install(snapshot: &Path, branch_dir: &Path) -> Result<(), StoreError> {
     let sql = branch_dir.join("sql");
     if sql.exists() {
