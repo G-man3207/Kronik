@@ -526,10 +526,24 @@ pub async fn restore_with_fault(
     if stage.exists() {
         std::fs::remove_dir_all(&stage)?;
     }
+    // The directories this restore may create, innermost first: a refusal
+    // removes them again, so "nothing was written" holds for a destination
+    // that did not exist.
+    let created: Vec<PathBuf> = std::iter::once(data.join("keys"))
+        .chain(data.ancestors().map(Path::to_path_buf))
+        .take_while(|d| !d.exists())
+        .collect();
     let staged = stage_restore(remote, data, &stage, branch, key_path, mode).await;
     let result = match staged {
         Ok(s) => install_staged(data, &stage, branch, &branch_dir, s, fault),
-        Err(e) => Err(e),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&stage);
+            // Empty only: never anything else that appeared meanwhile.
+            for d in &created {
+                let _ = std::fs::remove_dir(d);
+            }
+            Err(e)
+        }
     };
     let _ = std::fs::remove_dir_all(&stage);
     result
