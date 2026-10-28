@@ -211,7 +211,7 @@ step_examples() {
 step_ts() {
     local kronik
     npm ci --prefix sdk/ts --no-audit --no-fund
-    (cd sdk/ts && npm run --silent check && node --test test/ && npm run --silent types && git diff --exit-code -- types)
+    (cd sdk/ts && npm run --silent check && node --test test/*.test.ts && npm run --silent types && git diff --exit-code -- types)
     cargo build --locked --release -p kronik
     # Where cargo put it, also with CARGO_TARGET_DIR set.
     kronik="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/kronik"

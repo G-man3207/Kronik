@@ -1,5 +1,5 @@
 // Unit tests for the parts of the SDK that make no host calls:
-// node --test test/
+// node --test test/*.test.ts
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
