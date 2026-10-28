@@ -29,7 +29,12 @@ if ! command -v cargo >/dev/null 2>&1 && [ -f "${CARGO_HOME:-$HOME/.cargo}/env" 
 fi
 
 bin="$(realpath "${KRONIK_BIN:-${CARGO_TARGET_DIR:-target}/release/kronik}")"
-dir="${1:-/var/tmp/kronik-identity}"
+# WORKDIR is optional: ci.sh passes only `--only ...` when libfaketime is missing.
+dir=/var/tmp/kronik-identity
+if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
+    dir="$1"
+    shift
+fi
 
 payments="$(cargo build --quiet --locked --release --manifest-path examples/fake-payments/Cargo.toml \
     --message-format=json | python3 -c '
@@ -52,4 +57,4 @@ if [ -z "$faketime_lib" ]; then
 fi
 
 exec python3 scripts/identity-examples.py --bin "$bin" --dir "$dir" --fake-payments "$payments" \
-    ${faketime_lib:+--faketime-lib "$faketime_lib"} "${@:2}"
+    ${faketime_lib:+--faketime-lib "$faketime_lib"} "$@"
