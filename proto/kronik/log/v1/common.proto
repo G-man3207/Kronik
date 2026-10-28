@@ -1,0 +1,103 @@
+// Kronik log format v1: shared types.
+//
+// Rules for every message in this package (see docs/design/m1-core.md):
+// - Field 0 of every enum is <NAME>_UNSPECIFIED and never means an operation.
+//   A record carrying 0 or an unknown enum value is STORAGE_CORRUPT when it is
+//   applied; a missing field is never read as a default operation.
+// - Everything that can carry user data is a `Sealable`, tagged with at most
+//   one subject even when it is stored in plain text (I9).
+// - Adding fields is the only compatible change (I16). Removing, renumbering
+//   or changing the type of a field needs a new format version and a
+//   compatibility fixture.
+syntax = "proto3";
+
+package kronik.log.v1;
+
+// "kind/key", for example billing/acme.
+message ActorRef {
+  string kind = 1;
+  string key = 2;
+}
+
+// A value that may be sealed with its subject's key (privacy mode). The
+// subject tag is recorded in both modes.
+message Sealable {
+  optional string subject = 1;
+  oneof value {
+    bytes plain = 2;
+    Sealed sealed = 3;
+  }
+}
+
+// XChaCha20-Poly1305 with the subject's key at `key_version`.
+message Sealed {
+  uint32 key_version = 1;
+  bytes nonce = 2;
+  bytes ciphertext = 3;
+}
+
+// The causal key pairs turns in production and in a fork: the root input's
+// id plus the path of (actor, outgoing ordinal) that led to a turn.
+message CausalKey {
+  // Root input id: 32 lowercase hex characters drawn from the entropy source
+  // when the root input is admitted, then recorded. Stable in replay because
+  // replay reads it from the log.
+  string root = 1;
+  repeated CausalStep path = 2;
+}
+
+message CausalStep {
+  // The actor whose turn produced the child (sender, caller, scheduler).
+  ActorRef actor = 1;
+  // The producing turn's operation ordinal (one counter per turn over send,
+  // call, timer.schedule and effects). 4294967295 marks the migrate turn
+  // that runs before the input of the parent key.
+  uint32 ordinal = 2;
+}
+
+// Who changed configuration and why (I12). Every mutation carries one.
+message Audit {
+  // Token id; "unix:uid=<n>" for the local API socket before M5.
+  string token_id = 1;
+  string reason = 2;
+  // Host wall-clock time of the request, for humans only; never an input to
+  // a turn.
+  uint64 wall_time_ms = 3;
+}
+
+// A content-addressed blob (M25/M26). Present in the format from v1.
+message BlobRef {
+  // "b3:" + 64 hex characters.
+  string hash = 1;
+  uint64 size = 2;
+}
+
+// An HTTP body: inline bytes, or a blob from M25.
+message Body {
+  oneof value {
+    Sealable inline = 1;
+    BlobRef blob = 2;
+  }
+}
+
+message Header {
+  string name = 1;
+  // Header values may carry personal data, so they are sealable.
+  Sealable value = 2;
+}
+
+// Data sent to an actor (`message` in the WIT).
+message Message {
+  string name = 1;
+  string content_type = 2;
+  Sealable body = 3;
+  // Always empty before M26.
+  repeated BlobRef blobs = 4;
+}
+
+// An HTTP response produced by a turn or received from an effect.
+message HttpResponse {
+  uint32 status = 1;
+  repeated Header headers = 2;
+  Body body = 3;
+}

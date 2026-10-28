@@ -1,0 +1,45 @@
+[package]
+name = "kronik-foreign"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+kronik-core = { workspace = true }
+kronik-effects = { workspace = true }
+kronik-privacy = { workspace = true }
+kronik-proto = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+flate2 = "1.1.10"
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+libc = { workspace = true }
+# Registry pulls (the brief names oci-client). rustls without a bundled
+# provider: Kronik installs ring, as everywhere else (no aws-lc C build).
+oci-client = { version = "0.18.0", default-features = false, features = ["rustls-tls-no-provider"] }
+rustls = { workspace = true }
+# zstd layers, decoded in pure Rust.
+ruzstd = "0.9.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tar = "0.4.46"
+thiserror = { workspace = true }
+# The real sandbox boundary (outside DST, ADR 0004 §5): Unix sockets for the
+# port-forward bridge, the TCP bridge of trusted actors, and file I/O of the
+# registry pull.
+tokio = { workspace = true, features = ["sync", "macros", "net", "fs", "io-util"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+kronik-core = { workspace = true, features = ["real"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

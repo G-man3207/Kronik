@@ -1,0 +1,3 @@
+A turn is one execution of an actor's `handle` for one input. It has an atomic local commit: state writes, SQL changes, `send`, timers (from M2) and blob references (from M26) are committed together or discarded together. External effects and `call` (from M2) can happen before commit and are not rolled back. Each actor runs one turn at a time, and nothing is applied, delivered or answered until the turn record is fsynced. A turn that traps, runs out of fuel or returns a `handler-error` writes a failed turn record; there is no automatic retry.
+
+See also: `turn-id`, `logical-time`, `execution-id`, `dead-letters`.

@@ -1,0 +1,15 @@
+# Rust build output, including standalone projects such as spikes.
+target/
+
+# JavaScript and TypeScript tooling and build output, including kronik
+# build's working directory.
+node_modules/
+dist/
+.kronik/
+
+# Editors and operating systems.
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

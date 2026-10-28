@@ -1,0 +1,10 @@
+# The files that may contain `unsafe` code or `allow(unsafe_code)` (the
+# Definition of done: `unsafe` only in allowlisted modules with a
+# justification). `scripts/ci.sh hygiene` fails on unsafe code in any other
+# file under crates/ or sdk/rust/, and on an entry here that no longer has
+# any. The workspace denies `unsafe_code`; each of these files also says why
+# at its `allow`. One file per line: the path, then the reason.
+crates/kronik-runtime/src/engine.rs   Wasmtime's Component::deserialize_file loads precompiled code from Kronik's own cache; the engine version is in the file name and Wasmtime checks the artifact's fingerprint
+crates/kronik-store/src/sql/ffi.rs    the SQLite C API that rusqlite does not wrap: the session extension (changesets), the VFS clock hook and the table filter for sessions
+crates/kronik-foreign/src/sys.rs      the Linux system calls of the gVisor sandboxes: unshare and setns for network namespaces, ioctl to bring loopback up, umount2, geteuid
+sdk/rust/src/lib.rs                   the `bindings` module that wit-bindgen generates for the kronik:actor world, which the guest's export! needs

@@ -1,0 +1,53 @@
+[package]
+name = "kronik-test-actor"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Test guests for the Kronik daemon tests and the simulator (not the SDK examples)"
+license = "Elastic-2.0"
+
+# Standalone project built for wasm32-wasip2; not part of the host workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.63.0"
+
+[features]
+# Builds the `notes` kind (SQL state, schema version 1) instead of `counter`.
+notes = []
+# Adds an operation using std::fs, so the component imports wasi:filesystem
+# (the deploy check must reject it with IMPORT_NOT_ALLOWED).
+fs-probe = []
+# Replay-test variants of `counter` (M3): increment adds 2; fetch request
+# bodies get " v2" appended; `get` fails; fetch-ok also GETs <url>/extra;
+# schema version 1 with a migration.
+step2 = []
+body-v2 = []
+fail-get = []
+fetch-extra = []
+schema1 = []
+# System-proposal variants (M9): increment also calls `tally` on
+# notes/tally; with `notes`, the new `tally` message; either kind also
+# claims GET /tally/{key} (route checks of a set).
+calls-tally = []
+tally = []
+route-tally = []
+# Gateway tests: POST /counter/{key}/respond answers with the status,
+# headers and body that the request body spells out.
+respond = []
+# Privacy tests (v0.1): every HTTP request fails with its request line
+# (`fail-line`, an agent's probe); with `notes`, `add-call` inserts its
+# body, then calls `increment` on counter/c (an SQL turn open across a call).
+fail-line = []
+sql-call = []
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+strip = true
+panic = "abort"

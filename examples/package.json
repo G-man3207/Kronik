@@ -1,0 +1,17 @@
+{
+  "name": "kronik-examples",
+  "private": true,
+  "description": "The TypeScript example actors, built with `kronik build` (scripts/build-examples-ts.sh).",
+  "workspaces": [
+    "billing-ts",
+    "counter-ts",
+    "notes-ts",
+    "todo-ts",
+    "webhook-relay-ts"
+  ],
+  "devDependencies": {
+    "@bytecodealliance/componentize-js": "0.23.0",
+    "@bytecodealliance/jco": "1.39.0",
+    "typescript": "7.0.2"
+  }
+}

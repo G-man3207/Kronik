@@ -1,0 +1,76 @@
+// Kronik log format v1: the plaintext inside EffectRecord.request and
+// EffectRecord.response (each a Sealable holding one of these, encoded).
+// Secret values never appear here: a secret is a name, a version and a
+// keyed version hash. See common.proto for the format rules.
+syntax = "proto3";
+
+package kronik.log.v1;
+
+import "kronik/log/v1/common.proto";
+
+// A secret used by an effect: never the value.
+message SecretRef {
+  string name = 1;
+  // Header template such as "Bearer {}"; empty for crypto and reveal.
+  string template = 2;
+  uint32 version = 3;
+  // 16 bytes of blake3_keyed(version key, name \0 version \0 value).
+  bytes version_hash = 4;
+}
+
+message HttpEffectHeader {
+  string name = 1;
+  oneof value {
+    string text = 2;
+    SecretRef secret = 3;
+  }
+}
+
+// http.fetch request.
+message HttpEffectRequest {
+  string method = 1;
+  string url = 2;
+  repeated HttpEffectHeader headers = 3;
+  bytes body = 4;
+}
+
+message HeaderPair {
+  string name = 1;
+  string value = 2;
+}
+
+// http.fetch response (after secret scrubbing).
+message HttpEffectResponse {
+  uint32 status = 1;
+  repeated HeaderPair headers = 2;
+  bytes body = 3;
+}
+
+// actor.call request.
+message CallEffectRequest {
+  ActorRef to = 1;
+  Message msg = 2;
+  // Unset when the call has no compensation.
+  Message compensate = 3;
+  string message_id = 4;
+}
+
+// actor.call response: the callee's reply, unset for output::none.
+message CallEffectResponse {
+  Message reply = 1;
+  // The callee's turn ("<branch>:<lsn>"), for orphans and history.
+  string turn_id = 2;
+}
+
+// crypto.hmac-sha256 and crypto.sign-ed25519; the response is the result.
+message CryptoEffectRequest {
+  string algorithm = 1;
+  SecretRef secret = 2;
+  // blake3 of the data.
+  bytes data_hash = 3;
+}
+
+// secret.reveal: no response payload, the value is never recorded.
+message RevealEffectRequest {
+  SecretRef secret = 1;
+}

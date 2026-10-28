@@ -1,0 +1,24 @@
+[package]
+name = "kronik-test-leaky"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Test guest (kind `leaky`) that reveals a secret and moves the value through effects, calls, compensations, SQL and state keys, for the I8 scrubbing tests"
+license = "Elastic-2.0"
+
+# Standalone project built for wasm32-wasip2; not part of the host workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.63.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+strip = true
+panic = "abort"

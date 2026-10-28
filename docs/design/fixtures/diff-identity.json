@@ -1,0 +1,122 @@
+{
+  "schema": "kronik.diff/v1",
+  "fork": "p-000000000001",
+  "proposal_id": "p-000000000001",
+  "base": {
+    "branch": "main",
+    "fork_lsn": 1200,
+    "from_lsn": 1201,
+    "to_lsn": 9800
+  },
+  "code": {
+    "before": [
+      {
+        "kind": "counter",
+        "code_hash": "b3:aaaaaaaaaaaa",
+        "schema_version": 0
+      }
+    ],
+    "after": [
+      {
+        "kind": "counter",
+        "code_hash": "b3:bbbbbbbbbbbb",
+        "schema_version": 0
+      }
+    ]
+  },
+  "options": {
+    "mode": "both",
+    "sample": 1.0,
+    "ignore_headers": [],
+    "ignore_json_paths": [],
+    "fuel_threshold": 0.02,
+    "stubs": [],
+    "live_allowlist": [],
+    "no_pii": false
+  },
+  "summary": {
+    "root_inputs": 100,
+    "replayed": 100,
+    "sample": 1.0,
+    "turns_prod": 100,
+    "turns_fork": 100,
+    "divergent_turns": 0,
+    "origins": 0,
+    "consequences": 0,
+    "exact": 0,
+    "approximate": 0,
+    "synthetic": 0,
+    "live": 0,
+    "confidence": 1.0,
+    "verified_through_lsn": 9800,
+    "changed": false
+  },
+  "causes": [],
+  "grounding": [],
+  "responses": {
+    "unchanged": 100,
+    "changed": 0,
+    "items": []
+  },
+  "effects": {
+    "added": 0,
+    "removed": 0,
+    "changed": 0,
+    "items": []
+  },
+  "state": {
+    "isolated": [],
+    "continuous": []
+  },
+  "cumulative": {
+    "actors_changed": 0,
+    "items": []
+  },
+  "errors": {
+    "introduced": 0,
+    "fixed": 0,
+    "new_orphans": 0,
+    "outcome_unknown": 0,
+    "items": []
+  },
+  "resources": {
+    "fuel": {
+      "prod": {
+        "p50": 40000,
+        "p95": 52000,
+        "p99": 61000
+      },
+      "fork": {
+        "p50": 40000,
+        "p95": 52000,
+        "p99": 61000
+      }
+    },
+    "memory": {
+      "prod": {
+        "p50": 1114112,
+        "p95": 1179648,
+        "p99": 1179648
+      },
+      "fork": {
+        "p50": 1114112,
+        "p95": 1179648,
+        "p99": 1179648
+      }
+    },
+    "fuel_p99_change": 0.0,
+    "memory_p99_change": 0.0
+  },
+  "samples": {
+    "origins": [],
+    "consequences": [],
+    "responses_changed": [],
+    "effects_changed": [],
+    "errors_introduced": [],
+    "synthetic": []
+  },
+  "expected_policy": {
+    "outcome": "allow",
+    "fired": []
+  }
+}

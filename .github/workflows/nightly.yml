@@ -1,0 +1,144 @@
+name: nightly
+
+# The Definition of done's long checks, too slow for every pull request
+# (ci.yml runs DST with 200 seeds): the crash test for 1,000 cycles
+# (scripts/chaos.sh), DST with 10,000 seeds over every scenario, over the
+# rebuild workload and over the webhook workload with webhook-relay-ts
+# (scripts/dst.sh), and a DST run of 1,000,000 steps. Also the release
+# build (scripts/release.sh, static musl
+# binaries for x86_64 and aarch64), which no per-PR job compiles. Each also
+# runs locally with the same command.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  chaos:
+    name: crash test, 1,000 cycles
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build kronik
+        run: cargo build --locked --release -p kronik
+      # A real disk, not tmpfs: the test is about fsync and recovery.
+      - name: Crash test
+        run: scripts/chaos.sh 1000 "$RUNNER_TEMP/chaos"
+      # The work directory of the first violation: data dir, daemon log,
+      # target log.
+      - name: Keep the work directory
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: chaos
+          path: ${{ runner.temp }}/chaos
+          retention-days: 14
+
+  dst-seeds:
+    name: DST, 10,000 seeds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Every scenario (counter, effects, webhook with webhook-relay-rs), each
+      # seed twice to check determinism. dst.sh keeps the shards' output in
+      # $TMPDIR.
+      - name: DST
+        run: TMPDIR="$RUNNER_TEMP" scripts/dst.sh 0..10000 "$(nproc)" --twice
+      # Startup bulk replays cut into tiny batches and segments; every
+      # start's recovered state against a rebuild from the log.
+      - name: DST, rebuild workload
+        run: TMPDIR="$RUNNER_TEMP" scripts/dst.sh 0..10000 "$(nproc)" --scenario rebuild --twice
+      - name: Keep the shards' output
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dst-seeds
+          path: ${{ runner.temp }}/kronik-dst.*
+          retention-days: 14
+
+  dst-relay-ts:
+    name: DST, 10,000 seeds with webhook-relay-ts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            sdk/ts/package-lock.json
+            examples/package-lock.json
+      - name: Build webhook-relay-ts
+        run: |
+          cargo build --locked --release -p kronik
+          npm ci --prefix sdk/ts --no-audit --no-fund
+          scripts/build-examples-ts.sh
+      - name: DST
+        run: |
+          TMPDIR="$RUNNER_TEMP" KRONIK_DST_RELAY="$PWD/examples/dist/webhook-relay-ts.wasm" \
+            scripts/dst.sh 0..10000 "$(nproc)" --scenario webhook --twice
+      - name: Keep the shards' output
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dst-relay-ts
+          path: ${{ runner.temp }}/kronik-dst.*
+          retention-days: 14
+
+  dst-long:
+    name: DST, 1,000,000 steps
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Twice, to check determinism over the whole run.
+      - name: DST
+        run: cargo test --locked --release -p kronik-sim --test dst -- --long 1000000 --twice
+
+  release:
+    name: release build, musl x86_64 and aarch64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build the release
+        run: scripts/release.sh

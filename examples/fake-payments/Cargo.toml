@@ -1,0 +1,25 @@
+# A standalone project: not part of the examples workspace (wasm actors) nor
+# of the host workspace. Built as a static musl binary and packed into an OCI
+# image by scripts/build-foreign-examples.sh.
+[package]
+name = "fake-payments"
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.99.1"
+license = "Elastic-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+panic = "abort"
+strip = true
+lto = true
+debug = false

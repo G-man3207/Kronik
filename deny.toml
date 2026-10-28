@@ -1,0 +1,55 @@
+# cargo-deny configuration, checked in CI by `scripts/ci.sh deny`.
+# Reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Hosts Kronik supports: Linux for production, macOS for local development.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+[licenses]
+# Licenses that allow distributing Kronik under the Elastic License 2.0.
+# Allow only what the dependency graph needs; extend in the commit that adds
+# a dependency, and justify it there.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    # encoding_rs (string transcoding in Wasmtime's component model):
+    # "(Apache-2.0 OR MIT) AND BSD-3-Clause" for its generated data tables.
+    "BSD-3-Clause",
+    # ring (rustls's crypto provider, outbound HTTPS for effects):
+    # "Apache-2.0 AND ISC".
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+unused-allowed-license = "deny"
+
+[licenses.private]
+# Kronik's own crates are `publish = false` and licensed under ELv2.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal path dependencies carry no version requirement.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

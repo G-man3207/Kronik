@@ -1,0 +1,182 @@
+// Kronik log format v1: configuration records (I5: configuration is history).
+// Every configuration record carries the configuration epoch it creates and
+// an Audit. In v0.1 an epoch corresponds to one LSN; from v0.4 the cluster
+// maps an epoch to one LSN per shard. See common.proto for the format rules.
+// Deployment fields 1-5 follow the brief exactly.
+syntax = "proto3";
+
+package kronik.log.v1;
+
+import "kronik/log/v1/common.proto";
+
+message Deployment {
+  uint64 epoch = 1;         // configuration epoch
+  repeated KindVersion kinds = 2;
+  uint64 effective_lsn = 3;
+  uint64 verified_through_lsn = 4;
+  uint64 unverified_inputs = 5;
+  DeploymentCause cause = 6;
+  // The proposal (fork) this deployment promotes, if any.
+  string proposal_id = 7;
+  // For rollbacks: the epoch whose kinds are restored.
+  uint64 rollback_of_epoch = 8;
+  Audit audit = 9;
+}
+
+enum DeploymentCause {
+  DEPLOYMENT_CAUSE_UNSPECIFIED = 0;
+  // `kronik deploy` of a kind without history.
+  DEPLOYMENT_CAUSE_DEPLOY = 1;
+  // `kronik deploy --skip-verify` of a kind with history (policy permitting).
+  DEPLOYMENT_CAUSE_DEPLOY_UNVERIFIED = 2;
+  DEPLOYMENT_CAUSE_PROMOTE = 3;
+  DEPLOYMENT_CAUSE_ROLLBACK = 4;
+}
+
+// One actor kind's code in a deployment.
+message KindVersion {
+  string kind = 1;
+  // BLAKE3 of the component bytes; the bytes live in code/<hex>.wasm.
+  bytes code_hash = 2;
+  uint32 schema_version = 3;
+  // The manifest returned by `describe`, recorded so routes and requested
+  // capabilities are history too.
+  Manifest manifest = 4;
+  // Size of the component in bytes (for restore and shipping checks).
+  uint64 code_size = 5;
+}
+
+message Manifest {
+  string kind = 1;
+  uint32 schema_version = 2;
+  repeated Route routes = 3;
+  repeated string capabilities = 4;
+}
+
+message Route {
+  string method = 1;
+  string pattern = 2;
+}
+
+enum GrantOp {
+  GRANT_OP_UNSPECIFIED = 0;
+  GRANT_OP_GRANT = 1;
+  GRANT_OP_REVOKE = 2;
+}
+
+enum Delivery {
+  DELIVERY_UNSPECIFIED = 0;
+  DELIVERY_REPLAY_SAFE = 1;
+  DELIVERY_IDEMPOTENCY_KEYED = 2;
+  DELIVERY_UNSAFE = 3;
+}
+
+message Grant {
+  uint64 epoch = 1;
+  GrantOp op = 2;
+  string kind = 3;
+  // e.g. "http:api.stripe.com", "http:*.example.com", "foreign:payments",
+  // "secret:stripe-key", "secret-reveal:db-password".
+  string capability = 4;
+  // Unset: replay-safe for GET/HEAD/OPTIONS requests, unsafe otherwise.
+  optional Delivery delivery = 5;
+  // Unset means no rate limit.
+  Rate rate = 6;
+  Audit audit = 7;
+}
+
+message Rate {
+  uint32 count = 1;
+  uint64 per_ms = 2;
+}
+
+// Per-kind limits; unset fields keep the previous (or default) value.
+message Limits {
+  uint64 epoch = 1;
+  string kind = 2;
+  optional uint64 fuel = 3;
+  optional uint64 memory_bytes = 4;
+  optional uint64 message_bytes = 5;
+  optional uint64 state_value_bytes = 6;
+  optional uint64 sql_bytes_per_actor = 7;
+  optional uint64 effect_timeout_ms = 8;
+  optional uint64 effect_response_bytes = 9;
+  Audit audit = 10;
+}
+
+message Policy {
+  uint64 epoch = 1;
+  // The rules file exactly as set (`kronik policy set rules.toml`).
+  string rules_toml = 2;
+  // BLAKE3 of rules_toml, for approvals and diffs.
+  bytes rules_hash = 3;
+  Audit audit = 4;
+}
+
+message Approval {
+  string proposal_id = 1;
+  // BLAKE3 of the kronik.diff/v1 JSON the approval was given for.
+  bytes diff_hash = 2;
+  // The verified-through LSN of the approved diff.
+  uint64 verified_through_lsn = 3;
+  Audit audit = 4;
+  // Set on a request for approval (MCP request_approval) rather than an
+  // approval: nothing is approved; a later Approval answers it.
+  bool request = 5;
+  // For requests: the exact command for the human, e.g.
+  // "kronik approve p-7h3k2a9c1d0e --reason '...'".
+  string command = 6;
+}
+
+enum PrivacyState {
+  PRIVACY_STATE_UNSPECIFIED = 0;
+  PRIVACY_STATE_OFF = 1;
+  PRIVACY_STATE_ON = 2;
+}
+
+message PrivacyMode {
+  uint64 epoch = 1;
+  PrivacyState mode = 2;
+  Audit audit = 3;
+}
+
+enum ForeignOp {
+  FOREIGN_OP_UNSPECIFIED = 0;
+  FOREIGN_OP_ADD = 1;
+  FOREIGN_OP_REMOVE = 2;
+}
+
+enum Isolation {
+  ISOLATION_UNSPECIFIED = 0;
+  ISOLATION_GVISOR = 1;
+  ISOLATION_TRUSTED = 2;
+  ISOLATION_MICROVM = 3;
+}
+
+message ForeignActor {
+  uint64 epoch = 1;
+  ForeignOp op = 2;
+  string name = 3;
+  // Always pinned by digest: "<ref>@sha256:<hex>" or "oci-layout:<dir>@sha256:<hex>".
+  string image = 4;
+  uint32 port = 5;
+  uint32 cpu_millis = 6;
+  uint64 memory_bytes = 7;
+  Isolation isolation = 8;
+  // Secret names injected as environment variables.
+  repeated string secrets = 9;
+  // "systrap" or "kvm" for gVisor.
+  string platform = 10;
+  Audit audit = 11;
+}
+
+message EngineUpgrade {
+  uint64 epoch = 1;
+  string from_engine_version = 2;
+  string to_engine_version = 3;
+  uint64 effective_lsn = 4;
+  // BLAKE3 of the `upgrade check` report (an empty identity-replay diff).
+  bytes check_report_hash = 5;
+  uint64 checked_through_lsn = 6;
+  Audit audit = 7;
+}

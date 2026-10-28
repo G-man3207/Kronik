@@ -1,0 +1,22 @@
+[package]
+name = "kronik-effects"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aho-corasick = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+hmac = { workspace = true }
+http = { workspace = true }
+kronik-core = { workspace = true }
+kronik-privacy = { workspace = true }
+kronik-proto = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[lints]
+workspace = true

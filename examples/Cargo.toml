@@ -1,0 +1,38 @@
+# The example actors, built for wasm32-wasip2 with the Rust SDK
+# (scripts/build-examples.sh). A workspace of its own: not part of the host
+# workspace at the repository root.
+#
+# kronik-sdk is the symlink ../sdk/rust. Inside the workspace Cargo hashes it
+# by its relative path, so the components' hashes do not depend on where the
+# checkout is (its sources' paths are remapped by the build script).
+[workspace]
+resolver = "3"
+members = ["kronik-sdk", "counter-rs", "notes-rs", "webhook-relay-rs"]
+
+[workspace.package]
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.99.1"
+license = "Elastic-2.0"
+publish = false
+
+[workspace.dependencies]
+kronik-sdk = { path = "kronik-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+expect_used = "deny"
+unwrap_used = "deny"
+
+# Small components: every byte is compiled and stored per code hash.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+strip = true
+panic = "abort"

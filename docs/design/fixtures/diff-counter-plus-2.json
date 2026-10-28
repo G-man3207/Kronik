@@ -1,0 +1,213 @@
+{
+  "schema": "kronik.diff/v1",
+  "fork": "p-000000000002",
+  "proposal_id": "p-000000000002",
+  "base": {
+    "branch": "main",
+    "fork_lsn": 1200,
+    "from_lsn": 1201,
+    "to_lsn": 9800
+  },
+  "code": {
+    "before": [
+      {
+        "kind": "counter",
+        "code_hash": "b3:aaaaaaaaaaaa",
+        "schema_version": 0
+      }
+    ],
+    "after": [
+      {
+        "kind": "counter",
+        "code_hash": "b3:bbbbbbbbbbbb",
+        "schema_version": 0
+      }
+    ]
+  },
+  "options": {
+    "mode": "both",
+    "sample": 1.0,
+    "ignore_headers": [],
+    "ignore_json_paths": [],
+    "fuel_threshold": 0.02,
+    "stubs": [],
+    "live_allowlist": [],
+    "no_pii": false
+  },
+  "summary": {
+    "root_inputs": 100,
+    "replayed": 100,
+    "sample": 1.0,
+    "turns_prod": 100,
+    "turns_fork": 100,
+    "divergent_turns": 100,
+    "origins": 100,
+    "consequences": 0,
+    "exact": 0,
+    "approximate": 0,
+    "synthetic": 0,
+    "live": 0,
+    "confidence": 1.0,
+    "verified_through_lsn": 9800,
+    "changed": true
+  },
+  "causes": [
+    {
+      "kind": "counter",
+      "input": "POST /counter/{key}/{op}",
+      "origins": 100,
+      "consequences": 0,
+      "root_inputs": 100,
+      "samples": [
+        "p-000000000002:r1201.0"
+      ]
+    }
+  ],
+  "grounding": [],
+  "responses": {
+    "unchanged": 0,
+    "changed": 100,
+    "items": [
+      {
+        "root_lsn": 1201,
+        "route": "POST /counter/{key}/{op}",
+        "turn_prod": "main:1201",
+        "turn_fork": "p-000000000002:r1201.0",
+        "status": {
+          "prod": 200,
+          "fork": 200
+        },
+        "headers": [],
+        "body": [
+          {
+            "op": "replace",
+            "path": "",
+            "prod": {
+              "text": "1"
+            },
+            "fork": {
+              "text": "2"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "effects": {
+    "added": 0,
+    "removed": 0,
+    "changed": 0,
+    "items": []
+  },
+  "state": {
+    "isolated": [
+      {
+        "root_lsn": 1201,
+        "actor": "counter/a",
+        "keys": [
+          {
+            "key": "n",
+            "op": "set",
+            "prod": {
+              "text": "1"
+            },
+            "fork": {
+              "text": "2"
+            }
+          }
+        ],
+        "sql": []
+      }
+    ],
+    "continuous": [
+      {
+        "actor": "counter/a",
+        "keys": [
+          {
+            "key": "n",
+            "op": "set",
+            "prod": {
+              "text": "100"
+            },
+            "fork": {
+              "text": "200"
+            }
+          }
+        ],
+        "sql": []
+      }
+    ]
+  },
+  "cumulative": {
+    "actors_changed": 1,
+    "items": [
+      {
+        "actor": "counter/a",
+        "keys": [
+          {
+            "key": "n",
+            "op": "set",
+            "prod": {
+              "text": "100"
+            },
+            "fork": {
+              "text": "200"
+            }
+          }
+        ],
+        "sql": []
+      }
+    ]
+  },
+  "errors": {
+    "introduced": 0,
+    "fixed": 0,
+    "new_orphans": 0,
+    "outcome_unknown": 0,
+    "items": []
+  },
+  "resources": {
+    "fuel": {
+      "prod": {
+        "p50": 40000,
+        "p95": 52000,
+        "p99": 61000
+      },
+      "fork": {
+        "p50": 40000,
+        "p95": 52000,
+        "p99": 61000
+      }
+    },
+    "memory": {
+      "prod": {
+        "p50": 1114112,
+        "p95": 1179648,
+        "p99": 1179648
+      },
+      "fork": {
+        "p50": 1114112,
+        "p95": 1179648,
+        "p99": 1179648
+      }
+    },
+    "fuel_p99_change": 0.0,
+    "memory_p99_change": 0.0
+  },
+  "samples": {
+    "origins": [
+      "p-000000000002:r1201.0"
+    ],
+    "consequences": [],
+    "responses_changed": [
+      "p-000000000002:r1201.0"
+    ],
+    "effects_changed": [],
+    "errors_introduced": [],
+    "synthetic": []
+  },
+  "expected_policy": {
+    "outcome": "allow",
+    "fired": []
+  }
+}

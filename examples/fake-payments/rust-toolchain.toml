@@ -1,0 +1,6 @@
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
+# Static binaries for the OCI image.
+targets = ["x86_64-unknown-linux-musl"]

@@ -1,0 +1,168 @@
+{
+  "schema": "kronik.diff/v1",
+  "fork": "p-000000000005",
+  "proposal_id": "p-000000000005",
+  "base": {
+    "branch": "main",
+    "fork_lsn": 1200,
+    "from_lsn": 1201,
+    "to_lsn": 9800
+  },
+  "code": {
+    "before": [
+      {
+        "kind": "counter",
+        "code_hash": "b3:aaaaaaaaaaaa",
+        "schema_version": 0
+      }
+    ],
+    "after": [
+      {
+        "kind": "counter",
+        "code_hash": "b3:bbbbbbbbbbbb",
+        "schema_version": 0
+      }
+    ]
+  },
+  "options": {
+    "mode": "both",
+    "sample": 1.0,
+    "ignore_headers": [],
+    "ignore_json_paths": [],
+    "fuel_threshold": 0.02,
+    "stubs": [],
+    "live_allowlist": [],
+    "no_pii": false
+  },
+  "summary": {
+    "root_inputs": 100,
+    "replayed": 100,
+    "sample": 1.0,
+    "turns_prod": 100,
+    "turns_fork": 100,
+    "divergent_turns": 3,
+    "origins": 1,
+    "consequences": 2,
+    "exact": 5,
+    "approximate": 0,
+    "synthetic": 2,
+    "live": 0,
+    "confidence": 0.714286,
+    "verified_through_lsn": 9800,
+    "changed": true
+  },
+  "causes": [],
+  "grounding": [
+    {
+      "kind": "http.fetch",
+      "method": "GET",
+      "host": "api.example.com",
+      "route": "/items/{}",
+      "exact": 5,
+      "approximate": 0,
+      "synthetic": 2,
+      "live": 0,
+      "confidence": 0.714286
+    }
+  ],
+  "responses": {
+    "unchanged": 100,
+    "changed": 0,
+    "items": []
+  },
+  "effects": {
+    "added": 0,
+    "removed": 0,
+    "changed": 0,
+    "items": []
+  },
+  "state": {
+    "isolated": [],
+    "continuous": []
+  },
+  "cumulative": {
+    "actors_changed": 0,
+    "items": []
+  },
+  "errors": {
+    "introduced": 1,
+    "fixed": 0,
+    "new_orphans": 1,
+    "outcome_unknown": 0,
+    "items": [
+      {
+        "kind": "introduced",
+        "error_code": "TURN_FAILED",
+        "message": "boom",
+        "turn_prod": "main:1500",
+        "turn_fork": "p-000000000005:r1500.0",
+        "input": "POST /counter/{key}/{op}"
+      },
+      {
+        "kind": "new_orphan",
+        "error_code": "TURN_FAILED",
+        "message": "failing after call",
+        "turn_prod": null,
+        "turn_fork": "p-000000000005:r1500.1",
+        "input": "message call"
+      }
+    ]
+  },
+  "resources": {
+    "fuel": {
+      "prod": {
+        "p50": 40000,
+        "p95": 52000,
+        "p99": 61000
+      },
+      "fork": {
+        "p50": 80000,
+        "p95": 99000,
+        "p99": 122000
+      }
+    },
+    "memory": {
+      "prod": {
+        "p50": 1114112,
+        "p95": 1179648,
+        "p99": 1179648
+      },
+      "fork": {
+        "p50": 1114112,
+        "p95": 1179648,
+        "p99": 1179648
+      }
+    },
+    "fuel_p99_change": 1.0,
+    "memory_p99_change": 0.0
+  },
+  "samples": {
+    "origins": [],
+    "consequences": [],
+    "responses_changed": [],
+    "effects_changed": [],
+    "errors_introduced": [],
+    "synthetic": []
+  },
+  "expected_policy": {
+    "outcome": "deny",
+    "fired": [
+      {
+        "name": "no-new-errors",
+        "action": "deny"
+      },
+      {
+        "name": "no-new-orphans",
+        "action": "require_approval"
+      },
+      {
+        "name": "low-grounding-needs-approval",
+        "action": "require_approval"
+      },
+      {
+        "name": "fuel-regression",
+        "action": "deny"
+      }
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+[package]
+name = "kronik-sdk"
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.99.1"
+license = "Elastic-2.0"
+publish = false
+description = "Kronik's Rust SDK: write actors for the kronik:actor world"
+
+# Built as a member of the workspace that uses it: examples/ (through the
+# symlink examples/kronik-sdk) or a project from `kronik init`, which
+# vendors it. Inside the workspace Cargo hashes it by its relative path, so
+# the components' hashes do not depend on where the checkout is. `wit/` is
+# a symlink to the repository's WIT here and a copy in vendored projects.
+
+[dependencies]
+serde = "1"
+serde_json = "1"
+wit-bindgen = "=0.63.0"
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+expect_used = "deny"
+unwrap_used = "deny"

@@ -1,0 +1,15 @@
+{
+  "name": "webhook-relay-ts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "kronik": {
+    "entry": "src/actor.ts"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@kronik/sdk": "file:../../sdk/ts"
+  }
+}
