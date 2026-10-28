@@ -72,13 +72,13 @@ v0.1's evidence, 2026-10-28:
   (`integrity` lists no missing keys, sealed state readable), and restores
   without a key, or with a wrong one (`MASTER_KEY_MISMATCH`), were refused.
   The refused wrong-key restore still created the absent directory and an
-  empty `keys/`; 6b0e1a7 (`fix-restore-empty-dirs`) fixes that after v0.2.
-  MCP on a restored node is checked at that head.
+  empty `keys/`; 247bf5a, after v0.2, fixes that. MCP on a restored node
+  waits for the testbench (Next).
 - GitHub Actions CI passed on main at eb1218e, d80e52a and 4353863.
 
-v0.2 landed with f957475 (v0.2 section). v0.3 (`m12-simulators` to
-`m15-sdks`) lands next; after v0.3 the owner decides what follows. Other
-work is parked (Parked work).
+v0.2 landed with f957475 and v0.3 with 189c8c3 (their sections). v0.3's
+testbench rows come next; then the owner decides what follows. Other work
+is parked (Parked work).
 
 The testbench is `travelfiesta`: Debian 13, 2 vCPU Skylake, 3.7 GiB, no
 `/dev/kvm`, gVisor `release-20261019.0` with systrap. The batch
@@ -515,17 +515,99 @@ Evidence, 2026-10-28:
   mapping next to v0.2's code), plus the action's pin. The crash test, DST
   and the other rows carry over from c626ede.
 
+## v0.3: richer replay (M12 to M15)
+
+v0.3 landed on main with 189c8c3, one commit with the tree of `m15-sdks`
+e798b46: the branches `m12-simulators` to `m15-sdks`, rebased onto
+247bf5a. reviewer-v03's verdict on them: land, no must-fixes. M12 to M14
+meet their criteria in `scripts/ci.sh` at e798b46; M15's first criterion
+waits for the testbench. ADRs 0014 to 0016 (M12), 0017 and 0018 (M13),
+0019 and 0020 (M14) and 0030 (M15); ADRs 0023 and 0027 are amended. The
+testbench rows and the M14 unit proof (Next) gate v0.3's tags, not the
+landing.
+
+M12: effect simulators.
+
+- [x] Every synthetic answer is labeled with its simulator in the diff and
+      in `trace` (`crates/kronik-fork/tests/simulators.rs`, kronik-api's
+      `simulators.rs`; the neighbor in kronik-effects' unit tests).
+- [x] Contract fakes give schema-valid answers, and the same request
+      always gets the same answer (kronik-effects' contract tests;
+      `simulators.rs` compares the bytes of two runs).
+- [x] The same proposal run twice with the model simulator gives a
+      byte-identical diff through the cache, also after a restart
+      (`simulators.rs`, against a fake model server).
+- [x] The model simulator never sees sealed values (`simulators.rs`, with
+      privacy mode on).
+- [x] The policy can forbid synthetic answers per target
+      (`simulators.rs`).
+
+M13: rollback via replay.
+
+- [x] A rollback via replay after a migration gives the old code's state
+      and a list of irreversible effects
+      (`crates/kronik-fork/tests/rebase.rs`; `kronik rollback --by-replay`
+      against a daemon in `cli.rs`).
+- [x] Recovery from the log after a `StateRebase` gives the same state as
+      before the restart, also rebuilt from a snapshot before the switch
+      (`rebase.rs`).
+- [x] No root input is lost or duplicated during the switch (`rebase.rs`:
+      requests with idempotency keys during promote; a switch that cannot
+      pause in time writes nothing).
+
+M14: foreign actors in forks.
+
+- [x] A fork with `fork_mode = "sandbox"` starts a copy of a Postgres actor
+      from the nearest checkpoint (`crates/kronik/tests/foreign.rs`,
+      `postgres_fork_answers_from_a_copy`).
+- [x] A changed SQL query gets a real answer from the copy, graded
+      `forked` (the same test).
+- [x] The copy cannot reach the network and is deleted with the fork (the
+      same test).
+- For the copies' `runsc restore`, the systemd unit drops
+  `RestrictSUIDSGID` (ADR 0027, Open questions). The proof under the
+  installed unit is the testbench's `M14/unit`, pending.
+
+M15: Python and Go SDKs.
+
+- [ ] The example apps pass the same acceptance scripts as Rust and
+      TypeScript in M1 to M3. At e798b46, DST with `webhook-relay-py` and
+      `webhook-relay-go` passed on dev (below); the scripts (`e2e-m1.sh`,
+      `acceptance-m1.sh`, `e2e-webhook-relay.sh`, `verify-change.sh`) run
+      in the testbench's `M15` row, pending. They passed on dev before the
+      rebase, at bd6c6b1 in the earlier history.
+- [x] The imports are within the allowlist, and the determinism test passes
+      for both languages (`check_imports` and `sdk_determinism` in
+      `scripts/ci.sh sdks`).
+- The examples are counter, notes and webhook-relay in each language;
+  `kronik init --lang python|go` writes a counter project. Identity replay
+  covers them (`scripts/ci.sh identity`).
+
+Evidence, 2026-10-28:
+
+- At e798b46, 189c8c3's tree: `scripts/ci.sh`, every step, passed on dev,
+  ending 21:29 UTC: `sdks`, `foreign` (7 tests, the Postgres fork test
+  included), `identity` and `action` included.
+- On dev at e798b46, 21:54 to 23:01 UTC: the crash test (1 000 cycles,
+  120 320 acknowledged requests, 20 rebuild checks, an empty identity
+  replay of 126 235 root inputs) and DST (30 000 runs; 10 000 webhook runs
+  each with `webhook-relay-ts`, `webhook-relay-py` and `webhook-relay-go`;
+  10 000 `rebuild` runs; 1 000 000 steps twice), all without a failure.
+- Pending: the testbench batch, rows M1 to M15 and `identity` with
+  `M14/unit`, which Tailscale's check has stopped since 21:34 UTC; and the
+  first GitHub Actions run of `sdks`, `action` and the Postgres fork test
+  with docker, which this push starts.
+
 ## Next
 
-1. Push this commit to main (v0.2) and tag `v0.0.9` (M9) and `v0.0.11`
-   (M11) on it. M10 stays open: its criterion 4 needs a public repository
-   (Open questions).
-2. Land 6b0e1a7 (`fix-restore-empty-dirs`): a refused restore leaves its
-   directory as it was. Then check MCP on a restored node at that head.
-3. v0.3: `m12-simulators` to `m15-sdks`. Then the owner decides what
-   follows.
-4. Publishing, when the owner decides (Open questions).
-5. Add the testbench privacy overhead to `docs/perf.md`.
+1. The testbench at the pushed head: the rows M1 to M15 and `identity`,
+   `M14/unit` included, once Tailscale lets the batch in (Open questions).
+   `M14/unit`'s result goes into ADR 0027's Evidence and here. The
+   quickstart's MCP check on a restored node waits for the same access.
+2. The owner check-in: what follows v0.3, the milestone tags (`v0.0.9`,
+   `v0.0.11` and v0.3's are not set yet), publishing, and the Open
+   questions, ADR 0027's v0.3 decision among them.
+3. Add the testbench privacy overhead to `docs/perf.md`.
 
 ## Parked work
 
@@ -543,7 +625,8 @@ Each branch's last commit message carries its handoff.
   3091fbc). A partial review, 5 Highs, is in
   `docs/design/m21-review-partial.md`; the testbench proof needs a rerun;
   ADR 0060 is provisional.
-- M22 wasi:http: `m22-wasi-http` 297f871 (on `m15-sdks`); not reviewed.
+- M22 wasi:http: `m22-wasi-http` 297f871, on the earlier `m15-sdks` from
+  before the squash; not reviewed, and not rebased onto v0.3.
 - M23 secret backends: `m23-design` 30d4791, design only. ADR 0093
   (PKCS#11 through a keyhelper process) is the owner's decision.
 - M24 connections: `m24-design` da0a3e5, design only.
@@ -581,15 +664,21 @@ Each branch's last commit message carries its handoff.
   `--sample`. Only `payments-full-coverage` stops promote under a sample,
   so elsewhere coverage relies on the reviewer reading `summary.sample`.
   Should the default policy ask for more?
-- **ADR 0027: `RestrictSUIDSGID` and M14.** v0.1 keeps the setting
-  (e3fb81a). It makes `openat2` fail, which `runsc restore` needs for M14's
-  sandbox copies, so M14 drops it when it lands. Without it, code in an
-  untrusted image can leave setid files under its actor's `/data`; the ADR
-  states that residual risk. Confirm before v0.3 lands.
-- The testbench's Tailscale SSH check mode stopped the batch twice, on
-  2026-10-26 and for about eight hours on 2026-10-28: every ssh waited for
-  the owner to authenticate again. Relax the check for the testbench, or
-  expect a prompt to re-authenticate.
+- **ADR 0027: no `RestrictSUIDSGID` from v0.3.** The setting makes
+  `openat2` fail, and `runsc restore` needs it for M14's sandbox copies,
+  so v0.3's unit leaves it out; v0.1 kept it. The residual risk: code in
+  an untrusted image, root in its sandbox, can set the setuid or setgid bit
+  on a file under its actor's `/data`, and the host keeps it; so can a
+  compromised daemon or runsc, anywhere it writes. Only root reaches those
+  files, through 0700 parents; checkpoints and copies clear the bits, and
+  the operations guide says not to copy the tree with modes kept. Accept
+  it, or keep the setting and do without sandbox copies under systemd
+  until runsc falls back from `openat2`.
+- The testbench's Tailscale SSH check mode stopped the batch three times:
+  on 2026-10-26, for about eight hours on 2026-10-28, and again from 21:34
+  UTC on 2026-10-28, before v0.3's rows. Every ssh waits for the owner to
+  authenticate again. Relax the check for the testbench, or expect a
+  prompt to re-authenticate.
 - From v0.4 the testbench is a cluster of three VPSs, as the brief says;
   there is one, `travelfiesta`.
 - M20 (Firecracker) needs a test host with `/dev/kvm`: neither dev nor the
@@ -608,8 +697,10 @@ Each branch's last commit message carries its handoff.
   earlier main (b47780d) failed the crash test, which is fixed since.
   GitHub Actions CI is green on main since eb1218e (2026-10-28), after
   fixes to the ops test's KVM check, the TS test glob and
-  `identity-examples.sh`. `scripts/ci.sh` runs on dev (Debian 13), CI on
-  the workflow's Ubuntu 24.04.
+  `identity-examples.sh`. v0.3's `sdks` and `action` steps, and the
+  foreign step's Postgres fork test with docker, first run there with
+  v0.3's push. `scripts/ci.sh` runs on dev (Debian 13), CI on the
+  workflow's Ubuntu 24.04.
 - One actor commits 180 to 210 turns/s: each turn waits for the 2 ms
   group-commit window and an fsync before the actor's next turn. Across
   actors the counter commits about 7 900 turns/s on dev and 2 770 on
@@ -659,5 +750,15 @@ Each branch's last commit message carries its handoff.
   permitted`. With an explicit `User=root` and a seccomp-based setting,
   systemd 257 drops `CAP_SETUID`, and `NoNewPrivileges=true` kept runsc from
   getting it back. Fixed on 24c6dbc: the unit has no `User=` line (root is
-  the default) and keeps `NoNewPrivileges`; e3fb81a keeps `RestrictSUIDSGID`
-  in v0.1 too (ADR 0027, Open questions).
+  the default) and keeps `NoNewPrivileges`; e3fb81a kept `RestrictSUIDSGID`
+  for v0.1, and v0.3 drops it for M14 (ADR 0027, Open questions).
+- `M14/unit` has not run: ADR 0027's restore evidence comes from transient
+  units with the unit's settings, not from the installed unit (Next).
+- Previews of a rebase proposal are allowed and run the rebase's code on
+  main's head. Harmless, but whether to refuse them is an open product
+  decision.
+- A `watch` on a rebase's epoch can fire a guard rollback, which restores
+  the old code over the rebased state: the same as rolling back any
+  deployment whose new code wrote state.
+- CI's check that the workflow runs every `ci.sh` step counts one step per
+  line: `scripts/ci.sh a b` counts only `a`.
