@@ -26,7 +26,8 @@
 //!   logs, sends and replies whatever it got
 //! - `call` / `call-fail`: body `kind/key name [compensation]`; `call-fail`
 //!   fails the turn after the call
-//! - `schedule`: body `delay-ms name`, replies the timer id; `cancel`: body id
+//! - `schedule`: body `delay-ms name`, then optionally a newline and the
+//!   timer message's body; replies the timer id; `cancel`: body id
 //! - `flaky`: fails until `allow` was run on the actor, then increments
 //! - `reveal-persist`: body `secret`: reveals it and puts the value in
 //!   state, a log event, stdout, a message to counter/sink and the reply
@@ -38,7 +39,11 @@
 //! feature `step2` (increment adds 2), `body-v2` (fetch request bodies get
 //! " v2" appended), `fail-get` (`get` fails), `fetch-extra` (`fetch-ok` then
 //! also GETs `<url>/extra` and appends that answer), `schema1` (schema
-//! version 1; `migrate(0)` sets key "schema" to "1").
+//! version 1; `migrate(0)` sets key "schema" to "1"). In `fetch-extra`,
+//! request head lines `T read <key>`, `T hmac <secret>`, `T reveal
+//! <secret>` and `T call <kind/key> <name>` (which other builds ignore) read
+//! state, use or reveal a secret, or call before the extra GET, and the op `read` reads key "s": the
+//! model simulator's taint paths (review M5, N12-3).
 //! For system proposals (M9): feature `calls-tally` (every `increment`
 //! also calls `tally` on notes/tally and fails when that call does).
 //!
@@ -165,6 +170,36 @@ fn run(op: &str, body: &[u8]) -> Result<String, HandlerError> {
                 return Ok(first);
             }
             let url = text.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+            let head = text.split_once("\n\n").map_or(text.as_str(), |(h, _)| h);
+            for line in head.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                match parts.as_slice() {
+                    ["T", "read", key] => {
+                        let _ = state::get(key);
+                    }
+                    ["T", "hmac", secret] => {
+                        let _ = crypto::hmac_sha256(secret, b"x");
+                    }
+                    ["T", "reveal", secret] => {
+                        let _ = secrets::reveal(secret);
+                    }
+                    ["T", "call", target, name] => {
+                        let (kind, key) = target.split_once('/').unwrap_or(("counter", target));
+                        let to = ActorRef {
+                            kind: kind.to_string(),
+                            key: key.to_string(),
+                        };
+                        let msg = Message {
+                            name: name.to_string(),
+                            content_type: "text/plain".to_string(),
+                            body: Vec::new(),
+                            blobs: Vec::new(),
+                        };
+                        let _ = messaging::call(&to, &msg, None);
+                    }
+                    _ => {}
+                }
+            }
             let extra = fetch_text(&format!("GET {url}/extra"))
                 .unwrap_or_else(|e| format!("error {e}"));
             Ok(format!("{first} | {extra}"))
@@ -241,13 +276,14 @@ fn run(op: &str, body: &[u8]) -> Result<String, HandlerError> {
             Ok(out)
         }
         "schedule" => {
-            let (delay, name) = text.split_once(' ').unwrap_or(("0", "increment"));
+            let (head, body) = text.split_once('\n').unwrap_or((&text, ""));
+            let (delay, name) = head.split_once(' ').unwrap_or(("0", "increment"));
             let id = timers::schedule(
                 delay.trim().parse().unwrap_or(0),
                 &Message {
                     name: name.trim().to_string(),
                     content_type: "text/plain".to_string(),
-                    body: Vec::new(),
+                    body: body.as_bytes().to_vec(),
                     blobs: Vec::new(),
                 },
             );
@@ -308,6 +344,8 @@ fn run(op: &str, body: &[u8]) -> Result<String, HandlerError> {
             Err(HandlerError::Failed("get is broken in this build".to_string()))
         }
         "get" => Ok(counter().to_string()),
+        #[cfg(feature = "fetch-extra")]
+        "read" => Ok(state::get("s").map(|v| v.len()).unwrap_or(0).to_string()),
         "fanout" => {
             let n = increment();
             let count: u32 = text.trim().parse().unwrap_or(0);

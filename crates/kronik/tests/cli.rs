@@ -1879,3 +1879,221 @@ fn watch_rolls_back_a_failing_build_against_a_daemon() {
         "back to the code before epoch {epoch}: {v}"
     );
 }
+
+/// M12: `kronik stubs set` and `kronik simulators list` against a daemon:
+/// a target's simulators are written as history and listed (text and
+/// --json); a rule off the target is refused with BAD_REQUEST.
+#[test]
+fn stubs_set_and_simulators_list_against_a_daemon() {
+    let d = Daemon::start();
+    let rules = d.dir.path().join("rules.toml");
+    std::fs::write(
+        &rules,
+        "neighbor = true\n\n[[stub]]\nmethod = \"GET\"\nurl_prefix = \"https://api.example.com/v1/\"\nbody = \"stubbed\"\n",
+    )
+    .unwrap();
+    let rules_arg = rules.to_str().unwrap();
+
+    let o = d.run(&[
+        "stubs",
+        "set",
+        "http:api.example.com",
+        rules_arg,
+        "--reason",
+        "test",
+    ]);
+    assert_eq!(o.code, 0, "{o:?}");
+    assert!(
+        o.stdout
+            .starts_with("http:api.example.com now has 1 stub rule, neighbor (epoch "),
+        "{o:?}"
+    );
+    assert!(o.stdout.contains("kronik simulators list"), "{o:?}");
+
+    let o = d.run(&["simulators", "list"]);
+    assert_eq!(o.code, 0, "{o:?}");
+    for want in [
+        "SIMULATOR",
+        "fail-closed",
+        "placeholder",
+        "TARGET",
+        "http:api.example.com",
+        "test",
+    ] {
+        assert!(o.stdout.contains(want), "{want}: {o:?}");
+    }
+    let v = d.run(&["--json", "simulators", "list"]).json();
+    let t = &v["targets"][0];
+    assert_eq!(
+        (&t["target"], &t["stubs"], &t["neighbor"], &t["model"]),
+        (
+            &json!("http:api.example.com"),
+            &json!(1),
+            &json!(true),
+            &json!(false)
+        ),
+        "{v}"
+    );
+
+    // A stub whose URL is not on the target is refused, and nothing is written.
+    std::fs::write(
+        &rules,
+        "[[stub]]\nurl_prefix = \"https://elsewhere.example.com/\"\nbody = \"x\"\n",
+    )
+    .unwrap();
+    let o = d.run(&[
+        "stubs",
+        "set",
+        "http:api.example.com",
+        rules_arg,
+        "--reason",
+        "test",
+    ]);
+    assert_error(&o, "BAD_REQUEST");
+    let v = d.run(&["--json", "simulators", "list"]).json();
+    assert_eq!(v["targets"][0]["stubs"], 1, "{v}");
+}
+
+/// M13: `kronik rollback --by-replay` end to end: the rebase proposal (dry
+/// run, then for real), approval, and the switch back to the old code's
+/// state (docs/design/m13-rebase.md).
+#[test]
+fn rollback_by_replay_against_a_daemon() {
+    let target = http_target();
+    let d = Daemon::start();
+    assert_eq!(
+        d.run(&["deploy", COUNTER, "--reason", "first deploy"]).code,
+        0
+    );
+    let o = d.run(&["grant", "counter", "http:127.0.0.1", "--reason", "fetch"]);
+    assert_eq!(o.code, 0, "{o:?}");
+    let quiet = d.dir.path().join("quiet.toml");
+    std::fs::write(
+        &quiet,
+        "[[rule]]\nname = \"quiet\"\nwhen = \"false\"\naction = \"allow\"\n",
+    )
+    .unwrap();
+    let o = d.run(&[
+        "policy",
+        "set",
+        quiet.to_str().unwrap(),
+        "--reason",
+        "quiet",
+    ]);
+    assert_eq!(o.code, 0, "{o:?}");
+    for _ in 0..2 {
+        assert_eq!(
+            d.run(&["send", "counter/a", "increment", "--reason", "t"])
+                .code,
+            0
+        );
+    }
+    let fetch = |i: u32| {
+        let text = format!("POST http://{target}/v1/charges/{i}\n\namount=1");
+        let o = d.run(&[
+            "send",
+            "counter/pay",
+            "fetch-ok",
+            "--text",
+            &text,
+            "--reason",
+            "pay",
+        ]);
+        assert_eq!(o.code, 0, "{o:?}");
+    };
+    fetch(0);
+
+    // The schema-1 build migrates and also GETs <url>/extra.
+    let schema1 = format!("{}/counter-schema1-extra.wasm", guests());
+    let o = d.run(&["--json", "propose", &schema1, "--reason", "schema 1"]);
+    let id = o.json()["proposal"]["id"].as_str().unwrap().to_owned();
+    let o = d.run(&["--json", "promote", &id, "--reason", "ship it"]);
+    let epoch = o.json()["deployment"]["epoch"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let o = d.run(&["send", "counter/a", "increment", "--reason", "t"]);
+    assert_eq!(reply(&o), "3", "{o:?}");
+    fetch(1);
+
+    // A dry run writes nothing; the rebase proposal shows the irreversible
+    // effect and the next commands.
+    let cmd = [
+        "rollback",
+        &epoch,
+        "--by-replay",
+        "--reason",
+        "undo the schema change",
+    ];
+    let o = d.run(&[&cmd[..], &["--dry-run"]].concat());
+    assert!(
+        o.stdout.starts_with(&format!(
+            "Dry run: epoch {epoch} can be rolled back by replay from lsn "
+        )) && o.stdout.contains("; nothing was written\n"),
+        "{o:?}"
+    );
+    assert!(
+        o.stdout
+            .contains("\nIrreversible  1 external effects of the rolled-back code\n"),
+        "{o:?}"
+    );
+    assert!(
+        o.stdout.contains(&format!(
+            "Next     kronik rollback {epoch} --by-replay --reason 'undo the schema change'\n"
+        )),
+        "{o:?}"
+    );
+    let o = d.run(&cmd);
+    assert_eq!(o.code, 0, "{o:?}");
+    let rid = o.stdout.split_whitespace().nth(2).unwrap().to_owned();
+    assert!(rid.starts_with("r-"), "{o:?}");
+    for want in [
+        format!("Rebase proposal {rid} rolls back epoch {epoch}: replayed main since lsn "),
+        "\n  Irreversible  1 external effect of the rolled-back code the old code would not \
+         have made (cannot be undone)\n"
+            .to_owned(),
+        "                http.fetch GET 127.0.0.1/v1/charges/{}/extra (ok, replay-safe) in main:"
+            .to_owned(),
+        "\nPolicy   ALLOW\n".to_owned(),
+        format!("Next     kronik diff show {rid} --md\n"),
+        format!("         kronik approve {rid} --reason \"...\"\n"),
+        format!(
+            "         kronik promote {rid} --reason \"...\"   (switches main's state and code)\n"
+        ),
+    ] {
+        assert!(o.stdout.contains(&want), "{want}: {o:?}");
+    }
+    let v = d.run(&["--json", "proposals", "show", &rid]).json();
+    assert_eq!(v["rebase"]["rolled_back_epoch"].to_string(), epoch, "{v}");
+
+    // The switch needs an approval; then main runs the old code on the old
+    // code's state.
+    assert_error(
+        &d.run(&["promote", &rid, "--reason", "undo"]),
+        "APPROVAL_REQUIRED",
+    );
+    assert_eq!(d.run(&["approve", &rid, "--reason", "read it"]).code, 0);
+    let o = d.run(&["promote", &rid, "--reason", "undo"]);
+    assert!(o.stdout.starts_with("Rebased main at lsn "), "{o:?}");
+    for want in [
+        ": the state is the old code's from lsn ",
+        "\n  Code          counter b3:",
+        " (schema 0)\n",
+        "\n  Rebased       ",
+        " replayed turns, verified through lsn ",
+        "; 1 irreversible effect\n",
+        &format!("Next     kronik diff show {rid} --md\n"),
+    ] {
+        assert!(o.stdout.contains(want), "{want}: {o:?}");
+    }
+    let o = d.run(&["send", "counter/a", "increment", "--reason", "t"]);
+    assert_eq!(reply(&o), "4", "{o:?}");
+    let v = d.run(&["--json", "actors", "inspect", "counter/a"]).json();
+    let keys: Vec<&str> = v["state"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["n"], "no migrated key: {v}");
+}

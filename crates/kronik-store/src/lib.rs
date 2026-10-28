@@ -3,6 +3,7 @@
 //! it is derived from the log and rebuilt from it after a crash (I4).
 
 pub mod db;
+pub mod rebase;
 pub mod snapshot;
 pub mod sql;
 
@@ -18,6 +19,13 @@ use kronik_proto::log::v1 as pb;
 use tokio::sync::Notify;
 
 pub use db::{CatchupRows, StateDb};
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: a rebase switch fails right after an actor database's
+    /// copy, like a crash there.
+    pub(crate) static CRASH_AFTER_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -85,9 +93,23 @@ impl Store {
         }))
     }
 
+    /// An empty in-memory store (rebase shadows).
+    pub fn memory() -> Result<Arc<Store>, StoreError> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        Store::open(
+            conn,
+            sql::SqlPool::new(Arc::new(sql::MemOpener), sql::Limits::default(), usize::MAX),
+        )
+    }
+
     /// The sealer that opens sealed SQL changesets when they are applied.
     pub fn set_sealer(&self, sealer: Arc<kronik_privacy::sealer::Sealer>) {
         *self.sealer.lock().unwrap_or_else(|e| e.into_inner()) = sealer;
+    }
+
+    /// The sealer this store opens SQL changesets with.
+    pub fn sealer_arc(&self) -> Arc<kronik_privacy::sealer::Sealer> {
+        self.sealer()
     }
 
     fn sealer(&self) -> Arc<kronik_privacy::sealer::Sealer> {
@@ -132,6 +154,12 @@ impl Store {
         let Some(last) = batch.last() else {
             return Ok(());
         };
+        if let Some(c) = batch.iter().find(|c| c.record.rebase_switch().is_some()) {
+            return Err(StoreError::Corrupt(format!(
+                "the StateRebase switch at lsn {} needs its shadow",
+                c.lsn
+            )));
+        }
         let _apply = self.apply_lock();
         for (i, c) in batch.iter().enumerate() {
             match &c.record {
@@ -145,6 +173,122 @@ impl Store {
             self.db().checkpoint();
         }
         self.applied.set(self.applied.get().max(last.lsn));
+        Ok(())
+    }
+
+    /// [`Store::apply`] for batches that may hold a StateRebase switch: each
+    /// switch not applied yet is applied with the shadow `shadow` returns
+    /// for it (ADR 0017). A switch `state.db` has applied whose copy an
+    /// actor database lost (a power loss) has that copy redone, with the
+    /// shadow too.
+    pub fn apply_with(
+        &self,
+        batch: &[Committed],
+        shadow: &mut dyn FnMut(&Committed) -> Result<Arc<Store>, StoreError>,
+    ) -> Result<(), StoreError> {
+        let mut start = 0;
+        for (k, c) in batch.iter().enumerate() {
+            let Some((_, sw)) = c.record.rebase_switch() else {
+                continue;
+            };
+            self.apply(&batch[start..k])?;
+            if c.lsn > self.applied.get() {
+                let s = shadow(c)?;
+                self.apply_switch(c, sw, &s)?;
+            } else {
+                let lost = self.lost_copies(c.lsn, sw)?;
+                if !lost.is_empty() {
+                    let s = shadow(c)?;
+                    let _apply = self.apply_lock();
+                    self.copy_actors(c.lsn, &lost, &s)?;
+                }
+            }
+            start = k + 1;
+        }
+        self.apply(&batch[start..])
+    }
+
+    /// The affected actors of the switch at `lsn`, which `state.db` has
+    /// applied, whose database is below it: the copy of the switch was
+    /// lost. `state.db` keeps main's and the rebased turns in
+    /// `turn_index`, so the actors are known without the shadow.
+    pub fn lost_copies(
+        &self,
+        lsn: Lsn,
+        sw: &pb::RebaseSwitch,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        if lsn > self.applied.get() {
+            return Ok(Vec::new());
+        }
+        let mut lost = Vec::new();
+        let actors = self.db().turn_actors(sw.base_lsn, lsn)?;
+        for (kind, key) in actors {
+            let name = format!("{kind}/{key}");
+            let sql = self.db().actor(&kind, &key)?.is_some_and(|a| a.sql);
+            if !sql && !self.sql.exists(&name) {
+                continue;
+            }
+            let db = self.sql.get(&name)?;
+            let applied = db.lock().unwrap_or_else(|e| e.into_inner()).applied_lsn()?;
+            if applied < lsn {
+                lost.push((kind, key));
+            }
+        }
+        Ok(lost)
+    }
+
+    /// The transplant of a StateRebase switch (docs/design/m13-rebase.md
+    /// section 3): the affected actors' databases are replaced first (each
+    /// stamped with the switch's LSN in the same write, so a crash repeats
+    /// the switch without copying twice), then `state.db` in one transaction.
+    fn apply_switch(
+        &self,
+        c: &Committed,
+        sw: &pb::RebaseSwitch,
+        shadow: &Store,
+    ) -> Result<(), StoreError> {
+        let _apply = self.apply_lock();
+        let actors = self.db().rebase_actors(&shadow.db(), sw.base_lsn, c.lsn)?;
+        self.copy_actors(c.lsn, &actors, shadow)?;
+        self.db().apply_switch(c, sw, &shadow.db(), &actors)?;
+        self.applied.set(self.applied.get().max(c.lsn));
+        Ok(())
+    }
+
+    /// Each actor database of `actors` below `lsn` becomes the shadow's
+    /// (or empty) and carries `lsn` as its applied LSN, in one write.
+    fn copy_actors(
+        &self,
+        lsn: Lsn,
+        actors: &[(String, String)],
+        shadow: &Store,
+    ) -> Result<(), StoreError> {
+        for (kind, key) in actors {
+            let name = format!("{kind}/{key}");
+            let theirs = shadow.db().actor(kind, key)?.is_some_and(|a| a.sql);
+            if !theirs && !self.sql.exists(&name) {
+                continue;
+            }
+            let db = self.sql.get(&name)?;
+            let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+            if db.applied_lsn()? >= lsn {
+                continue;
+            }
+            if theirs {
+                let src = shadow.sql.get(&name)?;
+                let mut src = src.lock().unwrap_or_else(|e| e.into_inner());
+                // The copy carries the stamp: no window where the content
+                // is the shadow's but the applied LSN is main's.
+                src.stamp_applied(lsn)?;
+                db.copy_from(&src)?;
+            } else {
+                db.clear_at(lsn)?;
+            }
+            #[cfg(test)]
+            if CRASH_AFTER_COPY.with(std::cell::Cell::get) {
+                return Err(StoreError::Corrupt("test crash after an actor copy".into()));
+            }
+        }
         Ok(())
     }
 
@@ -274,5 +418,20 @@ impl Store {
                 .map_err(|e| StoreError::Corrupt(format!("erasure in {name} at lsn {lsn}: {e}")))?;
         }
         Ok(())
+    }
+
+    /// The erasure operation of `subject` again, on `kv` and every actor
+    /// database, keeping the applied LSNs (a rebase shadow after its staged
+    /// turns, m13-rebase §3).
+    pub fn erase_again(&self, subject: &str) -> Result<(), StoreError> {
+        let _apply = self.apply_lock();
+        for name in self.db().sql_actors()? {
+            let db = self.sql.get(&name)?;
+            let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+            let applied = db.applied_lsn()?;
+            db.erase_subject(subject, applied)
+                .map_err(|e| StoreError::Corrupt(format!("erasure in {name}: {e}")))?;
+        }
+        self.db().erase_subject_rows(subject)
     }
 }

@@ -10,9 +10,12 @@
 //! simulator (ADR 0004).
 
 pub mod effects;
+mod gate;
 pub mod host;
 mod node;
 mod privacy;
+mod rebase;
+pub use rebase::rebase_turn_bytes;
 mod reseal;
 pub mod scrub;
 mod sealing;
@@ -30,6 +33,7 @@ use kronik_runtime::{CodeStore, PoolSize, build_engine};
 use kronik_store::Store;
 use kronik_store::sql::{FileOpener, Limits, SqlPool};
 
+pub use gate::Drain;
 pub use node::{
     CodeSwitch, DeployResult, Ingress, METHODS, Node, NodeParts, Probe, RouteEntry, StartError,
     Waiter, normalize_pattern,
@@ -72,9 +76,9 @@ pub struct NodeConfig {
     /// before the result is recorded, so a test can crash exactly there.
     #[doc(hidden)]
     pub test_hold_after_call: bool,
-    /// Test hook: every code switch (promote, rollback) parks after its
-    /// `Deployment` is applied and before the code is swapped, until the
-    /// hold releases it (ADR 0013).
+    /// Test hook: every code switch (promote, rollback, the rebase switch)
+    /// parks after its record is applied and before the code is installed,
+    /// until the hold releases it (ADR 0013, 0018).
     #[doc(hidden)]
     pub test_hold_switch: Option<Arc<SwitchHold>>,
     /// `privacy.keystore_backup_retention` (default 30 days). Erasure

@@ -1,0 +1,8 @@
+[project]
+name = "notes-py"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.kronik]
+entry = "actor"
+sdk = "../../sdk/python"

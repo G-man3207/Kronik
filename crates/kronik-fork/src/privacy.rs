@@ -141,6 +141,9 @@ pub struct ForkState {
     actor: ActorRef,
     privacy: ForkPrivacy,
     masked: AtomicBool,
+    /// The turn read a state value with a subject (M12: the model
+    /// simulator then declines).
+    saw_subject: AtomicBool,
 }
 
 impl ForkState {
@@ -150,12 +153,18 @@ impl ForkState {
             actor,
             privacy,
             masked: AtomicBool::new(false),
+            saw_subject: AtomicBool::new(false),
         }
     }
 
     /// Whether the turn read a pseudonym or an erased value.
     pub fn masked(&self) -> bool {
         self.masked.load(Ordering::Relaxed)
+    }
+
+    /// Whether the turn read a state value with a subject.
+    pub fn saw_subject(&self) -> bool {
+        self.saw_subject.load(Ordering::Relaxed)
     }
 }
 
@@ -169,6 +178,9 @@ impl StateView for ForkState {
         let Some(mut value) = value else {
             return Ok(None);
         };
+        if value.subject.is_some() {
+            self.saw_subject.store(true, Ordering::Relaxed);
+        }
         if matches!(self.privacy.sealer.open(&value), Opened::Erased { .. }) {
             self.masked.store(true, Ordering::Relaxed);
             return Ok(None);

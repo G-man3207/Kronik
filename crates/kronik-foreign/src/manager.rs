@@ -27,7 +27,7 @@ const RECONCILE_WAIT: Duration = Duration::from_secs(30);
 /// How long a call waits for a starting or restarting actor.
 const CALL_WAIT: Duration = Duration::from_secs(10);
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -105,6 +105,8 @@ pub struct ForeignConfig {
     pub layout_dirs: Vec<PathBuf>,
     /// `[foreign] pull_timeout`: the longest one image fetch may take.
     pub pull_timeout: Duration,
+    /// `[foreign] checkpoints_kept`: checkpoints per actor (M14).
+    pub checkpoints_kept: usize,
 }
 
 /// `kronik foreign add` as the API received it.
@@ -123,6 +125,8 @@ pub struct AddRequest {
     /// The free bytes above `[log] disk_reserve`: an image whose new layers
     /// need more is refused before it is fetched (None: no reserve).
     pub max_new_bytes: Option<u64>,
+    /// `recorded` (default) or `sandbox` (M14).
+    pub fork_mode: Option<String>,
 }
 
 /// `dir` resolved, when it is inside one of `allowed`: first by its
@@ -222,9 +226,11 @@ pub struct Cleaned {
 
 /// The foreign actors of one daemon.
 pub struct Foreign {
-    ctx: Arc<Ctx>,
-    cfg: ForeignConfig,
-    actors: Mutex<BTreeMap<String, Arc<Actor>>>,
+    pub(crate) ctx: Arc<Ctx>,
+    pub(crate) cfg: ForeignConfig,
+    pub(crate) actors: Mutex<BTreeMap<String, Arc<Actor>>>,
+    /// Every copy started (M14), so shutdown stops the live ones.
+    pub(crate) copies: Mutex<Vec<std::sync::Weak<crate::checkpoint::CopyInner>>>,
     /// Serializes reconciles; true once leftovers were cleaned up.
     reconcile: tokio::sync::Mutex<bool>,
     /// The lock on `run_dir` (held for the daemon's life), or why this
@@ -340,6 +346,7 @@ impl Foreign {
             ctx: Arc::new(ctx),
             cfg,
             actors: Mutex::new(BTreeMap::new()),
+            copies: Mutex::new(Vec::new()),
             reconcile: tokio::sync::Mutex::new(false),
             run_lock,
             layout,
@@ -487,6 +494,20 @@ impl Foreign {
                 }
             }
         };
+        let fork_mode = match req.fork_mode.as_deref() {
+            None | Some("recorded") => "recorded",
+            Some("sandbox") if isolation == Isolation::Gvisor => "sandbox",
+            Some("sandbox") => {
+                return Err(bad(
+                    "fork_mode sandbox needs isolation gvisor: runc has no checkpoints",
+                ));
+            }
+            Some(other) => {
+                return Err(bad(format!(
+                    "fork_mode must be recorded or sandbox, not {other:?}"
+                )));
+            }
+        };
         let mut bindings: Vec<String> = Vec::new();
         let mut vars = std::collections::BTreeSet::new();
         for entry in &req.secrets {
@@ -557,6 +578,7 @@ impl Foreign {
                 isolation: isolation.to_pb(),
                 secrets: bindings,
                 platform,
+                fork_mode: fork_mode.to_owned(),
                 ..Default::default()
             },
             warnings,
@@ -710,8 +732,8 @@ impl Foreign {
         Ok(r.map(|(lines, truncated)| LogTail { lines, truncated }))
     }
 
-    /// Stops every sandbox (daemon shutdown) and removes this daemon's
-    /// cgroup parent once it is empty.
+    /// Stops every sandbox and every fork's copy (daemon shutdown) and
+    /// removes this daemon's cgroup parent once it is empty.
     pub async fn shutdown(&self) {
         let actors: Vec<Arc<Actor>> = std::mem::take(&mut *lock(&self.actors))
             .into_values()
@@ -719,6 +741,10 @@ impl Foreign {
         for a in actors {
             tracing::info!(foreign = a.name(), "stopping foreign actor");
             a.stop().await;
+        }
+        let copies = std::mem::take(&mut *lock(&self.copies));
+        for c in copies.iter().filter_map(std::sync::Weak::upgrade) {
+            c.stop_now().await;
         }
         if self.run_lock.is_ok() {
             self.remove_cgroup_parent();
@@ -852,7 +878,7 @@ impl Foreign {
             let mut ids: Vec<&str> = ids
                 .lines()
                 .map(str::trim)
-                .filter(|i| i.starts_with("kronik-foreign-"))
+                .filter(|i| i.starts_with("kronik-foreign-") || i.starts_with("kronik-copy-"))
                 .collect();
             // Longest first: runsc refuses an id that is a prefix of another
             // still there, as `kronik-foreign-<name>` ids from before they
@@ -874,6 +900,7 @@ impl Foreign {
         let netns = self.ctx.paths.netns_dir();
         let sock = self.ctx.paths.sock_root();
         let actors = self.ctx.paths.actors();
+        let branches = self.cfg.data_dir.join("branches");
         // runsc binds a namespace here for its sandboxes and leaves it
         // mounted after the last one; no sandbox of this run_dir is left.
         let null_netns = self.ctx.paths.run.join("runsc").join("null-netns");
@@ -905,6 +932,36 @@ impl Foreign {
                     for e in entries.flatten() {
                         if std::fs::remove_file(e.path().join("bundle/config.json")).is_ok() {
                             configs += 1;
+                        }
+                        // Partial checkpoints of a stopped daemon: memory
+                        // images that hold the secret values (M14).
+                        let checkpoints = e.path().join("checkpoints");
+                        for c in std::fs::read_dir(&checkpoints).into_iter().flatten().flatten() {
+                            if c.file_name().to_string_lossy().starts_with(".tmp-")
+                                && std::fs::remove_dir_all(c.path()).is_ok()
+                            {
+                                configs += 1;
+                            }
+                        }
+                    }
+                }
+                // Fork copies' bundles (branches/<fork>/foreign/<name>/
+                // <copy>/bundle) of copies the daemon did not stop (M14).
+                let dirs = |d: &std::path::Path| -> Vec<std::path::PathBuf> {
+                    std::fs::read_dir(d)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_dir())
+                        .collect()
+                };
+                for fork in dirs(&branches) {
+                    for actor in dirs(&fork.join("foreign")) {
+                        for copy in dirs(&actor) {
+                            if std::fs::remove_file(copy.join("bundle/config.json")).is_ok() {
+                                configs += 1;
+                            }
                         }
                     }
                 }
@@ -958,10 +1015,14 @@ impl Foreign {
             if !wanted.contains_key(a.name()) {
                 removed = true;
                 let bundle = self.ctx.paths.bundle(a.name());
+                let checkpoints = self.ctx.paths.actor(a.name()).join("checkpoints");
                 let _ = self
                     .ctx
                     .env
-                    .blocking("foreign-cleanup", move || std::fs::remove_dir_all(bundle))
+                    .blocking("foreign-cleanup", move || {
+                        let _ = std::fs::remove_dir_all(checkpoints);
+                        std::fs::remove_dir_all(bundle)
+                    })
                     .await;
             }
         }
@@ -1048,7 +1109,44 @@ impl ForeignHost for Host {
             a.running(env, CALL_WAIT)
                 .await
                 .map_err(|why| unavailable(&name, &why))?;
+            let _calls = a.calls.read().await;
             crate::bridge::send(env, &a.pool, &a.dialer, &name, req).await
+        })
+    }
+
+    fn checkpoint(
+        &self,
+        name: &str,
+        lsn: u64,
+        hold: Box<dyn std::any::Any + Send>,
+        budget: Option<u64>,
+    ) -> BoxFuture<'static, Result<kronik_effects::foreign::Checkpoint, String>> {
+        let me = self.0.clone();
+        let name = name.to_owned();
+        // On its own task: a dropped caller (a client gone from `POST
+        // /v1/snapshots`) must not stop it between `runsc pause` and the
+        // resume, which would leave production paused (review M14-H1).
+        let task = me.ctx.env.clone().spawn("foreign-checkpoint", async move {
+            me.checkpoint(&name, lsn, hold, budget).await
+        });
+        Box::pin(async move {
+            task.await
+                .unwrap_or_else(|| Err("the checkpoint task was dropped".to_owned()))
+        })
+    }
+
+    fn checkpoints(&self, name: &str) -> Vec<kronik_effects::foreign::Checkpoint> {
+        self.0.checkpoints(name)
+    }
+
+    fn start_copy(
+        &self,
+        spec: kronik_effects::foreign::CopySpec,
+    ) -> BoxFuture<'static, Result<Arc<dyn kronik_effects::foreign::ForeignCopy>, String>> {
+        let me = self.0.clone();
+        Box::pin(async move {
+            let copy: Arc<dyn kronik_effects::foreign::ForeignCopy> = me.start_copy(spec).await?;
+            Ok(copy)
         })
     }
 }
@@ -1099,6 +1197,7 @@ mod tests {
             insecure_registries: Vec::new(),
             layout_dirs: Vec::new(),
             pull_timeout: Duration::from_secs(5),
+            checkpoints_kept: 3,
         }
     }
 
@@ -1153,6 +1252,38 @@ mod tests {
             .unwrap_err();
         assert_eq!(add.code, ErrorCode::ForeignUnavailable, "{add}");
         assert!(f.cleanup().await.is_ok());
+    }
+
+    /// Review N14-1: `kronik foreign cleanup` also removes what fork copies
+    /// and partial checkpoints of a stopped daemon left that holds secret
+    /// values: copy bundles' config.json and .tmp checkpoint directories.
+    #[tokio::test]
+    async fn cleanup_covers_copy_bundles_and_partial_checkpoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(tmp.path());
+        let copy = cfg
+            .data_dir
+            .join("branches/f-1/foreign/pg/0123456789abcdef/bundle");
+        let partial = cfg
+            .data_dir
+            .join("foreign/actors/pg/checkpoints/.tmp-00000000000000000007");
+        let kept = cfg
+            .data_dir
+            .join("foreign/actors/pg/checkpoints/00000000000000000005");
+        for d in [&copy, &partial, &kept] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("config.json"), b"{\"env\": [\"KEY=secret\"]}").unwrap();
+        }
+        // The current layout, so the start moves nothing.
+        std::fs::write(cfg.data_dir.join("foreign/actors/.layout"), b"").unwrap();
+        let env = Env::real(tokio::runtime::Handle::current());
+        let f = Foreign::new(env, cfg);
+        let cleaned = f.cleanup().await.unwrap();
+        assert!(cleaned.configs >= 2, "{cleaned:?}");
+        assert!(!copy.join("config.json").exists());
+        assert!(!partial.exists());
+        // A complete checkpoint keeps its spec: a copy restores from it.
+        assert!(kept.join("config.json").exists());
     }
 
     /// A foreign manager whose "runsc" is any executable (adds only check

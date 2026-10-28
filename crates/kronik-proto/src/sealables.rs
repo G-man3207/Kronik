@@ -118,6 +118,14 @@ pub fn record_mut(r: &mut Record, f: Visit<'_>) {
             }
         }
         Record::TurnRecord(t) => turn_mut(t, f),
+        // A rebased turn holds a turn record's user data (M13).
+        Record::StateRebase(r) => {
+            if let Some(pb::state_rebase::Part::Turn(t)) = r.part.as_mut()
+                && let Some(t) = t.record.as_mut()
+            {
+                turn_mut(t, f);
+            }
+        }
         _ => {}
     }
 }

@@ -4,6 +4,7 @@
 //! `reason` and supports `dry_run` (I12); errors use the stable error JSON.
 
 pub mod auth;
+pub mod m12;
 mod m3;
 mod m6;
 pub mod m7;
@@ -21,7 +22,6 @@ use std::sync::Arc;
 use base64::Engine as _;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, CodeHash, TurnId};
-use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Node, TurnResult};
 use serde::Serialize;
@@ -389,6 +389,18 @@ fn request_line(e: &pb::EffectRecord) -> Option<String> {
     Some(format!("{} {rest}", r.method))
 }
 
+/// How a fork effect was answered (`exact`, `approximate`, `synthetic`);
+/// `None` for live effects, which production's look the same as.
+fn grounding_label(e: &pb::EffectRecord) -> Option<String> {
+    match pb::Grounding::try_from(e.grounding) {
+        Ok(pb::Grounding::Exact) => Some("exact".into()),
+        Ok(pb::Grounding::Approximate) => Some("approximate".into()),
+        Ok(pb::Grounding::Synthetic) => Some("synthetic".into()),
+        Ok(pb::Grounding::Forked) => Some("forked".into()),
+        _ => None,
+    }
+}
+
 /// The effects of a turn; a denied effect carries the exact grant command.
 fn effect_summaries(t: &pb::TurnRecord) -> Vec<EffectSummary> {
     let kind = t.actor.as_ref().map_or("<kind>", |a| a.kind.as_str());
@@ -409,6 +421,11 @@ fn effect_summaries(t: &pb::TurnRecord) -> Vec<EffectSummary> {
                 error: opt(&e.error),
                 hint,
                 request: None,
+                grounding: grounding_label(e),
+                // Empty for a record written before M12: unknown, not fail-closed.
+                simulator: (e.grounding == pb::Grounding::Synthetic as i32)
+                    .then(|| opt(&e.simulator))
+                    .flatten(),
             }
         })
         .collect()
@@ -738,6 +755,15 @@ impl Api {
                 Some(r) => r,
                 None => match self.route_m7(req, segs.as_slice(), &q).await {
                     Some(r) => r,
+                    None if segs.get(1) == Some(&"simulators") => {
+                        match self.route_m12(req, segs.as_slice()).await {
+                            Some(r) => r,
+                            None => Err(ApiError::new(
+                                ErrorCode::NotImplemented,
+                                format!("no endpoint {} {}", req.method, req.path),
+                            )),
+                        }
+                    }
                     None => match self.route_privacy(req, segs.as_slice()).await {
                         Some(r) => r,
                         None => match self.route_m6(req, segs.as_slice()).await {
@@ -1005,7 +1031,8 @@ impl Api {
                 .read_at(r.pos)
                 .await
                 .map_err(|e| ApiError::new(ErrorCode::StorageCorrupt, e.to_string()))?;
-            if let Record::TurnRecord(t) = &c.record {
+            // A rebased turn (M13) is a turn of the history too.
+            if let Some(t) = c.record.turn() {
                 // With pii:read the summary shows the path: unsealed first.
                 let mut s = if pii && input_has_sealed(t.input.as_ref()) {
                     let mut u = t.clone();
@@ -1439,8 +1466,8 @@ impl Api {
             Some(c) => c,
             None => return Err(self.missing_turn(id, lsn).await),
         };
-        match &c.record {
-            Record::TurnRecord(t) => {
+        match c.record.turn() {
+            Some(t) => {
                 let hide = !pii && input_has_sealed(t.input.as_ref());
                 let mut t = t.clone();
                 redact::redact_turn(&mut t, self.node.sealer(), pii);

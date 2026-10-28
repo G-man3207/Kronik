@@ -72,6 +72,26 @@ pub struct ReplaySetup {
     pub prod_store: Option<Arc<Store>>,
     /// Counts the root inputs replayed, when someone follows the replay.
     pub progress: Option<Arc<Progress>>,
+    /// Main's simulator configuration at the fork point with the request's
+    /// overrides (M12, I5, ADR 0014).
+    pub simulators: Arc<crate::simulators::Simulators>,
+    /// The model simulator, when the server configures one (ADR 0015).
+    pub model: Option<crate::simulators::ModelAccess>,
+    /// A rollback via replay (M13): its turns become main's state, so it
+    /// answers from recordings only and leaves every consequence production
+    /// has not run pending for main (m13-rebase §4, §8).
+    pub rebase: bool,
+    /// The fork's copies of `fork_mode = "sandbox"` foreign actors (M14,
+    /// ADR 0019), used by continuous replay only.
+    pub copies: Option<ForkCopies>,
+}
+
+/// The copies of foreign actors a fork's continuous replay talks to, and
+/// the environment whose timer bounds each call.
+#[derive(Clone)]
+pub struct ForkCopies {
+    pub env: Env,
+    pub copies: BTreeMap<String, Arc<dyn kronik_effects::foreign::ForeignCopy>>,
 }
 
 /// Live access from a fork: the allowlisted hosts and the environment
@@ -91,7 +111,11 @@ impl ReplaySetup {
         config: Config,
         secrets: Option<Arc<SecretStore>>,
     ) -> ReplaySetup {
+        let simulators = Arc::new(crate::simulators::Simulators::new(&index, &[]));
         ReplaySetup {
+            simulators,
+            model: None,
+            copies: None,
             fork,
             index,
             kinds,
@@ -103,6 +127,7 @@ impl ReplaySetup {
             privacy: crate::privacy::ForkPrivacy::plain(),
             prod_store: None,
             progress: None,
+            rebase: false,
         }
     }
 }
@@ -148,6 +173,12 @@ pub struct ForkTurn {
     /// by one, so its values may hold real SQL rows (SQL is not
     /// pseudonymized). Implies `masked`; see [`crate::privacy::conceal_turn`].
     pub sql: bool,
+    /// Its values may hold personal data, in any fork: its input was tagged
+    /// or came from such a turn, it read tagged state, used SQL, recorded a
+    /// tagged effect value, used a secret, or called a turn that did. The
+    /// model simulator declines for such turns and their consequences
+    /// (ADR 0015).
+    pub personal: bool,
 }
 
 /// The fork turns of one root input's tree (isolated replay).
@@ -192,7 +223,22 @@ pub fn advance(store: &Store, index: &ProductionIndex, upto: Lsn) -> Result<(), 
     }
     let cap = if end - start >= 8_192 { 65_536 } else { 512 };
     for chunk in index.records[start..end].chunks(cap) {
-        store.apply(chunk)?;
+        // A rebase switch in production's history installs its shadow,
+        // built from the same records (M13, ADR 0017).
+        store.apply_with(chunk, &mut |c| {
+            let (id, sw) = c
+                .record
+                .rebase_switch()
+                .ok_or_else(|| kronik_store::StoreError::Corrupt("not a switch".into()))?;
+            kronik_store::rebase::shadow_for(
+                id,
+                sw,
+                c.lsn,
+                index.base.as_ref().map(|b| (b.lsn, b.dir.as_path())),
+                &index.records,
+                index.sealer.clone(),
+            )
+        })?;
     }
     Ok(())
 }
@@ -206,6 +252,9 @@ struct Pending {
     subject: Option<String>,
     /// Sent by a turn whose values may hold real SQL rows ([`ForkTurn::sql`]).
     sql: bool,
+    /// Sent by a turn whose values may hold personal data
+    /// ([`ForkTurn::personal`]).
+    personal: bool,
 }
 
 struct Runner {
@@ -278,6 +327,14 @@ impl Runner {
                 o
             }
         }
+    }
+
+    /// A rebase leaves a consequence production has not run (not in the
+    /// index: in flight at the pause, or new under the old code) pending in
+    /// the fork's store, so main runs it, with real effects, after the
+    /// switch (m13-rebase §4). A later round queues it once production ran it.
+    fn deferred(&self, key: &pb::CausalKey) -> bool {
+        self.setup.rebase && self.setup.index.turn(key).is_none()
     }
 
     /// Before a matched turn that production committed after the root, apply
@@ -355,7 +412,7 @@ impl Runner {
                         .timer_pending(&p.actor.kind, &p.actor.key, t.timer_id)?
                 }
                 _ => false,
-            };
+            } || self.resend_not_needed(&p);
             if !skip {
                 self.clone().run(p, order).await?;
             }
@@ -366,6 +423,90 @@ impl Runner {
                 Progress::add(&progress.continuous_done, 1);
             }
         }
+    }
+
+    /// A dead-letter resend in the window whose original the fork ran with
+    /// success (M8): running it again would apply the message twice.
+    fn resend_not_needed(&self, p: &Pending) -> bool {
+        let Some(pb::input::Kind::Message(m)) = &p.input.kind else {
+            return false;
+        };
+        if m.source != pb::MessageSource::DeadLetterResend as i32 {
+            return false;
+        }
+        let Some(of) = kronik_core::ids::TurnId::parse(&m.resend_of) else {
+            return false;
+        };
+        lock(&self.turns).iter().any(|t| {
+            t.prod_lsn == Some(of.lsn)
+                && t.record
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|o| o.kind == pb::OutcomeKind::Committed as i32)
+        })
+    }
+
+    /// Queues what the store holds pending (continuous replay): its timers
+    /// not queued yet, and its mailbox in production delivery order (M7).
+    /// A message production delivered runs at that turn's place; one it did
+    /// not runs first, after `after` (a rebase leaves it for main).
+    fn queue_pending(&self, after: Lsn) -> Result<(), ReplayError> {
+        for t in self.store.db().timers(None)? {
+            if lock(&self.timers).contains_key(&(t.actor.clone(), t.timer_id)) {
+                continue;
+            }
+            let op = pb::TimerOp {
+                kind: pb::TimerOpKind::Schedule as i32,
+                timer_id: t.timer_id,
+                due_ms: t.due_ms,
+                msg: Some(t.msg),
+                ordinal: 0,
+            };
+            // A fork turn of an earlier round scheduled it: its id and flags,
+            // as when the timer is queued in that turn's round (review
+            // M13-1). Production scheduled the others: what that turn read
+            // is unknown, so they count as personal (review N12-3).
+            let (by, sql, personal) = lock(&self.turns)
+                .iter()
+                .find(|f| f.lsn == t.lsn)
+                .map_or_else(
+                    || (String::new(), false, true),
+                    |f| (f.id.clone(), f.sql, f.personal),
+                );
+            self.schedule_timer(&t.actor, t.causal_key, &op, &by, sql, personal);
+        }
+        for (i, m) in self.store.db().mailbox()?.into_iter().enumerate() {
+            let order = match self.setup.index.turn(&m.causal_key) {
+                Some((lsn, _)) => vec![lsn],
+                None if self.setup.rebase => continue,
+                None => vec![after, i as u64],
+            };
+            let (subject, time) = match &m.input.kind {
+                Some(pb::input::Kind::Message(x)) => (
+                    x.msg
+                        .as_ref()
+                        .and_then(|b| b.body.as_ref())
+                        .and_then(|b| b.subject.clone()),
+                    x.sent_logical_time_ms,
+                ),
+                _ => (None, 0),
+            };
+            self.push(
+                order,
+                Pending {
+                    actor: m.to,
+                    input: m.input,
+                    key: m.causal_key,
+                    time,
+                    subject,
+                    sql: false,
+                    // Production sent it (or a turn whose reads are not
+                    // known here): counted as personal (review N12-3).
+                    personal: true,
+                },
+            );
+        }
+        Ok(())
     }
 
     /// Schedules a fork timer. An isolated tree fires only the timers
@@ -379,10 +520,11 @@ impl Runner {
         op: &pb::TimerOp,
         scheduled_by: &str,
         sql: bool,
+        personal: bool,
     ) {
         let order = match self.setup.index.turn(&key) {
             Some((lsn, _)) => vec![lsn],
-            None if self.isolated => return,
+            None if self.isolated || self.setup.rebase => return,
             None => match self.setup.index.first_root_at_or_after(op.due_ms) {
                 // Right before the first production position at or after
                 // the due time.
@@ -417,6 +559,7 @@ impl Runner {
                 time: op.due_ms,
                 subject,
                 sql,
+                personal,
             },
         );
     }
@@ -489,6 +632,7 @@ impl Runner {
             masked: sql || pseudonyms,
             pseudonyms,
             sql,
+            personal: p.personal || p.subject.is_some(),
         };
         lock(&self.turns).push(turn.clone());
         Ok(turn)
@@ -531,6 +675,7 @@ impl Runner {
                     time: p.time,
                     subject: None,
                     sql: false,
+                    personal: false,
                 };
                 let mut morder = order.clone();
                 morder.push(0);
@@ -597,16 +742,6 @@ impl Runner {
             }
             _ => Vec::new(),
         };
-        let gate = Arc::new(ReplayGate {
-            runner: self.clone(),
-            actor: p.actor.clone(),
-            key: p.key.clone(),
-            time,
-            order: order.clone(),
-            prod: prod_effects,
-            call_chain,
-            state: Mutex::new(GateState::default()),
-        });
         let sql = Arc::new(Mutex::new(SqlTurn::new(
             self.store.clone(),
             &p.actor,
@@ -619,6 +754,26 @@ impl Runner {
                 max_bytes: kl.sql_bytes_per_actor,
             },
         )));
+        let state = Arc::new(crate::privacy::ForkState::new(
+            self.store.clone(),
+            p.actor.clone(),
+            self.setup.privacy.clone(),
+        ));
+        let gate = Arc::new(ReplayGate {
+            runner: self.clone(),
+            actor: p.actor.clone(),
+            key: p.key.clone(),
+            time,
+            order: order.clone(),
+            prod: prod_effects,
+            call_chain,
+            state: Mutex::new(GateState::default()),
+            input_tagged: p.subject.is_some()
+                || p.personal
+                || crate::privacy::tagged_input(Some(&p.input)),
+            fork_state: state.clone(),
+            sql: sql.clone(),
+        });
         let req = TurnRequest {
             actor: p.actor.clone(),
             causal_key: p.key.clone(),
@@ -628,11 +783,6 @@ impl Runner {
             limits,
             subject: p.subject.clone(),
         };
-        let state = Arc::new(crate::privacy::ForkState::new(
-            self.store.clone(),
-            p.actor.clone(),
-            self.setup.privacy.clone(),
-        ));
         let run = kind
             .program
             .run(
@@ -699,6 +849,7 @@ impl Runner {
             kronik_sched::scrub::message(&mut m.msg, &gs.secrets);
         }
         let real_rows = self.setup.privacy.no_pii && (used_sql || gs.sql || p.sql);
+        let personal = gate.saw_personal_with(&gs) || used_sql;
         let committed = out.committed();
         // As in production: a turn that did not commit after an effect whose
         // outcome is unknown fails with EFFECT_OUTCOME_UNKNOWN.
@@ -765,6 +916,9 @@ impl Runner {
                     continue;
                 };
                 let key = causal::child(&p.key, &p.actor, m.ordinal);
+                if self.deferred(&key) {
+                    continue;
+                }
                 let order = self.child_order(&order, &key, m.ordinal);
                 let subject = m
                     .msg
@@ -780,13 +934,14 @@ impl Runner {
                         time,
                         subject,
                         sql: real_rows,
+                        personal,
                     },
                 );
             }
             for t in &record.timers {
                 if t.kind == pb::TimerOpKind::Schedule as i32 {
                     let key = causal::child(&p.key, &p.actor, t.ordinal);
-                    self.schedule_timer(&p.actor, key, t, &id, real_rows);
+                    self.schedule_timer(&p.actor, key, t, &id, real_rows, personal);
                 } else {
                     self.cancel_timer(&p.actor, t.timer_id);
                 }
@@ -797,6 +952,9 @@ impl Runner {
                     continue;
                 };
                 let key = causal::compensation(&p.key, &p.actor, m.ordinal, &to);
+                if self.deferred(&key) {
+                    continue;
+                }
                 let compensates = causal::message_id(&p.key, m.ordinal);
                 let order = self.child_order(&order, &key, m.ordinal);
                 self.push(
@@ -814,6 +972,7 @@ impl Runner {
                         time,
                         subject: None,
                         sql: real_rows,
+                        personal,
                     },
                 );
             }
@@ -833,6 +992,7 @@ impl Runner {
             masked: pseudonyms || (self.setup.privacy.no_pii && real_rows),
             pseudonyms,
             sql: real_rows,
+            personal,
         };
         lock(&self.turns).push(turn.clone());
         Ok(turn)
@@ -866,6 +1026,8 @@ struct GateState {
     secrets: Vec<(String, Vec<u8>)>,
     /// A callee's values may hold real SQL rows ([`ForkTurn::sql`]).
     sql: bool,
+    /// A callee's values may hold personal data ([`ForkTurn::personal`]).
+    personal: bool,
 }
 
 /// The replay effect gate of one fork turn.
@@ -878,6 +1040,11 @@ struct ReplayGate {
     prod: Vec<pb::EffectRecord>,
     call_chain: Vec<ActorRef>,
     state: Mutex<GateState>,
+    /// What the turn has seen of personal data, for the model simulator
+    /// (ADR 0015): its root input's subject, state reads, SQL.
+    input_tagged: bool,
+    fork_state: Arc<crate::privacy::ForkState>,
+    sql: Arc<Mutex<SqlTurn>>,
 }
 
 struct GateHandle(Arc<ReplayGate>);
@@ -947,8 +1114,36 @@ impl ReplayGate {
             status: pb::EffectStatus::Denied as i32,
             error: NO_RECORDING.into(),
             grounding: pb::Grounding::Synthetic as i32,
+            simulator: kronik_effects::simulator::label::FAIL_CLOSED.into(),
             ..Default::default()
         }
+    }
+
+    /// Whether the turn has seen personal data or a secret: the model
+    /// simulator then declines (docs/design/m12-simulators.md §3.3).
+    fn tainted(&self, req: &FetchRequest) -> bool {
+        req.subject.is_some() || self.saw_personal()
+    }
+
+    /// Whether the turn has seen personal data or a secret so far.
+    fn saw_personal(&self) -> bool {
+        lock(&self.sql).used() || self.saw_personal_with(&lock(&self.state))
+    }
+
+    /// [`ReplayGate::saw_personal`] with the gate's state at hand (SQL use
+    /// aside): its input (tagged, or sent by a turn that saw personal data),
+    /// tagged state it read, a callee that saw personal data or SQL rows,
+    /// a secret, a tagged effect value.
+    fn saw_personal_with(&self, state: &GateState) -> bool {
+        self.input_tagged
+            || self.fork_state.saw_subject()
+            || state.personal
+            || state.sql
+            || !state.secrets.is_empty()
+            || state.records.iter().any(|r| {
+                r.request.as_ref().is_some_and(|x| x.subject.is_some())
+                    || r.response.as_ref().is_some_and(|x| x.subject.is_some())
+            })
     }
 
     async fn fetch(&self, ordinal: u32, req: FetchRequest) -> FetchOutcome {
@@ -1044,6 +1239,25 @@ impl ReplayGate {
         let plain_fp = fingerprint(&request).unwrap_or_default();
         let fp = sealer.effect_fingerprint(req.subject.as_deref(), plain_fp.clone());
         let encoded = tagged(&req.subject, request.encode_to_vec());
+        // A copy of the foreign actor answers in continuous replay (M14).
+        if t.scheme == "foreign"
+            && !self.runner.isolated
+            && let Some(copies) = self.runner.setup.copies.clone()
+            && let Some(copy) = copies.copies.get(&t.host).cloned()
+        {
+            return self
+                .fetch_copy(
+                    ordinal,
+                    cap,
+                    (fp, plain_fp),
+                    encoded,
+                    req,
+                    prod,
+                    copy,
+                    copies.env,
+                )
+                .await;
+        }
         if let (Some(p), Some(pr)) = (prod, prod_req) {
             if sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &plain_fp) {
                 let mut rec = p;
@@ -1063,9 +1277,13 @@ impl ReplayGate {
             }
         }
         let setup = &self.runner.setup;
-        // Synthetic: a stub rule if one matches.
-        if let Some(rule) = crate::stubs::find(&setup.stubs, &req.method, &req.url) {
+        let sims = setup.simulators.target(&cap);
+        // Synthetic: a stub rule of the request, then of the target.
+        let rule = crate::stubs::find(&setup.stubs, &req.method, &req.url)
+            .or_else(|| sims.and_then(|s| crate::stubs::find(&s.stubs, &req.method, &req.url)));
+        if let Some(rule) = rule {
             let mut rec = self.synthetic(ordinal, kind, cap, fp, encoded);
+            rec.simulator = kronik_effects::simulator::label::STUB.into();
             rec.error = String::new();
             rec.status = match rule.error.as_deref() {
                 Some("network") => pb::EffectStatus::Network,
@@ -1112,8 +1330,168 @@ impl ReplayGate {
             let env = live.env.clone();
             return self.fetch_live(ordinal, cap, fp, encoded, req, env).await;
         }
+        if let Some(s) = sims {
+            use kronik_effects::simulator::{EffectRequest, EffectSimulator, ReplayContext};
+            let ereq = EffectRequest {
+                ordinal,
+                kind: kind.into(),
+                target: cap.clone(),
+                fingerprint: fp.clone(),
+                http: Some(request.clone()),
+            };
+            let ctx = ReplayContext { recorded: &[] };
+            let neighbor = s
+                .neighbor
+                .then(|| setup.simulators.neighbor(&setup.index, &cap));
+            let answer = s
+                .contract
+                .as_ref()
+                .and_then(|c| c.respond(&ereq, &ctx))
+                .or_else(|| neighbor.and_then(|n| n.respond(&ereq, &ctx)));
+            if let Some(a) = answer {
+                let mut rec = a.record;
+                rec.request = encoded;
+                let out = outcome_of_fetch(&rec);
+                self.push(rec);
+                return out;
+            }
+            if s.model
+                && let Some(model) = &setup.model
+                && !self.tainted(&req)
+            {
+                let max = model.config.max_examples;
+                let examples = |holds: &dyn Fn(&[u8]) -> bool| {
+                    crate::simulators::model_examples(
+                        &crate::simulators::Simulators::model_sources(&setup.index, &cap),
+                        max,
+                        holds,
+                    )
+                };
+                if let Some(a) = model.answer(&cap, &fp, &request, examples).await {
+                    let rec = pb::EffectRecord {
+                        ordinal,
+                        kind: kind.into(),
+                        target: cap,
+                        fingerprint: fp,
+                        request: encoded,
+                        status: pb::EffectStatus::Ok as i32,
+                        grounding: pb::Grounding::Synthetic as i32,
+                        simulator: kronik_effects::simulator::label::MODEL.into(),
+                        response: plain(
+                            pb::HttpEffectResponse {
+                                status: u32::from(a.status),
+                                headers: a
+                                    .headers
+                                    .into_iter()
+                                    .map(|(name, value)| pb::HeaderPair { name, value })
+                                    .collect(),
+                                body: a.body.into_bytes(),
+                            }
+                            .encode_to_vec(),
+                        ),
+                        ..Default::default()
+                    };
+                    let out = outcome_of_fetch(&rec);
+                    self.push(rec);
+                    return out;
+                }
+            }
+        }
         self.push(self.synthetic(ordinal, kind, cap, fp, encoded));
         FetchOutcome::Denied(NO_RECORDING.into())
+    }
+
+    /// A call to a fork's copy of a foreign actor (M14): sent to the copy
+    /// in fork order, so its state follows the fork. Production's recorded
+    /// answer stays when the request is the same (`exact`); otherwise the
+    /// copy's answer is the result (`forked`, ADR 0020).
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_copy(
+        &self,
+        ordinal: u32,
+        cap: String,
+        (fp, plain_fp): (Vec<u8>, Vec<u8>),
+        encoded: Option<pb::Sealable>,
+        req: FetchRequest,
+        prod: Option<pb::EffectRecord>,
+        copy: Arc<dyn kronik_effects::foreign::ForeignCopy>,
+        env: Env,
+    ) -> FetchOutcome {
+        let limits = self.config().limits(&self.actor.kind);
+        let sealer = &self.runner.setup.privacy.sealer;
+        let exact = prod.as_ref().is_some_and(|p| {
+            sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &plain_fp)
+        });
+        let headers = req
+            .headers
+            .iter()
+            .filter_map(|(n, v)| match v {
+                FetchHeader::Text(t) => Some((n.clone(), t.clone())),
+                FetchHeader::Secret { .. } => None,
+            })
+            .collect();
+        let call = copy.http(kronik_core::env::HttpRequest {
+            method: req.method,
+            url: req.url,
+            headers,
+            body: req.body.into(),
+            max_response_bytes: limits.effect_response_bytes,
+        });
+        let answer = env.timeout(limits.effect_timeout, call).await;
+        if let Some(p) = prod.filter(|_| exact) {
+            let mut rec = p;
+            rec.grounding = pb::Grounding::Exact as i32;
+            let out = outcome_of_fetch(&rec);
+            self.push(rec);
+            return out;
+        }
+        let mut rec = pb::EffectRecord {
+            ordinal,
+            kind: "foreign.http".into(),
+            target: cap,
+            fingerprint: fp,
+            request: encoded,
+            grounding: pb::Grounding::Forked as i32,
+            ..Default::default()
+        };
+        rec.status = match answer {
+            Err(_) => {
+                rec.error = format!(
+                    "no response within {} ms",
+                    limits.effect_timeout.as_millis()
+                );
+                pb::EffectStatus::Timeout
+            }
+            Ok(Err(kronik_core::env::NetError::TooLarge)) => {
+                rec.error = format!(
+                    "the response exceeds {} bytes",
+                    limits.effect_response_bytes
+                );
+                pb::EffectStatus::TooLarge
+            }
+            Ok(Err(kronik_core::env::NetError::Connect(e) | kronik_core::env::NetError::Io(e))) => {
+                rec.error = e;
+                pb::EffectStatus::Network
+            }
+            Ok(Ok(resp)) => {
+                rec.response = plain(
+                    pb::HttpEffectResponse {
+                        status: u32::from(resp.status),
+                        headers: resp
+                            .headers
+                            .into_iter()
+                            .map(|(name, value)| pb::HeaderPair { name, value })
+                            .collect(),
+                        body: resp.body.to_vec(),
+                    }
+                    .encode_to_vec(),
+                );
+                pb::EffectStatus::Ok
+            }
+        } as i32;
+        let out = outcome_of_fetch(&rec);
+        self.push(rec);
+        out
     }
 
     /// A live GET from a fork (`[fork] live_allowlist`), grounding `live`.
@@ -1254,14 +1632,17 @@ impl ReplayGate {
                         time: self.time,
                         subject,
                         sql: false,
+                        personal: self.saw_personal(),
                     },
                     order,
                 )
                 .await
                 .map_err(|e| GateError::Host(e.to_string()))?;
             let o = turn.record.outcome.clone().unwrap_or_default();
-            if turn.sql {
-                lock(&self.state).sql = true;
+            {
+                let mut state = lock(&self.state);
+                state.sql |= turn.sql;
+                state.personal |= turn.personal;
             }
             (map_call_outcome(&o), turn.id)
         };
@@ -1419,6 +1800,12 @@ impl ReplayGate {
             } else {
                 pb::Grounding::Synthetic
             } as i32,
+            // Every synthetic answer is labeled (M12 criterion 1).
+            simulator: if matched {
+                String::new()
+            } else {
+                kronik_effects::simulator::label::PLACEHOLDER.into()
+            },
             ..Default::default()
         });
         Ok(format!("[secret:{name}]"))
@@ -1475,6 +1862,7 @@ fn root_pending(r: &RootInput) -> Pending {
         time: r.logical_time_ms,
         subject: r.subject.clone(),
         sql: false,
+        personal: false,
     }
 }
 
@@ -1670,9 +2058,14 @@ pub struct Continuous {
 }
 
 impl Continuous {
+    /// The setup the next turns run under (the model cache to save).
+    pub fn setup(&self) -> &ReplaySetup {
+        &self.setup
+    }
+
     /// State at the fork point plus the fork's own leading records (its
     /// `BranchCreated` and `Deployment`, at `fork_lsn + 1..`), with the
-    /// timers pending there queued.
+    /// timers and messages pending there queued.
     pub fn start(setup: Arc<ReplaySetup>, head: &[Record]) -> Result<Continuous, ReplayError> {
         let store = cursor(&setup.index)?;
         advance(&store, &setup.index, setup.index.fork_lsn)?;
@@ -1692,17 +2085,7 @@ impl Continuous {
             format!("{}:", setup.fork),
             false,
         );
-        let pending = store.db().timers(None)?;
-        for t in pending {
-            let op = pb::TimerOp {
-                kind: pb::TimerOpKind::Schedule as i32,
-                timer_id: t.timer_id,
-                due_ms: t.due_ms,
-                msg: Some(t.msg),
-                ordinal: 0,
-            };
-            runner.schedule_timer(&t.actor, t.causal_key, &op, "", false);
-        }
+        runner.queue_pending(setup.index.fork_lsn)?;
         let fork_lsn = setup.index.fork_lsn;
         Ok(Continuous {
             setup,
@@ -1756,6 +2139,13 @@ impl Continuous {
         *lock(&runner.turns) = turns;
         *lock(&runner.queue) = queue;
         *lock(&runner.timers) = timers;
+        runner.timer_seq.store(
+            self.runner.timer_seq.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        // What the last round left pending: timers not due within it, and
+        // a rebase's consequences production has run since.
+        runner.queue_pending(self.replayed_to)?;
         self.runner = runner;
         self.setup = setup;
         self.run().await
@@ -1831,6 +2221,7 @@ impl Continuous {
                     time,
                     subject,
                     sql: false,
+                    personal: false,
                 },
                 order,
             )

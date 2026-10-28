@@ -674,8 +674,7 @@ fn apply_layer(
 
         let header = entry.header();
         // Setuid and setgid are never set, the sticky bit is: a foreign actor
-        // needs neither, and the unit's RestrictSUIDSGID=true makes the
-        // kernel refuse them (ADR 0027).
+        // needs neither, and no setid file comes from an image (ADR 0027).
         let header_mode = header.mode().map_err(tar_err)?;
         let mode = header_mode & 0o1777;
         let setid = u64::from(header_mode & 0o6000 != 0);
@@ -1680,9 +1679,9 @@ mod tests {
         assert_eq!(md.mode() & 0o7777, 0o755);
     }
 
-    /// The kernel refuses a chmod with setuid or setgid under
-    /// RestrictSUIDSGID (ADR 0027), as postgres:17-alpine's `run/postgresql`
-    /// (2777) needs: the bits are cleared, whatever the unit says.
+    /// No setid bit comes from an image (ADR 0027), also not
+    /// postgres:17-alpine's `run/postgresql` (2777): the bits are cleared,
+    /// and sticky bits kept.
     #[test]
     fn setid_bits_are_cleared_and_counted_and_sticky_bits_kept() {
         let tmp = temp_dir();

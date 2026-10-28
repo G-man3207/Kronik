@@ -97,6 +97,11 @@ impl SqlTurn {
         Ok(db)
     }
 
+    /// Whether the turn has used its SQL database.
+    pub fn used(&self) -> bool {
+        self.db.is_some()
+    }
+
     /// Ends the turn's SQL: the changes when `commit`, nothing otherwise.
     /// Values of `secrets` the turn wrote are scrubbed first. `Ok(None)` when
     /// the turn never used SQL; `Err` when SQLite rolled the transaction back

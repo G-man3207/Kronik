@@ -8,6 +8,7 @@ syntax = "proto3";
 package kronik.log.v1;
 
 import "kronik/log/v1/common.proto";
+import "kronik/log/v1/effects.proto";
 
 message Deployment {
   uint64 epoch = 1;         // configuration epoch
@@ -168,6 +169,11 @@ message ForeignActor {
   // "systrap" or "kvm" for gVisor.
   string platform = 10;
   Audit audit = 11;
+  // What a fork does with calls to this actor (M14, ADR 0019): "recorded"
+  // (the default; empty in older records) matches them against
+  // recordings, "sandbox" answers them from a copy restored from the
+  // nearest checkpoint.
+  string fork_mode = 12;
 }
 
 message EngineUpgrade {
@@ -234,4 +240,32 @@ message GuardWindow {
   // Of TurnRecord.duration_us; 0 without turns.
   uint64 latency_p50_us = 8;
   uint64 latency_p99_us = 9;
+}
+
+// M12: how a replay answers an effect without a recording for one target
+// (docs/design/m12-simulators.md §2, ADR 0014). Replaces the target's whole
+// configuration; all fields empty or false clear it. A replay uses the
+// records in force at the end of its window.
+message SimulatorConfig {
+  uint64 epoch = 1;
+  // "http:<host>" or "foreign:<name>", an exact host.
+  string target = 2;
+  repeated StubRuleSpec stubs = 3;
+  // An OpenAPI 3 document as JSON for ContractFake; empty for none.
+  bytes contract = 4;
+  bool neighbor = 5;
+  bool model = 6;
+  Audit audit = 7;
+}
+
+// A canned answer: requests whose method (when set) and URL prefix match
+// get the response, or the error when `error` is set.
+message StubRuleSpec {
+  string method = 1;
+  string url_prefix = 2;
+  uint32 status = 3;
+  repeated HeaderPair headers = 4;
+  bytes body = 5;
+  // "network", "timeout", "too-large" or "denied"; empty for a response.
+  string error = 6;
 }

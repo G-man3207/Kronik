@@ -1933,6 +1933,8 @@ dependencies = [
  "kronik-core",
  "kronik-privacy",
  "kronik-proto",
+ "prost",
+ "serde_json",
  "sha2 0.11.1",
  "tokio",
 ]

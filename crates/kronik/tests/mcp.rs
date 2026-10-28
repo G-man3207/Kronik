@@ -351,6 +351,26 @@ async fn over_streamable_http(daemon: &Daemon) {
         rollback["error"]["code"], "DEPLOYMENT_NOT_FOUND",
         "{rollback}"
     );
+    // by_replay goes to the rollback via replay: the counter's first
+    // deployment has no code before it to replay.
+    let deployments = api_get(&daemon.socket, "/v1/deployments");
+    let first = deployments["deployments"][0]["epoch"].as_u64().unwrap();
+    let rebase = call(
+        &client,
+        "rollback",
+        json!({"deployment": first, "by_replay": true, "mode": "continuous",
+               "reason": "mcp test", "dry_run": true}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(rebase["error"]["code"], "BAD_REQUEST", "{rebase}");
+    assert!(
+        rebase["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("a deployment cannot remove it"),
+        "{rebase}"
+    );
 
     // A message into a fork runs there, and main is untouched.
     call(

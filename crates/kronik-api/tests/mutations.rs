@@ -53,6 +53,11 @@ fn cases() -> Vec<Case> {
         },
         Case {
             method: "POST",
+            path: "/v1/deployments/{epoch}/rebase",
+            extra: json!({}),
+        },
+        Case {
+            method: "POST",
             path: "/v1/deployments/{epoch}/watch",
             extra: json!({"for_ms": 60_000}),
         },
@@ -172,6 +177,11 @@ fn cases() -> Vec<Case> {
             extra: json!({}),
         },
         Case {
+            method: "PUT",
+            path: "/v1/simulators/{target}",
+            extra: json!({"neighbor": true}),
+        },
+        Case {
             method: "POST",
             path: "/v1/privacy/mode",
             extra: json!({"mode": "on"}),
@@ -200,6 +210,7 @@ fn concrete(path: &str) -> String {
         .replace("{id}", "main:1")
         .replace("{name}", "try")
         .replace("{epoch}", "1")
+        .replace("{target}", "http:example.com")
 }
 
 fn with_reason(extra: &Value, reason: &str, dry_run: bool) -> Value {

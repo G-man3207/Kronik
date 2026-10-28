@@ -4,6 +4,11 @@
 #
 #   examples/foreign-echo   -> examples/dist/foreign-echo.oci   (foreign-echo:dev)
 #   examples/fake-payments  -> examples/dist/fake-payments.oci  (fake-payments:dev)
+#   examples/foreign-pg     -> examples/dist/foreign-pg.oci     (foreign-pg:dev)
+#
+# foreign-pg (M14) is Postgres 16.4 plus the shim: its base is the pinned
+# postgres image, exported with docker (skipped, with a message, without
+# docker). It runs as root (Postgres's entrypoint drops privileges).
 #
 # Each image is one gzip layer with /bin/<name>, /etc/passwd, /etc/group and
 # /tmp; it runs as nobody, listens on 8080/tcp. The packer is the
@@ -14,7 +19,7 @@
 # Prints one line per image: `<name> oci-layout:<absolute dir>@<digest>`,
 # usable as `kronik foreign add --image`.
 #
-# Usage: scripts/build-foreign-examples.sh [--check] [--only foreign-echo|fake-payments]
+# Usage: scripts/build-foreign-examples.sh [--check] [--only foreign-echo|fake-payments|foreign-pg]
 #   --check  build everything a second time from scratch into separate
 #            directories and fail unless the digests match (reproducibility)
 set -euo pipefail
@@ -30,19 +35,19 @@ if ! command -v cargo >/dev/null 2>&1 && [ -f "${CARGO_HOME:-$HOME/.cargo}/env" 
 fi
 
 usage() {
-    echo "usage: $0 [--check] [--only foreign-echo|fake-payments]" >&2
+    echo "usage: $0 [--check] [--only foreign-echo|fake-payments|foreign-pg]" >&2
     exit 2
 }
 
 check=0
-names=(foreign-echo fake-payments)
+names=(foreign-echo fake-payments foreign-pg)
 while [ $# -gt 0 ]; do
     case "$1" in
         --check) check=1 ;;
         --only)
             [ $# -ge 2 ] || usage
             case "$2" in
-                foreign-echo | fake-payments) names=("$2") ;;
+                foreign-echo | fake-payments | foreign-pg) names=("$2") ;;
                 *) usage ;;
             esac
             shift
@@ -96,9 +101,41 @@ pack() {
         --expose 8080/tcp
 }
 
+# The Postgres base of foreign-pg, pinned by digest.
+PG_BASE=postgres@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c
+
+# image_pg TARGET_DIR OUT: foreign-pg on the exported Postgres image.
+image_pg() {
+    local target_dir=$1 out=$2 rootfs=$1/rootfs cid
+    build foreign-pg "$target_dir"
+    docker pull -q "$PG_BASE" >/dev/null
+    rm -rf "$rootfs"
+    mkdir -p "$rootfs"
+    cid=$(docker create "$PG_BASE")
+    docker export "$cid" | tar -x -C "$rootfs"
+    docker rm "$cid" >/dev/null
+    install -m 0755 "$target_dir/$target/release/foreign-pg" "$rootfs/usr/local/bin/foreign-pg"
+    cargo run -q --release -p kronik-foreign --example oci_pack -- \
+        --out "$out" \
+        --ref "foreign-pg:dev" \
+        --layer "gzip:$rootfs" \
+        --entrypoint '["/usr/local/bin/foreign-pg"]' \
+        --cmd '["--listen","0.0.0.0:8080"]' \
+        --env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        --env PGDATA=/data/pg \
+        --env POSTGRES_HOST_AUTH_METHOD=trust \
+        --env LANG=en_US.utf8 \
+        --workdir / \
+        --expose 8080/tcp
+}
+
 # image NAME TARGET_DIR OUT: builds, stages and packs one image; prints the digest.
 image() {
     local name=$1 target_dir=$2 out=$3
+    if [ "$name" = foreign-pg ]; then
+        image_pg "$target_dir" "$out"
+        return
+    fi
     build "$name" "$target_dir"
     stage "$name" "$target_dir/$target/release/$name" "$target_dir/rootfs"
     pack "$name" "$target_dir/rootfs" "$out"
@@ -107,6 +144,10 @@ image() {
 mkdir -p "$root/examples/dist"
 failed=0
 for name in "${names[@]}"; do
+    if [ "$name" = foreign-pg ] && ! command -v docker >/dev/null 2>&1; then
+        echo "foreign-pg skipped: it needs docker for its pinned Postgres base"
+        continue
+    fi
     target_dir="$root/examples/$name/target"
     out="$root/examples/dist/$name.oci"
     digest=$(image "$name" "$target_dir" "$out")

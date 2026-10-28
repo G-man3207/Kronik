@@ -130,6 +130,8 @@ pub fn required_scope(method: &str, segs: &[&str]) -> Scope {
         ("POST", ["v1", "deployments", _, "watch"]) => Scope::Promote,
         // Stopping a watch gives up its rollback: as much as starting one.
         ("POST", ["v1", "watches", _, "stop"]) => Scope::Promote,
+        // A rollback via replay creates a proposal; its switch is a promote.
+        ("POST", ["v1", "deployments", _, "rebase"]) => Scope::Propose,
         // Grants, limits, secrets, messages and resends on main.
         _ => Scope::Operate,
     }

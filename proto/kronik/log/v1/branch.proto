@@ -5,6 +5,8 @@ syntax = "proto3";
 package kronik.log.v1;
 
 import "kronik/log/v1/common.proto";
+import "kronik/log/v1/config.proto";
+import "kronik/log/v1/turn.proto";
 
 // Written in the new branch's log as its first record.
 message BranchCreated {
@@ -39,4 +41,45 @@ message SnapshotMarker {
   // BLAKE3 of manifest.json.
   bytes manifest_hash = 3;
   string engine_version = 4;
+}
+
+// Rollback via replay (M13, ADR 0017). A rebase fork replays main's root
+// inputs since a deployment through the old code; its turns are copied into
+// main's log as `turn` parts, which change nothing until a `switch` part
+// with the same `rebase_id` follows. The switch replaces main's actor state
+// with the state of the fork point plus those turns
+// (docs/design/m13-rebase.md section 3) and switches the code.
+message StateRebase {
+  // The rebase proposal (its fork), `r-<12 hex>`.
+  string rebase_id = 1;
+  oneof part {
+    RebasedTurn turn = 2;
+    RebaseSwitch switch = 3;
+  }
+}
+
+// One turn of the rebase fork's continuous history, as the fork recorded it.
+message RebasedTurn {
+  // The turn's LSN in the fork's log (fork order).
+  uint64 fork_lsn = 1;
+  TurnRecord record = 2;
+}
+
+message RebaseSwitch {
+  // The fork point: main's last LSN before the rolled-back deployment.
+  uint64 base_lsn = 1;
+  uint64 rolled_back_epoch = 2;
+  // The last LSN of main whose root inputs the fork replayed.
+  uint64 verified_through_lsn = 3;
+  // This rebase's `turn` records: the LSN range and their number.
+  uint64 first_turn_lsn = 4;
+  uint64 last_turn_lsn = 5;
+  uint64 turns = 6;
+  // The code from the switch on (cause ROLLBACK, rollback_of_epoch,
+  // proposal_id = rebase_id, a new epoch).
+  Deployment deployment = 7;
+  // The approved diff, and how many irreversible effects it lists.
+  string diff_hash = 8;
+  uint64 irreversible_effects = 9;
+  Audit audit = 10;
 }

@@ -214,6 +214,7 @@ pub(crate) fn foreign_config(
         insecure_registries,
         layout_dirs: config.foreign.layout_dirs.clone(),
         pull_timeout: config.foreign.pull_timeout.0,
+        checkpoints_kept: config.foreign.checkpoints_kept,
     }
 }
 
@@ -360,8 +361,18 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
     let mut proposals = kronik_fork::proposal::Proposals::open(node.clone(), data_dir.clone())
         .map_err(|e| anyhow::anyhow!("loading proposals: {}", e.message))?
         .with_live_allowlist(config.fork.live_allowlist.clone())
+        .with_model(
+            config
+                .simulators
+                .model
+                .as_ref()
+                .map(crate::config::SimulatorModel::resolve)
+                .transpose()
+                .map_err(anyhow::Error::msg)?,
+        )
         .with_promote(config.promote.max_gap.0, config.promote.catch_up_timeout.0)
-        .with_preview_ttl(config.fork.preview_ttl.0);
+        .with_preview_ttl(config.fork.preview_ttl.0)
+        .with_rebase(config.rebase.max_pause.0);
     if let Some(path) = args.test_replay_permits.clone() {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         proposals = proposals.with_test_gate(gate.clone());

@@ -297,6 +297,7 @@ fn isolated_split_mid_chunk_gives_the_same_diff() {
                 options: &options,
                 isolated: Some(trees),
                 continuous: None,
+                rebase: false,
             })
             .unwrap()
             .to_bytes()
@@ -737,7 +738,7 @@ fn replay_from_a_snapshot_equals_replay_from_the_start() {
         p.http(&format!("k{}", i % 4), "increment", "");
         note(&format!("n{}", i % 3), &format!("window {i}"));
     }
-    let base = kronik_fork::pick_base(dir.path(), "main", fork_lsn, false)
+    let base = kronik_fork::pick_base(dir.path(), "main", fork_lsn, false, None)
         .unwrap()
         .unwrap();
     assert_eq!(base.lsn, snap.lsn);

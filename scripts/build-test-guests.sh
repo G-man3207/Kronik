@@ -21,6 +21,11 @@ done
 # leaky (I8 scrubbing tests): its own crate, kind `leaky`.
 (cd ../leaky && cargo build --locked --release --target wasm32-wasip2 --target-dir target &&
     cp target/wasm32-wasip2/release/kronik_test_leaky.wasm ../leaky.wasm)
+# Rollback via replay (M13): a schema-1 build that migrates and also makes
+# the extra GET, so the rolled-back code had a migration and effects the old
+# code would not make.
+cargo build --locked --release --target wasm32-wasip2 --target-dir target/schema1-extra --features "schema1,fetch-extra"
+cp "target/schema1-extra/$target" ../counter-schema1-extra.wasm
 cp "target/counter/$target" ../counter.wasm
 cp "target/notes/$target" ../notes.wasm
 cp "target/fs-probe/$target" ../fs-probe.wasm

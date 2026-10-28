@@ -285,6 +285,7 @@ impl Proposals {
         let options = DiffOptions {
             mode: diff::Mode::Continuous,
             stubs: p.options.stubs.clone(),
+            simulator_overrides: p.options.simulator_overrides.clone(),
             live_allowlist: self.live_allowlist.clone(),
             no_pii: no_pii || p.options.no_pii,
             ..DiffOptions::default()
@@ -309,6 +310,7 @@ impl Proposals {
             unchanged: Vec::new(),
             window_cut: None,
             error: None,
+            rebase: None,
             preview: Some(Preview {
                 proposal: proposal.to_owned(),
                 expires_ms: self.now().saturating_add(ttl_ms),
@@ -329,7 +331,19 @@ impl Proposals {
         // stale, and its first request rebuilds it (N4).
         let erasure = self.erasures();
         let mut live = self
-            .replay(&id, head, head, &kinds, &meta.options, 1, None)
+            .replay(
+                &id,
+                head,
+                head,
+                &kinds,
+                &meta.options,
+                1,
+                None,
+                false,
+                false,
+                // Copies would outlive the request that made them (M14).
+                Some(super::copies::PREVIEW),
+            )
             .await?;
         live.erasure = erasure;
         // Recorded and listed before its log is written, with no await in

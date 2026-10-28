@@ -11,7 +11,8 @@
 # or target/release/kronik. `--only todo-ts,billing-ts` runs some of them.
 #
 # Needs python3 and the example components in examples/dist
-# (scripts/build-examples.sh and scripts/build-examples-ts.sh). Builds
+# (scripts/build-examples.sh, scripts/build-examples-ts.sh, -py.sh and
+# -go.sh). Builds
 # fake-payments for billing-ts. todo-ts's sweep timer fires a day after an
 # item is done, so its daemon restarts with libfaketime moving its clock
 # ahead. Install libfaketime (Debian and Ubuntu: apt-get install faketime) or

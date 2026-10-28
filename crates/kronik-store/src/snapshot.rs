@@ -181,6 +181,71 @@ impl SqlActor {
         self.reset_caches();
         Ok(())
     }
+
+    /// Replaces this database's content with `src`'s (a rebase switch, ADR
+    /// 0017).
+    pub fn copy_from(&mut self, src: &SqlActor) -> Result<(), StoreError> {
+        self.set_host();
+        src.set_host();
+        {
+            let backup =
+                rusqlite::backup::Backup::new(&src.conn, &mut self.conn).map_err(sqlite)?;
+            backup
+                .run_to_completion(1024, std::time::Duration::ZERO, None)
+                .map_err(sqlite)?;
+        }
+        self.reset_caches();
+        Ok(())
+    }
+
+    /// Drops every table and view but Kronik's own and sets the applied LSN
+    /// to `lsn`, in one transaction (a rebase switch for an actor the old
+    /// code gave no database).
+    pub fn clear_at(&mut self, lsn: u64) -> Result<(), StoreError> {
+        self.set_host();
+        let tx = self.conn.transaction().map_err(sqlite)?;
+        let objects: Vec<(String, String)> = {
+            let mut st = tx
+                .prepare(
+                    "SELECT type, name FROM sqlite_schema WHERE type IN ('table', 'view') \
+                     AND name NOT LIKE 'sqlite_%' AND name != '_kronik_meta'",
+                )
+                .map_err(sqlite)?;
+            let rows = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(sqlite)?;
+            rows.collect::<Result<_, _>>().map_err(sqlite)?
+        };
+        for (kind, name) in objects {
+            let kind = if kind == "view" { "VIEW" } else { "TABLE" };
+            tx.execute_batch(&format!(
+                "DROP {kind} IF EXISTS \"{}\"",
+                name.replace('"', "\"\"")
+            ))
+            .map_err(sqlite)?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO _kronik_meta (k, v) VALUES ('applied_lsn', ?1)",
+            [lsn as i64],
+        )
+        .map_err(sqlite)?;
+        tx.commit().map_err(sqlite)?;
+        self.reset_caches();
+        Ok(())
+    }
+
+    /// Sets the database's applied LSN (a rebase switch replaced it at
+    /// `lsn`).
+    pub fn stamp_applied(&mut self, lsn: u64) -> Result<(), StoreError> {
+        self.set_host();
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO _kronik_meta (k, v) VALUES ('applied_lsn', ?1)",
+                [lsn as i64],
+            )
+            .map_err(sqlite)?;
+        Ok(())
+    }
 }
 
 impl Store {

@@ -193,7 +193,12 @@ code and propose again; `policy.fired` and `errors.items` say what to fix.
 
 `list_actors`, `query_history` and `kronik://config` show what runs now. A
 promoted change can be undone with `rollback` and the deployment's epoch,
-which also needs the `promote` scope.
+which also needs the `promote` scope. When that deployment migrated state,
+`rollback` with `by_replay` creates a rollback via replay instead (`propose`
+and `pii:read` scopes: it replays on full data, so a token without `pii:read`
+gets `SCOPE_MISSING` and a human creates it): a rebase proposal `r-...` whose diff shows the old code's state and
+the effects that cannot be undone; it needs a human's approval, then
+`promote`.
 
 ## Tools
 
@@ -206,7 +211,7 @@ which also needs the `promote` scope.
 | `propose_change` | `propose` | Replays recent traffic through new code; returns the proposal and its diff summary |
 | `get_diff` | `read` | The whole behavior diff of a proposal or a fork |
 | `request_approval` | `propose` | A pending request with the exact command for a human |
-| `promote`, `rollback` | `promote` | Switch code; promote runs catch-up first |
+| `promote`, `rollback` | `promote` | Switch code; promote runs catch-up first; `rollback` with `by_replay` creates a rebase proposal (`propose` and `pii:read`) |
 | `explain` | `read` | Concepts and error codes |
 
 Resources: `kronik://agent-guide` (this page), `kronik://concepts`,

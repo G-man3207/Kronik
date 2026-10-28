@@ -342,20 +342,30 @@ const TOOLS: &[Spec] = &[
         name: "rollback",
         title: "Roll back a deployment",
         scope: "promote",
-        description: "Switch back to the code that ran before a deployment.",
+        description: "Switch back to the code that ran before a deployment. With `by_replay` \
+            (a deployment that migrated state), instead create a rollback via replay: a rebase \
+            proposal `r-...` whose diff shows the old code's state and the irreversible effects \
+            (needs the `propose` and `pii:read` scopes: it replays on full data); a human \
+            approves it, then `promote` switches main.",
         mutates: true,
         dry_run: true,
         destructive: true,
         input: || {
             object(
-                json!({"deployment": {"type": "integer", "minimum": 0, "description": "The deployment's epoch."}}),
+                json!({
+                    "deployment": {"type": "integer", "minimum": 0, "description": "The deployment's epoch."},
+                    "by_replay": {"type": "boolean", "description": "Roll back via replay (kronik rollback --by-replay)."},
+                    "mode": {"type": "string", "enum": ["continuous", "both"], "description": "With by_replay: the replay mode (default continuous)."},
+                    "threads": {"type": "integer", "minimum": 1, "description": "With by_replay: replay workers."}
+                }),
                 &["deployment"],
             )
         },
         output: || {
             result(json!({
                 "dry_run": {"type": "boolean"},
-                "deployment": {"type": "object"}
+                "deployment": {"type": "object"},
+                "proposal": {"type": "object", "description": "With by_replay: the rebase proposal, with `rebase` {rolled_back_epoch, base_lsn, irreversible_effects}."}
             }))
         },
     },
@@ -518,6 +528,12 @@ pub(crate) async fn call(
             .segment("proposal")
             .map(|id| args.post(format!("/v1/proposals/{id}/promote"), &[])),
         "rollback" => match args.0.get("deployment").and_then(Value::as_u64) {
+            Some(epoch) if args.0.get("by_replay").and_then(Value::as_bool) == Some(true) => {
+                Ok(args.post(
+                    format!("/v1/deployments/{epoch}/rebase"),
+                    &["mode", "threads"],
+                ))
+            }
             Some(epoch) => Ok(args.post(format!("/v1/deployments/{epoch}/rollback"), &[])),
             None => Err(bad_request(
                 "`deployment` must be a deployment epoch (an integer)",

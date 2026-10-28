@@ -369,8 +369,10 @@ impl Node {
                 reseal_record(self.sealer(), record, &erased, &fill, wall).map(|(s, t)| {
                     counts.0 += s;
                     counts.1 += t;
+                    // A rebased turn owns the state rows it wrote, as a turn
+                    // record does (M13).
                     if s + t > 0
-                        && let Record::TurnRecord(turn) = &*record
+                        && let Some(turn) = record.turn()
                     {
                         turns.push((lsn, turn.clone()));
                     }

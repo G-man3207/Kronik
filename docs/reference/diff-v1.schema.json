@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "kronik.diff/v1",
-  "description": "A behavior diff: how a fork's code behaves on main's root inputs, next to production (docs/design/m3-fork.md §5). The same fork, code and options always give the same bytes. `kronik diff show --md` and `format=md` render the same diff as Markdown.",
+  "description": "A behavior diff: how a fork's code behaves on main's root inputs, next to production (docs/design/m3-fork.md §5). The same fork, code and options always give the same bytes, except for answers of copies of foreign actors (`forked`, M14, ADR 0020), which are real and not reproducible. `kronik diff show --md` and `format=md` render the same diff as Markdown.",
   "type": "object",
   "required": [
     "schema",
@@ -110,9 +110,71 @@
     },
     "samples": {
       "$ref": "#/$defs/DiffSamples"
+    },
+    "irreversible": {
+      "$ref": "#/$defs/DiffIrreversible"
     }
   },
   "$defs": {
+    "DiffIrreversible": {
+      "description": "A rollback via replay only (M13): main's external effects since the rolled-back deployment that the old code would not have made the same way (no exact match in the fork). The rebased state does not account for them.",
+      "type": "object",
+      "required": [
+        "count",
+        "items"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "items": {
+          "description": "At most 200, in log order.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "turn_prod",
+              "kind",
+              "method",
+              "host",
+              "route",
+              "status",
+              "delivery"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "turn_prod": {
+                "$ref": "#/$defs/DiffTurnId"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "method": {
+                "type": "string"
+              },
+              "host": {
+                "type": "string"
+              },
+              "route": {
+                "type": "string"
+              },
+              "status": {
+                "description": "`ok`, `outcome_unknown`, `network`, `timeout`, ...",
+                "type": "string"
+              },
+              "delivery": {
+                "description": "`replay-safe`, `idempotency-keyed` or `unsafe`.",
+                "type": "string"
+              },
+              "idempotency_key": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
     "DiffCount": {
       "type": "integer",
       "minimum": 0
@@ -267,7 +329,147 @@
         "no_pii": {
           "description": "A fork without access to personal data: it ran on pseudonyms (M8).",
           "type": "boolean"
+        },
+        "foreign": {
+          "description": "The fork's foreign actors with fork_mode sandbox (M14): the checkpoint a copy started from, or why the actor stayed recorded.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "mode",
+              "replayed_calls"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "mode": {
+                "enum": [
+                  "sandbox",
+                  "recorded"
+                ]
+              },
+              "checkpoint_lsn": {
+                "$ref": "#/$defs/DiffCount"
+              },
+              "replayed_calls": {
+                "$ref": "#/$defs/DiffCount"
+              },
+              "why": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "simulators": {
+          "description": "The simulator configuration the replay used, per target (M12): main's as of the fork point (I5), with the request's overrides. Absent when no target has one.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffSimulatorOption"
+          }
+        },
+        "simulator_overrides": {
+          "description": "Per-target simulator configuration the replay request carried, replacing main's for this fork (the fields of `PUT /v1/simulators/{target}`). Absent when there are none.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffSimulatorOverride"
+          }
         }
+      }
+    },
+    "DiffSimulatorOption": {
+      "description": "One target's simulator configuration (a `SimulatorConfig` record).",
+      "type": "object",
+      "required": [
+        "target",
+        "epoch",
+        "lsn",
+        "stubs",
+        "neighbor",
+        "model"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "description": "`http:<host>` or `foreign:<name>`.",
+          "type": "string"
+        },
+        "epoch": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "lsn": {
+          "$ref": "#/$defs/DiffCount"
+        },
+        "stubs": {
+          "description": "The number of stub rules.",
+          "$ref": "#/$defs/DiffCount"
+        },
+        "contract": {
+          "description": "BLAKE3 of the OpenAPI document as stored (`b3:` + hex); absent without a contract.",
+          "type": "string"
+        },
+        "neighbor": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "boolean"
+        },
+        "request": {
+          "description": "From `simulator_overrides` (epoch and LSN are 0); absent for main's configuration.",
+          "const": true
+        }
+      }
+    },
+    "DiffSimulatorOverride": {
+      "description": "One target's simulator configuration for this replay only.",
+      "type": "object",
+      "required": [
+        "target",
+        "stubs",
+        "neighbor",
+        "model"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "description": "`http:<host>` or `foreign:<name>`.",
+          "type": "string"
+        },
+        "stubs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffStubRule"
+          }
+        },
+        "contract": {
+          "description": "An OpenAPI 3 document; absent for none.",
+          "type": "object"
+        },
+        "neighbor": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "boolean"
+        }
+      }
+    },
+    "DiffSyntheticBy": {
+      "description": "Synthetic answers per simulator (M12); absent when there are none.",
+      "type": "object",
+      "propertyNames": {
+        "enum": [
+          "stub",
+          "contract",
+          "neighbor",
+          "model",
+          "fail-closed",
+          "placeholder"
+        ]
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/DiffCount"
       }
     },
     "DiffStubRule": {
@@ -388,15 +590,22 @@
           "$ref": "#/$defs/DiffCount"
         },
         "synthetic": {
-          "description": "Fork effects with no recording: a stub rule answered, or the effect failed closed.",
+          "description": "Fork effects with no recording: a simulator answered (stub, contract, neighbor, model), or the effect failed closed.",
           "$ref": "#/$defs/DiffCount"
+        },
+        "synthetic_by": {
+          "$ref": "#/$defs/DiffSyntheticBy"
         },
         "live": {
           "description": "Allowlisted GETs that went out live from the fork.",
           "$ref": "#/$defs/DiffCount"
         },
+        "forked": {
+          "description": "Answers of the fork's copies of foreign actors (M14).",
+          "$ref": "#/$defs/DiffCount"
+        },
         "confidence": {
-          "description": "exact / (exact + approximate + synthetic + live); 1.0 without effects.",
+          "description": "exact / (exact + approximate + synthetic + live + forked); 1.0 without effects.",
           "$ref": "#/$defs/DiffRatio"
         },
         "verified_through_lsn": {
@@ -626,10 +835,18 @@
         "synthetic": {
           "$ref": "#/$defs/DiffCount"
         },
+        "synthetic_by": {
+          "$ref": "#/$defs/DiffSyntheticBy"
+        },
         "live": {
           "$ref": "#/$defs/DiffCount"
         },
+        "forked": {
+          "description": "Answers of a fork's copy of the foreign actor (M14).",
+          "$ref": "#/$defs/DiffCount"
+        },
         "confidence": {
+          "description": "exact / (exact + approximate + synthetic + live + forked) of this target; 1.0 without effects.",
           "$ref": "#/$defs/DiffRatio"
         }
       }
@@ -843,12 +1060,24 @@
           "type": "string"
         },
         "grounding": {
-          "description": "How the fork's effect was answered.",
+          "description": "How the fork's effect was answered (`forked`: a copy of a foreign actor, M14).",
           "enum": [
             "exact",
             "approximate",
             "synthetic",
-            "live"
+            "live",
+            "forked"
+          ]
+        },
+        "simulator": {
+          "description": "The simulator of a synthetic answer (M12); absent for other groundings.",
+          "enum": [
+            "stub",
+            "contract",
+            "neighbor",
+            "model",
+            "fail-closed",
+            "placeholder"
           ]
         },
         "turn_prod": {

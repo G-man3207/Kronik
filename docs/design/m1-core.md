@@ -73,6 +73,8 @@ enforcement in CI.
 | 12 | `Erasure` | privacy erase (M8) |
 | 13 | `EngineUpgrade` | upgrade (M6) |
 | 14 | `SnapshotMarker` | snapshot (M6) |
+| 15 | `SimulatorConfig` | stubs set (M12) |
+| 16 | `StateRebase` | rollback --by-replay: rebased turns, the switch (M13) |
 | 17 | `GuardTriggered` | a `kronik watch` guard that fired (M11) |
 
 0 and any other value (15 and 16 are reserved) are `STORAGE_CORRUPT`, except kind 255, the footer readers skip. The messages are in

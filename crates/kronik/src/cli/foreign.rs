@@ -66,6 +66,11 @@ pub enum ForeignCommand {
         /// `<VAR>=<name>`. Repeat for more. The program sees the value.
         #[arg(long = "secret", value_name = "[VAR=]NAME")]
         secrets: Vec<String>,
+        /// What forks do with calls to it: `recorded` (default) matches
+        /// them against recordings; `sandbox` answers changed calls from a
+        /// copy restored from the nearest checkpoint (M14; gvisor only).
+        #[arg(long, value_enum)]
+        fork_mode: Option<ForkMode>,
         #[command(flatten)]
         mutation: Mutation,
     },
@@ -112,6 +117,7 @@ pub(super) fn foreign(ctx: &Ctx, command: ForeignCommand) -> Result<ExitCode, Er
             memory,
             isolation,
             secrets,
+            fork_mode,
             mutation,
         } => add(
             ctx,
@@ -123,6 +129,7 @@ pub(super) fn foreign(ctx: &Ctx, command: ForeignCommand) -> Result<ExitCode, Er
                 memory,
                 isolation,
                 secrets,
+                fork_mode,
             },
             &mutation,
         ),
@@ -234,6 +241,24 @@ struct AddArgs {
     memory: Option<String>,
     isolation: Option<Isolation>,
     secrets: Vec<String>,
+    fork_mode: Option<ForkMode>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ForkMode {
+    /// Forks match calls against production's recordings (the default).
+    Recorded,
+    /// Forks start a copy from the nearest checkpoint.
+    Sandbox,
+}
+
+impl ForkMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ForkMode::Recorded => "recorded",
+            ForkMode::Sandbox => "sandbox",
+        }
+    }
 }
 
 fn local(code: ErrorCode, msg: String, hint: &str) -> Error {
@@ -327,6 +352,9 @@ fn add(ctx: &Ctx, a: AddArgs, mutation: &Mutation) -> Result<ExitCode, Error> {
     for s in &a.secrets {
         let _ = write!(rerun, " --secret {}", shell_quote(s));
     }
+    if let Some(m) = a.fork_mode {
+        let _ = write!(rerun, " --fork-mode {}", m.as_str());
+    }
     let _ = write!(rerun, " --reason {}", shell_quote(reason));
     let body = ctx.post(
         "/v1/foreign",
@@ -338,6 +366,7 @@ fn add(ctx: &Ctx, a: AddArgs, mutation: &Mutation) -> Result<ExitCode, Error> {
             memory_bytes: memory,
             isolation: a.isolation.map(|i| i.as_str().to_owned()),
             secrets: a.secrets.clone(),
+            fork_mode: a.fork_mode.map(|m| m.as_str().to_owned()),
             reason: reason.to_owned(),
             dry_run: mutation.dry_run,
         },
@@ -387,6 +416,13 @@ fn describe(out: &mut String, f: &ForeignView) {
         "",
     );
     field(out, "Secrets", &f.secrets, "none");
+    if f.fork_mode == "sandbox" {
+        let forks = match f.checkpoints.last() {
+            Some(c) => format!("sandbox: copies start from the checkpoint at lsn {}", c.lsn),
+            None => "sandbox: copies start from checkpoints, taken with snapshots".to_owned(),
+        };
+        field(out, "Forks", &[forks], "");
+    }
     if let Some(e) = f.status.as_ref().and_then(|s| s.error.as_ref()) {
         field(out, "Error", std::slice::from_ref(e), "");
     }
@@ -470,6 +506,10 @@ fn render_list(r: &ForeignListResponse) -> String {
                 cpu_text(f.cpu_millis),
                 units::size_flag(f.memory_bytes),
                 f.isolation.clone(),
+                match f.checkpoints.last() {
+                    Some(c) if f.fork_mode == "sandbox" => format!("sandbox (lsn {})", c.lsn),
+                    _ => f.fork_mode.clone(),
+                },
                 f.image.clone(),
             ]
         })
@@ -483,6 +523,7 @@ fn render_list(r: &ForeignListResponse) -> String {
             "CPU",
             "MEMORY",
             "ISOLATION",
+            "FORKS",
             "IMAGE",
         ],
         rows,

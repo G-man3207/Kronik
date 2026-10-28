@@ -38,8 +38,8 @@ StateDirectoryMode=0700
 # Hardening. Left out on purpose: MemoryDenyWriteExecute (Wasmtime compiles
 # code at run time), ProtectHostname, ProtectKernelTunables,
 # ProtectControlGroups and a CapabilityBoundingSet (runsc creates namespaces
-# and cgroups for foreign actors). RestrictSUIDSGID also makes openat2 fail,
-# which only `runsc restore` needs; v0.1 never restores a sandbox (ADR 0027).
+# and cgroups for foreign actors), and RestrictSUIDSGID: it also makes
+# openat2 fail, which `runsc restore` needs for M14's sandbox copies (ADR 0027).
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
@@ -47,7 +47,6 @@ NoNewPrivileges=true
 ProtectClock=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
-RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 SystemCallArchitectures=native

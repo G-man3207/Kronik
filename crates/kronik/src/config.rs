@@ -50,7 +50,9 @@ pub struct Config {
     pub replay: Replay,
     pub fork: Fork,
     pub promote: Promote,
+    pub rebase: Rebase,
     pub foreign: Foreign,
+    pub simulators: Simulators,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -300,6 +302,63 @@ impl Default for Fork {
     }
 }
 
+/// `[simulators]` (M12): server-wide simulator settings.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Simulators {
+    /// `[simulators.model]`: off when absent (ADR 0015).
+    pub model: Option<SimulatorModel>,
+}
+
+/// An OpenAI-compatible chat completions endpoint for the model simulator.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimulatorModel {
+    pub endpoint: String,
+    pub model: String,
+    /// The environment variable holding the API key; the key itself never
+    /// appears in the file.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default = "SimulatorModel::default_timeout")]
+    pub timeout: Dur,
+    #[serde(default = "SimulatorModel::default_max_examples")]
+    pub max_examples: usize,
+    /// Send recorded examples to the model even when privacy mode is or was
+    /// on (state reads are not recorded, so personal data in an untagged
+    /// request cannot be ruled out). Off by default.
+    #[serde(default)]
+    pub examples_under_privacy: bool,
+}
+
+impl SimulatorModel {
+    fn default_timeout() -> Dur {
+        Dur::secs(20)
+    }
+
+    fn default_max_examples() -> usize {
+        5
+    }
+
+    /// The fork's model configuration; reads the key from `api_key_env`.
+    pub fn resolve(&self) -> Result<kronik_fork::simulators::ModelConfig, String> {
+        let api_key = match &self.api_key_env {
+            None => None,
+            Some(var) => Some(std::env::var(var).map_err(|_| {
+                format!("[simulators.model] api_key_env = {var:?}: the variable is not set")
+            })?),
+        };
+        Ok(kronik_fork::simulators::ModelConfig {
+            endpoint: self.endpoint.clone(),
+            model: self.model.clone(),
+            api_key,
+            timeout: self.timeout.0,
+            max_examples: self.max_examples,
+            examples_under_privacy: self.examples_under_privacy,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Promote {
@@ -312,6 +371,22 @@ impl Default for Promote {
         Promote {
             max_gap: Dur::secs(2),
             catch_up_timeout: Dur::secs(300),
+        }
+    }
+}
+
+/// `[rebase]` (M13): the switch of a rollback via replay.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Rebase {
+    /// The longest the switch holds new requests and turns.
+    pub max_pause: Dur,
+}
+
+impl Default for Rebase {
+    fn default() -> Self {
+        Rebase {
+            max_pause: Dur::secs(2),
         }
     }
 }
@@ -340,6 +415,8 @@ pub struct Foreign {
     pub layout_dirs: Vec<PathBuf>,
     /// The longest one image pull from a registry may take.
     pub pull_timeout: Dur,
+    /// Checkpoints kept per `fork_mode = "sandbox"` actor (M14).
+    pub checkpoints_kept: usize,
 }
 
 impl Default for Foreign {
@@ -350,6 +427,7 @@ impl Default for Foreign {
             run_dir: "/run/kronik".into(),
             layout_dirs: Vec::new(),
             pull_timeout: Dur::secs(600),
+            checkpoints_kept: 3,
         }
     }
 }
@@ -640,6 +718,14 @@ impl Config {
         }
         if self.fork.preview_ttl.0.is_zero() {
             return Err("[fork] preview_ttl must be more than zero, such as \"24h\"".into());
+        }
+        if let Some(m) = &self.simulators.model
+            && kronik_effects::http::parse_url(&m.endpoint).is_err()
+        {
+            return Err(format!(
+                "[simulators.model] endpoint = {:?} is not an http(s) URL",
+                m.endpoint
+            ));
         }
         self.api_listen()?;
         Ok(())

@@ -510,6 +510,16 @@ pub struct EffectSummary {
     /// request is sealed for a data subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<String>,
+    /// Fork turns only: how the effect was answered, `exact`,
+    /// `approximate`, `synthetic` or `forked` (a copy of a foreign actor,
+    /// M14). Absent for production and live effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grounding: Option<String>,
+    /// Synthetic fork effects only: the simulator that answered (`stub`,
+    /// `contract`, `neighbor`, `model`, `fail-closed`, `placeholder`; M12). Absent for a
+    /// fork turn recorded before M12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulator: Option<String>,
 }
 
 // ------------------------------------------------------------------ M3
@@ -550,6 +560,13 @@ pub struct ReplayOptions {
     /// keeps the flag it was created with).
     #[serde(default)]
     pub no_pii: bool,
+    /// Simulator configuration for this replay only, per target: `[{"target",
+    /// "stubs", "contract", "neighbor", "model"}]`, each replacing main's
+    /// configuration as of the fork point (I5; the fields of `PUT
+    /// /v1/simulators/{target}`). Recorded in the diff's options.
+    #[serde(default)]
+    #[schemars(with = "Vec<serde_json::Map<String, serde_json::Value>>")]
+    pub simulator_overrides: Vec<kronik_fork::simulators::SimulatorOverride>,
 }
 
 /// `at`: an LSN, `"now"`, or an RFC 3339 time (logical time).
@@ -747,6 +764,9 @@ pub struct ProposalInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::openapi::error_schema")]
     pub error: Option<serde_json::Value>,
+    /// A rollback via replay (M13): what it rolls back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebase: Option<RebaseView>,
 }
 
 /// Root inputs replayed so far and to replay, per replay mode (0 and 0 for
@@ -757,6 +777,47 @@ pub struct ProposalProgress {
     pub isolated_total: u64,
     pub continuous_done: u64,
     pub continuous_total: u64,
+}
+
+/// What a rebase proposal rolls back (M13).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RebaseView {
+    pub rolled_back_epoch: u64,
+    /// The fork point: main's last LSN before the rolled-back deployment.
+    pub base_lsn: u64,
+    /// External effects of the rolled-back code the old code would not
+    /// have made (the diff's `irreversible`).
+    pub irreversible_effects: u64,
+    /// The `StateRebase` switch, once promoted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_lsn: Option<u64>,
+}
+
+/// `POST /v1/deployments/{epoch}/rebase`: a rollback via replay (M13).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct RebaseRequest {
+    /// `continuous` (default) or `both`; the switch needs continuous replay.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Isolated replay workers, for `both`.
+    #[serde(default)]
+    pub threads: Option<usize>,
+    /// Required: missing or blank answers REASON_REQUIRED.
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// The switch of a rollback via replay (M13).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RebaseSwitchInfo {
+    /// The `StateRebase` record (0 for a dry run).
+    pub lsn: u64,
+    pub base_lsn: u64,
+    /// The replayed turns that became main's state.
+    pub turns: u64,
+    pub irreversible_effects: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -801,6 +862,9 @@ pub struct PromoteResponse {
     pub deployment: SwitchInfo,
     #[schemars(schema_with = "crate::openapi::policy_evaluation")]
     pub policy: serde_json::Value,
+    /// Set for a rollback via replay (M13).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebase: Option<RebaseSwitchInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

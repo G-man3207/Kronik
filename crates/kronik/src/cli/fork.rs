@@ -15,9 +15,9 @@ use kronik_api::types::{
     ApproveResponse, DeployRequest, DeploymentKind, ForkCreateRequest, ForkCreateResponse,
     ForkDeleteResponse, ForkDeployResponse, ForkPoint, ForksResponse, PolicyResponse,
     PolicySetRequest, PolicySetResponse, PolicyTestRequest, PromoteResponse, ProposalInfo,
-    ProposalsResponse, ProposeRequest, ProposeResponse, ReplayOptions, ReplayRequest,
-    ReplayResponse, ResendRequest, RollbackResponse, SwitchInfo, WatchInfo, WatchRequest,
-    WatchResponse, WatchTriggered, WatchesResponse,
+    ProposalsResponse, ProposeRequest, ProposeResponse, RebaseRequest, ReplayOptions,
+    ReplayRequest, ReplayResponse, ResendRequest, RollbackResponse, SwitchInfo, WatchInfo,
+    WatchRequest, WatchResponse, WatchTriggered, WatchesResponse,
 };
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_fork::stubs::StubRule;
@@ -131,6 +131,12 @@ pub struct ReplayOptionArgs {
     /// matching rule answers.
     #[arg(long = "stub", value_name = "FILE")]
     stubs: Vec<PathBuf>,
+    /// Simulators for this replay only: TARGET=RULES (the TOML file
+    /// `kronik stubs set` takes). Replaces main's configuration of TARGET
+    /// as of the fork point and is recorded in the diff's options.
+    /// Repeatable, one per target.
+    #[arg(long = "simulators", value_name = "TARGET=FILE")]
+    simulators: Vec<String>,
 }
 
 /// A `--stub` TOML file: `[[stub]]` tables.
@@ -193,6 +199,25 @@ impl ReplayOptionArgs {
         for path in &self.stubs {
             stubs.extend(read_stubs(path)?);
         }
+        let mut simulator_overrides = Vec::new();
+        for spec in &self.simulators {
+            let Some((target, path)) = spec.split_once('=') else {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!("--simulators {spec:?}: give TARGET=FILE"),
+                )
+                .with_hint("For example: --simulators http:payments.internal=payments.toml")
+                .into());
+            };
+            let r = super::simulators::read_rules(Path::new(path))?;
+            simulator_overrides.push(kronik_fork::simulators::SimulatorOverride {
+                target: target.to_owned(),
+                stubs: r.stubs,
+                contract: r.contract,
+                neighbor: r.neighbor,
+                model: r.model,
+            });
+        }
         Ok(ReplayOptions {
             mode: self
                 .mode
@@ -204,6 +229,7 @@ impl ReplayOptionArgs {
             threads: self.threads.map(usize::from),
             stubs,
             no_pii: false,
+            simulator_overrides,
         })
     }
 
@@ -227,6 +253,9 @@ impl ReplayOptionArgs {
         }
         for s in &self.stubs {
             let _ = write!(out, " --stub {}", shell_quote(&s.display().to_string()));
+        }
+        for s in &self.simulators {
+            let _ = write!(out, " --simulators {}", shell_quote(s));
         }
         out
     }
@@ -336,6 +365,19 @@ pub struct RollbackArgs {
     /// The deployment to undo, by its epoch, which `kronik deploy` and
     /// `kronik promote` print.
     epoch: u64,
+    /// Roll back by replay (M13), also after a schema change: a proposal
+    /// whose fork replays every root input since the deployment through
+    /// the old code; its diff shows the old code's state and the effects
+    /// that cannot be undone. `kronik approve` and `kronik promote` switch.
+    #[arg(long)]
+    by_replay: bool,
+    /// With --by-replay: `continuous` (default) or `both` (adds isolated
+    /// replay to the diff).
+    #[arg(long, requires = "by_replay", value_name = "MODE")]
+    mode: Option<String>,
+    /// With --by-replay and `--mode both`: isolated replay workers.
+    #[arg(long, requires = "by_replay")]
+    threads: Option<usize>,
     #[command(flatten)]
     mutation: Mutation,
 }
@@ -1159,6 +1201,17 @@ fn diff_header(d: &Value) -> String {
     out
 }
 
+/// ` (contract 2, fail-closed 1)`: synthetic answers per simulator (M12).
+fn by_simulator(v: &Value) -> String {
+    match v.as_object() {
+        Some(m) if !m.is_empty() => {
+            let parts: Vec<String> = m.iter().map(|(k, n)| format!("{k} {}", int(n))).collect();
+            format!(" ({})", parts.join(", "))
+        }
+        _ => String::new(),
+    }
+}
+
 /// The behavior diff in short, like the brief's `kronik propose` sample.
 fn diff_block(d: &Value) -> String {
     let s = &d["summary"];
@@ -1299,32 +1352,49 @@ fn diff_block(d: &Value) -> String {
     );
 
     let live = int(&s["live"]);
+    let forked = |v: &Value| match int(&v["forked"]) {
+        0 => String::new(),
+        n => format!(", {n} forked"),
+    };
     let mut grounding = vec![format!(
-        "{} exact, {} approximate, {} synthetic{} (confidence {})",
+        "{} exact, {} approximate, {} synthetic{}{}{} (confidence {})",
         int(&s["exact"]),
         int(&s["approximate"]),
         int(&s["synthetic"]),
+        by_simulator(&s["synthetic_by"]),
         if live > 0 {
             format!(", {live} live")
         } else {
             String::new()
         },
+        forked(s),
         ratio(&s["confidence"])
     )];
     for g in array(&d["grounding"]) {
-        if int(&g["approximate"]) + int(&g["synthetic"]) > 0 {
+        if int(&g["approximate"]) + int(&g["synthetic"]) + int(&g["forked"]) > 0 {
             grounding.push(format!(
-                "{} {} {}: {} exact, {} approximate, {} synthetic",
+                "{} {} {}: {} exact, {} approximate, {} synthetic{}{}",
                 text(&g["host"]),
                 text(&g["method"]),
                 text(&g["route"]),
                 int(&g["exact"]),
                 int(&g["approximate"]),
-                int(&g["synthetic"])
+                int(&g["synthetic"]),
+                by_simulator(&g["synthetic_by"]),
+                forked(&g)
             ));
         }
     }
     field(&mut out, "Grounding", &grounding, "");
+    // Copies of foreign actors (M14).
+    let foreign: Vec<String> = array(&d["options"]["foreign"])
+        .iter()
+        .filter_map(|f| serde_json::from_value::<kronik_fork::diff::ForeignFork>(f.clone()).ok())
+        .map(|f| format!("{}: {}", f.name, kronik_fork::markdown::foreign_line(&f)))
+        .collect();
+    if !foreign.is_empty() {
+        field(&mut out, "Foreign", &foreign, "");
+    }
     // Stub rules answered effects without a recording (synthetic).
     let stubs: Vec<String> = array(&d["options"]["stubs"])
         .iter()
@@ -1373,11 +1443,16 @@ fn summary_lines(out: &mut String, s: &Value) {
         )],
         "",
     );
+    // `forked` (M14) only when a copy answered, so older output is unchanged.
+    let forked = match int(&s["forked"]) {
+        0 => String::new(),
+        n => format!(", {n} forked"),
+    };
     field(
         out,
         "Grounding",
         &[format!(
-            "{} exact, {} approximate, {} synthetic (confidence {})",
+            "{} exact, {} approximate, {} synthetic{forked} (confidence {})",
             int(&s["exact"]),
             int(&s["approximate"]),
             int(&s["synthetic"]),
@@ -1519,6 +1594,32 @@ pub fn promote(ctx: &Ctx, a: ProposalArgs) -> Result<ExitCode, Error> {
             out.push_str(&next(&[rerun]));
             return out;
         }
+        if let Some(rb) = &r.rebase {
+            let _ = writeln!(
+                out,
+                "Rebased main at lsn {}, epoch {}: the state is the old code's from lsn {} on, and the old code runs",
+                rb.lsn, d.epoch, rb.base_lsn
+            );
+            switch_fields(&mut out, d);
+            field(
+                &mut out,
+                "Rebased",
+                &[format!(
+                    "{} replayed {}, verified through lsn {}; {} irreversible {}",
+                    rb.turns,
+                    plural(rb.turns, "turn"),
+                    d.verified_through_lsn,
+                    rb.irreversible_effects,
+                    plural(rb.irreversible_effects, "effect")
+                )],
+                "",
+            );
+            out.push_str(&next(&[
+                format!("kronik diff show {} --md", a.proposal),
+                "kronik actors list".to_owned(),
+            ]));
+            return out;
+        }
         let _ = writeln!(
             out,
             "Promoted proposal {} at lsn {}, epoch {}",
@@ -1551,7 +1652,97 @@ pub fn promote(ctx: &Ctx, a: ProposalArgs) -> Result<ExitCode, Error> {
     })
 }
 
+/// `kronik rollback <epoch> --by-replay`: the rebase proposal, its summary
+/// and the effects that cannot be undone.
+fn rollback_by_replay(ctx: &Ctx, a: &RollbackArgs) -> Result<ExitCode, Error> {
+    let reason = reason(&a.mutation)?;
+    let body = ctx.post(
+        &format!("/v1/deployments/{}/rebase", a.epoch),
+        &RebaseRequest {
+            mode: a.mode.clone(),
+            threads: a.threads,
+            reason: reason.to_owned(),
+            dry_run: a.mutation.dry_run,
+        },
+    )?;
+    if ctx.json {
+        ctx.print_raw(&body);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let r: ProposeResponse = ctx.decode(&body)?;
+    let p = &r.proposal;
+    let rb = p.rebase.as_ref();
+    let mut out = String::new();
+    if r.dry_run {
+        let mut rerun = format!("kronik rollback {} --by-replay", a.epoch);
+        if let Some(m) = &a.mode {
+            let _ = write!(rerun, " --mode {m}");
+        }
+        let _ = write!(rerun, " --reason {}", shell_quote(reason));
+        let _ = writeln!(
+            out,
+            "Dry run: epoch {} can be rolled back by replay from lsn {}; nothing was written",
+            a.epoch, p.fork_lsn
+        );
+        summary_lines(&mut out, &p.summary);
+        let _ = writeln!(
+            out,
+            "Irreversible  {} external effects of the rolled-back code",
+            rb.map_or(0, |r| r.irreversible_effects)
+        );
+        out.push_str(&next(&[rerun]));
+        ctx.print(&out);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let diff = fetch_diff(ctx, &p.fork)?;
+    let _ = writeln!(
+        out,
+        "Rebase proposal {} rolls back epoch {}: replayed main since lsn {} through the old code, verified through lsn {}",
+        p.id, a.epoch, p.fork_lsn, p.verified_through_lsn
+    );
+    out.push('\n');
+    out.push_str(&diff_block(&diff));
+    let items: Vec<String> = array(&diff["irreversible"]["items"])
+        .iter()
+        .take(10)
+        .map(|e| {
+            format!(
+                "{} {} {}{} ({}, {}) in {}",
+                text(&e["kind"]),
+                text(&e["method"]),
+                text(&e["host"]),
+                text(&e["route"]),
+                text(&e["status"]),
+                text(&e["delivery"]),
+                text(&e["turn_prod"])
+            )
+        })
+        .collect();
+    let count = int(&diff["irreversible"]["count"]);
+    let mut lines = vec![format!(
+        "{count} external {} of the rolled-back code the old code would not have made (cannot be undone)",
+        plural(count, "effect")
+    )];
+    lines.extend(items);
+    field(&mut out, "Irreversible", &lines, "");
+    out.push('\n');
+    policy_lines(&mut out, &p.policy);
+    out.push_str(&next(&[
+        format!("kronik diff show {} --md", p.id),
+        format!("kronik approve {} --reason \"...\"", p.id),
+        format!(
+            "kronik promote {} --reason \"...\"   (switches main's state and code)",
+            p.id
+        ),
+    ]));
+    ctx.print(&out);
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn rollback(ctx: &Ctx, a: RollbackArgs) -> Result<ExitCode, Error> {
+    if a.by_replay {
+        return rollback_by_replay(ctx, &a);
+    }
     let reason = reason(&a.mutation)?;
     let body = ctx.post(
         &format!("/v1/deployments/{}/rollback", a.epoch),
@@ -2175,6 +2366,7 @@ mod tests {
             ignore_json_paths: vec![],
             threads: None,
             stubs: vec![],
+            simulators: vec![],
         }
         .options_from(&config);
         let omitted = must_options(omitted);
@@ -2187,6 +2379,7 @@ mod tests {
             ignore_json_paths: vec![],
             threads: None,
             stubs: vec![],
+            simulators: vec![],
         }
         .options_from(&config);
         let explicit = must_options(explicit);
@@ -2200,6 +2393,7 @@ mod tests {
             ignore_json_paths: vec![],
             threads: None,
             stubs: vec![],
+            simulators: vec![],
         }
         .options_from(&defaults);
         let from_defaults = must_options(from_defaults);

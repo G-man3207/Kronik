@@ -746,6 +746,26 @@
             "string",
             "null"
           ]
+        },
+        "grounding": {
+          "description": "Fork turns only: how the effect was answered (M12). Absent for production turns and for live effects of a fork.",
+          "enum": [
+            "exact",
+            "approximate",
+            "synthetic",
+            "forked"
+          ]
+        },
+        "simulator": {
+          "description": "Synthetic fork effects only: the simulator that answered (M12). Absent for a fork turn recorded before M12.",
+          "enum": [
+            "stub",
+            "contract",
+            "neighbor",
+            "model",
+            "fail-closed",
+            "placeholder"
+          ]
         }
       }
     },

@@ -18,6 +18,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde_json::{Map, Value, json};
 
 use crate::m7::*;
+use crate::m12::*;
 use crate::privacy::*;
 use crate::types::*;
 
@@ -265,6 +266,14 @@ pub const OPERATIONS: &[Operation] = &[
         query: &[],
         request: Some(schema::<ResendRequest>),
         answer: Answer::Json(schema::<WatchResponse>),
+    },
+    Operation {
+        method: "POST",
+        path: "/v1/deployments/{epoch}/rebase",
+        summary: "Roll back a deployment by replay: a proposal with the old code's state and the irreversible effects (needs pii:read besides x-kronik-scope)",
+        query: &[],
+        request: Some(schema::<RebaseRequest>),
+        answer: Answer::Json(schema::<ProposeResponse>),
     },
     Operation {
         method: "POST",
@@ -663,6 +672,22 @@ pub const OPERATIONS: &[Operation] = &[
         query: &[],
         request: Some(schema::<ForeignRemoveRequest>),
         answer: Answer::Json(schema::<ForeignRemoveResponse>),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/simulators",
+        summary: "The effect simulators and each target's simulator configuration",
+        query: &[],
+        request: None,
+        answer: Answer::Json(schema::<SimulatorsResponse>),
+    },
+    Operation {
+        method: "PUT",
+        path: "/v1/simulators/{target}",
+        summary: "Set a target's stub rules, contract, neighbor and model simulators",
+        query: &[],
+        request: Some(schema::<SimulatorsSetRequest>),
+        answer: Answer::Json(schema::<SimulatorsSetResponse>),
     },
     Operation {
         method: "GET",

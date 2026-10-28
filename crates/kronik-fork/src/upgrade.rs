@@ -73,7 +73,9 @@ pub async fn check(
         return Err(format!("{} holds no log", data.display()));
     }
     // The fork point: every root input retention keeps, then the window.
-    let oldest = pick_base(data, branch, head, true)?;
+    // Offline (the daemon is stopped): the switch from the state database.
+    let rebase = kronik_sched::snapshots::last_rebase_at(data, branch);
+    let oldest = pick_base(data, branch, head, true, rebase)?;
     let from = oldest.as_ref().map_or(0, |b| b.lsn);
     let all = ProductionIndex::load_from(&reader, oldest, from, head)
         .await
@@ -91,7 +93,7 @@ pub async fn check(
     };
     let from_engine = recorded_engine(&all).unwrap_or_else(|| ENGINE_VERSION.to_owned());
     drop(all);
-    let base = pick_base(data, branch, fork_lsn, false)?;
+    let base = pick_base(data, branch, fork_lsn, false, rebase)?;
     let index = Arc::new(
         ProductionIndex::load_from(&reader, base, fork_lsn, head)
             .await

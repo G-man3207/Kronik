@@ -145,6 +145,8 @@ across all record kinds and segments. A segment is closed at 64 MiB or after
 | `Erasure` | privacy erase (M8) |
 | `EngineUpgrade` | upgrade (M6) |
 | `SnapshotMarker` | snapshot (M6) |
+| `SimulatorConfig` | stubs set: a target's effect simulators (M12) |
+| `StateRebase` | rollback via replay: the replayed turns and the switch (M13) |
 | `GuardTriggered` | a `kronik watch` guard that fired (M11) |
 
 A record with an enum value of 0 or an unknown enum value is

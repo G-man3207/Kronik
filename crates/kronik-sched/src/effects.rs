@@ -352,6 +352,7 @@ impl TurnFx {
             kind: kind.into(),
             target: cap_target.clone(),
             fingerprint: fp.clone(),
+            http: None,
         };
         if let Some(rec) = self.recorded_keyed(&ereq, &plain_fp)? {
             lock(&self.state).records.push(rec.clone());
@@ -549,6 +550,7 @@ impl TurnFx {
             kind: kind.into(),
             target: target.clone(),
             fingerprint: fp.clone(),
+            http: None,
         };
         let mut rec = self.base(ordinal, kind, target, fp);
         rec.request = tagged(&msg_subject, encoded);
@@ -709,6 +711,7 @@ impl TurnFx {
             kind: kind.into(),
             target: cap.clone(),
             fingerprint: fp.clone(),
+            http: None,
         };
         if let Some(rec) = self.recorded(&ereq)? {
             lock(&self.state).records.push(rec.clone());
@@ -791,6 +794,7 @@ impl TurnFx {
             kind: kind.into(),
             target: cap.clone(),
             fingerprint: fp.clone(),
+            http: None,
         };
         if let Some(rec) = self.recorded(&ereq)? {
             lock(&self.state).records.push(rec.clone());

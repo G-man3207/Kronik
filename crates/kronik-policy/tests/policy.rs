@@ -101,9 +101,11 @@ fn every_fixture_gives_its_expected_policy_under_the_default_rules() {
         [
             "diff-approximate-payments.json",
             "diff-counter-plus-2.json",
+            "diff-forked-postgres.json",
             "diff-identity.json",
             "diff-introduced-error.json",
             "diff-sampled-payments.json",
+            "diff-synthetic-v01.json",
             "diff-system-caller-alone.json",
         ]
     );
@@ -195,6 +197,28 @@ fn a_rule_can_judge_one_kind_of_a_system_diff() {
     let evaluation = rules.evaluate(&old);
     assert_eq!(evaluation.outcome, Action::RequireApproval);
     assert_eq!(evaluation.errors.len(), 1);
+}
+
+/// M14: a rule can single out answers from a copy of a foreign actor
+/// (`forked`), per target; on a diff from before M14 `has()` keeps it quiet.
+#[test]
+fn a_rule_can_judge_forked_answers_per_target() {
+    let diff = fixture_named("diff-forked-postgres.json");
+    let rules = rule_set(&[(
+        "copies-need-review",
+        "diff.grounding.exists(t, t.host == 'pg' && has(t.forked) && t.forked > 0)",
+        "require_approval",
+    )]);
+    let evaluation = rules.evaluate(&diff);
+    assert_eq!(evaluation.errors, []);
+    assert_eq!(
+        fired(&evaluation),
+        [("copies-need-review", Action::RequireApproval)]
+    );
+    let old = fixture_named("diff-approximate-payments.json");
+    let evaluation = rules.evaluate(&old);
+    assert_eq!(evaluation.errors, []);
+    assert_eq!(evaluation.outcome, Action::Allow);
 }
 
 #[test]

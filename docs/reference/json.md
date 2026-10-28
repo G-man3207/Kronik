@@ -61,7 +61,7 @@ against both.
 | `kronik proposal wait` | [`ProposalInfo`](#proposalinfo) (`GET /v1/proposals/{id}`) |
 | `kronik approve` | [`ApproveResponse`](#approveresponse) (`POST /v1/proposals/{id}/approve`) |
 | `kronik promote` | [`PromoteResponse`](#promoteresponse) (`POST /v1/proposals/{id}/promote`) |
-| `kronik rollback` | [`RollbackResponse`](#rollbackresponse) (`POST /v1/deployments/{epoch}/rollback`) |
+| `kronik rollback` | [`RollbackResponse`](#rollbackresponse) (`POST /v1/deployments/{epoch}/rollback`); with --by-replay: [`ProposeResponse`](#proposeresponse) (`POST /v1/deployments/{epoch}/rebase`) |
 | `kronik watch` | [`WatchInfo`](#watchinfo) (`GET /v1/watches/{id}`); with with --async or --dry-run: [`WatchResponse`](#watchresponse) (`POST /v1/deployments/{epoch}/watch`) |
 | `kronik watches list` | [`WatchesResponse`](#watchesresponse) (`GET /v1/watches`) |
 | `kronik watches show` | [`WatchInfo`](#watchinfo) (`GET /v1/watches/{id}`) |
@@ -80,6 +80,8 @@ against both.
 | `kronik foreign logs` | [`ForeignLogsResponse`](#foreignlogsresponse) (`GET /v1/foreign/{name}/logs`) |
 | `kronik foreign remove` | [`ForeignRemoveResponse`](#foreignremoveresponse) (`DELETE /v1/foreign/{name}`) |
 | `kronik foreign cleanup` | [`CleanupOutput`](#cleanupoutput), from the CLI itself |
+| `kronik stubs set` | [`SimulatorsSetResponse`](#simulatorssetresponse) (`PUT /v1/simulators/{target}`) |
+| `kronik simulators list` | [`SimulatorsResponse`](#simulatorsresponse) (`GET /v1/simulators`) |
 | `kronik privacy mode` | [`PrivacyModeResponse`](#privacymoderesponse) (`POST /v1/privacy/mode`) |
 | `kronik privacy status` | [`PrivacyStatus`](#privacystatus) (`GET /v1/privacy`) |
 | `kronik privacy erase` | [`ErasureResponse`](#erasureresponse) (`POST /v1/privacy/erase`) |
@@ -340,6 +342,39 @@ against both.
 }
 ```
 
+### CheckpointView
+
+```json
+{
+  "description": "One checkpoint of a foreign actor (M14).",
+  "properties": {
+    "at_ms": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "bytes": {
+      "description": "The size of its copy of the data directory.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "lsn": {
+      "description": "Main's LSN the checkpoint is at.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "lsn",
+    "at_ms",
+    "bytes"
+  ],
+  "type": "object"
+}
+```
+
 ### CleanupOutput
 
 ```json
@@ -398,6 +433,37 @@ against both.
 }
 ```
 
+### ContractView
+
+```json
+{
+  "description": "The contract of a target.",
+  "properties": {
+    "bytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "digest": {
+      "description": "BLAKE3 of the document, `b3:` + hex.",
+      "type": "string"
+    },
+    "title": {
+      "description": "The document's `info.title`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "digest",
+    "bytes"
+  ],
+  "type": "object"
+}
+```
+
 ### Created
 
 ```json
@@ -405,7 +471,7 @@ against both.
   "description": "What `kronik init` made: its `--json` output.",
   "properties": {
     "files": {
-      "description": "The files written, relative to the project; the SDK and the WIT in\n`vendor/kronik-sdk` are not listed.",
+      "description": "The files written, relative to the project; the vendored SDK and its\nWIT (`vendor/kronik-sdk`, for Go `kronik-sdk`) are not listed.",
       "items": {
         "type": "string"
       },
@@ -416,7 +482,7 @@ against both.
       "type": "string"
     },
     "lang": {
-      "description": "`ts` or `rust`.",
+      "description": "`ts`, `rust`, `python` or `go`.",
       "type": "string"
     },
     "next": {
@@ -678,7 +744,7 @@ against both.
 ```json
 {
   "additionalProperties": false,
-  "description": "A behavior diff: how a fork's code behaves on main's root inputs, next to production (docs/design/m3-fork.md §5). The same fork, code and options always give the same bytes. `kronik diff show --md` and `format=md` render the same diff as Markdown.",
+  "description": "A behavior diff: how a fork's code behaves on main's root inputs, next to production (docs/design/m3-fork.md §5). The same fork, code and options always give the same bytes, except for answers of copies of foreign actors (`forked`, M14, ADR 0020), which are real and not reproducible. `kronik diff show --md` and `format=md` render the same diff as Markdown.",
   "properties": {
     "base": {
       "$ref": "#/components/schemas/DiffBase"
@@ -732,6 +798,9 @@ against both.
         "$ref": "#/components/schemas/DiffGroundingRow"
       },
       "type": "array"
+    },
+    "irreversible": {
+      "$ref": "#/components/schemas/DiffIrreversible"
     },
     "kinds": {
       "description": "Each actor kind on its own, sorted by kind: every kind of the fork's code and every kind a replayed turn ran as (M9). Absent from diffs written before M9.",
@@ -1061,12 +1130,13 @@ against both.
       "type": "array"
     },
     "grounding": {
-      "description": "How the fork's effect was answered.",
+      "description": "How the fork's effect was answered (`forked`: a copy of a foreign actor, M14).",
       "enum": [
         "exact",
         "approximate",
         "synthetic",
-        "live"
+        "live",
+        "forked"
       ]
     },
     "host": {
@@ -1080,6 +1150,17 @@ against both.
     },
     "route": {
       "type": "string"
+    },
+    "simulator": {
+      "description": "The simulator of a synthetic answer (M12); absent for other groundings.",
+      "enum": [
+        "stub",
+        "contract",
+        "neighbor",
+        "model",
+        "fail-closed",
+        "placeholder"
+      ]
     },
     "turn_fork": {
       "anyOf": [
@@ -1262,10 +1343,15 @@ against both.
       "$ref": "#/components/schemas/DiffCount"
     },
     "confidence": {
-      "$ref": "#/components/schemas/DiffRatio"
+      "$ref": "#/components/schemas/DiffRatio",
+      "description": "exact / (exact + approximate + synthetic + live + forked) of this target; 1.0 without effects."
     },
     "exact": {
       "$ref": "#/components/schemas/DiffCount"
+    },
+    "forked": {
+      "$ref": "#/components/schemas/DiffCount",
+      "description": "Answers of a fork's copy of the foreign actor (M14)."
     },
     "host": {
       "type": "string"
@@ -1286,6 +1372,9 @@ against both.
     },
     "synthetic": {
       "$ref": "#/components/schemas/DiffCount"
+    },
+    "synthetic_by": {
+      "$ref": "#/components/schemas/DiffSyntheticBy"
     }
   },
   "required": [
@@ -1298,6 +1387,70 @@ against both.
     "synthetic",
     "live",
     "confidence"
+  ],
+  "type": "object"
+}
+```
+
+### DiffIrreversible
+
+```json
+{
+  "additionalProperties": false,
+  "description": "A rollback via replay only (M13): main's external effects since the rolled-back deployment that the old code would not have made the same way (no exact match in the fork). The rebased state does not account for them.",
+  "properties": {
+    "count": {
+      "$ref": "#/components/schemas/DiffCount"
+    },
+    "items": {
+      "description": "At most 200, in log order.",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "delivery": {
+            "description": "`replay-safe`, `idempotency-keyed` or `unsafe`.",
+            "type": "string"
+          },
+          "host": {
+            "type": "string"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string"
+          },
+          "route": {
+            "type": "string"
+          },
+          "status": {
+            "description": "`ok`, `outcome_unknown`, `network`, `timeout`, ...",
+            "type": "string"
+          },
+          "turn_prod": {
+            "$ref": "#/components/schemas/DiffTurnId"
+          }
+        },
+        "required": [
+          "turn_prod",
+          "kind",
+          "method",
+          "host",
+          "route",
+          "status",
+          "delivery"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "count",
+    "items"
   ],
   "type": "object"
 }
@@ -1474,6 +1627,39 @@ against both.
   "additionalProperties": false,
   "description": "The replay options the diff was made with.",
   "properties": {
+    "foreign": {
+      "description": "The fork's foreign actors with fork_mode sandbox (M14): the checkpoint a copy started from, or why the actor stayed recorded.",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_lsn": {
+            "$ref": "#/components/schemas/DiffCount"
+          },
+          "mode": {
+            "enum": [
+              "sandbox",
+              "recorded"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "replayed_calls": {
+            "$ref": "#/components/schemas/DiffCount"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "mode",
+          "replayed_calls"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
     "fuel_threshold": {
       "description": "A fuel change below this share is not a change.",
       "minimum": 0,
@@ -1517,6 +1703,20 @@ against both.
       "exclusiveMinimum": 0,
       "maximum": 1,
       "type": "number"
+    },
+    "simulator_overrides": {
+      "description": "Per-target simulator configuration the replay request carried, replacing main's for this fork (the fields of `PUT /v1/simulators/{target}`). Absent when there are none.",
+      "items": {
+        "$ref": "#/components/schemas/DiffSimulatorOverride"
+      },
+      "type": "array"
+    },
+    "simulators": {
+      "description": "The simulator configuration the replay used, per target (M12): main's as of the fork point (I5), with the request's overrides. Absent when no target has one.",
+      "items": {
+        "$ref": "#/components/schemas/DiffSimulatorOption"
+      },
+      "type": "array"
     },
     "stubs": {
       "description": "Canned answers for effects without a recording, tried in order (synthetic grounding).",
@@ -1854,6 +2054,92 @@ against both.
 }
 ```
 
+### DiffSimulatorOption
+
+```json
+{
+  "additionalProperties": false,
+  "description": "One target's simulator configuration (a `SimulatorConfig` record).",
+  "properties": {
+    "contract": {
+      "description": "BLAKE3 of the OpenAPI document as stored (`b3:` + hex); absent without a contract.",
+      "type": "string"
+    },
+    "epoch": {
+      "$ref": "#/components/schemas/DiffCount"
+    },
+    "lsn": {
+      "$ref": "#/components/schemas/DiffCount"
+    },
+    "model": {
+      "type": "boolean"
+    },
+    "neighbor": {
+      "type": "boolean"
+    },
+    "request": {
+      "const": true,
+      "description": "From `simulator_overrides` (epoch and LSN are 0); absent for main's configuration."
+    },
+    "stubs": {
+      "$ref": "#/components/schemas/DiffCount",
+      "description": "The number of stub rules."
+    },
+    "target": {
+      "description": "`http:<host>` or `foreign:<name>`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "target",
+    "epoch",
+    "lsn",
+    "stubs",
+    "neighbor",
+    "model"
+  ],
+  "type": "object"
+}
+```
+
+### DiffSimulatorOverride
+
+```json
+{
+  "additionalProperties": false,
+  "description": "One target's simulator configuration for this replay only.",
+  "properties": {
+    "contract": {
+      "description": "An OpenAPI 3 document; absent for none.",
+      "type": "object"
+    },
+    "model": {
+      "type": "boolean"
+    },
+    "neighbor": {
+      "type": "boolean"
+    },
+    "stubs": {
+      "items": {
+        "$ref": "#/components/schemas/DiffStubRule"
+      },
+      "type": "array"
+    },
+    "target": {
+      "description": "`http:<host>` or `foreign:<name>`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "target",
+    "stubs",
+    "neighbor",
+    "model"
+  ],
+  "type": "object"
+}
+```
+
 ### DiffSqlChange
 
 ```json
@@ -2030,7 +2316,7 @@ against both.
     },
     "confidence": {
       "$ref": "#/components/schemas/DiffRatio",
-      "description": "exact / (exact + approximate + synthetic + live); 1.0 without effects."
+      "description": "exact / (exact + approximate + synthetic + live + forked); 1.0 without effects."
     },
     "consequences": {
       "$ref": "#/components/schemas/DiffCount",
@@ -2043,6 +2329,10 @@ against both.
     "exact": {
       "$ref": "#/components/schemas/DiffCount",
       "description": "Fork effects answered by an identical recording."
+    },
+    "forked": {
+      "$ref": "#/components/schemas/DiffCount",
+      "description": "Answers of the fork's copies of foreign actors (M14)."
     },
     "live": {
       "$ref": "#/components/schemas/DiffCount",
@@ -2078,7 +2368,10 @@ against both.
     },
     "synthetic": {
       "$ref": "#/components/schemas/DiffCount",
-      "description": "Fork effects with no recording: a stub rule answered, or the effect failed closed."
+      "description": "Fork effects with no recording: a simulator answered (stub, contract, neighbor, model), or the effect failed closed."
+    },
+    "synthetic_by": {
+      "$ref": "#/components/schemas/DiffSyntheticBy"
     },
     "turns_fork": {
       "$ref": "#/components/schemas/DiffCount",
@@ -2110,6 +2403,28 @@ against both.
     "verified_through_lsn",
     "changed"
   ],
+  "type": "object"
+}
+```
+
+### DiffSyntheticBy
+
+```json
+{
+  "additionalProperties": {
+    "$ref": "#/components/schemas/DiffCount"
+  },
+  "description": "Synthetic answers per simulator (M12); absent when there are none.",
+  "propertyNames": {
+    "enum": [
+      "stub",
+      "contract",
+      "neighbor",
+      "model",
+      "fail-closed",
+      "placeholder"
+    ]
+  },
   "type": "object"
 }
 ```
@@ -2149,6 +2464,13 @@ against both.
         "null"
       ]
     },
+    "grounding": {
+      "description": "Fork turns only: how the effect was answered, `exact`,\n`approximate`, `synthetic` or `forked` (a copy of a foreign actor,\nM14). Absent for production and live effects.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "hint": {
       "description": "For denied effects: the exact command that grants the capability.",
       "type": [
@@ -2166,6 +2488,13 @@ against both.
     },
     "request": {
       "description": "In history, for an HTTP effect: the request's method, host and path,\nsuch as `POST api.example.com/hooks`. Omitted otherwise, and when the\nrequest is sealed for a data subject.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "simulator": {
+      "description": "Synthetic fork effects only: the simulator that answered (`stub`,\n`contract`, `neighbor`, `model`, `fail-closed`, `placeholder`; M12). Absent for a\nfork turn recorded before M12.",
       "type": [
         "string",
         "null"
@@ -2534,6 +2863,13 @@ against both.
 {
   "description": "A declared foreign actor.",
   "properties": {
+    "checkpoints": {
+      "description": "Checkpoints for forks (`sandbox`), oldest first.",
+      "items": {
+        "$ref": "#/components/schemas/CheckpointView"
+      },
+      "type": "array"
+    },
     "cpu_millis": {
       "format": "uint32",
       "minimum": 0,
@@ -2543,6 +2879,10 @@ against both.
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
+    },
+    "fork_mode": {
+      "description": "`recorded` or `sandbox` (M14).",
+      "type": "string"
     },
     "image": {
       "type": "string"
@@ -2603,6 +2943,8 @@ against both.
     "isolation",
     "platform",
     "secrets",
+    "fork_mode",
+    "checkpoints",
     "epoch",
     "lsn",
     "reason"
@@ -3327,6 +3669,36 @@ against both.
 }
 ```
 
+### ModelView
+
+```json
+{
+  "description": "The server's model simulator (`[simulators.model]`); never the key.",
+  "properties": {
+    "configured": {
+      "type": "boolean"
+    },
+    "endpoint_host": {
+      "description": "The endpoint's host, when configured.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "configured"
+  ],
+  "type": "object"
+}
+```
+
 ### Orphan
 
 ```json
@@ -3825,6 +4197,17 @@ against both.
     },
     "policy": {
       "$ref": "#/components/schemas/PolicyEvaluation"
+    },
+    "rebase": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/RebaseSwitchInfo"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Set for a rollback via replay (M13)."
     }
   },
   "required": [
@@ -3894,6 +4277,17 @@ against both.
         }
       ],
       "description": "While `running`: how far the replay has come (M10)."
+    },
+    "rebase": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/RebaseView"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "A rollback via replay (M13): what it rolls back."
     },
     "status": {
       "description": "`running`, `evaluated`, `approved`, `promoted`, `rejected`, `stale`\nor `failed`.",
@@ -4017,6 +4411,87 @@ against both.
   "required": [
     "dry_run",
     "proposal"
+  ],
+  "type": "object"
+}
+```
+
+### RebaseSwitchInfo
+
+```json
+{
+  "description": "The switch of a rollback via replay (M13).",
+  "properties": {
+    "base_lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "irreversible_effects": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "lsn": {
+      "description": "The `StateRebase` record (0 for a dry run).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "turns": {
+      "description": "The replayed turns that became main's state.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "lsn",
+    "base_lsn",
+    "turns",
+    "irreversible_effects"
+  ],
+  "type": "object"
+}
+```
+
+### RebaseView
+
+```json
+{
+  "description": "What a rebase proposal rolls back (M13).",
+  "properties": {
+    "base_lsn": {
+      "description": "The fork point: main's last LSN before the rolled-back deployment.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "irreversible_effects": {
+      "description": "External effects of the rolled-back code the old code would not\nhave made (the diff's `irreversible`).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "rolled_back_epoch": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "switch_lsn": {
+      "description": "The `StateRebase` switch, once promoted.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "rolled_back_epoch",
+    "base_lsn",
+    "irreversible_effects"
   ],
   "type": "object"
 }
@@ -4500,6 +4975,96 @@ against both.
 }
 ```
 
+### SimulatorInfo
+
+```json
+{
+  "description": "One simulator Kronik has.",
+  "properties": {
+    "description": {
+      "type": "string"
+    },
+    "grounding": {
+      "description": "`recorded` (exact and approximate matches) or `synthetic`.",
+      "type": "string"
+    },
+    "name": {
+      "description": "`recorded`, `stub`, `contract`, `neighbor`, `model`, `fail-closed`,\n`placeholder`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "grounding",
+    "description"
+  ],
+  "type": "object"
+}
+```
+
+### SimulatorsResponse
+
+```json
+{
+  "properties": {
+    "model": {
+      "$ref": "#/components/schemas/ModelView"
+    },
+    "simulators": {
+      "items": {
+        "$ref": "#/components/schemas/SimulatorInfo"
+      },
+      "type": "array"
+    },
+    "targets": {
+      "items": {
+        "$ref": "#/components/schemas/TargetSimulatorsView"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "simulators",
+    "targets",
+    "model"
+  ],
+  "type": "object"
+}
+```
+
+### SimulatorsSetResponse
+
+```json
+{
+  "properties": {
+    "dry_run": {
+      "type": "boolean"
+    },
+    "epoch": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "lsn": {
+      "description": "0 for a dry run.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "target": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "dry_run",
+    "target",
+    "epoch",
+    "lsn"
+  ],
+  "type": "object"
+}
+```
+
 ### SnapshotCreateResponse
 
 ```json
@@ -4750,6 +5315,64 @@ against both.
     "verified_through_lsn",
     "unverified_inputs",
     "kinds"
+  ],
+  "type": "object"
+}
+```
+
+### TargetSimulatorsView
+
+```json
+{
+  "description": "A target's simulator configuration in force.",
+  "properties": {
+    "contract": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/ContractView"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "epoch": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "model": {
+      "type": "boolean"
+    },
+    "neighbor": {
+      "type": "boolean"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "stubs": {
+      "description": "The number of stub rules.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "target": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "target",
+    "stubs",
+    "neighbor",
+    "model",
+    "epoch",
+    "lsn",
+    "reason"
   ],
   "type": "object"
 }

@@ -3,7 +3,7 @@
 # commands. Exits non-zero as soon as a step fails.
 #
 # Usage: scripts/ci.sh [STEP...]
-# Steps: fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny,
+# Steps: fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny,
 # foreign (needs root and runsc; skipped with a message otherwise, a failure
 # with KRONIK_FOREIGN_TESTS=require),
 # identity (without libfaketime, todo-ts is skipped with a message too),
@@ -138,6 +138,21 @@ for b in bad:
     print("error: " + b, file=sys.stderr)
 sys.exit(1 if bad else 0)
 PY
+    # The GitHub workflow runs every step of this script, in this order
+    # (review M15 N1: a step it lacks breaks the steps after it). A call may
+    # sit inside a multi-line command (foreign runs under sudo); steps that
+    # call no ci.sh step (Install gVisor) and comments don't count.
+    python3 - <<'PY'
+import pathlib, re, sys
+script = pathlib.Path("scripts/ci.sh").read_text()
+steps = re.search(r"set -- ([a-z ]+)\n", script).group(1).split()
+workflow = pathlib.Path(".github/workflows/ci.yml").read_text()
+runs = re.findall(r"^(?![ \t]*#)[^\n]*?\bscripts/ci\.sh (\w+)", workflow, re.M)
+if runs != steps:
+    print(f"error: .github/workflows/ci.yml runs {runs}, scripts/ci.sh has {steps}", file=sys.stderr)
+    sys.exit(1)
+
+PY
 }
 
 step_test() {
@@ -220,7 +235,47 @@ step_ts() {
     KRONIK_BIN="$kronik" scripts/build-examples-ts.sh
     cargo run --quiet --locked -p kronik-runtime --example check_imports -- examples/dist/*-ts*.wasm
     (cd examples && KRONIK_BIN="$kronik" npm test --workspaces)
-    KRONIK_BIN="$kronik" scripts/e2e-init.sh
+    KRONIK_BIN="$kronik" E2E_INIT_LANGS="ts rust" scripts/e2e-init.sh
+}
+
+# M15: the Python and Go SDKs (ADR 0030, docs/design/m15-sdks.md). Installs
+# the pinned toolchains (scripts/install-sdk-tools.sh, once per version),
+# checks that both SDKs carry the actor WIT unchanged and that the Go
+# bindings are generated from it, runs the SDKs' unit tests, builds the
+# examples with kronik build, lists their imports against the allowlist,
+# runs the examples' tests in test hosts and the determinism test on them,
+# and new projects from kronik init in both languages (scripts/e2e-init.sh).
+# Needs Linux x86_64, python3 with pip, and network access for the first
+# install and Go's module downloads.
+step_sdks() {
+    local kronik tools
+    tools="${KRONIK_SDK_TOOLS:-$HOME/.cache/kronik/sdk-tools}"
+    scripts/install-sdk-tools.sh "$tools"
+    export KRONIK_SDK_TOOLS="$tools"
+    cmp wit/kronik-actor.wit sdk/python/wit/kronik-actor.wit
+    cmp wit/kronik-actor.wit sdk/go/wit/deps/kronik-actor/kronik-actor.wit
+    (cd sdk/go && PATH="$tools/bin:$PATH" ./generate.sh && git diff --exit-code -- internal/wit)
+    python3 -m unittest discover -s sdk/python/tests
+    # The SDK package's own tests (sdk_test.go, host_test.go) and testkit.
+    (cd sdk/go && PATH="$tools/bin:$PATH" GOTOOLCHAIN=local go vet . ./testkit/... &&
+        PATH="$tools/bin:$PATH" GOTOOLCHAIN=local go test . ./testkit/...)
+    cargo build --locked --release -p kronik
+    # Where cargo put it, also with CARGO_TARGET_DIR set.
+    kronik="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/kronik"
+    KRONIK_BIN="$kronik" scripts/build-examples-py.sh
+    KRONIK_BIN="$kronik" scripts/build-examples-go.sh
+    cargo run --quiet --locked -p kronik-runtime --example check_imports -- examples/dist/*-py*.wasm examples/dist/*-go*.wasm
+    local example
+    for example in counter-py notes-py webhook-relay-py; do
+        (cd "examples/$example" && KRONIK_BIN="$kronik" python3 -m unittest discover -s tests)
+    done
+    for example in counter-go notes-go webhook-relay-go; do
+        (cd "examples/$example/test" && KRONIK_BIN="$kronik" PATH="$tools/bin:$PATH" GOTOOLCHAIN=local go test ./...)
+    done
+    # Absolute: cargo runs the test in the crate's directory.
+    KRONIK_DETERMINISM_COMPONENTS="$(printf '%s:' "$PWD"/examples/dist/{counter,notes,webhook-relay}-{py,go}.wasm)" \
+        cargo test --locked -p kronik-sched --test sdk_determinism
+    KRONIK_BIN="$kronik" E2E_INIT_LANGS="python go" scripts/e2e-init.sh
 }
 
 # The simulator's acceptance run: 200 seeds of the counter workload (M1) and
@@ -247,7 +302,8 @@ step_deny() {
 # M7: foreign actors in real gVisor sandboxes. Needs root and runsc
 # (docs/design/m7-foreign.md §14); elsewhere it says why and skips, unless
 # KRONIK_FOREIGN_TESTS=require (as in CI), which makes every skip, here and
-# in the tests, a failure.
+# in the tests, a failure. M14's Postgres fork test also needs docker, for
+# the foreign-pg image's base.
 step_foreign() {
     local runsc="${KRONIK_RUNSC:-/usr/local/bin/runsc}"
     if [ "$(id -u)" != 0 ] || [ ! -x "$runsc" ]; then
@@ -289,7 +345,7 @@ step_identity() {
     if [ -z "$faketime_lib" ]; then
         echo "skipped: todo-ts needs libfaketime for its sweep (Debian and Ubuntu: apt-get install faketime)"
         # Every example in scripts/identity-examples.py's EXAMPLES but todo-ts.
-        only=(--only counter-rs,counter-ts,notes-rs,notes-ts,webhook-relay-rs,webhook-relay-ts,billing-ts)
+        only=(--only counter-rs,counter-ts,counter-py,counter-go,notes-rs,notes-ts,notes-py,notes-go,webhook-relay-rs,webhook-relay-ts,webhook-relay-py,webhook-relay-go,billing-ts)
     fi
     cargo build --locked --release -p kronik
     # Where cargo put it, also with CARGO_TARGET_DIR set.
@@ -309,14 +365,14 @@ step_action() {
 }
 
 if [ "$#" -eq 0 ]; then
-    set -- fmt clippy hygiene test docs book examples ts dst deny foreign identity action
+    set -- fmt clippy hygiene test docs book examples ts sdks dst deny foreign identity action
 fi
 
 for step in "$@"; do
     case "$step" in
-        fmt | clippy | hygiene | test | docs | book | examples | ts | dst | deny | foreign | identity | action) ;;
+        fmt | clippy | hygiene | test | docs | book | examples | ts | sdks | dst | deny | foreign | identity | action) ;;
         *)
-            echo "error: unknown step '$step'; expected fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny, foreign, identity or action" >&2
+            echo "error: unknown step '$step'; expected fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, foreign, identity or action" >&2
             exit 2
             ;;
     esac

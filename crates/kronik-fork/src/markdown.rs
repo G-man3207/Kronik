@@ -7,6 +7,27 @@ use serde_json::Value;
 
 use crate::diff::{ActorState, Diff, FieldDiff, KeyDiff, SqlDiff};
 
+/// What a fork did with a `fork_mode = "sandbox"` foreign actor (M14).
+pub fn foreign_line(f: &crate::diff::ForeignFork) -> String {
+    match f.checkpoint_lsn {
+        Some(lsn) if f.mode == "sandbox" => format!(
+            "a copy from the checkpoint at LSN {lsn}, {} recorded call{} replayed",
+            f.replayed_calls,
+            if f.replayed_calls == 1 { "" } else { "s" }
+        ),
+        _ => format!("recorded answers ({})", f.why),
+    }
+}
+
+/// `3 (contract 2, fail-closed 1)`: synthetic answers per simulator (M12).
+fn synthetic(n: u64, by: &std::collections::BTreeMap<String, u64>) -> String {
+    if by.is_empty() {
+        return num(n);
+    }
+    let parts: Vec<String> = by.iter().map(|(k, v)| format!("{k} {}", num(*v))).collect();
+    format!("{} ({})", num(n), parts.join(", "))
+}
+
 /// `10412` -> `10 412`.
 fn num(n: u64) -> String {
     let s = n.to_string();
@@ -249,7 +270,7 @@ pub fn summary(d: &Diff, policy: Option<&Value>, http_grants: &[&str]) -> String
     }
     // Per (kind, method, granted host): never the route, whose segments can
     // be user data (an e-mail address, a phone number).
-    let mut targets: std::collections::BTreeMap<(&str, &str, &str), [u64; 4]> = Default::default();
+    let mut targets: std::collections::BTreeMap<(&str, &str, &str), [u64; 5]> = Default::default();
     for g in &d.grounding {
         let t = targets
             .entry((
@@ -260,24 +281,31 @@ pub fn summary(d: &Diff, policy: Option<&Value>, http_grants: &[&str]) -> String
             .or_default();
         for (sum, n) in t
             .iter_mut()
-            .zip([g.exact, g.approximate, g.synthetic, g.live])
+            .zip([g.exact, g.approximate, g.synthetic, g.live, g.forked])
         {
             *sum += n;
         }
     }
     let mut rows: Vec<_> = targets.into_iter().collect();
-    rows.sort_by_key(|(_, [_, a, s, _])| a + s == 0);
+    rows.sort_by_key(|(_, [_, a, s, _, f])| a + s + f == 0);
     if !rows.is_empty() {
+        // Forked answers (M14) get a column only when there are some.
+        let forked = rows.iter().any(|(_, [.., f])| *f > 0);
         let _ = writeln!(o, "\n## Grounding\n");
         let _ = writeln!(
             o,
-            "| Kind | Method | Host | Exact | Approximate | Synthetic | Live | Confidence |"
+            "| Kind | Method | Host | Exact | Approximate | Synthetic | Live |{} Confidence |",
+            if forked { " Forked |" } else { "" }
         );
-        let _ = writeln!(o, "| --- | --- | --- | --- | --- | --- | --- | --- |");
-        for ((kind, method, host), [e, a, s, l]) in rows.iter().take(10) {
+        let _ = writeln!(
+            o,
+            "| --- | --- | --- | --- | --- | --- | --- |{} --- |",
+            if forked { " --- |" } else { "" }
+        );
+        for ((kind, method, host), [e, a, s, l, f]) in rows.iter().take(10) {
             let _ = writeln!(
                 o,
-                "| {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} |{} {} |",
                 code(kind),
                 code(method),
                 code(host),
@@ -285,7 +313,12 @@ pub fn summary(d: &Diff, policy: Option<&Value>, http_grants: &[&str]) -> String
                 num(*a),
                 num(*s),
                 num(*l),
-                pct(*e as f64 / (e + a + s + l).max(1) as f64)
+                if forked {
+                    format!(" {} |", num(*f))
+                } else {
+                    String::new()
+                },
+                pct(*e as f64 / (e + a + s + l + f).max(1) as f64)
             );
         }
         if rows.len() > 10 {
@@ -402,10 +435,15 @@ fn overview(o: &mut String, d: &Diff, policy: Option<&Value>, title: &str, publi
     }
     let _ = writeln!(
         o,
-        "| Effects | exact {}, approximate {}, synthetic {} (confidence {}) |",
+        "| Effects | exact {}, approximate {}, synthetic {}{} (confidence {}) |",
         num(s.exact),
         num(s.approximate),
-        num(s.synthetic),
+        synthetic(s.synthetic, &s.synthetic_by),
+        if s.forked > 0 {
+            format!(", forked {}", num(s.forked))
+        } else {
+            String::new()
+        },
         pct(s.confidence)
     );
     let _ = writeln!(o, "| Verified through | LSN {} |", s.verified_through_lsn);
@@ -464,27 +502,45 @@ fn render_details(o: &mut String, d: &Diff) {
         }
     }
     if !d.grounding.is_empty() {
+        // The Forked column only when a copy of a foreign actor answered (M14).
+        let forked = d.grounding.iter().any(|g| g.forked > 0);
+        let (head, rule) = if forked {
+            (" Forked |", " --- |")
+        } else {
+            ("", "")
+        };
         let _ = writeln!(o, "\n## Grounding\n");
         let _ = writeln!(
             o,
-            "| Kind | Method | Host | Route | Exact | Approximate | Synthetic | Confidence |"
+            "| Kind | Method | Host | Route | Exact | Approximate | Synthetic |{head} Confidence |"
         );
-        let _ = writeln!(o, "| --- | --- | --- | --- | --- | --- | --- | --- |");
+        let _ = writeln!(o, "| --- | --- | --- | --- | --- | --- | --- |{rule} --- |");
         let mut rows: Vec<_> = d.grounding.iter().collect();
-        rows.sort_by_key(|g| g.approximate + g.synthetic == 0);
+        rows.sort_by_key(|g| g.approximate + g.synthetic + g.forked == 0);
         for g in rows {
             let _ = writeln!(
                 o,
-                "| {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} |{} {} |",
                 g.kind,
                 g.method,
                 g.host,
                 g.route,
                 num(g.exact),
                 num(g.approximate),
-                num(g.synthetic),
+                synthetic(g.synthetic, &g.synthetic_by),
+                if forked {
+                    format!(" {} |", num(g.forked))
+                } else {
+                    String::new()
+                },
                 pct(g.confidence)
             );
+        }
+    }
+    if !d.options.foreign.is_empty() {
+        let _ = writeln!(o, "\n## Foreign actors\n");
+        for f in &d.options.foreign {
+            let _ = writeln!(o, "- `{}`: {}", f.name, foreign_line(f));
         }
     }
     let r = &d.responses;
@@ -552,13 +608,17 @@ fn render_details(o: &mut String, d: &Diff) {
         for i in &e.items {
             let _ = writeln!(
                 o,
-                "- {} {} {} {}{} ({}; {} → {})",
+                "- {} {} {} {}{} ({}{}; {} → {})",
                 i.change,
                 i.kind,
                 i.method,
                 i.host,
                 i.route,
                 i.grounding,
+                i.simulator
+                    .as_deref()
+                    .map(|s| format!(": {s}"))
+                    .unwrap_or_default(),
                 i.turn_prod.as_deref().unwrap_or("∅"),
                 i.turn_fork.as_deref().unwrap_or("∅")
             );
@@ -652,6 +712,26 @@ fn render_details(o: &mut String, d: &Diff) {
         ("Introduced errors", &sm.errors_introduced),
         ("Synthetic effects", &sm.synthetic),
     ];
+    if let Some(irr) = &d.irreversible {
+        let _ = writeln!(o, "\n## Irreversible effects\n");
+        let _ = writeln!(
+            o,
+            "{} external effects happened under the rolled-back code that the old code \
+             would not have made the same way; the rebased state does not account for them.\n",
+            num(irr.count)
+        );
+        if !irr.items.is_empty() {
+            let _ = writeln!(o, "| Turn | Effect | Status | Delivery |");
+            let _ = writeln!(o, "| --- | --- | --- | --- |");
+            for e in &irr.items {
+                let _ = writeln!(
+                    o,
+                    "| `{}` | {} {} {}{} | {} | {} |",
+                    e.turn_prod, e.kind, e.method, e.host, e.route, e.status, e.delivery
+                );
+            }
+        }
+    }
     if cats.iter().any(|(_, v)| !v.is_empty()) {
         let _ = writeln!(o, "\n## Samples\n");
         for (name, ids) in cats {
@@ -758,7 +838,9 @@ mod tests {
             exact: 1,
             approximate: 2,
             synthetic: 3,
+            synthetic_by: Default::default(),
             live: 4,
+            forked: 0,
             confidence: 0.1,
         }
     }

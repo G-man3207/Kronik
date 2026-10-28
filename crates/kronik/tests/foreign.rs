@@ -940,3 +940,445 @@ fn actor_names_that_prefix_each_other_keep_their_own_sandboxes() {
         assert_eq!(d.foreign(name)["status"]["starts"], 1);
     }
 }
+
+fn pg_layout() -> PathBuf {
+    Path::new(ROOT).join("examples/dist/foreign-pg.oci")
+}
+
+/// M14 acceptance (docs/design/m14-foreign-forks.md §7): a continuous fork
+/// with a `fork_mode = "sandbox"` Postgres starts a copy from the nearest
+/// checkpoint, brings it to the fork point with main's calls, gets real
+/// answers to changed queries from it (`forked`), cannot reach the network
+/// from it, and deletes it with the fork.
+#[test]
+fn postgres_fork_answers_from_a_copy() {
+    if !should_run() {
+        return;
+    }
+    if !pg_layout().join("index.json").exists() {
+        let why = format!(
+            "needs {} (scripts/build-foreign-examples.sh, with docker)",
+            pg_layout().display()
+        );
+        assert!(
+            std::env::var("KRONIK_FOREIGN_TESTS").as_deref() != Ok("require"),
+            "KRONIK_FOREIGN_TESTS=require, but the Postgres test {why}"
+        );
+        eprintln!("skipped: the Postgres fork test {why}");
+        return;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("kronik-m14-")
+        .tempdir_in("/var/tmp")
+        .unwrap()
+        .keep();
+    let _cleanup = Cleanup(dir.clone());
+    let d = Daemon::start(&dir);
+    let runsc_root = dir.join("run/runsc");
+    let image = format!(
+        "oci-layout:{}",
+        pg_layout().canonicalize().unwrap().display()
+    );
+    let guest = |name: &str| {
+        base64::engine::general_purpose::STANDARD
+            .encode(std::fs::read(Path::new(ROOT).join("tests/guests").join(name)).unwrap())
+    };
+    d.ok(
+        "POST",
+        "/v1/deployments",
+        json!({"wasm_base64": guest("counter.wasm"), "reason": "m14 test"}),
+    );
+    d.ok(
+        "POST",
+        "/v1/grants",
+        json!({"kind": "counter", "capability": "foreign:pg", "reason": "m14 test"}),
+    );
+    let v = d.ok(
+        "POST",
+        "/v1/foreign",
+        json!({"name": "pg", "image": image, "port": 8080, "fork_mode": "sandbox",
+               "reason": "m14 test"}),
+    );
+    assert_eq!(v["foreign"]["fork_mode"], "sandbox", "{v}");
+    // initdb in gVisor can outlast the add on a busy host.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while d.foreign("pg")["status"]["state"] != "running" {
+        assert!(Instant::now() < deadline, "{}", d.foreign("pg"));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let sql = |q: &str| d.fetch(&format!("POST foreign://pg/sql\n\n{q}"));
+    assert_eq!(sql("CREATE TABLE t (n int)"), "200 ");
+    assert_eq!(sql("INSERT INTO t VALUES (1), (2)"), "200 ");
+
+    // A snapshot checkpoints pg at its LSN.
+    d.ok("POST", "/v1/snapshots", json!({"reason": "m14 test"}));
+    let checkpoints = d.foreign("pg")["checkpoints"].clone();
+    let ck = checkpoints[0]["lsn"].as_u64().unwrap();
+    assert!(
+        checkpoints[0]["bytes"].as_u64().unwrap() > 0,
+        "{checkpoints}"
+    );
+
+    // A call after the checkpoint (the copy replays it), then the fork point.
+    let (r, fork_at) = d.fetch_lsn("POST foreign://pg/sql\n\nINSERT INTO t VALUES (3)");
+    assert_eq!(r, "200 ");
+    assert!(fork_at > ck);
+    // Production after the fork point; the fork's code (counter-body-v2)
+    // appends " v2" to every body, which keeps these queries valid: an
+    // alias (or an empty body for /egress).
+    let count = "SELECT count(*) || ':' || current_query() FROM t";
+    assert_eq!(sql("INSERT INTO t SELECT 4"), "200 ");
+    assert_eq!(sql(count), format!("200 4:{count}\n"));
+    let r = d.fetch("GET foreign://pg/egress");
+    assert!(r.starts_with("200 unreachable"), "{r}");
+
+    // A continuous fork with the new code: a copy answers.
+    let fork = d.ok(
+        "POST",
+        "/v1/forks",
+        json!({"at": fork_at, "reason": "m14 test"}),
+    )["fork"]["name"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    d.ok(
+        "POST",
+        &format!("/v1/forks/{fork}/deployments"),
+        json!({"wasm_base64": guest("counter-body-v2.wasm"), "reason": "m14 test"}),
+    );
+    let v = d.ok(
+        "POST",
+        &format!("/v1/forks/{fork}/replay"),
+        json!({"mode": "continuous", "reason": "m14 test"}),
+    );
+    assert_eq!(
+        (&v["summary"]["forked"], &v["summary"]["exact"]),
+        (&json!(3), &json!(0)),
+        "{v}\n{}",
+        d.ok("GET", &format!("/v1/forks/{fork}/diff"), Value::Null)["options"]["foreign"]
+    );
+    let copies: Vec<String> = containers(RUNSC, &runsc_root, "-quiet")
+        .into_iter()
+        .filter(|c| c.starts_with("kronik-copy-"))
+        .collect();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    let key = copies[0].strip_prefix("kronik-copy-").unwrap();
+    let copy_dir = dir
+        .join("data/branches")
+        .join(&fork)
+        .join("foreign/pg")
+        .join(key);
+    // The copy's runtime spec, with the injected secret values, is gone once
+    // the copy runs, as production's is (review N14-1).
+    assert!(
+        !copy_dir.join("bundle/config.json").exists(),
+        "the copy kept its config.json"
+    );
+    assert!(copy_dir.join("data/pg").is_dir());
+    // The copy's sandbox runs in its own namespace, which has only `lo`
+    // (the positive control for the egress check below).
+    let state: Value = serde_json::from_str(&run(Command::new(RUNSC)
+        .arg("--root")
+        .arg(&runsc_root)
+        .args(["state", &copies[0]])))
+    .unwrap();
+    let netns = dir.join("run/netns").join(format!("copy-{key}"));
+    let ino = |p: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(p).unwrap());
+    assert_eq!(
+        ino(&PathBuf::from(format!("/proc/{}/ns/net", state["pid"]))),
+        ino(&netns),
+        "{state}"
+    );
+    let links = run(Command::new("nsenter")
+        .arg(format!("--net={}", netns.display()))
+        .args(["ip", "-o", "link", "show"]));
+    assert_eq!(
+        links
+            .lines()
+            .map(|l| l.split(':').nth(1).unwrap().trim())
+            .collect::<Vec<_>>(),
+        ["lo"],
+        "{links}"
+    );
+    let diff = d.ok("GET", &format!("/v1/forks/{fork}/diff"), Value::Null);
+    assert_eq!(
+        diff["options"]["foreign"],
+        json!([{"name": "pg", "mode": "sandbox", "checkpoint_lsn": ck, "replayed_calls": 1}]),
+        "{diff}"
+    );
+    let rows: Vec<(String, u64)> = diff["grounding"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|g| g["host"] == "pg" && g["exact"] == 0)
+        .map(|g| {
+            (
+                g["route"].as_str().unwrap().to_owned(),
+                g["forked"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [("/egress".to_owned(), 1), ("/sql".to_owned(), 2)],
+        "{diff}"
+    );
+
+    // A second replay replaces the copy (review H11): the new one answers.
+    d.ok(
+        "POST",
+        &format!("/v1/forks/{fork}/replay"),
+        json!({"mode": "continuous", "reason": "m14 test"}),
+    );
+    let again: Vec<String> = containers(RUNSC, &runsc_root, "-quiet")
+        .into_iter()
+        .filter(|c| c.starts_with("kronik-copy-"))
+        .collect();
+    assert_eq!(again.len(), 1, "{again:?}");
+    assert_ne!(again, copies);
+    assert!(!copy_dir.exists());
+
+    // The copy's state followed the fork: the checkpoint's two rows, the
+    // replayed third, the fork's fourth. Its answers are real and forked.
+    let send = |text: &str| {
+        d.ok(
+            "POST",
+            &format!("/v1/forks/{fork}/actors/counter/c1/messages"),
+            json!({"name": "fetch-ok", "text": text, "reason": "m14 test"}),
+        )
+    };
+    let v = send("POST foreign://pg/sql\n\nINSERT INTO t SELECT 5");
+    assert_eq!(v["reply"]["text"], "200 ", "{v}");
+    assert_eq!(v["effects"][0]["grounding"], "forked", "{v}");
+    let v = send(&format!("POST foreign://pg/sql\n\n{count}"));
+    assert_eq!(v["reply"]["text"], format!("200 5:{count} v2\n"), "{v}");
+    // The copy cannot reach the network.
+    let v = send("GET foreign://pg/egress");
+    let r = v["reply"]["text"].as_str().unwrap();
+    assert!(r.starts_with("200 unreachable"), "{v}");
+    assert_eq!(v["effects"][0]["grounding"], "forked", "{v}");
+    // Production did not see the fork's rows.
+    assert_eq!(sql(count), format!("200 4:{count}\n"));
+
+    // Deleting the fork deletes the copy, its namespace and its disk.
+    d.ok(
+        "DELETE",
+        &format!("/v1/forks/{fork}"),
+        json!({"reason": "m14 test"}),
+    );
+    assert!(
+        !containers(RUNSC, &runsc_root, "-quiet")
+            .iter()
+            .any(|c| c.starts_with("kronik-copy-")),
+        "{}",
+        d.serve_log()
+    );
+    assert!(!dir.join("data/branches").join(&fork).exists());
+    let netns: Vec<String> = std::fs::read_dir(dir.join("run/netns"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(!netns.iter().any(|n| n.starts_with("copy-")), "{netns:?}");
+    assert_eq!(
+        containers(RUNSC, &runsc_root, "-quiet"),
+        [kronik_foreign::Foreign::container_id("pg")]
+    );
+}
+
+/// A `fork_mode = "sandbox"` echo with a `memory` limit on a fresh daemon
+/// started with `extra`.
+fn sandbox_echo(prefix: &str, extra: &[&str], memory: u64) -> (PathBuf, Cleanup, Daemon) {
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in("/var/tmp")
+        .unwrap()
+        .keep();
+    let cleanup = Cleanup(dir.clone());
+    let d = Daemon::start_with(&dir, extra);
+    let image = format!("oci-layout:{}", layout().canonicalize().unwrap().display());
+    d.ok(
+        "POST",
+        "/v1/foreign",
+        json!({"name": "echo", "image": image, "port": 8080, "fork_mode": "sandbox",
+               "memory_bytes": memory, "reason": "m14 test"}),
+    );
+    d.wait_until("echo running", |d| {
+        d.foreign("echo")["status"]["state"] == "running"
+    });
+    (dir, cleanup, d)
+}
+
+/// `runsc state`'s status of the production sandbox of `name`.
+fn sandbox_status(dir: &Path, name: &str) -> String {
+    let out = Command::new(RUNSC)
+        .arg("--root")
+        .arg(dir.join("run/runsc"))
+        .args(["state", &kronik_foreign::Foreign::container_id(name)])
+        .output()
+        .unwrap();
+    serde_json::from_slice::<Value>(&out.stdout)
+        .ok()
+        .and_then(|v| v["status"].as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// Review M14-H1: a client that leaves `POST /v1/snapshots` while a sandbox
+/// actor is paused for its checkpoint does not leave it paused: the
+/// checkpoint runs on its own task, resumes the sandbox and is kept.
+#[test]
+fn a_dropped_snapshot_request_leaves_no_sandbox_paused() {
+    if !should_run() {
+        return;
+    }
+    let (dir, _cleanup, d) = sandbox_echo("kronik-m14-h1-", &[], 512 << 20);
+    // The pause covers the copy of the data: ballast makes it long enough to
+    // see between two `runsc state` calls on a busy machine.
+    std::fs::write(
+        dir.join("data/foreign/actors/echo/data/ballast"),
+        vec![1u8; 256 << 20],
+    )
+    .unwrap();
+    let body = json!({"reason": "m14 test"}).to_string();
+    // The newest checkpoint's LSN: retention keeps a fixed number of them,
+    // so their count stops growing (review M14 round 4).
+    let checkpoints = |d: &Daemon| newest_checkpoint(d, "echo");
+    for attempt in 1..=5 {
+        let before = checkpoints(&d);
+        let mut s = UnixStream::connect(dir.join("api.sock")).unwrap();
+        write!(
+            s,
+            "POST /v1/snapshots HTTP/1.1\r\nhost: kronik\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut paused = false;
+        while Instant::now() < deadline && checkpoints(&d) == before {
+            if sandbox_status(&dir, "echo") == "paused" {
+                paused = true;
+                break;
+            }
+        }
+        drop(s);
+        if !paused {
+            eprintln!("attempt {attempt}: the pause was not seen");
+            d.wait_until("the checkpoint", |d| checkpoints(d) > before);
+            continue;
+        }
+        d.wait_until("the sandbox to resume", |_| {
+            sandbox_status(&dir, "echo") == "running"
+        });
+        d.wait_until("the checkpoint", |d| checkpoints(d) > before);
+        return;
+    }
+    panic!("never saw the sandbox paused: {}", d.serve_log());
+}
+
+/// The LSN of `name`'s newest checkpoint (0: none).
+fn newest_checkpoint(d: &Daemon, name: &str) -> u64 {
+    d.foreign(name)["checkpoints"].as_array().map_or(0, |c| {
+        c.iter()
+            .filter_map(|c| c["lsn"].as_u64())
+            .max()
+            .unwrap_or(0)
+    })
+}
+
+/// Review M14 P1 (round 4): a checkpoint still running for a snapshot whose
+/// client left holds the actor's call gate. A second snapshot right after it
+/// does not keep main drained while it waits for that gate: it skips the
+/// actor, and main serves while the first checkpoint still runs.
+#[test]
+fn a_second_snapshot_does_not_stall_main_behind_a_detached_checkpoint() {
+    if !should_run() {
+        return;
+    }
+    let (dir, _cleanup, d) = sandbox_echo("kronik-m14-p1-", &[], 512 << 20);
+    let wasm = base64::engine::general_purpose::STANDARD
+        .encode(std::fs::read(Path::new(ROOT).join("tests/guests/counter.wasm")).unwrap());
+    d.ok(
+        "POST",
+        "/v1/deployments",
+        json!({"wasm_base64": wasm, "reason": "m14 test"}),
+    );
+    let increment = |d: &Daemon| {
+        d.ok(
+            "POST",
+            "/v1/actors/counter/c1/messages",
+            json!({"name": "increment", "text": "", "reason": "m14 test"}),
+        );
+    };
+    increment(&d);
+    // A long first checkpoint: the data is copied inside its pause.
+    std::fs::write(
+        dir.join("data/foreign/actors/echo/data/ballast"),
+        vec![1u8; 2 << 30],
+    )
+    .unwrap();
+    let body = json!({"reason": "m14 test"}).to_string();
+    let mut s = UnixStream::connect(dir.join("api.sock")).unwrap();
+    write!(
+        s,
+        "POST /v1/snapshots HTTP/1.1\r\nhost: kronik\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while sandbox_status(&dir, "echo") != "paused" {
+        assert!(
+            Instant::now() < deadline,
+            "never saw the first checkpoint's pause"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(s);
+    std::thread::scope(|scope| {
+        let second = scope.spawn(|| d.ok("POST", "/v1/snapshots", json!({"reason": "m14 test"})));
+        std::thread::sleep(Duration::from_millis(300));
+        increment(&d);
+        assert_eq!(
+            sandbox_status(&dir, "echo"),
+            "paused",
+            "main waited for the first checkpoint: {}",
+            d.serve_log()
+        );
+        second.join().unwrap();
+    });
+    d.wait_until("the sandbox to resume", |_| {
+        sandbox_status(&dir, "echo") == "running"
+    });
+}
+
+/// Review M14 M2: the checkpoint's size check counts the sandbox's memory
+/// (its limit), not only its data: with less room above `[log]
+/// disk_reserve` than that, the snapshot is taken and no checkpoint. The
+/// room is half the free space (other work on the machine moves it), the
+/// limit 1 TiB.
+#[test]
+fn a_checkpoint_counts_the_sandbox_memory_against_the_reserve() {
+    if !should_run() {
+        return;
+    }
+    // Room for the (tiny) data, not for the memory image.
+    let df = Command::new("df")
+        .args(["-B1", "--output=avail", "/var/tmp"])
+        .output()
+        .unwrap();
+    let free: u64 = String::from_utf8_lossy(&df.stdout)
+        .lines()
+        .nth(1)
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap();
+    let reserve = format!("{}B", free / 2);
+    let (_dir, _cleanup, d) =
+        sandbox_echo("kronik-m14-m2-", &["--disk-reserve", &reserve], 1 << 40);
+    d.ok("POST", "/v1/snapshots", json!({"reason": "m14 test"}));
+    assert_eq!(
+        d.foreign("echo")["checkpoints"],
+        json!([]),
+        "{}",
+        d.serve_log()
+    );
+    assert!(d.serve_log().contains("no checkpoint"), "{}", d.serve_log());
+}

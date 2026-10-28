@@ -62,6 +62,8 @@ pub enum Record {
     Erasure(pb::Erasure),
     EngineUpgrade(pb::EngineUpgrade),
     SnapshotMarker(pb::SnapshotMarker),
+    SimulatorConfig(pb::SimulatorConfig),
+    StateRebase(pb::StateRebase),
     GuardTriggered(pb::GuardTriggered),
 }
 
@@ -81,10 +83,11 @@ pub mod kind {
     pub const ERASURE: u8 = 12;
     pub const ENGINE_UPGRADE: u8 = 13;
     pub const SNAPSHOT_MARKER: u8 = 14;
-    // 15 and 16 are reserved for other milestones.
+    pub const SIMULATOR_CONFIG: u8 = 15;
+    pub const STATE_REBASE: u8 = 16;
     pub const GUARD_TRIGGERED: u8 = 17;
     /// All valid kinds, in order.
-    pub const ALL: [u8; 15] = [
+    pub const ALL: [u8; 17] = [
         TURN_BEGIN,
         EFFECT_RESULT,
         TURN_RECORD,
@@ -99,6 +102,8 @@ pub mod kind {
         ERASURE,
         ENGINE_UPGRADE,
         SNAPSHOT_MARKER,
+        SIMULATOR_CONFIG,
+        STATE_REBASE,
         GUARD_TRIGGERED,
     ];
 }
@@ -121,6 +126,8 @@ impl Record {
             Record::Erasure(_) => kind::ERASURE,
             Record::EngineUpgrade(_) => kind::ENGINE_UPGRADE,
             Record::SnapshotMarker(_) => kind::SNAPSHOT_MARKER,
+            Record::SimulatorConfig(_) => kind::SIMULATOR_CONFIG,
+            Record::StateRebase(_) => kind::STATE_REBASE,
             Record::GuardTriggered(_) => kind::GUARD_TRIGGERED,
         }
     }
@@ -142,6 +149,8 @@ impl Record {
             Record::Erasure(m) => m.encode_to_vec(),
             Record::EngineUpgrade(m) => m.encode_to_vec(),
             Record::SnapshotMarker(m) => m.encode_to_vec(),
+            Record::SimulatorConfig(m) => m.encode_to_vec(),
+            Record::StateRebase(m) => m.encode_to_vec(),
             Record::GuardTriggered(m) => m.encode_to_vec(),
         }
     }
@@ -166,6 +175,8 @@ impl Record {
             kind::ERASURE => Record::Erasure(de(kind, bytes)?),
             kind::ENGINE_UPGRADE => Record::EngineUpgrade(de(kind, bytes)?),
             kind::SNAPSHOT_MARKER => Record::SnapshotMarker(de(kind, bytes)?),
+            kind::SIMULATOR_CONFIG => Record::SimulatorConfig(de(kind, bytes)?),
+            kind::STATE_REBASE => Record::StateRebase(de(kind, bytes)?),
             kind::GUARD_TRIGGERED => Record::GuardTriggered(de(kind, bytes)?),
             other => return Err(DecodeError::UnknownKind(other)),
         };
@@ -183,19 +194,7 @@ impl Record {
             }
             Record::EffectResult(m) => effect(m.effect.as_ref(), "EffectResult.effect"),
             Record::TurnRecord(m) => turn_record(m),
-            Record::Deployment(m) => {
-                enum_value::<pb::DeploymentCause>(m.cause, "Deployment.cause")?;
-                for k in &m.kinds {
-                    if k.kind.is_empty() || k.code_hash.len() != 32 {
-                        return Err(invalid(
-                            "Deployment.kinds",
-                            "kind and 32-byte code_hash required",
-                        ));
-                    }
-                    some(k.manifest.as_ref(), "KindVersion.manifest")?;
-                }
-                Ok(())
-            }
+            Record::Deployment(m) => deployment(m),
             Record::Grant(m) => {
                 enum_value::<pb::GrantOp>(m.op, "Grant.op")?;
                 if let Some(delivery) = m.delivery {
@@ -210,18 +209,114 @@ impl Record {
                 if m.op == pb::ForeignOp::Add as i32 {
                     enum_value::<pb::Isolation>(m.isolation, "ForeignActor.isolation")?;
                 }
+                if !matches!(m.fork_mode.as_str(), "" | "recorded" | "sandbox") {
+                    return Err(invalid(
+                        "ForeignActor.fork_mode",
+                        "recorded or sandbox required",
+                    ));
+                }
                 Ok(())
             }
             Record::BranchCreated(_)
             | Record::Erasure(_)
             | Record::EngineUpgrade(_)
             | Record::SnapshotMarker(_) => Ok(()),
+            Record::SimulatorConfig(m) => {
+                let ok = m.target.split_once(':').is_some_and(|(scheme, host)| {
+                    matches!(scheme, "http" | "foreign") && !host.is_empty()
+                });
+                if !ok {
+                    return Err(invalid(
+                        "SimulatorConfig.target",
+                        "http:<host> or foreign:<name> required",
+                    ));
+                }
+                Ok(())
+            }
+            Record::StateRebase(m) => {
+                if m.rebase_id.is_empty() {
+                    return Err(invalid("StateRebase.rebase_id", "required"));
+                }
+                match &m.part {
+                    Some(pb::state_rebase::Part::Turn(t)) => {
+                        turn_record(some(t.record.as_ref(), "RebasedTurn.record")?)
+                    }
+                    Some(pb::state_rebase::Part::Switch(s)) => {
+                        deployment(some(s.deployment.as_ref(), "RebaseSwitch.deployment")?)?;
+                        let range_ok = if s.turns == 0 {
+                            s.first_turn_lsn == 0 && s.last_turn_lsn == 0
+                        } else {
+                            s.base_lsn < s.first_turn_lsn
+                                && s.first_turn_lsn <= s.last_turn_lsn
+                                && s.last_turn_lsn - s.first_turn_lsn + 1 >= s.turns
+                        };
+                        if !range_ok {
+                            return Err(invalid(
+                                "RebaseSwitch.turns",
+                                "turn LSN range after base_lsn holding `turns` records required",
+                            ));
+                        }
+                        Ok(())
+                    }
+                    None => Err(invalid("StateRebase.part", "turn or switch required")),
+                }
+            }
             Record::GuardTriggered(m) => {
                 enum_value::<pb::GuardAction>(m.action, "GuardTriggered.action")?;
                 enum_value::<pb::GuardOutcome>(m.outcome, "GuardTriggered.outcome")
             }
         }
     }
+
+    /// The turn a record holds: a `TurnRecord`, or a rebased turn copied
+    /// into main's log by a rollback via replay (ADR 0017).
+    pub fn turn(&self) -> Option<&pb::TurnRecord> {
+        match self {
+            Record::TurnRecord(t) => Some(t),
+            Record::StateRebase(pb::StateRebase {
+                part: Some(pb::state_rebase::Part::Turn(t)),
+                ..
+            }) => t.record.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// [`Record::turn`], mutable (reseal).
+    pub fn turn_mut(&mut self) -> Option<&mut pb::TurnRecord> {
+        match self {
+            Record::TurnRecord(t) => Some(t),
+            Record::StateRebase(pb::StateRebase {
+                part: Some(pb::state_rebase::Part::Turn(t)),
+                ..
+            }) => t.record.as_mut(),
+            _ => None,
+        }
+    }
+
+    /// The switch of a rollback via replay, if this is one.
+    pub fn rebase_switch(&self) -> Option<(&str, &pb::RebaseSwitch)> {
+        match self {
+            Record::StateRebase(pb::StateRebase {
+                rebase_id,
+                part: Some(pb::state_rebase::Part::Switch(s)),
+            }) => Some((rebase_id, s)),
+            _ => None,
+        }
+    }
+}
+
+fn deployment(m: &pb::Deployment) -> Result<(), DecodeError> {
+    enum_value::<pb::DeploymentCause>(m.cause, "Deployment.cause")?;
+    for k in &m.kinds {
+        if k.kind.is_empty() || k.code_hash.len() != 32 {
+            return Err(invalid(
+                "Deployment.kinds",
+                "kind and 32-byte code_hash required",
+            ));
+        }
+        some(k.manifest.as_ref(), "KindVersion.manifest")?;
+    }
+    Ok(())
 }
 
 fn enum_value<E: TryFrom<i32>>(value: i32, what: &'static str) -> Result<(), DecodeError> {
@@ -465,8 +560,8 @@ mod tests {
             Err(DecodeError::UnknownKind(0))
         ));
         assert!(matches!(
-            Record::decode(15, &[]),
-            Err(DecodeError::UnknownKind(15))
+            Record::decode(18, &[]),
+            Err(DecodeError::UnknownKind(18))
         ));
     }
 

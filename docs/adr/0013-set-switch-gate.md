@@ -22,8 +22,9 @@ stays.
 
 ## Decision
 
-- `Node` has `switch_gate: Arc<tokio::sync::RwLock<()>>` (shared, so a
-  switch's own task can hold an owned write guard). A turn takes its
+- The node's turn gate (`kronik-sched` `gate.rs`, `TurnGate`) holds the
+  switch gate, an `Arc<tokio::sync::RwLock<()>>` (shared, so a switch's own
+  task can hold an owned write guard). A turn takes its
   kind's code and the configuration epoch together under a read guard and
   passes the epoch into `run_turn` (and into the record of an input that
   could not run). After a job's migrate turn commits, it takes them again;
@@ -37,7 +38,7 @@ stays.
   without it. The append and the swap run on a task of their own that owns
   the deploy lock and the write guard, so a caller that goes away (a client
   disconnect) cannot leave a `Deployment` committed with the old code
-  running (`a_cancelled_code_switch_still_installs_its_code`).
+  running (`a_cancelled_set_switch_still_installs_its_code`).
 - So every turn starts either before the switch, with the old code of every
   kind and an epoch below the new one, or after the `Deployment` is
   applied, with the new code of every kind. Turns that arrive during the
@@ -86,3 +87,5 @@ stays.
   it replaced; nothing in it depends on timing.
 - In a cluster (M16) the epoch becomes an LSN per shard; the gate is per
   node, so that milestone has to keep the same rule per shard.
+- M13's rebase switch goes through the same gate and install path; the
+  pause it needs is the gate's drain (ADR 0018).
