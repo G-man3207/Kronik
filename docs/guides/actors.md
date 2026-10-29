@@ -67,14 +67,40 @@ Rust SDK's `Ctx`: `state`, `sql`, `http`, `crypto`, `secrets`, `timers`,
 - The API is synchronous: the host does the waiting.
 - Every input runs as one turn on a fresh instance; module-level variables do
   not survive it, and module scope runs once, at build time.
-- A handler that throws fails the turn and discards its writes: `Rejected`
-  becomes `handler-error::rejected`, anything else `handler-error::failed`
-  with the error's name and message.
+- A handler that throws (or an `async` handler whose promise rejects) fails
+  the turn and discards its writes: `Rejected` becomes
+  `handler-error::rejected`, anything else `handler-error::failed` with the
+  error's name and message.
 - Failed host calls throw `KronikError`, whose message names a
   `kronik explain` topic.
 - `console.log` and friends write to the turn's log.
-- There is no `fetch`, file system or process: the component imports only
-  what the [allowlist](../reference/wit.md#wasi-and-the-import-allowlist) allows.
+- Standard `fetch` works (M22): each request is an `http.fetch` effect, as
+  `ctx.http.fetch` is, with the same grants (`http:<host>`), recording,
+  replay and simulators in forks. A handler that calls it is `async`:
+
+  ```ts
+  async http(req, ctx) {
+    const [a, b] = await Promise.all([
+      fetch("https://api.example.com/a", { headers: { authorization: "Bearer {{secret:api-key}}" } }),
+      fetch("https://api.example.com/b"),
+    ]);
+    return ctx.json(200, { a: a.status, b: await b.json() });
+  },
+  ```
+
+  A header value with `{{secret:NAME}}` gets the secret inserted by the
+  host (it needs `secret:NAME`); the actor never holds the value. Requests
+  run one at a time, in the order their bodies complete, while the handler
+  waits. Every failure (a missing grant, a network error, a timeout) is the
+  same `TypeError` from `fetch`: use `ctx.http.fetch` when the kind of error
+  matters, and for `foreign://` URLs. `examples/uptime-ts` uses `fetch`.
+  Await every `fetch`: a request the handler never waits for is never
+  sent, and the turn's log warns about it. A request is bounded by the
+  effect timeout. Time does not move during a turn, so a `setTimeout` or
+  `AbortSignal.timeout` is due at once: racing one against `fetch` does
+  not bound the request, and it ends the same way in replay.
+- There is no file system or process: the component imports only what the
+  [allowlist](../reference/wit.md#wasi-and-the-import-allowlist) allows.
 
 ### Fuel in JavaScript
 
@@ -199,8 +225,9 @@ against 2.3 million for an empty JavaScript turn.
 fails, like `kronik deploy`, if the component imports an interface outside
 the allowlist (`IMPORT_NOT_ALLOWED`).
 
-- TypeScript: `tsc --noEmit`, then `jco componentize` with the HTTP,
-  fetch-event and stdio features disabled ([ADR 0002](../adr/0002-typescript-components.md))
+- TypeScript: `tsc --noEmit`, then `jco componentize` with the fetch-event
+  and stdio features disabled ([ADR 0002](../adr/0002-typescript-components.md);
+  `fetch` stays on, [ADR 0070](../adr/0070-wasi-http-outgoing-handler.md))
   on an entry that exports the default export of `package.json`'s
   `kronik.entry` (default `src/actor.ts`). ComponentizeJS output differs from
   build to build, so `kronik build` keeps the previous component when no

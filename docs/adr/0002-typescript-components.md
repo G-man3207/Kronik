@@ -136,7 +136,9 @@ These are SDK obligations for M4, observed with the raw bindings:
   today' }` gives `handler-error::rejected("not today")`.
 - **No `fetch`.** The `http` and `fetch-event` features are off; outgoing
   HTTP is `kronik:actor/http-client` through the SDK's `http.fetch`. (Standard
-  `fetch` through the effect layer is a later item in the brief.)
+  `fetch` through the effect layer is a later item in the brief.) Since M22
+  `http` is on: standard `fetch` is the `http.fetch` effect
+  ([ADR 0070](0070-wasi-http-outgoing-handler.md)).
 - **Module scope runs at build time,** under Wizer: whatever it computes is
   part of the snapshot (section 5).
 - **Module-level variables do not survive a turn** (I3): the probe's turn

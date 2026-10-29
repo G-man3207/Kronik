@@ -76,6 +76,7 @@
 - [ADR 0027: systemd unit hardening and runsc](adr/0027-systemd-unit-hardening.md)
 - [ADR 0030: Python and Go components](adr/0030-python-go-components.md)
 - [ADR 0031: A diff with pii-masked turns needs an approval](adr/0031-pii-masked-approval-floor.md)
+- [ADR 0070: Standard fetch through wasi:http as an http.fetch effect](adr/0070-wasi-http-outgoing-handler.md)
 - [ADR 0080: Spans are built from committed turn records](adr/0080-spans-from-the-log.md)
 - [ADR 0081: OTLP over HTTP with vendored protos, no OpenTelemetry crates](adr/0081-otlp-over-http-without-otel-crates.md)
 - [ADR 0082: What telemetry and audit export may carry off the node](adr/0082-what-leaves-the-node.md)

@@ -164,8 +164,11 @@ open, with the alternatives and the measurements behind them:
   instance per turn from a pre-linked component in a pooling allocator,
   deterministic WASI and the deploy-time import allowlist.
 - [ADR 0002](../adr/0002-typescript-components.md): TypeScript components
-  built with jco and ComponentizeJS, without the `http`, `fetch-event` and
-  `stdio` features, so that they stay inside the allowlist (M4).
+  built with jco and ComponentizeJS, without the `fetch-event` and `stdio`
+  features, so that they stay inside the allowlist (M4; `http` until M22).
+- [ADR 0070](../adr/0070-wasi-http-outgoing-handler.md): standard `fetch`
+  through `wasi:http/outgoing-handler` as `http.fetch` effects, driven only
+  while the guest waits (M22).
 - [ADR 0003](../adr/0003-gvisor-bridge.md): foreign actors in gVisor with
   `runsc` on the `systrap` platform, which needs no KVM, in a network
   namespace with only loopback, reached through `runsc port-forward

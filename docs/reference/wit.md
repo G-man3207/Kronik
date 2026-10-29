@@ -473,15 +473,15 @@ reads the component's imports before compiling it and accepts only these:
 | Package | Interfaces | Version | Host implementation |
 | --- | --- | --- | --- |
 | `kronik:actor` | `types`, `state`, `sql`, `context`, `messaging`, `timers`, `http-client`, `crypto`, `secrets`, `log`, `privacy` | `0.1.x` | Kronik |
-| `wasi:io` | `error`, `poll`, `streams` | `0.2.x` | Wasmtime's |
+| `wasi:io` | `error`, `poll`, `streams` | `0.2.x` | Wasmtime's; `poll`, `pollable.block` and the blocking stream calls first run the turn's outgoing `wasi:http` requests, and a wait that could never end traps |
 | `wasi:clocks` | `wall-clock`, `monotonic-clock` | `0.2.x` | Logical time, 1 ms resolution; sleeps return at once |
 | `wasi:random` | `random`, `insecure`, `insecure-seed` | `0.2.x` | ChaCha20 from the turn's seed |
 | `wasi:cli` | `environment`, `exit`, `stdin`, `stdout`, `stderr`, `terminal-input`, `terminal-output`, `terminal-stdin`, `terminal-stdout`, `terminal-stderr` | `0.2.x` | Empty environment, no arguments, empty stdin; stdout and stderr become log events; `exit` traps |
+| `wasi:http` | `types`, `outgoing-handler` | `0.2.x` | Each request is an [`http.fetch` effect](#standard-fetch-wasihttp) (M22) |
 
 Everything else is rejected, including `wasi:filesystem`, `wasi:sockets`,
-`wasi:http`, `wasi:clocks/timezone`, WASI 0.3, other packages, unversioned
-names and bare function imports. Outgoing HTTP goes through
-[`http-client`](#http-client) instead. Deploy then fails with
+`wasi:http/incoming-handler`, `wasi:clocks/timezone`, WASI 0.3, other
+packages, unversioned names and bare function imports. Deploy then fails with
 [`IMPORT_NOT_ALLOWED`](../errors.md#import_not_allowed), and the message
 lists the offending imports in this form:
 
@@ -495,16 +495,59 @@ interfaces, so a component that got past the check still could not
 instantiate. A Rust component built for `wasm32-wasip2` stays inside the
 allowlist ([ADR 0001](../adr/0001-wasmtime-determinism.md), §9), and so does
 a TypeScript component built with jco and ComponentizeJS without the
-`http`, `fetch-event` and `stdio` features
-([ADR 0002](../adr/0002-typescript-components.md), M4).
+`fetch-event` and `stdio` features
+([ADR 0002](../adr/0002-typescript-components.md), M4). Its standard `fetch`
+imports `wasi:http/types` and `wasi:http/outgoing-handler`, which are allowed
+since M22: each request is an `http.fetch` effect
+([ADR 0070](../adr/0070-wasi-http-outgoing-handler.md)).
+
+## Standard fetch (wasi:http)
+
+Since M22 a component may send HTTP requests through
+`wasi:http/outgoing-handler`, which is what a TypeScript `fetch` does
+([ADR 0070](../adr/0070-wasi-http-outgoing-handler.md)). Each request is an
+`http.fetch` effect, as with [`http-client`](#http-client): the same
+capability (`http:<host>`), delivery class, rate limit, recording, replay,
+fork matching and simulators.
+
+- A request runs when the guest waits (`wasi:io/poll`, `pollable.block` or a
+  blocking stream call) and its body is complete. Requests run one at a
+  time, in the order they were started among those whose bodies are
+  complete; each takes the turn's next operation ordinal when it runs.
+- A header value with one `{{secret:NAME}}` is a secret header: the host
+  inserts the secret, with the rest of the value as its template (`Bearer
+  {{secret:api-key}}` is the template `Bearer {}`). It needs `secret:NAME`;
+  the guest never holds the value, and responses are scrubbed of it. Two
+  placeholders in one value, or a literal `{}` beside one, are not sent.
+- The request body counts against `message_bytes`, like `http-client`'s;
+  responses are read whole within the effect limits. Trailers are not
+  supported, and `request-options` timeouts are ignored (the effect timeout
+  applies). A turn may have 32 requests that it has not waited for.
+- Errors arrive as `wasi:http` error codes: denied (a missing capability
+  or secret) is `HTTP-request-denied`, a timeout
+  `HTTP-response-timeout`, an answer over the limit
+  `HTTP-response-body-size`, a network error or an unknown outcome
+  `internal-error` with the reason (`outcome-unknown`). In TypeScript every
+  one of them is a `TypeError` from `fetch`; use `ctx.http.fetch` when the
+  kind of error matters.
+- A request whose future the guest drops before it waits is never sent,
+  and so is one still unwaited when the turn ends; the turn's log then has
+  a warning (`wasi:http: N request(s) the turn never waited for were not
+  sent`). A clock pollable is ready at once (time does not move during a
+  turn), so a timeout raced against a request, such as `AbortSignal.timeout`
+  in TypeScript, does not bound it; the effect timeout does. A
+  wait that could never end, such as one for the response to a request
+  whose body was never finished, fails the turn at once.
 
 ## Not in v0.1
 
 - Blobs: `blob-ref` and `http-body::blob` trap until M25, and
   `message.blobs` must stay empty until M26.
-- `wasi:filesystem`, `wasi:sockets` and `wasi:http`: no files or sockets,
-  and outgoing HTTP only through `http-client`. WASI 0.3 and a recorded
-  `wasi:http` are planned for M22.
+- `wasi:filesystem`, `wasi:sockets` and `wasi:http/incoming-handler`: no
+  files or sockets, and no inbound HTTP but the gateway's. Outgoing HTTP is
+  `http-client` or, since M22, `wasi:http/outgoing-handler` (both the
+  `http.fetch` effect). WASI 0.3 waits for Wasmtime to support it stably
+  ([ADR 0070](../adr/0070-wasi-http-outgoing-handler.md) §5).
 - Threads and shared memory.
 - `foreign://` URLs before M7.
 

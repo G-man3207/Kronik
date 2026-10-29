@@ -10,7 +10,7 @@ target=wasm32-wasip2/release/kronik_test_actor.wasm
 cargo build --locked --release --target wasm32-wasip2 --target-dir target/counter
 cargo build --locked --release --target wasm32-wasip2 --target-dir target/notes --features notes
 cargo build --locked --release --target wasm32-wasip2 --target-dir target/fs-probe --features fs-probe
-for v in step2 body-v2 fail-get fetch-extra schema1 calls-tally route-tally respond fail-line; do
+for v in step2 body-v2 fail-get fetch-extra schema1 calls-tally route-tally respond fail-line wasi-http; do
   cargo build --locked --release --target wasm32-wasip2 --target-dir "target/$v" --features "$v"
   cp "target/$v/$target" "../counter-$v.wasm"
 done
@@ -26,6 +26,9 @@ done
 # code would not make.
 cargo build --locked --release --target wasm32-wasip2 --target-dir target/schema1-extra --features "schema1,fetch-extra"
 cp "target/schema1-extra/$target" ../counter-schema1-extra.wasm
+# Standard fetch (M22): the wasi:http build that also GETs <url>/extra.
+cargo build --locked --release --target wasm32-wasip2 --target-dir target/wasi-http-extra --features "wasi-http,fetch-extra"
+cp "target/wasi-http-extra/$target" ../counter-wasi-http-extra.wasm
 cp "target/counter/$target" ../counter.wasm
 cp "target/notes/$target" ../notes.wasm
 cp "target/fs-probe/$target" ../fs-probe.wasm

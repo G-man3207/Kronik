@@ -2,10 +2,11 @@
 //!
 //! A component may import Kronik's own interfaces plus a deterministic WASI
 //! subset: `wasi:clocks` (logical time), `wasi:random` (turn seed), `wasi:cli`
-//! (stdout/stderr become log events, empty environment, no args) and the
-//! `wasi:io` streams those need. Everything else (`wasi:filesystem`,
-//! `wasi:sockets`, `wasi:http`, unknown packages, bare function imports,
-//! unversioned names) is rejected.
+//! (stdout/stderr become log events, empty environment, no args), outgoing
+//! `wasi:http` (`types` and `outgoing-handler`, the `http.fetch` effect, M22)
+//! and the `wasi:io` streams those need. Everything else (`wasi:filesystem`,
+//! `wasi:sockets`, `wasi:http/incoming-handler`, WASI 0.3, unknown packages,
+//! bare function imports, unversioned names) is rejected.
 //!
 //! The check works on the component bytes alone, before compilation, by
 //! reading the top-level import section of the outer component. Imports of
@@ -49,6 +50,7 @@ const WASI_INTERFACES: &[(&str, &[&str])] = &[
             "terminal-stderr",
         ],
     ),
+    ("http", &["types", "outgoing-handler"]),
 ];
 
 #[derive(Debug)]
@@ -152,6 +154,9 @@ mod tests {
         assert!(is_allowed("wasi:clocks/wall-clock@0.2.0"));
         assert!(is_allowed("wasi:random/insecure-seed@0.2.3"));
         assert!(is_allowed("wasi:cli/terminal-stderr@0.2.12"));
+        // ComponentizeJS 0.23's `fetch` (M22).
+        assert!(is_allowed("wasi:http/types@0.2.10"));
+        assert!(is_allowed("wasi:http/outgoing-handler@0.2.10"));
     }
 
     #[test]
@@ -159,7 +164,9 @@ mod tests {
         assert!(!is_allowed("wasi:filesystem/types@0.2.12"));
         assert!(!is_allowed("wasi:filesystem/preopens@0.2.12"));
         assert!(!is_allowed("wasi:sockets/tcp@0.2.12"));
-        assert!(!is_allowed("wasi:http/outgoing-handler@0.2.12"));
+        assert!(!is_allowed("wasi:http/incoming-handler@0.2.12"));
+        assert!(!is_allowed("wasi:http/handler@0.3.0"));
+        assert!(!is_allowed("wasi:http/types@0.3.0"));
         assert!(!is_allowed("wasi:clocks/timezone@0.2.12"));
         assert!(!is_allowed("wasi:io/streams@0.3.0"));
         assert!(!is_allowed("wasi:io/streams"));

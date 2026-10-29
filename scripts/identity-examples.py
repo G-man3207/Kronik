@@ -24,6 +24,10 @@ The traffic:
   inserted by the host. Also: a 500 retried by timer, a 400, a host that
   is not granted, and a configure message with a bad target, which becomes
   a dead letter and is resent.
+- uptime-ts: standard `fetch` (M22): two targets fetched at once, which
+  answer after random delays, a bearer token inserted by the host, a host
+  that is not granted (a TypeError in the guest), and a configure message
+  with a bad target, a dead letter, resent.
 - todo-ts: items added, changed, done and deleted. Then the daemon restarts
   a day later: libfaketime moves its wall clock 25 h ahead, so the sweep
   timer fires and removes the done items. Also a message, which todo does
@@ -41,6 +45,7 @@ import argparse
 import base64
 import json
 import os
+import random
 import shutil
 import socket
 import subprocess
@@ -285,6 +290,78 @@ def relay_traffic(ex):
     ex.dead_letter_resent("webhook-relay/acme", "configure", {"target": "ftp://example.com/"})
 
 
+# ------------------------------------------------------------------ uptime
+
+
+class UptimeTarget:
+    """What uptime-ts checks: /up answers 200, /down 503, each after a random
+    delay of up to 30 ms (the answers arrive in varying order)."""
+
+    def __init__(self):
+        target = self
+        self.requests, self.lock = [], threading.Lock()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                time.sleep(random.random() * 0.03)
+                with target.lock:
+                    target.requests.append({"path": self.path,
+                                            "headers": {k.lower(): v for k, v in self.headers.items()}})
+                body = b"ok" if self.path == "/up" else b"maintenance"
+                self.send_response(200 if self.path == "/up" else 503)
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def uptime_setup(ex):
+    ex.secret("uptime-token", "tok-uptime-identity")
+    ex.grant("uptime", "secret:uptime-token")
+    ex.grant("uptime", "http:127.0.0.1")
+
+
+def uptime_traffic(ex):
+    target = UptimeTarget()
+    ex.services.append(target.stop)
+    ex.send("uptime/shop", "configure", {"targets": [f"{target.url}/up", f"{target.url}/down"]})
+    for _ in range(3):
+        check = ex.expect("POST", "/uptime/shop/check", 200)
+        ex.check("both answers, in target order", [r.get("status") for r in check["results"]] == [200, 503], check)
+    ex.send("uptime/shop", "configure", {"token_secret": "uptime-token"})
+    ex.expect("POST", "/uptime/shop/check", 200)
+    sent = target.requests[-1]["headers"]
+    ex.check("the token is inserted by the host", sent.get("authorization") == "Bearer tok-uptime-identity", sent)
+    # M22 criterion 2: the value is in no file of the daemon (the log, the
+    # state, the stores hold it sealed) and not in its output.
+    for root, _, files in os.walk(ex.dir):
+        for f in files:
+            if not os.path.isfile(os.path.join(root, f)):  # the API socket
+                continue
+            with open(os.path.join(root, f), "rb") as fh:
+                ex.check(f"the token is not in {os.path.relpath(os.path.join(root, f), ex.dir)}",
+                         b"tok-uptime-identity" not in fh.read())
+    # A host that is not granted fails as a TypeError; the other target answers.
+    ex.send("uptime/blog", "configure", {"targets": [f"{target.url}/up", "http://localhost:9/"]})
+    check = ex.expect("POST", "/uptime/blog/check", 200)
+    ex.check("an ungranted host fails, the other answers",
+             check["results"][0].get("status") == 200 and check["results"][1].get("error", "").startswith("TypeError"),
+             check)
+    ex.expect("GET", "/uptime/shop", 200)
+    ex.expect("GET", "/uptime/none", 404)
+    ex.dead_letter_resent("uptime/shop", "configure", {"targets": ["ftp://example.com/"]})
+
+
 # -------------------------------------------------------------------- todo
 
 
@@ -397,6 +474,7 @@ EXAMPLES = {
     "webhook-relay-ts": (["webhook-relay-ts.wasm"], relay_setup, relay_traffic),
     "webhook-relay-py": (["webhook-relay-py.wasm"], relay_setup, relay_traffic),
     "webhook-relay-go": (["webhook-relay-go.wasm"], relay_setup, relay_traffic),
+    "uptime-ts": (["uptime-ts.wasm"], uptime_setup, uptime_traffic),
     "todo-ts": (["todo-ts.wasm"], None, todo_traffic),
     "billing-ts": (["billing-ts.wasm", "billing-ts-ledger.wasm"], billing_setup, billing_traffic),
 }

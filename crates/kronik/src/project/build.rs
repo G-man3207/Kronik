@@ -2,7 +2,8 @@
 //! `dist/<name>.wasm` (Python and Go: `build_sdk.rs`, ADR 0030).
 //!
 //! TypeScript (ADR 0002): `tsc --noEmit`, then `jco componentize` with
-//! `--disable http fetch-event stdio` on an entry that exports the module's
+//! `--disable fetch-event stdio` (`http` stays on for standard `fetch`, ADR
+//! 0070) on an entry that exports the module's
 //! default export as `handler`. ComponentizeJS builds are not reproducible,
 //! so the hash of every input goes into a custom section of the component,
 //! and a build whose inputs are unchanged keeps the previous component.
@@ -29,8 +30,9 @@ use super::Failure;
 /// The custom section that records the build's input hash.
 pub(super) const INPUT_SECTION: &str = "kronik-build-input";
 
-/// ComponentizeJS features Kronik's allowlist needs off (ADR 0002).
-const DISABLED_FEATURES: [&str; 3] = ["http", "fetch-event", "stdio"];
+/// ComponentizeJS features Kronik's allowlist needs off (ADR 0002); `http`
+/// (standard `fetch`) is the `http.fetch` effect since M22 (ADR 0070).
+const DISABLED_FEATURES: [&str; 2] = ["fetch-event", "stdio"];
 
 /// Directories whose contents are not build inputs.
 const SKIPPED_DIRS: [&str; 6] = [
