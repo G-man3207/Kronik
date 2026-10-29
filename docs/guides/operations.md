@@ -737,21 +737,43 @@ unfinished turn` lines; each names an actor and an execution id. For each,
 `kronik dead-letters list` shows outcome-unknown dead letters from that
 start.
 
-## Checking a new binary
+## Upgrading to a new release
 
-Before replacing the binary, the new one checks itself against the data
-directory. The old daemon keeps running; the check only reads:
+Each release has its own engine version, `kronik-<version>+wasmtime-<version>`
+(`kronik --version` prints it). Data written by another engine starts
+only after this binary has checked itself against it: a start without a
+passing check stops with `ENGINE_VERSION_MISMATCH` before it serves
+anything, and loses nothing. So an upgrade, for example from a 0.1.0-dev
+build to 0.3.0, is three steps:
 
-```sh
-kronik upgrade check --window 6h --data-dir /var/lib/kronik
-```
+1. Install the new binary (`install.sh` replaces `/usr/local/bin/kronik`;
+   the running daemon keeps the old one).
+2. Check it against the data directory, with the old daemon still running:
 
-An empty diff writes `<data-dir>/upgrade/<engine>.json` and exits 0. A
-diff that is not empty writes that report and the diff next to it
-(`<engine>.diff.json`) and exits 1 with `ENGINE_UPGRADE_DIVERGED`: keep
-the current binary. `--dry-run` prints the result and writes neither file.
-The window is logical time, default `6h`. A bad window or a directory
-with no log is `BAD_REQUEST`.
+   ```sh
+   sudo kronik upgrade check --window 6h --config /etc/kronik/kronik.toml
+   ```
+
+3. Restart: `sudo systemctl restart kronik`. The first start records the
+   upgrade (an `EngineUpgrade` record in the log) and compiles every
+   deployed component again for the new engine, so it takes longer than
+   usual. The compiled code of the old engine stays in `<data-dir>/code/`
+   (`*.<old engine>.cwasm`); delete those files once the new binary runs.
+
+The check replays the last `--window` of logical time with the new engine
+and the same code. It reads the data directory, its privacy keystore and
+the master key that `kronik serve` uses (`--config`, `--master-key-file`,
+`KRONIK_MASTER_KEY` or `<data-dir>/keys/master.key`), so sealed values in
+the window replay too. An empty diff writes `<data-dir>/upgrade/<engine>.json`
+and exits 0. A diff that is not empty writes that report and the diff next
+to it (`<engine>.diff.json`) and exits 1 with `ENGINE_UPGRADE_DIVERGED`:
+keep the current binary. `--dry-run` prints the result and writes neither
+file. A bad window or a directory with no log is `BAD_REQUEST`.
+
+After the restart the data is the new engine's. Going back to the old
+binary is the same procedure the other way: its own `kronik upgrade check`
+first. A restore from a bucket that an older binary shipped also needs the
+check before the restored directory's first start.
 
 ## Foreign actors
 

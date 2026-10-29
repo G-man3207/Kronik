@@ -292,13 +292,17 @@ Next     kronik serve --data-dir /var/lib/kronik
 
 ## kronik upgrade check
 
-`kronik upgrade check [--window 6h] [--data-dir <DIR>] [--config <PATH>] [--workers <N>] [--dry-run]`
+`kronik upgrade check [--window 6h] [--data-dir <DIR>] [--config <PATH>] [--master-key-file <PATH>] [--workers <N>] [--dry-run]`
 
 Checks this binary against a data directory before it replaces the one
 that is running (M6). Offline and read-only apart from the report: the
 old daemon may keep running. It replays the last `--window` of logical
 time (default `6h`) with this binary's engine and the same code hashes.
-Fuel is not compared.
+Fuel is not compared. Sealed values in the window open with the
+directory's privacy keystore and the master key `kronik serve` uses
+(`--master-key-file`, `[keys] master_key_file` in `--config`,
+`KRONIK_MASTER_KEY`, else `<data-dir>/keys/master.key`): without that key
+the check is `MASTER_KEY_MISSING` or `MASTER_KEY_MISMATCH`.
 
 An empty diff writes `<data-dir>/upgrade/<engine>.json` and exits 0. A
 diff that is not empty writes that report and the diff next to it
@@ -310,11 +314,11 @@ one was written, even when the command exits 1.
 
 ```text
 $ kronik upgrade check --window 6h --data-dir /var/lib/kronik
-Upgrade check passed: kronik-0.1.0-dev+wasmtime-50.0.0 -> kronik-0.1.0-dev+wasmtime-50.0.0, window 6h, fork lsn 1 through 12
-  Root inputs   3
-  Turns         3
-  Diff          b3:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-  Report        /var/lib/kronik/upgrade/kronik-0.1.0-dev+wasmtime-50.0.0.json
+Upgrade check passed: kronik-0.1.0-dev+wasmtime-50.0.0 -> kronik-0.3.0+wasmtime-50.0.0, window 6h, fork lsn 7 through 95
+  Root inputs   62
+  Turns         63
+  Diff          b3:6aff290d69f92f2a99a3236ce9d5a5285bbd527b1321dca03e212ffddc5adf6c
+  Report        /var/lib/kronik/upgrade/kronik-0.3.0+wasmtime-50.0.0.json
 Next     kronik serve --data-dir /var/lib/kronik
 ```
 
