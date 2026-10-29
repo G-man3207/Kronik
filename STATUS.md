@@ -694,7 +694,8 @@ Criteria:
       `standard_fetch_is_matched_in_replay_and_meets_the_simulators`.
 - [x] A secret in a header never reaches the guest or the log: kronik-sched's
       `standard_fetch_secret_headers_never_reach_the_guest_or_the_log`;
-      kronik-runtime's `a_secret_placeholder_reaches_the_gate_as_a_secret_header`;
+      kronik-runtime's
+      `a_secret_placeholder_reaches_the_gate_as_a_secret_header`;
       for TypeScript, identity replay checks the target received the
       inserted header and that the value is in no file of the daemon.
 - [ ] WASI 0.3 components pass determinism and identity replay. Blocked:
@@ -729,7 +730,20 @@ Evidence:
 
 ## Next
 
-1. M28 and M22 landed (their sections). What comes next is the owner's.
+1. M28 and M22 landed (their sections). What comes next is the owner's
+   (asked 2026-10-29). The recommendation is items 2 and 3.
+2. M23's slices B1 to B5, which need no owner decision. First the
+   re-review of the revised design, then spike 0 (design §12). B1 to B5:
+   the KMS key sources (OpenBao, AWS, GCP, Azure), `master.wrapped` and
+   `keys status|wrap|rewrap`; the `SecretBackend` trait, the
+   `SecretVersion` and `SecretLink` records and `history`; the cache,
+   outage handling and its DST scenario, `secret-outage`; the providers
+   (env, OpenBao, AWS, GCP, Azure); the proof against OpenBao, moto and
+   the emulators, and the docs. B6 (PKCS#11) waits for ADR 0093.
+3. M24: the owner's answers to its design's §11 (Open questions), then its
+   first design review.
+4. Every other parked track waits for the owner or for money (Parked work,
+   Open questions).
 
 ## Parked work
 
@@ -748,8 +762,10 @@ Each branch's last commit message carries its handoff.
   `docs/design/m21-review-partial.md`; the testbench proof needs a rerun;
   ADR 0060 is provisional.
 - M23 secret backends: `m23-design` 30d4791, design only. ADR 0093
-  (PKCS#11 through a keyhelper process) is the owner's decision.
-- M24 connections: `m24-design` da0a3e5, design only.
+  (PKCS#11 through a keyhelper process) is the owner's decision. Slices
+  B1–B5 need no owner decision (Next).
+- M24 connections: `m24-design` da0a3e5, design only. Its owner questions
+  are under Open questions.
 
 ## Open questions
 
@@ -793,6 +809,35 @@ Each branch's last commit message carries its handoff.
   `--sample`. Only `payments-full-coverage` stops promote under a sample,
   so elsewhere coverage relies on the reviewer reading `summary.sample`.
   Should the default policy ask for more?
+- **M24 (connections), its design's §11 on `m24-design` da0a3e5:** (1) a
+  new minor ABI, `kronik:actor@0.2.0`, which keeps one entry point, or a
+  second export within 0.1.x; the choice binds future ABIs (ADR 0066);
+  (2) whether only the actor that accepted a connection may send on it
+  (fan-out goes through that owner, so a handle passed in a message
+  grants nothing), or whether that is too strict for an app; (3) whether
+  an actor may use its own connections, buffered or `send-now`, without a
+  capability (I6 read as "its own messages"; ADR 0068); (4) whether M26's
+  `blobs` interface joins 0.2.0 if it ships in the same release. Its
+  design has not been reviewed yet.
+- **M23 (secret backends):** its design's §13 on `m23-design` 30d4791.
+  - ADR 0093: the release `kronik` is static musl and cannot load a
+    PKCS#11 module, so PKCS#11 goes through a separate glibc
+    `kronik-keyhelper`, its own release artifact that loads the module
+    for one call at start (the only C code besides SQLite, outside the
+    daemon), or PKCS#11 is left out as a documented gap;
+  - confirm that master-key rotation (re-keying every store under a new
+    seed) stays out of M23: it is not in the brief, and `keys wrap` covers
+    moving an existing key into a KMS;
+  - optionally, a real-cloud check of the AWS, GCP and Azure providers
+    before release, a few dollars a month while keys exist; without it
+    they are proven only against emulators and, for GCP Cloud KMS, which
+    has no emulator, an in-test fake server.
+- **M28's reading of "samma historik":** a restored node writes one
+  `restore` audit event when it first starts, so its log is the source's
+  log plus that event. M6's "samma state-hash och samma historik" is read
+  as the state hash and the log through the source's applied LSN
+  (`kronik integrity --through <lsn>`), with exactly that one `restore`
+  event after it. The owner may read it as the whole log.
 - **Resolved:** ADR 0027, no `RestrictSUIDSGID` from v0.3. The setting
   makes `openat2` fail, and `runsc restore` needs it for M14's sandbox
   copies, so v0.3's unit leaves it out, and copies run under it (ADR
