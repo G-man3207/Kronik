@@ -16,7 +16,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "counter-rs"
-version = "0.1.0-dev"
+version = "0.3.0"
 dependencies = [
  "kronik-sdk",
  "serde_json",
@@ -75,7 +75,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kronik-sdk"
-version = "0.1.0-dev"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -113,7 +113,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "notes-rs"
-version = "0.1.0-dev"
+version = "0.3.0"
 dependencies = [
  "kronik-sdk",
  "serde",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "webhook-relay-rs"
-version = "0.1.0-dev"
+version = "0.3.0"
 dependencies = [
  "kronik-sdk",
  "serde",
