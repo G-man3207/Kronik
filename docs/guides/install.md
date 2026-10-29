@@ -1,17 +1,19 @@
 # Installing Kronik
 
 Kronik is one static binary for Linux on x86_64 or aarch64. On the brief's
-target, a fresh Ubuntu 24.04 VPS:
+target, a fresh Ubuntu 24.04 VPS, the latest
+[release](https://github.com/G-man3207/Kronik/releases):
 
 ```sh
-curl -fsSL https://<project>/install.sh | sh
+curl -fsSL https://github.com/G-man3207/Kronik/releases/latest/download/install.sh | sh
 kronik doctor
 ```
 
 A published release's `install.sh` names its release: its base URL is
-written into it when the release is built. For a release's files served
-from somewhere else, such as a mirror or a local HTTP server, give their
-URL to `sh`, not to `curl`:
+written into it when the release is built, e.g.
+`https://github.com/G-man3207/Kronik/releases/download/v0.3.0`. For a
+release's files served from somewhere else, such as a mirror or a local
+HTTP server, give their URL to `sh`, not to `curl`:
 
 ```sh
 curl -fsSL <url>/install.sh | KRONIK_BASE_URL=<url> sh

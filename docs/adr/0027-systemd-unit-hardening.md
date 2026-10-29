@@ -1,9 +1,9 @@
 # 0027. systemd unit hardening and runsc
 
-- **Status:** Accepted. Amended 2026-10-28 for v0.1: `RestrictSUIDSGID`
-  stayed while nothing ran `runsc restore`. Amended for v0.3: M14's sandbox
-  copies run `runsc restore`, so the unit drops it (see "Without
-  `RestrictSUIDSGID` (M14)").
+- **Status:** Accepted (owner confirmed 2026-10-29). Amended 2026-10-28 for
+  v0.1: `RestrictSUIDSGID` stayed while nothing ran `runsc restore`.
+  Amended for v0.3: M14's sandbox copies run `runsc restore`, so the unit
+  drops it (see "Without `RestrictSUIDSGID` (M14)").
 - **Date:** 2026-10-27, amended 2026-10-28 (v0.1 and v0.3); v0.3's evidence
   under the installed unit 2026-10-29
 

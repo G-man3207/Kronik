@@ -669,17 +669,16 @@ Each branch's last commit message carries its handoff.
   `--sample`. Only `payments-full-coverage` stops promote under a sample,
   so elsewhere coverage relies on the reviewer reading `summary.sample`.
   Should the default policy ask for more?
-- **ADR 0027: no `RestrictSUIDSGID` from v0.3.** The setting makes
-  `openat2` fail, and `runsc restore` needs it for M14's sandbox copies,
-  so v0.3's unit leaves it out, and copies run under it (ADR 0027's
-  Evidence); v0.1 kept it. The residual risk: code in an untrusted image,
-  root in its sandbox, can set the setuid or setgid bit on a file under its
-  actor's `/data`, and the host keeps it; so can a compromised daemon or
-  runsc, anywhere it writes. Only root reaches those files, through 0700
-  parents; checkpoints and copies clear the bits, and the operations guide
-  says not to copy the tree with modes kept. Accept it, or keep the setting
-  and do without sandbox copies under systemd until runsc falls back from
-  `openat2`.
+- **Resolved:** ADR 0027, no `RestrictSUIDSGID` from v0.3. The setting
+  makes `openat2` fail, and `runsc restore` needs it for M14's sandbox
+  copies, so v0.3's unit leaves it out, and copies run under it (ADR
+  0027's Evidence); v0.1 kept it. The residual risk: code in an untrusted
+  image, root in its sandbox, can set the setuid or setgid bit on a file
+  under its actor's `/data`, and the host keeps it; so can a compromised
+  daemon or runsc, anywhere it writes. Only root reaches those files,
+  through 0700 parents; checkpoints and copies clear the bits, and the
+  operations guide says not to copy the tree with modes kept. The owner
+  accepted the ADR on 2026-10-29.
 - **Resolved:** the testbench's Tailscale SSH check mode stopped the batch
   three times: on 2026-10-26, for about eight hours on 2026-10-28, and for
   about two hours from 21:34 UTC that evening, before v0.3's rows. The

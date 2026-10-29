@@ -4,10 +4,9 @@ The finished-product journey: from an empty machine to a verified deploy,
 with the release binary. A reader without a public DNS name or a bucket can
 do every step; the steps that need one say what to do instead.
 
-There is no public release URL yet. `https://<project>/install.sh` is the
-placeholder the [install guide](install.md) uses. In a checkout of the
-repository, `cargo build -p kronik` builds the binary as
-`target/debug/kronik`.
+Releases are on [GitHub](https://github.com/G-man3207/Kronik/releases);
+the install line below takes the latest. In a checkout of the repository,
+`cargo build -p kronik` builds the binary as `target/debug/kronik`.
 
 ## 1. Install
 
@@ -19,7 +18,7 @@ Node.js 24 from NodeSource:
 apt-get update && apt-get install -y curl
 curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
 apt-get install -y nodejs
-curl -fsSL https://<project>/install.sh | sh
+curl -fsSL https://github.com/G-man3207/Kronik/releases/latest/download/install.sh | sh
 kronik doctor
 ```
 
