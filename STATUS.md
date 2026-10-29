@@ -96,8 +96,10 @@ release binaries built on dev from one commit; a row of M9 or later runs
 only at a commit that has its milestone. Logs are in
 `/var/tmp/kronik-batch/logs/` on the testbench. The whole batch passed at
 68008f9 and at 927c80a (52 of 52 suites, 2026-10-27), at e3fb81a (56 of 56),
-with v0.2's rows at c626ede (67 of 67, 2026-10-28), and with v0.3's rows at
-94d20ac (88 of 88, 2026-10-29).
+with v0.2's rows at c626ede (67 of 67, 2026-10-28), with v0.3's rows at
+94d20ac (88 of 88, 2026-10-29), and with M22's and M28's rows at 1c50d78
+(90 of 90, 2026-10-29; main's head 21ac637 adds only uptime-ts's npm test
+glob, which no row runs).
 
 ## M0: repository and spikes (closed, `v0.0.0` on 89a8b34)
 
@@ -656,6 +658,8 @@ Testbench rows, every one passing for 1c279df (travelfiesta, 2026-10-29):
 - Startup with a 1 GiB log (without / with `state.db`): 19.5 to 20.9 s /
   16.9 to 17.7 s at d1a4f6c, in line with v0.3's 19.7 to 22.7 / 16.0 to
   18.9 s.
+- The full batch at 1c50d78 (M28 and M22 on main), 2026-10-29, 16:50 to
+  18:30 UTC: 90 of 90 suites, `M28/otel` and M6 included (M22 section).
 
 ## M22: standard fetch through wasi:http
 
@@ -713,7 +717,15 @@ Evidence:
   `M22/fetch-secret` (the target got the inserted Bearer token, the token
   is in no file of the daemon, identity replay empty in both modes),
   `identity` across all 15 examples, M2 4/4, M4 6/6, M12 4/4 and M15 11/11.
-  The full batch at the final main covers M22 together with M28.
+- The full batch at 1c50d78, the M22 commit on top of M28, 2026-10-29,
+  16:50 to 18:30 UTC on travelfiesta: 90 of 90 suites. Per row: M1 10/10,
+  M2 4/4, M3 5/5, M4 6/6, M5 7/7, M6 11/11, M7 3/3, M8 6/6, M9 3/3, M10
+  6/6 (`remote-30min` included), M11 5/5, M12 4/4, M13 3/3, M14 3/3
+  (`M14/unit` included), M15 11/11, M22 1/1, M28 1/1 and `identity` 1/1
+  (15 examples). Startup with a 1 GiB log: 18.9 to 19.6 s without
+  `state.db`, 15.7 to 16.7 s with it. Main's final head, 21ac637, differs
+  from 1c50d78 only in uptime-ts's npm `test` script (the glob CI's Node
+  needs), which no row runs, so the batch carries over.
 
 ## Next
 
@@ -795,10 +807,10 @@ Each branch's last commit message carries its handoff.
   batch on 2026-10-26, for about eight hours on 2026-10-28, and for about
   two hours from 21:34 UTC that evening. Check mode is still active: after
   the owner's fix on 2026-10-29, BatchMode ssh worked at 08:34 UTC and
-  asked for a check again at 11:46 UTC, which holds M22's and M28's
-  testbench rows. `tailscale status --json` on dev and on the testbench
-  shows nothing of the SSH policy. The lasting fix is the owner's: a
-  change to the SSH policy.
+  asked for a check again at 11:46 UTC; access came back at 13:20 UTC,
+  after the owner authenticated again. `tailscale status --json` on dev
+  and on the testbench shows nothing of the SSH policy. The lasting fix is
+  the owner's: a change to the SSH policy.
 - From v0.4 the testbench is a cluster of three VPSs, as the brief says;
   there is one, `travelfiesta`.
 - M20 (Firecracker) needs a test host with `/dev/kvm`: neither dev nor the
