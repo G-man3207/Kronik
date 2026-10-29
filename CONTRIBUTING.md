@@ -36,6 +36,13 @@ Pull requests must keep it green.
 - **English only.** Code, comments, docs, commit messages, error messages and
   all user-facing text are in English.
 - **Small commits** with descriptive messages.
+- **Commit messages.** The subject is `area: summary` in the imperative, at
+  most 72 characters and with no final period, for example
+  `CI: run the foreign step as root with gVisor installed`. A squashed
+  milestone or release is `Kronik M28: OpenTelemetry and audit export`.
+  The body, wrapped at 72 columns, says why when the diff does not. A
+  message describes the change, not how it came about: no people, agents
+  or machines, and no review rounds.
 - **Docs move with behavior.** Docs and the error catalog are updated in the
   same commit as the behavior they describe.
 - **No panics in the daemon.** No `unwrap` or `expect` in daemon code paths; a
