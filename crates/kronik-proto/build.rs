@@ -13,6 +13,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed={}", file.display());
     }
     let descriptors = protox::compile(&files, [&root])?;
-    prost_build::Config::new().compile_fds(descriptors)?;
+    // BTreeMap so that a record's bytes (and so its hash) are deterministic.
+    prost_build::Config::new()
+        .btree_map([".kronik.log.v1.AuditEvent.details"])
+        .compile_fds(descriptors)?;
     Ok(())
 }

@@ -143,6 +143,11 @@ fn samples() -> Vec<Record> {
             outcome: pb::GuardOutcome::RolledBack as i32,
             ..Default::default()
         }),
+        Record::AuditEvent(pb::AuditEvent {
+            action: "secret.set".into(),
+            audit: Some(pb::Audit::default()),
+            ..Default::default()
+        }),
     ]
 }
 

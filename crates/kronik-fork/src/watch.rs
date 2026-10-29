@@ -593,8 +593,8 @@ impl Watches {
             for_ms,
             deployment_time_ms,
             status: WATCHING.into(),
-            reason: audit.reason,
-            token_id: audit.token_id,
+            reason: audit.reason.clone(),
+            token_id: audit.token_id.clone(),
             created_ms: env.clock.wall_ms(),
             triggered: Vec::new(),
             metrics: None,
@@ -629,6 +629,17 @@ impl Watches {
             w.metrics = Some(ev.guard);
             return Ok(w);
         }
+        // A watch lives outside the log (M11); its start is audited (M28)
+        // before it runs, so the event precedes anything the watch writes
+        // and a caller that stops waiting cannot lose it. A crash before
+        // the save over-reports, the safe direction (ADR 0083).
+        let details = [
+            ("epoch".to_owned(), epoch.to_string()),
+            ("for_ms".to_owned(), for_ms.to_string()),
+        ];
+        self.node
+            .record_audit_event("watch.start", &w.id, details.into(), audit)
+            .await?;
         self.save(&w)?;
         let id = w.id.clone();
         lock(&self.watches).insert(id.clone(), w.clone());

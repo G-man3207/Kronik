@@ -391,6 +391,8 @@ mod tests {
         ));
         assert!(unit.contains("Group=kronik"));
         assert!(unit.contains("ProtectSystem=strict"));
+        // The default audit sink's directory (m28-otel §4.4).
+        assert!(unit.contains("\nLogsDirectory=kronik\n"));
         assert!(!unit.contains("MemoryDenyWriteExecute=true"));
         // ADR 0027: an explicit User= costs runsc CAP_SETUID under the
         // seccomp settings, and RestrictSUIDSGID breaks `runsc restore`,

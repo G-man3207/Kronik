@@ -710,6 +710,25 @@ fn call_crash_before_the_result_is_recorded_reuses_the_saved_response() {
     assert_eq!(a.effects[0].status, pb::EffectStatus::Ok as i32);
 }
 
+/// Every effect records when it started in the turn and how long it took
+/// (m28-otel §3.3), not only fetch: the call's span covers the callee.
+#[test]
+fn a_call_effect_records_its_offset_and_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy();
+    let r = p.send("counter/a", msg("call", "counter/b increment"));
+    assert!(r.committed(), "{r:?}");
+    let a = turn_records(&p.records())
+        .into_iter()
+        .find(|t| t.actor.as_ref().is_some_and(|a| a.key == "a"))
+        .unwrap();
+    let call = &a.effects[0];
+    assert_eq!(call.kind, "actor.call");
+    assert!(call.offset_us > 0, "{call:?}");
+    assert!(call.duration_us > 0, "{call:?}");
+}
+
 #[test]
 fn compensations_and_orphans() {
     let dir = tempfile::tempdir().unwrap();

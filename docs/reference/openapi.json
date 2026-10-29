@@ -160,6 +160,36 @@
         ],
         "type": "object"
       },
+      "AuditResponse": {
+        "description": "`GET /v1/audit`: `kronik.audit/v1` lines in LSN order (m28-otel §4.3).",
+        "properties": {
+          "applied_lsn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lines": {
+            "items": {
+              "$ref": "#/components/schemas/Line"
+            },
+            "type": "array"
+          },
+          "next": {
+            "description": "The `from` of the next page; absent at the applied LSN.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "lines",
+          "applied_lsn"
+        ],
+        "type": "object"
+      },
       "CheckpointView": {
         "description": "One checkpoint of a foreign actor (M14).",
         "properties": {
@@ -2128,6 +2158,7 @@
                 "enum": [
                   "ACTOR_NOT_FOUND",
                   "APPROVAL_REQUIRED",
+                  "AUDIT_RANGE_GONE",
                   "BAD_REQUEST",
                   "CAPABILITY_NOT_GRANTED",
                   "DEAD_LETTER_ALREADY_RESENT",
@@ -2136,6 +2167,7 @@
                   "EFFECT_OUTCOME_UNKNOWN",
                   "ENGINE_UPGRADE_DIVERGED",
                   "ENGINE_VERSION_MISMATCH",
+                  "EXPORT_NOT_CONFIGURED",
                   "FOREIGN_EXISTS",
                   "FOREIGN_NOT_FOUND",
                   "FOREIGN_UNAVAILABLE",
@@ -2203,6 +2235,147 @@
         },
         "required": [
           "error"
+        ],
+        "type": "object"
+      },
+      "ExportRewindRequest": {
+        "description": "`POST /v1/export/{stream}/rewind`.",
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "reason": {
+            "default": "",
+            "description": "Required: missing or blank answers REASON_REQUIRED.",
+            "type": "string"
+          },
+          "to": {
+            "description": "Resend the records after this LSN; at most the stream's cursor, and\nnot before the first retained record (`AUDIT_RANGE_GONE`).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "to"
+        ],
+        "type": "object"
+      },
+      "ExportRewindResponse": {
+        "properties": {
+          "dry_run": {
+            "type": "boolean"
+          },
+          "from": {
+            "description": "The cursor before the rewind.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stream": {
+            "type": "string"
+          },
+          "to": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "dry_run",
+          "stream",
+          "from",
+          "to"
+        ],
+        "type": "object"
+      },
+      "ExportStatusResponse": {
+        "description": "`GET /v1/export`: every export stream of the daemon.",
+        "properties": {
+          "streams": {
+            "items": {
+              "$ref": "#/components/schemas/ExportStream"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "streams"
+        ],
+        "type": "object"
+      },
+      "ExportStream": {
+        "properties": {
+          "applied_lsn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cursor": {
+            "description": "The last LSN the sink acknowledged.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "gaps": {
+            "description": "Ranges retention deleted before the stream read them, since the\nstart.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lag": {
+            "description": "`applied_lsn - cursor` while enabled, else 0.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_error": {
+            "description": "The last failure's code (`http_503`, `connect`, `timeout`, ...),\nnever its text.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_success_wall_ms": {
+            "description": "Wall-clock milliseconds of the last delivered batch since the start.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "`traces` or `audit`.",
+            "type": "string"
+          },
+          "sink": {
+            "description": "The sink's or endpoint's scheme and host only (never a path, query\nor credentials); empty when not configured.",
+            "type": "string"
+          },
+          "stalled_ms": {
+            "default": null,
+            "description": "While there is lag: milliseconds since the last delivered batch, or\nsince the stream started without one. `kronik doctor` warns on it.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "enabled",
+          "sink",
+          "cursor",
+          "applied_lsn",
+          "lag",
+          "gaps"
         ],
         "type": "object"
       },
@@ -3089,7 +3262,7 @@
             "type": "integer"
           },
           "log_hash": {
-            "description": "BLAKE3 over the records `log_first_lsn..=applied_lsn` (LSN, kind and\nencoded record of each).",
+            "description": "BLAKE3 over the records `log_first_lsn..=through_lsn` (LSN, kind and\nencoded record of each).",
             "type": "string"
           },
           "newest_logical_time_ms": {
@@ -3116,6 +3289,13 @@
           "state_hash": {
             "description": "BLAKE3 over the materialized state (m6-storage §8).",
             "type": "string"
+          },
+          "through_lsn": {
+            "default": 0,
+            "description": "The last LSN `log_hash` covers: `applied_lsn`, or the `through`\nasked for. An older response that omits it decodes as 0.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
@@ -3358,6 +3538,79 @@
           "sql_bytes_per_actor",
           "effect_timeout_ms",
           "effect_response_bytes"
+        ],
+        "type": "object"
+      },
+      "Line": {
+        "description": "One exported line, keys in §4.3's order.",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "at_wall_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "details": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "effect": {
+            "description": "The effect ordinal of a reveal line; absent otherwise.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "epoch": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "lsn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "reason_truncated": {
+            "type": "boolean"
+          },
+          "record_hash": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "token_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema",
+          "lsn",
+          "kind",
+          "action",
+          "at_wall_ms",
+          "token_id",
+          "reason",
+          "branch",
+          "details",
+          "record_hash"
         ],
         "type": "object"
       },
@@ -6965,6 +7218,55 @@
         "x-kronik-scope": "read"
       }
     },
+    "/v1/audit": {
+      "get": {
+        "operationId": "get_v1_audit",
+        "parameters": [
+          {
+            "description": "Lines of records at this LSN and after; the first retained record when absent.",
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "At most this many; 1 to 1000, 100 when absent.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "summary": "The audit lines of main's log (kronik.audit/v1), as an audit sink receives them",
+        "x-kronik-scope": "admin"
+      }
+    },
     "/v1/dead-letters": {
       "get": {
         "operationId": "get_v1_dead_letters",
@@ -7274,6 +7576,84 @@
         },
         "summary": "Watch a deployment's error rate and latency; alert or roll back on a guard",
         "x-kronik-scope": "promote"
+      }
+    },
+    "/v1/export": {
+      "get": {
+        "operationId": "get_v1_export",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExportStatusResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "summary": "The export streams (traces, audit): sink scheme and host, cursor, lag, last success and error code, gaps",
+        "x-kronik-scope": "read"
+      }
+    },
+    "/v1/export/{stream}/rewind": {
+      "post": {
+        "operationId": "post_v1_export_stream_rewind",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "stream",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExportRewindRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExportRewindResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "summary": "Move an export stream's cursor back to resend from after `to` (writes an AuditEvent export.rewind)",
+        "x-kronik-scope": "operate"
       }
     },
     "/v1/foreign": {
@@ -7955,6 +8335,17 @@
     "/v1/integrity": {
       "get": {
         "operationId": "get_v1_integrity",
+        "parameters": [
+          {
+            "description": "Hash the log only through this LSN (1 to the applied LSN): a restored node's first start adds a `restore` event after the source's last record.",
+            "in": "query",
+            "name": "through",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {

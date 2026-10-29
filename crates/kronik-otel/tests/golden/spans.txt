@@ -1,0 +1,9 @@
+resource service.name="kronik" service.version="0.1.0-dev" kronik.node="main" kronik.engine="kronik-0.1.0+wasmtime-50.0.0"
+scope kronik 0.1.0-dev
+span "counter message increment" trace=4bf92f3577b34da6a3ce929d0e0e4736 id=86bcf169f9754967 parent=99a6b3cd42c40f1b kind=2 1761500000123000000..1761500000123001000 status=None
+  kronik.turn_id="main:7" kronik.actor.kind="counter" kronik.actor.key="kh:counter-1" kronik.input="message" kronik.message.name="increment" kronik.message.source="call" kronik.outcome="committed" kronik.code_hash="b3:abababababababababababababababababababababababababababababababab" kronik.config_epoch=3 kronik.fuel_used=42
+  link trace=4bf92f3577b34da6a3ce929d0e0e4736 id=99a6b3cd42c40f1b kronik.link="call" opentracing.ref_type="child_of"
+span "counter POST /counter/{key}/{op}" trace=4bf92f3577b34da6a3ce929d0e0e4736 id=05d33d41d7253b4e parent= kind=2 1761500000123000000..1761500000126520000 status=None
+  kronik.turn_id="main:7" kronik.actor.kind="counter" kronik.actor.key="kh:counter-1" kronik.input="http" http.request.method="POST" http.route="/counter/{key}/{op}" kronik.outcome="committed" kronik.code_hash="b3:abababababababababababababababababababababababababababababababab" kronik.config_epoch=3 kronik.fuel_used=42
+span "actor.call" trace=4bf92f3577b34da6a3ce929d0e0e4736 id=99a6b3cd42c40f1b parent=05d33d41d7253b4e kind=3 1761500000123120000..1761500000126520000 status=None
+  kronik.effect.kind="actor.call" kronik.effect.ordinal=0 kronik.effect.status="ok" kronik.effect.grounding="live" kronik.effect.target="actor" kronik.target.actor.kind="counter" kronik.target.actor.key="kh:counter-1"

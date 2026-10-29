@@ -59,6 +59,9 @@ pub(crate) struct TurnSpec {
     pub execution_id: String,
     pub causal_key: pb::CausalKey,
     pub time: u64,
+    /// The turn's start on the monotonic clock: effects record their
+    /// `offset_us` from it (m28-otel §3.3).
+    pub started: std::time::Duration,
     pub config: Arc<Config>,
     pub limits: KindLimits,
     pub call_chain: Vec<ActorRef>,
@@ -170,9 +173,23 @@ impl TurnFx {
         Ok(())
     }
 
+    /// Microseconds since the turn started.
+    fn since_start(&self) -> u64 {
+        self.node
+            .env
+            .clock
+            .monotonic()
+            .saturating_sub(self.spec.started)
+            .as_micros() as u64
+    }
+
     /// Appends and fsyncs the result before the guest sees it, without the
     /// values of the secrets the turn used or revealed so far (I8).
     async fn record(&self, mut rec: pb::EffectRecord) -> Result<(), GateError> {
+        // From the effect's start (`base`) unless the effect timed itself.
+        if rec.duration_us == 0 {
+            rec.duration_us = self.since_start().saturating_sub(rec.offset_us);
+        }
         let secrets = lock(&self.state).secrets.clone();
         crate::scrub::effect(&mut rec, &secrets);
         let status = pb::EffectStatus::try_from(rec.status)
@@ -205,6 +222,7 @@ impl TurnFx {
             target,
             fingerprint: fp,
             grounding: pb::Grounding::Live as i32,
+            offset_us: self.since_start(),
             ..Default::default()
         }
     }
@@ -423,6 +441,7 @@ impl TurnFx {
             .collect();
         lock(&self.state).secrets.extend(secrets.iter().cloned());
         let started = self.node.env.clock.monotonic();
+        rec.offset_us = started.saturating_sub(self.spec.started).as_micros() as u64;
         let wire = HttpRequest {
             method: req.method,
             url: req.url,

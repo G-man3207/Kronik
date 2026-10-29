@@ -780,6 +780,129 @@ async fn secret_values_are_scrubbed_from_base64_payloads_too() {
     }
 }
 
+/// Review M5: audit text is scrubbed when it is written, so secrets deleted
+/// before an export reads the log are not in it: the new value of a
+/// `secret.set` in its own reason, and stored values in the reasons of a
+/// grant and of a `secret.delete`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_secret_deleted_before_the_export_is_not_in_the_audit_log() {
+    const SECRET: &str = "hunter2-db-password";
+    const OTHER: &str = "sk-live-other-9931";
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::real(tokio::runtime::Handle::current());
+    let node = start_local(env, dir.path(), NodeConfig::default())
+        .await
+        .unwrap();
+    let api = Arc::new(Api::new(node.clone()));
+    for (method, path, body) in [
+        (
+            "PUT",
+            "/v1/secrets/db-password",
+            json!({"text": SECRET, "reason": format!("rotate to {SECRET}")}),
+        ),
+        (
+            "PUT",
+            "/v1/secrets/other",
+            json!({"text": OTHER, "reason": "r"}),
+        ),
+        (
+            "POST",
+            "/v1/grants",
+            json!({"kind": "counter", "capability": "http:example.com", "reason": format!("key {OTHER}")}),
+        ),
+        (
+            "DELETE",
+            "/v1/secrets/other",
+            json!({"reason": format!("leaked {OTHER}")}),
+        ),
+        ("DELETE", "/v1/secrets/db-password", json!({"reason": "r"})),
+    ] {
+        let (s, v) = call(&api, method, path, body).await;
+        assert_eq!(s, 200, "{method} {path}: {v}");
+    }
+    let mut text = String::new();
+    node.reader()
+        .read(1, node.applied_lsn(), |c| {
+            text.push_str(&format!("{:?}\n", c.record));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(text.contains("[secret:other]"), "{text}");
+    assert!(!text.contains(SECRET) && !text.contains(OTHER), "{text}");
+}
+
+/// Token secrets never reach the log (ADR 0082), and a scrub that cannot
+/// load the stored secrets withholds the reason instead of writing it
+/// unscrubbed: the reason of a `Grant`, and of an `AuditEvent`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_secrets_are_scrubbed_and_an_unloadable_scrub_withholds_the_reason() {
+    const SECRET: &str = "hunter2-db-password";
+    let token = format!("kronik_{}", "Ab-_".repeat(10) + "xyz");
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::real(tokio::runtime::Handle::current());
+    let node = start_local(env, dir.path(), NodeConfig::default())
+        .await
+        .unwrap();
+    let api = Arc::new(Api::new(node.clone()));
+    let grant = |reason: String| json!({"kind": "counter", "capability": "http:example.com", "reason": reason});
+    let log = || async {
+        let mut text = String::new();
+        node.reader()
+            .read(1, node.applied_lsn(), |c| {
+                text.push_str(&format!("{:?}\n", c.record));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        text
+    };
+    for (method, path, body) in [
+        ("POST", "/v1/grants", grant(format!("leaked {token}"))),
+        (
+            "PUT",
+            "/v1/secrets/db-password",
+            json!({"text": SECRET, "reason": format!("was {token}")}),
+        ),
+    ] {
+        let (s, v) = call(&api, method, path, body).await;
+        assert_eq!(s, 200, "{method} {path}: {v}");
+    }
+    let text = log().await;
+    assert!(!text.contains(&token), "{text}");
+    assert_eq!(text.matches("[token]").count(), 2, "{text}");
+
+    // One undecryptable row: the stored values cannot be loaded.
+    rusqlite::Connection::open(dir.path().join("keys/secrets.db"))
+        .unwrap()
+        .execute("UPDATE secrets SET ciphertext = x'00'", [])
+        .unwrap();
+    for (method, path, body) in [
+        ("POST", "/v1/grants", grant(format!("key {SECRET}"))),
+        (
+            "PUT",
+            "/v1/secrets/other",
+            json!({"text": "v", "reason": format!("key {SECRET}")}),
+        ),
+    ] {
+        let (s, v) = call(&api, method, path, body).await;
+        assert_eq!(s, 200, "{method} {path}: {v}");
+    }
+    let text = log().await;
+    assert!(!text.contains(SECRET), "{text}");
+    // The grant's reason and the secret.set event's reason; the event's
+    // target (the secret's name) stays, so the line says what changed.
+    assert_eq!(
+        text.matches(kronik_sched::scrub::WITHHELD).count(),
+        2,
+        "{text}"
+    );
+    assert!(
+        text.contains("\"other\""),
+        "the target was withheld: {text}"
+    );
+}
+
 /// Re-review #6 (v0.1): with privacy mode on, a subject's failed turn after
 /// a successful call leaves an orphan that still names the callee's turn
 /// (the sealed reply is not read; the callee's delivery gives it).

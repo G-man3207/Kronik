@@ -42,6 +42,7 @@
 - [M13 rollback via replay design](design/m13-rebase.md)
 - [M14 foreign actors in forks design](design/m14-foreign-forks.md)
 - [M15 Python and Go SDKs design](design/m15-sdks.md)
+- [M28 OpenTelemetry and audit export design](design/m28-otel.md)
 - [Performance](perf.md)
 
 # Decisions
@@ -75,3 +76,8 @@
 - [ADR 0027: systemd unit hardening and runsc](adr/0027-systemd-unit-hardening.md)
 - [ADR 0030: Python and Go components](adr/0030-python-go-components.md)
 - [ADR 0031: A diff with pii-masked turns needs an approval](adr/0031-pii-masked-approval-floor.md)
+- [ADR 0080: Spans are built from committed turn records](adr/0080-spans-from-the-log.md)
+- [ADR 0081: OTLP over HTTP with vendored protos, no OpenTelemetry crates](adr/0081-otlp-over-http-without-otel-crates.md)
+- [ADR 0082: What telemetry and audit export may carry off the node](adr/0082-what-leaves-the-node.md)
+- [ADR 0083: The audit export: the log is the audit trail](adr/0083-audit-export.md)
+- [ADR 0084: Export cursors, and the audit export holds retention](adr/0084-export-cursors-and-retention.md)

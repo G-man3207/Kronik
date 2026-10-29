@@ -76,6 +76,7 @@ enforcement in CI.
 | 15 | `SimulatorConfig` | stubs set (M12) |
 | 16 | `StateRebase` | rollback --by-replay: rebased turns, the switch (M13) |
 | 17 | `GuardTriggered` | a `kronik watch` guard that fired (M11) |
+| 40 | `AuditEvent` | mutations outside the log, after they succeeded; changes no state (M28) |
 
 0 and any other value (15 and 16 are reserved) are `STORAGE_CORRUPT`, except kind 255, the footer readers skip. The messages are in
 `proto/kronik/log/v1/` (`common`, `input`, `turn`, `config`, `branch`).

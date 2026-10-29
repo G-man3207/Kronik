@@ -4,11 +4,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use kronik_core::env::Env;
+use kronik_core::env::{BoxFuture, Env};
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
@@ -520,6 +521,218 @@ fn retention_deletes_old_segments_a_snapshot_covers() {
         .err()
         .unwrap();
     assert!(err.to_string().contains("no snapshot reaches it"), "{err}");
+}
+
+/// A node with small segments, no history window and `[log] disk_reserve`
+/// set to `disk_reserve`, its log filled with closed segments that a
+/// snapshot covers.
+fn held(dir: &Path, disk_reserve: u64) -> Proc {
+    held_on(dir, disk_reserve, None)
+}
+
+/// [`held`] on a disk whose free space is `free` (when given), with
+/// snapshots an hour apart.
+fn held_on(dir: &Path, disk_reserve: u64, free: Option<Arc<AtomicU64>>) -> Proc {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let node = rt.block_on(async {
+        let mut storage = StorageConfig::new(dir.to_path_buf());
+        storage.history = Duration::ZERO;
+        storage.snapshot_interval = Duration::from_secs(3600);
+        let mut env = Env::real(tokio::runtime::Handle::current());
+        if let Some(free) = free {
+            env.fs = Arc::new(TestDisk {
+                inner: env.fs.clone(),
+                free,
+            });
+        }
+        start_local(
+            env,
+            dir,
+            NodeConfig {
+                concurrency: 8,
+                storage: Some(storage),
+                segment_max_bytes: Some(4096),
+                disk_reserve,
+                ..NodeConfig::default()
+            },
+        )
+        .await
+        .unwrap()
+    });
+    let p = Proc { rt, node };
+    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false))
+        .unwrap();
+    for i in 0..80 {
+        p.send(&format!("counter/k{}", i % 5), "increment", "");
+        if i % 20 == 19 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    p
+}
+
+/// The audit hold (ADR 0084): retention keeps every segment past the
+/// export's floor; once free disk is below `[audit] hold_release` it
+/// deletes as before, and root inputs are still admitted (review H2).
+#[test]
+fn the_audit_hold_keeps_segments_until_disk_runs_low() {
+    let dir = tempdir();
+    let log_dir = dir.path().join("branches/main/log");
+    let p = held(dir.path(), 1);
+    let hold = p.node.retention_hold();
+    hold.configure(0, Duration::ZERO);
+    hold.set(1, p.node.env().clock.wall_ms());
+    p.rt.block_on(p.node.snapshot("manual")).unwrap();
+    assert_eq!(kronik_log::segment_starts(&log_dir).unwrap()[0], 1);
+    // More than any disk has free: released.
+    hold.configure(u64::MAX, Duration::ZERO);
+    let storage = p.node.storage_config().unwrap().clone();
+    let first = p.node.compact(&storage).unwrap();
+    assert!(first > 2, "{first}");
+    assert_eq!(p.node.log_first(&storage).unwrap(), first);
+    assert_eq!(p.node.disk_below_reserve(), None);
+    p.send("counter/k0", "increment", "");
+}
+
+/// Review M4: with `[log] disk_reserve = 0` free disk is still measured for
+/// the hold, so `hold_release` still gives way.
+#[test]
+fn the_audit_hold_gives_way_without_a_disk_reserve() {
+    let dir = tempdir();
+    let p = held(dir.path(), 0);
+    let hold = p.node.retention_hold();
+    // More than any disk has free: released.
+    hold.configure(u64::MAX, Duration::ZERO);
+    hold.set(1, p.node.env().clock.wall_ms());
+    p.rt.block_on(p.node.snapshot("manual")).unwrap();
+    let storage = p.node.storage_config().unwrap().clone();
+    let first = p.node.log_first(&storage).unwrap();
+    assert!(first > 2, "{first}");
+    assert_eq!(p.node.disk_free(), None);
+}
+
+/// The real file system, with the free space the test sets.
+struct TestDisk {
+    inner: Arc<dyn kronik_core::env::Fs>,
+    free: Arc<AtomicU64>,
+}
+
+impl kronik_core::env::Fs for TestDisk {
+    fn create_dir_all(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
+        self.inner.create_dir_all(p)
+    }
+    fn open(
+        &self,
+        p: PathBuf,
+        mode: kronik_core::env::OpenMode,
+    ) -> BoxFuture<'static, std::io::Result<Arc<dyn kronik_core::env::File>>> {
+        self.inner.open(p, mode)
+    }
+    fn exists(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<bool>> {
+        self.inner.exists(p)
+    }
+    fn read_dir(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<Vec<String>>> {
+        self.inner.read_dir(p)
+    }
+    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
+        self.inner.rename(from, to)
+    }
+    fn remove_file(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
+        self.inner.remove_file(p)
+    }
+    fn sync_dir(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
+        self.inner.sync_dir(p)
+    }
+    fn available(&self, _: PathBuf) -> BoxFuture<'static, std::io::Result<u64>> {
+        let free = self.free.load(Ordering::SeqCst);
+        Box::pin(async move { Ok(free) })
+    }
+}
+
+/// Perf review R2: once free disk is below `hold_release`, the hold gives
+/// way within seconds, not at the next snapshot pass an hour away, so a
+/// busy node does not reach the disk reserve in between.
+#[test]
+fn the_audit_hold_gives_way_between_snapshot_passes() {
+    const RESERVE: u64 = 1 << 20;
+    let dir = tempdir();
+    let free = Arc::new(AtomicU64::new(1 << 40));
+    let p = held_on(dir.path(), RESERVE, Some(free.clone()));
+    let hold = p.node.retention_hold();
+    hold.configure(2 * RESERVE, Duration::ZERO);
+    hold.set(1, p.node.env().clock.wall_ms());
+    p.rt.block_on(p.node.snapshot("manual")).unwrap();
+    let storage = p.node.storage_config().unwrap().clone();
+    assert_eq!(p.node.log_first(&storage).unwrap(), 1, "held");
+    free.store(RESERVE + RESERVE / 2, Ordering::SeqCst);
+    let mut first = 1;
+    for _ in 0..100 {
+        first = p.node.log_first(&storage).unwrap();
+        if first > 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(first > 2, "the hold never gave way: log_first {first}");
+    assert_eq!(p.node.disk_below_reserve(), None);
+    p.send("counter/k0", "increment", "");
+    // perf review R2-cost: minutes of the disk loop with nothing left to
+    // delete compact the index rows at most once, not every minute.
+    std::thread::sleep(Duration::from_millis(200));
+    let before = p.node.db_compactions();
+    for _ in 0..5 {
+        assert!(p.rt.block_on(p.node.retain_if_released(RESERVE + RESERVE / 2)));
+    }
+    let ran = p.node.db_compactions() - before;
+    assert!(ran <= 1, "the index rows were compacted {ran} times");
+}
+
+/// Review M1: a rewind during a delivery keeps its floor when that batch
+/// completes, so compaction keeps what the rewind resends; a batch from
+/// the rewind's point on moves the floor again.
+#[test]
+fn a_rewind_holds_retention_past_a_batch_in_flight() {
+    let dir = tempdir();
+    let p = held(dir.path(), 0);
+    let hold = p.node.retention_hold();
+    let now = p.node.env().clock.wall_ms();
+    hold.configure(0, Duration::ZERO);
+    hold.set(40, now);
+    // The rewind comes while the batch 41.. is at the sink; it completes.
+    hold.rewind(2, now);
+    hold.set(40, now);
+    assert_eq!(hold.floor(), Some(2));
+    p.rt.block_on(p.node.snapshot("manual")).unwrap();
+    let storage = p.node.storage_config().unwrap().clone();
+    // Everything after the rewind's point is kept.
+    let first = p.node.log_first(&storage).unwrap();
+    assert!(first <= 3, "{first}");
+    // The follower resends from 3: the floor follows deliveries again.
+    hold.set(2, now);
+    hold.set(60, now);
+    assert_eq!(hold.floor(), Some(60));
+    assert!(p.node.compact(&storage).unwrap() > 2);
+}
+
+/// `[audit] max_hold`: a floor that has not moved for longer is released.
+#[test]
+fn the_audit_hold_gives_way_after_max_hold() {
+    let dir = tempdir();
+    let p = held(dir.path(), 1);
+    let hold = p.node.retention_hold();
+    let now = p.node.env().clock.wall_ms();
+    hold.configure(0, Duration::from_secs(60));
+    hold.set(1, now);
+    p.rt.block_on(p.node.snapshot("manual")).unwrap();
+    let storage = p.node.storage_config().unwrap().clone();
+    assert_eq!(p.node.compact(&storage).unwrap(), 1);
+    assert_eq!(hold.age_ms(now + 61_000), Some(61_000));
+    hold.set(1, now - 61_000);
+    assert!(p.node.compact(&storage).unwrap() > 2);
 }
 
 /// What `state.db` holds after the log is applied: the state hash and the

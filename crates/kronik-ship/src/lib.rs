@@ -41,6 +41,30 @@ pub enum ShipError {
     KeystoreIncomplete(String),
 }
 
+impl ShipError {
+    /// A stable code for logs and statuses. Never the error's text: a store's
+    /// error carries its URL and the provider's response body, which can echo
+    /// credentials or personal data (m28 review M9).
+    pub fn code(&self) -> &'static str {
+        use object_store::Error as E;
+        match self {
+            ShipError::Config(_) => "s3_config",
+            ShipError::Io(_) => "io",
+            ShipError::Restore(_) => "restore",
+            ShipError::Key(_) => "master_key",
+            ShipError::KeystoreIncomplete(_) => "keystore_incomplete",
+            ShipError::Store(e) => match e {
+                E::NotFound { .. } => "s3_not_found",
+                E::PermissionDenied { .. } => "s3_forbidden",
+                E::Unauthenticated { .. } => "s3_unauthenticated",
+                E::Precondition { .. } | E::NotModified { .. } => "s3_precondition",
+                E::AlreadyExists { .. } => "s3_conflict",
+                _ => "s3",
+            },
+        }
+    }
+}
+
 /// zstd level for shipped objects.
 const LEVEL: i32 = 3;
 
@@ -102,14 +126,16 @@ impl Remote {
         }
     }
 
-    async fn put(&self, rel: &str, bytes: Vec<u8>) -> Result<(), ShipError> {
+    /// Stores `bytes` under `rel` (below the prefix).
+    pub async fn put(&self, rel: &str, bytes: Vec<u8>) -> Result<(), ShipError> {
         self.store
             .put(&self.key(rel), PutPayload::from(bytes))
             .await?;
         Ok(())
     }
 
-    async fn get(&self, rel: &str) -> Result<Vec<u8>, ShipError> {
+    /// The object under `rel`.
+    pub async fn get(&self, rel: &str) -> Result<Vec<u8>, ShipError> {
         Ok(self
             .store
             .get(&self.key(rel))
@@ -125,7 +151,7 @@ impl Remote {
     }
 
     /// Object names directly under `rel/` and sub-directory names.
-    async fn list(&self, rel: &str) -> Result<(Vec<String>, Vec<String>), ShipError> {
+    pub async fn list(&self, rel: &str) -> Result<(Vec<String>, Vec<String>), ShipError> {
         let prefix = self.key(rel);
         let r = self.store.list_with_delimiter(Some(&prefix)).await?;
         let name = |p: &Key| p.filename().unwrap_or_default().to_owned();
@@ -500,8 +526,16 @@ pub async fn restore(
     restore_with_fault(remote, data, branch, force, key_path, mode, &|_| Ok(())).await
 }
 
+/// The file a restore leaves in the branch directory, with the last LSN of
+/// the restored log (`through_lsn`): the next `kronik serve` records a
+/// system `AuditEvent` `restore` from it, then deletes it (M28 review H4:
+/// a restore is a mutation, and LSNs after it repeat ones an audit sink
+/// has already seen).
+pub const RESTORE_MARKER: &str = "restored.json";
+
 /// [`restore`] that calls `fault` before each step of moving the staged
-/// restore into place, so tests can interrupt it there.
+/// restore into place, and once after (`committed`), so tests can
+/// interrupt it there.
 #[doc(hidden)]
 pub async fn restore_with_fault(
     remote: &Remote,
@@ -559,6 +593,8 @@ struct Staged {
     keys_missing: Vec<String>,
     /// The snapshot at or before a later rebase switch's base (M13).
     older: Option<Manifest>,
+    /// The last LSN of the staged log (the snapshot's without a segment).
+    through_lsn: Lsn,
 }
 
 async fn stage_restore(
@@ -602,6 +638,7 @@ async fn stage_restore(
     std::fs::create_dir_all(&log)?;
     let (names, _) = remote.list(&format!("{branch}/segments")).await?;
     let mut segments = Vec::new();
+    let mut through_lsn = m.lsn;
     for n in &names {
         let Some(seg) = n.strip_suffix(".zst") else {
             continue;
@@ -612,6 +649,7 @@ async fn stage_restore(
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| ShipError::Restore(format!("{n} is not a segment name")))?;
         kronik_log::scan_segment_image(&bytes, branch, start, 0, Lsn::MAX, true, |mut c| {
+            through_lsn = through_lsn.max(c.lsn);
             if let kronik_proto::Record::Erasure(e) = &c.record {
                 let wall = e.audit.as_ref().map_or(0, |a| a.wall_time_ms);
                 erasures.push((e.subject.clone(), e.key_version, wall));
@@ -744,6 +782,7 @@ async fn stage_restore(
         keystore_backup_ms,
         keys_missing,
         older,
+        through_lsn,
     })
 }
 
@@ -851,11 +890,17 @@ fn install_staged(
     }
     // Nothing was shipped from here yet.
     let _ = std::fs::remove_file(ShipState::path(data));
+    // The marker is durable before the new state is in place (perf review
+    // R4): restored state without it would let an audit cursor past the
+    // restored log skip the new history.
+    let marker = serde_json::json!({ "through_lsn": s.through_lsn }).to_string();
+    snapshots::write_synced(&branch_dir.join(RESTORE_MARKER), marker.as_bytes())?;
     fault("commit")?;
     std::fs::rename(
         stage.join("branch").join("state.db"),
         branch_dir.join("state.db"),
     )?;
+    fault("committed")?;
     let first = kronik_log::segment_starts(&log_dir)?
         .first()
         .copied()

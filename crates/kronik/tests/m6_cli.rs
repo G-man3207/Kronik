@@ -536,6 +536,60 @@ fn restore_from_a_file_bucket_lands_in_the_named_directory() {
     );
     assert!(data.join("branches/main/state.db").is_file());
 
+    // The next serve records the restore in the log and deletes the marker
+    // (M28 review H4).
+    let marker = dest.path().join("branches/main/restored.json");
+    assert!(marker.is_file(), "restore left no marker");
+    let dest_socket = dest.path().join("api.sock");
+    let mut served = command()
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(dest.path())
+        .arg("--api-socket")
+        .arg(&dest_socket)
+        .arg("--http-listen")
+        .arg("127.0.0.1:0")
+        .env("KRONIK_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let up = (0..600).any(|_| {
+        let ok = kronik(&["--socket", dest_socket.to_str().unwrap(), "actors", "list"]).code == 0;
+        if !ok {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        ok
+    });
+    let _ = served.kill();
+    let _ = served.wait();
+    assert!(up, "serve on the restored directory did not come up");
+    assert!(!marker.exists(), "the marker outlived the recorded restore");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let events = rt.block_on(async {
+        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+        let reader = kronik_log::LogReader::new(env, dest.path().join("branches/main/log"), "main");
+        let mut out = Vec::new();
+        reader
+            .read(1, u64::MAX, |c| {
+                if let kronik_proto::Record::AuditEvent(e) = c.record {
+                    out.push(e);
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        out
+    });
+    let restore: Vec<_> = events.iter().filter(|e| e.action == "restore").collect();
+    assert_eq!(restore.len(), 1, "{events:?}");
+    let through: u64 = restore[0].details["through_lsn"].parse().unwrap();
+    assert!(through >= lsn, "{events:?}");
+    assert_eq!(restore[0].audit.as_ref().unwrap().token_id, "system");
+
     let again = kronik(&[
         "--json",
         "restore",

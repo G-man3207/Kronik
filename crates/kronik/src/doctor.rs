@@ -43,7 +43,7 @@ enum Status {
 #[derive(Debug, Serialize, JsonSchema)]
 struct Check {
     /// Stable: config, kernel, runsc, kvm, cgroup, root, disk, clock, tls,
-    /// dns01_hook, ship.
+    /// dns01_hook, ship, export.
     name: &'static str,
     status: Status,
     /// An error code from the catalog, when one applies.
@@ -140,6 +140,7 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
     checks.extend(dns01_hook(&config));
     checks.extend(wildcard_certificate(&config));
     checks.push(ship(&config));
+    checks.push(export(&config));
     let count = |s| checks.iter().filter(|c| c.status == s).count();
     let report = Report {
         pass: count(Status::Pass),
@@ -766,6 +767,87 @@ fn ship(config: &Config) -> Check {
     }
 }
 
+/// The export streams of a running daemon (m28-otel §5, §6.2): its `GET
+/// /v1/export` on the configured API socket.
+fn export(config: &Config) -> Check {
+    if config.audit.sink().is_none() && config.otel.endpoint().is_none() {
+        return check("export", Status::Pass, "no export is configured");
+    }
+    let socket = &config.server.api_socket;
+    let token = crate::cli::client_token_from(None).ok().flatten();
+    let endpoint = crate::cli::http::Endpoint::Unix(socket.clone());
+    match crate::cli::http::request(
+        &endpoint,
+        "GET",
+        "/v1/export",
+        None,
+        token.as_deref(),
+        std::time::Duration::from_secs(5),
+    ) {
+        Ok(r) if r.status == 200 => {
+            match serde_json::from_slice::<kronik_api::types::ExportStatusResponse>(&r.body) {
+                Ok(s) => export_streams(config, &s.streams),
+                Err(e) => check(
+                    "export",
+                    Status::Warn,
+                    format!("unexpected export status: {e}"),
+                ),
+            }
+        }
+        Ok(r) => check(
+            "export",
+            Status::Warn,
+            format!("cannot read the export status: HTTP {}", r.status),
+        )
+        .hint("set KRONIK_TOKEN to a token with the read scope"),
+        Err(_) => check(
+            "export",
+            Status::Pass,
+            format!(
+                "no daemon on {}: the export streams are not checked",
+                socket.display()
+            ),
+        ),
+    }
+}
+
+/// Warns when a stream with lag has not delivered for 10 × its interval,
+/// and when the audit export has held retention for longer than
+/// `[retention] history` (the hold's age is the time since its last
+/// delivery).
+fn export_streams(config: &Config, streams: &[kronik_api::types::ExportStream]) -> Check {
+    let history = config.retention.history.0;
+    let mut warnings = Vec::new();
+    for s in streams.iter().filter(|s| s.enabled) {
+        let Some(stalled) = s.stalled_ms.map(Duration::from_millis) else {
+            continue;
+        };
+        let interval = if s.name == "audit" {
+            config.audit.interval.0
+        } else {
+            config.otel.interval.0
+        };
+        let shown = crate::cli::units::duration(stalled.as_millis() as u64);
+        if s.name == "audit" && stalled > history {
+            warnings.push(format!(
+                "the audit export has held retention for {shown}, longer than [retention] history, with {} records to export",
+                s.lag
+            ));
+        } else if stalled > interval * 10 {
+            warnings.push(format!(
+                "the {} export has not delivered for {shown}, with {} records to export",
+                s.name, s.lag
+            ));
+        }
+    }
+    if warnings.is_empty() {
+        return check("export", Status::Pass, "the export streams are delivering");
+    }
+    check("export", Status::Warn, warnings.join("; ")).hint(
+        "`kronik export status` shows each sink's last error; the audit hold gives way below [audit] hold_release free disk and records a gap",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,5 +945,45 @@ mod tests {
         assert_eq!(has_cap_setuid(&status("000001f3fdfeff7f")), Some(false));
         assert_eq!(has_cap_setuid("Name:\tkronik\n"), None);
         assert_eq!(has_cap_setuid(&status("zz")), None);
+    }
+
+    #[test]
+    fn a_stalled_export_and_an_old_audit_hold_warn() {
+        let stream = |name: &str, stalled_ms: Option<u64>| kronik_api::types::ExportStream {
+            name: name.into(),
+            enabled: true,
+            sink: "file://".into(),
+            cursor: 1,
+            applied_lsn: 9,
+            lag: 8,
+            last_success_wall_ms: None,
+            stalled_ms,
+            last_error: None,
+            gaps: 0,
+        };
+        let config = Config::default();
+        let ok = export_streams(
+            &config,
+            &[stream("traces", Some(1_000)), stream("audit", None)],
+        );
+        assert_eq!(ok.status, Status::Pass, "{}", ok.message);
+        // traces: 10 × 5 s.
+        let stale = export_streams(&config, &[stream("traces", Some(51_000))]);
+        assert_eq!(stale.status, Status::Warn);
+        assert!(
+            stale.message.contains("traces export has not delivered"),
+            "{}",
+            stale.message
+        );
+        // audit: 10 × 1 s, then past the 7-day history.
+        let stale = export_streams(&config, &[stream("audit", Some(11_000))]);
+        assert!(
+            stale.message.contains("audit export has not delivered"),
+            "{}",
+            stale.message
+        );
+        let held = export_streams(&config, &[stream("audit", Some(8 * 86_400_000))]);
+        assert_eq!(held.status, Status::Warn);
+        assert!(held.message.contains("held retention"), "{}", held.message);
     }
 }

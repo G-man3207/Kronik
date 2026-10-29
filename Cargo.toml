@@ -21,6 +21,7 @@ kronik-effects = { path = "crates/kronik-effects" }
 kronik-fork = { path = "crates/kronik-fork" }
 kronik-mcp = { path = "crates/kronik-mcp" }
 kronik-metrics = { path = "crates/kronik-metrics" }
+kronik-otel = { path = "crates/kronik-otel" }
 kronik-policy = { path = "crates/kronik-policy" }
 kronik-privacy = { path = "crates/kronik-privacy" }
 kronik-proto = { path = "crates/kronik-proto" }

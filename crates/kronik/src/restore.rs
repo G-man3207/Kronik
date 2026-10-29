@@ -1,6 +1,7 @@
 //! `kronik restore`: install a data directory from object storage
 //! (docs/design/m6-storage.md §6). Offline: it does not talk to a daemon,
-//! and it does not write a log record, so it takes no `--reason`.
+//! and it writes no log record itself, so it takes no `--reason`; it leaves
+//! a marker from which the next `kronik serve` records an `AuditEvent`.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -183,10 +184,11 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
             remote.check().await.map_err(ship_error)?;
             return Ok(None);
         }
-        kronik_ship::restore(&remote, &data, &branch, force, &key_path, mode)
+        // The install writes the restore marker before its commit step.
+        let report = kronik_ship::restore(&remote, &data, &branch, force, &key_path, mode)
             .await
-            .map(Some)
-            .map_err(ship_error)
+            .map_err(ship_error)?;
+        Ok::<_, ApiError>(Some(report))
     })?;
     let output = RestoreOutput {
         dry_run,
@@ -322,7 +324,7 @@ fn rerun(from: &str, endpoint: Option<&str>, dir: &str, force: bool, dry_run: bo
     cmd
 }
 
-fn runtime() -> Result<tokio::runtime::Runtime, ApiError> {
+pub(crate) fn runtime() -> Result<tokio::runtime::Runtime, ApiError> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("kronik")

@@ -273,6 +273,8 @@ pub struct Proposals {
 /// that started it (M10, ADR 0022).
 struct Job {
     progress: Arc<replay::Progress>,
+    /// Closed when the job is done.
+    done: Arc<tokio::sync::Semaphore>,
 }
 
 /// What `propose` checked and chose before the replay.
@@ -1070,6 +1072,7 @@ impl Proposals {
             p.id.clone(),
             Job {
                 progress: progress.clone(),
+                done: done.clone(),
             },
         );
         let this = self.clone();
@@ -1111,11 +1114,20 @@ impl Proposals {
         if !wait {
             return Ok((running, false));
         }
-        let _ = done.acquire().await;
-        let meta = self.get(&id).await?;
+        Ok((self.wait(&id).await?, false))
+    }
+
+    /// Waits for proposal `id`'s job to end (at once when none runs) and
+    /// returns the finished proposal, or the job's error.
+    pub async fn wait(&self, id: &str) -> Result<Proposal, ApiError> {
+        let done = lock(&self.jobs).get(id).map(|j| j.done.clone());
+        if let Some(done) = done {
+            let _ = done.acquire().await;
+        }
+        let meta = self.get(id).await?;
         match (meta.status.as_str(), &meta.error) {
             ("failed", Some(e)) => Err(e.clone()),
-            _ => Ok((meta, false)),
+            _ => Ok(meta),
         }
     }
 

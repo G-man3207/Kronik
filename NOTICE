@@ -3,3 +3,8 @@ Copyright 2026 Gustaf Ekfeldt
 
 Licensed under the Elastic License 2.0 (ELv2). See the LICENSE file for the
 full license text.
+
+This product includes the OpenTelemetry protocol definitions
+(proto/opentelemetry/, from https://github.com/open-telemetry/opentelemetry-proto
+tag v1.7.0), Copyright The OpenTelemetry Authors, licensed under the Apache
+License, Version 2.0 (proto/opentelemetry/LICENSE).

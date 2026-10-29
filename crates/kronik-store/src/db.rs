@@ -689,7 +689,9 @@ impl StateDb {
                 }
                 Record::BranchCreated(_)
                 | Record::SnapshotMarker(_)
-                | Record::GuardTriggered(_) => {}
+                | Record::GuardTriggered(_)
+                // An AuditEvent is audit trail only (M28): it changes no state.
+                | Record::AuditEvent(_) => {}
                 // A rebased turn changes nothing until its switch (ADR 0017),
                 // which `Store::apply_with` applies with its shadow.
                 Record::StateRebase(r) => {

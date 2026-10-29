@@ -9,10 +9,12 @@ never parses the human output. A client command prints the JSON API's
 response body unchanged, so its schema is that of the operation it calls,
 as in [openapi.json](openapi.json), the OpenAPI 3.1 description that
 `GET /v1/openapi.json` serves. `explain`, `doctor`, `init`, `build`,
-`restore` and `upgrade check` answer themselves. A failure prints the
-[`Error`](#error) object instead, with exit code 1, except
-`upgrade check`, which prints its report either way and exits 1 when
-the replay is not empty (`code` is `ENGINE_UPGRADE_DIVERGED`). The
+`restore`, `upgrade check` and `audit verify` answer themselves. A
+failure prints the [`Error`](#error) object instead, with exit code 1,
+except `upgrade check`, which prints its report either way and exits 1
+when the replay is not empty (`code` is `ENGINE_UPGRADE_DIVERGED`), and
+`audit verify`, which prints its report either way and exits 1 when it
+is not `complete`. The
 schemas are JSON Schema 2020-12; `$ref`s name the definitions below.
 
 Two bodies are not generated from types but written by hand, and also
@@ -89,6 +91,10 @@ against both.
 | `kronik snapshot list` | [`SnapshotsResponse`](#snapshotsresponse) (`GET /v1/snapshots`) |
 | `kronik snapshot create` | [`SnapshotCreateResponse`](#snapshotcreateresponse) (`POST /v1/snapshots`) |
 | `kronik integrity` | [`IntegrityResponse`](#integrityresponse) (`GET /v1/integrity`) |
+| `kronik export status` | [`ExportStatusResponse`](#exportstatusresponse) (`GET /v1/export`) |
+| `kronik export rewind` | [`ExportRewindResponse`](#exportrewindresponse) (`POST /v1/export/{stream}/rewind`) |
+| `kronik audit show` | [`AuditResponse`](#auditresponse) (`GET /v1/audit`) |
+| `kronik audit verify` | [`Report2`](#report2), from the CLI itself |
 | `kronik mcp` | no JSON: MCP's JSON-RPC on stdout instead |
 | `kronik explain` | [explain output](#explain-output), from the CLI itself |
 
@@ -262,6 +268,41 @@ against both.
 }
 ```
 
+### AuditResponse
+
+```json
+{
+  "description": "`GET /v1/audit`: `kronik.audit/v1` lines in LSN order (m28-otel §4.3).",
+  "properties": {
+    "applied_lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "lines": {
+      "items": {
+        "$ref": "#/components/schemas/Line"
+      },
+      "type": "array"
+    },
+    "next": {
+      "description": "The `from` of the next page; absent at the applied LSN.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "lines",
+    "applied_lsn"
+  ],
+  "type": "object"
+}
+```
+
 ### BuildOutput
 
 ```json
@@ -326,7 +367,7 @@ against both.
       "type": "string"
     },
     "name": {
-      "description": "Stable: config, kernel, runsc, kvm, cgroup, root, disk, clock, tls,\ndns01_hook, ship.",
+      "description": "Stable: config, kernel, runsc, kvm, cgroup, root, disk, clock, tls,\ndns01_hook, ship, export.",
       "type": "string"
     },
     "status": {
@@ -2589,6 +2630,7 @@ against both.
           "enum": [
             "ACTOR_NOT_FOUND",
             "APPROVAL_REQUIRED",
+            "AUDIT_RANGE_GONE",
             "BAD_REQUEST",
             "CAPABILITY_NOT_GRANTED",
             "DEAD_LETTER_ALREADY_RESENT",
@@ -2597,6 +2639,7 @@ against both.
             "EFFECT_OUTCOME_UNKNOWN",
             "ENGINE_UPGRADE_DIVERGED",
             "ENGINE_VERSION_MISMATCH",
+            "EXPORT_NOT_CONFIGURED",
             "FOREIGN_EXISTS",
             "FOREIGN_NOT_FOUND",
             "FOREIGN_UNAVAILABLE",
@@ -2664,6 +2707,138 @@ against both.
   },
   "required": [
     "error"
+  ],
+  "type": "object"
+}
+```
+
+### ExportRewindResponse
+
+```json
+{
+  "properties": {
+    "dry_run": {
+      "type": "boolean"
+    },
+    "from": {
+      "description": "The cursor before the rewind.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "stream": {
+      "type": "string"
+    },
+    "to": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "dry_run",
+    "stream",
+    "from",
+    "to"
+  ],
+  "type": "object"
+}
+```
+
+### ExportStatusResponse
+
+```json
+{
+  "description": "`GET /v1/export`: every export stream of the daemon.",
+  "properties": {
+    "streams": {
+      "items": {
+        "$ref": "#/components/schemas/ExportStream"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "streams"
+  ],
+  "type": "object"
+}
+```
+
+### ExportStream
+
+```json
+{
+  "properties": {
+    "applied_lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "cursor": {
+      "description": "The last LSN the sink acknowledged.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "gaps": {
+      "description": "Ranges retention deleted before the stream read them, since the\nstart.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "lag": {
+      "description": "`applied_lsn - cursor` while enabled, else 0.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "last_error": {
+      "description": "The last failure's code (`http_503`, `connect`, `timeout`, ...),\nnever its text.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_success_wall_ms": {
+      "description": "Wall-clock milliseconds of the last delivered batch since the start.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "name": {
+      "description": "`traces` or `audit`.",
+      "type": "string"
+    },
+    "sink": {
+      "description": "The sink's or endpoint's scheme and host only (never a path, query\nor credentials); empty when not configured.",
+      "type": "string"
+    },
+    "stalled_ms": {
+      "default": null,
+      "description": "While there is lag: milliseconds since the last delivered batch, or\nsince the stream started without one. `kronik doctor` warns on it.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "name",
+    "enabled",
+    "sink",
+    "cursor",
+    "applied_lsn",
+    "lag",
+    "gaps"
   ],
   "type": "object"
 }
@@ -3433,7 +3608,7 @@ against both.
       "type": "integer"
     },
     "log_hash": {
-      "description": "BLAKE3 over the records `log_first_lsn..=applied_lsn` (LSN, kind and\nencoded record of each).",
+      "description": "BLAKE3 over the records `log_first_lsn..=through_lsn` (LSN, kind and\nencoded record of each).",
       "type": "string"
     },
     "newest_logical_time_ms": {
@@ -3460,6 +3635,13 @@ against both.
     "state_hash": {
       "description": "BLAKE3 over the materialized state (m6-storage §8).",
       "type": "string"
+    },
+    "through_lsn": {
+      "default": 0,
+      "description": "The last LSN `log_hash` covers: `applied_lsn`, or the `through`\nasked for. An older response that omits it decodes as 0.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
     }
   },
   "required": [
@@ -3467,6 +3649,45 @@ against both.
     "state_hash",
     "log_first_lsn",
     "log_hash"
+  ],
+  "type": "object"
+}
+```
+
+### Item
+
+```json
+{
+  "description": "One item of a verification report.",
+  "properties": {
+    "action": {
+      "type": "string"
+    },
+    "effect": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "kind": {
+      "type": "string"
+    },
+    "lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "record_hash": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "lsn",
+    "kind",
+    "action",
+    "record_hash"
   ],
   "type": "object"
 }
@@ -3644,6 +3865,84 @@ against both.
     "sql_bytes_per_actor",
     "effect_timeout_ms",
     "effect_response_bytes"
+  ],
+  "type": "object"
+}
+```
+
+### Line
+
+```json
+{
+  "description": "One exported line, keys in §4.3's order.",
+  "properties": {
+    "action": {
+      "type": "string"
+    },
+    "at_wall_ms": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "branch": {
+      "type": "string"
+    },
+    "details": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "effect": {
+      "description": "The effect ordinal of a reveal line; absent otherwise.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "epoch": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "kind": {
+      "type": "string"
+    },
+    "lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "reason_truncated": {
+      "type": "boolean"
+    },
+    "record_hash": {
+      "type": "string"
+    },
+    "schema": {
+      "type": "string"
+    },
+    "token_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "lsn",
+    "kind",
+    "action",
+    "at_wall_ms",
+    "token_id",
+    "reason",
+    "branch",
+    "details",
+    "record_hash"
   ],
   "type": "object"
 }
@@ -4588,6 +4887,81 @@ against both.
     "pass",
     "warn",
     "fail"
+  ],
+  "type": "object"
+}
+```
+
+### Report2
+
+```json
+{
+  "description": "`kronik audit verify` (§4.5): a sink's lines against the log's.",
+  "properties": {
+    "complete": {
+      "description": "Nothing missing, extra or conflicting.",
+      "type": "boolean"
+    },
+    "conflicting": {
+      "description": "Lines whose (lsn, effect) the log has with a different record, or\nwith other fields.",
+      "items": {
+        "$ref": "#/components/schemas/Item"
+      },
+      "type": "array"
+    },
+    "expected": {
+      "description": "Audited items of the log in the range.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "extra": {
+      "description": "Lines for no item of the log.",
+      "items": {
+        "$ref": "#/components/schemas/Item"
+      },
+      "type": "array"
+    },
+    "from": {
+      "description": "The range checked, `(from, to]`.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "lines": {
+      "description": "Distinct sink lines in the range.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "missing": {
+      "items": {
+        "$ref": "#/components/schemas/Item"
+      },
+      "type": "array"
+    },
+    "superseded": {
+      "description": "Lines of a tail that a later `restore` event replaced: exported\nbefore the restore, with LSNs past its `through_lsn`.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "to": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "complete",
+    "from",
+    "to",
+    "expected",
+    "lines",
+    "missing",
+    "extra",
+    "conflicting",
+    "superseded"
   ],
   "type": "object"
 }

@@ -215,6 +215,15 @@ impl Api {
         let r: ResealRequest = json(&req.body)?;
         reason(&r.reason)?;
         let done = self.node.reseal(r.dry_run).await?;
+        if !r.dry_run {
+            let details = [
+                ("segments", done.segments.to_string()),
+                ("values_sealed", done.values_sealed.to_string()),
+                ("tombstones", done.tombstones.to_string()),
+            ];
+            self.audit_event(req, "privacy.reseal", "", &details, r.reason)
+                .await?;
+        }
         ok(&ResealResponse {
             dry_run: r.dry_run,
             started: done.started,

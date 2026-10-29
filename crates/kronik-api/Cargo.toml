@@ -22,6 +22,7 @@ kronik-core = { workspace = true }
 kronik-effects = { workspace = true }
 kronik-fork = { workspace = true }
 kronik-foreign = { workspace = true }
+kronik-otel = { workspace = true }
 kronik-policy = { workspace = true }
 kronik-privacy = { workspace = true }
 kronik-proto = { workspace = true }

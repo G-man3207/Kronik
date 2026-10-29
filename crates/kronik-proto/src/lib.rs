@@ -65,6 +65,7 @@ pub enum Record {
     SimulatorConfig(pb::SimulatorConfig),
     StateRebase(pb::StateRebase),
     GuardTriggered(pb::GuardTriggered),
+    AuditEvent(pb::AuditEvent),
 }
 
 /// Envelope kind bytes. 0 and every value not listed here are invalid.
@@ -86,8 +87,9 @@ pub mod kind {
     pub const SIMULATOR_CONFIG: u8 = 15;
     pub const STATE_REBASE: u8 = 16;
     pub const GUARD_TRIGGERED: u8 = 17;
+    pub const AUDIT_EVENT: u8 = 40;
     /// All valid kinds, in order.
-    pub const ALL: [u8; 17] = [
+    pub const ALL: [u8; 18] = [
         TURN_BEGIN,
         EFFECT_RESULT,
         TURN_RECORD,
@@ -105,6 +107,7 @@ pub mod kind {
         SIMULATOR_CONFIG,
         STATE_REBASE,
         GUARD_TRIGGERED,
+        AUDIT_EVENT,
     ];
 }
 
@@ -129,6 +132,7 @@ impl Record {
             Record::SimulatorConfig(_) => kind::SIMULATOR_CONFIG,
             Record::StateRebase(_) => kind::STATE_REBASE,
             Record::GuardTriggered(_) => kind::GUARD_TRIGGERED,
+            Record::AuditEvent(_) => kind::AUDIT_EVENT,
         }
     }
 
@@ -152,6 +156,31 @@ impl Record {
             Record::SimulatorConfig(m) => m.encode_to_vec(),
             Record::StateRebase(m) => m.encode_to_vec(),
             Record::GuardTriggered(m) => m.encode_to_vec(),
+            Record::AuditEvent(m) => m.encode_to_vec(),
+        }
+    }
+
+    /// The length of [`Record::encode`], without encoding.
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            Record::TurnBegin(m) => m.encoded_len(),
+            Record::EffectResult(m) => m.encoded_len(),
+            Record::TurnRecord(m) => m.encoded_len(),
+            Record::Deployment(m) => m.encoded_len(),
+            Record::Grant(m) => m.encoded_len(),
+            Record::Limits(m) => m.encoded_len(),
+            Record::Policy(m) => m.encoded_len(),
+            Record::Approval(m) => m.encoded_len(),
+            Record::PrivacyMode(m) => m.encoded_len(),
+            Record::ForeignActor(m) => m.encoded_len(),
+            Record::BranchCreated(m) => m.encoded_len(),
+            Record::Erasure(m) => m.encoded_len(),
+            Record::EngineUpgrade(m) => m.encoded_len(),
+            Record::SnapshotMarker(m) => m.encoded_len(),
+            Record::SimulatorConfig(m) => m.encoded_len(),
+            Record::StateRebase(m) => m.encoded_len(),
+            Record::GuardTriggered(m) => m.encoded_len(),
+            Record::AuditEvent(m) => m.encoded_len(),
         }
     }
 
@@ -178,6 +207,7 @@ impl Record {
             kind::SIMULATOR_CONFIG => Record::SimulatorConfig(de(kind, bytes)?),
             kind::STATE_REBASE => Record::StateRebase(de(kind, bytes)?),
             kind::GUARD_TRIGGERED => Record::GuardTriggered(de(kind, bytes)?),
+            kind::AUDIT_EVENT => Record::AuditEvent(de(kind, bytes)?),
             other => return Err(DecodeError::UnknownKind(other)),
         };
         record.validate()?;
@@ -264,6 +294,13 @@ impl Record {
             Record::GuardTriggered(m) => {
                 enum_value::<pb::GuardAction>(m.action, "GuardTriggered.action")?;
                 enum_value::<pb::GuardOutcome>(m.outcome, "GuardTriggered.outcome")
+            }
+            Record::AuditEvent(m) => {
+                some(m.audit.as_ref(), "AuditEvent.audit")?;
+                if m.action.is_empty() {
+                    return Err(invalid("AuditEvent.action", "empty"));
+                }
+                Ok(())
             }
         }
     }
@@ -563,6 +600,58 @@ mod tests {
             Record::decode(18, &[]),
             Err(DecodeError::UnknownKind(18))
         ));
+    }
+
+    /// The committed bytes of an M28 `EffectRecord` with `offset_us` (field
+    /// 80) set decode, and the encoder still writes exactly them (I16).
+    /// Fixture: `tests/fixtures/effect-record-v2.hex`, the v1 fixture plus
+    /// field 80 = 250.
+    #[test]
+    fn effect_record_fixture_with_offset_us_round_trips() {
+        use prost::Message as _;
+        let hex = include_str!("../tests/fixtures/effect-record-v2.hex").trim();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let e = pb::EffectRecord::decode(bytes.as_slice()).unwrap();
+        assert_eq!(
+            (e.kind.as_str(), e.duration_us, e.offset_us),
+            ("http.fetch", 1_500, 250)
+        );
+        assert_eq!(e.encode_to_vec(), bytes);
+    }
+
+    /// The committed bytes of an M28 `AuditEvent` decode, and the encoder
+    /// still writes exactly them (I16). Fixture: `tests/fixtures/audit-event-v1.hex`.
+    #[test]
+    fn audit_event_fixture_decodes_and_requires_action_and_audit() {
+        let hex = include_str!("../tests/fixtures/audit-event-v1.hex").trim();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let record = Record::decode(kind::AUDIT_EVENT, &bytes).unwrap();
+        let Record::AuditEvent(e) = &record else {
+            panic!("{record:?}")
+        };
+        assert_eq!((e.action.as_str(), e.target.as_str()), ("secret.set", "db"));
+        assert_eq!(e.details.get("version").map(String::as_str), Some("2"));
+        let audit = e.audit.as_ref().unwrap();
+        assert_eq!(
+            (audit.token_id.as_str(), audit.reason.as_str()),
+            ("kronik", "rotate")
+        );
+        assert_eq!(record.encode(), bytes);
+
+        let mut no_audit = e.clone();
+        no_audit.audit = None;
+        let mut no_action = e.clone();
+        no_action.action.clear();
+        for bad in [no_audit, no_action] {
+            let err = Record::decode(kind::AUDIT_EVENT, &Record::AuditEvent(bad).encode());
+            assert!(matches!(err, Err(DecodeError::Invalid { .. })), "{err:?}");
+        }
     }
 
     /// A present sealable path, query or parameter value must hold a value,

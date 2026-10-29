@@ -34,8 +34,21 @@ pub(super) fn snapshot(ctx: &Ctx, command: SnapshotCommand) -> Result<ExitCode, 
     }
 }
 
-pub(super) fn integrity(ctx: &Ctx) -> Result<ExitCode, Error> {
-    let body = ctx.get("/v1/integrity")?;
+#[derive(Debug, clap::Args)]
+pub struct IntegrityArgs {
+    /// Hash the log only through this LSN: compare a restored node with
+    /// the source's applied LSN (the restored node's first start adds its
+    /// `restore` event after it).
+    #[arg(long, value_name = "LSN")]
+    pub through: Option<u64>,
+}
+
+pub(super) fn integrity(ctx: &Ctx, a: IntegrityArgs) -> Result<ExitCode, Error> {
+    let path = match a.through {
+        Some(t) => format!("/v1/integrity?through={t}"),
+        None => "/v1/integrity".to_owned(),
+    };
+    let body = ctx.get(&path)?;
     let r: IntegrityResponse = ctx.decode(&body)?;
     // Sealed values nobody can read are a failed check, not a detail.
     let status = if r.keys_missing.is_empty() {
@@ -50,7 +63,15 @@ pub(super) fn integrity(ctx: &Ctx) -> Result<ExitCode, Error> {
     let mut out = String::new();
     let _ = writeln!(out, "Applied LSN   {}", r.applied_lsn);
     let _ = writeln!(out, "State hash    {}", r.state_hash);
-    let _ = writeln!(out, "Log hash      {}", r.log_hash);
+    if r.through_lsn != 0 && r.through_lsn != r.applied_lsn {
+        let _ = writeln!(
+            out,
+            "Log hash      {} (through lsn {})",
+            r.log_hash, r.through_lsn
+        );
+    } else {
+        let _ = writeln!(out, "Log hash      {}", r.log_hash);
+    }
     let _ = writeln!(out, "Log first LSN {}", r.log_first_lsn);
     let _ = writeln!(
         out,

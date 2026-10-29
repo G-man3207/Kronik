@@ -134,6 +134,7 @@ without a file the defaults below apply.
 | `--gateway-timeout-ms <MS>` | `gateway.timeout` | 30 seconds |
 | `--master-key-file <PATH>` | `keys.master_key_file` | `<data dir>/keys/master.key`; `$KRONIK_MASTER_KEY_FILE`. `$KRONIK_MASTER_KEY`, when set, is the key itself (64 hex characters) and no file is read or created; setting both stops the start |
 | `--disk-reserve <SIZE>` | `log.disk_reserve` | `512MiB`; `$KRONIK_DISK_RESERVE`. Below this much free space new inputs and changes are refused; `0B` turns it off |
+| `--otel-endpoint <URL>` | `otel.endpoint` | off; `$KRONIK_OTEL_ENDPOINT` (an OTLP/HTTP collector for spans and metrics, M28) |
 | `--concurrency <N>` | | `64` |
 | `--log-format text\|json` | | `text`; `$KRONIK_LOG_FORMAT` (`json`: one JSON object per line) |
 
@@ -183,6 +184,11 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_gateway_request_duration_seconds` | histogram | Time to answer an HTTP request at the gateway, by status code. |
 | `kronik_replay_runs_total` | counter | Replays run for forks and proposals, by mode. |
 | `kronik_guard_triggered_total` | counter | Guards of `kronik watch` that fired, by action and outcome. |
+| `kronik_export_records_total` | counter | Log records an export stream delivered (or skipped), by stream. |
+| `kronik_export_lag_records` | gauge | Committed records an export stream has not delivered yet, by stream. |
+| `kronik_export_errors_total` | counter | Failed export attempts (retried), by stream. |
+| `kronik_export_dropped_total` | counter | Records in batches the sink refused for good and the export skipped, by stream. |
+| `kronik_export_gaps_total` | counter | Log ranges retention deleted before an export stream read them, by stream. |
 
 `kronik serve --init [--domain <NAME>]... [--acme-email <EMAIL>] [--dry-run]`
 sets a host up, as root (M6): it writes the configuration file, creates the
@@ -1884,12 +1890,18 @@ Next     kronik snapshot list
 
 ## kronik integrity
 
-`kronik integrity`
+`kronik integrity [--through <LSN>]`
 
 Prints the applied LSN, the state hash, a hash of the log still on disk,
 and the retention window (`GET /v1/integrity`, scope `read`). A restore is
-checked by comparing the hashes with the source node: the same state hash
-and log hash mean the restored node matches. Log first LSN is the oldest
+checked by comparing the hashes with the source node. A restored node's
+first start appends one `restore` audit event after the source's last
+record (M28), so compare its log through the source's applied LSN:
+`kronik integrity --through <the source's applied LSN>` on the restored
+node gives the source's log hash, its state hash is the source's, and
+`kronik audit show --from <that LSN + 1>` shows the one `restore` line.
+`--through` hashes the log only through that LSN (1 to the applied LSN;
+`through_lsn` in the JSON). Log first LSN is the oldest
 record retention has kept. The window is `[retention] history` back from
 the newest logical time; a fork point before the cutoff is refused.
 
@@ -1901,6 +1913,86 @@ Log hash      b3:1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80
 Log first LSN 1
 Window        7 days back from logical time 1761400000000 (cutoff 1760795200000)
 Next     kronik snapshot list
+```
+
+## kronik export status
+
+`kronik export status`
+
+Shows every export stream of the daemon (M28): `traces` (spans over OTLP,
+`[otel]`) and `audit` (`GET /v1/export`, scope `read`). For each: whether
+it is on, the sink's scheme and host only (never a path, query or
+credentials), the cursor (the last LSN the sink acknowledged), the lag
+behind the applied LSN, the last success, the last error's code (such as
+`http_503`, `connect` or `timeout`; never its text) and the gaps retention
+made since the start. With `--json`, `stalled_ms` is, while there is lag,
+the time since the last delivery (or since the start without one);
+`kronik doctor` warns on it.
+
+```text
+$ kronik export status
+stream  enabled  sink                   cursor  lag  last success          last error  gaps
+traces  yes      http://127.0.0.1:4318  41      0    2026-10-27T09:12:04Z  -           0
+audit   yes      file://                41      0    2026-10-27T09:12:04Z  -           0
+```
+
+## kronik export rewind
+
+`kronik export rewind <STREAM> --to <LSN> --reason <REASON> [--dry-run]`
+
+Moves a stream's cursor back, so that the records after `--to` are sent
+again, after a sink lost them (`POST /v1/export/{stream}/rewind`, scope
+`operate`). `--to` is at most the cursor, and not before the record before
+the first retained one (`AUDIT_RANGE_GONE`). For `audit`, retention is held
+from `--to` at once. A stream that is off answers `EXPORT_NOT_CONFIGURED`.
+The rewind is recorded as an `AuditEvent` `export.rewind`. For `traces`, the
+exporter first rebuilds its open-turn set at `--to` from the retained log,
+so the resent spans are the ones it sent before.
+
+```text
+$ kronik export rewind audit --to 1200 --reason "the bucket lost a day"
+audit resends from LSN 1201 (its cursor was 1342)
+Next     kronik export status
+```
+
+## kronik audit show
+
+`kronik audit show [--from <LSN>] [--limit <N>]`
+
+Prints the audit lines (`kronik.audit/v1`) of main's log from `--from` (the
+first retained record by default), as an audit sink receives them, also
+when no sink is set (`GET /v1/audit`, scope `admin`: the lines name tokens
+and callers). `--limit` is 1 to 1000 lines, 100 by default; a page ends
+between records. `--json` prints the lines in full.
+
+```text
+$ kronik audit show --limit 3
+lsn  action         at                    token       reason
+1    deploy         2026-10-27T09:10:00Z  unix:uid=0  first version
+3    send           2026-10-27T09:10:02Z  unix:uid=0  check the key
+3#1  secret.reveal  2026-10-27T09:10:02Z  unix:uid=0  check the key
+Next     kronik audit show --from 4
+```
+
+## kronik audit verify
+
+`kronik audit verify [--sink <URL>] [--from <LSN>] [--to <LSN>] [--config <PATH>] [--data-dir <DIR>]`
+
+Compares an audit sink with main's log (m28-otel §4.5): every audited
+record in (`--from`, `--to`] must have its line, deduplicated by `lsn`,
+`effect` and `record_hash`, and equal in kind, action, token and time;
+no line may be extra or conflict with the log's record. Lines of a tail
+that a later `restore` line replaced are counted as superseded. Needs no
+daemon: it reads the data directory (`--data-dir`, else `server.data_dir`)
+and the sink, `--sink` or `[audit] sink`: a `file://` directory or an
+`s3://` bucket (with `[audit] endpoint` and the `AWS_*` variables). A
+webhook cannot be read back. `--from` defaults to the record before the
+first retained one, `--to` to the audit cursor in `export.json`. It prints
+the report, and exits 1 unless the sink is complete.
+
+```text
+$ kronik audit verify --sink file:///var/log/kronik/audit/
+Complete: file://: 1342 audited items in (0, 1342], 1342 distinct lines
 ```
 
 ## kronik token create

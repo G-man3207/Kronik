@@ -1,9 +1,9 @@
 //! Process-wide metrics, exported at `/metrics` in the Prometheus text
-//! format (M6). [`METRICS`] is the catalog: a name, its help text and its
-//! type. Recording never reads a clock: daemon code measures durations with
-//! `Env::clock` and passes them in (ADR 0004). Nothing in the daemon reads
-//! the values back, so they cannot change behavior, in production or in the
-//! simulator.
+//! format (M6) and pushed over OTLP (M28, [`snapshot`]). [`METRICS`] is the
+//! catalog: a name, its help text and its type. Recording never reads a
+//! clock: daemon code measures durations with `Env::clock` and passes them
+//! in (ADR 0004). Only the exporters read the values back, so they cannot
+//! change behavior, in production or in the simulator.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -18,7 +18,7 @@ pub enum Type {
 }
 
 /// One exported metric.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Def {
     pub name: &'static str,
     pub help: &'static str,
@@ -92,10 +92,35 @@ pub const METRICS: &[Def] = &[
         help: "Guards of `kronik watch` that fired, by action and outcome.",
         kind: Type::Counter,
     },
+    Def {
+        name: "kronik_export_records_total",
+        help: "Log records an export stream delivered (or skipped), by stream.",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_export_lag_records",
+        help: "Committed records an export stream has not delivered yet, by stream.",
+        kind: Type::Gauge,
+    },
+    Def {
+        name: "kronik_export_errors_total",
+        help: "Failed export attempts (retried), by stream.",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_export_dropped_total",
+        help: "Records in batches the sink refused for good and the export skipped, by stream.",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_export_gaps_total",
+        help: "Log ranges retention deleted before an export stream read them, by stream.",
+        kind: Type::Counter,
+    },
 ];
 
 /// Histogram bucket bounds, in seconds.
-const BUCKETS: [f64; 14] = [
+pub const BUCKETS: [f64; 14] = [
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
@@ -320,6 +345,63 @@ pub fn render() -> String {
     out
 }
 
+/// A recorded series' value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SampleValue {
+    Counter(u64),
+    Gauge(f64),
+    /// `buckets[i]` counts observations at most [`BUCKETS`]`[i]`
+    /// (cumulative, as `le` in the text format).
+    Histogram {
+        buckets: [u64; BUCKETS.len()],
+        sum: f64,
+        count: u64,
+    },
+}
+
+/// One recorded series.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sample {
+    pub def: &'static Def,
+    /// Sorted by name.
+    pub labels: Vec<(&'static str, String)>,
+    pub value: SampleValue,
+}
+
+/// Every recorded series of the catalog with its current value, in the
+/// order [`render`] writes them.
+pub fn snapshot() -> Vec<Sample> {
+    let registry = match REGISTRY.lock() {
+        Ok(registry) => registry.clone(),
+        Err(_) => return Vec::new(),
+    };
+    METRICS
+        .iter()
+        .flat_map(|def| {
+            registry
+                .iter()
+                .filter(move |(k, _)| k.name == def.name)
+                .map(move |(k, v)| Sample {
+                    def,
+                    labels: k.labels.clone(),
+                    value: match v {
+                        Value::Counter(c) => SampleValue::Counter(*c),
+                        Value::Gauge(g) => SampleValue::Gauge(*g),
+                        Value::Histogram {
+                            buckets,
+                            sum,
+                            count,
+                        } => SampleValue::Histogram {
+                            buckets: *buckets,
+                            sum: *sum,
+                            count: *count,
+                        },
+                    },
+                })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +481,24 @@ mod tests {
             .collect();
         let catalog: Vec<&str> = METRICS.iter().map(|d| d.name).collect();
         assert_eq!(announced, catalog);
+        // The read-back holds the same values.
+        let samples = snapshot();
+        let turns = samples
+            .iter()
+            .find(|s| {
+                s.def.name == "kronik_turns_total"
+                    && s.labels == [("kind", "counter".into()), ("outcome", "committed".into())]
+            })
+            .unwrap();
+        assert_eq!(turns.value, SampleValue::Counter(2));
+        assert_eq!(turns.def.kind, Type::Counter);
+        let fsync = samples
+            .iter()
+            .find(|s| s.def.name == "kronik_log_fsync_duration_seconds")
+            .unwrap();
+        let SampleValue::Histogram { buckets, count, .. } = &fsync.value else {
+            panic!("{fsync:?}")
+        };
+        assert_eq!((buckets[2], buckets[3], *count), (0, 1, 1));
     }
 }

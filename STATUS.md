@@ -611,12 +611,57 @@ Evidence, 2026-10-28 and 29:
   run there of `sdks`, `action` and the foreign step's Postgres fork test
   with docker.
 
+## M28: OpenTelemetry and audit export
+
+M28 lands as one commit, "Kronik M28: OpenTelemetry and audit export"
+(`m28-land`). The design is `docs/design/m28-otel.md`, with ADRs 0080 to
+0084. The design review, two code reviews (reviewer-designs, then perf)
+and perf's re-review found no open must-fix; the lows that remain are
+under Known gaps, "M28: lows of the perf review".
+
+- [x] A call through three actors is one connected trace in an ordinary
+      OpenTelemetry backend. On the testbench, `M28/otel`
+      (`with_garage scripts/jaeger.sh demo/vps-otel.sh`) PASS: Jaeger 2.22
+      shows one trace per call (a → b → x, 2 `actor.call` spans, one root,
+      every parent present, call links), and with an incoming
+      `traceparent` the root links to it. CI: `crates/kronik/tests/otel.rs`
+      with an in-process OTLP receiver.
+- [x] The exported audit log is complete compared with the log's records,
+      and a test compares them: `crates/kronik/tests/audit.rs` drives every
+      mutating API route and requires `kronik audit verify` to report
+      complete. On the testbench the same `M28/otel` row exports to Garage
+      S3, and `kronik audit verify --sink s3://…` passes.
+
+Found by the testbench: `M6/vps-restore` failed at b4ea11c. The restored
+node's first start appends its `restore` audit event (the review's H-A
+fix), so its whole log no longer equals the source's. The brief asks for
+"samma state-hash och samma historik", so the demo now compares the state
+hash, the log through the source's applied LSN (new `kronik integrity
+--through <lsn>`), and requires exactly one `restore` event after it. Fixed
+at d1a4f6c; locally it passes against moto S3.
+
+Testbench rows, every one passing for 1c279df (travelfiesta, 2026-10-29):
+
+- At 1c279df, 15:46 UTC: `M28/otel` 1/1 (`PASS: traces`, `PASS: audit`,
+  no skip) and `M6/vps-restore` 1/1 (the log through lsn 302 equal, A
+  applied 304, B's `restore` event at 305).
+- At d1a4f6c, 15:27 to 15:46 UTC: `M28/otel` 1/1 and all of M6, 11/11.
+  1c279df differs from it only in STATUS.md and the one-line OpenAPI route
+  registration of `GET /v1/integrity` (behaviour unchanged), so these carry
+  over.
+- At b4ea11c, 14:27 to 15:27 UTC: M7 3/3, M3 5/5, M13 3/3, M10 6/6
+  (`remote-30min` 1864 s) and M11 5/5; M6 10/11, the failure being the
+  vps-restore finding above. d1a4f6c differs from b4ea11c only in
+  integrity, the restore demo and docs, so these carry over.
+- Startup with a 1 GiB log (without / with `state.db`): 19.5 to 20.9 s /
+  16.9 to 17.7 s at d1a4f6c, in line with v0.3's 19.7 to 22.7 / 16.0 to
+  18.9 s.
+
 ## Next
 
-1. M28, OpenTelemetry and audit export (`m28-land` 63278de, on 854e4a9),
-   and M22, standard `fetch` through `wasi:http` (`m22-wasi-http` 569b692,
-   on 4e89aa8), are in progress. Their testbench rows wait for SSH access
-   to the testbench (Open questions).
+1. M28 (above) lands once its testbench rows pass. M22, standard `fetch`
+   through `wasi:http` (`m22-wasi-http` 569b692, on 4e89aa8), is in
+   progress.
 
 ## Parked work
 
@@ -634,7 +679,7 @@ Each branch's last commit message carries its handoff.
   3091fbc). A partial review, 5 Highs, is in
   `docs/design/m21-review-partial.md`; the testbench proof needs a rerun;
   ADR 0060 is provisional.
-- M22 and M28 are in progress (Next).
+- M22 is in progress (Next).
 - M23 secret backends: `m23-design` 30d4791, design only. ADR 0093
   (PKCS#11 through a keyhelper process) is the owner's decision.
 - M24 connections: `m24-design` da0a3e5, design only.
@@ -786,3 +831,55 @@ Each branch's last commit message carries its handoff.
   deployment whose new code wrote state.
 - CI's check that the workflow runs every `ci.sh` step counts one step per
   line: `scripts/ci.sh a b` counts only `a`.
+
+### M28: lows of the perf review
+
+Not fixed with the review's must-fixes and R1 to R5:
+
+- Only the scrub of what is written to the log fails closed. The export
+  (kronik-otel `sink.rs`), `GET /v1/audit` and API answers still scrub with
+  `Node::secret_values()`, which is empty when one secret cannot be
+  decrypted.
+- An operator `send`'s message name reaches `details.message` and the span
+  name unscrubbed (`audit.rs`, `spans.rs`).
+- An erasure's reason loses its subject by exact substring only: other
+  case or URL-encoding leaks it, and a short subject such as `42` is also
+  replaced inside other numbers (`audit.rs`).
+- `scheme_host` cuts at the first `/`: a malformed webhook URL such as
+  `https://u:p/ss@h/` shows `https://u:p` in `export status` (`http.rs`).
+- The ship loop logs a `ShipError`'s full text, not its `code()`
+  (kronik-ship, before M28).
+- A `GuardTriggered` line's `outcome` is `GUARD_OUTCOME_ROLLED_BACK`, unlike
+  every other enum label.
+- Kinds 15 to 17 have no audit samples or golden lines and no needle in
+  stub bodies or `GuardTriggered.reason`; the classification test checks
+  `class()`, which the exporter never calls.
+- The `rollback.rebase` line does not name the code it switches to.
+- `kronik doctor`'s export check passes on any failed request, timeouts
+  included, and skips a daemon whose export comes from flags or the
+  environment.
+- A preview, a `watch.stop`, a `preview.delete` or a proposal can complete
+  without its `AuditEvent` when a later write fails (for a proposal: the
+  `proposal.create` append failing after its job started).
+- Rewind edges: `caught_up()` clears a pending rewind's marker; two rewinds
+  before the follower takes one disagree (`follow.rs` and `snapshots.rs`);
+  a pending rewind lives only in memory; a webhook honouring
+  `idempotency-key` answers a rewound resend with the same cut points from
+  its cache.
+- The cursor is not saved after a recorded gap, so a crash records a second
+  `audit.gap`.
+- A restore does not reset the `audit.config` cursor entry (`serve.rs`).
+- A disaster restore into a fresh directory with `from = "now"` skips the
+  `restore` line.
+- A released hold writes no gap record while the sink stays down.
+- M3 bounds the batch, not the read: `LogReader::read` decodes a whole
+  segment range first.
+- `export.json` carries the trace stream's open and kept turns (up to 200k
+  entries) on every save.
+- `[otel] metrics_interval = "0s"` is accepted, and the push loop then
+  spins.
+- A corrupt `export.json` stops `kronik serve` even with both exports off.
+- File sink edges: the newest file is read whole when the sink opens; there
+  is no cap on `file_max_bytes`; a sink directory removed while the daemon
+  runs is not recreated; opens follow symlinks; a file sink that fails to
+  open stops `kronik serve`.

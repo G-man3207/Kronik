@@ -185,19 +185,34 @@ step "serve B and compare"
 start_serve "$dir/b.toml" "$b/api.sock" "$dir/serve-b.log"
 sock="$b/api.sock"
 gw="http://127.0.0.1:$port_b"
-integrity_b=$("$bin" --socket "$sock" --json integrity)
+# B's first start appends one `restore` audit event after A's last record
+# (M28): compare the log through A's applied LSN, then what follows it.
+applied_a=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["applied_lsn"])' "$integrity_a")
+integrity_b=$("$bin" --socket "$sock" --json integrity --through "$applied_a")
+after_b=$("$bin" --socket "$sock" --json audit show --from "$((applied_a + 1))")
 history_b=$("$bin" --socket "$sock" --json history counter/alice --limit 5)
 n_b=$(curl -sf "$gw/counter/alice") || fail "read restored counter"
 
-python3 - "$integrity_a" "$integrity_b" "$history_a" "$history_b" "$n_a" "$n_b" "$lsn" <<'PY' || fail "restored node does not match"
+python3 - "$integrity_a" "$integrity_b" "$history_a" "$history_b" "$n_a" "$n_b" "$lsn" "$after_b" <<'PY' || fail "restored node does not match"
 import json, sys
-a, b, ha, hb, na, nb, lsn = sys.argv[1:]
+a, b, ha, hb, na, nb, lsn, after = sys.argv[1:]
 ia, ib = json.loads(a), json.loads(b)
 lsn = int(lsn)
-for key in ("state_hash", "log_hash", "applied_lsn"):
+# B's state equals A's, and B's log through A's applied LSN is A's log.
+for key in ("state_hash", "log_first_lsn"):
     if ia[key] != ib[key]:
         print(f"{key}: {ia[key]} != {ib[key]}", file=sys.stderr)
         sys.exit(1)
+if ib["through_lsn"] != ia["applied_lsn"] or ia["log_hash"] != ib["log_hash"]:
+    print(f"log through {ia['applied_lsn']}: {ia['log_hash']} != {ib['log_hash']}", file=sys.stderr)
+    sys.exit(1)
+# After it comes exactly one record: the restore's audit event.
+lines = json.loads(after)["lines"]
+if int(ib["applied_lsn"]) != int(ia["applied_lsn"]) + 1 or [
+    (l["lsn"], l["action"]) for l in lines
+] != [(int(ia["applied_lsn"]) + 1, "restore")]:
+    print(f"after lsn {ia['applied_lsn']}: applied {ib['applied_lsn']}, lines {lines}", file=sys.stderr)
+    sys.exit(1)
 # The restored node replayed at least to the snapshot's LSN, like A.
 for name, node in (("A", ia), ("B", ib)):
     if not 0 < lsn <= int(node["applied_lsn"]):
@@ -220,7 +235,7 @@ if sample(ha) != sample(hb):
 print(f"state {ia['state_hash']}")
 print(f"log   {ia['log_hash']}")
 print(f"n     {na}")
-print(f"lsn   {lsn} (applied {ia['applied_lsn']} on both)")
+print(f"lsn   {lsn} (A applied {ia['applied_lsn']}; B adds its restore event at {ib['applied_lsn']})")
 PY
 
 stop_serve

@@ -13,7 +13,7 @@ use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::snapshots::StorageConfig;
 use kronik_sched::{Node, NodeConfig, start_local};
-use kronik_ship::{KeystoreMode, Remote, ShipState, restore, ship_once};
+use kronik_ship::{KeystoreMode, RESTORE_MARKER, Remote, ShipState, restore, ship_once};
 use tokio::runtime::Runtime;
 
 fn guest(name: &str) -> Vec<u8> {
@@ -197,7 +197,9 @@ fn ship_destroy_and_restore_from_a_directory_bucket() {
 
 /// Review F2: a restore interrupted while it moves into place leaves no
 /// `state.db` (never the old state with the new log), so it can simply run
-/// again; and nothing of the staging directory is left behind.
+/// again; and nothing of the staging directory is left behind. Perf review
+/// R4: the restore marker is durable before the commit step, so restored
+/// state never comes without it.
 #[test]
 fn an_interrupted_restore_leaves_a_consistent_directory() {
     let bucket = tempdir("ship-int-bucket-");
@@ -232,17 +234,45 @@ fn an_interrupted_restore_leaves_a_consistent_directory() {
             },
         ))
     };
-    run(false, None).unwrap();
+    let report = run(false, None).unwrap();
     let state = dst.path().join("branches/main/state.db");
-    for step in ["state", "log", "sql", "snapshot", "code", "keys", "commit"] {
+    let marker = dst.path().join("branches/main").join(RESTORE_MARKER);
+    let through = |when: &str| -> u64 {
+        let body = std::fs::read(&marker).unwrap_or_else(|e| panic!("{when}: no marker: {e}"));
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        v["through_lsn"].as_u64().unwrap()
+    };
+    let want = through("restore");
+    assert!(want >= report.snapshot_lsn, "{want}");
+    for step in [
+        "state",
+        "log",
+        "sql",
+        "snapshot",
+        "code",
+        "keys",
+        "commit",
+        "committed",
+    ] {
+        // As `kronik serve` leaves it after recording the restore.
+        std::fs::remove_file(&marker).unwrap();
         let err = run(true, Some(step)).unwrap_err();
         assert!(err.to_string().contains("injected"), "{step}: {err}");
         // "state" fails before anything moved: the old restore is intact.
-        assert_eq!(state.exists(), step == "state", "{step}");
+        // After "committed" the restore is in place.
+        assert_eq!(
+            state.exists(),
+            matches!(step, "state" | "committed"),
+            "{step}"
+        );
+        if matches!(step, "commit" | "committed") {
+            assert_eq!(through(step), want, "{step}");
+        }
         assert!(!dst.path().join(".restore").exists(), "{step}: stage left");
         // Without a state.db, a plain restore runs again and is complete.
-        run(step == "state", None).unwrap();
+        run(matches!(step, "state" | "committed"), None).unwrap();
         assert!(state.exists(), "{step}");
+        through(step);
     }
     let q = start(dst.path(), None);
     assert_eq!(q.node.store().state_hash().unwrap(), hash);

@@ -230,6 +230,13 @@ const COMMANDS: &[(&str, Output)] = &[
         Output::Api(&[("", "POST", "/v1/snapshots")]),
     ),
     ("integrity", Output::Api(&[("", "GET", "/v1/integrity")])),
+    ("export status", Output::Api(&[("", "GET", "/v1/export")])),
+    (
+        "export rewind",
+        Output::Api(&[("", "POST", "/v1/export/{stream}/rewind")]),
+    ),
+    ("audit show", Output::Api(&[("", "GET", "/v1/audit")])),
+    ("audit verify", Output::Local(super::audit::verify_schema)),
     ("mcp", Output::None("MCP's JSON-RPC on stdout instead")),
     ("explain", Output::Local(explain_schema)),
 ];
@@ -399,10 +406,12 @@ pub(crate) fn page() -> String {
          response body unchanged, so its schema is that of the operation it calls,\n\
          as in [openapi.json](openapi.json), the OpenAPI 3.1 description that\n\
          `GET /v1/openapi.json` serves. `explain`, `doctor`, `init`, `build`,\n\
-         `restore` and `upgrade check` answer themselves. A failure prints the\n\
-         [`Error`](#error) object instead, with exit code 1, except\n\
-         `upgrade check`, which prints its report either way and exits 1 when\n\
-         the replay is not empty (`code` is `ENGINE_UPGRADE_DIVERGED`). The\n\
+         `restore`, `upgrade check` and `audit verify` answer themselves. A\n\
+         failure prints the [`Error`](#error) object instead, with exit code 1,\n\
+         except `upgrade check`, which prints its report either way and exits 1\n\
+         when the replay is not empty (`code` is `ENGINE_UPGRADE_DIVERGED`), and\n\
+         `audit verify`, which prints its report either way and exits 1 when it\n\
+         is not `complete`. The\n\
          schemas are JSON Schema 2020-12; `$ref`s name the definitions below.\n\n\
          Two bodies are not generated from types but written by hand, and also\n\
          stand alone for validators: the behavior diff,\n\

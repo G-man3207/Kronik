@@ -217,8 +217,10 @@ the old one (the old daemon keeps running; the check only reads):
 ## 8. State hash and integrity
 
 `GET /v1/integrity` (scope `read`): `{"applied_lsn", "state_hash",
-"log_first_lsn", "log_hash", "retention_history_ms",
-"newest_logical_time_ms", "retention_cutoff_ms"}`. The three retention
+"log_first_lsn", "log_hash", "through_lsn", "retention_history_ms",
+"newest_logical_time_ms", "retention_cutoff_ms"}`; `?through=<lsn>` hashes
+the log only through that LSN (M28: a restored node's first start appends
+its `restore` audit event after the source's last record). The three retention
 fields are 0 when the node has no storage config.
 
 - `state_hash` = BLAKE3 over, in key order: `actors` (kind, key, schema
@@ -232,9 +234,12 @@ fields are 0 when the node has no storage config.
   `.hash-copy-<file>.tmp` file deleted after and swept at start; a
   snapshot hashes its copies), so `state_hash` is always the applied
   LSN's.
-- `log_hash` = BLAKE3 over the encoded records `log_first_lsn..=applied_lsn`.
-- `demo/vps-restore.sh` compares both, plus the history of sample actors,
-  between the source and the restored node.
+- `log_hash` = BLAKE3 over the encoded records `log_first_lsn..=through_lsn`
+  (`applied_lsn` unless `through` is given).
+- `demo/vps-restore.sh` compares the state hash, the log hash through the
+  source's applied LSN, and the history of sample actors, between the
+  source and the restored node; after that LSN the restored node holds
+  exactly one record, its `restore` audit event.
 
 ## 9. Startup target
 
