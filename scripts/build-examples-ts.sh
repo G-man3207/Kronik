@@ -7,6 +7,8 @@
 #   counter-ts-step2.wasm                  counter-ts adding 2, for the M3
 #                                          demo (COUNTER_NEW)
 #   todo-ts.wasm                           to-do lists with a sweep timer
+#   uptime-ts.wasm                         uptime checks with standard fetch
+#                                          through wasi:http (M22)
 #   webhook-relay-ts.wasm                  twin of webhook-relay-rs
 #   billing-ts.wasm                        invoices with VAT, charged through
 #                                          payments.internal
@@ -28,7 +30,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 bin="${KRONIK_BIN:-${CARGO_TARGET_DIR:-target}/release/kronik}"
 npm ci --prefix examples --no-audit --no-fund
 mkdir -p examples/dist
-for example in counter-ts notes-ts todo-ts webhook-relay-ts; do
+for example in counter-ts notes-ts todo-ts uptime-ts webhook-relay-ts; do
     "$bin" build --dir "examples/$example"
     cp "examples/$example/dist/$example.wasm" "examples/dist/$example.wasm"
 done

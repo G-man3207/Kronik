@@ -14,6 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = "=0.63.0"
+wasip2 = { version = "=1.0.4", optional = true }
 
 [features]
 # Builds the `notes` kind (SQL state, schema version 1) instead of `counter`.
@@ -43,6 +44,8 @@ respond = []
 # body, then calls `increment` on counter/c (an SQL turn open across a call).
 fail-line = []
 sql-call = []
+# Standard fetch (M22): `wfetch*` operations through wasi:http directly.
+wasi-http = ["dep:wasip2"]
 
 [profile.release]
 opt-level = "s"

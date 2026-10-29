@@ -22,14 +22,14 @@ export interface ActorSpec {
   routes?: Route[];
   /** Capabilities the actor type asks for, such as `http:api.example.com`. */
   capabilities?: string[];
-  /** Handles an HTTP request. */
-  http?(req: Request, ctx: Ctx): Output;
+  /** Handles an HTTP request. A handler may be `async` (to `await fetch(...)`). */
+  http?(req: Request, ctx: Ctx): Output | Promise<Output>;
   /** Handles a message from another actor or the operator. */
-  message?(msg: Message, ctx: Ctx): Output;
+  message?(msg: Message, ctx: Ctx): Output | Promise<Output>;
   /** Handles a timer this actor scheduled. */
-  timer?(timer: Timer, ctx: Ctx): Output;
+  timer?(timer: Timer, ctx: Ctx): Output | Promise<Output>;
   /** Migrates the actor's state from schema version `from`; SQL DDL is allowed only here. */
-  migrate?(from: number, ctx: Ctx): void;
+  migrate?(from: number, ctx: Ctx): void | Promise<void>;
 }
 
 /** The `kronik:actor/handler` export: what `kronik build` exports from the module's default export. */
@@ -73,9 +73,11 @@ for (const [method, level] of consoleLevels) {
  *
  * Every input runs as one turn on a fresh instance: module-level variables
  * do not survive it, and module scope itself runs at build time. A handler
- * that throws fails the turn and its writes are discarded: {@link Rejected}
- * gives `handler-error::rejected`, anything else `handler-error::failed` with
- * the error's message.
+ * that throws (or whose promise rejects) fails the turn and its writes are
+ * discarded: {@link Rejected} gives `handler-error::rejected`, anything else
+ * `handler-error::failed` with the error's message. An `async` handler's
+ * turn ends when its promise settles; standard `fetch` calls run while it
+ * waits (each is an `http.fetch` effect, as `ctx.http.fetch`).
  */
 export function actor(spec: ActorSpec): Handler {
   return {
@@ -91,31 +93,44 @@ export function actor(spec: ActorSpec): Handler {
     handle(input: Input): Output {
       const ctx = new Ctx();
       try {
-        switch (input.tag) {
-          case 'http':
-            if (!spec.http) throw new Rejected(unhandled(ctx, 'HTTP requests', 'http', 'actor'));
-            return spec.http(new Request(input.val), ctx);
-          case 'message':
-            if (!spec.message) throw new Rejected(unhandled(ctx, 'messages', 'message', 'message'));
-            return spec.message(new Message(input.val.msg, input.val.sender), ctx);
-          case 'timer':
-            if (!spec.timer) throw new Rejected(unhandled(ctx, 'timers', 'timer', 'dead-letters'));
-            return spec.timer({ id: input.val.id, message: new Message(input.val.msg) }, ctx);
-          case 'migrate':
-            spec.migrate?.(input.val, ctx);
-            return { tag: 'none' };
-        }
+        const out = dispatch(spec, input, ctx);
+        // ComponentizeJS runs the event loop until a returned promise
+        // settles and uses its value, or its rejection as a throw.
+        return out instanceof Promise ? (out.then(undefined, (e) => fail(e)) as unknown as Output) : out;
       } catch (e) {
-        // ComponentizeJS turns a thrown handler-error value into the export's
-        // error result; anything else would trap and lose its message.
-        const error: HandlerError =
-          e instanceof Rejected
-            ? { tag: 'rejected', val: e.message }
-            : { tag: 'failed', val: e instanceof Error ? `${e.name}: ${e.message}` : String(e) };
-        throw error;
+        fail(e);
       }
     },
   };
+}
+
+function dispatch(spec: ActorSpec, input: Input, ctx: Ctx): Output | Promise<Output> {
+  switch (input.tag) {
+    case 'http':
+      if (!spec.http) throw new Rejected(unhandled(ctx, 'HTTP requests', 'http', 'actor'));
+      return spec.http(new Request(input.val), ctx);
+    case 'message':
+      if (!spec.message) throw new Rejected(unhandled(ctx, 'messages', 'message', 'message'));
+      return spec.message(new Message(input.val.msg, input.val.sender), ctx);
+    case 'timer':
+      if (!spec.timer) throw new Rejected(unhandled(ctx, 'timers', 'timer', 'dead-letters'));
+      return spec.timer({ id: input.val.id, message: new Message(input.val.msg) }, ctx);
+    case 'migrate': {
+      const done = spec.migrate?.(input.val, ctx);
+      return done instanceof Promise ? done.then(() => ({ tag: 'none' })) : { tag: 'none' };
+    }
+  }
+}
+
+/** Throws `e` as the WIT `handler-error`: ComponentizeJS turns a thrown
+ * handler-error value into the export's error result; anything else would
+ * trap and lose its message. */
+function fail(e: unknown): never {
+  const error: HandlerError =
+    e instanceof Rejected
+      ? { tag: 'rejected', val: e.message }
+      : { tag: 'failed', val: e instanceof Error ? `${e.name}: ${e.message}` : String(e) };
+  throw error;
 }
 
 function unhandled(ctx: Ctx, what: string, method: string, topic: string): string {

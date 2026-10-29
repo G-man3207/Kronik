@@ -182,6 +182,7 @@ impl Program {
         if let Some(fatal) = host.fatal.take() {
             return Err(RunError::Host(fatal));
         }
+        host.warn_unsent();
         let subject = host.subject.clone();
         let mut outcome = match result {
             Ok(Ok(output)) => committed(output, subject, message_bytes),

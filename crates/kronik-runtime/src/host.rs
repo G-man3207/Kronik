@@ -38,6 +38,8 @@ use bindings::kronik::actor::{
 
 pub use sql::{Rows as SqlRows, SqlError, SqlValue};
 
+mod wasi_http;
+
 /// Maximum bytes per random request; larger requests trap.
 const MAX_RANDOM_BYTES: u64 = 1 << 20;
 
@@ -302,6 +304,7 @@ pub struct TurnHost {
     pub(crate) timers: Vec<pb::TimerOp>,
     gate: Option<Arc<dyn EffectGate>>,
     next_ordinal: u32,
+    http: wasi_http::State,
     /// A host failure (not guest-visible); the turn is abandoned.
     pub(crate) fatal: Option<String>,
 }
@@ -370,6 +373,7 @@ impl TurnHost {
             timers: Vec::new(),
             gate: init.gate,
             next_ordinal: 0,
+            http: wasi_http::State::new(),
             fatal: None,
         }
     }
@@ -992,8 +996,9 @@ impl OutputStream for LogOutput {
 }
 
 /// The linker with exactly the allowlisted interfaces. No filesystem, sockets
-/// or http are linked, so even a component that bypassed the deploy check
-/// could not instantiate.
+/// or incoming HTTP are linked, so even a component that bypassed the deploy
+/// check could not instantiate; outgoing `wasi:http` is the `http.fetch`
+/// effect (`wasi_http`).
 pub(crate) fn build_linker(
     engine: &wasmtime::Engine,
 ) -> wasmtime::Result<wasmtime::component::Linker<TurnHost>> {
@@ -1006,12 +1011,8 @@ pub(crate) fn build_linker(
     wasmtime_wasi_io::bindings::wasi::io::error::add_to_linker::<TurnHost, HasIo>(&mut l, |s| {
         &mut s.table
     })?;
-    wasmtime_wasi_io::bindings::wasi::io::poll::add_to_linker::<TurnHost, HasIo>(&mut l, |s| {
-        &mut s.table
-    })?;
-    wasmtime_wasi_io::bindings::wasi::io::streams::add_to_linker::<TurnHost, HasIo>(&mut l, |s| {
-        &mut s.table
-    })?;
+    // poll and streams drive outgoing wasi:http requests before they wait.
+    wasi_http::add_to_linker(&mut l)?;
     wall_clock::add_to_linker::<TurnHost, DetWasi>(&mut l, |s| s)?;
     monotonic_clock::add_to_linker::<TurnHost, DetWasi>(&mut l, |s| s)?;
     random::add_to_linker::<TurnHost, DetWasi>(&mut l, |s| s)?;

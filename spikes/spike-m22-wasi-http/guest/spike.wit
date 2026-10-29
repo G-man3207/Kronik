@@ -1,0 +1,5 @@
+package spike:m22;
+
+world spike {
+  export run: func(mode: string) -> string;
+}

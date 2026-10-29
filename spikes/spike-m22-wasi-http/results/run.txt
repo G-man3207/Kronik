@@ -1,0 +1,264 @@
+== two: 100 runs, 1 distinct transcript(s)
+-- 100x
+{
+  "effects": [
+    "#0 GET http://b.example/fast?q=1 [\"authorization: secret api template \\\"Bearer {}\\\"\", \"x-n: 2\"] body \"\"",
+    "#1 POST http://a.example/slow [\"content-length: 7\", \"content-type: text/plain;charset=UTF-8\"] body \"hello a\""
+  ],
+  "fuel": 2345224,
+  "output": "{\"order\":[\"b\",\"a\"],\"a\":{\"status\":200,\"text\":\"POST http://a.example/slow 7 bytes; content-length=7, content-type=text/plain;charset=UTF-8\"},\"b\":{\"status\":200,\"text\":\"GET http://b.example/fast?q=1 0 bytes; authorization=Bearer [secret:api], x-n=2\"}}",
+  "waits": [
+    "poll 2 -> [1, 0]",
+    "poll 2 -> [0, 1]",
+    "blocking-flush",
+    "poll 2 -> [1, 0]",
+    "poll 2 -> [0, 1]",
+    "poll 2 -> [0, 1]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]"
+  ]
+}
+== stream: 100 runs, 1 distinct transcript(s)
+-- 100x
+{
+  "effects": [
+    "#0 POST http://s.example/upload [] body \"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl\""
+  ],
+  "fuel": 3616482,
+  "output": "{\"order\":[\"s\"],\"s\":{\"status\":200,\"text\":\"POST http://s.example/upload 64 bytes; \"}}",
+  "waits": [
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "blocking-flush",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]"
+  ]
+}
+== error: 100 runs, 1 distinct transcript(s)
+-- 100x
+{
+  "effects": [
+    "#0 GET http://denied.example/ [] body \"\""
+  ],
+  "fuel": 1425535,
+  "output": "{\"order\":[],\"error\":\"TypeError: NetworkError when attempting to fetch resource\"}",
+  "waits": [
+    "poll 1 -> [0]"
+  ]
+}
+== two --naive: 100 runs, 8 distinct transcript(s)
+-- 15x
+{
+  "effects": [
+    "#0 POST http://a.example/slow [\"content-length: 7\", \"content-type: text/plain;charset=UTF-8\"] body \"hello a\"",
+    "#1 GET http://b.example/fast?q=1 [\"authorization: secret api template \\\"Bearer {}\\\"\", \"x-n: 2\"] body \"\""
+  ],
+  "fuel": 2344002,
+  "output": "{\"order\":[\"a\",\"b\"],\"a\":{\"status\":200,\"text\":\"POST http://a.example/slow 7 bytes; content-length=7, content-type=text/plain;charset=UTF-8\"},\"b\":{\"status\":200,\"text\":\"GET http://b.example/fast?q=1 0 bytes; authorization=Bearer [secret:api], x-n=2\"}}",
+  "waits": [
+    "poll 2 -> [1]",
+    "blocking-flush",
+    "poll 2 -> [1]",
+    "poll 2 -> [1]",
+    "poll 2 -> [1]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]"
+  ]
+}
+-- 13x
+{
+  "effects": [
+    "#0 POST http://a.example/slow [\"content-length: 7\", \"content-type: text/plain;charset=UTF-8\"] body \"hello a\"",
+    "#1 GET http://b.example/fast?q=1 [\"authorization: secret api template \\\"Bearer {}\\\"\", \"x-n: 2\"] body \"\""
+  ],
+  "fuel": 2344330,
+  "output": "{\"order\":[\"b\",\"a\"],\"a\":{\"status\":200,\"text\":\"POST http://a.example/slow 7 bytes; content-length=7, content-type=text/plain;charset=UTF-8\"},\"b\":{\"status\":200,\"text\":\"GET http://b.example/fast?q=1 0 bytes; authorization=Bearer [secret:api], x-n=2\"}}",
+  "waits": [
+    "poll 2 -> [1]",
+    "blocking-flush",
+    "poll 2 -> [0]",
+    "poll 2 -> [1]",
+    "poll 2 -> [1]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]"
+  ]
+}
+-- 10x
+{
+  "effects": [
+    "#0 POST http://a.example/slow [\"content-length: 7\", \"content-type: text/plain;charset=UTF-8\"] body \"hello a\"",
+    "#1 GET http://b.example/fast?q=1 [\"authorization: secret api template \\\"Bearer {}\\\"\", \"x-n: 2\"] body \"\""
+  ],
+  "fuel": 2344671,
+  "output": "{\"order\":[\"b\",\"a\"],\"a\":{\"status\":200,\"text\":\"POST http://a.example/slow 7 bytes; content-length=7, content-type=text/plain;charset=UTF-8\"},\"b\":{\"status\":200,\"text\":\"GET http://b.example/fast?q=1 0 bytes; authorization=Bearer [secret:api], x-n=2\"}}",
+  "waits": [
+    "poll 2 -> [1]",
+    "blocking-flush",
+    "poll 2 -> [1, 0]",
+    "poll 2 -> [0, 1]",
+    "poll 2 -> [0, 1]",
+    "poll 2 -> [1, 0]",
+    "poll 2 -> [0, 1]",
+    "poll 1 -> [0]"
+  ]
+}
+-- 23x
+{
+  "effects": [
+    "#1 GET http://b.example/fast?q=1 [\"authorization: secret api template \\\"Bearer {}\\\"\", \"x-n: 2\"] body \"\"",
+    "#0 POST http://a.example/slow [\"content-length: 7\", \"content-type: text/plain;charset=UTF-8\"] body \"hello a\""
+  ],
+  "fuel": 2344002,
+  "output": "{\"order\":[\"a\",\"b\"],\"a\":{\"status\":200,\"text\":\"POST http://a.example/slow 7 bytes; content-length=7, content-type=text/plain;charset=UTF-8\"},\"b\":{\"status\":200,\"text\":\"GET http://b.example/fast?q=1 0 bytes; authorization=Bearer [secret:api], x-n=2\"}}",
+  "waits": [
+    "poll 2 -> [1]",
+    "blocking-flush",
+    "poll 2 -> [1]",
+    "poll 2 -> [1]",
+    "poll 2 -> [1]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]"
+  ]
+}
+-- 26x
+{
+  "effects": [
+    "#1 GET http://b.example/fast?q=1 [\"authorization: secret api template \\\"Bearer {}\\\"\", \"x-n: 2\"] body \"\"",
+    "#0 POST http://a.example/slow [\"content-length: 7\", \"content-type: text/plain;charset=UTF-8\"] body \"hello a\""
+  ],
+  "fuel": 2344330,
+  "output": "{\"order\":[\"b\",\"a\"],\"a\":{\"status\":200,\"text\":\"POST http://a.example/slow 7 bytes; content-length=7, content-type=text/plain;charset=UTF-8\"},\"b\":{\"status\":200,\"text\":\"GET http://b.example/fast?q=1 0 bytes; authorization=Bearer [secret:api], x-n=2\"}}",
+  "waits": [
+    "poll 2 -> [1]",
+    "blocking-flush",
+    "poll 2 -> [0]",
+    "poll 2 -> [1]",
+    "poll 2 -> [1]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]",
+    "poll 1 -> [0]"
+  ]
+}
+-- 1x
+{
+  "effects": [
+    "#1 GET http://b.example/fast?q=1 [\"authorization: secret api template \\\"Bearer {}\\\"\", \"x-n: 2\"] body \"\"",
+    "#0 POST http://a.example/slow [\"content-length: 7\", \"content-type: text/plain;charset=UTF-8\"] body \"hello a\""
+  ],
+  "fuel": 2344614,
+  "output": "{\"order\":[\"b\",\"a\"],\"a\":{\"status\":200,\"text\":\"POST http://a.example/slow 7 bytes; content-length=7, content-type=text/plain;charset=UTF-8\"},\"b\":{\"status\":200,\"text\":\"GET http://b.example/fast?q=1 0 bytes; authorization=Bearer [secret:api], x-n=2\"}}",
+  "waits": [
+    "poll 2 -> [1]",
+    "blocking-flush",
+    "poll 2 -> [0]",
+    "poll 2 -> [0, 1]",
+    "poll 2 -> [0, 1]",
+    "poll 2 -> [1, 0]",
+    "poll 2 -> [0, 1]",
+    "poll 1 -> [0]"
+  ]
+}
+-- 2x
+{
+  "effects": [
+    "#1 GET http://b.example/fast?q=1 [\"authorization: secret api template \\\"Bearer {}\\\"\", \"x-n: 2\"] body \"\"",
+    "#0 POST http://a.example/slow [\"content-length: 7\", \"content-type: text/plain;charset=UTF-8\"] body \"hello a\""
+  ],
+  "fuel": 2344621,
+  "output": "{\"order\":[\"a\",\"b\"],\"a\":{\"status\":200,\"text\":\"POST http://a.example/slow 7 bytes; content-length=7, content-type=text/plain;charset=UTF-8\"},\"b\":{\"status\":200,\"text\":\"GET http://b.example/fast?q=1 0 bytes; authorization=Bearer [secret:api], x-n=2\"}}",
+  "waits": [
+    "poll 2 -> [1]",
+    "blocking-flush",
+    "poll 2 -> [1]",
+    "poll 2 -> [0, 1]",
+    "poll 2 -> [0, 1]",
+    "poll 2 -> [1, 0]",
+    "poll 2 -> [0, 1]",
+    "poll 1 -> [0]"
+  ]
+}
+-- 10x
+{
+  "effects": [
+    "#1 GET http://b.example/fast?q=1 [\"authorization: secret api template \\\"Bearer {}\\\"\", \"x-n: 2\"] body \"\"",
+    "#0 POST http://a.example/slow [\"content-length: 7\", \"content-type: text/plain;charset=UTF-8\"] body \"hello a\""
+  ],
+  "fuel": 2344671,
+  "output": "{\"order\":[\"b\",\"a\"],\"a\":{\"status\":200,\"text\":\"POST http://a.example/slow 7 bytes; content-length=7, content-type=text/plain;charset=UTF-8\"},\"b\":{\"status\":200,\"text\":\"GET http://b.example/fast?q=1 0 bytes; authorization=Bearer [secret:api], x-n=2\"}}",
+  "waits": [
+    "poll 2 -> [1]",
+    "blocking-flush",
+    "poll 2 -> [1, 0]",
+    "poll 2 -> [0, 1]",
+    "poll 2 -> [0, 1]",
+    "poll 2 -> [1, 0]",
+    "poll 2 -> [0, 1]",
+    "poll 1 -> [0]"
+  ]
+}

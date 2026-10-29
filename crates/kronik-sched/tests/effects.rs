@@ -894,6 +894,61 @@ fn secrets_never_leak_without_reveal() {
     assert_eq!(reply(&r), "[secret:api-key]");
 }
 
+const COUNTER_WASI_HTTP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/guests/counter-wasi-http.wasm"
+);
+
+/// M22 (ADR 0070): standard fetch through `wasi:http` is an `http.fetch`
+/// effect. A `{{secret:NAME}}` header needs `secret:NAME`, carries the value
+/// only on the wire, and the guest, the records, the logs and the data
+/// directory never hold it; the echo comes back scrubbed.
+#[test]
+fn standard_fetch_secret_headers_never_reach_the_guest_or_the_log() {
+    const SECRET: &str = "wasi-http-secret-4c1d9e7a";
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start();
+    let p = start(dir.path());
+    let wasm = std::fs::read(COUNTER_WASI_HTTP).unwrap();
+    p.rt.block_on(p.node.deploy(&wasm, audit(), false)).unwrap();
+    p.node
+        .secret_set("api-key", SECRET.as_bytes(), &audit(), false)
+        .unwrap();
+    p.grant("http:127.0.0.1", None, None);
+    let spec = |secret: &str| {
+        format!(
+            "POST {}\nx-api-key: Bearer {{{{secret:{secret}}}}}\n\necho",
+            server.url("/echo")
+        )
+    };
+    // Without `secret:api-key` the request is denied (a denied record).
+    let r = p.send("counter/a", msg("wfetch", &spec("api-key")));
+    assert_eq!(reply(&r), "error ErrorCode::HttpRequestDenied", "{r:?}");
+    assert!(server.seen("/echo").is_empty());
+    p.grant("secret:api-key", None, None);
+    let r = p.send("counter/a", msg("wfetch", &spec("api-key")));
+    let echo = reply(&r);
+    assert!(echo.starts_with("200 "), "{echo}");
+    assert!(echo.contains("Bearer [secret:api-key]"), "scrubbed: {echo}");
+    assert!(!echo.contains(SECRET));
+    assert_eq!(
+        server.seen("/echo")[0]
+            .headers
+            .get("x-api-key")
+            .map(String::as_str),
+        Some(format!("Bearer {SECRET}").as_str())
+    );
+    // An unknown secret is denied too.
+    p.grant("secret:missing", None, None);
+    let r = p.send("counter/a", msg("wfetch", &spec("missing")));
+    assert_eq!(reply(&r), "error ErrorCode::HttpRequestDenied");
+    assert_eq!(server.seen("/echo").len(), 1);
+    drop(p);
+    let mut leaks = Vec::new();
+    scan(dir.path(), SECRET.as_bytes(), &mut leaks);
+    assert!(leaks.is_empty(), "the secret value is in {leaks:?}");
+}
+
 fn scan(dir: &Path, needle: &[u8], hits: &mut Vec<String>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let p = entry.unwrap().path();

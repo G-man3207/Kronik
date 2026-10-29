@@ -85,7 +85,7 @@ v0.1's evidence, 2026-10-28:
 
 v0.2 landed with f957475 and v0.3 with 189c8c3 (their sections); v0.3
 passed the testbench and is released as `v0.3.0` (86d5a4b). The owner
-chose to continue: M28 and M22 are in progress (Next). Other work is
+chose to continue: M28 and M22 landed (their sections). Other work is
 parked (Parked work).
 
 The testbench is `travelfiesta`: Debian 13, 2 vCPU Skylake, 3.7 GiB, no
@@ -657,11 +657,67 @@ Testbench rows, every one passing for 1c279df (travelfiesta, 2026-10-29):
   16.9 to 17.7 s at d1a4f6c, in line with v0.3's 19.7 to 22.7 / 16.0 to
   18.9 s.
 
+## M22: standard fetch through wasi:http
+
+M22 lands with the commit "Kronik M22: standard fetch through wasi:http".
+Criteria 1 and 2 are met; criterion 3 is open, blocked on Wasmtime. ADR
+0070 (accepted with the spike's results); ADR 0002 is amended.
+
+- A component may import `wasi:http/types` and `outgoing-handler` 0.2.x
+  (`incoming-handler` and 0.3 stay out of the allowlist). kronik-runtime
+  links `outgoing-handler.handle` itself (wasmtime-wasi-http 50, p2 only):
+  each request is an `http.fetch` effect through the effect layer, run when
+  the guest waits and its body is complete, in `handle` order, with the
+  turn's next operation ordinal, so it is recorded, replayed, matched in
+  forks and answered by simulators as `ctx.http.fetch` is.
+- A header value with `{{secret:NAME}}` is the existing secret-header
+  template: the host inserts the secret; the guest never holds it.
+- TypeScript: `kronik build` keeps ComponentizeJS's http feature, SDK
+  handlers may be `async`, and `fetch`, `Headers`, `Response` and
+  `ReadableStream` are typed. `examples/uptime-ts` fetches its targets with
+  `Promise.all` and a `Bearer {{secret:NAME}}` header.
+- A turn warns when it ends with a request it never waited for.
+
+Criteria:
+
+- [x] Standard `fetch` in TypeScript goes through the effect layer, is
+      recorded and is matched in replay: identity replay of `uptime-ts`,
+      empty in both modes with 9 effects exact (`scripts/ci.sh identity`);
+      kronik-runtime's `tests/wasi_http.rs` (parallel requests and two
+      bodies completed before one poll, each deterministic over 50 runs
+      with random latency; streamed bodies; error codes; dropped and
+      never-awaited requests); kronik-fork's
+      `standard_fetch_is_matched_in_replay_and_meets_the_simulators`.
+- [x] A secret in a header never reaches the guest or the log: kronik-sched's
+      `standard_fetch_secret_headers_never_reach_the_guest_or_the_log`;
+      kronik-runtime's `a_secret_placeholder_reaches_the_gate_as_a_secret_header`;
+      for TypeScript, identity replay checks the target received the
+      inserted header and that the value is in no file of the daemon.
+- [ ] WASI 0.3 components pass determinism and identity replay. Blocked:
+      Wasmtime 50 marks `wasmtime-wasi` and `wasmtime-wasi-http` p3
+      "experimental, no patch releases" (ADR 0070 §5, the spike in
+      `spikes/spike-m22-wasi-http`). It reopens when a Wasmtime that Kronik
+      pins ships p3 as stable.
+
+Review: reviewer-v03 (first review): land as closing criteria 1 and 2
+after D1, a determinism test with two request bodies completed before one
+poll (TypeScript's `Promise.all`), which now fails when the drive order
+depends on time. Its lows are done: the turn-end warning for requests
+never waited for, and the docs on the effect timeout and logical-time
+timers.
+
+Evidence:
+
+- `scripts/ci.sh`, every step, on this landing's tree.
+- Testbench rows at 569b692 (M22 on 4e89aa8), 27 of 27 suites: the new
+  `M22/fetch-secret` (the target got the inserted Bearer token, the token
+  is in no file of the daemon, identity replay empty in both modes),
+  `identity` across all 15 examples, M2 4/4, M4 6/6, M12 4/4 and M15 11/11.
+  The full batch at the final main covers M22 together with M28.
+
 ## Next
 
-1. M28 (above) lands once its testbench rows pass. M22, standard `fetch`
-   through `wasi:http` (`m22-wasi-http` 569b692, on 4e89aa8), is in
-   progress.
+1. M28 and M22 landed (their sections). What comes next is the owner's.
 
 ## Parked work
 
@@ -679,7 +735,6 @@ Each branch's last commit message carries its handoff.
   3091fbc). A partial review, 5 Highs, is in
   `docs/design/m21-review-partial.md`; the testbench proof needs a rerun;
   ADR 0060 is provisional.
-- M22 is in progress (Next).
 - M23 secret backends: `m23-design` 30d4791, design only. ADR 0093
   (PKCS#11 through a keyhelper process) is the owner's decision.
 - M24 connections: `m24-design` da0a3e5, design only.
@@ -753,6 +808,17 @@ Each branch's last commit message carries its handoff.
 
 ## Known gaps
 
+- M22: every failure of TypeScript's `fetch` (a missing grant, a network
+  error, a timeout) is the same `TypeError` (StarlingMonkey); actors that
+  need the kind of error use `ctx.http.fetch`, which also serves
+  `foreign://`.
+- M22: a `fetch` that is never awaited is never sent; the turn's log warns.
+- M22: time does not move during a turn, so `setTimeout` and
+  `AbortSignal.timeout` are due at once and do not bound a request; the
+  effect timeout does.
+- M22: TypeScript builds now keep ComponentizeJS's http feature, so every
+  TS kind gets a new code hash once when rebuilt, and a component that
+  imports `wasi:http` is refused by daemons older than M22.
 - The shipper notices a keystore change by the size and mtime of
   `keystore.db` and its WAL. A write that reuses the WAL after a
   checkpoint, at the same length and within one mtime tick, is missed until

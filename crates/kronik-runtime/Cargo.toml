@@ -10,6 +10,8 @@ publish.workspace = true
 blake3 = { workspace = true }
 bytes = { workspace = true }
 chacha20 = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
 kronik-core = { workspace = true }
 kronik-proto = { workspace = true }
 thiserror = { workspace = true }
@@ -19,6 +21,7 @@ wasmparser = { workspace = true }
 wasmtime = { workspace = true, features = ["runtime", "cranelift", "component-model", "async", "pooling-allocator", "parallel-compilation", "std"] }
 wasmtime-environ = { workspace = true }
 wasmtime-wasi = { workspace = true }
+wasmtime-wasi-http = { workspace = true }
 wasmtime-wasi-io = { workspace = true }
 
 [dev-dependencies]

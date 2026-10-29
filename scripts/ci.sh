@@ -345,7 +345,7 @@ step_identity() {
     if [ -z "$faketime_lib" ]; then
         echo "skipped: todo-ts needs libfaketime for its sweep (Debian and Ubuntu: apt-get install faketime)"
         # Every example in scripts/identity-examples.py's EXAMPLES but todo-ts.
-        only=(--only counter-rs,counter-ts,counter-py,counter-go,notes-rs,notes-ts,notes-py,notes-go,webhook-relay-rs,webhook-relay-ts,webhook-relay-py,webhook-relay-go,billing-ts)
+        only=(--only counter-rs,counter-ts,counter-py,counter-go,notes-rs,notes-ts,notes-py,notes-go,webhook-relay-rs,webhook-relay-ts,webhook-relay-py,webhook-relay-go,uptime-ts,billing-ts)
     fi
     cargo build --locked --release -p kronik
     # Where cargo put it, also with CARGO_TARGET_DIR set.

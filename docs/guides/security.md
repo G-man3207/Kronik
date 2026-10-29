@@ -66,8 +66,9 @@ Secrets arrive with M2.
   the stored values cannot be decrypted, so back the key up apart from the
   data directory.
 - **Handles.** Guest code names a secret in an HTTP header template such as
-  `Bearer {}` or in a `crypto` call, and the host inserts the value at the
-  effect boundary or computes with it. The value never enters guest memory,
+  `Bearer {}` (with standard `fetch`, M22, the header value `Bearer
+  {{secret:NAME}}`) or in a `crypto` call, and the host inserts the value at
+  the effect boundary or computes with it. The value never enters guest memory,
   and the log records only the secret's name and a keyed hash of its
   version, which reveals nothing even about short values.
 - **Operations.** `kronik secret set` reads the value from stdin, never

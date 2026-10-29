@@ -956,3 +956,61 @@ fn the_model_declines_for_timers_pending_at_the_fork_point() {
     assert_eq!(sims, ["", "fail-closed"], "{:?}", turn.effects);
     assert!(seen.lock().unwrap().is_empty());
 }
+
+/// M22 (ADR 0070): standard fetch through `wasi:http` in forks. The same
+/// code replays with every recorded request matched; a build that also GETs
+/// `<url>/extra` gets those answers from the simulators, labeled, and nothing
+/// goes out.
+#[test]
+fn standard_fetch_is_matched_in_replay_and_meets_the_simulators() {
+    let (addr, hits) = server();
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    p.deploy("counter-wasi-http");
+    p.grant("http:127.0.0.1");
+    let fork_lsn = p.settle();
+    for i in 0..3 {
+        let r = p.http(
+            "pay",
+            "wfetch",
+            &format!("POST http://{addr}/v1/charges/{i}\n\namount=10"),
+        );
+        assert!(http_body(&r).starts_with("200 "), "{r:?}");
+    }
+    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+
+    // The same code: every request matches its recording.
+    p.rt.block_on(props.create_fork(Some("same".into()), fork_lsn, false, audit(), false))
+        .unwrap();
+    let bytes = std::fs::read(guest("counter-wasi-http")).unwrap();
+    p.rt.block_on(props.fork_deploy("same", &bytes, false))
+        .unwrap();
+    let d: Value = serde_json::from_slice(&replay(&p, &props, "same")).unwrap();
+    assert_eq!(d["summary"]["changed"], false, "{d}");
+    assert_eq!(d["summary"]["exact"], 3, "{d}");
+
+    // A build that also GETs <url>/extra: a target stub answers those.
+    p.rt.block_on(props.create_fork(Some("extra".into()), fork_lsn, false, audit(), false))
+        .unwrap();
+    let bytes = std::fs::read(guest("counter-wasi-http-extra")).unwrap();
+    p.rt.block_on(props.fork_deploy("extra", &bytes, false))
+        .unwrap();
+    let stub = StubRule {
+        method: Some("GET".into()),
+        url_prefix: format!("http://{addr}/v1/charges/"),
+        status: 200,
+        headers: vec![],
+        body: "stubbed".into(),
+        error: None,
+    };
+    let d: Value = serde_json::from_slice(&replay_with(
+        &p,
+        &props,
+        "extra",
+        overrides(vec![stub], None, false, false),
+    ))
+    .unwrap();
+    assert_eq!(d["summary"]["synthetic_by"], json!({"stub": 3}), "{d}");
+    assert!(all_synthetic_by(&d, "stub"), "{d}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+}

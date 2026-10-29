@@ -41,6 +41,9 @@ wasmtime-environ = { version = "=50.0.0", default-features = false }
 wasmparser = { version = "0.261.0", default-features = false, features = ["std", "component-model"] }
 wasmtime-wasi = { version = "=50.0.0", default-features = false, features = ["p2"] }
 wasmtime-wasi-io = { version = "=50.0.0", default-features = false, features = ["std"] }
+# Standard `fetch` (M22, ADR 0070): p2 only. Never `default-send-request`
+# (its own network stack and TLS roots) or `p3` (experimental in Wasmtime 50).
+wasmtime-wasi-http = { version = "=50.0.0", default-features = false, features = ["p2"] }
 
 clap = { version = "4.6.7", features = ["derive", "env"] }
 anyhow = "1"

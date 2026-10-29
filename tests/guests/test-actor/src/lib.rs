@@ -54,6 +54,27 @@
 //! Privacy tests (v0.1): `fail-line` (every HTTP request fails with its
 //! request line); with `notes`, `sql-call` (`add-call` inserts its body,
 //! then calls `increment` on counter/c).
+//! Standard fetch (M22): feature `wasi-http` adds operations that use
+//! `wasi:http` directly, the way StarlingMonkey's `fetch` does (`handle`
+//! first, the body after). A request is `METHOD URL`, `name: value` header
+//! lines, an empty line and the body:
+//! - `wfetch`: one request; replies "<status> <body>" or "error <code>"
+//!   (with `fetch-extra`, then also GETs `<url>/extra` and appends that)
+//! - `wfetch2`: two requests separated by a `---` line, both started
+//!   before either body is written; the second body is finished first, then
+//!   both responses are polled together, then the first body is written:
+//!   replies the ready lists and both answers
+//! - `wfetch3`: two requests separated by a `---` line, both started, then
+//!   both bodies finished with non-blocking writes (as StarlingMonkey's
+//!   `Promise.all` of fetches does), then both responses polled together:
+//!   replies the first ready list and both answers
+//! - `wstream`: one request whose body (the spec's body) is written one byte
+//!   at a time through `check-write`, `subscribe` and `poll`
+//! - `wstall`: starts a request, never finishes its body, waits for it
+//! - `wleave`: starts a request, finishes its body and returns without
+//!   waiting (a `fetch` nobody awaits)
+//! - `wdrop`: starts a request and drops its future, then sends the next
+//!   one (after `---`)
 
 // The notes build does not use the counter helpers.
 #![cfg_attr(feature = "notes", allow(unused_imports, dead_code))]
@@ -432,6 +453,8 @@ fn run(op: &str, body: &[u8]) -> Result<String, HandlerError> {
                 .unwrap_or(0);
             Ok("x".repeat(n))
         }
+        #[cfg(feature = "wasi-http")]
+        "wfetch" | "wfetch2" | "wfetch3" | "wleave" | "wstream" | "wstall" | "wdrop" => Ok(wasi_http_ops::run(op, &text)),
         other => Err(HandlerError::Rejected(format!("unknown operation {other}"))),
     }
 }
@@ -646,5 +669,203 @@ fn respond(body: &[u8]) -> HttpResponse {
         status,
         headers,
         body: HttpBody::Inline(rest.as_bytes().to_vec()),
+    }
+}
+
+#[cfg(feature = "wasi-http")]
+mod wasi_http_ops {
+    use wasip2::http::outgoing_handler;
+    use wasip2::http::types::{
+        ErrorCode, Fields, FutureIncomingResponse, Method, OutgoingBody, OutgoingRequest, Scheme,
+    };
+    use wasip2::io::poll;
+
+    struct Started {
+        future: FutureIncomingResponse,
+        body: OutgoingBody,
+        payload: Vec<u8>,
+    }
+
+    /// Starts a request: `handle` before any body byte is written.
+    fn start(spec: &str) -> Result<Started, String> {
+        let (head, body) = spec.split_once("\n\n").unwrap_or((spec, ""));
+        let mut lines = head.lines();
+        let first = lines.next().unwrap_or("GET http://invalid/");
+        let (method, url) = first.split_once(' ').unwrap_or(("GET", first));
+        let mut entries = Vec::new();
+        for l in lines {
+            if let Some((name, value)) = l.split_once(": ") {
+                entries.push((name.to_string(), value.as_bytes().to_vec()));
+            }
+        }
+        let headers = Fields::from_list(&entries).map_err(|e| format!("headers: {e:?}"))?;
+        let req = OutgoingRequest::new(headers);
+        let method = match method {
+            "GET" => Method::Get,
+            "POST" => Method::Post,
+            "PUT" => Method::Put,
+            "DELETE" => Method::Delete,
+            other => Method::Other(other.to_string()),
+        };
+        req.set_method(&method).map_err(|()| "method")?;
+        let (scheme, rest) = url.split_once("://").ok_or("url")?;
+        let scheme = if scheme == "https" { Scheme::Https } else { Scheme::Http };
+        let (authority, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        req.set_scheme(Some(&scheme)).map_err(|()| "scheme")?;
+        req.set_authority(Some(authority)).map_err(|()| "authority")?;
+        req.set_path_with_query(Some(path)).map_err(|()| "path")?;
+        let out = req.body().map_err(|()| "body")?;
+        let future = outgoing_handler::handle(req, None).map_err(|e| format!("handle: {e:?}"))?;
+        Ok(Started {
+            future,
+            body: out,
+            payload: body.as_bytes().to_vec(),
+        })
+    }
+
+    /// Writes the whole body with blocking writes and finishes it.
+    fn finish(s: Started) -> FutureIncomingResponse {
+        {
+            let stream = s.body.write().expect("body stream");
+            for chunk in s.payload.chunks(4096) {
+                stream.blocking_write_and_flush(chunk).expect("body write");
+            }
+        }
+        OutgoingBody::finish(s.body, None).expect("finish");
+        s.future
+    }
+
+    /// Writes the whole body with non-blocking writes (none of which drives
+    /// a request) and finishes it.
+    fn finish_quietly(s: Started) -> Result<FutureIncomingResponse, String> {
+        {
+            let stream = s.body.write().map_err(|()| "body stream")?;
+            let mut rest = &s.payload[..];
+            while !rest.is_empty() {
+                let n = stream.check_write().map_err(|e| format!("check-write: {e:?}"))? as usize;
+                let n = n.min(rest.len()).max(1);
+                stream.write(&rest[..n]).map_err(|e| format!("write: {e:?}"))?;
+                rest = &rest[n..];
+            }
+        }
+        OutgoingBody::finish(s.body, None).map_err(|e| format!("finish: {e:?}"))?;
+        Ok(s.future)
+    }
+
+    fn answer(future: &FutureIncomingResponse) -> String {
+        match future.get() {
+            None => "not ready".to_string(),
+            Some(Err(())) => "taken".to_string(),
+            Some(Ok(Err(e))) => format!("error {}", code(&e)),
+            Some(Ok(Ok(resp))) => {
+                let status = resp.status();
+                let body = resp.consume().expect("consume");
+                let mut bytes = Vec::new();
+                {
+                    let stream = body.stream().expect("stream");
+                    while let Ok(chunk) = stream.blocking_read(65536) {
+                        bytes.extend_from_slice(&chunk);
+                    }
+                }
+                format!("{status} {}", String::from_utf8_lossy(&bytes))
+            }
+        }
+    }
+
+    fn code(e: &ErrorCode) -> String {
+        match e {
+            ErrorCode::InternalError(Some(m)) => format!("internal-error({m})"),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn wait(future: FutureIncomingResponse) -> String {
+        future.subscribe().block();
+        answer(&future)
+    }
+
+    pub fn run(op: &str, text: &str) -> String {
+        let r = (|| -> Result<String, String> {
+            match op {
+                "wfetch" => {
+                    let first = wait(finish(start(text)?));
+                    if !cfg!(feature = "fetch-extra") {
+                        return Ok(first);
+                    }
+                    // As fetch-ok in fetch-extra: also GET <url>/extra.
+                    let url = text.lines().next().and_then(|l| l.split_whitespace().nth(1));
+                    let extra = wait(finish(start(&format!("GET {}/extra", url.unwrap_or("")))?));
+                    Ok(format!("{first} | {extra}"))
+                }
+                "wfetch2" => {
+                    let (a, b) = text.split_once("\n---\n").unwrap_or((text, ""));
+                    let a = start(a)?;
+                    let b = finish(start(b)?);
+                    let (pa, pb) = (a.future.subscribe(), b.subscribe());
+                    let first = poll::poll(&[&pa, &pb]);
+                    drop(pa);
+                    let a = finish(a);
+                    let pa = a.subscribe();
+                    let second = poll::poll(&[&pa, &pb]);
+                    drop((pa, pb));
+                    Ok(format!(
+                        "ready {first:?} then {second:?}: {} | {}",
+                        answer(&a),
+                        answer(&b)
+                    ))
+                }
+                "wfetch3" => {
+                    let (a, b) = text.split_once("\n---\n").unwrap_or((text, ""));
+                    let (a, b) = (start(a)?, start(b)?);
+                    let (a, b) = (finish_quietly(a)?, finish_quietly(b)?);
+                    let (pa, pb) = (a.subscribe(), b.subscribe());
+                    let first = poll::poll(&[&pa, &pb]);
+                    drop((pa, pb));
+                    Ok(format!("ready {first:?}: {} | {}", answer(&a), answer(&b)))
+                }
+                "wleave" => {
+                    let future = finish_quietly(start(text)?)?;
+                    // Kept until the turn ends, never waited for.
+                    std::mem::forget(future);
+                    Ok("left".into())
+                }
+                "wstream" => {
+                    let s = start(text)?;
+                    {
+                        let stream = s.body.write().map_err(|()| "body stream")?;
+                        for byte in &s.payload {
+                            loop {
+                                match stream.check_write() {
+                                    Ok(0) => {
+                                        let p = stream.subscribe();
+                                        poll::poll(&[&p]);
+                                    }
+                                    Ok(_) => break,
+                                    Err(e) => return Err(format!("check-write: {e:?}")),
+                                }
+                            }
+                            stream.write(&[*byte]).map_err(|e| format!("write: {e:?}"))?;
+                        }
+                    }
+                    OutgoingBody::finish(s.body, None).map_err(|e| format!("finish: {e:?}"))?;
+                    Ok(wait(s.future))
+                }
+                "wstall" => {
+                    let s = start(text)?;
+                    let _body = s.body;
+                    Ok(wait(s.future))
+                }
+                "wdrop" => {
+                    let (a, b) = text.split_once("\n---\n").unwrap_or((text, ""));
+                    drop(finish(start(a)?));
+                    Ok(wait(finish(start(b)?)))
+                }
+                _ => Err("unknown".into()),
+            }
+        })();
+        r.unwrap_or_else(|e| format!("guest error {e}"))
     }
 }
