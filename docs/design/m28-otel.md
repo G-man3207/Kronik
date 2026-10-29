@@ -1,8 +1,8 @@
 # M28: OpenTelemetry and audit export (design)
 
 Status: design, revised after the design review (reviewer-designs: H1–H4,
-M1–M9, L1–L6; each fix names its finding). Phase B is being built on
-`m28-otel`. The decisions are in ADRs 0080–0084.
+M1–M9, L1–L6; each fix names its finding). Delivered in 9d1f65b. The
+decisions are in ADRs 0080–0084.
 
 B2 (trace and metrics export) is in, with these refinements:
 - The open-turn set (§3.1) also decides links into other traces: a link
@@ -19,7 +19,7 @@ B2 (trace and metrics export) is in, with these refinements:
   the trace stream's state is its open-turn set, `{"open": […], "kept":
   […]}` (an older plain list of open pairs still loads).
 
-Code review fixes, export follower and traces (M28 code review, 0d80811):
+Code review fixes, export follower and traces (M28 code review):
 - **M2:** a failed `audit.gap` record keeps the cursor before the gap: the
   follower counts it as an error (`last_error` is the sink's code), backs
   off and records the gap again; the gap is counted once it is recorded.
@@ -71,7 +71,7 @@ B3 (audit export) is in, with these refinements:
 - The completeness test drives foreign add and remove as failures (no
   sandbox in CI), which must export nothing, as `mutations.rs` does.
 
-Code review fixes (M28 code review, 0d80811):
+Code review fixes (M28 code review):
 - H-A: the first start after `kronik restore` clamps every stream in
   `export.json` to the restored log, and drops the trace stream's state
   when it clamps it, before it removes the marker, with export on or off

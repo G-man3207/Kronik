@@ -529,9 +529,9 @@ Evidence, 2026-10-28:
 
 ## v0.3: richer replay (M12 to M15)
 
-v0.3 landed on main with 189c8c3, one commit with the tree of `m15-sdks`
-e798b46: the branches `m12-simulators` to `m15-sdks`, rebased onto
-247bf5a. reviewer-v03's verdict on them: land, no must-fixes. M12 to M15
+v0.3 landed on main with 189c8c3, one commit carrying the tree of the
+`m15-sdks` branch (the branches `m12-simulators` to `m15-sdks`, rebased
+onto 247bf5a). reviewer-v03's verdict on them: land, no must-fixes. M12 to M15
 are closed: every criterion passes in `scripts/ci.sh`, on dev and on
 GitHub, and the testbench batch passed. ADRs 0014 to 0016 (M12), 0017 and
 0018 (M13), 0019 and 0020 (M14) and 0030 (M15); ADRs 0023 and 0027 are
@@ -597,10 +597,10 @@ M15: Python and Go SDKs (closed).
 
 Evidence, 2026-10-28 and 29:
 
-- At e798b46, 189c8c3's tree: `scripts/ci.sh`, every step, passed on dev,
-  ending 21:29 UTC: `sdks`, `foreign` (7 tests, the Postgres fork test
-  included), `identity` and `action` included.
-- On dev at e798b46, 21:54 to 23:01 UTC: the crash test (1 000 cycles,
+- At 189c8c3: `scripts/ci.sh`, every step, passed on dev, ending 21:29
+  UTC: `sdks`, `foreign` (7 tests, the Postgres fork test included),
+  `identity` and `action` included.
+- On dev at 189c8c3, 21:54 to 23:01 UTC: the crash test (1 000 cycles,
   120 320 acknowledged requests, 20 rebuild checks, an empty identity
   replay of 126 235 root inputs) and DST (30 000 runs; 10 000 webhook runs
   each with `webhook-relay-ts`, `webhook-relay-py` and `webhook-relay-go`;
@@ -887,8 +887,10 @@ Each branch's last commit message carries its handoff.
   branches, eleven more were recovered from the testbench into
   `/var/tmp/kronik-recovered-2026-10-29.bundle`, and thirty-five are gone
   from every machine. Their content is in main, but the commits themselves
-  cannot be opened: older notes that name one of those tips (`e798b46` for
-  `m15-sdks`, for example) no longer resolve.
+  cannot be opened. The four heads this file cites as evidence
+  (`329da48`, `b4ea11c`, `d1a4f6c`, `1c279df`) were restored from that
+  bundle and are kept on dev as `refs/evidence/*`; elsewhere, run
+  `git fetch <bundle> 'refs/recovered/cited-*:refs/evidence/*'`.
 - The nightly passed on the pushed history on 2026-10-29 (run 40853121650,
   head 4e89aa8: crash test 1,000 cycles, DST 10,000 seeds, DST over
   webhook-relay-ts, DST 1,000,000 steps and the release build). Its runs on
