@@ -680,11 +680,14 @@ Each branch's last commit message carries its handoff.
   says not to copy the tree with modes kept. Accept it, or keep the setting
   and do without sandbox copies under systemd until runsc falls back from
   `openat2`.
-- The testbench's Tailscale SSH check mode stopped the batch three times:
-  on 2026-10-26, for about eight hours on 2026-10-28, and for about two
-  hours from 21:34 UTC that evening, before v0.3's rows. Every ssh waits
-  for the owner to authenticate again. Relax the check for the testbench,
-  or expect a prompt to re-authenticate.
+- **Resolved:** the testbench's Tailscale SSH check mode stopped the batch
+  three times: on 2026-10-26, for about eight hours on 2026-10-28, and for
+  about two hours from 21:34 UTC that evening, before v0.3's rows. The
+  owner fixed Tailscale SSH to the testbench on 2026-10-29; BatchMode ssh
+  works (three checks at 08:34 UTC, each exit 0). On dev and on the
+  testbench, `tailscale status --json` says nothing about the SSH policy or
+  check mode: both nodes list the SSH capabilities (`cap/ssh`,
+  `ssh-behavior-v1`, `ssh-env-vars`) without values, and no login URL.
 - From v0.4 the testbench is a cluster of three VPSs, as the brief says;
   there is one, `travelfiesta`.
 - M20 (Firecracker) needs a test host with `/dev/kvm`: neither dev nor the
