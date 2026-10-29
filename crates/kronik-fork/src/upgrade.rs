@@ -58,12 +58,15 @@ fn recorded_engine(index: &ProductionIndex) -> Option<String> {
 
 /// Replays `(fork point, head]` of `data`'s main, where the fork point is
 /// `window` of logical time before the newest root input (or the oldest
-/// point retention keeps), in both modes with the same code.
+/// point retention keeps), in both modes with the same code. `sealer` opens
+/// the sealed values in the window, as the daemon's does
+/// ([`kronik_sched::offline_sealer`]).
 pub async fn check(
     env: &Env,
     data: &Path,
     window: Duration,
     workers: usize,
+    sealer: Option<Arc<kronik_privacy::sealer::Sealer>>,
 ) -> Result<Checked, String> {
     let branch = "main";
     let log_dir = data.join("branches").join(branch).join("log");
@@ -94,11 +97,18 @@ pub async fn check(
     let from_engine = recorded_engine(&all).unwrap_or_else(|| ENGINE_VERSION.to_owned());
     drop(all);
     let base = pick_base(data, branch, fork_lsn, false, rebase)?;
-    let index = Arc::new(
-        ProductionIndex::load_from(&reader, base, fork_lsn, head)
-            .await
-            .map_err(|e| e.to_string())?,
-    );
+    let mut index = ProductionIndex::load_from(&reader, base, fork_lsn, head)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Sealed values in the window open as they do for the daemon's forks.
+    let privacy = sealer.map(|sealer| crate::privacy::ForkPrivacy {
+        sealer,
+        no_pii: false,
+    });
+    if let Some(p) = &privacy {
+        index.reveal(p);
+    }
+    let index = Arc::new(index);
     let engine = build_engine(PoolSize {
         concurrency: workers.max(1) as u32,
     })
@@ -112,13 +122,17 @@ pub async fn check(
     )
     .map_err(|e| e.to_string())?;
     let config = config_at(&index, fork_lsn);
-    let setup = Arc::new(ReplaySetup::new(
+    let mut setup = ReplaySetup::new(
         format!("upgrade-{ENGINE_VERSION}"),
         index.clone(),
         fc.kinds,
         config,
         None,
-    ));
+    );
+    if let Some(p) = privacy {
+        setup.privacy = p;
+    }
+    let setup = Arc::new(setup);
     let options = DiffOptions {
         mode: Mode::Both,
         fuel_threshold: NO_FUEL_THRESHOLD,
