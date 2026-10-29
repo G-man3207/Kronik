@@ -7,7 +7,7 @@
     "entry": "src/actor.ts"
   },
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test test/*.test.ts"
   },
   "dependencies": {
     "@kronik/sdk": "file:../../sdk/ts"
