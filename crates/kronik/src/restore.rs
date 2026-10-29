@@ -144,22 +144,7 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
             )
             .with_hint("Fix the file, or pass --data-dir <dir>.")
         })?;
-    // The key the restored daemon will use, wherever it is configured.
-    let configured = match args.master_key_file.clone() {
-        Some(path) => Some(path),
-        None => config::Config::find(args.config.as_deref())
-            .ok()
-            .and_then(|(c, _)| c.keys.master_key_file),
-    };
-    if configured.is_some() && std::env::var_os(kronik_privacy::MASTER_KEY_ENV).is_some() {
-        return Err(ApiError::new(
-            ErrorCode::BadRequest,
-            "KRONIK_MASTER_KEY and a master key file (--master-key-file, \
-             KRONIK_MASTER_KEY_FILE or [keys] master_key_file) are both set",
-        )
-        .with_hint("Remove one of them, as for `kronik serve`."));
-    }
-    let key_path = configured.unwrap_or_else(|| data.join("keys").join("master.key"));
+    let key_path = master_key_path(args.config.as_deref(), args.master_key_file.clone(), &data)?;
     // The same refusal `restore` makes, before anything is opened, so a dry
     // run and a real run fail the same way and neither writes.
     let state = data.join("branches").join(&args.branch).join("state.db");
@@ -348,6 +333,33 @@ fn runtime() -> Result<tokio::runtime::Runtime, ApiError> {
                 format!("starting the runtime failed: {e}"),
             )
         })
+}
+
+/// The master key file `kronik serve` will use on `data`: `flag`
+/// (--master-key-file, KRONIK_MASTER_KEY_FILE), else `[keys]
+/// master_key_file` in the configuration file, else
+/// `<data>/keys/master.key`. `KRONIK_MASTER_KEY` together with a file is
+/// refused, as by serve.
+pub(crate) fn master_key_path(
+    config: Option<&Path>,
+    flag: Option<PathBuf>,
+    data: &Path,
+) -> Result<PathBuf, ApiError> {
+    let configured = match flag {
+        Some(path) => Some(path),
+        None => config::Config::find(config)
+            .ok()
+            .and_then(|(c, _)| c.keys.master_key_file),
+    };
+    if configured.is_some() && std::env::var_os(kronik_privacy::MASTER_KEY_ENV).is_some() {
+        return Err(ApiError::new(
+            ErrorCode::BadRequest,
+            "KRONIK_MASTER_KEY and a master key file (--master-key-file, \
+             KRONIK_MASTER_KEY_FILE or [keys] master_key_file) are both set",
+        )
+        .with_hint("Remove one of them, as for `kronik serve`."));
+    }
+    Ok(configured.unwrap_or_else(|| data.join("keys").join("master.key")))
 }
 
 fn ship_error(e: ShipError) -> ApiError {

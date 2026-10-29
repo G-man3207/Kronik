@@ -112,7 +112,8 @@ fn the_check_replays_the_window_with_this_engine_and_passes() {
     let checked = rt
         .block_on(async {
             let env = Env::real(tokio::runtime::Handle::current());
-            kronik_fork::upgrade::check(&env, dir.path(), Duration::from_secs(6 * 3600), 2).await
+            kronik_fork::upgrade::check(&env, dir.path(), Duration::from_secs(6 * 3600), 2, None)
+                .await
         })
         .unwrap();
     let r = &checked.report;
@@ -131,11 +132,55 @@ fn the_check_replays_the_window_with_this_engine_and_passes() {
     let short = rt
         .block_on(async {
             let env = Env::real(tokio::runtime::Handle::current());
-            kronik_fork::upgrade::check(&env, dir.path(), Duration::ZERO, 2).await
+            kronik_fork::upgrade::check(&env, dir.path(), Duration::ZERO, 2, None).await
         })
         .unwrap();
     assert!(short.report.passed);
     assert_eq!(short.report.root_inputs, 1);
+}
+
+/// Sealed values in the window (privacy mode on, a message with a subject)
+/// open with the data directory's keystore and master key, as the daemon
+/// opens them; without them the replay cannot read its inputs.
+#[test]
+fn the_check_opens_sealed_values_with_the_directorys_keystore() {
+    let dir = tempdir();
+    workload(dir.path());
+    let rt = rt();
+    let node = start(&rt, dir.path()).unwrap();
+    rt.block_on(async {
+        node.set_privacy_mode(pb::PrivacyState::On, audit(), false)
+            .await
+            .unwrap();
+        let mut m = msg("increment", "");
+        m.body.as_mut().unwrap().subject = Some("user:1".into());
+        let r = node
+            .send(ActorRef::parse("counter/c9").unwrap(), m, audit(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r.committed(), "{r:?}");
+    });
+    drop(node);
+    let check = |sealer| {
+        rt.block_on(async {
+            let env = Env::real(tokio::runtime::Handle::current());
+            kronik_fork::upgrade::check(&env, dir.path(), Duration::from_secs(6 * 3600), 2, sealer)
+                .await
+        })
+    };
+    let err = check(None).err().unwrap();
+    assert!(err.contains("KEYSTORE_INCOMPLETE"), "{err}");
+    let key = dir.path().join("keys/master.key");
+    let sealer = kronik_sched::offline_sealer(dir.path(), &key).unwrap();
+    assert!(sealer.is_some());
+    let checked = check(sealer).unwrap();
+    assert!(
+        checked.report.passed,
+        "{}",
+        String::from_utf8_lossy(&checked.diff_bytes)
+    );
+    assert_eq!(checked.report.root_inputs, 41);
 }
 
 #[test]

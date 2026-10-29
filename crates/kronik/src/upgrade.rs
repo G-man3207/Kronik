@@ -36,6 +36,13 @@ pub struct CheckArgs {
     /// The configuration file [default: /etc/kronik/kronik.toml if it exists].
     #[arg(long, value_name = "PATH", env = "KRONIK_CONFIG")]
     config: Option<PathBuf>,
+    /// The master key file `kronik serve` uses on this directory [default:
+    /// keys.master_key_file in the configuration file, else
+    /// <data-dir>/keys/master.key]. The check opens sealed values with it
+    /// and the privacy keystore. `KRONIK_MASTER_KEY`, when set, is the key
+    /// itself.
+    #[arg(long, value_name = "PATH", env = "KRONIK_MASTER_KEY_FILE")]
+    master_key_file: Option<PathBuf>,
     /// Replay workers [default: the machine's cores, at most 16].
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     workers: Option<u16>,
@@ -128,6 +135,13 @@ fn execute(args: CheckArgs) -> Result<Done, ApiError> {
         .workers
         .map(usize::from)
         .unwrap_or_else(default_workers);
+    // Sealed values in the window open as they do for the daemon.
+    let key_path = crate::restore::master_key_path(
+        args.config.as_deref(),
+        args.master_key_file.clone(),
+        &data,
+    )?;
+    let sealer = kronik_sched::offline_sealer(&data, &key_path).map_err(key_error)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("kronik")
@@ -141,8 +155,14 @@ fn execute(args: CheckArgs) -> Result<Done, ApiError> {
     let checked = rt
         .block_on(async {
             let env = Env::real(tokio::runtime::Handle::current());
-            kronik_fork::upgrade::check(&env, &data, Duration::from_millis(window_ms), workers)
-                .await
+            kronik_fork::upgrade::check(
+                &env,
+                &data,
+                Duration::from_millis(window_ms),
+                workers,
+                sealer,
+            )
+            .await
         })
         .map_err(check_error)?;
 
@@ -270,9 +290,31 @@ fn check_error(msg: String) -> ApiError {
         ApiError::new(ErrorCode::BadRequest, msg).with_hint(
             "Point --data-dir at a data directory that has served, or start one with `kronik serve --data-dir <dir>`.",
         )
+    } else if let Some(i) = msg.find("KEYSTORE_INCOMPLETE: ") {
+        ApiError::new(ErrorCode::KeystoreIncomplete, msg[i..].to_owned()).with_hint(
+            "The privacy keystore lacks a subject's key; `kronik integrity` lists the subjects.",
+        )
     } else if msg.to_ascii_lowercase().contains("corrupt") {
         ApiError::new(ErrorCode::StorageCorrupt, msg)
     } else {
         ApiError::new(ErrorCode::Internal, msg)
+    }
+}
+
+/// The master key or the privacy keystore could not be opened.
+fn key_error(e: kronik_privacy::PrivacyError) -> ApiError {
+    let hint = "Use the master key `kronik serve` uses on this directory: --master-key-file, \
+                [keys] master_key_file with --config, <data-dir>/keys/master.key, or \
+                KRONIK_MASTER_KEY.";
+    match e {
+        kronik_privacy::PrivacyError::KeyMissing(_) => {
+            ApiError::new(ErrorCode::MasterKeyMissing, format!("upgrade check: {e}"))
+                .with_hint(hint)
+        }
+        kronik_privacy::PrivacyError::KeyMismatch(_) => {
+            ApiError::new(ErrorCode::MasterKeyMismatch, format!("upgrade check: {e}"))
+                .with_hint(hint)
+        }
+        e => ApiError::new(ErrorCode::StorageCorrupt, format!("upgrade check: {e}")),
     }
 }

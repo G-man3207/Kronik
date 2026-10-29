@@ -235,6 +235,27 @@ pub async fn start_local(
     .await
 }
 
+/// The data directory's privacy keystore as a sealer, for an offline reader
+/// of its log (`kronik upgrade check`): sealed values open as they do for
+/// the daemon. `key_path` is the master key file serve uses; `None` when
+/// the directory has no keystore. A running daemon may hold it too.
+pub fn offline_sealer(
+    data: &Path,
+    key_path: &Path,
+) -> Result<Option<Arc<kronik_privacy::sealer::Sealer>>, kronik_privacy::PrivacyError> {
+    let keys = data.join("keys");
+    let file = keys.join("keystore.db");
+    if !file.exists() {
+        return Ok(None);
+    }
+    let (master, _) = kronik_privacy::MasterKey::open(key_path, &keys, None)?;
+    let keystore = kronik_privacy::keystore::Keystore::open_file(&file, &master)?;
+    Ok(Some(Arc::new(
+        kronik_privacy::sealer::Sealer::new(Arc::new(keystore))
+            .with_pseudonyms(kronik_privacy::keystore::Pseudonyms::new(&master)),
+    )))
+}
+
 /// A wrong or missing master key has its own code; anything else in the
 /// key or the stores is corruption.
 fn key_error(e: kronik_privacy::PrivacyError) -> StartError {
