@@ -12,8 +12,10 @@ through new code and review a behavior diff before anything goes live.
 
 ## Status
 
-Pre-alpha. Kronik is being built toward v0.1 and is not usable yet. See
-[`STATUS.md`](STATUS.md) for progress.
+Pre-alpha. Kronik is not usable yet. v0.1.0 and v0.3.0 are released as
+static binaries ([releases](https://github.com/G-man3207/Kronik/releases));
+milestones M0 to M15 and M22 and M28 are closed. See
+[`STATUS.md`](STATUS.md) for progress, evidence and known gaps.
 
 ## Development
 

@@ -7,7 +7,8 @@ force-pushed. Commit ids from before the squash, here and in the ADRs,
 refer to the earlier history, which the owner keeps; so did the milestone
 tags `v0.0.0` to `v0.0.8`, now kept on dev under `refs/backup/tags/` and
 not published. The releases are `v0.1.0` and `v0.3.0` (Open questions,
-release tags).
+release tags). The 76 temporary work branches, which held no content that
+was not already on main, were deleted on 2026-10-29 (known gaps).
 
 ## Current milestone
 
@@ -881,8 +882,17 @@ Each branch's last commit message carries its handoff.
   checkpoint, at the same length and within one mtime tick, is missed until
   the next change or the daily backup (review F7 on fix-v01-keystore-restore).
   A change counter kept in the keystore itself would close it.
-- The nightly has not run on the pushed history yet; its runs on the
-  earlier main (b47780d) failed the crash test, which is fixed since.
+- The 76 work branches were deleted on 2026-10-29 and their objects
+  pruned. Thirty tips stayed reachable from main or from the parked
+  branches, eleven more were recovered from the testbench into
+  `/var/tmp/kronik-recovered-2026-10-29.bundle`, and thirty-five are gone
+  from every machine. Their content is in main, but the commits themselves
+  cannot be opened: older notes that name one of those tips (`e798b46` for
+  `m15-sdks`, for example) no longer resolve.
+- The nightly passed on the pushed history on 2026-10-29 (run 40853121650,
+  head 4e89aa8: crash test 1,000 cycles, DST 10,000 seeds, DST over
+  webhook-relay-ts, DST 1,000,000 steps and the release build). Its runs on
+  the earlier main (b47780d) failed the crash test, fixed since.
   GitHub Actions CI is green on main since eb1218e (2026-10-28), after
   fixes to the ops test's KVM check, the TS test glob and
   `identity-examples.sh`. v0.3's `sdks` and `action` steps and the foreign
