@@ -87,7 +87,8 @@ v0.1's evidence, 2026-10-28:
 v0.2 landed with f957475 and v0.3 with 189c8c3 (their sections); v0.3
 passed the testbench and is released as `v0.3.0` (86d5a4b). The owner
 chose to continue: M28 and M22 landed (their sections). Other work is
-parked (Parked work).
+parked (Parked work). `README.md` was rewritten on 2026-10-29 to describe
+the releases, the closed milestones and the parked work.
 
 The testbench is `travelfiesta`: Debian 13, 2 vCPU Skylake, 3.7 GiB, no
 `/dev/kvm`, gVisor `release-20261019.0` with systrap. The batch

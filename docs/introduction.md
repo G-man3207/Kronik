@@ -8,11 +8,12 @@ function of its history. The goal is that every change can be verified
 against real production traffic before it goes live. The determinism covers
 everything that runs as Wasm actors, including their SQL state.
 
-Kronik is pre-alpha: it has no release and is not ready for production. This
-book describes what the code in the repository does. `STATUS.md` in the
-repository root shows how far the work has come, including what has not been
-run on a VPS. The [quickstart](guides/quickstart.md) is the finished-product
-journey with the commands that exist today.
+Kronik is pre-alpha: it has two releases, `v0.1.0` and `v0.3.0`, and is not
+ready for production. This book describes what the code in the repository
+does. `STATUS.md` in the repository root shows how far the work has come,
+including what has not been run on a VPS. The
+[quickstart](guides/quickstart.md) is the finished-product journey with the
+commands that exist today.
 
 ## What Kronik is
 
