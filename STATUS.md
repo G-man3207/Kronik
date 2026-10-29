@@ -4,15 +4,18 @@ Last updated: 2026-10-29
 
 The history was squashed on 2026-10-28 into `Kronik v0.1` (0c3c266) and
 force-pushed. Commit ids from before the squash, here and in the ADRs,
-refer to the earlier history, which the owner keeps; so do the milestone
-tags `v0.0.0` to `v0.0.8`.
+refer to the earlier history, which the owner keeps; so did the milestone
+tags `v0.0.0` to `v0.0.8`, now kept on dev under `refs/backup/tags/` and
+not published. The releases are `v0.1.0` and `v0.3.0` (Open questions,
+release tags).
 
 ## Current milestone
 
-v0.1 is done; publishing it is the owner's (Open questions). M0 to M8 are
-closed and tagged, `v0.0.0` to `v0.0.8`, M2 to M8 on 927c80a. On main, v0.1
-ends at 4353863: `Kronik v0.1` (0c3c266), main's CI fixes and the keystore
-restore fix. After the milestone tags v0.1 gained six fixes:
+v0.1 is done and released as `v0.1.0` (4353863). M0 to M8 are closed;
+their milestone tags, `v0.0.0` to `v0.0.8`, M2 to M8 on 927c80a, are kept
+as backups (above). On main, v0.1 ends at 4353863: `Kronik v0.1`
+(0c3c266), main's CI fixes and the keystore restore fix. After the
+milestone tags v0.1 gained six fixes:
 
 - Promote pins the code of changed kinds (`PROPOSAL_STALE`): 24fef29, and
   07bdeae, which pins it at the proposal's creation head instead of its
@@ -80,9 +83,10 @@ v0.1's evidence, 2026-10-28:
   masked turns.
 - GitHub Actions CI passed on main at eb1218e, d80e52a and 4353863.
 
-v0.2 landed with f957475 and v0.3 with 189c8c3 (their sections), and v0.3
-passed the testbench. Whether to stop or continue is the owner's (Next).
-Other work is parked (Parked work).
+v0.2 landed with f957475 and v0.3 with 189c8c3 (their sections); v0.3
+passed the testbench and is released as `v0.3.0` (86d5a4b). The owner
+chose to continue: M28 and M22 are in progress (Next). Other work is
+parked (Parked work).
 
 The testbench is `travelfiesta`: Debian 13, 2 vCPU Skylake, 3.7 GiB, no
 `/dev/kvm`, gVisor `release-20261019.0` with systrap. The batch
@@ -609,7 +613,10 @@ Evidence, 2026-10-28 and 29:
 
 ## Next
 
-1. Owner check-in: stop or continue.
+1. M28, OpenTelemetry and audit export (`m28-land` 63278de, on 854e4a9),
+   and M22, standard `fetch` through `wasi:http` (`m22-wasi-http` 569b692,
+   on 4e89aa8), are in progress. Their testbench rows wait for SSH access
+   to the testbench (Open questions).
 
 ## Parked work
 
@@ -627,13 +634,10 @@ Each branch's last commit message carries its handoff.
   3091fbc). A partial review, 5 Highs, is in
   `docs/design/m21-review-partial.md`; the testbench proof needs a rerun;
   ADR 0060 is provisional.
-- M22 wasi:http: `m22-wasi-http` 297f871, on the earlier `m15-sdks` from
-  before the squash; not reviewed, and not rebased onto v0.3.
+- M22 and M28 are in progress (Next).
 - M23 secret backends: `m23-design` 30d4791, design only. ADR 0093
   (PKCS#11 through a keyhelper process) is the owner's decision.
 - M24 connections: `m24-design` da0a3e5, design only.
-- M28 OpenTelemetry and audit: `m28-otel` 9b65bb4, with the unmerged review
-  fixes `m28-fixa` e5dcec9 and `m28-fixb` 066b604.
 
 ## Open questions
 
@@ -646,14 +650,22 @@ Each branch's last commit message carries its handoff.
   erasure deletes only rows with `_subject = subject`, so such rows survive
   erasure in plain text. M1 implements the brief as written (ADR 0005,
   `subjects/gap-without-column`).
-- **Publishing.** The v0.1.0 GitHub release; GitHub Actions minutes for CI
-  and the nightly; and a public install URL and domain, for `install.sh`
-  and for ACME with a real certificate.
-- **Release tags.** The milestone tags `v0.0.0` to `v0.0.8` point into the
-  history from before the squash, and no later milestone is tagged.
-  Proposal: release tags on the squashed commits instead, `v0.1.0` at
-  4353863 and `v0.3.0` at the commit that records this question; `v0.2.0`
-  waits for M10's criterion 4.
+- **Publishing.** GitHub Actions minutes for CI and the nightly, and a
+  public domain for ACME with a real certificate. The releases and
+  `install.sh` are on GitHub (release tags, below).
+- **Done: release tags** on the squashed commits, each with a GitHub
+  release of static musl binaries for x86_64 and aarch64, an SBOM,
+  `install.sh` and `SHA256SUMS`:
+  [`v0.1.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.1.0) at
+  4353863 (M0 to M9; its binaries report `0.1.0-dev`: the version was
+  never bumped there) and, the latest,
+  [`v0.3.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.3.0) at
+  86d5a4b (adds M10 except its criterion 4, M11 and M12 to M15; version
+  0.3.0). `v0.2.0` waits for M10's criterion 4. v0.3.0 is the first engine
+  change: `kronik upgrade check` must pass before its first start on
+  existing data, and cf80ecd lets the check open sealed values. Once a
+  node has run 0.3.0, a 0.1.0-dev binary can't take its data back with
+  privacy mode on: the old binary's check lacks that fix.
 - M10's criterion 4 needs a public repository with `examples/github-flow`,
   a daemon GitHub's runners can reach, and GitHub Actions minutes.
 - **Crypto in forks is a signing oracle.** As the brief's effect table
@@ -679,14 +691,14 @@ Each branch's last commit message carries its handoff.
   through 0700 parents; checkpoints and copies clear the bits, and the
   operations guide says not to copy the tree with modes kept. The owner
   accepted the ADR on 2026-10-29.
-- **Resolved:** the testbench's Tailscale SSH check mode stopped the batch
-  three times: on 2026-10-26, for about eight hours on 2026-10-28, and for
-  about two hours from 21:34 UTC that evening, before v0.3's rows. The
-  owner fixed Tailscale SSH to the testbench on 2026-10-29; BatchMode ssh
-  works (three checks at 08:34 UTC, each exit 0). On dev and on the
-  testbench, `tailscale status --json` says nothing about the SSH policy or
-  check mode: both nodes list the SSH capabilities (`cap/ssh`,
-  `ssh-behavior-v1`, `ssh-env-vars`) without values, and no login URL.
+- **Reopened:** the testbench's Tailscale SSH check mode. It stopped the
+  batch on 2026-10-26, for about eight hours on 2026-10-28, and for about
+  two hours from 21:34 UTC that evening. Check mode is still active: after
+  the owner's fix on 2026-10-29, BatchMode ssh worked at 08:34 UTC and
+  asked for a check again at 11:46 UTC, which holds M22's and M28's
+  testbench rows. `tailscale status --json` on dev and on the testbench
+  shows nothing of the SSH policy. The lasting fix is the owner's: a
+  change to the SSH policy.
 - From v0.4 the testbench is a cluster of three VPSs, as the brief says;
   there is one, `travelfiesta`.
 - M20 (Firecracker) needs a test host with `/dev/kvm`: neither dev nor the
@@ -724,8 +736,12 @@ Each branch's last commit message carries its handoff.
   not measured since (`docs/perf.md`).
 - The first rate-limited call after a restart waits one full period (up to
   an hour for `N/h`): rate windows start full and are not persisted.
-- `kronik upgrade check` has not seen a real engine change: there is one
-  engine version, `kronik-0.1.0-dev+wasmtime-50.0.0`.
+- `kronik upgrade check` met its first real engine change with 0.3.0
+  (86d5a4b): a data directory written by 0.1.0-dev is refused with
+  `ENGINE_VERSION_MISMATCH` until the check passes, and cf80ecd lets the
+  check open sealed values. Going back from 0.3.0 to a 0.1.0-dev binary
+  does not work with privacy mode on: the old binary's check lacks that
+  fix.
 - The daemon did not set `PR_SET_DUMPABLE`. Fixed: `kronik serve` makes
   itself non-dumpable at start through rustix (6bf2f60 in the earlier
   history), besides the unit's `LimitCORE=0`; if the call fails it logs a
