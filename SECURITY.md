@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-Kronik is pre-alpha and has no releases. Only the latest commit on the `main`
-branch receives security fixes. Do not run Kronik in production yet.
+Kronik is pre-alpha. The latest `v0.x` release and the latest commit on the
+`main` branch receive security fixes. Do not run Kronik in production yet.
 
 ## Reporting a vulnerability
 
