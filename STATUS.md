@@ -1,6 +1,6 @@
 # Status
 
-Last updated: 2026-10-28
+Last updated: 2026-10-29
 
 The history was squashed on 2026-10-28 into `Kronik v0.1` (0c3c266) and
 force-pushed. Commit ids from before the squash, here and in the ADRs,
@@ -72,13 +72,17 @@ v0.1's evidence, 2026-10-28:
   (`integrity` lists no missing keys, sealed state readable), and restores
   without a key, or with a wrong one (`MASTER_KEY_MISMATCH`), were refused.
   The refused wrong-key restore still created the absent directory and an
-  empty `keys/`; 247bf5a, after v0.2, fixes that. MCP on a restored node
-  waits for the testbench (Next).
+  empty `keys/`; 247bf5a, after v0.2, fixes that. MCP on a restored node,
+  2026-10-28, 23:27 to 23:34 UTC, with f957475's release: the restore with
+  sealed values installed the keystore (`keys_missing` empty), and an agent
+  without `pii:read` replayed 6 of 6 root inputs over stdio MCP without an
+  `INTERNAL`; the PII floor (`pii-masked-needs-approval`) fired for the 2
+  masked turns.
 - GitHub Actions CI passed on main at eb1218e, d80e52a and 4353863.
 
-v0.2 landed with f957475 and v0.3 with 189c8c3 (their sections). v0.3's
-testbench rows come next; then the owner decides what follows. Other work
-is parked (Parked work).
+v0.2 landed with f957475 and v0.3 with 189c8c3 (their sections), and v0.3
+passed the testbench. Whether to stop or continue is the owner's (Next).
+Other work is parked (Parked work).
 
 The testbench is `travelfiesta`: Debian 13, 2 vCPU Skylake, 3.7 GiB, no
 `/dev/kvm`, gVisor `release-20261019.0` with systrap. The batch
@@ -87,8 +91,9 @@ repository) runs its suites one at a time under the testbench lock, with
 release binaries built on dev from one commit; a row of M9 or later runs
 only at a commit that has its milestone. Logs are in
 `/var/tmp/kronik-batch/logs/` on the testbench. The whole batch passed at
-68008f9 and at 927c80a (52 of 52 suites, 2026-10-27), at e3fb81a (56 of 56)
-and, with v0.2's rows, at c626ede (67 of 67, 2026-10-28).
+68008f9 and at 927c80a (52 of 52 suites, 2026-10-27), at e3fb81a (56 of 56),
+with v0.2's rows at c626ede (67 of 67, 2026-10-28), and with v0.3's rows at
+94d20ac (88 of 88, 2026-10-29).
 
 ## M0: repository and spikes (closed, `v0.0.0` on 89a8b34)
 
@@ -519,14 +524,13 @@ Evidence, 2026-10-28:
 
 v0.3 landed on main with 189c8c3, one commit with the tree of `m15-sdks`
 e798b46: the branches `m12-simulators` to `m15-sdks`, rebased onto
-247bf5a. reviewer-v03's verdict on them: land, no must-fixes. M12 to M14
-meet their criteria in `scripts/ci.sh` at e798b46; M15's first criterion
-waits for the testbench. ADRs 0014 to 0016 (M12), 0017 and 0018 (M13),
-0019 and 0020 (M14) and 0030 (M15); ADRs 0023 and 0027 are amended. The
-testbench rows and the M14 unit proof (Next) gate v0.3's tags, not the
-landing.
+247bf5a. reviewer-v03's verdict on them: land, no must-fixes. M12 to M15
+are closed: every criterion passes in `scripts/ci.sh`, on dev and on
+GitHub, and the testbench batch passed. ADRs 0014 to 0016 (M12), 0017 and
+0018 (M13), 0019 and 0020 (M14) and 0030 (M15); ADRs 0023 and 0027 are
+amended.
 
-M12: effect simulators.
+M12: effect simulators (closed).
 
 - [x] Every synthetic answer is labeled with its simulator in the diff and
       in `trace` (`crates/kronik-fork/tests/simulators.rs`, kronik-api's
@@ -542,7 +546,7 @@ M12: effect simulators.
 - [x] The policy can forbid synthetic answers per target
       (`simulators.rs`).
 
-M13: rollback via replay.
+M13: rollback via replay (closed).
 
 - [x] A rollback via replay after a migration gives the old code's state
       and a list of irreversible effects
@@ -555,7 +559,7 @@ M13: rollback via replay.
       requests with idempotency keys during promote; a switch that cannot
       pause in time writes nothing).
 
-M14: foreign actors in forks.
+M14: foreign actors in forks (closed).
 
 - [x] A fork with `fork_mode = "sandbox"` starts a copy of a Postgres actor
       from the nearest checkpoint (`crates/kronik/tests/foreign.rs`,
@@ -565,17 +569,18 @@ M14: foreign actors in forks.
 - [x] The copy cannot reach the network and is deleted with the fork (the
       same test).
 - For the copies' `runsc restore`, the systemd unit drops
-  `RestrictSUIDSGID` (ADR 0027, Open questions). The proof under the
-  installed unit is the testbench's `M14/unit`, pending.
+  `RestrictSUIDSGID` (ADR 0027, Open questions). Under the installed unit
+  the batch's `M14/unit` started a copy of foreign-echo from its checkpoint
+  (ADR 0027's Evidence).
 
-M15: Python and Go SDKs.
+M15: Python and Go SDKs (closed).
 
-- [ ] The example apps pass the same acceptance scripts as Rust and
-      TypeScript in M1 to M3. At e798b46, DST with `webhook-relay-py` and
-      `webhook-relay-go` passed on dev (below); the scripts (`e2e-m1.sh`,
-      `acceptance-m1.sh`, `e2e-webhook-relay.sh`, `verify-change.sh`) run
-      in the testbench's `M15` row, pending. They passed on dev before the
-      rebase, at bd6c6b1 in the earlier history.
+- [x] The example apps pass the same acceptance scripts as Rust and
+      TypeScript in M1 to M3: the testbench's `M15` row runs `e2e-m1.sh`
+      and `acceptance-m1.sh` with `M1_GUESTS=py` and `go`,
+      `e2e-webhook-relay.sh` and DST with each relay, and
+      `verify-change.sh` with each counter and its `-step2` build. DST with
+      both relays also ran 10 000 seeds twice on dev.
 - [x] The imports are within the allowlist, and the determinism test passes
       for both languages (`check_imports` and `sdk_determinism` in
       `scripts/ci.sh sdks`).
@@ -583,7 +588,7 @@ M15: Python and Go SDKs.
   `kronik init --lang python|go` writes a counter project. Identity replay
   covers them (`scripts/ci.sh identity`).
 
-Evidence, 2026-10-28:
+Evidence, 2026-10-28 and 29:
 
 - At e798b46, 189c8c3's tree: `scripts/ci.sh`, every step, passed on dev,
   ending 21:29 UTC: `sdks`, `foreign` (7 tests, the Postgres fork test
@@ -593,21 +598,18 @@ Evidence, 2026-10-28:
   replay of 126 235 root inputs) and DST (30 000 runs; 10 000 webhook runs
   each with `webhook-relay-ts`, `webhook-relay-py` and `webhook-relay-go`;
   10 000 `rebuild` runs; 1 000 000 steps twice), all without a failure.
-- Pending: the testbench batch, rows M1 to M15 and `identity` with
-  `M14/unit`, which Tailscale's check has stopped since 21:34 UTC; and the
-  first GitHub Actions run of `sdks`, `action` and the Postgres fork test
-  with docker, which this push starts.
+- The testbench batch at 94d20ac (189c8c3 and STATUS): 88 of 88 suites in
+  the rows M1 to M15 and `identity`, 2026-10-28 23:35 to 2026-10-29 01:15
+  UTC, `M10/remote-30min` and 14 identity examples included. `M14/unit`
+  passed when rerun at 01:20 UTC, after fixes to its own script; its
+  result is in ADR 0027's Evidence.
+- GitHub Actions run 40785502137 at 94d20ac passed every step: the first
+  run there of `sdks`, `action` and the foreign step's Postgres fork test
+  with docker.
 
 ## Next
 
-1. The testbench at the pushed head: the rows M1 to M15 and `identity`,
-   `M14/unit` included, once Tailscale lets the batch in (Open questions).
-   `M14/unit`'s result goes into ADR 0027's Evidence and here. The
-   quickstart's MCP check on a restored node waits for the same access.
-2. The owner check-in: what follows v0.3, the milestone tags (`v0.0.9`,
-   `v0.0.11` and v0.3's are not set yet), publishing, and the Open
-   questions, ADR 0027's v0.3 decision among them.
-3. Add the testbench privacy overhead to `docs/perf.md`.
+1. Owner check-in: stop or continue.
 
 ## Parked work
 
@@ -644,11 +646,14 @@ Each branch's last commit message carries its handoff.
   erasure deletes only rows with `_subject = subject`, so such rows survive
   erasure in plain text. M1 implements the brief as written (ADR 0005,
   `subjects/gap-without-column`).
-- **Publishing.** The v0.1.0 GitHub release; the milestone tags, whose
-  `v0.0.0` to `v0.0.8` point into the earlier history (push that history
-  with them, or tag this one instead); GitHub Actions minutes for CI and
-  the nightly; and a public install URL and domain, for `install.sh` and
-  for ACME with a real certificate.
+- **Publishing.** The v0.1.0 GitHub release; GitHub Actions minutes for CI
+  and the nightly; and a public install URL and domain, for `install.sh`
+  and for ACME with a real certificate.
+- **Release tags.** The milestone tags `v0.0.0` to `v0.0.8` point into the
+  history from before the squash, and no later milestone is tagged.
+  Proposal: release tags on the squashed commits instead, `v0.1.0` at
+  4353863 and `v0.3.0` at the commit that records this question; `v0.2.0`
+  waits for M10's criterion 4.
 - M10's criterion 4 needs a public repository with `examples/github-flow`,
   a daemon GitHub's runners can reach, and GitHub Actions minutes.
 - **Crypto in forks is a signing oracle.** As the brief's effect table
@@ -666,19 +671,20 @@ Each branch's last commit message carries its handoff.
   Should the default policy ask for more?
 - **ADR 0027: no `RestrictSUIDSGID` from v0.3.** The setting makes
   `openat2` fail, and `runsc restore` needs it for M14's sandbox copies,
-  so v0.3's unit leaves it out; v0.1 kept it. The residual risk: code in
-  an untrusted image, root in its sandbox, can set the setuid or setgid bit
-  on a file under its actor's `/data`, and the host keeps it; so can a
-  compromised daemon or runsc, anywhere it writes. Only root reaches those
-  files, through 0700 parents; checkpoints and copies clear the bits, and
-  the operations guide says not to copy the tree with modes kept. Accept
-  it, or keep the setting and do without sandbox copies under systemd
-  until runsc falls back from `openat2`.
+  so v0.3's unit leaves it out, and copies run under it (ADR 0027's
+  Evidence); v0.1 kept it. The residual risk: code in an untrusted image,
+  root in its sandbox, can set the setuid or setgid bit on a file under its
+  actor's `/data`, and the host keeps it; so can a compromised daemon or
+  runsc, anywhere it writes. Only root reaches those files, through 0700
+  parents; checkpoints and copies clear the bits, and the operations guide
+  says not to copy the tree with modes kept. Accept it, or keep the setting
+  and do without sandbox copies under systemd until runsc falls back from
+  `openat2`.
 - The testbench's Tailscale SSH check mode stopped the batch three times:
-  on 2026-10-26, for about eight hours on 2026-10-28, and again from 21:34
-  UTC on 2026-10-28, before v0.3's rows. Every ssh waits for the owner to
-  authenticate again. Relax the check for the testbench, or expect a
-  prompt to re-authenticate.
+  on 2026-10-26, for about eight hours on 2026-10-28, and for about two
+  hours from 21:34 UTC that evening, before v0.3's rows. Every ssh waits
+  for the owner to authenticate again. Relax the check for the testbench,
+  or expect a prompt to re-authenticate.
 - From v0.4 the testbench is a cluster of three VPSs, as the brief says;
   there is one, `travelfiesta`.
 - M20 (Firecracker) needs a test host with `/dev/kvm`: neither dev nor the
@@ -697,9 +703,9 @@ Each branch's last commit message carries its handoff.
   earlier main (b47780d) failed the crash test, which is fixed since.
   GitHub Actions CI is green on main since eb1218e (2026-10-28), after
   fixes to the ops test's KVM check, the TS test glob and
-  `identity-examples.sh`. v0.3's `sdks` and `action` steps, and the
-  foreign step's Postgres fork test with docker, first run there with
-  v0.3's push. `scripts/ci.sh` runs on dev (Debian 13), CI on the
+  `identity-examples.sh`. v0.3's `sdks` and `action` steps and the foreign
+  step's Postgres fork test with docker passed there at 94d20ac (run
+  40785502137). `scripts/ci.sh` runs on dev (Debian 13), CI on the
   workflow's Ubuntu 24.04.
 - One actor commits 180 to 210 turns/s: each turn waits for the 2 ms
   group-commit window and an fsync before the actor's next turn. Across
@@ -752,8 +758,8 @@ Each branch's last commit message carries its handoff.
   getting it back. Fixed on 24c6dbc: the unit has no `User=` line (root is
   the default) and keeps `NoNewPrivileges`; e3fb81a kept `RestrictSUIDSGID`
   for v0.1, and v0.3 drops it for M14 (ADR 0027, Open questions).
-- `M14/unit` has not run: ADR 0027's restore evidence comes from transient
-  units with the unit's settings, not from the installed unit (Next).
+- `docs/perf.md` does not have the testbench's privacy overhead yet
+  (`M8/bench-privacy` measures it).
 - Previews of a rebase proposal are allowed and run the rebase's code on
   main's head. Harmless, but whether to refuse them is an open product
   decision.

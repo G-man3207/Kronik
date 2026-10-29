@@ -4,7 +4,8 @@
   stayed while nothing ran `runsc restore`. Amended for v0.3: M14's sandbox
   copies run `runsc restore`, so the unit drops it (see "Without
   `RestrictSUIDSGID` (M14)").
-- **Date:** 2026-10-27, amended 2026-10-28 (v0.1 and v0.3)
+- **Date:** 2026-10-27, amended 2026-10-28 (v0.1 and v0.3); v0.3's evidence
+  under the installed unit 2026-10-29
 
 ## Context
 
@@ -177,6 +178,28 @@ the residual risk, which is wider than a compromised process:
     process, and `sandbox` passes.
   - Afterwards: no unit, configuration, data, group or runsc process left.
     `/run/kronik` holds only its `foreign.lock` again.
+- **The v0.3 unit with M14's copies, on travelfiesta, 2026-10-29, 01:20:36
+  to 01:20:41 UTC, under the VPS lock** (the batch's `M14/unit`). The
+  94d20ac release, installed by `install.sh` and `kronik serve --init`; the
+  installed unit is `deploy/systemd/kronik.service` with only `@KRONIK@`
+  substituted (`cmp`: identical).
+  - `systemctl show`: `User=` empty, `Group=kronik`,
+    `NoNewPrivileges=yes`, `RestrictSUIDSGID=no`. The daemon has `CapInh 0`,
+    `CapPrm 000001f3fdfeffff`, `NoNewPrivs 1`.
+  - `kronik foreign add echo --fork-mode sandbox` with foreign-echo:
+    `running`. `counter/c1` sent `GET foreign://echo/healthz`: `200 ok`.
+  - `kronik snapshot create` at lsn 6 checkpointed echo: paused 86 ms, a
+    runsc image of 242 453 bytes (its `/data` is empty); `foreign list`
+    shows `sandbox (lsn 6)`.
+  - Calls at lsn 10, the fork point, and at 13 and 16. A fork at lsn 10
+    with counter-body-v2, replayed continuously: `forked` 2, `exact` 0. Its
+    copy, `kronik-copy-fafc41352e586d2b`, ran under `/run/kronik/runsc` in
+    its own network namespace, started by `runsc restore` from the
+    checkpoint (journal: "started a fork copy of a foreign actor … lsn=6").
+  - `kronik fork delete` removed the copy; `kronik foreign remove echo`
+    left no container and no namespace.
+  - Afterwards: unit, group, data, configuration, binary and image copy
+    removed; no runsc process left.
 
 To repeat the toggle test on a host with runsc (as root, under the lock;
 `$B` is a bundle whose `config.json` has `"terminal": false`):
