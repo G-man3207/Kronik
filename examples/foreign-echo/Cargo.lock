@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "foreign-echo"
-version = "0.3.0"
+version = "0.4.0-dev"

@@ -6687,7 +6687,7 @@
   "info": {
     "description": "The daemon's API, versioned under /v1, on the Unix socket and, with a bearer token, over TCP (`--api-listen`). Every mutation requires `reason` and takes `dry_run`; every error is the stable error JSON. `x-kronik-scope` is the scope an operation needs; without a token, the socket's caller has every scope.",
     "title": "Kronik JSON API",
-    "version": "0.3.0"
+    "version": "0.4.0-dev"
   },
   "openapi": "3.1.0",
   "paths": {

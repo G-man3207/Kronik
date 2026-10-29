@@ -1,6 +1,6 @@
 {
   "name": "@kronik/sdk",
-  "version": "0.3.0",
+  "version": "0.4.0-dev",
   "description": "Kronik's TypeScript SDK: write actors for the kronik:actor world",
   "license": "Elastic-2.0",
   "private": true,

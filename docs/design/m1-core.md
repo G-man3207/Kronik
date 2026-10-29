@@ -168,7 +168,7 @@ carry both `"text"` (when the bytes are valid UTF-8) and `"base64"`.
 
 | Method and path | Request | Response |
 | --- | --- | --- |
-| `GET /v1/health` | | `{"status":"ok","version":"0.3.0","engine":"kronik-…+wasmtime-…","applied_lsn":N,"branch":"main","http_listen":"127.0.0.1:8080"}` |
+| `GET /v1/health` | | `{"status":"ok","version":"0.4.0-dev","engine":"kronik-…+wasmtime-…","applied_lsn":N,"branch":"main","http_listen":"127.0.0.1:8080"}` |
 | `POST /v1/deployments` | `{"wasm_base64":"…","reason":"…","dry_run":false}` | `{"dry_run":false,"deployment":{"epoch":N,"lsn":N,"kind":"counter","code_hash":"b3:…","schema_version":1,"routes":[{"method":"POST","pattern":"/counter/{key}/increment"}],"capabilities":[…]},"warnings":["capability http:x is not granted; run: kronik grant counter http:x --reason '…'"]}`. Errors: `IMPORT_NOT_ALLOWED` (lists imports), `VERIFY_REQUIRED` (kind has history), `ROUTE_CONFLICT`, `TURN_FAILED` (describe trapped). |
 | `GET /v1/deployments` | | `{"deployments":[{"epoch","lsn","cause","kinds":[{"kind","code_hash","schema_version"}],"reason"}]}` |
 | `POST /v1/actors/{kind}/{key}/messages` | `{"name":"…","content_type":"…","text"|"base64":…,"subject":null,"reason":"…","dry_run":false}` | `{"dry_run":false,"turn_id":"main:N","outcome":{"kind":"committed","error_code":null,"message":null},"reply":{"name","content_type","text","base64"}}`. The call waits for the turn and answers 200 with its outcome also when it did not commit: `outcome.kind` is then `rejected`, `failed`, `trap`, `fuel_exhausted`, … with `error_code` (`TURN_FAILED`, `FUEL_EXHAUSTED`, …) and `message`, and `reply` is null; `kronik send` exits 1 for any outcome but `committed`. Errors: `ACTOR_NOT_FOUND` (unknown kind). |

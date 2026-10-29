@@ -1828,7 +1828,7 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "kronik"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-api"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1904,7 +1904,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-core"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "blake3",
  "bytes",
@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-effects"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "aho-corasick",
  "blake3",
@@ -1941,7 +1941,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-foreign"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "blake3",
  "bytes",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-fork"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1997,7 +1997,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-gateway"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-log"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "bytes",
  "crc32c",
@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-mcp"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "bytes",
  "http",
@@ -2053,11 +2053,11 @@ dependencies = [
 
 [[package]]
 name = "kronik-metrics"
-version = "0.3.0"
+version = "0.4.0-dev"
 
 [[package]]
 name = "kronik-policy"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "cel",
  "serde",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-privacy"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -2081,7 +2081,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-proto"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "prost",
  "prost-build",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-runtime"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "blake3",
  "bytes",
@@ -2112,7 +2112,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-sched"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "blake3",
  "bytes",
@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-ship"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "blake3",
  "kronik-core",
@@ -2159,7 +2159,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-sim"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "blake3",
  "bytes",
@@ -2180,7 +2180,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-store"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "blake3",
  "chacha20",
@@ -2199,7 +2199,7 @@ dependencies = [
 
 [[package]]
 name = "kronik-testhost"
-version = "0.3.0"
+version = "0.4.0-dev"
 dependencies = [
  "base64 0.22.1",
  "blake3",
