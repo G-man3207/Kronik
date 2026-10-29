@@ -35,6 +35,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | --- | --- | --- | --- |
 | [`ACTOR_NOT_FOUND`](#actor_not_found) | 404 | M1 | No such actor or actor type |
 | [`APPROVAL_REQUIRED`](#approval_required) | 403 | M3 | The policy requires an approval first |
+| [`AUDIT_RANGE_GONE`](#audit_range_gone) | 410 | M28 | The requested log range is before the first retained record |
 | [`BAD_REQUEST`](#bad_request) | 400 | M1 | The request is malformed |
 | [`CAPABILITY_NOT_GRANTED`](#capability_not_granted) | 403 | M2 | The actor type lacks a capability for this effect |
 | [`DEAD_LETTER_ALREADY_RESENT`](#dead_letter_already_resent) | 409 | M1 | The dead letter was already resent |
@@ -43,6 +44,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`EFFECT_OUTCOME_UNKNOWN`](#effect_outcome_unknown) | 500 | M2 | An unsafe effect may or may not have happened |
 | [`ENGINE_UPGRADE_DIVERGED`](#engine_upgrade_diverged) | 409 | M6 | The new engine version changes behavior |
 | [`ENGINE_VERSION_MISMATCH`](#engine_version_mismatch) | 409 | M6 | The engine version differs from the recorded one |
+| [`EXPORT_NOT_CONFIGURED`](#export_not_configured) | 409 | M28 | The export stream is off |
 | [`FOREIGN_EXISTS`](#foreign_exists) | 409 | M7 | A foreign actor with this name is already declared |
 | [`FOREIGN_NOT_FOUND`](#foreign_not_found) | 404 | M7 | No foreign actor with this name is declared |
 | [`FOREIGN_UNAVAILABLE`](#foreign_unavailable) | 503 | M7 | The foreign actor is not reachable |
@@ -128,6 +130,22 @@ To fix it, a human reads the diff and approves the proposal (from M5 this needs 
     kronik promote p-7h3k --reason "Apply EU VAT"
 
 See also: [`proposal`](concepts/glossary.md#proposal), [`behavior-diff`](concepts/glossary.md#behavior-diff), [`grounding`](concepts/glossary.md#grounding).
+
+## AUDIT_RANGE_GONE
+
+HTTP status 410, milestone M28. The requested log range is before the first retained record.
+
+Default hint: Start at the first retained LSN named in the message.
+
+The requested range starts before the first record the log still holds. Retention deletes closed segments once a snapshot covers them and they are older than `[retention] history`, so `kronik audit show --from` and `kronik export rewind --to` can only reach back to the first retained record. The message names that LSN.
+
+To fix it, start at the first retained LSN:
+
+    kronik audit show --from <first retained LSN>
+
+Records before it are gone from this node. If the audit sink lost lines from that range, a shipped copy of the log (`kronik restore` into a scratch data directory) still has them.
+
+See also: [`lsn`](concepts/glossary.md#lsn), [`segment`](concepts/glossary.md#segment), [`snapshot`](concepts/glossary.md#snapshot).
 
 ## BAD_REQUEST
 
@@ -254,6 +272,20 @@ To fix it, run a binary with the recorded engine version (`kronik --version` pri
     kronik upgrade check --window 6h
 
 See also: [`ENGINE_UPGRADE_DIVERGED`](#engine_upgrade_diverged).
+
+## EXPORT_NOT_CONFIGURED
+
+HTTP status 409, milestone M28. The export stream is off.
+
+Default hint: Turn it on in kronik.toml ([audit] sink or [otel] endpoint) and restart; see `kronik export status`.
+
+The export stream named in the request is off: `audit` has no `[audit] sink`, or `traces` has no `[otel] endpoint`. A stream that is off has no cursor to move, so `kronik export rewind` refuses it.
+
+To fix it, check which streams are on, then set the sink or endpoint in `kronik.toml` (or `KRONIK_AUDIT_SINK`, `KRONIK_OTEL_ENDPOINT`) and restart `kronik serve`:
+
+    kronik export status
+
+See also: [`lsn`](concepts/glossary.md#lsn).
 
 ## FOREIGN_EXISTS
 

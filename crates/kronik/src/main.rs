@@ -6,6 +6,7 @@ mod config;
 mod doctor;
 mod init;
 mod mcp;
+mod otel;
 mod project;
 mod restore;
 mod serve;

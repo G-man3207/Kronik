@@ -34,6 +34,11 @@ RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=restart
 StateDirectory=kronik
 StateDirectoryMode=0700
+# /var/log/kronik is writable under ProtectSystem=strict for the default
+# audit sink, file:///var/log/kronik/audit/ (M28). Its lines name tokens and
+# callers; rotating them is the operator's.
+LogsDirectory=kronik
+LogsDirectoryMode=0750
 
 # Hardening. Left out on purpose: MemoryDenyWriteExecute (Wasmtime compiles
 # code at run time), ProtectHostname, ProtectKernelTunables,

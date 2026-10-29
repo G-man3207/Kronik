@@ -3,7 +3,9 @@
 //! [`server`] binds it to hyper on a Unix socket. Every mutation requires a
 //! `reason` and supports `dry_run` (I12); errors use the stable error JSON.
 
+mod audit;
 pub mod auth;
+mod export;
 pub mod m12;
 mod m3;
 mod m6;
@@ -82,6 +84,11 @@ pub struct Api {
     tokens: Option<Arc<tokens::TokenStore>>,
     /// The foreign actors (M7), when this daemon runs them.
     foreign: Option<Arc<kronik_foreign::Foreign>>,
+    /// How `GET /v1/audit` builds lines (`[otel] actor_keys`); without it,
+    /// actor keys are left out.
+    audit_mapper: Option<Arc<kronik_otel::audit::Mapper>>,
+    /// The export streams (M28) `GET /v1/export` shows.
+    exports: Vec<Arc<kronik_otel::follow::Stream>>,
 }
 
 type Result<T, E = ApiError> = std::result::Result<T, E>;
@@ -166,7 +173,29 @@ fn reason(r: &str) -> Result<()> {
             "every mutation needs a non-empty reason",
         ));
     }
+    // The audit export carries the reason in every line (M28 §4.3).
+    if r.len() > MAX_REASON_BYTES {
+        return Err(bad(format!(
+            "the reason is {} bytes; at most {MAX_REASON_BYTES} are allowed",
+            r.len()
+        ))
+        .with_hint("Shorten the reason and link to the details (a ticket or PR) instead."));
+    }
     Ok(())
+}
+
+/// The longest `reason` a mutation accepts, in bytes.
+pub const MAX_REASON_BYTES: usize = 4096;
+
+#[cfg(test)]
+mod reason_tests {
+    #[test]
+    fn a_reason_over_4_kib_is_a_bad_request() {
+        assert!(super::reason(&"r".repeat(4096)).is_ok());
+        let err = super::reason(&"r".repeat(4097)).unwrap_err();
+        assert_eq!(err.code, kronik_core::error::ErrorCode::BadRequest);
+        assert!(err.hint.unwrap().starts_with("Shorten the reason"));
+    }
 }
 
 fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
@@ -599,12 +628,26 @@ impl Api {
             auth: Arc::new(auth::LocalAuthenticator),
             tokens: None,
             foreign: None,
+            audit_mapper: None,
+            exports: Vec::new(),
         }
+    }
+
+    /// The export streams of this daemon (M28), enabled or not.
+    pub fn with_exports(mut self, exports: Vec<Arc<kronik_otel::follow::Stream>>) -> Api {
+        self.exports = exports;
+        self
     }
 
     /// Serves `/v1/foreign` (M7) from `foreign`.
     pub fn with_foreign(mut self, foreign: Arc<kronik_foreign::Foreign>) -> Api {
         self.foreign = Some(foreign);
+        self
+    }
+
+    /// Builds `GET /v1/audit`'s lines as the audit export does.
+    pub fn with_audit_mapper(mut self, mapper: Arc<kronik_otel::audit::Mapper>) -> Api {
+        self.audit_mapper = Some(mapper);
         self
     }
 
@@ -679,12 +722,71 @@ impl Api {
         })
     }
 
+    /// The caller's `Audit`, its reason scrubbed of every stored secret
+    /// value and token now (review M5): a secret deleted before the export
+    /// reads the record would otherwise leave its value in the log for
+    /// good. Withheld when the secrets cannot be loaded.
     fn audit(&self, req: &ApiRequest, reason: String) -> pb::Audit {
+        let secrets = self.node.try_secret_values().ok();
         pb::Audit {
             token_id: req.token_id.clone(),
-            reason,
+            reason: kronik_sched::scrub::for_log(&reason, secrets.as_deref()),
             wall_time_ms: self.node.env().clock.wall_ms(),
         }
+    }
+
+    /// Writes the `AuditEvent` of a mutation that succeeded outside the log
+    /// (M28 §4.2), its target and details scrubbed as [`Api::audit`]
+    /// scrubs the reason. Never for a dry run: callers return before it.
+    async fn audit_event(
+        &self,
+        req: &ApiRequest,
+        action: &str,
+        target: &str,
+        details: &[(&str, String)],
+        reason: String,
+    ) -> Result<()> {
+        use kronik_sched::scrub::for_log;
+        let secrets = self.node.try_secret_values().ok();
+        let details = details
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), for_log(v, secrets.as_deref())))
+            .collect();
+        let target = kronik_sched::scrub::for_target(target, secrets.as_deref());
+        self.node
+            .record_audit_event(action, &target, details, self.audit(req, reason))
+            .await?;
+        Ok(())
+    }
+
+    /// For secrets and tokens the `AuditEvent` is the intent, written
+    /// before the change (M28 review M3); a failed change adds
+    /// `<action>.failed` with the error code. A crash in between leaves an
+    /// intent without a change: it over-reports, the safe direction.
+    async fn intent<T>(
+        &self,
+        req: &ApiRequest,
+        action: &str,
+        target: &str,
+        details: &[(&str, String)],
+        reason: &str,
+        change: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.audit_event(req, action, target, details, reason.to_owned())
+            .await?;
+        let e = match change() {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        let mut failed = details.to_vec();
+        failed.push(("code", e.code.as_str().to_owned()));
+        let failed_action = format!("{action}.failed");
+        // The change's error is the answer; the event's own error only
+        // stops the node (Node::commit sets it fatal on a log failure).
+        let _ = self
+            .audit_event(req, &failed_action, target, &failed, reason.to_owned())
+            .await;
+        Err(e)
     }
 
     /// Serves one request; errors become the stable error JSON. The caller
@@ -743,14 +845,15 @@ impl Api {
             ("GET", ["v1", "grants"]) => self.grants(&q),
             ("POST", ["v1", "limits"]) => self.set_limits(req).await,
             ("GET", ["v1", "limits"]) => self.limits(&q),
-            ("PUT", ["v1", "secrets", name]) => self.secret_set(req, name),
+            ("PUT", ["v1", "secrets", name]) => self.secret_set(req, name).await,
             ("GET", ["v1", "secrets"]) => self.secrets(),
-            ("DELETE", ["v1", "secrets", name]) => self.secret_delete(req, name),
+            ("DELETE", ["v1", "secrets", name]) => self.secret_delete(req, name).await,
             ("GET", ["v1", "orphans"]) => self.orphans(&q),
             ("GET", ["v1", "actors", kind, key, "timers"]) => self.timers(kind, key),
-            ("POST", ["v1", "tokens"]) => self.token_create(req),
+            ("POST", ["v1", "tokens"]) => self.token_create(req).await,
             ("GET", ["v1", "tokens"]) => self.tokens(),
-            ("POST", ["v1", "tokens", name, "revoke"]) => self.token_revoke(req, name),
+            ("POST", ["v1", "tokens", name, "revoke"]) => self.token_revoke(req, name).await,
+            ("GET", ["v1", "audit"]) => self.audit_lines(&q).await,
             _ => match self.route_m3(req, segs.as_slice(), &q, caller).await {
                 Some(r) => r,
                 None => match self.route_m7(req, segs.as_slice(), &q).await {
@@ -770,10 +873,13 @@ impl Api {
                             Some(r) => r,
                             None => match self.route_preview(req, segs.as_slice(), caller).await {
                                 Some(r) => r,
-                                None => Err(ApiError::new(
-                                    ErrorCode::NotImplemented,
-                                    format!("no endpoint {} {}", req.method, req.path),
-                                )),
+                                None => match self.route_export(req, segs.as_slice()).await {
+                                    Some(r) => r,
+                                    None => Err(ApiError::new(
+                                        ErrorCode::NotImplemented,
+                                        format!("no endpoint {} {}", req.method, req.path),
+                                    )),
+                                },
                             },
                         },
                     },
@@ -1238,16 +1344,28 @@ impl Api {
         }
     }
 
-    fn secret_set(&self, req: &ApiRequest, name: &str) -> Result<ApiResponse> {
+    async fn secret_set(&self, req: &ApiRequest, name: &str) -> Result<ApiResponse> {
         let r: SecretSetRequest = json(&req.body)?;
         reason(&r.reason)?;
         let value = r.value.to_bytes().map_err(bad)?;
         if value.is_empty() {
             return Err(bad("the secret value is empty"));
         }
-        let meta = self
-            .node
-            .secret_set(name, &value, &self.audit(req, r.reason), r.dry_run)?;
+        // Never the value in the log, nor in the reason: the new value is
+        // not stored yet, so it is scrubbed here (review M5).
+        let reason =
+            kronik_effects::http::scrub_str(&r.reason, &[(name.to_owned(), value.clone())]);
+        let audit = self.audit(req, reason.clone());
+        // Validates without writing, so that a bad request writes no intent.
+        self.node.secret_set(name, &value, &audit, true)?;
+        let meta = if r.dry_run {
+            None
+        } else {
+            self.intent(req, "secret.set", name, &[], &reason, || {
+                self.node.secret_set(name, &value, &audit, false)
+            })
+            .await?
+        };
         ok(&SecretResponse {
             dry_run: r.dry_run,
             secret: meta.as_ref().map(Self::secret_view),
@@ -1265,10 +1383,17 @@ impl Api {
         })
     }
 
-    fn secret_delete(&self, req: &ApiRequest, name: &str) -> Result<ApiResponse> {
+    async fn secret_delete(&self, req: &ApiRequest, name: &str) -> Result<ApiResponse> {
         let r: SecretDeleteRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let versions = self.node.secret_delete(name, r.dry_run)?;
+        let mut versions = self.node.secret_delete(name, true)?;
+        if !r.dry_run {
+            versions = self
+                .intent(req, "secret.delete", name, &[], &r.reason, || {
+                    self.node.secret_delete(name, false)
+                })
+                .await?;
+        }
         ok(&SecretDeleteResponse {
             dry_run: r.dry_run,
             deleted: SecretDeleted {
@@ -1301,7 +1426,7 @@ impl Api {
 
     /// `kronik token create`: the token is in the answer once, and only its
     /// hash is stored.
-    fn token_create(&self, req: &ApiRequest) -> Result<ApiResponse> {
+    async fn token_create(&self, req: &ApiRequest) -> Result<ApiResponse> {
         let r: TokenCreateRequest = json(&req.body)?;
         reason(&r.reason)?;
         let scopes = match &r.scopes {
@@ -1313,13 +1438,24 @@ impl Api {
             by: &req.token_id,
             reason: &r.reason,
         };
-        let (meta, secret) = self.token_store()?.create(
-            &r.name,
-            scopes,
-            self.node.env().random_bytes::<32>(),
-            &change,
-            r.dry_run,
-        )?;
+        let store = self.token_store()?;
+        let random = self.node.env().random_bytes::<32>();
+        let (meta, secret) = if r.dry_run {
+            store.create(&r.name, scopes, random, &change, true)?
+        } else {
+            // Validates first, so that a bad request writes no intent; never
+            // the token itself in the log, only its name, scopes and id.
+            store.create(&r.name, scopes.clone(), random, &change, true)?;
+            let names = scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+            let details = [
+                ("scopes", names.join(",")),
+                ("token_id", tokens::token_id(&r.name)),
+            ];
+            self.intent(req, "token.create", &r.name, &details, &r.reason, || {
+                store.create(&r.name, scopes, random, &change, false)
+            })
+            .await?
+        };
         ok(&TokenCreateResponse {
             dry_run: r.dry_run,
             token: Self::token_view(&meta),
@@ -1338,7 +1474,7 @@ impl Api {
         })
     }
 
-    fn token_revoke(&self, req: &ApiRequest, name: &str) -> Result<ApiResponse> {
+    async fn token_revoke(&self, req: &ApiRequest, name: &str) -> Result<ApiResponse> {
         let r: TokenRevokeRequest = json(&req.body)?;
         reason(&r.reason)?;
         let change = tokens::Change {
@@ -1346,7 +1482,16 @@ impl Api {
             by: &req.token_id,
             reason: &r.reason,
         };
-        let meta = self.token_store()?.revoke(name, &change, r.dry_run)?;
+        let store = self.token_store()?;
+        let mut meta = store.revoke(name, &change, true)?;
+        if !r.dry_run {
+            let details = [("token_id", tokens::token_id(name))];
+            meta = self
+                .intent(req, "token.revoke", name, &details, &r.reason, || {
+                    store.revoke(name, &change, false)
+                })
+                .await?;
+        }
         ok(&TokenRevokeResponse {
             dry_run: r.dry_run,
             token: Self::token_view(&meta),

@@ -114,6 +114,8 @@ pub fn required_scope(method: &str, segs: &[&str]) -> Scope {
         ("POST", ["v1", "policy", "test"]) => Scope::Read,
         // Tokens are credentials: listing them is not reading the system.
         (_, ["v1", "tokens", ..]) => Scope::Admin,
+        // Audit lines name tokens and callers, as `token list` does.
+        (_, ["v1", "audit"]) => Scope::Admin,
         ("GET" | "HEAD", ["v1", "foreign", _, "logs"]) => Scope::Operate,
         ("GET" | "HEAD", _) => Scope::Read,
         ("PUT", ["v1", "policy"]) => Scope::Admin,
@@ -169,6 +171,8 @@ mod tests {
         assert_eq!(need("GET", "/v1/tokens"), Scope::Admin);
         assert_eq!(need("POST", "/v1/tokens"), Scope::Admin);
         assert_eq!(need("POST", "/v1/tokens/agent-1/revoke"), Scope::Admin);
+        assert_eq!(need("GET", "/v1/audit"), Scope::Admin);
+        assert_eq!(need("POST", "/v1/export/audit/rewind"), Scope::Operate);
         assert_eq!(need("GET", "/v1/foreign/pdf/logs"), Scope::Operate);
         assert_eq!(
             need("POST", "/v1/actors/counter/a/messages"),

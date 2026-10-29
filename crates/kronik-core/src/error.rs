@@ -104,6 +104,9 @@ codes! {
     ApprovalRequired = "APPROVAL_REQUIRED", 403, "M3",
         "The policy requires an approval first",
         "Read the diff, then run `kronik approve <proposal> --reason '...'`.";
+    AuditRangeGone = "AUDIT_RANGE_GONE", 410, "M28",
+        "The requested log range is before the first retained record",
+        "Start at the first retained LSN named in the message.";
     BadRequest = "BAD_REQUEST", 400, "M1",
         "The request is malformed",
         "Fix the field or value named in the message and send the request again.";
@@ -128,6 +131,9 @@ codes! {
     EngineVersionMismatch = "ENGINE_VERSION_MISMATCH", 409, "M6",
         "The engine version differs from the recorded one",
         "Run the recorded engine version, or verify the new one with `kronik upgrade check`.";
+    ExportNotConfigured = "EXPORT_NOT_CONFIGURED", 409, "M28",
+        "The export stream is off",
+        "Turn it on in kronik.toml ([audit] sink or [otel] endpoint) and restart; see `kronik export status`.";
     ForeignExists = "FOREIGN_EXISTS", 409, "M7",
         "A foreign actor with this name is already declared",
         "Remove it first with `kronik foreign remove <name> --reason '...'`, then add it again.";
@@ -517,8 +523,8 @@ mod tests {
 
     #[test]
     fn every_code_has_a_status_milestone_title_hint_and_explanation() {
-        const MILESTONES: [&str; 11] = [
-            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11",
+        const MILESTONES: [&str; 12] = [
+            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M28",
         ];
         for &code in ErrorCode::ALL {
             assert!((400..600).contains(&code.http_status()), "{code}");

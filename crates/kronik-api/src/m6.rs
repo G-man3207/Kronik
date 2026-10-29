@@ -47,7 +47,7 @@ impl Api {
         Some(match (req.method.as_str(), segs) {
             ("GET", ["v1", "snapshots"]) => self.snapshots(),
             ("POST", ["v1", "snapshots"]) => self.snapshot_create(req).await,
-            ("GET", ["v1", "integrity"]) => self.integrity().await,
+            ("GET", ["v1", "integrity"]) => self.integrity(req).await,
             _ => return None,
         })
     }
@@ -82,6 +82,9 @@ impl Api {
             });
         }
         let m = self.node.snapshot("manual").await?;
+        let details = [("lsn", m.lsn.to_string())];
+        self.audit_event(req, "snapshot.create", &m.id, &details, r.reason)
+            .await?;
         let shipped = self.shipped_lsns().contains(&m.lsn);
         ok(&SnapshotCreateResponse {
             dry_run: false,
@@ -90,10 +93,21 @@ impl Api {
         })
     }
 
-    async fn integrity(&self) -> Result<ApiResponse> {
+    /// `through`: hash the log only through that LSN, to compare a
+    /// restored node, whose first start adds its `restore` event, with the
+    /// source up to the source's applied LSN.
+    async fn integrity(&self, req: &ApiRequest) -> Result<ApiResponse> {
+        let through = crate::Query::parse(&req.query)?.num("through")?;
         let store = self.node.store();
         let state_hash = store.state_hash().map_err(internal)?;
         let applied = self.node.applied_lsn();
+        if let Some(t) = through.filter(|t| *t == 0 || *t > applied) {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                format!("through {t} is not in 1..={applied}, the applied LSN"),
+            ));
+        }
+        let upto = through.unwrap_or(applied);
         let mut first = None;
         let mut h = blake3::Hasher::new();
         let mut needed = kronik_store::db::SubjectKeys::new();
@@ -104,9 +118,11 @@ impl Api {
                 if c.lsn > applied {
                     return Ok(());
                 }
-                h.update(&c.lsn.to_le_bytes());
-                h.update(&[c.record.kind()]);
-                h.update(&c.record.encode());
+                if c.lsn <= upto {
+                    h.update(&c.lsn.to_le_bytes());
+                    h.update(&[c.record.kind()]);
+                    h.update(&c.record.encode());
+                }
                 kronik_proto::sealables::record_mut(
                     &mut c.record,
                     &mut kronik_store::db::note_sealed(&mut needed),
@@ -158,6 +174,7 @@ impl Api {
             state_hash,
             log_first_lsn: first.unwrap_or(1),
             log_hash: format!("b3:{}", h.finalize().to_hex()),
+            through_lsn: upto,
             retention_history_ms,
             newest_logical_time_ms,
             retention_cutoff_ms,

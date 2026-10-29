@@ -5,9 +5,11 @@
 //! the API's response body unchanged. With `$KRONIK_TOKEN` set, every
 //! request carries that token and acts as it, with its scopes.
 
+mod audit;
+mod export;
 mod foreign;
 mod fork;
-mod http;
+pub(crate) mod http;
 mod preview;
 mod privacy;
 mod render;
@@ -16,7 +18,7 @@ mod schemas;
 mod simulators;
 mod snapshot;
 mod token;
-mod units;
+pub(crate) mod units;
 
 use std::io::{self, BufRead as _, IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -184,7 +186,13 @@ pub enum Command {
     Snapshot(snapshot::SnapshotCommand),
     /// The applied LSN, the state hash and a hash of the log, to compare
     /// after a restore.
-    Integrity,
+    Integrity(snapshot::IntegrityArgs),
+    /// The export streams: spans over OTLP and the audit log (M28).
+    #[command(subcommand)]
+    Export(export::ExportCommand),
+    /// The audit log: its lines, or a sink compared with the log (M28).
+    #[command(subcommand)]
+    Audit(audit::AuditCommand),
     /// Explain a concept or an error code. Needs no daemon.
     Explain(ExplainArgs),
 }
@@ -509,7 +517,9 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
         Command::Stubs(c) => simulators::stubs(&ctx, c),
         Command::Simulators(c) => simulators::simulators(&ctx, c),
         Command::Snapshot(c) => snapshot::snapshot(&ctx, c),
-        Command::Integrity => snapshot::integrity(&ctx),
+        Command::Integrity(a) => snapshot::integrity(&ctx, a),
+        Command::Export(c) => export::export(&ctx, c),
+        Command::Audit(c) => audit::audit(&ctx, c),
         Command::Explain(a) => explain_topic(&ctx, a),
     };
     result.unwrap_or_else(|e| {

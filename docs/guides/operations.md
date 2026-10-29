@@ -208,6 +208,34 @@ stays the same when it is replayed again.
 | `pull_timeout` | `"10m"` | How long an image pull or layout import may take |
 | `checkpoints_kept` | `3` | Checkpoints kept per `fork_mode = "sandbox"` actor ([M14](../design/m14-foreign-forks.md)); one is taken with every snapshot, and a fork's copy starts from the newest at or before its fork point |
 
+### [otel]
+
+| Key | Default | Meaning | Flag |
+|---|---|---|---|
+| `endpoint` | none (off) | An OTLP/HTTP collector, `"http://127.0.0.1:4318"` or `"https://…"`; spans and metrics go to `<endpoint>/v1/traces` and `/v1/metrics`. See [OpenTelemetry](#opentelemetry) | `--otel-endpoint`, `KRONIK_OTEL_ENDPOINT` |
+| `traces` | `true` | Export a span per committed turn and its effects | |
+| `metrics` | `true` | Push the metrics of `/metrics` | |
+| `service_name` | `"kronik"` | The `service.name` backends group by | |
+| `actor_keys` | `"hashed"` | How actor keys leave the node: `"hashed"` (`kh:` + 12 hex of a keyed hash), `"plain"` or `"none"` | |
+| `interval` | `"5s"` | A batch smaller than `batch_spans` waits this long for more | |
+| `metrics_interval` | `"60s"` | How often metrics are pushed | |
+| `batch_spans` | `512` | At most this many log records per request (and at most 4 MiB of them; a larger record goes alone) | |
+| `headers_env` | none | The environment variable holding extra headers, `key=value,…` (as `OTEL_EXPORTER_OTLP_HEADERS`); with it, `http://` is refused unless the host is loopback | |
+
+### [audit]
+
+| Key | Default | Meaning | Flag |
+|---|---|---|---|
+| `sink` | none (off) | Where the audit lines go: `"file:///var/log/kronik/audit/"`, `"https://…"` (a webhook; `http://` only to loopback) or `"s3://bucket/prefix"`. See [the audit log](#the-audit-log) | `KRONIK_AUDIT_SINK` |
+| `endpoint` | none | An S3-compatible server, as `[ship] endpoint`; `s3://` only | |
+| `batch_records` | `500` | At most this many log records per delivery (and at most 4 MiB of them; a larger record goes alone) | |
+| `interval` | `"1s"` | A smaller batch waits this long for more | |
+| `file_max_bytes` | `"64MiB"` | A directory sink starts a new file at this size | |
+| `headers_env` | none | The environment variable holding a webhook's extra headers, `key=value,…` | |
+| `from` | `"start"` | Where a first export starts: `"start"` (the first retained record) or `"now"` | |
+| `max_hold` | `"0s"` | Retention ignores the audit hold once it is older (`"0s"`: no cap) | |
+| `hold_release` | `"2x"` | Retention ignores the hold below this much free disk: a multiple of `[log] disk_reserve`, or a size. With a sink it must be above `disk_reserve` unless `max_hold` is set (so `disk_reserve = "0B"` needs a size here) | |
+
 ### Other settings of kronik serve
 
 | Flag | Default | Meaning |
@@ -265,7 +293,8 @@ the source):
   `config.json` (secret values) are removed even when the daemon was
   killed.
   `StateDirectory=kronik` (`/var/lib/kronik`, mode 0700) is the data
-  directory.
+  directory. `LogsDirectory=kronik` (`/var/log/kronik`, mode 0750) makes
+  the default audit sink, `file:///var/log/kronik/audit/`, writable.
 - Hardening: `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
   `NoNewPrivileges`, `ProtectClock`, `ProtectKernelModules`,
   `ProtectKernelLogs`, `RestrictRealtime`, `LockPersonality`,
@@ -446,6 +475,7 @@ rather than fail, unless `kronik.toml` asks for what is missing
 | `tls` | The certificate has expired or can't be read (failure), or expires within 30 days (warning). With `acme` and no certificate cached yet, it warns | Renew the files; for ACME see [TLS](#tls): the gateway orders a certificate when it starts |
 | `dns01_hook` | `[tls] dns01_hook` is set and is not an executable file (failure); the cached `*.<preview_domain>` certificate has expired (failure), expires within 30 days or isn't cached yet (warning) | `chmod +x` the hook, or fix the path; for the certificate, read the hook's output in the daemon log; see [Preview forks](#preview-forks-a-wildcard-certificate-by-dns-01) |
 | `ship` | `[ship] endpoint` is not reachable over TCP (failure); passes when shipping is off | Check the address and the network |
+| `export` | With `[otel]` or `[audit]` on and the daemon answering on `server.api_socket`: a stream with lag has not delivered for 10 × its `interval`, or the audit export has held retention for longer than `[retention] history` (warnings); passes without a daemon | `kronik export status` shows the sink's last error code; fix the sink, or see [the audit log](#the-audit-log) |
 
 ## Metrics and logs
 
@@ -475,6 +505,11 @@ firewall):
 | `kronik_gateway_request_duration_seconds` | histogram | `status` | Gateway request duration |
 | `kronik_replay_runs_total` | counter | `mode` | Fork replays by mode |
 | `kronik_guard_triggered_total` | counter | `action`, `outcome` | Guards of `kronik watch` that fired |
+| `kronik_export_records_total` | counter | `stream` | Log records an export stream (`traces`, `audit`) delivered or skipped |
+| `kronik_export_lag_records` | gauge | `stream` | Committed records the stream has not delivered yet |
+| `kronik_export_errors_total` | counter | `stream` | Failed attempts, retried with backoff |
+| `kronik_export_dropped_total` | counter | `stream` | Records in batches the sink refused for good (OTLP 400) |
+| `kronik_export_gaps_total` | counter | `stream` | Ranges retention deleted before the stream read them |
 
 A Prometheus scrape job:
 
@@ -484,6 +519,152 @@ scrape_configs:
     static_configs:
       - targets: ["127.0.0.1:9464"]
 ```
+
+### OpenTelemetry
+
+With `[otel] endpoint` set, `kronik serve` sends every committed turn as a
+span, and each of its effects as a child span, to an OpenTelemetry
+collector over OTLP/HTTP with protobuf (no gRPC), and pushes the metrics
+above every `metrics_interval` (counters as cumulative sums, histograms
+with their bounds). Spans are built from the log after commit, off the turn
+path: a slow or absent collector never slows a turn. Delivery is at least
+once, in log order, from a cursor in `<data_dir>/export.json`, so a restart
+or a collector outage resumes where it stopped (spans of a turn are the
+same spans when sent twice). A first start exports from the current end of
+the log, not the history. Retention does not wait for the collector: spans
+of deleted segments are skipped and counted in
+`kronik_export_gaps_total{stream="traces"}`. `kronik export status` shows
+the cursor, the lag, the last success and the last error's code;
+`kronik_export_lag_records` also counts up while the collector is down. An
+exporter that died (a bug) is started again from its saved cursor after a
+backoff, with last error `panic`. `kronik export rewind traces --to <lsn>`
+resends the spans after `<lsn>` as they were first sent: the exporter
+first rebuilds which turns were open there from the retained log.
+
+A trace is one root input (an HTTP request, an operator send, a resend)
+and the calls it makes: a call through three actors is one connected
+trace. A message sent to another actor and a timer start traces of their
+own, with a link (`kronik.link = "message"` or `"timer"`) to the turn that
+caused them, so two actors messaging each other do not make one endless
+trace. The trace id is the turn's causal root. An incoming W3C
+`traceparent` header becomes a link on the root span (`kronik.link =
+"traceparent"`), not its parent, so a callee always computes the same
+trace. A message, timer or compensation sent by a callee links to that
+callee's span in its caller's trace; a callee whose call timed out still
+joins its caller's trace when it runs.
+
+- **A collector:** point `endpoint` at the OpenTelemetry Collector's
+  `otlp` receiver (`http` protocol, port 4318) and forward from there.
+- **Jaeger** (v2) takes OTLP/HTTP on 4318 itself:
+  `docker run --rm -p 127.0.0.1:4318:4318 -p 127.0.0.1:16686:16686
+  jaegertracing/jaeger`, then `endpoint = "http://127.0.0.1:4318"` and the
+  UI on port 16686.
+- **Grafana Tempo** takes OTLP/HTTP on its distributor (4318 when the
+  `otlp` receiver's `http` protocol is on); metrics go to a collector or
+  Mimir's OTLP endpoint.
+- **A vendor:** `endpoint = "https://otlp.vendor.example"` and
+  `headers_env = "KRONIK_OTEL_HEADERS"`, with
+  `KRONIK_OTEL_HEADERS=authorization=Bearer …` in the unit's environment
+  (`systemctl edit kronik`), so the credential stays out of the file.
+
+**Try it with Jaeger.** From a checkout, `scripts/jaeger.sh COMMAND` runs a
+throwaway Jaeger v2 in docker (pinned by digest, in-memory, removed
+afterwards) on free loopback ports and gives COMMAND
+`KRONIK_TEST_OTLP_ENDPOINT` (for `[otel] endpoint`) and
+`KRONIK_TEST_JAEGER_QUERY` (the UI). `scripts/jaeger.sh demo/vps-otel.sh`
+serves with that endpoint, calls through three actors, with and without a
+`traceparent`, and checks in Jaeger's API that each call is one connected
+trace (`KRONIK_BIN` picks the binary). To look around yourself,
+`scripts/jaeger.sh bash` and start `kronik serve` from that shell.
+
+**What leaves the node** (ADR 0082): actor kinds, keys (hashed by
+default), route patterns and methods, status codes, outcome kinds and error
+codes, effect kinds, statuses and target hosts, secret names, code hashes,
+epochs and turn ids. Never a request or message body, a header, a path or
+query string, a reply, state, `Outcome.message`, an effect's error text, a
+subject id or a secret. With `actor_keys = "hashed"` a key such as
+`counter/carol@example.com` leaves as `kh:` plus 12 hex of a keyed hash:
+the same key always gives the same label, and without the node's key it
+cannot be reversed. The hash key derives from the master key, or on a node
+without one from `<data_dir>/otel.key` (created at first use, mode 0600).
+`"plain"` exports keys as they are (test data); `"none"` leaves them out.
+
+### The audit log
+
+The log is the audit trail: every mutation writes a log record with its
+token and reason (`kronik history` and the diff read them). With
+`[audit] sink` set, `kronik serve` also writes one JSON line
+(`kronik.audit/v1`) per audited record to the sink, in log order, at least
+once, from the `audit` cursor in `<data_dir>/export.json`: configuration
+changes, operator sends and resends, each `secret.reveal`, guards that
+fired (`watch.guard`), the switch of a rollback via replay
+(`rollback.rebase`), and the mutations recorded as `AuditEvent`s
+(secrets, tokens, forks, proposals, a rollback via replay's proposal
+(`rebase.create`), watch start and stop, preview create and delete,
+snapshots, reseal, export rewinds, and the node's own `restore`,
+`audit.gap` and `audit.config`). `kronik audit show` prints the same lines
+from the log, also when no sink is set (scope `admin`). A consumer
+deduplicates by `lsn`, `effect` and `record_hash`; after `kronik restore`
+from an older ship point, new records reuse the lost tail's LSNs, and a
+`restore` line marks the point. The first start after a restore moves
+every export cursor in `export.json` back to the restored log (with the
+export on or off), so the `restore` line and everything after it are
+exported; no sink overwrites the lines it got before.
+
+- **A directory** (`file:///var/log/kronik/audit/`): lines go to
+  `audit-<first lsn>.jsonl` files (mode 0640), fsynced before the cursor
+  moves; a new file starts at `file_max_bytes`, as
+  `audit-<first lsn>.<n>.jsonl` when that name is taken (LSNs repeat after
+  a restore or a rewind). A start truncates a line a
+  crash left half written. Kronik never deletes these files: rotation is
+  yours: compress, move or copy to cold storage what you like. When the
+  newest file is moved away, replaced by another (logrotate's `create`) or
+  truncated (`copytruncate`), the next batch starts a new file. Keep what
+  `kronik audit verify` should still check. The unit's
+  `LogsDirectory=kronik` makes `/var/log/kronik` writable; another
+  directory needs `ReadWritePaths=`.
+- **A webhook** (`https://…`): one POST per batch,
+  `application/x-ndjson`, with `kronik-audit-range: <first>-<last>` and
+  `idempotency-key: <first>-<last>-<hash of the body>` headers, so a batch
+  with other lines over the same range is never answered from the
+  receiver's cache; credentials through `headers_env`. Anything but
+  a 2xx is retried with backoff (a 4xx other than 408 and 429 also logs a
+  warning): audit lines are never dropped on the sink's say-so.
+- **Object storage** (`s3://bucket/prefix`, with `endpoint` and the
+  `AWS_*` variables as for shipping): one object per batch,
+  `<prefix>/audit/<prepared ms>-<first>-<last>.jsonl`, the wall time the
+  batch was prepared first, so names sort in write order; a retried batch
+  overwrites itself.
+
+**Retention waits for the audit export, production does not.** Retention
+keeps every segment the export has not delivered, until free disk falls
+below `hold_release` (or the hold is older than `max_hold`): then it
+deletes as before, and the export writes an `audit.gap` event naming the
+lost range and counts `kronik_export_gaps_total{stream="audit"}`. Free
+disk is measured for this with `[log] disk_reserve = "0B"` too. A sink
+that stays down shows in `kronik export status`, in
+`kronik_export_lag_records{stream="audit"}`, and in `kronik doctor`.
+
+**Checking a sink.** `kronik audit verify` (no daemon needed; it reads the
+data directory and the master key, which an erasure's `record_hash` is
+keyed with) compares a `file://` or `s3://` sink with the log: every
+audited record must have its line, with no extra or conflicting line. It
+checks up to the audit cursor by default, prints what is missing, extra or
+conflicting, and exits 1 unless the sink is complete. A webhook cannot be
+read back; verify the store behind it. After a sink lost data,
+`kronik export rewind audit --to <lsn> --reason …` sends the records after
+`<lsn>` again (scope `operate`); retention keeps them from the moment you
+ask.
+
+**What leaves the node** (ADR 0082): the line's action, token id, reason,
+wall time, epoch, record hash and plain facts (kinds and code hashes,
+capabilities, limits, policy rule names and hash, secret and token names,
+fork and proposal ids, a foreign image's digest). Never a secret value, a
+token, a message body, a subject id or a sealed value: a subject is `s:`
+plus 12 hex of its keyed hash, actor keys follow `[otel] actor_keys`.
+**Reasons leave the node as written**, minus exact secret values (removed
+when the reason is written, so a secret deleted later stays out too) and
+an erasure's subject id: do not put personal data in a `--reason`.
 
 ### Logs
 
@@ -614,7 +795,11 @@ file's size and BLAKE3 hash. The daemon takes one:
 
 `kronik snapshot list` shows them, newest first. `kronik integrity` prints
 the applied LSN, the state hash and a hash of the log, which is how a
-restore is compared with the node it came from.
+restore is compared with the node it came from. The restored node's first
+start records one `restore` audit event after the source's last record, so
+on it run `kronik integrity --through <the source's applied LSN>`: the state
+hash and log hash then equal the source's, and `kronik audit show --from
+<that LSN + 1>` shows the `restore` line.
 
 After each snapshot the daemon applies retention. It keeps the newest
 `snapshots_kept` snapshots (48 by default) plus the oldest one the log

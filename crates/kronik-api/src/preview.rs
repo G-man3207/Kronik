@@ -63,6 +63,20 @@ impl Api {
                 r.dry_run,
             )
             .await?;
+        // Previews are forks: their creation is audited like fork.create (M28).
+        if !dry_run {
+            self.audit_event(
+                req,
+                "preview.create",
+                &p.id,
+                &[
+                    ("proposal", r.proposal.clone()),
+                    ("no_pii", no_pii.to_string()),
+                ],
+                r.reason,
+            )
+            .await?;
+        }
         ok(&PreviewCreateResponse {
             dry_run,
             preview: self.preview_info(&p)?,
@@ -84,6 +98,10 @@ impl Api {
         let r: ResendRequest = json(&req.body)?;
         reason(&r.reason)?;
         self.proposals()?.delete_preview(id, r.dry_run).await?;
+        if !r.dry_run {
+            self.audit_event(req, "preview.delete", id, &[], r.reason)
+                .await?;
+        }
         ok(&PreviewDeleteResponse {
             dry_run: r.dry_run,
             deleted: id.to_owned(),

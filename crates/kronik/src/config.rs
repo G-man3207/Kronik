@@ -53,6 +53,8 @@ pub struct Config {
     pub rebase: Rebase,
     pub foreign: Foreign,
     pub simulators: Simulators,
+    pub audit: Audit,
+    pub otel: Otel,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -432,6 +434,200 @@ impl Default for Foreign {
     }
 }
 
+/// `[audit]`: the audit export (docs/design/m28-otel.md §4, §6.1).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Audit {
+    /// `file:///dir/`, `https://…` or `s3://bucket/prefix`; none: off.
+    /// `KRONIK_AUDIT_SINK` overrides it ([`Audit::sink`]).
+    pub sink: Option<String>,
+    /// An S3-compatible server, as `[ship] endpoint` (s3:// only).
+    pub endpoint: Option<String>,
+    pub batch_records: usize,
+    pub interval: Dur,
+    /// A directory sink starts a new file at this size.
+    pub file_max_bytes: Size,
+    /// The environment variable holding a webhook's extra headers
+    /// (`key=value,…`), so credentials stay out of this file.
+    pub headers_env: Option<String>,
+    /// Where a new export starts: the first retained record, or the
+    /// applied LSN.
+    pub from: AuditFrom,
+    /// Retention ignores the hold once it is older ("0s": no cap).
+    pub max_hold: Dur,
+    /// Retention ignores the hold below this much free disk: `"2x"` (of
+    /// `[log] disk_reserve`) or a size.
+    pub hold_release: HoldRelease,
+}
+
+impl Default for Audit {
+    fn default() -> Self {
+        Audit {
+            sink: None,
+            endpoint: None,
+            batch_records: 500,
+            interval: Dur::secs(1),
+            file_max_bytes: Size(64 << 20),
+            headers_env: None,
+            from: AuditFrom::Start,
+            max_hold: Dur::secs(0),
+            hold_release: HoldRelease::Times(2),
+        }
+    }
+}
+
+/// `[otel] actor_keys`: how actor keys leave the node in spans and audit
+/// lines (m28-otel §3.5, ADR 0082).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorKeys {
+    /// `kh:` + 12 hex of a keyed hash: stable, not reversible.
+    #[default]
+    Hashed,
+    Plain,
+    /// Left out.
+    #[serde(rename = "none")]
+    Omit,
+}
+
+/// OpenTelemetry export (m28-otel §3, §6.1): spans of committed turns and
+/// the metrics, over OTLP/HTTP protobuf. Off without an endpoint.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Otel {
+    /// `http(s)://host:port` of a collector; `KRONIK_OTEL_ENDPOINT` and
+    /// `--otel-endpoint` override it.
+    pub endpoint: Option<String>,
+    pub traces: bool,
+    pub metrics: bool,
+    pub service_name: String,
+    pub actor_keys: ActorKeys,
+    /// How long a batch smaller than `batch_spans` waits for more.
+    pub interval: Dur,
+    pub metrics_interval: Dur,
+    /// At most this many log records per OTLP request.
+    pub batch_spans: u64,
+    /// The environment variable holding extra headers, `key=value,…`.
+    pub headers_env: Option<String>,
+}
+
+impl Default for Otel {
+    fn default() -> Self {
+        Otel {
+            endpoint: None,
+            traces: true,
+            metrics: true,
+            service_name: "kronik".into(),
+            actor_keys: ActorKeys::Hashed,
+            interval: Dur::secs(5),
+            metrics_interval: Dur::secs(60),
+            batch_spans: 512,
+            headers_env: None,
+        }
+    }
+}
+
+/// Environment override of `[audit] sink`.
+pub const AUDIT_SINK_ENV: &str = "KRONIK_AUDIT_SINK";
+
+impl Audit {
+    /// The sink in force: `KRONIK_AUDIT_SINK`, else the file's; None
+    /// (off) for an empty value or `"none"`.
+    pub fn sink(&self) -> Option<String> {
+        std::env::var(AUDIT_SINK_ENV)
+            .ok()
+            .or_else(|| self.sink.clone())
+            .filter(|s| !s.is_empty() && s != "none")
+    }
+
+    /// The parsed sink in force, checked (§6.1).
+    pub fn parsed_sink(&self) -> Result<Option<kronik_otel::sink::Sink>, String> {
+        self.sink()
+            .map(|s| kronik_otel::sink::Sink::parse(&s, self.endpoint.as_deref()))
+            .transpose()
+    }
+
+    /// `hold_release` in bytes.
+    pub fn hold_release_bytes(&self, disk_reserve: u64) -> u64 {
+        match self.hold_release {
+            HoldRelease::Times(n) => disk_reserve.saturating_mul(n),
+            HoldRelease::Bytes(b) => b,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditFrom {
+    Start,
+    Now,
+}
+
+/// `[audit] hold_release`: a multiple of `[log] disk_reserve` (`"2x"`) or a
+/// size (`"1GiB"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldRelease {
+    Times(u64),
+    Bytes(u64),
+}
+
+impl std::str::FromStr for HoldRelease {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<HoldRelease, String> {
+        match s.trim().strip_suffix('x') {
+            Some(n) => n.parse().map(HoldRelease::Times).map_err(|_| {
+                format!("invalid hold_release {s:?}: use a multiple such as \"2x\" or a size")
+            }),
+            None => s.parse::<Size>().map(|b| HoldRelease::Bytes(b.0)),
+        }
+    }
+}
+
+impl Otel {
+    /// The endpoint without a trailing `/`, when one is set.
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint
+            .as_deref()
+            .map(|e| e.trim_end_matches('/'))
+            .filter(|e| !e.is_empty())
+    }
+
+    /// An `http(s)://` endpoint with a host; plain HTTP leaves the host
+    /// only to a loopback collector when headers (usually credentials) are
+    /// sent (review L4).
+    pub fn check(&self) -> Result<(), String> {
+        if self.batch_spans == 0 {
+            return Err("[otel] batch_spans must be at least 1".into());
+        }
+        let Some(endpoint) = self.endpoint() else {
+            return Ok(());
+        };
+        // Errors show the scheme and host only: userinfo, path and query can
+        // hold credentials, and the error reaches the log (review M9).
+        let shown = kronik_otel::http::scheme_host(endpoint);
+        let scheme = endpoint.split_once("://").map(|(s, _)| s);
+        if !matches!(scheme, Some("http" | "https"))
+            || kronik_otel::http::host(endpoint).is_none_or(str::is_empty)
+        {
+            return Err(format!(
+                "[otel] endpoint {shown:?}: use http://host:port or https://host:port"
+            ));
+        }
+        if scheme == Some("http")
+            && self.headers_env.is_some()
+            && !kronik_otel::http::is_loopback(endpoint)
+        {
+            return Err(format!(
+                "[otel] endpoint {shown:?} is plain HTTP to a host that is not loopback, \
+                 and headers_env sends headers (usually credentials) with every request; \
+                 use https:// or a local collector"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A duration written with a unit: `500ms`, `30s`, `60m`, `24h`, `7d`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dur(pub Duration);
@@ -538,7 +734,7 @@ macro_rules! from_string {
     )*};
 }
 
-from_string!(Dur, Size, Percent);
+from_string!(Dur, Size, Percent, HoldRelease);
 
 /// A file that can't be used: where, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -727,7 +923,34 @@ impl Config {
                 m.endpoint
             ));
         }
+        self.audit.parsed_sink()?;
+        if self.audit.endpoint.is_some() && self.audit.sink().is_none() {
+            return Err("[audit] endpoint is for an s3:// sink only".into());
+        }
+        if self.audit.batch_records == 0 {
+            return Err("[audit] batch_records must be at least 1".into());
+        }
+        self.check_audit_hold()?;
+        self.otel.check()?;
         self.api_listen()?;
+        Ok(())
+    }
+
+    /// An audit sink's hold must be able to give way (perf review R3): with
+    /// `hold_release` at or below `[log] disk_reserve` (`"0B"` with `"2x"`,
+    /// `"1x"`) and no `max_hold`, a sink that stays down keeps the log
+    /// until the reserve refuses work, or the disk fills. Checked again
+    /// after the flags, which can change the reserve.
+    pub fn check_audit_hold(&self) -> Result<(), String> {
+        let reserve = self.log.disk_reserve.0;
+        let release = self.audit.hold_release_bytes(reserve);
+        if self.audit.sink().is_some() && self.audit.max_hold.0.is_zero() && release <= reserve {
+            return Err(format!(
+                "[audit] hold_release ({release} bytes) must be above [log] disk_reserve \
+                 ({reserve} bytes), or max_hold set: otherwise a sink that stays down holds \
+                 the log until the disk reserve refuses work"
+            ));
+        }
         Ok(())
     }
 
@@ -848,6 +1071,7 @@ pub struct Overrides {
     pub gateway_timeout: Option<Duration>,
     pub master_key_file: Option<PathBuf>,
     pub disk_reserve: Option<Size>,
+    pub otel_endpoint: Option<String>,
 }
 
 impl Config {
@@ -876,6 +1100,9 @@ impl Config {
         }
         if let Some(v) = o.disk_reserve {
             self.log.disk_reserve = v;
+        }
+        if let Some(v) = o.otel_endpoint {
+            self.otel.endpoint = Some(v);
         }
         self
     }
@@ -1199,5 +1426,122 @@ mod tests {
         .unwrap();
         assert_eq!(acme.public_host(at("0.0.0.0:443")), "www.app.example");
         assert_eq!(acme.public_host(at("0.0.0.0:8443")), "www.app.example:8443");
+    }
+
+    /// `[audit]` (m28-otel §6.1): the sink's scheme, plain HTTP only to
+    /// loopback, a bucket, and `endpoint` only with `s3://`.
+    #[test]
+    fn audit_sinks_are_checked() {
+        let c = parse(
+            "[audit]\nsink = \"s3://b/kronik\"\nendpoint = \"http://127.0.0.1:3900\"\n\
+             hold_release = \"1GiB\"\nfrom = \"now\"\nmax_hold = \"7d\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.audit.hold_release_bytes(512), 1 << 30);
+        assert_eq!(c.audit.from, AuditFrom::Now);
+        let d = parse("").unwrap();
+        assert_eq!(d.audit.hold_release_bytes(512 << 20), 1 << 30);
+        assert_eq!(d.audit.sink(), None);
+        parse("[audit]\nsink = \"file:///var/log/kronik/audit/\"\n").unwrap();
+        parse("[audit]\nsink = \"http://127.0.0.1:9000/hook\"\n").unwrap();
+        for (text, message) in [
+            ("[audit]\nsink = \"ftp://x/\"\n", "use file:///dir/"),
+            (
+                "[audit]\nsink = \"http://hooks.example.com/x\"\n",
+                "loopback",
+            ),
+            ("[audit]\nsink = \"s3:///x\"\n", "no bucket"),
+            (
+                "[audit]\nsink = \"https://h/\"\nendpoint = \"http://127.0.0.1:3900\"\n",
+                "s3:// sink only",
+            ),
+            ("[audit]\nhold_release = \"2y\"\n", "invalid size"),
+            ("[audit]\nfrom = \"later\"\n", "unknown variant"),
+        ] {
+            let e = parse(text).unwrap_err();
+            assert!(e.message.contains(message), "{text}: {e}");
+        }
+    }
+
+    /// Perf review R3: an audit sink's hold must be able to give way:
+    /// `hold_release` above `[log] disk_reserve`, or `max_hold` set; also
+    /// when a flag sets the reserve.
+    #[test]
+    fn an_audit_hold_that_can_never_give_way_is_refused() {
+        let sink = "[audit]\nsink = \"file:///var/log/kronik/audit/\"\n";
+        for (extra, ok) in [
+            ("[log]\ndisk_reserve = \"0B\"\n", false),
+            ("hold_release = \"1x\"\n", false),
+            ("hold_release = \"512MiB\"\n", false),
+            ("hold_release = \"1GiB\"\n", true),
+            (
+                "hold_release = \"1GiB\"\n[log]\ndisk_reserve = \"0B\"\n",
+                true,
+            ),
+            ("hold_release = \"1x\"\nmax_hold = \"1d\"\n", true),
+        ] {
+            let r = parse(&format!("{sink}{extra}"));
+            match ok {
+                true => assert!(r.is_ok(), "{extra}: {r:?}"),
+                false => {
+                    let e = r.unwrap_err();
+                    assert!(e.message.contains("hold_release"), "{extra}: {e}");
+                }
+            }
+        }
+        // Without a sink nothing is held.
+        parse("[log]\ndisk_reserve = \"0B\"\n").unwrap();
+        // `--disk-reserve 0B` (or KRONIK_DISK_RESERVE) with the default 2x.
+        let c = parse(sink).unwrap().with(Overrides {
+            disk_reserve: Some(Size(0)),
+            ..Overrides::default()
+        });
+        assert!(c.check_audit_hold().unwrap_err().contains("hold_release"));
+    }
+
+    #[test]
+    fn otel_endpoints_are_checked() {
+        let empty = parse("").unwrap();
+        assert_eq!(empty.otel.endpoint(), None);
+        assert_eq!(empty.otel.actor_keys, ActorKeys::Hashed);
+        assert_eq!(empty.otel.batch_spans, 512);
+        let c = parse(
+            "[otel]\nendpoint = \"http://127.0.0.1:4318/\"\nactor_keys = \"none\"\n\
+             headers_env = \"KRONIK_OTEL_HEADERS\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.otel.endpoint(), Some("http://127.0.0.1:4318"));
+        assert_eq!(c.otel.actor_keys, ActorKeys::Omit);
+        parse("[otel]\nendpoint = \"https://otlp.example.com\"\nheaders_env = \"H\"\n").unwrap();
+        parse("[otel]\nendpoint = \"http://collector:4318\"\n").unwrap();
+        for (text, message) in [
+            (
+                "[otel]\nendpoint = \"grpc://c:4317\"\n",
+                "use http://host:port",
+            ),
+            ("[otel]\nendpoint = \"http://\"\n", "use http://host:port"),
+            (
+                "[otel]\nendpoint = \"http://collector:4318\"\nheaders_env = \"H\"\n",
+                "not loopback",
+            ),
+            ("[otel]\nbatch_spans = 0\n", "at least 1"),
+            (
+                "[otel]\nactor_keys = \"clear\"\n",
+                "unknown variant `clear`",
+            ),
+        ] {
+            let e = parse(text).unwrap_err();
+            assert!(e.message.contains(message), "{text}: {e}");
+        }
+        // A rejected endpoint is shown as scheme and host only (review M9).
+        for text in [
+            "[otel]\nendpoint = \"grpc://u:NEEDLE@c:4317/NEEDLE?t=NEEDLE\"\n",
+            "[otel]\nendpoint = \"http://u:NEEDLE@collector:4318/NEEDLE?t=NEEDLE\"\n\
+             headers_env = \"H\"\n",
+        ] {
+            let e = parse(text).unwrap_err();
+            assert!(!e.to_string().contains("NEEDLE"), "{text}: {e}");
+            assert!(e.message.contains("://c"), "{e}");
+        }
     }
 }

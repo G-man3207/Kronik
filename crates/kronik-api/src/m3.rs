@@ -66,6 +66,15 @@ fn kinds_json(list: &[String]) -> Vec<DeploymentKind> {
         .collect()
 }
 
+/// The `kinds` detail of an `AuditEvent`: `kind=b3:<hex>` joined by commas.
+fn kinds_detail<'a>(kinds: impl IntoIterator<Item = &'a pb::KindVersion>) -> String {
+    kinds
+        .into_iter()
+        .map(|k| format!("{}=b3:{}", k.kind, kronik_core::ids::hex(&k.code_hash)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn proposal_info(p: &Proposal, props: &Proposals) -> ProposalInfo {
     ProposalInfo {
         approval_requests: Vec::new(),
@@ -282,6 +291,14 @@ impl Api {
                 r.dry_run,
             )
             .await?;
+        if !dry_run {
+            let details = [
+                ("at", p.fork_lsn.to_string()),
+                ("no_pii", p.options.no_pii.to_string()),
+            ];
+            self.audit_event(req, "fork.create", &p.id, &details, r.reason)
+                .await?;
+        }
         ok(&ForkCreateResponse {
             dry_run,
             fork: ForkInfo {
@@ -315,6 +332,10 @@ impl Api {
         let r: ResendRequest = json(&req.body)?;
         reason(&r.reason)?;
         self.proposals()?.delete_fork(name, r.dry_run).await?;
+        if !r.dry_run {
+            self.audit_event(req, "fork.delete", name, &[], r.reason)
+                .await?;
+        }
         ok(&ForkDeleteResponse {
             dry_run: r.dry_run,
             deleted: name.to_owned(),
@@ -331,6 +352,11 @@ impl Api {
             .proposals()?
             .fork_deploy(name, &wasm, r.dry_run)
             .await?;
+        if !r.dry_run {
+            let details = [("kinds", kinds_detail([&k]))];
+            self.audit_event(req, "fork.deploy", name, &details, r.reason)
+                .await?;
+        }
         ok(&ForkDeployResponse {
             dry_run: r.dry_run,
             fork: name.to_owned(),
@@ -345,6 +371,9 @@ impl Api {
         let p = self
             .proposals()?
             .fork_replay(name, r.to_lsn, options, r.options.threads)
+            .await?;
+        let details = [("mode", r.options.mode.clone())];
+        self.audit_event(req, "fork.replay", name, &details, r.reason)
             .await?;
         ok(&ReplayResponse {
             fork: p.id,
@@ -403,6 +432,9 @@ impl Api {
             .with_hint("Leave out --async for a dry run."));
         }
         let props = self.proposals()?;
+        // Started without waiting, so `proposal.create` (M28) is written
+        // before the replay can end: a caller that stops waiting cannot
+        // lose it.
         let (p, dry_run) = props
             .propose_job(
                 Propose {
@@ -415,9 +447,32 @@ impl Api {
                     audit: self.audit(req, r.reason.clone()),
                     dry_run: r.dry_run,
                 },
-                !r.run_async,
+                false,
             )
             .await?;
+        if dry_run {
+            return ok(&ProposeResponse {
+                dry_run,
+                proposal: proposal_info(&p, props),
+            });
+        }
+        let kinds: Vec<pb::KindVersion> = p
+            .kinds
+            .iter()
+            .filter_map(|k| STANDARD.decode(k).ok())
+            .filter_map(|b| pb::KindVersion::decode(b.as_slice()).ok())
+            .collect();
+        let details = [
+            ("kinds", kinds_detail(&kinds)),
+            ("fork_lsn", p.fork_lsn.to_string()),
+        ];
+        self.audit_event(req, "proposal.create", &p.id, &details, r.reason)
+            .await?;
+        let p = if r.run_async {
+            p
+        } else {
+            props.wait(&p.id).await?
+        };
         ok(&ProposeResponse {
             dry_run,
             proposal: proposal_info(&p, props),
@@ -520,7 +575,14 @@ impl Api {
             }),
             blobs: Vec::new(),
         };
+        // The actor is plain here; the audit export hashes it (M28 §3.5).
+        let details = [
+            ("actor", format!("{}/{}", actor.kind, actor.key)),
+            ("message", msg.name.clone()),
+        ];
         let t = self.proposals()?.fork_send(name, actor, msg).await?;
+        self.audit_event(req, "fork.send", name, &details, r.reason)
+            .await?;
         let o = t.record.outcome.clone().unwrap_or_default();
         let tr = crate::turn_response(Some(kronik_sched::TurnResult {
             turn_id: kronik_core::ids::TurnId {
@@ -795,6 +857,14 @@ impl Api {
                 dry_run: r.dry_run,
             })
             .await?;
+        if let (false, Some(info)) = (dry_run, &p.rebase) {
+            let details = [
+                ("rolled_back_epoch", info.rolled_back_epoch.to_string()),
+                ("base_lsn", info.base_lsn.to_string()),
+            ];
+            self.audit_event(req, "rebase.create", &p.id, &details, r.reason)
+                .await?;
+        }
         ok(&ProposeResponse {
             dry_run,
             proposal: proposal_info(&p, props),
@@ -845,12 +915,13 @@ impl Api {
             )
             .with_hint("Leave out --async for a dry run."));
         }
+        // `Watches::watch` writes `watch.start` (M28) before it waits.
         let w = self
             .watches()?
             .watch(
                 epoch,
                 r.for_ms,
-                self.audit(req, r.reason.clone()),
+                self.audit(req, r.reason),
                 r.dry_run,
                 !r.run_async,
             )
@@ -882,6 +953,10 @@ impl Api {
             .watches()?
             .stop(id, self.audit(req, r.reason.clone()), r.dry_run)
             .await?;
+        if !r.dry_run {
+            self.audit_event(req, "watch.stop", id, &[], r.reason)
+                .await?;
+        }
         ok(&WatchResponse {
             dry_run: r.dry_run,
             watch: watch_info(&w)?,

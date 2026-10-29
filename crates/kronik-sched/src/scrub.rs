@@ -145,6 +145,53 @@ pub fn effect(e: &mut pb::EffectRecord, secrets: &Secrets) {
     }
 }
 
+/// What an operator's text (a reason, an `AuditEvent`'s target or detail)
+/// becomes before it reaches the log: every stored secret value and every
+/// token secret replaced (I8, ADR 0082). `None` (the secrets could not be
+/// loaded) withholds the whole text: the scrub never fails open.
+pub fn for_log(text: &str, secrets: Option<&Secrets>) -> String {
+    let Some(secrets) = secrets else {
+        return WITHHELD.to_owned();
+    };
+    tokens(&scrub_str(text, secrets))
+}
+
+/// An AuditEvent's target (a secret's, fork's or proposal's name or id):
+/// scrubbed like [`for_log`] when the secrets loaded, else of token secrets
+/// only, and never withheld, so the line still says what changed.
+pub fn for_target(text: &str, secrets: Option<&Secrets>) -> String {
+    match secrets {
+        Some(_) => for_log(text, secrets),
+        None => tokens(text),
+    }
+}
+
+/// The text `for_log` writes in place of one it cannot scrub.
+pub const WITHHELD: &str = "[withheld: secrets could not be loaded]";
+
+/// Replaces every API token secret (`kronik_` and 43 base64url
+/// characters) with `[token]`.
+fn tokens(text: &str) -> String {
+    const PREFIX: &str = "kronik_";
+    const LEN: usize = 43;
+    let b64url = |c: u8| c.is_ascii_alphanumeric() || c == b'-' || c == b'_';
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(PREFIX) {
+        let tail = &rest.as_bytes()[i + PREFIX.len()..];
+        if tail.len() >= LEN && tail[..LEN].iter().all(|&c| b64url(c)) {
+            out.push_str(&rest[..i]);
+            out.push_str("[token]");
+            rest = &rest[i + PREFIX.len() + LEN..];
+        } else {
+            out.push_str(&rest[..i + PREFIX.len()]);
+            rest = &rest[i + PREFIX.len()..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +208,18 @@ mod tests {
             Some(pb::sealable::Value::Plain(b)) => b.clone(),
             _ => Vec::new(),
         }
+    }
+
+    #[test]
+    fn log_text_loses_secret_values_and_tokens_and_is_withheld_without_secrets() {
+        let secrets = vec![("db".to_owned(), b"s3cr3t".to_vec())];
+        let token = format!("kronik_{}", "A-_9".repeat(10) + "abc");
+        let text = format!("rotate {token}, was s3cr3t; kronik_short stays");
+        assert_eq!(
+            for_log(&text, Some(&secrets)),
+            "rotate [token], was [secret:db]; kronik_short stays"
+        );
+        assert_eq!(for_log(&text, None), WITHHELD);
     }
 
     #[test]

@@ -141,6 +141,33 @@ async fn rebase_endpoints() {
     assert!(rid.starts_with("r-"), "{rid}");
     assert_eq!(p["rebase"]["rolled_back_epoch"], epoch, "{p}");
     assert_eq!(p["rebase"]["irreversible_effects"], 0, "{p}");
+    // The creation is audited once, naming the rebase (M28 §4.2); the
+    // refusals and the dry run write nothing.
+    let mut events = Vec::new();
+    node.reader()
+        .read(1, node.applied_lsn(), |c| {
+            if let kronik_proto::Record::AuditEvent(e) = &c.record
+                && e.action == "rebase.create"
+            {
+                events.push(e.clone());
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].target, rid);
+    assert_eq!(
+        events[0].details["rolled_back_epoch"],
+        epoch.to_string(),
+        "{events:?}"
+    );
+    assert_eq!(
+        events[0].details["base_lsn"],
+        p["rebase"]["base_lsn"].to_string(),
+        "{events:?}"
+    );
+    assert_eq!(events[0].audit.as_ref().unwrap().reason, "undo");
     let (_, d) = call(
         &api,
         "GET",

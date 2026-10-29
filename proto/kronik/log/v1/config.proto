@@ -269,3 +269,14 @@ message StubRuleSpec {
   // "network", "timeout", "too-large" or "denied"; empty for a response.
   string error = 6;
 }
+
+// A mutation whose effect is not a log record of its own (secrets, tokens,
+// forks and proposals, snapshots, reseal): written after it succeeded, so
+// that the log is the complete audit trail (M28, ADR 0083). Applying it
+// changes no state.
+message AuditEvent {
+  string action = 1;   // e.g. "secret.set", "token.create", "fork.delete"
+  string target = 2;   // the secret's or token's name, the fork or proposal id
+  map<string, string> details = 3;  // plain, non-secret facts: scopes, version
+  Audit audit = 4;
+}

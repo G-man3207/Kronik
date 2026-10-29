@@ -741,9 +741,44 @@ pub const OPERATIONS: &[Operation] = &[
         method: "GET",
         path: "/v1/integrity",
         summary: "The applied LSN, the state hash and a hash of the log, to compare after a restore",
-        query: &[],
+        query: &[Param {
+            name: "through",
+            kind: "integer",
+            description: "Hash the log only through this LSN (1 to the applied LSN): a restored node's first start adds a `restore` event after the source's last record.",
+        }],
         request: None,
         answer: Answer::Json(schema::<IntegrityResponse>),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/audit",
+        summary: "The audit lines of main's log (kronik.audit/v1), as an audit sink receives them",
+        query: &[
+            Param {
+                name: "from",
+                kind: "integer",
+                description: "Lines of records at this LSN and after; the first retained record when absent.",
+            },
+            LIMIT,
+        ],
+        request: None,
+        answer: Answer::Json(schema::<AuditResponse>),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/export",
+        summary: "The export streams (traces, audit): sink scheme and host, cursor, lag, last success and error code, gaps",
+        query: &[],
+        request: None,
+        answer: Answer::Json(schema::<ExportStatusResponse>),
+    },
+    Operation {
+        method: "POST",
+        path: "/v1/export/{stream}/rewind",
+        summary: "Move an export stream's cursor back to resend from after `to` (writes an AuditEvent export.rewind)",
+        query: &[],
+        request: Some(schema::<ExportRewindRequest>),
+        answer: Answer::Json(schema::<ExportRewindResponse>),
     },
 ];
 

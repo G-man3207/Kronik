@@ -1215,9 +1215,13 @@ pub struct IntegrityResponse {
     pub state_hash: String,
     /// The first LSN the log still holds (retention deletes older segments).
     pub log_first_lsn: u64,
-    /// BLAKE3 over the records `log_first_lsn..=applied_lsn` (LSN, kind and
+    /// BLAKE3 over the records `log_first_lsn..=through_lsn` (LSN, kind and
     /// encoded record of each).
     pub log_hash: String,
+    /// The last LSN `log_hash` covers: `applied_lsn`, or the `through`
+    /// asked for. An older response that omits it decodes as 0.
+    #[serde(default)]
+    pub through_lsn: u64,
     /// `[retention] history` in milliseconds. Zero when the node has no
     /// storage config (`Node::start` with `storage: None`, including DST).
     /// `start_local` and `kronik serve` always install one; the default is
@@ -1237,4 +1241,70 @@ pub struct IntegrityResponse {
     /// be read (`KEYSTORE_INCOMPLETE`). Empty on a healthy node.
     #[serde(default)]
     pub keys_missing: Vec<String>,
+}
+
+/// `GET /v1/audit`: `kronik.audit/v1` lines in LSN order (m28-otel §4.3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AuditResponse {
+    pub lines: Vec<kronik_otel::audit::Line>,
+    /// The `from` of the next page; absent at the applied LSN.
+    pub next: Option<u64>,
+    pub applied_lsn: u64,
+}
+
+// Export (docs/design/m28-otel.md §6.2).
+
+/// `GET /v1/export`: every export stream of the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ExportStatusResponse {
+    pub streams: Vec<ExportStream>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ExportStream {
+    /// `traces` or `audit`.
+    pub name: String,
+    pub enabled: bool,
+    /// The sink's or endpoint's scheme and host only (never a path, query
+    /// or credentials); empty when not configured.
+    pub sink: String,
+    /// The last LSN the sink acknowledged.
+    pub cursor: u64,
+    pub applied_lsn: u64,
+    /// `applied_lsn - cursor` while enabled, else 0.
+    pub lag: u64,
+    /// Wall-clock milliseconds of the last delivered batch since the start.
+    pub last_success_wall_ms: Option<u64>,
+    /// While there is lag: milliseconds since the last delivered batch, or
+    /// since the stream started without one. `kronik doctor` warns on it.
+    #[serde(default)]
+    pub stalled_ms: Option<u64>,
+    /// The last failure's code (`http_503`, `connect`, `timeout`, ...),
+    /// never its text.
+    pub last_error: Option<String>,
+    /// Ranges retention deleted before the stream read them, since the
+    /// start.
+    pub gaps: u64,
+}
+
+/// `POST /v1/export/{stream}/rewind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ExportRewindRequest {
+    /// Resend the records after this LSN; at most the stream's cursor, and
+    /// not before the first retained record (`AUDIT_RANGE_GONE`).
+    pub to: u64,
+    /// Required: missing or blank answers REASON_REQUIRED.
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ExportRewindResponse {
+    pub dry_run: bool,
+    pub stream: String,
+    /// The cursor before the rewind.
+    pub from: u64,
+    pub to: u64,
 }

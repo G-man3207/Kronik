@@ -1,0 +1,40 @@
+[package]
+name = "kronik-otel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+bytes = { workspace = true }
+kronik-core = { workspace = true }
+kronik-effects = { workspace = true }
+kronik-log = { workspace = true }
+kronik-metrics = { workspace = true }
+kronik-privacy = { workspace = true }
+kronik-proto = { workspace = true }
+kronik-runtime = { workspace = true }
+kronik-sched = { workspace = true }
+kronik-ship = { workspace = true }
+prost = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros"] }
+toml = { workspace = true, features = ["std", "parse", "serde"] }
+tracing = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protox = { workspace = true }
+
+[dev-dependencies]
+kronik-core = { workspace = true, features = ["real"] }
+protox = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

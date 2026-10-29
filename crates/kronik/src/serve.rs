@@ -57,6 +57,10 @@ pub struct ServeArgs {
     /// log.disk_reserve].
     #[arg(long, value_name = "SIZE", env = "KRONIK_DISK_RESERVE")]
     disk_reserve: Option<crate::config::Size>,
+    /// OTLP/HTTP collector for spans and metrics, e.g.
+    /// `http://127.0.0.1:4318` [file: otel.endpoint].
+    #[arg(long, value_name = "URL", env = "KRONIK_OTEL_ENDPOINT")]
+    otel_endpoint: Option<String>,
     /// Test hook: callers stop after the callee answered and before the
     /// result is recorded, so a crash test can kill the daemon there.
     #[arg(long, hide = true)]
@@ -73,6 +77,11 @@ pub struct ServeArgs {
     /// from over plain HTTP. Repeatable.
     #[arg(long, hide = true, value_name = "HOST:PORT")]
     test_insecure_registry: Vec<String>,
+    /// Test hook: after a `kronik restore`, exit once the `restore` event is
+    /// committed, before the export cursors are clamped and the marker is
+    /// removed, as a crash there would.
+    #[arg(long, hide = true)]
+    test_stop_after_restore_event: bool,
     /// Log lines as text or as JSON objects (one per line).
     #[arg(long, value_enum, default_value_t = LogFormat::Text, env = "KRONIK_LOG_FORMAT")]
     log_format: LogFormat,
@@ -84,7 +93,7 @@ impl ServeArgs {
     /// The configuration file, if any, with the flags in place.
     fn config(&self) -> anyhow::Result<Config> {
         let (config, _file) = Config::find(self.config.as_deref())?;
-        Ok(config.with(Overrides {
+        let config = config.with(Overrides {
             data_dir: self.data_dir.clone(),
             api_socket: self.api_socket.clone(),
             http_listen: self.http_listen,
@@ -93,7 +102,12 @@ impl ServeArgs {
             gateway_timeout: self.gateway_timeout_ms.map(Duration::from_millis),
             master_key_file: self.master_key_file.clone(),
             disk_reserve: self.disk_reserve,
-        }))
+            otel_endpoint: self.otel_endpoint.clone(),
+        });
+        // The overrides are checked as the file's values are.
+        config.otel.check().map_err(anyhow::Error::msg)?;
+        config.check_audit_hold().map_err(anyhow::Error::msg)?;
+        Ok(config)
     }
 }
 
@@ -337,6 +351,25 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
     let node = start_local(env.clone(), &data_dir, node_config)
         .await
         .with_context(|| format!("recovering {}", data_dir.display()))?;
+    // Export streams (M28): each follows the log from its cursor.
+    let cursors = Arc::new(
+        kronik_otel::cursor::Cursors::load(env.clone(), &data_dir)
+            .await
+            .context("reading the export cursors")?,
+    );
+    record_restore(
+        &node,
+        &data_dir.join("branches/main"),
+        &cursors,
+        args.test_stop_after_restore_event,
+    )
+    .await?;
+    let (audit_mapper, audit) =
+        crate::otel::start_audit(&config, &node, &cursors, &data_dir).await?;
+    let exports = vec![
+        crate::otel::start(&config, &node, &cursors, &data_dir)?,
+        audit,
+    ];
     // Shipping to object storage (m6-storage §4), when enabled.
     if config.ship.enabled {
         let url = config
@@ -443,7 +476,9 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
             .with_proposals(proposals)
             .with_watches(watches)
             .with_tokens(Arc::new(tokens))
-            .with_foreign(foreign.clone()),
+            .with_foreign(foreign.clone())
+            .with_exports(exports)
+            .with_audit_mapper(audit_mapper),
     );
     let api_socket = &config.server.api_socket;
     let unix = kronik_api::server::bind(api_socket)
@@ -538,6 +573,78 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
     // Sandboxes never outlive the daemon (docs/design/m7-foreign.md §5).
     foreign.shutdown().await;
     served
+}
+
+/// After a `kronik restore`, records the system `AuditEvent` `restore`,
+/// clamps every export cursor to the restored log and then deletes the
+/// marker (M28 reviews H4, H-A). The clamp does not depend on an export
+/// being on: a later start with `[audit]` on resumes at the restore point,
+/// so it exports the `restore` line and everything after it. Each step is
+/// durable before the next, so a crash leaves the marker and the next start
+/// finishes the job: the event is recorded once (the log after the restore
+/// point holds it then), and the clamp is idempotent.
+async fn record_restore(
+    node: &kronik_sched::Node,
+    branch_dir: &Path,
+    cursors: &kronik_otel::cursor::Cursors,
+    stop_after_event: bool,
+) -> anyhow::Result<()> {
+    let marker = branch_dir.join(kronik_ship::RESTORE_MARKER);
+    let body = match std::fs::read(&marker) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", marker.display())),
+    };
+    let v: serde_json::Value = serde_json::from_slice(&body)
+        .with_context(|| format!("{} is not JSON", marker.display()))?;
+    let through = v["through_lsn"].as_u64().unwrap_or(0);
+    let shown = through.to_string();
+    let mut recorded = false;
+    if node.applied_lsn() > through {
+        node.reader()
+            .read(through + 1, node.applied_lsn(), |c| {
+                recorded |= matches!(&c.record, kronik_proto::Record::AuditEvent(e)
+                    if e.action == "restore" && e.details.get("through_lsn") == Some(&shown));
+                Ok(())
+            })
+            .await
+            .context("reading the log after the restore point")?;
+    }
+    if !recorded {
+        let audit = kronik_proto::log::v1::Audit {
+            token_id: "system".into(),
+            reason: "kronik restore".into(),
+            wall_time_ms: node.env().clock.wall_ms(),
+        };
+        let details = [("through_lsn".to_owned(), shown)].into();
+        node.record_audit_event("restore", "", details, audit)
+            .await
+            .map_err(|e| anyhow::anyhow!("recording the restore: {}", e.message))?;
+    }
+    if stop_after_event {
+        anyhow::bail!("stopped after the restore event (--test-stop-after-restore-event)");
+    }
+    for stream in [crate::otel::TRACES, kronik_otel::sink::STREAM] {
+        if let Some(e) = cursors.get(stream).filter(|e| e.lsn > through) {
+            // The trace stream's open turns are the lost tail's.
+            let state = if stream == crate::otel::TRACES {
+                serde_json::Value::Null
+            } else {
+                e.state
+            };
+            let entry = kronik_otel::cursor::Entry {
+                lsn: through,
+                state,
+            };
+            cursors
+                .save(stream, entry)
+                .await
+                .context("saving the export cursors")?;
+        }
+    }
+    std::fs::remove_file(&marker).with_context(|| format!("removing {}", marker.display()))?;
+    tracing::info!(through_lsn = through, "recorded the restore in the log");
+    Ok(())
 }
 
 #[cfg(test)]

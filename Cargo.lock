@@ -1848,12 +1848,14 @@ dependencies = [
  "kronik-log",
  "kronik-mcp",
  "kronik-metrics",
+ "kronik-otel",
  "kronik-privacy",
  "kronik-proto",
  "kronik-runtime",
  "kronik-sched",
  "kronik-ship",
  "kronik-testhost",
+ "prost",
  "rcgen",
  "rmcp",
  "rusqlite",
@@ -1885,6 +1887,7 @@ dependencies = [
  "kronik-effects",
  "kronik-foreign",
  "kronik-fork",
+ "kronik-otel",
  "kronik-policy",
  "kronik-privacy",
  "kronik-proto",
@@ -2054,6 +2057,33 @@ dependencies = [
 [[package]]
 name = "kronik-metrics"
 version = "0.4.0-dev"
+
+[[package]]
+name = "kronik-otel"
+version = "0.4.0-dev"
+dependencies = [
+ "blake3",
+ "bytes",
+ "kronik-core",
+ "kronik-effects",
+ "kronik-log",
+ "kronik-metrics",
+ "kronik-privacy",
+ "kronik-proto",
+ "kronik-runtime",
+ "kronik-sched",
+ "kronik-ship",
+ "prost",
+ "prost-build",
+ "protox",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+]
 
 [[package]]
 name = "kronik-policy"

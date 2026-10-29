@@ -148,6 +148,7 @@ across all record kinds and segments. A segment is closed at 64 MiB or after
 | `SimulatorConfig` | stubs set: a target's effect simulators (M12) |
 | `StateRebase` | rollback via replay: the replayed turns and the switch (M13) |
 | `GuardTriggered` | a `kronik watch` guard that fired (M11) |
+| `AuditEvent` | secrets, tokens, forks, proposals, reseal and snapshot by request: the mutations without a record of their own, after they succeeded; changes no state (M28) |
 
 A record with an enum value of 0 or an unknown enum value is
 `STORAGE_CORRUPT`; it is never read as a default.

@@ -60,6 +60,25 @@ fn response(status: u16, content_type: &'static str, body: String) -> hyper::Res
     resp
 }
 
+/// The gauges read at scrape time, set before `/metrics` answers and
+/// before each OTLP metrics push.
+pub fn set_scrape_gauges(node: &Node) {
+    kronik_metrics::set(
+        "kronik_build_info",
+        &[
+            ("version", kronik_runtime::KRONIK_VERSION),
+            ("engine", kronik_runtime::ENGINE_VERSION),
+        ],
+        1.0,
+    );
+    kronik_metrics::set("kronik_applied_lsn", &[], node.applied_lsn() as f64);
+    if let Some(free) = node.disk_free() {
+        kronik_metrics::set("kronik_disk_free_bytes", &[], free as f64);
+        let low = node.disk_below_reserve().is_some();
+        kronik_metrics::set("kronik_disk_below_reserve", &[], f64::from(u8::from(low)));
+    }
+}
+
 fn answer(method: &hyper::Method, path: &str, node: &Node) -> hyper::Response<Full<Bytes>> {
     if method != hyper::Method::GET {
         let e = ApiError::new(ErrorCode::BadRequest, format!("{method} {path}: only GET"));
@@ -67,20 +86,7 @@ fn answer(method: &hyper::Method, path: &str, node: &Node) -> hyper::Response<Fu
     }
     match path {
         "/metrics" => {
-            kronik_metrics::set(
-                "kronik_build_info",
-                &[
-                    ("version", kronik_runtime::KRONIK_VERSION),
-                    ("engine", kronik_runtime::ENGINE_VERSION),
-                ],
-                1.0,
-            );
-            kronik_metrics::set("kronik_applied_lsn", &[], node.applied_lsn() as f64);
-            if let Some(free) = node.disk_free() {
-                kronik_metrics::set("kronik_disk_free_bytes", &[], free as f64);
-                let low = node.disk_below_reserve().is_some();
-                kronik_metrics::set("kronik_disk_below_reserve", &[], f64::from(u8::from(low)));
-            }
+            set_scrape_gauges(node);
             response(
                 200,
                 "text/plain; version=0.0.4; charset=utf-8",

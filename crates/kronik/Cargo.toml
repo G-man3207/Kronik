@@ -22,8 +22,11 @@ kronik-foreign = { workspace = true }
 kronik-effects = { workspace = true }
 kronik-gateway = { workspace = true, features = ["server"] }
 kronik-mcp = { workspace = true }
+kronik-log = { workspace = true }
 kronik-metrics = { workspace = true }
+kronik-otel = { workspace = true }
 kronik-privacy = { workspace = true }
+kronik-proto = { workspace = true }
 kronik-runtime = { workspace = true }
 kronik-sched = { workspace = true }
 kronik-ship = { workspace = true }
@@ -49,8 +52,8 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 boon = { workspace = true }
-kronik-log = { workspace = true }
-kronik-proto = { workspace = true }
+# otel.rs decodes OTLP requests with the vendored types.
+prost = { workspace = true }
 rcgen = { workspace = true }
 # privacy_mode.rs reads a copy of keys/keystore.db.
 rusqlite = { workspace = true }

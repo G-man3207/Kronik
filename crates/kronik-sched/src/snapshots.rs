@@ -4,6 +4,7 @@
 //! log.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kronik_core::error::{ApiError, ErrorCode};
@@ -34,6 +35,95 @@ impl StorageConfig {
             snapshots_kept: 48,
             history: Duration::from_secs(7 * 86_400),
         }
+    }
+}
+
+/// The audit export's floor under retention (ADR 0084, review H2). While
+/// set, [`Node::compact`] keeps every segment that holds a record past the
+/// floor, unless free disk is below `release_below` (before the disk
+/// reserve refuses work: the node never waits on a sink) or the floor has
+/// not been refreshed for `max_hold`. Then retention deletes as before, and
+/// the exporter records the gap.
+#[derive(Debug)]
+pub struct RetentionHold {
+    /// Records after this LSN are held; `u64::MAX`: no hold.
+    floor: AtomicU64,
+    /// Wall time of the last [`RetentionHold::set`].
+    set_ms: AtomicU64,
+    /// A rewind the follower has not taken yet: the floor stays at or
+    /// below it (review M1). The lock also orders the floor's updates.
+    rewind: std::sync::Mutex<Option<Lsn>>,
+    release_below: AtomicU64,
+    /// 0: no time cap.
+    max_hold_ms: AtomicU64,
+}
+
+impl Default for RetentionHold {
+    fn default() -> Self {
+        RetentionHold {
+            floor: AtomicU64::new(u64::MAX),
+            set_ms: AtomicU64::new(0),
+            rewind: std::sync::Mutex::new(None),
+            release_below: AtomicU64::new(0),
+            max_hold_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+impl RetentionHold {
+    /// `[audit] hold_release` (free bytes) and `max_hold` (zero: none).
+    pub fn configure(&self, release_below: u64, max_hold: Duration) {
+        self.release_below.store(release_below, Ordering::Relaxed);
+        self.max_hold_ms
+            .store(max_hold.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// The exporter has delivered through `floor`, as of `now_ms`. Called
+    /// after each batch and while caught up, so the hold's age is the time
+    /// the export has been stuck. While a rewind waits, a batch that was in
+    /// flight when it came does not raise the floor past it; one starting
+    /// at or before it means the follower took the rewind.
+    pub fn set(&self, floor: Lsn, now_ms: u64) {
+        let mut rewind = self.rewind.lock().unwrap_or_else(|e| e.into_inner());
+        let floor = match *rewind {
+            Some(to) if floor > to => to,
+            _ => {
+                *rewind = None;
+                floor
+            }
+        };
+        self.floor.store(floor, Ordering::Relaxed);
+        self.set_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// `kronik export rewind --to`: holds from `to` at once, and until the
+    /// follower resends from there (review M1).
+    pub fn rewind(&self, to: Lsn, now_ms: u64) {
+        let mut rewind = self.rewind.lock().unwrap_or_else(|e| e.into_inner());
+        let to = rewind.map_or(to, |r| r.min(to));
+        *rewind = Some(to);
+        self.floor.fetch_min(to, Ordering::Relaxed);
+        self.set_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// The floor, when held.
+    pub fn floor(&self) -> Option<Lsn> {
+        let f = self.floor.load(Ordering::Relaxed);
+        (f != u64::MAX).then_some(f)
+    }
+
+    /// How long the floor has not been refreshed, when held.
+    pub fn age_ms(&self, now_ms: u64) -> Option<u64> {
+        self.floor()
+            .map(|_| now_ms.saturating_sub(self.set_ms.load(Ordering::Relaxed)))
+    }
+
+    /// Whether retention ignores the hold: free disk (when measured) is
+    /// below `release_below`, or the hold is older than `max_hold`.
+    fn released(&self, disk_free: Option<u64>, now_ms: u64) -> bool {
+        let max = self.max_hold_ms.load(Ordering::Relaxed);
+        disk_free.is_some_and(|free| free < self.release_below.load(Ordering::Relaxed))
+            || (max > 0 && self.age_ms(now_ms).is_some_and(|age| age > max))
     }
 }
 
@@ -147,7 +237,9 @@ fn hash_file(path: &Path) -> std::io::Result<(u64, String)> {
     ))
 }
 
-fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Writes `path` durably: a temporary file, fsynced, renamed into place,
+/// and the directory fsynced.
+pub fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     let tmp = path.with_extension("tmp");
     let mut f = std::fs::File::create(&tmp)?;
@@ -432,6 +524,32 @@ impl Node {
         self.prune_snapshots(storage);
     }
 
+    /// Retention between snapshot passes while the audit hold has given
+    /// way (perf review R2): a sink down past `history` would otherwise
+    /// keep free disk near `hold_release` until the next pass, and a busy
+    /// node could drop below the disk reserve in between. Returns whether
+    /// it ran. Only segments: the index rows follow when one was deleted.
+    #[doc(hidden)]
+    pub async fn retain_if_released(&self, free: u64) -> bool {
+        let hold = self.retention_hold();
+        if hold.floor().is_none()
+            || !hold.released(Some(free), self.env.clock.wall_ms())
+            || self.fatal().is_some()
+        {
+            return false;
+        }
+        let Ok(storage) = self.storage() else {
+            return false;
+        };
+        let _one = self.snapshot_lock.lock().await;
+        sweep_partial(&snapshots_dir(&storage.data_dir, self.branch()));
+        if let Err(e) = self.compact_with(storage, false) {
+            tracing::warn!(error = %e.message, "compaction failed");
+        }
+        self.prune_snapshots(storage);
+        true
+    }
+
     /// The snapshot `kronik serve` takes when it stops. None when nothing
     /// but snapshot markers follows the newest snapshot, so an idle restart
     /// writes no copy of the state and appends no marker.
@@ -583,8 +701,8 @@ impl Node {
         Ok(())
     }
 
-    /// The first LSN the branch's log holds.
-    fn log_first(&self, storage: &StorageConfig) -> Result<Lsn, ApiError> {
+    /// The first LSN the branch's log holds (the first retained record).
+    pub fn log_first(&self, storage: &StorageConfig) -> Result<Lsn, ApiError> {
         let dir = storage
             .data_dir
             .join("branches")
@@ -648,6 +766,15 @@ impl Node {
     /// turn newer than everything in it and that later segment, too, is
     /// entirely older than the cutoff; without a later turn it is kept.
     pub fn compact(&self, storage: &StorageConfig) -> Result<Lsn, ApiError> {
+        self.compact_with(storage, true)
+    }
+
+    /// [`Node::compact`]; with `always_index` false the index rows are
+    /// compacted only when a segment was deleted: their deletes scan whole
+    /// tables under the store's lock, which the disk loop must not take
+    /// every minute while a released hold has nothing left to delete
+    /// (perf review R2-cost).
+    fn compact_with(&self, storage: &StorageConfig, always_index: bool) -> Result<Lsn, ApiError> {
         let dir = storage
             .data_dir
             .join("branches")
@@ -663,12 +790,15 @@ impl Node {
             .last()
             .map(|(_, m)| m.lsn);
         let mut first = starts.first().copied().unwrap_or(1);
+        let was_first = first;
         // A rebuild may still have to cross the newest rebase switch from
         // before its base (ADR 0017): keep everything until a snapshot at or
         // after the switch exists.
         let rebase_hold = self
             .last_rebase()?
             .is_some_and(|(r, _)| newest_snapshot.is_none_or(|n| n < r));
+        let hold = self.retention_hold();
+        let released = hold.released(self.measured_disk_free(), self.env.clock.wall_ms());
         // Closed segments only: never the newest (active) one, oldest first.
         for w in starts.windows(2).take_while(|_| !rebase_hold) {
             let (start, next) = (w[0], w[1]);
@@ -688,11 +818,33 @@ impl Node {
             if bound.is_none_or(|b| b >= cutoff) || !covered {
                 break;
             }
-            kronik_log::delete_segment(&dir, start).map_err(|e| io_err("segment", e))?;
+            if let Some(floor) = hold.floor().filter(|f| last_lsn > *f) {
+                if !released {
+                    break;
+                }
+                tracing::warn!(
+                    floor,
+                    start,
+                    last_lsn,
+                    "retention released the audit hold: free disk is below [audit] hold_release \
+                     or the hold is older than max_hold; the export records the gap"
+                );
+            }
+            match kronik_log::delete_segment(&dir, start) {
+                // Deleted by a pass under the snapshot lock while this one
+                // (a test's direct call) ran without it.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                r => r.map_err(|e| io_err("segment", e))?,
+            }
             tracing::info!(start, last_lsn, "deleted a segment past retention");
             first = next;
         }
+        if !always_index && first == was_first {
+            return Ok(first);
+        }
         let ingress_ttl = self.cfg.ingress_ttl.as_millis() as u64;
+        self.db_compactions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.store()
             .db()
             .compact(first, hwm.saturating_sub(ingress_ttl))

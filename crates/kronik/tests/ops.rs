@@ -363,7 +363,7 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
         names,
         [
             "config", "kernel", "runsc", "kvm", "cgroup", "root", "runc", "netns", "run_dir",
-            "caps", "sandbox", "disk", "clock", "tls", "ship"
+            "caps", "sandbox", "disk", "clock", "tls", "ship", "export"
         ]
     );
     assert_eq!(status(&report, "config")["status"], "pass");
@@ -410,7 +410,7 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
     let (report, ok) = doctor(&config);
     assert!(!ok);
     assert_eq!(status(&report, "config")["status"], "fail");
-    assert_eq!(report["checks"].as_array().unwrap().len(), 15);
+    assert_eq!(report["checks"].as_array().unwrap().len(), 16);
 }
 
 /// `GET path` on plain HTTP: the status line's code and the body.

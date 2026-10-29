@@ -337,6 +337,25 @@ against code written to move rows out.
   (target `kronik::guest`), not to Kronik's log. Don't log personal data;
   `execution_id` and `causal_id` identify the turn without it.
 - Metrics never carry subjects.
+- **OpenTelemetry export** (`[otel]`, [operations
+  guide](operations.md#opentelemetry)) carries no sealable value, in any
+  mode: spans have actor kinds, route patterns and methods, status codes,
+  outcome kinds, error codes, effect kinds, target hosts and secret names,
+  never a body, header, path, query, reply, state, guest-written error
+  text, subject id or secret. Actor keys, which are plain everywhere else,
+  leave hashed by default (`actor_keys = "hashed"`: `kh:` and 12 hex of a
+  keyed hash, stable but not reversible without the node's key), because a
+  key can be an e-mail address and the backend is outside the node.
+  `"plain"` sends them as they are, `"none"` leaves them out. An incoming
+  `traceparent` contributes only its two ids, and none once its subject is
+  erased.
+- **Audit lines** (`[audit]`; ADR 0082) carry no sealable value, no body
+  and no subject id. An erasure's subject leaves as
+  `s:` plus 12 hex of its keyed hash, also inside its reason; actor keys
+  are hashed by default (`[otel] actor_keys`). The audit line's
+  `record_hash` covers each sealed value as its subject tag only, so a
+  reseal or an erasure changes no exported line. Other reasons leave the
+  node as written: keep personal data out of `--reason`.
 - Code that has seen a value can always leak it, for example in a log line
   or an outgoing request. Sealing protects what Kronik stores, not what
   actors do.

@@ -281,7 +281,9 @@ pub struct Node {
     group_commit_window: Duration,
     fatal: Arc<Fatal>,
     /// Free bytes on the log's file system, refreshed every second while
-    /// `[log] disk_reserve` is set (`u64::MAX` until the first reading).
+    /// `[log] disk_reserve` is set or retention runs, whose audit hold gives
+    /// way on it even without a reserve (review M4); `u64::MAX` until the
+    /// first reading.
     disk_free: AtomicU64,
     config: Mutex<ConfigHistory>,
     pub(crate) secrets: Option<Arc<SecretStore>>,
@@ -297,6 +299,10 @@ pub struct Node {
     /// applier.
     pub(crate) rebase: crate::rebase::RebaseCtx,
     pub probe: Probe,
+    /// The audit export's floor under retention (ADR 0084).
+    retention_hold: crate::snapshots::RetentionHold,
+    /// How often retention compacted the index rows (`db.compact`).
+    pub(crate) db_compactions: std::sync::atomic::AtomicU64,
     me: Weak<Node>,
 }
 
@@ -601,7 +607,8 @@ impl Node {
         }
 
         // The first reading before any work is admitted; then every second.
-        let disk_free = if config.disk_reserve > 0 {
+        let measure = config.disk_reserve > 0 || config.storage.is_some();
+        let disk_free = if measure {
             env.fs
                 .available(space_dir.clone())
                 .await
@@ -637,6 +644,8 @@ impl Node {
             wheel_notify: Arc::new(Notify::new()),
             rebase: rebase.clone(),
             probe: Probe::default(),
+            retention_hold: Default::default(),
+            db_compactions: Default::default(),
             me: me.clone(),
             foreign: config.foreign.0.clone(),
             cfg: config,
@@ -741,7 +750,7 @@ impl Node {
         }
         let weak = Arc::downgrade(&node);
         env.spawn("timers", timer_loop(weak));
-        if node.cfg.disk_reserve > 0 {
+        if measure {
             env.spawn(
                 "disk-space",
                 disk_space_loop(Arc::downgrade(&node), space_dir),
@@ -1393,6 +1402,7 @@ impl Node {
                 execution_id: execution_id.clone(),
                 causal_key: key.clone(),
                 time,
+                started: self.env.clock.monotonic(),
                 config,
                 limits: kind_limits,
                 call_chain,
@@ -1832,12 +1842,31 @@ impl Node {
             .filter(|free| *free < self.cfg.disk_reserve)
     }
 
+    /// How often retention compacted the index rows (tests, R2-cost).
+    #[doc(hidden)]
+    pub fn db_compactions(&self) -> u64 {
+        self.db_compactions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The audit export's floor under retention, which the exporter sets.
+    pub fn retention_hold(&self) -> &crate::snapshots::RetentionHold {
+        &self.retention_hold
+    }
+
     /// The free bytes of the log's file system (read every second), when
     /// `[log] disk_reserve` is set and a reading succeeded (`u64::MAX`
     /// stands for no reading yet).
     pub fn disk_free(&self) -> Option<u64> {
+        self.measured_disk_free()
+            .filter(|_| self.cfg.disk_reserve > 0)
+    }
+
+    /// The last reading of free disk, with or without a reserve: the audit
+    /// hold's `hold_release` needs it either way.
+    pub(crate) fn measured_disk_free(&self) -> Option<u64> {
         let free = self.disk_free.load(Ordering::Relaxed);
-        (self.cfg.disk_reserve > 0 && free != u64::MAX).then_some(free)
+        (free != u64::MAX).then_some(free)
     }
 
     /// How many bytes new work may still write before the log's file
@@ -2389,9 +2418,12 @@ impl Node {
         Ok((epoch, lsn))
     }
 
-    /// Writes an `Approval` record in this branch's log.
-    pub async fn record_approval(&self, approval: pb::Approval) -> Result<Lsn, ApiError> {
+    /// Writes an `Approval` record in this branch's log, its command
+    /// scrubbed of stored secret values and tokens (review M5).
+    pub async fn record_approval(&self, mut approval: pb::Approval) -> Result<Lsn, ApiError> {
         self.check_alive()?;
+        let secrets = self.try_secret_values().ok();
+        approval.command = crate::scrub::for_log(&approval.command, secrets.as_deref());
         self.commit(Record::Approval(approval)).await
     }
 
@@ -2401,6 +2433,27 @@ impl Node {
     pub async fn record_guard(&self, guard: pb::GuardTriggered) -> Result<Lsn, ApiError> {
         self.check_alive()?;
         self.commit(Record::GuardTriggered(guard)).await
+    }
+
+    /// Writes an `AuditEvent` (M28, ADR 0083) after a mutation outside the
+    /// log succeeded. Only `check_alive`: the action already ran, possibly
+    /// below the disk reserve, so its event must be written too. Waits for
+    /// the apply, so the caller's next read sees it.
+    pub async fn record_audit_event(
+        &self,
+        action: &str,
+        target: &str,
+        details: std::collections::BTreeMap<String, String>,
+        audit: pb::Audit,
+    ) -> Result<Lsn, ApiError> {
+        self.check_alive()?;
+        self.commit(Record::AuditEvent(pb::AuditEvent {
+            action: action.to_owned(),
+            target: target.to_owned(),
+            details,
+            audit: Some(audit),
+        }))
+        .await
     }
 
     /// `kronik policy set`: a `Policy` record at the next epoch (the rules
@@ -2831,12 +2884,19 @@ impl Node {
             .map_err(internal)
     }
 
-    /// Values of every live secret, for scrubbing API output.
+    /// Values of every live secret, for scrubbing API output; empty when
+    /// they cannot be loaded (see [`Node::try_secret_values`]).
     pub fn secret_values(&self) -> Vec<(String, Vec<u8>)> {
-        self.secrets
-            .as_ref()
-            .and_then(|s| s.values().ok())
-            .unwrap_or_default()
+        self.try_secret_values().unwrap_or_default()
+    }
+
+    /// Values of every live secret, or the error that kept them from
+    /// loading: a scrub that writes to the log fails closed on it.
+    pub fn try_secret_values(&self) -> Result<Vec<(String, Vec<u8>)>, ApiError> {
+        match &self.secrets {
+            Some(s) => s.values().map_err(internal),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Reads one record of this branch's log.
@@ -2974,9 +3034,12 @@ fn turn_limits(l: &KindLimits) -> TurnLimits {
 }
 
 /// Reads the free space of the log's file system every second into
-/// `Node::disk_free`, and says when it crosses `[log] disk_reserve`.
+/// `Node::disk_free`, and says when it crosses `[log] disk_reserve`. While
+/// the audit hold has given way, it runs retention, at most once a minute.
 async fn disk_space_loop(node: Weak<Node>, dir: std::path::PathBuf) {
+    const RETAIN_EVERY: Duration = Duration::from_secs(60);
     let mut low = false;
+    let mut retained_at: Option<Duration> = None;
     loop {
         let Some(n) = node.upgrade() else { return };
         match n.env.fs.available(dir.clone()).await {
@@ -2996,6 +3059,12 @@ async fn disk_space_loop(node: Weak<Node>, dir: std::path::PathBuf) {
                     );
                 }
                 low = now_low;
+                let now = n.env.clock.monotonic();
+                if retained_at.is_none_or(|t| now.saturating_sub(t) >= RETAIN_EVERY)
+                    && n.retain_if_released(free).await
+                {
+                    retained_at = Some(now);
+                }
             }
             Err(e) => {
                 tracing::warn!(dir = %dir.display(), error = %e, "reading free disk space failed")

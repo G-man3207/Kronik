@@ -79,7 +79,7 @@ struct Inner {
     live: HashMap<[u8; 32], (String, BTreeSet<Scope>)>,
 }
 
-fn token_id(name: &str) -> String {
+pub(crate) fn token_id(name: &str) -> String {
     format!("token:{name}")
 }
 
