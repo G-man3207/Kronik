@@ -51,26 +51,29 @@ class PackagingTest(unittest.TestCase):
         _, dependencies = PACKAGER["packages"](metadata)
         self.assertEqual([p["name"] for p in dependencies], ["normal", "transitive"])
 
-    def test_rust_notice_inputs_preserve_daemon_default_and_full_guest_attribution(self):
+    def test_rust_notices_select_requested_documents_and_require_them(self):
         with tempfile.TemporaryDirectory() as directory:
             rust = Path(directory)
             (rust / "licenses").mkdir()
             library = (ROOT / "proto/opentelemetry/LICENSE").read_text()
             compiler = (ROOT / "scripts/licenses/cel-0.15.0-MIT.txt").read_text()
+            supplied = (ROOT / "scripts/licenses/asn1-rs-impl-0.2.0-MIT.txt").read_text()
             (rust / "COPYRIGHT-library.html").write_text("<pre>" + escape(library) + "</pre>")
-            (rust / "COPYRIGHT.html").write_text("<pre>" + escape(compiler) + "</pre>")
-            (rust / "licenses/original.txt").write_text(compiler)
-            section = PACKAGER["section"]
-            old = section("actual version input", library) + section("Rust supplied license text: original.txt", compiler)
-            self.assertEqual(PACKAGER["rust_notices"](rust, "actual version input"), old)
-            guest = PACKAGER["rust_notices"](rust, "actual version input",
-                                             copyright_files=("COPYRIGHT-library.html", "COPYRIGHT.html"))
-            self.assertIn(section("actual version input: COPYRIGHT.html", compiler), guest)
-            self.assertIn(section("Rust supplied license text: original.txt", compiler), guest)
-            (rust / "COPYRIGHT.html").unlink()
+            (rust / "licenses/original.txt").write_text(supplied)
+            standard = PACKAGER["rust_notices"](rust, "test toolchain")
+            self.assertIn(library.strip(), standard)
+            self.assertIn(supplied.strip(), standard)
+            self.assertNotIn(compiler.strip(), standard)
             with self.assertRaises(FileNotFoundError):
-                PACKAGER["rust_notices"](rust, "actual version input",
+                PACKAGER["rust_notices"](rust, "test toolchain",
                                          copyright_files=("COPYRIGHT-library.html", "COPYRIGHT.html"))
+            (rust / "COPYRIGHT.html").write_text("<pre>" + escape(compiler) + "</pre>")
+            full = PACKAGER["rust_notices"](rust, "test toolchain",
+                                           copyright_files=("COPYRIGHT-library.html", "COPYRIGHT.html"))
+            self.assertIn(library.strip(), full)
+            self.assertIn(compiler.strip(), full)
+            self.assertIn(supplied.strip(), full)
+
 
     def test_guest_notices_reuse_the_exact_normal_dependency_collector(self):
         with tempfile.TemporaryDirectory() as directory:

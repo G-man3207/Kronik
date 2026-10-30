@@ -8,7 +8,7 @@ import sys
 
 
 def check(script, workflow):
-    match = re.search(r"^\s*set -- ([a-z ]+)$", script, re.M)
+    match = re.search(r"^\s*set -- ([a-z -]+)$", script, re.M)
     if match is None:
         raise ValueError("scripts/ci.sh has no default step inventory")
     steps = match.group(1).split()
