@@ -19,7 +19,7 @@ use kronik_core::ids::Lsn;
 use kronik_privacy::key_source::{KeySource, KeySourceError, Keys, Wrapped};
 use kronik_sched::snapshots::{self, Manifest};
 use object_store::path::Path as Key;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +63,7 @@ impl ShipError {
                 E::Unauthenticated { .. } => "s3_unauthenticated",
                 E::Precondition { .. } | E::NotModified { .. } => "s3_precondition",
                 E::AlreadyExists { .. } => "s3_conflict",
+                E::NotImplemented { .. } => "s3_unsupported",
                 _ => "s3",
             },
         }
@@ -138,15 +139,24 @@ impl Remote {
         Ok(())
     }
 
+    /// Publishes only when the name is absent. A collision is not an ACK.
+    pub async fn put_create(&self, rel: &str, payload: PutPayload) -> Result<bool, ShipError> {
+        match self
+            .store
+            .put_opts(&self.key(rel), payload, PutMode::Create.into())
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// The object under `rel`.
     pub async fn get(&self, rel: &str) -> Result<Vec<u8>, ShipError> {
-        Ok(self
-            .store
-            .get(&self.key(rel))
-            .await?
-            .bytes()
-            .await?
-            .to_vec())
+        Ok(Vec::from(
+            self.store.get(&self.key(rel)).await?.bytes().await?,
+        ))
     }
 
     async fn delete(&self, rel: &str) -> Result<(), ShipError> {
@@ -163,6 +173,33 @@ impl Remote {
             r.objects.iter().map(|o| name(&o.location)).collect(),
             r.common_prefixes.iter().map(name).collect(),
         ))
+    }
+
+    /// Visits prefix-relative object names without collecting the recursive listing.
+    pub async fn list_each(
+        &self,
+        rel: &str,
+        mut visit: impl FnMut(&str) -> Result<(), ShipError>,
+    ) -> Result<(), ShipError> {
+        let prefix = self.key(rel);
+        let leading = if prefix.as_ref().is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}/")
+        };
+        let mut objects = self.store.list(Some(&prefix));
+        while let Some(object) = std::future::poll_fn(|cx| objects.as_mut().poll_next(cx)).await {
+            let object = object?;
+            let name = object
+                .location
+                .as_ref()
+                .strip_prefix(&leading)
+                .ok_or_else(|| {
+                    ShipError::Config("object listing escaped its requested prefix".into())
+                })?;
+            visit(name)?;
+        }
+        Ok(())
     }
 
     /// A cheap check that the bucket is reachable and the credentials work
@@ -426,7 +463,7 @@ pub async fn ship_keystore(
     let (names, _) = match remote.list("keystore").await {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, "could not list keystore backups");
+            tracing::warn!(code = e.code(), "could not list keystore backups");
             return Ok(report);
         }
     };
@@ -474,7 +511,7 @@ pub async fn ship_loop(
                 );
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "shipping failed; retrying next round"),
+            Err(e) => tracing::warn!(code = e.code(), "shipping failed; retrying next round"),
         }
         let mut nonce = [0u8; 24];
         env.entropy.fill(&mut nonce);
@@ -499,7 +536,10 @@ pub async fn ship_loop(
                 );
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "keystore backup failed; retrying next round"),
+            Err(e) => tracing::warn!(
+                code = e.code(),
+                "keystore backup failed; retrying next round"
+            ),
         }
         env.clock.sleep(interval).await;
     }
@@ -1115,7 +1155,7 @@ async fn check_keystore_backup(
     let (names, _) = match remote.list("keystore").await {
         Ok(v) => v,
         Err(e) => {
-            tracing::info!(error = %e, "restore: no keystore backups");
+            tracing::info!(code = e.code(), "restore: no keystore backups");
             return Ok(Err("none_in_bucket"));
         }
     };

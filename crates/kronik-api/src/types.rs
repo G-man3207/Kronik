@@ -1257,7 +1257,7 @@ pub struct IntegrityResponse {
     pub keys_missing: Vec<String>,
 }
 
-/// `GET /v1/audit`: `kronik.audit/v1` lines in LSN order (m28-otel §4.3).
+/// `GET /v1/audit`: `kronik.audit/v2` lines in LSN order (m28-otel §4.3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AuditResponse {
     pub lines: Vec<kronik_otel::audit::Line>,

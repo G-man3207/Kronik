@@ -15,6 +15,51 @@ use prost::Message as _;
 /// Secret names and values, as the effect gate collects them.
 pub type Secrets = [(String, Vec<u8>)];
 
+/// Public log positions of the two audit actions whose semantics use them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditPositions {
+    Restore { through_lsn: u64 },
+    Gap { from: u64, to: u64 },
+}
+
+impl AuditPositions {
+    /// Validates the action's required positions, never arbitrary free-text keys.
+    pub fn parse(
+        action: &str,
+        details: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Option<Self>, &'static str> {
+        let position = |field: &str| -> Option<u64> {
+            let value = details.get(field)?;
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            value.parse().ok()
+        };
+        match action {
+            "restore" => position("through_lsn")
+                .map(|through_lsn| Some(Self::Restore { through_lsn }))
+                .ok_or("restore requires a valid decimal through_lsn"),
+            "audit.gap" => match (position("from"), position("to")) {
+                (Some(from), Some(to)) if from > 0 && from <= to => {
+                    Ok(Some(Self::Gap { from, to }))
+                }
+                _ => Err("audit.gap requires a valid nonempty decimal range"),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// The validated numeric value of a field in this action's schema.
+    pub fn value(self, field: &str) -> Option<u64> {
+        match (self, field) {
+            (Self::Restore { through_lsn }, "through_lsn") => Some(through_lsn),
+            (Self::Gap { from, .. }, "from") => Some(from),
+            (Self::Gap { to, .. }, "to") => Some(to),
+            _ => None,
+        }
+    }
+}
+
 /// Replaces secret values in a sealable's plain bytes (raw user bytes).
 pub fn sealable(s: &mut Option<pb::Sealable>, secrets: &Secrets) {
     if let Some(pb::Sealable {

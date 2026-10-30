@@ -90,15 +90,24 @@ impl Api {
         if r.dry_run {
             return ok(&answer);
         }
-        if stream.name == kronik_otel::sink::STREAM {
-            self.node
-                .retention_hold()
-                .rewind(r.to, self.node.env().clock.wall_ms());
-        }
-        stream.rewind(r.to);
         let details = [("from", from.to_string()), ("to", r.to.to_string())];
-        self.audit_event(req, "export.rewind", name, &details, r.reason)
+        self.audit_event(req, "export.rewind", name, &details, r.reason.clone())
             .await?;
+        if let Err(error) = stream.rewind(&self.node, r.to).await {
+            let error = if error.kind() == std::io::ErrorKind::InvalidInput {
+                ApiError::new(ErrorCode::BadRequest, "the rewind no longer matches the durable export cursor")
+                    .with_hint("Run `kronik export status`, choose a retained point at or before its cursor, and retry.")
+            } else {
+                ApiError::new(ErrorCode::Unavailable, "the export rewind could not be made durable")
+                    .with_hint("Check storage health and write access to the data directory, then retry; the rewind was not acknowledged.")
+            };
+            let mut failed = details.to_vec();
+            failed.push(("code", error.code.as_str().to_owned()));
+            let _ = self
+                .audit_event(req, "export.rewind.failed", name, &failed, r.reason)
+                .await;
+            return Err(error);
+        }
         ok(&answer)
     }
 }

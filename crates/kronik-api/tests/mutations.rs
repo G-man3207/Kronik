@@ -340,6 +340,11 @@ async fn every_mutation_requires_a_reason_and_a_dry_run_writes_nothing() {
     )
     .unwrap()
     .start();
+    let cursors = Arc::new(
+        kronik_otel::cursor::Cursors::load(node.env().clone(), dir.path())
+            .await
+            .unwrap(),
+    );
     let api = Arc::new(
         Api::new(node)
             .with_proposals(proposals)
@@ -349,6 +354,7 @@ async fn every_mutation_requires_a_reason_and_a_dry_run_writes_nothing() {
                 true,
                 "file://".into(),
                 0,
+                cursors,
             )]),
     );
     let start = applied(&api).await;
@@ -581,6 +587,11 @@ async fn every_mutation_writes_its_audited_record() {
     .unwrap()
     .start();
     let tokens = kronik_api::tokens::TokenStore::open_file(&dir.path().join("tokens.db")).unwrap();
+    let cursors = Arc::new(
+        kronik_otel::cursor::Cursors::load(node.env().clone(), dir.path())
+            .await
+            .unwrap(),
+    );
     let api = Arc::new(
         Api::new(node.clone())
             .with_proposals(proposals)
@@ -592,6 +603,7 @@ async fn every_mutation_writes_its_audited_record() {
                 true,
                 "file://".into(),
                 0,
+                cursors,
             )]),
     );
     let b64 = |p: &str| base64::engine::general_purpose::STANDARD.encode(std::fs::read(p).unwrap());
@@ -1070,26 +1082,255 @@ async fn a_synchronous_propose_dropped_while_waiting_is_still_audited() {
         "r",
         false,
     );
-    let dropped = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        call(&api, "POST", "/v1/proposals", body),
-    )
-    .await;
-    assert!(dropped.is_err(), "the propose did not wait: {dropped:?}");
-    gate.add_permits(1000);
-    let mut list = Vec::new();
-    for _ in 0..600 {
-        list = proposals.list().await;
-        if list.iter().all(|p| p.status != "running") {
-            break;
+    let id = {
+        let request = call(&api, "POST", "/v1/proposals", body);
+        tokio::pin!(request);
+        tokio::select! {
+            biased;
+            result = &mut request => panic!("the proposal did not wait: {result:?}"),
+            id = async {
+                loop {
+                    for p in proposals.list().await {
+                        if proposals.progress(&p.id).is_some_and(|progress| {
+                            progress.isolated_total > 0 && progress.isolated_done == 0
+                        }) {
+                            return p.id;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            } => id,
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    let [p] = list.try_into().unwrap();
+        // The request is dropped only after its published replay is gated.
+    };
+    gate.add_permits(1000);
+    let p = proposals.wait(&id).await.unwrap();
     assert_eq!(p.status, "evaluated", "{p:?}");
     let [(_, event)] = events_of(&node, "proposal.create")
         .await
         .try_into()
         .unwrap();
     assert_eq!(event.target, p.id);
+}
+
+/// Cancellation after a durable intent but before apply must not abandon
+/// the daemon-owned publication and replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proposal_dropped_during_its_audit_apply_still_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start_local(
+        Env::real(tokio::runtime::Handle::current()),
+        dir.path(),
+        NodeConfig::default(),
+    )
+    .await
+    .unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let proposals = Arc::new(
+        kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_test_gate(gate.clone()),
+    );
+    let api = Api::new(node.clone()).with_proposals(proposals.clone());
+    for (path, body) in [
+        ("/v1/deployments", json!({"wasm_base64": guest("counter")})),
+        (
+            "/v1/actors/counter/a/messages",
+            json!({"name": "increment"}),
+        ),
+    ] {
+        let (s, v) = call(&api, "POST", path, with_reason(&body, "r", false)).await;
+        assert_eq!(s, 200, "{path}: {v}");
+    }
+    let before = node.applied_lsn();
+    // WAL readers and the log writer continue, but the applier cannot commit.
+    let state = rusqlite::Connection::open(dir.path().join("branches/main/state.db")).unwrap();
+    state.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let body = with_reason(
+        &json!({"wasm_base64": [guest("counter-step2")]}),
+        "cancel during apply",
+        false,
+    );
+    let id = {
+        let request = call(&api, "POST", "/v1/proposals", body);
+        tokio::pin!(request);
+        tokio::select! {
+            biased;
+            result = &mut request => panic!("the proposal did not wait for apply: {result:?}"),
+            id = async {
+                loop {
+                    let mut intent = None;
+                    node.reader().read(before + 1, u64::MAX, |c| {
+                        if let Record::AuditEvent(event) = c.record
+                            && event.action == "proposal.create"
+                        {
+                            intent = Some((c.lsn, c.pos.segment, event.target));
+                        }
+                        Ok(())
+                    }).await.unwrap();
+                    if let Some((lsn, segment, id)) = intent {
+                        assert_eq!(lsn, before + 1);
+                        // Reading bytes alone does not prove fsync completed.
+                        std::fs::File::open(dir.path().join("branches/main/log")
+                            .join(format!("{segment:020}.seg")))
+                            .unwrap()
+                            .sync_all()
+                            .unwrap();
+                        assert_eq!(node.applied_lsn(), before);
+                        return id;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            } => id,
+        }
+    };
+    state.execute_batch("ROLLBACK").unwrap();
+    let running = proposals.get(&id).await.unwrap();
+    assert_eq!(running.status, "running");
+    assert!(proposals.progress(&id).is_some());
+    gate.add_permits(1000);
+    assert_eq!(proposals.wait(&id).await.unwrap().status, "evaluated");
+    let [(_, event)] = events_of(&node, "proposal.create")
+        .await
+        .try_into()
+        .unwrap();
+    assert_eq!(event.target, id);
+}
+
+/// A real log-roll failure must gate every out-of-log lifecycle effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_audit_failure_prevents_publication_stop_and_job_spawn() {
+    for action in [
+        "preview.create",
+        "preview.delete",
+        "watch.stop",
+        "proposal.create",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let node = start_local(
+            Env::real(tokio::runtime::Handle::current()),
+            dir.path(),
+            NodeConfig {
+                segment_max_bytes: Some(1),
+                ..NodeConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let audit = pb::Audit {
+            token_id: "operator".into(),
+            reason: "before fault".into(),
+            wall_time_ms: 123,
+        };
+        let deployed = node
+            .deploy(&std::fs::read(COUNTER).unwrap(), audit.clone(), false)
+            .await
+            .unwrap();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let proposals = Arc::new(
+            kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf())
+                .unwrap()
+                .with_test_gate(gate),
+        );
+        let watches = Arc::new(
+            kronik_fork::watch::Watches::open(
+                node.clone(),
+                proposals.clone(),
+                dir.path().to_path_buf(),
+            )
+            .unwrap(),
+        );
+        let api = Api::new(node.clone())
+            .with_proposals(proposals.clone())
+            .with_watches(watches.clone());
+        let (method, path, body, watch_id) = match action {
+            "watch.stop" => {
+                let watch = watches
+                    .watch(deployed.epoch, 60_000, audit.clone(), false, false)
+                    .await
+                    .unwrap();
+                (
+                    "POST",
+                    format!("/v1/watches/{}/stop", watch.id),
+                    json!({}),
+                    Some(watch.id),
+                )
+            }
+            "proposal.create" => (
+                "POST",
+                "/v1/proposals".into(),
+                json!({"wasm_base64": [guest("counter-step2")], "async": true}),
+                None,
+            ),
+            _ => {
+                let (s, value) = call(
+                    &api,
+                    "POST",
+                    "/v1/proposals",
+                    with_reason(
+                        &json!({"wasm_base64": [guest("counter-step2")]}),
+                        "prepare",
+                        false,
+                    ),
+                )
+                .await;
+                assert_eq!(s, 200, "{value}");
+                let proposal = value["proposal"]["id"].as_str().unwrap();
+                if action == "preview.create" {
+                    (
+                        "POST",
+                        "/v1/previews".into(),
+                        json!({"proposal": proposal}),
+                        None,
+                    )
+                } else {
+                    let (preview, _) = proposals
+                        .create_preview(proposal, None, false, audit.clone(), false)
+                        .await
+                        .unwrap();
+                    (
+                        "DELETE",
+                        format!("/v1/previews/{}", preview.id),
+                        json!({}),
+                        None,
+                    )
+                }
+            }
+        };
+        let before = proposals.list().await;
+        let previews = proposals.previews().await;
+        let branch_names = || {
+            let mut names: Vec<_> = std::fs::read_dir(dir.path().join("branches"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let persisted = branch_names();
+        let log = dir.path().join("branches/main/log");
+        // Block only the next writer creation. Readers stop at the applied
+        // LSN, so every acknowledged segment remains readable by the watch.
+        let next_segment = log.join(format!("{:020}.seg", node.applied_lsn() + 1));
+        std::fs::create_dir(&next_segment).unwrap();
+        let (s, value) = call(&api, method, &path, with_reason(&body, "attempt", false)).await;
+        assert_eq!(s, 503, "{action}: {value}");
+        assert!(node.fatal().is_some(), "{action}");
+        assert_eq!(proposals.list().await, before, "{action}");
+        assert_eq!(proposals.previews().await, previews, "{action}");
+        assert_eq!(
+            branch_names(),
+            persisted,
+            "{action}: manager persistence preceded audit"
+        );
+        assert!(before.iter().all(|p| proposals.progress(&p.id).is_none()));
+        if let Some(id) = watch_id {
+            assert_eq!(watches.get(&id).unwrap().status, "watching");
+            let persisted: kronik_fork::watch::Watch = serde_json::from_slice(
+                &std::fs::read(dir.path().join("watches").join(format!("{id}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(persisted.status, "watching");
+        }
+    }
 }

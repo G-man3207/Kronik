@@ -50,9 +50,9 @@ pub struct RetentionHold {
     floor: AtomicU64,
     /// Wall time of the last [`RetentionHold::set`].
     set_ms: AtomicU64,
-    /// A rewind the follower has not taken yet: the floor stays at or
-    /// below it (review M1). The lock also orders the floor's updates.
-    rewind: std::sync::Mutex<Option<Lsn>>,
+    /// The latest pending generation and earliest requested cut. The lock
+    /// orders rewind requests against durable completion and floor updates.
+    rewind: std::sync::Mutex<Option<([u8; 16], Lsn)>>,
     release_below: AtomicU64,
     /// 0: no time cap.
     max_hold_ms: AtomicU64,
@@ -78,31 +78,51 @@ impl RetentionHold {
             .store(max_hold.as_millis() as u64, Ordering::Relaxed);
     }
 
-    /// The exporter has delivered through `floor`, as of `now_ms`. Called
-    /// after each batch and while caught up, so the hold's age is the time
-    /// the export has been stuck. While a rewind waits, a batch that was in
-    /// flight when it came does not raise the floor past it; one starting
-    /// at or before it means the follower took the rewind.
+    /// Refreshes the durable floor without completing any pending rewind.
     pub fn set(&self, floor: Lsn, now_ms: u64) {
-        let mut rewind = self.rewind.lock().unwrap_or_else(|e| e.into_inner());
-        let floor = match *rewind {
-            Some(to) if floor > to => to,
-            _ => {
-                *rewind = None;
-                floor
-            }
-        };
+        let rewind = self.rewind.lock().unwrap_or_else(|e| e.into_inner());
+        let floor = rewind.map_or(floor, |(_, to)| floor.min(to));
         self.floor.store(floor, Ordering::Relaxed);
         self.set_ms.store(now_ms, Ordering::Relaxed);
     }
 
-    /// `kronik export rewind --to`: holds from `to` at once, and until the
-    /// follower resends from there (review M1).
-    pub fn rewind(&self, to: Lsn, now_ms: u64) {
+    /// Holds the earliest cut until the latest generation durably completes.
+    pub fn rewind(&self, generation: [u8; 16], to: Lsn, now_ms: u64) {
         let mut rewind = self.rewind.lock().unwrap_or_else(|e| e.into_inner());
-        let to = rewind.map_or(to, |r| r.min(to));
-        *rewind = Some(to);
+        let to = rewind.map_or(to, |(_, cut)| cut.min(to));
+        *rewind = Some((generation, to));
         self.floor.fetch_min(to, Ordering::Relaxed);
+        self.set_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Only a durable completion of the current generation releases its cut.
+    pub fn complete_rewind(&self, generation: [u8; 16], floor: Lsn, now_ms: u64) {
+        let mut rewind = self.rewind.lock().unwrap_or_else(|e| e.into_inner());
+        if rewind.is_some_and(|(pending, _)| pending == generation) {
+            *rewind = None;
+        }
+        let floor = rewind.map_or(floor, |(_, to)| floor.min(to));
+        self.floor.store(floor, Ordering::Relaxed);
+        self.set_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Rolls back only the failed request, using the current durable control.
+    pub fn restore_control(
+        &self,
+        failed_generation: [u8; 16],
+        pending: Option<([u8; 16], Lsn)>,
+        durable_floor: Lsn,
+        now_ms: u64,
+    ) {
+        let mut rewind = self.rewind.lock().unwrap_or_else(|e| e.into_inner());
+        if !rewind.is_some_and(|(generation, _)| generation == failed_generation) {
+            return;
+        }
+        *rewind = pending;
+        self.floor.store(
+            pending.map_or(durable_floor, |(_, to)| durable_floor.min(to)),
+            Ordering::Relaxed,
+        );
         self.set_ms.store(now_ms, Ordering::Relaxed);
     }
 

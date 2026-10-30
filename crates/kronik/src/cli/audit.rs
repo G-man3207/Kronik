@@ -201,9 +201,9 @@ async fn compare(
             }
         }
     };
-    // Only what verify compares (kind, action, token, time, hash) matters:
-    // no actor key hashing or secret scrub. An erasure's hash covers its
-    // subject's keyed label (review M6), so the master key is needed.
+    // Verification identities come only from retained records. Historical v1
+    // hashes stay internal; all newly projected lines use the v2 hash domain.
+    // The master key is needed for keyed subject and actor labels.
     let source =
         kronik_privacy::key_source::KeySource::load(env.clone(), keys.clone(), data_dir, false)
             .await
@@ -226,7 +226,7 @@ async fn compare(
         reader
             .read(from + 1, to, |c| {
                 last = c.lsn;
-                expected.extend(kronik_otel::audit::lines(c.lsn, &c.record, &line_ctx));
+                expected.extend(kronik_otel::audit::expected(c.lsn, &c.record, &line_ctx)?);
                 Ok(())
             })
             .await
@@ -264,25 +264,37 @@ async fn read_sink(sink: &Sink) -> Result<Vec<Line>, ApiError> {
                         format!("reading {}: {e}", f.display()),
                     )
                 })?;
-                bodies.push((f.display().to_string(), body));
+                bodies.push(body);
             }
         }
         Sink::S3 { url, endpoint } => {
             let remote = kronik_ship::Remote::open(url, endpoint.as_deref())
-                .map_err(|e| unavailable(format!("opening the audit bucket: {e}")))?;
-            // Names start with the time the batch was prepared, so name
-            // order is write order, after a restore too (review H-B).
-            let (mut names, _) = remote
-                .list("audit")
-                .await
-                .map_err(|e| unavailable(format!("listing the audit bucket: {}", e.code())))?;
-            names.sort();
-            for name in names {
-                let body = remote
-                    .get(&format!("audit/{name}"))
+                .map_err(|e| unavailable(format!("opening the audit bucket: {}", e.code())))?;
+            for prefix in ["audit", kronik_otel::sink::OBJECT_PREFIX] {
+                let (mut names, directories) = remote
+                    .list(prefix)
                     .await
-                    .map_err(|e| unavailable(format!("reading audit/{name}: {}", e.code())))?;
-                bodies.push((name, body));
+                    .map_err(|e| unavailable(format!("listing the audit bucket: {}", e.code())))?;
+                let ordered = prefix == kronik_otel::sink::OBJECT_PREFIX;
+                if directories.iter().any(|name| ordered || name != "v2")
+                    || (ordered
+                        && names
+                            .iter()
+                            .any(|name| kronik_otel::sink::object_sequence(name).is_none()))
+                {
+                    return Err(ApiError::new(
+                        ErrorCode::BadRequest,
+                        "unsupported audit object namespace or noncanonical sequence",
+                    ));
+                }
+                // Historical wall-time objects precede the create-only numeric namespace.
+                names.sort_unstable();
+                for name in names {
+                    let body = remote.get(&format!("{prefix}/{name}")).await.map_err(|e| {
+                        unavailable(format!("reading the audit bucket: {}", e.code()))
+                    })?;
+                    bodies.push(body);
+                }
             }
         }
         Sink::Webhook(_) => {
@@ -294,16 +306,16 @@ async fn read_sink(sink: &Sink) -> Result<Vec<Line>, ApiError> {
         }
     }
     let mut lines = Vec::new();
-    for (name, body) in bodies {
+    for body in bodies {
         let whole = body.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
         for (i, raw) in body[..whole].split(|b| *b == b'\n').enumerate() {
             if raw.is_empty() {
                 continue;
             }
-            let line = serde_json::from_slice::<Line>(raw).map_err(|e| {
+            let line = serde_json::from_slice::<Line>(raw).map_err(|_| {
                 ApiError::new(
                     ErrorCode::BadRequest,
-                    format!("{name} line {}: not a kronik.audit/v1 line: {e}", i + 1),
+                    format!("audit sink line {}: invalid audit line", i + 1),
                 )
             })?;
             lines.push(line);

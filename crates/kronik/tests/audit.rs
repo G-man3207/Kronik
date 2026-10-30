@@ -931,7 +931,11 @@ fn a_restore_from_an_older_ship_point_then_new_mutations_verify() {
         "\n[ship]\nenabled = true\nurl = \"file://{}\"\n",
         bucket.path().display()
     );
-    let d = Daemon::start(dir.path(), &data, &ship);
+    let d = Daemon::start(
+        dir.path(),
+        &data,
+        &format!("file_max_bytes = \"1B\"\n{ship}"),
+    );
     let mut deploy = json!({"reason": "deploy"});
     deploy["wasm_base64"] = json!(b64(COUNTER));
     assert_eq!(d.api("POST", "/v1/deployments", &deploy).0, 200);
@@ -954,6 +958,10 @@ fn a_restore_from_an_older_ship_point_then_new_mutations_verify() {
         .collect();
     assert_eq!(lost.len(), 3);
     d.stop();
+    let previous_files: BTreeSet<_> = kronik_otel::sink::files(&dir.path().join("audit"))
+        .unwrap()
+        .into_iter()
+        .collect();
 
     let dest = dir.path().join("restored");
     // The master key is never in the bucket: it goes into place first.
@@ -968,19 +976,31 @@ fn a_restore_from_an_older_ship_point_then_new_mutations_verify() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     // The restored node exports to the same sink, without shipping.
-    let d = Daemon::start(dir.path(), &dest, "");
+    let d = Daemon::start(
+        dir.path(),
+        &dest,
+        "from = \"now\"\nfile_max_bytes = \"1B\"\n",
+    );
     for host in ["example.com", "example.org", "example.net", "example.edu"] {
         let grant = json!({"kind": "counter", "capability": format!("http:{host}"), "reason": "after restore"});
         assert_eq!(d.api("POST", "/v1/grants", &grant).0, 200, "{}", d.log());
     }
     d.wait_exported();
+    let rotated: Vec<_> = kronik_otel::sink::files(&dir.path().join("audit"))
+        .unwrap()
+        .into_iter()
+        .filter(|file| !previous_files.contains(file))
+        .collect();
+    assert!(!rotated.is_empty());
+    for file in rotated {
+        std::fs::File::open(file)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+    }
     let lines = sink_lines(dir.path());
     let restore = lines.iter().find(|l| l.action == "restore").unwrap();
-    let through: u64 = restore.details["through_lsn"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let through = restore.details["through_lsn"].as_u64().unwrap();
     assert!(lost.iter().all(|l| l.lsn > through), "{restore:?} {lost:?}");
     // A reused LSN, told apart by hash.
     let reused = lost.iter().any(|old| {
@@ -1030,6 +1050,15 @@ fn restore_over_the_exported_directory(stop_after_event: bool) {
     assert!(wait_until_shipped(&data, lsn), "the snapshot did not ship");
     let older = tempfile::tempdir().unwrap();
     copy_dir(bucket.path(), older.path());
+    d.stop();
+    let changed = format!("batch_records = 3\n{ship}");
+    let d = Daemon::start(dir.path(), &data, &changed);
+    d.wait_exported();
+    let cache: Value = serde_json::from_slice(
+        &std::fs::read(data.join(kronik_otel::cursor::Cursors::FILE)).unwrap(),
+    )
+    .unwrap();
+    assert!(cache["audit_config"]["lsn"].as_u64().unwrap() > lsn);
     for host in ["example.com", "example.org", "example.net"] {
         let grant =
             json!({"kind": "counter", "capability": format!("http:{host}"), "reason": "lost tail"});
@@ -1046,6 +1075,12 @@ fn restore_over_the_exported_directory(stop_after_event: bool) {
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
+    let marker: Value = serde_json::from_slice(
+        &std::fs::read(data.join("branches/main").join(kronik_ship::RESTORE_MARKER)).unwrap(),
+    )
+    .unwrap();
+    let through = marker["through_lsn"].as_u64().unwrap();
+    assert!(cache["audit_config"]["lsn"].as_u64().unwrap() > through);
     if stop_after_event {
         let out = command()
             .args(["serve", "--config"])
@@ -1053,18 +1088,42 @@ fn restore_over_the_exported_directory(stop_after_event: bool) {
             .arg("--test-stop-after-restore-event")
             .output()
             .unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !out.status.success() && stderr.contains("stopped after the restore event"),
-            "{out:?}"
-        );
+        assert!(!out.status.success(), "{out:?}");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut recorded = false;
+        rt.block_on(async {
+            let reader = kronik_log::LogReader::new(
+                kronik_core::env::Env::real(tokio::runtime::Handle::current()),
+                data.join("branches/main/log"),
+                "main",
+            );
+            reader
+                .read(through + 1, through + 1, |c| {
+                    recorded = matches!(
+                        c.record,
+                        kronik_proto::Record::AuditEvent(e) if e.action == "restore"
+                    );
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        });
+        assert!(recorded);
     } else {
-        let d = Daemon::start_with(dir.path(), &data, "", &[("KRONIK_AUDIT_SINK", "none")]);
+        let d = Daemon::start_with(
+            dir.path(),
+            &data,
+            "batch_records = 3\n",
+            &[("KRONIK_AUDIT_SINK", "none")],
+        );
         assert_eq!(d.audit_stream()["enabled"], false);
         d.settled();
         d.stop();
     }
-    let d = Daemon::start(dir.path(), &data, "");
+    let d = Daemon::start(dir.path(), &data, "batch_records = 3\n");
     for host in ["example.com", "example.org", "example.net", "example.edu"] {
         let grant = json!({"kind": "counter", "capability": format!("http:{host}"), "reason": "after restore"});
         assert_eq!(d.api("POST", "/v1/grants", &grant).0, 200, "{}", d.log());
@@ -1073,6 +1132,11 @@ fn restore_over_the_exported_directory(stop_after_event: bool) {
     let lines = distinct(sink_lines(dir.path()));
     let restores: Vec<&Line> = lines.iter().filter(|l| l.action == "restore").collect();
     assert_eq!(restores.len(), 1, "{}", sink_text(dir.path()));
+    assert!(
+        lines
+            .iter()
+            .any(|line| { line.action == "audit.config" && line.lsn > restores[0].lsn })
+    );
     let after = lines.iter().filter(|l| l.reason == "after restore").count();
     assert_eq!(after, 4, "{}", sink_text(dir.path()));
     let (code, report) = verify(&d, &data);

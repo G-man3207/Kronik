@@ -33,6 +33,21 @@ pub mod preview;
 mod rebase;
 pub use rebase::{RebaseDone, RebaseInfo, RebaseRequest};
 
+/// A failed lifecycle attempt keeps its intent and original error.
+pub(crate) async fn audit_failed(
+    node: &Node,
+    action: &str,
+    target: &str,
+    mut details: BTreeMap<String, String>,
+    audit: pb::Audit,
+    error: &ApiError,
+) {
+    details.insert("code".into(), error.code.as_str().into());
+    let _ = node
+        .record_audit_event(&format!("{action}.failed"), target, details, audit)
+        .await;
+}
+
 /// Catch-up converges when the newest root input is at most this far (in
 /// logical time) ahead of the verified one (`[promote] max_gap`).
 pub const MAX_GAP: Duration = Duration::from_secs(2);
@@ -1017,6 +1032,7 @@ impl Proposals {
         wait: bool,
     ) -> Result<(Proposal, bool), ApiError> {
         let dry_run = req.dry_run;
+        let audit = req.audit.clone();
         let p = self.prepare(req).await?;
         if dry_run {
             let this = self.clone();
@@ -1030,6 +1046,28 @@ impl Proposals {
                 .ok_or_else(|| internal("the dry run was dropped"))??;
             return Ok((meta, true));
         }
+        // Once validated, the intent and publication belong to the daemon:
+        // dropping the request during the durable append must not lose the job.
+        let this = self.clone();
+        let running = self
+            .node
+            .env()
+            .spawn("propose-start", async move {
+                this.start_proposal(p, audit).await
+            })
+            .await
+            .ok_or_else(|| internal("the proposal start was dropped"))??;
+        if !wait {
+            return Ok((running, false));
+        }
+        Ok((self.wait(&running.id).await?, false))
+    }
+
+    async fn start_proposal(
+        self: &Arc<Self>,
+        p: Prepared,
+        audit: pb::Audit,
+    ) -> Result<Proposal, ApiError> {
         let running = Proposal {
             id: p.id.clone(),
             fork: p.id.clone(),
@@ -1052,10 +1090,27 @@ impl Proposals {
             preview: None,
             rebase: None,
         };
-        // Save, insert and spawn under the entries lock with no await in
-        // between: a caller dropped while queued on the lock leaves nothing.
+        let details: BTreeMap<String, String> = [
+            (
+                "kinds".into(),
+                p.kinds
+                    .iter()
+                    .map(|k| format!("{}=b3:{}", k.kind, kronik_core::ids::hex(&k.code_hash)))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            ("fork_lsn".into(), p.fork_lsn.to_string()),
+        ]
+        .into();
+        // Keep the publication lock across the durable intent.
         let mut entries = self.entries.lock().await;
-        self.save(&running, None)?;
+        self.node
+            .record_audit_event("proposal.create", &p.id, details.clone(), audit.clone())
+            .await?;
+        if let Err(e) = self.save(&running, None) {
+            audit_failed(&self.node, "proposal.create", &p.id, details, audit, &e).await;
+            return Err(e);
+        }
         entries.insert(
             p.id.clone(),
             Entry {
@@ -1076,7 +1131,6 @@ impl Proposals {
             },
         );
         let this = self.clone();
-        let id = p.id.clone();
         let finished = done.clone();
         // The handle is dropped: the job runs to its end whoever waits.
         drop(self.node.env().spawn("propose-job", async move {
@@ -1098,6 +1152,7 @@ impl Proposals {
                 });
             if let Err(e) = result {
                 tracing::warn!(proposal = %id, error = %e, "proposal failed");
+                audit_failed(&this.node, "proposal.create", &id, details, audit, &e).await;
                 let mut entries = this.entries.lock().await;
                 if let Some(entry) = entries.get_mut(&id) {
                     entry.meta.status = "failed".into();
@@ -1111,10 +1166,7 @@ impl Proposals {
             finished.close();
         }));
         drop(entries);
-        if !wait {
-            return Ok((running, false));
-        }
-        Ok((self.wait(&id).await?, false))
+        Ok(running)
     }
 
     /// Waits for proposal `id`'s job to end (at once when none runs) and

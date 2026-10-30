@@ -81,6 +81,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`RUNSC_MISSING`](#runsc_missing) | 503 | M7 | gVisor's runsc is not installed |
 | [`SCOPE_MISSING`](#scope_missing) | 403 | M5 | The token lacks the scope for this operation |
 | [`SECRET_NOT_FOUND`](#secret_not_found) | 404 | M2 | No such secret |
+| [`SECRET_UNAVAILABLE`](#secret_unavailable) | 503 | M23 | Secret values needed by this operation are unavailable |
 | [`STORAGE_CORRUPT`](#storage_corrupt) | 500 | M1 | The log or state on disk is corrupt |
 | [`SUBJECT_ERASED`](#subject_erased) | 410 | M8 | The subject's data was erased |
 | [`TOKEN_NOT_FOUND`](#token_not_found) | 404 | M5 | No API token with that name |
@@ -852,6 +853,20 @@ To fix it, list the secrets that exist, or set the secret; `kronik secret set` r
     kronik secret set <name> --reason "..."
 
 See also: [`secret-handle`](concepts/glossary.md#secret-handle).
+
+## SECRET_UNAVAILABLE
+
+HTTP status 503, milestone M23. Secret values needed by this operation are unavailable.
+
+Default hint: Check `kronik doctor`, the secret backend and access to retained versions; retry after complete secret coverage is restored.
+
+The secret value or complete retained-secret inventory needed by this operation is unavailable. Kronik refuses the affected effect or redaction-dependent response rather than returning an unsanitized success body or substituting another version.
+
+Typical causes include an unavailable external backend, denied access to a required immutable version, or a local secret-store value that cannot be decrypted. A successfully empty inventory is different from a failed or incomplete inventory.
+
+Check `kronik doctor`, the configured backend and access to the required retained versions. Retry after coverage is restored; a destroyed old version cannot be replaced with the backend's current value. Metadata-only health and key status remain available, and turns that need no linked secret do not wait for provider recovery.
+
+This is not `KEY_SOURCE_UNAVAILABLE`: that code concerns loading the master seed. Do not switch master-key sources or create a fallback key to work around missing secret coverage.
 
 ## STORAGE_CORRUPT
 

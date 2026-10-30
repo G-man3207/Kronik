@@ -21,7 +21,7 @@ pub const TRACES: &str = "traces";
 
 /// Starts what `[otel]` turns on and returns the trace stream for the
 /// export status (disabled without an endpoint or with `traces = false`).
-pub fn start(
+pub async fn start(
     config: &Config,
     node: &Arc<Node>,
     cursors: &Arc<Cursors>,
@@ -38,10 +38,22 @@ pub fn start(
         None if on => node.applied_lsn(),
         None => 0,
     };
+    if on && saved.is_none() {
+        cursors
+            .save(
+                TRACES,
+                Entry {
+                    lsn: cursor,
+                    ..Entry::default()
+                },
+            )
+            .await
+            .context("saving the first trace cursor")?;
+    }
     let sink_name = endpoint
         .map(kronik_otel::http::scheme_host)
         .unwrap_or_default();
-    let stream = Stream::new(TRACES, on, sink_name, cursor);
+    let stream = Stream::new(TRACES, on, sink_name, cursor, cursors.clone());
     let Some(endpoint) = endpoint else {
         return Ok(stream);
     };
@@ -66,24 +78,26 @@ pub fn start(
             interval: otel.interval.0,
         };
         tracing::info!(endpoint = %stream.sink, cursor, "exporting spans over OTLP");
-        let (node, cursors, stream) = (node.clone(), cursors.clone(), stream.clone());
-        drop(env.spawn("otel-traces", async move {
-            // A first start's cursor is saved before its first batch: a
-            // refused batch and a restart then resend it (review Low).
-            if saved.is_none() {
-                let entry = Entry {
-                    lsn: cursor,
-                    state: serde_json::Value::Null,
-                };
-                if let Err(e) = cursors.save(TRACES, entry).await {
-                    tracing::warn!(error = %e, "otel: saving the first trace cursor failed");
-                }
+        let (node, stream, data_dir) = (node.clone(), stream.clone(), data_dir.to_owned());
+        let make_node = node.clone();
+        let make = move |saved: Entry| {
+            let (node, settings, hasher, data_dir) = (
+                make_node.clone(),
+                settings.clone(),
+                hasher.clone(),
+                data_dir.clone(),
+            );
+            async move {
+                TraceSink::open(node, settings, hasher, &data_dir, &saved.state, saved.lsn)
+                    .await
+                    .map_err(|error| {
+                        kronik_otel::trace_state::failure_code(&error)
+                            .unwrap_or("state_read")
+                            .to_owned()
+                    })
             }
-            let make = |state: &serde_json::Value| {
-                TraceSink::new(node.clone(), settings.clone(), hasher.clone(), state)
-            };
-            supervise(node.clone(), cursors, stream, options, make).await;
-        }));
+        };
+        drop(env.spawn("otel-traces", supervise(node, stream, options, make)));
     }
     if otel.metrics {
         let gauges = node.clone();
@@ -104,9 +118,44 @@ pub fn start(
     Ok(stream)
 }
 
+/// Externalizes real historical inline trace state once, before an audit
+/// checkpoint could otherwise rewrite that whole state for every batch.
+pub async fn migrate_trace_state(
+    node: &Arc<Node>,
+    cursors: &Arc<Cursors>,
+    data_dir: &Path,
+) -> anyhow::Result<()> {
+    let Some(mut saved) = cursors
+        .get(TRACES)
+        .filter(|entry| entry.state.is_array() || entry.state.get("open").is_some())
+    else {
+        return Ok(());
+    };
+    cursors
+        .stabilize()
+        .await
+        .context("stabilizing the export cursors")?;
+    let env = node.env().clone();
+    let hasher = KeyHasher::open(node.sealer().clone(), data_dir, || env.random_bytes())?;
+    let (mut writer, mut open) =
+        kronik_otel::trace_state::load(env, data_dir, &saved.state, saved.lsn, hasher.id_key())
+            .await
+            .context("reading the historical trace metadata")?;
+    saved.state = writer
+        .checkpoint(&mut open, saved.lsn)
+        .await
+        .context("migrating the historical trace metadata")?;
+    cursors
+        .save(TRACES, saved)
+        .await
+        .context("saving the export cursors")?;
+    writer.committed(&mut open);
+    Ok(())
+}
+
 /// The `export.json` entry holding the hash of the `[audit]` and `[otel]`
 /// settings last recorded in an `audit.config` event.
-const AUDIT_CONFIG: &str = "audit_config";
+pub(crate) const AUDIT_CONFIG: &str = "audit_config";
 
 /// The audit export: the line mapper, which `GET /v1/audit` shares, and the
 /// stream (disabled without a sink). Then records an `audit.config` event
@@ -146,7 +195,13 @@ pub async fn start_audit(
     );
     let hash = format!("b3:{}", blake3::hash(settings.as_bytes()).to_hex());
     let stream = match sink {
-        None => Stream::new(kronik_otel::sink::STREAM, false, String::new(), 0),
+        None => Stream::new(
+            kronik_otel::sink::STREAM,
+            false,
+            String::new(),
+            0,
+            cursors.clone(),
+        ),
         Some(sink) => {
             let a = &config.audit;
             let settings = kronik_otel::sink::Settings {
@@ -166,10 +221,17 @@ pub async fn start_audit(
     };
     let saved = cursors.get(AUDIT_CONFIG).map(|e| e.state);
     let on = stream.enabled || config.otel.endpoint().is_some();
-    if saved.as_ref().and_then(|s| s.as_str()) != Some(hash.as_str()) && (on || saved.is_some()) {
+    if saved.as_ref().and_then(|s| s.as_str()) != Some(hash.as_str())
+        && (on || saved.is_some() || !cursors.is_active())
+    {
         let audit = kronik_proto::log::v1::Audit {
             token_id: "system".into(),
-            reason: "the [audit] or [otel] settings changed".into(),
+            reason: if cursors.is_active() {
+                "the [audit] or [otel] settings changed"
+            } else {
+                "the [audit] and [otel] settings observed without readable export state"
+            }
+            .into(),
             wall_time_ms: env.clock.wall_ms(),
         };
         let details = [
@@ -183,11 +245,14 @@ pub async fn start_audit(
         let entry = kronik_otel::cursor::Entry {
             lsn: node.applied_lsn(),
             state: hash.into(),
+            ..Entry::default()
         };
-        cursors
-            .save(AUDIT_CONFIG, entry)
-            .await
-            .context("saving the export cursors")?;
+        if cursors.is_active() {
+            cursors
+                .save(AUDIT_CONFIG, entry)
+                .await
+                .context("saving the export cursors")?;
+        }
     }
     Ok((mapper, stream))
 }

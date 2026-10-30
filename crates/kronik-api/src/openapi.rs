@@ -768,7 +768,7 @@ pub const OPERATIONS: &[Operation] = &[
     Operation {
         method: "GET",
         path: "/v1/audit",
-        summary: "The audit lines of main's log (kronik.audit/v1), as an audit sink receives them",
+        summary: "The audit lines of main's log (kronik.audit/v2), as an audit sink receives them",
         query: &[
             Param {
                 name: "from",

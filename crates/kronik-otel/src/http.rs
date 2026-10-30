@@ -17,14 +17,14 @@ pub async fn post(
     url: String,
     mut headers: Vec<(String, String)>,
     content_type: &str,
-    body: Vec<u8>,
+    body: Bytes,
 ) -> Result<HttpResponse, &'static str> {
     headers.push(("content-type".into(), content_type.into()));
     let req = HttpRequest {
         method: "POST".into(),
         url,
         headers,
-        body: Bytes::from(body),
+        body,
         max_response_bytes: 1 << 20,
     };
     match env.timeout(TIMEOUT, env.net.http(req)).await {
@@ -81,12 +81,23 @@ pub fn retry_after(resp: &HttpResponse) -> Option<Duration> {
 /// `scheme://host[:port]` of a URL: no user, password, path or query,
 /// which can hold credentials (review M6).
 pub fn scheme_host(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Ok(parsed) = url.parse::<http::Uri>() else {
         return String::new();
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.rsplit('@').next().unwrap_or("");
-    format!("{scheme}://{host}")
+    let (Some(scheme), Some(authority)) = (parsed.scheme_str(), parsed.authority()) else {
+        return String::new();
+    };
+    let host = authority.host();
+    let host_port = authority.as_str().rsplit('@').next().unwrap_or_default();
+    // URI authorities permit opaque ports; a credential prefix is not a displayable host.
+    if host.is_empty() || (authority.port().is_none() && host_port != host) {
+        return String::new();
+    }
+    let port = authority
+        .port()
+        .map(|p| format!(":{p}"))
+        .unwrap_or_default();
+    format!("{scheme}://{host}{port}")
 }
 
 /// The host of an `http://` or `https://` URL, without brackets or port.
@@ -121,6 +132,24 @@ mod tests {
         );
         assert_eq!(scheme_host("s3://bucket/prefix"), "s3://bucket");
         assert_eq!(scheme_host("nonsense"), "");
+        assert_eq!(
+            scheme_host("https://user:pw@[::1]:8443/private"),
+            "https://[::1]:8443"
+        );
+        assert_eq!(
+            scheme_host("https://USER:pw@Host:443/path"),
+            "https://Host:443"
+        );
+        for malformed in [
+            "https://u:p/ss@h/",
+            "https://u:NEEDLE?secret@host/",
+            "https://u:NEEDLE#secret@host/",
+            "https://u:NEEDLE\\secret@host/",
+            "https://u:NEEDLE%2fsecret@host:bad/",
+            "https://NEEDLE:NEEDLE/path@host/",
+        ] {
+            assert_eq!(scheme_host(malformed), "");
+        }
         assert!(is_loopback("http://127.0.0.1:4318"));
         assert!(is_loopback("http://[::1]:4318/"));
         assert!(is_loopback("http://localhost"));

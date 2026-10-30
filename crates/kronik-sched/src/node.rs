@@ -2436,7 +2436,7 @@ impl Node {
     /// scrubbed of stored secret values and tokens (review M5).
     pub async fn record_approval(&self, mut approval: pb::Approval) -> Result<Lsn, ApiError> {
         self.check_alive()?;
-        let secrets = self.try_secret_values().ok();
+        let secrets = self.secret_values().ok();
         approval.command = crate::scrub::for_log(&approval.command, secrets.as_deref());
         self.commit(Record::Approval(approval)).await
     }
@@ -2449,21 +2449,32 @@ impl Node {
         self.commit(Record::GuardTriggered(guard)).await
     }
 
-    /// Writes an `AuditEvent` (M28, ADR 0083) after a mutation outside the
-    /// log succeeded. Only `check_alive`: the action already ran, possibly
-    /// below the disk reserve, so its event must be written too. Waits for
-    /// the apply, so the caller's next read sees it.
+    /// Writes a canonically scrubbed `AuditEvent`, including mutation intents
+    /// before effects. Allowed below the disk reserve; waits for apply.
     pub async fn record_audit_event(
         &self,
         action: &str,
         target: &str,
-        details: std::collections::BTreeMap<String, String>,
-        audit: pb::Audit,
+        mut details: std::collections::BTreeMap<String, String>,
+        mut audit: pb::Audit,
     ) -> Result<Lsn, ApiError> {
         self.check_alive()?;
+        let positions = crate::scrub::AuditPositions::parse(action, &details)
+            .map_err(|message| ApiError::new(ErrorCode::BadRequest, message))?;
+        let secrets = self.secret_values().ok();
+        audit.reason = crate::scrub::for_log(&audit.reason, secrets.as_deref());
+        let target = crate::scrub::for_target(target, secrets.as_deref());
+        for (field, value) in &mut details {
+            if positions
+                .and_then(|positions| positions.value(field))
+                .is_none()
+            {
+                *value = crate::scrub::for_log(value, secrets.as_deref());
+            }
+        }
         self.commit(Record::AuditEvent(pb::AuditEvent {
             action: action.to_owned(),
-            target: target.to_owned(),
+            target,
             details,
             audit: Some(audit),
         }))
@@ -2898,17 +2909,16 @@ impl Node {
             .map_err(internal)
     }
 
-    /// Values of every live secret, for scrubbing API output; empty when
-    /// they cannot be loaded (see [`Node::try_secret_values`]).
-    pub fn secret_values(&self) -> Vec<(String, Vec<u8>)> {
-        self.try_secret_values().unwrap_or_default()
-    }
-
-    /// Values of every live secret, or the error that kept them from
-    /// loading: a scrub that writes to the log fails closed on it.
-    pub fn try_secret_values(&self) -> Result<Vec<(String, Vec<u8>)>, ApiError> {
+    /// Complete retained secret values for redaction. Unavailable is never
+    /// represented by a successfully empty collection.
+    pub fn secret_values(&self) -> Result<Vec<(String, Vec<u8>)>, ApiError> {
         match &self.secrets {
-            Some(s) => s.values().map_err(internal),
+            Some(store) => store.values().map_err(|_| {
+                ApiError::new(
+                    ErrorCode::SecretUnavailable,
+                    "The retained secret inventory could not be loaded",
+                )
+            }),
             None => Ok(Vec::new()),
         }
     }

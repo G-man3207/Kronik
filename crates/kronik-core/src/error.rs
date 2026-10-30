@@ -242,6 +242,9 @@ codes! {
     SecretNotFound = "SECRET_NOT_FOUND", 404, "M2",
         "No such secret",
         "List secrets with `kronik secret list`.";
+    SecretUnavailable = "SECRET_UNAVAILABLE", 503, "M23",
+        "Secret values needed by this operation are unavailable",
+        "Check `kronik doctor`, the secret backend and access to retained versions; retry after complete secret coverage is restored.";
     StorageCorrupt = "STORAGE_CORRUPT", 500, "M1",
         "The log or state on disk is corrupt",
         "Stop the daemon and keep the data directory; do not delete log segments.";

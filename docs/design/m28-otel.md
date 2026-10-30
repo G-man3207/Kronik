@@ -1,8 +1,10 @@
 # M28: OpenTelemetry and audit export (design)
 
-Status: design, revised after the design review (reviewer-designs: H1–H4,
-M1–M9, L1–L6; each fix names its finding). Delivered in 9d1f65b. The
-decisions are in ADRs 0080–0084.
+Status: accepted design and implemented hardening. Initial delivery was
+9d1f65b; the current 102-test exporter run and actual binary archive/
+restore proofs are described below. Complete retained external/deleted
+secret inventory across restart remains M23 work. Decisions are in
+ADRs 0080–0084.
 
 B2 (trace and metrics export) is in, with these refinements:
 - The open-turn set (§3.1) also decides links into other traces: a link
@@ -15,9 +17,9 @@ B2 (trace and metrics export) is in, with these refinements:
   is resent after a restart.
 - `[otel] batch_spans` caps the log records read per request (each turn
   record gives its turn span plus one per effect).
-- The cursor file is `{"traces": {"lsn": N, "state": …}, "audit": …}`:
-  the trace stream's state is its open-turn set, `{"open": […], "kept":
-  […]}` (an older plain list of open pairs still loads).
+- The cursor retains a small `kronik.trace-state/v1` reference rather than
+  serializing the open/kept sets into `export.json`. Legacy open-pairs and
+  `{open,kept}` migrate once; selected modern state must validate (§4.6).
 
 Code review fixes, export follower and traces (M28 code review):
 - **M2:** a failed `audit.gap` record keeps the cursor before the gap: the
@@ -31,6 +33,8 @@ Code review fixes, export follower and traces (M28 code review):
   so links from them name its span in the caller's trace. Kept turns are
   capped like open ones (100,000), dropping the oldest (a cancelled timer
   never arrives).
+  This count limit does not establish a blanket heap bound; checkpoint
+  payloads are separately byte-limited (§4.6).
 - **M8:** `kronik export rewind traces` rebuilds the open-turn set at the
   rewind point by replaying the retained log's beginnings and commits from
   an empty set, so a re-export sends the same spans. Chosen over refusing a
@@ -55,13 +59,13 @@ Code review fixes, export follower and traces (M28 code review):
 
 B3 (audit export) is in, with these refinements:
 - The audit cursor of a first start is the record before the first
-  retained one (not 0), and the hold lags the cursor by one batch, so it
-  never depends on a cursor not yet saved.
-- `kronik audit verify` reads a directory sink's files by modification
-  time, then name (LSNs repeat after a restore), and an S3 sink's objects
-  by name, which starts with the wall time the batch was prepared (§4.4),
-  so both are in write order after a restore too. It deduplicates on every
-  compared field.
+  retained one (not 0). The hold never advances ahead of the durably saved
+  cursor.
+- `kronik audit verify` reads historical directory files by their original
+  mtime/name order, then `audit-v2-<sequence>.jsonl` by numeric sequence.
+  Historical top-level S3 objects precede `audit/v2/<sequence>.jsonl`.
+  Numbered publication does not depend on wall clocks or reused LSNs.
+  `branch` and `epoch` are compared identity fields.
 - `audit.config` is recorded after the stream's start cursor (so `from =
   "now"` exports it too), and not on a node that never had `[otel]` or
   `[audit]` on. The hash is over the settings in force, overrides included.
@@ -72,13 +76,13 @@ B3 (audit export) is in, with these refinements:
   sandbox in CI), which must export nothing, as `mutations.rs` does.
 
 Code review fixes (M28 code review):
-- H-A: the first start after `kronik restore` clamps every stream in
-  `export.json` to the restored log, and drops the trace stream's state
-  when it clamps it, before it removes the marker, with export on or off
-  (§4.2).
+- H-A: startup durably clamps or initializes trace/audit cursors after
+  restore, including absent/from-now entries, and discards lost-tail
+  resume state before marker removal and parent sync (§4.2).
 - H-B: no sink overwrites earlier lines when LSNs repeat: new files never
-  reuse a name, object names start with the batch's preparation time, and
-  the webhook's `idempotency-key` includes a hash of the body (§4.4).
+  reuse a name, object names are exclusively created numeric slots, and
+  webhook retry keys bind the body and replay generation (§4.4). Current
+  file/S3 names use confirmed numeric slots, independent of wall clocks.
 - M1: a rewind's retention floor holds until the follower resends from it;
   a batch in flight does not raise it (§5).
 - M4: free disk is measured for `hold_release` with `[log] disk_reserve`
@@ -488,13 +492,13 @@ Rules for `AuditEvent`:
     of the staged install before its commit step, with the last LSN of the
     staged log (the snapshot's when no segment follows it), so restored
     state never comes without it (perf review R4). The start records the
-    event unless the log after `through_lsn` holds it already (a crash
-    after the event), then clamps every stream in `export.json` to
-    `through_lsn` (the trace stream also loses its open-turn state, which
-    describes the lost tail), durably, whether or not an export is on, and
-    only then removes the marker (review H-A). A later start with
-    `[audit]` on therefore exports the `restore` line and what follows;
-    `restore --force` keeps an old `export.json`, and this is why;
+    event unless the log after `through_lsn` holds it already. Startup
+    then durably clamps or initializes both export cursors, even if absent
+    or configured from `"now"`; drops lost-tail resume state; resets the
+    lost-tail audit-configuration hash; preserves/clamps pending replay;
+    and assigns a new applied generation. Only after durable cursors does
+    it remove the marker and sync its parent directory, with exports on
+    or off. `restore --force` may keep an old `export.json`.
   - `audit.gap`, for a range retention deleted before export (§5);
   - `audit.config`, at a start where `[audit]` or `[otel]` differ from the
     last recorded one (review L2), with the settings' hash and the sink's
@@ -504,12 +508,12 @@ Rules for `AuditEvent`:
   configuration record or `AuditEvent`. A new route without one fails the
   test.
 
-### 4.3 The JSON line (`kronik.audit/v1`)
+### 4.3 The JSON line (`kronik.audit/v2`)
 
 One object per line, UTF-8, `\n`-terminated, keys in this order:
 
 ```json
-{"schema":"kronik.audit/v1","lsn":1234,"kind":"deployment","action":"promote",
+{"schema":"kronik.audit/v2","lsn":1234,"kind":"deployment","action":"promote",
  "at_wall_ms":1761500000123,"token_id":"token:ci-promote","reason":"PR #12",
  "branch":"main","epoch":7,
  "details":{"proposal_id":"p-…","kinds":[{"kind":"counter","code_hash":"b3:…","schema_version":0}]},
@@ -522,16 +526,20 @@ One object per line, UTF-8, `\n`-terminated, keys in this order:
   an older ship point, new records reuse the LSNs of the lost tail. The
   `restore` event marks the point, and `kronik audit verify` reports lines
   that share an LSN but conflict.
-- **`record_hash`** is blake3 of a canonical form of the record: its
-  encoding with every `Sealable` payload replaced by its subject tag (review
-  M2). It reveals no value, and a reseal, which rewrites sealed payloads,
-  leaves it unchanged. Anyone holding the log can check a line against it.
-  An erasure's subject, the one field its line leaves out, is replaced by
-  its keyed `s:` label (in the reason too), so a backend cannot test
-  guessed subjects against the hash; `audit verify` reads the master key
-  to compute it (code review M6). The same holds for the actor key in a
-  `fork.send` event's `details.actor`, which the line hides: the hash
-  covers `kind/` plus its keyed label (perf review R1).
+- **`record_hash`** is blake3 over `kronik.audit/v2\0`, the record kind
+  byte and canonical record encoding. Sealables become subject tags;
+  canonical free text is `WITHHELD` and token-scrubbed. Erasure subjects
+  and hidden actor keys use keyed labels. Resealing does not change it.
+  New emissions use v2 only. Verification derives the exact legacy v1
+  hash from the source record, including its historical subject masking;
+  it never accepts an arbitrary alternate hash. Known schema, hash and
+  identity fields must match. Mixed v1/v2 retries count as one logical
+  source item. Only trusted source restore records authorize superseding
+  cuts; a sink cannot authorize a cut.
+- **Positions:** `restore.through_lsn` and `audit.gap.from`/`to` are
+  action-specific validated `u64` values internally, JSON numbers in v2
+  and explicitly decimal strings in legacy v1. Key names do not exempt
+  generic details or free text from scrubbing.
 - **`action` and `details` per kind:**
 
 | Kind | `action` | `details` |
@@ -554,21 +562,17 @@ One object per line, UTF-8, `\n`-terminated, keys in this order:
 
 - **Privacy (ADR 0082):**
   - No sealable value appears in a line, and no subject id.
-  - `reason`, `command` and the AuditEvent's `target` and `details` are
-    free text or names. They are scrubbed for every stored version of
-    every secret (`kronik_effects::http::scrub_str` with
-    `Node::secret_values()`), as the API does: once when the record is
-    written (the API's `Audit`, `AuditEvent` and `Node::record_approval`;
-    a `secret.set` also scrubs its new value from its reason), so a
-    secret deleted before the export reads the record stays out of the
-    log (code review M5), and again at export.
-  - `reason` is capped at 4 KiB (a `"reason_truncated":true` key marks a
-    cut). Phase B also caps it at the API: a `reason` over 4 KiB is
-    `BAD_REQUEST`.
-  - Reasons are exported as written, apart from the secret scrub. The one
-    known exception (review M8): an Erasure's reason usually names the
-    subject, so its subject id is replaced by the `s:` hash in the reason
-    too. The operations guide says reasons leave the node.
+  - Free text, names and span labels are scrubbed for secret values and
+    token spellings at recording and export. Subject masking handles
+    case, percent encoding and identifier boundaries.
+  - `reason` is capped at 4 KiB (`"reason_truncated":true` marks an export
+    cut); the API rejects longer reasons with `BAD_REQUEST`.
+  - Unavailable inventory gives privacy-sensitive API projections HTTP
+    503 `SECRET_UNAVAILABLE`; mutating audit text is safely withheld and
+    exporter preparation stalls without cursor advance.
+  - Current LocalSecretStore inventory does not close complete retained
+    external/deleted-version coverage across restart; that remains M23
+    work. Do not put personal data in reasons.
 - **Fixed fields:** `token_id` is the caller's token id (`token:<name>`,
   `unix:uid=<n>`, `kronik`, `system`), as the history shows it today.
   `at_wall_ms` is the audit's own `wall_time_ms`.
@@ -578,28 +582,36 @@ One object per line, UTF-8, `\n`-terminated, keys in this order:
 `[audit] sink` is one URL:
 
 - **Directory:** `file:///var/log/kronik/audit/`. Lines are appended to
-  `audit-<first lsn:020>.jsonl` (mode 0640) and fsynced before the cursor
-  moves. A new file starts at `[audit] file_max_bytes` (default 64 MiB),
-  under a name no file has: `audit-<first lsn:020>.<n>.jsonl` when LSNs
-  repeat after a restore or a rewind. An existing file is never opened at
-  offset 0 (code review H-B). Newly created directories are fsynced into
-  their parents.
-  - **Torn lines** (review M7): at start, the newest file is truncated to
-    its last `\n`, so a crash mid-append leaves no partial line for the next
-    batch to continue.
-  - Kronik never deletes a file; rotation is the operator's (logrotate or
-    a copy to cold storage), and the operations guide says so (review L3).
+  `audit-v2-<sequence:020>.jsonl` (mode 0640) and fsynced before the cursor
+  moves. `[audit] file_max_bytes` is 1 B–1 GiB (default 64 MiB), a soft
+  whole-batch threshold: oversized records are not dropped. Recovery
+  selects the highest canonical sequence, not an mtime or first LSN.
+  Rotation uses exclusive create and syncs its directory; an existing
+  file is never overwritten. Historical LSN-named files retain their
+  original read order but receive no new appends.
+  - **Torn lines:** at start, a fixed-buffer tail scan finds the last `\n`
+    and truncates a partial tail. Files are opened no-follow, must be
+    regular and uniquely linked; a new name never overwrites an old file.
+  - Kronik never deletes a file; rotation is the operator's. Keep the
+    newest numbered file across restarts so recovery retains the high-water
+    mark; do not renumber archive files or assume removed history is checked.
     The sink starts a new file when the newest one is gone, replaced (another
     inode, as logrotate's `create` leaves it) or shorter than written (its
     `copytruncate`), never writing at a stale offset (perf review R5).
     The systemd unit gets `LogsDirectory=kronik`, so the default path is
     writable under `ProtectSystem=strict`.
+  - Removed directories are recreated; recoverable open/write failures
+    retry. Any sync failure or EIO permanently latches that export writer
+    as `storage_sync`, with no later filesystem attempts or cursor
+    acknowledgement. The node remains usable. Repair/quarantine storage,
+    create a new writer and safely rewind; restarting alone is not proof
+    durability was repaired. There is no automatic COW repair.
 - **Webhook:** `https://…`. One POST per batch of up to `[audit]
   batch_records` (default 500) lines, `content-type: application/x-ndjson`,
   with `kronik-audit-range: <first>-<last>` and `idempotency-key:
-  <first>-<last>-<32 hex of the body's blake3>` headers: after a restore
-  the same range carries other lines, which a receiver honouring the key
-  must not answer from its cache (code review H-B).
+  <generation>-<first>-<last>-<32 hex of the body's blake3>` headers.
+  Retries keep the key; an intentional replay gets a new generation,
+  so a receiver cannot answer the new delivery from an old ACK cache.
   - 2xx is delivered.
   - 4xx other than 408 and 429 stops the export with
     `kronik_export_errors_total{stream="audit"}` and a warning. It retries
@@ -607,12 +619,18 @@ One object per line, UTF-8, `\n`-terminated, keys in this order:
   - Credentials come from `[audit] headers_env`, as for OTLP.
   - `http://` is allowed only to a loopback address.
 - **Object storage:** `s3://bucket/prefix` with `[audit] endpoint`, using
-  `kronik-ship`'s `Remote`: `put` becomes `pub`, with the same `AWS_*`
-  credentials and ring provider. One object per batch,
-  `<prefix>/audit/<prepared wall ms:020>-<first:020>-<last:020>.jsonl`. A
-  retried batch overwrites itself; a batch over reused LSNs gets a name of
-  its own, and names sort in write order for `audit verify` (code review
-  H-B).
+  `kronik-ship`'s `Remote` and the same `AWS_*` credentials/ring provider.
+  `audit/v2/<sequence:020>.jsonl` is an atomic create-only publication slot.
+  Recovery streams its tail once; confirmed create or collision advances
+  the candidate, but only a successful create acknowledges this delivery.
+  Unknown failures do not invent holes; lost ACKs can cause duplicates.
+  Legacy top-level objects are read first, then canonical numbered objects.
+  Overflow or invalid names stall; unsupported conditional create is
+  `s3_unsupported`, without cursor advance. This relies on an append-only
+  v2 namespace and the backend's atomic/durable create contract: external
+  deletion or bucket-lifecycle removal plus stale listing can reuse a hole.
+  Kronik never deletes audit objects. Historical clock misordering is not
+  repaired, and there is no extra head/reservation/wrapper protocol.
 
 The sink is shown and refused like `[ship] url`: an unknown scheme is a
 configuration error at start.
@@ -632,38 +650,53 @@ The definition, which the test checks:
 Here F is the cursor's start (0 on a new data directory). L is a point where
 the export cursor equals the applied LSN.
 
-**The tests:**
-- **Completeness:** `crates/kronik/tests/audit.rs`, a real `kronik serve`
-  with a file sink. It drives every mutating route from the
-  `mutations.rs` table, sends and resends included (each once, plus a dry
-  run of each, which must export nothing), and restarts the daemon once in
-  between, so the cursor survives a restart. It waits for `kronik export
-  status` to show the audit cursor at the applied LSN.
-  - **Its expectations come from what it drove** (review M4), not from the
-    exporter's classifier: the test keeps its own list of (route, action,
-    reason, token) and requires exactly one line for each, plus one for a
-    test actor's `secret.reveal`, plus the `restore` event after a restore
-    step.
-  - It then runs `kronik audit verify` (§6) over the sink, which reads the
-    whole log with `LogReader` and must report complete.
-  - Separate tests: export, reseal, verify still passes (review M2); a
-    partial line injected before a restart is truncated (review M7); export,
-    restore from an older ship point, mutate, verify passes and the reused
-    LSNs are told apart by hash (review H4).
-- **Privacy:** the same run uses a secret value, a subject id, a message
-  body and a token secret as needles. The test checks that none of them
-  appears in any exported line, while the reason of a mutation and the
-  secret's name do appear.
-- **Unit tests in `kronik-otel`:** one per record kind, checking the line
-  (golden JSON).
+**Observed evidence:**
+- One complete current exporter run: 102 tests pass, including replay
+  generations, cursor faults, source gaps across restart, bounded frame
+  decoding, fatal sync latching and archive compatibility fixtures.
+- All seven actual binary audit tests pass. The real ship/restore/verify
+  path reproduces and now survives owned-file mtime rollback, initializes
+  fresh from-now cursors, and re-audits configuration lost by a restore.
+- A 27.31 s actual local S3 binary run against pinned Moto verifies
+  conditional create, legacy/current readback and forged-line rejection,
+  rewind/restart without overwrite, and `s3_unsupported` with durable
+  cursor zero while the counter still runs. Its seven archive objects
+  and daemon logs exclude the needle; human tables and cleanup are recorded.
+- The earlier 2.66 s daemon/API/OTLP smoke exercises recoverable I/O,
+  whole-batch rotation, removed-directory recovery, and restart with
+  corrupt secret ciphertext: three API 503s, both export cursors frozen
+  and an unrelated healthy turn. Two actual OTLP binary tests passed.
+- These runs do not establish physical fsync repair, cloud IAM or HSM
+  behavior, or complete retained external/deleted-version secret coverage.
 
 ### 4.6 Delivery and order
 
 - **Batches:** the exporter reads from its cursor, builds a batch, delivers
   it to the sink, then advances the cursor.
-- **Cursor:** `<data>/export.json`, `{"traces": <lsn>, "audit": <lsn>}`.
-  It is written to a temp file, fsynced, renamed, and the directory
-  fsynced (the `snapshots.rs` `write_synced` pattern).
+- **Cursor:** `<data>/export.json` holds per-stream entries, written by
+  temp file, sync, rename and directory sync. Optional version-1 `control`
+  contains the applied 128-bit generation and durable pending replay's
+  earliest cut and old acknowledged-through position. Acknowledgement
+  merges newer requests. A new generation first checkpoints exactly its
+  cut and clears pending replay only when that generation reaches its head.
+- **Rewind ownership:** an owned `Env` task survives caller cancellation.
+  Audit intent precedes the effect; failures record an event and stable
+  code. Requests wake retry loops; webhook keys bind generation and S3
+  replay creates new ordered objects.
+- **Trace state:** the cursor stores only a `kronik.trace-state/v1`
+  reference (`format`, `slot`, `generation`, `end`, `lsn`, `hash`).
+  Two fixed files plus scratch hold checksummed snapshot/deltas, preserve
+  kept sequence/next values and compact dirty-key appends. Each load makes
+  a fresh snapshot. Payloads share the log's 128 MiB `MAX_RECORD`; selected
+  prefix is bounded by `24 + 2 * (40 + 128 MiB)`. Bounded serialization
+  rejects excess with `trace_state_limit`, never truncation; count limits
+  alone are not a heap bound. Legacy open-pairs/`{open,kept}` migrate once
+  before audit cursor writes; corrupt selected modern state stalls traces.
+- **Disabled exporters:** if both cursor exporters are off, unreadable
+  `export.json` is left unchanged. Configuration observations remain
+  source-audited even if its cache is unavailable.
+- The complete current exporter run and binary restore/S3 proofs above
+  exercise these control/checkpoint contracts.
 - **Order:** in LSN order, at least once. A crash after delivery and before
   the cursor write re-sends that batch, so consumers dedup by (`lsn`, `effect`, `record_hash`).
 - **Duplicates and gaps:** the only duplicates are such re-sent batches. The
@@ -694,14 +727,14 @@ older than `[retention] history`. A slow sink would otherwise lose records.
     is refused, after the flags too: that hold could never give way
     before the reserve refuses work (perf review R3).
   - `[audit] max_hold` (default 0 = no time cap) can also cap the hold.
-  - **A rewind holds at once** (`RetentionHold::rewind`): the floor drops
-    to its point and stays there, under the same lock, until the follower
-    delivers (or records a gap) from there; a batch in flight when the
-    rewind came does not raise it (code review M1).
-  - A gap is an `AuditEvent` `audit.gap` with the lost range, appended
-    through the `check_alive` path (never refused by the reserve), and
-    `kronik_export_gaps_total{stream="audit"}` counts it. The node keeps
-    serving.
+  - **Durable floor:** the hold is restored before exporter spawn, then
+    updated only after durable checkpoints. A replay request's earliest
+    pending cut survives an older in-flight acknowledgement.
+  - Gaps are derived from authoritative retained source positions even
+    while remote delivery retries. `audit.gap` notices deduplicate across
+    checkpoint failure/restart, and the skipped range is durably saved
+    before later preparation. The append uses `check_alive` (never
+    refused by the reserve); the metric counts it and the node serves.
   - A sink that stays down shows in the export status,
     `kronik_export_lag_records{stream="audit"}`, and `kronik doctor`, which
     warns once the hold is older than `[retention] history`.

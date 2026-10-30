@@ -1,6 +1,6 @@
 # 0080. Spans are built from committed turn records
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-10-27
 
 ## Context
@@ -25,6 +25,9 @@ and I4). DST requires determinism in everything the scheduler does.
   `TurnRecord`s from the log, after commit, and turns each into one span.
   Each of its `EffectRecord`s becomes a child span. Nothing in the turn path
   creates spans.
+  Span names and attributes follow ADR 0082's secret/token scrub. If the
+  secret inventory is unavailable, preparation stalls without advancing
+  the trace cursor; unrelated node work remains usable.
 - **Ids.** Every id is a deterministic function of the record and the
   node's id key:
   - Trace id: the causal root, which is 16 random bytes as hex (blake3 of
@@ -108,8 +111,8 @@ and I4). DST requires determinism in everything the scheduler does.
   missing. A crash before commit leaves no span, which matches the log.
 - Callees commit before their callers, so a trace fills in from the leaves.
   Backends join spans by id, whatever order they arrive in.
-- Verified by `crates/kronik/tests/otel.rs` (an in-process OTLP receiver,
-  three actors, connectivity checks) and by `demo/vps-otel.sh` against
-  Jaeger (m28-otel §8).
+- Exercised by two actual OTLP binary tests and local wire privacy needles.
+  The Jaeger recipe (`demo/vps-otel.sh`, m28-otel §8) is an operator
+  integration recipe, not additional evidence of a run here.
 - Revisit if a backend needs spans while a turn is still running. That
   would need live spans in addition to these.

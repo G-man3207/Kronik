@@ -12,9 +12,10 @@ use std::time::Duration;
 use common::*;
 use kronik_core::error::ErrorCode;
 use kronik_fork::diff::DiffOptions;
-use kronik_fork::proposal::{Proposals, ProposeRequest};
+use kronik_fork::proposal::{Proposal, Proposals, ProposeRequest};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
+use kronik_sched::NodeConfig;
 
 fn propose(
     p: &Proc,
@@ -585,6 +586,23 @@ fn held_job(
         .unwrap();
     assert!(!dry);
     assert_eq!(running.status, "running");
+    let mut events = Vec::new();
+    p.rt.block_on(p.node.reader().read(1, p.node.applied_lsn(), |c| {
+        if let Record::AuditEvent(event) = c.record
+            && event.action == "proposal.create"
+            && event.target == running.id
+        {
+            events.push(event);
+        }
+        Ok(())
+    }))
+    .unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "the held job must already have its durable intent"
+    );
+    assert_eq!(events[0].audit.as_ref(), Some(&audit()));
     (props, gate, running.id)
 }
 
@@ -679,8 +697,95 @@ fn a_job_that_fails_leaves_the_proposal_failed() {
     let failed = p.rt.block_on(props.get(&id)).unwrap();
     assert_eq!(failed.status, "failed");
     assert!(failed.error.is_some(), "{failed:?}");
+    let mut events = Vec::new();
+    p.rt.block_on(p.node.reader().read(1, p.node.applied_lsn(), |c| {
+        if let Record::AuditEvent(event) = c.record
+            && event.target == id
+        {
+            events.push(event);
+        }
+        Ok(())
+    }))
+    .unwrap();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0].action, "proposal.create");
+    assert_eq!(events[1].action, "proposal.create.failed");
+    assert_eq!(
+        events[1].details["code"],
+        failed.error.as_ref().unwrap().code.as_str()
+    );
+    assert_eq!(events[1].audit.as_ref(), Some(&audit()));
     let e =
         p.rt.block_on(props.promote(&id, audit(), false))
             .unwrap_err();
     assert_eq!(e.code, ErrorCode::BadRequest, "{e}");
+}
+
+#[test]
+fn proposal_save_failure_never_publishes_or_starts_a_job() {
+    let dir = tempdir();
+    let mut fault = None;
+    let p = Proc::start_env(
+        dir.path(),
+        NodeConfig {
+            concurrency: 8,
+            ..Default::default()
+        },
+        |env| fault = Some(ProposalSaveFault::install(env)),
+    );
+    let fault = fault.unwrap();
+    let data = dir.path().join("proposal-manager");
+    std::fs::create_dir_all(&data).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), data.clone()).unwrap());
+    fault.arm(&data, "p-");
+    let audit = pb::Audit {
+        token_id: "proposal-operator".into(),
+        reason: "proposal persistence fault".into(),
+        wall_time_ms: 1234,
+    };
+    let before = p.node.applied_lsn();
+    let e =
+        p.rt.block_on(props.propose_job(
+            ProposeRequest {
+                wasm: vec![std::fs::read(guest("counter-step2")).unwrap()],
+                names: Vec::new(),
+                window_ms: None,
+                at: None,
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit.clone(),
+                dry_run: false,
+            },
+            false,
+        ))
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Internal, "{e}");
+    assert!(p.rt.block_on(props.list()).is_empty());
+    let mut events = Vec::new();
+    p.rt.block_on(p.node.reader().read(before + 1, p.node.applied_lsn(), |c| {
+        if let Record::AuditEvent(event) = c.record {
+            events.push(event);
+        }
+        Ok(())
+    }))
+    .unwrap();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0].action, "proposal.create");
+    assert_eq!(events[1].action, "proposal.create.failed");
+    assert_eq!(events[0].target, events[1].target);
+    for event in &events {
+        assert_eq!(event.audit.as_ref(), Some(&audit));
+    }
+    assert!(props.progress(&events[0].target).is_none());
+    assert_eq!(events[1].details["code"], e.code.as_str());
+    let branch = data.join("branches").join(&events[0].target);
+    assert!(branch.join("proposal.json").is_dir());
+    let pending: Proposal =
+        serde_json::from_slice(&std::fs::read(branch.join("proposal.tmp")).unwrap()).unwrap();
+    assert_eq!(pending.id, events[0].target);
+    assert_eq!(pending.status, "running");
+    assert_eq!(pending.reason, audit.reason);
+    let mut details = events[0].details.clone();
+    details.insert("code".into(), e.code.as_str().into());
+    assert_eq!(events[1].details, details);
 }

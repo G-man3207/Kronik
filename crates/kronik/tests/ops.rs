@@ -2,7 +2,7 @@
 //! `serve --init --dry-run` prints the plan and changes nothing.
 
 // Test helpers outside #[test] functions may unwrap too.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
 mod common;
 
@@ -311,7 +311,13 @@ fn tls_from_files_serves_https_and_a_bad_file_stops_the_start() {
 
 /// `kronik --json doctor --config <file>`: the report and the exit code.
 fn doctor(config: &Path) -> (serde_json::Value, bool) {
-    let out = kronik(&["--json", "doctor", "--config", config.to_str().unwrap()]);
+    let out = command()
+        .env_remove("KRONIK_TOKEN")
+        .env_remove("KRONIK_AUDIT_SINK")
+        .env_remove("KRONIK_OTEL_ENDPOINT")
+        .args(["--json", "doctor", "--config", config.to_str().unwrap()])
+        .output()
+        .unwrap();
     let report = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"));
     (report, out.status.success())
 }
@@ -428,6 +434,96 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
     assert!(!ok);
     assert_eq!(status(&report, "config")["status"], "fail");
     assert_eq!(report["checks"].as_array().unwrap().len(), 17);
+}
+
+#[test]
+fn doctor_queries_live_exports_and_warns_on_real_api_failures() {
+    use std::os::unix::net::UnixListener;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("api.sock");
+    let config = dir.path().join("kronik.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\ndata_dir = {:?}\napi_socket = {:?}\n[tls]\nmode = \"off\"\n",
+            dir.path().join("data"),
+            socket,
+        ),
+    )
+    .unwrap();
+    let (report, ok) = doctor(&config);
+    assert_eq!(status(&report, "export")["status"], "pass", "{report}");
+    assert_eq!(ok, report["fail"] == 0, "{report}");
+
+    let stalled = serde_json::json!({"streams": [{
+        "name": "audit", "enabled": true, "sink": "https://example.test",
+        "cursor": 0, "applied_lsn": 1, "lag": 1,
+        "last_success_wall_ms": null, "stalled_ms": 86_400_000,
+        "last_error": "timeout", "gaps": 0
+    }]})
+    .to_string();
+    const NEEDLE: &str = "doctor-response-secret-c51b7093";
+    let invalid = serde_json::json!({"streams": NEEDLE}).to_string();
+    let responses = [
+        Some(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{stalled}",
+            stalled.len()
+        )),
+        Some("this is not HTTP\r\n\r\n".into()),
+        Some("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n{".into()),
+        Some(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{invalid}",
+            invalid.len()
+        )),
+        Some("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".into()),
+        None,
+    ];
+    for response in responses {
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "doctor never queried the daemon"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let n = stream.read(&mut request).unwrap();
+            assert!(request[..n].starts_with(b"GET /v1/export HTTP/1.1\r\n"));
+            if let Some(response) = response {
+                stream.write_all(response.as_bytes()).unwrap();
+            } else {
+                std::thread::sleep(Duration::from_secs(6));
+            }
+        });
+        let (report, ok) = doctor(&config);
+        server.join().unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        assert_eq!(status(&report, "export")["status"], "warn", "{report}");
+        assert_eq!(
+            ok,
+            report["fail"] == 0,
+            "warnings must not fail doctor: {report}"
+        );
+        assert!(!report.to_string().contains(NEEDLE));
+    }
+    // A stale socket exists, but connection refusal is not daemon absence.
+    drop(UnixListener::bind(&socket).unwrap());
+    let (report, ok) = doctor(&config);
+    assert_eq!(status(&report, "export")["status"], "warn", "{report}");
+    assert_eq!(ok, report["fail"] == 0, "{report}");
 }
 
 /// `GET path` on plain HTTP: the status line's code and the body.
@@ -553,9 +649,14 @@ fn healthz_answers_while_the_node_runs() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("api.sock");
     let admin = format!("127.0.0.1:{}", free_port());
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let manifest = data.join(kronik_otel::cursor::Cursors::FILE);
+    let unknown = b"{unknown truncated export state";
+    std::fs::write(&manifest, unknown).unwrap();
     let _serve = Serve::start(&[
         "--data-dir",
-        dir.path().join("data").to_str().unwrap(),
+        data.to_str().unwrap(),
         "--api-socket",
         socket.to_str().unwrap(),
         "--http-listen",
@@ -575,6 +676,7 @@ fn healthz_answers_while_the_node_runs() {
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(body["status"], "ok");
     assert_eq!(http_get(&admin, "/other").0, 404);
+    assert_eq!(std::fs::read(manifest).unwrap(), unknown);
 }
 
 #[test]

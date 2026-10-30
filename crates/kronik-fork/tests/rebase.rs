@@ -8,11 +8,13 @@ mod common;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::TcpListener;
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::*;
+use kronik_core::env::{BoxFuture, Clock, Env, File, Fs, OpenMode, Spawner};
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
 use kronik_fork::diff::{DiffOptions, Mode};
@@ -906,6 +908,259 @@ fn consequences_in_flight_at_the_pause_run_on_main_after_the_switch() {
     // Every forward reached counter/f once (3 + 1 increments of a before).
     assert_eq!(kv(p, "f", "n"), Some(sent.to_string()));
     assert_eq!(kv(p, "a", "n"), Some((4 + sent).to_string()));
+}
+
+/// Holds the last round's real log read while the test advances the
+/// environment's clock; every sleep in that phase uses virtual deadlines.
+struct PauseBudget {
+    now: Mutex<Option<Duration>>,
+    observed: Mutex<Option<Duration>>,
+    sleepers: Mutex<Vec<Duration>>,
+    timer_started: AtomicBool,
+    read_started: AtomicBool,
+    actor_polled: AtomicBool,
+    changed: tokio::sync::Notify,
+    release_read: tokio::sync::Semaphore,
+}
+
+impl PauseBudget {
+    fn advance(&self, by: Duration) {
+        *self.now.lock().unwrap().as_mut().unwrap() += by;
+        self.changed.notify_waiters();
+    }
+
+    fn advance_before_pause(&self) {
+        let mut now = self.now.lock().unwrap();
+        if self.timer_started.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut sleepers = self.sleepers.lock().unwrap();
+        if let Some(next) = sleepers.iter().min().copied() {
+            *now = Some(now.unwrap().max(next));
+            sleepers.retain(|d| *d > now.unwrap());
+            self.changed.notify_waiters();
+        }
+    }
+}
+
+struct PauseEnv {
+    inner: Env,
+    pause: Arc<PauseBudget>,
+    max_pause: Duration,
+}
+
+impl Clock for PauseEnv {
+    fn wall_ms(&self) -> u64 {
+        self.inner.clock.wall_ms()
+    }
+
+    fn monotonic(&self) -> Duration {
+        self.pause
+            .now
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| self.inner.clock.monotonic())
+    }
+
+    fn sleep(&self, d: Duration) -> BoxFuture<'static, ()> {
+        let now = self.pause.now.lock().unwrap();
+        let Some(now) = *now else {
+            return self.inner.clock.sleep(d);
+        };
+        let deadline = now + d;
+        let alarm = d == self.max_pause;
+        if alarm {
+            self.pause.timer_started.store(true, Ordering::SeqCst);
+        }
+        self.pause.sleepers.lock().unwrap().push(deadline);
+        let pause = self.pause.clone();
+        Box::pin(async move {
+            loop {
+                let changed = pause.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let now = pause.now.lock().unwrap().unwrap();
+                if alarm {
+                    *pause.observed.lock().unwrap() = Some(now);
+                }
+                if now >= deadline {
+                    return;
+                }
+                changed.await;
+            }
+        })
+    }
+}
+
+impl Spawner for PauseEnv {
+    fn spawn(&self, name: &'static str, mut fut: BoxFuture<'static, ()>) {
+        if name != "actor" {
+            return self.inner.spawner.spawn(name, fut);
+        }
+        let pause = self.pause.clone();
+        self.inner.spawner.spawn(
+            name,
+            Box::pin(std::future::poll_fn(move |cx| {
+                let result = fut.as_mut().poll(cx);
+                if pause.timer_started.load(Ordering::SeqCst) {
+                    pause.actor_polled.store(true, Ordering::SeqCst);
+                }
+                result
+            })),
+        );
+    }
+
+    fn spawn_blocking(&self, name: &'static str, f: Box<dyn FnOnce() + Send + 'static>) {
+        self.inner.spawner.spawn_blocking(name, f);
+    }
+}
+
+impl Fs for PauseEnv {
+    fn create_dir_all(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
+        self.inner.fs.create_dir_all(p)
+    }
+
+    fn open(
+        &self,
+        p: PathBuf,
+        mode: OpenMode,
+    ) -> BoxFuture<'static, std::io::Result<Arc<dyn File>>> {
+        if matches!(mode, OpenMode::Read)
+            && self.pause.timer_started.load(Ordering::SeqCst)
+            && !self.pause.read_started.swap(true, Ordering::SeqCst)
+        {
+            let inner = self.inner.fs.clone();
+            let pause = self.pause.clone();
+            return Box::pin(async move {
+                pause.release_read.acquire().await.unwrap().forget();
+                inner.open(p, mode).await
+            });
+        }
+        self.inner.fs.open(p, mode)
+    }
+
+    fn exists(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<bool>> {
+        self.inner.fs.exists(p)
+    }
+
+    fn read_dir(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<Vec<String>>> {
+        self.inner.fs.read_dir(p)
+    }
+
+    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
+        self.inner.fs.rename(from, to)
+    }
+
+    fn remove_file(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
+        self.inner.fs.remove_file(p)
+    }
+
+    fn sync_dir(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
+        self.inner.fs.sync_dir(p)
+    }
+
+    fn available(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<u64>> {
+        self.inner.fs.available(p)
+    }
+}
+
+/// H5: a queued request is not admitted before the pause deadline and is
+/// admitted at it, even while the last round's log I/O cannot complete.
+#[test]
+fn a_pause_deadline_releases_admission_before_catch_up_io_finishes() {
+    let dir = tempdir();
+    let max_pause = Duration::from_millis(150);
+    let pause = Arc::new(PauseBudget {
+        now: Mutex::new(None),
+        observed: Mutex::new(None),
+        sleepers: Mutex::new(Vec::new()),
+        timer_started: AtomicBool::new(false),
+        read_started: AtomicBool::new(false),
+        actor_polled: AtomicBool::new(false),
+        changed: tokio::sync::Notify::new(),
+        release_read: tokio::sync::Semaphore::new(0),
+    });
+    let hold = Arc::new(SwitchHold::default());
+    hold.release.add_permits(1);
+    let control = pause.clone();
+    let s = setup_env(
+        dir.path(),
+        max_pause,
+        NodeConfig {
+            concurrency: 8,
+            test_hold_switch: Some(hold.clone()),
+            ..NodeConfig::default()
+        },
+        move |env| {
+            let wrapped = Arc::new(PauseEnv {
+                inner: env.clone(),
+                pause: control,
+                max_pause,
+            });
+            env.clock = wrapped.clone();
+            env.fs = wrapped.clone();
+            env.spawner = wrapped;
+        },
+        |_| {},
+    );
+    let r = rebase(&s);
+    s.p.rt
+        .block_on(s.props.approve(&r.id, audit(), false))
+        .unwrap();
+    let armed = s.p.node.env().clock.monotonic();
+    *pause.now.lock().unwrap() = Some(armed);
+    let props = s.props.clone();
+    let promote =
+        s.p.rt
+            .spawn(async move { props.promote(&r.id, audit(), false).await });
+    // Staging itself advances main's head past the replay, so the final
+    // catch-up reads the log even without concurrent traffic.
+    wait_until("the last round's log read is held", || {
+        pause.advance_before_pause();
+        pause.read_started.load(Ordering::SeqCst)
+    });
+    let started = s.p.node.env().clock.monotonic();
+    let before = hold.arrived.load(Ordering::SeqCst);
+    s.p.http_detached("a", "increment", "");
+    wait_until("the queued request's worker was polled", || {
+        pause.actor_polled.load(Ordering::SeqCst)
+    });
+    assert_eq!(hold.arrived.load(Ordering::SeqCst), before);
+    assert_eq!(kv(&s.p, "a", "n").as_deref(), Some("4"));
+    let last_tick = Duration::from_millis(1);
+    pause.advance(max_pause - last_tick);
+    wait_until("the deadline was polled before its last tick", || {
+        *pause.observed.lock().unwrap() == Some(started + max_pause - last_tick)
+    });
+    assert!(
+        !promote.is_finished(),
+        "the pause ended before its deadline"
+    );
+    assert_eq!(hold.arrived.load(Ordering::SeqCst), before);
+    pause.advance(last_tick);
+    wait_until("the deadline releases promote", || promote.is_finished());
+    let err = s.p.rt.block_on(promote).unwrap().unwrap_err();
+    assert_eq!(err.code, ErrorCode::ProposalStale, "{err}");
+    wait_until("the held request is admitted without catch-up I/O", || {
+        hold.arrived.load(Ordering::SeqCst) == before + 1
+    });
+    assert_eq!(hold.arrived.load(Ordering::SeqCst), before + 1);
+    assert_eq!(s.p.node.env().clock.monotonic() - started, max_pause);
+    wait_until("the admitted request commits without catch-up I/O", || {
+        let next = pause.sleepers.lock().unwrap().iter().min().copied();
+        if let Some(next) = next {
+            let now = s.p.node.env().clock.monotonic();
+            pause.advance(next.saturating_sub(now));
+            pause.sleepers.lock().unwrap().retain(|d| *d > next);
+        }
+        kv(&s.p, "a", "n").as_deref() == Some("5")
+    });
+    assert_eq!(pause.release_read.available_permits(), 0);
+    assert_eq!(s.p.node.last_rebase().unwrap(), None);
+    assert_eq!(s.p.node.epoch(), s.epoch);
+    assert_eq!(kv(&s.p, "a", "schema").as_deref(), Some("1"));
+    // Ingress-to-reply latency also includes actor execution, log/apply,
+    // waiter wake-up and host scheduling; it is not drain occupancy.
 }
 
 /// H5: the whole pause is bounded by `rebase.max_pause`: with a last round

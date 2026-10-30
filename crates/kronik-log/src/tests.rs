@@ -1,8 +1,9 @@
 // Tests drive the log from several tokio tasks to mix records in batches.
 #![allow(clippy::disallowed_methods)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use kronik_core::env::{BoxFuture, Fs};
 use kronik_proto::log::v1 as pb;
 
 use super::*;
@@ -196,6 +197,361 @@ impl Harness {
         v.sort();
         v
     }
+}
+
+struct ReadFs {
+    inner: Arc<dyn Fs>,
+    calls: Arc<Mutex<Vec<(u64, usize)>>>,
+}
+
+impl Fs for ReadFs {
+    fn create_dir_all(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
+        self.inner.create_dir_all(path)
+    }
+
+    fn open(&self, path: PathBuf, mode: OpenMode) -> BoxFuture<'static, io::Result<Arc<dyn File>>> {
+        let opened = self.inner.open(path, mode);
+        let calls = self.calls.clone();
+        Box::pin(async move {
+            Ok(Arc::new(ReadFile {
+                inner: opened.await?,
+                calls,
+            }) as Arc<dyn File>)
+        })
+    }
+
+    fn exists(&self, path: PathBuf) -> BoxFuture<'static, io::Result<bool>> {
+        self.inner.exists(path)
+    }
+
+    fn read_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<Vec<String>>> {
+        self.inner.read_dir(path)
+    }
+
+    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, io::Result<()>> {
+        self.inner.rename(from, to)
+    }
+
+    fn remove_file(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
+        self.inner.remove_file(path)
+    }
+
+    fn sync_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
+        self.inner.sync_dir(path)
+    }
+}
+
+struct ReadFile {
+    inner: Arc<dyn File>,
+    calls: Arc<Mutex<Vec<(u64, usize)>>>,
+}
+
+impl File for ReadFile {
+    fn len(&self) -> BoxFuture<'static, io::Result<u64>> {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'static, io::Result<Vec<u8>>> {
+        self.calls.lock().unwrap().push((offset, len));
+        self.inner.read_at(offset, len)
+    }
+
+    fn write_at(&self, offset: u64, data: Bytes) -> BoxFuture<'static, io::Result<()>> {
+        self.inner.write_at(offset, data)
+    }
+
+    fn set_len(&self, len: u64) -> BoxFuture<'static, io::Result<()>> {
+        self.inner.set_len(len)
+    }
+
+    fn sync_data(&self) -> BoxFuture<'static, io::Result<()>> {
+        self.inner.sync_data()
+    }
+}
+
+#[tokio::test]
+async fn bounded_reads_stop_at_each_batch_and_resume_without_loss() {
+    let mut h = harness();
+    std::fs::create_dir_all(&h.cfg.dir).unwrap();
+    let mut record = samples()[2].clone();
+    if let Record::TurnRecord(turn) = &mut record {
+        turn.effects[0].response = plain(&vec![b'x'; 16 << 10]);
+    }
+    let encoded = record.encode();
+    let mut image = header_bytes("main", 1);
+    let header_len = image.len();
+    let frame_len = ENVELOPE_LEN + record.encoded_len();
+    for lsn in 1..=257 {
+        encode_entry(lsn, &record, &mut image);
+    }
+    std::fs::write(h.cfg.dir.join(segment_name(1)), &image).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    h.env.fs = Arc::new(ReadFs {
+        inner: h.env.fs.clone(),
+        calls: calls.clone(),
+    });
+    let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
+    let mut consumed = Vec::new();
+    while consumed.len() < 257 {
+        calls.lock().unwrap().clear();
+        let from = consumed.len() as u64 + 1;
+        let mut batch = Vec::new();
+        let mut callbacks = 0;
+        reader
+            .read_while(from, 257, |c| {
+                callbacks += 1;
+                if batch.len() == 17 {
+                    return Ok(false);
+                }
+                assert_eq!(c.record.encode(), encoded);
+                assert_eq!(
+                    c.pos.offset as usize,
+                    header_len + (c.lsn as usize - 1) * frame_len
+                );
+                batch.push(c.lsn);
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        assert_eq!(callbacks, (258 - from).min(18) as usize);
+        let last_visited = from + callbacks as u64 - 1;
+        let end = header_len + last_visited as usize * frame_len;
+        let reads = calls.lock().unwrap();
+        assert_eq!(reads.len(), 1 + last_visited as usize * 2);
+        assert!(reads.iter().all(|&(_, len)| len <= frame_len));
+        assert_eq!(
+            reads.iter().map(|&(off, len)| off as usize + len).max(),
+            Some(end)
+        );
+        assert_eq!(reads.iter().map(|&(_, len)| len).sum::<usize>(), end);
+        consumed.extend(batch);
+    }
+    assert_eq!(consumed, (1..=257).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn bounded_reads_decode_only_the_requested_and_visited_records() {
+    let h = harness();
+    std::fs::create_dir_all(&h.cfg.dir).unwrap();
+    let mut image = header_bytes("main", 1);
+    // A skipped, CRC-valid protobuf is not decoded, as with read().
+    encode_raw_entry(1, kronik_proto::kind::TURN_RECORD, &[0xff], &mut image);
+    encode_entry(2, &samples()[2], &mut image);
+    encode_raw_entry(3, kronik_proto::kind::TURN_RECORD, &[0xff], &mut image);
+    std::fs::write(h.cfg.dir.join(segment_name(1)), &image).unwrap();
+    let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
+    let mut seen = Vec::new();
+    reader
+        .read_while(2, 3, |c| {
+            seen.push(c.lsn);
+            Ok(false)
+        })
+        .await
+        .unwrap();
+    assert_eq!(seen, vec![2]);
+    assert!(matches!(
+        reader.read_while(3, 3, |_| Ok(true)).await,
+        Err(LogError::Corrupt(_))
+    ));
+    assert!(matches!(
+        reader.read_while(1, 3, |_| Ok(true)).await,
+        Err(LogError::Corrupt(_))
+    ));
+    assert!(matches!(
+        reader.read_while(2, 3, |_| Err(corrupt("callback"))).await,
+        Err(LogError::Corrupt(message)) if message == "callback"
+    ));
+    let mut unknown = header_bytes("main", 1);
+    encode_raw_entry(1, 0, &[], &mut unknown);
+    encode_entry(2, &samples()[2], &mut unknown);
+    std::fs::write(h.cfg.dir.join(segment_name(1)), &unknown).unwrap();
+    assert!(matches!(
+        reader.read_while(2, 2, |_| Ok(true)).await,
+        Err(LogError::Corrupt(_))
+    ));
+}
+
+#[tokio::test]
+async fn bounded_reads_require_finite_endpoints_but_empty_ranges_do_no_io() {
+    let h = harness();
+    let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
+    // The directory does not exist: even listing it would fail.
+    reader
+        .read_while(2, 1, |_| panic!("empty range"))
+        .await
+        .unwrap();
+    reader
+        .read_while(0, 0, |_| panic!("zero endpoint"))
+        .await
+        .unwrap();
+    std::fs::create_dir_all(&h.cfg.dir).unwrap();
+    assert!(matches!(
+        reader.read_while(1, 1, |_| Ok(true)).await,
+        Err(LogError::Corrupt(_))
+    ));
+    reader
+        .read_while(1, Lsn::MAX, |_| panic!("empty log"))
+        .await
+        .unwrap();
+    let mut image = header_bytes("main", 10);
+    encode_entry(10, &samples()[2], &mut image);
+    std::fs::write(h.cfg.dir.join(segment_name(10)), &image).unwrap();
+    assert!(matches!(
+        reader.read_while(1, 5, |_| Ok(true)).await,
+        Err(LogError::Corrupt(_))
+    ));
+}
+
+#[tokio::test]
+async fn bounded_reads_crc_check_large_skipped_payloads_in_small_chunks() {
+    let mut h = harness();
+    std::fs::create_dir_all(&h.cfg.dir).unwrap();
+    let mut image = header_bytes("main", 1);
+    let header_len = image.len();
+    encode_raw_entry(
+        1,
+        kronik_proto::kind::TURN_RECORD,
+        &vec![0xff; 256 << 10],
+        &mut image,
+    );
+    encode_entry(2, &samples()[2], &mut image);
+    let path = h.cfg.dir.join(segment_name(1));
+    std::fs::write(&path, &image).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    h.env.fs = Arc::new(ReadFs {
+        inner: h.env.fs.clone(),
+        calls: calls.clone(),
+    });
+    let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
+    let mut seen = Vec::new();
+    reader
+        .read_while(2, 2, |c| {
+            seen.push(c.lsn);
+            Ok(true)
+        })
+        .await
+        .unwrap();
+    assert_eq!(seen, vec![2]);
+    {
+        let reads = calls.lock().unwrap();
+        assert!(reads.iter().all(|&(_, len)| len <= 64 << 10));
+        assert_eq!(reads.iter().filter(|&&(_, len)| len == 64 << 10).count(), 4);
+        assert_eq!(
+            reads.iter().map(|&(_, len)| len).sum::<usize>(),
+            image.len()
+        );
+    }
+    image[header_len + ENVELOPE_LEN + (128 << 10)] ^= 1;
+    std::fs::write(&path, &image).unwrap();
+    assert!(matches!(
+        reader
+            .read_while(2, 2, |_| panic!("corrupt skipped prefix"))
+            .await,
+        Err(LogError::Corrupt(_))
+    ));
+}
+
+#[tokio::test]
+async fn bounded_reads_preserve_segment_boundaries_and_reject_damaged_frames() {
+    let h = harness();
+    std::fs::create_dir_all(&h.cfg.dir).unwrap();
+    let record = &samples()[2];
+    let mut first = header_bytes("main", 10);
+    for lsn in 10..=12 {
+        encode_entry(lsn, record, &mut first);
+    }
+    encode_raw_entry(
+        0,
+        FOOTER_KIND,
+        &footer_payload(&FooterIndex::new()).unwrap(),
+        &mut first,
+    );
+    let mut second = header_bytes("main", 13);
+    for lsn in 13..=15 {
+        encode_entry(lsn, record, &mut second);
+    }
+    let first_path = h.cfg.dir.join(segment_name(10));
+    let second_path = h.cfg.dir.join(segment_name(13));
+    std::fs::write(&first_path, &first).unwrap();
+    std::fs::write(&second_path, &second).unwrap();
+    let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
+    let mut seen = Vec::new();
+    reader
+        .read_while(11, 14, |c| {
+            seen.push((c.lsn, c.pos.segment));
+            Ok(true)
+        })
+        .await
+        .unwrap();
+    assert_eq!(seen, vec![(11, 10), (12, 10), (13, 13), (14, 13)]);
+
+    for damaged in [
+        first[..first.len() - 1].to_vec(),
+        {
+            let mut bad = first.clone();
+            let crc = parse_header(&bad).unwrap().len + 4;
+            bad[crc] ^= 1;
+            bad
+        },
+        {
+            let mut bad = header_bytes("main", 10);
+            encode_entry(10, record, &mut bad);
+            encode_entry(12, record, &mut bad);
+            bad
+        },
+        {
+            let mut bad = header_bytes("main", 10);
+            encode_entry(10, record, &mut bad);
+            encode_entry(11, record, &mut bad);
+            bad
+        },
+        {
+            let mut bad = header_bytes("main", 10);
+            bad.extend_from_slice(&(MAX_RECORD + 1).to_le_bytes());
+            bad.extend_from_slice(&[0; ENVELOPE_LEN - 4]);
+            bad
+        },
+    ] {
+        std::fs::write(&first_path, &damaged).unwrap();
+        assert!(matches!(
+            reader.read(10, 15, |_| Ok(())).await,
+            Err(LogError::Corrupt(_))
+        ));
+        assert!(matches!(
+            reader.read_while(10, 15, |_| Ok(true)).await,
+            Err(LogError::Corrupt(_))
+        ));
+    }
+    std::fs::write(&first_path, &first).unwrap();
+    for damaged in [
+        second[..second.len() - 1].to_vec(),
+        second[..parse_header(&second).unwrap().len].to_vec(),
+        {
+            let mut bad = second.clone();
+            let crc = parse_header(&bad).unwrap().len + 4;
+            bad[crc] ^= 1;
+            bad
+        },
+    ] {
+        std::fs::write(&second_path, &damaged).unwrap();
+        assert!(matches!(
+            reader.read_while(13, 15, |_| Ok(true)).await,
+            Err(LogError::Corrupt(_))
+        ));
+        reader.read_while(13, Lsn::MAX, |_| Ok(true)).await.unwrap();
+    }
+    std::fs::write(&second_path, header_bytes("other", 13)).unwrap();
+    assert!(matches!(
+        reader.read_while(13, 15, |_| Ok(true)).await,
+        Err(LogError::Corrupt(_))
+    ));
+    let mut mismatch = header_bytes("main", 14);
+    encode_entry(14, record, &mut mismatch);
+    std::fs::write(&second_path, &mismatch).unwrap();
+    assert!(matches!(
+        reader.read_while(13, 15, |_| Ok(true)).await,
+        Err(LogError::Corrupt(_))
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]

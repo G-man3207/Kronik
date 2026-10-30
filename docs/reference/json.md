@@ -275,7 +275,7 @@ against both.
 
 ```json
 {
-  "description": "`GET /v1/audit`: `kronik.audit/v1` lines in LSN order (m28-otel §4.3).",
+  "description": "`GET /v1/audit`: `kronik.audit/v2` lines in LSN order (m28-otel §4.3).",
   "properties": {
     "applied_lsn": {
       "format": "uint64",
@@ -2679,6 +2679,7 @@ against both.
             "RUNSC_MISSING",
             "SCOPE_MISSING",
             "SECRET_NOT_FOUND",
+            "SECRET_UNAVAILABLE",
             "STORAGE_CORRUPT",
             "SUBJECT_ERASED",
             "TOKEN_NOT_FOUND",
@@ -3685,14 +3686,14 @@ against both.
       "type": "integer"
     },
     "record_hash": {
+      "description": "The current source hash; absent when no authoritative source item exists.",
       "type": "string"
     }
   },
   "required": [
     "lsn",
     "kind",
-    "action",
-    "record_hash"
+    "action"
   ],
   "type": "object"
 }

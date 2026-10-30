@@ -114,6 +114,11 @@ with the old code; that is not enough here.
   cost is the affected actors' state.
 - The last round reads main's records since the previous round only; its
   replay of those root inputs must fit in `rebase.max_pause`.
+- `a_pause_deadline_releases_admission_before_catch_up_io_finishes`
+  supplements the consumer-facing latency check
+  `the_pause_holds_requests_at_most_max_pause`: with an environment clock
+  and a blocked real log read, it checks queued admission just before and
+  at the deadline, before catch-up I/O is released.
 - Verified by `the_pause_holds_requests_at_most_max_pause`,
   `consequences_in_flight_at_the_pause_run_on_main_after_the_switch`,
   `a_resume_that_cannot_prove_its_staged_turns_is_refused` and

@@ -17,6 +17,32 @@ use kronik_otel::spans::{
 use kronik_proto::log::v1 as pb;
 use prost::Message as _;
 
+fn persisted(mut open: OpenTurns) -> OpenTurns {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+        let (mut state, _) = kronik_otel::trace_state::load(
+            env.clone(),
+            dir.path(),
+            &serde_json::Value::Null,
+            0,
+            IDS,
+        )
+        .await
+        .unwrap();
+        let reference = state.checkpoint(&mut open, 1).await.unwrap();
+        state.committed(&mut open);
+        kronik_otel::trace_state::load(env, dir.path(), &reference, 1, IDS)
+            .await
+            .unwrap()
+            .1
+    })
+}
+
 const ROOT: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 const T0: u64 = 1_761_500_000_123;
 
@@ -116,6 +142,7 @@ fn turn(r: &pb::TurnRecord) -> Turn<'_> {
         record: r,
         lsn: 7,
         branch: "main",
+        secrets: &[],
         open: &NONE_OPEN,
         resend_of: None,
     }
@@ -582,7 +609,7 @@ fn a_callees_messages_timers_and_compensation_link_into_its_callers_trace() {
     let callee_span = map_commit(&mut open, &callee);
     assert_eq!(callee_span.trace_id, trace_id(ROOT));
     map_commit(&mut open, &caller);
-    let mut open = OpenTurns::from_json(&open.to_json(), IDS);
+    let mut open = persisted(open);
     assert_eq!((open.len(), open.kept()), (0, 1));
     let b_span = SpanRef {
         trace_id: trace_id(ROOT),
@@ -794,17 +821,13 @@ fn open_turns_round_trip_through_the_cursor_state() {
     let a = actor("counter/a");
     let t = timer(causal::child(&root_key(), &a, 0));
     let open = open(&[&t]);
-    let back = OpenTurns::from_json(&open.to_json(), IDS);
+    let back = persisted(open);
     assert_eq!(back.len(), 1);
     let key = causal::child(t.causal_key.as_ref().unwrap(), &a, 2);
     let call = Some(msg_input(pb::MessageSource::Call, "get"));
     assert_eq!(
         back.trace(&key, call.as_ref()),
         new_trace_id(&IDS, t.causal_key.as_ref().unwrap())
-    );
-    assert_eq!(
-        OpenTurns::from_json(&serde_json::json!("junk"), IDS).len(),
-        0
     );
 }
 
@@ -1109,7 +1132,7 @@ fn no_needle_leaves_in_an_export_request() {
     };
     let needle_msg = || {
         Some(pb::Message {
-            name: "increment".into(),
+            name: format!("increment-{N}-kronik_{}", "A".repeat(43)),
             content_type: "text/plain".into(),
             body: sealed(&format!("body-{N}")),
             blobs: vec![],
@@ -1206,14 +1229,65 @@ fn no_needle_leaves_in_an_export_request() {
         output: Some(pb::outcome::Output::Reply(needle_msg().unwrap())),
         ..Default::default()
     });
-    let mut all = spans(&turn(&http_root), &ActorKeys::Hashed(&hasher));
+    let secrets = vec![("api-key".into(), N.as_bytes().to_vec())];
+    let map = |r: &pb::TurnRecord| {
+        spans(
+            &Turn {
+                secrets: &secrets,
+                ..turn(r)
+            },
+            &ActorKeys::Hashed(&hasher),
+        )
+    };
+    let mut all = map(&http_root);
     assert_eq!(link(&all[0]).unwrap().1, "traceparent");
-    all.extend(spans(&turn(&msg_turn), &ActorKeys::Hashed(&hasher)));
+    let message_spans = map(&msg_turn);
+    assert_eq!(
+        str_attr(&message_spans[0], "kronik.message.name"),
+        Some("increment-[secret:api-key]-[token]")
+    );
+    all.extend(message_spans);
+    for source in [
+        pb::MessageSource::Operator,
+        pb::MessageSource::DeadLetterResend,
+    ] {
+        let Some(pb::input::Kind::Message(message)) = msg_turn
+            .input
+            .as_mut()
+            .and_then(|input| input.kind.as_mut())
+        else {
+            unreachable!()
+        };
+        message.source = source as i32;
+        let unmasked = spans(&turn(&msg_turn), &ActorKeys::Hashed(&hasher));
+        let masked = map(&msg_turn);
+        assert_eq!(masked[0].trace_id, unmasked[0].trace_id);
+        assert_eq!(masked[0].span_id, unmasked[0].span_id);
+        assert_eq!(
+            masked[0].name,
+            "counter message increment-[secret:api-key]-[token]"
+        );
+        all.extend(masked);
+    }
+    msg_turn.input = Some(pb::Input {
+        kind: Some(pb::input::Kind::Timer(pb::TimerInput {
+            msg: needle_msg(),
+            ..Default::default()
+        })),
+    });
+    let timer = map(&msg_turn);
+    assert_eq!(
+        timer[0].name,
+        "counter timer increment-[secret:api-key]-[token]"
+    );
+    all.extend(timer);
     let bytes = request(&resource(), all).encode_to_vec();
     assert!(
         !bytes.windows(N.len()).any(|w| w == N.as_bytes()),
         "a needle left the node"
     );
+    let token = format!("kronik_{}", "A".repeat(43));
+    assert!(!bytes.windows(token.len()).any(|w| w == token.as_bytes()));
 }
 
 // ---- the acceptance: three actors, one trace ----

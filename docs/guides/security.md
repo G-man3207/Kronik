@@ -216,6 +216,22 @@ that a turn generated from `random-bytes`.
   else `unix:uid=<n>`, the uid of the connecting process from the socket's
   peer credentials. Token names are never reused, so the id stays
   unambiguous in the log.
+  Secret/token changes record intent before changing their stores and
+  record a `.failed` event if the change fails; intent is not proof of
+  success. Audit export emits `kronik.audit/v2` only. Free text, names and
+  spans are scrubbed for secret values and token spellings; canonical
+  hashing withholds free text. Subject masking handles case, percent
+  encoding and identifier boundaries.
+  If the inventory cannot be loaded, privacy-sensitive API projections
+  return 503 `SECRET_UNAVAILABLE`, mutating audit text is withheld, and
+  both exporters stall preparation without cursor advance. Unrelated
+  node work remains usable. Complete retained external/deleted-version
+  coverage across restart remains M23 work; current local inventory is
+  not evidence that this is closed.
+  Export rewind also records intent before its effect; intent is not a
+  success claim. An owned task preserves the durable replay request after
+  caller cancellation. Configuration observations remain source-audited
+  even if the export cursor cache is unavailable.
 - **The gateway** serves plain HTTP, on `127.0.0.1:8080` unless
   `--http-listen` says otherwise, or HTTPS when `[tls]` in `kronik.toml`
   sets `mode = "files"` (a certificate and key, reloaded every 12 hours) or

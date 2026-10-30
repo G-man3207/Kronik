@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use kronik_core::env::Env;
+use kronik_core::env::{EntropySource, Env};
 use kronik_core::ids::{ActorRef, Lsn};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Ingress, Node, NodeConfig, TurnResult, start_local};
@@ -31,6 +31,45 @@ pub fn guest(name: &str) -> String {
         "{}/../../tests/guests/{name}.wasm",
         env!("CARGO_MANIFEST_DIR")
     )
+}
+
+/// Fails the next generated proposal/preview's atomic metadata rename,
+/// without obstructing main's history or replacing real entropy.
+pub struct ProposalSaveFault {
+    source: Arc<dyn EntropySource>,
+    target: std::sync::Mutex<Option<(std::path::PathBuf, &'static str)>>,
+}
+
+impl ProposalSaveFault {
+    pub fn install(env: &mut Env) -> Arc<Self> {
+        let fault = Arc::new(Self {
+            source: env.entropy.clone(),
+            target: std::sync::Mutex::new(None),
+        });
+        env.entropy = fault.clone();
+        fault
+    }
+
+    pub fn arm(&self, data: &Path, prefix: &'static str) {
+        *self.target.lock().unwrap() = Some((data.to_path_buf(), prefix));
+    }
+}
+
+impl EntropySource for ProposalSaveFault {
+    fn fill(&self, buf: &mut [u8]) {
+        self.source.fill(buf);
+        // random_id uses 16 bytes; proposal/preview IDs keep their first 12 hex digits.
+        if buf.len() == 16
+            && let Some((data, prefix)) = self.target.lock().unwrap().take()
+        {
+            let id = format!("{prefix}{}", &kronik_core::ids::hex(buf)[..12]);
+            std::fs::create_dir_all(data.join("branches").join(id).join("proposal.json")).unwrap();
+        }
+    }
+
+    fn sign_rs256(&self, pkcs8: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
+        self.source.sign_rs256(pkcs8, message)
+    }
 }
 
 pub struct Proc {

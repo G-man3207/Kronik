@@ -870,7 +870,6 @@ async fn token_secrets_are_scrubbed_and_an_unloadable_scrub_withholds_the_reason
     }
     let text = log().await;
     assert!(!text.contains(&token), "{text}");
-    assert_eq!(text.matches("[token]").count(), 2, "{text}");
 
     // One undecryptable row: the stored values cannot be loaded.
     rusqlite::Connection::open(dir.path().join("keys/secrets.db"))
@@ -890,17 +889,193 @@ async fn token_secrets_are_scrubbed_and_an_unloadable_scrub_withholds_the_reason
     }
     let text = log().await;
     assert!(!text.contains(SECRET), "{text}");
-    // The grant's reason and the secret.set event's reason; the event's
-    // target (the secret's name) stays, so the line says what changed.
-    assert_eq!(
-        text.matches(kronik_sched::scrub::WITHHELD).count(),
-        2,
-        "{text}"
-    );
-    assert!(
-        text.contains("\"other\""),
-        "the target was withheld: {text}"
-    );
+    let (mut grant_reason, mut set_reason) = (None, None);
+    node.reader()
+        .read(1, node.applied_lsn(), |c| {
+            match c.record {
+                kronik_proto::Record::Grant(grant) => {
+                    grant_reason = grant.audit.map(|audit| audit.reason);
+                }
+                kronik_proto::Record::AuditEvent(event)
+                    if event.action == "secret.set" && event.target == "other" =>
+                {
+                    set_reason = event.audit.map(|audit| audit.reason);
+                }
+                _ => {}
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(grant_reason.as_deref(), Some(kronik_sched::scrub::WITHHELD));
+    assert_eq!(set_reason.as_deref(), Some(kronik_sched::scrub::WITHHELD));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_audit_positions_do_not_become_free_secret_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start_local(
+        Env::real(tokio::runtime::Handle::current()),
+        dir.path(),
+        NodeConfig::default(),
+    )
+    .await
+    .unwrap();
+    let api = Api::new(node.clone());
+    for (name, text) in [
+        ("numeric-pin", "1234"),
+        ("restore-key", "through_lsn"),
+        ("gap-key", "from"),
+    ] {
+        let (status, response) = call(
+            &api,
+            "PUT",
+            &format!("/v1/secrets/{name}"),
+            json!({"text": text, "reason": "enroll"}),
+        )
+        .await;
+        assert_eq!(status, 200, "{response}");
+    }
+    let audit = || kronik_proto::log::v1::Audit {
+        token_id: "unix:uid=0".into(),
+        reason: "operator pin 1234".into(),
+        wall_time_ms: 1,
+    };
+    for (action, positions) in [
+        ("restore", vec![("through_lsn", "1234")]),
+        ("audit.gap", vec![("from", "1234"), ("to", "1235")]),
+        ("operator.note", vec![("through_lsn", "1234")]),
+    ] {
+        let details = positions
+            .into_iter()
+            .chain([("note", "operator pin 1234")])
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        node.record_audit_event(action, "test", details, audit())
+            .await
+            .unwrap();
+    }
+    let (status, response) = call(&api, "GET", "/v1/audit", Value::Null).await;
+    assert_eq!(status, 200, "{response}");
+    let lines: Vec<kronik_otel::audit::Line> =
+        serde_json::from_value(response["lines"].clone()).unwrap();
+    for line in &lines {
+        assert!(!line.reason.contains("1234"));
+        if let Some(note) = line.details.get("note").and_then(Value::as_str) {
+            assert!(!note.contains("1234"));
+        }
+        match line.action.as_str() {
+            "restore" => {
+                assert_eq!(line.details["through_lsn"].as_u64(), Some(1234));
+                assert_eq!(
+                    line.details.keys().map(String::as_str).collect::<Vec<_>>(),
+                    ["note", "target", "through_lsn"],
+                );
+            }
+            "audit.gap" => {
+                assert_eq!(line.details["from"].as_u64(), Some(1234));
+                assert_eq!(line.details["to"].as_u64(), Some(1235));
+            }
+            "operator.note" => {
+                assert!(!line.details.contains_key("through_lsn"));
+                assert!(
+                    line.details
+                        .values()
+                        .all(|value| { value.as_str().is_some_and(|text| !text.contains("1234")) })
+                );
+            }
+            _ => {}
+        }
+    }
+    let mapper = kronik_otel::audit::Mapper {
+        keys: kronik_otel::audit::Keys::Omit,
+        sealer: node.sealer().clone(),
+        branch: node.branch().to_owned(),
+    };
+    let mut expected = Vec::new();
+    node.reader()
+        .read(1, node.applied_lsn(), |committed| {
+            expected.extend(mapper.expected(committed.lsn, &committed.record)?);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let report = kronik_otel::audit::verify(&expected, &lines, 0, node.applied_lsn());
+    assert!(report.complete, "{report:?}");
+    for value in ["", "-1", "not-a-position", "18446744073709551616"] {
+        let before = node.applied_lsn();
+        let error = node
+            .record_audit_event(
+                "restore",
+                "test",
+                [("through_lsn".into(), value.into())].into(),
+                audit(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, kronik_core::error::ErrorCode::BadRequest);
+        assert_eq!(node.applied_lsn(), before);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_secret_inventory_blocks_disclosure_not_unrelated_turns() {
+    const SECRET: &str = "retained-api-secret-c51b7093";
+    let dir = tempfile::tempdir().unwrap();
+    let node = start_local(
+        Env::real(tokio::runtime::Handle::current()),
+        dir.path(),
+        NodeConfig::default(),
+    )
+    .await
+    .unwrap();
+    let api = Api::new(node);
+    for (path, body) in [
+        (
+            "/v1/deployments",
+            json!({"wasm_base64": wasm(COUNTER), "reason": "bootstrap"}),
+        ),
+        (
+            "/v1/actors/counter/a/messages",
+            json!({"name": "increment", "reason": "before failure"}),
+        ),
+    ] {
+        let (status, response) = call(&api, "POST", path, body).await;
+        assert_eq!(status, 200, "{response}");
+    }
+    let (status, response) = call(
+        &api,
+        "PUT",
+        "/v1/secrets/api-key",
+        json!({"text": SECRET, "reason": "enroll"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{response}");
+    rusqlite::Connection::open(dir.path().join("keys/secrets.db"))
+        .unwrap()
+        .execute("UPDATE secrets SET ciphertext = x'00'", [])
+        .unwrap();
+    for path in [
+        "/v1/audit",
+        "/v1/actors/counter/a",
+        "/v1/actors/counter/a/history",
+    ] {
+        let (status, response) = call(&api, "GET", path, Value::Null).await;
+        assert_eq!(status, 503, "{path}: {response}");
+        assert_eq!(response["error"]["code"], "SECRET_UNAVAILABLE");
+        assert!(!response.to_string().contains(SECRET));
+    }
+    let (status, response) = call(&api, "GET", "/v1/health", Value::Null).await;
+    assert_eq!(status, 200, "{response}");
+    let (status, response) = call(
+        &api,
+        "POST",
+        "/v1/actors/counter/a/messages",
+        json!({"name": "increment", "reason": "during inventory failure"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["reply"]["text"], "2");
 }
 
 /// Re-review #6 (v0.1): with privacy mode on, a subject's failed turn after

@@ -432,9 +432,7 @@ impl Api {
             .with_hint("Leave out --async for a dry run."));
         }
         let props = self.proposals()?;
-        // Started without waiting, so `proposal.create` (M28) is written
-        // before the replay can end: a caller that stops waiting cannot
-        // lose it.
+        // The lifecycle owner audits before publishing or spawning the job.
         let (p, dry_run) = props
             .propose_job(
                 Propose {
@@ -456,18 +454,6 @@ impl Api {
                 proposal: proposal_info(&p, props),
             });
         }
-        let kinds: Vec<pb::KindVersion> = p
-            .kinds
-            .iter()
-            .filter_map(|k| STANDARD.decode(k).ok())
-            .filter_map(|b| pb::KindVersion::decode(b.as_slice()).ok())
-            .collect();
-        let details = [
-            ("kinds", kinds_detail(&kinds)),
-            ("fork_lsn", p.fork_lsn.to_string()),
-        ];
-        self.audit_event(req, "proposal.create", &p.id, &details, r.reason)
-            .await?;
         let p = if r.run_async {
             p
         } else {
@@ -953,10 +939,6 @@ impl Api {
             .watches()?
             .stop(id, self.audit(req, r.reason.clone()), r.dry_run)
             .await?;
-        if !r.dry_run {
-            self.audit_event(req, "watch.stop", id, &[], r.reason)
-                .await?;
-        }
         ok(&WatchResponse {
             dry_run: r.dry_run,
             watch: watch_info(&w)?,

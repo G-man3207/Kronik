@@ -4,6 +4,7 @@
 //! delivered them. At least once, in LSN order; off the turn path (an
 //! `env.spawn` task of `kronik serve` that only reads).
 
+use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use kronik_core::ids::Lsn;
 use kronik_log::Committed;
 use kronik_sched::Node;
 
-use crate::cursor::{Cursors, Entry};
+use crate::cursor::{Control, Cursors, Entry, Generation};
 
 /// What a sink did with a batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,17 +38,28 @@ pub trait Sink: Send {
     type Batch: Send + Sync;
 
     /// Builds the delivery for committed records, in LSN order. Never
-    /// called with an empty batch.
-    fn prepare(&mut self, records: Vec<Committed>) -> impl Future<Output = Self::Batch> + Send;
+    /// called with an empty batch. Failure must leave sink state unchanged;
+    /// the follower retries without advancing its cursor.
+    fn prepare(
+        &mut self,
+        records: Vec<Committed>,
+        generation: Generation,
+    ) -> impl Future<Output = Result<Self::Batch, String>> + Send;
 
     /// Sends a prepared batch; called again with the same batch on retry.
     fn deliver(&mut self, batch: &Self::Batch) -> impl Future<Output = Delivery> + Send;
 
-    /// The state saved with the cursor after a delivery, handed back by
-    /// [`Cursors::get`] at the next start.
-    fn state(&self) -> serde_json::Value {
-        serde_json::Value::Null
+    /// Stages durable resume metadata without publishing its cursor. A retry
+    /// must keep the same candidate until publication succeeds.
+    fn checkpoint(
+        &mut self,
+        _lsn: Lsn,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send {
+        async { Ok(serde_json::Value::Null) }
     }
+
+    /// The manifest now durably selects the staged state and generation.
+    fn committed(&mut self, _lsn: Lsn, _generation: Generation, _rewind_pending: bool) {}
 
     /// Retention deleted `from..=to` before the stream read it. Called
     /// before the next batch; the cursor moves past the gap only once this
@@ -65,8 +77,12 @@ pub trait Sink: Send {
     /// The cursor moved back (or on) to `to` (`kronik export rewind`):
     /// called before the next batch, so that a sink's state is rebuilt as
     /// it was after `to`.
-    fn rewind(&mut self, _to: Lsn) -> impl Future<Output = ()> + Send {
-        async {}
+    fn rewind(
+        &mut self,
+        _to: Lsn,
+        _generation: Generation,
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        async { Ok(()) }
     }
 }
 
@@ -94,12 +110,19 @@ pub struct Stream {
     /// The sink's or endpoint's scheme and host only ([`crate::http::scheme_host`]).
     pub sink: String,
     progress: Mutex<Progress>,
-    rewind: Mutex<Option<Lsn>>,
+    cursors: Arc<Cursors>,
+    control: tokio::sync::Mutex<()>,
     rewound: tokio::sync::Notify,
 }
 
 impl Stream {
-    pub fn new(name: &'static str, enabled: bool, sink: String, cursor: Lsn) -> Arc<Stream> {
+    pub fn new(
+        name: &'static str,
+        enabled: bool,
+        sink: String,
+        cursor: Lsn,
+        cursors: Arc<Cursors>,
+    ) -> Arc<Stream> {
         Arc::new(Stream {
             name,
             enabled,
@@ -108,7 +131,8 @@ impl Stream {
                 cursor,
                 ..Progress::default()
             }),
-            rewind: Mutex::new(None),
+            cursors,
+            control: tokio::sync::Mutex::new(()),
             rewound: tokio::sync::Notify::new(),
         })
     }
@@ -117,11 +141,62 @@ impl Stream {
         lock(&self.progress).clone()
     }
 
-    /// Asks the follower to resend from after `to` (`kronik export rewind`).
-    /// It moves the cursor and saves it before its next batch.
-    pub fn rewind(&self, to: Lsn) {
-        *lock(&self.rewind) = Some(to);
-        self.rewound.notify_one();
+    /// Durably requests a new replay generation before waking the follower.
+    /// The owned task completes even if the operator stops waiting.
+    pub async fn rewind(self: &Arc<Self>, node: &Arc<Node>, to: Lsn) -> io::Result<()> {
+        let (stream, node) = (self.clone(), node.clone());
+        let env = node.env().clone();
+        env.spawn("export-rewind", async move {
+            let _control = stream.control.lock().await;
+            let current = stream.cursors.get(stream.name).unwrap_or_default();
+            let generation = loop {
+                let generation = node.env().random_bytes();
+                if generation != [0; 16]
+                    && generation != current.generation()
+                    && current
+                        .pending_rewind()
+                        .is_none_or(|r| r.generation != generation)
+                {
+                    break generation;
+                }
+            };
+            let audit = stream.name == crate::sink::STREAM;
+            if audit {
+                node.retention_hold()
+                    .rewind(generation, to, node.env().clock.wall_ms());
+            }
+            match stream
+                .cursors
+                .request_rewind(stream.name, generation, to)
+                .await
+            {
+                Ok(pending) => {
+                    if audit {
+                        node.retention_hold().rewind(
+                            pending.generation,
+                            pending.to,
+                            node.env().clock.wall_ms(),
+                        );
+                    }
+                    stream.rewound.notify_one();
+                    Ok(())
+                }
+                Err(error) => {
+                    if audit {
+                        let saved = stream.cursors.get(stream.name).unwrap_or_default();
+                        node.retention_hold().restore_control(
+                            generation,
+                            saved.pending_rewind().map(|r| (r.generation, r.to)),
+                            saved.lsn,
+                            node.env().clock.wall_ms(),
+                        );
+                    }
+                    Err(error)
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|| Err(io::Error::other("export rewind task did not complete")))
     }
 
     fn update(&self, f: impl FnOnce(&mut Progress)) {
@@ -162,28 +237,38 @@ const MIN_IDLE_TICK: Duration = Duration::from_millis(100);
 /// keeps its retention hold, which `kronik doctor` shows as a stall, until
 /// the daemon restarts. Supervise it too (rebuilding its sink) if one ever
 /// dies in production.
-pub async fn supervise<S, F>(
-    node: Arc<Node>,
-    cursors: Arc<Cursors>,
-    stream: Arc<Stream>,
-    opts: Options,
-    mut make: F,
-) where
+pub async fn supervise<S, F, Fut>(node: Arc<Node>, stream: Arc<Stream>, opts: Options, mut make: F)
+where
     S: Sink + 'static,
-    F: FnMut(&serde_json::Value) -> S + Send,
+    F: FnMut(Entry) -> Fut + Send,
+    Fut: Future<Output = Result<S, String>> + Send,
 {
     let env = node.env().clone();
+    let cursors = stream.cursors.clone();
     let mut backoff = FIRST_BACKOFF;
     loop {
-        let saved = cursors.get(stream.name);
-        let state = saved.as_ref().map(|e| e.state.clone()).unwrap_or_default();
-        if let Some(saved) = &saved {
-            stream.update(|p| p.cursor = saved.lsn);
-        }
-        let sink = make(&state);
+        let saved = cursors.get(stream.name).unwrap_or_else(|| Entry {
+            lsn: stream.progress().cursor,
+            ..Entry::default()
+        });
+        stream.update(|p| p.cursor = saved.lsn);
+        let sink = match cursors.stabilize().await {
+            Ok(()) => make(saved).await,
+            Err(_) => Err("cursor_save".into()),
+        };
+        let sink = match sink {
+            Ok(sink) => sink,
+            Err(code) => {
+                stream.update(|p| p.last_error = Some(code));
+                kronik_metrics::inc("kronik_export_errors_total", &[("stream", stream.name)]);
+                pause(&env, &stream, backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
+            }
+        };
         let task = env.spawn(
             stream.name,
-            follow(node.clone(), cursors.clone(), stream.clone(), opts, sink),
+            follow(node.clone(), stream.clone(), opts, sink),
         );
         // `follow` never returns: the task ended because it panicked (or the
         // runtime is shutting down, which drops this task too).
@@ -202,22 +287,19 @@ pub async fn supervise<S, F>(
 }
 
 /// Follows main's committed log from the stream's cursor forever.
-pub async fn follow<S: Sink>(
-    node: Arc<Node>,
-    cursors: Arc<Cursors>,
-    stream: Arc<Stream>,
-    opts: Options,
-    mut sink: S,
-) {
+pub async fn follow<S: Sink>(node: Arc<Node>, stream: Arc<Stream>, opts: Options, mut sink: S) {
     let env = node.env().clone();
     let name = stream.name;
     let labels = [("stream", name)];
     let batch = opts.batch.max(1);
-    let mut cursor = stream.progress().cursor;
+    let mut entry = stream.cursors.get(name).unwrap_or_else(|| Entry {
+        lsn: stream.progress().cursor,
+        ..Entry::default()
+    });
+    let mut noticed = entry.lsn;
     let mut gap_backoff = FIRST_BACKOFF;
-    let started = env.clock.wall_ms();
-    stream.update(|p| p.started_wall_ms = Some(started));
-    // Also while a sink is down, so the gauge shows the backlog growing.
+    let mut prepare_backoff = FIRST_BACKOFF;
+    stream.update(|p| p.started_wall_ms = Some(env.clock.wall_ms()));
     let lag = |cursor: Lsn| {
         kronik_metrics::set(
             "kronik_export_lag_records",
@@ -225,140 +307,255 @@ pub async fn follow<S: Sink>(
             node.applied_lsn().saturating_sub(cursor) as f64,
         );
     };
-    loop {
-        let rewind = lock(&stream.rewind).take();
-        if let Some(to) = rewind {
-            cursor = to;
-            sink.rewind(to).await;
-            stream.update(|p| p.cursor = to);
-            save(&cursors, name, cursor, sink.state()).await;
+    'records: loop {
+        if rewind_requested(&stream, entry.generation()) {
+            // A management request cannot supersede the first generation
+            // checkpoint while its manifest publication is being retried.
+            let _control = stream.control.lock().await;
+            let pending = stream.cursors.get(name).and_then(|e| e.pending_rewind());
+            if let Some(pending) = pending.filter(|r| r.generation != entry.generation()) {
+                if let Err(code) = sink.rewind(pending.to, pending.generation).await {
+                    failure(&stream, code);
+                    drop(_control);
+                    pause(&env, &stream, prepare_backoff).await;
+                    prepare_backoff = (prepare_backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+                let candidate = Entry {
+                    lsn: pending.to,
+                    control: Some(Control::new(pending.generation)),
+                    ..Entry::default()
+                };
+                match checkpoint(&node, &stream, &mut sink, candidate).await {
+                    Ok(saved) => {
+                        entry = saved;
+                        noticed = entry.lsn;
+                        prepare_backoff = FIRST_BACKOFF;
+                    }
+                    Err(code) => {
+                        failure(&stream, code);
+                        drop(_control);
+                        pause(&env, &stream, prepare_backoff).await;
+                        prepare_backoff = (prepare_backoff * 2).min(MAX_BACKOFF);
+                        continue;
+                    }
+                }
+            }
         }
+        let cursor = entry.lsn;
+        let generation = entry.generation();
         if node.applied_lsn() <= cursor {
             sink.caught_up();
-            // Awake once per interval while idle, so that `caught_up` keeps
-            // what a sink ages fresh.
             let tick = opts.interval.max(MIN_IDLE_TICK);
             tokio::select! {
                 biased;
-                woke = env.timeout(tick, node.store().applied.wait(cursor + 1)) => {
+                () = stream.rewound.notified() => continue,
+                woke = env.timeout(tick, node.store().applied.wait(cursor.saturating_add(1))) => {
                     if woke.is_err() {
                         continue;
                     }
                 }
-                () = stream.rewound.notified() => continue,
             }
-            // Nothing lagged until now.
             sink.caught_up();
         }
-        if node.applied_lsn() < cursor + batch {
-            let _ = env
-                .timeout(opts.interval, node.store().applied.wait(cursor + batch))
-                .await;
+        let end = cursor.saturating_add(batch);
+        if node.applied_lsn() < end {
+            tokio::select! {
+                biased;
+                () = stream.rewound.notified() => continue,
+                _ = env.timeout(opts.interval, node.store().applied.wait(end)) => {}
+            }
         }
-        // Retention may have deleted what the cursor has not reached
-        // (traces do not hold retention; audit does until its hold is
-        // released): one gap up to the first segment, then on from there.
-        if let Ok(starts) = node.reader().starts().await
-            && let Some(&first) = starts.first()
-            && first > cursor + 1
+        let gap = match gap_after(
+            &node,
+            &mut sink,
+            &stream,
+            cursor,
+            &mut noticed,
+            &mut gap_backoff,
+        )
+        .await
         {
+            Ok(gap) => gap,
+            Err(()) => continue,
+        };
+        if let Some(to) = gap {
+            loop {
+                if rewind_requested(&stream, generation) {
+                    continue 'records;
+                }
+                let candidate = Entry {
+                    lsn: to,
+                    control: entry.control,
+                    ..Entry::default()
+                };
+                match checkpoint(&node, &stream, &mut sink, candidate).await {
+                    Ok(saved) => {
+                        entry = saved;
+                        continue 'records;
+                    }
+                    Err(code) => {
+                        failure(&stream, code);
+                        pause(&env, &stream, prepare_backoff).await;
+                    }
+                }
+            }
+        }
+        let upto = node.applied_lsn().min(end);
+        let mut records = Vec::new();
+        let mut bytes = 0;
+        let read = node
+            .reader()
+            .read_while(cursor.saturating_add(1), upto, |c| {
+                let size = c.record.encoded_len();
+                if !records.is_empty() && bytes + size > BATCH_BYTES {
+                    return Ok(false);
+                }
+                bytes += size;
+                records.push(c);
+                Ok(true)
+            })
+            .await;
+        if read.is_err() {
+            failure(&stream, "log_read".into());
+            pause(&env, &stream, MAX_BACKOFF).await;
+            continue;
+        }
+        let Some(first) = records.first().map(|c| c.lsn) else {
+            continue;
+        };
+        if first > cursor.saturating_add(1) {
             if !report_gap(
                 &env,
                 &mut sink,
                 &stream,
-                cursor + 1,
+                cursor.saturating_add(1),
                 first - 1,
+                &mut noticed,
                 &mut gap_backoff,
             )
             .await
             {
                 continue;
             }
-            cursor = first - 1;
-            stream.update(|p| p.cursor = cursor);
-        }
-        let upto = node.applied_lsn().min(cursor + batch);
-        let mut records = Vec::new();
-        let (mut bytes, mut full) = (0, false);
-        let read = node
-            .reader()
-            .read(cursor + 1, upto, |c| {
-                let size = c.record.encoded_len();
-                full |= !records.is_empty() && bytes + size > BATCH_BYTES;
-                if !full {
-                    bytes += size;
-                    records.push(c);
-                }
-                Ok(())
-            })
-            .await;
-        let upto = match records.last() {
-            Some(last) if full => last.lsn,
-            _ => upto,
-        };
-        if let Err(e) = read {
-            tracing::warn!(stream = name, error = %e, "export: reading the log failed");
-            kronik_metrics::inc("kronik_export_errors_total", &labels);
-            stream.update(|p| p.last_error = Some("log_read".into()));
-            env.clock.sleep(MAX_BACKOFF).await;
-            continue;
-        }
-        // LSNs are dense: a later first record means retention deleted the
-        // records in between since the check above.
-        let first = records.first().map_or(upto + 1, |c| c.lsn);
-        if first > cursor + 1
-            && !report_gap(
-                &env,
-                &mut sink,
-                &stream,
-                cursor + 1,
-                first - 1,
-                &mut gap_backoff,
-            )
-            .await
-        {
-            continue;
-        }
-        let count = records.len() as u64;
-        if !records.is_empty() {
-            let prepared = sink.prepare(records).await;
-            let mut backoff = FIRST_BACKOFF;
+            // Save the skipped range before preparing later records.
             loop {
-                match sink.deliver(&prepared).await {
-                    Delivery::Delivered => break,
-                    Delivery::Dropped { code } => {
-                        tracing::warn!(
-                            stream = name,
-                            code,
-                            from = cursor + 1,
-                            upto,
-                            "export: the sink refused a batch; skipped"
-                        );
-                        kronik_metrics::add("kronik_export_dropped_total", &labels, count);
-                        stream.update(|p| p.last_error = Some(code));
-                        break;
+                if rewind_requested(&stream, generation) {
+                    continue 'records;
+                }
+                let candidate = Entry {
+                    lsn: first - 1,
+                    control: entry.control,
+                    ..Entry::default()
+                };
+                match checkpoint(&node, &stream, &mut sink, candidate).await {
+                    Ok(saved) => {
+                        entry = saved;
+                        continue 'records;
                     }
-                    Delivery::Retry { code, after } => {
-                        tracing::warn!(stream = name, code, "export: delivery failed; retrying");
-                        kronik_metrics::inc("kronik_export_errors_total", &labels);
-                        lag(cursor);
-                        stream.update(|p| p.last_error = Some(code));
-                        let wait = after.map_or(backoff, |a| a.min(MAX_RETRY_AFTER));
-                        env.clock.sleep(wait).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                    Err(code) => {
+                        failure(&stream, code);
+                        pause(&env, &stream, prepare_backoff).await;
                     }
                 }
             }
         }
-        cursor = upto;
-        let wall = env.clock.wall_ms();
-        stream.update(|p| {
-            p.cursor = cursor;
-            p.last_success_wall_ms = Some(wall);
-        });
-        save(&cursors, name, cursor, sink.state()).await;
+        let upto = records.last().map_or(upto, |c| c.lsn);
+        let count = records.len() as u64;
+        let prepared = match sink.prepare(records, generation).await {
+            Ok(batch) => {
+                prepare_backoff = FIRST_BACKOFF;
+                batch
+            }
+            Err(code) => {
+                failure(&stream, code);
+                lag(cursor);
+                pause(&env, &stream, prepare_backoff).await;
+                prepare_backoff = (prepare_backoff * 2).min(MAX_BACKOFF);
+                continue;
+            }
+        };
+        let mut backoff = FIRST_BACKOFF;
+        loop {
+            if rewind_requested(&stream, generation) {
+                continue 'records;
+            }
+            let delivery = tokio::select! {
+                biased;
+                () = stream.rewound.notified() => continue,
+                delivery = sink.deliver(&prepared) => delivery,
+            };
+            match delivery {
+                Delivery::Delivered => break,
+                Delivery::Dropped { code } => {
+                    tracing::warn!(
+                        stream = name,
+                        code,
+                        from = cursor + 1,
+                        upto,
+                        "export: the sink refused a batch; skipped"
+                    );
+                    kronik_metrics::add("kronik_export_dropped_total", &labels, count);
+                    stream.update(|p| p.last_error = Some(code));
+                    break;
+                }
+                Delivery::Retry { code, after } => {
+                    failure(&stream, code);
+                    lag(cursor);
+                    let wait = after.map_or(backoff, |a| a.min(MAX_RETRY_AFTER));
+                    let asleep = env.clock.sleep(wait);
+                    tokio::pin!(asleep);
+                    loop {
+                        let _ = gap_after(
+                            &node,
+                            &mut sink,
+                            &stream,
+                            upto,
+                            &mut noticed,
+                            &mut gap_backoff,
+                        )
+                        .await;
+                        tokio::select! {
+                            biased;
+                            () = stream.rewound.notified() => {
+                                if rewind_requested(&stream, generation) {
+                                    continue 'records;
+                                }
+                            }
+                            () = &mut asleep => break,
+                            () = env.clock.sleep(FIRST_BACKOFF) => lag(cursor),
+                        }
+                    }
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+        drop(prepared);
+        // A successful remote delivery is frozen while local persistence
+        // retries: do not prepare/post a later batch or lose staged metadata.
+        loop {
+            if rewind_requested(&stream, generation) {
+                continue 'records;
+            }
+            let candidate = Entry {
+                lsn: upto,
+                control: entry.control,
+                ..Entry::default()
+            };
+            match checkpoint(&node, &stream, &mut sink, candidate).await {
+                Ok(saved) => {
+                    entry = saved;
+                    break;
+                }
+                Err(code) => {
+                    failure(&stream, code);
+                    pause(&env, &stream, prepare_backoff).await;
+                    prepare_backoff = (prepare_backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
         kronik_metrics::add("kronik_export_records_total", &labels, count);
-        lag(cursor);
+        lag(entry.lsn);
     }
 }
 
@@ -372,8 +569,13 @@ async fn report_gap<S: Sink>(
     stream: &Stream,
     from: Lsn,
     to: Lsn,
+    noticed: &mut Lsn,
     backoff: &mut Duration,
 ) -> bool {
+    let from = from.max(noticed.saturating_add(1));
+    if from > to {
+        return true;
+    }
     tracing::warn!(
         stream = stream.name,
         from,
@@ -391,21 +593,102 @@ async fn report_gap<S: Sink>(
         );
         kronik_metrics::inc("kronik_export_errors_total", &labels);
         stream.update(|p| p.last_error = Some(code));
-        env.clock.sleep(*backoff).await;
+        pause(env, stream, *backoff).await;
         *backoff = (*backoff * 2).min(MAX_BACKOFF);
         return false;
     }
     *backoff = FIRST_BACKOFF;
+    *noticed = to;
     kronik_metrics::inc("kronik_export_gaps_total", &labels);
     stream.update(|p| p.gaps += 1);
     true
 }
 
-/// A failed save only costs a resend after a restart (at least once), so
-/// the follower goes on.
-async fn save(cursors: &Cursors, name: &str, lsn: Lsn, state: serde_json::Value) {
-    let entry = Entry { lsn, state };
-    if let Err(e) = cursors.save(name, entry).await {
-        tracing::warn!(stream = name, error = %e, "export: saving the cursor failed");
+fn rewind_requested(stream: &Stream, generation: Generation) -> bool {
+    stream
+        .cursors
+        .get(stream.name)
+        .and_then(|e| e.pending_rewind())
+        .is_some_and(|r| r.generation != generation)
+}
+
+fn failure(stream: &Stream, code: String) {
+    tracing::warn!(stream = stream.name, code, "export failed; retrying");
+    kronik_metrics::inc("kronik_export_errors_total", &[("stream", stream.name)]);
+    stream.update(|p| p.last_error = Some(code));
+}
+
+async fn pause(env: &Env, stream: &Stream, duration: Duration) {
+    tokio::select! {
+        biased;
+        () = stream.rewound.notified() => {}
+        () = env.clock.sleep(duration) => {}
+    }
+}
+
+async fn gap_after<S: Sink>(
+    node: &Node,
+    sink: &mut S,
+    stream: &Stream,
+    after: Lsn,
+    noticed: &mut Lsn,
+    backoff: &mut Duration,
+) -> Result<Option<Lsn>, ()> {
+    let first = match node.reader().starts().await {
+        Ok(starts) => starts.first().copied(),
+        Err(_) => {
+            failure(stream, "log_read".into());
+            pause(node.env(), stream, *backoff).await;
+            return Err(());
+        }
+    };
+    let Some(first) = first.filter(|first| *first > after.saturating_add(1)) else {
+        return Ok(None);
+    };
+    if report_gap(
+        node.env(),
+        sink,
+        stream,
+        after.saturating_add(1),
+        first - 1,
+        noticed,
+        backoff,
+    )
+    .await
+    {
+        Ok(Some(first - 1))
+    } else {
+        Err(())
+    }
+}
+
+async fn checkpoint<S: Sink>(
+    node: &Node,
+    stream: &Stream,
+    sink: &mut S,
+    mut entry: Entry,
+) -> Result<Entry, String> {
+    entry.state = sink.checkpoint(entry.lsn).await?;
+    let mut backoff = FIRST_BACKOFF;
+    loop {
+        match stream.cursors.advance(stream.name, entry.clone()).await {
+            Ok(saved) => {
+                sink.committed(
+                    saved.lsn,
+                    saved.generation(),
+                    saved.pending_rewind().is_some(),
+                );
+                stream.update(|p| {
+                    p.cursor = saved.lsn;
+                    p.last_success_wall_ms = Some(node.env().clock.wall_ms());
+                });
+                return Ok(saved);
+            }
+            Err(_) => {
+                failure(stream, "cursor_save".into());
+                pause(node.env(), stream, backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
     }
 }

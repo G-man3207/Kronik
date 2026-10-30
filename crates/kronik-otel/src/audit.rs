@@ -1,11 +1,13 @@
 //! The audit line mapping (docs/design/m28-otel.md §4.1, §4.3; ADRs 0082,
-//! 0083): which records are audited, and the `kronik.audit/v1` line of each,
+//! 0083): which records are audited, and the `kronik.audit/v2` line of each,
 //! as pure functions of the record. The exporter, `kronik audit show` and
 //! `kronik audit verify` all build lines here.
 
 use kronik_core::ids::hex;
+use kronik_log::LogError;
 use kronik_proto::log::v1 as pb;
 use kronik_proto::{Record, sealables};
+use kronik_sched::scrub::AuditPositions;
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -13,7 +15,9 @@ use serde_json::{Map, Value, json};
 use crate::spans::ActorKeys;
 
 /// The `schema` of every line.
-pub const SCHEMA: &str = "kronik.audit/v1";
+pub const SCHEMA: &str = "kronik.audit/v2";
+
+const LEGACY_SCHEMA: &str = "kronik.audit/v1";
 
 /// The cap on a line's `reason`, in bytes (§4.3).
 pub const REASON_MAX: usize = 4096;
@@ -125,7 +129,12 @@ pub struct Mapper {
 
 impl Mapper {
     /// [`lines`] of a committed record, with `secrets` scrubbed.
-    pub fn lines(&self, lsn: u64, record: &Record, secrets: &[(String, Vec<u8>)]) -> Vec<Line> {
+    pub fn lines(
+        &self,
+        lsn: u64,
+        record: &Record,
+        secrets: &[(String, Vec<u8>)],
+    ) -> Result<Vec<Line>, LogError> {
         let hashed = |kind: &str, key: &str| match &self.keys {
             Keys::Hashed(h) => h.label(kind, key),
             _ => String::new(),
@@ -144,6 +153,20 @@ impl Mapper {
                 keys: &keys,
                 subject: &subject,
                 secrets,
+            },
+        )
+    }
+
+    /// Record-derived verification identities; legacy hashes never leave this type.
+    pub fn expected(&self, lsn: u64, record: &Record) -> Result<Vec<Expected>, LogError> {
+        expected(
+            lsn,
+            record,
+            &Ctx {
+                branch: &self.branch,
+                keys: &ActorKeys::Omit,
+                subject: &|s| subject_label(&self.sealer, s),
+                secrets: &[],
             },
         )
     }
@@ -167,13 +190,21 @@ pub fn subject_label(sealer: &kronik_privacy::sealer::Sealer, subject: &str) -> 
 /// event's `actor` detail (`fork.send`, review R1), which its line hashes
 /// or omits.
 pub fn record_hash(record: &Record, subject: &dyn Fn(&str) -> String) -> String {
+    canonical_hashes(record, subject, false).0
+}
+
+fn canonical_hashes(
+    record: &Record,
+    subject: &dyn Fn(&str) -> String,
+    include_legacy: bool,
+) -> (String, String) {
     let mut canon = record.clone();
     sealables::record_mut(&mut canon, &mut |s| s.value = None);
     match &mut canon {
         Record::Erasure(e) => {
             let label = subject(&e.subject);
             if let Some(a) = e.audit.as_mut().filter(|_| !e.subject.is_empty()) {
-                a.reason = a.reason.replace(&e.subject, &label);
+                a.reason = mask_subject(&a.reason, &e.subject, &label);
             }
             e.subject = label;
         }
@@ -185,15 +216,127 @@ pub fn record_hash(record: &Record, subject: &dyn Fn(&str) -> String) -> String 
         }
         _ => {}
     }
-    let mut h = blake3::Hasher::new();
-    h.update(&[canon.kind()]);
-    h.update(&canon.encode());
-    format!("b3:{}", h.finalize().to_hex())
+    let kind = canon.kind();
+    let mut encoded = canon.encode();
+    let current = encoded_hash(kind, &encoded, false);
+    if !include_legacy {
+        return (current, String::new());
+    }
+    if let (Record::Erasure(original), Record::Erasure(canonical)) = (record, &mut canon)
+        && !original.subject.is_empty()
+        && let (Some(original_audit), Some(canonical_audit)) =
+            (&original.audit, &mut canonical.audit)
+    {
+        let reason = original_audit
+            .reason
+            .replace(&original.subject, &canonical.subject);
+        if reason != canonical_audit.reason {
+            canonical_audit.reason = reason;
+            encoded = canon.encode();
+        }
+    }
+    (current, encoded_hash(kind, &encoded, true))
+}
+
+fn encoded_hash(kind: u8, encoded: &[u8], legacy: bool) -> String {
+    let mut hash = blake3::Hasher::new();
+    if !legacy {
+        hash.update(b"kronik.audit/v2\0");
+    }
+    hash.update(&[kind]);
+    hash.update(encoded);
+    format!("b3:{}", hash.finalize().to_hex())
+}
+
+/// Match case and percent-encoded subject spellings, but not part of another id.
+fn mask_subject(text: &str, subject: &str, label: &str) -> String {
+    if subject.is_empty() {
+        return text.to_owned();
+    }
+    let mut decoded = Vec::with_capacity(text.len());
+    let mut positions = Vec::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let escape = bytes.get(i..i + 3).filter(|b| b[0] == b'%').and_then(|b| {
+            let hi = (b[1] as char).to_digit(16)?;
+            let lo = (b[2] as char).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        });
+        let end = i + if escape.is_some() { 3 } else { 1 };
+        decoded.push(escape.unwrap_or(bytes[i]));
+        positions.push((i, end));
+        i = end;
+    }
+    let mut folded = Vec::with_capacity(decoded.len());
+    let mut offset = 0;
+    for chunk in decoded.utf8_chunks() {
+        for (at, ch) in chunk.valid().char_indices() {
+            let (start, _) = positions[offset + at];
+            let (_, end) = positions[offset + at + ch.len_utf8() - 1];
+            folded.extend(ch.to_lowercase().map(|ch| (ch, start, end)));
+        }
+        offset += chunk.valid().len();
+        for _ in chunk.invalid() {
+            let (start, end) = positions[offset];
+            folded.push(('\u{fffd}', start, end));
+            offset += 1;
+        }
+    }
+    let identifier = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let needle: Vec<char> = subject.chars().flat_map(char::to_lowercase).collect();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while at + needle.len() <= folded.len() {
+        let end = at + needle.len();
+        if folded[at..end]
+            .iter()
+            .map(|c| c.0)
+            .eq(needle.iter().copied())
+            && (at == 0 || (folded[at - 1].2 <= folded[at].1 && !identifier(folded[at - 1].0)))
+            && (end == folded.len()
+                || (folded[end - 1].2 <= folded[end].1 && !identifier(folded[end].0)))
+        {
+            out.push_str(&text[copied..folded[at].1]);
+            out.push_str(label);
+            copied = folded[end - 1].2;
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 /// The lines of one committed record, in order: none for a record that is
 /// not audited.
-pub fn lines(lsn: u64, record: &Record, ctx: &Ctx) -> Vec<Line> {
+pub fn lines(lsn: u64, record: &Record, ctx: &Ctx) -> Result<Vec<Line>, LogError> {
+    Ok(projected_lines(
+        lsn,
+        record,
+        ctx,
+        audit_positions(record)?,
+        || record_hash(record, ctx.subject),
+    ))
+}
+
+fn audit_positions(record: &Record) -> Result<Option<AuditPositions>, LogError> {
+    match record {
+        Record::AuditEvent(event) => AuditPositions::parse(&event.action, &event.details)
+            .map_err(|error| LogError::Corrupt(error.into())),
+        _ => Ok(None),
+    }
+}
+
+fn projected_lines(
+    lsn: u64,
+    record: &Record,
+    ctx: &Ctx,
+    positions: Option<AuditPositions>,
+    hash: impl FnOnce() -> String,
+) -> Vec<Line> {
     let mut out = Vec::new();
     let line = |kind: &str, action: &str, audit: Option<&pb::Audit>, epoch, details| Line {
         schema: SCHEMA.into(),
@@ -217,14 +360,7 @@ pub fn lines(lsn: u64, record: &Record, ctx: &Ctx) -> Vec<Line> {
                 Ok(pb::DeploymentCause::Rollback) => "rollback",
                 _ => "deploy",
             };
-            let kinds: Vec<Value> = d
-                .kinds
-                .iter()
-                .map(|k| {
-                    json!({"kind": k.kind, "code_hash": format!("b3:{}", hex(&k.code_hash)),
-                           "schema_version": k.schema_version})
-                })
-                .collect();
+            let kinds = deployment_kinds(&d.kinds);
             let details = obj(json!({"kinds": kinds, "proposal_id": d.proposal_id,
                                      "rollback_of_epoch": d.rollback_of_epoch}));
             out.push(line(
@@ -301,7 +437,7 @@ pub fn lines(lsn: u64, record: &Record, ctx: &Ctx) -> Vec<Line> {
                 "proposal_id": a.proposal_id,
                 "diff_hash": format!("b3:{}", hex(&a.diff_hash)),
                 "verified_through_lsn": a.verified_through_lsn,
-                "command": kronik_effects::http::scrub_str(&a.command, ctx.secrets),
+                "command": a.command,
             }));
             out.push(line("approval", action, a.audit.as_ref(), None, details));
         }
@@ -348,7 +484,7 @@ pub fn lines(lsn: u64, record: &Record, ctx: &Ctx) -> Vec<Line> {
             );
             // Review M8: the reason usually names the subject.
             if !e.subject.is_empty() {
-                l.reason = l.reason.replace(&e.subject, &hashed);
+                l.reason = mask_subject(&l.reason, &e.subject, &hashed);
             }
             out.push(l);
         }
@@ -383,8 +519,10 @@ pub fn lines(lsn: u64, record: &Record, ctx: &Ctx) -> Vec<Line> {
                 Ok(pb::GuardAction::Rollback) => "rollback",
                 _ => "alert",
             };
-            let outcome =
-                pb::GuardOutcome::try_from(g.outcome).map_or("unspecified", |o| o.as_str_name());
+            let outcome = pb::GuardOutcome::try_from(g.outcome).map_or_else(
+                |_| "unspecified".into(),
+                |o| label(o.as_str_name(), "GUARD_OUTCOME_"),
+            );
             let details = obj(json!({
                 "watch_id": g.watch_id,
                 "guard": g.guard,
@@ -410,6 +548,7 @@ pub fn lines(lsn: u64, record: &Record, ctx: &Ctx) -> Vec<Line> {
                     "turns": s.turns,
                     "diff_hash": s.diff_hash,
                     "irreversible_effects": s.irreversible_effects,
+                    "kinds": s.deployment.as_ref().map(|d| deployment_kinds(&d.kinds)).unwrap_or_default(),
                 }));
                 out.push(line(
                     "state_rebase",
@@ -423,10 +562,14 @@ pub fn lines(lsn: u64, record: &Record, ctx: &Ctx) -> Vec<Line> {
         Record::AuditEvent(a) => {
             let mut details = Map::new();
             for (k, v) in &a.details {
-                let v = kronik_effects::http::scrub_str(v, ctx.secrets);
+                if let Some(value) = positions.and_then(|positions| positions.value(k)) {
+                    details.insert(k.clone(), value.into());
+                    continue;
+                }
+                let v = v.as_str();
                 // fork.send names its actor plain (kronik-api m3.rs).
                 if k == "actor" {
-                    let (kind, key) = v.split_once('/').unwrap_or((&v, ""));
+                    let (kind, key) = v.split_once('/').unwrap_or((v, ""));
                     if let Some(key) = ctx.keys.export(kind, key) {
                         details.insert(k.clone(), format!("{kind}/{key}").into());
                     }
@@ -434,10 +577,7 @@ pub fn lines(lsn: u64, record: &Record, ctx: &Ctx) -> Vec<Line> {
                 }
                 details.insert(k.clone(), v.into());
             }
-            details.insert(
-                "target".into(),
-                kronik_effects::http::scrub_str(&a.target, ctx.secrets).into(),
-            );
+            details.insert("target".into(), a.target.clone().into());
             out.push(line(
                 "audit_event",
                 &a.action,
@@ -455,9 +595,10 @@ pub fn lines(lsn: u64, record: &Record, ctx: &Ctx) -> Vec<Line> {
     if out.is_empty() {
         return out;
     }
-    let hash = record_hash(record, ctx.subject);
+    let hash = hash();
     for l in &mut out {
-        l.reason = kronik_effects::http::scrub_str(&l.reason, ctx.secrets);
+        l.reason = kronik_sched::scrub::for_log(&l.reason, Some(ctx.secrets));
+        scrub_details(&mut l.details, ctx.secrets, positions);
         if l.reason.len() > REASON_MAX {
             let mut cut = REASON_MAX;
             while !l.reason.is_char_boundary(cut) {
@@ -544,6 +685,41 @@ fn turn_lines(t: &pb::TurnRecord, ctx: &Ctx, line: &LineFn, out: &mut Vec<Line>)
     }
 }
 
+fn deployment_kinds(kinds: &[pb::KindVersion]) -> Vec<Value> {
+    kinds
+        .iter()
+        .map(|k| {
+            json!({"kind": k.kind, "code_hash": format!("b3:{}", hex(&k.code_hash)),
+                   "schema_version": k.schema_version})
+        })
+        .collect()
+}
+
+fn scrub_details(
+    details: &mut Map<String, Value>,
+    secrets: &[(String, Vec<u8>)],
+    positions: Option<AuditPositions>,
+) {
+    fn scrub(value: &mut Value, secrets: &[(String, Vec<u8>)]) {
+        match value {
+            Value::String(text) => *text = kronik_sched::scrub::for_log(text, Some(secrets)),
+            Value::Array(values) => values.iter_mut().for_each(|v| scrub(v, secrets)),
+            Value::Object(values) => scrub_details(values, secrets, None),
+            _ => {}
+        }
+    }
+    *details = std::mem::take(details)
+        .into_iter()
+        .map(|(key, mut value)| {
+            if let Some(value) = positions.and_then(|positions| positions.value(&key)) {
+                return (key, value.into());
+            }
+            scrub(&mut value, secrets);
+            (kronik_sched::scrub::for_log(&key, Some(secrets)), value)
+        })
+        .collect();
+}
+
 fn obj(v: Value) -> Map<String, Value> {
     match v {
         Value::Object(m) => m,
@@ -582,6 +758,8 @@ pub struct Item {
     pub effect: Option<u32>,
     pub kind: String,
     pub action: String,
+    /// The current source hash; absent when no authoritative source item exists.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub record_hash: String,
 }
 
@@ -620,51 +798,117 @@ pub struct Report {
     pub superseded: usize,
 }
 
-/// Compares `sink` lines (in the order they were written) with the log's
-/// `expected` lines in `(from, to]`. Lines are deduplicated by (`lsn`,
-/// `effect`, `record_hash`), and equal when `kind`, `action`, `token_id`
-/// and `at_wall_ms` agree too. A `restore` line supersedes the lines
-/// written before it with LSNs past its `through_lsn` (review H4).
-pub fn verify(expected: &[Line], sink: &[Line], from: u64, to: u64) -> Report {
+/// A source record's verification identity. The historical hash is deliberately
+/// private and not serializable: only the v2 projection may leave the node.
+#[derive(Clone)]
+pub struct Expected {
+    line: Line,
+    legacy_hash: String,
+    positions: Option<AuditPositions>,
+}
+
+/// Builds both format readers' identities from the authoritative record.
+pub fn expected(lsn: u64, record: &Record, ctx: &Ctx) -> Result<Vec<Expected>, LogError> {
+    let positions = audit_positions(record)?;
+    let mut legacy_hash = String::new();
+    let projected = projected_lines(lsn, record, ctx, positions, || {
+        let (current, legacy) = canonical_hashes(record, ctx.subject, true);
+        legacy_hash = legacy;
+        current
+    });
+    if projected.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(projected
+        .into_iter()
+        .map(|line| Expected {
+            line,
+            legacy_hash: legacy_hash.clone(),
+            positions,
+        })
+        .collect())
+}
+
+impl Expected {
+    fn matches(&self, line: &Line) -> bool {
+        let hash = match line.schema.as_str() {
+            SCHEMA => &self.line.record_hash,
+            LEGACY_SCHEMA => &self.legacy_hash,
+            _ => return false,
+        };
+        fn identity(l: &Line) -> (&str, &str, &str, u64, &str, Option<u64>) {
+            (
+                l.kind.as_str(),
+                l.action.as_str(),
+                l.token_id.as_str(),
+                l.at_wall_ms,
+                l.branch.as_str(),
+                l.epoch,
+            )
+        }
+        if &line.record_hash != hash || identity(line) != identity(&self.line) {
+            return false;
+        }
+        if let Some(positions) = self.positions {
+            for field in ["through_lsn", "from", "to"] {
+                let Some(expected) = positions.value(field) else {
+                    continue;
+                };
+                let value = line.details.get(field).and_then(|value| {
+                    if line.schema == SCHEMA {
+                        value.as_u64()
+                    } else {
+                        value
+                            .as_str()
+                            .filter(|text| {
+                                !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+                            })
+                            .and_then(|text| text.parse::<u64>().ok())
+                    }
+                });
+                if value != Some(expected) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Compares versioned sink lines against record-derived identities in `(from, to]`.
+/// A restore cut is trusted only after its source identity and cut have matched.
+pub fn verify(expected: &[Expected], sink: &[Line], from: u64, to: u64) -> Report {
     use std::collections::{BTreeMap, BTreeSet};
+    let in_range = |l: &Line| l.lsn > from && l.lsn <= to;
+    let want: BTreeMap<_, _> = expected
+        .iter()
+        .filter(|e| in_range(&e.line))
+        .map(|e| (e.line.item(), e))
+        .collect();
     let mut superseded = vec![false; sink.len()];
     let mut restores = BTreeSet::new();
-    for (i, l) in sink.iter().enumerate() {
-        if l.kind == "audit_event"
-            && l.action == "restore"
-            && restores.insert((l.lsn, l.record_hash.clone()))
+    for (i, line) in sink.iter().enumerate() {
+        let Some(source) = want.get(&line.item()).filter(|e| e.matches(line)) else {
+            continue;
+        };
+        if let Some(AuditPositions::Restore {
+            through_lsn: through,
+        }) = source.positions
+            && restores.insert(line.item())
         {
-            let through: u64 = l.details["through_lsn"]
-                .as_str()
-                .and_then(|t| t.parse().ok())
-                .unwrap_or(u64::MAX);
-            for (j, s) in sink[..i].iter().enumerate() {
-                superseded[j] |= s.lsn > through;
+            for (j, prior) in sink[..i].iter().enumerate() {
+                let invalid_current = want.get(&prior.item()).is_some_and(|expected| {
+                    (prior.record_hash == expected.line.record_hash
+                        || prior.record_hash == expected.legacy_hash)
+                        && !expected.matches(prior)
+                });
+                superseded[j] |= prior.lsn > through
+                    && matches!(prior.schema.as_str(), SCHEMA | LEGACY_SCHEMA)
+                    && !invalid_current;
             }
         }
     }
-    let in_range = |l: &Line| l.lsn > from && l.lsn <= to;
-    let want: BTreeMap<(u64, Option<u32>), &Line> = expected
-        .iter()
-        .filter(|l| in_range(l))
-        .map(|l| (l.item(), l))
-        .collect();
-    let same = |a: &Line, b: &Line| {
-        (
-            &a.record_hash,
-            &a.kind,
-            &a.action,
-            &a.token_id,
-            a.at_wall_ms,
-        ) == (
-            &b.record_hash,
-            &b.kind,
-            &b.action,
-            &b.token_id,
-            b.at_wall_ms,
-        )
-    };
-    let mut r = Report {
+    let mut report = Report {
         from,
         to,
         expected: want.len(),
@@ -672,45 +916,60 @@ pub fn verify(expected: &[Line], sink: &[Line], from: u64, to: u64) -> Report {
     };
     let (mut seen, mut matched) = (BTreeSet::new(), BTreeSet::new());
     let (mut extra, mut conflicting) = (BTreeSet::new(), BTreeSet::new());
-    for (l, gone) in sink.iter().zip(superseded) {
+    for (line, gone) in sink.iter().zip(superseded) {
         if gone {
-            r.superseded += 1;
+            report.superseded += 1;
             continue;
         }
-        // A repeat of a line (a re-sent batch) counts once; a line that
-        // differs in a compared field is a line of its own.
-        let key = (
-            l.lsn,
-            l.effect,
-            &l.record_hash,
-            &l.kind,
-            &l.action,
-            &l.token_id,
-            l.at_wall_ms,
-        );
-        if !in_range(l) || !seen.insert(key) {
+        if !in_range(line) {
             continue;
         }
-        r.lines += 1;
-        match want.get(&l.item()) {
-            Some(w) if same(w, l) => {
-                matched.insert(l.item());
+        match want.get(&line.item()) {
+            Some(source) if source.matches(line) => {
+                if matched.insert(line.item()) {
+                    report.lines += 1;
+                }
             }
-            Some(_) => {
-                conflicting.insert(Item::from(l));
-            }
-            None => {
-                extra.insert(Item::from(l));
+            source => {
+                let key = (
+                    line.item(),
+                    &line.schema,
+                    &line.record_hash,
+                    &line.kind,
+                    &line.action,
+                    &line.token_id,
+                    line.at_wall_ms,
+                    &line.branch,
+                    line.epoch,
+                    line.details.get("through_lsn").and_then(Value::as_str),
+                    line.details.get("through_lsn").and_then(Value::as_u64),
+                );
+                if !seen.insert(key) {
+                    continue;
+                }
+                report.lines += 1;
+                if let Some(expected) = source {
+                    conflicting.insert(Item::from(&expected.line));
+                } else {
+                    extra.insert(Item {
+                        lsn: line.lsn,
+                        effect: line.effect,
+                        kind: "unverified".into(),
+                        action: "unverified".into(),
+                        record_hash: String::new(),
+                    });
+                }
             }
         }
     }
-    r.missing = want
+    report.missing = want
         .iter()
-        .filter(|(k, _)| !matched.contains(*k))
-        .map(|(_, l)| Item::from(*l))
+        .filter(|(key, _)| !matched.contains(*key))
+        .map(|(_, source)| Item::from(&source.line))
         .collect();
-    r.extra = extra.into_iter().collect();
-    r.conflicting = conflicting.into_iter().collect();
-    r.complete = r.missing.is_empty() && r.extra.is_empty() && r.conflicting.is_empty();
-    r
+    report.extra = extra.into_iter().collect();
+    report.conflicting = conflicting.into_iter().collect();
+    report.complete =
+        report.missing.is_empty() && report.extra.is_empty() && report.conflicting.is_empty();
+    report
 }

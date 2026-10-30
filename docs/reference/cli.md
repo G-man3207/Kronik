@@ -2013,6 +2013,16 @@ behind the applied LSN, the last success, the last error's code (such as
 made since the start. With `--json`, `stalled_ms` is, while there is lag,
 the time since the last delivery (or since the start without one);
 `kronik doctor` warns on it.
+`storage_sync` means any sync failure or EIO latched the file writer:
+it makes no later filesystem attempts or cursor acknowledgements.
+The node remains usable. Repair/quarantine storage, create a new writer
+and safely rewind; restart alone does not prove durability repaired.
+`s3_unsupported` means the audit backend cannot perform the required atomic
+create; no cursor advances. Configure a supporting backend, not an overwrite
+fallback. Current archive names are monotonic, independent of clock rollback:
+`audit-v2-<sequence>.jsonl` locally and `audit/v2/<sequence>.jsonl` remotely.
+Keep the remote namespace append-only; see the operations guide for rotation
+and backend-consistency requirements.
 
 ```text
 $ kronik export status
@@ -2030,9 +2040,15 @@ again, after a sink lost them (`POST /v1/export/{stream}/rewind`, scope
 `operate`). `--to` is at most the cursor, and not before the record before
 the first retained one (`AUDIT_RANGE_GONE`). For `audit`, retention is held
 from `--to` at once. A stream that is off answers `EXPORT_NOT_CONFIGURED`.
-The rewind is recorded as an `AuditEvent` `export.rewind`. For `traces`, the
-exporter first rebuilds its open-turn set at `--to` from the retained log,
-so the resent spans are the ones it sent before.
+The rewind writes audit intent before its effect; failure records an event
+and stable code. An owned task preserves the request if the caller
+cancels. New requests wake retries, survive older acknowledgements, and
+begin a new generation with a checkpoint exactly at its earliest cut.
+Pending replay clears only when that generation reaches its replay head.
+For traces, causal state is rebuilt at `--to` from retained source records.
+The hold is restored before exporter startup and moves only after durable
+checkpoints. Current control/checkpoint and restore behavior is exercised
+by the exporter integration and actual binary audit tests.
 
 ```text
 $ kronik export rewind audit --to 1200 --reason "the bucket lost a day"
@@ -2044,11 +2060,13 @@ Next     kronik export status
 
 `kronik audit show [--from <LSN>] [--limit <N>]`
 
-Prints the audit lines (`kronik.audit/v1`) of main's log from `--from` (the
+Prints the audit lines (`kronik.audit/v2`) of main's log from `--from` (the
 first retained record by default), as an audit sink receives them, also
 when no sink is set (`GET /v1/audit`, scope `admin`: the lines name tokens
 and callers). `--limit` is 1 to 1000 lines, 100 by default; a page ends
 between records. `--json` prints the lines in full.
+Unavailable secret inventory returns HTTP 503 `SECRET_UNAVAILABLE`
+rather than an unscrubbed projection.
 
 ```text
 $ kronik audit show --limit 3
@@ -2066,9 +2084,13 @@ Next     kronik audit show --from 4
 Compares an audit sink with main's log (m28-otel §4.5): every audited
 record in (`--from`, `--to`] must have its line, deduplicated by `lsn`,
 `effect` and `record_hash`, and equal in kind, action, token and time;
-no line may be extra or conflict with the log's record. Lines of a tail
-that a later `restore` line replaced are counted as superseded. Needs no
-daemon: it reads the data directory (`--data-dir`, else `server.data_dir`)
+no line may be extra or conflict with the log's record. Known schema,
+source-derived hash and identity fields are validated. Exact legacy v1
+read compatibility counts mixed v1/v2 retries as one logical source item;
+new emissions are v2 only. Only trusted source restore records authorize
+superseding a tail, never a sink's own restore claim. Restore/gap positions
+are validated action-specific `u64`: v2 JSON numbers, v1 decimal strings.
+Needs no daemon: it reads the data directory (`--data-dir`, else `server.data_dir`)
 and the sink, `--sink` or `[audit] sink`: a `file://` directory or an
 `s3://` bucket (with `[audit] endpoint` and the `AWS_*` variables). A
 webhook cannot be read back. `--from` defaults to the record before the

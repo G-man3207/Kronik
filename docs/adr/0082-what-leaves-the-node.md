@@ -1,6 +1,6 @@
 # 0082. What telemetry and audit export may carry off the node
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-10-27
 
 ## Context
@@ -39,7 +39,7 @@ not sealable:
 - kinds, route patterns, methods, status codes, outcome kinds and error
   codes;
 - effect kinds, statuses and grounding;
-- the host of an `http:` target, and secret and token names;
+- the host of an `http:` target, and scrubbed secret and token names;
 - code hashes, epochs and LSNs.
 
 **Hashed:**
@@ -58,16 +58,21 @@ not sealable:
   same key under `"kronik otel ids v1"` (ADR 0080).
 
 **Scrubbed and capped:**
-- Free text that the audit line must keep (`reason`, an approval's
-  `command`, an `AuditEvent`'s target and details) is scrubbed of every
-  stored version of every secret (`scrub_str` with
-  `Node::secret_values()`), as the API does: when the record is written,
-  so a secret deleted before the export stays out, and again at export.
-- `reason` is capped at 4 KiB in the line, and also at the API, where a
-  longer reason is `BAD_REQUEST`.
-- Reasons otherwise leave as written; the operations guide says so. An
-  Erasure's reason, which usually names the subject, has its subject id
-  replaced by the `s:` hash.
+- Free text, names and span labels are scrubbed for available secret
+  values and token spellings, both at mutation recording and export.
+  Canonical audit hashing replaces free text with `WITHHELD` and applies
+  token scrubbing; it must not become a guessing oracle for private text.
+- Subject masking recognizes case and percent-encoded spellings at
+  identifier boundaries, rather than replacing arbitrary substrings.
+- `reason` is capped at 4 KiB in the line and at the API (`BAD_REQUEST`
+  above that limit). Do not put personal data in reasons.
+- An unavailable secret inventory fails closed: privacy-sensitive API
+  projections return HTTP 503 `SECRET_UNAVAILABLE`; mutating audit text
+  is safely withheld; exporter preparation stalls without cursor advance.
+  The current LocalSecretStore inventory does not establish complete
+  retained external/deleted-version coverage across restart; that remains
+  M23 work. Numeric restore/gap positions are validated action-specific
+  `u64` values, not generic exemptions for keys or free text.
 - `kronik export status` (scope `read`) shows a sink's scheme and host only,
   and an error's code, not its text.
 

@@ -169,7 +169,7 @@ pub async fn push_loop(
             url.clone(),
             headers.clone(),
             "application/x-protobuf",
-            body,
+            body.into(),
         )
         .await;
         let delivery = crate::traces::otlp_delivery(resp, |b| {

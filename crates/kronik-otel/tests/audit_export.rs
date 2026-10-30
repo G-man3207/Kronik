@@ -34,7 +34,11 @@ fn audit() -> pb::Audit {
 /// A webhook that answers 503 until `up`, then 200, keeping what it got. It
 /// honours `idempotency-key`: a key it has seen is answered from its cache
 /// and not kept again.
-fn webhook(up: Arc<AtomicBool>, got: Arc<Mutex<Vec<String>>>) -> String {
+fn webhook(
+    up: Arc<AtomicBool>,
+    got: Arc<Mutex<Vec<String>>>,
+    attempts: Arc<Mutex<Vec<(String, String)>>>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/hook", listener.local_addr().unwrap());
     std::thread::spawn(move || {
@@ -58,9 +62,11 @@ fn webhook(up: Arc<AtomicBool>, got: Arc<Mutex<Vec<String>>>) -> String {
             }
             let mut body = vec![0; len];
             r.read_exact(&mut body).unwrap();
+            let body = String::from_utf8(body).unwrap();
+            attempts.lock().unwrap().push((key.clone(), body.clone()));
             let status = if up.load(Ordering::SeqCst) {
                 if seen.insert(key) {
-                    got.lock().unwrap().push(String::from_utf8(body).unwrap());
+                    got.lock().unwrap().push(body);
                 }
                 "200 OK"
             } else {
@@ -102,7 +108,7 @@ fn a_released_hold_records_a_gap_and_the_node_keeps_serving() {
         .unwrap()
     });
     let (up, got) = (Arc::new(AtomicBool::new(false)), Arc::default());
-    let url = webhook(up.clone(), Arc::clone(&got));
+    let url = webhook(up.clone(), Arc::clone(&got), Arc::default());
     let cursors = Arc::new(
         rt.block_on(Cursors::load(node.env().clone(), dir.path()))
             .unwrap(),
@@ -155,6 +161,28 @@ fn a_released_hold_records_a_gap_and_the_node_keeps_serving() {
     assert!(first > 5, "{first}");
     assert_eq!(node.disk_below_reserve(), None);
     send();
+    // A gap is local evidence: a remote outage must not delay its append.
+    for _ in 0..400 {
+        let mut recorded = false;
+        rt.block_on(node.reader().read(first, node.applied_lsn(), |c| {
+            recorded |= matches!(&c.record, Record::AuditEvent(e) if e.action == "audit.gap");
+            Ok(())
+        }))
+        .unwrap();
+        if recorded {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut local_gaps = 0;
+    rt.block_on(node.reader().read(first, node.applied_lsn(), |c| {
+        local_gaps +=
+            usize::from(matches!(&c.record, Record::AuditEvent(e) if e.action == "audit.gap"));
+        Ok(())
+    }))
+    .unwrap();
+    assert_eq!(local_gaps, 1, "remote sink is still down");
+    assert!(got.lock().unwrap().is_empty());
     up.store(true, Ordering::SeqCst);
     for _ in 0..600 {
         if stream.progress().cursor >= node.applied_lsn() && stream.progress().gaps > 0 {
@@ -194,11 +222,17 @@ fn a_released_hold_records_a_gap_and_the_node_keeps_serving() {
         .collect();
     assert!(lines.iter().any(|l| l.action == "audit.gap"), "{lines:?}");
     assert!(lines.iter().any(|l| l.action == "deploy"), "{lines:?}");
-    assert!(
-        kronik_metrics::render().contains("kronik_export_gaps_total{stream=\"audit\"} 1"),
-        "{}",
-        kronik_metrics::render()
-    );
+    // Other exporters in this test binary share the process-wide counter.
+    let metrics = kronik_metrics::render();
+    let counter = metrics
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("kronik_export_gaps_total{stream=\"audit\"} ")?
+                .parse::<f64>()
+                .ok()
+        })
+        .unwrap_or(0.0);
+    assert!(counter >= 1.0, "{metrics}");
 }
 
 /// A node on `dir` with a runtime of its own; dropping both stops it.
@@ -238,6 +272,355 @@ fn mapper(node: &Node) -> Arc<Mapper> {
     })
 }
 
+#[test]
+fn retries_keep_the_key_but_an_identical_rewind_reaches_the_receiver_again() {
+    let data = tempfile::tempdir().unwrap();
+    let (rt, node) = node_at(data.path());
+    grant(&rt, &node, "same.example", "same source bytes");
+    let up = Arc::new(AtomicBool::new(false));
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let url = webhook(up.clone(), got.clone(), attempts.clone());
+    let cursors = Arc::new(
+        rt.block_on(Cursors::load(node.env().clone(), data.path()))
+            .unwrap(),
+    );
+    let stream = rt
+        .block_on(start(
+            node.clone(),
+            cursors.clone(),
+            Settings {
+                sink: Sink::Webhook(url),
+                batch_records: 1000,
+                interval: Duration::from_millis(10),
+                file_max_bytes: 1024,
+                headers_env: None,
+                from_now: false,
+                max_hold: Duration::ZERO,
+                hold_release: 0,
+            },
+            mapper(&node),
+        ))
+        .unwrap();
+    for _ in 0..400 {
+        if attempts.lock().unwrap().len() >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    {
+        let attempts = attempts.lock().unwrap();
+        assert!(attempts.len() >= 2, "{attempts:?}");
+        assert_eq!(
+            attempts[0], attempts[1],
+            "same-generation retry changed key or bytes"
+        );
+    }
+    assert!(got.lock().unwrap().is_empty());
+    up.store(true, Ordering::SeqCst);
+    for _ in 0..600 {
+        if cursors
+            .get("audit")
+            .is_some_and(|entry| entry.lsn == node.applied_lsn())
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(cursors.get("audit").unwrap().lsn, node.applied_lsn());
+    assert_eq!(got.lock().unwrap().len(), 1);
+    let old_generation = cursors.get("audit").unwrap().generation();
+    rt.block_on(stream.rewind(&node, 0)).unwrap();
+    for _ in 0..600 {
+        if cursors.get("audit").is_some_and(|entry| {
+            entry.lsn == node.applied_lsn()
+                && entry.generation() != old_generation
+                && entry.pending_rewind().is_none()
+        }) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let entry = cursors.get("audit").unwrap();
+    assert_eq!(entry.lsn, node.applied_lsn());
+    assert_ne!(entry.generation(), old_generation);
+    assert!(entry.pending_rewind().is_none());
+    let got = got.lock().unwrap();
+    assert_eq!(
+        got.len(),
+        2,
+        "a cached old ACK must not swallow an explicit replay"
+    );
+    assert_eq!(
+        got[0], got[1],
+        "this case must replay identical source bytes"
+    );
+    let attempts = attempts.lock().unwrap();
+    assert_eq!(attempts.first().unwrap().1, attempts.last().unwrap().1);
+    assert_ne!(attempts.first().unwrap().0, attempts.last().unwrap().0);
+}
+
+#[test]
+fn source_gap_coverage_survives_a_failed_checkpoint_but_not_a_new_incarnation() {
+    let data = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let open = || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let node = rt.block_on(async {
+            let mut storage = StorageConfig::new(data.path().to_path_buf());
+            storage.history = Duration::ZERO;
+            start_local(
+                Env::real(tokio::runtime::Handle::current()),
+                data.path(),
+                NodeConfig {
+                    storage: Some(storage),
+                    segment_max_bytes: Some(1024),
+                    ..NodeConfig::default()
+                },
+            )
+            .await
+            .unwrap()
+        });
+        (rt, node)
+    };
+    let settings = || Settings {
+        sink: Sink::File(out.path().to_path_buf()),
+        batch_records: 1000,
+        interval: Duration::from_millis(10),
+        file_max_bytes: 1 << 20,
+        headers_env: None,
+        from_now: false,
+        max_hold: Duration::ZERO,
+        hold_release: 0,
+    };
+    let gaps = |rt: &tokio::runtime::Runtime, node: &Node| {
+        let mut gaps = Vec::new();
+        rt.block_on(node.reader().read(1, node.applied_lsn(), |c| {
+            if let Record::AuditEvent(event) = c.record
+                && event.action == "audit.gap"
+            {
+                gaps.push((c.lsn, event.details));
+            }
+            Ok(())
+        }))
+        .unwrap();
+        gaps
+    };
+    let wait = |cursors: &Cursors, node: &Node| {
+        for _ in 0..600 {
+            if cursors
+                .get("audit")
+                .is_some_and(|entry| entry.lsn == node.applied_lsn())
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "cursor did not reach source head: {:?}",
+            cursors.get("audit")
+        );
+    };
+    let (rt, node) = open();
+    for i in 0..80 {
+        grant(
+            &rt,
+            &node,
+            &format!("initial-{i}.example"),
+            "source before retention",
+        );
+    }
+    // Retention needs a later, strictly older turn-time bound across segments.
+    let wasm = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/guests/counter.wasm"
+    ))
+    .unwrap();
+    rt.block_on(node.deploy(&wasm, audit(), false)).unwrap();
+    let advance = |rt: &tokio::runtime::Runtime, node: &Node| {
+        for i in 0..80 {
+            rt.block_on(node.send(
+                ActorRef::parse("counter/a").unwrap(),
+                pb::Message {
+                    name: "increment".into(),
+                    ..Default::default()
+                },
+                audit(),
+                false,
+            ))
+            .unwrap()
+            .unwrap();
+            if i % 20 == 19 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    };
+    advance(&rt, &node);
+    rt.block_on(node.snapshot("manual")).unwrap();
+    let first = node.log_first(node.storage_config().unwrap()).unwrap();
+    assert!(first > 1);
+    let cursors = Arc::new(
+        rt.block_on(Cursors::load(node.env().clone(), data.path()))
+            .unwrap(),
+    );
+    rt.block_on(cursors.save("audit", kronik_otel::cursor::Entry::default()))
+        .unwrap();
+    let temporary = data.path().join("export.json.tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    let stream = rt
+        .block_on(start(
+            node.clone(),
+            cursors.clone(),
+            settings(),
+            mapper(&node),
+        ))
+        .unwrap();
+    for _ in 0..400 {
+        if gaps(&rt, &node).len() == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let before = gaps(&rt, &node);
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].1["from"], "1");
+    assert_eq!(before[0].1["to"], (first - 1).to_string());
+    // The source append succeeded, but the local publication cannot succeed.
+    assert!(
+        rt.block_on(cursors.advance(
+            "audit",
+            kronik_otel::cursor::Entry {
+                lsn: first - 1,
+                ..Default::default()
+            }
+        ))
+        .is_err()
+    );
+    assert_eq!(cursors.get("audit").unwrap().lsn, 0);
+    assert_eq!(node.retention_hold().floor(), Some(0));
+    drop(stream);
+    drop(cursors);
+    drop(node);
+    drop(rt);
+    std::fs::remove_dir(&temporary).unwrap();
+
+    let (rt, node) = open();
+    assert_eq!(
+        node.log_first(node.storage_config().unwrap()).unwrap(),
+        first
+    );
+    let cursors = Arc::new(
+        rt.block_on(Cursors::load(node.env().clone(), data.path()))
+            .unwrap(),
+    );
+    let stream = rt
+        .block_on(start(
+            node.clone(),
+            cursors.clone(),
+            settings(),
+            mapper(&node),
+        ))
+        .unwrap();
+    wait(&cursors, &node);
+    assert_eq!(
+        gaps(&rt, &node),
+        before,
+        "restart duplicated an already durable source notice"
+    );
+    let old_head = node.applied_lsn();
+    drop(stream);
+    drop(cursors);
+    drop(node);
+    drop(rt);
+
+    // A new deletion passes the old notice's own LSN. Its coverage cannot
+    // justify suppressing this larger missing range.
+    let (rt, node) = open();
+    for i in 0..80 {
+        grant(
+            &rt,
+            &node,
+            &format!("later-{i}.example"),
+            "source after retention",
+        );
+    }
+    advance(&rt, &node);
+    rt.block_on(node.snapshot("manual")).unwrap();
+    let later_first = node.log_first(node.storage_config().unwrap()).unwrap();
+    assert!(later_first > old_head);
+    assert!(
+        gaps(&rt, &node).is_empty(),
+        "the first notice must actually be deleted"
+    );
+    let cursors = Arc::new(
+        rt.block_on(Cursors::load(node.env().clone(), data.path()))
+            .unwrap(),
+    );
+    let stream = rt
+        .block_on(start(
+            node.clone(),
+            cursors.clone(),
+            settings(),
+            mapper(&node),
+        ))
+        .unwrap();
+    wait(&cursors, &node);
+    let later = gaps(&rt, &node);
+    assert_eq!(later.len(), 1);
+    assert_eq!(later[0].1["from"], (old_head + 1).to_string());
+    assert_eq!(later[0].1["to"], (later_first - 1).to_string());
+    drop(stream);
+    drop(cursors);
+    drop(node);
+    drop(rt);
+
+    // A restore marker starts a new source incarnation, even if an old
+    // notice with the identical range remains in the restored source.
+    let (rt, node) = open();
+    let through = node.applied_lsn();
+    rt.block_on(node.record_audit_event(
+        "restore",
+        "",
+        [("through_lsn".into(), through.to_string())].into(),
+        pb::Audit {
+            token_id: "system".into(),
+            ..audit()
+        },
+    ))
+    .unwrap();
+    let cursors = Arc::new(
+        rt.block_on(Cursors::load(node.env().clone(), data.path()))
+            .unwrap(),
+    );
+    rt.block_on(cursors.save(
+        "audit",
+        kronik_otel::cursor::Entry {
+            lsn: old_head,
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    let _stream = rt
+        .block_on(start(
+            node.clone(),
+            cursors.clone(),
+            settings(),
+            mapper(&node),
+        ))
+        .unwrap();
+    wait(&cursors, &node);
+    let restored = gaps(&rt, &node);
+    assert_eq!(restored.len(), 2);
+    assert_eq!(
+        restored[0].1, restored[1].1,
+        "new incarnation must append the same missing range anew"
+    );
+}
+
 /// Exports the log of the node on `dir` to `sink` from its start, a record
 /// per batch and a file per batch, until it is caught up.
 fn export(rt: &tokio::runtime::Runtime, node: &Arc<Node>, dir: &Path, sink: Sink) {
@@ -274,7 +657,8 @@ fn read_back(sink: &Sink, got: &Mutex<Vec<String>>) -> Vec<Line> {
             .map(|f| std::fs::read_to_string(f).unwrap())
             .collect(),
         Sink::S3 { url, .. } => {
-            let dir = Path::new(url.strip_prefix("file://").unwrap()).join("audit");
+            let dir = Path::new(url.strip_prefix("file://").unwrap())
+                .join(kronik_otel::sink::OBJECT_PREFIX);
             let mut names: Vec<_> = std::fs::read_dir(&dir)
                 .unwrap()
                 .map(|e| e.unwrap().path())
@@ -290,6 +674,82 @@ fn read_back(sink: &Sink, got: &Mutex<Vec<String>>) -> Vec<Line> {
     text.lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect()
+}
+
+#[test]
+fn an_initially_unavailable_file_sink_retries_without_blocking_the_node() {
+    let data = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let blocked = root.path().join("blocked");
+    // A regular file in place of a parent is unavailable even when tests run as root.
+    std::fs::write(&blocked, b"leave unchanged").unwrap();
+    let sink = Sink::File(blocked.join("audit"));
+    let (rt, node) = node_at(data.path());
+    grant(&rt, &node, "before.example", "before exporter");
+    let cursors = Arc::new(
+        rt.block_on(Cursors::load(node.env().clone(), data.path()))
+            .unwrap(),
+    );
+    let settings = Settings {
+        sink: sink.clone(),
+        batch_records: 1,
+        interval: Duration::from_millis(10),
+        file_max_bytes: 1 << 20,
+        headers_env: None,
+        from_now: false,
+        max_hold: Duration::ZERO,
+        hold_release: 0,
+    };
+    let stream = rt
+        .block_on(start(
+            node.clone(),
+            cursors.clone(),
+            settings,
+            mapper(&node),
+        ))
+        .unwrap();
+    let initial = stream.progress().cursor;
+    for _ in 0..200 {
+        if stream.progress().last_error.as_deref() == Some("io") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let progress = stream.progress();
+    assert_eq!(progress.last_error.as_deref(), Some("io"), "{progress:?}");
+    assert_eq!(progress.cursor, initial);
+    assert_eq!(cursors.get("audit").unwrap().lsn, initial);
+    grant(&rt, &node, "during.example", "while sink unavailable");
+    assert!(node.applied_lsn() > initial);
+    assert_eq!(stream.progress().cursor, initial);
+    assert_eq!(std::fs::read(&blocked).unwrap(), b"leave unchanged");
+
+    std::fs::remove_file(&blocked).unwrap();
+    for _ in 0..600 {
+        if stream.progress().cursor >= node.applied_lsn() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let progress = stream.progress();
+    assert_eq!(progress.cursor, node.applied_lsn(), "{progress:?}");
+    assert_eq!(cursors.get("audit").unwrap().lsn, node.applied_lsn());
+    let lines = read_back(&sink, &Mutex::new(Vec::new()));
+    let mut expected = Vec::new();
+    let m = mapper(&node);
+    rt.block_on(node.reader().read(1, node.applied_lsn(), |c| {
+        expected.extend(m.expected(c.lsn, &c.record)?);
+        Ok(())
+    }))
+    .unwrap();
+    let report = verify(&expected, &lines, 0, node.applied_lsn());
+    assert!(report.complete, "{report:?}");
+    assert!(lines.iter().any(|line| line.reason == "before exporter"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.reason == "while sink unavailable")
+    );
 }
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -313,7 +773,11 @@ fn copy_dir(from: &Path, to: &Path) {
 #[test]
 fn a_restore_that_reuses_lsns_loses_no_exported_line() {
     let got = Arc::new(Mutex::new(Vec::new()));
-    let hook = webhook(Arc::new(AtomicBool::new(true)), Arc::clone(&got));
+    let hook = webhook(
+        Arc::new(AtomicBool::new(true)),
+        Arc::clone(&got),
+        Arc::default(),
+    );
     let (files, objects) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     for sink in [
         Sink::File(files.path().join("audit")),
@@ -362,7 +826,7 @@ fn a_restore_that_reuses_lsns_loses_no_exported_line() {
         let mut expected = Vec::new();
         let m = mapper(&node);
         rt.block_on(node.reader().read(1, node.applied_lsn(), |c| {
-            expected.extend(m.lines(c.lsn, &c.record, &[]));
+            expected.extend(m.expected(c.lsn, &c.record)?);
             Ok(())
         }))
         .unwrap();

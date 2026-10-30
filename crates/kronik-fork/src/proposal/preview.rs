@@ -303,7 +303,7 @@ impl Proposals {
             summary: Value::Null,
             options,
             kinds: kinds.iter().map(encode_kind).collect(),
-            reason: audit.reason,
+            reason: audit.reason.clone(),
             approved: None,
             promoted: None,
             plain_fork: true,
@@ -327,57 +327,72 @@ impl Proposals {
         if dry_run {
             return Ok((meta, true));
         }
-        // Read before the replay: an erasure from now on makes this state
-        // stale, and its first request rebuilds it (N4).
-        let erasure = self.erasures();
-        let mut live = self
-            .replay(
-                &id,
-                head,
-                head,
-                &kinds,
-                &meta.options,
-                1,
-                None,
-                false,
-                false,
-                // Copies would outlive the request that made them (M14).
-                Some(super::copies::PREVIEW),
-            )
+        let details: std::collections::BTreeMap<String, String> = [
+            ("proposal".to_owned(), proposal.to_owned()),
+            ("no_pii".to_owned(), no_pii.to_string()),
+        ]
+        .into();
+        self.node
+            .record_audit_event("preview.create", &id, details.clone(), audit.clone())
             .await?;
-        live.erasure = erasure;
-        // Recorded and listed before its log is written, with no await in
-        // between (P-F7): whatever stops this later leaves a preview that
-        // answers and expires, never a directory nothing deletes.
-        let served = {
-            let mut entries = self.entries.lock().await;
-            self.preview_room()?;
-            self.save(&meta, None)?;
-            entries.insert(
-                id.clone(),
-                Entry {
-                    meta: meta.clone(),
-                    live: None,
-                },
-            );
-            let served = Served::new(meta, Some(live));
-            lock(&self.previews).insert(id.clone(), served.clone());
-            served
-        };
-        let mut state = served.state.lock().await;
-        let Entry { meta, live } = &mut *state;
-        if meta.preview.is_some()
-            && let Some(live) = live.as_mut()
-        {
-            self.write_log(&id, live).await?;
-            self.save_preview_diff(meta, live)?;
+        let result = async {
+            // Read before the replay: an erasure from now on makes this state
+            // stale, and its first request rebuilds it (N4).
+            let erasure = self.erasures();
+            let mut live = self
+                .replay(
+                    &id,
+                    head,
+                    head,
+                    &kinds,
+                    &meta.options,
+                    1,
+                    None,
+                    false,
+                    false,
+                    // Copies would outlive the request that made them (M14).
+                    Some(super::copies::PREVIEW),
+                )
+                .await?;
+            live.erasure = erasure;
+            // Recorded and listed before its log is written, with no await in
+            // between (P-F7): whatever stops this later leaves a preview that
+            // answers and expires, never a directory nothing deletes.
+            let served = {
+                let mut entries = self.entries.lock().await;
+                self.preview_room()?;
+                self.save(&meta, None)?;
+                entries.insert(
+                    id.clone(),
+                    Entry {
+                        meta: meta.clone(),
+                        live: None,
+                    },
+                );
+                let served = Served::new(meta, Some(live));
+                lock(&self.previews).insert(id.clone(), served.clone());
+                served
+            };
+            let mut state = served.state.lock().await;
+            let Entry { meta, live } = &mut *state;
+            if meta.preview.is_some()
+                && let Some(live) = live.as_mut()
+            {
+                self.write_log(&id, live).await?;
+                self.save_preview_diff(meta, live)?;
+            }
+            let meta = meta.clone();
+            drop(state);
+            if let Some(e) = self.entries.lock().await.get_mut(&id) {
+                e.meta = meta.clone();
+            }
+            Ok((meta, false))
         }
-        let meta = meta.clone();
-        drop(state);
-        if let Some(e) = self.entries.lock().await.get_mut(&id) {
-            e.meta = meta.clone();
+        .await;
+        if let Err(e) = &result {
+            super::audit_failed(&self.node, "preview.create", &id, details, audit, e).await;
         }
-        Ok((meta, false))
+        result
     }
 
     /// Builds the preview's diff and saves it with its record.
@@ -432,7 +447,12 @@ impl Proposals {
     }
 
     /// `kronik preview delete`: the fork, its directory and its routes.
-    pub async fn delete_preview(&self, id: &str, dry_run: bool) -> Result<Proposal, ApiError> {
+    pub async fn delete_preview(
+        &self,
+        id: &str,
+        audit: pb::Audit,
+        dry_run: bool,
+    ) -> Result<Proposal, ApiError> {
         let served = self.served(id)?;
         // After the request in flight, if any.
         let mut state = served.state.lock().await;
@@ -443,13 +463,27 @@ impl Proposals {
         if dry_run {
             return Ok(meta);
         }
+        self.node
+            .record_audit_event("preview.delete", id, Default::default(), audit.clone())
+            .await?;
         // Gone for every request, also one already waiting for the lock.
         state.meta.preview = None;
         state.live = None;
         lock(&self.previews).remove(id);
         drop(state);
         self.entries.lock().await.remove(id);
-        std::fs::remove_dir_all(self.dir(id)).map_err(internal)?;
+        if let Err(e) = std::fs::remove_dir_all(self.dir(id)).map_err(internal) {
+            super::audit_failed(
+                &self.node,
+                "preview.delete",
+                id,
+                Default::default(),
+                audit,
+                &e,
+            )
+            .await;
+            return Err(e);
+        }
         Ok(meta)
     }
 
@@ -564,7 +598,7 @@ impl Proposals {
         // The reply leaves the fork: no real SQL rows in it (M5), as
         // fork_send's, and no secret value (I8), as any answer.
         let mut outcome = shown_record(&turn).outcome.unwrap_or_default();
-        let secrets = self.node.secret_values();
+        let secrets = self.node.secret_values()?;
         if !secrets.is_empty() {
             kronik_sched::scrub::outcome_output(&mut outcome.output, &secrets);
             outcome.message = kronik_effects::http::scrub_str(&outcome.message, &secrets);

@@ -1,0 +1,7 @@
+{
+  "audit": {"lsn": 9, "state": null},
+  "traces": {
+    "lsn": 41,
+    "state": {"open": [], "kept": []}
+  }
+}

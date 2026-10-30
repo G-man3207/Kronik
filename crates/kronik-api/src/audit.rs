@@ -30,7 +30,7 @@ impl Api {
             None => first,
         };
         let applied = self.node.applied_lsn();
-        let secrets = self.node.secret_values();
+        let secrets = self.node.secret_values()?;
         let fallback;
         let mapper = match &self.audit_mapper {
             Some(m) => m.as_ref(),
@@ -59,7 +59,7 @@ impl Api {
                 .map_err(internal)?;
             for c in records {
                 let more = if lines.len() < limit {
-                    mapper.lines(c.lsn, &c.record, &secrets)
+                    mapper.lines(c.lsn, &c.record, &secrets).map_err(internal)?
                 } else {
                     Vec::new()
                 };

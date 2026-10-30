@@ -590,6 +590,9 @@ impl Otel {
         if self.batch_spans == 0 {
             return Err("[otel] batch_spans must be at least 1".into());
         }
+        if self.metrics_interval.0.is_zero() {
+            return Err("[otel] metrics_interval must be more than zero".into());
+        }
         let Some(endpoint) = self.endpoint() else {
             return Ok(());
         };
@@ -914,7 +917,16 @@ impl Config {
                 m.endpoint
             ));
         }
-        self.audit.parsed_sink()?;
+        if matches!(
+            self.audit.parsed_sink()?,
+            Some(kronik_otel::sink::Sink::File(_))
+        ) && !(1..=kronik_otel::sink::MAX_FILE_BYTES).contains(&self.audit.file_max_bytes.0)
+        {
+            return Err(
+                "[audit] file_max_bytes must be between 1B and 1GiB; use a threshold in that range"
+                    .into(),
+            );
+        }
         if self.audit.endpoint.is_some() && self.audit.sink().is_none() {
             return Err("[audit] endpoint is for an s3:// sink only".into());
         }
@@ -1427,6 +1439,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn file_rotation_threshold_rejects_out_of_range_configuration() {
+        for (size, valid) in [
+            ("0B", false),
+            ("1B", true),
+            ("1GiB", true),
+            ("1073741825B", false),
+        ] {
+            let result = parse(&format!(
+                "[audit]\nsink = \"file:///var/log/kronik/audit/\"\nfile_max_bytes = \"{size}\"\n"
+            ));
+            assert_eq!(result.is_ok(), valid, "{size}: {result:?}");
+        }
+    }
+
     /// Perf review R3: an audit sink's hold must be able to give way:
     /// `hold_release` above `[log] disk_reserve`, or `max_hold` set; also
     /// when a flag sets the reserve.
@@ -1461,6 +1488,14 @@ mod tests {
             ..Overrides::default()
         });
         assert!(c.check_audit_hold().unwrap_err().contains("hold_release"));
+    }
+
+    #[test]
+    fn zero_metrics_timer_is_rejected_before_export_starts() {
+        for endpoint in ["", "endpoint = \"http://127.0.0.1:4318\"\n"] {
+            assert!(parse(&format!("[otel]\n{endpoint}metrics_interval = \"0s\"\n")).is_err());
+            assert!(parse(&format!("[otel]\n{endpoint}metrics_interval = \"1ms\"\n")).is_ok());
+        }
     }
 
     #[test]

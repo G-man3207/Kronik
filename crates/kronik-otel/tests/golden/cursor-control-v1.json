@@ -1,0 +1,15 @@
+{
+  "traces": {
+    "lsn": 20,
+    "state": null,
+    "control": {
+      "version": 1,
+      "generation": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "rewind": {
+        "generation": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        "to": 5,
+        "through": 20
+      }
+    }
+  }
+}

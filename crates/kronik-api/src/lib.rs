@@ -706,7 +706,7 @@ impl Api {
     /// every string and in every byte payload: a `base64` field is decoded,
     /// scrubbed, encoded again, and its `text` twin follows (I8).
     fn ok_scrubbed<T: Serialize>(&self, v: &T) -> Result<ApiResponse> {
-        let secrets = self.node.secret_values();
+        let secrets = self.node.secret_values()?;
         if secrets.is_empty() {
             return Ok(ApiResponse {
                 status: 200,
@@ -728,7 +728,7 @@ impl Api {
     /// reads the record would otherwise leave its value in the log for
     /// good. Withheld when the secrets cannot be loaded.
     fn audit(&self, req: &ApiRequest, reason: String) -> pb::Audit {
-        let secrets = self.node.try_secret_values().ok();
+        let secrets = self.node.secret_values().ok();
         pb::Audit {
             token_id: req.token_id.clone(),
             reason: kronik_sched::scrub::for_log(&reason, secrets.as_deref()),
@@ -736,9 +736,8 @@ impl Api {
         }
     }
 
-    /// Writes the `AuditEvent` of a mutation that succeeded outside the log
-    /// (M28 §4.2), its target and details scrubbed as [`Api::audit`]
-    /// scrubs the reason. Never for a dry run: callers return before it.
+    /// Writes a mutation event or intent, canonically scrubbed by Node.
+    /// Never for a dry run: callers return before it.
     async fn audit_event(
         &self,
         req: &ApiRequest,
@@ -747,15 +746,17 @@ impl Api {
         details: &[(&str, String)],
         reason: String,
     ) -> Result<()> {
-        use kronik_sched::scrub::for_log;
-        let secrets = self.node.try_secret_values().ok();
         let details = details
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), for_log(v, secrets.as_deref())))
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
             .collect();
-        let target = kronik_sched::scrub::for_target(target, secrets.as_deref());
+        let audit = pb::Audit {
+            token_id: req.token_id.clone(),
+            reason,
+            wall_time_ms: self.node.env().clock.wall_ms(),
+        };
         self.node
-            .record_audit_event(action, &target, details, self.audit(req, reason))
+            .record_audit_event(action, target, details, audit)
             .await?;
         Ok(())
     }

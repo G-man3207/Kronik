@@ -161,7 +161,7 @@
         "type": "object"
       },
       "AuditResponse": {
-        "description": "`GET /v1/audit`: `kronik.audit/v1` lines in LSN order (m28-otel §4.3).",
+        "description": "`GET /v1/audit`: `kronik.audit/v2` lines in LSN order (m28-otel §4.3).",
         "properties": {
           "applied_lsn": {
             "format": "uint64",
@@ -2204,6 +2204,7 @@
                   "RUNSC_MISSING",
                   "SCOPE_MISSING",
                   "SECRET_NOT_FOUND",
+                  "SECRET_UNAVAILABLE",
                   "STORAGE_CORRUPT",
                   "SUBJECT_ERASED",
                   "TOKEN_NOT_FOUND",
@@ -7320,7 +7321,7 @@
             "description": "An error: the stable error JSON."
           }
         },
-        "summary": "The audit lines of main's log (kronik.audit/v1), as an audit sink receives them",
+        "summary": "The audit lines of main's log (kronik.audit/v2), as an audit sink receives them",
         "x-kronik-scope": "admin"
       }
     },

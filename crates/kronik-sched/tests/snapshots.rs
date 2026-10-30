@@ -691,9 +691,7 @@ fn the_audit_hold_gives_way_between_snapshot_passes() {
     assert!(ran <= 1, "the index rows were compacted {ran} times");
 }
 
-/// Review M1: a rewind during a delivery keeps its floor when that batch
-/// completes, so compaction keeps what the rewind resends; a batch from
-/// the rewind's point on moves the floor again.
+/// A rewind during delivery holds its cut until matching durable completion.
 #[test]
 fn a_rewind_holds_retention_past_a_batch_in_flight() {
     let dir = tempdir();
@@ -703,7 +701,7 @@ fn a_rewind_holds_retention_past_a_batch_in_flight() {
     hold.configure(0, Duration::ZERO);
     hold.set(40, now);
     // The rewind comes while the batch 41.. is at the sink; it completes.
-    hold.rewind(2, now);
+    hold.rewind([1; 16], 2, now);
     hold.set(40, now);
     assert_eq!(hold.floor(), Some(2));
     p.rt.block_on(p.node.snapshot("manual")).unwrap();
@@ -711,11 +709,53 @@ fn a_rewind_holds_retention_past_a_batch_in_flight() {
     // Everything after the rewind's point is kept.
     let first = p.node.log_first(&storage).unwrap();
     assert!(first <= 3, "{first}");
-    // The follower resends from 3: the floor follows deliveries again.
-    hold.set(2, now);
+    // Starting below the cut, or a stale ACK, cannot complete the rewind.
+    hold.set(1, now);
     hold.set(60, now);
+    hold.complete_rewind([0; 16], 60, now);
+    assert_eq!(hold.floor(), Some(2));
+    hold.complete_rewind([1; 16], 60, now);
     assert_eq!(hold.floor(), Some(60));
     assert!(p.node.compact(&storage).unwrap() > 2);
+}
+
+#[test]
+fn rewind_completion_matches_the_latest_generation_and_keeps_the_earliest_cut() {
+    let hold = kronik_sched::snapshots::RetentionHold::default();
+    hold.set(100, 1);
+    hold.rewind([1; 16], 20, 2);
+    hold.rewind([2; 16], 40, 3);
+    assert_eq!(hold.floor(), Some(20));
+    hold.complete_rewind([1; 16], 100, 4);
+    assert_eq!(hold.floor(), Some(20));
+    hold.set(10, 5);
+    assert_eq!(hold.floor(), Some(10));
+    hold.set(100, 6);
+    assert_eq!(hold.floor(), Some(20));
+    hold.rewind([3; 16], 5, 7);
+    hold.complete_rewind([2; 16], 100, 8);
+    assert_eq!(hold.floor(), Some(5));
+    assert_eq!(hold.age_ms(9), Some(1));
+    hold.complete_rewind([3; 16], 100, 10);
+    assert_eq!(hold.floor(), Some(100));
+    assert_eq!(hold.age_ms(11), Some(1));
+}
+
+#[test]
+fn a_failed_rewind_restores_only_its_own_pending_control() {
+    let hold = kronik_sched::snapshots::RetentionHold::default();
+    hold.set(100, 1);
+    hold.rewind([1; 16], 20, 2);
+    hold.rewind([2; 16], 5, 3);
+    hold.restore_control([2; 16], Some(([1; 16], 20)), 100, 4);
+    assert_eq!(hold.floor(), Some(20));
+    hold.complete_rewind([2; 16], 100, 5);
+    assert_eq!(hold.floor(), Some(20));
+    hold.rewind([3; 16], 10, 6);
+    hold.restore_control([2; 16], None, 100, 7);
+    assert_eq!(hold.floor(), Some(10));
+    hold.restore_control([3; 16], None, 100, 8);
+    assert_eq!(hold.floor(), Some(100));
 }
 
 /// `[audit] max_hold`: a floor that has not moved for longer is released.

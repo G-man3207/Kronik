@@ -2,7 +2,11 @@
 //! records of a batch to spans and POSTs them to `<endpoint>/v1/traces` as
 //! OTLP/HTTP protobuf. Its cursor state is the open-turn set.
 
+use std::io;
+use std::path::Path;
 use std::sync::Arc;
+
+use bytes::Bytes;
 
 use kronik_core::ids::Lsn;
 use kronik_log::Committed;
@@ -11,10 +15,12 @@ use kronik_proto::log::v1 as pb;
 use kronik_sched::Node;
 use prost::Message as _;
 
+use crate::cursor::Generation;
 use crate::follow::{Delivery, Sink};
 use crate::keys::KeyHasher;
 use crate::otlp::collector::trace::v1::ExportTraceServiceResponse;
 use crate::spans::{self, ActorKeys, OpenTurns, Resource, SpanRef, Turn};
+use crate::trace_state::{self, TraceState};
 
 /// `[otel] actor_keys`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,25 +46,35 @@ pub struct TraceSink {
     settings: Settings,
     hasher: KeyHasher,
     open: OpenTurns,
+    checkpoints: TraceState,
     /// Whether the open-turn cap was hit since the last warning.
     capped: bool,
 }
 
 impl TraceSink {
     /// `state` is the cursor's saved open-turn set.
-    pub fn new(
+    pub async fn open(
         node: Arc<Node>,
         settings: Settings,
         hasher: KeyHasher,
+        data_dir: &Path,
         state: &serde_json::Value,
-    ) -> TraceSink {
-        TraceSink {
+        lsn: Lsn,
+    ) -> io::Result<TraceSink> {
+        let (checkpoints, open) =
+            trace_state::load(node.env().clone(), data_dir, state, lsn, hasher.id_key()).await?;
+        let mut sink = TraceSink {
             node,
             settings,
-            open: OpenTurns::from_json(state, hasher.id_key()),
+            open,
+            checkpoints,
             hasher,
             capped: false,
+        };
+        if state.is_null() {
+            sink.rewind(lsn, [0; 16]).await.map_err(io::Error::other)?;
         }
+        Ok(sink)
     }
 
     /// The span of the dead-lettered turn a resend names (`main:<lsn>`),
@@ -119,9 +135,17 @@ impl TraceSink {
 
 impl Sink for TraceSink {
     /// The encoded request, or none when the batch had no turn records.
-    type Batch = Option<Vec<u8>>;
+    type Batch = Option<Bytes>;
 
-    async fn prepare(&mut self, records: Vec<Committed>) -> Self::Batch {
+    async fn prepare(
+        &mut self,
+        records: Vec<Committed>,
+        _generation: Generation,
+    ) -> Result<Self::Batch, String> {
+        let secrets = self
+            .node
+            .secret_values()
+            .map_err(|e| e.code.as_str().to_owned())?;
         let mut out = Vec::new();
         for c in records {
             match c.record {
@@ -151,6 +175,7 @@ impl Sink for TraceSink {
                         branch: self.node.branch(),
                         open: &self.open,
                         resend_of,
+                        secrets: &secrets,
                     };
                     out.extend(spans::spans(&turn, &keys));
                     self.open.commit(&r);
@@ -162,7 +187,7 @@ impl Sink for TraceSink {
             self.capped = false;
         }
         if out.is_empty() {
-            return None;
+            return Ok(None);
         }
         // Callees commit first, so a caller in the same batch clamps them.
         spans::clamp(&mut out);
@@ -172,7 +197,7 @@ impl Sink for TraceSink {
             node: self.node.branch(),
             engine: kronik_runtime::ENGINE_VERSION,
         };
-        Some(spans::request(&resource, out).encode_to_vec())
+        Ok(Some(spans::request(&resource, out).encode_to_vec().into()))
     }
 
     async fn deliver(&mut self, batch: &Self::Batch) -> Delivery {
@@ -193,8 +218,19 @@ impl Sink for TraceSink {
         )
     }
 
-    fn state(&self) -> serde_json::Value {
-        self.open.to_json()
+    async fn checkpoint(&mut self, lsn: Lsn) -> Result<serde_json::Value, String> {
+        self.checkpoints
+            .checkpoint(&mut self.open, lsn)
+            .await
+            .map_err(|error| {
+                trace_state::failure_code(&error)
+                    .unwrap_or("state_io")
+                    .to_owned()
+            })
+    }
+
+    fn committed(&mut self, _lsn: Lsn, _generation: Generation, _rewind_pending: bool) {
+        self.checkpoints.committed(&mut self.open);
     }
 
     /// Rebuilds the open-turn set as it was after `to` (review M8): from
@@ -207,12 +243,19 @@ impl Sink for TraceSink {
     /// open or kept after `to` is not known, so what names it falls back as
     /// past the cap; keep set snapshots with the cursor if rewinds past
     /// retention ever matter. Reads the retained log up to `to` once.
-    async fn rewind(&mut self, to: Lsn) {
+    async fn rewind(&mut self, to: Lsn, _generation: Generation) -> Result<(), String> {
         let mut open = OpenTurns::new(*self.open.ids());
-        let read = self
-            .node
-            .reader()
-            .read(1, to, |c| {
+        open.tracking = false;
+        let reader = self.node.reader();
+        let first = reader
+            .starts()
+            .await
+            .map_err(|_| "state_read".to_owned())?
+            .first()
+            .copied()
+            .unwrap_or(1);
+        reader
+            .read_while(first, to, |c| {
                 match &c.record {
                     Record::TurnBegin(b) => {
                         if let Some(key) = &b.causal_key {
@@ -222,13 +265,14 @@ impl Sink for TraceSink {
                     Record::TurnRecord(r) => open.commit(r),
                     _ => {}
                 }
-                Ok(())
+                Ok(true)
             })
-            .await;
-        if let Err(e) = read {
-            tracing::warn!(error = %e, to, "otel: rebuilding the open turns for a rewind failed; links may name other traces");
-        }
+            .await
+            .map_err(|_| "state_read".to_owned())?;
+        open.tracking = true;
         self.open = open;
+        self.checkpoints.reset();
+        Ok(())
     }
 }
 

@@ -7,7 +7,7 @@
 //! value, no `Outcome.message` or `EffectRecord.error`, no path or query,
 //! no subject. The caller hashes actor keys and supplies the id key.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use kronik_core::causal;
 use kronik_core::ids::{ActorRef, hex};
@@ -150,24 +150,27 @@ fn joins_parent(input: Option<&pb::Input>) -> bool {
 #[derive(Debug, Clone)]
 pub struct OpenTurns {
     ids: IdKey,
-    traces: HashMap<Vec<u8>, [u8; 16]>,
-    kept: HashMap<Vec<u8>, Kept>,
+    pub(crate) traces: HashMap<Vec<u8>, [u8; 16]>,
+    pub(crate) kept: HashMap<Vec<u8>, Kept>,
     /// The kept turns' keys by `Kept::seq`, oldest first.
-    order: BTreeMap<u64, Vec<u8>>,
-    next: u64,
+    pub(crate) order: BTreeMap<u64, Vec<u8>>,
+    pub(crate) next: u64,
+    pub(crate) dirty: HashSet<Vec<u8>>,
+    pub(crate) tracking: bool,
 }
 
-#[derive(Debug, Clone)]
-struct Kept {
-    trace: [u8; 16],
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Kept {
+    pub(crate) trace: [u8; 16],
     /// The last step's ordinal of each turn still to come that this one
     /// produced, and whether that turn joins this trace (only a timed-out
     /// call's callee does).
-    children: Vec<(u32, bool)>,
+    pub(crate) children: Vec<(u32, bool)>,
     /// A callee whose caller has not committed: a failed caller sends it
     /// a compensation, which links to it.
-    caller: bool,
-    seq: u64,
+    pub(crate) caller: bool,
+    pub(crate) seq: u64,
 }
 
 impl OpenTurns {
@@ -186,6 +189,14 @@ impl OpenTurns {
             kept: HashMap::new(),
             order: BTreeMap::new(),
             next: 0,
+            dirty: HashSet::new(),
+            tracking: true,
+        }
+    }
+
+    fn mark_changed(&mut self, key: &[u8]) {
+        if self.tracking && !self.dirty.contains(key) {
+            self.dirty.insert(key.to_vec());
         }
     }
 
@@ -248,6 +259,7 @@ impl OpenTurns {
             return false;
         }
         let trace = self.place(key, input);
+        self.mark_changed(&k);
         self.traces.insert(k, trace);
         true
     }
@@ -262,7 +274,9 @@ impl OpenTurns {
         let input = r.input.as_ref();
         let k = causal::encode(key);
         let trace = self.trace(key, input);
-        self.traces.remove(&k);
+        if self.traces.remove(&k).is_some() {
+            self.mark_changed(&k);
+        }
         let up = parent(key).map(|p| causal::encode(&p));
         // A turn its producer waited for came.
         if let (Some(up), Some(step)) = (&up, key.path.last()) {
@@ -317,6 +331,7 @@ impl OpenTurns {
     }
 
     fn keep(&mut self, k: Vec<u8>, trace: [u8; 16], children: Vec<(u32, bool)>, caller: bool) {
+        self.mark_changed(&k);
         let seq = self.next;
         self.next += 1;
         if let Some(old) = self.kept.insert(
@@ -336,6 +351,9 @@ impl OpenTurns {
                 break;
             };
             self.kept.remove(&oldest);
+            if self.tracking {
+                self.dirty.insert(oldest);
+            }
         }
     }
 
@@ -344,9 +362,16 @@ impl OpenTurns {
         let Some(e) = self.kept.get_mut(k) else {
             return;
         };
+        let before_children = e.children.len();
+        let before_caller = e.caller;
         f(e);
-        if e.children.is_empty() && !e.caller {
-            let seq = e.seq;
+        let changed = before_children != e.children.len() || before_caller != e.caller;
+        let remove = e.children.is_empty() && !e.caller;
+        let seq = e.seq;
+        if changed {
+            self.mark_changed(k);
+        }
+        if remove {
             self.kept.remove(k);
             self.order.remove(&seq);
         }
@@ -382,56 +407,6 @@ impl OpenTurns {
             }
         })
     }
-
-    /// The set as the trace stream's cursor state: `{"open": [[key hex,
-    /// trace hex], …] sorted, "kept": [[key hex, trace hex, [[ordinal,
-    /// joins], …], caller], …] oldest first}`.
-    pub fn to_json(&self) -> serde_json::Value {
-        let mut open: Vec<(String, String)> =
-            self.traces.iter().map(|(k, t)| (hex(k), hex(t))).collect();
-        open.sort();
-        let kept: Vec<_> = self
-            .order
-            .values()
-            .filter_map(|k| {
-                let e = self.kept.get(k)?;
-                Some((hex(k), hex(&e.trace), &e.children, e.caller))
-            })
-            .collect();
-        serde_json::json!({ "open": open, "kept": kept })
-    }
-
-    /// The set from [`OpenTurns::to_json`], or from the open pairs alone
-    /// that came before kept turns; what does not parse is left out.
-    pub fn from_json(v: &serde_json::Value, ids: IdKey) -> OpenTurns {
-        let open = v.get("open").unwrap_or(v);
-        let pairs: Vec<(String, String)> = serde_json::from_value(open.clone()).unwrap_or_default();
-        type KeptJson = Vec<(String, String, Vec<(u32, bool)>, bool)>;
-        let kept: KeptJson = v
-            .get("kept")
-            .and_then(|k| serde_json::from_value(k.clone()).ok())
-            .unwrap_or_default();
-        let mut out = OpenTurns {
-            traces: pairs
-                .iter()
-                .filter_map(|(k, t)| Some((unhex_vec(k)?, unhex(t)?)))
-                .collect(),
-            ..OpenTurns::new(ids)
-        };
-        for (k, t, children, caller) in kept {
-            if let (Some(k), Some(t)) = (unhex_vec(&k), unhex(&t)) {
-                out.keep(k, t, children, caller);
-            }
-        }
-        out
-    }
-}
-
-fn unhex_vec(s: &str) -> Option<Vec<u8>> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
-        .collect()
 }
 
 /// A turn's span id: 8 bytes of `blake3_keyed(ids, "kronik span v1" ‖
@@ -525,6 +500,8 @@ pub struct Turn<'a> {
     pub record: &'a pb::TurnRecord,
     pub lsn: u64,
     pub branch: &'a str,
+    /// Complete retained-secret inventory; unavailable coverage must not be mapped.
+    pub secrets: &'a [(String, Vec<u8>)],
     /// The exporter's open turns, this turn's own entry included while its
     /// record is mapped.
     pub open: &'a OpenTurns,
@@ -832,6 +809,25 @@ pub fn spans(turn: &Turn, keys: &ActorKeys) -> Vec<Span> {
             ..Default::default()
         },
     );
+    for span in &mut out {
+        span.name = kronik_sched::scrub::for_log(&span.name, Some(turn.secrets));
+        for attribute in span.attributes.iter_mut().chain(
+            span.links
+                .iter_mut()
+                .flat_map(|link| link.attributes.iter_mut()),
+        ) {
+            if let Some(any_value::Value::StringValue(text)) = attribute
+                .value
+                .as_mut()
+                .and_then(|value| value.value.as_mut())
+            {
+                *text = kronik_sched::scrub::for_log(text, Some(turn.secrets));
+            }
+        }
+        if let Some(status) = &mut span.status {
+            status.message = kronik_sched::scrub::for_log(&status.message, Some(turn.secrets));
+        }
+    }
     clamp(&mut out);
     out
 }

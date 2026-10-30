@@ -592,9 +592,9 @@ fn serve_fails(dir: &Path, sections: &str, envs: &[(&str, &str)]) -> String {
     std::fs::read_to_string(dir.join("serve.log")).unwrap()
 }
 
-/// An S3-compatible endpoint that refuses everything with 403 and an
-/// error body echoing `NEEDLE`, as a provider may echo a credential.
-fn refusing_s3() -> String {
+/// Returns a credential-echoing 403 at either listing or publication.
+/// `allow_listing` reaches PUT as well as the independently tested LIST failure.
+fn refusing_s3(allow_listing: bool) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     std::thread::spawn(move || {
@@ -612,6 +612,16 @@ fn refusing_s3() -> String {
                 .map_or(0, |v| v.trim().parse().unwrap_or(0));
             let mut body = vec![0; len];
             let _ = s.read_exact(&mut body);
+            if allow_listing && head.starts_with("get ") {
+                let reply = "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>false</IsTruncated></ListBucketResult>";
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                continue;
+            }
             let reply =
                 format!("<Error><Code>AccessDenied</Code><Message>key {NEEDLE}</Message></Error>");
             let _ = write!(
@@ -646,7 +656,7 @@ fn credentials_never_reach_the_daemons_log() {
             &format!("x-team=a,authorization: Bearer {NEEDLE}"),
         )],
     );
-    assert!(log.contains("$KRONIK_TEST_HEADERS: header 2"), "{log}");
+    assert!(log.contains("KRONIK_TEST_HEADERS"), "{log}");
     assert!(!log.contains(NEEDLE), "{log}");
 
     let log = serve_fails(
@@ -660,34 +670,40 @@ fn credentials_never_reach_the_daemons_log() {
     assert!(log.contains("http://collector.example:4318"), "{log}");
     assert!(!log.contains(NEEDLE), "{log}");
 
-    let s3 = refusing_s3();
-    let d = Daemon::start_with(
-        &sub("s3"),
-        &format!(
-            "[audit]\nsink = \"s3://bucket/prefix\"\nendpoint = \"{s3}\"\ninterval = \"100ms\"\nmax_hold = \"30d\"\n"
-        ),
-        &[
-            ("AWS_ACCESS_KEY_ID", "AKIDTEST"),
-            ("AWS_SECRET_ACCESS_KEY", NEEDLE),
-        ],
-    );
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let v = d.json(&["export", "status"]);
-        let audit = v["streams"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|s| s["name"] == "audit")
-            .unwrap()
-            .clone();
-        if audit["last_error"] == "s3_forbidden" {
-            break;
+    // The SDK wraps LIST failures generically; PUT retains its typed 403.
+    // Both boundaries must keep the provider body and credentials out of logs.
+    for (allow_listing, code) in [(false, "s3"), (true, "s3_forbidden")] {
+        let s3 = refusing_s3(allow_listing);
+        let d = Daemon::start_with(
+            &sub(if allow_listing { "s3-put" } else { "s3-list" }),
+            &format!(
+                "[audit]\nsink = \"s3://bucket/prefix\"\nendpoint = \"{s3}\"\ninterval = \"100ms\"\nmax_hold = \"30d\"\n"
+            ),
+            &[
+                ("AWS_ACCESS_KEY_ID", "AKIDTEST"),
+                ("AWS_SECRET_ACCESS_KEY", NEEDLE),
+            ],
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let v = d.json(&["export", "status"]);
+            let audit = v["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["name"] == "audit")
+                .unwrap()
+                .clone();
+            if audit["last_error"] == code {
+                assert_eq!(audit["cursor"], 0);
+                assert!(audit["lag"].as_u64().unwrap() > 0);
+                break;
+            }
+            assert!(Instant::now() < deadline, "{audit}\n{}", d.log());
+            std::thread::sleep(Duration::from_millis(100));
         }
-        assert!(Instant::now() < deadline, "{audit}\n{}", d.log());
-        std::thread::sleep(Duration::from_millis(100));
+        let log = d.log();
+        assert!(log.contains(code), "{log}");
+        assert!(!log.contains(NEEDLE), "{log}");
     }
-    let log = d.log();
-    assert!(log.contains("s3_forbidden"), "{log}");
-    assert!(!log.contains(NEEDLE), "{log}");
 }

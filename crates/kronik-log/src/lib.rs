@@ -1119,6 +1119,149 @@ impl LogReader {
         Ok(())
     }
 
+    /// Calls `f` in LSN order, stopping immediately when it returns false.
+    /// Reads and decodes one frame at a time, not the rest of the segment.
+    /// Earlier frames and footers are CRC checked in bounded chunks without
+    /// decoding. Resume at the last consumed LSN + 1; a callback may leave
+    /// its last record unconsumed. Only the visited prefix is validated,
+    /// and callbacks may have run before a later corruption is reported.
+    /// A finite `upto` must exist: a missing or torn acknowledged record
+    /// is corrupt. `Lsn::MAX` permits an unacknowledged active-segment tail.
+    /// Empty ranges (`from > upto` or `upto == 0`) do no I/O.
+    pub async fn read_while(
+        &self,
+        from: Lsn,
+        upto: Lsn,
+        mut f: impl FnMut(Committed) -> Result<bool, LogError>,
+    ) -> Result<(), LogError> {
+        if from > upto || upto == 0 {
+            return Ok(());
+        }
+        let starts = self.starts().await?;
+        let mut expected = None;
+        for (i, &start) in starts.iter().enumerate() {
+            if starts.get(i + 1).is_some_and(|&next| next <= from) {
+                continue;
+            }
+            if start > upto {
+                break;
+            }
+            let path = self.dir.join(segment_name(start));
+            let file = self.env.fs.open(path.clone(), OpenMode::Read).await?;
+            let file_len = file.len().await?;
+            // A valid header must name this branch; never allocate from an
+            // untrusted on-disk branch length.
+            let image = file.read_at(0, 24 + self.branch.len()).await?;
+            let header = parse_header(&image).ok_or_else(|| {
+                corrupt(format!("segment {} has no valid header", path.display()))
+            })?;
+            if header.start_lsn != start || header.branch != self.branch {
+                return Err(corrupt(format!(
+                    "segment {} header mismatch",
+                    path.display()
+                )));
+            }
+            if let Some(exp) = expected
+                && exp != start
+            {
+                return Err(corrupt(format!(
+                    "segment {} starts at lsn {start}, expected {exp}",
+                    path.display()
+                )));
+            }
+            let mut next_lsn = start;
+            let mut off = header.len as u64;
+            while off < file_len {
+                if next_lsn > upto {
+                    return Ok(());
+                }
+                let envelope = file.read_at(off, ENVELOPE_LEN).await?;
+                if envelope.len() != ENVELOPE_LEN {
+                    break;
+                }
+                let (Some(len), Some(stored_crc), Some(lsn)) = (
+                    u32_at(&envelope, 0),
+                    u32_at(&envelope, 4),
+                    u64_at(&envelope, 8),
+                ) else {
+                    break;
+                };
+                if len > MAX_RECORD || ENVELOPE_LEN as u64 + len as u64 > file_len - off {
+                    break;
+                }
+                let kind = envelope[16];
+                if kind != FOOTER_KIND && lsn != next_lsn {
+                    break;
+                }
+                let mut crc = crc32c::crc32c(&envelope[8..]);
+                let mut payload = Vec::new();
+                if kind != FOOTER_KIND && lsn >= from {
+                    payload = file
+                        .read_at(off + ENVELOPE_LEN as u64, len as usize)
+                        .await?;
+                    if payload.len() != len as usize {
+                        break;
+                    }
+                    crc = crc32c::crc32c_append(crc, &payload);
+                } else {
+                    let mut read = 0;
+                    while read < len as usize {
+                        let size = (len as usize - read).min(64 << 10);
+                        let chunk = file
+                            .read_at(off + ENVELOPE_LEN as u64 + read as u64, size)
+                            .await?;
+                        if chunk.len() != size {
+                            break;
+                        }
+                        crc = crc32c::crc32c_append(crc, &chunk);
+                        read += size;
+                    }
+                    if read != len as usize {
+                        break;
+                    }
+                }
+                if crc != stored_crc {
+                    break;
+                }
+                if kind == FOOTER_KIND {
+                    off += ENVELOPE_LEN as u64 + len as u64;
+                    continue;
+                }
+                if lsn >= from {
+                    let record = Record::decode(kind, &payload)
+                        .map_err(|err| corrupt(format!("record at lsn {lsn}: {err}")))?;
+                    if !f(Committed {
+                        lsn,
+                        pos: Position {
+                            segment: start,
+                            offset: off,
+                        },
+                        record,
+                    })? {
+                        return Ok(());
+                    }
+                } else if kind == 0 || !kronik_proto::kind::ALL.contains(&kind) {
+                    return Err(corrupt(format!("record at lsn {lsn} has kind {kind}")));
+                }
+                next_lsn += 1;
+                off += ENVELOPE_LEN as u64 + len as u64;
+            }
+            if (off < file_len && i + 1 != starts.len())
+                || (i + 1 == starts.len() && upto != Lsn::MAX && next_lsn <= upto)
+            {
+                return Err(corrupt(format!(
+                    "segment {} is invalid at offset {off}",
+                    path.display()
+                )));
+            }
+            expected = Some(next_lsn);
+        }
+        if upto != Lsn::MAX && expected.is_none_or(|next| next <= upto) {
+            return Err(corrupt(format!("log has no record at lsn {upto}")));
+        }
+        Ok(())
+    }
+
     /// Reads the record at a known position.
     pub async fn read_at(&self, pos: Position) -> Result<Committed, LogError> {
         let path = self.dir.join(segment_name(pos.segment));

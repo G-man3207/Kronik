@@ -17,10 +17,10 @@ use kronik_core::error::ErrorCode;
 use kronik_core::ids::ActorRef;
 use kronik_fork::diff::{DiffOptions, MAX_SAMPLES};
 use kronik_fork::proposal::preview::MAX_PREVIEWS;
-use kronik_fork::proposal::{Proposals, ProposeRequest};
+use kronik_fork::proposal::{Proposal, Proposals, ProposeRequest};
 use kronik_gateway::PreviewRouter;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::TurnResult;
+use kronik_sched::{NodeConfig, TurnResult};
 
 /// counter/x is 1 on main; returns a proposal of counter-step2 (increment
 /// adds 2).
@@ -120,8 +120,127 @@ fn previews_keep_bounded_state_and_are_capped() {
                 .unwrap_err();
         assert_eq!(e.code, ErrorCode::PreviewLimit, "{e}");
     }
-    p.rt.block_on(props.delete_preview(&id, false)).unwrap();
+    p.rt.block_on(props.delete_preview(&id, audit(), false))
+        .unwrap();
     create(&p, &props, &proposal);
+}
+
+#[test]
+fn preview_persistence_failures_keep_intent_failure_and_caller_context() {
+    let dir = tempdir();
+    let mut fault = None;
+    let p = Proc::start_env(
+        dir.path(),
+        NodeConfig {
+            concurrency: 8,
+            ..Default::default()
+        },
+        |env| fault = Some(ProposalSaveFault::install(env)),
+    );
+    let fault = fault.unwrap();
+    let data = dir.path().join("preview-manager");
+    let props = Arc::new(Proposals::open(p.node.clone(), data.clone()).unwrap());
+    let proposal = propose_step2(&p, &props);
+    let branches = data.join("branches");
+    let audit = pb::Audit {
+        token_id: "operator".into(),
+        reason: "preview persistence fault".into(),
+        wall_time_ms: 1234,
+    };
+    let before = p.node.applied_lsn();
+    fault.arm(&data, "v-");
+    let (preview, dry_run) =
+        p.rt.block_on(props.create_preview(&proposal, None, true, audit.clone(), true))
+            .unwrap();
+    assert!(dry_run);
+    assert_eq!(p.node.applied_lsn(), before);
+    assert!(p.rt.block_on(props.previews()).is_empty());
+    let branch = branches.join(&preview.id);
+    assert!(branch.join("proposal.json").is_dir());
+    assert!(!branch.join("proposal.tmp").exists());
+    std::fs::remove_dir_all(&branch).unwrap();
+    fault.arm(&data, "v-");
+    let e =
+        p.rt.block_on(props.create_preview(&proposal, None, true, audit.clone(), false))
+            .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Internal, "{e}");
+    assert!(p.rt.block_on(props.previews()).is_empty());
+    let mut events = Vec::new();
+    p.rt.block_on(p.node.reader().read(before + 1, p.node.applied_lsn(), |c| {
+        if let kronik_proto::Record::AuditEvent(event) = c.record {
+            events.push(event);
+        }
+        Ok(())
+    }))
+    .unwrap();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0].action, "preview.create");
+    assert_eq!(events[1].action, "preview.create.failed");
+    assert_eq!(events[0].target, events[1].target);
+    for event in &events {
+        assert_eq!(event.audit.as_ref(), Some(&audit));
+        assert_eq!(event.details["proposal"], proposal);
+        assert_eq!(event.details["no_pii"], "true");
+    }
+    assert_eq!(events[1].details["code"], e.code.as_str());
+    let branch = branches.join(&events[0].target);
+    assert!(branch.join("proposal.json").is_dir());
+    let pending: Proposal =
+        serde_json::from_slice(&std::fs::read(branch.join("proposal.tmp")).unwrap()).unwrap();
+    assert_eq!(pending.id, events[0].target);
+    assert_eq!(pending.status, "preview");
+    assert_eq!(pending.preview.unwrap().proposal, proposal);
+
+    std::fs::remove_dir_all(&branch).unwrap();
+    let id = create(&p, &props, &proposal);
+    let branch = branches.join(&id);
+    std::fs::remove_dir_all(&branch).unwrap();
+    std::fs::write(&branch, b"not a directory").unwrap();
+    let before = p.node.applied_lsn();
+    p.rt.block_on(props.delete_preview(&id, audit.clone(), true))
+        .unwrap();
+    assert_eq!(p.node.applied_lsn(), before);
+    let e =
+        p.rt.block_on(props.delete_preview(&id, audit.clone(), false))
+            .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Internal, "{e}");
+    let mut events = Vec::new();
+    p.rt.block_on(p.node.reader().read(before + 1, p.node.applied_lsn(), |c| {
+        if let kronik_proto::Record::AuditEvent(event) = c.record {
+            events.push(event);
+        }
+        Ok(())
+    }))
+    .unwrap();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0].action, "preview.delete");
+    assert_eq!(events[1].action, "preview.delete.failed");
+    for event in &events {
+        assert_eq!(event.target, id);
+        assert_eq!(event.audit.as_ref(), Some(&audit));
+    }
+    assert_eq!(events[1].details["code"], e.code.as_str());
+}
+
+#[test]
+fn preview_output_is_unavailable_when_retained_secret_loading_fails() {
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    let proposal = propose_step2(&p, &props);
+    let id = create(&p, &props, &proposal);
+    p.node
+        .secret_set("scrub", b"retained-preview-secret", &audit(), false)
+        .unwrap();
+    rusqlite::Connection::open(dir.path().join("keys/secrets.db"))
+        .unwrap()
+        .execute("UPDATE secrets SET ciphertext = x'00'", [])
+        .unwrap();
+    let (actor, http) = request("get", "");
+    let e =
+        p.rt.block_on(PreviewRouter::send(props, id, actor, http, None))
+            .unwrap_err();
+    assert_eq!(e.code.as_str(), "SECRET_UNAVAILABLE", "{e}");
 }
 
 /// P-F4: a preview request waiting for an allowlisted live GET holds only

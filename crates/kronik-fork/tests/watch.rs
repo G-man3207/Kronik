@@ -490,11 +490,26 @@ fn a_stopped_watch_acts_no_more() {
     let w =
         p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false))
             .unwrap();
+    let before = p.node.applied_lsn();
     let dry = p.rt.block_on(watches.stop(&w.id, audit(), true)).unwrap();
     assert_eq!(dry.status, "watching");
+    assert_eq!(p.node.applied_lsn(), before, "dry-run writes no intent");
     let stopped = p.rt.block_on(watches.stop(&w.id, audit(), false)).unwrap();
     assert_eq!(stopped.status, "stopped");
     assert_eq!(stopped.stopped.unwrap().reason, "test");
+    let mut events = Vec::new();
+    p.rt.block_on(p.node.reader().read(before + 1, p.node.applied_lsn(), |c| {
+        if let Record::AuditEvent(event) = c.record
+            && event.action == "watch.stop"
+        {
+            events.push(event);
+        }
+        Ok(())
+    }))
+    .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].target, w.id);
+    assert_eq!(events[0].audit.as_ref(), Some(&audit()));
     get_n(&p, 25);
     p.settle();
     std::thread::sleep(Duration::from_millis(300));
@@ -505,6 +520,63 @@ fn a_stopped_watch_acts_no_more() {
         p.rt.block_on(watches.stop(&w.id, audit(), false))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
+}
+
+#[test]
+fn failed_watch_stop_keeps_the_watch_live_and_audits_the_failure() {
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    let epoch = p
+        .node
+        .store()
+        .db()
+        .deployments()
+        .unwrap()
+        .last()
+        .unwrap()
+        .1
+        .epoch;
+    let watches = Arc::new(
+        Watches::open(p.node.clone(), props, dir.path().to_path_buf())
+            .unwrap()
+            .with_interval(Duration::from_secs(3600)),
+    );
+    let w =
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false))
+            .unwrap();
+    let path = dir.path().join("watches");
+    std::fs::rename(&path, dir.path().join("held-watches")).unwrap();
+    std::fs::write(&path, b"not a directory").unwrap();
+    let audit = pb::Audit {
+        token_id: "stop-operator".into(),
+        reason: "stop persistence failure".into(),
+        wall_time_ms: 456,
+    };
+    let before = p.node.applied_lsn();
+    let e =
+        p.rt.block_on(watches.stop(&w.id, audit.clone(), false))
+            .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Internal, "{e}");
+    let live = watches.get(&w.id).unwrap();
+    assert_eq!(live.status, "watching");
+    assert!(live.stopped.is_none());
+    let mut events = Vec::new();
+    p.rt.block_on(p.node.reader().read(before + 1, p.node.applied_lsn(), |c| {
+        if let Record::AuditEvent(event) = c.record {
+            events.push(event);
+        }
+        Ok(())
+    }))
+    .unwrap();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0].action, "watch.stop");
+    assert_eq!(events[1].action, "watch.stop.failed");
+    for event in &events {
+        assert_eq!(event.target, w.id);
+        assert_eq!(event.audit.as_ref(), Some(&audit));
+    }
+    assert_eq!(events[1].details["code"], e.code.as_str());
 }
 
 /// Review W-L2: a dry run evaluates the guards on the current windows.

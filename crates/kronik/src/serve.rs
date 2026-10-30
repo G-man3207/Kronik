@@ -353,10 +353,24 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
         .with_context(|| format!("recovering {}", data_dir.display()))?;
     record_key_source(&node, &data_dir).await?;
     // Export streams (M28): each follows the log from its cursor.
-    let cursors = Arc::new(
-        kronik_otel::cursor::Cursors::load(env.clone(), &data_dir)
-            .await
-            .context("reading the export cursors")?,
+    let exports_on =
+        config.audit.sink().is_some() || (config.otel.endpoint().is_some() && config.otel.traces);
+    let restore_pending = data_dir
+        .join("branches/main")
+        .join(kronik_ship::RESTORE_MARKER)
+        .try_exists()?;
+    let mut cursors = Arc::new(
+        match kronik_otel::cursor::Cursors::load(env.clone(), &data_dir).await {
+            Ok(cursors) => cursors,
+            Err(_) if !exports_on && !restore_pending => {
+                tracing::warn!(
+                    code = "export_state",
+                    "disabled exporters left unreadable export state untouched"
+                );
+                kronik_otel::cursor::Cursors::inactive(env.clone(), &data_dir)
+            }
+            Err(error) => return Err(error).context("reading the export cursors"),
+        },
     );
     record_restore(
         &node,
@@ -365,10 +379,23 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
         args.test_stop_after_restore_event,
     )
     .await?;
+    if let Err(error) = crate::otel::migrate_trace_state(&node, &cursors, &data_dir).await {
+        if exports_on {
+            return Err(error);
+        }
+        tracing::warn!(
+            code = "state_read",
+            "disabled exporters left unmigrated trace state untouched"
+        );
+        cursors = Arc::new(kronik_otel::cursor::Cursors::inactive(
+            env.clone(),
+            &data_dir,
+        ));
+    }
     let (audit_mapper, audit) =
         crate::otel::start_audit(&config, &node, &cursors, &data_dir).await?;
     let exports = vec![
-        crate::otel::start(&config, &node, &cursors, &data_dir)?,
+        crate::otel::start(&config, &node, &cursors, &data_dir).await?,
         audit,
     ];
     // Shipping to object storage (m6-storage §4), when enabled.
@@ -606,7 +633,10 @@ async fn record_restore(
     };
     let v: serde_json::Value = serde_json::from_slice(&body)
         .with_context(|| format!("{} is not JSON", marker.display()))?;
-    let through = v["through_lsn"].as_u64().unwrap_or(0);
+    let through = v["through_lsn"]
+        .as_u64()
+        .filter(|through| *through <= node.applied_lsn())
+        .context("the restore marker requires a valid through_lsn within the recovered log")?;
     let shown = through.to_string();
     let mut recorded = false;
     if node.applied_lsn() > through {
@@ -634,24 +664,69 @@ async fn record_restore(
         anyhow::bail!("stopped after the restore event (--test-stop-after-restore-event)");
     }
     for stream in [crate::otel::TRACES, kronik_otel::sink::STREAM] {
-        if let Some(e) = cursors.get(stream).filter(|e| e.lsn > through) {
-            // The trace stream's open turns are the lost tail's.
-            let state = if stream == crate::otel::TRACES {
+        let saved = cursors.get(stream);
+        let missing = saved.is_none();
+        let old = saved.unwrap_or_default();
+        let generation = loop {
+            let generation = node.env().random_bytes();
+            if generation != [0; 16]
+                && generation != old.generation()
+                && old
+                    .pending_rewind()
+                    .is_none_or(|r| r.generation != generation)
+            {
+                break generation;
+            }
+        };
+        let mut control = kronik_otel::cursor::Control::new(generation);
+        control.rewind = old.pending_rewind().map(|r| kronik_otel::cursor::Rewind {
+            to: r.to.min(through),
+            through: r.through.min(through),
+            ..r
+        });
+        let entry = kronik_otel::cursor::Entry {
+            lsn: old.lsn.min(through),
+            state: if old.lsn > through {
                 serde_json::Value::Null
             } else {
-                e.state
-            };
-            let entry = kronik_otel::cursor::Entry {
+                old.state
+            },
+            control: Some(control),
+        };
+        // A fresh destination starts before the restore event even with
+        // from="now"; an existing exporter keeps its older undelivered backlog.
+        let entry = if missing {
+            kronik_otel::cursor::Entry {
                 lsn: through,
-                state,
-            };
-            cursors
-                .save(stream, entry)
-                .await
-                .context("saving the export cursors")?;
-        }
+                ..entry
+            }
+        } else {
+            entry
+        };
+        cursors
+            .save(stream, entry)
+            .await
+            .context("saving the export cursors")?;
+    }
+    if cursors
+        .get(crate::otel::AUDIT_CONFIG)
+        .is_some_and(|e| e.lsn > through)
+    {
+        cursors
+            .save(
+                crate::otel::AUDIT_CONFIG,
+                kronik_otel::cursor::Entry {
+                    lsn: through,
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("resetting the restored audit configuration cache")?;
     }
     std::fs::remove_file(&marker).with_context(|| format!("removing {}", marker.display()))?;
+    std::fs::File::open(branch_dir)?
+        .sync_all()
+        .context("syncing the restored branch after removing its marker")?;
     tracing::info!(through_lsn = through, "recorded the restore in the log");
     Ok(())
 }
@@ -681,7 +756,7 @@ async fn record_key_source(node: &kronik_sched::Node, data: &Path) -> anyhow::Re
         })
         .await?;
     if !recorded {
-        let secrets = node.try_secret_values().ok();
+        let secrets = node.secret_values().ok();
         let scrub = |s| kronik_sched::scrub::for_log(s, secrets.as_deref());
         let details = [
             ("id".into(), id.into()),

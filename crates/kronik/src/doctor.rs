@@ -771,11 +771,14 @@ fn ship(config: &Config) -> Check {
 /// The export streams of a running daemon (m28-otel §5, §6.2): its `GET
 /// /v1/export` on the configured API socket.
 fn export(config: &Config) -> Check {
-    if config.audit.sink().is_none() && config.otel.endpoint().is_none() {
-        return check("export", Status::Pass, "no export is configured");
-    }
     let socket = &config.server.api_socket;
-    let token = crate::cli::client_token_from(None).ok().flatten();
+    let token = match crate::cli::client_token_from(None) {
+        Ok(token) => token,
+        Err(_) => {
+            return check("export", Status::Warn, "cannot load the API token")
+                .hint("check KRONIK_TOKEN and its token file");
+        }
+    };
     let endpoint = crate::cli::http::Endpoint::Unix(socket.clone());
     match crate::cli::http::request(
         &endpoint,
@@ -788,11 +791,12 @@ fn export(config: &Config) -> Check {
         Ok(r) if r.status == 200 => {
             match serde_json::from_slice::<kronik_api::types::ExportStatusResponse>(&r.body) {
                 Ok(s) => export_streams(config, &s.streams),
-                Err(e) => check(
+                Err(_) => check(
                     "export",
                     Status::Warn,
-                    format!("unexpected export status: {e}"),
-                ),
+                    "the API returned invalid export status",
+                )
+                .hint("check the selected API socket and daemon version"),
             }
         }
         Ok(r) => check(
@@ -801,14 +805,28 @@ fn export(config: &Config) -> Check {
             format!("cannot read the export status: HTTP {}", r.status),
         )
         .hint("set KRONIK_TOKEN to a token with the read scope"),
-        Err(_) => check(
+        Err(crate::cli::http::Failure::Connect(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            check(
+                "export",
+                Status::Pass,
+                format!(
+                    "no daemon on {}: the export streams are not checked",
+                    socket.display()
+                ),
+            )
+        }
+        Err(e) => check(
             "export",
-            Status::Pass,
-            format!(
-                "no daemon on {}: the export streams are not checked",
-                socket.display()
-            ),
-        ),
+            Status::Warn,
+            match e {
+                crate::cli::http::Failure::Connect(_) => "cannot connect to the API socket",
+                crate::cli::http::Failure::Tls(_) => "the API TLS handshake failed",
+                crate::cli::http::Failure::Io(_) => "the API connection broke",
+                crate::cli::http::Failure::Timeout => "the API request timed out",
+                crate::cli::http::Failure::Malformed(_) => "the API returned malformed HTTP",
+            },
+        )
+        .hint("check the API socket and daemon; the export streams are not checked"),
     }
 }
 

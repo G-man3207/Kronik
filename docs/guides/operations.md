@@ -598,7 +598,7 @@ without one from `<data_dir>/otel.key` (created at first use, mode 0600).
 The log is the audit trail: every mutation writes a log record with its
 token and reason (`kronik history` and the diff read them). With
 `[audit] sink` set, `kronik serve` also writes one JSON line
-(`kronik.audit/v1`) per audited record to the sink, in log order, at least
+(`kronik.audit/v2`) per audited record to the sink, in log order, at least
 once, from the `audit` cursor in `<data_dir>/export.json`: configuration
 changes, operator sends and resends, each `secret.reveal`, guards that
 fired (`watch.guard`), the switch of a rollback via replay
@@ -610,35 +610,56 @@ snapshots, reseal, export rewinds, and the node's own `restore`,
 from the log, also when no sink is set (scope `admin`). A consumer
 deduplicates by `lsn`, `effect` and `record_hash`; after `kronik restore`
 from an older ship point, new records reuse the lost tail's LSNs, and a
-`restore` line marks the point. The first start after a restore moves
-every export cursor in `export.json` back to the restored log (with the
-export on or off), so the `restore` line and everything after it are
-exported; no sink overwrites the lines it got before.
+`restore` line marks the point. The first start after restore durably
+clamps or initializes both export cursors (including absent/from-now
+entries), drops lost-tail trace resume state, resets the lost-tail
+audit-configuration hash, preserves/clamps pending replay and assigns a
+new applied generation. Only then is the restore marker removed and its
+parent synced, with exports on or off.
 
 - **A directory** (`file:///var/log/kronik/audit/`): lines go to
-  `audit-<first lsn>.jsonl` files (mode 0640), fsynced before the cursor
-  moves; a new file starts at `file_max_bytes`, as
-  `audit-<first lsn>.<n>.jsonl` when that name is taken (LSNs repeat after
-  a restore or a rewind). A start truncates a line a
-  crash left half written. Kronik never deletes these files: rotation is
-  yours: compress, move or copy to cold storage what you like. When the
-  newest file is moved away, replaced by another (logrotate's `create`) or
+  `audit-v2-<sequence:020>.jsonl` files (mode 0640), fsynced before the cursor
+  moves; `file_max_bytes` (1 B–1 GiB, default 64 MiB) is a soft
+  whole-batch rotation threshold, not an oversized-record drop limit.
+  Exclusive-create names use an increasing sequence, independent of LSNs
+  and file mtimes. Recovery and verification read numbered files by sequence,
+  after historical LSN-named files; historical ordering is not repaired.
+  A fixed-buffer tail scan truncates a crash's partial line at start.
+  Files must be no-follow, regular and uniquely linked. Kronik never deletes
+  them. Rotate sealed older files to cold storage, keeping the newest
+  numbered file across writer restarts; do not renumber the archive.
+  When the newest file is moved away, replaced by another (logrotate's `create`) or
   truncated (`copytruncate`), the next batch starts a new file. Keep what
   `kronik audit verify` should still check. The unit's
   `LogsDirectory=kronik` makes `/var/log/kronik` writable; another
   directory needs `ReadWritePaths=`.
+  Removed directories are recreated and recoverable open/write errors
+  retry. Any sync failure or EIO latches that writer as `storage_sync`:
+  no later filesystem attempts or cursor acknowledgements occur, but the
+  node remains usable. Repair or quarantine the storage, create a new
+  writer and safely rewind from retained records. Restart alone is not
+  proof that durability was repaired; no automatic COW repair is promised.
 - **A webhook** (`https://…`): one POST per batch,
   `application/x-ndjson`, with `kronik-audit-range: <first>-<last>` and
-  `idempotency-key: <first>-<last>-<hash of the body>` headers, so a batch
-  with other lines over the same range is never answered from the
-  receiver's cache; credentials through `headers_env`. Anything but
+  `idempotency-key: <generation>-<first>-<last>-<body hash>` headers.
+  Retries retain the key; intentional replay changes generation and cannot
+  reuse the receiver's old ACK. Credentials come through `headers_env`.
+  Anything but
   a 2xx is retried with backoff (a 4xx other than 408 and 429 also logs a
   warning): audit lines are never dropped on the sink's say-so.
 - **Object storage** (`s3://bucket/prefix`, with `endpoint` and the
-  `AWS_*` variables as for shipping): one object per batch,
-  `<prefix>/audit/<prepared ms>-<first>-<last>.jsonl`, the wall time the
-  batch was prepared first, so names sort in write order; a retried batch
-  overwrites itself.
+  `AWS_*` variables as for shipping): one create-only object per successful
+  delivery at `<prefix>/audit/v2/<sequence:020>.jsonl`. Recovery streams the
+  tail once, not once per batch. Collisions prove occupation but never ACK
+  this delivery; unknown failures do not advance the candidate, and lost
+  ACKs may yield duplicates. Legacy top-level objects are read first, then
+  numbered v2 objects. Keep the v2 namespace append-only: disable bucket
+  lifecycle deletion there and do not remove/renumber objects during
+  publication or recovery. Ordering assumes the backend's conditional
+  create is atomic and its ACK durable; arbitrary deletion plus stale
+  listing is not safe. Historical ordering is not retroactively repaired.
+  A backend without conditional create stalls with `s3_unsupported` and no
+  cursor advance; fix the backend/configuration rather than bypass it.
 
 **Retention waits for the audit export, production does not.** Retention
 keeps every segment the export has not delivered, until free disk falls
@@ -660,15 +681,53 @@ read back; verify the store behind it. After a sink lost data,
 `<lsn>` again (scope `operate`); retention keeps them from the moment you
 ask.
 
+Replay requests are durable and processed by an owned task, so cancelling
+the API call does not lose the request. Audit intent precedes the effect;
+failures leave an event and stable code. A newer request survives older
+in-flight acknowledgements: its generation first checkpoints the earliest
+cut and clears pending replay only on reaching that generation's head.
+The retention hold is restored before export starts and moves only after
+durable checkpoints. Requests wake retry loops; webhook keys bind generation
+and S3 replay creates new ordered objects. Authoritative source gaps are
+recorded during remote retries,
+deduplicated across checkpoint failure/restart, and the skipped range is
+durably saved before preparing later data.
+
+Trace resume metadata is a small checksummed `kronik.trace-state/v1`
+reference into two fixed snapshot/delta files plus scratch. Legacy
+open-pair/`{open,kept}` state migrates once; corrupt selected modern state
+stalls trace export rather than silently resetting it. Oversized metadata
+reports `trace_state_limit`, not truncated state. Entry-count limits alone
+are not a heap bound. With both cursor exporters off, unreadable
+`export.json` is left untouched; configuration changes remain
+source-audited even if the cache is unavailable.
+
+The current exporter integration suite and actual binary restore/S3 checks
+exercise these control/checkpoint contracts. Physical fsync repair and
+complete retained external/deleted-version secret coverage are not implied.
+
 **What leaves the node** (ADR 0082): the line's action, token id, reason,
 wall time, epoch, record hash and plain facts (kinds and code hashes,
 capabilities, limits, policy rule names and hash, secret and token names,
 fork and proposal ids, a foreign image's digest). Never a secret value, a
 token, a message body, a subject id or a sealed value: a subject is `s:`
 plus 12 hex of its keyed hash, actor keys follow `[otel] actor_keys`.
-**Reasons leave the node as written**, minus exact secret values (removed
-when the reason is written, so a secret deleted later stays out too) and
-an erasure's subject id: do not put personal data in a `--reason`.
+Free text, names and spans are scrubbed for secret values and token
+spellings; canonical audit hashing withholds free text. Subject masking
+handles case, percent encoding and identifier boundaries. Never put
+personal data in `--reason`. If secret inventory is unavailable,
+privacy-sensitive API projections return 503 `SECRET_UNAVAILABLE`,
+mutating audit text is withheld and both exporters stall preparation
+without cursor advance. Unrelated node work remains usable. Complete
+retained external/deleted-version coverage across restart remains M23
+work, not a guarantee of the current local inventory.
+
+Verification accepts exact source-derived legacy v1 lines alongside v2,
+validates known schema/hash/identity, and counts mixed retries as one
+logical item. Only trusted source restores authorize superseding cuts,
+never sink-provided lines. `restore.through_lsn` and `audit.gap.from`/`to`
+are validated action-specific `u64` positions: v2 JSON numbers, legacy
+v1 decimal strings; other text gets no key-name exemption.
 
 ### Logs
 

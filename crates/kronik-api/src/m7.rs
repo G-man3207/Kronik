@@ -317,7 +317,7 @@ impl Api {
         let tail = q.num("tail")?.unwrap_or(200).clamp(1, 10_000) as usize;
         let declared = self.node.config_now().foreign(name).is_some();
         let foreign = self.foreign_manager()?;
-        let logs = foreign.logs(name, tail, self.node.secret_values()).await?;
+        let logs = foreign.logs(name, tail, self.node.secret_values()?).await?;
         let (lines, truncated) = match logs {
             Some(t) => (t.lines, t.truncated),
             None if declared => (Vec::new(), false),

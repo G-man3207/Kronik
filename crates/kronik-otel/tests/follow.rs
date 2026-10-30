@@ -21,7 +21,7 @@ use kronik_core::env::Env;
 use kronik_core::ids::{ActorRef, Lsn};
 use kronik_log::Committed;
 use kronik_otel::audit::{Keys, Mapper};
-use kronik_otel::cursor::Cursors;
+use kronik_otel::cursor::{Cursors, Entry, Generation};
 use kronik_otel::follow::{BATCH_BYTES, Delivery, Options, Sink, Stream, follow, supervise};
 use kronik_otel::keys::KeyHasher;
 use kronik_otel::otlp::collector::trace::v1::ExportTraceServiceRequest;
@@ -117,16 +117,10 @@ impl Fixture {
 
     /// Runs the follower of a new stream from `cursor` on `sink`.
     fn follow(&self, name: &'static str, cursor: Lsn, sink: Fake) -> Arc<Stream> {
-        let stream = Stream::new(name, true, String::new(), cursor);
+        let stream = Stream::new(name, true, String::new(), cursor, self.cursors.clone());
         drop(self.node.env().spawn(
             "test-follow",
-            follow(
-                self.node.clone(),
-                self.cursors.clone(),
-                stream.clone(),
-                OPTS,
-                sink,
-            ),
+            follow(self.node.clone(), stream.clone(), OPTS, sink),
         ));
         stream
     }
@@ -170,6 +164,8 @@ struct Seen {
     batches: Mutex<Vec<(usize, usize)>>,
     /// Retry every delivery while set.
     down: AtomicBool,
+    /// Refuse preparation while complete secret coverage is unavailable.
+    preparation_down: AtomicBool,
     /// Fail this many gap records.
     gap_failures: AtomicU32,
     /// (from, to, the saved cursor then) per gap call.
@@ -187,7 +183,14 @@ struct Fake {
 impl Sink for Fake {
     type Batch = ();
 
-    async fn prepare(&mut self, records: Vec<Committed>) {
+    async fn prepare(
+        &mut self,
+        records: Vec<Committed>,
+        _generation: Generation,
+    ) -> Result<(), String> {
+        if self.seen.preparation_down.load(Ordering::SeqCst) {
+            return Err("SECRET_UNAVAILABLE".into());
+        }
         if self.seen.panics.load(Ordering::SeqCst) > 0 {
             self.seen.panics.fetch_sub(1, Ordering::SeqCst);
             panic!("a bug in a sink");
@@ -198,6 +201,7 @@ impl Sink for Fake {
             .lock()
             .unwrap()
             .push((records.len(), bytes));
+        Ok(())
     }
 
     async fn deliver(&mut self, _: &()) -> Delivery {
@@ -262,6 +266,55 @@ fn a_failed_gap_record_keeps_the_cursor_before_the_gap_and_is_retried() {
     assert_eq!(stream.progress().gaps, 1);
 }
 
+#[test]
+fn failed_preparation_keeps_cursor_and_sink_state_until_coverage_recovers() {
+    let f = Fixture::new(false);
+    let seen = Arc::new(Seen::default());
+    seen.preparation_down.store(true, Ordering::SeqCst);
+    let stream = f.follow("preparation", 0, fake(&f, "preparation", &seen));
+    f.wait("unavailable inventory", || {
+        stream.progress().last_error.as_deref() == Some("SECRET_UNAVAILABLE")
+    });
+    assert_eq!(stream.progress().cursor, 0);
+    assert!(f.cursors.get("preparation").is_none());
+    assert!(seen.batches.lock().unwrap().is_empty());
+    seen.preparation_down.store(false, Ordering::SeqCst);
+    f.wait("recovered preparation", || f.caught_up(&stream));
+    assert_eq!(
+        f.cursors.get("preparation").unwrap().lsn,
+        f.node.applied_lsn()
+    );
+    let prepared: usize = seen.batches.lock().unwrap().iter().map(|b| b.0).sum();
+    assert_eq!(prepared as u64, f.node.applied_lsn());
+}
+
+#[test]
+fn a_failed_cursor_save_cannot_escape_through_an_unrelated_stream_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let env = Env::real(rt.handle().clone());
+    let cursors = rt.block_on(Cursors::load(env.clone(), dir.path())).unwrap();
+    let entry = |lsn| kronik_otel::cursor::Entry {
+        lsn,
+        state: serde_json::json!({"checkpoint": lsn}),
+        ..Default::default()
+    };
+    rt.block_on(cursors.save("traces", entry(1))).unwrap();
+    let temporary = dir.path().join("export.json.tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    assert!(rt.block_on(cursors.save("traces", entry(2))).is_err());
+    assert_eq!(cursors.get("traces").unwrap().lsn, 1);
+    std::fs::remove_dir(temporary).unwrap();
+    rt.block_on(cursors.save("audit", entry(5))).unwrap();
+    let restored = rt.block_on(Cursors::load(env, dir.path())).unwrap();
+    assert_eq!(restored.get("traces").unwrap().lsn, 1);
+    assert_eq!(restored.get("traces").unwrap().state["checkpoint"], 1);
+    assert_eq!(restored.get("audit").unwrap().lsn, 5);
+}
+
 /// Review M3: a backlog of large records is read in batches of at most
 /// `BATCH_BYTES`, however many records the count allows.
 #[test]
@@ -272,13 +325,12 @@ fn a_backlog_of_large_records_is_batched_by_bytes() {
         f.send(&format!("counter/n{i}"), "note", &body);
     }
     let seen = Arc::new(Seen::default());
-    let stream = Stream::new("bytes", true, String::new(), 0);
+    let stream = Stream::new("bytes", true, String::new(), 0, f.cursors.clone());
     let opts = Options { batch: 500, ..OPTS };
     drop(f.node.env().spawn(
         "test-follow",
         follow(
             f.node.clone(),
-            f.cursors.clone(),
             stream.clone(),
             opts,
             fake(&f, "bytes", &seen),
@@ -326,29 +378,22 @@ fn a_panicked_follower_restarts() {
     }
     let seen = Arc::new(Seen::default());
     seen.panics.store(1, Ordering::SeqCst);
-    let stream = Stream::new("panics", true, String::new(), 0);
-    let builds = Arc::new(AtomicU32::new(0));
-    let (sink_seen, count, cursors) = (seen.clone(), builds.clone(), f.cursors.clone());
-    let make = move |_: &serde_json::Value| {
-        count.fetch_add(1, Ordering::SeqCst);
-        Fake {
+    let stream = Stream::new("panics", true, String::new(), 0, f.cursors.clone());
+    let (sink_seen, cursors) = (seen.clone(), f.cursors.clone());
+    let make = move |_: Entry| {
+        let sink = Fake {
             seen: sink_seen.clone(),
             cursors: cursors.clone(),
             name: "panics",
-        }
+        };
+        async move { Ok(sink) }
     };
     drop(f.node.env().spawn(
         "test-supervise",
-        supervise(
-            f.node.clone(),
-            f.cursors.clone(),
-            stream.clone(),
-            OPTS,
-            make,
-        ),
+        supervise(f.node.clone(), stream.clone(), OPTS, make),
     ));
     f.wait("a restarted follower", || f.caught_up(&stream));
-    assert_eq!(builds.load(Ordering::SeqCst), 2);
+    assert_eq!(f.cursors.get("panics").unwrap().lsn, f.node.applied_lsn());
     assert_eq!(stream.progress().last_error.as_deref(), Some("panic"));
 }
 
@@ -390,8 +435,8 @@ fn the_audit_hold_does_not_age_while_the_export_is_idle() {
     assert!(age < max_hold.as_millis() as u64, "{age} ms");
 }
 
-fn decode(batch: Option<Vec<u8>>) -> BTreeMap<Vec<u8>, Span> {
-    let req = ExportTraceServiceRequest::decode(batch.unwrap().as_slice()).unwrap();
+fn decode(batch: Option<bytes::Bytes>) -> BTreeMap<Vec<u8>, Span> {
+    let req = ExportTraceServiceRequest::decode(batch.unwrap()).unwrap();
     req.resource_spans
         .into_iter()
         .flat_map(|rs| rs.scope_spans)
@@ -415,20 +460,27 @@ fn a_trace_rewind_resends_the_same_spans() {
         service_name: "kronik".into(),
         keys: KeyMode::Omit,
     };
-    let mut sink = TraceSink::new(
-        f.node.clone(),
-        settings,
-        KeyHasher::Local([7; 32]),
-        &serde_json::Value::Null,
-    );
-    let first = decode(f.rt.block_on(sink.prepare(all.clone())));
+    let mut sink =
+        f.rt.block_on(TraceSink::open(
+            f.node.clone(),
+            settings,
+            KeyHasher::Local([7; 32]),
+            f._dir.path(),
+            &serde_json::Value::Null,
+            0,
+        ))
+        .unwrap();
     let begin = all
         .iter()
         .find(|c| matches!(c.record, Record::TurnBegin(_)))
         .unwrap()
         .lsn;
-    f.rt.block_on(sink.rewind(begin));
-    let again = decode(f.rt.block_on(sink.prepare(f.records(begin + 1))));
+    let first = decode(f.rt.block_on(sink.prepare(all, [0; 16])).unwrap());
+    f.rt.block_on(sink.rewind(begin, [1; 16])).unwrap();
+    let again = decode(
+        f.rt.block_on(sink.prepare(f.records(begin + 1), [1; 16]))
+            .unwrap(),
+    );
     // The two callees' turn spans and their effects, and the caller's.
     assert!(again.len() >= 5, "{again:?}");
     for (id, s) in &again {

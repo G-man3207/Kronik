@@ -4,7 +4,7 @@
 //! `proto/opentelemetry/` files (ADR 0081). [`spans`] maps committed turn
 //! records to OTLP spans as pure functions of the record (ADR 0080), with
 //! only what may leave the node (ADR 0082). [`audit`] maps audited records
-//! to `kronik.audit/v1` lines (ADR 0083).
+//! to `kronik.audit/v2` lines (ADR 0083).
 //!
 //! The exporters follow the committed log ([`follow`]) from a durable
 //! cursor ([`cursor`]), as `env.spawn` tasks of `kronik serve`, off the turn
@@ -18,6 +18,7 @@ pub mod keys;
 pub mod metrics;
 pub mod sink;
 pub mod spans;
+pub mod trace_state;
 pub mod traces;
 
 /// The OTLP 1.x messages (opentelemetry-proto v1.7.0). The module tree

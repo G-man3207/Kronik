@@ -1,0 +1,18 @@
+{
+  "legacy": [
+    {"name": "audit-00000000000000000010.jsonl", "mtime_seconds": 200},
+    {"name": "audit-00000000000000000002.1.jsonl", "mtime_seconds": 300}
+  ],
+  "current": [
+    {"name": "audit-v2-00000000000000000001.jsonl", "mtime_seconds": 20},
+    {"name": "audit-v2-00000000000000000002.jsonl", "mtime_seconds": 10},
+    {"name": "audit-v2-18446744073709551615.jsonl", "mtime_seconds": 1}
+  ],
+  "rejected": [
+    "audit-v2-00000000000000000000.jsonl",
+    "audit-v2-1.jsonl",
+    "audit-v2-000000000000000000001.jsonl",
+    "audit-v2-18446744073709551616.jsonl",
+    "audit-v3-00000000000000000001.jsonl"
+  ]
+}

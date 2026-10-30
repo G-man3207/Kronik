@@ -651,9 +651,9 @@ impl Watches {
         self.get(&id)
     }
 
-    /// `kronik watches stop <id>`: the watch ends `stopped`; it writes no
-    /// record and rolls nothing back from then on. A dry run checks and
-    /// changes nothing.
+    /// `kronik watches stop <id>`: audits the intent, then ends the watch
+    /// `stopped`; it triggers no more guards or rollbacks. A dry run checks
+    /// and changes nothing.
     pub async fn stop(&self, id: &str, audit: pb::Audit, dry_run: bool) -> Result<Watch, ApiError> {
         let _acting = self.acting.lock().await;
         let w = self.get(id)?;
@@ -667,14 +667,29 @@ impl Watches {
         if dry_run {
             return Ok(w);
         }
-        let w = self.update(id, |w| {
-            w.status = "stopped".into();
-            w.stopped = Some(Stopped {
-                token_id: audit.token_id,
-                reason: audit.reason,
-                wall_time_ms: audit.wall_time_ms,
-            });
-        })?;
+        self.node
+            .record_audit_event("watch.stop", id, Default::default(), audit.clone())
+            .await?;
+        let mut w = w;
+        w.status = "stopped".into();
+        w.stopped = Some(Stopped {
+            token_id: audit.token_id.clone(),
+            reason: audit.reason.clone(),
+            wall_time_ms: audit.wall_time_ms,
+        });
+        if let Err(e) = self.save(&w) {
+            crate::proposal::audit_failed(
+                &self.node,
+                "watch.stop",
+                id,
+                Default::default(),
+                audit,
+                &e,
+            )
+            .await;
+            return Err(e);
+        }
+        lock(&self.watches).insert(id.to_owned(), w.clone());
         tracing::info!(watch = %id, epoch = w.epoch, "watch stopped");
         Ok(w)
     }
