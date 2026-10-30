@@ -278,8 +278,8 @@ never loads one:
 - The daemon keeps the rule "no C beyond bundled SQLite". The helper is the
   narrow exception ADR 0093 asks the maintainers to confirm; the alternative is
   PKCS#11 as a documented gap.
-- **Proof** runs against the release artifacts (`dist/release/kronik-*-musl`
-  plus the helper), never a dev build: SoftHSM2 in `e2e-keys.sh`.
+- **Proof** runs against the daemon and helper extracted from release archives
+  (`dist/release/*.tar.gz`), never a dev build: SoftHSM2 in `e2e-keys.sh`.
 - M21's unit has `PrivateDevices=yes`, which hides USB HSMs: the guide
   ships a `DeviceAllow=` drop-in for them (review, Low).
 
