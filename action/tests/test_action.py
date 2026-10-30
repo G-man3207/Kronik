@@ -7,8 +7,10 @@ import io
 import json
 import os
 import re
+import resource
 import runpy
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -336,6 +338,60 @@ class InstallTest(ActionTest):
                            capture_output=True, text=True, stdin=subprocess.DEVNULL)
         self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(old.read_bytes(), b"existing binary")
+
+    def test_failed_binary_write_preserves_existing_executable(self):
+        # Real EFBIG from the kernel, not a mocked copy or a fake executable.
+        payload = self.payload()
+        payload["kronik"] = Path(sys.executable).read_bytes()
+        limit = max(8192, *(len(data) for name, data in payload.items() if name != "kronik"))
+        self.assertGreater(len(payload["kronik"]), limit)
+        release = self.release(payload=payload)
+        version = subprocess.check_output([sys.executable, "--version"])
+        fault_bin = self.tmp / "fault-bin"
+        fault_bin.mkdir()
+        for tool in ("cp", "mv"):
+            wrapper = fault_bin / tool
+            wrapper.write_text(
+                f"#!{sys.executable}\n"
+                "import os, resource, signal, sys\n"
+                "if os.path.basename(sys.argv[1]) == 'kronik':\n"
+                "    signal.signal(signal.SIGXFSZ, signal.SIG_IGN)\n"
+                f"    resource.setrlimit(resource.RLIMIT_FSIZE, ({limit}, {limit}))\n"
+                f"os.execv({shutil.which(tool)!r}, sys.argv)\n")
+            wrapper.chmod(0o755)
+
+        def restrict_file_size():
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+
+        with tempfile.TemporaryDirectory(prefix="kronik-install-fault-", dir="/dev/shm") as download:
+            self.assertNotEqual(Path(download).stat().st_dev, self.tmp.stat().st_dev,
+                                "the shell regression must exercise a cross-filesystem move")
+            for consumer in ("shell", "action"):
+                with self.subTest(consumer=consumer):
+                    destination = self.tmp / consumer / "kronik-bin"
+                    destination.mkdir(parents=True)
+                    old = destination / "kronik"
+                    old.write_bytes(payload["kronik"])
+                    old.chmod(0o755)
+                    digest = hashlib.sha256(old.read_bytes()).hexdigest()
+                    env = {k: v for k, v in os.environ.items()
+                           if not k.startswith(("GITHUB_", "INPUT_", "KRONIK_", "RUNNER_"))}
+                    env.update(LC_ALL="C", TMPDIR=download,
+                               PATH=str(fault_bin) + os.pathsep + os.environ["PATH"],
+                               KRONIK_BASE_URL=release, KRONIK_INSTALL_DIR=str(destination),
+                               KRONIK_INSTALL_RUNSC="no", INPUT_COMMAND="install",
+                               INPUT_BASE_URL=release, RUNNER_TEMP=str(destination.parent))
+                    argv = (["sh", str(ROOT / "scripts/install.sh")] if consumer == "shell"
+                            else [sys.executable, str(SCRIPT)])
+                    p = subprocess.run(argv, env=env, capture_output=True, text=True,
+                                       stdin=subprocess.DEVNULL, timeout=60,
+                                       preexec_fn=restrict_file_size if consumer == "action" else None)
+                    self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertIn("File too large", p.stdout + p.stderr)
+                    self.assertEqual(hashlib.sha256(old.read_bytes()).hexdigest(), digest)
+                    self.assertEqual(subprocess.check_output([str(old), "--version"]), version)
+                    self.assertEqual(list(destination.glob(".kronik*")), [])
 
 
 class ProposeTest(ActionTest):

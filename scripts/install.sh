@@ -61,10 +61,12 @@ esac
 need curl
 need sha256sum
 need tar
+need sync
 archive="kronik-$arch-unknown-linux-musl.tar.gz"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT INT TERM
+candidate=""
+trap 'rm -rf "$tmp"; if [ -n "$candidate" ]; then rm -f "$candidate"; fi' EXIT INT TERM
 
 say "Downloading kronik $VERSION for $arch from $BASE_URL"
 curl -fsSL --proto '=https,http,file' -o "$tmp/release.tar.gz" "$BASE_URL/$archive" ||
@@ -97,7 +99,13 @@ for member in LICENSE NOTICE THIRD_PARTY_LICENSES.txt; do
     cp "$tmp/$member" "$dir/kronik-licenses/$member"
     chmod 644 "$dir/kronik-licenses/$member"
 done
-mv "$tmp/kronik" "$dir/kronik"
+# Stage on the destination filesystem so rename never copies over the live binary.
+candidate="$(mktemp "$dir/.kronik.XXXXXX")"
+cp "$tmp/kronik" "$candidate" || fail "could not stage kronik; the existing binary is unchanged"
+chmod 755 "$candidate"
+sync "$candidate" || fail "could not sync kronik; the existing binary is unchanged"
+mv -fT "$candidate" "$dir/kronik"
+candidate=""
 say "Installed $("$dir/kronik" --version | head -n 1) to $dir/kronik"
 case ":$PATH:" in
     *":$dir:"*) ;;

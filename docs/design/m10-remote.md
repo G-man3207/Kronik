@@ -64,10 +64,13 @@ whose comment names the proposal id counts); without one it fails and prints
 the `kronik approve` command for a person. It promotes nothing when the branch's head is no longer the run's commit
 (`contents: read`): with a notice (status `skipped`) when a newer push run of
 the workflow exists to promote the head (`actions: read`), else it fails. `allow` is promoted without an
-approval. `install` downloads the release binary and `SHA256SUMS` from
-`https://`, `file://` or loopback `http://` and refuses a mismatch. Token:
-`KRONIK_TOKEN` only in the environment, masked; `read,propose` for
-`propose` and `verify`, `read,approve,promote` in the environment.
+approval. This checkout's `install` downloads the licensed release archive
+and its per-archive `.sha256` sidecar from `https://`, `file://` or loopback
+`http://`, refuses a mismatch or missing notices, and atomically replaces the
+executable from a private destination-side file. Historical Action pins keep
+their original raw-binary/checksum path. Token: `KRONIK_TOKEN` only in the
+environment, masked; `read,propose` for `propose` and `verify`,
+`read,approve,promote` in the environment.
 
 ## 5. Compatibility
 

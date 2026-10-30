@@ -18,12 +18,13 @@ HTTP server, give their URL to `sh`, not to `curl`:
 ```sh
 curl -fsSL <url>/install.sh | KRONIK_BASE_URL=<url> sh
 ```
-The published `v0.3.0` installer and its raw binaries/checksum manifest are
-unchanged. The archive format below is implemented in the current checkout,
-not a new published release. Supplemental archives made from the exact
-checksum-verified `v0.3.0` binaries are prepared locally for review; do not
-point the new installer or Action at a public archive URL until those assets
-actually exist. The published installation command above remains usable.
+The published `v0.3.0` installer and all five original assets are unchanged.
+The release now also provides licensed `.tar.gz` archives and their checksum
+sidecars for both targets, usable by this checkout's installer and Action at
+`https://github.com/G-man3207/Kronik/releases/download/v0.3.0`. Their binaries
+are the exact historical Wasmtime **50.0.0** bytes: this is a licensing
+supplement, **not** the Wasmtime 50.0.1 security/engine patch in current source.
+The published installation command above still uses the original installer.
 
 
 ## Prerequisites
@@ -60,8 +61,11 @@ actually exist. The published installation command above remains usable.
    `THIRD_PARTY_LICENSES.txt` members into private temporary regular files,
    refusing a missing or empty notice, then installs `kronik` into
    `/usr/local/bin` as root, else `~/.local/bin`, with the three notice files
-   in that directory's `kronik-licenses/` subdirectory; no parent-directory
-   write or archive-path extraction is needed;
+   in that directory's `kronik-licenses/` subdirectory. It stages the verified
+   executable in a private temporary file inside the install directory, then
+   renames it on the same filesystem. A notice, copy or sync failure leaves
+   the existing executable unchanged; no parent-directory write or
+   archive-path extraction is needed;
 4. offers to install gVisor's `runsc`, which only foreign actors need
    ([ADR 0003](../adr/0003-gvisor-bridge.md)): the pinned release
    `release-20261019.0`, checked against a SHA-512 written into the script,
@@ -78,7 +82,7 @@ The environment changes what it does:
 | `KRONIK_INSTALL_RUNSC` | `yes`, `no`, or `ask` (the default) |
 | `TMPDIR` | Parent for private `mktemp` directories; must be writable and executable because the verified candidate runs before installation. With a `noexec` `/tmp`, use an already owned executable directory such as the install directory |
 
-Without the script, for a release that actually provides the new archives:
+For a new installation without the script (use the installer for replacement):
 
 ```sh
 sha256sum --check kronik-x86_64-unknown-linux-musl.tar.gz.sha256
@@ -101,6 +105,11 @@ corruption; a checksum from the same server is not an independent signature.
 | `kronik-<target>.tar.gz.sha256` | The archive's SHA-256, usable without replacing a historical release's checksum manifest |
 | `install.sh` | The archive installer, with the release's version and base URL |
 | `SHA256SUMS` | SHA-256 of the new archives, their sidecars and installer |
+
+The additive `v0.3.0` archives retain its original published `kronik.cdx.json`
+verbatim, not a newly generated per-target SBOM. Its original installer and
+`SHA256SUMS` continue to describe the original raw binaries; the new sidecars
+describe only the supplementary archives.
 
 The Cargo SBOM supplies dependency identities/license expressions, not a
 substitute for license texts. `scripts/package-release.py` uses locked,

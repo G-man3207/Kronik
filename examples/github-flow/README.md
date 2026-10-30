@@ -90,9 +90,10 @@ after a reviewer approves, and only on main.
 This workflow retains its published Action pin and the original, available
 `v0.3.0` raw-binary distribution. The current checkout's archive installer
 instead needs `kronik-<arch>-unknown-linux-musl.tar.gz` and its `.sha256`
-sidecar, including the real license/notice files. Supplemental archives are
-prepared locally for review, not yet public: do not repoint this workflow
-to nonexistent assets or change historical checksums. See the
+sidecar, including the real license/notice files. Both supplemental archives
+are now public at the same `v0.3.0` release URL; no historical assets or Action
+pins were replaced. They retain the exact Wasmtime 50.0.0 binaries, not the
+current source's 50.0.1 security patch. See the
 [installation guide](../../docs/guides/install.md) before changing the pin.
 
 ## 4. A change, end to end

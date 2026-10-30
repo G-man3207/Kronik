@@ -142,14 +142,25 @@ def install(base_url):
         raise Failure(f"invalid release archive: {error}") from error
     bin_dir = os.path.join(env("RUNNER_TEMP", tempfile.gettempdir()), "kronik-bin")
     license_dir = os.path.join(bin_dir, "kronik-licenses")
-    os.makedirs(license_dir, exist_ok=True)
-    for member in required[1:]:
-        with open(os.path.join(license_dir, member), "wb") as f:
-            f.write(payload[member])
-    path = os.path.join(bin_dir, "kronik")
-    with open(path, "wb") as f:
-        f.write(payload["kronik"])
-    os.chmod(path, 0o755)
+    candidate = None
+    try:
+        os.makedirs(license_dir, exist_ok=True)
+        for member in required[1:]:
+            with open(os.path.join(license_dir, member), "wb") as f:
+                f.write(payload[member])
+        path = os.path.join(bin_dir, "kronik")
+        fd, candidate = tempfile.mkstemp(prefix=".kronik-", dir=bin_dir)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload["kronik"])
+            f.flush()
+            os.fchmod(f.fileno(), 0o755)
+            os.fsync(f.fileno())
+        os.replace(candidate, path)
+    except OSError as error:
+        raise Failure(f"could not install kronik; the existing binary is unchanged: {error}") from error
+    finally:
+        if candidate is not None and os.path.exists(candidate):
+            os.unlink(candidate)
     os.environ["PATH"] = bin_dir + os.pathsep + env("PATH")
     if env("GITHUB_PATH"):
         with open(env("GITHUB_PATH"), "a") as f:

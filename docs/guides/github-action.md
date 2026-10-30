@@ -30,7 +30,10 @@ checks the archive's SHA-256 **before** reading it, and requires nonempty
 `LICENSE`, `NOTICE` and `THIRD_PARTY_LICENSES.txt` alongside the binary.
 It refuses missing notices, duplicates, links and non-flat archive paths,
 then retains the notices in the installed binary directory's
-`kronik-licenses/`. No archive ownership or paths are extracted.
+`kronik-licenses/`. The executable is written and synced to a private temporary
+file in its destination directory, then atomically renamed; a failed write
+does not truncate an existing executable. No archive ownership or paths are
+extracted.
 It puts `kronik` on `PATH` for later steps and prints `kronik --version`.
 Without `base-url` it uses the `kronik` already on `PATH`. The Action needs
 a Linux runner with `python3` 3.9 or newer.
@@ -38,10 +41,11 @@ a Linux runner with `python3` 3.9 or newer.
 **Match the Action revision to an actually available distribution.** The
 published `v0.3.0` Action/installer and the reference workflow's historical
 pin remain unchanged and use the original raw-binary assets. Supplemental
-licensed archives of those exact binaries are prepared locally, not yet
-published. Until reviewed assets exist, use a local bundle URL for the new
-Action or leave `base-url` empty with an already installed binary; do not
-invent a new release URL or replace historical checksums.
+licensed archives of those exact binaries are now public at
+`https://github.com/G-man3207/Kronik/releases/download/v0.3.0`; this checkout's
+Action can use that `base-url`. They still contain Wasmtime **50.0.0**, not
+the current source's 50.0.1 patch. No historical checksums, installer or Action
+pins were replaced, and this licensing supplement is not a new software version.
 
 `base-url` must be `https://` or `file://`, or `http://` to a loopback IP
 (`127.0.0.1`, `[::1]`). The archive and its checksum come from the same
