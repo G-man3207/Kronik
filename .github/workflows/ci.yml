@@ -83,15 +83,19 @@ jobs:
         run: scripts/ci.sh dst
       - name: deny
         run: scripts/ci.sh deny
-      # scripts/install.sh's pinned gVisor release, checked against its
-      # SHA-512. install.sh installs kronik first: it gets this build's binary
-      # (built by the test step) from a file:// release, into a throwaway
-      # directory. It writes only those two binaries: no user, unit or config.
+      # Bootstrap only runsc through the real installer, using a throwaway
+      # debug-binary archive (not a release/compliance artifact). Full release
+      # notices/SBOMs are produced by package-release.py in release.sh.
       - name: Install gVisor
         run: |
           release=$(mktemp -d)
-          cp target/debug/kronik "$release/kronik-x86_64-unknown-linux-musl"
-          (cd "$release" && sha256sum kronik-x86_64-unknown-linux-musl >SHA256SUMS)
+          trap 'sudo rm -rf "$release"' EXIT
+          cp target/debug/kronik "$release/kronik"
+          cp LICENSE NOTICE "$release/"
+          cp scripts/licenses/tinygo-0.43.0.txt "$release/THIRD_PARTY_LICENSES.txt"
+          archive=kronik-x86_64-unknown-linux-musl.tar.gz
+          (cd "$release" && tar -czf "$archive" kronik LICENSE NOTICE THIRD_PARTY_LICENSES.txt &&
+            sha256sum "$archive" >"$archive.sha256")
           sudo KRONIK_BASE_URL="file://$release" KRONIK_INSTALL_DIR="$release/bin" \
             KRONIK_INSTALL_RUNSC=yes sh scripts/install.sh </dev/null
           runsc --version

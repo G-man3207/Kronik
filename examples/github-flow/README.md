@@ -87,6 +87,14 @@ In the repository's settings:
 The promote token lives only in the environment. So a job reaches it only
 after a reviewer approves, and only on main.
 
+This workflow retains its published Action pin and the original, available
+`v0.3.0` raw-binary distribution. The current checkout's archive installer
+instead needs `kronik-<arch>-unknown-linux-musl.tar.gz` and its `.sha256`
+sidecar, including the real license/notice files. Supplemental archives are
+prepared locally for review, not yet public: do not repoint this workflow
+to nonexistent assets or change historical checksums. See the
+[installation guide](../../docs/guides/install.md) before changing the pin.
+
 ## 4. A change, end to end
 
 On a branch, make the counter count by 2: in `src/lib.rs`, change

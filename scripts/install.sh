@@ -3,11 +3,11 @@
 #
 #   curl -fsSL https://<project>/install.sh | sh
 #
-# Downloads the static kronik binary for this machine (Linux on x86_64 or
-# aarch64) and the release's SHA256SUMS, checks the binary's SHA-256 and
-# installs it. Then it offers to install gVisor's runsc, which foreign actors
-# need (docs/adr/0003-gvisor-bridge.md): the pinned release, checked against
-# the SHA-512 below, into /usr/local/bin. Last, it suggests `kronik doctor`.
+# Downloads the licensed static release archive for Linux x86_64 or aarch64,
+# verifies its per-archive SHA-256 before reading it, and installs kronik with
+# its license/notice texts. Then it offers gVisor's runsc, which foreign actors
+# need (docs/adr/0003-gvisor-bridge.md), checked against the pinned SHA-512.
+# Last, it suggests `kronik doctor`.
 #
 # scripts/release.sh writes the release's version and base URL into the copy
 # of this script that it puts next to the binaries. The environment
@@ -60,20 +60,28 @@ case "$(uname -m)" in
 esac
 need curl
 need sha256sum
-binary="kronik-$arch-unknown-linux-musl"
+need tar
+archive="kronik-$arch-unknown-linux-musl.tar.gz"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 say "Downloading kronik $VERSION for $arch from $BASE_URL"
-curl -fsSL --proto '=https,http,file' -o "$tmp/kronik" "$BASE_URL/$binary" ||
-    fail "could not download $BASE_URL/$binary"
-curl -fsSL --proto '=https,http,file' -o "$tmp/SHA256SUMS" "$BASE_URL/SHA256SUMS" ||
-    fail "could not download $BASE_URL/SHA256SUMS"
-want="$(awk -v f="$binary" '$2 == f || $2 == "*" f { print $1 }' "$tmp/SHA256SUMS")"
-got="$(sha256sum "$tmp/kronik" | cut -d ' ' -f 1)"
-[ -n "$want" ] || fail "SHA256SUMS has no line for $binary"
-[ "$got" = "$want" ] || fail "the SHA-256 of $binary is $got, but SHA256SUMS says $want"
+curl -fsSL --proto '=https,http,file' -o "$tmp/release.tar.gz" "$BASE_URL/$archive" ||
+    fail "could not download $BASE_URL/$archive"
+curl -fsSL --proto '=https,http,file' -o "$tmp/checksum" "$BASE_URL/$archive.sha256" ||
+    fail "could not download $BASE_URL/$archive.sha256"
+want="$(awk -v f="$archive" '$2 == f || $2 == "*" f { print $1 }' "$tmp/checksum")"
+got="$(sha256sum "$tmp/release.tar.gz" | cut -d ' ' -f 1)"
+[ -n "$want" ] || fail "$archive.sha256 has no line for $archive"
+[ "$got" = "$want" ] || fail "the SHA-256 of $archive is $got, but its checksum says $want"
+# Stream only named members into private regular files: archive paths, links
+# and ownership are never extracted onto the installer's filesystem.
+for member in kronik LICENSE NOTICE THIRD_PARTY_LICENSES.txt; do
+    tar -xzOf "$tmp/release.tar.gz" "$member" >"$tmp/$member" ||
+        fail "the release archive has no readable $member"
+    [ -s "$tmp/$member" ] || fail "the release archive has an empty $member"
+done
 chmod 755 "$tmp/kronik"
 "$tmp/kronik" --version >/dev/null || fail "the downloaded kronik does not run on this machine"
 
@@ -84,7 +92,11 @@ elif [ "$(id -u)" = 0 ]; then
 else
     dir="$HOME/.local/bin"
 fi
-mkdir -p "$dir"
+mkdir -p "$dir/kronik-licenses"
+for member in LICENSE NOTICE THIRD_PARTY_LICENSES.txt; do
+    cp "$tmp/$member" "$dir/kronik-licenses/$member"
+    chmod 644 "$dir/kronik-licenses/$member"
+done
 mv "$tmp/kronik" "$dir/kronik"
 say "Installed $("$dir/kronik" --version | head -n 1) to $dir/kronik"
 case ":$PATH:" in

@@ -24,20 +24,30 @@ approval. Without such an approval it approves and promotes nothing.
 
 ## What it does
 
-Each run first installs `kronik` when `base-url` is set: it downloads the
-binary for the runner's architecture (`kronik-x86_64-unknown-linux-musl` or
-`kronik-aarch64-unknown-linux-musl`) and the release's `SHA256SUMS`, checks
-the binary's SHA-256 and refuses it when the sum differs or `SHA256SUMS` has
-no line for it, as `install.sh` does. It puts `kronik` on `PATH` for the
-job's later steps and prints `kronik --version`. Without `base-url` it uses
-the `kronik` already on `PATH`. The action needs a Linux runner with
-`python3` 3.9 or newer, which GitHub's Ubuntu runners have.
+This checkout's Action installs `kronik` when `base-url` is set: it downloads
+`kronik-<arch>-unknown-linux-musl.tar.gz` and its `.tar.gz.sha256` sidecar,
+checks the archive's SHA-256 **before** reading it, and requires nonempty
+`LICENSE`, `NOTICE` and `THIRD_PARTY_LICENSES.txt` alongside the binary.
+It refuses missing notices, duplicates, links and non-flat archive paths,
+then retains the notices in the installed binary directory's
+`kronik-licenses/`. No archive ownership or paths are extracted.
+It puts `kronik` on `PATH` for later steps and prints `kronik --version`.
+Without `base-url` it uses the `kronik` already on `PATH`. The Action needs
+a Linux runner with `python3` 3.9 or newer.
+
+**Match the Action revision to an actually available distribution.** The
+published `v0.3.0` Action/installer and the reference workflow's historical
+pin remain unchanged and use the original raw-binary assets. Supplemental
+licensed archives of those exact binaries are prepared locally, not yet
+published. Until reviewed assets exist, use a local bundle URL for the new
+Action or leave `base-url` empty with an already installed binary; do not
+invent a new release URL or replace historical checksums.
 
 `base-url` must be `https://` or `file://`, or `http://` to a loopback IP
-address (`127.0.0.1`, `[::1]`): the binary and `SHA256SUMS` come from the same
-place, so the checksum guards against corruption, not against whoever serves
-both. Point it at one release's files (a URL with the version in it, not a
-"latest" one), and pin the action to that release's commit.
+(`127.0.0.1`, `[::1]`). The archive and its checksum come from the same
+place: this detects corruption, not a malicious publisher or an independent
+signature. Pin one actually available bundle URL, not “latest”; release
+signature proof remains M31 work.
 
 Then, by `command`:
 

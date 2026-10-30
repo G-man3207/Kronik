@@ -1,0 +1,26 @@
+{
+  "asn1-rs-impl-0.2.0-MIT.txt": {
+    "sha256": "a5c61b93b6ee1d104af9920cf020ff3c7efe818e31fe562c72261847a728f513",
+    "url": "https://raw.githubusercontent.com/rusticata/asn1-rs/a20e5f7319c896737ad0f2557037817b91ad854f/LICENSE-MIT"
+  },
+  "cel-0.15.0-MIT.txt": {
+    "sha256": "87dd66ad9efb705e70f28a2f9efe4cfaca69073d9ce1447bdece366471c4664f",
+    "url": "https://raw.githubusercontent.com/cel-rust/cel-rust/57b2a7e9b835425be0a7320e6bc0461380843f2d/LICENSE"
+  },
+  "go-bindings-LLVM.txt": {
+    "sha256": "c75e353fd29c7eafd9504c2309b5a881f501373ac547264fb4b62c9f29e9949b",
+    "url": "https://raw.githubusercontent.com/bytecodealliance/go-modules/v0.7.0/LICENSE"
+  },
+  "tinygo-0.43.0.txt": {
+    "sha256": "4cb7d99a97ebd57584ea8398898c4b0bbbcb39662330712b43153efdad308766",
+    "url": "https://raw.githubusercontent.com/tinygo-org/tinygo/v0.43.0/LICENSE"
+  },
+  "w3c-community-cla.txt": {
+    "sha256": "1cfc7461f0bf2e9b304a1b9316f95b905e6d4b59b5b582a2cf9f1a4ef1443a60",
+    "url": "https://www.w3.org/community/about/agreements/cla/"
+  },
+  "wasi-0.2.0.txt": {
+    "sha256": "0416590f3f47381bb5b9b467c27824d1228fac58b8031d693130865273ffefcb",
+    "url": "https://raw.githubusercontent.com/WebAssembly/wasi-io/v0.2.0/LICENSE.md"
+  }
+}

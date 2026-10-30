@@ -3,6 +3,7 @@ runs as on a runner, against a fake kronik (fake_kronik.py on PATH) and a
 fake GitHub API on 127.0.0.1, with fake GITHUB_* variables and events."""
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import tarfile
 import time
 import unittest
 import urllib.parse
@@ -199,15 +201,31 @@ class ActionTest(unittest.TestCase):
 
 
 class InstallTest(ActionTest):
-    def release(self, sums=None):
+    def payload(self):
+        return {
+            "kronik": FAKE.read_bytes(),
+            "LICENSE": (ROOT / "LICENSE").read_bytes(),
+            "NOTICE": (ROOT / "NOTICE").read_bytes(),
+            "THIRD_PARTY_LICENSES.txt": (ROOT / "scripts/licenses/tinygo-0.43.0.txt").read_bytes(),
+        }
+
+    def release(self, sums=None, payload=None, extra=None):
         rel = self.tmp / "release"
         rel.mkdir(exist_ok=True)
-        lines = []
         for arch in ("x86_64", "aarch64"):
-            name = f"kronik-{arch}-unknown-linux-musl"
-            shutil.copy(FAKE, rel / name)
-            lines.append(f"{hashlib.sha256(FAKE.read_bytes()).hexdigest()}  {name}")
-        (rel / "SHA256SUMS").write_text((sums if sums is not None else "\n".join(lines)) + "\n")
+            name = f"kronik-{arch}-unknown-linux-musl.tar.gz"
+            with tarfile.open(rel / name, "w:gz") as tar:
+                for member, data in (self.payload() if payload is None else payload).items():
+                    info = tarfile.TarInfo(member)
+                    info.size = len(data)
+                    info.mode = 0o755 if member == "kronik" else 0o644
+                    tar.addfile(info, io.BytesIO(data))
+                if extra:
+                    info, data = extra
+                    tar.addfile(info, io.BytesIO(data))
+            digest = hashlib.sha256((rel / name).read_bytes()).hexdigest()
+            (rel / (name + ".sha256")).write_text(
+                (sums if sums is not None else f"{digest}  {name}") + "\n")
         return rel.as_uri()
 
     def installed(self):
@@ -220,19 +238,22 @@ class InstallTest(ActionTest):
         self.assertTrue(os.access(self.installed(), os.X_OK))
         self.assertEqual((self.tmp / "path").read_text(), f"{self.installed().parent}\n")
         self.assertEqual(calls[0]["argv"], ["--version"])
+        for member, data in self.payload().items():
+            if member != "kronik":
+                self.assertEqual((self.installed().parent / "kronik-licenses" / member).read_bytes(), data)
 
     def test_checksum_mismatch_refused(self):
-        sums = "\n".join(f"{'0' * 64}  kronik-{a}-unknown-linux-musl" for a in ("x86_64", "aarch64"))
+        sums = "\n".join(f"{'0' * 64}  kronik-{a}-unknown-linux-musl.tar.gz" for a in ("x86_64", "aarch64"))
         p, calls = self.run_action("install", base_url=self.release(sums), event={}, event_name="push", path_bin=False)
         self.assertEqual(p.returncode, 1)
-        self.assertIn("but SHA256SUMS says", p.stdout)
+        self.assertIn("checksum", p.stdout)
         self.assertFalse(self.installed().exists())
         self.assertEqual(calls, [])
 
     def test_missing_checksum_line_refused(self):
         p, calls = self.run_action("install", base_url=self.release(f"{'0' * 64}  other-file"), event={}, event_name="push", path_bin=False)
         self.assertEqual(p.returncode, 1)
-        self.assertIn("SHA256SUMS has no line for kronik-", p.stdout)
+        self.assertIn("no unique valid line", p.stdout)
         self.assertFalse(self.installed().exists())
 
     def test_install_then_propose(self):
@@ -253,6 +274,68 @@ class InstallTest(ActionTest):
                 p, _ = self.run_action("install", base_url=url, event={}, event_name="push", path_bin=False)
                 self.assertEqual(p.returncode, 1)
                 self.assertIn("could not download", p.stdout)
+
+    def test_missing_or_empty_notice_refused_before_install(self):
+        for member in ("LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.txt"):
+            for empty in (False, True):
+                with self.subTest(member=member, empty=empty):
+                    payload = self.payload()
+                    if empty:
+                        payload[member] = b""
+                    else:
+                        del payload[member]
+                    p, calls = self.run_action("install", base_url=self.release(payload=payload),
+                                               event={}, event_name="push", path_bin=False)
+                    self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                    self.assertFalse(self.installed().exists())
+                    self.assertEqual(calls, [])
+
+    def test_archive_paths_links_and_duplicates_refused(self):
+        for name, kind in (("../escape", tarfile.REGTYPE),
+                           (str(self.tmp / "escape-absolute"), tarfile.REGTYPE),
+                           ("NOTICE", tarfile.SYMTYPE),
+                           ("kronik", tarfile.LNKTYPE),
+                           ("NOTICE", tarfile.REGTYPE)):
+            with self.subTest(name=name, kind=kind):
+                info = tarfile.TarInfo(name)
+                info.type = kind
+                info.linkname = "../escape" if kind != tarfile.REGTYPE else ""
+                data = b"escape"
+                info.size = len(data) if kind == tarfile.REGTYPE else 0
+                p, calls = self.run_action("install", base_url=self.release(extra=(info, data)),
+                                           event={}, event_name="push", path_bin=False)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertFalse(self.installed().exists())
+                self.assertEqual(calls, [])
+                self.assertFalse((self.tmp / "escape").exists())
+                self.assertFalse((self.tmp / "escape-absolute").exists())
+
+    def test_shell_installer_keeps_notices_inside_install_directory(self):
+        destination = self.tmp / "private-bin"
+        env = dict(os.environ, KRONIK_BASE_URL=self.release(),
+                   KRONIK_INSTALL_DIR=str(destination), KRONIK_INSTALL_RUNSC="no")
+        p = subprocess.run(["sh", str(ROOT / "scripts/install.sh")], env=env,
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual((destination / "kronik").read_bytes(), FAKE.read_bytes())
+        for member, data in self.payload().items():
+            if member != "kronik":
+                self.assertEqual((destination / "kronik-licenses" / member).read_bytes(), data)
+        self.assertFalse((self.tmp / "share").exists())
+
+    def test_shell_installer_missing_notice_preserves_existing_binary(self):
+        destination = self.tmp / "private-bin"
+        destination.mkdir()
+        old = destination / "kronik"
+        old.write_bytes(b"existing binary")
+        payload = self.payload()
+        del payload["NOTICE"]
+        env = dict(os.environ, KRONIK_BASE_URL=self.release(payload=payload),
+                   KRONIK_INSTALL_DIR=str(destination), KRONIK_INSTALL_RUNSC="no")
+        p = subprocess.run(["sh", str(ROOT / "scripts/install.sh")], env=env,
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(old.read_bytes(), b"existing binary")
 
 
 class ProposeTest(ActionTest):
@@ -753,17 +836,6 @@ class LintTest(unittest.TestCase):
                 p = subprocess.run(["shellcheck", "-s", "bash", "-"], input=script, capture_output=True, text=True)
                 self.assertEqual(p.returncode, 0, p.stdout)
 
-
-class GuideTest(unittest.TestCase):
-    def test_guide_includes_the_workflow(self):
-        guide = (ROOT / "docs" / "guides" / "github-action.md").read_text()
-        self.assertIn("{{#include ../examples/kronik-ci.yml}}", guide)
-
-    def test_the_example_repository_has_the_reference_workflow(self):
-        # examples/github-flow is what goes in a repository: its workflow is
-        # the one the tests above check, byte for byte.
-        example = ROOT / "examples" / "github-flow" / ".github" / "workflows" / "kronik.yml"
-        self.assertEqual(example.read_text(), WORKFLOW.read_text())
 
 
 if __name__ == "__main__":

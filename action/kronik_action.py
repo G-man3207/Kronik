@@ -21,6 +21,7 @@ KRONIK_TOKEN reach kronik through its environment, never its command line.
 import glob
 import hashlib
 import ipaddress
+import io
 import json
 import os
 import platform
@@ -28,6 +29,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import urllib.error
@@ -111,21 +113,42 @@ def install(base_url):
         raise Failure(f"there is no kronik for {machine}; there is one for x86_64 and one for aarch64")
     check_base_url(base_url)
     base_url = base_url.rstrip("/")
-    name = f"kronik-{arch}-unknown-linux-musl"
-    binary = download(f"{base_url}/{name}")
-    sums = download(f"{base_url}/SHA256SUMS").decode("utf-8", "replace")
-    # sha256sum's format: "<hex>  <file>", or "<hex> *<file>" in binary mode.
+    name = f"kronik-{arch}-unknown-linux-musl.tar.gz"
+    archive = download(f"{base_url}/{name}")
+    sums = download(f"{base_url}/{name}.sha256").decode("utf-8", "replace")
+    # A sidecar also permits supplemental archives on an existing release
+    # without replacing its historical raw-binary SHA256SUMS or installer.
     want = [f[0].lower() for f in map(str.split, sums.splitlines()) if len(f) == 2 and f[1].lstrip("*") == name]
-    if not want:
-        raise Failure(f"SHA256SUMS has no line for {name}; refusing to install it")
-    got = hashlib.sha256(binary).hexdigest()
+    if len(want) != 1 or not re.fullmatch(r"[0-9a-f]{64}", want[0]):
+        raise Failure(f"{name}.sha256 has no unique valid line for {name}; refusing to install it")
+    got = hashlib.sha256(archive).hexdigest()
     if got != want[0]:
-        raise Failure(f"the SHA-256 of {name} is {got}, but SHA256SUMS says {want[0]}; refusing to install it")
+        raise Failure(f"the SHA-256 of {name} is {got}, but its checksum says {want[0]}; refusing to install it")
+    payload = {}
+    required = ("kronik", "LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.txt")
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            members = tar.getmembers()
+            for member in members:
+                if not member.isfile() or member.name not in (*required, "kronik.cdx.json"):
+                    raise Failure(f"unsafe release archive member: {member.name!r}")
+                if member.name in payload:
+                    raise Failure(f"duplicate release archive member: {member.name}")
+                payload[member.name] = tar.extractfile(member).read()
+            for member in required:
+                if not payload.get(member):
+                    raise Failure(f"release archive has no nonempty {member}")
+    except (tarfile.TarError, EOFError, OSError) as error:
+        raise Failure(f"invalid release archive: {error}") from error
     bin_dir = os.path.join(env("RUNNER_TEMP", tempfile.gettempdir()), "kronik-bin")
-    os.makedirs(bin_dir, exist_ok=True)
+    license_dir = os.path.join(bin_dir, "kronik-licenses")
+    os.makedirs(license_dir, exist_ok=True)
+    for member in required[1:]:
+        with open(os.path.join(license_dir, member), "wb") as f:
+            f.write(payload[member])
     path = os.path.join(bin_dir, "kronik")
     with open(path, "wb") as f:
-        f.write(binary)
+        f.write(payload["kronik"])
     os.chmod(path, 0o755)
     os.environ["PATH"] = bin_dir + os.pathsep + env("PATH")
     if env("GITHUB_PATH"):
@@ -135,9 +158,9 @@ def install(base_url):
 
 
 def check_base_url(base_url):
-    """https:// or file://, or http:// to a loopback IP: the binary and its
-    SHA256SUMS come from the same place, so plain HTTP elsewhere would let the
-    network swap both."""
+    """https:// or file://, or http:// to a loopback IP: the archive and its
+    checksum come from the same place, so plain HTTP elsewhere would let the
+    network swap both. Checksums are not signatures (M31)."""
     url = urllib.parse.urlsplit(base_url)
     if url.scheme in ("https", "file"):
         return

@@ -18,6 +18,13 @@ HTTP server, give their URL to `sh`, not to `curl`:
 ```sh
 curl -fsSL <url>/install.sh | KRONIK_BASE_URL=<url> sh
 ```
+The published `v0.3.0` installer and its raw binaries/checksum manifest are
+unchanged. The archive format below is implemented in the current checkout,
+not a new published release. Supplemental archives made from the exact
+checksum-verified `v0.3.0` binaries are prepared locally for review; do not
+point the new installer or Action at a public archive URL until those assets
+actually exist. The published installation command above remains usable.
+
 
 ## Prerequisites
 
@@ -46,12 +53,15 @@ curl -fsSL <url>/install.sh | KRONIK_BASE_URL=<url> sh
 
 `install.sh`:
 
-1. picks the binary for the machine (`kronik-x86_64-unknown-linux-musl` or
-   `kronik-aarch64-unknown-linux-musl`) and downloads it and the release's
-   `SHA256SUMS`;
-2. refuses a binary whose SHA-256 is not the one in `SHA256SUMS`;
-3. installs `kronik` into `/usr/local/bin` as root, else into
-   `~/.local/bin`;
+1. picks `kronik-<arch>-unknown-linux-musl.tar.gz` for the machine and
+   downloads it and its `.tar.gz.sha256` sidecar;
+2. checks the archive's SHA-256 **before** reading any member;
+3. streams the named `kronik`, `LICENSE`, `NOTICE` and
+   `THIRD_PARTY_LICENSES.txt` members into private temporary regular files,
+   refusing a missing or empty notice, then installs `kronik` into
+   `/usr/local/bin` as root, else `~/.local/bin`, with the three notice files
+   in that directory's `kronik-licenses/` subdirectory; no parent-directory
+   write or archive-path extraction is needed;
 4. offers to install gVisor's `runsc`, which only foreign actors need
    ([ADR 0003](../adr/0003-gvisor-bridge.md)): the pinned release
    `release-20261019.0`, checked against a SHA-512 written into the script,
@@ -66,22 +76,52 @@ The environment changes what it does:
 | `KRONIK_BASE_URL` | Where the release's files are (`https://`, `http://` or `file://`); a release's `install.sh` has its own |
 | `KRONIK_INSTALL_DIR` | Where `kronik` goes |
 | `KRONIK_INSTALL_RUNSC` | `yes`, `no`, or `ask` (the default) |
+| `TMPDIR` | Parent for private `mktemp` directories; must be writable and executable because the verified candidate runs before installation. With a `noexec` `/tmp`, use an already owned executable directory such as the install directory |
 
-Without the script: download the binary and `SHA256SUMS`, then
+Without the script, for a release that actually provides the new archives:
 
 ```sh
-sha256sum --check --ignore-missing SHA256SUMS
-install -m 755 kronik-x86_64-unknown-linux-musl /usr/local/bin/kronik
+sha256sum --check kronik-x86_64-unknown-linux-musl.tar.gz.sha256
+mkdir kronik-release
+tar -xzf kronik-x86_64-unknown-linux-musl.tar.gz -C kronik-release
+mkdir -p "$HOME/.local/bin/kronik-licenses"
+install -m 755 kronik-release/kronik "$HOME/.local/bin/kronik"
+cp kronik-release/LICENSE kronik-release/NOTICE \
+  kronik-release/THIRD_PARTY_LICENSES.txt "$HOME/.local/bin/kronik-licenses/"
 ```
+
+Retain the notices when redistributing the binary. Checksums detect
+corruption; a checksum from the same server is not an independent signature.
 
 ## What a release contains
 
 | File | |
 | --- | --- |
-| `kronik-x86_64-unknown-linux-musl`, `kronik-aarch64-unknown-linux-musl` | Static binaries: musl, with SQLite compiled in, stripped |
-| `kronik.cdx.json` | A CycloneDX 1.5 SBOM of the crates in the binary |
-| `install.sh` | The installer, with the release's version and base URL |
-| `SHA256SUMS` | The SHA-256 of each of the above |
+| `kronik-<target>.tar.gz` | Static, stripped musl `kronik`, `LICENSE`, `NOTICE`, `THIRD_PARTY_LICENSES.txt` and a target-specific `kronik.cdx.json` |
+| `kronik-<target>.tar.gz.sha256` | The archive's SHA-256, usable without replacing a historical release's checksum manifest |
+| `install.sh` | The archive installer, with the release's version and base URL |
+| `SHA256SUMS` | SHA-256 of the new archives, their sidecars and installer |
+
+The Cargo SBOM supplies dependency identities/license expressions, not a
+substitute for license texts. `scripts/package-release.py` uses locked,
+target-filtered Cargo metadata for the binary's normal dependency closure,
+retains packaged license/notice files and source-specific copyright comments,
+and fails rather than inventing a missing license or copyright holder.
+Wasmtime's shared root text is reused only at the same upstream revision and
+declared license; other absent packaged texts have checked-in, hash-checked
+upstream provenance in `scripts/licenses/sources.json`. `crc32c 0.6.8` has no
+upstream license file: its declared Apache-2.0 alternative is supplied without
+inventing a MIT copyright.
+
+The notices also cover Rust's supplied standard-library dependencies,
+musl/Zig native runtime sources, bundled SQLite/ring/BLAKE3 and the embedded
+OpenTelemetry definitions and Go SDK/WASI interface sources. The WIT
+specifications retain their actual WASI 0.2.0/W3C attribution and terms.
+ComponentizeJS/StarlingMonkey, CPython, TinyGo and WASI-Virt runtimes are
+external actor-build tools/outputs, not embedded host runtimes. Source notice
+collection is conservative and does not claim every listed portion is linked.
+This distribution work does not settle contributor provenance or the
+licensor/CLA ownership review.
 
 ## Building a release
 
@@ -97,12 +137,17 @@ needs the variable when it runs.
 ```sh
 KRONIK_BASE_URL=https://<where the files will be> scripts/release.sh
 scripts/e2e-install.sh dist/release        # install.sh in a clean Ubuntu 24.04 container
-KRONIK_BIN=$PWD/dist/release/kronik-x86_64-unknown-linux-musl scripts/e2e-m1.sh
+release_tmp="$(mktemp -d)"
+tar -xzf dist/release/kronik-x86_64-unknown-linux-musl.tar.gz -C "$release_tmp" kronik
+KRONIK_BIN="$release_tmp/kronik" scripts/e2e-m1.sh
+rm -rf "$release_tmp"
 ```
 
 `scripts/e2e-install.sh` installs as root from `file://`, as a user with
-`curl | sh` over HTTP, refuses a corrupted binary, and with `RUNSC=1` also
-installs `runsc` and checks that `kronik doctor` finds it.
+`curl | sh` over HTTP, keeps the license/notice files, refuses a corrupted
+archive, and with `RUNSC=1` also installs `runsc` and checks that `doctor`
+finds it. Packaging requires Python 3.11 or later; it fixes archive ordering,
+ownership, modes and timestamps, and checks the ELF target/static boundary.
 
 On GitHub, the Release workflow runs the same script, but only when started
 by hand; its files are kept as the run's artifact and, if asked, become a
