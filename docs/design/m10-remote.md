@@ -114,9 +114,14 @@ environment, masked; `read,propose` for `propose` and `verify`,
   plaintext credentials and private keys, binds metadata and data to repository/
   head/run/attempt/proposal, and restores without re-proposing. A fresh promote
   credential is minted by the actual Unix-authenticated operator CLI; unchanged
-  proposal/code/diff hashes are checked before and after. Local smoke also proves
-  token scopes, trust failures, replay, restore, the actual Approval log record,
-  integrity and changed response; it explicitly is not GitHub approval.
+  proposal/code/diff hashes are checked before and after credential creation.
+  The raw Approval's proposal ID, full diff hash and verified-through LSN are
+  independently compared to the original validated gated artifact. Promotion's
+  legitimate catch-up may rewrite the current diff; gated and post-promote hashes
+  and verified ranges are reported separately, without changing promotion
+  semantics or forcing equality. Local smoke also proves token scopes, trust
+  failures, replay, restore, the actual Approval record, integrity and changed
+  response; it explicitly is not GitHub approval.
 - `action/tests/test_github_fixture.py`: strict component selection, secret
   exclusion, safe bounded archive extraction, composite identity and log decoding.
 - Still not done: two actual public PR heads with the same updated comment and

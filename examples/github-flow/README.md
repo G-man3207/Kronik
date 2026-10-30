@@ -52,10 +52,15 @@ private-key material is refused. A digest binds both archive and metadata to
 the repository, exact head, run, attempt and proposal. After the actual GitHub
 gate, `promote` restores it without proposing again. It creates a fresh
 `read,approve,promote` token through the existing real Unix-authenticated operator
-CLI and verifies that proposal/code/diff bytes remain unchanged despite allowed
-credential audit records. The final check inspects the actual Approval record,
-deployment, integrity result and changed HTTPS response. The synthetic fixture's
-public encryption seed is not a production key.
+CLI and verifies that proposal/code/diff bytes remain unchanged through that
+credential creation. The final check binds the raw Approval's proposal ID, full
+diff hash and verified-through LSN to the original validated gated artifact,
+not to mutable post-promotion proposal metadata or the reason alone. Normal
+promotion catch-up may rewrite the current diff and advance its verified range;
+`gated_diff_hash` and `post_promote_diff_hash` report those distinct identities
+without requiring equality. Deployment, integrity and the changed HTTPS response
+are also checked. The synthetic fixture's public encryption seed is not a
+production key.
 
 The configured `kronik-production` environment has only reviewer `G-man3207`
 (user ID 113182292), prevents review, disallows administrator bypass and

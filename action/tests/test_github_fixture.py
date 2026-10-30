@@ -98,6 +98,27 @@ class GithubFixtureTest(unittest.TestCase):
             (root / "data.tar.gz").write_bytes(b"changed archive identity")
             self.assertNotEqual(FIXTURE["artifact_digest"](root), second)
 
+    def test_approval_binds_original_artifact_not_the_post_promote_hash(self):
+        # Captured real v0.3.0 Approval from local product smoke, not GitHub approval.
+        payload = bytes.fromhex(
+            "0a0e702d34626531633165653934646612207d0294f84c407b295fcddc5a055847550b"
+            "3e820a231fce43ea7e4203a47ddb87180522440a11746f6b656e3a6d31302d70726f"
+            "6d6f746512286c6f63616c2070726f6475637420736d6f6b652c206e6f7420476974"
+            "48756220617070726f76616c18fcf09aee9834")
+        gated = {"proposal_id": "p-4be1c1ee94df", "verified_through_lsn": 5,
+                 "diff_hash": "b3:7d0294f84c407b295fcddc5a055847550b3e820a231fce43ea7e4203a47ddb87"}
+        record = FIXTURE["approval_record"](payload, 7, gated, github=False)
+        self.assertEqual(record["diff_hash"], gated["diff_hash"])
+        self.assertEqual(record["verified_through_lsn"], 5)
+        self.assertEqual(record["reason"], "local product smoke, not GitHub approval")
+        post_promote_hash = "b3:d4b04ff2124863ce86e42a90ae49ce0bf39202f7545d757f5fef9083c8f58109"
+        for field, value in (("proposal_id", "p-000000000000"), ("diff_hash", post_promote_hash),
+                             ("verified_through_lsn", 7)):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "original gated"):
+                FIXTURE["approval_record"](payload, 7, dict(gated, **{field: value}), github=False)
+        with self.assertRaisesRegex(ValueError, "original gated"):
+            FIXTURE["approval_record"](payload + b"\x28\x01", 7, gated, github=False)
+
     def test_approval_record_decoder_fails_closed_on_truncation_and_duplicates(self):
         self.assertEqual(FIXTURE["wire_fields"](b"\x0a\x01x\x18\x01"), {1: b"x", 3: 1})
         for data in (b"\x0a\x05x", b"\x0a\x01x\x0a\x01y", b"\x09", b"\x00", b"\x80" * 11):

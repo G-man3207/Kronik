@@ -435,11 +435,32 @@ def wire_fields(payload):
     return fields
 
 
+def approval_record(payload, lsn, gated, github):
+    fields = wire_fields(payload)
+    audit = wire_fields(fields[4])
+    actual = (fields[1].decode(), "b3:" + fields[2].hex(), fields.get(3, 0))
+    expected = (gated["proposal_id"], gated["diff_hash"], gated["verified_through_lsn"])
+    if actual != expected or fields.get(5, 0) != 0:
+        raise ValueError("raw Approval does not match the original gated proposal/diff/verified LSN")
+    assert audit[1].decode() == "token:m10-promote"
+    reason = audit[2].decode()
+    if github:
+        assert "approved in the GitHub environment kronik-production" in reason
+        assert "by G-man3207" in reason
+        assert f"/{REPOSITORY}/actions/runs/{identity()['run_id']}" in reason
+    return {"proposal_id": actual[0], "diff_hash": actual[1], "verified_through_lsn": actual[2],
+            "lsn": lsn, "request": False, "token_id": audit[1].decode(), "reason": reason,
+            "wire_payload_hex": payload.hex()}
+
+
 def completed(root, proposal, github=True):
+    gated = state(root)["proof"]
+    if gated["proposal_id"] != proposal:
+        raise ValueError("completion proposal does not match the original gated artifact")
     info = operator(root, "proposal", "status", proposal)
     assert info["status"] == "promoted"
     deployment = operator(root, "deployments", "list")["deployments"][-1]
-    assert deployment["cause"] == "promote" and deployment["kinds"] == info["kinds"]
+    assert deployment["cause"] == "promote" and deployment["kinds"] == info["kinds"] == gated["kinds"]
     assert deployment["token_id"] == "token:m10-promote"
     assert response(root, "m10-completed") == "2"
     integrity = operator(root, "integrity")
@@ -456,20 +477,14 @@ def completed(root, proposal, github=True):
             end = offset + 17 + size
             assert end <= len(image)
             if kind == 8 and lsn == approval_lsn:
-                fields = wire_fields(image[offset + 17:end])
-                audit = wire_fields(fields[4])
-                assert fields[1].decode() == proposal and fields.get(5, 0) == 0
-                assert fields[2].hex() == meta["approved"]["diff_hash"].removeprefix("b3:")
-                assert audit[1].decode() == "token:m10-promote"
-                reason = audit[2].decode()
-                if github:
-                    assert "approved in the GitHub environment kronik-production" in reason
-                    assert "by G-man3207" in reason
-                    assert f"/{REPOSITORY}/actions/runs/{identity()['run_id']}" in reason
-                approvals.append({"lsn": lsn, "token_id": audit[1].decode(), "reason": reason})
+                approvals.append(approval_record(image[offset + 17:end], lsn, gated, github))
             offset = end
     assert len(approvals) == 1
-    report = {"github_approval_record_required": github, "proposal_id": proposal, "diff_hash": info["diff_hash"],
+    report = {"github_approval_record_required": github, "proposal_id": proposal,
+              "gated_diff_hash": gated["diff_hash"],
+              "gated_verified_through_lsn": gated["verified_through_lsn"],
+              "post_promote_diff_hash": info["diff_hash"],
+              "post_promote_verified_through_lsn": info["verified_through_lsn"],
               "approval": approvals[0], "deployment": deployment, "integrity": integrity,
               "changed_fresh_response": "2"}
     save(Path(root) / "evidence.json", report)
