@@ -24,7 +24,7 @@ import tempfile
 LEGAL_NAME = re.compile(r"^(licen[cs]e|copying|copyright|notice|unlicense)", re.I)
 COMMENTS = re.compile(r"/\*.*?\*/|^(?:[ \t]*(?://|#|;|@)[^\n]*(?:\n|$))+", re.S | re.M)
 LEGAL_COMMENT = re.compile(r"copyright|permission.{0,40}granted|redistribution and use|SPDX-License-Identifier", re.I)
-SOURCE_SUFFIXES = {".rs", ".c", ".h", ".hh", ".hpp", ".cc", ".cpp", ".inc", ".inl", ".S", ".s", ".asm", ".zig"}
+SOURCE_SUFFIXES = {".rs", ".proto", ".c", ".h", ".hh", ".hpp", ".cc", ".cpp", ".inc", ".inl", ".S", ".s", ".asm", ".zig"}
 SUPPLEMENTS = Path(__file__).resolve().parent / "licenses"
 
 
@@ -32,8 +32,8 @@ def section(label, text):
     return f"\n{'=' * 78}\n{label}\n{'=' * 78}\n{text.rstrip()}\n"
 
 
-def legal_files(root):
-    paths = sorted(p for p in root.rglob("*") if p.is_file() and
+def legal_files(root, paths=None):
+    paths = sorted(p for p in (root.rglob("*") if paths is None else paths) if p.is_file() and
                    any(LEGAL_NAME.match(part) for part in p.relative_to(root).parts))
     for path in paths:
         if not path.resolve().is_relative_to(root.resolve()):
@@ -41,11 +41,11 @@ def legal_files(root):
     return paths
 
 
-def source_notices(root):
+def source_notices(root, paths=None):
     if not root.is_dir():
         raise ValueError(f"missing runtime source directory: {root}")
     result = []
-    for path in sorted(root.rglob("*")):
+    for path in sorted(root.rglob("*") if paths is None else paths):
         if not path.is_file() or path.suffix not in SOURCE_SUFFIXES:
             continue
         if not path.resolve().is_relative_to(root.resolve()):
@@ -64,6 +64,51 @@ def revision(root):
     return json.loads(path.read_text())["git"]["sha1"] if path.is_file() else None
 
 
+def local_origin(package, workspace):
+    root = Path(package["manifest_path"]).parent.resolve()
+    path = root / "ORIGIN.json"
+    if not root.is_relative_to(workspace) or not path.resolve().is_relative_to(root):
+        raise ValueError(f"third-party origin escapes workspace/package: {package['name']}")
+    origin = json.loads(path.read_text())
+    if (origin["schema_version"] != 1 or origin["name"] != package["name"] or
+            origin["repository"] != package["repository"] or
+            not origin["repository"].startswith("https://") or
+            not re.fullmatch(r"[0-9a-f]{40}", origin["revision"]) or
+            not origin["archive"]["url"].startswith("https://") or
+            not re.fullmatch(r"[0-9a-f]{64}", origin["archive"]["sha256"]) or
+            origin["license"]["spdx"] != package["license"] or not origin["patches"]):
+        raise ValueError(f"invalid third-party origin: {package['name']}")
+    full_path = (root / origin.get("full_import_manifest", "ORIGIN.json")).resolve()
+    if not full_path.is_relative_to(workspace):
+        raise ValueError(f"full import manifest escapes workspace: {package['name']}")
+    full = json.loads(full_path.read_text())
+    if (any(full[key] != origin[key] for key in ("schema_version", "repository", "revision", "archive")) or
+            [(p["repository_path"], p["sha256"]) for p in full["patches"]] !=
+            [(p["repository_path"], p["sha256"]) for p in origin["patches"]]):
+        raise ValueError(f"inconsistent third-party import manifest: {package['name']}")
+    for patch in origin["patches"]:
+        relative = Path(patch["repository_path"])
+        actual = (root / patch["path"]).resolve()
+        if (relative.is_absolute() or ".." in relative.parts or
+                not actual.is_relative_to(workspace) or actual != (workspace / relative).resolve() or
+                hashlib.sha256(actual.read_bytes()).hexdigest() != patch["sha256"]):
+            raise ValueError(f"changed/escaping third-party patch: {package['name']}")
+    paths = []
+    for item in full["maintained_files"]:
+        relative = Path(item["path"])
+        actual = (workspace / relative).resolve()
+        if (relative.is_absolute() or ".." in relative.parts or not actual.is_relative_to(workspace) or
+                hashlib.sha256(actual.read_bytes()).hexdigest() != item["sha256"]):
+            raise ValueError(f"changed/escaping maintained source: {item['path']}")
+        if actual.is_relative_to(root):
+            paths.append(actual)
+    for name in (origin["license"]["text"], origin["license"]["downstream_attribution_index"], "Cargo.toml"):
+        actual = (root / name).resolve()
+        if actual not in paths or not actual.is_relative_to(root) or not actual.stat().st_size:
+            raise ValueError(f"missing verified third-party license/source: {package['name']}: {name}")
+    return origin, paths
+
+
 def packages(metadata):
     nodes = {n["id"]: n for n in metadata["resolve"]["nodes"]}
     root = next(p for p in metadata["packages"] if p["name"] == "kronik")
@@ -75,13 +120,30 @@ def packages(metadata):
         seen.add(ident)
         todo.extend(d["pkg"] for d in nodes[ident]["deps"]
                     if any(k["kind"] is None for k in d["dep_kinds"]))
-    return root, sorted((p for p in metadata["packages"] if p["id"] in seen and p["source"]),
-                        key=lambda p: (p["name"], p["version"]))
+    workspace = Path(metadata["workspace_root"]).resolve()
+    members = set(metadata["workspace_members"])
+    dependencies = []
+    for package in metadata["packages"]:
+        if package["id"] not in seen or package["id"] == root["id"]:
+            continue
+        if package["source"] is None:
+            source = Path(package["manifest_path"]).parent.resolve()
+            origin = source / "ORIGIN.json"
+            if (package["id"] in members and source.is_relative_to(workspace) and
+                    not source.is_relative_to(workspace / "vendor") and not origin.exists()):
+                continue
+            if not source.is_relative_to(workspace) or not origin.is_file():
+                raise ValueError(f"unclassified local dependency needs ORIGIN.json: {package['name']}")
+        dependencies.append(package)
+    return root, sorted(dependencies, key=lambda p: (p["name"], p["version"]))
 
 
 def dependency_notices(metadata, apache):
     _, dependencies = packages(metadata)
-    files = {p["id"]: legal_files(Path(p["manifest_path"]).parent) for p in dependencies}
+    workspace = Path(metadata["workspace_root"]).resolve()
+    origins = {p["id"]: local_origin(p, workspace) for p in dependencies if p["source"] is None}
+    files = {p["id"]: legal_files(Path(p["manifest_path"]).parent,
+                                origins[p["id"]][1] if p["id"] in origins else None) for p in dependencies}
     revisions = {p["id"]: revision(Path(p["manifest_path"]).parent) for p in dependencies}
     supplements = json.loads((SUPPLEMENTS / "sources.json").read_text())
     result = []
@@ -94,6 +156,8 @@ def dependency_notices(metadata, apache):
             explicit = root / explicit
             if not explicit.resolve().is_relative_to(root.resolve()):
                 raise ValueError(f"license_file escapes package: {package['name']}")
+            if package["id"] in origins and explicit.resolve() not in origins[package["id"]][1]:
+                raise ValueError(f"unverified third-party license_file: {package['name']}")
             paths = sorted(set(paths) | {explicit})
         origin = "packaged source"
         if not paths:
@@ -128,7 +192,11 @@ def dependency_notices(metadata, apache):
                    f"Source: {package['source']}\nRepository: {package['repository']}\n"
                    f"VCS revision: {revisions[package['id']]}\n"
                    f"Declared license: {package['license']}\nAuthors (package metadata): {', '.join(package['authors'])}")
-        result.append(section(heading, "".join(texts) + source_notices(root)))
+        origin, retained = origins.get(package["id"], (None, None))
+        if origin is not None:
+            texts.append(section("Verified third-party ORIGIN.json (patch order retained)",
+                                 json.dumps(origin, indent=2, sort_keys=True)))
+        result.append(section(heading, "".join(texts) + source_notices(root, retained)))
     return "".join(result)
 
 

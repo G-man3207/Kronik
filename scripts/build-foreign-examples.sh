@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Builds the foreign-actor examples (standalone Cargo projects, std only) as
+# Builds the foreign-actor examples (standalone Cargo projects) as
 # static musl binaries and packs each into a local OCI image layout:
 #
 #   examples/foreign-echo   -> examples/dist/foreign-echo.oci   (foreign-echo:dev)
 #   examples/fake-payments  -> examples/dist/fake-payments.oci  (fake-payments:dev)
 #   examples/foreign-pg     -> examples/dist/foreign-pg.oci     (foreign-pg:dev)
+#   examples/foreign-probe -> examples/dist/foreign-probe.oci (--only; root inside the sandbox)
 #
 # foreign-pg (M14) is Postgres 16.4 plus the shim: its base is the pinned
 # postgres image, exported with docker (skipped, with a message, without
@@ -13,13 +14,14 @@
 # Each image is one gzip layer with /bin/<name>, /etc/passwd, /etc/group and
 # /tmp; it runs as nobody, listens on 8080/tcp. The packer is the
 # kronik-foreign example `oci_pack`, which writes a deterministic layout.
+# The opt-in isolation probe instead uses OCI UID 0 to test the strongest confined actor.
 # Paths of the sources and of the Cargo home are remapped, so the digest does
 # not depend on where the checkout is.
 #
 # Prints one line per image: `<name> oci-layout:<absolute dir>@<digest>`,
 # usable as `kronik foreign add --image`.
 #
-# Usage: scripts/build-foreign-examples.sh [--check] [--only foreign-echo|fake-payments|foreign-pg]
+# Usage: scripts/build-foreign-examples.sh [--check] [--only foreign-echo|fake-payments|foreign-pg|foreign-probe]
 #   --check  build everything a second time from scratch into separate
 #            directories and fail unless the digests match (reproducibility)
 set -euo pipefail
@@ -35,7 +37,7 @@ if ! command -v cargo >/dev/null 2>&1 && [ -f "${CARGO_HOME:-$HOME/.cargo}/env" 
 fi
 
 usage() {
-    echo "usage: $0 [--check] [--only foreign-echo|fake-payments|foreign-pg]" >&2
+    echo "usage: $0 [--check] [--only foreign-echo|fake-payments|foreign-pg|foreign-probe]" >&2
     exit 2
 }
 
@@ -47,7 +49,7 @@ while [ $# -gt 0 ]; do
         --only)
             [ $# -ge 2 ] || usage
             case "$2" in
-                foreign-echo | fake-payments | foreign-pg) names=("$2") ;;
+                foreign-echo | fake-payments | foreign-pg | foreign-probe) names=("$2") ;;
                 *) usage ;;
             esac
             shift
@@ -90,13 +92,15 @@ stage() {
 # pack NAME ROOTFS OUT: writes the OCI layout OUT and prints its manifest digest.
 pack() {
     local name=$1 rootfs=$2 out=$3
+    local user=nobody
+    [ "$name" != foreign-probe ] || user=0
     cargo run -q --release -p kronik-foreign --example oci_pack -- \
         --out "$out" \
         --ref "$name:dev" \
         --layer "gzip:$rootfs" \
         --entrypoint "[\"/bin/$name\"]" \
         --cmd '["--listen","0.0.0.0:8080"]' \
-        --user nobody \
+        --user "$user" \
         --workdir / \
         --expose 8080/tcp
 }

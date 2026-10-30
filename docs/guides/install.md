@@ -116,6 +116,11 @@ substitute for license texts. `scripts/package-release.py` uses locked,
 target-filtered Cargo metadata for the binary's normal dependency closure,
 retains packaged license/notice files and source-specific copyright comments,
 and fails rather than inventing a missing license or copyright holder.
+Local third-party path dependencies are not project code merely because Cargo's
+`source` is null. They need an explicit `ORIGIN.json` with the actual upstream
+revision/archive, ordered hash-checked patches, license/attribution paths and a
+hash-checked maintained-file inventory; notices retain that provenance and the
+verified original texts. Unclassified local dependencies and changed inputs fail.
 Wasmtime's shared root text is reused only at the same upstream revision and
 declared license; other absent packaged texts have checked-in, hash-checked
 upstream provenance in `scripts/licenses/sources.json`. `crc32c 0.6.8` has no

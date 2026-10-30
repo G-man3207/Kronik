@@ -31,7 +31,8 @@ step_clippy() {
 # kronik-api), kronik-core's `real` Env and kronik-foreign (the real sandbox
 # boundary, outside DST: docs/design/m7-foreign.md §1) may enable tokio's
 # runtime, time, net, fs, process or signal features; daemon code uses only
-# `sync` and `macros`. Every `select!` must be `biased;`. And the Definition
+# `sync` and `macros`. kronik-cluster has only its exact opt-in server boundary.
+# Every `select!` must be `biased;`. And the Definition
 # of done's rules: `unsafe` code only in the files that
 # scripts/unsafe-allowlist.txt lists with a reason (and no stale entries),
 # and no `unwrap`/`expect` in the daemon's code paths: every crate inherits
@@ -42,16 +43,28 @@ step_hygiene() {
 import json, sys
 allowed = {"kronik", "kronik-gateway", "kronik-api", "kronik-core", "kronik-foreign"}
 banned = {"rt", "rt-multi-thread", "time", "net", "fs", "process", "signal", "full"}
+server_deps = {"h2", "http-body-util", "hyper", "hyper-util", "rustls", "tokio-rustls"}
+cluster_server = {"dep:" + name for name in server_deps} | {"tokio/io-util", "tokio/net", "tokio/rt", "tokio/time"}
 bad = []
 for p in json.load(sys.stdin)["packages"]:
     if p["name"] in allowed:
         continue
+    cluster = p["name"] == "kronik-cluster"
+    if cluster and (set(p["features"].get("server", [])) != cluster_server or
+                    p["features"].get("default") or
+                    any("server" in items for name, items in p["features"].items() if name != "server")):
+        bad.append("kronik-cluster: server must be the exact opt-in transport boundary")
     for d in p["dependencies"]:
         if d["name"] == "tokio" and d["kind"] is None:
+            if cluster and (set(d["features"]) != {"sync", "macros"} or d["uses_default_features"]):
+                bad.append("kronik-cluster: normal tokio dependency must use only sync/macros")
             bad += [f"{p["name"]}: tokio feature {f}" for f in banned & set(d["features"])]
+        if cluster and d["kind"] is None and d["name"] in server_deps and not d["optional"]:
+            bad.append(f"kronik-cluster: {d["name"]} must be optional behind server")
     for feature, items in p["features"].items():
         bad += [f"{p["name"]}[{feature}]: {i}" for i in items
-                if i.split("/")[0] == "tokio" and i.split("/")[-1] in banned]
+                if i.split("/")[0] == "tokio" and i.split("/")[-1] in banned
+                and not (cluster and feature == "server" and i in cluster_server)]
 for b in bad:
     print("error: " + b, file=sys.stderr)
 sys.exit(1 if bad else 0)
@@ -115,7 +128,8 @@ for entry in pathlib.Path("scripts/unsafe-allowlist.txt").read_text().splitlines
         if not why.strip():
             bad.append(f"scripts/unsafe-allowlist.txt: {path} has no reason")
         allowed[path] = why.strip()
-files = [f for root in ("crates", "sdk/rust/src") for f in pathlib.Path(root).rglob("*.rs") if "target" not in f.parts]
+files = [f for root in ("crates", "sdk/rust/src", "vendor/raft/src", "vendor/raft-proto/src")
+         for f in pathlib.Path(root).rglob("*.rs") if "target" not in f.parts]
 for f in sorted(files):
     src = code(f.read_text())
     uses = [m.start() for m in re.finditer(r"\bunsafe\s*(\{|fn\b|impl\b|extern\b|trait\b)|\ballow\s*\([^)]*\bunsafe_code\b", src)]

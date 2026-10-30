@@ -1,5 +1,7 @@
 """Release packager boundary checks; full packaging/consumer proof uses real binaries."""
 
+import hashlib
+import json
 from pathlib import Path
 import runpy
 import struct
@@ -37,6 +39,8 @@ class PackagingTest(unittest.TestCase):
                                          for child, kind in dependencies]}
 
         metadata = {
+            "workspace_root": str(ROOT),
+            "workspace_members": ["kronik"],
             "packages": [{"id": name, "name": name, "version": "1", "source": "registry" if name != "kronik" else None}
                          for name in ("kronik", "normal", "transitive", "dev", "build")],
             "resolve": {"nodes": [node("kronik", [("normal", None), ("dev", "dev"), ("build", "build")]),
@@ -55,6 +59,7 @@ class PackagingTest(unittest.TestCase):
                           "source": "registry", "manifest_path": str(manifest),
                           "license_file": None, "license": "MIT", "repository": None, "authors": []}
             metadata = {"packages": [{"id": "kronik", "name": "kronik", "source": None}, dependency],
+                        "workspace_root": str(ROOT), "workspace_members": ["kronik"],
                         "resolve": {"nodes": [{"id": "kronik", "deps": [
                             {"pkg": "unlicensed", "dep_kinds": [{"kind": None}]}]},
                             {"id": "unlicensed", "deps": []}]}}
@@ -78,6 +83,78 @@ class PackagingTest(unittest.TestCase):
                 metadata["resolve"]["nodes"].append({"id": "sibling", "deps": []})
                 with self.assertRaisesRegex(ValueError, "missing actual license"):
                     PACKAGER["dependency_notices"](metadata, "not a copyright fallback")
+
+    def test_local_dependencies_need_explicit_verified_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            source = workspace / "vendor/third-party"
+            source.mkdir(parents=True)
+            dependency = {"id": "third-party", "name": "third-party", "version": "1",
+                          "source": None, "manifest_path": str(source / "Cargo.toml"),
+                          "license_file": None, "license": "Apache-2.0",
+                          "repository": "https://example.invalid/upstream", "authors": []}
+            metadata = {"workspace_root": str(workspace), "workspace_members": ["kronik"],
+                        "packages": [{"id": "kronik", "name": "kronik", "source": None}, dependency],
+                        "resolve": {"nodes": [{"id": "kronik", "deps": [
+                            {"pkg": "third-party", "dep_kinds": [{"kind": None}]}]},
+                            {"id": "third-party", "deps": []}]}}
+            for members in (["kronik"], ["kronik", "third-party"]):
+                metadata["workspace_members"] = members
+                with self.assertRaisesRegex(ValueError, "unclassified local"):
+                    PACKAGER["packages"](metadata)
+            (source / "Cargo.toml").write_text('[package]\nname="third-party"\n')
+            (source / "LICENSE").write_bytes((ROOT / "proto/opentelemetry/LICENSE").read_bytes())
+            (source / "NOTICE").write_text("Downstream attribution index; no upstream NOTICE.\n")
+            (source / "src").mkdir()
+            (source / "src/lib.rs").write_text("// SPDX-License-Identifier: Apache-2.0\n")
+            (source / "patches").mkdir()
+            patches = []
+            for name in ("first.patch", "second.patch"):
+                patch = source / "patches" / name
+                patch.write_text(f"fixture delta: {name}\n")
+                patches.append({"path": f"patches/{name}",
+                                "repository_path": str(patch.relative_to(workspace)),
+                                "sha256": hashlib.sha256(patch.read_bytes()).hexdigest()})
+            inventory = [{"path": str(p.relative_to(workspace)),
+                          "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+                         for p in source.rglob("*") if p.is_file()]
+            origin = {"schema_version": 1, "name": "third-party",
+                      "repository": dependency["repository"], "revision": "1" * 40,
+                      "archive": {"url": "https://example.invalid/source.tar.gz", "sha256": "2" * 64},
+                      "license": {"spdx": "Apache-2.0", "text": "LICENSE",
+                                  "downstream_attribution_index": "NOTICE"},
+                      "patches": patches, "maintained_files": inventory}
+            path = source / "ORIGIN.json"
+            path.write_text(json.dumps(origin))
+            # A workspace member under vendor is still third-party.
+            _, dependencies = PACKAGER["packages"](metadata)
+            self.assertEqual([p["name"] for p in dependencies], ["third-party"])
+            text = PACKAGER["dependency_notices"](metadata, "unused")
+            self.assertIn("SPDX-License-Identifier: Apache-2.0", text)
+            start = text.index("\n{", text.index("Verified third-party ORIGIN.json")) + 1
+            embedded, _ = json.JSONDecoder().raw_decode(text[start:])
+            self.assertEqual(embedded["patches"], patches)
+            self.assertIn("Verified third-party ORIGIN.json", text)
+            (source / "untracked-license").write_bytes((source / "LICENSE").read_bytes())
+            dependency["license_file"] = "untracked-license"
+            with self.assertRaisesRegex(ValueError, "unverified third-party license_file"):
+                PACKAGER["dependency_notices"](metadata, "unused")
+            dependency["license_file"] = None
+            # Build outputs are not source/attribution inputs.
+            (source / "target").mkdir()
+            (source / "target/unrelated.rs").write_text("// Copyright unrelated build output\n")
+            self.assertEqual(PACKAGER["dependency_notices"](metadata, "unused"), text)
+            for relative in ("patches/first.patch", "LICENSE", "src/lib.rs"):
+                target = source / relative
+                original = target.read_bytes()
+                target.write_bytes(original + b"changed")
+                with self.assertRaises(ValueError):
+                    PACKAGER["dependency_notices"](metadata, "unused")
+                target.write_bytes(original)
+            origin["name"] = "not-this-package"
+            path.write_text(json.dumps(origin))
+            with self.assertRaisesRegex(ValueError, "invalid third-party origin"):
+                PACKAGER["dependency_notices"](metadata, "unused")
 
     def test_legal_and_source_symlinks_cannot_disclose_other_files(self):
         with tempfile.TemporaryDirectory() as directory:

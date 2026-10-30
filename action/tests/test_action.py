@@ -786,6 +786,28 @@ class CiInventoryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no default"):
             self.check("run: scripts/ci.sh fmt", "# no defaults")
 
+    def test_cluster_server_is_an_exact_opt_in_boundary(self):
+        script = (ROOT / "scripts/ci.sh").read_text().split("python3 -c '\n", 1)[1].split("\n'\n", 1)[0]
+        server = ["dep:h2", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:rustls",
+                  "dep:tokio-rustls", "tokio/io-util", "tokio/net", "tokio/rt", "tokio/time"]
+        package = {"name": "kronik-cluster", "features": {"server": server},
+                   "dependencies": [{"name": "tokio", "kind": None, "features": ["sync", "macros"],
+                                     "uses_default_features": False, "optional": False},
+                                    {"name": "hyper", "kind": None, "optional": True}]}
+        for change, succeeds in (({}, True),
+                                 ({"features": {"server": server + ["tokio/fs"]}}, False),
+                                 ({"features": {"server": server, "default": ["server"]}}, False),
+                                 ({"features": {"server": server, "alias": ["server"]}}, False),
+                                 ({"name": "another-core-crate"}, False),
+                                 ({"dependencies": [dict(package["dependencies"][0], features=["net"])]}, False),
+                                 ({"dependencies": [package["dependencies"][0],
+                                                    {"name": "hyper", "kind": None, "optional": False}]}, False)):
+            with self.subTest(change=change):
+                metadata = {"packages": [dict(package, **change)]}
+                p = subprocess.run([sys.executable, "-c", script], input=json.dumps(metadata),
+                                   capture_output=True, text=True, timeout=10)
+                self.assertEqual(p.returncode == 0, succeeds, p.stderr)
+
 
 class LintTest(unittest.TestCase):
     """Lint the real composite action and reference workflow with actionlint,
