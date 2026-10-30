@@ -4,8 +4,8 @@ The `kronik` binary runs the daemon (`kronik serve`) and the client commands
 that talk to it. Client commands call the JSON API on the daemon's Unix
 socket (`/v1`, see [M1 core design](../design/m1-core.md) §4 and
 [M2 effects design](../design/m2-effects.md) §8). `kronik explain`,
-`kronik doctor`, `kronik restore` and `kronik upgrade check` work without a
-daemon.
+`kronik doctor`, `kronik keys wrap`, `kronik restore` and
+`kronik upgrade check` work without a daemon.
 
 Commands have the brief's form `kronik <noun> <verb>`, such as
 `kronik actors list` and `kronik secret set`; the golden path's verbs
@@ -22,13 +22,13 @@ except where a sample names another address.
 | `--socket <PATH>` | The daemon's API socket. Default: `$KRONIK_API_SOCKET`, else `server.api_socket` in `/etc/kronik/kronik.toml` when that file exists, else `/run/kronik/api.sock` (the same as `kronik serve`). Not with `--url`. |
 | `--url <URL>` | A remote API (M10): `https://host:port`, the daemon's `server.api_listen` with TLS on. The port is required: 443 or 80 is usually the gateway, which would record the token with the request. Default: `$KRONIK_URL`. Plain `http://` is accepted only to `localhost` or a loopback address; anything else is refused before a connection is made, so a token never crosses a network in the clear. `localhost` is never looked up: the CLI dials `[::1]`, then `127.0.0.1` (RFC 6761), and over plain HTTP it dials only loopback addresses. The scheme is lower case. An error about the URL names only its scheme, host and port, never user info, a path or a query. |
 | `--token <TOKEN>` | The bearer token. Default: `$KRONIK_TOKEN`, which is preferred: a flag shows in the shell history and in the process list. An empty `$KRONIK_TOKEN` means no token; an empty or blank `--token` is refused (`BAD_REQUEST`), since over the socket no token means every scope. `kronik mcp` takes it too. |
-| `--json` | Print one JSON object on stdout: the API's response body unchanged for a client command, the result of `init`, `build`, `doctor`, `restore`, `upgrade check` and `explain`, and the error JSON on failure. An error answer that is not the API's (a proxy's HTML page, an empty body) becomes an `UNAVAILABLE` error JSON, so stdout is always JSON. [JSON output](json.md) gives every command's schema; [openapi.json](openapi.json) describes the API (M5). `upgrade check` prints its report even when it exits 1. |
+| `--json` | Print one JSON object on stdout: the API's response body unchanged for a client command, the result of `init`, `build`, `doctor`, `keys wrap`, `restore`, `upgrade check` and `explain`, and the error JSON on failure. An error answer that is not the API's (a proxy's HTML page, an empty body) becomes an `UNAVAILABLE` error JSON, so stdout is always JSON. [JSON output](json.md) gives every command's schema; [openapi.json](openapi.json) describes the API (M5). `upgrade check` prints its report even when it exits 1. |
 
 They can go before or after the command: `kronik --json actors list` and
 `kronik actors list --json` are the same. `kronik serve` takes none of
 them and refuses them; it has `--api-socket`. `init`, `build`, `doctor`,
-`restore` and `upgrade` do not talk to the API: they refuse `--url` and
-`--token` (exit 2) rather than ignore them. `kronik mcp` takes `--socket`
+`keys wrap`, `restore` and `upgrade` do not talk to the API: they refuse
+`--url` and `--token` (exit 2) rather than ignore them. `kronik mcp` takes `--socket`
 and `--token` and refuses `--url`, and `$KRONIK_URL` without `--socket`
 (see [kronik mcp](#kronik-mcp)).
 
@@ -71,7 +71,7 @@ Every mutation (`deploy`, `send`, `dead-letters resend`, `grant`, `revoke`,
 `limits set`, `secret set`, `secret delete`, `fork create`, `fork deploy`,
 `fork delete`, `propose`, `approve`, `promote`, `rollback`, `policy set`,
 `foreign add`, `foreign remove`, `privacy mode`, `privacy erase`,
-`privacy reseal`,
+`privacy reseal`, `keys wrap`, `keys rewrap`,
 `token create`, `token revoke`, `snapshot create`) requires `--reason`,
 which the history records with the change, and supports `--dry-run`, which
 checks the request and writes nothing (I12). `replay` writes only in its
@@ -132,7 +132,7 @@ without a file the defaults below apply.
 | `--api-listen <ADDR>` | `server.api_listen` | off; `$KRONIK_API_LISTEN` (the JSON API and MCP over TCP, every request with a bearer token) |
 | `--admin-listen <ADDR>` | `server.admin_listen` | `127.0.0.1:9464`; `$KRONIK_ADMIN_LISTEN` (`/metrics` and `/healthz`) |
 | `--gateway-timeout-ms <MS>` | `gateway.timeout` | 30 seconds |
-| `--master-key-file <PATH>` | `keys.master_key_file` | `<data dir>/keys/master.key`; `$KRONIK_MASTER_KEY_FILE`. `$KRONIK_MASTER_KEY`, when set, is the key itself (64 hex characters) and no file is read or created; setting both stops the start |
+| `--master-key-file <PATH>` | `keys.master_key_file` | For the file source: `<data dir>/keys/master.key`; `$KRONIK_MASTER_KEY_FILE`. `$KRONIK_MASTER_KEY`, when set, is the key itself (64 hex characters) and no file is read or created. File flags and the variable conflict; KMS sources refuse both. Configure KMS with `[keys] source` and its provider table, not this flag |
 | `--disk-reserve <SIZE>` | `log.disk_reserve` | `512MiB`; `$KRONIK_DISK_RESERVE`. Below this much free space new inputs and changes are refused; `0B` turns it off |
 | `--otel-endpoint <URL>` | `otel.endpoint` | off; `$KRONIK_OTEL_ENDPOINT` (an OTLP/HTTP collector for spans and metrics, M28) |
 | `--concurrency <N>` | | `64` |
@@ -860,6 +860,81 @@ $ kronik secret delete stripe-key --reason "rotated out"
 Deleted secret stripe-key: 1 version
 Next     kronik secret list
 ```
+
+## kronik keys status
+
+`kronik keys status`
+
+Shows the loaded master-key source, the wrapping key and version when there
+are any, and whether the seed passed the local store checks. Needs `read`;
+calls `GET /v1/keys`. It never returns key bytes, ciphertext or credentials.
+`check_ok` describes the loaded key, not current provider reachability:
+the running node does not unwrap again for this command.
+
+## kronik keys wrap
+
+`kronik keys wrap --source <openbao|aws|gcp|azure> [--config <PATH>] [--data-dir <DIR>] [--master-key-file <PATH>] --reason <REASON> [--dry-run] [--remove-file]`
+
+Offline migration of an existing file or environment master seed into a KMS.
+Stop the daemon first. The target configuration must already select the
+same `source` as `--source` and contain that provider's settings; this
+command does not rewrite the configuration. See
+[master-key configuration](../guides/operations.md#the-master-key) for the
+four provider tables and bootstrap credentials.
+
+`--data-dir` overrides `server.data_dir`. The old file comes from
+`--master-key-file`, else `KRONIK_MASTER_KEY_FILE`, else
+`<data-dir>/keys/master.key`; alternatively give the old 64-character hex
+seed with `KRONIK_MASTER_KEY`, not both. Unset both old-key environment
+variables before starting with the target KMS configuration; the printed
+start command does so. A relative `wrapped_file` selects the encrypted
+envelope; its default is `keys/master.wrapped` under the data directory.
+
+The command validates the existing encrypted stores, wraps the same seed,
+unwraps it to check the result, then atomically persists the envelope.
+It does not rotate the seed or re-encrypt the stores. A private marker
+becomes a `keys.source` audit event at the next start. Never put key bytes
+or credentials in `--reason`; reasons are history.
+
+`--dry-run` contacts the provider and checks the wrapping operation but
+writes neither envelope nor marker and removes no file. The old file is
+preserved by default; `--remove-file` explicitly removes it only after a
+successful non-dry migration. Deletion is not secure erasure of disk
+snapshots or backups. A migrated file seed therefore was on disk before
+migration.
+
+New daemons and this command cooperate through a lock on the data directory
+itself, with no writable parent or sibling required. A running daemon with
+that lock is refused. Released v0.3 daemons did not hold it: explicitly stop
+an older daemon rather than relying on lock detection.
+
+```sh
+kronik keys wrap --source openbao --config /etc/kronik/kronik-kms.toml \
+  --master-key-file /etc/kronik/master.key \
+  --reason "move the existing seed into OpenBao" --dry-run
+```
+
+## kronik keys rewrap
+
+`kronik keys rewrap --reason <REASON> [--dry-run]`
+
+Online re-encryption of the already loaded seed with the configured KMS's
+current wrapping-key version. Needs `admin`; calls `POST /v1/keys/rewrap`.
+Read and operate tokens cannot rewrap, including a dry run. The file and
+environment sources must be migrated with offline `keys wrap` first.
+
+The command checks that old and new ciphertext unwrap to the existing
+seed, validates the stores and atomically replaces only the envelope.
+It records `keys.rewrap` (and `keys.rewrap.failed` if the operation fails).
+The daemon keeps its loaded key; turns and shipping do not need another
+unwrap. A dry run still performs the provider checks but leaves the
+envelope and audit log unchanged.
+
+Keep older provider key versions decryptable while any backup still
+depends on them. Shipping publishes the current envelope independently of
+keystore changes and pairs each encrypted keystore backup with an envelope;
+restore checks the chosen material before installing it. Rewrap is not
+master-seed rotation.
 
 ## kronik fork create
 

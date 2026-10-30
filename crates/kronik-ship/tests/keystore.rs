@@ -58,7 +58,8 @@ fn a_keystore_change_is_shipped_pruned_and_restored() {
             wall,
             Duration::from_secs(30 * 86_400),
             [7; 24],
-            &src.path().join("keys/master.key"),
+            node.key_source().unwrap(),
+            node.sealer().keystore().unwrap(),
         ))
         .unwrap();
     assert_eq!(report.objects, 1, "{report:?}");
@@ -72,8 +73,12 @@ fn a_keystore_change_is_shipped_pruned_and_restored() {
     assert!(!old.join("1000.bin").exists());
     assert!(!old.join("2000.bin").exists());
 
-    let (master, _) =
-        MasterKey::load_or_create(&src.path().join("keys/master.key"), [0; 32]).unwrap();
+    let (master, _) = MasterKey::open(
+        &src.path().join("keys/master.key"),
+        &src.path().join("keys"),
+        None,
+    )
+    .unwrap();
     let round = tempfile::tempdir().unwrap();
     let restored =
         Keystore::import_backup_file(&round.path().join("keystore.db"), &master, &bytes).unwrap();
@@ -96,7 +101,8 @@ fn a_keystore_change_is_shipped_pruned_and_restored() {
             wall + 1_000,
             Duration::from_secs(30 * 86_400),
             [8; 24],
-            &src.path().join("keys/master.key"),
+            node.key_source().unwrap(),
+            node.sealer().keystore().unwrap(),
         ))
         .unwrap();
     assert_eq!(again.objects, 0, "debounced: {again:?}");
@@ -130,7 +136,8 @@ fn a_keystore_change_is_shipped_pruned_and_restored() {
             dst.path(),
             "main",
             false,
-            &dst.path().join("keys/master.key"),
+            &Env::real(runtime.handle().clone()),
+            &Default::default(),
             KeystoreMode::Require,
         ))
         .unwrap();

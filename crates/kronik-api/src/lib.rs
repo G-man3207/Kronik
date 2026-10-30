@@ -6,6 +6,7 @@
 mod audit;
 pub mod auth;
 mod export;
+mod keys;
 pub mod m12;
 mod m3;
 mod m6;
@@ -845,6 +846,8 @@ impl Api {
             ("GET", ["v1", "grants"]) => self.grants(&q),
             ("POST", ["v1", "limits"]) => self.set_limits(req).await,
             ("GET", ["v1", "limits"]) => self.limits(&q),
+            ("GET", ["v1", "keys"]) => self.keys_status(),
+            ("POST", ["v1", "keys", "rewrap"]) => self.keys_rewrap(req).await,
             ("PUT", ["v1", "secrets", name]) => self.secret_set(req, name).await,
             ("GET", ["v1", "secrets"]) => self.secrets(),
             ("DELETE", ["v1", "secrets", name]) => self.secret_delete(req, name).await,

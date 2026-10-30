@@ -113,8 +113,9 @@ impl TestHost {
         log.group_commit_window = Duration::ZERO;
         let secrets_conn =
             rusqlite::Connection::open_in_memory().map_err(|e| Error::new("secrets", e))?;
-        let secrets = SecretStore::open(secrets_conn, &MasterKey::from_bytes([7; 32]))
-            .map_err(|e| Error::new("secrets", e))?;
+        let master = MasterKey::from_bytes([7; 32]).map_err(|e| Error::new("master key", e))?;
+        let secrets =
+            SecretStore::open(secrets_conn, &master).map_err(|e| Error::new("secrets", e))?;
         let node = Node::start(NodeParts {
             env,
             config: NodeConfig {
@@ -126,6 +127,8 @@ impl TestHost {
             code,
             secrets: Some(Arc::new(secrets)),
             sealer: None,
+            key_source: None,
+            ownership: None,
         })
         .await
         .map_err(|e| Error::new("starting the node", e))?;

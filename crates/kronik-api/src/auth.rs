@@ -116,6 +116,7 @@ pub fn required_scope(method: &str, segs: &[&str]) -> Scope {
         (_, ["v1", "tokens", ..]) => Scope::Admin,
         // Audit lines name tokens and callers, as `token list` does.
         (_, ["v1", "audit"]) => Scope::Admin,
+        ("POST", ["v1", "keys", "rewrap"]) => Scope::Admin,
         ("GET" | "HEAD", ["v1", "foreign", _, "logs"]) => Scope::Operate,
         ("GET" | "HEAD", _) => Scope::Read,
         ("PUT", ["v1", "policy"]) => Scope::Admin,

@@ -14,7 +14,9 @@ use std::sync::Mutex;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rusqlite::{Connection, OptionalExtension, params};
+use zeroize::Zeroizing;
 
+use crate::key_memory::ProtectedKey;
 use crate::{MasterKey, PrivacyError, hex};
 
 const SCHEMA: &str = "
@@ -45,7 +47,7 @@ pub fn valid_subject(subject: &str) -> bool {
 #[derive(Clone)]
 pub struct SubjectKey {
     pub version: u32,
-    key: [u8; 32],
+    key: Zeroizing<[u8; 32]>,
 }
 
 impl std::fmt::Debug for SubjectKey {
@@ -97,8 +99,8 @@ pub struct KeystoreStats {
 /// `keys/keystore.db`.
 pub struct Keystore {
     conn: Mutex<Connection>,
-    wrap: XChaCha20Poly1305,
-    backup: XChaCha20Poly1305,
+    wrap: ProtectedKey,
+    backup: ProtectedKey,
 }
 
 impl std::fmt::Debug for Keystore {
@@ -124,7 +126,39 @@ fn seal_aad(subject: &str, version: u32) -> Vec<u8> {
 }
 
 impl Keystore {
+    pub(crate) fn validate_legacy_key(
+        conn: &Connection,
+        master: &MasterKey,
+    ) -> Result<bool, PrivacyError> {
+        let row: Option<(String, u32, Vec<u8>, Vec<u8>)> = conn
+            .query_row(
+                "SELECT subject, version, nonce, wrapped FROM subject_keys LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((subject, version, nonce, wrapped)) = row else {
+            return Ok(true);
+        };
+        let Ok(nonce) = XNonce::try_from(nonce.as_slice()) else {
+            return Ok(false);
+        };
+        let key = master.derive("kronik keystore v1")?;
+        Ok(XChaCha20Poly1305::new(key.bytes().into())
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: &wrapped,
+                    aad: &wrap_aad(&subject, version),
+                },
+            )
+            .map(Zeroizing::new)
+            .is_ok_and(|bytes| bytes.len() == 32))
+    }
+
     pub fn open(conn: Connection, master: &MasterKey) -> Result<Keystore, PrivacyError> {
+        let wrap = master.derive("kronik keystore v1")?;
+        let backup = master.derive("kronik keystore backup v1")?;
         // secure_delete: an erased key's bytes are zeroed in its page, and
         // `erase` truncates the WAL that still holds older copies.
         conn.execute_batch(
@@ -133,8 +167,8 @@ impl Keystore {
         conn.execute_batch(SCHEMA)?;
         let store = Keystore {
             conn: Mutex::new(conn),
-            wrap: XChaCha20Poly1305::new(&master.derive("kronik keystore v1").into()),
-            backup: XChaCha20Poly1305::new(&master.derive("kronik keystore backup v1").into()),
+            wrap,
+            backup,
         };
         {
             let conn = store.conn();
@@ -169,17 +203,19 @@ impl Keystore {
     ) -> Result<SubjectKey, PrivacyError> {
         let decrypt = || PrivacyError::Decrypt(format!("the key of {subject} (version {version})"));
         let nonce = XNonce::try_from(nonce).map_err(|_| decrypt())?;
-        let bytes = self
-            .wrap
-            .decrypt(
-                &nonce,
-                Payload {
-                    msg: wrapped,
-                    aad: &wrap_aad(subject, version),
-                },
-            )
-            .map_err(|_| decrypt())?;
-        let key: [u8; 32] = bytes.try_into().map_err(|_| decrypt())?;
+        let bytes = Zeroizing::new(
+            XChaCha20Poly1305::new(self.wrap.bytes().into())
+                .decrypt(
+                    &nonce,
+                    Payload {
+                        msg: wrapped,
+                        aad: &wrap_aad(subject, version),
+                    },
+                )
+                .map_err(|_| decrypt())?,
+        );
+        let bytes: &[u8; 32] = bytes.as_slice().try_into().map_err(|_| decrypt())?;
+        let key = Zeroizing::new(*bytes);
         Ok(SubjectKey { version, key })
     }
 
@@ -199,16 +235,15 @@ impl Keystore {
         conn: &Connection,
         subject: &str,
         version: u32,
-        fresh: [u8; 32],
+        fresh: &[u8; 32],
         nonce: [u8; 24],
         wall_ms: u64,
     ) -> Result<SubjectKey, PrivacyError> {
-        let wrapped = self
-            .wrap
+        let wrapped = XChaCha20Poly1305::new(self.wrap.bytes().into())
             .encrypt(
                 &XNonce::from(nonce),
                 Payload {
-                    msg: &fresh,
+                    msg: fresh,
                     aad: &wrap_aad(subject, version),
                 },
             )
@@ -219,7 +254,7 @@ impl Keystore {
         )?;
         Ok(SubjectKey {
             version,
-            key: fresh,
+            key: Zeroizing::new(*fresh),
         })
     }
 
@@ -233,6 +268,7 @@ impl Keystore {
         nonce: [u8; 24],
         wall_ms: u64,
     ) -> Result<SubjectKey, PrivacyError> {
+        let fresh = Zeroizing::new(fresh);
         if !valid_subject(subject) {
             return Err(PrivacyError::InvalidSubject(subject.to_owned()));
         }
@@ -249,7 +285,7 @@ impl Keystore {
             return self.unwrap_key(subject, version as u32, &n, &wrapped);
         }
         let version = Self::erased_through(&conn, subject)?.unwrap_or(0) + 1;
-        self.insert_key(&conn, subject, version, fresh, nonce, wall_ms)
+        self.insert_key(&conn, subject, version, &fresh, nonce, wall_ms)
     }
 
     /// One version of a subject's key, to unseal with.
@@ -283,6 +319,7 @@ impl Keystore {
         nonce: [u8; 24],
         wall_ms: u64,
     ) -> Result<u32, PrivacyError> {
+        let fresh = Zeroizing::new(fresh);
         if !valid_subject(subject) {
             return Err(PrivacyError::InvalidSubject(subject.to_owned()));
         }
@@ -297,7 +334,7 @@ impl Keystore {
             .flatten();
         let floor = Self::erased_through(&conn, subject)?.unwrap_or(0);
         let version = newest.map_or(floor, |v| v as u32).max(floor) + 1;
-        self.insert_key(&conn, subject, version, fresh, nonce, wall_ms)
+        self.insert_key(&conn, subject, version, &fresh, nonce, wall_ms)
             .map(|k| k.version)
     }
 
@@ -429,7 +466,7 @@ impl Keystore {
     /// hidden too. [`Keystore::import_backup`] reads it.
     pub fn export_backup(&self, nonce: [u8; 24]) -> Result<Vec<u8>, PrivacyError> {
         let conn = self.conn();
-        let mut payload = Vec::new();
+        let mut payload = Zeroizing::new(Vec::new());
         {
             let mut stmt = conn.prepare_cached(
                 "SELECT subject, version, nonce, wrapped, created_wall_ms FROM subject_keys ORDER BY subject, version",
@@ -454,8 +491,7 @@ impl Keystore {
                 payload.extend_from_slice(&(r.get::<_, i64>(2)? as u64).to_le_bytes());
             }
         }
-        let ciphertext = self
-            .backup
+        let ciphertext = XChaCha20Poly1305::new(self.backup.bytes().into())
             .encrypt(
                 &XNonce::from(nonce),
                 Payload {
@@ -482,15 +518,18 @@ impl Keystore {
         }
         let (nonce, ciphertext) = rest.split_at(24);
         let nonce = XNonce::try_from(nonce).map_err(|_| bad())?;
-        let payload = XChaCha20Poly1305::new(&master.derive("kronik keystore backup v1").into())
-            .decrypt(
-                &nonce,
-                Payload {
-                    msg: ciphertext,
-                    aad: BACKUP_MAGIC,
-                },
-            )
-            .map_err(|_| PrivacyError::Decrypt("the keystore backup".into()))?;
+        let key = master.derive("kronik keystore backup v1")?;
+        let payload = Zeroizing::new(
+            XChaCha20Poly1305::new(key.bytes().into())
+                .decrypt(
+                    &nonce,
+                    Payload {
+                        msg: ciphertext,
+                        aad: BACKUP_MAGIC,
+                    },
+                )
+                .map_err(|_| PrivacyError::Decrypt("the keystore backup".into()))?,
+        );
         let mut rows = BackupRows::default();
         let mut r = Reader(&payload);
         while let Some(tag) = r.byte() {
@@ -627,7 +666,7 @@ pub fn seal(
     nonce: [u8; 24],
     plaintext: &[u8],
 ) -> Result<SealedValue, PrivacyError> {
-    let cipher = XChaCha20Poly1305::new(&key.key.into());
+    let cipher = XChaCha20Poly1305::new((&*key.key).into());
     let ciphertext = cipher
         .encrypt(
             &XNonce::from(nonce),
@@ -650,7 +689,7 @@ pub fn unseal(
     key: &SubjectKey,
     sealed: &SealedValue,
 ) -> Result<Vec<u8>, PrivacyError> {
-    let cipher = XChaCha20Poly1305::new(&key.key.into());
+    let cipher = XChaCha20Poly1305::new((&*key.key).into());
     cipher
         .decrypt(
             &XNonce::from(sealed.nonce),
@@ -670,8 +709,8 @@ pub fn unseal(
 /// the hashes that sit next to sealed values (diff redactions, ingress
 /// request hashes, effect fingerprints).
 pub struct Pseudonyms {
-    key: [u8; 32],
-    hashes: [u8; 32],
+    key: ProtectedKey,
+    hashes: ProtectedKey,
 }
 
 impl std::fmt::Debug for Pseudonyms {
@@ -681,15 +720,15 @@ impl std::fmt::Debug for Pseudonyms {
 }
 
 impl Pseudonyms {
-    pub fn new(master: &MasterKey) -> Pseudonyms {
-        Pseudonyms {
-            key: master.derive("kronik pseudonym v1"),
-            hashes: master.derive("kronik keyed hash v1"),
-        }
+    pub fn new(master: &MasterKey) -> Result<Pseudonyms, PrivacyError> {
+        Ok(Pseudonyms {
+            key: master.derive("kronik pseudonym v1")?,
+            hashes: master.derive("kronik keyed hash v1")?,
+        })
     }
 
     pub fn of(&self, subject: &str, value: &[u8]) -> String {
-        let mut h = blake3::Hasher::new_keyed(&self.key);
+        let mut h = Zeroizing::new(blake3::Hasher::new_keyed(self.key.bytes()));
         h.update(subject.as_bytes());
         h.update(b"\0");
         h.update(value);
@@ -699,7 +738,7 @@ impl Pseudonyms {
     /// A keyed BLAKE3 of `parts` for `purpose` (a fixed domain string):
     /// each part is length-prefixed, so part boundaries can't be shifted.
     pub fn keyed_hash(&self, purpose: &str, parts: &[&[u8]]) -> [u8; 32] {
-        let mut h = blake3::Hasher::new_keyed(&self.hashes);
+        let mut h = Zeroizing::new(blake3::Hasher::new_keyed(self.hashes.bytes()));
         h.update(purpose.as_bytes());
         h.update(b"\0");
         for p in parts {
@@ -717,7 +756,7 @@ mod tests {
     fn store(master: u8) -> Keystore {
         Keystore::open(
             Connection::open_in_memory().unwrap(),
-            &MasterKey::from_bytes([master; 32]),
+            &MasterKey::from_bytes([master; 32]).unwrap(),
         )
         .unwrap()
     }
@@ -736,7 +775,7 @@ mod tests {
         assert_eq!(k.version, 1);
         // The second call returns the stored key, not the new material.
         let again = ks.key_for_sealing("user:1", [8; 32], [2; 24], 11).unwrap();
-        assert_eq!((again.version, again.key), (1, [7; 32]));
+        assert_eq!((again.version, *again.key), (1, [7; 32]));
         let sealed = seal("user:1", &k, [3; 24], b"alice@example.com").unwrap();
         assert!(!sealed.ciphertext.windows(5).any(|w| w == b"alice"));
         assert_eq!(
@@ -768,7 +807,7 @@ mod tests {
         let old = seal("user:1", &v1, [9; 24], b"old").unwrap();
         assert_eq!(ks.rotate("user:1", [2; 32], [2; 24], 1).unwrap(), 2);
         let v2 = ks.key_for_sealing("user:1", [3; 32], [3; 24], 2).unwrap();
-        assert_eq!((v2.version, v2.key), (2, [2; 32]));
+        assert_eq!((v2.version, *v2.key), (2, [2; 32]));
         assert_eq!(
             unseal(
                 "user:1",
@@ -836,7 +875,7 @@ mod tests {
         let path = dir.path().join("keystore.db");
         let ks = Keystore::open(
             Connection::open(&path).unwrap(),
-            &MasterKey::from_bytes([1; 32]),
+            &MasterKey::from_bytes([1; 32]).unwrap(),
         )
         .unwrap();
         ks.key_for_sealing("user:1", [0xab; 32], [1; 24], 0)
@@ -848,7 +887,7 @@ mod tests {
             .unwrap();
         assert!(!wrapped.windows(4).any(|w| w == [0xab; 4]));
         // Another master key is refused before it can try to unwrap.
-        let other = Keystore::open(conn, &MasterKey::from_bytes([2; 32]));
+        let other = Keystore::open(conn, &MasterKey::from_bytes([2; 32]).unwrap());
         assert!(matches!(other, Err(PrivacyError::KeyMismatch(_))));
     }
 
@@ -865,7 +904,7 @@ mod tests {
 
         let restored = Keystore::import_backup(
             Connection::open_in_memory().unwrap(),
-            &MasterKey::from_bytes([1; 32]),
+            &MasterKey::from_bytes([1; 32]).unwrap(),
             &backup,
         )
         .unwrap();
@@ -886,7 +925,7 @@ mod tests {
 
         let wrong = Keystore::import_backup(
             Connection::open_in_memory().unwrap(),
-            &MasterKey::from_bytes([2; 32]),
+            &MasterKey::from_bytes([2; 32]).unwrap(),
             &backup,
         );
         assert!(matches!(wrong, Err(PrivacyError::Decrypt(_))));
@@ -895,13 +934,13 @@ mod tests {
         tampered[last] ^= 1;
         let tampered = Keystore::import_backup(
             Connection::open_in_memory().unwrap(),
-            &MasterKey::from_bytes([1; 32]),
+            &MasterKey::from_bytes([1; 32]).unwrap(),
             &tampered,
         );
         assert!(matches!(tampered, Err(PrivacyError::Decrypt(_))));
         let junk = Keystore::import_backup(
             Connection::open_in_memory().unwrap(),
-            &MasterKey::from_bytes([1; 32]),
+            &MasterKey::from_bytes([1; 32]).unwrap(),
             b"junk",
         );
         assert!(matches!(junk, Err(PrivacyError::BadBackup)));
@@ -910,28 +949,29 @@ mod tests {
         // its key check included.
         let dir = tempfile::tempdir().unwrap();
         let kept = dir.path().join("kept.db");
-        Keystore::open_file(&kept, &MasterKey::from_bytes([3; 32]))
+        Keystore::open_file(&kept, &MasterKey::from_bytes([3; 32]).unwrap())
             .unwrap()
             .key_for_sealing("user:7", [7; 32], [7; 24], 0)
             .unwrap();
         assert!(matches!(
-            Keystore::import_backup_file(&kept, &MasterKey::from_bytes([3; 32]), &backup),
+            Keystore::import_backup_file(&kept, &MasterKey::from_bytes([3; 32]).unwrap(), &backup),
             Err(PrivacyError::Decrypt(_))
         ));
-        let still = Keystore::open_file(&kept, &MasterKey::from_bytes([3; 32])).unwrap();
+        let still = Keystore::open_file(&kept, &MasterKey::from_bytes([3; 32]).unwrap()).unwrap();
         found(still.key("user:7", 1).unwrap());
 
         // A restore over a keystore of another key replaces it, key included.
         let path = dir.path().join("keystore.db");
-        Keystore::open_file(&path, &MasterKey::from_bytes([3; 32]))
+        Keystore::open_file(&path, &MasterKey::from_bytes([3; 32]).unwrap())
             .unwrap()
             .key_for_sealing("user:9", [9; 32], [9; 24], 0)
             .unwrap();
         let replaced =
-            Keystore::import_backup_file(&path, &MasterKey::from_bytes([1; 32]), &backup).unwrap();
+            Keystore::import_backup_file(&path, &MasterKey::from_bytes([1; 32]).unwrap(), &backup)
+                .unwrap();
         found(replaced.key("user:1", 1).unwrap());
         drop(replaced);
-        Keystore::open_file(&path, &MasterKey::from_bytes([1; 32])).unwrap();
+        Keystore::open_file(&path, &MasterKey::from_bytes([1; 32]).unwrap()).unwrap();
     }
 
     /// Review F4: a key of the right version from another lineage (a new
@@ -985,7 +1025,7 @@ mod tests {
 
     #[test]
     fn pseudonyms_are_deterministic_short_and_keyed() {
-        let p = Pseudonyms::new(&MasterKey::from_bytes([1; 32]));
+        let p = Pseudonyms::new(&MasterKey::from_bytes([1; 32]).unwrap()).unwrap();
         let a = p.of("user:1", b"alice@example.com");
         assert_eq!(a.len(), 16);
         assert!(
@@ -999,7 +1039,9 @@ mod tests {
         assert_ne!(a, p.of("user:1", b"bob@example.com"));
         assert_ne!(
             a,
-            Pseudonyms::new(&MasterKey::from_bytes([2; 32])).of("user:1", b"alice@example.com")
+            Pseudonyms::new(&MasterKey::from_bytes([2; 32]).unwrap())
+                .unwrap()
+                .of("user:1", b"alice@example.com")
         );
     }
 }

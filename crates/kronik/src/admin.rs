@@ -72,6 +72,11 @@ pub fn set_scrape_gauges(node: &Node) {
         1.0,
     );
     kronik_metrics::set("kronik_applied_lsn", &[], node.applied_lsn() as f64);
+    kronik_metrics::set(
+        "kronik_key_source_up",
+        &[],
+        f64::from(u8::from(node.key_source().is_some())),
+    );
     if let Some(free) = node.disk_free() {
         kronik_metrics::set("kronik_disk_free_bytes", &[], free as f64);
         let low = node.disk_below_reserve().is_some();

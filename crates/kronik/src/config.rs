@@ -28,6 +28,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer};
 
 use kronik_gateway::subject::SubjectFrom;
+use kronik_privacy::key_source::Keys;
 
 /// Where `kronik serve` and the CLI look for the file.
 pub const DEFAULT_PATH: &str = "/etc/kronik/kronik.toml";
@@ -220,17 +221,6 @@ pub struct Ship {
     pub enabled: bool,
     pub url: Option<String>,
     pub endpoint: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Keys {
-    /// The secret store's and the privacy keystore's master key; see
-    /// [`Config::master_key_file`] for the default. The
-    /// `KRONIK_MASTER_KEY` environment variable, when set, holds the key
-    /// material itself (64 hex characters) and no file is read or created;
-    /// setting both is refused.
-    pub master_key_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -796,6 +786,7 @@ impl Config {
 
     /// Requirements across keys that the types can't express.
     fn check(&self) -> Result<(), String> {
+        self.keys.check()?;
         match self.tls.mode {
             TlsMode::Acme if self.tls.domains.is_empty() => {
                 return Err(
@@ -1008,16 +999,6 @@ impl Config {
         }
     }
 
-    /// The master key file: `keys.master_key_file`, else
-    /// `<data_dir>/keys/master.key`. The `KRONIK_MASTER_KEY` environment
-    /// variable, when set, is the key itself and no file is used.
-    pub fn master_key_file(&self) -> PathBuf {
-        self.keys
-            .master_key_file
-            .clone()
-            .unwrap_or_else(|| self.server.data_dir.join("keys/master.key"))
-    }
-
     /// Where HTTP root inputs get their subject; checked by [`Config::check`].
     pub fn subject_from(&self) -> Option<SubjectFrom> {
         self.privacy
@@ -1128,23 +1109,6 @@ pub fn client_config() -> Result<Config, ConfigError> {
     Config::find(None).map(|(config, _)| config)
 }
 
-/// `--data-dir`, else `server.data_dir` from the configuration file, else
-/// `/var/lib/kronik`. An explicit `--data-dir` without `--config` does not
-/// read the default configuration file, so a broken system file does not
-/// block a command that already named its directory.
-pub fn resolve_data_dir(
-    config: Option<&Path>,
-    data_dir: Option<PathBuf>,
-) -> Result<PathBuf, ConfigError> {
-    match (config, data_dir) {
-        (None, Some(dir)) => Ok(dir),
-        (config, data_dir) => {
-            let (cfg, _) = Config::find(config)?;
-            Ok(data_dir.unwrap_or(cfg.server.data_dir))
-        }
-    }
-}
-
 fn line_of(text: &str, offset: usize) -> usize {
     text.get(..offset).unwrap_or(text).matches('\n').count() + 1
 }
@@ -1182,7 +1146,7 @@ mod tests {
         assert_eq!(config.retention.history, Dur::secs(7 * 86_400));
         assert_eq!(config.sql.max_size_per_actor, Size(1 << 30));
         assert_eq!(
-            config.master_key_file(),
+            config.keys.key_path(&config.server.data_dir),
             PathBuf::from("/etc/kronik/master.key")
         );
         assert_eq!(
@@ -1213,7 +1177,7 @@ mod tests {
         assert_eq!(empty.tls.mode, TlsMode::Off);
         assert_eq!(empty.http_listen(), "127.0.0.1:8080".parse().unwrap());
         assert_eq!(
-            empty.master_key_file(),
+            empty.keys.key_path(&empty.server.data_dir),
             PathBuf::from("/var/lib/kronik/keys/master.key")
         );
         assert!(!empty.ship.enabled);

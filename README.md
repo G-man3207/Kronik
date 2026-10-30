@@ -28,8 +28,11 @@ change between releases.
 
 `v0.3.0` is the latest release: static musl binaries for x86_64 and aarch64,
 with `install.sh`, `SHA256SUMS` and a CycloneDX SBOM. Since that tag, `main`
-has added OpenTelemetry traces and a verifiable audit export, and standard
-`fetch` through `wasi:http`; both are unreleased.
+has added OpenTelemetry traces and a verifiable audit export, standard
+`fetch` through `wasi:http`, and KMS master-key custody; these are unreleased.
+M23 B1 custody (OpenBao/AWS/GCP/Azure) is complete; its emulator and
+static-musl acceptance is recorded in `STATUS.md`. External secret backends
+are later M23 work, not part of that custody change.
 
 Two criteria remain open:
 
@@ -68,8 +71,10 @@ questions and the known gaps.
   guard breaks, and preview forks take new requests on unproposed code.
 - **Operations.** TLS from certificate files or ACME, a systemd unit,
   snapshots, shipping to object storage, `kronik restore`, `kronik upgrade
-  check`, `kronik doctor` and `/metrics`. ACME is tested against Pebble, not a
-  public certificate authority.
+  check`, `kronik doctor`, `keys status|wrap|rewrap` and `/metrics`.
+  Master-key custody supports file/env or OpenBao/AWS/GCP/Azure KMS,
+  checked against free emulators, not production cloud IAM. ACME is tested
+  against Pebble, not a public certificate authority.
 - **Privacy mode.** Values with a subject can be sealed, erased and resealed,
   and forks replay without personal data unless a token carries `pii:read`.
 - **Foreign actors.** Linux programs from OCI images run in gVisor behind the

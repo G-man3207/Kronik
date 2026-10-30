@@ -30,8 +30,9 @@ kronik doctor
    from Let's Encrypt. Without it, the gateway listens on `0.0.0.0:80`
    without TLS.
 2. It creates the data directory `/var/lib/kronik` (mode 0700).
-3. It creates the master key `/etc/kronik/master.key` (32 random bytes from
-   `/dev/urandom`, mode 0600). See [the master key](#the-master-key).
+3. It creates or loads the master key through `[keys] source`. The default
+   is `/etc/kronik/master.key` (mode 0600); a KMS source stores only a
+   wrapped key. See [the master key](#the-master-key).
 4. It creates the system group `kronik`.
 5. It installs `/etc/systemd/system/kronik.service`, whose `ExecStart`
    points at the binary you ran.
@@ -143,7 +144,10 @@ release still parses; unknown keys are errors.
 
 | Key | Default | Meaning | Flag |
 |---|---|---|---|
-| `master_key_file` | `<data_dir>/keys/master.key` (`--init` writes `/etc/kronik/master.key`) | The master key of the secret store and the privacy keystore. Not read when `KRONIK_MASTER_KEY` is set | `--master-key-file`, `KRONIK_MASTER_KEY_FILE` |
+| `master_key_file` | `<data_dir>/keys/master.key` (`--init` writes `/etc/kronik/master.key`) | The file source's 64 hex characters. Conflicts with `KRONIK_MASTER_KEY` and with KMS sources | `--master-key-file`, `KRONIK_MASTER_KEY_FILE` |
+| `source` | `"file"` | `"file"`, `"env"`, `"openbao"`, `"aws"`, `"gcp"` or `"azure"`; see [the master key](#the-master-key) | |
+| `wrapped_file` | `"keys/master.wrapped"` | KMS ciphertext, relative to `data_dir`; absolute paths, `.` and `..` are refused | |
+| `start_timeout` | `"60s"` | Total retry/timeout budget for one high-level KMS load, wrap or rewrap, including encrypt and verification decrypt; a positive duration in `ms`, `s` or `m` | |
 
 ### [privacy]
 
@@ -740,44 +744,264 @@ metric, or on the log line, to page someone.
 
 ## The master key
 
-The master key encrypts the secret store (`<data_dir>/keys/secrets.db`) and
-the privacy keystore (`<data_dir>/keys/keystore.db`). It is 32 random bytes
-in hex, in `[keys] master_key_file`, mode 0600: `/etc/kronik/master.key`
-when `kronik serve --init` set up the host, or `<data_dir>/keys/master.key`,
-which `kronik serve` creates at the first start if it is missing (and logs
-a warning saying so).
+The master key is a 32-byte seed. It protects the secret store
+(`<data_dir>/keys/secrets.db`), the privacy keystore
+(`<data_dir>/keys/keystore.db`) and their derived keys. Init, start,
+shipping, restore, upgrade checks and audit verification use the same
+checked `[keys]` configuration.
 
-The key can also come from the environment: `KRONIK_MASTER_KEY` holds the 64
-hex characters themselves, the way a secret manager hands the key to the
-daemon (a systemd `Environment=` line, a container's environment). When it is
-set, it is the key: no key file is read or created, not even at the first
-start. The value is never logged. Material that is not 64 hex characters
-stops `kronik serve` with an error. Setting `KRONIK_MASTER_KEY` together with
-a key file (`--master-key-file`, `KRONIK_MASTER_KEY_FILE` or
-`[keys] master_key_file`) also stops the start, so a stale file can never
-silently win over the material; remove one of the two.
+### File and environment sources
 
-- **Back it up separately**, somewhere offline, and not next to backups of
-  the data directory. A copy of the data directory without the key reveals
-  no secret values or sealed personal data, and that is the point.
-- **It is never shipped** or copied anywhere by Kronik: child processes,
-  the DNS-01 hook included, don't inherit `KRONIK_MASTER_KEY`.
-- **Losing it** loses every secret value and every sealed value: the stores
-  can't be decrypted without it. There is no recovery.
-- **No new key over existing stores.** `kronik serve` makes a key only for a
-  data directory without stores. When the key is missing and
-  `keys/secrets.db` or `keys/keystore.db` exists, it stops with
-  `MASTER_KEY_MISSING`; with another key than theirs, with
-  `MASTER_KEY_MISMATCH` (each store records which key it belongs to). Put
-  the right key back, or, if it is lost for good, move both files aside to
-  start over without those secrets and sealed values.
-- **Shipping and restore use the same key source** as `kronik serve`: the
-  configured file or `KRONIK_MASTER_KEY`. `kronik restore` takes
-  `--master-key-file` (or the configuration file's `[keys]`) and needs the
-  key in place *before* it runs: with a privacy keystore backup in the
-  bucket and no key (or another key), it fails without writing anything,
-  unless `--without-keystore`.
-- v0.1 has no command that rotates the master key.
+`source = "file"` is the default. `[keys] master_key_file` holds 64 hex
+characters, mode 0600: `/etc/kronik/master.key` after `serve --init`, or
+`<data_dir>/keys/master.key` otherwise. A first start creates it only when
+there are no encrypted stores.
+
+With `source = "env"`, `KRONIK_MASTER_KEY` must hold the 64 hex characters
+themselves, not a filename. For existing configurations, the default file
+source also accepts that variable when no key file was explicitly
+configured. No key file is then read or created. Setting the material
+together with `master_key_file`, `--master-key-file` or a KMS source is an
+error; unset the variable before starting a KMS-backed node. Child
+processes, including the DNS-01 hook, do not inherit it.
+
+Back a file/env key up separately, offline, not beside the data directory's
+backup. Losing it loses every secret and sealed value. A missing key over
+existing stores is `MASTER_KEY_MISSING`, never permission to generate a
+replacement; a key that does not match the stores is
+`MASTER_KEY_MISMATCH`.
+
+### KMS sources
+
+`source = "openbao"`, `"aws"`, `"gcp"` or `"azure"` keeps the provider's
+key outside Kronik. Kronik generates a seed in memory and asks that key to
+wrap it. Only the ciphertext envelope is written, mode 0600, at
+`<data_dir>/<wrapped_file>`. At start the provider unwraps it; no plaintext
+master-key file or temporary key file is created. The envelope's source,
+key, version, format and purpose are checked against the node's
+configuration. An envelope cannot choose an endpoint or a credential.
+
+Configure exactly the table matching `source`. Credentials are file paths
+or the supported environment/instance identity, never inline TOML values.
+Relative credential and CA paths resolve under systemd's
+`$CREDENTIALS_DIRECTORY`; otherwise use absolute paths. A provider's
+`ca_file` adds a private PEM CA to its own TLS client, not to guest HTTP
+effects. OpenBao certificate authentication uses that provider's client
+certificate and key. Plain HTTP is accepted only on loopback.
+
+**OpenBao transit** (Vault-compatible API):
+
+```toml
+[keys]
+source = "openbao"
+wrapped_file = "keys/master.wrapped"
+start_timeout = "60s"
+
+[keys.openbao]
+address = "https://bao.internal:8200"
+mount = "transit"
+key = "kronik"
+auth = "token"
+token_file = "/etc/kronik/bao-token"
+ca_file = "/etc/kronik/bao-ca.pem"
+```
+
+Create a dedicated derived transit key in OpenBao, for example
+`bao secrets enable transit` then
+`bao write transit/keys/kronik derived=true type=aes256-gcm96`. Kronik
+binds the purpose `kronik master v1` through the transit `context`.
+`mount` defaults to `transit`. Authentication is exactly one of:
+
+- `auth = "token"` with `token_file`;
+- `auth = "approle"` with `role_id_file` and `secret_id_file`, optionally
+  `auth_mount`;
+- `auth = "cert"` with `cert_file` and `key_file`, optionally `auth_mount`
+  and `role`.
+
+**AWS KMS:**
+
+```toml
+[keys]
+source = "aws"
+
+[keys.aws]
+region = "eu-north-1"
+key_id = "arn:aws:kms:eu-north-1:123456789012:key/01234567-89ab-cdef-0123-456789abcdef"
+auth = "auto"
+```
+
+`key_id` must be the full immutable key ARN in `region`, not an alias or
+bare id. `auth` is `auto` (environment, then IMDSv2), `env` or `imds`.
+Environment credentials are `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+and, for temporary credentials, `AWS_SESSION_TOKEN`. Profiles, SSO and web
+identity are not credential providers. `endpoint` selects a KMS-compatible
+endpoint, such as loopback moto for tests; `ca_file` is optional. The
+provider's encryption context binds the purpose.
+
+**Google Cloud KMS:**
+
+```toml
+[keys]
+source = "gcp"
+
+[keys.gcp]
+key = "projects/my-project/locations/global/keyRings/kronik/cryptoKeys/master"
+# service_account_file = "/etc/kronik/service-account.json"
+```
+
+`key` is the full unversioned `cryptoKeys` resource. A
+`service_account_file` supplies an RSA service-account key for an RS256 JWT
+exchanged for an OAuth token; without it, the provider uses the instance
+metadata service. Workload identity federation is not supported. `endpoint`
+and `ca_file` are optional. Authenticated additional data binds the purpose.
+
+**Azure Key Vault:**
+
+```toml
+[keys]
+source = "azure"
+
+[keys.azure]
+key = "https://my-vault.vault.azure.net/keys/kronik"
+# tenant_id = "00000000-0000-0000-0000-000000000000"
+# client_id = "11111111-1111-1111-1111-111111111111"
+# client_secret_file = "/etc/kronik/azure-client-secret"
+```
+
+`key` is an unversioned Key Vault key URL. Set all three client-credential
+fields together, or omit `tenant_id` and `client_secret_file` to use
+managed identity; `client_id` may select a managed identity. `ca_file` is
+optional. Kronik resolves the current version and uses RSA-OAEP-256
+wrap/unwrap. Unlike the other providers, this operation has no AAD; the
+envelope's format and checked key reference identify its purpose.
+
+For isolated tests, AWS `imds_endpoint` and Azure `authority_endpoint` may
+override a loopback origin; GCP `token_endpoint`/`metadata_endpoint` and
+Azure `metadata_endpoint` may name a full loopback URL. These overrides
+are never read from the envelope, cannot target a non-loopback host and
+contain no inline credentials. Normal deployments leave them unset.
+
+PKCS#11 is not implemented by this slice. Neither an HSM module nor a
+keyhelper is loaded.
+
+### Migration and rewrap
+
+`kronik keys status` (scope `read`) shows the source, key reference,
+provider version and store-check result; never seed bytes.
+
+To move an existing file/env seed into a KMS:
+
+1. Stop the daemon on this data directory.
+2. Write the target configuration with the chosen KMS `source` and its
+   provider table, without `master_key_file`.
+3. Run a dry run with the old file explicitly named:
+
+   ```sh
+   kronik keys wrap --source openbao --config /etc/kronik/kronik-kms.toml \
+     --data-dir /var/lib/kronik --master-key-file /etc/kronik/master.key \
+     --reason "move the existing seed into OpenBao" --dry-run
+   ```
+
+4. Repeat without `--dry-run`, then start using the target configuration.
+   Keep any old `KRONIK_MASTER_KEY` or `KRONIK_MASTER_KEY_FILE` only for the
+   migration command and unset both before KMS start. The printed start
+   command does this explicitly.
+
+The old file is preserved unless `--remove-file` is explicit; it is not
+securely erased from disk snapshots or backups. A migrated seed therefore
+*was* on disk once. A seed that has never been persisted requires a new
+KMS-backed node. `keys wrap` does not rotate the seed or re-encrypt stores.
+New daemons and `keys wrap` use a cooperative lock on the directory itself;
+no writable sibling or parent lock file is needed. Released v0.3 daemons
+do not hold this lock: stop an older daemon explicitly before migration.
+
+After rotating the provider's wrapping-key version, run:
+
+```sh
+kronik keys rewrap --reason "use the current wrapping-key version" --dry-run
+kronik keys rewrap --reason "use the current wrapping-key version"
+```
+
+This is online, requires `admin`, checks that old and new envelopes unwrap
+to the node's existing seed, and atomically replaces only the ciphertext.
+The API records `keys.rewrap`; offline migration leaves a marker which the
+next start records as `keys.source`. Neither operation records key bytes
+or credentials. Rewrap is not master-seed rotation.
+
+### Outages, backup and restore
+
+The running node shares its loaded key with the shipper. A KMS outage
+does not stop turns or require another unwrap for a keystore backup.
+Start and commands that load or rewrap a key do need the provider:
+unavailability is `KEY_SOURCE_UNAVAILABLE` after retries within
+`start_timeout`. A missing envelope over encrypted stores is
+`MASTER_KEY_MISSING`, not a new seed.
+
+For KMS sources, shipping publishes the ciphertext with the keystore
+backup, before marking the pair complete, and publishes a changed
+envelope after rewrap even when the keystore has not changed. On a fresh
+machine, restore with the same KMS configuration:
+
+```sh
+kronik restore --from s3://my-bucket/kronik/prod \
+  --config /etc/kronik/kronik-kms.toml --data-dir /var/lib/kronik
+kronik serve --config /etc/kronik/kronik-kms.toml
+```
+
+Restore stages the shipped envelope and encrypted stores, unwraps and
+checks them before installation, and never replaces an existing target
+key on failed validation. File/env restores still need their original
+key supplied separately. `--allow-missing-keys` and `--without-keystore`
+keep their explicitly destructive meanings for subject keys.
+
+Keep every provider key version needed by a retained backup enabled for
+that backup's lifetime. Losing the KMS key loses the encrypted data.
+The envelope protects a stolen data directory or bucket only when its
+bootstrap credential is not stolen too: prefer instance identity, or keep
+credential files outside the data/backup tree. `doctor` warns about
+credential files under the data directory.
+
+The seed and long-lived derived keys live in locked mappings, shared by
+reference rather than copied when cloned. On Linux those mappings are
+also excluded from core dumps (`MADV_DONTDUMP`), and key-loading processes
+are non-dumpable. macOS locks the mappings and disables standard core
+dumps with `RLIMIT_CORE=0`; it has no per-mapping `MADV_DONTDUMP`. Failure
+to protect a key is `KEY_PROTECTION_UNAVAILABLE`, never an unprotected
+fallback. Give the process enough `LimitMEMLOCK` for its key mappings.
+
+### Free emulator acceptance
+
+`scripts/e2e-keys.sh` exercises an already-built Linux binary against pinned
+OpenBao, Moto KMS, GCP KMS and Azure Key Vault emulator images. It builds and
+installs nothing, uses dummy credentials, and needs Linux root, Python 3.12+
+(`os.setns`), Docker, OpenSSL and the host public CA bundle at
+`/etc/ssl/certs/ca-certificates.crt` (the Debian test VPS path). The checked-in
+counter component supplies the secret-HMAC and sealed-value workload.
+
+```sh
+KRONIK_BIN=target/x86_64-unknown-linux-musl/release/kronik \
+  flock -w 20 /var/tmp/kronik-vps.lock scripts/e2e-keys.sh
+```
+
+The VPS lock is the existing shared test VPS convention: do not run another
+suite concurrently. Each run creates a fresh private directory beneath
+`/var/tmp`, prints its `results.json` path and retains logs/test data there.
+On exit the driver removes only its owned containers, reports removal
+failures and records a filtered post-cleanup observation. Existing services
+and data are not touched. Containers have read-only root filesystems,
+explicit resource limits and no external network. Only the trusted driver
+enters their private network namespace for loopback API/OAuth calls.
+
+`--probe-only` checks emulator capabilities without claiming product
+acceptance; `--only openbao,gcp` selects a subset while iterating. A full B1
+proof needs all four providers and a release-musl run, not a probe-only or
+subset success. The fixtures verify actual OpenBao HTTPS client-certificate
+authentication and GCP RS256 JWT signatures/claims; they do not prove real
+cloud IAM. Moto does not enforce SigV4; the separate published AWS signing
+vectors cover the signer. Azure's emulator validates JWT form, not live
+Entra authorization. Do not use these emulator credentials or certificates
+outside the disposable tests.
+
 
 ## Snapshots and retention
 
@@ -879,11 +1103,11 @@ copy does not leave the machine.
   code. Everything but manifests is compressed with zstd. Segments and
   snapshots that retention deletes locally are deleted from the bucket
   too. `<data_dir>/ship.json` records what is already up.
-- **What is never uploaded:** the master key. Snapshots carry the secret
-  store encrypted under it, so keep the key's own backup separate (see
+- **What is never uploaded:** the plaintext master key or its bootstrap
+  credentials. File/env keys need a separate backup; KMS sources ship
+  their ciphertext envelope with the encrypted keystore backup (see
   [the master key](#the-master-key)). Forks and proposals, with their
-  diffs (`<data_dir>/branches/<name>/`), are not uploaded either: they stay
-  in the old data directory.
+  diffs (`<data_dir>/branches/<name>/`), stay in the old data directory.
 - `kronik doctor`'s `ship` check tells whether the endpoint is reachable.
 
 Restoring onto a new machine (the daemon must not be running on the
@@ -901,11 +1125,11 @@ the plan and writes nothing. Restore writes no log record, so it takes no
 restored node, `kronik proposals list` shows only proposals made after the
 restore, and an earlier one answers `PROPOSAL_NOT_FOUND`. Deployments and
 approvals are log records and are restored, each approval with the hash of
-the diff it was given for (`diff_hash`). Copy the master key into place
-before serving if secrets must be readable; it is not in the bucket. In a
-checkout of the repository, `demo/vps-restore.sh` does this with two data
-directories and one bucket (`scripts/minio.sh demo/vps-restore.sh` runs it
-against a local MinIO in Docker).
+the diff it was given for (`diff_hash`). File/env sources need the
+original master key before restore; KMS sources install the shipped
+wrapped key and unwrap it using the supplied configuration. In a checkout,
+`demo/vps-restore.sh` does this with two data directories and one bucket
+(`scripts/minio.sh demo/vps-restore.sh` uses a local MinIO in Docker).
 
 **Starts that replay a long stretch of the log, up to v0.0.8.** A start
 that replays 8,192 or more records in one
@@ -947,9 +1171,9 @@ build to 0.3.0, is three steps:
 
 The check replays the last `--window` of logical time with the new engine
 and the same code. It reads the data directory, its privacy keystore and
-the master key that `kronik serve` uses (`--config`, `--master-key-file`,
-`KRONIK_MASTER_KEY` or `<data-dir>/keys/master.key`), so sealed values in
-the window replay too. An empty diff writes `<data-dir>/upgrade/<engine>.json`
+the same key-source configuration as `kronik serve`. A KMS-backed check
+needs the provider and its credentials, even while the old daemon keeps
+running. An empty diff writes `<data-dir>/upgrade/<engine>.json`
 and exits 0. A diff that is not empty writes that report and the diff next
 to it (`<engine>.diff.json`) and exits 1 with `ENGINE_UPGRADE_DIVERGED`:
 keep the current binary. `--dry-run` prints the result and writes neither

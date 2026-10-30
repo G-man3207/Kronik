@@ -7,6 +7,8 @@
 //! version hash. M8 adds the per-subject [`keystore`]
 //! (docs/design/m8-privacy.md).
 
+mod key_memory;
+pub mod key_source;
 pub mod keystore;
 pub mod sealer;
 
@@ -17,6 +19,9 @@ use std::sync::Mutex;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rusqlite::{Connection, OptionalExtension, params};
+use zeroize::{Zeroize, Zeroizing};
+
+use key_memory::ProtectedKey;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrivacyError {
@@ -42,12 +47,14 @@ pub enum PrivacyError {
     KeyMissing(String),
     #[error("MASTER_KEY_MISMATCH: {0}")]
     KeyMismatch(String),
+    #[error("KEY_PROTECTION_UNAVAILABLE: key memory protection unavailable")]
+    KeyProtection,
 }
 
-/// The installation's master key: the 64 hex characters of the
-/// `KRONIK_MASTER_KEY` environment variable, or `[keys] master_key_file`.
+/// The installation's 32-byte seed, retained only in protected memory.
+/// [`key_source::KeySource`] selects its file/env or wrapped KMS custody.
 #[derive(Clone)]
-pub struct MasterKey([u8; 32]);
+pub struct MasterKey(ProtectedKey);
 
 impl std::fmt::Debug for MasterKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -56,7 +63,14 @@ impl std::fmt::Debug for MasterKey {
 }
 
 fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    // Leave room for the key-file newline without reallocating secret material.
+    let mut text = String::with_capacity(b.len() * 2 + 1);
+    for byte in b {
+        text.push(HEX[(byte >> 4) as usize] as char);
+        text.push(HEX[(byte & 15) as usize] as char);
+    }
+    text
 }
 
 /// The environment variable that, when set, holds the master key material
@@ -66,9 +80,36 @@ pub const MASTER_KEY_ENV: &str = "KRONIK_MASTER_KEY";
 /// How `MASTER_KEY_ENV` is named in error messages.
 const ENV_SOURCE: &str = "environment variable KRONIK_MASTER_KEY";
 
+fn encrypted_stores(keys: &Path) -> Result<bool, std::io::Error> {
+    for file in ["secrets.db", "keystore.db"] {
+        match std::fs::metadata(keys.join(file)) {
+            Ok(meta) if meta.len() > 0 => return Ok(true),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(false)
+}
 impl MasterKey {
-    pub fn from_bytes(bytes: [u8; 32]) -> MasterKey {
-        MasterKey(bytes)
+    /// Locks the input and excludes standard core dumps, then zeroizes the input.
+    pub fn from_bytes(mut bytes: [u8; 32]) -> Result<MasterKey, PrivacyError> {
+        let result = ProtectedKey::from_slice(&bytes).map(MasterKey);
+        bytes.zeroize();
+        result
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8; 32] {
+        self.0.bytes()
+    }
+
+    /// Compares seeds without copying them or exiting at the first differing byte.
+    pub fn same_key(&self, other: &MasterKey) -> bool {
+        self.bytes()
+            .iter()
+            .zip(other.bytes())
+            .fold(0_u8, |different, (a, b)| different | (a ^ b))
+            == 0
     }
 
     /// Parses 64 hex characters of key material. `source` names where the
@@ -81,12 +122,12 @@ impl MasterKey {
         if t.len() != 64 || !t.is_ascii() {
             return Err(PrivacyError::BadKey(source));
         }
-        let mut key = [0u8; 32];
+        let mut key = Zeroizing::new([0u8; 32]);
         for (i, k) in key.iter_mut().enumerate() {
             *k = u8::from_str_radix(&t[2 * i..2 * i + 2], 16)
                 .map_err(|_| PrivacyError::BadKey(source.clone()))?;
         }
-        Ok(MasterKey(key))
+        ProtectedKey::from_slice(&key).map(MasterKey)
     }
 
     /// The master key: `material` (the `KRONIK_MASTER_KEY` environment
@@ -98,6 +139,7 @@ impl MasterKey {
         path: &Path,
         fresh: Option<[u8; 32]>,
     ) -> Result<(MasterKey, bool), PrivacyError> {
+        let fresh = fresh.map(Zeroizing::new);
         if let Some(text) = material {
             // No key file is created, but the secret store and the privacy
             // keystore live in the same directory, so make sure it exists;
@@ -117,6 +159,7 @@ impl MasterKey {
         };
         match std::fs::read_to_string(path) {
             Ok(text) => {
+                let text = Zeroizing::new(text);
                 Self::from_hex(&text, format!("file {}", path.display())).map(|k| (k, false))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -129,6 +172,7 @@ impl MasterKey {
                         path.display()
                     )));
                 };
+                let key = MasterKey(ProtectedKey::from_slice(&fresh)?);
                 if let Some(dir) = path.parent() {
                     std::fs::create_dir_all(dir).map_err(io)?;
                 }
@@ -138,77 +182,136 @@ impl MasterKey {
                     .mode(0o600)
                     .open(path)
                     .map_err(io)?;
-                f.write_all(format!("{}\n", hex(&fresh)).as_bytes())
-                    .map_err(io)?;
+                let mut encoded = Zeroizing::new(hex(key.bytes()));
+                encoded.push('\n');
+                f.write_all(encoded.as_bytes()).map_err(io)?;
                 f.sync_all().map_err(io)?;
                 if let Some(dir) = path.parent() {
                     std::fs::File::open(dir)
                         .and_then(|d| d.sync_all())
                         .map_err(io)?;
                 }
-                Ok((MasterKey(fresh), true))
+                Ok((key, true))
             }
             Err(e) => Err(io(e)),
         }
     }
 
-    /// Reads the key file, or creates it with `fresh` (32 bytes from the OS
-    /// CSPRNG) and mode 0600 when it does not exist. Returns whether the
-    /// file was created. The `KRONIK_MASTER_KEY` environment variable comes
-    /// first: when it is set, its 64 hex characters are the key and the
-    /// file is neither read nor created.
-    pub fn load_or_create(path: &Path, fresh: [u8; 32]) -> Result<(MasterKey, bool), PrivacyError> {
-        MasterKey::load(env_material()?.as_deref(), path, Some(fresh))
-    }
-
-    /// The one loader for the daemon, shipping and restore:
-    /// `KRONIK_MASTER_KEY`, else the key file at `path` (the configured one,
-    /// wherever it is). A missing file is created from `fresh` only when
-    /// `keys` (the data directory's `keys/`) holds no encrypted store: a new
-    /// key over them would make them unreadable without a word. `None`
-    /// never creates one.
+    /// Retained file/env loader: `KRONIK_MASTER_KEY`, else `path`.
+    /// A missing file is created from `fresh` only when `keys` holds no
+    /// encrypted store. `None` never creates one. Runtime/offline source
+    /// selection belongs to [`key_source::KeySource`].
     pub fn open(
         path: &Path,
         keys: &Path,
-        fresh: Option<[u8; 32]>,
+        mut fresh: Option<[u8; 32]>,
     ) -> Result<(MasterKey, bool), PrivacyError> {
-        let material = env_material()?;
-        if material.is_none() && !path.exists() {
-            let stores = ["secrets.db", "keystore.db"]
-                .iter()
-                .any(|f| std::fs::metadata(keys.join(f)).is_ok_and(|m| m.len() > 0));
-            if fresh.is_none() || stores {
-                let held = if stores {
-                    format!(
-                        ", and {} holds stores encrypted under a key",
-                        keys.display()
-                    )
+        let result = (|| {
+            let material = env_material()?;
+            if material.is_none()
+                && !path.try_exists().map_err(|source| PrivacyError::Io {
+                    path: path.display().to_string(),
+                    source,
+                })?
+            {
+                let stores = encrypted_stores(keys).map_err(|source| PrivacyError::Io {
+                    path: keys.display().to_string(),
+                    source,
+                })?;
+                if fresh.is_none() || stores {
+                    let held = if stores {
+                        format!(
+                            ", and {} holds stores encrypted under a key",
+                            keys.display()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    return Err(PrivacyError::KeyMissing(format!(
+                        "no master key: {} does not exist and KRONIK_MASTER_KEY is not set{held}",
+                        path.display()
+                    )));
+                }
+            }
+            MasterKey::load(material.as_deref().map(String::as_str), path, fresh)
+        })();
+        fresh.zeroize();
+        result
+    }
+
+    /// Checks stores without creating schemas or recording a key verifier.
+    /// Use staged copies when SQLite WAL sidecar activity must be excluded too.
+    pub fn validate_stores(&self, keys: &Path) -> Result<(), PrivacyError> {
+        for (file, table) in [("secrets.db", "secrets"), ("keystore.db", "subject_keys")] {
+            let path = keys.join(file);
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.len() == 0 => continue,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(PrivacyError::Io {
+                        path: path.display().to_string(),
+                        source,
+                    });
+                }
+            }
+            let conn =
+                Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let has_check: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='key_check')",
+                [],
+                |row| row.get(0),
+            )?;
+            let have: Option<Vec<u8>> = if has_check {
+                conn.query_row("SELECT value FROM key_check WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
+                .optional()?
+            } else {
+                None
+            };
+            let matches = if let Some(have) = have {
+                have.as_slice() == self.check_value()
+            } else {
+                let has_data: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )?;
+                if !has_data {
+                    true
+                } else if file == "secrets.db" {
+                    SecretStore::validate_legacy_key(&conn, self)?
                 } else {
-                    String::new()
-                };
-                return Err(PrivacyError::KeyMissing(format!(
-                    "no master key: {} does not exist and KRONIK_MASTER_KEY is not set{held}",
-                    path.display()
+                    keystore::Keystore::validate_legacy_key(&conn, self)?
+                }
+            };
+            if !matches {
+                return Err(PrivacyError::KeyMismatch(format!(
+                    "{file} was encrypted under another master key"
                 )));
             }
         }
-        MasterKey::load(material.as_deref(), path, fresh)
+        Ok(())
     }
 
-    fn derive(&self, context: &str) -> [u8; 32] {
-        blake3::derive_key(context, &self.0)
+    pub(crate) fn derive(&self, context: &str) -> Result<ProtectedKey, PrivacyError> {
+        ProtectedKey::derive(context, self.bytes())
     }
 
-    /// What each store's `key_check` row holds for this key.
+    /// What each store's `key_check` row holds: a deliberately persisted verifier.
     fn check_value(&self) -> [u8; 32] {
-        self.derive("kronik master check v1")
+        let mut hasher = Zeroizing::new(blake3::Hasher::new_derive_key("kronik master check v1"));
+        hasher.update(self.bytes());
+        *hasher.finalize().as_bytes()
     }
 }
 
-fn env_material() -> Result<Option<String>, PrivacyError> {
+fn env_material() -> Result<Option<Zeroizing<String>>, PrivacyError> {
     std::env::var_os(MASTER_KEY_ENV)
         .map(|v| {
             v.into_string()
+                .map(Zeroizing::new)
                 .map_err(|_| PrivacyError::BadKey(ENV_SOURCE.to_owned()))
         })
         .transpose()
@@ -298,8 +401,9 @@ CREATE TABLE IF NOT EXISTS secrets (
 /// `keys/secrets.db`.
 pub struct SecretStore {
     conn: Mutex<Connection>,
-    cipher: XChaCha20Poly1305,
-    hash_key: [u8; 32],
+    // Cipher instances copy keys, so create only zeroizing per-operation instances.
+    cipher: ProtectedKey,
+    hash_key: ProtectedKey,
 }
 
 impl SecretStore {
@@ -315,12 +419,14 @@ impl SecretStore {
     }
 
     pub fn open(conn: Connection, master: &MasterKey) -> Result<SecretStore, PrivacyError> {
+        let cipher = master.derive("kronik secrets v1")?;
+        let hash_key = master.derive("kronik secret version v1")?;
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")?;
         conn.execute_batch(SCHEMA)?;
         let store = SecretStore {
             conn: Mutex::new(conn),
-            cipher: XChaCha20Poly1305::new(&master.derive("kronik secrets v1").into()),
-            hash_key: master.derive("kronik secret version v1"),
+            cipher,
+            hash_key,
         };
         {
             let conn = store.conn();
@@ -334,11 +440,41 @@ impl SecretStore {
                     )
                     .optional()?;
                 Ok(row.is_none_or(|(name, version, nonce, ct)| {
-                    store.decrypt(&name, version, &nonce, &ct).is_ok()
+                    store
+                        .decrypt(&name, version, &nonce, &ct)
+                        .map(Zeroizing::new)
+                        .is_ok()
                 }))
             })?;
         }
         Ok(store)
+    }
+
+    fn validate_legacy_key(conn: &Connection, master: &MasterKey) -> Result<bool, PrivacyError> {
+        let row: Option<(String, u32, Vec<u8>, Vec<u8>)> = conn
+            .query_row(
+                "SELECT name, version, nonce, ciphertext FROM secrets WHERE length(ciphertext) > 0 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((name, version, nonce, ciphertext)) = row else {
+            return Ok(true);
+        };
+        let Ok(nonce) = XNonce::try_from(nonce.as_slice()) else {
+            return Ok(false);
+        };
+        let key = master.derive("kronik secrets v1")?;
+        Ok(XChaCha20Poly1305::new(key.bytes().into())
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: &ciphertext,
+                    aad: &Self::aad(&name, version),
+                },
+            )
+            .map(Zeroizing::new)
+            .is_ok())
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -346,7 +482,7 @@ impl SecretStore {
     }
 
     fn version_hash(&self, name: &str, version: u32, value: &[u8]) -> Vec<u8> {
-        let mut h = blake3::Hasher::new_keyed(&self.hash_key);
+        let mut h = Zeroizing::new(blake3::Hasher::new_keyed(self.hash_key.bytes()));
         h.update(name.as_bytes());
         h.update(b"\0");
         h.update(&version.to_le_bytes());
@@ -382,8 +518,7 @@ impl SecretStore {
             .optional()?
             .flatten();
         let version = last.map_or(1, |v| v as u32 + 1);
-        let ciphertext = self
-            .cipher
+        let ciphertext = XChaCha20Poly1305::new(self.cipher.bytes().into())
             .encrypt(
                 &XNonce::from(nonce),
                 Payload {
@@ -414,7 +549,7 @@ impl SecretStore {
         ct: &[u8],
     ) -> Result<Vec<u8>, PrivacyError> {
         let nonce = XNonce::try_from(nonce).map_err(|_| PrivacyError::Decrypt(name.to_owned()))?;
-        self.cipher
+        XChaCha20Poly1305::new(self.cipher.bytes().into())
             .decrypt(
                 &nonce,
                 Payload {
@@ -530,9 +665,94 @@ mod tests {
     fn store(key: u8) -> SecretStore {
         SecretStore::open(
             Connection::open_in_memory().unwrap(),
-            &MasterKey::from_bytes([key; 32]),
+            &MasterKey::from_bytes([key; 32]).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn protected_keys_preserve_cipher_hash_and_verifier_bytes() {
+        fn zeroizes_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        zeroizes_on_drop::<XChaCha20Poly1305>();
+        let master = MasterKey::from_bytes([7; 32]).unwrap();
+        let s = SecretStore::open(Connection::open_in_memory().unwrap(), &master).unwrap();
+        let meta = s.set("token", b"value", [3; 24], 0, "", "").unwrap();
+        let old_cipher_key = blake3::derive_key("kronik secrets v1", &[7; 32]);
+        let expected_ciphertext = XChaCha20Poly1305::new((&old_cipher_key).into())
+            .encrypt(
+                &XNonce::from([3; 24]),
+                Payload {
+                    msg: b"value",
+                    aad: b"token|1",
+                },
+            )
+            .unwrap();
+        let ciphertext: Vec<u8> = s
+            .conn()
+            .query_row(
+                "SELECT ciphertext FROM secrets WHERE name='token' AND version=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ciphertext, expected_ciphertext);
+        let old_hash_key = blake3::derive_key("kronik secret version v1", &[7; 32]);
+        let mut h = blake3::Hasher::new_keyed(&old_hash_key);
+        h.update(b"token\0");
+        h.update(&1_u32.to_le_bytes());
+        h.update(b"\0value");
+        assert_eq!(meta.version_hash, h.finalize().as_bytes()[..16]);
+        assert_eq!(
+            master.check_value(),
+            blake3::derive_key("kronik master check v1", &[7; 32])
+        );
+        assert!(std::ptr::eq(master.bytes(), master.clone().bytes()));
+        assert!(master.same_key(&master.clone()));
+        assert!(!master.same_key(&MasterKey::from_bytes([8; 32]).unwrap()));
+    }
+
+    #[test]
+    fn store_preflight_checks_current_and_legacy_keys_without_blessing_them() {
+        for legacy in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let right = MasterKey::from_bytes([1; 32]).unwrap();
+            let wrong = MasterKey::from_bytes([2; 32]).unwrap();
+            right.validate_stores(dir.path()).unwrap();
+            let secrets = dir.path().join("secrets.db");
+            let subjects = dir.path().join("keystore.db");
+            SecretStore::open(Connection::open(&secrets).unwrap(), &right)
+                .unwrap()
+                .set("token", b"value", [1; 24], 0, "", "")
+                .unwrap();
+            keystore::Keystore::open_file(&subjects, &right)
+                .unwrap()
+                .key_for_sealing("user:1", [3; 32], [2; 24], 0)
+                .unwrap();
+            if legacy {
+                for path in [&secrets, &subjects] {
+                    Connection::open(path)
+                        .unwrap()
+                        .execute_batch("DROP TABLE key_check")
+                        .unwrap();
+                }
+            }
+            let before = [
+                std::fs::read(&secrets).unwrap(),
+                std::fs::read(&subjects).unwrap(),
+            ];
+            right.validate_stores(dir.path()).unwrap();
+            assert!(matches!(
+                wrong.validate_stores(dir.path()),
+                Err(PrivacyError::KeyMismatch(_))
+            ));
+            assert_eq!(
+                before,
+                [
+                    std::fs::read(&secrets).unwrap(),
+                    std::fs::read(&subjects).unwrap()
+                ]
+            );
+        }
     }
 
     #[test]
@@ -583,11 +803,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secrets.db");
         let key_path = dir.path().join("keys/master.key");
-        let (key, created) = MasterKey::load_or_create(&key_path, [7; 32]).unwrap();
+        let (key, created) =
+            MasterKey::open(&key_path, &dir.path().join("keys"), Some([7; 32])).unwrap();
         assert!(created);
-        let (again, created) = MasterKey::load_or_create(&key_path, [9; 32]).unwrap();
+        let (again, created) =
+            MasterKey::open(&key_path, &dir.path().join("keys"), Some([9; 32])).unwrap();
         assert!(!created);
-        assert_eq!(again.0, key.0);
+        assert_eq!(again.bytes(), key.bytes());
         use std::os::unix::fs::PermissionsExt as _;
         let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
@@ -609,7 +831,7 @@ mod tests {
         }
         let wrong = SecretStore::open(
             Connection::open(&path).unwrap(),
-            &MasterKey::from_bytes([8; 32]),
+            &MasterKey::from_bytes([8; 32]).unwrap(),
         );
         assert!(matches!(wrong, Err(PrivacyError::KeyMismatch(_))));
     }
@@ -618,7 +840,7 @@ mod tests {
     fn a_store_from_before_the_key_check_is_checked_by_its_values() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secrets.db");
-        let right = MasterKey::from_bytes([7; 32]);
+        let right = MasterKey::from_bytes([7; 32]).unwrap();
         SecretStore::open(Connection::open(&path).unwrap(), &right)
             .unwrap()
             .set("a", b"value-1", [3; 24], 1, "t", "r")
@@ -632,7 +854,7 @@ mod tests {
         forget();
         let wrong = SecretStore::open(
             Connection::open(&path).unwrap(),
-            &MasterKey::from_bytes([8; 32]),
+            &MasterKey::from_bytes([8; 32]).unwrap(),
         );
         assert!(matches!(wrong, Err(PrivacyError::KeyMismatch(_))));
         // The right key passes and is recorded, so an empty store can't be
@@ -643,7 +865,7 @@ mod tests {
         assert!(matches!(
             SecretStore::open(
                 Connection::open(&path).unwrap(),
-                &MasterKey::from_bytes([8; 32])
+                &MasterKey::from_bytes([8; 32]).unwrap()
             ),
             Err(PrivacyError::KeyMismatch(_))
         ));
@@ -694,10 +916,10 @@ mod tests {
         assert!(!created);
         assert!(fresh_path.parent().unwrap().is_dir());
         assert!(!fresh_path.exists());
-        assert_eq!(key.0, [7; 32]);
+        assert_eq!(key.bytes(), &[7; 32]);
         let (key, created) = MasterKey::load(Some(&material), &key_path, Some([1; 32])).unwrap();
         assert!(!created);
-        assert_eq!(key.0, [7; 32]);
+        assert_eq!(key.bytes(), &[7; 32]);
         assert_eq!(
             std::fs::read_to_string(&key_path).unwrap().trim(),
             hex(&[9; 32]),
@@ -726,6 +948,6 @@ mod tests {
         // Without material, the file is read as before.
         let (key, created) = MasterKey::load(None, &key_path, Some([1; 32])).unwrap();
         assert!(!created);
-        assert_eq!(key.0, [9; 32]);
+        assert_eq!(key.bytes(), &[9; 32]);
     }
 }

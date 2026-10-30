@@ -16,7 +16,6 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::cli::{self, field, next, shell_quote};
-use crate::config;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum UpgradeCommand {
@@ -123,25 +122,18 @@ fn execute(args: CheckArgs) -> Result<Done, ApiError> {
         ApiError::new(ErrorCode::BadRequest, format!("--window: {m}"))
             .with_hint("Give a duration with ms, s, m or h, e.g. 6h.")
     })?;
-    let data =
-        config::resolve_data_dir(args.config.as_deref(), args.data_dir.clone()).map_err(|e| {
-            ApiError::new(
-                ErrorCode::BadRequest,
-                format!("the configuration file is invalid: {e}"),
-            )
-            .with_hint("Fix the file, or pass --data-dir <dir>.")
-        })?;
+    let (configuration, _) =
+        crate::restore::key_config(args.config.as_deref(), args.master_key_file.clone())?;
+    let data = args
+        .data_dir
+        .clone()
+        .unwrap_or(configuration.server.data_dir);
     let workers = args
         .workers
         .map(usize::from)
         .unwrap_or_else(default_workers);
     // Sealed values in the window open as they do for the daemon.
-    let key_path = crate::restore::master_key_path(
-        args.config.as_deref(),
-        args.master_key_file.clone(),
-        &data,
-    )?;
-    let sealer = kronik_sched::offline_sealer(&data, &key_path).map_err(key_error)?;
+    let keys = configuration.keys;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("kronik")
@@ -152,19 +144,21 @@ fn execute(args: CheckArgs) -> Result<Done, ApiError> {
                 format!("starting the runtime failed: {e}"),
             )
         })?;
-    let checked = rt
-        .block_on(async {
-            let env = Env::real(tokio::runtime::Handle::current());
-            kronik_fork::upgrade::check(
-                &env,
-                &data,
-                Duration::from_millis(window_ms),
-                workers,
-                sealer,
-            )
+    let checked = rt.block_on(async {
+        let env = Env::real(tokio::runtime::Handle::current());
+        let sealer = kronik_sched::offline_sealer(env.clone(), &data, keys)
             .await
-        })
-        .map_err(check_error)?;
+            .map_err(|e| e.api_error())?;
+        kronik_fork::upgrade::check(
+            &env,
+            &data,
+            Duration::from_millis(window_ms),
+            workers,
+            sealer,
+        )
+        .await
+        .map_err(check_error)
+    })?;
 
     let report_file = UpgradeReport::path(&data, &checked.report.to_engine);
     let diff_file = report_file.with_extension("diff.json");
@@ -298,23 +292,5 @@ fn check_error(msg: String) -> ApiError {
         ApiError::new(ErrorCode::StorageCorrupt, msg)
     } else {
         ApiError::new(ErrorCode::Internal, msg)
-    }
-}
-
-/// The master key or the privacy keystore could not be opened.
-fn key_error(e: kronik_privacy::PrivacyError) -> ApiError {
-    let hint = "Use the master key `kronik serve` uses on this directory: --master-key-file, \
-                [keys] master_key_file with --config, <data-dir>/keys/master.key, or \
-                KRONIK_MASTER_KEY.";
-    match e {
-        kronik_privacy::PrivacyError::KeyMissing(_) => {
-            ApiError::new(ErrorCode::MasterKeyMissing, format!("upgrade check: {e}"))
-                .with_hint(hint)
-        }
-        kronik_privacy::PrivacyError::KeyMismatch(_) => {
-            ApiError::new(ErrorCode::MasterKeyMismatch, format!("upgrade check: {e}"))
-                .with_hint(hint)
-        }
-        e => ApiError::new(ErrorCode::StorageCorrupt, format!("upgrade check: {e}")),
     }
 }

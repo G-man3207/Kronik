@@ -2784,14 +2784,14 @@ mod tests {
     /// pseudonym; without the key neither is shown.
     #[test]
     fn redacted_values_hash_keyed_and_hide_the_subject() {
-        let master = kronik_privacy::MasterKey::from_bytes([1; 32]);
+        let master = kronik_privacy::MasterKey::from_bytes([1; 32]).unwrap();
         let ks = kronik_privacy::keystore::Keystore::open(
             rusqlite::Connection::open_in_memory().unwrap(),
             &master,
         )
         .unwrap();
         let keyed = Sealer::new(Arc::new(ks))
-            .with_pseudonyms(kronik_privacy::keystore::Pseudonyms::new(&master));
+            .with_pseudonyms(kronik_privacy::keystore::Pseudonyms::new(&master).unwrap());
         let v = redacted(&keyed, "user:9", b"alice");
         let hash = v["hash"].as_str().unwrap();
         assert_eq!(hash.len(), 2 + 16, "{v}");

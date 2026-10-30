@@ -129,11 +129,6 @@ fn verify(ctx: &Ctx, a: VerifyArgs) -> Result<ExitCode, Error> {
     let (config, _) = crate::config::Config::find(a.config.as_deref())
         .map_err(|e| bad(format!("the configuration file is invalid: {e}")))?;
     let data_dir = a.data_dir.unwrap_or(config.server.data_dir.clone());
-    let key_file = config
-        .keys
-        .master_key_file
-        .clone()
-        .unwrap_or_else(|| data_dir.join("keys/master.key"));
     let url = a.sink.or_else(|| config.audit.sink()).ok_or_else(|| {
         bad("no sink to verify".into()).with_hint(
             "Pass --sink file:///dir/ or --sink s3://bucket/prefix, or set [audit] sink.",
@@ -145,8 +140,13 @@ fn verify(ctx: &Ctx, a: VerifyArgs) -> Result<ExitCode, Error> {
         .as_deref()
         .filter(|_| url.starts_with("s3://"));
     let sink = Sink::parse(&url, endpoint).map_err(bad)?;
-    let report =
-        crate::restore::runtime()?.block_on(compare(&data_dir, &key_file, &sink, a.from, a.to))?;
+    let report = crate::restore::runtime()?.block_on(compare(
+        &data_dir,
+        &config.keys,
+        &sink,
+        a.from,
+        a.to,
+    ))?;
     if ctx.json {
         ctx.print(&format!(
             "{}\n",
@@ -165,7 +165,7 @@ fn verify(ctx: &Ctx, a: VerifyArgs) -> Result<ExitCode, Error> {
 /// Reads main's log in `(from, to]` and the sink's lines, and compares them.
 async fn compare(
     data_dir: &Path,
-    key_file: &Path,
+    keys: &kronik_privacy::key_source::Keys,
     sink: &Sink,
     from: Option<u64>,
     to: Option<u64>,
@@ -190,7 +190,7 @@ async fn compare(
     let to = match to {
         Some(t) => t,
         None => {
-            let cursors = kronik_otel::cursor::Cursors::load(env, data_dir)
+            let cursors = kronik_otel::cursor::Cursors::load(env.clone(), data_dir)
                 .await
                 .map_err(|e| {
                     ApiError::new(ErrorCode::Internal, format!("reading export.json: {e}"))
@@ -204,20 +204,14 @@ async fn compare(
     // Only what verify compares (kind, action, token, time, hash) matters:
     // no actor key hashing or secret scrub. An erasure's hash covers its
     // subject's keyed label (review M6), so the master key is needed.
-    let master = kronik_privacy::MasterKey::open(key_file, &data_dir.join("keys"), None)
-        .map(|(k, _)| k)
-        .map_err(|e| {
-            ApiError::new(
-                ErrorCode::BadRequest,
-                format!("reading the master key: {e}"),
-            )
-            .with_hint(
-                "verify recomputes erasure records' hashes with the master key: run it as the \
-             daemon's user, or set [keys] master_key_file or KRONIK_MASTER_KEY.",
-            )
-        })?;
-    let sealer = kronik_privacy::sealer::Sealer::plain()
-        .with_pseudonyms(kronik_privacy::keystore::Pseudonyms::new(&master));
+    let source =
+        kronik_privacy::key_source::KeySource::load(env.clone(), keys.clone(), data_dir, false)
+            .await
+            .map_err(|e| e.api_error())?;
+    let sealer = kronik_privacy::sealer::Sealer::plain().with_pseudonyms(
+        kronik_privacy::keystore::Pseudonyms::new(source.master())
+            .map_err(|e| kronik_privacy::key_source::KeySourceError::Key(e).api_error())?,
+    );
     let keys = ActorKeys::Omit;
     let subject = |s: &str| kronik_otel::audit::subject_label(&sealer, s);
     let line_ctx = LineCtx {

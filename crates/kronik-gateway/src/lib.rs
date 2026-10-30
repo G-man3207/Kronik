@@ -859,8 +859,8 @@ mod tests {
             peer: None,
             body: Vec::new(),
         };
-        let keyed =
-            Sealer::plain().with_pseudonyms(Pseudonyms::new(&MasterKey::from_bytes([1; 32])));
+        let keyed = Sealer::plain()
+            .with_pseudonyms(Pseudonyms::new(&MasterKey::from_bytes([1; 32]).unwrap()).unwrap());
         let plain = Sealer::plain();
         let a = request_hash(&req(&[]), Some("user:1"), &keyed);
         assert_eq!((a.len(), a[0]), (33, INGRESS_HASH_VERSION));

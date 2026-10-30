@@ -15,6 +15,9 @@ real = [
     "dep:hyper-rustls",
     "dep:hyper-util",
     "dep:rustix",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:ring",
     "tokio/rt",
     "tokio/fs",
     "tokio/time",
@@ -30,6 +33,9 @@ hyper = { workspace = true, optional = true, features = ["client"] }
 hyper-rustls = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true, features = ["client-legacy", "http1"] }
 rustix = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+ring = { workspace = true, optional = true }
 kronik-proto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

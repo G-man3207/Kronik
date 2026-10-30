@@ -92,6 +92,12 @@ const COMMANDS: &[(&str, Output)] = &[
         "secret delete",
         Output::Api(&[("", "DELETE", "/v1/secrets/{name}")]),
     ),
+    ("keys status", Output::Api(&[("", "GET", "/v1/keys")])),
+    (
+        "keys rewrap",
+        Output::Api(&[("", "POST", "/v1/keys/rewrap")]),
+    ),
+    ("keys wrap", Output::Local(super::keys::wrap_schema)),
     ("fork create", Output::Api(&[("", "POST", "/v1/forks")])),
     ("fork list", Output::Api(&[("", "GET", "/v1/forks")])),
     (

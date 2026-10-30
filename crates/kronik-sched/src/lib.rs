@@ -59,8 +59,8 @@ pub struct NodeConfig {
     pub ingress_ttl: Duration,
     /// Records applied per `state.db` transaction at most.
     pub apply_batch: usize,
-    /// `[keys] master_key_file`; default `<data_dir>/keys/master.key`.
-    pub master_key_file: Option<std::path::PathBuf>,
+    /// File/env or KMS source; the same configuration serves offline readers.
+    pub keys: kronik_privacy::key_source::Keys,
     /// The sandboxes behind `foreign://` (M7); none in DST, forks and the
     /// test host, where foreign calls are never live.
     pub foreign: kronik_effects::foreign::ForeignSlot,
@@ -111,7 +111,7 @@ impl Default for NodeConfig {
             concurrency: 64,
             ingress_ttl: Duration::from_secs(24 * 3600),
             apply_batch: 512,
-            master_key_file: None,
+            keys: Default::default(),
             foreign: kronik_effects::foreign::ForeignSlot::default(),
             storage: None,
             segment_max_bytes: None,
@@ -169,6 +169,11 @@ pub async fn start_local(
     data: &Path,
     mut config: NodeConfig,
 ) -> Result<Arc<Node>, StartError> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .create(data)
+        .map_err(|e| StartError::Log(kronik_log::LogError::Io(e)))?;
+    let ownership = kronik_privacy::key_source::lock_data(data).map_err(StartError::KeySource)?;
     let branch_dir = data.join("branches").join(&config.branch);
     std::fs::create_dir_all(&branch_dir)
         .map_err(|e| StartError::Log(kronik_log::LogError::Io(e)))?;
@@ -200,26 +205,21 @@ pub async fn start_local(
     if let Some(w) = config.group_commit_window {
         log.group_commit_window = w;
     }
-    let key_path = config
-        .master_key_file
-        .clone()
-        .unwrap_or_else(|| data.join("keys").join("master.key"));
-    let fresh = env.random_bytes::<32>();
+    let source =
+        kronik_privacy::key_source::KeySource::load(env.clone(), config.keys.clone(), data, true)
+            .await
+            .map_err(StartError::KeySource)?;
+    let master = source.master();
     let keys = data.join("keys");
-    let (master, created) =
-        kronik_privacy::MasterKey::open(&key_path, &keys, Some(fresh)).map_err(key_error)?;
-    if created {
-        tracing::warn!(path = %key_path.display(), "created a new master key; back it up");
-    }
     private_files(&keys, &["secrets.db", "keystore.db"])
         .map_err(|e| StartError::Log(kronik_log::LogError::Io(e)))?;
     let secrets_conn = rusqlite::Connection::open(keys.join("secrets.db"))
         .map_err(|e| StartError::Store(e.into()))?;
-    let secrets = kronik_privacy::SecretStore::open(secrets_conn, &master).map_err(key_error)?;
+    let secrets = kronik_privacy::SecretStore::open(secrets_conn, master).map_err(key_error)?;
     let keystore_conn = rusqlite::Connection::open(keys.join("keystore.db"))
         .map_err(|e| StartError::Store(e.into()))?;
     let keystore =
-        kronik_privacy::keystore::Keystore::open(keystore_conn, &master).map_err(key_error)?;
+        kronik_privacy::keystore::Keystore::open(keystore_conn, master).map_err(key_error)?;
     Node::start(NodeParts {
         env,
         config,
@@ -228,40 +228,42 @@ pub async fn start_local(
         code,
         secrets: Some(Arc::new(secrets)),
         sealer: Some(Arc::new(
-            kronik_privacy::sealer::Sealer::new(Arc::new(keystore))
-                .with_pseudonyms(kronik_privacy::keystore::Pseudonyms::new(&master)),
+            kronik_privacy::sealer::Sealer::new(Arc::new(keystore)).with_pseudonyms(
+                kronik_privacy::keystore::Pseudonyms::new(master).map_err(key_error)?,
+            ),
         )),
+        key_source: Some(source),
+        ownership: Some(ownership),
     })
     .await
 }
 
-/// The data directory's privacy keystore as a sealer, for an offline reader
-/// of its log (`kronik upgrade check`): sealed values open as they do for
-/// the daemon. `key_path` is the master key file serve uses; `None` when
-/// the directory has no keystore. A running daemon may hold it too.
-pub fn offline_sealer(
+/// The data directory's privacy keystore for an offline reader. It shares
+/// the daemon's source configuration and never creates key material.
+pub async fn offline_sealer(
+    env: Env,
     data: &Path,
-    key_path: &Path,
-) -> Result<Option<Arc<kronik_privacy::sealer::Sealer>>, kronik_privacy::PrivacyError> {
-    let keys = data.join("keys");
-    let file = keys.join("keystore.db");
+    config: kronik_privacy::key_source::Keys,
+) -> Result<Option<Arc<kronik_privacy::sealer::Sealer>>, kronik_privacy::key_source::KeySourceError>
+{
+    let file = data.join("keys/keystore.db");
     if !file.exists() {
         return Ok(None);
     }
-    let (master, _) = kronik_privacy::MasterKey::open(key_path, &keys, None)?;
-    let keystore = kronik_privacy::keystore::Keystore::open_file(&file, &master)?;
+    let source = kronik_privacy::key_source::KeySource::load(env, config, data, false).await?;
+    let keystore = kronik_privacy::keystore::Keystore::open_file(&file, source.master())?;
     Ok(Some(Arc::new(
         kronik_privacy::sealer::Sealer::new(Arc::new(keystore))
-            .with_pseudonyms(kronik_privacy::keystore::Pseudonyms::new(&master)),
+            .with_pseudonyms(kronik_privacy::keystore::Pseudonyms::new(source.master())?),
     )))
 }
 
-/// A wrong or missing master key has its own code; anything else in the
-/// key or the stores is corruption.
+/// Wrong/missing keys and exhausted memory protection have their own codes.
 fn key_error(e: kronik_privacy::PrivacyError) -> StartError {
     match e {
         kronik_privacy::PrivacyError::KeyMissing(_)
-        | kronik_privacy::PrivacyError::KeyMismatch(_) => StartError::Key(e),
+        | kronik_privacy::PrivacyError::KeyMismatch(_)
+        | kronik_privacy::PrivacyError::KeyProtection => StartError::Key(e),
         e => StartError::Corrupt(e.to_string()),
     }
 }

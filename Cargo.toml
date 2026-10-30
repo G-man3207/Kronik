@@ -54,9 +54,9 @@ prost-build = "0.14.4"
 # Pure-Rust protobuf compiler for build scripts: no `protoc` on build hosts.
 protox = "0.10.0"
 thiserror = "2"
-blake3 = "1.8"
+blake3 = { version = "1.8", features = ["zeroize"] }
 chacha20 = { version = "0.10.2", default-features = false, features = ["rng"] }
-chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 bytes = "1"
 crc32c = "0.6"
 base64 = "0.22"
@@ -76,7 +76,7 @@ libc = "0.2"
 rusqlite = { version = "=0.41.0", features = ["bundled", "hooks", "functions", "limits", "backup"] }
 # statvfs(2) without unsafe (free space for [log] disk_reserve); already in
 # the tree through tempfile, pure Rust on Linux.
-rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process", "mm", "param"] }
 # CEL for policy rules (ADR 0007). Pinned exactly: its evaluation semantics
 # decide policy outcomes, so an upgrade is a reviewed change. Features are
 # enabled by the crates that use them.
@@ -123,6 +123,10 @@ sha2 = "0.11"
 # Secret scrubbing: one pass over a payload for every stored secret value.
 # Already in the tree (regex).
 aho-corasick = "1.1"
+# Existing locked dependencies for KMS wire protocols and protected key buffers.
+ring = "0.17.14"
+url = "2.5.8"
+zeroize = "1.9.1"
 tempfile = "3"
 tracing = "0.1"
 # Daemon crates enable only `sync` and `macros` (ADR 0004); runtime features

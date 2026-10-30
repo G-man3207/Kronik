@@ -56,6 +56,11 @@ pub trait Spawner: Send + Sync + 'static {
 /// execution ids and tokens. Real: the OS CSPRNG. Simulated: the run seed.
 pub trait EntropySource: Send + Sync + 'static {
     fn fill(&self, buf: &mut [u8]);
+    /// Deterministic PKCS#1 SHA-256 signature; RSA's internal blinding uses
+    /// OS entropy only in the production environment, never in providers.
+    fn sign_rs256(&self, _pkcs8: &[u8], _message: &[u8]) -> Result<Vec<u8>, String> {
+        Err("RSA signing is not supported by this environment".into())
+    }
 }
 
 /// How a file is opened.
@@ -132,11 +137,25 @@ pub enum NetError {
     TooLarge,
 }
 
+/// Node-local TLS for a provider client. Never installed on the guest's
+/// effect client; certificate chains and the PKCS#8 key are DER.
+pub struct TlsConfig {
+    pub ca: Vec<Vec<u8>>,
+    pub identity: Option<(Vec<Vec<u8>>, Vec<u8>)>,
+}
+
 /// Outbound network at the HTTP level. Inbound HTTP is not part of `Net`: the
 /// gateway's service function is called directly in simulation and bound to a
 /// hyper listener in production.
 pub trait Net: Send + Sync + 'static {
     fn http(&self, req: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>>;
+    /// Builds a separate provider client; simulated networks may implement
+    /// this without changing their deterministic request boundary.
+    fn with_tls(&self, _tls: TlsConfig) -> Result<Arc<dyn Net>, NetError> {
+        Err(NetError::Connect(
+            "TLS configuration is not supported".into(),
+        ))
+    }
 }
 
 /// A child process (`runsc`, later Firecracker). Its stdin is always

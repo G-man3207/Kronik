@@ -141,6 +141,7 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
     checks.extend(wildcard_certificate(&config));
     checks.push(ship(&config));
     checks.push(export(&config));
+    checks.push(key_source(&config));
     let count = |s| checks.iter().filter(|c| c.status == s).count();
     let report = Report {
         pass: count(Status::Pass),
@@ -808,6 +809,99 @@ fn export(config: &Config) -> Check {
                 socket.display()
             ),
         ),
+    }
+}
+
+fn key_source(config: &Config) -> Check {
+    use kronik_privacy::key_source::KeySource;
+    let source = config.keys.source.as_str();
+    let data = &config.server.data_dir;
+    let mut credentials = Vec::new();
+    if let Some(c) = &config.keys.openbao {
+        credentials.extend([
+            &c.token_file,
+            &c.role_id_file,
+            &c.secret_id_file,
+            &c.key_file,
+        ]);
+    }
+    if let Some(c) = &config.keys.gcp {
+        credentials.push(&c.service_account_file);
+    }
+    if let Some(c) = &config.keys.azure {
+        credentials.push(&c.client_secret_file);
+    }
+    let canonical_data = std::fs::canonicalize(data).unwrap_or_else(|_| data.clone());
+    for file in credentials.into_iter().flatten() {
+        let file = if file.is_absolute() {
+            file.clone()
+        } else {
+            std::env::var_os("CREDENTIALS_DIRECTORY")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(file)
+        };
+        let file = std::fs::canonicalize(&file).unwrap_or(file);
+        if file.starts_with(&canonical_data) {
+            return check("key_source", Status::Warn, format!("{source}: bootstrap credential is under the data directory"))
+                .hint("keep bootstrap credentials out of the data directory and its backups; prefer instance identity");
+        }
+    }
+    if !config.keys.source.is_kms()
+        && !data.join("keys/secrets.db").exists()
+        && !config.keys.key_path(data).exists()
+        && std::env::var_os(kronik_privacy::MASTER_KEY_ENV).is_none()
+    {
+        return check(
+            "key_source",
+            Status::Pass,
+            format!("{source}: not initialized yet"),
+        );
+    }
+    let endpoint = crate::cli::http::Endpoint::Unix(config.server.api_socket.clone());
+    let token = crate::cli::client_token_from(None).ok().flatten();
+    if let Ok(r) = crate::cli::http::request(
+        &endpoint,
+        "GET",
+        "/v1/keys",
+        None,
+        token.as_deref(),
+        Duration::from_secs(5),
+    ) && r.status == 200
+        && let Ok(status) = serde_json::from_slice::<kronik_privacy::key_source::KeyStatus>(&r.body)
+    {
+        return check(
+            "key_source",
+            Status::Pass,
+            format!("{}: loaded; key checks match", status.source),
+        );
+    }
+    let result = crate::restore::runtime()
+        .map_err(|e| e.code.as_str().to_owned())
+        .and_then(|runtime| {
+            runtime.block_on(async {
+                let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+                KeySource::load(env, config.keys.clone(), data, false)
+                    .await
+                    .map_err(|e| e.api_error().code.as_str().to_owned())
+            })
+        });
+    match result {
+        Ok(loaded) => {
+            let status = loaded.status();
+            check(
+                "key_source",
+                Status::Pass,
+                format!(
+                    "{} {} {}; key checks match",
+                    status.source,
+                    status.key.unwrap_or_default(),
+                    status.key_version.unwrap_or_default()
+                ),
+            )
+        }
+        Err(code) => check("key_source", Status::Fail, format!("{source}: {code}"))
+            .hint("check the configured provider, credentials, key version and memory-lock limit"),
     }
 }
 

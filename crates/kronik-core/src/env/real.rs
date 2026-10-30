@@ -71,6 +71,19 @@ impl EntropySource for RealEntropy {
             panic!("OS entropy unavailable: {e}");
         }
     }
+    fn sign_rs256(&self, pkcs8: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
+        let key =
+            ring::signature::RsaKeyPair::from_pkcs8(pkcs8).map_err(|_| "invalid RSA PKCS#8 key")?;
+        let mut signature = vec![0; key.public().modulus_len()];
+        key.sign(
+            &ring::signature::RSA_PKCS1_SHA256,
+            &ring::rand::SystemRandom::new(),
+            message,
+            &mut signature,
+        )
+        .map_err(|_| "RSA signing failed")?;
+        Ok(signature)
+    }
 }
 
 pub struct RealFs(pub Handle);
@@ -337,6 +350,41 @@ impl Default for RealNet {
 }
 
 impl Net for RealNet {
+    fn with_tls(&self, tls: crate::env::TlsConfig) -> Result<Arc<dyn Net>, NetError> {
+        let bad = |_| NetError::Connect("invalid provider TLS configuration".into());
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs().certs {
+            roots.add(cert).map_err(bad)?;
+        }
+        for cert in tls.ca {
+            roots.add(cert.into()).map_err(bad)?;
+        }
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(bad)?
+        .with_root_certificates(roots);
+        let config = match tls.identity {
+            Some((chain, key)) => builder
+                .with_client_auth_cert(
+                    chain.into_iter().map(Into::into).collect(),
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(key).into(),
+                )
+                .map_err(bad)?,
+            None => builder.with_no_client_auth(),
+        };
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(config)
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(connector);
+        Ok(Arc::new(RealNet { client: Ok(client) }))
+    }
+
     fn http(&self, req: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
         let client = self.client.clone();
         Box::pin(async move {

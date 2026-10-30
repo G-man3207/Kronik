@@ -218,6 +218,15 @@ Resources: `kronik://agent-guide` (this page), `kronik://concepts`,
 `kronik://errors`, `kronik://wit/kronik-actor.wit` (the interface every
 component implements) and `kronik://config`.
 
+Master-key custody is an operator concern. `kronik keys status` (or
+`GET /v1/keys`, scope `read`) reports the loaded source, wrapping-key
+identity/version and local key-check result, never key bytes. Rewrap is an
+audited `admin` operation; file/environment migration is offline
+`kronik keys wrap` after the operator stops the daemon. Do not copy keys,
+provider credentials or ciphertext into a chat or a reason. If a key source
+is unavailable, hand off its configuration/reachability to the operator;
+never “fix” missing key material by making a new seed over existing data.
+
 ## Errors you will meet
 
 | Code | What it means for you |
@@ -231,5 +240,8 @@ component implements) and `kronik://config`.
 | `CAPABILITY_NOT_GRANTED` | The code calls a target it has no grant for. In a fork that call is denied; in production a human grants it. |
 | `ACTOR_NOT_FOUND`, `FORK_NOT_FOUND`, `PROPOSAL_NOT_FOUND`, `TURN_NOT_FOUND` | Check the id: list again. |
 | `UNAUTHENTICATED` | Your token is missing, unknown or revoked. |
+| `KEY_SOURCE_UNAVAILABLE` | A KMS operation could not complete within its total budget. Ask the operator to check provider reachability, credentials and key versions; the running node may still have its loaded key. |
+| `KEY_PROTECTION_UNAVAILABLE` | Required memory/dump protection failed. Ask the operator to fix host limits/protection; do not disable it. |
+| `MASTER_KEY_MISSING`, `MASTER_KEY_MISMATCH` | Existing encrypted stores need the original seed/correct wrapping material. Stop and hand off recovery; do not regenerate or overwrite the key. |
 
 Call `explain` with `{"topic": "<CODE or concept>"}` for anything else.

@@ -1,0 +1,9 @@
+{
+  "schema": "kronik.wrapped-key/v1",
+  "source": "openbao",
+  "key": "transit/keys/kronik",
+  "key_version": "1",
+  "ciphertext": "vault:v1:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "aad": "kronik master v1",
+  "created_wall_ms": 1793354046571
+}

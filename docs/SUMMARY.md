@@ -42,6 +42,7 @@
 - [M13 rollback via replay design](design/m13-rebase.md)
 - [M14 foreign actors in forks design](design/m14-foreign-forks.md)
 - [M15 Python and Go SDKs design](design/m15-sdks.md)
+- [M23 key backends: B1 and parked remaining design](design/m23-secret-backends.md)
 - [M28 OpenTelemetry and audit export design](design/m28-otel.md)
 - [Performance](perf.md)
 
@@ -82,3 +83,5 @@
 - [ADR 0082: What telemetry and audit export may carry off the node](adr/0082-what-leaves-the-node.md)
 - [ADR 0083: The audit export: the log is the audit trail](adr/0083-audit-export.md)
 - [ADR 0084: Export cursors, and the audit export holds retention](adr/0084-export-cursors-and-retention.md)
+- [ADR 0092: The master seed wrapped by a KMS](adr/0092-master-key-wrapped-by-a-kms.md)
+- [ADR 0094: Key providers without SDKs](adr/0094-secret-providers-without-sdks.md)

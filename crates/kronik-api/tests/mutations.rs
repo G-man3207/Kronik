@@ -125,6 +125,12 @@ fn cases() -> Vec<Case> {
         },
         Case {
             method: "POST",
+            path: "/v1/keys/rewrap",
+            writes: "keys.rewrap",
+            extra: json!({}),
+        },
+        Case {
+            method: "POST",
             path: "/v1/tokens",
             writes: "token.create",
             extra: json!({"name": "agent-1"}),
@@ -543,7 +549,13 @@ async fn audited_since(node: &kronik_sched::Node, after: u64) -> Vec<String> {
 /// and an image (`crates/kronik/tests/foreign.rs` covers its record). They
 /// are still called, and a failed call must write nothing.
 // shortcut: foreign add/remove are only checked to write nothing on failure here, extend once a test harness for foreign actors exists in kronik-api.
-const UNDRIVEN: &[(&str, &str)] = &[("POST", "/v1/foreign"), ("DELETE", "/v1/foreign/{name}")];
+// This file-source fixture also proves unsupported rewrap writes nothing.
+// Provider-backed rewrap and its audit use real KMS in scripts/e2e-keys.sh.
+const UNDRIVEN: &[(&str, &str)] = &[
+    ("POST", "/v1/foreign"),
+    ("DELETE", "/v1/foreign/{name}"),
+    ("POST", "/v1/keys/rewrap"),
+];
 
 /// Every mutating route, run once for real, writes exactly the audited
 /// record its `writes` column names in main's log (M28 §4.2), and the
@@ -788,6 +800,7 @@ async fn every_mutation_writes_its_audited_record() {
             "/v1/foreign/echo",
             json!({}),
         ),
+        ("POST", "/v1/keys/rewrap", "/v1/keys/rewrap", json!({})),
     ];
     let run: std::collections::BTreeSet<(&str, &str)> =
         steps.iter().map(|(m, t, _, _)| (*m, *t)).collect();

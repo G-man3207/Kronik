@@ -57,8 +57,10 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`IMPORT_NOT_ALLOWED`](#import_not_allowed) | 400 | M1 | The component imports an interface outside the allowlist |
 | [`INTERNAL`](#internal) | 500 | M1 | An internal error in Kronik |
 | [`KEYSTORE_INCOMPLETE`](#keystore_incomplete) | 409 | M8 | A sealed value's subject key is not in the keystore |
+| [`KEY_PROTECTION_UNAVAILABLE`](#key_protection_unavailable) | 503 | M23 | The operating system could not protect the key's memory |
+| [`KEY_SOURCE_UNAVAILABLE`](#key_source_unavailable) | 503 | M23 | The configured KMS key source is unavailable |
 | [`KVM_UNAVAILABLE`](#kvm_unavailable) | 503 | M7 | KVM is not available on this host |
-| [`MASTER_KEY_MISMATCH`](#master_key_mismatch) | 409 | M2 | The master key is not the key the stores were encrypted under |
+| [`MASTER_KEY_MISMATCH`](#master_key_mismatch) | 409 | M2 | The master key or wrapped source does not match this data directory |
 | [`MASTER_KEY_MISSING`](#master_key_missing) | 409 | M2 | The master key is missing, and the data directory holds encrypted stores |
 | [`NOTHING_TO_PROPOSE`](#nothing_to_propose) | 409 | M10 | Main already runs every component of the proposal |
 | [`NOT_IMPLEMENTED`](#not_implemented) | 501 | M1 | Not available in this version |
@@ -482,6 +484,32 @@ To fix it, let the source node ship again (or wait a minute while it runs) and r
 
 See also: [`MASTER_KEY_MISSING`](#master_key_missing), [`SUBJECT_ERASED`](#subject_erased).
 
+## KEY_PROTECTION_UNAVAILABLE
+
+HTTP status 503, milestone M23. The operating system could not protect the key's memory.
+
+Default hint: Check RLIMIT_MEMLOCK and available memory; key loading fails closed rather than keeping an unlocked key.
+
+The operating system refused to protect key memory. Kronik stops loading the key rather than retain an unlocked master or derived key. This is a resource or host-configuration failure, not evidence of storage corruption.
+
+On Linux the master seed and six retained derived keys use stable, dedicated `mlock`ed mappings with `MADV_DONTDUMP`. Check the service's `LimitMEMLOCK`/`RLIMIT_MEMLOCK` and available memory. Each retained mapping consumes one page, not one mapping per actor, subject or turn. On macOS, key mappings are locked and standard process core dumps are disabled with `RLIMIT_CORE=0`; that is not Linux's per-mapping dump exclusion or protection from a debugger.
+
+Transient cryptographic working state and supplied credentials are not covered by a blanket no-swap guarantee. Controlled KMS payload and credential buffers are zeroized, not every HTTP header, Hyper buffer or dependency-internal copy. A successful file needle scan alone does not prove memory protection; Linux acceptance also checks the daemon's actual `lo` and `dd` mapping flags.
+
+## KEY_SOURCE_UNAVAILABLE
+
+HTTP status 503, milestone M23. The configured KMS key source is unavailable.
+
+Default hint: Check the KMS endpoint, credentials, key version and start_timeout; Kronik never creates a fallback master key.
+
+The configured KMS source could not finish within `[keys] start_timeout`. This is one total window for loading the key, including verification of a newly wrapped seed. Kronik does not write a plaintext key or create a fallback key when the provider is unavailable.
+
+Check the provider endpoint, credentials or instance identity, wrapping-key permissions and whether the recorded provider key version remains enabled. The key reference in the envelope must match the configured source and key. Unsupported local credential sources are configuration errors, not service outages; their safe variable or credential-type name is reported without the value.
+
+The KMS is needed when loading a key and when wrapping or rewrapping it. Once the daemon starts, ordinary turns and keystore shipping use its loaded key and make no KMS requests. A restart during a KMS outage cannot load the seed and is an installation outage.
+
+Use `kronik keys status` for the loaded source, and `kronik doctor --config <file>` to check it. Keep wrapping-key versions enabled while retained backups need them. Losing the wrapping key loses the encrypted data.
+
 ## KVM_UNAVAILABLE
 
 HTTP status 503, milestone M7. KVM is not available on this host.
@@ -500,43 +528,49 @@ See also: [`isolation-level`](concepts/glossary.md#isolation-level).
 
 ## MASTER_KEY_MISMATCH
 
-HTTP status 409, milestone M2. The master key is not the key the stores were encrypted under.
+HTTP status 409, milestone M2. The master key or wrapped source does not match this data directory.
 
-Default hint: Start with the data directory's own master key: the file it was created with, or its KRONIK_MASTER_KEY.
+Default hint: For file/env, use the original key file or KRONIK_MASTER_KEY. For KMS, restore matching master.wrapped and [keys] source/provider key; KMS never falls back to an env or raw-file seed.
 
-The master key that `kronik serve` loaded is not the key the data directory's secret store or privacy keystore was encrypted under. Each store records a value derived from its key at its first start, and older stores are checked by decrypting one of their values. Kronik stops instead of serving secrets it cannot read.
+The loaded master key does not match the data directory's encrypted stores, or a KMS envelope does not match its configured source, provider key, version or fixed purpose. Each store records a value derived from its key at first start; older stores are checked by decrypting an existing value. Kronik stops instead of replacing an envelope or serving secrets it cannot read.
 
 Typical causes:
 
 - The key of another node or installation: a copied configuration, or `KRONIK_MASTER_KEY` set for a different data directory.
-- `kronik serve --init` made a new key file over a lost one.
+- An older release generated a replacement seed after the original was lost.
 - A store that holds values under two keys, left by older versions that
   made a new key when the old one was missing: the first value decides.
 - A damaged store: a value that does not decrypt for another reason is
   reported here too. If the key is certainly right, treat it as
   `STORAGE_CORRUPT` and keep the directory.
+- The wrapped ciphertext belongs to another provider/key, its recorded version is invalid for the configured key, or its metadata was changed.
 
-To fix it, start with the key this data directory was created with. `kronik restore` checks the privacy keystore backup against the key before it writes anything, and fails with this code when they don't match.
+Use the original seed or its matching KMS envelope and provider key. `kronik restore` unwraps and checks staged stores before installing the envelope or committing destination state; a mismatch preserves the existing destination. Do not repair this error by generating another seed or overwriting the wrapper.
 
-See also: [`MASTER_KEY_MISSING`](#master_key_missing).
+For KMS custody, use the matching `[keys] wrapped_file` (default `<data_dir>/keys/master.wrapped`), `[keys] source` and provider key reference. Keep the original wrapping version available. Do not set `KRONIK_MASTER_KEY` or select a raw key file to bypass a mismatch: KMS custody rejects those fallbacks.
+
+See also: [`MASTER_KEY_MISSING`](#master_key_missing), [`KEY_SOURCE_UNAVAILABLE`](#key_source_unavailable), [`KEY_PROTECTION_UNAVAILABLE`](#key_protection_unavailable).
 
 ## MASTER_KEY_MISSING
 
 HTTP status 409, milestone M2. The master key is missing, and the data directory holds encrypted stores.
 
-Default hint: Put the key back where [keys] master_key_file points, or set KRONIK_MASTER_KEY; Kronik does not make a new key over existing stores.
+Default hint: For file/env, restore the original key file or KRONIK_MASTER_KEY. For KMS, restore matching master.wrapped and [keys] source/provider key; never substitute env/raw material or generate a replacement seed.
 
-`kronik serve` found no master key: the key file (`[keys] master_key_file`, `--master-key-file` or `KRONIK_MASTER_KEY_FILE`, else `<data_dir>/keys/master.key`) does not exist and `KRONIK_MASTER_KEY` is not set. The data directory already holds the secret store or the privacy keystore, which are encrypted under the key this directory was created with. A new key would make every secret and every sealed value unreadable, and would change the keyed hashes in the log, so Kronik refuses to make one. A new, empty data directory still gets a key at its first start.
+Kronik could not load the existing master key. For `source = "file"` (the default), the configured key file does not exist and `KRONIK_MASTER_KEY` is not set. For `source = "env"`, that environment variable is missing. For a KMS source, the configured wrapped-key file is missing while encrypted stores already exist. Kronik never creates a replacement seed over existing encrypted data: that would make secrets and sealed values unreadable and change keyed hashes. A new, empty data directory can create its first key.
 
 Typical causes:
 
-- A restored data directory: the key is never in the bucket, and must be put in place on the new machine.
+- A restored data directory: a file/env seed is never in the bucket and must be supplied separately. KMS restores need the shipped wrapped ciphertext and access to the configured provider key.
 - The configuration names another key file than before, or `KRONIK_MASTER_KEY` is not set in this environment (a unit file, a container) although the node was started with it.
 - The key file was deleted.
+- A KMS envelope was removed or `wrapped_file` points at a different path.
 
-To fix it, put the original key back where the configuration points, or set `KRONIK_MASTER_KEY` to it, and start again. If the key is lost, the stores cannot be decrypted by anyone: move `keys/secrets.db` and `keys/keystore.db` aside to start with a new key and without those secrets and sealed values.
+Restore the original file/env material, or restore the original KMS envelope with its matching provider configuration and credentials. Never generate another seed to bypass this error. If the seed or provider key is permanently lost, keep the existing data for investigation; those encrypted values cannot be recovered by changing configuration.
 
-See also: [`MASTER_KEY_MISMATCH`](#master_key_mismatch).
+For KMS custody, restore the matching `[keys] wrapped_file` (default `<data_dir>/keys/master.wrapped`) together with the matching `[keys] source` and provider key reference. `KRONIK_MASTER_KEY` and a raw `master_key_file` are not fallbacks: they conflict with a KMS source and must not be substituted for its envelope.
+
+See also: [`MASTER_KEY_MISMATCH`](#master_key_mismatch), [`KEY_SOURCE_UNAVAILABLE`](#key_source_unavailable), [`KEY_PROTECTION_UNAVAILABLE`](#key_protection_unavailable).
 
 ## NOTHING_TO_PROPOSE
 
@@ -919,6 +953,8 @@ Default hint: Retry shortly; if it persists, check the daemon log.
 The daemon cannot serve the request right now: it is starting or shutting down, it stopped accepting turns after a fatal error such as a failed log write, or the data directory's file system is below `[log] disk_reserve`, where new inputs and changes are refused until there is room. This code exists so that clients can tell a temporary state of the daemon from an error in their request.
 
 To fix it, retry shortly. If it persists, read the message and the daemon log. Below the reserve, free disk space (old snapshots, foreign actors' data; `kronik foreign remove` and rollback still work) or lower the reserve. After a fatal error, fix the cause, for example a full disk, and restart the daemon.
+
+For `serve`, `restore`, `keys wrap` or first key creation during `serve --init`, this also means another daemon or offline operation owns the data-directory lock. Stop that owning process, or use a different `--data-dir`. A missing or stale API socket is not evidence that the directory is free. Do not remove key files or bypass the maintainersship check.
 
 ## VERIFY_REQUIRED
 

@@ -16,7 +16,7 @@ repository root says how to report a vulnerability.
 | Untrusted images | gVisor, no external network, images pinned by digest, resource limits | All of them since M7: gVisor sandboxes with no outbound network, images pinned by digest, CPU and memory limits ([M7 design](../design/m7-foreign.md)); `isolation = "trusted"` runs runc with a seccomp filter instead |
 | Agents with too much power | Tokens with scopes, policy and approvals, forks without personal data by default, a reason on every mutation | A reason on every mutation. Policy and approvals: M3. Tokens and scopes: M5. Forks without personal data: M8 |
 | Leaked secrets | Handles by default: the value is inserted at the effect boundary and never reaches the guest or the log. Revealing a value requires its own capability, and the value is scrubbed | All of them, since M2 |
-| Theft of the data directory | Privacy mode with sealed values; without it the log is plaintext, so use an encrypted disk | Privacy mode arrives with M8; until then the log is plaintext |
+| Theft of the data directory | Sealed subject values and encrypted secrets, with their master seed held separately; encrypt the disk for plaintext log data | Privacy mode since M8; M23 B1 adds KMS-wrapped master seeds. This does not encrypt ordinary log inputs/metadata or protect a compromised live host |
 | Unauthorized API access | Unix socket with file permissions, TCP only with a token, TLS for external traffic | The Unix socket; TCP only with a bearer token and, off loopback, only with TLS (M5); scopes per token (M5); TLS for the gateway and the TCP API since M6 |
 | The supply chain | cargo-deny, SBOM and release builds that are as reproducible as possible | cargo-deny in CI. Static release binaries arrive with M6, and the SBOM with the v0.1.0 release |
 
@@ -58,13 +58,16 @@ the hardening milestone, M31).
 
 Secrets arrive with M2.
 
-- **Storage.** `kronik serve` loads the master key from
-  `<data>/keys/master.key` (`--master-key-file`), or creates it on first
-  start: 32 random bytes in hex, mode 0600. The values live in
-  `<data>/keys/secrets.db`, sealed with XChaCha20-Poly1305 under a key
-  derived from the master key, one row per version. Without the master key
-  the stored values cannot be decrypted, so back the key up apart from the
-  data directory.
+- **Storage.** The file source loads `<data>/keys/master.key`
+  (`--master-key-file`), or creates 32 random bytes in hex, mode 0600.
+  `KRONIK_MASTER_KEY` supplies that seed from the environment without a key
+  file. M23 B1 also supports OpenBao transit, AWS KMS, GCP Cloud KMS and
+  Azure Key Vault: the provider wraps the same 32-byte seed, and only its
+  ciphertext envelope lives at `<data>/keys/master.wrapped`. A fresh
+  KMS-backed node never writes a plaintext seed file. Secret values remain
+  in `<data>/keys/secrets.db`, sealed with XChaCha20-Poly1305 under a derived
+  key, one row per version. These key sources change custody of the master
+  seed, not the built-in secret store into an external secret backend.
 - **Handles.** Guest code names a secret in an HTTP header template such as
   `Bearer {}` (with standard `fetch`, M22, the header value `Bearer
   {{secret:NAME}}`) or in a `crypto` call, and the host inserts the value at
@@ -106,6 +109,50 @@ compensations are scrubbed in the sender's turn before delivery, so their
 receivers get the placeholder). Grant `secret-reveal` as rarely as
 possible.
 
+### Master-key custody
+
+Keep file keys and KMS bootstrap credentials apart from the data directory
+and its backups. Relative provider credential/CA paths resolve beneath
+`CREDENTIALS_DIRECTORY`; absolute paths are also accepted. Each provider's
+custom CA and OpenBao client identity are scoped to that provider, not
+guest HTTP effects. There is no insecure TLS or unprotected-memory fallback.
+
+The long-lived master seed and its derived storage/hash keys occupy locked
+pages. Linux marks those mappings `MADV_DONTDUMP` and the key-loading process
+non-dumpable; macOS disables core dumps and locks the mappings. Failure to
+establish required protection is `KEY_PROTECTION_UNAVAILABLE`, not a warning.
+Controlled KMS payload and credential buffers are zeroized on drop, but
+HTTP headers and libraries can make ordinary transient copies that are not
+all controlled or wiped. This is not a blanket guarantee against sensitive
+data reaching swap. The protections do not defend against a privileged
+attacker on the running host or make arbitrary application state secret.
+
+A running node keeps its loaded seed: an unavailable KMS does not stop
+turns or force the shipper to unwrap again. Start, offline verification and
+rewrap do need the provider and fail with `KEY_SOURCE_UNAVAILABLE` within
+the configured total operation budget. Missing ciphertext over existing
+encrypted stores is `MASTER_KEY_MISSING`; Kronik must not regenerate a
+replacement seed there.
+
+`keys wrap` migrates an existing file/environment seed offline; stop the
+daemon first. Older v0.3 daemons do not participate in the new cooperative
+directory lock. The old file is preserved unless `--remove-file` is explicit,
+and removing it does not erase copies in filesystem snapshots or backups.
+Migration is therefore not proof that a seed was never on disk.
+
+Online `keys rewrap` needs `admin` and a reason, retains the seed, verifies
+the new ciphertext and records the change. It is not seed rotation. Keep
+old provider key versions decryptable for retained backups. Shipping stores
+the current encrypted envelope independently and pairs keystore backups
+with ciphertext; restore validates these and the restored stores before
+installing them. Neither plaintext seeds nor bootstrap credentials belong
+in the bucket. Theft of the envelope **and** credentials authorized to unwrap
+it can still expose the seed; use least-privilege provider policy.
+
+See [the operations guide](operations.md#the-master-key) for provider
+configuration, migration, outages and restore.
+
+
 ## The log is sensitive
 
 The log holds the whole history of the system: every input, state value, SQL
@@ -131,10 +178,12 @@ that a turn generated from `random-bytes`.
   when the API socket is inside it, so that the socket's group can reach
   it), `keys/` mode 0700, and the key stores in it (`master.key`,
   `secrets.db`, `keystore.db`, `tokens.db`, with their SQLite `-wal` and
-  `-shm` files) mode 0600. The API socket has mode 0660. Other files get
-  the process's default permissions; the directory's mode keeps them
-  private. The systemd unit that `kronik serve --init` installs creates the
-  data directory with mode 0700 too.
+  `-shm` files) mode 0600. New or replaced KMS ciphertext envelopes are
+  mode 0600; loading an existing or custom `wrapped_file` does not
+  universally reset its permissions. The API socket has mode 0660. Other
+  files get the process's default permissions; the directory's mode keeps
+  them private. The systemd unit that `kronik serve --init` installs creates
+  the data directory with mode 0700 too.
 
 ## API access
 

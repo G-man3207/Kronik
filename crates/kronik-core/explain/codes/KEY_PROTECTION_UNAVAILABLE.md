@@ -1,0 +1,5 @@
+The operating system refused to protect key memory. Kronik stops loading the key rather than retain an unlocked master or derived key. This is a resource or host-configuration failure, not evidence of storage corruption.
+
+On Linux the master seed and six retained derived keys use stable, dedicated `mlock`ed mappings with `MADV_DONTDUMP`. Check the service's `LimitMEMLOCK`/`RLIMIT_MEMLOCK` and available memory. Each retained mapping consumes one page, not one mapping per actor, subject or turn. On macOS, key mappings are locked and standard process core dumps are disabled with `RLIMIT_CORE=0`; that is not Linux's per-mapping dump exclusion or protection from a debugger.
+
+Transient cryptographic working state and supplied credentials are not covered by a blanket no-swap guarantee. Controlled KMS payload and credential buffers are zeroized, not every HTTP header, Hyper buffer or dependency-internal copy. A successful file needle scan alone does not prove memory protection; Linux acceptance also checks the daemon's actual `lo` and `dd` mapping flags.

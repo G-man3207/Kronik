@@ -50,6 +50,9 @@ against both.
 | `kronik secret set` | [`SecretResponse`](#secretresponse) (`PUT /v1/secrets/{name}`) |
 | `kronik secret list` | [`SecretsResponse`](#secretsresponse) (`GET /v1/secrets`) |
 | `kronik secret delete` | [`SecretDeleteResponse`](#secretdeleteresponse) (`DELETE /v1/secrets/{name}`) |
+| `kronik keys status` | [`KeyStatus`](#keystatus) (`GET /v1/keys`) |
+| `kronik keys rewrap` | [`KeysChangeResponse`](#keyschangeresponse) (`POST /v1/keys/rewrap`) |
+| `kronik keys wrap` | [`KeysChangeResponse`](#keyschangeresponse), from the CLI itself |
 | `kronik fork create` | [`ForkCreateResponse`](#forkcreateresponse) (`POST /v1/forks`) |
 | `kronik fork list` | [`ForksResponse`](#forksresponse) (`GET /v1/forks`) |
 | `kronik fork deploy` | [`ForkDeployResponse`](#forkdeployresponse) (`POST /v1/forks/{name}/deployments`) |
@@ -2652,6 +2655,8 @@ against both.
             "IMPORT_NOT_ALLOWED",
             "INTERNAL",
             "KEYSTORE_INCOMPLETE",
+            "KEY_PROTECTION_UNAVAILABLE",
+            "KEY_SOURCE_UNAVAILABLE",
             "KVM_UNAVAILABLE",
             "MASTER_KEY_MISMATCH",
             "MASTER_KEY_MISSING",
@@ -3688,6 +3693,58 @@ against both.
     "kind",
     "action",
     "record_hash"
+  ],
+  "type": "object"
+}
+```
+
+### KeyStatus
+
+```json
+{
+  "properties": {
+    "check_ok": {
+      "type": "boolean"
+    },
+    "key": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "key_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "source",
+    "check_ok"
+  ],
+  "type": "object"
+}
+```
+
+### KeysChangeResponse
+
+```json
+{
+  "properties": {
+    "dry_run": {
+      "type": "boolean"
+    },
+    "keys": {
+      "$ref": "#/components/schemas/KeyStatus"
+    }
+  },
+  "required": [
+    "dry_run",
+    "keys"
   ],
   "type": "object"
 }

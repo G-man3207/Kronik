@@ -56,6 +56,8 @@ pub struct NodeParts {
     /// (docs/design/m8-privacy.md); `None` runs without a keystore: nothing
     /// is sealed and `privacy status` has no keystore counts.
     pub sealer: Option<Arc<Sealer>>,
+    pub key_source: Option<Arc<kronik_privacy::key_source::KeySource>>,
+    pub ownership: Option<std::fs::File>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +76,8 @@ pub enum StartError {
     /// than theirs (`MASTER_KEY_MISSING`, `MASTER_KEY_MISMATCH`).
     #[error(transparent)]
     Key(kronik_privacy::PrivacyError),
+    #[error(transparent)]
+    KeySource(kronik_privacy::key_source::KeySourceError),
     /// An erasure's record could not be committed at start
     /// ([`Node::recover_erasures`]).
     #[error("erasure recovery: {0}")]
@@ -287,6 +291,8 @@ pub struct Node {
     disk_free: AtomicU64,
     config: Mutex<ConfigHistory>,
     pub(crate) secrets: Option<Arc<SecretStore>>,
+    key_source: Option<Arc<kronik_privacy::key_source::KeySource>>,
+    _ownership: Option<std::fs::File>,
     /// Follows the latest `PrivacyMode` record (set at start and by
     /// `set_privacy_mode`).
     pub(crate) sealer: Arc<Sealer>,
@@ -492,6 +498,8 @@ impl Node {
             code,
             secrets,
             sealer,
+            key_source,
+            ownership,
         } = parts;
         let sealer = sealer.unwrap_or_else(|| Arc::new(Sealer::plain()));
         // The store opens sealed SQL changesets while it replays the log
@@ -638,6 +646,8 @@ impl Node {
             disk_free: AtomicU64::new(disk_free),
             config: Mutex::new(history),
             secrets,
+            key_source,
+            _ownership: ownership,
             sealer: sealer.clone(),
             rates: RateLimiter::starting_full(env.clock.monotonic()),
             wheel: Mutex::new(Wheel::default()),
@@ -793,6 +803,10 @@ impl Node {
     /// The secret store, when a master key is configured.
     pub fn secrets(&self) -> Option<&Arc<SecretStore>> {
         self.secrets.as_ref()
+    }
+    /// The already-loaded master key; consumers must not reopen a KMS.
+    pub fn key_source(&self) -> Option<&Arc<kronik_privacy::key_source::KeySource>> {
+        self.key_source.as_ref()
     }
 
     pub fn reader(&self) -> &LogReader {

@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use kronik_core::env::Env;
 use kronik_core::ids::Lsn;
+use kronik_privacy::key_source::{KeySource, KeySourceError, Keys, Wrapped};
 use kronik_sched::snapshots::{self, Manifest};
 use object_store::path::Path as Key;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -35,6 +36,8 @@ pub enum ShipError {
     /// backup's.
     #[error(transparent)]
     Key(kronik_privacy::PrivacyError),
+    #[error(transparent)]
+    KeySource(#[from] KeySourceError),
     /// A sealed value in the restored data has no key in the keystore the
     /// bucket can provide.
     #[error("KEYSTORE_INCOMPLETE: {0}")]
@@ -52,6 +55,7 @@ impl ShipError {
             ShipError::Io(_) => "io",
             ShipError::Restore(_) => "restore",
             ShipError::Key(_) => "master_key",
+            ShipError::KeySource(_) => "key_source",
             ShipError::KeystoreIncomplete(_) => "keystore_incomplete",
             ShipError::Store(e) => match e {
                 E::NotFound { .. } => "s3_not_found",
@@ -191,6 +195,9 @@ pub struct ShipState {
     /// mtime/size stamp of `keys/keystore.db` at that backup.
     #[serde(default)]
     pub keystore_stamp: Option<u64>,
+    /// Digest of independently published wrapped ciphertext (rewraps too).
+    #[serde(default)]
+    pub wrapped_hash: Option<String>,
 }
 
 impl ShipState {
@@ -365,6 +372,8 @@ fn keystore_stamp(path: &Path) -> Option<u64> {
 /// Uploads `keystore/<wall_ms>.bin` (the export bytes, not zstd) and deletes
 /// backups older than `retention`. The newest is always kept. The master
 /// key is never uploaded.
+// Keep the loaded source and keystore explicit; no per-backup key loader.
+#[allow(clippy::too_many_arguments)]
 pub async fn ship_keystore(
     remote: &Remote,
     data: &Path,
@@ -372,9 +381,21 @@ pub async fn ship_keystore(
     wall_ms: u64,
     retention: Duration,
     nonce: [u8; 24],
-    key_path: &Path,
+    source: &KeySource,
+    keystore: &kronik_privacy::keystore::Keystore,
 ) -> Result<ShipReport, ShipError> {
     let mut report = ShipReport::default();
+    let wrapped = source.wrapped_bytes()?;
+    if let Some(bytes) = &wrapped {
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        if state.wrapped_hash.as_deref() != Some(&hash) {
+            remote.put("wrapped/current.wrapped", bytes.clone()).await?;
+            state.wrapped_hash = Some(hash);
+            state.save(data)?;
+            report.objects += 1;
+            report.bytes += bytes.len() as u64;
+        }
+    }
     let path = data.join("keys").join("keystore.db");
     let stamp = keystore_stamp(&path);
     let since = state.keystore_backup_ms.map(|t| wall_ms.saturating_sub(t));
@@ -382,16 +403,20 @@ pub async fn ship_keystore(
     let interval_ok = since.is_none_or(|s| s >= KEYSTORE_BACKUP_MIN_INTERVAL.as_millis() as u64);
     let daily_due = since.is_some_and(|s| s >= KEYSTORE_BACKUP_DAILY.as_millis() as u64);
     if stamp.is_some() && ((changed && interval_ok) || daily_due) {
-        // The daemon's own key, wherever it is configured (never shipped).
-        let (master, _) = kronik_privacy::MasterKey::open(key_path, &data.join("keys"), None)
-            .map_err(|e| ShipError::Config(e.to_string()))?;
-        let ks = kronik_privacy::keystore::Keystore::open_file(&path, &master)
-            .map_err(|e| ShipError::Config(e.to_string()))?;
-        let blob = ks
+        let blob = keystore
             .export_backup(nonce)
             .map_err(|e| ShipError::Config(e.to_string()))?;
         report.bytes += blob.len() as u64;
         report.objects += 1;
+        // The .bin commits its pair: an interrupted wrapper upload cannot
+        // publish a backup without the ciphertext needed to open it.
+        if let Some(bytes) = &wrapped {
+            remote
+                .put(&format!("keystore/{wall_ms}.wrapped"), bytes.clone())
+                .await?;
+            report.objects += 1;
+            report.bytes += bytes.len() as u64;
+        }
         remote.put(&format!("keystore/{wall_ms}.bin"), blob).await?;
         state.keystore_backup_ms = Some(wall_ms);
         state.keystore_stamp = stamp;
@@ -417,6 +442,9 @@ pub async fn ship_keystore(
     for w in walls {
         if w < cutoff && w != newest {
             remote.delete(&format!("keystore/{w}.bin")).await?;
+            if wrapped.is_some() {
+                remote.delete(&format!("keystore/{w}.wrapped")).await?;
+            }
             report.deleted += 1;
         }
     }
@@ -431,7 +459,8 @@ pub async fn ship_loop(
     data: PathBuf,
     branch: String,
     interval: Duration,
-    key_path: PathBuf,
+    source: Arc<KeySource>,
+    keystore: Arc<kronik_privacy::keystore::Keystore>,
 ) {
     let mut state = ShipState::load(&data);
     loop {
@@ -457,7 +486,8 @@ pub async fn ship_loop(
             env.clock.wall_ms(),
             retention,
             nonce,
-            &key_path,
+            &source,
+            &keystore,
         )
         .await
         {
@@ -520,10 +550,11 @@ pub async fn restore(
     data: &Path,
     branch: &str,
     force: bool,
-    key_path: &Path,
+    env: &Env,
+    keys: &Keys,
     mode: KeystoreMode,
 ) -> Result<RestoreReport, ShipError> {
-    restore_with_fault(remote, data, branch, force, key_path, mode, &|_| Ok(())).await
+    restore_with_fault(remote, data, branch, force, env, keys, mode, &|_| Ok(())).await
 }
 
 /// The file a restore leaves in the branch directory, with the last LSN of
@@ -536,16 +567,28 @@ pub const RESTORE_MARKER: &str = "restored.json";
 /// [`restore`] that calls `fault` before each step of moving the staged
 /// restore into place, and once after (`committed`), so tests can
 /// interrupt it there.
+// The normal restore parameters plus one deterministic fault-injection seam.
+#[allow(clippy::too_many_arguments)]
 #[doc(hidden)]
 pub async fn restore_with_fault(
     remote: &Remote,
     data: &Path,
     branch: &str,
     force: bool,
-    key_path: &Path,
+    env: &Env,
+    keys: &Keys,
     mode: KeystoreMode,
     fault: &dyn Fn(&str) -> std::io::Result<()>,
 ) -> Result<RestoreReport, ShipError> {
+    // The directories this restore may create, innermost first: a refusal
+    // removes them again, so "nothing was written" holds for a destination
+    // that did not exist.
+    let created: Vec<PathBuf> = std::iter::once(data.join("keys"))
+        .chain(data.ancestors().map(Path::to_path_buf))
+        .take_while(|d| !d.exists())
+        .collect();
+    std::fs::create_dir_all(data)?;
+    let _ownership = kronik_privacy::key_source::lock_data(data)?;
     let branch_dir = data.join("branches").join(branch);
     if branch_dir.join("state.db").exists() && !force {
         return Err(ShipError::Restore(format!(
@@ -560,14 +603,7 @@ pub async fn restore_with_fault(
     if stage.exists() {
         std::fs::remove_dir_all(&stage)?;
     }
-    // The directories this restore may create, innermost first: a refusal
-    // removes them again, so "nothing was written" holds for a destination
-    // that did not exist.
-    let created: Vec<PathBuf> = std::iter::once(data.join("keys"))
-        .chain(data.ancestors().map(Path::to_path_buf))
-        .take_while(|d| !d.exists())
-        .collect();
-    let staged = stage_restore(remote, data, &stage, branch, key_path, mode).await;
+    let staged = stage_restore(remote, data, &stage, branch, env, keys, mode).await;
     let result = match staged {
         Ok(s) => install_staged(data, &stage, branch, &branch_dir, s, fault),
         Err(e) => {
@@ -595,6 +631,7 @@ struct Staged {
     older: Option<Manifest>,
     /// The last LSN of the staged log (the snapshot's without a segment).
     through_lsn: Lsn,
+    wrapped_path: Option<PathBuf>,
 }
 
 async fn stage_restore(
@@ -602,7 +639,8 @@ async fn stage_restore(
     data: &Path,
     stage: &Path,
     branch: &str,
-    key_path: &Path,
+    env: &Env,
+    keys: &Keys,
     mode: KeystoreMode,
 ) -> Result<Staged, ShipError> {
     // 1. The newest complete remote snapshot.
@@ -627,10 +665,85 @@ async fn stage_restore(
     let m = newest.ok_or_else(|| ShipError::Restore("no snapshot in the bucket".into()))?;
     // The keystore backup is checked before anything is downloaded, so a
     // missing or wrong key fails fast (m8-privacy §10).
+    let mut wrapped = None;
+    let mut master = if keys.source.is_kms() {
+        let bytes = match remote.get("wrapped/current.wrapped").await {
+            Ok(bytes) => bytes,
+            Err(ShipError::Store(object_store::Error::NotFound { .. })) => {
+                let (backups, _) = remote.list("keystore").await?;
+                let wall = backups
+                    .iter()
+                    .filter_map(|n| n.strip_suffix(".bin")?.parse::<u64>().ok())
+                    .max()
+                    .ok_or_else(|| {
+                        ShipError::Restore("no wrapped master key in the bucket".into())
+                    })?;
+                remote.get(&format!("keystore/{wall}.wrapped")).await?
+            }
+            Err(e) => return Err(e),
+        };
+        Wrapped::parse(&bytes, keys)?;
+        let master = kronik_privacy::key_source::unwrap_envelope(env, keys, &bytes).await?;
+        kronik_privacy::key_source::validate_staged_stores(&master, &data.join("keys"))?;
+        // On a forced restore the target's envelope is never silently replaced
+        // with a different seed, even when both use the configured provider.
+        let target = keys.envelope_path(data)?;
+        if target.exists() {
+            let old = kronik_privacy::key_source::read_envelope(&target)?;
+            let old = kronik_privacy::key_source::unwrap_envelope(env, keys, &old).await?;
+            if !master.same_key(&old) {
+                return Err(ShipError::Key(kronik_privacy::PrivacyError::KeyMismatch(
+                    "the restored envelope differs from the destination's master key".into(),
+                )));
+            }
+        }
+        wrapped = Some((target, bytes));
+        Some(master)
+    } else if mode != KeystoreMode::Without {
+        let (backups, _) = remote.list("keystore").await?;
+        if backups.iter().any(|n| {
+            n.strip_suffix(".bin")
+                .is_some_and(|n| n.parse::<u64>().is_ok())
+        }) {
+            Some(
+                KeySource::load(env.clone(), keys.clone(), data, false)
+                    .await?
+                    .master()
+                    .clone(),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let keystore =
-        check_keystore_backup(remote, data, key_path, mode == KeystoreMode::Without).await?;
+        check_keystore_backup(remote, master.as_ref(), mode == KeystoreMode::Without).await?;
     let snap = stage.join("snapshot");
     download_snapshot(remote, &snap, branch, &m).await?;
+    if master.is_none() && mode != KeystoreMode::Without && snap.join("secrets.db").exists() {
+        master = Some(
+            KeySource::load(env.clone(), keys.clone(), data, false)
+                .await?
+                .master()
+                .clone(),
+        );
+    }
+    // Validate the snapshot's encrypted secret store before touching the target.
+    if let Some(master) = &master {
+        master.validate_stores(&snap).map_err(ShipError::Key)?;
+    }
+    let wrapped_path = if let Some((path, bytes)) = wrapped {
+        kronik_privacy::key_source::write_envelope(
+            env,
+            &stage.join("master.wrapped"),
+            &bytes,
+            true,
+        )?;
+        Some(path)
+    } else {
+        None
+    };
     // 2. Every remote segment, and the subject keys its sealed values need.
     let mut needed = kronik_store::db::SubjectKeys::new();
     let mut erasures: Vec<(String, u32, u64)> = Vec::new();
@@ -783,6 +896,7 @@ async fn stage_restore(
         keys_missing,
         older,
         through_lsn,
+        wrapped_path,
     })
 }
 
@@ -881,6 +995,12 @@ fn install_staged(
             }
         }
         tracing::info!(wall = ?s.keystore_backup_ms, "restore: installed a keystore backup");
+    }
+    if let Some(path) = &s.wrapped_path {
+        replace_file(&stage.join("master.wrapped"), path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
     }
     if !s.keys_missing.is_empty() {
         tracing::warn!(
@@ -989,8 +1109,7 @@ struct KeystoreBackup {
 /// unreadable). Otherwise the status: `none_in_bucket` or `skipped`.
 async fn check_keystore_backup(
     remote: &Remote,
-    data: &Path,
-    key_path: &Path,
+    master: Option<&kronik_privacy::MasterKey>,
     without: bool,
 ) -> Result<Result<KeystoreBackup, &'static str>, ShipError> {
     let (names, _) = match remote.list("keystore").await {
@@ -1018,11 +1137,18 @@ async fn check_keystore_backup(
         );
         return Ok(Err("skipped"));
     }
-    let (master, _) = kronik_privacy::MasterKey::open(key_path, &data.join("keys"), None)
-        .map_err(ShipError::Key)?;
+    let master = master.ok_or_else(|| {
+        ShipError::Key(kronik_privacy::PrivacyError::KeyMissing(
+            "the keystore backup needs a configured master key".into(),
+        ))
+    })?;
     let blob = remote.get(&format!("keystore/{wall}.bin")).await?;
-    match kronik_privacy::keystore::Keystore::read_backup(&master, &blob) {
-        Ok(_) => Ok(Ok(KeystoreBackup { wall, blob, master })),
+    match kronik_privacy::keystore::Keystore::read_backup(master, &blob) {
+        Ok(_) => Ok(Ok(KeystoreBackup {
+            wall,
+            blob,
+            master: master.clone(),
+        })),
         Err(kronik_privacy::PrivacyError::Decrypt(_)) => Err(ShipError::Key(
             kronik_privacy::PrivacyError::KeyMismatch(format!(
                 "the keystore backup {wall} does not decrypt with this master key \

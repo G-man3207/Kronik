@@ -137,15 +137,13 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
             format!("--branch {:?} is not a branch name", args.branch),
         ));
     }
-    let data =
-        config::resolve_data_dir(args.config.as_deref(), args.data_dir.clone()).map_err(|e| {
-            ApiError::new(
-                ErrorCode::BadRequest,
-                format!("the configuration file is invalid: {e}"),
-            )
-            .with_hint("Fix the file, or pass --data-dir <dir>.")
-        })?;
-    let key_path = master_key_path(args.config.as_deref(), args.master_key_file.clone(), &data)?;
+    let (configuration, selected_config) =
+        key_config(args.config.as_deref(), args.master_key_file.clone())?;
+    let data = args
+        .data_dir
+        .clone()
+        .unwrap_or(configuration.server.data_dir);
+    let keys = configuration.keys;
     // The same refusal `restore` makes, before anything is opened, so a dry
     // run and a real run fail the same way and neither writes.
     let state = data.join("branches").join(&args.branch).join("state.db");
@@ -158,9 +156,8 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
             ),
         )
         .with_hint(format!(
-            "Restore into an empty directory, or replace this one with `kronik restore --from {} --data-dir {} --force`.",
-            shell_quote(&args.from),
-            shell_quote(&data.display().to_string())
+            "Restore into an empty directory, or replace this one with `{}`.",
+            rerun(&args, selected_config.as_deref(), &data, true)
         )));
     }
     let rt = runtime()?;
@@ -185,7 +182,8 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
             return Ok(None);
         }
         // The install writes the restore marker before its commit step.
-        let report = kronik_ship::restore(&remote, &data, &branch, force, &key_path, mode)
+        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+        let report = kronik_ship::restore(&remote, &data, &branch, force, &env, &keys, mode)
             .await
             .map_err(ship_error)?;
         Ok::<_, ApiError>(Some(report))
@@ -209,18 +207,20 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
             .unwrap_or_default(),
     };
     Ok((
-        render(&output, &from, endpoint.as_deref(), &data, force),
+        render(&output, &args, &data, selected_config.as_deref()),
         output,
     ))
 }
 
 fn render(
     o: &RestoreOutput,
-    from: &str,
-    endpoint: Option<&str>,
+    args: &RestoreArgs,
     data: &Path,
-    force: bool,
+    config_path: Option<&Path>,
 ) -> String {
+    let from = &o.from;
+    let endpoint = o.endpoint.as_deref();
+    let force = args.force;
     let dir = shell_quote(&data.display().to_string());
     let mut out = String::new();
     if o.dry_run {
@@ -249,7 +249,7 @@ fn render(
             out,
             "Restore does not write a log record, so it takes no --reason."
         );
-        out.push_str(&next(&[rerun(from, endpoint, &dir, force, false)]));
+        out.push_str(&next(&[rerun(args, config_path, data, force)]));
         return out;
     }
     let _ = writeln!(
@@ -303,23 +303,59 @@ fn render(
             "",
         );
     }
-    out.push_str(&next(&[format!("kronik serve --data-dir {dir}")]));
+    let mut command = format!("kronik serve --data-dir {dir}");
+    if let Some(path) = config_path {
+        let _ = write!(
+            command,
+            " --config {}",
+            shell_quote(&path.display().to_string())
+        );
+    }
+    if let Some(path) = &args.master_key_file {
+        let _ = write!(
+            command,
+            " --master-key-file {}",
+            shell_quote(&path.display().to_string())
+        );
+    }
+    out.push_str(&next(&[command]));
     out
 }
 
-fn rerun(from: &str, endpoint: Option<&str>, dir: &str, force: bool, dry_run: bool) -> String {
+fn rerun(args: &RestoreArgs, config_path: Option<&Path>, data: &Path, force: bool) -> String {
     let mut cmd = format!(
-        "kronik restore --from {} --data-dir {dir}",
-        shell_quote(from)
+        "kronik restore --from {} --data-dir {}",
+        shell_quote(&args.from),
+        shell_quote(&data.display().to_string())
     );
-    if let Some(endpoint) = endpoint {
+    if let Some(endpoint) = &args.endpoint {
         let _ = write!(cmd, " --endpoint {}", shell_quote(endpoint));
+    }
+    if let Some(path) = config_path {
+        let _ = write!(
+            cmd,
+            " --config {}",
+            shell_quote(&path.display().to_string())
+        );
+    }
+    if let Some(path) = &args.master_key_file {
+        let _ = write!(
+            cmd,
+            " --master-key-file {}",
+            shell_quote(&path.display().to_string())
+        );
+    }
+    if args.branch != "main" {
+        let _ = write!(cmd, " --branch {}", shell_quote(&args.branch));
+    }
+    if args.without_keystore {
+        cmd.push_str(" --without-keystore");
+    }
+    if args.allow_missing_keys {
+        cmd.push_str(" --allow-missing-keys");
     }
     if force {
         cmd.push_str(" --force");
-    }
-    if dry_run {
-        cmd.push_str(" --dry-run");
     }
     cmd
 }
@@ -337,35 +373,27 @@ pub(crate) fn runtime() -> Result<tokio::runtime::Runtime, ApiError> {
         })
 }
 
-/// The master key file `kronik serve` will use on `data`: `flag`
-/// (--master-key-file, KRONIK_MASTER_KEY_FILE), else `[keys]
-/// master_key_file` in the configuration file, else
-/// `<data>/keys/master.key`. `KRONIK_MASTER_KEY` together with a file is
-/// refused, as by serve.
-pub(crate) fn master_key_path(
+/// Source configuration shared by restore, upgrade and the daemon.
+pub(crate) fn key_config(
     config: Option<&Path>,
     flag: Option<PathBuf>,
-    data: &Path,
-) -> Result<PathBuf, ApiError> {
-    let configured = match flag {
-        Some(path) => Some(path),
-        None => config::Config::find(config)
-            .ok()
-            .and_then(|(c, _)| c.keys.master_key_file),
-    };
-    if configured.is_some() && std::env::var_os(kronik_privacy::MASTER_KEY_ENV).is_some() {
-        return Err(ApiError::new(
+) -> Result<(config::Config, Option<PathBuf>), ApiError> {
+    let (mut config, path) = config::Config::find(config).map_err(|e| {
+        ApiError::new(
             ErrorCode::BadRequest,
-            "KRONIK_MASTER_KEY and a master key file (--master-key-file, \
-             KRONIK_MASTER_KEY_FILE or [keys] master_key_file) are both set",
+            format!("the configuration file is invalid: {e}"),
         )
-        .with_hint("Remove one of them, as for `kronik serve`."));
+    })?;
+    if let Some(path) = flag {
+        config.keys.master_key_file = Some(path);
     }
-    Ok(configured.unwrap_or_else(|| data.join("keys").join("master.key")))
+    config.keys.check_environment().map_err(|e| e.api_error())?;
+    Ok((config, path))
 }
 
 fn ship_error(e: ShipError) -> ApiError {
     match e {
+        ShipError::KeySource(e) => e.api_error(),
         ShipError::Config(m) => ApiError::new(ErrorCode::BadRequest, format!("ship: {m}")),
         ShipError::Restore(m) if m.contains("already holds state") => {
             ApiError::new(ErrorCode::BadRequest, format!("restore: {m}"))
@@ -397,6 +425,9 @@ fn ship_error(e: ShipError) -> ApiError {
             ApiError::new(ErrorCode::MasterKeyMismatch, format!("restore: {e}")).with_hint(
                 "Use the key the shipping node ran with, and restore again; nothing was written.",
             )
+        }
+        ShipError::Key(e @ kronik_privacy::PrivacyError::KeyProtection) => {
+            kronik_privacy::key_source::KeySourceError::Key(e).api_error()
         }
         ShipError::Key(e) => ApiError::new(ErrorCode::BadRequest, format!("restore: {e}")),
         ShipError::KeystoreIncomplete(m) => ApiError::new(

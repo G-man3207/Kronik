@@ -456,6 +456,20 @@ pub struct SecretDeleteResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct KeysRewrapRequest {
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct KeysChangeResponse {
+    pub dry_run: bool,
+    pub keys: kronik_privacy::key_source::KeyStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Compensation {
     pub message_id: String,
     /// pending, dead_letter or done.

@@ -171,8 +171,13 @@ fn the_check_opens_sealed_values_with_the_directorys_keystore() {
     };
     let err = check(None).err().unwrap();
     assert!(err.contains("KEYSTORE_INCOMPLETE"), "{err}");
-    let key = dir.path().join("keys/master.key");
-    let sealer = kronik_sched::offline_sealer(dir.path(), &key).unwrap();
+    let sealer = rt
+        .block_on(kronik_sched::offline_sealer(
+            Env::real(rt.handle().clone()),
+            dir.path(),
+            Default::default(),
+        ))
+        .unwrap();
     assert!(sealer.is_some());
     let checked = check(sealer).unwrap();
     assert!(

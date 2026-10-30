@@ -2180,6 +2180,8 @@
                   "IMPORT_NOT_ALLOWED",
                   "INTERNAL",
                   "KEYSTORE_INCOMPLETE",
+                  "KEY_PROTECTION_UNAVAILABLE",
+                  "KEY_SOURCE_UNAVAILABLE",
                   "KVM_UNAVAILABLE",
                   "MASTER_KEY_MISMATCH",
                   "MASTER_KEY_MISSING",
@@ -3304,6 +3306,61 @@
           "log_first_lsn",
           "log_hash"
         ],
+        "type": "object"
+      },
+      "KeyStatus": {
+        "properties": {
+          "check_ok": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "check_ok"
+        ],
+        "type": "object"
+      },
+      "KeysChangeResponse": {
+        "properties": {
+          "dry_run": {
+            "type": "boolean"
+          },
+          "keys": {
+            "$ref": "#/components/schemas/KeyStatus"
+          }
+        },
+        "required": [
+          "dry_run",
+          "keys"
+        ],
+        "type": "object"
+      },
+      "KeysRewrapRequest": {
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "reason": {
+            "default": "",
+            "type": "string"
+          }
+        },
         "type": "object"
       },
       "KeystoreCounts": {
@@ -8370,6 +8427,74 @@
         },
         "summary": "The applied LSN, the state hash and a hash of the log, to compare after a restore",
         "x-kronik-scope": "read"
+      }
+    },
+    "/v1/keys": {
+      "get": {
+        "operationId": "get_v1_keys",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyStatus"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "summary": "The master key source and provider version, never key material",
+        "x-kronik-scope": "read"
+      }
+    },
+    "/v1/keys/rewrap": {
+      "post": {
+        "operationId": "post_v1_keys_rewrap",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeysRewrapRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeysChangeResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "summary": "Wrap the current master seed under the provider's current key version",
+        "x-kronik-scope": "admin"
       }
     },
     "/v1/limits": {

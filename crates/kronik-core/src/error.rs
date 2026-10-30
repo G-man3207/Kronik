@@ -170,15 +170,21 @@ codes! {
     KeystoreIncomplete = "KEYSTORE_INCOMPLETE", 409, "M8",
         "A sealed value's subject key is not in the keystore",
         "Let the source ship its keystore again and restore again; if it is gone, `kronik restore --allow-missing-keys` keeps every other subject readable.";
+    KeyProtectionUnavailable = "KEY_PROTECTION_UNAVAILABLE", 503, "M23",
+        "The operating system could not protect the key's memory",
+        "Check RLIMIT_MEMLOCK and available memory; key loading fails closed rather than keeping an unlocked key.";
+    KeySourceUnavailable = "KEY_SOURCE_UNAVAILABLE", 503, "M23",
+        "The configured KMS key source is unavailable",
+        "Check the KMS endpoint, credentials, key version and start_timeout; Kronik never creates a fallback master key.";
     KvmUnavailable = "KVM_UNAVAILABLE", 503, "M7",
         "KVM is not available on this host",
         "Set `platform = \"auto\"` or `\"systrap\"` under `[foreign]`, or enable `/dev/kvm`.";
     MasterKeyMismatch = "MASTER_KEY_MISMATCH", 409, "M2",
-        "The master key is not the key the stores were encrypted under",
-        "Start with the data directory's own master key: the file it was created with, or its KRONIK_MASTER_KEY.";
+        "The master key or wrapped source does not match this data directory",
+        "For file/env, use the original key file or KRONIK_MASTER_KEY. For KMS, restore matching master.wrapped and [keys] source/provider key; KMS never falls back to an env or raw-file seed.";
     MasterKeyMissing = "MASTER_KEY_MISSING", 409, "M2",
         "The master key is missing, and the data directory holds encrypted stores",
-        "Put the key back where [keys] master_key_file points, or set KRONIK_MASTER_KEY; Kronik does not make a new key over existing stores.";
+        "For file/env, restore the original key file or KRONIK_MASTER_KEY. For KMS, restore matching master.wrapped and [keys] source/provider key; never substitute env/raw material or generate a replacement seed.";
     NothingToPropose = "NOTHING_TO_PROPOSE", 409, "M10",
         "Main already runs every component of the proposal",
         "Nothing changed: main already runs this code. Change a component and build it again.";
@@ -523,8 +529,8 @@ mod tests {
 
     #[test]
     fn every_code_has_a_status_milestone_title_hint_and_explanation() {
-        const MILESTONES: [&str; 12] = [
-            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M28",
+        const MILESTONES: [&str; 13] = [
+            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M23", "M28",
         ];
         for &code in ErrorCode::ALL {
             assert!((400..600).contains(&code.http_status()), "{code}");

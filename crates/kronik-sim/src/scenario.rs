@@ -408,6 +408,8 @@ impl World {
             code: self.code.clone(),
             secrets: self.secrets.clone(),
             sealer: None,
+            key_source: None,
+            ownership: None,
         };
         let node = match Node::start(parts).await {
             Ok(n) => n,
@@ -1284,7 +1286,8 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
         .map(|fx| SimService::new(clock.clone(), SimRng::new(seed, b"service"), fx.faults));
     let secrets = match cfg.effects.filter(|fx| fx.webhook).map(|_| {
         let conn = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
-        kronik_privacy::SecretStore::open(conn, &kronik_privacy::MasterKey::from_bytes([7; 32]))
+        let master = kronik_privacy::MasterKey::from_bytes([7; 32]).map_err(|e| e.to_string())?;
+        kronik_privacy::SecretStore::open(conn, &master)
             .map(Arc::new)
             .map_err(|e| e.to_string())
     }) {

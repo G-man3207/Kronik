@@ -10,6 +10,7 @@ mod export;
 mod foreign;
 mod fork;
 pub(crate) mod http;
+mod keys;
 mod preview;
 mod privacy;
 mod render;
@@ -127,6 +128,9 @@ pub enum Command {
     /// shown.
     #[command(subcommand)]
     Secret(SecretCommand),
+    /// Show the key source, migrate a seed to a KMS, or rewrap it.
+    #[command(subcommand)]
+    Keys(keys::KeysCommand),
     /// Create, list, deploy to or delete forks: branches of the history.
     #[command(subcommand)]
     Fork(fork::ForkCommand),
@@ -462,6 +466,11 @@ pub enum SecretCommand {
 /// Runs a client command and returns the process exit code: 0 on success,
 /// 1 on an error or a failed turn.
 pub fn run(command: Command, global: &Global) -> ExitCode {
+    if matches!(&command, Command::Keys(keys::KeysCommand::Wrap(_)))
+        && let Some(exit) = global.refuse_remote("keys wrap")
+    {
+        return exit;
+    }
     let endpoint = client_endpoint(global);
     let ctx = Ctx {
         url_flag: global
@@ -498,6 +507,7 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
         Command::Secret(SecretCommand::Delete { name, mutation }) => {
             secret_delete(&ctx, &name, mutation)
         }
+        Command::Keys(c) => keys::keys(&ctx, c),
         Command::Fork(c) => fork::fork(&ctx, c),
         Command::Replay(a) => fork::replay(&ctx, a),
         Command::Diff(c) => fork::diff(&ctx, c),

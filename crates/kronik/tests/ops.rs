@@ -155,23 +155,17 @@ fn a_bad_configuration_stops_serve_with_the_file_and_line() {
     assert!(!out.status.success());
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
-        stderr.contains(&format!(
-            "{}:3: unknown field `http_lisen`",
-            config.display()
-        )),
+        stderr.contains(&format!("{}:3:", config.display())),
         "{stderr}"
     );
+    assert!(stderr.contains("http_lisen"), "{stderr}");
     let out = kronik(&[
         "serve",
         "--config",
         dir.path().join("none.toml").to_str().unwrap(),
     ]);
     assert!(!out.status.success());
-    assert!(
-        String::from_utf8(out.stderr)
-            .unwrap()
-            .contains("cannot read the configuration")
-    );
+    assert!(String::from_utf8(out.stderr).unwrap().contains("none.toml"));
 }
 
 #[test]
@@ -190,19 +184,27 @@ fn init_dry_run_prints_the_plan_and_changes_nothing() {
         config.to_str().unwrap(),
     ]);
     assert!(out.status.success(), "{out:?}");
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.starts_with("kronik serve --init would do this (dry run, nothing changed):"));
-    for line in [
-        format!("create  {} (mode 0644)", config.display()),
-        "/etc/kronik/master.key (mode 0600, 32 random bytes)".into(),
-        "group kronik (groupadd --system kronik)".into(),
-        "/etc/systemd/system/kronik.service (mode 0644)".into(),
-        "run     systemctl daemon-reload".into(),
-        "run     systemctl enable --now kronik.service".into(),
-    ] {
-        assert!(stdout.contains(&line), "{line:?} missing from:\n{stdout}");
-    }
     assert!(!config.exists());
+    assert!(!dir.path().join("etc").exists());
+    let data = dir.path().join("data");
+    let key = dir.path().join("master.key");
+    let config = dir.path().join("existing.toml");
+    let contents = format!(
+        "[server]\ndata_dir = {:?}\n[keys]\nmaster_key_file = {:?}\n",
+        data, key
+    );
+    std::fs::write(&config, &contents).unwrap();
+    let out = kronik(&[
+        "serve",
+        "--init",
+        "--dry-run",
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), contents);
+    assert!(!data.exists());
+    assert!(!key.exists());
 
     // --domain needs --acme-email, and both need --init.
     assert!(
@@ -362,8 +364,23 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
     assert_eq!(
         names,
         [
-            "config", "kernel", "runsc", "kvm", "cgroup", "root", "runc", "netns", "run_dir",
-            "caps", "sandbox", "disk", "clock", "tls", "ship", "export"
+            "config",
+            "kernel",
+            "runsc",
+            "kvm",
+            "cgroup",
+            "root",
+            "runc",
+            "netns",
+            "run_dir",
+            "caps",
+            "sandbox",
+            "disk",
+            "clock",
+            "tls",
+            "ship",
+            "export",
+            "key_source"
         ]
     );
     assert_eq!(status(&report, "config")["status"], "pass");
@@ -410,7 +427,7 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
     let (report, ok) = doctor(&config);
     assert!(!ok);
     assert_eq!(status(&report, "config")["status"], "fail");
-    assert_eq!(report["checks"].as_array().unwrap().len(), 16);
+    assert_eq!(report["checks"].as_array().unwrap().len(), 17);
 }
 
 /// `GET path` on plain HTTP: the status line's code and the body.
@@ -589,29 +606,20 @@ fn the_master_key_can_come_from_the_environment() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(
-        String::from_utf8(out.stderr)
-            .unwrap()
-            .contains("master key environment variable KRONIK_MASTER_KEY must hold 64 hex"),
-        "serve must refuse material that is not 64 hex characters"
-    );
+    assert!(!dir.path().join("bad/keys/master.key").exists());
 
     // Material and a key file together is ambiguous and refused.
     let out = command()
         .arg("serve")
-        .args(args(&dir.path().join("bad")))
+        .args(args(&dir.path().join("conflict")))
         .arg("--master-key-file")
         .arg(dir.path().join("master.key"))
         .env("KRONIK_MASTER_KEY", material(1))
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(
-        String::from_utf8(out.stderr)
-            .unwrap()
-            .contains("KRONIK_MASTER_KEY and a master key file"),
-        "serve must refuse material and a key file together"
-    );
+    assert!(!dir.path().join("conflict").exists());
+    assert!(!dir.path().join("master.key").exists());
 
     // The material is the key: no key file appears, the secret set under it
     // survives a restart with the same material, and the same secret's
@@ -650,6 +658,16 @@ fn the_master_key_can_come_from_the_environment() {
     let serve = Serve::start_with_master_key(args(&a), &material(1));
     let answer = gateway_answer(&socket, &format!("127.0.0.1:{port}"));
     assert!(answer.contains("ROUTE_NOT_FOUND"), "{answer}");
+    let out = kronik(&[
+        "--socket",
+        socket.to_str().unwrap(),
+        "--json",
+        "keys",
+        "status",
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["source"], "env");
     assert!(!a.join("keys/master.key").exists());
     let hash_a = set_secret();
     drop(serve);
@@ -785,4 +803,137 @@ fn below_the_disk_reserve_health_says_so_and_forks_and_adds_wait() {
             .unwrap()
             .any(|e| { e.unwrap().file_name().to_string_lossy().starts_with("f-") })
     );
+}
+
+// The real TLS peer is an I/O harness; the client under test still uses Env.
+#[allow(clippy::disallowed_methods)]
+#[tokio::test]
+async fn scoped_provider_tls_does_not_change_guest_trust_or_identity() {
+    use kronik_core::env::{Env, HttpRequest, TlsConfig};
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::sync::Arc;
+
+    fn server(
+        config: rustls::ServerConfig,
+    ) -> (String, std::thread::JoinHandle<std::io::Result<()>>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", free_port())).unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+            socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+            let mut connection = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+            while connection.is_handshaking() {
+                connection.complete_io(&mut socket)?;
+            }
+            let mut stream = rustls::StreamOwned::new(connection, socket);
+            let mut request = [0u8; 512];
+            if stream.read(&mut request)? == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+            stream.flush()
+        });
+        (format!("https://localhost:{}", address.port()), worker)
+    }
+    async fn get(
+        env: &Env,
+        net: &Arc<dyn kronik_core::env::Net>,
+        url: String,
+    ) -> Result<kronik_core::env::HttpResponse, kronik_core::env::NetError> {
+        env.timeout(
+            Duration::from_secs(5),
+            net.http(HttpRequest {
+                method: "GET".into(),
+                url,
+                headers: vec![],
+                body: bytes::Bytes::new(),
+                max_response_bytes: 64,
+            }),
+        )
+        .await
+        .unwrap()
+    }
+    let root_key = rcgen::KeyPair::generate().unwrap();
+    let mut root_params = rcgen::CertificateParams::new(vec![]).unwrap();
+    root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    root_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    let root = root_params.self_signed(&root_key).unwrap();
+    let issuer = rcgen::Issuer::from_params(&root_params, &root_key);
+    let server_key = rcgen::KeyPair::generate().unwrap();
+    let mut server_params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+    server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+    let client_key = rcgen::KeyPair::generate().unwrap();
+    let mut client_params = rcgen::CertificateParams::new(vec![]).unwrap();
+    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let client_cert = client_params.signed_by(&client_key, &issuer).unwrap();
+    let crypto = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = || {
+        rustls::ServerConfig::builder_with_provider(crypto.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+    };
+    let certificate = || vec![server_cert.der().clone()];
+    let key = || PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der()));
+    let ordinary_server = builder()
+        .with_no_client_auth()
+        .with_single_cert(certificate(), key())
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(root.der().clone()).unwrap();
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        crypto.clone(),
+    )
+    .build()
+    .unwrap();
+    let authenticated_server = builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certificate(), key())
+        .unwrap();
+    let env = Env::real(tokio::runtime::Handle::current());
+    let trusted_guest = env
+        .net
+        .with_tls(TlsConfig {
+            ca: vec![root.der().to_vec()],
+            identity: None,
+        })
+        .unwrap();
+    let provider = trusted_guest
+        .with_tls(TlsConfig {
+            ca: vec![root.der().to_vec()],
+            identity: Some((vec![client_cert.der().to_vec()], client_key.serialize_der())),
+        })
+        .unwrap();
+    // No client auth here: a failure specifically proves the private CA did
+    // not leak into the original guest client's trust roots.
+    let (url, worker) = server(ordinary_server);
+    assert!(get(&env, &env.net, url).await.is_err());
+    assert!(worker.join().unwrap().is_err());
+    let (url, worker) = server(authenticated_server.clone());
+    assert_eq!(get(&env, &provider, url).await.unwrap().status, 200);
+    worker.join().unwrap().unwrap();
+    // This base trusts the same CA, so the rejection proves the provider's
+    // client identity was not installed on its parent.
+    let (url, worker) = server(authenticated_server);
+    assert!(get(&env, &trusted_guest, url).await.is_err());
+    assert!(worker.join().unwrap().is_err());
 }

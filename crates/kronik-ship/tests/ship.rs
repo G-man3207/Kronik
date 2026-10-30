@@ -160,7 +160,8 @@ fn ship_and_restore(remote: &Remote) {
             dst.path(),
             "main",
             false,
-            &dst.path().join("keys/master.key"),
+            &Env::real(rt.handle().clone()),
+            &Default::default(),
             KeystoreMode::Require,
         ))
         .unwrap();
@@ -174,7 +175,8 @@ fn ship_and_restore(remote: &Remote) {
             dst.path(),
             "main",
             false,
-            &dst.path().join("keys/master.key"),
+            &Env::real(rt.handle().clone()),
+            &Default::default(),
             KeystoreMode::Require,
         ))
         .unwrap_err();
@@ -218,7 +220,6 @@ fn an_interrupted_restore_leaves_a_consistent_directory() {
     let dst = tempdir("ship-int-dst-");
     std::fs::create_dir_all(dst.path().join("keys")).unwrap();
     std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
-    let key_path = dst.path().join("keys/master.key");
     let rt = rt();
     let run = |force: bool, at: Option<&'static str>| {
         rt.block_on(kronik_ship::restore_with_fault(
@@ -226,7 +227,8 @@ fn an_interrupted_restore_leaves_a_consistent_directory() {
             dst.path(),
             "main",
             force,
-            &key_path,
+            &Env::real(rt.handle().clone()),
+            &Default::default(),
             KeystoreMode::Require,
             &|step| match at {
                 Some(s) if s == step => Err(std::io::Error::other(format!("injected at {step}"))),

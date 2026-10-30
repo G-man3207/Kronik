@@ -5,7 +5,6 @@
 //! checks what is there first, so running it again changes nothing that is
 //! already right; `--dry-run` prints the plan and changes nothing (I12).
 
-use std::io::Read as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -57,7 +56,10 @@ enum Step {
         path: PathBuf,
         mode: u32,
     },
-    MasterKey(PathBuf),
+    MasterKey {
+        keys: Box<kronik_privacy::key_source::Keys>,
+        data: PathBuf,
+    },
     Group,
     Run(&'static [&'static str]),
 }
@@ -71,7 +73,23 @@ impl Step {
             | Step::Dir { path, mode } => {
                 format!("{} (mode {mode:04o})", path.display())
             }
-            Step::MasterKey(path) => format!("{} (mode 0600, 32 random bytes)", path.display()),
+            Step::MasterKey { keys, .. }
+                if keys.source == kronik_privacy::key_source::Source::Env
+                    || (keys.source == kronik_privacy::key_source::Source::File
+                        && std::env::var_os(kronik_privacy::MASTER_KEY_ENV).is_some()) =>
+            {
+                "env master key from KRONIK_MASTER_KEY (no key file)".into()
+            }
+            Step::MasterKey { keys, data } => format!(
+                "{} master key at {}",
+                keys.source.as_str(),
+                if keys.source.is_kms() {
+                    data.join(&keys.wrapped_file)
+                } else {
+                    keys.key_path(data)
+                }
+                .display(),
+            ),
             Step::Group => "group kronik (groupadd --system kronik)".into(),
             Step::Run(argv) => argv.join(" "),
         }
@@ -80,9 +98,8 @@ impl Step {
     /// `None` when the step has nothing to do, else the verb of the plan.
     fn needed(&self) -> anyhow::Result<Option<&'static str>> {
         Ok(match self {
-            Step::Create { path, .. } | Step::MasterKey(path) => {
-                (!path.exists()).then_some("create")
-            }
+            Step::Create { path, .. } => (!path.exists()).then_some("create"),
+            Step::MasterKey { .. } => Some("check"),
             Step::Dir { path, .. } => (!path.is_dir()).then_some("create"),
             Step::Install { path, contents, .. } => match std::fs::read_to_string(path) {
                 Ok(current) if current == *contents => None,
@@ -121,18 +138,35 @@ impl Step {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode))
                     .with_context(|| format!("setting the mode of {}", path.display()))
             }
-            Step::MasterKey(path) => {
-                let mut fresh = [0u8; 32];
-                std::fs::File::open("/dev/urandom")
-                    .and_then(|mut f| f.read_exact(&mut fresh))
-                    .context("reading /dev/urandom")?;
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir)
-                        .with_context(|| format!("creating {}", dir.display()))?;
-                }
-                kronik_privacy::MasterKey::load_or_create(path, fresh)
+            Step::MasterKey { keys, data } => {
+                let existing = if keys.source.is_kms() {
+                    keys.envelope_path(data)?.try_exists()?
+                } else {
+                    keys.source == kronik_privacy::key_source::Source::Env
+                        || std::env::var_os(kronik_privacy::MASTER_KEY_ENV).is_some()
+                        || keys.key_path(data).try_exists()?
+                };
+                // A rerun may read an active key; only first creation owns
+                // the directory exclusively. Read-only loading uses staging.
+                let _ownership = if existing {
+                    None
+                } else {
+                    Some(kronik_privacy::key_source::lock_data(data)?)
+                };
+                let runtime = crate::restore::runtime().map_err(anyhow::Error::msg)?;
+                runtime
+                    .block_on(async {
+                        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+                        kronik_privacy::key_source::KeySource::load(
+                            env,
+                            keys.as_ref().clone(),
+                            data,
+                            !existing,
+                        )
+                        .await
+                    })
                     .map(|_| ())
-                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .map_err(anyhow::Error::from)
             }
             Step::Group => run(&["groupadd", "--system", "kronik"]),
             Step::Run(argv) => run(argv),
@@ -292,7 +326,10 @@ fn rest(config: &Config, exe: &Path) -> impl Iterator<Item = Step> {
             path: config.server.data_dir.clone(),
             mode: 0o700,
         },
-        Step::MasterKey(config.master_key_file()),
+        Step::MasterKey {
+            keys: Box::new(config.keys.clone()),
+            data: config.server.data_dir.clone(),
+        },
         Step::Group,
         Step::Install {
             path: UNIT_PATH.into(),
@@ -358,6 +395,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rerunning_key_init_reads_an_owned_source_but_never_creates_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = kronik_privacy::key_source::Keys::default();
+        let path = keys.key_path(dir.path());
+        kronik_privacy::MasterKey::open(&path, &dir.path().join("keys"), Some([7; 32])).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let _owner = kronik_privacy::key_source::lock_data(dir.path()).unwrap();
+        let step = Step::MasterKey {
+            keys: Box::new(keys),
+            data: dir.path().to_owned(),
+        };
+        step.apply().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(&path).unwrap();
+        let error = step.apply().unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<kronik_privacy::key_source::KeySourceError>(),
+            Some(kronik_privacy::key_source::KeySourceError::DataInUse)
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn the_written_configuration_parses_to_what_was_asked() {
         let path = Path::new("kronik.toml");
         let acme = Config::parse(
@@ -369,7 +429,10 @@ mod tests {
         assert_eq!(acme.tls.domains, ["app.example.com"]);
         assert_eq!(acme.tls.acme_email.as_deref(), Some("ops@example.com"));
         assert_eq!(acme.http_listen(), "0.0.0.0:443".parse().unwrap());
-        assert_eq!(acme.master_key_file(), PathBuf::from(MASTER_KEY));
+        assert_eq!(
+            acme.keys.key_path(&acme.server.data_dir),
+            PathBuf::from(MASTER_KEY)
+        );
         let plain = Config::parse(&config_file(&[], None), path).unwrap();
         assert_eq!(plain.tls.mode, crate::config::TlsMode::Off);
         assert_eq!(plain.http_listen(), "0.0.0.0:80".parse().unwrap());

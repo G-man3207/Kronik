@@ -1,3 +1,5 @@
 The daemon cannot serve the request right now: it is starting or shutting down, it stopped accepting turns after a fatal error such as a failed log write, or the data directory's file system is below `[log] disk_reserve`, where new inputs and changes are refused until there is room. This code exists so that clients can tell a temporary state of the daemon from an error in their request.
 
 To fix it, retry shortly. If it persists, read the message and the daemon log. Below the reserve, free disk space (old snapshots, foreign actors' data; `kronik foreign remove` and rollback still work) or lower the reserve. After a fatal error, fix the cause, for example a full disk, and restart the daemon.
+
+For `serve`, `restore`, `keys wrap` or first key creation during `serve --init`, this also means another daemon or offline operation owns the data-directory lock. Stop that owning process, or use a different `--data-dir`. A missing or stale API socket is not evidence that the directory is free. Do not remove key files or bypass the maintainersship check.

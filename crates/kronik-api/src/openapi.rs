@@ -276,6 +276,22 @@ pub const OPERATIONS: &[Operation] = &[
         answer: Answer::Json(schema::<ProposeResponse>),
     },
     Operation {
+        method: "GET",
+        path: "/v1/keys",
+        summary: "The master key source and provider version, never key material",
+        query: &[],
+        request: None,
+        answer: Answer::Json(schema::<kronik_privacy::key_source::KeyStatus>),
+    },
+    Operation {
+        method: "POST",
+        path: "/v1/keys/rewrap",
+        summary: "Wrap the current master seed under the provider's current key version",
+        query: &[],
+        request: Some(schema::<KeysRewrapRequest>),
+        answer: Answer::Json(schema::<KeysChangeResponse>),
+    },
+    Operation {
         method: "POST",
         path: "/v1/actors/{kind}/{key}/messages",
         summary: "Send an operator message and wait for its turn",

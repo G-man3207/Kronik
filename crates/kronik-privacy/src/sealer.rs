@@ -461,7 +461,7 @@ mod tests {
     use crate::MasterKey;
 
     fn sealer(dir: &std::path::Path) -> Sealer {
-        let (master, _) = MasterKey::load_or_create(&dir.join("master.key"), [7; 32]).unwrap();
+        let (master, _) = MasterKey::open(&dir.join("master.key"), dir, Some([7; 32])).unwrap();
         let conn = rusqlite::Connection::open(dir.join("keystore.db")).unwrap();
         Sealer::new(Arc::new(Keystore::open(conn, &master).unwrap()))
     }
@@ -563,10 +563,10 @@ mod tests {
     /// the master-derived key; records with plain fingerprints still match.
     #[test]
     fn a_subjects_fingerprint_is_keyed() {
-        let keyed =
-            Sealer::plain().with_pseudonyms(Pseudonyms::new(&MasterKey::from_bytes([1; 32])));
-        let other =
-            Sealer::plain().with_pseudonyms(Pseudonyms::new(&MasterKey::from_bytes([2; 32])));
+        let keyed = Sealer::plain()
+            .with_pseudonyms(Pseudonyms::new(&MasterKey::from_bytes([1; 32]).unwrap()).unwrap());
+        let other = Sealer::plain()
+            .with_pseudonyms(Pseudonyms::new(&MasterKey::from_bytes([2; 32]).unwrap()).unwrap());
         let fp = blake3::hash(b"POST /v1/pay alice@example.com")
             .as_bytes()
             .to_vec();

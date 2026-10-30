@@ -331,7 +331,7 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
             foreign.clone(),
         )))),
         concurrency: args.concurrency.max(1),
-        master_key_file: Some(config.master_key_file()),
+        keys: config.keys.clone(),
         storage: Some(kronik_sched::snapshots::StorageConfig {
             data_dir: data_dir.clone(),
             snapshot_interval: config.retention.snapshot_interval.0,
@@ -351,6 +351,7 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
     let node = start_local(env.clone(), &data_dir, node_config)
         .await
         .with_context(|| format!("recovering {}", data_dir.display()))?;
+    record_key_source(&node, &data_dir).await?;
     // Export streams (M28): each follows the log from its cursor.
     let cursors = Arc::new(
         kronik_otel::cursor::Cursors::load(env.clone(), &data_dir)
@@ -379,17 +380,25 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
             .context("[ship] enabled needs url = \"s3://bucket/prefix\"")?;
         let remote = kronik_ship::Remote::open(url, config.ship.endpoint.as_deref())?;
         tracing::info!(url, "shipping to object storage");
-        drop(env.spawn(
-            "ship",
-            kronik_ship::ship_loop(
-                env.clone(),
-                remote,
-                data_dir.clone(),
-                "main".into(),
-                kronik_ship::SHIP_INTERVAL,
-                config.master_key_file(),
+        drop(
+            env.spawn(
+                "ship",
+                kronik_ship::ship_loop(
+                    env.clone(),
+                    remote,
+                    data_dir.clone(),
+                    "main".into(),
+                    kronik_ship::SHIP_INTERVAL,
+                    node.key_source()
+                        .cloned()
+                        .context("the node has no loaded key source")?,
+                    node.sealer()
+                        .keystore()
+                        .cloned()
+                        .context("the node has no keystore")?,
+                ),
             ),
-        ));
+        );
     }
     let mut proposals = kronik_fork::proposal::Proposals::open(node.clone(), data_dir.clone())
         .map_err(|e| anyhow::anyhow!("loading proposals: {}", e.message))?
@@ -644,6 +653,60 @@ async fn record_restore(
     }
     std::fs::remove_file(&marker).with_context(|| format!("removing {}", marker.display()))?;
     tracing::info!(through_lsn = through, "recorded the restore in the log");
+    Ok(())
+}
+
+/// An offline source migration is audited once on its next successful start.
+async fn record_key_source(node: &kronik_sched::Node, data: &Path) -> anyhow::Result<()> {
+    let marker = data
+        .join("keys")
+        .join(kronik_privacy::key_source::SOURCE_MARKER);
+    let bytes = match kronik_privacy::key_source::read_envelope(&marker) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let id = value["id"]
+        .as_str()
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .context("invalid key-source audit marker")?;
+    let mut recorded = false;
+    let first = node.reader().starts().await?.first().copied().unwrap_or(1);
+    node.reader()
+        .read(first, node.applied_lsn(), |c| {
+            recorded |= matches!(&c.record, kronik_proto::Record::AuditEvent(e)
+            if e.action == "keys.source" && e.details.get("id").is_some_and(|v| v == id));
+            Ok(())
+        })
+        .await?;
+    if !recorded {
+        let secrets = node.try_secret_values().ok();
+        let scrub = |s| kronik_sched::scrub::for_log(s, secrets.as_deref());
+        let details = [
+            ("id".into(), id.into()),
+            (
+                "source".into(),
+                scrub(value["source"].as_str().unwrap_or("")),
+            ),
+            ("key".into(), scrub(value["key"].as_str().unwrap_or(""))),
+        ]
+        .into();
+        let audit = kronik_proto::log::v1::Audit {
+            token_id: "system".into(),
+            reason: scrub(value["reason"].as_str().unwrap_or("key source migration")),
+            wall_time_ms: value["wall_ms"]
+                .as_u64()
+                .unwrap_or(node.env().clock.wall_ms()),
+        };
+        node.record_audit_event("keys.source", "", details, audit)
+            .await
+            .map_err(|e| anyhow::anyhow!("recording key source: {}", e.message))?;
+    }
+    std::fs::remove_file(&marker)?;
+    if let Some(parent) = marker.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 

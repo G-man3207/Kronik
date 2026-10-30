@@ -730,6 +730,15 @@ fn every_mutation_reaches_the_file_sink_and_verify_reports_it_complete() {
                 json!({}),
                 None,
             ),
+            // File source rejects without audit; real KMS audit is covered
+            // by scripts/e2e-keys.sh.
+            step(
+                "POST",
+                "/v1/keys/rewrap",
+                "/v1/keys/rewrap",
+                json!({}),
+                None,
+            ),
         ],
         me,
         &mut want,
