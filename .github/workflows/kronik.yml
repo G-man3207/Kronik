@@ -1,0 +1,155 @@
+# A synthetic same-repository M10 proof using the existing official Action.
+# No fixture manifest exists until the director's actual PR; bootstrap does not run this flow.
+name: Kronik
+
+on:
+  pull_request:
+    branches: [main]
+    paths: [examples/github-flow/proof/change.json]
+  push:
+    branches: [main]
+    paths: [examples/github-flow/proof/change.json]
+
+permissions:
+  contents: read
+
+env:
+  KRONIK_BUNDLE: https://github.com/G-man3207/Kronik/releases/download/v0.3.0
+
+jobs:
+  propose:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: kronik-propose-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: G-man3207/Kronik/action@eb7de5f74d9ba73ff56a014de14364c52cea1145
+        with:
+          command: install
+          base-url: ${{ env.KRONIK_BUNDLE }}
+      - name: Start the real private TLS fixture
+        id: fixture
+        run: python3 scripts/e2e-github-flow.py start
+      - name: Propose the pull request's selected component
+        uses: G-man3207/Kronik/action@eb7de5f74d9ba73ff56a014de14364c52cea1145
+        with:
+          command: propose
+          components: ${{ steps.fixture.outputs.component }}
+          reason: ${{ steps.fixture.outputs.reason }}
+          timeout: 2m
+      - name: Remove only the owned fixture
+        if: always()
+        run: python3 scripts/e2e-github-flow.py cleanup
+
+  verify:
+    # A distinct real App bot must initiate the main push; no author self-review or dispatch substitute.
+    if: github.event_name == 'push' && endsWith(github.actor, '[bot]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write
+    outputs:
+      proposal-id: ${{ steps.propose.outputs.proposal-id }}
+      sha256: ${{ steps.snapshot.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: G-man3207/Kronik/action@eb7de5f74d9ba73ff56a014de14364c52cea1145
+        with:
+          command: install
+          base-url: ${{ env.KRONIK_BUNDLE }}
+      - name: Start the real private TLS fixture
+        id: fixture
+        run: python3 scripts/e2e-github-flow.py start
+      - name: Propose main's component
+        id: propose
+        uses: G-man3207/Kronik/action@eb7de5f74d9ba73ff56a014de14364c52cea1145
+        with:
+          command: propose
+          components: ${{ steps.fixture.outputs.component }}
+          reason: ${{ steps.fixture.outputs.reason }}
+          timeout: 2m
+      - name: Persist exactly the verified proposal without plaintext credentials
+        id: snapshot
+        env:
+          PROPOSAL: ${{ steps.propose.outputs.proposal-id }}
+        run: python3 scripts/e2e-github-flow.py snapshot --proposal "$PROPOSAL"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: kronik-m10-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.snapshot.outputs.artifact }}/
+          retention-days: 1
+          if-no-files-found: error
+      - name: Remove only the owned fixture
+        if: always()
+        run: python3 scripts/e2e-github-flow.py cleanup
+
+  promote:
+    needs: verify
+    if: needs.verify.outputs.proposal-id != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: kronik-production
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    concurrency:
+      group: kronik-production
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: G-man3207/Kronik/action@eb7de5f74d9ba73ff56a014de14364c52cea1145
+        with:
+          command: install
+          base-url: ${{ env.KRONIK_BUNDLE }}
+      - name: Download only this run and attempt's exact proposal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "kronik-m10-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --dir "$RUNNER_TEMP/kronik-m10-input"
+      - name: Restore and mint the scoped promote credential after the gate
+        env:
+          PROPOSAL: ${{ needs.verify.outputs.proposal-id }}
+          ARTIFACT_SHA256: ${{ needs.verify.outputs.sha256 }}
+        run: |
+          python3 scripts/e2e-github-flow.py restore --artifact "$RUNNER_TEMP/kronik-m10-input" \
+            --proposal "$PROPOSAL" --sha256 "$ARTIFACT_SHA256"
+      - name: Refuse an actual prior head without approving or deploying
+        env:
+          PROPOSAL: ${{ needs.verify.outputs.proposal-id }}
+          INPUT_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          previous=$(git rev-parse HEAD^)
+          python3 scripts/e2e-github-flow.py reject-stale --proposal "$PROPOSAL" --previous-sha "$previous"
+      - name: Promote the exact proposal after the actual human environment approval
+        uses: G-man3207/Kronik/action@eb7de5f74d9ba73ff56a014de14364c52cea1145
+        with:
+          command: promote
+          proposal: ${{ needs.verify.outputs.proposal-id }}
+          environment: kronik-production
+          timeout: 2m
+      - name: Check the real approval record, deployment and changed response
+        env:
+          PROPOSAL: ${{ needs.verify.outputs.proposal-id }}
+        run: python3 scripts/e2e-github-flow.py check --proposal "$PROPOSAL"
+      - name: Remove only the owned fixture
+        if: always()
+        run: python3 scripts/e2e-github-flow.py cleanup

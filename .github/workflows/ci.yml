@@ -3,7 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+    # Only the synthetic M10 deployment manifest has its own real fixture flow.
+    paths-ignore: [examples/github-flow/proof/change.json]
   pull_request:
+    paths-ignore: [examples/github-flow/proof/change.json]
 
 permissions:
   contents: read

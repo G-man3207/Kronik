@@ -34,6 +34,17 @@ fails the step. Its additional YAML structure checks need PyYAML.
 `hygiene` checks every argument of literal workflow `ci.sh` calls against
 the default step inventory; missing, unknown, duplicate or reordered steps
 fail. Pull requests must keep it green.
+The opt-in cluster server keeps its runtime/server dependencies behind the
+exact `server` feature; there is no whole-crate hygiene exemption. Vendored
+third-party Rust is included in the unsafe scan and still needs a per-file
+justification. Release packaging treats local third-party path dependencies
+as third-party: an explicit, hash-checked upstream/ordered-patch/license origin
+is required, rather than silently excluding every null Cargo `source`.
+
+Only `examples/github-flow/proof/change.json` is ignored by aggregate CI.
+Kronik's separate three-job synthetic M10 workflow handles that exact path;
+any other changed path still runs ordinary CI. Its real fixture smoke and
+remaining public acceptance requirements are in `examples/github-flow/README.md`.
 
 ## Conventions
 

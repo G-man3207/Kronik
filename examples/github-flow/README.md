@@ -8,11 +8,10 @@ This directory is what goes in a repository that runs Kronik's
 With it, pull requests are proposed with a comment and a check, and after a
 merge to main the change is promoted once a reviewer approves.
 
-> **Not yet run on GitHub.** The workflow and the action are tested against a
-> fake `kronik` and a fake GitHub API (`scripts/ci.sh action`). Running this
-> flow needs a repository and a Kronik daemon that GitHub's runners can
-> reach, which are the maintainers' to set up. Nothing below has been run on
-> GitHub yet.
+> **Public GitHub acceptance is not yet complete.** The reusable workflow below
+> still needs a reachable daemon and repository settings. Kronik's root workflow
+> now has a real, locally exercised TLS/persisted-proposal fixture (below);
+> local success is not evidence of a GitHub PR, check/comment or human gate approval.
 
 The files are kept in step with Kronik itself:
 - `kronik.yml` is `docs/examples/kronik-ci.yml`, byte for byte. A test in
@@ -21,6 +20,65 @@ The files are kept in step with Kronik itself:
   in `crates/kronik/src/project/init.rs` checks this.
 - `vendor/kronik-sdk` (the SDK and the WIT) is not here. `kronik init`
   writes it from the binary (step 2).
+
+## This repository's bounded proof
+
+The root [proof workflow](../../.github/workflows/kronik.yml) uses
+[`scripts/e2e-github-flow.py`](../../scripts/e2e-github-flow.py), not the external
+daemon/secrets setup below. Its strict manifest path is
+`examples/github-flow/proof/change.json`; the first actual proof PR will create:
+
+```json
+{"component":"counter-step2.wasm","reason":"M10 public proof, first head"}
+```
+
+A second PR head changes only the reason, after the first actual check/comment
+exists, to prove that the same comment is updated for the new head/proposal.
+The only other allowed component is the hash-pinned `counter.wasm` baseline.
+No manifest is committed with this preparation, so installing the workflow
+does not itself start a proof run.
+
+Each job allocates a bounded, non-root daemon in an owned internal Docker
+network, with no published host port or external route. The runner reaches
+its private bridge address using a freshly issued certificate for that exact
+address; wrong/missing trust and missing/wrong tokens fail. The public v0.3.0
+binary is hash-pinned and remains the historical Wasmtime 50.0.0 binary,
+not an engine security update. No Rust/guest build is added.
+
+`verify` stops the real daemon cleanly and uploads only the synthetic state,
+code, proposal/diff and correlation metadata. Plaintext bearer/bootstrap/master
+credentials and all private CA/TLS keys are excluded; unknown-file bearer or
+private-key material is refused. A digest binds both archive and metadata to
+the repository, exact head, run, attempt and proposal. After the actual GitHub
+gate, `promote` restores it without proposing again. It creates a fresh
+`read,approve,promote` token through the existing real Unix-authenticated operator
+CLI and verifies that proposal/code/diff bytes remain unchanged despite allowed
+credential audit records. The final check inspects the actual Approval record,
+deployment, integrity result and changed HTTPS response. The synthetic fixture's
+public encryption seed is not a production key.
+
+The configured `kronik-production` environment has only reviewer `G-man3207`
+(user ID 113182292), prevents review, disallows administrator bypass and
+allows only branch `main`; these properties were read back from GitHub.
+The main event must be authored by a genuinely distinct installed App bot,
+then actually approved by that human. No dispatch/PAT approval substitutes
+for either step. Fork PRs are skipped; an actual prior-head promotion attempt
+must fail without changing the evaluated proposal or deployments.
+
+Local smoke, with the exact public binary already installed:
+
+```sh
+KRONIK_BIN=/absolute/path/to/kronik \
+GITHUB_REPOSITORY=G-man3207/Kronik GITHUB_SHA=$(git rev-parse HEAD) \
+GITHUB_RUN_ID=10001 GITHUB_RUN_ATTEMPT=1 \
+python3 scripts/e2e-github-flow.py smoke
+```
+
+This performs real local product approval with an explicit **not GitHub approval**
+reason. It cannot satisfy the still-pending public PR/updated comment/check,
+App-authored merge, actual human environment approval and main promotion.
+Publishing branches or triggering those runs is separately director-batched.
+
 
 ## 1. A daemon GitHub can reach
 

@@ -107,5 +107,19 @@ environment, masked; `read,propose` for `propose` and `verify`,
   without one or on an API error), the token never on a command line;
   the reference workflow's shape and pins (pinned to an ancestor) (criterion
   4 as far as it can be tested without GitHub).
-- Owner action, not done: run the reference workflow in a real repository
-  (criterion 4).
+- `.github/workflows/kronik.yml` and `scripts/e2e-github-flow.py`: the bounded
+  public-proof adaptation uses the existing pinned Action and two real prebuilt
+  components, a private internal-network daemon with verified TLS, and an exact
+  persisted proposal across the real environment gate. The artifact excludes
+  plaintext credentials and private keys, binds metadata and data to repository/
+  head/run/attempt/proposal, and restores without re-proposing. A fresh promote
+  credential is minted by the actual Unix-authenticated operator CLI; unchanged
+  proposal/code/diff hashes are checked before and after. Local smoke also proves
+  token scopes, trust failures, replay, restore, the actual Approval log record,
+  integrity and changed response; it explicitly is not GitHub approval.
+- `action/tests/test_github_fixture.py`: strict component selection, secret
+  exclusion, safe bounded archive extraction, composite identity and log decoding.
+- Still not done: two actual public PR heads with the same updated comment and
+  actual check, a distinct authenticated App-authored main event, actual human
+  environment approval and exact main promotion (criterion 4). Environment
+  configuration readback and local product proof do not close this criterion.

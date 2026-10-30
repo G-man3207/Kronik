@@ -243,6 +243,16 @@ to, and set the variable, secrets and environment its header names.
 repository's content with this workflow and a Rust actor, and the steps to
 run the flow on GitHub end to end.
 
+Kronik's own root `.github/workflows/kronik.yml` is a separate, bounded public
+acceptance fixture, not a production daemon deployment. It selects only two
+hash-pinned prebuilt test components, runs a real daemon on an owned internal
+Docker network with verified private-CA TLS, and persists the exact evaluated
+proposal across the environment gate. Only its single
+`examples/github-flow/proof/change.json` path bypasses the aggregate CI workflow;
+every other changed path still runs normal CI. See the example README's
+**This repository's bounded proof** section. Local product proof does not replace
+the still-required real PR, updated comment/check and human-approved main run.
+
 ```yaml
 {{#include ../examples/kronik-ci.yml}}
 ```
