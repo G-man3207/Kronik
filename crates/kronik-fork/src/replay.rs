@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use kronik_core::causal;
 use kronik_core::env::{BoxFuture, Env};
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
-use kronik_effects::Config;
 use kronik_effects::http::{fingerprint, parse_url, target_of};
+use kronik_effects::{Config, ConfigHistory};
 use kronik_log::{Committed, Position};
 use kronik_privacy::SecretStore;
 use kronik_proto::Record;
@@ -59,6 +59,9 @@ pub struct ReplaySetup {
     pub kinds: BTreeMap<String, ForkKind>,
     pub config: Arc<Config>,
     pub epoch: u64,
+    /// Engine checks replay production policy, unlike a fork's fixed overrides.
+    pub(crate) upgrade_config: Option<Mutex<ConfigHistory>>,
+    pub(crate) upgrade_code: BTreeMap<CodeHash, ForkKind>,
     pub secrets: Option<Arc<SecretStore>>,
     /// Canned answers for effects without a recording (synthetic).
     pub stubs: Vec<crate::stubs::StubRule>,
@@ -121,6 +124,8 @@ impl ReplaySetup {
             kinds,
             epoch: config.epoch,
             config: Arc::new(config),
+            upgrade_config: None,
+            upgrade_code: BTreeMap::new(),
             secrets,
             stubs: Vec::new(),
             live: None,
@@ -129,6 +134,13 @@ impl ReplaySetup {
             progress: None,
             rebase: false,
         }
+    }
+
+    fn historical_config(&self, epoch: Option<u64>) -> Option<Arc<Config>> {
+        let epoch = epoch?;
+        self.upgrade_config
+            .as_ref()
+            .map(|history| lock(history).at(epoch))
     }
 }
 
@@ -608,6 +620,9 @@ impl Runner {
             message,
             output: None,
         };
+        let config = self
+            .setup
+            .historical_config(self.setup.index.turn(&p.key).map(|(_, t)| t.config_epoch));
         let record = pb::TurnRecord {
             execution_id: String::new(),
             actor: Some(p.actor.to_pb()),
@@ -617,7 +632,7 @@ impl Runner {
             logical_time_ms: p.time,
             input: Some(p.input.clone()),
             outcome: Some(outcome),
-            config_epoch: self.setup.epoch,
+            config_epoch: config.as_ref().map_or(self.setup.epoch, |c| c.epoch),
             ..Default::default()
         };
         let lsn = self.apply(record.clone())?;
@@ -647,7 +662,17 @@ impl Runner {
     ) -> BoxFuture<'static, Result<ForkTurn, ReplayError>> {
         Box::pin(async move {
             self.flush_leaves()?;
-            let Some(kind) = self.setup.kinds.get(&p.actor.kind).cloned() else {
+            let kind = match self
+                .setup
+                .upgrade_config
+                .as_ref()
+                .and_then(|_| self.setup.index.turn(&p.key))
+            {
+                Some((_, turn)) => CodeHash::from_slice(&turn.code_hash)
+                    .and_then(|hash| self.setup.upgrade_code.get(&hash)),
+                None => self.setup.kinds.get(&p.actor.kind),
+            };
+            let Some(kind) = kind.cloned() else {
                 return self.record_unrun(
                     &p,
                     None,
@@ -728,7 +753,14 @@ impl Runner {
                 (p.time, *blake3::hash(&bytes).as_bytes(), Vec::new())
             }
         };
-        let kl = self.setup.config.limits(&p.actor.kind);
+        let config = self
+            .setup
+            .historical_config(prod.map(|(_, t)| t.config_epoch));
+        let epoch = config.as_ref().map_or(self.setup.epoch, |c| c.epoch);
+        let kl = config
+            .as_deref()
+            .unwrap_or(&self.setup.config)
+            .limits(&p.actor.kind);
         let size = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
         let limits = TurnLimits {
             fuel: kl.fuel,
@@ -761,6 +793,7 @@ impl Runner {
         ));
         let gate = Arc::new(ReplayGate {
             runner: self.clone(),
+            config,
             actor: p.actor.clone(),
             key: p.key.clone(),
             time,
@@ -891,7 +924,7 @@ impl Runner {
             },
             sql_schema,
             blob_refs: Vec::new(),
-            config_epoch: self.setup.epoch,
+            config_epoch: epoch,
             memory_peak_bytes: out.memory_peak_bytes,
             schema_version: if committed { schema_version } else { 0 },
             // A recomputed turn's wall time says nothing about production.
@@ -1033,6 +1066,7 @@ struct GateState {
 /// The replay effect gate of one fork turn.
 struct ReplayGate {
     runner: Arc<Runner>,
+    config: Option<Arc<Config>>,
     actor: ActorRef,
     key: pb::CausalKey,
     time: u64,
@@ -1074,7 +1108,7 @@ pub const NO_RECORDING: &str = "replay: no recording";
 
 impl ReplayGate {
     fn config(&self) -> &Config {
-        &self.runner.setup.config
+        self.config.as_deref().unwrap_or(&self.runner.setup.config)
     }
 
     fn prod_at(&self, ordinal: u32) -> Option<&pb::EffectRecord> {

@@ -114,6 +114,7 @@ fn config_view(r: &Record) -> Option<Record> {
         | Record::Grant(_)
         | Record::Limits(_)
         | Record::ForeignActor(_)
+        | Record::PrivacyMode(_)
         | Record::SimulatorConfig(_) => Some(r.clone()),
         _ => r
             .rebase_switch()

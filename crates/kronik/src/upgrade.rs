@@ -122,7 +122,7 @@ fn execute(args: CheckArgs) -> Result<Done, ApiError> {
         ApiError::new(ErrorCode::BadRequest, format!("--window: {m}"))
             .with_hint("Give a duration with ms, s, m or h, e.g. 6h.")
     })?;
-    let (configuration, _) =
+    let (configuration, selected_config) =
         crate::restore::key_config(args.config.as_deref(), args.master_key_file.clone())?;
     let data = args
         .data_dir
@@ -208,7 +208,7 @@ fn execute(args: CheckArgs) -> Result<Done, ApiError> {
             .then(|| ErrorCode::EngineUpgradeDiverged.as_str().to_owned()),
     };
     let error = (!checked.report.passed).then(|| diverge_error(&value, &args.window));
-    let text = render(&value, &data, &args.window);
+    let text = render(&value, &args, &data, selected_config.as_deref());
     Ok(Done { text, value, error })
 }
 
@@ -230,7 +230,13 @@ fn diverge_error(v: &UpgradeCheckOutput, window: &str) -> ApiError {
     ))
 }
 
-fn render(v: &UpgradeCheckOutput, data: &Path, window: &str) -> String {
+fn render(
+    v: &UpgradeCheckOutput,
+    args: &CheckArgs,
+    data: &Path,
+    config_path: Option<&Path>,
+) -> String {
+    let window = &args.window;
     let mut out = String::new();
     let verb = if v.passed { "passed" } else { "diverged" };
     let dry = if v.dry_run { "Dry run: " } else { "" };
@@ -252,13 +258,32 @@ fn render(v: &UpgradeCheckOutput, data: &Path, window: &str) -> String {
         let _ = writeln!(out, "Nothing was written.");
     }
     let dir = shell_quote(&data.display().to_string());
-    let next_cmd = if v.passed && !v.dry_run {
+    let mut next_cmd = if v.passed && !v.dry_run {
         format!("kronik serve --data-dir {dir}")
     } else if v.dry_run {
-        format!("kronik upgrade check --window {window} --data-dir {dir}")
+        format!(
+            "kronik upgrade check --window {} --data-dir {dir}",
+            shell_quote(window)
+        )
     } else {
         "kronik explain ENGINE_UPGRADE_DIVERGED".to_owned()
     };
+    if v.passed || v.dry_run {
+        if let Some(path) = config_path {
+            let _ = write!(
+                next_cmd,
+                " --config {}",
+                shell_quote(&path.display().to_string())
+            );
+        }
+        if let Some(path) = &args.master_key_file {
+            let _ = write!(
+                next_cmd,
+                " --master-key-file {}",
+                shell_quote(&path.display().to_string())
+            );
+        }
+    }
     out.push_str(&next(&[next_cmd]));
     out
 }

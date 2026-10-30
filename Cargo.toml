@@ -35,15 +35,15 @@ kronik-testhost = { path = "crates/kronik-testhost" }
 # therefore of replay identity. `wasmtime-environ` provides the Wasmtime
 # version constant and must stay at the same exact version as `wasmtime`.
 # Features are enabled by the crates that use them.
-wasmtime = { version = "=50.0.0", default-features = false }
-wasmtime-environ = { version = "=50.0.0", default-features = false }
+wasmtime = { version = "=50.0.1", default-features = false }
+wasmtime-environ = { version = "=50.0.1", default-features = false }
 # Same version as Wasmtime 50 uses, for the deploy-time import check.
 wasmparser = { version = "0.261.0", default-features = false, features = ["std", "component-model"] }
-wasmtime-wasi = { version = "=50.0.0", default-features = false, features = ["p2"] }
-wasmtime-wasi-io = { version = "=50.0.0", default-features = false, features = ["std"] }
+wasmtime-wasi = { version = "=50.0.1", default-features = false, features = ["p2"] }
+wasmtime-wasi-io = { version = "=50.0.1", default-features = false, features = ["std"] }
 # Standard `fetch` (M22, ADR 0070): p2 only. Never `default-send-request`
 # (its own network stack and TLS roots) or `p3` (experimental in Wasmtime 50).
-wasmtime-wasi-http = { version = "=50.0.0", default-features = false, features = ["p2"] }
+wasmtime-wasi-http = { version = "=50.0.1", default-features = false, features = ["p2"] }
 
 clap = { version = "4.6.7", features = ["derive", "env"] }
 anyhow = "1"

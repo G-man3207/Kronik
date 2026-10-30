@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-24
+- **Updated:** 2026-10-30 (security patch and upgrade contract)
 
 ## Context
 
@@ -39,8 +40,9 @@ Wasmtime 50.0.0 (the latest stable release on crates.io on 2026-10-24).
 
 ### 1. Wasmtime version and features
 
-`wasmtime`, `wasmtime-environ`, `wasmtime-wasi` and `wasmtime-wasi-io` are all
-pinned at exactly `=50.0.0`. `wasmtime` uses `default-features = false` with
+`wasmtime`, `wasmtime-environ`, `wasmtime-wasi`, `wasmtime-wasi-io` and
+`wasmtime-wasi-http` are all pinned at exactly `=50.0.1`. `wasmtime` uses
+`default-features = false` with
 these features: `runtime`, `cranelift`, `component-model`, `async`,
 `pooling-allocator`, `parallel-compilation` and `std` (`addr2line` and
 `demangle` are only for diagnostics). The `threads`, `component-model-async`
@@ -71,6 +73,46 @@ The format is `kronik-<kronik semver>+wasmtime-<wasmtime semver>`, for example
 agree. The engine configuration above is code inside the Kronik binary, so any
 change to it ships as a new Kronik version and therefore as a new engine
 version.
+
+The 2026-10-30 patch from 50.0.0 to 50.0.1 follows the same contract; patch
+versions are not replay-compatible by assumption. 50.0.1 is the first
+patched 50.x release for
+[RUSTSEC-2026-0420](https://rustsec.org/advisories/RUSTSEC-2026-0420),
+[0421](https://rustsec.org/advisories/RUSTSEC-2026-0421),
+[0422](https://rustsec.org/advisories/RUSTSEC-2026-0422),
+[0423](https://rustsec.org/advisories/RUSTSEC-2026-0423) and
+[0424](https://rustsec.org/advisories/RUSTSEC-2026-0424). No advisory ignore,
+engine-name alias, feature change or determinism relaxation is permitted.
+All five packages share the exact linked version, checked against the
+lockfile. Existing records keep their original identity, and precompiled
+artifacts remain separated by engine version.
+
+Before serving data last written by another engine, the new binary must
+pass `kronik upgrade check` with the same code hashes in both replay modes;
+fuel is not compared across engines. Startup requires a passing report for
+the exact old/new pair and records `EngineUpgrade` before serving. A patch
+does not bypass this gate (see [M6 §7](../design/m6-storage.md#7-upgrades-kronik-upgrade-check)).
+The original 50.0.0 spike measurements below and archived spike projects
+remain historical evidence, not claims about 50.0.1.
+
+An engine check selects each matched turn's recorded code hash and
+configuration epoch, including deployments, grants and revocations inside
+the window. It preloads only used code and reuses cached `ConfigHistory`.
+This is upgrade-only: ordinary forks keep the fork-point/candidate policy
+and code, including explicit overrides.
+
+Observed on 2026-10-30: actual directories produced by the previous
+50.0.0 static binary, with file and environment master keys, both passed
+the 50.0.1 check over all 36 roots (11 effects and seven SQL-write turns).
+Startup first refused the unchecked pair, then appended exactly one
+`EngineUpgrade`; restart did not append another. State and the old log
+prefix hashes, sealed values, secret HMACs and key-source behavior stayed
+unchanged. Post-upgrade ordinary identity replay was empty in both modes,
+with 13 roots, 10 exact effects and no live effects. The expanded fixture
+initially exposed the old check's frozen configuration; the check was
+repaired, not narrowed or forced to pass. Focused regressions also cover
+grant/revoke within the window, fixed fork override precedence and a real
+same-kind code switch with distinct hashes (`kronik-fork/tests/upgrade.rs`).
 
 ### 4. Code store and precompiled cache
 

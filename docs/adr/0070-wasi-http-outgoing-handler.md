@@ -97,8 +97,10 @@ componentize-js 0.23 has no WASI 0.3 target [INFERENCE from its feature list].
 
 ### 1. Dependency
 
-Add `wasmtime-wasi-http = { version = "=50.0.0", default-features = false,
-features = ["p2"] }` to `kronik-runtime`. Never `default-send-request`, `p3`
+Use `wasmtime-wasi-http = { version = "=50.0.1", default-features = false,
+features = ["p2"] }` in `kronik-runtime` (security patch, 2026-10-30;
+[ADR 0001](0001-wasmtime-determinism.md#3-engine-version)). The findings
+above describe the original 50.0.0 spike. Never `default-send-request`, `p3`
 or `component-model-async`. `kronik-runtime` keeps no network code.
 
 ### 2. Interception: queue in the hook, drive in `wasi:io`

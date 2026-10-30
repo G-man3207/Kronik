@@ -250,3 +250,167 @@ fn another_engine_needs_a_passing_report_and_records_the_upgrade() {
     let node = start(&rt, dir.path()).unwrap();
     assert_eq!(node.applied_lsn(), head + 1);
 }
+
+#[test]
+fn upgrade_replays_grant_and_revoke_but_fork_overrides_stay_fixed() {
+    let dir = tempdir();
+    let rt = rt();
+    let node = start(&rt, dir.path()).unwrap();
+    rt.block_on(async {
+        node.deploy(&guest("counter"), audit(), false)
+            .await
+            .unwrap();
+        node.secret_set("key", b"upgrade-policy-test-key", &audit(), false)
+            .unwrap();
+        let fork_lsn = node.applied_lsn();
+        let actor = ActorRef::parse("counter/policy").unwrap();
+        let denied = node
+            .send(actor.clone(), msg("hmac", "key\ndata"), audit(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!denied.committed());
+        node.grant("counter", "secret:key", None, None, audit(), false)
+            .await
+            .unwrap();
+        let allowed = node
+            .send(actor.clone(), msg("hmac", "key\ndata"), audit(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(allowed.committed());
+        node.revoke("counter", "secret:key", audit(), false)
+            .await
+            .unwrap();
+        let revoked = node
+            .send(actor, msg("hmac", "key\ndata"), audit(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!revoked.committed());
+        let checked = kronik_fork::upgrade::check(
+            node.env(),
+            dir.path(),
+            Duration::from_secs(6 * 3600),
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(checked.report.passed, "{:?}", checked.diff);
+        assert_eq!(checked.report.root_inputs, 3);
+        assert_eq!(checked.diff.summary.live, 0);
+
+        let index = Arc::new(
+            kronik_fork::ProductionIndex::load(node.reader(), fork_lsn, node.applied_lsn())
+                .await
+                .unwrap(),
+        );
+        let code = kronik_fork::fork_kinds(
+            &index,
+            fork_lsn,
+            |hash| node.code().get(hash).map_err(|e| e.to_string()),
+            &[],
+        )
+        .unwrap();
+        let mut config = kronik_fork::config_at(&index, fork_lsn);
+        config.apply(&Record::Grant(pb::Grant {
+            epoch: 99,
+            op: pb::GrantOp::Revoke as i32,
+            kind: "counter".into(),
+            capability: "secret:key".into(),
+            ..Default::default()
+        }));
+        let setup = Arc::new(kronik_fork::ReplaySetup::new(
+            "fixed-policy".into(),
+            index,
+            code.kinds,
+            config,
+            None,
+        ));
+        let replay = kronik_fork::run(
+            node.env(),
+            setup,
+            &kronik_fork::diff::DiffOptions::default(),
+            2,
+            None,
+            code.before,
+            code.after,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(replay.diff.summary.changed);
+        assert_eq!(replay.diff.summary.live, 0);
+        let turns = replay.continuous.unwrap().turns();
+        assert!(turns.iter().all(|t| t.record.config_epoch == 99));
+        let effects: Vec<_> = turns.iter().flat_map(|t| &t.record.effects).collect();
+        assert_eq!(effects.len(), 3);
+        assert!(
+            effects
+                .iter()
+                .all(|e| e.status == pb::EffectStatus::Denied as i32)
+        );
+    });
+}
+
+#[test]
+fn upgrade_replays_recorded_code_across_a_same_kind_deployment() {
+    let dir = tempdir();
+    let rt = rt();
+    let node = start(&rt, dir.path()).unwrap();
+    rt.block_on(async {
+        node.deploy(&guest("counter"), audit(), false)
+            .await
+            .unwrap();
+        let actor = ActorRef::parse("counter/code").unwrap();
+        let first = node
+            .send(actor.clone(), msg("increment", ""), audit(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.committed());
+        let bytes = guest("counter-step2");
+        let (hash, _, manifest) = node.prepare_code(&bytes).await.unwrap();
+        assert_ne!(node.deployed("counter").unwrap().code_hash, hash.0);
+        node.switch_code(
+            kronik_sched::CodeSwitch {
+                kinds: vec![pb::KindVersion {
+                    kind: manifest.kind.clone(),
+                    code_hash: hash.0.to_vec(),
+                    schema_version: manifest.schema_version,
+                    manifest: Some(manifest),
+                    code_size: bytes.len() as u64,
+                }],
+                pinned: vec![node.deployed("counter").unwrap()],
+                cause: pb::DeploymentCause::Promote,
+                verified_through_lsn: node.applied_lsn(),
+                unverified_inputs: 0,
+                proposal_id: "checked-code-transition".into(),
+                rollback_of_epoch: 0,
+            },
+            audit(),
+            false,
+        )
+        .await
+        .unwrap();
+        let second = node
+            .send(actor, msg("increment", ""), audit(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second.committed());
+        let checked = kronik_fork::upgrade::check(
+            node.env(),
+            dir.path(),
+            Duration::from_secs(6 * 3600),
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(checked.report.passed, "{:?}", checked.diff);
+        assert_eq!(checked.report.root_inputs, 2);
+        assert_eq!(checked.diff.summary.live, 0);
+    });
+}

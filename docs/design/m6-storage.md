@@ -195,6 +195,11 @@ the old one (the old daemon keeps running; the check only reads):
    back from the newest root input, and runs an identity replay (both
    modes) of `(fork point, HEAD]` with the same code hashes and this
    binary's engine. Fuel is not compared (`fuel_threshold` infinite).
+   Each matched turn uses its recorded code hash and configuration epoch:
+   production deployments, grants, revocations and limits inside the window
+   are history to reproduce, not engine differences. This upgrade-only
+   policy must not replace ordinary forks' fixed fork-point/candidate
+   configuration and code overrides.
 2. An empty diff writes `DIR/upgrade/<to-engine>.json` with `{from_engine,
    to_engine, window, fork_lsn, checked_through_lsn, diff_hash,
    report_hash}` and exits 0. A non-empty diff exits with

@@ -304,11 +304,13 @@ Checks this binary against a data directory before it replaces the one
 that is running (M6). Offline and read-only apart from the report: the
 old daemon may keep running. It replays the last `--window` of logical
 time (default `6h`) with this binary's engine and the same code hashes.
-Fuel is not compared. Sealed values in the window open with the
-directory's privacy keystore and the master key `kronik serve` uses
-(`--master-key-file`, `[keys] master_key_file` in `--config`,
-`KRONIK_MASTER_KEY`, else `<data-dir>/keys/master.key`): without that key
-the check is `MASTER_KEY_MISSING` or `MASTER_KEY_MISMATCH`.
+Fuel is not compared. Sealed values open with the directory's privacy
+keystore and the same `[keys]` configuration as `serve`. Select the matching
+configuration with `--config` (or `KRONIK_CONFIG`). File/env sources use
+`--master-key-file`, `[keys] master_key_file`, `KRONIK_MASTER_KEY`, or
+`<data-dir>/keys/master.key` as configured; a KMS source needs its matching
+`master.wrapped`, provider key and credentials. Missing/mismatched material
+is refused; KMS never falls back to an environment seed or raw key file.
 
 An empty diff writes `<data-dir>/upgrade/<engine>.json` and exits 0. A
 diff that is not empty writes that report and the diff next to it
@@ -317,6 +319,14 @@ diff that is not empty writes that report and the diff next to it
 result, and writes neither file. A bad window or a data directory with no
 log is `BAD_REQUEST`. `--json` prints the report, and the diff path when
 one was written, even when the command exits 1.
+
+A Wasmtime patch also changes the recorded engine identity: 50.0.0 to
+50.0.1 still requires this check, with an empty behavior diff in both
+replay modes. The new daemon refuses the old directory until the exact
+pair has a passing report, then writes one `EngineUpgrade` before serving.
+Do not rewrite recorded engine metadata or relabel precompiled caches.
+
+Historical v0.3.0 output (the recorded versions and hashes are unchanged):
 
 ```text
 $ kronik upgrade check --window 6h --data-dir /var/lib/kronik

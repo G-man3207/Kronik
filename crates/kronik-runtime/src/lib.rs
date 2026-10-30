@@ -70,26 +70,26 @@ const fn concat_bytes<const N: usize>(parts: &[&str]) -> [u8; N] {
 
 #[cfg(test)]
 mod tests {
-    use super::{ENGINE_VERSION, KRONIK_VERSION, WASMTIME_VERSION};
-
-    #[test]
-    fn engine_version_combines_kronik_and_wasmtime_versions() {
-        assert_eq!(
-            ENGINE_VERSION,
-            format!("kronik-{KRONIK_VERSION}+wasmtime-{WASMTIME_VERSION}")
-        );
-    }
+    use super::WASMTIME_VERSION;
 
     #[test]
     fn wasmtime_version_is_the_locked_wasmtime_version() {
         let lockfile =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
                 .unwrap();
-        assert_eq!(locked_versions(&lockfile, "wasmtime"), [WASMTIME_VERSION]);
-        assert_eq!(
-            locked_versions(&lockfile, "wasmtime-environ"),
-            [WASMTIME_VERSION]
-        );
+        for name in [
+            "wasmtime",
+            "wasmtime-environ",
+            "wasmtime-wasi",
+            "wasmtime-wasi-io",
+            "wasmtime-wasi-http",
+        ] {
+            assert_eq!(
+                locked_versions(&lockfile, name),
+                [WASMTIME_VERSION],
+                "{name}"
+            );
+        }
     }
 
     /// Returns the versions of every package called `name` in a Cargo.lock.

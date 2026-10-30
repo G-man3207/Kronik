@@ -3,12 +3,13 @@
 //! data directory a running daemon may still be writing (read-only: the log
 //! through what is on disk, snapshots, components).
 
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use kronik_core::env::Env;
-use kronik_core::ids::Lsn;
+use kronik_core::ids::{CodeHash, Lsn};
 use kronik_log::LogReader;
 use kronik_runtime::{CodeStore, ENGINE_VERSION, PoolSize, build_engine};
 use kronik_sched::upgrade::{REPORT_SCHEMA, UpgradeReport};
@@ -129,6 +130,35 @@ pub async fn check(
         config,
         None,
     );
+    let mut config_history = kronik_effects::ConfigHistory::default();
+    let mut versions = BTreeMap::new();
+    for (_, record) in index.config_records_upto(head) {
+        if let kronik_proto::Record::Deployment(deployment) = &record {
+            for kind in &deployment.kinds {
+                let hash =
+                    CodeHash::from_slice(&kind.code_hash).ok_or("corrupt deployment code hash")?;
+                versions.insert(hash, kind.schema_version);
+            }
+        }
+        config_history.push(record);
+    }
+    for committed in index.records.iter().filter(|c| c.lsn > fork_lsn) {
+        if let kronik_proto::Record::TurnRecord(turn) = &committed.record {
+            let hash =
+                CodeHash::from_slice(&turn.code_hash).ok_or("corrupt recorded turn code hash")?;
+            if let Entry::Vacant(entry) = setup.upgrade_code.entry(hash) {
+                let schema_version = *versions
+                    .get(&hash)
+                    .ok_or("recorded code has no deployment metadata")?;
+                entry.insert(crate::ForkKind {
+                    hash,
+                    program: code.get(&hash).map_err(|e| e.to_string())?,
+                    schema_version,
+                });
+            }
+        }
+    }
+    setup.upgrade_config = Some(std::sync::Mutex::new(config_history));
     if let Some(p) = privacy {
         setup.privacy = p;
     }
