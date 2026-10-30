@@ -109,9 +109,9 @@ def local_origin(package, workspace):
     return origin, paths
 
 
-def packages(metadata):
+def packages(metadata, root_name: str = "kronik"):
     nodes = {n["id"]: n for n in metadata["resolve"]["nodes"]}
-    root = next(p for p in metadata["packages"] if p["name"] == "kronik")
+    root = next(p for p in metadata["packages"] if p["name"] == root_name)
     seen, todo = set(), [root["id"]]
     while todo:
         ident = todo.pop()
@@ -138,8 +138,8 @@ def packages(metadata):
     return root, sorted(dependencies, key=lambda p: (p["name"], p["version"]))
 
 
-def dependency_notices(metadata, apache):
-    _, dependencies = packages(metadata)
+def dependency_notices(metadata, apache, root_name: str = "kronik"):
+    _, dependencies = packages(metadata, root_name)
     workspace = Path(metadata["workspace_root"]).resolve()
     origins = {p["id"]: local_origin(p, workspace) for p in dependencies if p["source"] is None}
     files = {p["id"]: legal_files(Path(p["manifest_path"]).parent,
@@ -209,6 +209,20 @@ class PlainText(HTMLParser):
         self.parts.append(data)
 
 
+def rust_notices(rust: Path, rustc_version: str,
+                 copyright_files: tuple[str, ...] = ("COPYRIGHT-library.html",)):
+    text = ""
+    for name in copyright_files:
+        library = PlainText()
+        library.feed((rust / name).read_text())
+        label = rustc_version if name == "COPYRIGHT-library.html" else f"{rustc_version}: {name}"
+        text += section(label, "".join(library.parts))
+    for path in sorted((rust / "licenses").iterdir()):
+        if path.is_file():
+            text += section(f"Rust supplied license text: {path.name}", path.read_text())
+    return text
+
+
 def notices(metadata, zig, target):
     root = Path(metadata["workspace_root"])
     sysroot = Path(subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip())
@@ -222,12 +236,7 @@ def notices(metadata, zig, target):
             "Node/ComponentizeJS/StarlingMonkey, CPython, TinyGo and WASI-Virt runtimes are\n"
             "external actor-build tools/outputs, not runtimes embedded in this host binary.\n")
     text += dependency_notices(metadata, apache)
-    library = PlainText()
-    library.feed((rust / "COPYRIGHT-library.html").read_text())
-    text += section(subprocess.check_output(["rustc", "--version"], text=True).strip(), "".join(library.parts))
-    for path in sorted((rust / "licenses").iterdir()):
-        if path.is_file():
-            text += section(f"Rust supplied license text: {path.name}", path.read_text())
+    text += rust_notices(rust, subprocess.check_output(["rustc", "--version"], text=True).strip())
     for relative in ("LICENSE", "lib/libc/musl/COPYRIGHT", "lib/libunwind/LICENSE.TXT"):
         text += section(f"Zig supplied runtime: {relative}", (zig / relative).read_text())
     for relative in ("lib/libc/musl", "lib/libunwind", "lib/compiler_rt", "lib/include"):

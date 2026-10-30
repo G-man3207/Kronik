@@ -1,6 +1,7 @@
 """Release packager boundary checks; full packaging/consumer proof uses real binaries."""
 
 import hashlib
+from html import escape
 import json
 from pathlib import Path
 import runpy
@@ -49,6 +50,58 @@ class PackagingTest(unittest.TestCase):
         }
         _, dependencies = PACKAGER["packages"](metadata)
         self.assertEqual([p["name"] for p in dependencies], ["normal", "transitive"])
+
+    def test_rust_notice_inputs_preserve_daemon_default_and_full_guest_attribution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rust = Path(directory)
+            (rust / "licenses").mkdir()
+            library = (ROOT / "proto/opentelemetry/LICENSE").read_text()
+            compiler = (ROOT / "scripts/licenses/cel-0.15.0-MIT.txt").read_text()
+            (rust / "COPYRIGHT-library.html").write_text("<pre>" + escape(library) + "</pre>")
+            (rust / "COPYRIGHT.html").write_text("<pre>" + escape(compiler) + "</pre>")
+            (rust / "licenses/original.txt").write_text(compiler)
+            section = PACKAGER["section"]
+            old = section("actual version input", library) + section("Rust supplied license text: original.txt", compiler)
+            self.assertEqual(PACKAGER["rust_notices"](rust, "actual version input"), old)
+            guest = PACKAGER["rust_notices"](rust, "actual version input",
+                                             copyright_files=("COPYRIGHT-library.html", "COPYRIGHT.html"))
+            self.assertIn(section("actual version input: COPYRIGHT.html", compiler), guest)
+            self.assertIn(section("Rust supplied license text: original.txt", compiler), guest)
+            (rust / "COPYRIGHT.html").unlink()
+            with self.assertRaises(FileNotFoundError):
+                PACKAGER["rust_notices"](rust, "actual version input",
+                                         copyright_files=("COPYRIGHT-library.html", "COPYRIGHT.html"))
+
+    def test_guest_notices_reuse_the_exact_normal_dependency_collector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            packages = []
+            for name in ("kronik", "kronik-guest-init", "shared", "daemon-only", "guest-build"):
+                root = workspace / name
+                root.mkdir()
+                (root / "Cargo.toml").write_text(f'[package]\nname="{name}"\n')
+                (root / "LICENSE").write_bytes((ROOT / "proto/opentelemetry/LICENSE").read_bytes())
+                packages.append({"id": name, "name": name, "version": "1",
+                                 "source": None if name.startswith("kronik") else "registry",
+                                 "manifest_path": str(root / "Cargo.toml"), "license_file": None,
+                                 "license": "Apache-2.0", "repository": None, "authors": []})
+            def node(name, dependencies=()):
+                return {"id": name, "deps": [{"pkg": child, "dep_kinds": [{"kind": kind}]}
+                                             for child, kind in dependencies]}
+            metadata = {"workspace_root": str(workspace), "workspace_members": ["kronik", "kronik-guest-init"],
+                        "packages": packages, "resolve": {"nodes": [
+                            node("kronik", [("kronik-guest-init", None), ("daemon-only", None)]),
+                            node("kronik-guest-init", [("shared", None), ("guest-build", "build")]),
+                            node("shared"), node("daemon-only"), node("guest-build")]}}
+            _, daemon = PACKAGER["packages"](metadata)
+            guest, dependencies = PACKAGER["packages"](metadata, root_name="kronik-guest-init")
+            self.assertEqual(guest["name"], "kronik-guest-init")
+            self.assertEqual([p["name"] for p in daemon], ["daemon-only", "shared"])
+            self.assertEqual([p["name"] for p in dependencies], ["shared"])
+            text = PACKAGER["dependency_notices"](metadata, "unused", root_name="kronik-guest-init")
+            self.assertIn("shared 1", text)
+            self.assertNotIn("daemon-only 1", text)
+            self.assertNotIn("guest-build 1", text)
 
     def test_missing_license_is_not_fabricated(self):
         with tempfile.TemporaryDirectory() as directory:

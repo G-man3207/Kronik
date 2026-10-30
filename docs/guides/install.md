@@ -137,6 +137,17 @@ collection is conservative and does not claim every listed portion is linked.
 This distribution work does not settle contributor provenance or the
 licensor/CLA ownership review.
 
+Separate tool recipes reuse this collector rather than assuming the daemon's
+dependency or native-runtime closure. `packages` and `dependency_notices` accept
+the explicit `root_name="kronik-guest-init"` input; the default remains `kronik`.
+`rust_notices` retains the actual supplied Rust documentation/license inputs,
+with `copyright_files=("COPYRIGHT-library.html", "COPYRIGHT.html")` for the tool
+recipe's full compiler/runtime records. These records do not by themselves prove
+every native object's source attribution. A plain-Cargo musl build must establish
+its actual Rust/native source provenance, not borrow the Zig inputs or infer a
+version from its target name. No optional helper ABI or tool bundle is claimed
+accepted without its actual build, graph, original notices and runtime evidence.
+
 ## Building a release
 
 In a checkout of the repository, `scripts/release.sh` builds a release into
