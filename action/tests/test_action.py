@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -613,11 +614,44 @@ def load(path):
     return yaml.safe_load(path.read_text())
 
 
-class LintTest(unittest.TestCase):
-    """action.yml and the reference workflow: actionlint when installed, and
-    always (with PyYAML) the structure the guide promises."""
+class CiInventoryTest(unittest.TestCase):
+    def check(self, workflow, script="set -- fmt test action\n"):
+        runpy.run_path(str(ROOT / "scripts/check-ci-steps.py"))["check"](script, workflow)
 
-    @unittest.skipIf(shutil.which("actionlint") is None, "actionlint is not installed; skipping it")
+    def test_multi_argument_and_continued_calls(self):
+        self.check("run: scripts/ci.sh fmt test\\\n    action # selected checks\n")
+
+    def test_sudo_call_and_shell_failure_handler(self):
+        self.check("run: scripts/ci.sh fmt test\n"
+                   "  sudo -E env PATH=x scripts/ci.sh action || status=$?\n")
+
+    def test_defaults_and_comments(self):
+        self.check("# scripts/ci.sh unknown\nrun: scripts/ci.sh # all defaults\n")
+
+    def test_missing_step_and_no_calls_fail(self):
+        for workflow in ("run: scripts/ci.sh fmt test", "# no CI calls"):
+            with self.subTest(workflow=workflow), self.assertRaisesRegex(ValueError, "missing"):
+                self.check(workflow)
+
+    def test_unknown_step_fails(self):
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            self.check("run: scripts/ci.sh fmt test action typo")
+
+    def test_duplicates_and_wrong_order_fail(self):
+        for workflow in ("run: scripts/ci.sh fmt test test action",
+                         "run: scripts/ci.sh test fmt action"):
+            with self.subTest(workflow=workflow), self.assertRaises(ValueError):
+                self.check(workflow)
+
+    def test_missing_default_inventory_fails(self):
+        with self.assertRaisesRegex(ValueError, "no default"):
+            self.check("run: scripts/ci.sh fmt", "# no defaults")
+
+
+class LintTest(unittest.TestCase):
+    """Lint the real composite action and reference workflow with actionlint,
+    and (with PyYAML) the structure the guide promises."""
+
     def test_actionlint(self):
         # The workflow with the action as a local one, so that actionlint
         # checks action.yml and the inputs the workflow gives it too.

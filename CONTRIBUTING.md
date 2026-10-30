@@ -21,15 +21,19 @@ You need [rustup](https://rustup.rs) and
 Run the same checks as CI before you push:
 
 ```sh
-scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny, foreign, identity and action
+scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, foreign, identity and action
 scripts/ci.sh clippy test    # selected steps
 ```
 
 `scripts/ci.sh` exits non-zero if any step fails. The `foreign` step needs
 root and `runsc` and is skipped with a message otherwise; without
-libfaketime, `identity` skips `todo-ts` the same way. The `action` step skips
-its YAML checks without PyYAML, and actionlint when it is not installed.
-Pull requests must keep it green.
+libfaketime, `identity` skips `todo-ts` the same way. The `action` step
+installs checksum-verified actionlint 1.7.12 into `target/tools/` and lints
+the actual workflows and composite action; a download or lint failure
+fails the step. Its additional YAML structure checks need PyYAML.
+`hygiene` checks every argument of literal workflow `ci.sh` calls against
+the default step inventory; missing, unknown, duplicate or reordered steps
+fail. Pull requests must keep it green.
 
 ## Conventions
 

@@ -138,21 +138,8 @@ for b in bad:
     print("error: " + b, file=sys.stderr)
 sys.exit(1 if bad else 0)
 PY
-    # The GitHub workflow runs every step of this script, in this order
-    # (review M15 N1: a step it lacks breaks the steps after it). A call may
-    # sit inside a multi-line command (foreign runs under sudo); steps that
-    # call no ci.sh step (Install gVisor) and comments don't count.
-    python3 - <<'PY'
-import pathlib, re, sys
-script = pathlib.Path("scripts/ci.sh").read_text()
-steps = re.search(r"set -- ([a-z ]+)\n", script).group(1).split()
-workflow = pathlib.Path(".github/workflows/ci.yml").read_text()
-runs = re.findall(r"^(?![ \t]*#)[^\n]*?\bscripts/ci\.sh (\w+)", workflow, re.M)
-if runs != steps:
-    print(f"error: .github/workflows/ci.yml runs {runs}, scripts/ci.sh has {steps}", file=sys.stderr)
-    sys.exit(1)
-
-PY
+    # The workflow must run all default steps, including multi-step calls.
+    python3 scripts/check-ci-steps.py
 }
 
 step_test() {
@@ -354,14 +341,13 @@ step_identity() {
     KRONIK_BIN="$kronik" scripts/identity-examples.sh "${only[@]}"
 }
 
-# The GitHub Action (action/, docs/guides/github-action.md): its unit tests
-# run kronik_action.py against a fake kronik and a fake GitHub API, and lint
-# action.yml and the reference workflow (docs/examples/kronik-ci.yml): their
-# structure with PyYAML, their run: blocks with shellcheck, and both with
-# actionlint when it is installed; each check that lacks its tool is skipped
-# with a message.
+# The GitHub Action's tests and actual workflow/composite YAML. Install the
+# pinned, checksum-verified actionlint rather than silently skipping it.
 step_action() {
-    python3 -B -m unittest discover -v -s action/tests
+    local actionlint
+    actionlint="$(scripts/install-actionlint.sh)"
+    "$actionlint"
+    PATH="$(dirname "$actionlint"):$PATH" python3 -B -m unittest discover -v -s action/tests
 }
 
 if [ "$#" -eq 0 ]; then
