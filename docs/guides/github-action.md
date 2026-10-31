@@ -24,9 +24,15 @@ approval. Without such an approval it approves and promotes nothing.
 
 ## What it does
 
-This checkout's Action installs `kronik` when `base-url` is set: it downloads
-`kronik-<arch>-unknown-linux-musl.tar.gz` and its `.tar.gz.sha256` sidecar,
-checks the archive's SHA-256 **before** reading it, and requires nonempty
+When `base-url` is set, this checkout's Action requires the exact `version` and
+downloads `kronik-<arch>-unknown-linux-musl.tar.gz` with its standard
+`.tar.gz.sigstore.json` bundle. Before reading any member it verifies the archive
+with source-hash-pinned official GitHub CLI 2.103.3 and maintained Sigstore roots:
+the exact release workflow/tag, source ref, Actions issuer, hosted runner and
+numeric repository **1432583300** from the **verified certificate**.
+The verifier has private HOME/config/cache, no GitHub credentials, and no runtime
+trust-policy or unsigned override. It is temporary, not installed globally.
+The ELF must match the host architecture, with nonempty original
 `LICENSE`, `NOTICE` and `THIRD_PARTY_LICENSES.txt` alongside the binary.
 It refuses missing notices, duplicates, links and non-flat archive paths,
 then retains the notices in the installed binary directory's
@@ -38,20 +44,27 @@ It puts `kronik` on `PATH` for later steps and prints `kronik --version`.
 Without `base-url` it uses the `kronik` already on `PATH`. The Action needs
 a Linux runner with `python3` 3.9 or newer.
 
-**Match the Action revision to an actually available distribution.** The
-published `v0.3.0` Action/installer and the reference workflow's historical
-pin remain unchanged and use the original raw-binary assets. Supplemental
-licensed archives of those exact binaries are now public at
-`https://github.com/G-man3207/Kronik/releases/download/v0.3.0`; this checkout's
-Action can use that `base-url`. They still contain Wasmtime **50.0.0**, not
-the current source's 50.0.1 patch. No historical checksums, installer or Action
-pins were replaced, and this licensing supplement is not a new software version.
+**Match the Action revision to an actually available signed distribution.**
+Current consumers refuse unsigned historical `v0.3.0` archives. Its original and
+supplementary assets, installer, historical Action and the reference workflow's
+pin remain unchanged; their binaries still contain Wasmtime **50.0.0**, not the
+source's 50.0.1 patch. No signed public Kronik event has been performed for this
+source cutover, and no historical artifact is re-signed or relabeled.
 
-`base-url` must be `https://` or `file://`, or `http://` to a loopback IP
-(`127.0.0.1`, `[::1]`). The archive and its checksum come from the same
-place: this detects corruption, not a malicious publisher or an independent
-signature. Pin one actually available bundle URL, not “latest”; release
-signature proof remains M31 work.
+The reference/M10 and copied example pins are temporary historical checkpoints,
+not the signed-consumer cutover. After an actual signed Kronik version exists,
+migrate every download caller to the exact reviewed signing-implementation SHA
+and supply that exact version; never substitute a mutable/local PR Action or an
+unsigned fallback. Previous local M10 evidence covers only its old pin and binary.
+Without `base-url`, an already trusted checkout-built `kronik` on `PATH` still
+works; this is not permission to download an unsigned release.
+
+`base-url` remains `https://` or `file://`, or `http://` to a loopback IP.
+Version selects the exact authenticated tag, not a new trust root. Fresh
+verification needs HTTPS access to the official pinned verifier and maintained
+TUF endpoints even with a local artifact mirror; no account is needed. See
+[ADR 0100](../adr/0100-signed-reproducible-releases.md) for the trust/bootstrap
+boundary. Ordinary checksum sidecars remain human assets, not authentication.
 
 Then, by `command`:
 
@@ -172,7 +185,8 @@ protection rules**.
 | Input | Default | Meaning |
 | --- | --- | --- |
 | `command` | (required) | `install`, `propose` or `promote`. |
-| `base-url` | empty | Where one release's files are (`https://`, `file://`, or `http://` to a loopback IP). Empty: use the `kronik` on `PATH`. |
+| `base-url` | empty | Where one signed release's archive and standard bundle are. Requires `version`. Empty: use the already trusted `kronik` on `PATH`. |
+| `version` | empty | Exact signed version when `base-url` is set; controls the expected workflow/tag and source ref. |
 | `components` | `dist` | Whitespace-separated `.wasm` files, globs or directories, searched for `*.wasm`. |
 | `proposal` | empty | `promote`: the proposal to promote, the `verify` job's `proposal-id`. Empty: nothing to promote, with a notice. |
 | `environment` | `kronik-production` | `promote`: the job's environment, whose approval of the run is required for `require_approval`. |

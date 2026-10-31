@@ -203,79 +203,98 @@ class ActionTest(unittest.TestCase):
 
 
 class InstallTest(ActionTest):
+    """Post-authentication payload/atomic boundaries; real signatures use the
+    finite public-fixture consumer drill, never a mocked successful signature."""
+
     def payload(self):
         return {
-            "kronik": FAKE.read_bytes(),
+            "kronik": Path(sys.executable).read_bytes(),
             "LICENSE": (ROOT / "LICENSE").read_bytes(),
             "NOTICE": (ROOT / "NOTICE").read_bytes(),
             "THIRD_PARTY_LICENSES.txt": (ROOT / "scripts/licenses/tinygo-0.43.0.txt").read_bytes(),
         }
 
-    def release(self, sums=None, payload=None, extra=None):
+    def release(self, payload=None, extra=None):
         rel = self.tmp / "release"
         rel.mkdir(exist_ok=True)
-        for arch in ("x86_64", "aarch64"):
-            name = f"kronik-{arch}-unknown-linux-musl.tar.gz"
-            with tarfile.open(rel / name, "w:gz") as tar:
-                for member, data in (self.payload() if payload is None else payload).items():
-                    info = tarfile.TarInfo(member)
-                    info.size = len(data)
-                    info.mode = 0o755 if member == "kronik" else 0o644
-                    tar.addfile(info, io.BytesIO(data))
-                if extra:
-                    info, data = extra
-                    tar.addfile(info, io.BytesIO(data))
-            digest = hashlib.sha256((rel / name).read_bytes()).hexdigest()
-            (rel / (name + ".sha256")).write_text(
-                (sums if sums is not None else f"{digest}  {name}") + "\n")
+        name = "kronik-x86_64-unknown-linux-musl.tar.gz"
+        with tarfile.open(rel / name, "w:gz") as tar:
+            for member, data in (self.payload() if payload is None else payload).items():
+                info = tarfile.TarInfo(member)
+                info.size = len(data)
+                info.mode = 0o755 if member == "kronik" else 0o644
+                tar.addfile(info, io.BytesIO(data))
+            if extra:
+                info, data = extra
+                tar.addfile(info, io.BytesIO(data))
         return rel.as_uri()
 
     def installed(self):
         return self.tmp / "runner" / "kronik-bin" / "kronik"
 
-    def test_checksum_verified(self):
-        p, calls = self.run_action("install", base_url=self.release(), event={}, event_name="push", path_bin=False)
+    def run_payload(self, release, limit=None):
+        archive = Path(urllib.parse.urlsplit(release).path) / "kronik-x86_64-unknown-linux-musl.tar.gz"
+        code = ("import pathlib,runpy,sys; m=runpy.run_path(sys.argv[1]); "
+                "m['install_payload'](m['unpack_release'](pathlib.Path(sys.argv[2]).read_bytes()))")
+        def restrict():
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+        return subprocess.run(
+            [sys.executable, "-B", "-c", code, str(SCRIPT), str(archive)],
+            env={"PATH": os.environ["PATH"], "HOME": str(self.tmp), "LC_ALL": "C",
+                 "RUNNER_TEMP": str(self.tmp / "runner"), "GITHUB_PATH": str(self.tmp / "path")},
+            capture_output=True, text=True, timeout=30, preexec_fn=restrict if limit else None)
+
+    def test_verified_payload_installs_real_executable_and_notices(self):
+        p = self.run_payload(self.release())
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn("Using kronik 0.0.0-fake", p.stdout)
-        self.assertTrue(os.access(self.installed(), os.X_OK))
+        self.assertEqual(subprocess.check_output([str(self.installed()), "--version"]),
+                         subprocess.check_output([sys.executable, "--version"]))
         self.assertEqual((self.tmp / "path").read_text(), f"{self.installed().parent}\n")
-        self.assertEqual(calls[0]["argv"], ["--version"])
         for member, data in self.payload().items():
             if member != "kronik":
                 self.assertEqual((self.installed().parent / "kronik-licenses" / member).read_bytes(), data)
 
-    def test_checksum_mismatch_refused(self):
-        sums = "\n".join(f"{'0' * 64}  kronik-{a}-unknown-linux-musl.tar.gz" for a in ("x86_64", "aarch64"))
-        p, calls = self.run_action("install", base_url=self.release(sums), event={}, event_name="push", path_bin=False)
-        self.assertEqual(p.returncode, 1)
-        self.assertIn("checksum", p.stdout)
-        self.assertFalse(self.installed().exists())
+    def test_unsigned_release_preserves_existing_executable(self):
+        old = self.installed()
+        old.parent.mkdir(parents=True)
+        old.write_bytes(Path(sys.executable).read_bytes())
+        old.chmod(0o755)
+        digest = hashlib.sha256(old.read_bytes()).hexdigest()
+        p, calls = self.run_action("install", base_url=self.release(), version="0.4.0",
+                                   event={}, event_name="push", path_bin=False)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(hashlib.sha256(old.read_bytes()).hexdigest(), digest)
         self.assertEqual(calls, [])
 
-    def test_missing_checksum_line_refused(self):
-        p, calls = self.run_action("install", base_url=self.release(f"{'0' * 64}  other-file"), event={}, event_name="push", path_bin=False)
-        self.assertEqual(p.returncode, 1)
-        self.assertIn("no unique valid line", p.stdout)
-        self.assertFalse(self.installed().exists())
+    def test_exact_version_is_required_before_download(self):
+        base_url = f"http://127.0.0.1:{self.gh.server_port}/release"
+        for version in ("", "not-a-version", "0.4.0/another-ref"):
+            with self.subTest(version=version):
+                p, calls = self.run_action("install", base_url=base_url, version=version,
+                                           event={}, path_bin=False)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertEqual(calls, [])
+                self.assertEqual(self.gh.requests, [])
+                self.assertFalse(self.installed().exists())
 
-    def test_install_then_propose(self):
-        p, calls = self.run_action("propose", base_url=self.release(), path_bin=False)
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertEqual(self.subcommands(calls), ["--version", "propose", "proposal", "diff"])
+    def test_cargo_version_build_metadata_reaches_download_not_execution(self):
+        p, calls = self.run_action("install", base_url=f"http://127.0.0.1:{self.gh.server_port}/release",
+                                   version="0.4.0-rc.1+build.2", event={}, path_bin=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(len(self.gh.requests), 1)
+        self.assertEqual(self.gh.requests[0]["method"], "GET")
+        self.assertEqual(calls, [])
+        self.assertFalse(self.installed().exists())
 
     def test_base_url_scheme(self):
         for url in ("http://releases.example/v1", "http://localhost:1/v1", "ftp://releases.example/v1", "releases.example/v1"):
             with self.subTest(url=url):
-                p, calls = self.run_action("install", base_url=url, event={}, event_name="push", path_bin=False)
-                self.assertEqual(p.returncode, 1)
-                self.assertIn("base-url must be an https:// or file:// URL, or http:// to a loopback IP address", p.stdout)
+                p, calls = self.run_action("install", base_url=url, version="0.4.0",
+                                           event={}, event_name="push", path_bin=False)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("base-url must be", p.stdout)
                 self.assertEqual(calls, [])
-        # Allowed, and then fails only because nothing listens there.
-        for url in ("http://127.0.0.1:1/v1", "http://[::1]:1/v1"):
-            with self.subTest(url=url):
-                p, _ = self.run_action("install", base_url=url, event={}, event_name="push", path_bin=False)
-                self.assertEqual(p.returncode, 1)
-                self.assertIn("could not download", p.stdout)
 
     def test_missing_or_empty_notice_refused_before_install(self):
         for member in ("LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.txt"):
@@ -286,112 +305,40 @@ class InstallTest(ActionTest):
                         payload[member] = b""
                     else:
                         del payload[member]
-                    p, calls = self.run_action("install", base_url=self.release(payload=payload),
-                                               event={}, event_name="push", path_bin=False)
-                    self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                    p = self.run_payload(self.release(payload))
+                    self.assertNotEqual(p.returncode, 0)
                     self.assertFalse(self.installed().exists())
-                    self.assertEqual(calls, [])
 
     def test_archive_paths_links_and_duplicates_refused(self):
-        for name, kind in (("../escape", tarfile.REGTYPE),
-                           (str(self.tmp / "escape-absolute"), tarfile.REGTYPE),
-                           ("NOTICE", tarfile.SYMTYPE),
-                           ("kronik", tarfile.LNKTYPE),
+        for name, kind in (("../escape", tarfile.REGTYPE), ("/escape", tarfile.REGTYPE),
+                           ("NOTICE", tarfile.SYMTYPE), ("kronik", tarfile.LNKTYPE),
                            ("NOTICE", tarfile.REGTYPE)):
             with self.subTest(name=name, kind=kind):
                 info = tarfile.TarInfo(name)
                 info.type = kind
                 info.linkname = "../escape" if kind != tarfile.REGTYPE else ""
-                data = b"escape"
-                info.size = len(data) if kind == tarfile.REGTYPE else 0
-                p, calls = self.run_action("install", base_url=self.release(extra=(info, data)),
-                                           event={}, event_name="push", path_bin=False)
-                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                info.size = 6 if kind == tarfile.REGTYPE else 0
+                p = self.run_payload(self.release(extra=(info, b"escape")))
+                self.assertNotEqual(p.returncode, 0)
                 self.assertFalse(self.installed().exists())
-                self.assertEqual(calls, [])
                 self.assertFalse((self.tmp / "escape").exists())
-                self.assertFalse((self.tmp / "escape-absolute").exists())
 
-    def test_shell_installer_keeps_notices_inside_install_directory(self):
-        destination = self.tmp / "private-bin"
-        env = dict(os.environ, KRONIK_BASE_URL=self.release(),
-                   KRONIK_INSTALL_DIR=str(destination), KRONIK_INSTALL_RUNSC="no")
-        p = subprocess.run(["sh", str(ROOT / "scripts/install.sh")], env=env,
-                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertEqual((destination / "kronik").read_bytes(), FAKE.read_bytes())
-        for member, data in self.payload().items():
-            if member != "kronik":
-                self.assertEqual((destination / "kronik-licenses" / member).read_bytes(), data)
-        self.assertFalse((self.tmp / "share").exists())
-
-    def test_shell_installer_missing_notice_preserves_existing_binary(self):
-        destination = self.tmp / "private-bin"
-        destination.mkdir()
-        old = destination / "kronik"
-        old.write_bytes(b"existing binary")
-        payload = self.payload()
-        del payload["NOTICE"]
-        env = dict(os.environ, KRONIK_BASE_URL=self.release(payload=payload),
-                   KRONIK_INSTALL_DIR=str(destination), KRONIK_INSTALL_RUNSC="no")
-        p = subprocess.run(["sh", str(ROOT / "scripts/install.sh")], env=env,
-                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    def test_real_failed_payload_write_preserves_existing_executable(self):
+        old = self.installed()
+        old.parent.mkdir(parents=True)
+        old.write_bytes(Path(sys.executable).read_bytes())
+        old.chmod(0o755)
+        digest = hashlib.sha256(old.read_bytes()).hexdigest()
+        limit = max(8192, *(len(data) for member, data in self.payload().items() if member != "kronik"))
+        self.assertGreater(old.stat().st_size, limit)
+        p = self.run_payload(self.release(), limit=limit)
         self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertEqual(old.read_bytes(), b"existing binary")
+        self.assertIn("File too large", p.stderr)
+        self.assertEqual(hashlib.sha256(old.read_bytes()).hexdigest(), digest)
+        self.assertEqual(subprocess.check_output([str(old), "--version"]),
+                         subprocess.check_output([sys.executable, "--version"]))
+        self.assertEqual(list(old.parent.glob(".kronik*")), [])
 
-    def test_failed_binary_write_preserves_existing_executable(self):
-        # Real EFBIG from the kernel, not a mocked copy or a fake executable.
-        payload = self.payload()
-        payload["kronik"] = Path(sys.executable).read_bytes()
-        limit = max(8192, *(len(data) for name, data in payload.items() if name != "kronik"))
-        self.assertGreater(len(payload["kronik"]), limit)
-        release = self.release(payload=payload)
-        version = subprocess.check_output([sys.executable, "--version"])
-        fault_bin = self.tmp / "fault-bin"
-        fault_bin.mkdir()
-        for tool in ("cp", "mv"):
-            wrapper = fault_bin / tool
-            wrapper.write_text(
-                f"#!{sys.executable}\n"
-                "import os, resource, signal, sys\n"
-                "if os.path.basename(sys.argv[1]) == 'kronik':\n"
-                "    signal.signal(signal.SIGXFSZ, signal.SIG_IGN)\n"
-                f"    resource.setrlimit(resource.RLIMIT_FSIZE, ({limit}, {limit}))\n"
-                f"os.execv({shutil.which(tool)!r}, sys.argv)\n")
-            wrapper.chmod(0o755)
-
-        def restrict_file_size():
-            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
-            resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
-
-        with tempfile.TemporaryDirectory(prefix="kronik-install-fault-", dir="/dev/shm") as download:
-            self.assertNotEqual(Path(download).stat().st_dev, self.tmp.stat().st_dev,
-                                "the shell regression must exercise a cross-filesystem move")
-            for consumer in ("shell", "action"):
-                with self.subTest(consumer=consumer):
-                    destination = self.tmp / consumer / "kronik-bin"
-                    destination.mkdir(parents=True)
-                    old = destination / "kronik"
-                    old.write_bytes(payload["kronik"])
-                    old.chmod(0o755)
-                    digest = hashlib.sha256(old.read_bytes()).hexdigest()
-                    env = {k: v for k, v in os.environ.items()
-                           if not k.startswith(("GITHUB_", "INPUT_", "KRONIK_", "RUNNER_"))}
-                    env.update(LC_ALL="C", TMPDIR=download,
-                               PATH=str(fault_bin) + os.pathsep + os.environ["PATH"],
-                               KRONIK_BASE_URL=release, KRONIK_INSTALL_DIR=str(destination),
-                               KRONIK_INSTALL_RUNSC="no", INPUT_COMMAND="install",
-                               INPUT_BASE_URL=release, RUNNER_TEMP=str(destination.parent))
-                    argv = (["sh", str(ROOT / "scripts/install.sh")] if consumer == "shell"
-                            else [sys.executable, str(SCRIPT)])
-                    p = subprocess.run(argv, env=env, capture_output=True, text=True,
-                                       stdin=subprocess.DEVNULL, timeout=60,
-                                       preexec_fn=restrict_file_size if consumer == "action" else None)
-                    self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
-                    self.assertIn("File too large", p.stdout + p.stderr)
-                    self.assertEqual(hashlib.sha256(old.read_bytes()).hexdigest(), digest)
-                    self.assertEqual(subprocess.check_output([str(old), "--version"]), version)
-                    self.assertEqual(list(destination.glob(".kronik*")), [])
 
 
 class ProposeTest(ActionTest):

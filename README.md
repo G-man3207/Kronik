@@ -26,8 +26,10 @@ change between releases.
 | [`v0.1.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.1.0) | Durable turns, effects and capabilities, fork, replay and behavior diff with policy and approvals, proposals that span several actors, the TypeScript and Rust SDKs, the JSON API and MCP server, operations on a VPS, foreign actors in gVisor, privacy mode |
 | [`v0.3.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.3.0) | Python and Go SDKs, the CLI against a remote API, watch and preview forks, effect simulators, rollback via replay, foreign actors copied into forks |
 
-`v0.3.0` is the latest release: static musl binaries for x86_64 and aarch64,
-with `install.sh`, `SHA256SUMS` and a CycloneDX SBOM. Since that tag, `main`
+`v0.3.0` is the latest **historical unsigned** release: static musl binaries
+for x86_64 and aarch64, with `install.sh`, checksums and a CycloneDX SBOM.
+The new checkout installer/Action require exact-tag GitHub OIDC attestations;
+no public Kronik signing event has yet been run for that cutover. Since the tag, `main`
 has added OpenTelemetry traces and a verifiable audit export, standard
 `fetch` through `wasi:http`, and KMS master-key custody; these are unreleased.
 M23 B1 custody (OpenBao/AWS/GCP/Azure) is complete; its emulator and
@@ -84,10 +86,15 @@ questions and the known gaps.
 
 ## Getting started
 
-On a fresh Ubuntu 24.04 host, as root:
+The [installation guide](docs/guides/install.md) describes the signed-release
+contract and standalone curl-pipe installer. Historical `v0.3.0` and its unchanged
+installer remain unsigned; current consumers intentionally refuse its archives.
+Until an actually signed release is available, build current code only from a
+trusted checkout, with the prerequisites in [CONTRIBUTING.md](CONTRIBUTING.md):
 
 ```sh
-curl -fsSL https://github.com/G-man3207/Kronik/releases/latest/download/install.sh | sh
+cargo build --locked --release -p kronik
+export PATH="$PWD/target/release:$PATH"
 kronik doctor
 ```
 

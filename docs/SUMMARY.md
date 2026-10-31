@@ -85,3 +85,4 @@
 - [ADR 0084: Export cursors, and the audit export holds retention](adr/0084-export-cursors-and-retention.md)
 - [ADR 0092: The master seed wrapped by a KMS](adr/0092-master-key-wrapped-by-a-kms.md)
 - [ADR 0094: Key providers without SDKs](adr/0094-secret-providers-without-sdks.md)
+- [ADR 0100: Keyless signed and reproducible releases](adr/0100-signed-reproducible-releases.md)

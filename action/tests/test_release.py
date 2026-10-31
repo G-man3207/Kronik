@@ -1,16 +1,22 @@
 """Release packager boundary checks; full packaging/consumer proof uses real binaries."""
 
+import gzip
 import hashlib
 from html import escape
 import json
+import io
 from pathlib import Path
 import runpy
+import shutil
+import sys
+import tarfile
 import struct
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGER = runpy.run_path(str(ROOT / "scripts/package-release.py"))
+REPRO = runpy.run_path(str(ROOT / "scripts/reproduce-release.py"))
 
 
 class PackagingTest(unittest.TestCase):
@@ -232,6 +238,119 @@ class PackagingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "missing runtime source"):
                 PACKAGER["source_notices"](Path(directory) / "absent")
+
+
+class ReproducibilityTest(unittest.TestCase):
+    def test_sbom_graph_identity_is_independent_of_checkout_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            outputs = []
+            registry = "registry+https://github.com/rust-lang/crates.io-index#example@1.0.0"
+            signed = (ROOT / "action/tests/fixtures/gh-2.103.3.sigstore.json").read_text()
+            for name in ("first", "second"):
+                source = Path(directory) / name
+                source.mkdir()
+                local = "path+" + source.as_uri() + "/crates/kronik#0.4.0"
+                original = {"metadata": {"component": {"bom-ref": local, "version": "0.4.0",
+                            "components": [{"bom-ref": local + " bin-target-0"}],
+                            "purl": "pkg:cargo/kronik@0.4.0?download_url=file%3A%2F%2F."},
+                            "timestamp": "2026-01-01T00:00:00Z"},
+                            "properties": [{"name": "signed-fixture", "value": signed}],
+                            "components": [{"bom-ref": registry, "version": "1.0.0",
+                            "hashes": [{"alg": "SHA-256", "content": hashlib.sha256(signed.encode()).hexdigest()}],
+                            "licenses": [{"license": {"text": {"content": (ROOT / "LICENSE").read_text()}}}]}],
+                            "dependencies": [{"ref": local, "dependsOn": [registry]},
+                                             {"ref": registry, "dependsOn": [local]}]}
+                path = source / "kronik.cdx.json"
+                path.write_text(json.dumps(original))
+                result = PACKAGER["reproducible_sbom"](path, source)
+                outputs.append(result)
+                actual = json.loads(result)
+                normalized = actual["metadata"]["component"]["bom-ref"]
+                self.assertNotEqual(normalized, local)
+                self.assertEqual(actual["dependencies"][0]["ref"], normalized)
+                self.assertEqual(actual["dependencies"][1]["dependsOn"], [normalized])
+                self.assertEqual(actual["components"], original["components"])
+                self.assertEqual(actual["metadata"]["component"]["purl"], original["metadata"]["component"]["purl"])
+                expected = json.loads(json.dumps(original))
+                expected["metadata"]["component"]["bom-ref"] = normalized
+                expected["metadata"]["component"]["components"][0]["bom-ref"] = normalized + " bin-target-0"
+                expected["dependencies"][0]["ref"] = normalized
+                expected["dependencies"][1]["dependsOn"] = [normalized]
+                self.assertEqual(actual, expected)
+                self.assertEqual(json.loads(path.read_text()), original)
+                original["description"] = local
+                path.write_text(json.dumps(original))
+                self.assertEqual(json.loads(PACKAGER["reproducible_sbom"](path, source))["description"], local)
+            self.assertEqual(outputs[0], outputs[1])
+
+    def test_sbom_identity_collisions_and_dangling_dependency_refs_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            local = "path+" + source.as_uri() + "/crates/kronik#0.4.0"
+            original = {"components": [{"bom-ref": local}],
+                        "dependencies": [{"ref": local, "dependsOn": []}]}
+            path = source / "kronik.cdx.json"
+            path.write_text(json.dumps(original))
+            canonical = json.loads(PACKAGER["reproducible_sbom"](path, source))["components"][0]["bom-ref"]
+            for case in ("duplicate", "collision", "dangling-node", "dangling-edge"):
+                with self.subTest(case=case):
+                    invalid = json.loads(json.dumps(original))
+                    if case in ("duplicate", "collision"):
+                        invalid["components"].append({"bom-ref": local if case == "duplicate" else canonical})
+                    elif case == "dangling-node":
+                        invalid["dependencies"][0]["ref"] = "undefined-component"
+                    else:
+                        invalid["dependencies"][0]["dependsOn"].append("undefined-component")
+                    path.write_text(json.dumps(invalid))
+                    with self.assertRaises(ValueError):
+                        PACKAGER["reproducible_sbom"](path, source)
+
+    def fixture(self, root):
+        binary = Path(sys.executable).read_bytes()
+        output = root / "source/dist/release"
+        output.mkdir(parents=True)
+        for target in REPRO["TARGETS"]:
+            path = root / "target" / target / "release/kronik"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(binary)
+            archive = output / f"kronik-{target}.tar.gz"
+            with archive.open("wb") as raw, gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w") as tar:
+                    for name, data in (("kronik", binary), ("NOTICE", (ROOT / "NOTICE").read_bytes())):
+                        member = tarfile.TarInfo(name)
+                        member.size = len(data)
+                        tar.addfile(member, io.BytesIO(data))
+        return binary
+
+    def test_compiled_elf_is_compared_independently_of_identical_archives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = (Path(directory) / name for name in ("first", "second"))
+            binary = self.fixture(first)
+            shutil.copytree(first, second)
+            proof = REPRO["compare_builds"](first, second)
+            self.assertEqual(set(proof["targets"]), set(REPRO["TARGETS"]))
+            target = REPRO["TARGETS"][0]
+            (second / "target" / target / "release/kronik").write_bytes(binary + b"changed")
+            with self.assertRaises(ValueError):
+                REPRO["compare_builds"](first, second)
+
+    def test_archive_cannot_substitute_another_elf_or_drop_an_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = (Path(directory) / name for name in ("first", "second"))
+            self.fixture(first)
+            shutil.copytree(first, second)
+            target = REPRO["TARGETS"][0]
+            archive = second / "source/dist/release" / f"kronik-{target}.tar.gz"
+            with tarfile.open(archive, "w:gz") as tar:
+                member = tarfile.TarInfo("kronik")
+                member.size = 5
+                tar.addfile(member, io.BytesIO(b"other"))
+            with self.assertRaises(ValueError):
+                REPRO["compare_builds"](first, second)
+            shutil.copyfile(first / "source/dist/release" / archive.name, archive)
+            (second / "source/dist/release/unexpected").write_bytes(b"unlisted")
+            with self.assertRaises(ValueError):
+                REPRO["compare_builds"](first, second)
 
 
 if __name__ == "__main__":

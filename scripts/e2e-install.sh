@@ -7,7 +7,7 @@
 #      passes (warnings are fine; a failed check is not).
 #   2. As a user, as the brief says, `curl -fsSL <url>/install.sh | sh` over
 #      HTTP: kronik goes to ~/.local/bin, with notices in kronik-licenses/.
-#   3. An archive that does not match its checksum is refused.
+#   3. Tampered and unsigned archives are refused without replacing a real binary.
 #   4. With RUNSC=1, as root with KRONIK_INSTALL_RUNSC=yes: the pinned gVisor
 #      release is downloaded and checked, runsc is installed, and
 #      `kronik doctor` finds it.
@@ -20,6 +20,10 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 release="$(cd "${1:-dist/release}" && pwd)"
+test -s "$release/kronik-x86_64-unknown-linux-musl.tar.gz.sigstore.json" || {
+    echo "This drill requires an actually attested release, not unsigned build candidates." >&2
+    exit 1
+}
 port="${2:-47950}"
 name="kronik-e2e-install-$$"
 work="$(mktemp -d "${TMPDIR:-/var/tmp}/kronik-e2e-install.XXXXXX")"
@@ -31,10 +35,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The release with an archive that no longer matches its checksum.
-mkdir -p "$work/bad"
+# Untrusted mirrors cannot substitute bytes or omit their standard signature bundle.
+mkdir -p "$work/bad" "$work/unsigned"
 cp "$release"/* "$work/bad/"
+cp "$release"/* "$work/unsigned/"
 printf 'x' >>"$work/bad/kronik-x86_64-unknown-linux-musl.tar.gz"
+rm -f "$work/unsigned"/*.sigstore.json
 
 python3 -m http.server "$port" --bind 127.0.0.1 --directory "$release" >"$work/http.log" 2>&1 &
 server=$!
@@ -45,7 +51,7 @@ done
 
 docker run --rm --name "$name" --network host \
     -e RUNSC="${RUNSC:-0}" -e PORT="$port" \
-    -v "$release:/release:ro" -v "$work/bad:/bad:ro" \
+    -v "$release:/release:ro" -v "$work/bad:/bad:ro" -v "$work/unsigned:/unsigned:ro" \
     ubuntu:24.04 bash -euo pipefail -c '
 apt-get update -qq >/dev/null
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates bzip2 >/dev/null
@@ -64,12 +70,18 @@ useradd -m dev
 su dev -c "curl -fsSL http://127.0.0.1:$PORT/install.sh | KRONIK_BASE_URL=http://127.0.0.1:$PORT sh"
 su dev -c "test -x ~/.local/bin/kronik && ~/.local/bin/kronik --version | head -n 1"
 
-echo "== 3. a corrupted archive"
-if KRONIK_BASE_URL=file:///bad KRONIK_INSTALL_DIR=/tmp/bad sh /release/install.sh </dev/null 2>/tmp/err; then
-    echo "FAIL: the corrupted archive was installed"; exit 1
-fi
-grep -q "checksum says" /tmp/err && cat /tmp/err
-test ! -e /tmp/bad/kronik
+echo "== 3. corrupted and unsigned archives preserve an actual executable"
+mkdir /tmp/bad
+cp /usr/local/bin/kronik /tmp/bad/kronik
+before=$(sha256sum /tmp/bad/kronik)
+version=$(/tmp/bad/kronik --version)
+for source in /bad /unsigned; do
+    if KRONIK_BASE_URL="file://$source" KRONIK_INSTALL_DIR=/tmp/bad sh /release/install.sh </dev/null; then
+        echo "FAIL: untrusted release was installed"; exit 1
+    fi
+    test "$(sha256sum /tmp/bad/kronik)" = "$before"
+    test "$(/tmp/bad/kronik --version)" = "$version"
+done
 
 if [ "$RUNSC" = 1 ]; then
     echo "== 4. runsc"

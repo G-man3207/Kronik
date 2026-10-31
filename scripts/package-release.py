@@ -15,6 +15,7 @@ import json
 from html.parser import HTMLParser
 from pathlib import Path
 import re
+import shlex
 import struct
 import subprocess
 import tarfile
@@ -272,6 +273,56 @@ def check_binary(path, target):
             binary.seek(offset + index * size)
             if struct.unpack("<I", binary.read(4))[0] == 3:
                 raise ValueError("release binary has a dynamic ELF interpreter")
+
+
+def reproducible_sbom(sbom, source):
+    # cargo-cyclonedx's opaque graph IDs retain absolute source paths despite SOURCE_DATE_EPOCH.
+    prefix = "path+" + source.resolve().as_uri()
+
+    bom = json.loads(sbom.read_text())
+    components = list(bom.get("components", []))
+    if bom.get("metadata", {}).get("component") is not None:
+        components.append(bom["metadata"]["component"])
+    references = {}
+    for component in components:
+        components.extend(component.get("components", []))
+        if "bom-ref" not in component:
+            continue
+        original = component["bom-ref"]
+        if not isinstance(original, str) or not original or original in references:
+            raise ValueError("invalid or duplicate SBOM component reference")
+        replacement = original
+        if original == prefix or original.startswith((prefix + "/", prefix + "#")):
+            replacement = "path+file:///kronik" + original[len(prefix):]
+        references[original] = replacement
+    if len(set(references.values())) != len(references):
+        raise ValueError("workspace SBOM reference normalization collides with another component")
+    for dependency in bom.get("dependencies", []):
+        for reference in (dependency["ref"], *dependency.get("dependsOn", [])):
+            if reference not in references:
+                raise ValueError(f"dangling SBOM dependency reference: {reference}")
+        dependency["ref"] = references[dependency["ref"]]
+        if "dependsOn" in dependency:
+            dependency["dependsOn"] = [references[reference] for reference in dependency["dependsOn"]]
+    for component in components:
+        if "bom-ref" in component:
+            component["bom-ref"] = references[component["bom-ref"]]
+    return (json.dumps(bom, sort_keys=True, indent=2) + "\n").encode()
+
+def render_installer(source, version, base_url):
+    text = (source / "scripts/install.sh").read_text()
+    replacements = {
+        "'@VERSION@'": shlex.quote(version),
+        "'@BASE_URL@'": shlex.quote(base_url),
+        'sh "$(dirname "$0")/install-runsc.sh" # @RUNSC_SETUP@':
+            (source / "scripts/install-runsc.sh").read_text().rstrip(),
+    }
+    for token, value in replacements.items():
+        if text.count(token) != 1:
+            raise ValueError(f"installer template must contain exactly one {token}")
+        text = text.replace(token, value)
+    return text
+
 
 
 def package(target, binary, sbom, metadata, zig, out):

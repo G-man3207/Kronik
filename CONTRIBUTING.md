@@ -31,6 +31,12 @@ libfaketime, `identity` skips `todo-ts` the same way. The `action` step
 installs checksum-verified actionlint 1.7.12 into `target/tools/` and lints
 the actual workflows and composite action; a download or lint failure
 fails the step. Its additional YAML structure checks need PyYAML.
+The same step runs `scripts/e2e-release-signatures.py`: genuine public
+Sigstore bundles through the actual source/standalone installer and Action,
+including wrong-identity/artifact refusal and real authenticated EFBIG faults.
+It needs HTTPS access for official fixed-hash verifier archives and maintained
+TUF roots, but no account or GitHub token. Fixture identities are private SOURCE
+copies, never production runtime trust overrides.
 `hygiene` checks every argument of literal workflow `ci.sh` calls against
 the default step inventory; missing, unknown, duplicate or reordered steps
 fail. Pull requests must keep it green.
@@ -40,6 +46,13 @@ third-party Rust is included in the unsafe scan and still needs a per-file
 justification. Release packaging treats local third-party path dependencies
 as third-party: an explicit, hash-checked upstream/ordered-patch/license origin
 is required, rather than silently excluding every null Cargo `source`.
+
+Release candidates from `scripts/release.sh` are unsigned. The manual exact-tag
+workflow uses `scripts/reproduce-release.py` for two independent compiled builds
+before keyless attestation. No compiled Kronik output is shared; pinned tools
+and source inputs may be. Actual comparison evidence and a real signed
+Kronik run are required before release claims. See
+[ADR 0100](docs/adr/0100-signed-reproducible-releases.md).
 
 Only `examples/github-flow/proof/change.json` is ignored by aggregate CI.
 Kronik's separate three-job synthetic M10 workflow handles that exact path;

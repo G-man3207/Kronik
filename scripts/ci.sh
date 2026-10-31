@@ -308,7 +308,7 @@ step_deny() {
 step_foreign() {
     local runsc="${KRONIK_RUNSC:-/usr/local/bin/runsc}"
     if [ "$(id -u)" != 0 ] || [ ! -x "$runsc" ]; then
-        local why="the foreign step needs root and runsc at $runsc (scripts/install.sh installs gVisor)"
+        local why="the foreign step needs root and runsc at $runsc (scripts/install-runsc.sh installs gVisor)"
         if [ "${KRONIK_FOREIGN_TESTS:-}" = require ]; then
             echo "error: KRONIK_FOREIGN_TESTS=require, but $why" >&2
             return 1
@@ -362,6 +362,7 @@ step_action() {
     actionlint="$(scripts/install-actionlint.sh)"
     "$actionlint"
     PATH="$(dirname "$actionlint"):$PATH" python3 -B -m unittest discover -v -s action/tests
+    python3 -B scripts/e2e-release-signatures.py
 }
 
 if [ "$#" -eq 0 ]; then

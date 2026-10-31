@@ -3,11 +3,10 @@
 #
 #   curl -fsSL https://<project>/install.sh | sh
 #
-# Downloads the licensed static release archive for Linux x86_64 or aarch64,
-# verifies its per-archive SHA-256 before reading it, and installs kronik with
-# its license/notice texts. Then it offers gVisor's runsc, which foreign actors
-# need (docs/adr/0003-gvisor-bridge.md), checked against the pinned SHA-512.
-# Last, it suggests `kronik doctor`.
+# Downloads the licensed static release archive for Linux x86_64 or aarch64.
+# A source-pinned official GitHub verifier checks its GitHub OIDC attestation
+# before any archive member is read or executed. Then the installer offers
+# pinned gVisor setup and suggests `kronik doctor`.
 #
 # scripts/release.sh writes the release's version and base URL into the copy
 # of this script that it puts next to the binaries. The environment
@@ -15,17 +14,28 @@
 #
 #   KRONIK_BASE_URL       where the release's files are: https://, http:// or
 #                         file://
+#   KRONIK_VERSION        exact signed release version (needed in a checkout)
 #   KRONIK_INSTALL_DIR    where kronik goes; default /usr/local/bin as root,
 #                         else ~/.local/bin
 #   KRONIK_INSTALL_RUNSC  yes, no or ask (the default): ask asks on the
 #                         terminal, and without one installs nothing
 set -eu
 
-BASE_URL="${KRONIK_BASE_URL:-@BASE_URL@}"
-VERSION="@VERSION@"
-RUNSC_RELEASE="20261019.0"
-RUNSC_URL="https://storage.googleapis.com/gvisor/releases/release/$RUNSC_RELEASE"
-RUNSC_DIR="/usr/local/bin"
+RELEASE_BASE_URL='@BASE_URL@'
+RELEASE_VERSION='@VERSION@'
+BASE_URL="${KRONIK_BASE_URL:-$RELEASE_BASE_URL}"
+VERSION="${KRONIK_VERSION:-$RELEASE_VERSION}"
+RELEASE_REPOSITORY=G-man3207/Kronik
+RELEASE_REPOSITORY_ID=1432583300
+RELEASE_WORKFLOW=.github/workflows/release.yml
+RELEASE_ISSUER=https://token.actions.githubusercontent.com
+RELEASE_REF='refs/tags/v{version}'
+RELEASE_FILES='kronik kronik
+LICENSE LICENSE
+NOTICE NOTICE
+THIRD_PARTY_LICENSES.txt THIRD_PARTY_LICENSES.txt'
+VERIFIER_VERSION=2.103.3
+VERIFIER_URL=https://github.com/cli/cli/releases/download/v2.103.3
 
 say() { printf '%s\n' "$*"; }
 fail() {
@@ -36,22 +46,48 @@ need() {
     command -v "$1" >/dev/null 2>&1 || fail "$1 is needed; install it and run this again"
 }
 
-# The SHA-512 of a gVisor release archive, pinned here rather than taken from
-# the server that serves the archive.
-runsc_sha512() {
-    case "$1/$2" in
-        x86_64/gvisor.tar.zstd) echo bcbf431b2f9a039f6ab23bfe23986031130c0f149294978cedfd46910901deba0737d8642c848f597ed4b5c72324885db4d75ee86a1f6a90915fbe1f2f2eb915 ;;
-        x86_64/gvisor.tar.bz2) echo 7cbc2aeeee809dcccfb40e612504a1b76f2c119790cee59e482f7b35428cccc4f71705e7e322442d07d1f7d29b5d9e72e31319fc3088d6dcbec9fc7c1f0d8881 ;;
-        aarch64/gvisor.tar.zstd) echo 60a8239ec21ba1495633dbfa24ab4d43578066fcebef2482f9d0cd1486abbfd3c5c5face1749a31cc62b287a0a44198a0852024c7f2e5683917c7c1c342d0bbe ;;
-        aarch64/gvisor.tar.bz2) echo 6b14b582cd3185169df54275eed8721d94c9b40e6cb1533d0d0c46573271c6d2d03db586ea1caac46a45e805797f00b115bead9fb93636a1ffa69f2430958977 ;;
-        *) fail "no pinned checksum for $1/$2" ;;
+# Verify the downloaded verifier against this trusted script, never its server.
+verify_release() {
+    case "$arch" in
+        x86_64)
+            gh_arch=amd64
+            gh_sha256=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+            ;;
+        aarch64)
+            gh_arch=arm64
+            gh_sha256=ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63
+            ;;
     esac
+    gh_name="gh_${VERIFIER_VERSION}_linux_$gh_arch"
+    curl -q -fsSL --proto '=https,file' -o "$tmp/verifier.tar.gz" "$VERIFIER_URL/$gh_name.tar.gz" ||
+        fail "could not download the pinned official GitHub verifier"
+    printf '%s  %s\n' "$gh_sha256" "$tmp/verifier.tar.gz" | sha256sum -c - >/dev/null ||
+        fail "the official GitHub verifier does not match its source-pinned SHA-256"
+    tar -xzOf "$tmp/verifier.tar.gz" "$gh_name/bin/gh" >"$tmp/gh"
+    tar -xzOf "$tmp/verifier.tar.gz" "$gh_name/LICENSE" >"$tmp/gh-LICENSE"
+    chmod 700 "$tmp/gh"
+    mkdir -m 700 "$tmp/home" "$tmp/config" "$tmp/cache" "$tmp/tmp"
+    ref="$(printf '%s\n' "$RELEASE_REF" | sed "s/{version}/$VERSION/")"
+    query="if length > 0 and all(.[].verificationResult.signature.certificate; .sourceRepositoryIdentifier == \"$RELEASE_REPOSITORY_ID\") then true else error(\"wrong numeric repository identity\") end"
+    verified="$(env -i PATH=/usr/bin:/bin LC_ALL=C HOME="$tmp/home" \
+        GH_CONFIG_DIR="$tmp/config" XDG_CACHE_HOME="$tmp/cache" TMPDIR="$tmp/tmp" \
+        GH_HOST=github.com GH_PROMPT_DISABLED=1 \
+        timeout --kill-after=10s 180 "$tmp/gh" attestation verify "$tmp/release.tar.gz" \
+        --bundle "$tmp/bundle.json" --repo "$RELEASE_REPOSITORY" \
+        --cert-identity "https://github.com/$RELEASE_REPOSITORY/$RELEASE_WORKFLOW@$ref" \
+        --source-ref "$ref" --cert-oidc-issuer "$RELEASE_ISSUER" \
+        --deny-self-hosted-runners --format json --jq "$query")" ||
+        fail "release signature verification failed; the existing binary is unchanged"
+    [ "$verified" = true ] || fail "release signature verification returned no verified repository identity"
 }
 
 case "$BASE_URL" in
     "" | @*) fail "this install.sh does not name a release; set KRONIK_BASE_URL to where the release's files are" ;;
 esac
 BASE_URL="${BASE_URL%/}"
+VERSION="${VERSION#v}"
+printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' ||
+    fail "set KRONIK_VERSION to the exact signed release version, for example 0.4.0"
 [ "$(uname -s)" = Linux ] || fail "kronik runs on Linux, not $(uname -s)"
 case "$(uname -m)" in
     x86_64 | amd64) arch=x86_64 ;;
@@ -62,6 +98,9 @@ need curl
 need sha256sum
 need tar
 need sync
+need timeout
+need od
+need sed
 archive="kronik-$arch-unknown-linux-musl.tar.gz"
 
 tmp="$(mktemp -d)"
@@ -69,21 +108,27 @@ candidate=""
 trap 'rm -rf "$tmp"; if [ -n "$candidate" ]; then rm -f "$candidate"; fi' EXIT INT TERM
 
 say "Downloading kronik $VERSION for $arch from $BASE_URL"
-curl -fsSL --proto '=https,http,file' -o "$tmp/release.tar.gz" "$BASE_URL/$archive" ||
+curl -q -fsSL --proto '=https,http,file' -o "$tmp/release.tar.gz" "$BASE_URL/$archive" ||
     fail "could not download $BASE_URL/$archive"
-curl -fsSL --proto '=https,http,file' -o "$tmp/checksum" "$BASE_URL/$archive.sha256" ||
-    fail "could not download $BASE_URL/$archive.sha256"
-want="$(awk -v f="$archive" '$2 == f || $2 == "*" f { print $1 }' "$tmp/checksum")"
-got="$(sha256sum "$tmp/release.tar.gz" | cut -d ' ' -f 1)"
-[ -n "$want" ] || fail "$archive.sha256 has no line for $archive"
-[ "$got" = "$want" ] || fail "the SHA-256 of $archive is $got, but its checksum says $want"
+curl -q -fsSL --proto '=https,http,file' -o "$tmp/bundle.json" "$BASE_URL/$archive.sigstore.json" ||
+    fail "could not download $BASE_URL/$archive.sigstore.json; unsigned releases are refused"
+verify_release
 # Stream only named members into private regular files: archive paths, links
 # and ownership are never extracted onto the installer's filesystem.
-for member in kronik LICENSE NOTICE THIRD_PARTY_LICENSES.txt; do
-    tar -xzOf "$tmp/release.tar.gz" "$member" >"$tmp/$member" ||
+while read -r member path; do
+    tar -xzOf "$tmp/release.tar.gz" "$path" >"$tmp/$member" ||
         fail "the release archive has no readable $member"
     [ -s "$tmp/$member" ] || fail "the release archive has an empty $member"
-done
+done <<EOF
+$RELEASE_FILES
+EOF
+magic="$(od -An -tx1 -N6 "$tmp/kronik" | tr -d ' \n')"
+machine="$(od -An -tx1 -j18 -N2 "$tmp/kronik" | tr -d ' \n')"
+[ "$magic" = 7f454c460201 ] || fail "the signed release is not a 64-bit little-endian ELF"
+case "$arch/$machine" in
+    x86_64/3e00 | aarch64/b700) ;;
+    *) fail "the signed release ELF does not match $arch" ;;
+esac
 chmod 755 "$tmp/kronik"
 "$tmp/kronik" --version >/dev/null || fail "the downloaded kronik does not run on this machine"
 
@@ -112,52 +157,7 @@ case ":$PATH:" in
     *) say "Note: $dir is not on your PATH; add it, or run $dir/kronik" ;;
 esac
 
-# gVisor's runsc, for foreign actors.
-install_runsc() {
-    if [ "$(id -u)" != 0 ]; then
-        say "Skipping runsc: installing it into $RUNSC_DIR needs root"
-        return 0
-    fi
-    if command -v zstd >/dev/null 2>&1 && tar --zstd --help >/dev/null 2>&1; then
-        archive=gvisor.tar.zstd
-        unpack="--zstd"
-    else
-        need bzip2
-        archive=gvisor.tar.bz2
-        unpack="--bzip2"
-    fi
-    say "Downloading gVisor release-$RUNSC_RELEASE ($archive)"
-    curl -fsSL -o "$tmp/$archive" "$RUNSC_URL/$arch/$archive" ||
-        fail "could not download $RUNSC_URL/$arch/$archive"
-    printf '%s  %s\n' "$(runsc_sha512 "$arch" "$archive")" "$tmp/$archive" | sha512sum -c - >/dev/null ||
-        fail "the SHA-512 of $archive is not the pinned one"
-    tar "$unpack" -xf "$tmp/$archive" -C "$RUNSC_DIR"
-    say "Installed $("$RUNSC_DIR/runsc" --version | head -n 1) to $RUNSC_DIR/runsc"
-}
-
-installed_runsc="$( (runsc --version 2>/dev/null || true) | head -n 1)"
-case "$installed_runsc" in
-    *"release-$RUNSC_RELEASE"*)
-        say "runsc release-$RUNSC_RELEASE is already installed"
-        ;;
-    *)
-        answer="${KRONIK_INSTALL_RUNSC:-ask}"
-        if [ "$answer" = ask ]; then
-            answer=no
-            # /dev/tty can exist without a terminal behind it (containers,
-            # cron): only opening it tells.
-            if (: </dev/tty) 2>/dev/null; then
-                printf 'Install gVisor runsc release-%s for foreign actors? [y/N] ' "$RUNSC_RELEASE" >/dev/tty
-                read -r reply </dev/tty || reply=""
-                case "$reply" in y | Y | yes | YES) answer=yes ;; esac
-            fi
-        fi
-        case "$answer" in
-            yes) install_runsc ;;
-            no) say "Skipping runsc; foreign actors need it (install it later with KRONIK_INSTALL_RUNSC=yes)" ;;
-            *) fail "KRONIK_INSTALL_RUNSC must be yes, no or ask, not $answer" ;;
-        esac
-        ;;
-esac
+# release.sh embeds the same trusted-checkout setup that CI uses directly.
+sh "$(dirname "$0")/install-runsc.sh" # @RUNSC_SETUP@
 
 say "Next: kronik doctor"

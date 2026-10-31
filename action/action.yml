@@ -11,7 +11,11 @@ inputs:
     description: "install, propose (on pull_request, push or workflow_dispatch) or promote (the verify job's proposal, in a job with a protected environment)."
     required: true
   base-url:
-    description: "Where the matching release's licensed kronik-<arch>-unknown-linux-musl.tar.gz and .tar.gz.sha256 are: https://, file://, or loopback http://. Pin an actually available bundle URL. The archive is checksum-verified and requires license/notice texts. Empty: use kronik already on PATH."
+    description: "Where one signed release's licensed kronik-<arch>-unknown-linux-musl.tar.gz and .tar.gz.sigstore.json are: https://, file://, or loopback http://. Requires version. The exact GitHub workflow/tag/issuer and numeric repository identity are verified before use. Empty: use kronik already on PATH."
+    required: false
+    default: ""
+  version:
+    description: "Exact signed release version when base-url is set, such as 0.4.0. Historical unsigned releases are refused."
     required: false
     default: ""
   components:
@@ -71,6 +75,7 @@ runs:
       env:
         INPUT_COMMAND: ${{ inputs.command }}
         INPUT_BASE_URL: ${{ inputs.base-url }}
+        INPUT_VERSION: ${{ inputs.version }}
         INPUT_COMPONENTS: ${{ inputs.components }}
         INPUT_PROPOSAL: ${{ inputs.proposal }}
         INPUT_ENVIRONMENT: ${{ inputs.environment }}

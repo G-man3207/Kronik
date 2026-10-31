@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The Kronik GitHub Action (action.yml runs it; docs/guides/github-action.md).
 
-Installs kronik from a release (checking its SHA-256), then:
+Installs kronik from a release after verifying its GitHub OIDC attestation, then:
 
 - install: nothing more;
 - propose: proposes the components (of a pull request, or of main in the
@@ -26,8 +26,10 @@ import json
 import os
 import platform
 import re
+from pathlib import Path
 import shlex
 import subprocess
+import struct
 import sys
 import tarfile
 import tempfile
@@ -49,6 +51,22 @@ SUMMARY_LIMIT = 65000  # the Checks API takes at most 65535 characters
 # Events whose pull request code is_fork cannot judge: refused unless
 # allow-forks (they can run a fork's code with the secrets).
 UNSAFE_EVENTS = ("pull_request_target", "workflow_run", "issue_comment")
+
+# Release identities are source policy, never inputs or environment overrides.
+RELEASE_REPOSITORY = "G-man3207/Kronik"
+RELEASE_REPOSITORY_ID = "1432583300"
+RELEASE_WORKFLOW = ".github/workflows/release.yml"
+RELEASE_ISSUER = "https://token.actions.githubusercontent.com"
+RELEASE_REF = "refs/tags/v{version}"
+RELEASE_ARCHIVE = "kronik-{arch}-unknown-linux-musl.tar.gz"
+RELEASE_FILES = {name: name for name in ("kronik", "LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.txt")}
+RELEASE_EXTRA_FILES = ("kronik.cdx.json",)
+VERIFIER_VERSION = "2.103.3"
+VERIFIER_URL = "https://github.com/cli/cli/releases/download/v2.103.3"
+VERIFIER_SHA256 = {
+    "amd64": "4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d",
+    "arm64": "ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63",
+}
 
 
 class Failure(Exception):
@@ -104,48 +122,75 @@ def download(url):
         raise Failure(f"could not download {url}: {e}") from e
 
 
-def install(base_url):
-    if platform.system() != "Linux":
-        raise Failure(f"kronik runs on Linux runners, not {platform.system()}")
-    machine = platform.machine().lower()
-    arch = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(machine)
-    if not arch:
-        raise Failure(f"there is no kronik for {machine}; there is one for x86_64 and one for aarch64")
-    check_base_url(base_url)
-    base_url = base_url.rstrip("/")
-    name = f"kronik-{arch}-unknown-linux-musl.tar.gz"
-    archive = download(f"{base_url}/{name}")
-    sums = download(f"{base_url}/{name}.sha256").decode("utf-8", "replace")
-    # A sidecar also permits supplemental archives on an existing release
-    # without replacing its historical raw-binary SHA256SUMS or installer.
-    want = [f[0].lower() for f in map(str.split, sums.splitlines()) if len(f) == 2 and f[1].lstrip("*") == name]
-    if len(want) != 1 or not re.fullmatch(r"[0-9a-f]{64}", want[0]):
-        raise Failure(f"{name}.sha256 has no unique valid line for {name}; refusing to install it")
-    got = hashlib.sha256(archive).hexdigest()
-    if got != want[0]:
-        raise Failure(f"the SHA-256 of {name} is {got}, but its checksum says {want[0]}; refusing to install it")
-    payload = {}
-    required = ("kronik", "LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.txt")
+def verify_release(archive, bundle, version, arch, work):
+    gh_arch = {"x86_64": "amd64", "aarch64": "arm64"}[arch]
+    name = f"gh_{VERIFIER_VERSION}_linux_{gh_arch}"
+    verifier = download(f"{VERIFIER_URL}/{name}.tar.gz")
+    if hashlib.sha256(verifier).hexdigest() != VERIFIER_SHA256[gh_arch]:
+        raise Failure("the official GitHub verifier does not match its source-pinned SHA-256")
+    gh = work / "gh"
+    try:
+        with tarfile.open(fileobj=io.BytesIO(verifier), mode="r:gz") as tar:
+            for member, destination in (("bin/gh", gh), ("LICENSE", work / "gh-LICENSE")):
+                destination.write_bytes(tar.extractfile(f"{name}/{member}").read())
+    except (tarfile.TarError, KeyError, OSError) as error:
+        raise Failure(f"could not read the pinned GitHub verifier: {error}") from error
+    gh.chmod(0o700)
+    private = {}
+    for key, directory in (("HOME", "home"), ("GH_CONFIG_DIR", "config"),
+                           ("XDG_CACHE_HOME", "cache"), ("TMPDIR", "tmp")):
+        path = work / directory
+        path.mkdir(mode=0o700)
+        private[key] = str(path)
+    private.update(PATH="/usr/bin:/bin", LC_ALL="C", GH_HOST="github.com", GH_PROMPT_DISABLED="1")
+    ref = RELEASE_REF.format(version=version)
+    query = ('if length > 0 and all(.[].verificationResult.signature.certificate; '
+             f'.sourceRepositoryIdentifier == "{RELEASE_REPOSITORY_ID}") then true '
+             'else error("wrong numeric repository identity") end')
+    args = [str(gh), "attestation", "verify", str(archive), "--bundle", str(bundle),
+            "--repo", RELEASE_REPOSITORY,
+            "--cert-identity", f"https://github.com/{RELEASE_REPOSITORY}/{RELEASE_WORKFLOW}@{ref}",
+            "--source-ref", ref, "--cert-oidc-issuer", RELEASE_ISSUER,
+            "--deny-self-hosted-runners", "--format", "json", "--jq", query]
+    try:
+        result = subprocess.run(args, env=private, capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Failure(f"release signature verification failed: {error}") from error
+    if result.returncode != 0 or result.stdout.strip() != "true":
+        raise Failure(f"release signature verification failed: {result.stderr.strip()}")
+
+
+def unpack_release(archive):
+    payload, seen = {}, set()
     try:
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
-            members = tar.getmembers()
-            for member in members:
-                if not member.isfile() or member.name not in (*required, "kronik.cdx.json"):
+            for member in tar:
+                if not member.isfile() or member.name not in (*RELEASE_FILES.values(), *RELEASE_EXTRA_FILES):
                     raise Failure(f"unsafe release archive member: {member.name!r}")
-                if member.name in payload:
+                if member.name in seen:
                     raise Failure(f"duplicate release archive member: {member.name}")
-                payload[member.name] = tar.extractfile(member).read()
-            for member in required:
+                seen.add(member.name)
+                names = [name for name, path in RELEASE_FILES.items() if path == member.name]
+                if names:
+                    data = tar.extractfile(member).read()
+                    payload.update((name, data) for name in names)
+            for member in RELEASE_FILES:
                 if not payload.get(member):
                     raise Failure(f"release archive has no nonempty {member}")
     except (tarfile.TarError, EOFError, OSError) as error:
         raise Failure(f"invalid release archive: {error}") from error
+    return payload
+
+
+def install_payload(payload):
     bin_dir = os.path.join(env("RUNNER_TEMP", tempfile.gettempdir()), "kronik-bin")
     license_dir = os.path.join(bin_dir, "kronik-licenses")
     candidate = None
     try:
         os.makedirs(license_dir, exist_ok=True)
-        for member in required[1:]:
+        for member in RELEASE_FILES:
+            if member == "kronik":
+                continue
             with open(os.path.join(license_dir, member), "wb") as f:
                 f.write(payload[member])
         path = os.path.join(bin_dir, "kronik")
@@ -165,13 +210,40 @@ def install(base_url):
     if env("GITHUB_PATH"):
         with open(env("GITHUB_PATH"), "a") as f:
             f.write(bin_dir + "\n")
-    print(f"Installed {name} from {base_url}, SHA-256 {got}")
+
+
+def install(base_url):
+    if platform.system() != "Linux":
+        raise Failure(f"kronik runs on Linux runners, not {platform.system()}")
+    machine = platform.machine().lower()
+    arch = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(machine)
+    if not arch:
+        raise Failure(f"there is no kronik for {machine}; there is one for x86_64 and one for aarch64")
+    check_base_url(base_url)
+    version = inp("version").removeprefix("v")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version):
+        raise Failure("version must name the exact signed release, for example 0.4.0")
+    base_url = base_url.rstrip("/")
+    name = RELEASE_ARCHIVE.format(arch=arch)
+    archive = download(f"{base_url}/{name}")
+    bundle = download(f"{base_url}/{name}.sigstore.json")
+    with tempfile.TemporaryDirectory(prefix="kronik-verify-") as directory:
+        work = Path(directory)
+        archive_path, bundle_path = work / name, work / "bundle.json"
+        archive_path.write_bytes(archive)
+        bundle_path.write_bytes(bundle)
+        verify_release(archive_path, bundle_path, version, arch, work)
+    payload = unpack_release(archive)
+    binary = payload["kronik"]
+    machine_id = {"x86_64": 62, "aarch64": 183}[arch]
+    if len(binary) < 20 or binary[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", binary, 18)[0] != machine_id:
+        raise Failure(f"the signed release is not a 64-bit little-endian {arch} ELF")
+    install_payload(payload)
+    print(f"Installed {name} from {base_url}, verified {RELEASE_REPOSITORY} release v{version}")
 
 
 def check_base_url(base_url):
-    """https:// or file://, or http:// to a loopback IP: the archive and its
-    checksum come from the same place, so plain HTTP elsewhere would let the
-    network swap both. Checksums are not signatures (M31)."""
+    """Keep release transport confined to HTTPS, local files or loopback HTTP."""
     url = urllib.parse.urlsplit(base_url)
     if url.scheme in ("https", "file"):
         return

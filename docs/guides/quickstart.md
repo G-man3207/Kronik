@@ -4,9 +4,13 @@ The finished-product journey: from an empty machine to a verified deploy,
 with the release binary. A reader without a public DNS name or a bucket can
 do every step; the steps that need one say what to do instead.
 
-Releases are on [GitHub](https://github.com/G-man3207/Kronik/releases);
-the install line below takes the latest. In a checkout of the repository,
-`cargo build -p kronik` builds the binary as `target/debug/kronik`.
+Releases are on [GitHub](https://github.com/G-man3207/Kronik/releases).
+Current consumers require an actually signed exact tag; the latest published
+`v0.3.0` remains historical and unsigned. No public signing event has been run
+for this cutover. Follow the [installation trust contract](install.md), or build
+unreleased code from a trusted checkout with `cargo build -p kronik` and put
+`target/debug` on `PATH`. The rest of this journey uses that trusted binary or
+an actually signed release, not an unsigned fallback.
 
 ## 1. Install
 
@@ -15,16 +19,18 @@ Node.js 22.20 or later; Ubuntu's own `nodejs` package is 18, so take
 Node.js 24 from NodeSource:
 
 ```sh
-apt-get update && apt-get install -y curl
+apt-get update && apt-get install -y curl ca-certificates
 curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
 apt-get install -y nodejs
-curl -fsSL https://github.com/G-man3207/Kronik/releases/latest/download/install.sh | sh
+# Replace VERSION only after that signed release is actually published:
+curl -fsSL "https://github.com/G-man3207/Kronik/releases/download/vVERSION/install.sh" | sh
 kronik doctor
 ```
 
-A published release's `install.sh` knows where its files are. If you serve
-a release's files yourself, give their URL to `sh`:
-`curl -fsSL <url>/install.sh | KRONIK_BASE_URL=<url> sh`.
+A published signed release's standalone `install.sh` knows its exact version
+and base URL. A mirror changes only where the authenticated archive/bundle are
+downloaded; obtain the installer itself from the trusted source:
+`curl -fsSL "<trusted-url>/install.sh" | KRONIK_BASE_URL="<mirror-url>" sh`.
 
 `install.sh` installs `kronik` and offers to install gVisor's `runsc`.
 `kronik doctor` needs no daemon. It reports what this host can run. Its

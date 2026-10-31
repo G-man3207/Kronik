@@ -86,21 +86,12 @@ jobs:
         run: scripts/ci.sh dst
       - name: deny
         run: scripts/ci.sh deny
-      # Bootstrap only runsc through the real installer, using a throwaway
-      # debug-binary archive (not a release/compliance artifact). Full release
-      # notices/SBOMs are produced by package-release.py in release.sh.
+      # Trusted checkout setup only: never manufacture an unsigned release to
+      # bypass the production installer's attestation policy.
       - name: Install gVisor
         run: |
-          release=$(mktemp -d)
-          trap 'sudo rm -rf "$release"' EXIT
-          cp target/debug/kronik "$release/kronik"
-          cp LICENSE NOTICE "$release/"
-          cp scripts/licenses/tinygo-0.43.0.txt "$release/THIRD_PARTY_LICENSES.txt"
-          archive=kronik-x86_64-unknown-linux-musl.tar.gz
-          (cd "$release" && tar -czf "$archive" kronik LICENSE NOTICE THIRD_PARTY_LICENSES.txt &&
-            sha256sum "$archive" >"$archive.sha256")
-          sudo KRONIK_BASE_URL="file://$release" KRONIK_INSTALL_DIR="$release/bin" \
-            KRONIK_INSTALL_RUNSC=yes sh scripts/install.sh </dev/null
+          target/debug/kronik --version
+          sudo KRONIK_INSTALL_RUNSC=yes sh scripts/install-runsc.sh </dev/null
           runsc --version
       # The foreign step needs root: it runs as root with this user's
       # toolchain, then gives the build files back for the later steps and the
