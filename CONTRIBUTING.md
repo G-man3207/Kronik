@@ -37,6 +37,10 @@ including wrong-identity/artifact refusal and real authenticated EFBIG faults.
 It needs HTTPS access for official fixed-hash verifier archives and maintained
 TUF roots, but no account or GitHub token. Fixture identities are private SOURCE
 copies, never production runtime trust overrides.
+It also runs the bounded performance-comparator self-tests in `scripts/tests`.
+Those synthetic reports check the strict greater-than-10% regression boundary
+and input/workload/rig matching; they are not real benchmark results or
+between-release performance acceptance, and fetch no baseline or target.
 `hygiene` checks every argument of literal workflow `ci.sh` calls against
 the default step inventory; missing, unknown, duplicate or reordered steps
 fail. Pull requests must keep it green.

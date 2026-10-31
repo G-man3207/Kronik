@@ -355,13 +355,14 @@ step_identity() {
     KRONIK_BIN="$kronik" scripts/identity-examples.sh "${only[@]}"
 }
 
-# The GitHub Action's tests and actual workflow/composite YAML. Install the
-# pinned, checksum-verified actionlint rather than silently skipping it.
+# The GitHub Action and pure-Python boundary tests. Install the pinned,
+# checksum-verified actionlint rather than silently skipping it.
 step_action() {
     local actionlint
     actionlint="$(scripts/install-actionlint.sh)"
     "$actionlint"
     PATH="$(dirname "$actionlint"):$PATH" python3 -B -m unittest discover -v -s action/tests
+    python3 -B -m unittest discover -s scripts/tests -p test_check_performance.py
     python3 -B scripts/e2e-release-signatures.py
 }
 
