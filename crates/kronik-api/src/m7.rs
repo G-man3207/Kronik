@@ -7,7 +7,7 @@ use kronik_proto::log::v1 as pb;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Api, AuthorizedRequest, ApiResponse, Query, Result, json, ok, reason};
+use crate::{Api, ApiResponse, AuthorizedRequest, Query, Result, json, ok, reason};
 
 /// How long `add` waits for the actor to leave `starting`.
 const ADD_WAIT: Duration = Duration::from_secs(10);
@@ -285,26 +285,32 @@ impl Api {
         if r.dry_run {
             view.status = None;
         }
-        self.ok_scrubbed(ForeignAddResponse { dry_run: r.dry_run,
-        foreign: view,
-        warnings, })
+        self.ok_scrubbed(ForeignAddResponse {
+            dry_run: r.dry_run,
+            foreign: view,
+            warnings,
+        })
     }
 
     fn foreign_list(&self) -> Result<ApiResponse> {
         let config = self.node.config_now();
         let lsns = self.config_lsns();
-        self.ok_scrubbed(ForeignListResponse { foreign: config
-            .foreign_actors()
-            .map(|r| self.foreign_view(r, lsns.get(&r.epoch).copied().unwrap_or(0)))
-            .collect(),
-        unavailable: self.foreign.as_ref().and_then(|f| f.off()), })
+        self.ok_scrubbed(ForeignListResponse {
+            foreign: config
+                .foreign_actors()
+                .map(|r| self.foreign_view(r, lsns.get(&r.epoch).copied().unwrap_or(0)))
+                .collect(),
+            unavailable: self.foreign.as_ref().and_then(|f| f.off()),
+        })
     }
 
     fn foreign_show(&self, name: &str) -> Result<ApiResponse> {
         let config = self.node.config_now();
         let r = config.foreign(name).ok_or_else(|| not_found(name))?;
         let lsn = self.config_lsns().get(&r.epoch).copied().unwrap_or(0);
-        self.ok_scrubbed(ForeignShowResponse { foreign: self.foreign_view(r, lsn), })
+        self.ok_scrubbed(ForeignShowResponse {
+            foreign: self.foreign_view(r, lsn),
+        })
     }
 
     async fn foreign_logs(&self, name: &str, q: &Query) -> Result<ApiResponse> {
@@ -328,7 +334,10 @@ impl Api {
         let r: ForeignRemoveRequest = json(&req.body)?;
         reason(&r.reason)?;
         let audit = self.audit(req, r.reason.clone());
-        let (epoch, lsn) = self.node.foreign_remove(name, audit, r.dry_run, req.authority.clone()).await?;
+        let (epoch, lsn) = self
+            .node
+            .foreign_remove(name, audit, r.dry_run, req.authority.clone())
+            .await?;
         ok(&ForeignRemoveResponse {
             dry_run: r.dry_run,
             removed: ForeignRemoved {

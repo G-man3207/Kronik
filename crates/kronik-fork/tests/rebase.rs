@@ -128,7 +128,7 @@ fn setup_env(
     let p = Proc::start_env(dir, cfg, wrap);
     p.grant("http:127.0.0.1");
     before(&p);
-    p.rt.block_on(p.node.set_policy(QUIET, audit(), false))
+    p.rt.block_on(p.node.set_policy(QUIET, audit(), false, p.owner()))
         .unwrap();
     for _ in 0..3 {
         p.http("a", "increment", "");
@@ -139,7 +139,7 @@ fn setup_env(
         &format!("POST http://{addr}/v1/charges/0\n\namount=1"),
     );
     p.settle();
-    p.rt.block_on(p.node.snapshot("before the deployment"))
+    p.rt.block_on(p.node.snapshot("before the deployment", p.owner()))
         .unwrap();
     let props = Arc::new(
         Proposals::open(p.node.clone(), dir.to_path_buf())
@@ -148,19 +148,22 @@ fn setup_env(
     );
     let bytes = std::fs::read(guest("counter-schema1-extra")).unwrap();
     let (prop, _) =
-        p.rt.block_on(props.propose(ProposeRequest {
-            wasm: vec![bytes],
-            names: Vec::new(),
-            window_ms: None,
-            at: None,
-            options: DiffOptions::default(),
-            workers: Some(2),
-            audit: audit(),
-            dry_run: false,
-        }))
+        p.rt.block_on(props.propose(
+            ProposeRequest {
+                wasm: vec![bytes],
+                names: Vec::new(),
+                window_ms: None,
+                at: None,
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
         .unwrap();
     let promoted =
-        p.rt.block_on(props.promote(&prop.id, audit(), false))
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();
     // The new code: the migration runs first, then the increment; the
     // fetch makes the POST and an extra GET, both real.
@@ -186,26 +189,29 @@ fn setup_env(
 fn rebase(s: &Setup) -> kronik_fork::proposal::Proposal {
     s.p.settle();
     s.p.rt
-        .block_on(s.props.rebase(RebaseRequest {
-            epoch: s.epoch,
-            options: DiffOptions {
-                mode: Mode::Continuous,
-                ..DiffOptions::default()
+        .block_on(s.props.rebase(
+            RebaseRequest {
+                epoch: s.epoch,
+                options: DiffOptions {
+                    mode: Mode::Continuous,
+                    ..DiffOptions::default()
+                },
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
             },
-            workers: Some(2),
-            audit: audit(),
-            dry_run: false,
-        }))
+            s.p.owner(),
+        ))
         .unwrap()
         .0
 }
 
 fn switch(s: &Setup, id: &str) -> kronik_fork::proposal::PromoteResult {
     s.p.rt
-        .block_on(s.props.approve(id, audit(), false))
+        .block_on(s.props.approve(id, audit(), false, None, s.p.owner()))
         .unwrap();
     s.p.rt
-        .block_on(s.props.promote(id, audit(), false))
+        .block_on(s.props.promote(id, audit(), false, s.p.owner()))
         .unwrap()
 }
 
@@ -242,7 +248,7 @@ fn rollback_by_replay_after_a_migration_restores_the_old_state() {
 
     // A rebase must be newest, and the switch needs an approval.
     let err =
-        p.rt.block_on(s.props.promote(&r.id, audit(), false))
+        p.rt.block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::ApprovalRequired, "{err}");
     let new_code_turn = p.node.applied_lsn();
@@ -276,13 +282,16 @@ fn rollback_by_replay_after_a_migration_restores_the_old_state() {
     assert_eq!(s.hits.load(Ordering::SeqCst), s.hits_after_promote);
     // A second rollback via replay of the same deployment is refused.
     let err =
-        p.rt.block_on(s.props.rebase(RebaseRequest {
-            epoch: s.epoch,
-            options: DiffOptions::default(),
-            workers: Some(2),
-            audit: audit(),
-            dry_run: true,
-        }))
+        p.rt.block_on(s.props.rebase(
+            RebaseRequest {
+                epoch: s.epoch,
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: true,
+            },
+            s.p.owner(),
+        ))
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
 }
@@ -366,7 +375,7 @@ fn no_root_input_is_lost_or_duplicated_during_the_switch() {
     let s = setup(dir.path(), Duration::from_secs(5));
     let r = rebase(&s);
     s.p.rt
-        .block_on(s.props.approve(&r.id, audit(), false))
+        .block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     let go = AtomicBool::new(true);
     let (sent, done) = std::thread::scope(|scope| {
@@ -390,7 +399,7 @@ fn no_root_input_is_lost_or_duplicated_during_the_switch() {
         std::thread::sleep(Duration::from_millis(200));
         let done =
             s.p.rt
-                .block_on(s.props.promote(&r.id, audit(), false))
+                .block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
                 .unwrap();
         std::thread::sleep(Duration::from_millis(200));
         go.store(false, Ordering::SeqCst);
@@ -447,7 +456,7 @@ fn a_switch_that_cannot_pause_in_time_writes_nothing() {
     let s = setup(dir.path(), Duration::from_millis(300));
     let r = rebase(&s);
     s.p.rt
-        .block_on(s.props.approve(&r.id, audit(), false))
+        .block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     let (slow, release) = hanging();
     std::thread::scope(|scope| {
@@ -457,7 +466,7 @@ fn a_switch_that_cannot_pause_in_time_writes_nothing() {
         std::thread::sleep(Duration::from_millis(300));
         let err =
             s.p.rt
-                .block_on(s.props.promote(&r.id, audit(), false))
+                .block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
                 .unwrap_err();
         assert_eq!(err.code, ErrorCode::ProposalStale, "{err}");
         assert!(err.message.contains("max_pause"), "{err}");
@@ -470,14 +479,18 @@ fn a_switch_that_cannot_pause_in_time_writes_nothing() {
     // Released: the retry switches. The slow turn may have added an
     // effect the approval did not cover; then the new diff is approved.
     s.p.settle();
-    let done = match s.p.rt.block_on(s.props.promote(&r.id, audit(), false)) {
+    let done = match s
+        .p
+        .rt
+        .block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
+    {
         Ok(d) => d,
         Err(e) if e.code == ErrorCode::ApprovalRequired => {
             s.p.rt
-                .block_on(s.props.approve(&r.id, audit(), false))
+                .block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
                 .unwrap();
             s.p.rt
-                .block_on(s.props.promote(&r.id, audit(), false))
+                .block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
                 .unwrap()
         }
         Err(e) => panic!("{e}"),
@@ -550,10 +563,12 @@ fn no_turn_starts_with_old_code_after_a_rebase_switch() {
     let _release = Release(hold.clone());
     let p = &s.p;
     let r = rebase(&s);
-    p.rt.block_on(s.props.approve(&r.id, audit(), false))
+    p.rt.block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     std::thread::scope(|scope| {
-        let promote = scope.spawn(|| p.rt.block_on(s.props.promote(&r.id, audit(), false)));
+        let promote = scope.spawn(|| {
+            p.rt.block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
+        });
         wait_until("the rebase switch parks", || {
             hold.parked.load(Ordering::SeqCst) == 2
         });
@@ -586,15 +601,19 @@ fn a_set_switch_waits_for_a_rebase_switch() {
     let _release = Release(hold.clone());
     let p = &s.p;
     let r = rebase(&s);
-    p.rt.block_on(s.props.approve(&r.id, audit(), false))
+    p.rt.block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     std::thread::scope(|scope| {
-        let promote = scope.spawn(|| p.rt.block_on(s.props.promote(&r.id, audit(), false)));
+        let promote = scope.spawn(|| {
+            p.rt.block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
+        });
         wait_until("the rebase switch parks", || {
             hold.parked.load(Ordering::SeqCst) == 2
         });
         let notes = std::fs::read(guest("notes")).unwrap();
-        let deploy = scope.spawn(move || p.rt.block_on(p.node.deploy(&notes, audit(), false)));
+        let deploy = scope.spawn(move || {
+            p.rt.block_on(p.node.deploy(&notes, audit(), false, p.owner()))
+        });
         hold.release.add_permits(1);
         let done = promote.join().unwrap().unwrap();
         let deployed = deploy.join().unwrap().unwrap();
@@ -678,16 +697,19 @@ fn rebased_turns(p: &Proc, id: &str) -> Vec<pb::TurnRecord> {
 /// A proposal of the build `name` (not promoted).
 fn propose(p: &Proc, props: &Arc<Proposals>, name: &str) -> kronik_fork::proposal::Proposal {
     p.settle();
-    p.rt.block_on(props.propose(ProposeRequest {
-        wasm: vec![std::fs::read(guest(name)).unwrap()],
-        names: Vec::new(),
-        window_ms: None,
-        at: None,
-        options: DiffOptions::default(),
-        workers: Some(2),
-        audit: audit(),
-        dry_run: false,
-    }))
+    p.rt.block_on(props.propose(
+        ProposeRequest {
+            wasm: vec![std::fs::read(guest(name)).unwrap()],
+            names: Vec::new(),
+            window_ms: None,
+            at: None,
+            options: DiffOptions::default(),
+            workers: Some(2),
+            audit: audit(),
+            dry_run: false,
+        },
+        p.owner(),
+    ))
     .unwrap()
     .0
 }
@@ -701,7 +723,7 @@ fn deployed(
 ) -> (Proc, Arc<Proposals>, u64) {
     let p = Proc::start(dir);
     before(&p);
-    p.rt.block_on(p.node.set_policy(QUIET, audit(), false))
+    p.rt.block_on(p.node.set_policy(QUIET, audit(), false, p.owner()))
         .unwrap();
     p.http("a", "increment", "");
     let props = Arc::new(
@@ -711,7 +733,7 @@ fn deployed(
     );
     let prop = propose(&p, &props, name);
     let epoch =
-        p.rt.block_on(props.promote(&prop.id, audit(), false))
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap()
             .epoch;
     (p, props, epoch)
@@ -719,21 +741,24 @@ fn deployed(
 
 fn rebase_of(
     p: &Proc,
-    props: &Proposals,
+    props: &Arc<Proposals>,
     epoch: u64,
     dry_run: bool,
 ) -> (kronik_fork::proposal::Proposal, bool) {
     p.settle();
-    p.rt.block_on(props.rebase(RebaseRequest {
-        epoch,
-        options: DiffOptions {
-            mode: Mode::Continuous,
-            ..DiffOptions::default()
+    p.rt.block_on(props.rebase(
+        RebaseRequest {
+            epoch,
+            options: DiffOptions {
+                mode: Mode::Continuous,
+                ..DiffOptions::default()
+            },
+            workers: Some(2),
+            audit: audit(),
+            dry_run,
         },
-        workers: Some(2),
-        audit: audit(),
-        dry_run,
-    }))
+        p.owner(),
+    ))
     .unwrap()
 }
 
@@ -754,14 +779,14 @@ fn a_deployment_after_the_rebase_makes_its_promote_stale() {
     let r = rebase(&s);
     let newer = propose(&s.p, &s.props, "counter-fetch-extra");
     s.p.rt
-        .block_on(s.props.promote(&newer.id, audit(), false))
+        .block_on(s.props.promote(&newer.id, audit(), false, s.p.owner()))
         .unwrap();
     s.p.rt
-        .block_on(s.props.approve(&r.id, audit(), false))
+        .block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     let err =
         s.p.rt
-            .block_on(s.props.promote(&r.id, audit(), false))
+            .block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::ProposalStale, "{err}");
     assert!(err.message.contains("came after"), "{err}");
@@ -787,7 +812,7 @@ fn a_proposal_from_before_a_rebase_switch_is_stale() {
     switch(&s, &r.id);
     let err =
         s.p.rt
-            .block_on(s.props.promote(&older.id, audit(), false))
+            .block_on(s.props.promote(&older.id, audit(), false, s.p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::ProposalStale, "{err}");
     assert!(err.message.contains("state rebase"), "{err}");
@@ -848,7 +873,7 @@ fn consequences_in_flight_at_the_pause_run_on_main_after_the_switch() {
     let s = setup(dir.path(), Duration::from_secs(5));
     let r = rebase(&s);
     s.p.rt
-        .block_on(s.props.approve(&r.id, audit(), false))
+        .block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     let go = AtomicBool::new(true);
     let (sent, done) = std::thread::scope(|scope| {
@@ -869,7 +894,7 @@ fn consequences_in_flight_at_the_pause_run_on_main_after_the_switch() {
         std::thread::sleep(Duration::from_millis(300));
         let done =
             s.p.rt
-                .block_on(s.props.promote(&r.id, audit(), false))
+                .block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
                 .unwrap();
         go.store(false, Ordering::SeqCst);
         let sent: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
@@ -1105,14 +1130,15 @@ fn a_pause_deadline_releases_admission_before_catch_up_io_finishes() {
     );
     let r = rebase(&s);
     s.p.rt
-        .block_on(s.props.approve(&r.id, audit(), false))
+        .block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     let armed = s.p.node.env().clock.monotonic();
     *pause.now.lock().unwrap() = Some(armed);
     let props = s.props.clone();
+    let owner = s.p.owner();
     let promote =
         s.p.rt
-            .spawn(async move { props.promote(&r.id, audit(), false).await });
+            .spawn(async move { props.promote(&r.id, audit(), false, owner).await });
     // Staging itself advances main's head past the replay, so the final
     // catch-up reads the log even without concurrent traffic.
     wait_until("the last round's log read is held", || {
@@ -1190,7 +1216,7 @@ fn the_pause_holds_requests_at_most_max_pause() {
     };
     let r = rebase(&s);
     s.p.rt
-        .block_on(s.props.approve(&r.id, audit(), false))
+        .block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     let go = AtomicBool::new(true);
     // Busy turns on 6 actors run in parallel on main (8 workers) but one
@@ -1220,7 +1246,9 @@ fn the_pause_holds_requests_at_most_max_pause() {
             })
             .collect();
         std::thread::sleep(Duration::from_millis(300));
-        let result = s.p.rt.block_on(s.props.promote(&r.id, audit(), false));
+        let result =
+            s.p.rt
+                .block_on(s.props.promote(&r.id, audit(), false, s.p.owner()));
         std::thread::sleep(Duration::from_millis(200));
         go.store(false, Ordering::SeqCst);
         let held: Vec<Duration> = workers
@@ -1260,9 +1288,14 @@ fn a_rebase_scrubs_revealed_secrets_like_production() {
             ..NodeConfig::default()
         },
         |p| {
-            p.node
-                .secret_set("db-password", SECRET.as_bytes(), &audit(), false)
-                .unwrap();
+            p.rt.block_on(p.node.secret_set(
+                "db-password",
+                SECRET.as_bytes().to_vec(),
+                &audit(),
+                false,
+                p.owner(),
+            ))
+            .unwrap();
             p.grant("secret-reveal:db-password");
         },
     );
@@ -1330,6 +1363,7 @@ fn a_rebase_uses_recordings_only_and_its_dry_run_writes_nothing() {
         },
         audit(),
         false,
+        p.owner(),
     ))
     .unwrap();
     // propose holds the proposals in an Arc: open them again with the model.
@@ -1352,23 +1386,26 @@ fn a_rebase_uses_recordings_only_and_its_dry_run_writes_nothing() {
     let before = branches();
     // Overrides would be ignored: they are refused, like stubs (H8).
     let err =
-        p.rt.block_on(props.rebase(RebaseRequest {
-            epoch,
-            options: DiffOptions {
-                mode: Mode::Continuous,
-                simulator_overrides: vec![kronik_fork::simulators::SimulatorOverride {
-                    target: "http:127.0.0.1".into(),
-                    stubs: vec![],
-                    contract: None,
-                    neighbor: true,
-                    model: false,
-                }],
-                ..DiffOptions::default()
+        p.rt.block_on(props.rebase(
+            RebaseRequest {
+                epoch,
+                options: DiffOptions {
+                    mode: Mode::Continuous,
+                    simulator_overrides: vec![kronik_fork::simulators::SimulatorOverride {
+                        target: "http:127.0.0.1".into(),
+                        stubs: vec![],
+                        contract: None,
+                        neighbor: true,
+                        model: false,
+                    }],
+                    ..DiffOptions::default()
+                },
+                workers: Some(2),
+                audit: audit(),
+                dry_run: true,
             },
-            workers: Some(2),
-            audit: audit(),
-            dry_run: true,
-        }))
+            p.owner(),
+        ))
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
     assert!(err.message.contains("simulator overrides"), "{err}");
@@ -1411,7 +1448,7 @@ fn a_rebase_uses_recordings_only_and_its_dry_run_writes_nothing() {
 fn a_message_pending_at_the_fork_point_is_replayed() {
     let dir = tempdir();
     let p = Proc::start(dir.path());
-    p.rt.block_on(p.node.set_policy(QUIET, audit(), false))
+    p.rt.block_on(p.node.set_policy(QUIET, audit(), false, p.owner()))
         .unwrap();
     p.http("a", "forward", "f");
     p.wait_kv("counter/f", "n");
@@ -1425,19 +1462,22 @@ fn a_message_pending_at_the_fork_point_is_replayed() {
         .0;
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let (prop, _) =
-        p.rt.block_on(props.propose(ProposeRequest {
-            wasm: vec![std::fs::read(guest("counter-fail-get")).unwrap()],
-            names: Vec::new(),
-            window_ms: None,
-            at: Some(at),
-            options: DiffOptions {
-                mode: Mode::Continuous,
-                ..DiffOptions::default()
+        p.rt.block_on(props.propose(
+            ProposeRequest {
+                wasm: vec![std::fs::read(guest("counter-fail-get")).unwrap()],
+                names: Vec::new(),
+                window_ms: None,
+                at: Some(at),
+                options: DiffOptions {
+                    mode: Mode::Continuous,
+                    ..DiffOptions::default()
+                },
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
             },
-            workers: Some(2),
-            audit: audit(),
-            dry_run: false,
-        }))
+            p.owner(),
+        ))
         .unwrap();
     let d: Value =
         serde_json::from_slice(&p.rt.block_on(props.diff(&prop.id, false, false)).unwrap())
@@ -1460,11 +1500,12 @@ fn a_resend_of_a_message_the_old_code_ran_is_skipped() {
     assert!(!r.committed());
     let dl = p.node.store().db().dead_letters(0, 10).unwrap();
     let lsn = dl.last().unwrap().lsn;
-    p.rt.block_on(p.node.resend(lsn, audit(), false)).unwrap();
-    let (rb, _) = rebase_of(&p, &props, epoch, false);
-    p.rt.block_on(props.approve(&rb.id, audit(), false))
+    p.rt.block_on(p.node.resend(lsn, audit(), false, p.owner()))
         .unwrap();
-    p.rt.block_on(props.promote(&rb.id, audit(), false))
+    let (rb, _) = rebase_of(&p, &props, epoch, false);
+    p.rt.block_on(props.approve(&rb.id, audit(), false, None, p.owner()))
+        .unwrap();
+    p.rt.block_on(props.promote(&rb.id, audit(), false, p.owner()))
         .unwrap();
     let resends = rebased_turns(&p, &rb.id)
         .into_iter()
@@ -1493,7 +1534,7 @@ fn a_resume_that_cannot_prove_its_staged_turns_is_refused() {
     let s = setup(dir.path(), Duration::from_millis(300));
     let r = rebase(&s);
     s.p.rt
-        .block_on(s.props.approve(&r.id, audit(), false))
+        .block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     let (slow, release) = hanging();
     std::thread::scope(|scope| {
@@ -1503,7 +1544,7 @@ fn a_resume_that_cannot_prove_its_staged_turns_is_refused() {
         std::thread::sleep(Duration::from_millis(300));
         let err =
             s.p.rt
-                .block_on(s.props.promote(&r.id, audit(), false))
+                .block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
                 .unwrap_err();
         assert_eq!(err.code, ErrorCode::ProposalStale, "{err}");
         release.store(true, Ordering::SeqCst);
@@ -1529,7 +1570,7 @@ fn a_resume_that_cannot_prove_its_staged_turns_is_refused() {
         .with_rebase(Duration::from_secs(2));
     p.settle();
     let err =
-        p.rt.block_on(props.promote(&r.id, audit(), false))
+        p.rt.block_on(props.promote(&r.id, audit(), false, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::ProposalStale, "{err}");
     assert!(err.message.contains("differs"), "{err}");
@@ -1563,8 +1604,10 @@ fn a_rebase_replaces_and_clears_sql_actor_databases() {
             .is_some()
     );
     let (r, _) = rebase_of(&p, &props, epoch, false);
-    p.rt.block_on(props.approve(&r.id, audit(), false)).unwrap();
-    p.rt.block_on(props.promote(&r.id, audit(), false)).unwrap();
+    p.rt.block_on(props.approve(&r.id, audit(), false, None, p.owner()))
+        .unwrap();
+    p.rt.block_on(props.promote(&r.id, audit(), false, p.owner()))
+        .unwrap();
     p.settle();
     let list = |p: &Proc| {
         let r = p.send("notes/n", "list", "");
@@ -1626,7 +1669,7 @@ fn a_proposal_after_a_rebase_switch_pins_the_rebased_code() {
         switched.lsn
     );
     s.p.rt
-        .block_on(s.props.promote(&newer.id, audit(), false))
+        .block_on(s.props.promote(&newer.id, audit(), false, s.p.owner()))
         .unwrap();
     let kinds = s.p.node.store().db().kinds().unwrap();
     assert!(
@@ -1647,7 +1690,7 @@ fn a_rebase_promote_cut_short_after_its_switch_is_recorded() {
     let _release = Release(hold.clone());
     let p = &s.p;
     let r = rebase(&s);
-    p.rt.block_on(s.props.approve(&r.id, audit(), false))
+    p.rt.block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     // The caller goes away once the switch is applied and parks.
     p.rt.block_on(async {
@@ -1659,7 +1702,7 @@ fn a_rebase_promote_cut_short_after_its_switch_is_recorded() {
         tokio::select! {
             biased;
             _ = parked => {}
-            r = s.props.promote(&r.id, audit(), false) => panic!("finished: {r:?}"),
+            r = s.props.promote(&r.id, audit(), false, s.p.owner()) => panic!("finished: {r:?}"),
         }
     });
     let (switch_lsn, _) = p.node.last_rebase().unwrap().unwrap();
@@ -1670,7 +1713,7 @@ fn a_rebase_promote_cut_short_after_its_switch_is_recorded() {
     assert_eq!(got.promoted.as_ref().unwrap().lsn, switch_lsn);
     assert_eq!(got.rebase.as_ref().unwrap().switch_lsn, Some(switch_lsn));
     let err =
-        p.rt.block_on(s.props.promote(&r.id, audit(), false))
+        p.rt.block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
             .unwrap_err();
     assert!(err.message.contains("already promoted"), "{err}");
     assert_eq!(
@@ -1695,7 +1738,7 @@ fn a_rebase_resumes_after_a_restart_with_privacy_on() {
         |p| {
             p.rt.block_on(
                 p.node
-                    .set_privacy_mode(pb::PrivacyState::On, audit(), false),
+                    .set_privacy_mode(pb::PrivacyState::On, audit(), false, p.owner()),
             )
             .unwrap();
         },
@@ -1707,7 +1750,7 @@ fn a_rebase_resumes_after_a_restart_with_privacy_on() {
     }
     let r = rebase(&s);
     s.p.rt
-        .block_on(s.props.approve(&r.id, audit(), false))
+        .block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     let (slow, release) = hanging();
     std::thread::scope(|scope| {
@@ -1717,7 +1760,7 @@ fn a_rebase_resumes_after_a_restart_with_privacy_on() {
         std::thread::sleep(Duration::from_millis(300));
         let err =
             s.p.rt
-                .block_on(s.props.promote(&r.id, audit(), false))
+                .block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
                 .unwrap_err();
         assert_eq!(err.code, ErrorCode::ProposalStale, "{err}");
         release.store(true, Ordering::SeqCst);
@@ -1743,11 +1786,14 @@ fn a_rebase_resumes_after_a_restart_with_privacy_on() {
     p.settle();
     // The diff after the restart's replay gets its own approval.
     let err =
-        p.rt.block_on(props.promote(&r.id, audit(), false))
+        p.rt.block_on(props.promote(&r.id, audit(), false, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::ApprovalRequired, "{err}");
-    p.rt.block_on(props.approve(&r.id, audit(), false)).unwrap();
-    let done = p.rt.block_on(props.promote(&r.id, audit(), false)).unwrap();
+    p.rt.block_on(props.approve(&r.id, audit(), false, None, p.owner()))
+        .unwrap();
+    let done =
+        p.rt.block_on(props.promote(&r.id, audit(), false, p.owner()))
+            .unwrap();
     assert!(done.rebase.is_some());
     assert_eq!(
         p.node.last_rebase().unwrap().map(|(l, _)| l),
@@ -1801,7 +1847,7 @@ fn a_rebase_promote_dry_run_writes_and_changes_nothing() {
     let meta = p.rt.block_on(props.get(&r.id)).unwrap();
     // Unapproved: the dry run answers APPROVAL_REQUIRED, without writing.
     let err =
-        p.rt.block_on(props.promote(&r.id, audit(), true))
+        p.rt.block_on(props.promote(&r.id, audit(), true, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::ApprovalRequired, "{err}");
     assert!(
@@ -1826,7 +1872,7 @@ fn a_rebase_is_refused_below_the_disk_reserve() {
     let s = setup(dir.path(), Duration::from_secs(2));
     let r = rebase(&s);
     s.p.rt
-        .block_on(s.props.approve(&r.id, audit(), false))
+        .block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     let epoch = s.epoch;
     let Setup { p, props, .. } = s;
@@ -1841,25 +1887,30 @@ fn a_rebase_is_refused_below_the_disk_reserve() {
             ..NodeConfig::default()
         },
     );
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
-        .unwrap()
-        .with_rebase(Duration::from_secs(2));
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_rebase(Duration::from_secs(2)),
+    );
     assert!(p.node.disk_below_reserve().is_some());
     let err =
-        p.rt.block_on(props.rebase(RebaseRequest {
-            epoch,
-            options: DiffOptions {
-                mode: Mode::Continuous,
-                ..DiffOptions::default()
+        p.rt.block_on(props.rebase(
+            RebaseRequest {
+                epoch,
+                options: DiffOptions {
+                    mode: Mode::Continuous,
+                    ..DiffOptions::default()
+                },
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
             },
-            workers: Some(2),
-            audit: audit(),
-            dry_run: false,
-        }))
+            p.owner(),
+        ))
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
     let err =
-        p.rt.block_on(props.promote(&r.id, audit(), false))
+        p.rt.block_on(props.promote(&r.id, audit(), false, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
     assert!(err.message.contains("disk_reserve"), "{err}");
@@ -1880,7 +1931,7 @@ fn a_fork_at_the_switch_skips_snapshots_inside_the_rebased_window() {
     s.p.http("a", "increment", "");
     s.p.settle();
     s.p.rt
-        .block_on(s.p.node.snapshot("inside the window"))
+        .block_on(s.p.node.snapshot("inside the window", s.p.owner()))
         .unwrap();
     let switch_lsn = switch(&s, &r.id).rebase.unwrap().lsn;
     s.p.settle();
@@ -1890,10 +1941,14 @@ fn a_fork_at_the_switch_skips_snapshots_inside_the_rebased_window() {
         }
     }
     s.p.rt
-        .block_on(
-            s.props
-                .create_fork(Some("after".into()), switch_lsn, false, audit(), false),
-        )
+        .block_on(s.props.create_fork(
+            Some("after".into()),
+            switch_lsn,
+            false,
+            audit(),
+            false,
+            s.p.owner(),
+        ))
         .unwrap();
     s.p.rt
         .block_on(s.props.fork_replay(
@@ -1904,6 +1959,7 @@ fn a_fork_at_the_switch_skips_snapshots_inside_the_rebased_window() {
                 ..DiffOptions::default()
             },
             Some(2),
+            s.p.owner(),
         ))
         .unwrap();
 }
@@ -2012,7 +2068,7 @@ fn rebase_staging_keeps_to_the_disk_reserve() {
     );
     let r = rebase(&s);
     s.p.rt
-        .block_on(s.props.approve(&r.id, audit(), false))
+        .block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     // The fork's turns as staging takes them.
     let fork_turns: Vec<(Lsn, pb::TurnRecord)> = (r.fork_lsn + 1..=s.p.node.applied_lsn() + 64)
@@ -2032,7 +2088,7 @@ fn rebase_staging_keeps_to_the_disk_reserve() {
     set_free(&s.p, &free, RESERVE + bare + 1);
     let err =
         s.p.rt
-            .block_on(s.props.promote(&r.id, audit(), false))
+            .block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
     // Refused by the estimate before staging, not by the first batch.
@@ -2044,14 +2100,17 @@ fn rebase_staging_keeps_to_the_disk_reserve() {
     // (2) A batch on a disk below the reserve writes nothing.
     set_free(&s.p, &free, RESERVE - 1);
     s.p.rt
-        .block_on(s.p.node.rebase_prepare(&r.id, r.fork_lsn))
+        .block_on(s.p.node.rebase_prepare(&r.id, r.fork_lsn, s.p.owner()))
         .unwrap();
     let err =
         s.p.rt
-            .block_on(
-                s.p.node
-                    .rebase_stage(&r.id, fork_turns, s.p.node.applied_lsn(), None),
-            )
+            .block_on(s.p.node.rebase_stage(
+                &r.id,
+                fork_turns,
+                s.p.node.applied_lsn(),
+                None,
+                s.p.owner(),
+            ))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
     assert!(rebased_turns(&s.p, &r.id).is_empty(), "nothing staged");
@@ -2060,7 +2119,7 @@ fn rebase_staging_keeps_to_the_disk_reserve() {
     set_free(&s.p, &free, 1 << 40);
     let switch_lsn =
         s.p.rt
-            .block_on(s.props.promote(&r.id, audit(), false))
+            .block_on(s.props.promote(&r.id, audit(), false, s.p.owner()))
             .unwrap()
             .rebase
             .unwrap()

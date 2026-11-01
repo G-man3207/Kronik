@@ -23,10 +23,7 @@ pub fn asset(path: &str) -> Option<Asset> {
             "text/css; charset=utf-8",
             include_bytes!("../../../ui/app.css"),
         ),
-        "/ui/icon.svg" => (
-            "image/svg+xml",
-            include_bytes!("../../../ui/icon.svg"),
-        ),
+        "/ui/icon.svg" => ("image/svg+xml", include_bytes!("../../../ui/icon.svg")),
         _ => return None,
     };
     Some(Asset {

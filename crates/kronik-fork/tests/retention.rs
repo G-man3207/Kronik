@@ -49,7 +49,7 @@ fn start(dir: &Path, history: Option<Duration>, segment: Option<u64>) -> Proc {
 
 fn deploy(p: &Proc) {
     let bytes = std::fs::read(guest("counter")).unwrap();
-    p.rt.block_on(p.node.deploy(&bytes, audit(), false))
+    p.rt.block_on(p.node.deploy(&bytes, audit(), false, p.owner()))
         .unwrap();
 }
 
@@ -109,8 +109,14 @@ fn zero_history_refuses_an_early_fork_and_accepts_head() {
     let props = open_props(&p, dir.path());
     let before = branch_names(dir.path());
 
-    let dry =
-        p.rt.block_on(props.create_fork(Some("early".into()), early, false, audit(), true));
+    let dry = p.rt.block_on(props.create_fork(
+        Some("early".into()),
+        early,
+        false,
+        audit(),
+        true,
+        p.owner(),
+    ));
     let err = dry.unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("outside retention"), "{err}");
@@ -126,15 +132,23 @@ fn zero_history_refuses_an_early_fork_and_accepts_head() {
     assert_eq!(branch_names(dir.path()), before, "dry-run wrote a fork");
 
     let again =
-        p.rt.block_on(props.create_fork(Some("early".into()), early, false, audit(), false))
-            .unwrap_err();
+        p.rt.block_on(props.create_fork(
+            Some("early".into()),
+            early,
+            false,
+            audit(),
+            false,
+            p.owner(),
+        ))
+        .unwrap_err();
     assert!(again.message.contains("outside retention"), "{again}");
     assert_eq!(branch_names(dir.path()), before);
 
     let head = p.node.applied_lsn();
-    let (made, dry_run) =
-        p.rt.block_on(props.create_fork(Some("head".into()), head, false, audit(), false))
-            .unwrap();
+    let (made, dry_run) = p
+        .rt
+        .block_on(props.create_fork(Some("head".into()), head, false, audit(), false, p.owner()))
+        .unwrap();
     assert!(!dry_run);
     assert_eq!(made.fork_lsn, head);
     assert!(dir.path().join("branches/head/proposal.json").is_file());
@@ -148,9 +162,15 @@ fn zero_history_refuses_a_point_before_the_first_turn() {
     let before_first = early - 1;
     let props = open_props(&p, dir.path());
     let names = branch_names(dir.path());
-    let err = p
-        .rt
-        .block_on(props.create_fork(Some("before".into()), before_first, false, audit(), false))
+    let err =
+        p.rt.block_on(props.create_fork(
+            Some("before".into()),
+            before_first,
+            false,
+            audit(),
+            false,
+            p.owner(),
+        ))
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
     assert!(err.message.contains("outside retention"), "{err}");
@@ -166,16 +186,19 @@ fn propose_refuses_an_early_point_without_writing() {
     let props = open_props(&p, dir.path());
     let wasm = std::fs::read(guest("counter-step2")).unwrap();
     let err =
-        p.rt.block_on(props.propose(ProposeRequest {
-            wasm: vec![wasm],
-            names: Vec::new(),
-            window_ms: None,
-            at: Some(early),
-            options: DiffOptions::default(),
-            workers: Some(2),
-            audit: audit(),
-            dry_run: true,
-        }))
+        p.rt.block_on(props.propose(
+            ProposeRequest {
+                wasm: vec![wasm],
+                names: Vec::new(),
+                window_ms: None,
+                at: Some(early),
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: true,
+            },
+            p.owner(),
+        ))
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("outside retention"), "{err}");
@@ -194,16 +217,19 @@ fn promote_is_stale_when_the_window_shrinks() {
     let props = open_props(&p, dir.path());
     let wasm = std::fs::read(guest("counter-step2")).unwrap();
     let (prop, _) =
-        p.rt.block_on(props.propose(ProposeRequest {
-            wasm: vec![wasm],
-            names: Vec::new(),
-            window_ms: None,
-            at: Some(early),
-            options: DiffOptions::default(),
-            workers: Some(2),
-            audit: audit(),
-            dry_run: false,
-        }))
+        p.rt.block_on(props.propose(
+            ProposeRequest {
+                wasm: vec![wasm],
+                names: Vec::new(),
+                window_ms: None,
+                at: Some(early),
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
         .unwrap();
     let id = prop.id.clone();
     let deployments = p.node.store().db().deployments().unwrap().len();
@@ -213,7 +239,7 @@ fn promote_is_stale_when_the_window_shrinks() {
     let p = start(dir.path(), Some(Duration::ZERO), None);
     let props = open_props(&p, dir.path());
     let err =
-        p.rt.block_on(props.promote(&id, audit(), false))
+        p.rt.block_on(props.promote(&id, audit(), false, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::ProposalStale, "{err}");
     assert!(err.message.contains("outside retention"), "{err}");
@@ -244,16 +270,19 @@ fn promote_dry_run_of_an_aged_proposal_does_not_mark_it_stale() {
     let props = open_props(&p, dir.path());
     let wasm = std::fs::read(guest("counter-step2")).unwrap();
     let (prop, _) =
-        p.rt.block_on(props.propose(ProposeRequest {
-            wasm: vec![wasm],
-            names: Vec::new(),
-            window_ms: None,
-            at: Some(early),
-            options: DiffOptions::default(),
-            workers: Some(2),
-            audit: audit(),
-            dry_run: false,
-        }))
+        p.rt.block_on(props.propose(
+            ProposeRequest {
+                wasm: vec![wasm],
+                names: Vec::new(),
+                window_ms: None,
+                at: Some(early),
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
         .unwrap();
     let id = prop.id.clone();
     let status = prop.status.clone();
@@ -266,7 +295,7 @@ fn promote_dry_run_of_an_aged_proposal_does_not_mark_it_stale() {
     let path = dir.path().join("branches").join(&id).join("proposal.json");
     let before = std::fs::read(&path).unwrap();
     let err =
-        p.rt.block_on(props.promote(&id, audit(), true))
+        p.rt.block_on(props.promote(&id, audit(), true, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::ProposalStale, "{err}");
     assert!(err.message.contains("outside retention"), "{err}");
@@ -281,7 +310,7 @@ fn replay_refuses_after_the_window_shrinks() {
     let dir = tempdir();
     let (p, early) = two_turns(dir.path(), None);
     let props = open_props(&p, dir.path());
-    p.rt.block_on(props.create_fork(Some("try".into()), early, false, audit(), false))
+    p.rt.block_on(props.create_fork(Some("try".into()), early, false, audit(), false, p.owner()))
         .unwrap();
     drop(props);
     drop(p);
@@ -289,7 +318,7 @@ fn replay_refuses_after_the_window_shrinks() {
     let p = start(dir.path(), Some(Duration::ZERO), None);
     let props = open_props(&p, dir.path());
     let err =
-        p.rt.block_on(props.fork_replay("try", None, DiffOptions::default(), Some(2)))
+        p.rt.block_on(props.fork_replay("try", None, DiffOptions::default(), Some(2), p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
     assert!(err.message.contains("outside retention"), "{err}");
@@ -307,7 +336,7 @@ fn fork_create_refuses_a_point_the_log_no_longer_covers() {
     }
     let before = kronik_log::segment_starts(&log_dir).unwrap();
     assert!(before.len() > 3, "{before:?}");
-    let _ = p.rt.block_on(p.node.snapshot("manual")).unwrap();
+    let _ = p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
     let after = kronik_log::segment_starts(&log_dir).unwrap();
     assert!(
         after[0] > 1,
@@ -324,7 +353,7 @@ fn fork_create_refuses_a_point_the_log_no_longer_covers() {
     );
     let props = open_props(&p, dir.path());
     let err =
-        p.rt.block_on(props.create_fork(Some("gone".into()), 1, false, audit(), false))
+        p.rt.block_on(props.create_fork(Some("gone".into()), 1, false, audit(), false, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
     assert!(err.message.contains("outside retention"), "{err}");
@@ -336,16 +365,19 @@ fn fork_create_refuses_a_point_the_log_no_longer_covers() {
 
 fn propose_window(p: &Proc, props: &Arc<Proposals>) -> kronik_fork::proposal::Proposal {
     let wasm = std::fs::read(guest("counter-step2")).unwrap();
-    p.rt.block_on(props.propose(ProposeRequest {
-        wasm: vec![wasm],
-        names: Vec::new(),
-        window_ms: None,
-        at: None,
-        options: DiffOptions::default(),
-        workers: Some(2),
-        audit: audit(),
-        dry_run: false,
-    }))
+    p.rt.block_on(props.propose(
+        ProposeRequest {
+            wasm: vec![wasm],
+            names: Vec::new(),
+            window_ms: None,
+            at: None,
+            options: DiffOptions::default(),
+            workers: Some(2),
+            audit: audit(),
+            dry_run: false,
+        },
+        p.owner(),
+    ))
     .unwrap()
     .0
 }
@@ -380,7 +412,7 @@ fn a_young_nodes_first_deployment_survives_its_first_restart() {
     assert_eq!(prop.summary["root_inputs"], 12, "{}", prop.summary);
     assert!(prop.warnings().is_empty(), "{:?}", prop.warnings());
     let (fork, _) =
-        p.rt.block_on(props.create_fork(Some("at3".into()), 3, false, audit(), false))
+        p.rt.block_on(props.create_fork(Some("at3".into()), 3, false, audit(), false, p.owner()))
             .unwrap();
     assert_eq!(fork.fork_lsn, 3);
 }
@@ -401,7 +433,7 @@ fn a_window_cut_by_retention_is_reported() {
     }
     std::thread::sleep(Duration::from_secs(3));
     p.send("counter/k5", "increment", "");
-    let snap = p.rt.block_on(p.node.snapshot("manual")).unwrap();
+    let snap = p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
     assert!(
         kronik_log::segment_starts(&log_dir).unwrap()[0] > 1,
         "nothing was compacted"

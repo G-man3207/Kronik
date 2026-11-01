@@ -20,17 +20,17 @@
 pub mod effects;
 mod gate;
 pub mod host;
-mod node;
 mod native_execution;
+mod node;
 mod privacy;
 mod rebase;
 pub use rebase::rebase_turn_bytes;
 mod reseal;
 pub mod scrub;
-pub mod secrets;
 mod sealing;
-mod subject_keys;
+pub mod secrets;
 pub mod snapshots;
+mod subject_keys;
 mod timers;
 pub mod upgrade;
 
@@ -46,9 +46,8 @@ use kronik_store::sql::{FileOpener, Limits, SqlPool};
 
 pub use gate::Drain;
 pub use node::{
-    CodeSwitch, DeployResult, Ingress, METHODS, Node, NodeParts, Probe, RouteEntry, StartError, SystemAudit,
-    ShardReadPoint, ShardReader, ShardRecordPage,
-    Waiter, normalize_pattern,
+    CodeSwitch, DeployResult, Ingress, METHODS, Node, NodeParts, Probe, RouteEntry, ShardReadPoint,
+    ShardReader, ShardRecordPage, StartError, SystemAudit, Waiter, normalize_pattern,
 };
 pub use privacy::{ErasureDone, PrivacyModeChange};
 pub use reseal::{
@@ -232,10 +231,13 @@ pub async fn start_local(
     let keys = data.join("keys");
     private_files(&keys, &["secrets.db", "keystore.db"])
         .map_err(|e| StartError::Log(kronik_log::LogError::Io(e)))?;
-    let data = kronik_privacy::SecretStore::owned_data(&ownership).map_err(key_error)?
+    let data = kronik_privacy::SecretStore::owned_data(&ownership)
+        .map_err(key_error)?
         .unwrap_or_else(|| secrets::SecretCacheData::new());
-    let secrets = kronik_privacy::SecretStore::open_owned(&ownership, master, data).map_err(key_error)?;
-    let keystore = kronik_privacy::keystore::Keystore::open_owned(&ownership, master).map_err(key_error)?;
+    let secrets =
+        kronik_privacy::SecretStore::open_owned(&ownership, master, data).map_err(key_error)?;
+    let keystore =
+        kronik_privacy::keystore::Keystore::open_owned(&ownership, master).map_err(key_error)?;
     Node::start(NodeParts {
         env,
         config,
@@ -267,8 +269,9 @@ pub async fn offline_sealer(
         return Ok(None);
     }
     let source = kronik_privacy::key_source::KeySource::load(env, config, data, false).await?;
-    let connection = rusqlite::Connection::open_with_flags(&file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(kronik_privacy::PrivacyError::from)?;
+    let connection =
+        rusqlite::Connection::open_with_flags(&file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(kronik_privacy::PrivacyError::from)?;
     let keystore = kronik_privacy::keystore::Keystore::open_readonly(connection, source.master())?;
     Ok(Some(Arc::new(
         kronik_privacy::sealer::Sealer::new(Arc::new(keystore))

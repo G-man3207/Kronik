@@ -35,19 +35,22 @@ fn promote_all(p: &Proc, props: &Arc<Proposals>, wasm: &[&str], before: usize) -
         .collect();
     p.settle();
     let (prop, _) =
-        p.rt.block_on(props.propose(ProposeRequest {
-            wasm,
-            names: Vec::new(),
-            window_ms: None,
-            at: None,
-            options: DiffOptions::default(),
-            workers: Some(2),
-            audit: audit(),
-            dry_run: false,
-        }))
+        p.rt.block_on(props.propose(
+            ProposeRequest {
+                wasm,
+                names: Vec::new(),
+                window_ms: None,
+                at: None,
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
         .unwrap();
     assert_eq!(prop.policy["outcome"], "allow", "{}", prop.policy);
-    p.rt.block_on(props.promote(&prop.id, audit(), false))
+    p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
         .unwrap()
         .epoch
 }
@@ -91,7 +94,7 @@ fn error_rate_up(t: &[Triggered]) -> Vec<&Triggered> {
 }
 
 fn set_guards(p: &Proc, toml: &str) {
-    p.rt.block_on(p.node.set_policy(toml, audit(), false))
+    p.rt.block_on(p.node.set_policy(toml, audit(), false, p.owner()))
         .unwrap();
 }
 
@@ -124,7 +127,7 @@ fn watch_rolls_back_when_the_error_rate_after_promote_breaks_a_guard() {
     p.settle();
     let watches = watches(&p, &props, dir.path());
     let w =
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false, p.owner()))
             .unwrap();
     let w = wait_for(&watches, &w.id, |w| w.status != "watching");
     assert_eq!(w.status, "rolled_back", "{w:?}");
@@ -178,7 +181,7 @@ fn watch_alerts_instead_of_rolling_back_a_schema_change() {
     p.settle();
     let watches = watches(&p, &props, dir.path());
     let w =
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false, p.owner()))
             .unwrap();
     let w = wait_for(&watches, &w.id, |w| !w.triggered.is_empty());
     assert_eq!(w.status, "watching", "{w:?}");
@@ -219,7 +222,7 @@ fn a_later_promote_ends_the_watch_and_is_never_rolled_back() {
     let epoch = promote(&p, &props, "counter-fail-get", 20);
     let watches = watches(&p, &props, dir.path());
     let w =
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false, p.owner()))
             .unwrap();
     get_n(&p, 25);
     // 20 more turns under the failing build, then the hotfix, then 20
@@ -251,8 +254,15 @@ fn a_watched_rollback_after_a_later_promote_is_stale() {
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let epoch = promote(&p, &props, "counter-fail-get", 5);
     promote(&p, &props, "counter-body-v2", 5);
+    // `rollback_watched` is the configured guard's path: its audit must be
+    // the one a watch writes, or the fixed-origin producer refuses it.
+    let watch_audit = pb::Audit {
+        token_id: "kronik".into(),
+        reason: "watch w-stale: guard `error-rate-up` fired".into(),
+        wall_time_ms: 0,
+    };
     let e =
-        p.rt.block_on(props.rollback_watched(epoch, audit()))
+        p.rt.block_on(props.rollback_watched(epoch, watch_audit))
             .unwrap_err();
     assert_eq!(e.code, ErrorCode::ProposalStale, "{e}");
     assert!(rollbacks(&p).is_empty());
@@ -269,12 +279,12 @@ fn a_manual_rollback_ends_the_watch_without_a_second_rollback() {
     let epoch = promote(&p, &props, "counter-fail-get", 20);
     let watches = watches(&p, &props, dir.path());
     let w =
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false, p.owner()))
             .unwrap();
     get_n(&p, 50);
     p.settle();
     let (manual, _, _) =
-        p.rt.block_on(props.rollback(epoch, audit(), false))
+        p.rt.block_on(props.rollback(epoch, audit(), false, p.owner()))
             .unwrap();
     // 15 healthy turns after it: 65 since the watched deployment.
     get_n(&p, 15);
@@ -300,15 +310,15 @@ fn watching_a_replaced_deployment_or_for_too_long_is_refused() {
     let new = promote(&p, &props, "counter-body-v2", 5);
     let watches = watches(&p, &props, dir.path());
     let err =
-        p.rt.block_on(watches.watch(old, 60_000, audit(), true, false))
+        p.rt.block_on(watches.watch(old, 60_000, audit(), true, false, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
     assert!(err.message.contains("no longer the latest"), "{err}");
     let err =
-        p.rt.block_on(watches.watch(new, MAX_FOR_MS + 1, audit(), true, false))
+        p.rt.block_on(watches.watch(new, MAX_FOR_MS + 1, audit(), true, false, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
-    p.rt.block_on(watches.watch(new, MAX_FOR_MS, audit(), true, false))
+    p.rt.block_on(watches.watch(new, MAX_FOR_MS, audit(), true, false, p.owner()))
         .unwrap();
 }
 
@@ -324,7 +334,7 @@ fn a_rollback_without_its_record_is_recorded_at_resume() {
     // The watch as it was saved, and its rollback with the watch's audit.
     let mut w = {
         let watches = watches(&p, &props, dir.path());
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), true, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), true, false, p.owner()))
             .unwrap()
     };
     w.metrics = None;
@@ -340,7 +350,7 @@ fn a_rollback_without_its_record_is_recorded_at_resume() {
         wall_time_ms: 0,
     };
     let (rollback, _, _) =
-        p.rt.block_on(props.rollback(epoch, crashed, false))
+        p.rt.block_on(props.rollback(epoch, crashed, false, p.owner()))
             .unwrap();
     get_n(&p, 25);
     p.settle();
@@ -372,7 +382,7 @@ fn guards_wait_for_a_turn_after_the_deployment() {
     let epoch = promote(&p, &props, "counter-fail-get", 20);
     let watches = watches(&p, &props, dir.path());
     let w =
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false, p.owner()))
             .unwrap();
     std::thread::sleep(Duration::from_millis(300));
     assert!(guards_in_log(&p).is_empty());
@@ -401,7 +411,7 @@ fn a_guard_that_cannot_be_evaluated_alerts_once_and_can_still_roll_back() {
     let epoch = promote(&p, &props, "counter-fail-get", 20);
     let watches = watches(&p, &props, dir.path());
     let w =
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false, p.owner()))
             .unwrap();
     get_n(&p, 2);
     p.settle();
@@ -431,7 +441,7 @@ fn rejected_turns_do_not_roll_back() {
     p.settle();
     let watches = watches(&p, &props, dir.path());
     let w =
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false, p.owner()))
             .unwrap();
     // Evaluated on all 25 turns, a few times over.
     wait_for(&watches, &w.id, |w| {
@@ -465,7 +475,7 @@ fn an_empty_guard_list_never_rolls_back() {
     p.settle();
     let watches = watches(&p, &props, dir.path());
     let w =
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false, p.owner()))
             .unwrap();
     wait_for(&watches, &w.id, |w| {
         w.metrics
@@ -488,13 +498,17 @@ fn a_stopped_watch_acts_no_more() {
     let epoch = promote(&p, &props, "counter-fail-get", 20);
     let watches = watches(&p, &props, dir.path());
     let w =
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false, p.owner()))
             .unwrap();
     let before = p.node.applied_lsn();
-    let dry = p.rt.block_on(watches.stop(&w.id, audit(), true)).unwrap();
+    let dry =
+        p.rt.block_on(watches.stop(&w.id, audit(), true, p.owner()))
+            .unwrap();
     assert_eq!(dry.status, "watching");
     assert_eq!(p.node.applied_lsn(), before, "dry-run writes no intent");
-    let stopped = p.rt.block_on(watches.stop(&w.id, audit(), false)).unwrap();
+    let stopped =
+        p.rt.block_on(watches.stop(&w.id, audit(), false, p.owner()))
+            .unwrap();
     assert_eq!(stopped.status, "stopped");
     assert_eq!(stopped.stopped.unwrap().reason, "test");
     let mut events = Vec::new();
@@ -517,7 +531,7 @@ fn a_stopped_watch_acts_no_more() {
     assert!(rollbacks(&p).is_empty());
     assert_eq!(watches.get(&w.id).unwrap().status, "stopped");
     let err =
-        p.rt.block_on(watches.stop(&w.id, audit(), false))
+        p.rt.block_on(watches.stop(&w.id, audit(), false, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
 }
@@ -543,7 +557,7 @@ fn failed_watch_stop_keeps_the_watch_live_and_audits_the_failure() {
             .with_interval(Duration::from_secs(3600)),
     );
     let w =
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false, p.owner()))
             .unwrap();
     let path = dir.path().join("watches");
     std::fs::rename(&path, dir.path().join("held-watches")).unwrap();
@@ -555,7 +569,7 @@ fn failed_watch_stop_keeps_the_watch_live_and_audits_the_failure() {
     };
     let before = p.node.applied_lsn();
     let e =
-        p.rt.block_on(watches.stop(&w.id, audit.clone(), false))
+        p.rt.block_on(watches.stop(&w.id, audit.clone(), false, p.owner()))
             .unwrap_err();
     assert_eq!(e.code, ErrorCode::Internal, "{e}");
     let live = watches.get(&w.id).unwrap();
@@ -590,7 +604,7 @@ fn a_dry_run_reports_the_guards_that_would_fire() {
     p.settle();
     let watches = watches(&p, &props, dir.path());
     let w =
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), true, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), true, false, p.owner()))
             .unwrap();
     assert_eq!(w.metrics.as_ref().unwrap()["after"]["failed"], 25);
     // Only error-rate-up is certain: latency-p99-up depends on the host's
@@ -615,13 +629,13 @@ fn a_dry_run_predicts_a_failing_rollback() {
     p.settle();
     let watches = watches(&p, &props, dir.path());
     let dry =
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), true, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), true, false, p.owner()))
             .unwrap();
     let fired = error_rate_up(&dry.triggered);
     assert_eq!(fired.len(), 1, "{dry:?}");
     assert_eq!(fired[0].outcome, "rollback_failed");
     let w =
-        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false))
+        p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false, p.owner()))
             .unwrap();
     let w = wait_for(&watches, &w.id, |w| !error_rate_up(&w.triggered).is_empty());
     assert_eq!(

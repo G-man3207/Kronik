@@ -77,17 +77,22 @@ impl Dispatch<'_> {
     fn check(self) -> Result<(), crate::secret_backend::BackendError> {
         match self {
             Self::StartupBootstrap => Ok(()),
-            Self::Authorized(original) => original.check().map_err(|_| crate::secret_backend::BackendError::Denied),
+            Self::Authorized(original) => original
+                .check()
+                .map_err(|_| crate::secret_backend::BackendError::Unauthorized),
         }
     }
 
-    async fn wait<T>(self, future: impl Future<Output = T>) -> Result<T, crate::secret_backend::BackendError> {
+    async fn wait<T>(
+        self,
+        future: impl Future<Output = T>,
+    ) -> Result<T, crate::secret_backend::BackendError> {
         self.check()?;
         let result = match self {
             Self::StartupBootstrap => future.await,
             Self::Authorized(original) => tokio::select! {
                 biased;
-                () = original.cancelled() => return Err(crate::secret_backend::BackendError::Denied),
+                () = original.cancelled() => return Err(crate::secret_backend::BackendError::Unauthorized),
                 result = future => result,
             },
         };
@@ -130,22 +135,31 @@ async fn request_raw(
         body: secret_body(std::mem::take(&mut *body)),
         max_response_bytes: cap as u64,
     };
-    dispatch.wait(async {
-        env.timeout(REQUEST_TIMEOUT, async {
-            let response = match dispatch {
-                Dispatch::StartupBootstrap => env.net.http(req).await,
-                Dispatch::Authorized(original) => env.net.http_authorized(req, original.clone()).await,
-            }.map_err(|error| match error {
-                kronik_core::env::NetError::TooLarge => BackendError::Invalid,
-                _ => BackendError::Unavailable,
-            })?;
-            dispatch.check()?;
-            let status = response.status;
-            let data = Zeroizing::new(Vec::<u8>::from(response.body));
-            if data.len() > cap { return Err(BackendError::Invalid); }
-            Ok((status, data))
-        }).await.map_err(|_| BackendError::Unavailable)?
-    }).await?
+    dispatch
+        .wait(async {
+            env.timeout(REQUEST_TIMEOUT, async {
+                let response = match dispatch {
+                    Dispatch::StartupBootstrap => env.net.http(req).await,
+                    Dispatch::Authorized(original) => {
+                        env.net.http_authorized(req, original.clone()).await
+                    }
+                }
+                .map_err(|error| match error {
+                    kronik_core::env::NetError::TooLarge => BackendError::Invalid,
+                    _ => BackendError::Unavailable,
+                })?;
+                dispatch.check()?;
+                let status = response.status;
+                let data = Zeroizing::new(Vec::<u8>::from(response.body));
+                if data.len() > cap {
+                    return Err(BackendError::Invalid);
+                }
+                Ok((status, data))
+            })
+            .await
+            .map_err(|_| BackendError::Unavailable)?
+        })
+        .await?
 }
 
 async fn request_bytes(
@@ -155,9 +169,17 @@ async fn request_bytes(
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
-    let (status, data) = request_raw(env, method, url, headers, body, CAP, Dispatch::StartupBootstrap)
-        .await
-        .map_err(|error| error.to_string())?;
+    let (status, data) = request_raw(
+        env,
+        method,
+        url,
+        headers,
+        body,
+        CAP,
+        Dispatch::StartupBootstrap,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     if !(200..300).contains(&status) {
         return Err(format!("provider returned HTTP {status}"));
     }
@@ -177,8 +199,16 @@ async fn secret_request(
     dispatch: Dispatch<'_>,
 ) -> Result<SecretJson, crate::secret_backend::BackendError> {
     use crate::secret_backend::BackendError;
-    let (status, data) =
-        request_raw(env, method, url, headers, body, SECRET_RESPONSE_CAP, dispatch).await?;
+    let (status, data) = request_raw(
+        env,
+        method,
+        url,
+        headers,
+        body,
+        SECRET_RESPONSE_CAP,
+        dispatch,
+    )
+    .await?;
     match status {
         200..=299 => serde_json::from_slice(&data)
             .map(SecretJson)
@@ -212,38 +242,49 @@ async fn json_request(
     let body = serde_json::to_vec(&value.0).map_err(|_| "invalid provider request")?;
     request(env, "POST", url, headers, body).await
 }
-async fn credential(env: &Env, path: &Path, dispatch: Dispatch<'_>) -> Result<Zeroizing<Vec<u8>>, String> {
-    dispatch.wait(async {
-    let path = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        let dir = std::env::var_os("CREDENTIALS_DIRECTORY")
-            .ok_or("relative credentials require CREDENTIALS_DIRECTORY")?;
-        std::path::PathBuf::from(dir).join(path)
-    };
-    let f = env
-        .fs
-        .open(path, OpenMode::Read)
+async fn credential(
+    env: &Env,
+    path: &Path,
+    dispatch: Dispatch<'_>,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    dispatch
+        .wait(async {
+            let path = if path.is_absolute() {
+                path.to_owned()
+            } else {
+                let dir = std::env::var_os("CREDENTIALS_DIRECTORY")
+                    .ok_or("relative credentials require CREDENTIALS_DIRECTORY")?;
+                std::path::PathBuf::from(dir).join(path)
+            };
+            let f = env
+                .fs
+                .open(path, OpenMode::Read)
+                .await
+                .map_err(|_| "cannot open credential file")?;
+            dispatch.check().map_err(|error| error.to_string())?;
+            let len = f.len().await.map_err(|_| "cannot read credential file")?;
+            if len == 0 || len > CAP as u64 {
+                return Err("invalid credential file size".into());
+            }
+            dispatch.check().map_err(|error| error.to_string())?;
+            let data = Zeroizing::new(
+                f.read_at(0, len as usize)
+                    .await
+                    .map_err(|_| "cannot read credential file")?,
+            );
+            if data.len() != len as usize {
+                return Err("incomplete credential file".into());
+            }
+            Ok(data)
+        })
         .await
-        .map_err(|_| "cannot open credential file")?;
-    dispatch.check().map_err(|error| error.to_string())?;
-    let len = f.len().await.map_err(|_| "cannot read credential file")?;
-    if len == 0 || len > CAP as u64 {
-        return Err("invalid credential file size".into());
-    }
-    dispatch.check().map_err(|error| error.to_string())?;
-    let data = Zeroizing::new(
-        f.read_at(0, len as usize)
-            .await
-            .map_err(|_| "cannot read credential file")?,
-    );
-    if data.len() != len as usize {
-        return Err("incomplete credential file".into());
-    }
-    Ok(data)
-    }).await.map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?
 }
-async fn credential_text(env: &Env, p: &Path, dispatch: Dispatch<'_>) -> Result<Zeroizing<String>, String> {
+async fn credential_text(
+    env: &Env,
+    p: &Path,
+    dispatch: Dispatch<'_>,
+) -> Result<Zeroizing<String>, String> {
     let data = credential(env, p, dispatch).await?;
     let s = std::str::from_utf8(&data).map_err(|_| "invalid credential encoding")?;
     let text = Zeroizing::new(s.trim().to_owned());
@@ -363,9 +404,9 @@ pub(super) fn validate_wrapped(cfg: &Keys, wrapped: &Wrapped) -> Result<(), Stri
                 .decode(&wrapped.ciphertext)
                 .map_err(|_| "invalid Azure ciphertext encoding")?;
         }
-        Source::Pkcs11 => super::pkcs11::validate_wrapped(
-            cfg.pkcs11.as_ref().ok_or("PKCS11_CONFIG")?, wrapped,
-        )?,
+        Source::Pkcs11 => {
+            super::pkcs11::validate_wrapped(cfg.pkcs11.as_ref().ok_or("PKCS11_CONFIG")?, wrapped)?
+        }
         _ => return Err("source is not a KMS".into()),
     }
     Ok(())
@@ -385,9 +426,10 @@ pub(super) async fn encrypt(
         Source::Aws => aws::encrypt(env, cfg, seed, aad).await,
         Source::Gcp => gcp::encrypt(env, cfg, seed, aad).await,
         Source::Azure => azure::encrypt(env, cfg, seed).await,
-        Source::Pkcs11 => super::pkcs11::encrypt(
-            env, cfg.pkcs11.as_ref().ok_or("PKCS11_CONFIG")?, seed, aad,
-        ).await,
+        Source::Pkcs11 => {
+            super::pkcs11::encrypt(env, cfg.pkcs11.as_ref().ok_or("PKCS11_CONFIG")?, seed, aad)
+                .await
+        }
         _ => Err("source is not a KMS".into()),
     }
 }
@@ -402,9 +444,9 @@ pub(super) async fn decrypt(
         Source::Aws => aws::decrypt(env, cfg, wrapped).await,
         Source::Gcp => gcp::decrypt(env, cfg, wrapped).await,
         Source::Azure => azure::decrypt(env, cfg, wrapped).await,
-        Source::Pkcs11 => super::pkcs11::decrypt(
-            env, cfg.pkcs11.as_ref().ok_or("PKCS11_CONFIG")?, wrapped,
-        ).await,
+        Source::Pkcs11 => {
+            super::pkcs11::decrypt(env, cfg.pkcs11.as_ref().ok_or("PKCS11_CONFIG")?, wrapped).await
+        }
         _ => Err("source is not a KMS".into()),
     }?;
     if plain.len() != 32 {

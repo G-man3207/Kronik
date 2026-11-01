@@ -413,16 +413,23 @@ impl Node {
             () = authority.cancelled() => return Err(ApiError::new(ErrorCode::Unauthenticated, "request revoked while waiting for snapshot lock")),
             held = self.snapshot_lock.clone().lock_owned() => held,
         };
-        let node = self.arc().ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self
+            .arc()
+            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
         let reason = reason.to_owned();
         self.authorized_effect(authority, move || async move {
             let _held = held;
             if let Err(error) = node.check_running() {
-                if node.fatal().is_none() && let Ok(storage) = node.storage() { node.retain(storage); }
+                if node.fatal().is_none()
+                    && let Ok(storage) = node.storage()
+                {
+                    node.retain(storage);
+                }
                 return Err(error);
             }
             node.take_snapshot_locked(&reason).await
-        }).await
+        })
+        .await
     }
 
     /// Fixed configured interval/shutdown path, never an operator fallback.

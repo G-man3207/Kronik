@@ -34,7 +34,10 @@ impl pb::SecretRef {
     /// Sets the single canonical version encoding without changing the hash.
     pub fn set_resolved_version(&mut self, version: u64) -> Result<(), DecodeError> {
         if version == 0 || version > MAX_SECRET_VERSION {
-            return Err(invalid("secret reference", "version is outside the supported domain"));
+            return Err(invalid(
+                "secret reference",
+                "version is outside the supported domain",
+            ));
         }
         match u32::try_from(version) {
             Ok(version) => {
@@ -52,9 +55,17 @@ impl pb::SecretRef {
 
 pub(crate) fn peer_name(name: &str) -> Result<(), DecodeError> {
     let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.len() > 64
+    if bytes.is_empty()
+        || bytes.len() > 64
         || !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
-        || !bytes.iter().all(|&byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-'))
-    { return Err(invalid("peer secret name", "not a canonical FILE secret name")); }
+        || !bytes.iter().all(|&byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
+        })
+    {
+        return Err(invalid(
+            "peer secret name",
+            "not a canonical FILE secret name",
+        ));
+    }
     Ok(())
 }

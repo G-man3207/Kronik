@@ -38,7 +38,11 @@ fn erasure_floor_never_uses_active_a2_as_proof_of_old_plaintext_provenance() {
     assert!(matches!(pair.a.open(&old), Opened::Erased { .. }));
     assert_eq!(pair.b.open(&new).bytes(), Some(b"new active A2".as_slice()));
     let original = legacy.clone();
-    assert!(pair.a.seal_plain_source(&mut legacy, None, &|bytes| pair.fill(bytes), 3).is_err());
+    assert!(
+        pair.a
+            .seal_plain_source(&mut legacy, None, &|bytes| pair.fill(bytes), 3)
+            .is_err()
+    );
     assert_eq!(legacy, original);
 }
 
@@ -47,9 +51,14 @@ fn erasure_floor_failure_cannot_reuse_cached_absence_or_guess_unknown_history() 
     assert!(Sealer::plain().erasure_floor("user:1").is_err());
     for erased in [false, true] {
         let pair = Pair::new();
-        if erased { pair.second.erase_through("user:1", 0, 1).unwrap(); }
+        if erased {
+            pair.second.erase_through("user:1", 0, 1).unwrap();
+        }
         assert_eq!(pair.a.erasure_floor("user:1").unwrap(), erased.then_some(0));
-        pair.first.conn().execute("DROP TABLE keystore_revision", []).unwrap();
+        pair.first
+            .conn()
+            .execute("DROP TABLE keystore_revision", [])
+            .unwrap();
         assert!(pair.a.erasure_floor("user:1").is_err());
         assert!(pair.b.erasure_floor("user:1").is_err());
         assert!(pair.a.erasure_floor("bad subject").is_err());
@@ -64,14 +73,27 @@ fn erasure_floor_and_revision_share_one_snapshot_despite_concurrent_zero_floor_c
     let erased = Arc::new(AtomicBool::new(false));
     let observed = erased.clone();
     let writer = pair.second.clone();
-    pair.first.conn().authorizer(Some(move |context: AuthContext<'_>| {
-        if matches!(context.action, AuthAction::Read { table_name: "keystore_revision", .. })
-            && !observed.swap(true, Ordering::SeqCst)
-        { writer.erase_through("user:1", 0, 1).unwrap(); }
-        Authorization::Allow
-    })).unwrap();
+    pair.first
+        .conn()
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(
+                context.action,
+                AuthAction::Read {
+                    table_name: "keystore_revision",
+                    ..
+                }
+            ) && !observed.swap(true, Ordering::SeqCst)
+            {
+                writer.erase_through("user:1", 0, 1).unwrap();
+            }
+            Authorization::Allow
+        }))
+        .unwrap();
     let (stamp, floor) = pair.first.erasure_floor_at_revision("user:1").unwrap();
-    pair.first.conn().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+    pair.first
+        .conn()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
     assert!(erased.load(Ordering::SeqCst));
     assert_eq!(floor, None);
     assert_eq!(stamp.revision, before);

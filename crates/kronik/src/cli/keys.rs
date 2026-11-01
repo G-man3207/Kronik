@@ -120,14 +120,22 @@ pub(super) fn keys(ctx: &Ctx, command: KeysCommand) -> Result<ExitCode, Error> {
                         &file,
                         args.remove_file,
                         |master, stage| {
-                            let secrets = rusqlite::Connection::open_with_flags(stage.join("secrets.db"),
-                                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                                .map_err(kronik_privacy::PrivacyError::from)
-                                .and_then(|conn| kronik_privacy::SecretStore::open_readonly(conn, master))
-                                .and_then(|store| store.values())
-                                .ok();
-                            let patterns = secrets.as_ref().map(|values| values.iter()
-                                .map(|(name, value)| (name.as_str(), value.as_slice())).collect::<Vec<_>>());
+                            let secrets = rusqlite::Connection::open_with_flags(
+                                stage.join("secrets.db"),
+                                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                            )
+                            .map_err(kronik_privacy::PrivacyError::from)
+                            .and_then(|conn| {
+                                kronik_privacy::SecretStore::open_readonly(conn, master)
+                            })
+                            .and_then(|store| store.values())
+                            .ok();
+                            let patterns = secrets.as_ref().map(|values| {
+                                values
+                                    .iter()
+                                    .map(|(name, value)| (name.as_str(), value.as_slice()))
+                                    .collect::<Vec<_>>()
+                            });
                             kronik_sched::scrub::for_log(why, patterns.as_deref())
                         },
                         args.mutation.dry_run,
@@ -195,24 +203,43 @@ pub(super) fn keys(ctx: &Ctx, command: KeysCommand) -> Result<ExitCode, Error> {
             }
         }
         KeysCommand::Enroll { config: path } => {
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| ApiError::new(ErrorCode::BadRequest, format!("{}: {e}", path.display())))?;
-            let document: toml::Value = toml::from_str(&text)
-                .map_err(|_| ApiError::new(ErrorCode::BadRequest, "Invalid enrollment configuration"))?;
-            let keys: kronik_privacy::key_source::Keys = document.get("keys").cloned()
-                .ok_or_else(|| ApiError::new(ErrorCode::BadRequest, "Enrollment requires [keys] configuration"))?
-                .try_into().map_err(|_| ApiError::new(ErrorCode::BadRequest, "Invalid [keys] enrollment configuration"))?;
+            let text = std::fs::read_to_string(&path).map_err(|e| {
+                ApiError::new(ErrorCode::BadRequest, format!("{}: {e}", path.display()))
+            })?;
+            let document: toml::Value = toml::from_str(&text).map_err(|_| {
+                ApiError::new(ErrorCode::BadRequest, "Invalid enrollment configuration")
+            })?;
+            let keys: kronik_privacy::key_source::Keys = document
+                .get("keys")
+                .cloned()
+                .ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::BadRequest,
+                        "Enrollment requires [keys] configuration",
+                    )
+                })?
+                .try_into()
+                .map_err(|_| {
+                    ApiError::new(
+                        ErrorCode::BadRequest,
+                        "Invalid [keys] enrollment configuration",
+                    )
+                })?;
             let runtime = crate::restore::runtime()?;
-            let probe = runtime.block_on(async {
-                let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
-                kronik_privacy::key_source::enroll_pkcs11(&env, &keys).await
-            }).map_err(|e| e.api_error())?;
+            let probe = runtime
+                .block_on(async {
+                    let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+                    kronik_privacy::key_source::enroll_pkcs11(&env, &keys).await
+                })
+                .map_err(|e| e.api_error())?;
             if ctx.json {
-                ctx.print(&serde_json::to_string(&probe)
-                    .map_err(|_| ApiError::new(ErrorCode::Internal, "Cannot encode enrollment probe"))?);
+                ctx.print(&serde_json::to_string(&probe).map_err(|_| {
+                    ApiError::new(ErrorCode::Internal, "Cannot encode enrollment probe")
+                })?);
             } else {
-                let probe = toml::to_string(&probe)
-                    .map_err(|_| ApiError::new(ErrorCode::Internal, "Cannot encode enrollment probe"))?;
+                let probe = toml::to_string(&probe).map_err(|_| {
+                    ApiError::new(ErrorCode::Internal, "Cannot encode enrollment probe")
+                })?;
                 ctx.print(&format!("Verified PKCS#11 key possession. Save this non-secret probe in {}:\n\n[keys.pkcs11.probe]\n{probe}", path.display()));
                 ctx.print(&next(&[format!(
                     "kronik keys wrap --source pkcs11 --config {} --reason \"...\"",

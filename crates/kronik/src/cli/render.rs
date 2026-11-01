@@ -6,9 +6,9 @@ use std::fmt::Write as _;
 use kronik_api::types::{
     ActorsResponse, DeadLettersResponse, DeployResponse, DeploymentsResponse, EffectSummary,
     ForkTurnResponse, GrantResponse, GrantsResponse, HistoryResponse, InspectResponse,
-    LimitsListResponse, LimitsResponse, LimitsView, OrphansResponse, Outcome, Payload,
-    Reply, RevokeResponse, Route, SecretBackendsResponse, SecretDeleteResponse, SecretHistoryResponse,
-    SecretLinkResponse, SecretResponse, SecretsResponse, SecretVersionPhase, TimersResponse,
+    LimitsListResponse, LimitsResponse, LimitsView, OrphansResponse, Outcome, Payload, Reply,
+    RevokeResponse, Route, SecretBackendsResponse, SecretDeleteResponse, SecretHistoryResponse,
+    SecretLinkResponse, SecretResponse, SecretVersionPhase, SecretsResponse, TimersResponse,
     TraceNode, TraceResponse, TurnResponse, TurnSummary,
 };
 use kronik_core::error::ApiError;
@@ -117,7 +117,12 @@ fn reply_lines(reply: &Reply) -> Vec<String> {
         Some(blob) => vec![format!("Blob {} ({} bytes)", blob.hash, blob.size)],
         None => payload_lines(&reply.body),
     };
-    lines.extend(reply.blobs.iter().map(|blob| format!("Attachment {} ({} bytes)", blob.hash, blob.size)));
+    lines.extend(
+        reply
+            .blobs
+            .iter()
+            .map(|blob| format!("Attachment {} ({} bytes)", blob.hash, blob.size)),
+    );
     lines
 }
 
@@ -852,16 +857,36 @@ pub fn secrets(r: &SecretsResponse) -> String {
     };
     if !r.links.is_empty() {
         let _ = writeln!(out, "\nBindings");
-        out.push_str(&table(&["NAME", "BACKEND", "REFERENCE", "GENERATION", "EPOCH"],
-            r.links.iter().map(|link| vec![link.name.clone(),
-                if link.backend.is_empty() { "built-in".into() } else { link.backend.clone() },
-                link.r#ref.clone(), link.generation.to_string(), link.epoch.to_string()]).collect()));
+        out.push_str(&table(
+            &["NAME", "BACKEND", "REFERENCE", "GENERATION", "EPOCH"],
+            r.links
+                .iter()
+                .map(|link| {
+                    vec![
+                        link.name.clone(),
+                        if link.backend.is_empty() {
+                            "built-in".into()
+                        } else {
+                            link.backend.clone()
+                        },
+                        link.r#ref.clone(),
+                        link.generation.to_string(),
+                        link.epoch.to_string(),
+                    ]
+                })
+                .collect(),
+        ));
     }
     if let Some(first) = r.secrets.first() {
-        out.push_str(&next(&[format!("kronik grant <kind> {} --reason \"...\"",
-            shell_quote(&format!("secret:{}", first.name)))]));
+        out.push_str(&next(&[format!(
+            "kronik grant <kind> {} --reason \"...\"",
+            shell_quote(&format!("secret:{}", first.name))
+        )]));
     } else if let Some(first) = r.links.first() {
-        out.push_str(&next(&[format!("kronik secret refresh {} --reason \"...\"", shell_quote(&first.name))]));
+        out.push_str(&next(&[format!(
+            "kronik secret refresh {} --reason \"...\"",
+            shell_quote(&first.name)
+        )]));
     }
     out
 }
@@ -892,17 +917,32 @@ pub fn secret_link(r: &SecretLinkResponse, rerun: &str) -> String {
     let link = &r.link;
     let mut out = String::new();
     if r.dry_run {
-        let _ = writeln!(out, "Dry run: binding {} can change; nothing was written", link.name);
+        let _ = writeln!(
+            out,
+            "Dry run: binding {} can change; nothing was written",
+            link.name
+        );
         out.push_str(&next(&[rerun.to_owned()]));
         return out;
     }
     if link.backend.is_empty() {
-        let _ = writeln!(out, "Secret {} now uses the built-in store, generation {}", link.name, link.generation);
+        let _ = writeln!(
+            out,
+            "Secret {} now uses the built-in store, generation {}",
+            link.name, link.generation
+        );
     } else {
-        let _ = writeln!(out, "Linked {} to {} {}, generation {}", link.name, link.backend, link.r#ref, link.generation);
+        let _ = writeln!(
+            out,
+            "Linked {} to {} {}, generation {}",
+            link.name, link.backend, link.r#ref, link.generation
+        );
     }
     out.push_str(&next(&[
-        format!("kronik secret refresh {} --reason \"...\"", shell_quote(&link.name)),
+        format!(
+            "kronik secret refresh {} --reason \"...\"",
+            shell_quote(&link.name)
+        ),
         format!("kronik secret history {}", shell_quote(&link.name)),
     ]));
     out
@@ -911,45 +951,119 @@ pub fn secret_link(r: &SecretLinkResponse, rerun: &str) -> String {
 pub fn secret_refreshed(name: &str, r: &SecretResponse, rerun: &str) -> String {
     let mut out = String::new();
     if r.dry_run {
-        let _ = writeln!(out, "Dry run: secret {name} can be refreshed; no version or value was cached");
+        let _ = writeln!(
+            out,
+            "Dry run: secret {name} can be refreshed; no version or value was cached"
+        );
         out.push_str(&next(&[rerun.to_owned()]));
     } else if let Some(secret) = &r.secret {
-        let _ = writeln!(out, "Observed secret {}, version {}", secret.name, secret.version);
-        field(&mut out, "Version hash", std::slice::from_ref(&secret.version_hash), "");
-        out.push_str(&next(&[format!("kronik secret history {}", shell_quote(name))]));
+        let _ = writeln!(
+            out,
+            "Observed secret {}, version {}",
+            secret.name, secret.version
+        );
+        field(
+            &mut out,
+            "Version hash",
+            std::slice::from_ref(&secret.version_hash),
+            "",
+        );
+        out.push_str(&next(&[format!(
+            "kronik secret history {}",
+            shell_quote(name)
+        )]));
     } else {
         let _ = writeln!(out, "Secret {name} has no committed observation");
-        out.push_str(&next(&[format!("kronik secret history {}", shell_quote(name))]));
+        out.push_str(&next(&[format!(
+            "kronik secret history {}",
+            shell_quote(name)
+        )]));
     }
     out
 }
 
 pub fn secret_history(r: &SecretHistoryResponse) -> String {
     if r.versions.is_empty() {
-        return format!("No committed versions for {}.\n{}", r.name,
-            next(&[format!("kronik secret refresh {} --reason \"...\"", shell_quote(&r.name))]));
+        return format!(
+            "No committed versions for {}.\n{}",
+            r.name,
+            next(&[format!(
+                "kronik secret refresh {} --reason \"...\"",
+                shell_quote(&r.name)
+            )])
+        );
     }
-    let rows = r.versions.iter().map(|version| {
-        let phase = match version.phase {
-            SecretVersionPhase::Reserved => "reserved",
-            SecretVersionPhase::Active => "active",
-            SecretVersionPhase::Failed => "failed",
-        };
-        vec![version.version.to_string(), phase.into(), version.version_hash.clone(),
-            version.backend.clone(), version.r#ref.clone(), version.source_version.clone(),
-            version.link_generation.to_string(), version.deleted.to_string(),
-            units::utc(version.created_wall_ms), version.token_id.clone(), version.reason.clone()]
-    }).collect();
-    let mut out = table(&["VERSION", "PHASE", "HASH", "BACKEND", "REFERENCE", "SOURCE VERSION",
-        "GENERATION", "DELETED", "OBSERVED", "WHO", "REASON"], rows);
-    out.push_str(&next(&[format!("kronik secret refresh {} --reason \"...\"", shell_quote(&r.name))]));
+    let rows = r
+        .versions
+        .iter()
+        .map(|version| {
+            let phase = match version.phase {
+                SecretVersionPhase::Reserved => "reserved",
+                SecretVersionPhase::Active => "active",
+                SecretVersionPhase::Failed => "failed",
+            };
+            vec![
+                version.version.to_string(),
+                phase.into(),
+                version.version_hash.clone(),
+                version.backend.clone(),
+                version.r#ref.clone(),
+                version.source_version.clone(),
+                version.link_generation.to_string(),
+                version.deleted.to_string(),
+                units::utc(version.created_wall_ms),
+                version.token_id.clone(),
+                version.reason.clone(),
+            ]
+        })
+        .collect();
+    let mut out = table(
+        &[
+            "VERSION",
+            "PHASE",
+            "HASH",
+            "BACKEND",
+            "REFERENCE",
+            "SOURCE VERSION",
+            "GENERATION",
+            "DELETED",
+            "OBSERVED",
+            "WHO",
+            "REASON",
+        ],
+        rows,
+    );
+    out.push_str(&next(&[format!(
+        "kronik secret refresh {} --reason \"...\"",
+        shell_quote(&r.name)
+    )]));
     out
 }
 
 pub fn secret_backends(r: &SecretBackendsResponse) -> String {
-    let rows = r.backends.iter().map(|backend| vec![backend.id.clone(), backend.kind.clone(),
-        backend.binding.clone(), backend.configured.to_string(), backend.inventory_complete.to_string()]).collect();
-    let mut out = table(&["BACKEND", "KIND", "BINDING", "CONFIGURED", "INVENTORY COMPLETE"], rows);
+    let rows = r
+        .backends
+        .iter()
+        .map(|backend| {
+            vec![
+                backend.id.clone(),
+                backend.kind.clone(),
+                backend.binding.clone(),
+                backend.configured.to_string(),
+                backend.inventory_complete.to_string(),
+            ]
+        })
+        .collect();
+    let mut out = table(
+        &[
+            "BACKEND",
+            "KIND",
+            "BINDING",
+            "CONFIGURED",
+            "INVENTORY COMPLETE",
+        ],
+        rows,
+    );
     out.push_str(&next(&["kronik secret list".to_owned()]));
     out
 }
@@ -1364,22 +1478,43 @@ mod tests {
 
     #[test]
     fn turn_views_show_body_and_attachment_identities_instead_of_empty_replies() {
-        let body = kronik_api::types::BlobReference { hash: format!("b3:{}", "11".repeat(32)), size: 1073741824 };
-        let attachment = kronik_api::types::BlobReference { hash: format!("b3:{}", "22".repeat(32)), size: 29 };
+        let body = kronik_api::types::BlobReference {
+            hash: format!("b3:{}", "11".repeat(32)),
+            size: 1073741824,
+        };
+        let attachment = kronik_api::types::BlobReference {
+            hash: format!("b3:{}", "22".repeat(32)),
+            size: 29,
+        };
         let response = TurnResponse {
             dry_run: false,
             turn_id: Some("main:9".into()),
-            outcome: Some(Outcome { kind: "committed".into(), error_code: None, message: None }),
+            outcome: Some(Outcome {
+                kind: "committed".into(),
+                error_code: None,
+                message: None,
+            }),
             reply: Some(Reply::blob("http 200".into(), String::new(), body.clone())),
         };
-        let shown = turn(&response, &TurnContext::Send { actor: "kind/key".into(), rerun: String::new() });
+        let shown = turn(
+            &response,
+            &TurnContext::Send {
+                actor: "kind/key".into(),
+                rerun: String::new(),
+            },
+        );
         assert!(shown.contains(&body.hash));
         assert!(shown.contains(&body.size.to_string()));
         let fork = ForkTurnResponse {
-            fork: "preview".into(), turn_id: "preview:9".into(),
+            fork: "preview".into(),
+            turn_id: "preview:9".into(),
             outcome: response.outcome.unwrap(),
-            reply: Some(Reply::inline("reply".into(), "text/plain".into(),
-                Payload::from_bytes(b"actual inline body"), vec![attachment.clone()])),
+            reply: Some(Reply::inline(
+                "reply".into(),
+                "text/plain".into(),
+                Payload::from_bytes(b"actual inline body"),
+                vec![attachment.clone()],
+            )),
             effects: Vec::new(),
         };
         let shown = fork_turn(&fork, "kind/key");

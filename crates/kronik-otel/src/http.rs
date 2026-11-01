@@ -35,13 +35,20 @@ pub async fn post(
     let owned_env = env.clone();
     let work = node.authorized_effect(original.clone(), move || async move {
         let remaining = deadline.saturating_sub(owned_env.clock.monotonic());
-        if remaining.is_zero() { return Ok(Err("timeout")); }
-        Ok(match owned_env.timeout(remaining, owned_env.net.http_authorized(req, original)).await {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(NetError::Connect(_))) => Err("connect"),
-            Ok(Err(NetError::Io(_) | NetError::TooLarge)) => Err("io"),
-            Err(_) => Err("timeout"),
-        })
+        if remaining.is_zero() {
+            return Ok(Err("timeout"));
+        }
+        Ok(
+            match owned_env
+                .timeout(remaining, owned_env.net.http_authorized(req, original))
+                .await
+            {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(NetError::Connect(_))) => Err("connect"),
+                Ok(Err(NetError::Io(_) | NetError::TooLarge)) => Err("io"),
+                Err(_) => Err("timeout"),
+            },
+        )
     });
     match env.timeout(TIMEOUT, work).await {
         Ok(Ok(result)) => result,
@@ -69,7 +76,10 @@ pub async fn post_authorized(
         body,
         max_response_bytes: 1 << 20,
     };
-    match env.timeout(TIMEOUT, env.net.http_authorized(request, original)).await {
+    match env
+        .timeout(TIMEOUT, env.net.http_authorized(request, original))
+        .await
+    {
         Ok(Ok(response)) if response.body.len() <= 1 << 20 => Ok(response),
         Ok(Ok(_)) => Err("io"),
         Ok(Err(NetError::Connect(_))) => Err("connect"),

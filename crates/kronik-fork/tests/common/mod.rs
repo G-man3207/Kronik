@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use kronik_core::authority::AuthLease;
 use kronik_core::env::{EntropySource, Env};
 use kronik_core::ids::{ActorRef, Lsn};
 use kronik_proto::log::v1 as pb;
@@ -149,17 +150,26 @@ impl Proc {
         Proc { rt, node }
     }
 
+    /// The local operator's original node-lifetime authority, as the daemon
+    /// itself would hold it (`crates/kronik-sched/tests` uses the same).
+    pub fn owner(&self) -> AuthLease {
+        self.node.local_operator_authority().unwrap()
+    }
+
     /// Deploys a test guest on main (a kind without history).
     pub fn deploy(&self, name: &str) {
         let bytes = std::fs::read(guest(name)).unwrap();
         self.rt
-            .block_on(self.node.deploy(&bytes, audit(), false))
+            .block_on(self.node.deploy(&bytes, audit(), false, self.owner()))
             .unwrap();
     }
 
     pub fn grant(&self, cap: &str) {
         self.rt
-            .block_on(self.node.grant("counter", cap, None, None, audit(), false))
+            .block_on(
+                self.node
+                    .grant("counter", cap, None, None, audit(), false, self.owner()),
+            )
             .unwrap();
     }
 
@@ -220,10 +230,13 @@ impl Proc {
             retained_compensation_source: None,
         };
         self.rt
-            .block_on(
-                self.node
-                    .send(ActorRef::parse(actor).unwrap(), m, audit(), false),
-            )
+            .block_on(self.node.send(
+                ActorRef::parse(actor).unwrap(),
+                m,
+                audit(),
+                false,
+                self.owner(),
+            ))
             .unwrap()
             .unwrap()
     }

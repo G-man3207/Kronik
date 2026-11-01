@@ -6,8 +6,8 @@
 //! request carries that token and acts as it, with its scopes.
 
 mod audit;
-mod export;
 mod events;
+mod export;
 mod fleet;
 mod foreign;
 mod fork;
@@ -535,9 +535,13 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
         Command::Actors(ActorsCommand::Inspect { actor }) => inspect(&ctx, &actor),
         Command::Actors(ActorsCommand::Timers { actor }) => timers(&ctx, &actor),
         Command::History(a) if a.orphans => orphans(&ctx, a.all),
-        Command::History(a) if a.operations => audit::audit(&ctx, audit::AuditCommand::Show {
-            from: None, limit: a.limit.map(u64::from),
-        }),
+        Command::History(a) if a.operations => audit::audit(
+            &ctx,
+            audit::AuditCommand::Show {
+                from: None,
+                limit: a.limit.map(u64::from),
+            },
+        ),
         Command::History(a) => history(&ctx, a),
         Command::Trace { turn_id } => trace(&ctx, &turn_id),
         Command::DeadLetters(DeadLettersCommand::List { after, limit }) => {
@@ -556,11 +560,18 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
         Command::Secret(SecretCommand::Delete { name, mutation }) => {
             secret_delete(&ctx, &name, mutation)
         }
-        Command::Secret(SecretCommand::Link { name, backend, reference, mutation }) => {
-            secret_link(&ctx, &name, &backend, &reference, mutation)
+        Command::Secret(SecretCommand::Link {
+            name,
+            backend,
+            reference,
+            mutation,
+        }) => secret_link(&ctx, &name, &backend, &reference, mutation),
+        Command::Secret(SecretCommand::Unlink { name, mutation }) => {
+            secret_unlink(&ctx, &name, mutation)
         }
-        Command::Secret(SecretCommand::Unlink { name, mutation }) => secret_unlink(&ctx, &name, mutation),
-        Command::Secret(SecretCommand::Refresh { name, mutation }) => secret_refresh(&ctx, &name, mutation),
+        Command::Secret(SecretCommand::Refresh { name, mutation }) => {
+            secret_refresh(&ctx, &name, mutation)
+        }
         Command::Secret(SecretCommand::History { name }) => secret_history(&ctx, &name),
         Command::Secret(SecretCommand::Backends) => secret_backends(&ctx),
         Command::Keys(c) => keys::keys(&ctx, c),
@@ -595,6 +606,7 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
 }
 
 /// Why a command failed.
+#[derive(Debug)]
 enum Error {
     /// An error found by the CLI itself.
     Local(ApiError),
@@ -715,7 +727,13 @@ impl Ctx {
 
     /// Sends a request; a 2xx response gives its body, any other status an
     /// [`Error::Remote`].
-    fn request(&self, method: &str, target: &str, body: Option<&[u8]>, cursor: Option<&str>) -> Result<Vec<u8>, Error> {
+    fn request(
+        &self,
+        method: &str,
+        target: &str,
+        body: Option<&[u8]>,
+        cursor: Option<&str>,
+    ) -> Result<Vec<u8>, Error> {
         self.request_within(method, target, body, cursor, REQUEST_TIMEOUT)
     }
 
@@ -734,29 +752,36 @@ impl Ctx {
             .map_err(|e| Error::Local(e.clone()))?;
         let token = self.token.as_ref().map_err(|e| Error::Local(e.clone()))?;
         let shown = endpoint.shown();
-        let r = http::request(endpoint, method, target, body, token.as_deref(), cursor, timeout).map_err(
-            |f| match f {
-                http::Failure::Connect(e) => connect_error(endpoint, &e),
-                http::Failure::Tls(m) => ApiError::new(
-                    ErrorCode::Unavailable,
-                    format!("TLS to {shown} failed: {m}"),
-                )
-                .with_hint(TLS_HINT),
-                http::Failure::Io(e) => ApiError::new(
-                    ErrorCode::Unavailable,
-                    format!("the connection to the daemon on {shown} broke: {e}"),
+        let r = http::request(
+            endpoint,
+            method,
+            target,
+            body,
+            token.as_deref(),
+            cursor,
+            timeout,
+        )
+        .map_err(|f| match f {
+            http::Failure::Connect(e) => connect_error(endpoint, &e),
+            http::Failure::Tls(m) => ApiError::new(
+                ErrorCode::Unavailable,
+                format!("TLS to {shown} failed: {m}"),
+            )
+            .with_hint(TLS_HINT),
+            http::Failure::Io(e) => ApiError::new(
+                ErrorCode::Unavailable,
+                format!("the connection to the daemon on {shown} broke: {e}"),
+            ),
+            http::Failure::Timeout => ApiError::new(
+                ErrorCode::Unavailable,
+                format!(
+                    "the daemon on {shown} did not answer within {}",
+                    units::duration(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
                 ),
-                http::Failure::Timeout => ApiError::new(
-                    ErrorCode::Unavailable,
-                    format!(
-                        "the daemon on {shown} did not answer within {}",
-                        units::duration(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
-                    ),
-                ),
-                http::Failure::Malformed(m) => ApiError::new(ErrorCode::Internal, m)
-                    .with_hint(format!("Check that {shown} is a Kronik API.")),
-            },
-        )?;
+            ),
+            http::Failure::Malformed(m) => ApiError::new(ErrorCode::Internal, m)
+                .with_hint(format!("Check that {shown} is a Kronik API.")),
+        })?;
         if (200..300).contains(&r.status) {
             Ok(r.body)
         } else {
@@ -1479,44 +1504,88 @@ fn secret_delete(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode, 
     Ok(ExitCode::SUCCESS)
 }
 
-fn secret_link(ctx: &Ctx, name: &str, backend: &str, reference: &str, mutation: Mutation) -> Result<ExitCode, Error> {
-    let body = ctx.send_json("PUT", &format!("{}/link", secret_path(name)), &SecretLinkRequest {
-        backend: backend.to_owned(), r#ref: reference.to_owned(),
-        reason: reason(&mutation)?.to_owned(), dry_run: mutation.dry_run,
-    })?;
-    if ctx.json { ctx.print_raw(&body); return Ok(ExitCode::SUCCESS); }
+fn secret_link(
+    ctx: &Ctx,
+    name: &str,
+    backend: &str,
+    reference: &str,
+    mutation: Mutation,
+) -> Result<ExitCode, Error> {
+    let body = ctx.send_json(
+        "PUT",
+        &format!("{}/link", secret_path(name)),
+        &SecretLinkRequest {
+            backend: backend.to_owned(),
+            r#ref: reference.to_owned(),
+            reason: reason(&mutation)?.to_owned(),
+            dry_run: mutation.dry_run,
+        },
+    )?;
+    if ctx.json {
+        ctx.print_raw(&body);
+        return Ok(ExitCode::SUCCESS);
+    }
     let response: SecretLinkResponse = ctx.decode(&body)?;
-    let rerun = format!("kronik secret link {} --backend {} --ref {} --reason \"...\"",
-        shell_quote(name), shell_quote(backend), shell_quote(reference));
+    let rerun = format!(
+        "kronik secret link {} --backend {} --ref {} --reason \"...\"",
+        shell_quote(name),
+        shell_quote(backend),
+        shell_quote(reference)
+    );
     ctx.print(&render::secret_link(&response, &rerun));
     Ok(ExitCode::SUCCESS)
 }
 
 fn secret_unlink(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode, Error> {
-    let body = ctx.send_json("DELETE", &format!("{}/link", secret_path(name)), &SecretDeleteRequest {
-        reason: reason(&mutation)?.to_owned(), dry_run: mutation.dry_run,
-    })?;
-    if ctx.json { ctx.print_raw(&body); return Ok(ExitCode::SUCCESS); }
+    let body = ctx.send_json(
+        "DELETE",
+        &format!("{}/link", secret_path(name)),
+        &SecretDeleteRequest {
+            reason: reason(&mutation)?.to_owned(),
+            dry_run: mutation.dry_run,
+        },
+    )?;
+    if ctx.json {
+        ctx.print_raw(&body);
+        return Ok(ExitCode::SUCCESS);
+    }
     let response: SecretLinkResponse = ctx.decode(&body)?;
-    let rerun = format!("kronik secret unlink {} --reason \"...\"", shell_quote(name));
+    let rerun = format!(
+        "kronik secret unlink {} --reason \"...\"",
+        shell_quote(name)
+    );
     ctx.print(&render::secret_link(&response, &rerun));
     Ok(ExitCode::SUCCESS)
 }
 
 fn secret_refresh(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode, Error> {
-    let body = ctx.send_json("POST", &format!("{}/refresh", secret_path(name)), &SecretRefreshRequest {
-        reason: reason(&mutation)?.to_owned(), dry_run: mutation.dry_run,
-    })?;
-    if ctx.json { ctx.print_raw(&body); return Ok(ExitCode::SUCCESS); }
+    let body = ctx.send_json(
+        "POST",
+        &format!("{}/refresh", secret_path(name)),
+        &SecretRefreshRequest {
+            reason: reason(&mutation)?.to_owned(),
+            dry_run: mutation.dry_run,
+        },
+    )?;
+    if ctx.json {
+        ctx.print_raw(&body);
+        return Ok(ExitCode::SUCCESS);
+    }
     let response: SecretResponse = ctx.decode(&body)?;
-    let rerun = format!("kronik secret refresh {} --reason \"...\"", shell_quote(name));
+    let rerun = format!(
+        "kronik secret refresh {} --reason \"...\"",
+        shell_quote(name)
+    );
     ctx.print(&render::secret_refreshed(name, &response, &rerun));
     Ok(ExitCode::SUCCESS)
 }
 
 fn secret_history(ctx: &Ctx, name: &str) -> Result<ExitCode, Error> {
     let body = ctx.get(&format!("{}/history", secret_path(name)))?;
-    if ctx.json { ctx.print_raw(&body); return Ok(ExitCode::SUCCESS); }
+    if ctx.json {
+        ctx.print_raw(&body);
+        return Ok(ExitCode::SUCCESS);
+    }
     let response: SecretHistoryResponse = ctx.decode(&body)?;
     ctx.print(&render::secret_history(&response));
     Ok(ExitCode::SUCCESS)
@@ -1524,7 +1593,10 @@ fn secret_history(ctx: &Ctx, name: &str) -> Result<ExitCode, Error> {
 
 fn secret_backends(ctx: &Ctx) -> Result<ExitCode, Error> {
     let body = ctx.get("/v1/secrets/backends")?;
-    if ctx.json { ctx.print_raw(&body); return Ok(ExitCode::SUCCESS); }
+    if ctx.json {
+        ctx.print_raw(&body);
+        return Ok(ExitCode::SUCCESS);
+    }
     let response: SecretBackendsResponse = ctx.decode(&body)?;
     ctx.print(&render::secret_backends(&response));
     Ok(ExitCode::SUCCESS)

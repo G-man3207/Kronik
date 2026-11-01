@@ -22,6 +22,7 @@ use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use kronik_core::authority::AuthLease;
 use kronik_core::env::{BoxFuture, Clock, Env};
 use kronik_core::ids::{ActorRef, Lsn};
 use kronik_gateway::{Gateway, GatewayConfig, HttpRequest, HttpResponse};
@@ -425,6 +426,15 @@ impl World {
             "node {node_id} recovered at lsn {}",
             node.applied_lsn()
         ));
+        // The operator's original lease: the same authority the scheduler
+        // tests use for deploy/grant/send/secret mutations, retained for the
+        // node process's lifetime like the daemon's configured operator does.
+        let authority = match node.local_operator_authority() {
+            Ok(authority) => authority,
+            Err(e) => {
+                return self.violation(format!("node {node_id} operator authority: {}", e.code));
+            }
+        };
         if self.cfg.check_recovery {
             // Taken before anything awaits: no re-run and no new input has
             // been applied yet.
@@ -443,7 +453,7 @@ impl World {
                 reason: "dst".into(),
                 wall_time_ms: 0,
             };
-            if let Err(e) = node.deploy(COUNTER, audit, false).await {
+            if let Err(e) = node.deploy(COUNTER, audit, false, authority.clone()).await {
                 self.event(format!("deploy failed: {}", e.code));
                 let _ = self.fatal_tx.send(node_id);
                 return;
@@ -469,6 +479,7 @@ impl World {
                     fx.rate,
                     audit,
                     false,
+                    authority.clone(),
                 )
                 .await
             {
@@ -479,7 +490,7 @@ impl World {
             self.event("granted http:payments");
         }
         if self.cfg.effects.is_some_and(|fx| fx.webhook)
-            && let Err(e) = self.setup_webhook(&node).await
+            && let Err(e) = self.setup_webhook(&node, &authority).await
         {
             self.event(format!("webhook setup failed: {e}"));
             let _ = self.fatal_tx.send(node_id);
@@ -512,7 +523,7 @@ impl World {
     /// Deploys webhook-relay-rs, grants it the service and its signing key,
     /// stores the key, and points each actor at the service (each step only
     /// once: they are history after a restart).
-    async fn setup_webhook(&self, node: &Node) -> Result<(), String> {
+    async fn setup_webhook(&self, node: &Node, authority: &AuthLease) -> Result<(), String> {
         let Some(fx) = self.cfg.effects else {
             return Ok(());
         };
@@ -523,7 +534,7 @@ impl World {
         };
         let kind = "webhook-relay";
         if !node.kind_exists(kind) {
-            node.deploy(webhook_relay()?, audit(), false)
+            node.deploy(webhook_relay()?, audit(), false, authority.clone())
                 .await
                 .map_err(|e| format!("deploy: {}", e.code))?;
             self.event("deployed webhook-relay");
@@ -537,23 +548,41 @@ impl World {
                 fx.rate,
                 audit(),
                 false,
+                authority.clone(),
             )
             .await
             .map_err(|e| format!("grant: {}", e.code))?;
         }
         if config.grant(kind, "secret:relay-signing-key").is_none() {
-            node.grant(kind, "secret:relay-signing-key", None, None, audit(), false)
-                .await
-                .map_err(|e| format!("grant: {}", e.code))?;
+            node.grant(
+                kind,
+                "secret:relay-signing-key",
+                None,
+                None,
+                audit(),
+                false,
+                authority.clone(),
+            )
+            .await
+            .map_err(|e| format!("grant: {}", e.code))?;
         }
         let have_key = node
             .secret_list()
+            .await
             .map_err(|e| format!("secrets: {}", e.code))?
+            .0
             .iter()
             .any(|m| m.name == "relay-signing-key");
         if !have_key {
-            node.secret_set("relay-signing-key", SIGNING_KEY, &audit(), false)
-                .map_err(|e| format!("secret: {}", e.code))?;
+            node.secret_set(
+                "relay-signing-key",
+                SIGNING_KEY.to_vec(),
+                &audit(),
+                false,
+                authority.clone(),
+            )
+            .await
+            .map_err(|e| format!("secret: {}", e.code))?;
         }
         for a in 0..self.cfg.actors {
             let key = format!("k{a}");
@@ -580,7 +609,7 @@ impl World {
                 retained_compensation_source: None,
             };
             let r = node
-                .send(actor, msg, audit(), false)
+                .send(actor, msg, audit(), false, authority.clone())
                 .await
                 .map_err(|e| format!("configure: {}", e.code))?;
             if !r.is_some_and(|r| r.committed()) {
@@ -1287,9 +1316,12 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
         .map(|fx| SimService::new(clock.clone(), SimRng::new(seed, b"service"), fx.faults));
     let secrets = match cfg.effects.filter(|fx| fx.webhook).map(|_| {
         let master = kronik_privacy::MasterKey::from_bytes([7; 32]).map_err(|e| e.to_string())?;
-        kronik_privacy::SecretStore::open_memory(&master, kronik_sched::secrets::SecretCacheData::new())
-            .map(Arc::new)
-            .map_err(|e| e.to_string())
+        kronik_privacy::SecretStore::open_memory(
+            &master,
+            kronik_sched::secrets::SecretCacheData::new(),
+        )
+        .map(Arc::new)
+        .map_err(|e| e.to_string())
     }) {
         Some(Ok(s)) => Some(s),
         Some(Err(e)) => {

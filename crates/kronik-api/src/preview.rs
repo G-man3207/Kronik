@@ -8,7 +8,7 @@ use kronik_fork::proposal::Proposal;
 
 use crate::auth::{Caller, Scope};
 use crate::types::*;
-use crate::{Api, AuthorizedRequest, ApiResponse, Result, internal, json, ok, reason};
+use crate::{Api, ApiResponse, AuthorizedRequest, Result, internal, json, ok, reason};
 
 impl Api {
     pub(crate) async fn route_preview(
@@ -46,7 +46,11 @@ impl Api {
         })
     }
 
-    async fn preview_create(&self, req: &AuthorizedRequest, caller: &Caller) -> Result<ApiResponse> {
+    async fn preview_create(
+        &self,
+        req: &AuthorizedRequest,
+        caller: &Caller,
+    ) -> Result<ApiResponse> {
         let r: PreviewCreateRequest = json(&req.body)?;
         reason(&r.reason)?;
         // New work, refused like a fork on a fatal node or a full disk.
@@ -85,7 +89,12 @@ impl Api {
         let r: ResendRequest = json(&req.body)?;
         reason(&r.reason)?;
         self.proposals()?
-            .delete_preview(id, self.audit(req, r.reason), r.dry_run, req.authority.clone())
+            .delete_preview(
+                id,
+                self.audit(req, r.reason),
+                r.dry_run,
+                req.authority.clone(),
+            )
             .await?;
         ok(&PreviewDeleteResponse {
             dry_run: r.dry_run,

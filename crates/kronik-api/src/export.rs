@@ -4,7 +4,7 @@
 use kronik_core::error::{ApiError, ErrorCode};
 
 use crate::types::{ExportRewindRequest, ExportRewindResponse, ExportStatusResponse, ExportStream};
-use crate::{Api, AuthorizedRequest, ApiResponse, Result, json, ok, reason};
+use crate::{Api, ApiResponse, AuthorizedRequest, Result, json, ok, reason};
 
 impl Api {
     pub(crate) async fn route_export(
@@ -60,7 +60,11 @@ impl Api {
     async fn export_rewind(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: ExportRewindRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let Some(stream) = self.exports.iter().find(|s| s.name.as_ref() == name && s.enabled) else {
+        let Some(stream) = self
+            .exports
+            .iter()
+            .find(|s| s.name.as_ref() == name && s.enabled)
+        else {
             return Err(ApiError::new(
                 ErrorCode::ExportNotConfigured,
                 format!("the export stream {name:?} is not on in this daemon"),
@@ -93,7 +97,7 @@ impl Api {
         let details = [("from", from.to_string()), ("to", r.to.to_string())];
         self.audit_event(req, "export.rewind", name, &details, r.reason.clone())
             .await?;
-        if let Err(error) = stream.rewind(&self.node, r.to, req.authority()).await {
+        if let Err(error) = stream.rewind(&self.node, r.to, req.authority.clone()).await {
             let error = match error.code {
                 ErrorCode::BadRequest => error.with_hint("Run `kronik export status`, choose a retained point at or before its cursor, and retry."),
                 ErrorCode::Unavailable => error.with_hint("Check storage health and write access to the data directory, then retry; the rewind was not acknowledged."),

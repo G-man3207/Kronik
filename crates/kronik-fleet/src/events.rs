@@ -38,15 +38,20 @@ impl Identity {
 }
 
 fn label(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 128
-        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
 }
 
 /// A namespace, never a global ordering relation or a caller-selected authority.
 pub fn domain(source: SourcePos) -> Cow<'static, str> {
     match source {
         SourcePos::Actor { shard: None, .. } => Cow::Borrowed("actor-native"),
-        SourcePos::Actor { shard: Some(shard), .. } => Cow::Owned(format!("actor-{shard}")),
+        SourcePos::Actor {
+            shard: Some(shard), ..
+        } => Cow::Owned(format!("actor-{shard}")),
         SourcePos::Metadata { .. } => Cow::Borrowed("metadata"),
     }
 }
@@ -60,10 +65,13 @@ pub fn coordinate(source: SourcePos) -> u64 {
 }
 
 fn valid_source(source: SourcePos) -> bool {
-    coordinate(source) > 0 && match source {
-        SourcePos::Actor { shard: Some(shard), .. } => shard < kronik_proto::MAX_SHARD_COUNT,
-        _ => true,
-    }
+    coordinate(source) > 0
+        && match source {
+            SourcePos::Actor {
+                shard: Some(shard), ..
+            } => shard < kronik_proto::MAX_SHARD_COUNT,
+            _ => true,
+        }
 }
 
 /// Next event to read in one actual source, not a synthetic actor LSN.
@@ -84,15 +92,21 @@ pub struct ResumeCursor {
 
 impl ResumeCursor {
     pub fn new(identity: Identity) -> Self {
-        Self { schema: CURSOR_SCHEMA.into(), identity, streams: BTreeMap::new() }
+        Self {
+            schema: CURSOR_SCHEMA.into(),
+            identity,
+            streams: BTreeMap::new(),
+        }
     }
 
     pub fn validate(&self, identity: &Identity) -> Result<(), String> {
         identity.validate()?;
-        if self.schema != CURSOR_SCHEMA || &self.identity != identity
+        if self.schema != CURSOR_SCHEMA
+            || &self.identity != identity
             || self.streams.len() > MAX_STREAMS
-            || self.streams.iter().any(|(key, position)|
-                !valid_source(position.source) || key != domain(position.source).as_ref())
+            || self.streams.iter().any(|(key, position)| {
+                !valid_source(position.source) || key != domain(position.source).as_ref()
+            })
         {
             return Err("events_cursor".into());
         }
@@ -155,18 +169,31 @@ impl EventData {
         let phase = if matches!(record, Record::AuditEvent(event)
             if matches!(event.operation.as_ref(), Some(kronik_proto::log::v1::audit_event::Operation::FleetState(_))))
         {
-            let value = line.details.get("phase").ok_or_else(||
-                ApiError::new(ErrorCode::StorageCorrupt, "missing typed fleet phase"))?;
-            Some(FleetPhase::deserialize(value).map_err(|_|
-                ApiError::new(ErrorCode::StorageCorrupt, "invalid typed fleet phase"))?)
-        } else { None };
+            let value = line.details.get("phase").ok_or_else(|| {
+                ApiError::new(ErrorCode::StorageCorrupt, "missing typed fleet phase")
+            })?;
+            Some(FleetPhase::deserialize(value).map_err(|_| {
+                ApiError::new(ErrorCode::StorageCorrupt, "invalid typed fleet phase")
+            })?)
+        } else {
+            None
+        };
         // Only the canonical mapper sets this closed fact after source validation.
         // Wire-origin fields and free Line.details are not consumer provenance.
-        let adoption = line.native_adoption_current_projection()
+        let adoption = line
+            .native_adoption_current_projection()
             .map(|current_projection| NativeAdoption { current_projection });
-        Ok(Self { schema: line.schema, kind: line.kind, action: line.action,
-            at_wall_ms: line.at_wall_ms, epoch: line.epoch, effect: line.effect, phase, adoption,
-            record_hash: line.record_hash })
+        Ok(Self {
+            schema: line.schema,
+            kind: line.kind,
+            action: line.action,
+            at_wall_ms: line.at_wall_ms,
+            epoch: line.epoch,
+            effect: line.effect,
+            phase,
+            adoption,
+            record_hash: line.record_hash,
+        })
     }
 }
 
@@ -192,19 +219,32 @@ impl Event {
 }
 
 /// Canonical operational identity, not sealed-value identity; no legacy hash fallback.
-pub fn event_id(identity: &Identity, source: SourcePos, actor_branch: Option<&str>,
-    subindex: u32, record_hash: &str) -> Result<String, String> {
+pub fn event_id(
+    identity: &Identity,
+    source: SourcePos,
+    actor_branch: Option<&str>,
+    subindex: u32,
+    record_hash: &str,
+) -> Result<String, String> {
     identity.validate()?;
     match (source, actor_branch) {
         (SourcePos::Actor { .. }, Some(branch)) => {
             kronik_proto::validate_source_branch(branch).map_err(|_| "events_source")?;
         }
-        (SourcePos::Metadata { .. }, None) => {},
+        (SourcePos::Metadata { .. }, None) => {}
         _ => return Err("events_source".into()),
     }
-    if !valid_source(source) { return Err("events_source".into()); }
-    let hash = record_hash.strip_prefix("b3k:v3:").ok_or("events_record_hash")?;
-    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+    if !valid_source(source) {
+        return Err("events_source".into());
+    }
+    let hash = record_hash
+        .strip_prefix("b3k:v3:")
+        .ok_or("events_record_hash")?;
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err("events_record_hash".into());
     }
     let installation = hex(identity.installation.as_bytes());
@@ -213,10 +253,14 @@ pub fn event_id(identity: &Identity, source: SourcePos, actor_branch: Option<&st
             let branch = hex(actor_branch.ok_or("events_source")?.as_bytes());
             match shard {
                 None => format!("ke1.{installation}.{branch}.actor.native.{lsn}.{subindex}.{hash}"),
-                Some(shard) => format!("ke1.{installation}.{branch}.actor.{shard}.{lsn}.{subindex}.{hash}"),
+                Some(shard) => {
+                    format!("ke1.{installation}.{branch}.actor.{shard}.{lsn}.{subindex}.{hash}")
+                }
             }
         }
-        SourcePos::Metadata { index } => format!("ke1.{installation}.metadata.{index}.{subindex}.{hash}"),
+        SourcePos::Metadata { index } => {
+            format!("ke1.{installation}.metadata.{index}.{subindex}.{hash}")
+        }
     })
 }
 
@@ -230,33 +274,73 @@ pub fn project(
     secrets: &[(&str, &[u8])],
 ) -> Result<Vec<Event>, ApiError> {
     identity.validate().map_err(bad_cursor)?;
-    source.validate().map_err(|_| ApiError::new(ErrorCode::StorageCorrupt, "invalid operational actor source"))?;
-    let position = SourcePos::Actor { shard: source.shard, lsn: source.lsn };
+    source.validate().map_err(|_| {
+        ApiError::new(
+            ErrorCode::StorageCorrupt,
+            "invalid operational actor source",
+        )
+    })?;
+    let position = SourcePos::Actor {
+        shard: source.shard,
+        lsn: source.lsn,
+    };
     let lines = mapper.operational_lines_actor_at(source, record, secrets)?;
     project_lines(identity, position, Some(&source.branch), record, lines)
 }
 
 /// Consume an actual metadata record envelope without dropping its adoption
 /// sidecar. The sole canonical mapper validates the record/origin relationship.
-pub fn project_metadata(mapper: &Mapper, identity: &Identity, source: &MetadataAuditRecord,
-    secrets: &[(&str, &[u8])]) -> Result<Vec<Event>, ApiError>
-{
+pub fn project_metadata(
+    mapper: &Mapper,
+    identity: &Identity,
+    source: &MetadataAuditRecord,
+    secrets: &[(&str, &[u8])],
+) -> Result<Vec<Event>, ApiError> {
     identity.validate().map_err(bad_cursor)?;
     let lines = mapper.operational_lines_metadata(source, secrets)?;
-    project_lines(identity, SourcePos::Metadata { index: source.index }, None, &source.record, lines)
+    project_lines(
+        identity,
+        SourcePos::Metadata {
+            index: source.index,
+        },
+        None,
+        &source.record,
+        lines,
+    )
 }
 
-fn project_lines(identity: &Identity, source: SourcePos, actor_branch: Option<&str>, record: &Record,
-    lines: Vec<Line>) -> Result<Vec<Event>, ApiError>
-{
-    lines.into_iter().enumerate().map(|(index, data)| {
-            let subindex = u32::try_from(index).map_err(|_| ApiError::new(ErrorCode::Internal, "events_limit"))?;
+fn project_lines(
+    identity: &Identity,
+    source: SourcePos,
+    actor_branch: Option<&str>,
+    record: &Record,
+    lines: Vec<Line>,
+) -> Result<Vec<Event>, ApiError> {
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, data)| {
+            let subindex = u32::try_from(index)
+                .map_err(|_| ApiError::new(ErrorCode::Internal, "events_limit"))?;
             let id = event_id(identity, source, actor_branch, subindex, &data.record_hash)
-                .map_err(|_| ApiError::new(ErrorCode::Unavailable, "keyed operational identity is unavailable"))?;
-            Ok(Event { schema: SCHEMA.into(), id, installation: identity.installation.clone(),
+                .map_err(|_| {
+                    ApiError::new(
+                        ErrorCode::Unavailable,
+                        "keyed operational identity is unavailable",
+                    )
+                })?;
+            Ok(Event {
+                schema: SCHEMA.into(),
+                id,
+                installation: identity.installation.clone(),
                 branch: actor_branch.map(str::to_owned),
-                source, subindex, record_kind: record.kind(), data: EventData::from_line(data, record)? })
-        }).collect()
+                source,
+                subindex,
+                record_kind: record.kind(),
+                data: EventData::from_line(data, record)?,
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -288,8 +372,15 @@ pub async fn page(
 ) -> Result<Page, ApiError> {
     cursor.validate(identity).map_err(bad_cursor)?;
     reader.check()?;
-    let SourcePos::Actor { shard, lsn: applied } = reader.point().source else {
-        return Err(ApiError::new(ErrorCode::StorageCorrupt, "actor events require an actual actor reader"));
+    let SourcePos::Actor {
+        shard,
+        lsn: applied,
+    } = reader.point().source
+    else {
+        return Err(ApiError::new(
+            ErrorCode::StorageCorrupt,
+            "actor events require an actual actor reader",
+        ));
     };
     let source_at = |lsn| SourcePos::Actor { shard, lsn };
     if !valid_source(source_at(1)) || limit == 0 || limit > MAX_EVENTS {
@@ -297,31 +388,59 @@ pub async fn page(
     }
     let first = reader.point().retained_from.max(1);
     let key = domain(source_at(1));
-    let position = cursor.streams.get(key.as_ref()).copied()
-        .unwrap_or(Position { source: source_at(first), subindex: 0 });
+    let position = cursor
+        .streams
+        .get(key.as_ref())
+        .copied()
+        .unwrap_or(Position {
+            source: source_at(first),
+            subindex: 0,
+        });
     let mut next_lsn = coordinate(position.source);
     let mut subindex = position.subindex;
     if next_lsn > applied.saturating_add(1) || (next_lsn > applied && subindex != 0) {
         return Err(bad_cursor("events_cursor_ahead"));
     }
-    let mut result = Page { events: Vec::new(), cursor: cursor.clone(), applied: source_at(applied),
-        gap: None, more: false };
+    let mut result = Page {
+        events: Vec::new(),
+        cursor: cursor.clone(),
+        applied: source_at(applied),
+        gap: None,
+        more: false,
+    };
     if next_lsn < first {
-        result.gap = Some(Gap { from: source_at(next_lsn), through: source_at(first - 1) });
-        result.cursor.rewind(Position { source: source_at(first), subindex: 0 }).map_err(bad_cursor)?;
+        result.gap = Some(Gap {
+            from: source_at(next_lsn),
+            through: source_at(first - 1),
+        });
+        result
+            .cursor
+            .rewind(Position {
+                source: source_at(first),
+                subindex: 0,
+            })
+            .map_err(bad_cursor)?;
         result.more = first <= applied;
         return Ok(result);
     }
-    let scan = reader.local_export_page(next_lsn - 1, MAX_SCAN_RECORDS as usize, MAX_PAGE_BYTES).await?;
+    let scan = reader
+        .local_export_page(next_lsn - 1, MAX_SCAN_RECORDS as usize, MAX_PAGE_BYTES)
+        .await?;
     let mut bytes = 0;
     let mut complete = true;
     'records: for (source, committed) in scan.records {
         if source.shard != shard || source.lsn != committed.lsn {
-            return Err(ApiError::new(ErrorCode::StorageCorrupt, "operational frame left its captured source"));
+            return Err(ApiError::new(
+                ErrorCode::StorageCorrupt,
+                "operational frame left its captured source",
+            ));
         }
         if committed.lsn > next_lsn {
             if result.events.is_empty() {
-                result.gap = Some(Gap { from: source_at(next_lsn), through: source_at(committed.lsn - 1) });
+                result.gap = Some(Gap {
+                    from: source_at(next_lsn),
+                    through: source_at(committed.lsn - 1),
+                });
                 next_lsn = committed.lsn;
                 subindex = 0;
             }
@@ -329,10 +448,17 @@ pub async fn page(
             break;
         }
         let events = project(mapper, identity, &source, &committed.record, secrets)?;
-        if subindex as usize > events.len() { return Err(bad_cursor("events_cursor_subindex")); }
+        if subindex as usize > events.len() {
+            return Err(bad_cursor("events_cursor_subindex"));
+        }
         for event in events.into_iter().skip(subindex as usize) {
-            let size = event.body().map_err(|error| ApiError::new(ErrorCode::Internal, error))?.len();
-            if size > MAX_PAGE_BYTES { return Err(ApiError::new(ErrorCode::Internal, "events_limit")); }
+            let size = event
+                .body()
+                .map_err(|error| ApiError::new(ErrorCode::Internal, error))?
+                .len();
+            if size > MAX_PAGE_BYTES {
+                return Err(ApiError::new(ErrorCode::Internal, "events_limit"));
+            }
             if result.events.len() == limit || bytes + size > MAX_PAGE_BYTES {
                 complete = false;
                 break 'records;
@@ -344,10 +470,18 @@ pub async fn page(
         next_lsn = committed.lsn.saturating_add(1);
         subindex = 0;
     }
-    if complete { next_lsn = next_lsn.max(scan.scanned_through.saturating_add(1)); }
+    if complete {
+        next_lsn = next_lsn.max(scan.scanned_through.saturating_add(1));
+    }
     reader.check()?;
     result.more = next_lsn <= applied;
-    result.cursor.rewind(Position { source: source_at(next_lsn), subindex }).map_err(bad_cursor)?;
+    result
+        .cursor
+        .rewind(Position {
+            source: source_at(next_lsn),
+            subindex,
+        })
+        .map_err(bad_cursor)?;
     Ok(result)
 }
 
@@ -360,17 +494,30 @@ pub(crate) fn metadata_batch(
         return Err(bad_cursor("events_limit"));
     }
     let batch = source.read_from(from, limit)?;
-    if batch.covered_from == 0 || batch.scanned_through > batch.durable_through
+    if batch.covered_from == 0
+        || batch.scanned_through > batch.durable_through
         || batch.covered_from > batch.durable_through.saturating_add(1)
         || batch.records.len() > limit
         || (batch.records.len() == limit
-            && batch.records.last().is_none_or(|record| record.index != batch.scanned_through))
+            && batch
+                .records
+                .last()
+                .is_none_or(|record| record.index != batch.scanned_through))
         || (batch.records.len() < limit && batch.scanned_through != batch.durable_through)
         || (from <= batch.durable_through && batch.scanned_through < from)
-        || batch.records.windows(2).any(|pair| pair[0].index >= pair[1].index)
-        || batch.records.iter().any(|record| record.index < from || record.index > batch.scanned_through)
+        || batch
+            .records
+            .windows(2)
+            .any(|pair| pair[0].index >= pair[1].index)
+        || batch
+            .records
+            .iter()
+            .any(|record| record.index < from || record.index > batch.scanned_through)
     {
-        return Err(ApiError::new(ErrorCode::StorageCorrupt, "invalid metadata audit coverage"));
+        return Err(ApiError::new(
+            ErrorCode::StorageCorrupt,
+            "invalid metadata audit coverage",
+        ));
     }
     Ok(batch)
 }
@@ -386,8 +533,13 @@ pub fn metadata_page(
     limit: usize,
 ) -> Result<Page, ApiError> {
     cursor.validate(identity).map_err(bad_cursor)?;
-    if limit == 0 || limit > MAX_EVENTS { return Err(bad_cursor("events_limit")); }
-    let from = cursor.streams.get("metadata").map_or(1, |position| coordinate(position.source));
+    if limit == 0 || limit > MAX_EVENTS {
+        return Err(bad_cursor("events_limit"));
+    }
+    let from = cursor
+        .streams
+        .get("metadata")
+        .map_or(1, |position| coordinate(position.source));
     let batch = metadata_batch(source, from, limit)?;
     metadata_page_from_batch(batch, mapper, identity, cursor, secrets, limit)
 }
@@ -402,23 +554,44 @@ pub(crate) fn metadata_page_from_batch(
     limit: usize,
 ) -> Result<Page, ApiError> {
     let at = |index| SourcePos::Metadata { index };
-    let start = cursor.streams.get("metadata").copied()
-        .unwrap_or(Position { source: at(1), subindex: 0 });
+    let start = cursor.streams.get("metadata").copied().unwrap_or(Position {
+        source: at(1),
+        subindex: 0,
+    });
     let from = coordinate(start.source);
     if from > batch.durable_through.saturating_add(1)
         || (from > batch.durable_through && start.subindex != 0)
     {
         return Err(bad_cursor("events_cursor_ahead"));
     }
-    let mut result = Page { events: Vec::new(), cursor: cursor.clone(),
-        applied: at(batch.durable_through), gap: None, more: false };
+    let mut result = Page {
+        events: Vec::new(),
+        cursor: cursor.clone(),
+        applied: at(batch.durable_through),
+        gap: None,
+        more: false,
+    };
     if from < batch.covered_from {
-        result.gap = Some(Gap { from: at(from), through: at(batch.covered_from - 1) });
-        result.cursor.rewind(Position { source: at(batch.covered_from), subindex: 0 }).map_err(bad_cursor)?;
+        result.gap = Some(Gap {
+            from: at(from),
+            through: at(batch.covered_from - 1),
+        });
+        result
+            .cursor
+            .rewind(Position {
+                source: at(batch.covered_from),
+                subindex: 0,
+            })
+            .map_err(bad_cursor)?;
         result.more = batch.covered_from <= batch.durable_through;
         return Ok(result);
     }
-    if start.subindex > 0 && batch.records.first().is_none_or(|record| record.index != from) {
+    if start.subindex > 0
+        && batch
+            .records
+            .first()
+            .is_none_or(|record| record.index != from)
+    {
         return Err(bad_cursor("events_cursor_subindex"));
     }
     let mut next = from;
@@ -426,14 +599,30 @@ pub(crate) fn metadata_page_from_batch(
     let mut bytes = 0;
     for record in batch.records {
         let index = record.index;
-        if index != next { next = index; subindex = 0; }
+        if index != next {
+            next = index;
+            subindex = 0;
+        }
         let events = project_metadata(mapper, identity, &record, secrets)?;
-        if subindex as usize > events.len() { return Err(bad_cursor("events_cursor_subindex")); }
+        if subindex as usize > events.len() {
+            return Err(bad_cursor("events_cursor_subindex"));
+        }
         for event in events.into_iter().skip(subindex as usize) {
-            let size = event.body().map_err(|error| ApiError::new(ErrorCode::Internal, error))?.len();
-            if size > MAX_PAGE_BYTES { return Err(ApiError::new(ErrorCode::Internal, "events_limit")); }
+            let size = event
+                .body()
+                .map_err(|error| ApiError::new(ErrorCode::Internal, error))?
+                .len();
+            if size > MAX_PAGE_BYTES {
+                return Err(ApiError::new(ErrorCode::Internal, "events_limit"));
+            }
             if result.events.len() == limit || bytes + size > MAX_PAGE_BYTES {
-                result.cursor.rewind(Position { source: at(next), subindex }).map_err(bad_cursor)?;
+                result
+                    .cursor
+                    .rewind(Position {
+                        source: at(next),
+                        subindex,
+                    })
+                    .map_err(bad_cursor)?;
                 result.more = next <= batch.durable_through;
                 return Ok(result);
             }
@@ -441,12 +630,24 @@ pub(crate) fn metadata_page_from_batch(
             subindex += 1;
             result.events.push(event);
         }
-        next = index.checked_add(1).ok_or_else(|| bad_cursor("metadata position exhausted"))?;
+        next = index
+            .checked_add(1)
+            .ok_or_else(|| bad_cursor("metadata position exhausted"))?;
         subindex = 0;
     }
-    next = next.max(batch.scanned_through.checked_add(1)
-        .ok_or_else(|| bad_cursor("metadata position exhausted"))?);
-    result.cursor.rewind(Position { source: at(next), subindex: 0 }).map_err(bad_cursor)?;
+    next = next.max(
+        batch
+            .scanned_through
+            .checked_add(1)
+            .ok_or_else(|| bad_cursor("metadata position exhausted"))?,
+    );
+    result
+        .cursor
+        .rewind(Position {
+            source: at(next),
+            subindex: 0,
+        })
+        .map_err(bad_cursor)?;
     result.more = next <= batch.durable_through;
     Ok(result)
 }
@@ -454,16 +655,20 @@ pub(crate) fn metadata_page_from_batch(
 pub fn resume_after(event: &Event, cursor: &ResumeCursor) -> Result<ResumeCursor, String> {
     cursor.validate(&cursor.identity)?;
     let branch_matches = match event.source {
-        SourcePos::Actor { .. } => event.branch.as_deref().is_some_and(|branch|
-            kronik_proto::validate_source_branch(branch).is_ok()),
+        SourcePos::Actor { .. } => event
+            .branch
+            .as_deref()
+            .is_some_and(|branch| kronik_proto::validate_source_branch(branch).is_ok()),
         SourcePos::Metadata { .. } => event.branch.is_none(),
     };
     if event.installation != cursor.identity.installation || !branch_matches {
         return Err("events_identity".into());
     }
     let mut next = cursor.clone();
-    next.rewind(Position { source: event.source,
-        subindex: event.subindex.checked_add(1).ok_or("events_cursor")? })?;
+    next.rewind(Position {
+        source: event.source,
+        subindex: event.subindex.checked_add(1).ok_or("events_cursor")?,
+    })?;
     Ok(next)
 }
 
@@ -478,7 +683,10 @@ pub fn sse_event(event: &Event, cursor: &ResumeCursor) -> Result<String, String>
 pub fn sse_cursor(page: &Page) -> Result<String, String> {
     let body = serde_json::to_string(page).map_err(|_| "events_encode".to_owned())?;
     let id = serde_json::to_string(&page.cursor).map_err(|_| "events_encode".to_owned())?;
-    Ok(format!("id: {id}\nevent: {}\ndata: {body}\n\n", if page.gap.is_some() { "gap" } else { "cursor" }))
+    Ok(format!(
+        "id: {id}\nevent: {}\ndata: {body}\n\n",
+        if page.gap.is_some() { "gap" } else { "cursor" }
+    ))
 }
 
 fn bad_cursor(message: impl Into<String>) -> ApiError {

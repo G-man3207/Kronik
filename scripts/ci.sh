@@ -138,7 +138,10 @@ for f in sorted(files):
     if not uses and str(f) in allowed:
         bad.append(f"scripts/unsafe-allowlist.txt: {f} has no unsafe code any more; remove its entry")
     allowed.pop(str(f), None)
-    if f.parts[0] == "crates" and not {"tests", "examples", "benches"} & set(f.parts):
+    # A `tests.rs` / `*_tests.rs` module file is test code: its parent module
+    # includes it under `#[cfg(test)]`, so an inner allow attribute is legal.
+    test_module = f.name == "tests.rs" or f.name.endswith("_tests.rs")
+    if f.parts[0] == "crates" and not {"tests", "examples", "benches"} & set(f.parts) and not test_module:
         for m in re.finditer(r"allow\s*\([^)]*clippy::(unwrap_used|expect_used)", src):
             before = src[max(0, m.start() - 300):m.start()]
             if not re.search(r"#\[cfg\(test\)\]\s*(mod\s+\w+\s*\{\s*#!\[|#\[)\s*$", before):

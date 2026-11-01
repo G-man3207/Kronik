@@ -951,9 +951,15 @@ async fn public_audit_positions_do_not_become_free_secret_text() {
             .chain([("note", "operator pin 1234")])
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect();
-        node.record_audit_event(action, "test", details, audit())
-            .await
-            .unwrap();
+        node.record_audit_event_authorized(
+            action,
+            "test",
+            details,
+            audit(),
+            node.local_operator_authority().unwrap(),
+        )
+        .await
+        .unwrap();
     }
     let (status, response) = call(&api, "GET", "/v1/audit", Value::Null).await;
     assert_eq!(status, 200, "{response}");
@@ -995,7 +1001,11 @@ async fn public_audit_positions_do_not_become_free_secret_text() {
     let mut expected = Vec::new();
     node.reader()
         .read(1, node.applied_lsn(), |committed| {
-            expected.extend(mapper.expected(committed.lsn, &committed.record)?);
+            expected.extend(
+                mapper
+                    .expected(committed.lsn, &committed.record)
+                    .expect("the audit mapper maps a committed record"),
+            );
             Ok(())
         })
         .await
@@ -1005,11 +1015,12 @@ async fn public_audit_positions_do_not_become_free_secret_text() {
     for value in ["", "-1", "not-a-position", "18446744073709551616"] {
         let before = node.applied_lsn();
         let error = node
-            .record_audit_event(
+            .record_audit_event_authorized(
                 "restore",
                 "test",
                 [("through_lsn".into(), value.into())].into(),
                 audit(),
+                node.local_operator_authority().unwrap(),
             )
             .await
             .unwrap_err();

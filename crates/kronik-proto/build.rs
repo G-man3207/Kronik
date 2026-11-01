@@ -7,8 +7,10 @@ use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?).join("../../proto");
-    let files = ["common", "input", "turn", "config", "branch", "effects", "control"]
-        .map(|name| root.join(format!("kronik/log/v1/{name}.proto")));
+    let files = [
+        "common", "input", "turn", "config", "branch", "effects", "control",
+    ]
+    .map(|name| root.join(format!("kronik/log/v1/{name}.proto")));
     for file in &files {
         println!("cargo:rerun-if-changed={}", file.display());
     }

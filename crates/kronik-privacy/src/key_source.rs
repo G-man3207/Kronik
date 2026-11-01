@@ -2,9 +2,9 @@
 //! is persisted for KMS sources; the loaded key is shared with shipping.
 
 pub mod config;
-pub(crate) mod providers;
-mod pkcs11;
 mod ownership;
+mod pkcs11;
+pub(crate) mod providers;
 pub use ownership::DataOwnership;
 
 use std::io::{Read as _, Write as _};
@@ -313,12 +313,21 @@ impl KeySource {
 /// Produce a non-secret key-possession probe without loading or changing a seed.
 pub async fn enroll_pkcs11(env: &Env, config: &Keys) -> Result<config::Probe, KeySourceError> {
     protect_process()?;
-    config.check_pkcs11_enrollment().map_err(KeySourceError::Config)?;
+    config
+        .check_pkcs11_enrollment()
+        .map_err(KeySourceError::Config)?;
     if !cfg!(target_os = "linux") {
         return Err(KeySourceError::Config("PKCS11_UNSUPPORTED_PLATFORM".into()));
     }
-    pkcs11::enroll(env, config.pkcs11.as_ref().ok_or_else(|| KeySourceError::Config("PKCS11_CONFIG".into()))?)
-        .await.map_err(KeySourceError::Pkcs11)
+    pkcs11::enroll(
+        env,
+        config
+            .pkcs11
+            .as_ref()
+            .ok_or_else(|| KeySourceError::Config("PKCS11_CONFIG".into()))?,
+    )
+    .await
+    .map_err(KeySourceError::Pkcs11)
 }
 
 pub async fn unwrap_envelope(
@@ -522,7 +531,9 @@ async fn encrypt_retry(
                 Wrapped::parse(&w.bytes()?, config)?;
                 return Ok(w);
             }
-            Ok(Err(code)) if config.source == Source::Pkcs11 => return Err(KeySourceError::Pkcs11(code)),
+            Ok(Err(code)) if config.source == Source::Pkcs11 => {
+                return Err(KeySourceError::Pkcs11(code));
+            }
             _ if config.source == Source::Pkcs11 => return Err(KeySourceError::Unavailable),
             _ if env.clock.monotonic() < deadline => {
                 env.clock
@@ -568,7 +579,9 @@ async fn unwrap_retry(
                 bytes.zeroize();
                 return MasterKey::from_bytes(*seed).map_err(Into::into);
             }
-            Ok(Err(code)) if config.source == Source::Pkcs11 => return Err(KeySourceError::Pkcs11(code)),
+            Ok(Err(code)) if config.source == Source::Pkcs11 => {
+                return Err(KeySourceError::Pkcs11(code));
+            }
             _ if config.source == Source::Pkcs11 => return Err(KeySourceError::Unavailable),
             _ if env.clock.monotonic() < deadline => {
                 env.clock

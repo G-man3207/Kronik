@@ -1849,21 +1849,7 @@ pub fn watch(ctx: &Ctx, a: WatchArgs) -> Result<ExitCode, Error> {
     let mut shown = None;
     let mut fired = 0;
     loop {
-        let body = ctx.get(&format!("/v1/watches/{id}")).map_err(|e| {
-            let message = match &e {
-                Error::Local(e) => e.message.clone(),
-                Error::Remote { status, .. } => format!("the API answered HTTP {status}"),
-            };
-            Error::from(
-                ApiError::new(
-                    ErrorCode::Unavailable,
-                    format!("watch {id} started, but following it failed: {message}"),
-                )
-                .with_hint(format!(
-                    "It runs on in the daemon; see it with: kronik watches show {id}"
-                )),
-            )
-        })?;
+        let body = watch_status(ctx, &id)?;
         let w: WatchInfo = ctx.decode(&body)?;
         if w.status != "watching" {
             if ctx.json {
@@ -1886,6 +1872,86 @@ pub fn watch(ctx: &Ctx, a: WatchArgs) -> Result<ExitCode, Error> {
         fired = w.triggered.len();
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// A deployment switch publishes its new epoch by retiring the certified
+/// secret cache and recertifying it asynchronously
+/// (crates/kronik-sched/src/secrets.rs `publish_secret_config_epoch`), so a
+/// scrubbed read can briefly answer 503 `SECRET_UNAVAILABLE` or `UNAVAILABLE`
+/// in between. A watch status poll holds no secret and is read-only, and the
+/// daemon's own hint says to retry that window; retry exactly those two codes
+/// within a bounded budget, and return every other error unchanged.
+const WATCH_TRANSIENT_BUDGET: Duration = Duration::from_secs(30);
+const WATCH_TRANSIENT_BACKOFF: Duration = Duration::from_millis(100);
+
+fn watch_status(ctx: &Ctx, id: &str) -> Result<Vec<u8>, Error> {
+    let target = format!("/v1/watches/{id}");
+    let mut deadline = None;
+    loop {
+        match ctx.get(&target) {
+            Ok(body) => return Ok(body),
+            Err(error) => {
+                let Some(transient) = secret_coverage_window(&error) else {
+                    return Err(watch_follow_error(error, id));
+                };
+                let first = deadline.is_none();
+                let limit =
+                    *deadline.get_or_insert_with(|| Instant::now() + WATCH_TRANSIENT_BUDGET);
+                if Instant::now() >= limit {
+                    return Err(Error::from(
+                        ApiError::new(
+                            ErrorCode::Unavailable,
+                            format!(
+                                "watch {id} started, but following it failed: HTTP 503 {}: {}",
+                                transient.code.as_str(),
+                                transient.message
+                            ),
+                        )
+                        .with_hint(transient.hint.clone().unwrap_or_else(|| {
+                            format!(
+                                "It runs on in the daemon; see it with: kronik watches show {id}"
+                            )
+                        })),
+                    ));
+                }
+                if first {
+                    let _ = writeln!(std::io::stderr(), "{id}: {}; retrying", transient.message);
+                }
+                std::thread::sleep(WATCH_TRANSIENT_BACKOFF);
+            }
+        }
+    }
+}
+
+/// The 503 body, but only inside the transient secret-coverage window: never
+/// select another status or another error code for a retry.
+fn secret_coverage_window(error: &Error) -> Option<ApiError> {
+    let Error::Remote { status: 503, body } = error else {
+        return None;
+    };
+    let error: ApiError = serde_json::from_slice(body).ok()?;
+    matches!(
+        error.code,
+        ErrorCode::SecretUnavailable | ErrorCode::Unavailable
+    )
+    .then_some(error)
+}
+
+/// The failure that ends `watch`'s follow loop for a non-transient error.
+fn watch_follow_error(error: Error, id: &str) -> Error {
+    let message = match &error {
+        Error::Local(error) => error.message.clone(),
+        Error::Remote { status, .. } => format!("the API answered HTTP {status}"),
+    };
+    Error::from(
+        ApiError::new(
+            ErrorCode::Unavailable,
+            format!("watch {id} started, but following it failed: {message}"),
+        )
+        .with_hint(format!(
+            "It runs on in the daemon; see it with: kronik watches show {id}"
+        )),
+    )
 }
 
 fn watch_exit(w: &WatchInfo) -> ExitCode {
@@ -2407,5 +2473,126 @@ mod tests {
             Err(Error::Local(e)) => panic!("{e}"),
             Err(Error::Remote { status, .. }) => panic!("remote status {status}"),
         }
+    }
+
+    /// A unix-socket API that answers one request per connection, in order,
+    /// and then watches for an unexpected extra request for a moment.
+    fn fake_api(
+        socket: &std::path::Path,
+        responses: Vec<(u16, &'static str)>,
+    ) -> (
+        http::Endpoint,
+        std::sync::Arc<std::sync::Mutex<usize>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let listener = UnixListener::bind(socket).unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let counted = requests.clone();
+        let server = std::thread::spawn(move || {
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                *counted.lock().unwrap() += 1;
+                let reason = if (200..300).contains(&status) {
+                    "OK"
+                } else {
+                    "Service Unavailable"
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.flush();
+            }
+            listener.set_nonblocking(true).ok();
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                if listener.accept().is_ok() {
+                    *counted.lock().unwrap() += 1;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        (http::Endpoint::Unix(socket.to_path_buf()), requests, server)
+    }
+
+    fn fake_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kronik-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_file(dir.join("api.sock"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn fake_ctx(endpoint: http::Endpoint) -> Ctx {
+        Ctx {
+            endpoint: Ok(endpoint),
+            json: false,
+            token: Ok(None),
+            url_flag: None,
+        }
+    }
+
+    /// A deployment switch briefly retires the certified secret cache, so a
+    /// read-only follow poll may answer 503 SECRET_UNAVAILABLE; the watch poll
+    /// retries exactly that window instead of ending the follow.
+    #[test]
+    fn a_watch_poll_retries_the_transient_secret_coverage_window() {
+        let dir = fake_dir("watch-retry");
+        let (endpoint, requests, server) = fake_api(
+            &dir.join("api.sock"),
+            vec![
+                (
+                    503,
+                    r#"{"error":{"code":"SECRET_UNAVAILABLE","message":"The retained secret identity or value is unavailable","hint":"retry after complete secret coverage is restored"}}"#,
+                ),
+                (200, r#"{"id":"w-1"}"#),
+            ],
+        );
+        let body = watch_status(&fake_ctx(endpoint), "w-1").unwrap();
+        assert_eq!(body, br#"{"id":"w-1"}"#.to_vec());
+        server.join().unwrap();
+        assert_eq!(*requests.lock().unwrap(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the secret-coverage window is transient: another 503 code ends the
+    /// follow at once and is not retried.
+    #[test]
+    fn a_watch_poll_does_not_retry_another_503() {
+        let dir = fake_dir("watch-no-retry");
+        let (endpoint, requests, server) = fake_api(
+            &dir.join("api.sock"),
+            vec![(
+                503,
+                r#"{"error":{"code":"KEY_PROTECTION_UNAVAILABLE","message":"the key is unavailable","hint":"check the key source"}}"#,
+            )],
+        );
+        let error = watch_status(&fake_ctx(endpoint), "w-1").unwrap_err();
+        server.join().unwrap();
+        assert_eq!(*requests.lock().unwrap(), 1);
+        let Error::Local(error) = error else {
+            panic!("a non-transient 503 is a follow failure");
+        };
+        assert_eq!(error.code, ErrorCode::Unavailable);
+        assert!(
+            error.message.contains("the API answered HTTP 503"),
+            "{}",
+            error.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

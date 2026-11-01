@@ -26,7 +26,10 @@ pub fn protect() -> Result<(), Error> {
             (libc::RLIMIT_CPU, 5),
             (libc::RLIMIT_NOFILE, 64),
         ] {
-            let limit = libc::rlimit { rlim_cur: value, rlim_max: value };
+            let limit = libc::rlimit {
+                rlim_cur: value,
+                rlim_max: value,
+            };
             if libc::setrlimit(resource, &limit) != 0 {
                 return Err(Error::Resource);
             }
@@ -47,7 +50,10 @@ pub fn protect() -> Result<(), Error> {
 }
 
 pub fn private_output() -> Result<File, Error> {
-    let null = OpenOptions::new().write(true).open("/dev/null").map_err(|_| Error::Resource)?;
+    let null = OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .map_err(|_| Error::Resource)?;
     // SAFETY: Duplicate stdout into an owned close-on-exec descriptor; mute all module diagnostics.
     unsafe {
         let saved = libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 4);
@@ -106,18 +112,23 @@ pub fn module(request: &Request<'_>) -> Result<File, Error> {
     for ancestor in path.ancestors().skip(1) {
         let metadata = ancestor.symlink_metadata().map_err(|_| Error::Module)?;
         let protected_sticky = metadata.uid() == 0 && metadata.mode() & libc::S_ISVTX != 0;
-        if !metadata.is_dir() || (metadata.uid() != 0 && metadata.uid() != uid)
+        if !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != uid)
             || (metadata.mode() & 0o022 != 0 && !protected_sticky)
         {
             return Err(Error::Module);
         }
     }
-    let mut file = OpenOptions::new().read(true)
+    let mut file = OpenOptions::new()
+        .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path).map_err(|_| Error::Module)?;
+        .open(path)
+        .map_err(|_| Error::Module)?;
     let metadata = file.metadata().map_err(|_| Error::Module)?;
-    if !metadata.is_file() || (metadata.uid() != 0 && metadata.uid() != uid)
-        || metadata.mode() & 0o022 != 0 || metadata.len() > 64 * 1024 * 1024
+    if !metadata.is_file()
+        || (metadata.uid() != 0 && metadata.uid() != uid)
+        || metadata.mode() & 0o022 != 0
+        || metadata.len() > 64 * 1024 * 1024
     {
         return Err(Error::Module);
     }

@@ -41,7 +41,12 @@ impl EpochAuthority {
     /// A recovered epoch is denied until its exact durable state is published.
     pub fn new(epoch: u64) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(EpochState { epoch, request_id: None, phase: None, revision: 0 }),
+            state: Mutex::new(EpochState {
+                epoch,
+                request_id: None,
+                phase: None,
+                revision: 0,
+            }),
             changed: Notify::new(),
         })
     }
@@ -49,7 +54,9 @@ impl EpochAuthority {
     pub fn guard(self: &Arc<Self>) -> EpochGuard {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         EpochGuard {
-            authority: self.clone(), epoch: state.epoch, revision: state.revision,
+            authority: self.clone(),
+            epoch: state.epoch,
+            revision: state.revision,
             request_id: state.request_id.clone(),
         }
     }
@@ -62,17 +69,29 @@ impl EpochAuthority {
             return Err(FleetError::Invalid("stale enrollment authority"));
         }
         if record.epoch == state.epoch {
-            if state.request_id.as_deref().is_some_and(|id| id != record.request_id) {
+            if state
+                .request_id
+                .as_deref()
+                .is_some_and(|id| id != record.request_id)
+            {
                 return Err(FleetError::Invalid("enrollment request identity changed"));
             }
             let allowed = match state.phase {
                 None => true,
-                Some(EnrollmentPhase::Pending) => matches!(record.phase,
-                    EnrollmentPhase::Pending | EnrollmentPhase::Requested | EnrollmentPhase::Revoked),
-                Some(EnrollmentPhase::Requested) => matches!(record.phase,
-                    EnrollmentPhase::Requested | EnrollmentPhase::Active | EnrollmentPhase::Revoked),
-                Some(EnrollmentPhase::Active) => matches!(record.phase,
-                    EnrollmentPhase::Active | EnrollmentPhase::Revoked),
+                Some(EnrollmentPhase::Pending) => matches!(
+                    record.phase,
+                    EnrollmentPhase::Pending
+                        | EnrollmentPhase::Requested
+                        | EnrollmentPhase::Revoked
+                ),
+                Some(EnrollmentPhase::Requested) => matches!(
+                    record.phase,
+                    EnrollmentPhase::Requested | EnrollmentPhase::Active | EnrollmentPhase::Revoked
+                ),
+                Some(EnrollmentPhase::Active) => matches!(
+                    record.phase,
+                    EnrollmentPhase::Active | EnrollmentPhase::Revoked
+                ),
                 Some(EnrollmentPhase::Revoked) => record.phase == EnrollmentPhase::Revoked,
             };
             if !allowed {
@@ -82,10 +101,13 @@ impl EpochAuthority {
                 return Ok(());
             }
         } else if state.request_id.as_deref() == Some(record.request_id.as_str()) {
-            return Err(FleetError::Invalid("a new epoch requires a new request identity"));
+            return Err(FleetError::Invalid(
+                "a new epoch requires a new request identity",
+            ));
         }
-        state.revision = state.revision.checked_add(1)
-            .ok_or(FleetError::Invalid("enrollment authority revision exhausted"))?;
+        state.revision = state.revision.checked_add(1).ok_or(FleetError::Invalid(
+            "enrollment authority revision exhausted",
+        ))?;
         state.epoch = record.epoch;
         if state.request_id.as_deref() != Some(record.request_id.as_str()) {
             state.request_id = Some(Arc::from(record.request_id.as_str()));
@@ -107,8 +129,14 @@ impl EpochGuard {
     }
 
     pub fn check(&self) -> Result<(), FleetError> {
-        let state = self.authority.state.lock().unwrap_or_else(|error| error.into_inner());
-        if self.epoch == 0 || state.epoch != self.epoch || state.revision != self.revision
+        let state = self
+            .authority
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.epoch == 0
+            || state.epoch != self.epoch
+            || state.revision != self.revision
             || state.phase != Some(EnrollmentPhase::Active)
             || state.request_id.as_deref() != self.request_id.as_deref()
         {
@@ -150,18 +178,32 @@ pub struct PreparedControl {
 }
 
 impl PreparedControl {
-    pub fn destination(&self) -> &str { &self.command.request.url }
-    pub fn body_hash(&self) -> [u8; 32] { self.command.body_hash }
-    pub fn command_hash(&self) -> [u8; 32] { self.command.command_hash }
-    pub fn key_version(&self) -> [u8; 32] { self.command.key_version }
-    pub fn epoch(&self) -> u64 { self.command.guard.epoch() }
-    pub fn request_id(&self) -> &str { &self.command.request_id }
+    pub fn destination(&self) -> &str {
+        &self.command.request.url
+    }
+    pub fn body_hash(&self) -> [u8; 32] {
+        self.command.body_hash
+    }
+    pub fn command_hash(&self) -> [u8; 32] {
+        self.command.command_hash
+    }
+    pub fn key_version(&self) -> [u8; 32] {
+        self.command.key_version
+    }
+    pub fn epoch(&self) -> u64 {
+        self.command.guard.epoch()
+    }
+    pub fn request_id(&self) -> &str {
+        &self.command.request_id
+    }
 
     /// Every opening requires its source admission: Native supplies its durable
     /// ordinary opening intent; Member runs the entire sealed exact-job flow.
     /// The callback returns resources only, never a replacement command or lease.
-    pub async fn dispatch_with_admission<F, Fut, H>(self, before_io: F)
-        -> Result<Arc<dyn WebSocket>, FleetError>
+    pub async fn dispatch_with_admission<F, Fut, H>(
+        self,
+        before_io: F,
+    ) -> Result<Arc<dyn WebSocket>, FleetError>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<H, FleetError>> + Send + 'static,
@@ -178,28 +220,41 @@ impl PreparedControl {
             let mut ready = None;
             let mut stale = String::from("fleet control opening was revoked");
             let mut duplicate = String::from("fleet control opening was handed off twice");
-            job_env.timeout(Duration::from_secs(30), async move {
-                check_control(&job_original, &job_guard)?;
-                let _hold = before_io().await?;
-                // The final fence transfers the WHOLE command into this already
-                // owned job's sole ready continuation. No I/O or lazy future is admitted.
-                job_original.admit(&mut || {
-                    if job_guard.check().is_err() {
-                        return Err(ApiError { code: ErrorCode::Unauthenticated,
-                            message: std::mem::take(&mut stale), hint: None });
-                    }
-                    if ready.is_some() {
-                        return Err(ApiError { code: ErrorCode::Internal,
-                            message: std::mem::take(&mut duplicate), hint: None });
-                    }
-                    let command = pending.take().ok_or_else(|| ApiError {
-                        code: ErrorCode::Internal, message: std::mem::take(&mut duplicate), hint: None,
-                    })?;
-                    ready = Some(ReadyControl(command));
-                    Ok(())
-                }).map_err(|_| FleetError::Revoked)?;
-                ready.ok_or(FleetError::Revoked)?.open().await
-            }).await.map_err(|_| FleetError::Unavailable)?
+            job_env
+                .timeout(Duration::from_secs(30), async move {
+                    check_control(&job_original, &job_guard)?;
+                    let _hold = before_io().await?;
+                    // The final fence transfers the WHOLE command into this already
+                    // owned job's sole ready continuation. No I/O or lazy future is admitted.
+                    job_original
+                        .admit(&mut || {
+                            if job_guard.check().is_err() {
+                                return Err(ApiError {
+                                    code: ErrorCode::Unauthenticated,
+                                    message: std::mem::take(&mut stale),
+                                    hint: None,
+                                });
+                            }
+                            if ready.is_some() {
+                                return Err(ApiError {
+                                    code: ErrorCode::Internal,
+                                    message: std::mem::take(&mut duplicate),
+                                    hint: None,
+                                });
+                            }
+                            let command = pending.take().ok_or_else(|| ApiError {
+                                code: ErrorCode::Internal,
+                                message: std::mem::take(&mut duplicate),
+                                hint: None,
+                            })?;
+                            ready = Some(ReadyControl(command));
+                            Ok(())
+                        })
+                        .map_err(|_| FleetError::Revoked)?;
+                    ready.ok_or(FleetError::Revoked)?.open().await
+                })
+                .await
+                .map_err(|_| FleetError::Unavailable)?
         };
         let opened = env.spawn("fleet-control-opening", job);
         tokio::select! {
@@ -217,11 +272,24 @@ struct ReadyControl(ConnectCommand);
 
 impl ReadyControl {
     async fn open(self) -> Result<Arc<dyn WebSocket>, FleetError> {
-        let ConnectCommand { env, net, request, original, guard, permit,
-            key_version, body_hash, command_hash, request_id } = self.0;
+        let ConnectCommand {
+            env,
+            net,
+            request,
+            original,
+            guard,
+            permit,
+            key_version,
+            body_hash,
+            command_hash,
+            request_id,
+        } = self.0;
         let _binding = (key_version, body_hash, command_hash, request_id);
         let _opening_permit = permit;
-        let socket = net.websocket(request).await.map_err(|_| FleetError::Unavailable)?;
+        let socket = net
+            .websocket(request)
+            .await
+            .map_err(|_| FleetError::Unavailable)?;
         if check_control(&original, &guard).is_err() {
             let _ = env.timeout(Duration::from_secs(2), socket.close()).await;
             return Err(FleetError::Revoked);
@@ -240,12 +308,19 @@ fn hash_field(hash: &mut Sha256, bytes: &[u8]) {
     hash.update(bytes);
 }
 
-fn control_hashes(request: &WebSocketRequest, enrollment: &EnrollmentRecord)
-    -> Result<([u8; 32], [u8; 32]), FleetError> {
+fn control_hashes(
+    request: &WebSocketRequest,
+    enrollment: &EnrollmentRecord,
+) -> Result<([u8; 32], [u8; 32]), FleetError> {
     let key_version = kronik_proto::control::fleet_control_tls_version(
-        &enrollment.plan.ca_sha256, &enrollment.client_key_sha256,
-        enrollment.client_cert_der.as_deref().ok_or(FleetError::Protocol)?,
-    ).map_err(|_| FleetError::Protocol)?;
+        &enrollment.plan.ca_sha256,
+        &enrollment.client_key_sha256,
+        enrollment
+            .client_cert_der
+            .as_deref()
+            .ok_or(FleetError::Protocol)?,
+    )
+    .map_err(|_| FleetError::Protocol)?;
     let mut command = Sha256::new();
     hash_field(&mut command, b"kronik.fleet-control-opening/v1");
     hash_field(&mut command, b"GET");
@@ -256,7 +331,10 @@ fn control_hashes(request: &WebSocketRequest, enrollment: &EnrollmentRecord)
         hash_field(&mut command, value.as_bytes());
     }
     hash_field(&mut command, b"");
-    hash_field(&mut command, &(request.max_message_bytes as u64).to_be_bytes());
+    hash_field(
+        &mut command,
+        &(request.max_message_bytes as u64).to_be_bytes(),
+    );
     hash_field(&mut command, &key_version);
     Ok((key_version, command.finalize().into()))
 }
@@ -281,9 +359,11 @@ where
 {
     check_control(&original, &guard)?;
     client.validate_plan(&enrollment.plan)?;
-    if enrollment.phase != EnrollmentPhase::Active || enrollment.epoch != guard.epoch()
+    if enrollment.phase != EnrollmentPhase::Active
+        || enrollment.epoch != guard.epoch()
         || guard.request_id() != Some(enrollment.request_id.as_str())
-        || bearer.is_empty() || bearer.len() > 4096
+        || bearer.is_empty()
+        || bearer.len() > 4096
         || !bearer.bytes().all(|byte| byte.is_ascii_graphic())
     {
         return Err(FleetError::Revoked);
@@ -296,7 +376,9 @@ where
     };
     check_control(&original, &guard)?;
     let request = WebSocketRequest {
-        url: client.endpoint("/v1/control").replacen("https://", "wss://", 1),
+        url: client
+            .endpoint("/v1/control")
+            .replacen("https://", "wss://", 1),
         headers: vec![
             ("authorization".into(), format!("Bearer {bearer}")),
             ("x-kronik-enrollment".into(), enrollment.request_id.clone()),
@@ -312,9 +394,18 @@ where
         () = guard.cancelled() => return Err(FleetError::Revoked),
         permit = opening_capacity.acquire_owned() => permit.map_err(|_| FleetError::Unavailable)?,
     };
-    let command = ConnectCommand { env: env.clone(), net, request, original: original.clone(),
-        guard: guard.clone(), request_id, key_version, body_hash: Sha256::digest(b"").into(),
-        command_hash, permit };
+    let command = ConnectCommand {
+        env: env.clone(),
+        net,
+        request,
+        original: original.clone(),
+        guard: guard.clone(),
+        request_id,
+        key_version,
+        body_hash: Sha256::digest(b"").into(),
+        command_hash,
+        permit,
+    };
     let socket = dispatch(PreparedControl { command }).await?;
     if check_control(&original, &guard).is_err() {
         let _ = env.timeout(Duration::from_secs(2), socket.close()).await;
@@ -336,8 +427,10 @@ where
             if frame.len() > TUNNEL_CHUNK_BYTES {
                 return Err(FleetError::Protocol);
             }
-            env.timeout(Duration::from_secs(120), write.write_all(&frame)).await
-                .map_err(|_| FleetError::Unavailable)?.map_err(|_| FleetError::Unavailable)?;
+            env.timeout(Duration::from_secs(120), write.write_all(&frame))
+                .await
+                .map_err(|_| FleetError::Unavailable)?
+                .map_err(|_| FleetError::Unavailable)?;
             check_control(&original, &guard)?;
         }
     };
@@ -354,8 +447,13 @@ where
                 return Ok::<(), FleetError>(());
             }
             check_control(&original, &guard)?;
-            env.timeout(Duration::from_secs(30), socket.send(buffer.split().freeze())).await
-                .map_err(|_| FleetError::Unavailable)?.map_err(|_| FleetError::Unavailable)?;
+            env.timeout(
+                Duration::from_secs(30),
+                socket.send(buffer.split().freeze()),
+            )
+            .await
+            .map_err(|_| FleetError::Unavailable)?
+            .map_err(|_| FleetError::Unavailable)?;
         }
     };
     let result = tokio::select! {

@@ -413,9 +413,13 @@ fn native_operations_history_keeps_durable_principal_reason_and_identity() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let d = Daemon::start(dir.path(), &data, "");
-    let (status, prepared) = d.api("PUT", "/v1/secrets/history-corpus", &json!({
-        "text":"history-fixture-credential-72c91b", "reason":"prepare retained audit corpus",
-    }));
+    let (status, prepared) = d.api(
+        "PUT",
+        "/v1/secrets/history-corpus",
+        &json!({
+            "text":"history-fixture-credential-72c91b", "reason":"prepare retained audit corpus",
+        }),
+    );
     assert_eq!(status, 200, "{prepared}");
     let (status, operator) = d.api("POST", "/v1/tokens", &json!({
         "name": "history-operator", "scopes": ["read", "admin"], "reason": "create history operator",
@@ -424,42 +428,82 @@ fn native_operations_history_keeps_durable_principal_reason_and_identity() {
     let bearer = operator["secret"].as_str().unwrap();
     let who = operator["token"]["token_id"].as_str().unwrap();
     let reason = "retain the operator decision";
-    let (status, created) = d.try_api("POST", "/v1/tokens", Some(&json!({
-        "name": "history-reader", "scopes": ["read"], "reason": reason,
-    })), Some(bearer)).unwrap();
+    let (status, created) = d
+        .try_api(
+            "POST",
+            "/v1/tokens",
+            Some(&json!({
+                "name": "history-reader", "scopes": ["read"], "reason": reason,
+            })),
+            Some(bearer),
+        )
+        .unwrap();
     assert_eq!(status, 200, "{created}");
     let show = |daemon: &Daemon| {
-        let output = command().arg("--socket").arg(&daemon.socket)
+        let output = command()
+            .arg("--socket")
+            .arg(&daemon.socket)
             .env("KRONIK_TOKEN", bearer)
-            .args(["--json", "history", "--operations", "--limit", "1000"]).output().unwrap();
+            .args(["--json", "history", "--operations", "--limit", "1000"])
+            .output()
+            .unwrap();
         assert!(output.status.success(), "{output:?}");
-        let response: kronik_api::types::AuditResponse = serde_json::from_slice(&output.stdout).unwrap();
+        let response: kronik_api::types::AuditResponse =
+            serde_json::from_slice(&output.stdout).unwrap();
         let kronik_api::types::AuditResponse::Native(page) = response else {
             panic!("standalone history was not a native audit page");
         };
         page
     };
-    let first = show(&d).lines.into_iter().find(|line|
-        line.action == "token.create" && line.token_id == who && line.reason == reason).unwrap();
+    let first = show(&d)
+        .lines
+        .into_iter()
+        .find(|line| line.action == "token.create" && line.token_id == who && line.reason == reason)
+        .unwrap();
     assert!(first.at_wall_ms > 0);
     d.stop();
 
     let d = Daemon::start(dir.path(), &data, "");
-    let restored = show(&d).lines.into_iter().find(|line| line.record_hash == first.record_hash).unwrap();
+    let restored = show(&d)
+        .lines
+        .into_iter()
+        .find(|line| line.record_hash == first.record_hash)
+        .unwrap();
     assert_eq!(restored.token_id, first.token_id);
     assert_eq!(restored.reason, first.reason);
     assert_eq!(restored.at_wall_ms, first.at_wall_ms);
     assert_eq!(restored.source, first.source);
     assert_eq!(restored.lsn, first.lsn);
-    let human = command().arg("--socket").arg(&d.socket).env("KRONIK_TOKEN", bearer)
-        .args(["history", "--operations", "--limit", "1000"]).output().unwrap();
+    let human = command()
+        .arg("--socket")
+        .arg(&d.socket)
+        .env("KRONIK_TOKEN", bearer)
+        .args(["history", "--operations", "--limit", "1000"])
+        .output()
+        .unwrap();
     assert!(human.status.success(), "{human:?}");
     let text = String::from_utf8(human.stdout).unwrap();
     assert!(text.contains(who) && text.contains(reason), "{text}");
     let read_only = created["secret"].as_str().unwrap();
-    assert_eq!(d.try_api("GET", "/v1/audit", None, Some(read_only)).unwrap().0, 403);
-    assert_eq!(d.api("POST", "/v1/tokens/history-operator/revoke", &json!({"reason":"close history access"})).0, 200);
-    assert_eq!(d.try_api("GET", "/v1/audit", None, Some(bearer)).unwrap().0, 401);
+    assert_eq!(
+        d.try_api("GET", "/v1/audit", None, Some(read_only))
+            .unwrap()
+            .0,
+        403
+    );
+    assert_eq!(
+        d.api(
+            "POST",
+            "/v1/tokens/history-operator/revoke",
+            &json!({"reason":"close history access"})
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        d.try_api("GET", "/v1/audit", None, Some(bearer)).unwrap().0,
+        401
+    );
 }
 
 /// Every mutating route once (plus a dry run each), an operator send and a
@@ -807,36 +851,76 @@ fn every_mutation_reaches_the_file_sink_and_verify_reports_it_complete() {
     let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reserved.local_addr().unwrap();
     drop(reserved);
-    let mut provider = oidc_provider::OwnedOidc::start(format!("https://localhost:{}", address.port()));
+    let mut provider =
+        oidc_provider::OwnedOidc::start(format!("https://localhost:{}", address.port()));
     let extra = format!(
         "[tls]\nmode=\"files\"\ncert_file={:?}\nkey_file={:?}\n\
          [oidc]\nissuer={:?}\nclient_id=\"kronik-ui\"\nredirect_uri={:?}\nca_file={:?}\n\
          [[oidc.bindings]]\nsubject=\"fixture-reviewer\"\ntoken=\"ui-reviewer\"\n",
-        provider.certificate(), provider.key(), provider.issuer,
-        format!("{}/v1/auth/callback", provider.origin), provider.ca());
+        provider.certificate(),
+        provider.key(),
+        provider.issuer,
+        format!("{}/v1/auth/callback", provider.origin),
+        provider.ca()
+    );
     let address = address.to_string();
-    let d = Daemon::start_with(dir.path(), &data, &extra, &[("KRONIK_ADMIN_LISTEN", &address)]);
+    let d = Daemon::start_with(
+        dir.path(),
+        &data,
+        &extra,
+        &[("KRONIK_ADMIN_LISTEN", &address)],
+    );
     let before = d.settled();
     let (status, missing) = d.api("PUT", "/v1/auth/config", &json!({"config": null}));
-    assert_eq!((status, missing["error"]["code"].as_str()), (400, Some("REASON_REQUIRED")));
+    assert_eq!(
+        (status, missing["error"]["code"].as_str()),
+        (400, Some("REASON_REQUIRED"))
+    );
     assert_eq!(d.settled(), before);
-    let created = drive(&d, vec![
-        step("POST", "/v1/tokens", "/v1/tokens",
-            json!({"name": "ui-reviewer", "scopes": ["read"]}), Some("token.create")),
-        step("PUT", "/v1/auth/config", "/v1/auth/config",
-            json!({"config": provider.profile("ui-reviewer")}), Some("auth.config")),
-    ], me, &mut want, &mut seen);
+    let created = drive(
+        &d,
+        vec![
+            step(
+                "POST",
+                "/v1/tokens",
+                "/v1/tokens",
+                json!({"name": "ui-reviewer", "scopes": ["read"]}),
+                Some("token.create"),
+            ),
+            step(
+                "PUT",
+                "/v1/auth/config",
+                "/v1/auth/config",
+                json!({"config": provider.profile("ui-reviewer")}),
+                Some("auth.config"),
+            ),
+        ],
+        me,
+        &mut want,
+        &mut seen,
+    );
     let ui_bearer = created[0]["secret"].as_str().unwrap().to_owned();
     let login = provider.login();
     assert!(login.principal.starts_with("oidc:") && login.principal.len() == 69);
-    want.push(("auth.oidc.login".into(), Some("verified OIDC authorization-code login".into()),
-        login.principal.clone()));
+    want.push((
+        "auth.oidc.login".into(),
+        Some("verified OIDC authorization-code login".into()),
+        login.principal.clone(),
+    ));
     let origin = provider.origin.clone();
     let headers = json!({"Content-Type": "application/json", "Cookie": login.cookie,
         "Origin": origin, "X-Kronik-CSRF": login.csrf});
-    for body in [json!({"dry_run": true}), json!({"reason": " ", "dry_run": true})] {
+    for body in [
+        json!({"dry_run": true}),
+        json!({"reason": " ", "dry_run": true}),
+    ] {
         let before = d.settled();
-        let rejected = provider.request("POST", &format!("{origin}/v1/auth/logout"), headers.clone(), Some(body));
+        let rejected = provider.request(
+            "POST",
+            &format!("{origin}/v1/auth/logout"),
+            headers.clone(),
+            Some(body),
+        );
         assert_eq!(rejected["status"], 400);
         let rejected: Value = serde_json::from_str(rejected["body"].as_str().unwrap()).unwrap();
         assert_eq!(rejected["error"]["code"], "REASON_REQUIRED");
@@ -844,23 +928,52 @@ fn every_mutation_reaches_the_file_sink_and_verify_reports_it_complete() {
     }
     let reason = "audit test POST /v1/auth/logout";
     let before = d.settled();
-    let dry = provider.request("POST", &format!("{origin}/v1/auth/logout"), headers.clone(),
-        Some(json!({"reason": reason, "dry_run": true})));
+    let dry = provider.request(
+        "POST",
+        &format!("{origin}/v1/auth/logout"),
+        headers.clone(),
+        Some(json!({"reason": reason, "dry_run": true})),
+    );
     assert_eq!(dry["status"], 200);
     let dry: Value = serde_json::from_str(dry["body"].as_str().unwrap()).unwrap();
     assert_eq!(dry["dry_run"], true);
     assert_eq!(d.settled(), before);
-    assert_eq!(provider.request("GET", &format!("{origin}/v1/actors"),
-        json!({"Cookie": login.cookie}), None)["status"], 200);
-    let logout = provider.request("POST", &format!("{origin}/v1/auth/logout"), headers,
-        Some(json!({"reason": reason, "dry_run": false})));
+    assert_eq!(
+        provider.request(
+            "GET",
+            &format!("{origin}/v1/actors"),
+            json!({"Cookie": login.cookie}),
+            None
+        )["status"],
+        200
+    );
+    let logout = provider.request(
+        "POST",
+        &format!("{origin}/v1/auth/logout"),
+        headers,
+        Some(json!({"reason": reason, "dry_run": false})),
+    );
     assert_eq!(logout["status"], 200);
     seen.push(("POST".into(), "/v1/auth/logout".into()));
     want.push(("auth.logout".into(), Some(reason.into()), login.principal));
-    assert_eq!(provider.request("GET", &format!("{origin}/v1/actors"),
-        json!({"Cookie": login.cookie}), None)["status"], 401);
-    assert_eq!(provider.request("GET", &format!("{origin}/v1/actors"),
-        json!({"Authorization": format!("Bearer {ui_bearer}")}), None)["status"], 200);
+    assert_eq!(
+        provider.request(
+            "GET",
+            &format!("{origin}/v1/actors"),
+            json!({"Cookie": login.cookie}),
+            None
+        )["status"],
+        401
+    );
+    assert_eq!(
+        provider.request(
+            "GET",
+            &format!("{origin}/v1/actors"),
+            json!({"Authorization": format!("Bearer {ui_bearer}")}),
+            None
+        )["status"],
+        200
+    );
     d.wait_exported();
 
     // Every mutating route of the API was driven.
@@ -874,9 +987,20 @@ fn every_mutation_reaches_the_file_sink_and_verify_reports_it_complete() {
 
     // Exactly one line per action driven, and nothing else.
     let text = sink_text(dir.path());
-    let private_values = [SECRET, SUBJECT, BODY, "fixture-reviewer", token.as_str(), ui_bearer.as_str(),
-        login.cookie.as_str(), login.csrf.as_str()];
-    assert!(private_values.iter().all(|value| !text.contains(*value)), "sensitive fixture value left the node");
+    let private_values = [
+        SECRET,
+        SUBJECT,
+        BODY,
+        "fixture-reviewer",
+        token.as_str(),
+        ui_bearer.as_str(),
+        login.cookie.as_str(),
+        login.csrf.as_str(),
+    ];
+    assert!(
+        private_values.iter().all(|value| !text.contains(*value)),
+        "sensitive fixture value left the node"
+    );
     let lines = distinct(sink_lines(dir.path()));
     let mut got: Vec<Want> = lines
         .iter()
@@ -898,7 +1022,12 @@ fn every_mutation_reaches_the_file_sink_and_verify_reports_it_complete() {
     assert!(shown.status.success(), "{shown:?}");
     let shown: Value = serde_json::from_slice(&shown.stdout).unwrap();
     let shown_text = shown.to_string();
-    assert!(private_values.iter().all(|value| !shown_text.contains(*value)), "sensitive fixture value in audit show");
+    assert!(
+        private_values
+            .iter()
+            .all(|value| !shown_text.contains(*value)),
+        "sensitive fixture value in audit show"
+    );
     assert_eq!(
         shown["lines"].as_array().unwrap().len(),
         lines.len(),
@@ -1020,7 +1149,9 @@ fn an_injected_conflicting_line_is_reported() {
     assert_eq!(report["complete"], false, "{report}");
     let conflicting = report["conflicting"].as_array().unwrap();
     assert_eq!(conflicting.len(), 1, "{report}");
-    assert_eq!(conflicting[0]["lsn"], forged.lsn, "{report}");
+    // A real exported line carries its LSN; the report renders that numeric LSN.
+    let forged_lsn = forged.lsn.expect("an exported grant line carries its LSN");
+    assert_eq!(conflicting[0]["lsn"], json!(forged_lsn), "{report}");
     // The human report names it too.
     let out = command()
         .args(["audit", "verify", "--config"])
@@ -1116,7 +1247,10 @@ fn a_restore_from_an_older_ship_point_then_new_mutations_verify() {
     let lines = sink_lines(dir.path());
     let restore = lines.iter().find(|l| l.action == "restore").unwrap();
     let through = restore.details["through_lsn"].as_u64().unwrap();
-    assert!(lost.iter().all(|l| l.lsn > through), "{restore:?} {lost:?}");
+    assert!(
+        lost.iter().all(|l| l.lsn.is_some_and(|lsn| lsn > through)),
+        "{restore:?} {lost:?}"
+    );
     // A reused LSN, told apart by hash.
     let reused = lost.iter().any(|old| {
         lines.iter().any(|l| {

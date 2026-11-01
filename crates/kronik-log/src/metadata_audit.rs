@@ -18,25 +18,47 @@ pub struct MetadataAuditRecord {
 impl MetadataAuditRecord {
     pub fn validate(&self) -> Result<(), ApiError> {
         use kronik_core::error::ErrorCode;
-        if self.index == 0 || self.index > i64::MAX as u64
-            || !matches!(&self.record, Record::AuditEvent(_) | Record::SecretVersion(_) | Record::SecretLink(_) | Record::Approval(_))
+        if self.index == 0
+            || self.index > i64::MAX as u64
+            || !matches!(
+                &self.record,
+                Record::AuditEvent(_)
+                    | Record::SecretVersion(_)
+                    | Record::SecretLink(_)
+                    | Record::Approval(_)
+            )
         {
-            return Err(ApiError::new(ErrorCode::StorageCorrupt, "invalid metadata audit record"));
+            return Err(ApiError::new(
+                ErrorCode::StorageCorrupt,
+                "invalid metadata audit record",
+            ));
         }
         if let Record::Approval(approval) = &self.record {
             kronik_proto::validate_proposal_approval(approval).map_err(|_| {
-                ApiError::new(ErrorCode::StorageCorrupt, "invalid ordinary metadata proposal approval")
+                ApiError::new(
+                    ErrorCode::StorageCorrupt,
+                    "invalid ordinary metadata proposal approval",
+                )
             })?;
         }
         if let Some(origin) = &self.native_origin {
             if !matches!(&self.record, Record::SecretVersion(_)) {
-                return Err(ApiError::new(ErrorCode::StorageCorrupt, "metadata adoption context is not a secret identity"));
+                return Err(ApiError::new(
+                    ErrorCode::StorageCorrupt,
+                    "metadata adoption context is not a secret identity",
+                ));
             }
             self.record.validate().map_err(|_| {
-                ApiError::new(ErrorCode::StorageCorrupt, "invalid imported secret identity")
+                ApiError::new(
+                    ErrorCode::StorageCorrupt,
+                    "invalid imported secret identity",
+                )
             })?;
             kronik_proto::control::validate_native_authority_origin(origin).map_err(|_| {
-                ApiError::new(ErrorCode::StorageCorrupt, "invalid metadata native adoption origin")
+                ApiError::new(
+                    ErrorCode::StorageCorrupt,
+                    "invalid metadata native adoption origin",
+                )
             })?;
         }
         Ok(())
@@ -75,7 +97,11 @@ impl MetadataAuditGap {
     ) -> Result<Self, kronik_proto::DecodeError> {
         let (stream, from_index, through_index) =
             kronik_proto::control::metadata_audit_gap_details(details)?;
-        Ok(Self { stream: stream.to_owned(), from_index, through_index })
+        Ok(Self {
+            stream: stream.to_owned(),
+            from_index,
+            through_index,
+        })
     }
 
     /// The event validator checks this exact closed schema before admission.
@@ -108,7 +134,11 @@ impl MetadataWebhookKeyChange {
         kronik_proto::control::validate_metadata_webhook_key_change_event(event)?;
         let (from_version, to_version) =
             kronik_proto::control::metadata_webhook_key_change_details(&event.details)?;
-        Ok(Self { stream: event.target.clone(), from_version, to_version })
+        Ok(Self {
+            stream: event.target.clone(),
+            from_version,
+            to_version,
+        })
     }
 
     /// The fixed producer validates the whole event before durable admission.
@@ -139,7 +169,10 @@ impl MetadataWebhookReplay {
     ) -> Result<Self, kronik_proto::DecodeError> {
         kronik_proto::control::validate_metadata_webhook_replay_event(event)?;
         let from_index = kronik_proto::control::metadata_webhook_replay_details(&event.details)?;
-        Ok(Self { stream: event.target.clone(), from_index })
+        Ok(Self {
+            stream: event.target.clone(),
+            from_index,
+        })
     }
 
     /// The fixed producer validates the whole event before durable admission.
@@ -161,13 +194,19 @@ mod tests {
 
     #[test]
     fn metadata_webhook_replay_round_trips_without_an_actor_position_alias() {
-        let replay = MetadataWebhookReplay { stream: "events-control:metadata".into(),
-            from_index: i64::MAX as u64 };
+        let replay = MetadataWebhookReplay {
+            stream: "events-control:metadata".into(),
+            from_index: i64::MAX as u64,
+        };
         let mut event = kronik_proto::log::v1::AuditEvent {
-            action: "events.webhook.replay".into(), target: replay.stream.clone(),
+            action: "events.webhook.replay".into(),
+            target: replay.stream.clone(),
             details: replay.to_details(),
-            audit: Some(kronik_proto::log::v1::Audit { token_id: "token:operator".into(),
-                reason: "recover receiver".into(), wall_time_ms: 1 }),
+            audit: Some(kronik_proto::log::v1::Audit {
+                token_id: "token:operator".into(),
+                reason: "recover receiver".into(),
+                wall_time_ms: 1,
+            }),
             ..Default::default()
         };
         assert_eq!(MetadataWebhookReplay::from_event(&event).unwrap(), replay);
@@ -178,16 +217,26 @@ mod tests {
 
     #[test]
     fn metadata_webhook_key_change_round_trips_the_closed_event() {
-        let change = MetadataWebhookKeyChange { stream: "events-metadata".into(),
-            from_version: u32::MAX as u64 + 1, to_version: kronik_proto::secret::MAX_SECRET_VERSION };
+        let change = MetadataWebhookKeyChange {
+            stream: "events-metadata".into(),
+            from_version: u32::MAX as u64 + 1,
+            to_version: kronik_proto::secret::MAX_SECRET_VERSION,
+        };
         let mut event = kronik_proto::log::v1::AuditEvent {
-            action: "audit.config".into(), target: change.stream.clone(),
+            action: "audit.config".into(),
+            target: change.stream.clone(),
             details: change.to_details(),
-            audit: Some(kronik_proto::log::v1::Audit { token_id: "system".into(),
-                reason: "signing key changed".into(), wall_time_ms: 1 }),
+            audit: Some(kronik_proto::log::v1::Audit {
+                token_id: "system".into(),
+                reason: "signing key changed".into(),
+                wall_time_ms: 1,
+            }),
             ..Default::default()
         };
-        assert_eq!(MetadataWebhookKeyChange::from_event(&event).unwrap(), change);
+        assert_eq!(
+            MetadataWebhookKeyChange::from_event(&event).unwrap(),
+            change
+        );
         assert_eq!(change.into_details(), event.details);
         event.details.insert("secret_name".into(), "private".into());
         assert!(MetadataWebhookKeyChange::from_event(&event).is_err());
@@ -195,14 +244,22 @@ mod tests {
 
     #[test]
     fn metadata_gap_is_a_closed_index_range_not_an_actor_lsn_alias() {
-        let gap = MetadataAuditGap { stream: "fleet-metadata".into(), from_index: 1, through_index: 17 };
+        let gap = MetadataAuditGap {
+            stream: "fleet-metadata".into(),
+            from_index: 1,
+            through_index: 17,
+        };
         let details = gap.to_details();
         assert_eq!(MetadataAuditGap::from_details(&details).unwrap(), gap);
         assert!(!details.contains_key("from") && !details.contains_key("to"));
         for (key, value) in [
-            ("namespace", "actor"), ("from_index", "0"), ("from_index", "01"),
-            ("from_index", "18"), ("through_index", "9223372036854775808"),
-            ("stream", ""), ("stream", "line\nbreak"),
+            ("namespace", "actor"),
+            ("from_index", "0"),
+            ("from_index", "01"),
+            ("from_index", "18"),
+            ("through_index", "9223372036854775808"),
+            ("stream", ""),
+            ("stream", "line\nbreak"),
         ] {
             let mut invalid = details.clone();
             invalid.insert(key.into(), value.into());

@@ -33,26 +33,41 @@ fn sqlite_error(code: i32) -> PrivacyError {
 /// capture identity. Closing any such descriptor can release this process's
 /// POSIX SQLite locks, including locks used by another connection. Retain the
 /// SAME connection/Keystore Arc as the actual witness; borrow only during fstat.
-pub(crate) fn file_identity(conn: &std::sync::MutexGuard<'_, Connection>) -> Result<FileIdentity, PrivacyError> {
+pub(crate) fn file_identity(
+    conn: &std::sync::MutexGuard<'_, Connection>,
+) -> Result<FileIdentity, PrivacyError> {
     // SAFETY: the caller exclusively holds the live Connection. The public
     // FILESTAT opcode takes an initialized sqlite3_str, which finish consumes
     // exactly once even on errors. No SQLite private structure is inspected.
     let (code, error, length, text) = unsafe {
         let db = conn.handle();
         let output = ffi::sqlite3_str_new(db);
-        let code = ffi::sqlite3_file_control(db, c"main".as_ptr(), ffi::SQLITE_FCNTL_FILESTAT, output.cast());
+        let code = ffi::sqlite3_file_control(
+            db,
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_FILESTAT,
+            output.cast(),
+        );
         let error = ffi::sqlite3_str_errcode(output);
         let length = ffi::sqlite3_str_length(output);
         (code, error, length, ffi::sqlite3_str_finish(output))
     };
     let result = (|| {
         if code == ffi::SQLITE_NOTFOUND {
-            return Err(PublicationError::FileIdentity("public SQLite FILESTAT is unavailable").into());
+            return Err(
+                PublicationError::FileIdentity("public SQLite FILESTAT is unavailable").into(),
+            );
         }
-        if code != ffi::SQLITE_OK { return Err(sqlite_error(code)); }
-        if error != ffi::SQLITE_OK { return Err(sqlite_error(error)); }
+        if code != ffi::SQLITE_OK {
+            return Err(sqlite_error(code));
+        }
+        if error != ffi::SQLITE_OK {
+            return Err(sqlite_error(error));
+        }
         if text.is_null() || !(1..=65_536).contains(&length) {
-            return Err(PublicationError::FileIdentity("invalid FILESTAT diagnostic length").into());
+            return Err(
+                PublicationError::FileIdentity("invalid FILESTAT diagnostic length").into(),
+            );
         }
         // SAFETY: finish returned SQLite's allocation of the recorded length;
         // it remains allocated until the single sqlite3_free below.
@@ -60,20 +75,28 @@ pub(crate) fn file_identity(conn: &std::sync::MutexGuard<'_, Connection>) -> Res
         let stat: FileStat<'_> = serde_json::from_slice(bytes)
             .map_err(|_| PublicationError::FileIdentity("invalid FILESTAT diagnostic JSON"))?;
         if stat.h < 0 || !matches!(stat.vfs, "unix" | "unix-excl") {
-            return Err(PublicationError::FileIdentity("FILESTAT is not the canonical Unix file").into());
+            return Err(
+                PublicationError::FileIdentity("FILESTAT is not the canonical Unix file").into(),
+            );
         }
         // SAFETY: the selected public Unix FILESTAT implementation reports its
         // live pFile->h. The caller still holds the Connection exclusively, so
         // SQLite cannot close it during this borrow. BorrowedFd never closes it.
         let descriptor = unsafe { BorrowedFd::borrow_raw(stat.h) };
         let metadata = rustix::fs::fstat(descriptor).map_err(|source| PrivacyError::CustodyIo {
-            path: "the opened privacy keystore".into(), source: source.into(),
+            path: "the opened privacy keystore".into(),
+            source: source.into(),
         })?;
-        Ok(FileIdentity { device: metadata.st_dev as u64, inode: metadata.st_ino as u64 })
+        Ok(FileIdentity {
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino as u64,
+        })
     })();
     // SAFETY: sqlite3_str_finish returns a sqlite3_malloc allocation or NULL;
     // sqlite3_free accepts either. All borrows into it ended with the closure.
-    unsafe { ffi::sqlite3_free(text.cast()); }
+    unsafe {
+        ffi::sqlite3_free(text.cast());
+    }
     result
 }
 
@@ -91,7 +114,9 @@ mod tests {
         // SQLite's OS lock, not a directory-owner refusal or a new authority.
         let conn = Connection::open(path).unwrap();
         conn.busy_timeout(std::time::Duration::ZERO).unwrap();
-        let error = conn.execute("UPDATE safety_probe SET value = value + 1", []).unwrap_err();
+        let error = conn
+            .execute("UPDATE safety_probe SET value = value + 1", [])
+            .unwrap_err();
         assert!(matches!(error, rusqlite::Error::SqliteFailure(code, _)
             if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)));
     }
@@ -101,8 +126,13 @@ mod tests {
         let test = test.split_once("::").unwrap().1;
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", test, "--test-threads=1"])
-            .env("KRONIK_TEST_BORROWED_SQLITE_LOCK", path).status().unwrap();
-        assert!(status.success(), "a second process must still observe the real SQLite write lock");
+            .env("KRONIK_TEST_BORROWED_SQLITE_LOCK", path)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "a second process must still observe the real SQLite write lock"
+        );
     }
 
     #[test]
@@ -113,10 +143,16 @@ mod tests {
         let mut first = first.lock().unwrap();
         // Rollback-journal mode specifically exercises the DB-file POSIX lock;
         // a WAL write-lock probe alone could miss a wrongly closed DB fd.
-        first.execute_batch("PRAGMA journal_mode=DELETE;
+        first
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE;
             CREATE TABLE safety_probe(value INTEGER NOT NULL);
-            INSERT INTO safety_probe VALUES(1);").unwrap();
-        let tx = first.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            INSERT INTO safety_probe VALUES(1);",
+            )
+            .unwrap();
+        let tx = first
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         probe(&path);
         let second = Mutex::new(Connection::open(&path).unwrap());
         let identity = {
@@ -129,7 +165,12 @@ mod tests {
         }
         drop(second); // SQLite, not an extra OwnedFd/File, manages this close.
         probe(&path);
-        assert_eq!(tx.query_row("SELECT value FROM safety_probe", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            tx.query_row("SELECT value FROM safety_probe", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
         tx.rollback().unwrap();
     }
 }

@@ -192,7 +192,9 @@ fn answer(outcome: FetchOutcome) -> Result<Answer, super::HostRedactionFailure> 
         FetchOutcome::Timeout => Ok(Err(HttpErr::HttpResponseTimeout)),
         FetchOutcome::TooLarge => Ok(Err(HttpErr::HttpResponseBodySize(None))),
         FetchOutcome::Network(m) => Ok(Err(HttpErr::InternalError(Some(m)))),
-        FetchOutcome::OutcomeUnknown => Ok(Err(HttpErr::InternalError(Some("outcome-unknown".into())))),
+        FetchOutcome::OutcomeUnknown => {
+            Ok(Err(HttpErr::InternalError(Some("outcome-unknown".into()))))
+        }
         FetchOutcome::HostRedactionFailure => Err(super::HostRedactionFailure),
     }
 }

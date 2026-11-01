@@ -238,6 +238,12 @@ fn privacy_mode_end_to_end() {
     let mut d = Daemon::start(dir);
     deploy(&d, "counter.wasm");
     deploy(&d, "notes.wasm");
+    // The fork point after the configuration and before the first turn. A
+    // fresh log now starts with a SecretVersion record and a startup
+    // AuditEvent, so the deployments are not at lsn 1-2.
+    let setup = d.api("GET", "/v1/health", Value::Null)["applied_lsn"]
+        .as_u64()
+        .unwrap();
     // A token without pii:read sees sealed values as placeholders.
     let reader = d.api(
         "POST",
@@ -313,7 +319,7 @@ fn privacy_mode_end_to_end() {
     let fork = d.api(
         "POST",
         "/v1/forks",
-        json!({"at": 2, "reason": "privacy test: identity"}),
+        json!({"at": setup, "reason": "privacy test: identity"}),
     )["fork"]["name"]
         .as_str()
         .unwrap()
@@ -396,7 +402,7 @@ fn privacy_mode_end_to_end() {
     let fork = d.api(
         "POST",
         "/v1/forks",
-        json!({"at": 2, "no_pii": true, "reason": "privacy test"}),
+        json!({"at": setup, "no_pii": true, "reason": "privacy test"}),
     )["fork"]["name"]
         .as_str()
         .unwrap()

@@ -8,7 +8,8 @@ use serde::Serialize;
 use crate::{Api, ApiResponse, Result, ok};
 
 /// Trusted host adapter to the real member producer; never an API caller's map.
-pub type ClusterStatusRead = Arc<dyn Fn() -> BoxFuture<'static, Result<serde_json::Value, ApiError>> + Send + Sync>;
+pub type ClusterStatusRead =
+    Arc<dyn Fn() -> BoxFuture<'static, Result<serde_json::Value, ApiError>> + Send + Sync>;
 
 #[derive(Serialize)]
 struct NonMemberStatus {

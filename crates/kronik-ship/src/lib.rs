@@ -10,8 +10,8 @@
 //! ```
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 use std::os::unix::fs::MetadataExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -226,16 +226,33 @@ fn decompress(bytes: &[u8]) -> Result<Vec<u8>, ShipError> {
 #[serde(tag = "schema", deny_unknown_fields)]
 pub enum KeystoreRevision {
     #[serde(rename = "kronik.keystore-revision/v1")]
-    V1 { revision: u64, device: u64, inode: u64 },
+    V1 {
+        revision: u64,
+        device: u64,
+        inode: u64,
+    },
 }
 
 impl KeystoreRevision {
     /// An acknowledged change frontier, not proof that an erased key is available.
     pub fn covers(self, required: Self) -> bool {
         match (self, required) {
-            (Self::V1 { revision, device, inode }, Self::V1 {
-                revision: required_revision, device: required_device, inode: required_inode,
-            }) => device == required_device && inode == required_inode && revision >= required_revision,
+            (
+                Self::V1 {
+                    revision,
+                    device,
+                    inode,
+                },
+                Self::V1 {
+                    revision: required_revision,
+                    device: required_device,
+                    inode: required_inode,
+                },
+            ) => {
+                device == required_device
+                    && inode == required_inode
+                    && revision >= required_revision
+            }
         }
     }
 }
@@ -251,8 +268,14 @@ pub async fn current_keystore_revision(
     env.blocking("keystore-backup-revision", move || {
         let file = std::fs::metadata(path)?;
         let revision = store.revision().map_err(ShipError::Keystore)?;
-        Ok::<_, ShipError>(KeystoreRevision::V1 { revision, device: file.dev(), inode: file.ino() })
-    }).await.ok_or_else(|| ShipError::Io(std::io::Error::other("keystore revision work was dropped")))?
+        Ok::<_, ShipError>(KeystoreRevision::V1 {
+            revision,
+            device: file.dev(),
+            inode: file.ino(),
+        })
+    })
+    .await
+    .ok_or_else(|| ShipError::Io(std::io::Error::other("keystore revision work was dropped")))?
 }
 
 /// What has been uploaded (`<data>/ship.json`).
@@ -283,12 +306,18 @@ impl ShipState {
     pub fn load(data: &Path) -> Result<ShipState, ShipError> {
         let bytes = match std::fs::read(Self::path(data)) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
             Err(error) => return Err(error.into()),
         };
-        serde_json::from_slice(&bytes).map_err(|error| ShipError::Config(format!(
-            "invalid persisted shipping state at line {}, column {}", error.line(), error.column()
-        )))
+        serde_json::from_slice(&bytes).map_err(|error| {
+            ShipError::Config(format!(
+                "invalid persisted shipping state at line {}, column {}",
+                error.line(),
+                error.column()
+            ))
+        })
     }
 
     fn save(&self, data: &Path) -> Result<(), ShipError> {
@@ -300,17 +329,29 @@ impl ShipState {
             .map_err(|error| ShipError::Config(format!("encode shipping state: {error}")))?;
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let temp = data.join(format!(".ship-state-{}-{serial}.tmp", std::process::id()));
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
         let held = file.metadata()?;
         let result = (|| -> Result<(), ShipError> {
             file.write_all(&bytes)?;
             file.sync_all()?;
             let named = std::fs::symlink_metadata(&temp)?;
             if !named.is_file() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
-                return Err(std::io::Error::other("owned shipping-state temporary changed before publication").into());
+                return Err(std::io::Error::other(
+                    "owned shipping-state temporary changed before publication",
+                )
+                .into());
             }
             match std::fs::symlink_metadata(&path) {
-                Ok(metadata) if !metadata.is_file() => return Err(std::io::Error::other("shipping-state target is not a regular file").into()),
+                Ok(metadata) if !metadata.is_file() => {
+                    return Err(std::io::Error::other(
+                        "shipping-state target is not a regular file",
+                    )
+                    .into());
+                }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -320,8 +361,10 @@ impl ShipState {
             Ok(())
         })();
         if result.is_err()
-            && std::fs::symlink_metadata(&temp).is_ok_and(|metadata| metadata.is_file()
-                && (held.dev(), held.ino()) == (metadata.dev(), metadata.ino())) {
+            && std::fs::symlink_metadata(&temp).is_ok_and(|metadata| {
+                metadata.is_file() && (held.dev(), held.ino()) == (metadata.dev(), metadata.ino())
+            })
+        {
             std::fs::remove_file(&temp)?;
         }
         result
@@ -457,7 +500,6 @@ pub const KEYSTORE_BACKUP_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// The daily backup, independent of changes.
 pub const KEYSTORE_BACKUP_DAILY: Duration = Duration::from_secs(86_400);
 
-
 /// Uploads `keystore/<wall_ms>.bin` (the export bytes, not zstd) and deletes
 /// backups older than `retention`. The newest is always kept. The master
 /// key is never uploaded.
@@ -494,9 +536,14 @@ pub async fn ship_keystore(
     let daily_due = since.is_some_and(|s| s >= KEYSTORE_BACKUP_DAILY.as_millis() as u64);
     if (changed && interval_ok) || daily_due {
         let store = keystore.clone();
-        let blob = env.blocking("keystore-backup-export", move || {
-            store.export_backup(nonce).map_err(ShipError::Keystore)
-        }).await.ok_or_else(|| ShipError::Io(std::io::Error::other("keystore export work was dropped")))??;
+        let blob = env
+            .blocking("keystore-backup-export", move || {
+                store.export_backup(nonce).map_err(ShipError::Keystore)
+            })
+            .await
+            .ok_or_else(|| {
+                ShipError::Io(std::io::Error::other("keystore export work was dropped"))
+            })??;
         report.bytes += blob.len() as u64;
         report.objects += 1;
         // The .bin commits its pair: an interrupted wrapper upload cannot
@@ -551,7 +598,10 @@ pub async fn ship_loop(
         let mut state = match ShipState::load(&data) {
             Ok(state) => state,
             Err(error) => {
-                tracing::warn!(code = error.code(), "shipping state unavailable; sidecar stalled");
+                tracing::warn!(
+                    code = error.code(),
+                    "shipping state unavailable; sidecar stalled"
+                );
                 env.clock.sleep(interval).await;
                 continue;
             }
@@ -576,7 +626,10 @@ pub async fn ship_loop(
             state = match ShipState::load(&data) {
                 Ok(state) => state,
                 Err(error) => {
-                    tracing::warn!(code = error.code(), "shipping state unavailable; sidecar stalled");
+                    tracing::warn!(
+                        code = error.code(),
+                        "shipping state unavailable; sidecar stalled"
+                    );
                     env.clock.sleep(interval).await;
                     continue;
                 }
@@ -715,9 +768,27 @@ pub async fn restore_with_fault(
     if stage.exists() {
         std::fs::remove_dir_all(&stage)?;
     }
-    let staged = stage_restore(remote, data, &stage, branch, env, keys, mode, &keystore_restore).await;
+    let staged = stage_restore(
+        remote,
+        data,
+        &stage,
+        branch,
+        env,
+        keys,
+        mode,
+        &keystore_restore,
+    )
+    .await;
     let result = match staged {
-        Ok(s) => install_staged(data, &stage, branch, &branch_dir, s, keystore_restore, fault),
+        Ok(s) => install_staged(
+            data,
+            &stage,
+            branch,
+            &branch_dir,
+            s,
+            keystore_restore,
+            fault,
+        ),
         Err(e) => {
             let _ = std::fs::remove_dir_all(&stage);
             // Empty only: never anything else that appeared meanwhile.
@@ -1147,7 +1218,11 @@ fn install_staged(
     std::fs::File::open(branch_dir)?.sync_all()?;
     std::fs::File::open(data.join("branches"))?.sync_all()?;
     std::fs::File::open(data)?.sync_all()?;
-    drop(keystore_restore.finish(s.keystore_master.as_ref()).map_err(ShipError::Key)?);
+    drop(
+        keystore_restore
+            .finish(s.keystore_master.as_ref())
+            .map_err(ShipError::Key)?,
+    );
     fault("committed")?;
     let first = kronik_log::segment_starts(&log_dir)?
         .first()

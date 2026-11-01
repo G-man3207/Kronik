@@ -119,10 +119,14 @@ fn reply_text(r: &TurnResult) -> String {
 }
 
 impl Proc {
+    fn owner(&self) -> kronik_core::authority::AuthLease {
+        self.node.local_operator_authority().unwrap()
+    }
+
     fn deploy(&self, path: &str) -> kronik_sched::DeployResult {
         let bytes = std::fs::read(path).unwrap();
         self.rt
-            .block_on(self.node.deploy(&bytes, audit(), false))
+            .block_on(self.node.deploy(&bytes, audit(), false, self.owner()))
             .unwrap()
     }
 
@@ -159,10 +163,13 @@ impl Proc {
 
     fn send(&self, actor: &str, m: pb::Message) -> TurnResult {
         self.rt
-            .block_on(
-                self.node
-                    .send(ActorRef::parse(actor).unwrap(), m, audit(), false),
-            )
+            .block_on(self.node.send(
+                ActorRef::parse(actor).unwrap(),
+                m,
+                audit(),
+                false,
+                self.owner(),
+            ))
             .unwrap()
             .unwrap()
     }
@@ -270,7 +277,7 @@ fn messages_failures_dead_letters_and_resend() {
     assert_eq!(dls[0].lsn, failed.turn_id.lsn);
 
     let resent =
-        p.rt.block_on(p.node.resend(failed.turn_id.lsn, audit(), false))
+        p.rt.block_on(p.node.resend(failed.turn_id.lsn, audit(), false, p.owner()))
             .unwrap()
             .unwrap();
     assert!(!resent.committed());
@@ -278,7 +285,7 @@ fn messages_failures_dead_letters_and_resend() {
     assert_eq!(dls.len(), 2);
     assert_eq!(dls[0].resent_as, Some(resent.turn_id.lsn));
     let again =
-        p.rt.block_on(p.node.resend(failed.turn_id.lsn, audit(), false));
+        p.rt.block_on(p.node.resend(failed.turn_id.lsn, audit(), false, p.owner()));
     assert_eq!(again.unwrap_err().code, ErrorCode::DeadLetterAlreadyResent);
 
     // Fuel exhaustion and traps are failed turns too.
@@ -419,13 +426,13 @@ fn deploy_checks() {
     let p = start(dir.path());
     let bytes = std::fs::read(FS_PROBE).unwrap();
     let err =
-        p.rt.block_on(p.node.deploy(&bytes, audit(), false))
+        p.rt.block_on(p.node.deploy(&bytes, audit(), false, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::ImportNotAllowed);
     assert!(err.message.contains("wasi:filesystem"), "{err}");
     let counter = std::fs::read(COUNTER).unwrap();
     let dry =
-        p.rt.block_on(p.node.deploy(&counter, audit(), true))
+        p.rt.block_on(p.node.deploy(&counter, audit(), true, p.owner()))
             .unwrap();
     assert!(dry.dry_run);
     assert!(!p.node.kind_exists("counter"));
@@ -439,6 +446,7 @@ fn deploy_checks() {
             msg("x", b""),
             audit(),
             false,
+            p.owner(),
         ))
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::ActorNotFound);
@@ -522,7 +530,7 @@ fn an_erasure_without_its_record_is_recovered_at_start() {
         p.deploy(COUNTER);
         p.rt.block_on(
             p.node
-                .set_privacy_mode(pb::PrivacyState::On, audit(), false),
+                .set_privacy_mode(pb::PrivacyState::On, audit(), false, p.owner()),
         )
         .unwrap();
         // `subject` writes s for user:1 and t for user:2.
@@ -568,14 +576,17 @@ fn below_the_disk_reserve_new_work_waits_and_the_node_stays_up() {
     let p = Proc { rt, node };
     let bytes = std::fs::read(COUNTER).unwrap();
     let e =
-        p.rt.block_on(p.node.deploy(&bytes, audit(), false))
+        p.rt.block_on(p.node.deploy(&bytes, audit(), false, p.owner()))
             .unwrap_err();
     assert_eq!(e.code, ErrorCode::Unavailable, "{e}");
     assert!(e.message.contains("disk_reserve"), "{e}");
     assert_eq!(p.node.fatal(), None);
-    p.rt.block_on(p.node.erase_subject("user:1", audit(), false))
+    p.rt.block_on(p.node.erase_subject("user:1", audit(), false, p.owner()))
         .unwrap();
     // A watch's guard record is an incident record too (W-M1).
-    p.rt.block_on(p.node.record_guard(pb::GuardTriggered::default()))
-        .unwrap();
+    p.rt.block_on(p.node.record_guard(pb::GuardTriggered {
+        audit: Some(audit()),
+        ..Default::default()
+    }))
+    .unwrap();
 }

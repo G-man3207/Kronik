@@ -90,6 +90,7 @@ impl Proc {
                 msg(name, body),
                 audit(),
                 false,
+                self.node.local_operator_authority().unwrap(),
             ))
             .unwrap()
             .unwrap();
@@ -125,15 +126,30 @@ fn tempdir(prefix: &str) -> tempfile::TempDir {
 fn ship_and_restore(remote: &Remote) {
     let src = tempdir("ship-src-");
     let p = start(src.path(), None);
-    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false))
-        .unwrap();
-    p.rt.block_on(p.node.deploy(&guest("notes"), audit(), false))
-        .unwrap();
+    p.rt.block_on(p.node.deploy(
+        &guest("counter"),
+        audit(),
+        false,
+        p.node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
+    p.rt.block_on(p.node.deploy(
+        &guest("notes"),
+        audit(),
+        false,
+        p.node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
     for i in 0..30 {
         p.send(&format!("counter/c{}", i % 4), "increment", "");
         p.send(&format!("notes/n{}", i % 3), "add", &format!("note {i}"));
     }
-    let m = p.rt.block_on(p.node.snapshot("manual")).unwrap();
+    let m =
+        p.rt.block_on(
+            p.node
+                .snapshot("manual", p.node.local_operator_authority().unwrap()),
+        )
+        .unwrap();
     let first = p.ship(remote, src.path());
     assert!(first.objects > 3, "{first:?}");
     // Records after the snapshot travel in the active segment.
@@ -209,10 +225,19 @@ fn an_interrupted_restore_leaves_a_consistent_directory() {
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     let src = tempdir("ship-int-src-");
     let p = start(src.path(), None);
-    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false))
-        .unwrap();
+    p.rt.block_on(p.node.deploy(
+        &guest("counter"),
+        audit(),
+        false,
+        p.node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
     p.send("counter/a", "increment", "");
-    p.rt.block_on(p.node.snapshot("manual")).unwrap();
+    p.rt.block_on(
+        p.node
+            .snapshot("manual", p.node.local_operator_authority().unwrap()),
+    )
+    .unwrap();
     p.ship(&remote, src.path());
     let hash = p.node.store().state_hash().unwrap();
     let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
@@ -299,8 +324,13 @@ fn retention_deletes_remote_segments_and_snapshots() {
     let bucket = tempdir("ship-ret-bucket-");
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     let p = start(src.path(), Some(Duration::ZERO));
-    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false))
-        .unwrap();
+    p.rt.block_on(p.node.deploy(
+        &guest("counter"),
+        audit(),
+        false,
+        p.node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
     for i in 0..80 {
         p.send(&format!("counter/k{}", i % 5), "increment", "");
     }
@@ -315,7 +345,11 @@ fn retention_deletes_remote_segments_and_snapshots() {
     // Snapshots compact the log (history zero) and prune to two kept.
     for _ in 0..3 {
         p.send("counter/k0", "increment", "");
-        p.rt.block_on(p.node.snapshot("manual")).unwrap();
+        p.rt.block_on(
+            p.node
+                .snapshot("manual", p.node.local_operator_authority().unwrap()),
+        )
+        .unwrap();
     }
     let report = p.ship(&remote, src.path());
     assert!(report.deleted > 0, "{report:?}");

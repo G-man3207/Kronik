@@ -71,18 +71,25 @@ fn tempdir() -> tempfile::TempDir {
         .unwrap()
 }
 
+/// The local operator's original node-lifetime authority.
+fn owner(node: &Node) -> kronik_core::authority::AuthLease {
+    node.local_operator_authority().unwrap()
+}
+
 /// A data directory with counter and notes turns, and a snapshot halfway.
 fn workload(dir: &Path) -> u64 {
     let rt = rt();
     let node = start(&rt, dir).unwrap();
     rt.block_on(async {
-        node.deploy(&guest("counter"), audit(), false)
+        node.deploy(&guest("counter"), audit(), false, owner(&node))
             .await
             .unwrap();
-        node.deploy(&guest("notes"), audit(), false).await.unwrap();
+        node.deploy(&guest("notes"), audit(), false, owner(&node))
+            .await
+            .unwrap();
         for i in 0..40 {
             if i == 20 {
-                node.snapshot("manual").await.unwrap();
+                node.snapshot("manual", owner(&node)).await.unwrap();
             }
             let (actor, name, body) = if i % 2 == 0 {
                 (format!("counter/c{}", i % 3), "increment", String::new())
@@ -95,6 +102,7 @@ fn workload(dir: &Path) -> u64 {
                     msg(name, &body),
                     audit(),
                     false,
+                    owner(&node),
                 )
                 .await
                 .unwrap()
@@ -150,13 +158,19 @@ fn the_check_opens_sealed_values_with_the_directorys_keystore() {
     let rt = rt();
     let node = start(&rt, dir.path()).unwrap();
     rt.block_on(async {
-        node.set_privacy_mode(pb::PrivacyState::On, audit(), false)
+        node.set_privacy_mode(pb::PrivacyState::On, audit(), false, owner(&node))
             .await
             .unwrap();
         let mut m = msg("increment", "");
         m.body.as_mut().unwrap().subject = Some("user:1".into());
         let r = node
-            .send(ActorRef::parse("counter/c9").unwrap(), m, audit(), false)
+            .send(
+                ActorRef::parse("counter/c9").unwrap(),
+                m,
+                audit(),
+                false,
+                owner(&node),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -258,33 +272,66 @@ fn upgrade_replays_grant_and_revoke_but_fork_overrides_stay_fixed() {
     let rt = rt();
     let node = start(&rt, dir.path()).unwrap();
     rt.block_on(async {
-        node.deploy(&guest("counter"), audit(), false)
+        node.deploy(&guest("counter"), audit(), false, owner(&node))
             .await
             .unwrap();
-        node.secret_set("key", b"upgrade-policy-test-key", &audit(), false)
-            .unwrap();
+        node.secret_set(
+            "key",
+            b"upgrade-policy-test-key".to_vec(),
+            &audit(),
+            false,
+            owner(&node),
+        )
+        .await
+        .unwrap();
         let fork_lsn = node.applied_lsn();
         let actor = ActorRef::parse("counter/policy").unwrap();
         let denied = node
-            .send(actor.clone(), msg("hmac", "key\ndata"), audit(), false)
+            .send(
+                actor.clone(),
+                msg("hmac", "key\ndata"),
+                audit(),
+                false,
+                owner(&node),
+            )
             .await
             .unwrap()
             .unwrap();
         assert!(!denied.committed());
-        node.grant("counter", "secret:key", None, None, audit(), false)
-            .await
-            .unwrap();
+        node.grant(
+            "counter",
+            "secret:key",
+            None,
+            None,
+            audit(),
+            false,
+            owner(&node),
+        )
+        .await
+        .unwrap();
         let allowed = node
-            .send(actor.clone(), msg("hmac", "key\ndata"), audit(), false)
+            .send(
+                actor.clone(),
+                msg("hmac", "key\ndata"),
+                audit(),
+                false,
+                owner(&node),
+            )
             .await
             .unwrap()
             .unwrap();
         assert!(allowed.committed());
-        node.revoke("counter", "secret:key", audit(), false)
+        node.revoke("counter", "secret:key", audit(), false, owner(&node))
             .await
             .unwrap();
         let revoked = node
-            .send(actor, msg("hmac", "key\ndata"), audit(), false)
+            .send(
+                actor,
+                msg("hmac", "key\ndata"),
+                audit(),
+                false,
+                owner(&node),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -361,18 +408,24 @@ fn upgrade_replays_recorded_code_across_a_same_kind_deployment() {
     let rt = rt();
     let node = start(&rt, dir.path()).unwrap();
     rt.block_on(async {
-        node.deploy(&guest("counter"), audit(), false)
+        node.deploy(&guest("counter"), audit(), false, owner(&node))
             .await
             .unwrap();
         let actor = ActorRef::parse("counter/code").unwrap();
         let first = node
-            .send(actor.clone(), msg("increment", ""), audit(), false)
+            .send(
+                actor.clone(),
+                msg("increment", ""),
+                audit(),
+                false,
+                owner(&node),
+            )
             .await
             .unwrap()
             .unwrap();
         assert!(first.committed());
         let bytes = guest("counter-step2");
-        let (hash, _, manifest) = node.prepare_code(&bytes).await.unwrap();
+        let (hash, _, manifest) = node.prepare_code(&bytes, owner(&node)).await.unwrap();
         assert_ne!(node.deployed("counter").unwrap().code_hash, hash.0);
         node.switch_code(
             kronik_sched::CodeSwitch {
@@ -392,11 +445,12 @@ fn upgrade_replays_recorded_code_across_a_same_kind_deployment() {
             },
             audit(),
             false,
+            owner(&node),
         )
         .await
         .unwrap();
         let second = node
-            .send(actor, msg("increment", ""), audit(), false)
+            .send(actor, msg("increment", ""), audit(), false, owner(&node))
             .await
             .unwrap()
             .unwrap();

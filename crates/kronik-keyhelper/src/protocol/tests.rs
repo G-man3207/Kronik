@@ -31,7 +31,10 @@ fn exact_input_limit_and_overflow_stop_without_module_loading() {
     assert_eq!(read_bounded(exact.as_slice(), LIMIT).unwrap().len(), LIMIT);
     exact.push(b' ');
     assert!(matches!(parse(&exact), Err(Error::Protocol)));
-    assert!(matches!(read_bounded(exact.as_slice(), LIMIT), Err(Error::Protocol)));
+    assert!(matches!(
+        read_bounded(exact.as_slice(), LIMIT),
+        Err(Error::Protocol)
+    ));
 
     struct Endless(usize);
     impl Read for Endless {
@@ -43,14 +46,19 @@ fn exact_input_limit_and_overflow_stop_without_module_loading() {
         }
     }
     let mut endless = Endless(0);
-    assert!(matches!(read_bounded(&mut endless, LIMIT), Err(Error::Protocol)));
+    assert!(matches!(
+        read_bounded(&mut endless, LIMIT),
+        Err(Error::Protocol)
+    ));
     assert_eq!(endless.0, LIMIT + 1);
 }
 
 #[test]
 fn duplicate_unknown_and_secret_channels_are_rejected() {
-    let duplicate = String::from_utf8(ENROLL.to_vec()).unwrap()
-        .replacen("{", "{\"op\":\"wrap\",", 1);
+    let duplicate =
+        String::from_utf8(ENROLL.to_vec())
+            .unwrap()
+            .replacen("{", "{\"op\":\"wrap\",", 1);
     assert!(matches!(parse(duplicate.as_bytes()), Err(Error::Protocol)));
     for field in ["pin", "password", "slot", "label", "aad", "provider_error"] {
         let mut request = fixture();
@@ -92,7 +100,17 @@ fn escaped_utf8_trusted_identity_roundtrips_and_preserves_canonical_aad() {
 
 #[test]
 fn required_identity_and_purpose_are_strict() {
-    for field in ["schema", "module", "module_sha256", "manufacturer", "model", "serial", "key_id", "key_version", "purpose"] {
+    for field in [
+        "schema",
+        "module",
+        "module_sha256",
+        "manufacturer",
+        "model",
+        "serial",
+        "key_id",
+        "key_version",
+        "purpose",
+    ] {
         let mut request = fixture();
         request.as_object_mut().unwrap().remove(field);
         assert!(!accepted(&request), "missing {field}");
@@ -101,9 +119,14 @@ fn required_identity_and_purpose_are_strict() {
         assert!(!accepted(&request), "empty {field}");
     }
     for (field, value) in [
-        ("schema", "kronik.pkcs11/v2"), ("purpose", "another purpose"),
-        ("module", "relative.so"), ("serial", " serial"), ("key_id", "abc"),
-        ("key_id", "ABCD"), ("key_id", "gg"), ("key_version", "v1\n"),
+        ("schema", "kronik.pkcs11/v2"),
+        ("purpose", "another purpose"),
+        ("module", "relative.so"),
+        ("serial", " serial"),
+        ("key_id", "abc"),
+        ("key_id", "ABCD"),
+        ("key_id", "gg"),
+        ("key_version", "v1\n"),
     ] {
         let mut request = fixture();
         request[field] = json!(value);
@@ -158,8 +181,14 @@ fn canonical_aad_binds_each_identity_field_and_separates_probe_from_seed() {
     let seed = aad(&request, false);
     assert_ne!(seed, aad(&request, true));
     let mut expected = b"kronik.pkcs11/seed/v1\0".to_vec();
-    for field in ["SoftHSM project", "SoftHSM v2", "244b62a631d0dce3",
-        "58809dacd6a0a338e60c233610601d75", "fixture-v1", "kronik master v1"] {
+    for field in [
+        "SoftHSM project",
+        "SoftHSM v2",
+        "244b62a631d0dce3",
+        "58809dacd6a0a338e60c233610601d75",
+        "fixture-v1",
+        "kronik master v1",
+    ] {
         expected.extend_from_slice(&(field.len() as u32).to_be_bytes());
         expected.extend_from_slice(field.as_bytes());
     }
@@ -212,8 +241,17 @@ fn response_overflow_never_partially_writes_and_errors_have_no_body() {
     let mut output = Vec::new();
     assert_eq!(response.write(&mut output), Err(Error::Protocol));
     assert!(output.is_empty());
-    for error in [Error::Protocol, Error::Resource, Error::Pin, Error::Module, Error::Token,
-        Error::Key, Error::Attributes, Error::Authentication, Error::Provider] {
+    for error in [
+        Error::Protocol,
+        Error::Resource,
+        Error::Pin,
+        Error::Module,
+        Error::Token,
+        Error::Key,
+        Error::Attributes,
+        Error::Authentication,
+        Error::Provider,
+    ] {
         let mut output = Vec::new();
         Response::failure(error).write(&mut output).unwrap();
         let value: Value = serde_json::from_slice(&output).unwrap();
@@ -230,7 +268,9 @@ fn maximum_valid_result_is_single_bounded_json_without_extra_fields() {
         let nonce = "11".repeat(12);
         let data = "22".repeat(if op == "unwrap" { 32 } else { 48 });
         let mut output = Vec::new();
-        Response::success(op, &nonce, &data).write(&mut output).unwrap();
+        Response::success(op, &nonce, &data)
+            .write(&mut output)
+            .unwrap();
         let value: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["ok"], true);
         assert_eq!(value["schema"], SCHEMA);

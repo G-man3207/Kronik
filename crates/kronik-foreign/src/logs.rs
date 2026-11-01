@@ -78,17 +78,19 @@ pub(crate) fn tail(
     }
     if cut_prefix {
         match bytes.iter().position(|byte| *byte == b'\n') {
-            Some(end) => { bytes.drain(..=end); }
+            Some(end) => {
+                bytes.drain(..=end);
+            }
             None => bytes.clear(),
         }
     }
-    std::str::from_utf8(&bytes)
-        .map_err(|_| TailError::Redaction(ScrubError::InvalidText))?;
-    let matcher = CompiledScrubber::new_output(secrets, 64 << 20)
-        .map_err(TailError::Redaction)?;
-    let redacted = zeroize::Zeroizing::new(matcher
-        .scrub_if_matched(&bytes, (WINDOW * 2) as usize)
-        .map_err(TailError::Redaction)?);
+    std::str::from_utf8(&bytes).map_err(|_| TailError::Redaction(ScrubError::InvalidText))?;
+    let matcher = CompiledScrubber::new_output(secrets, 64 << 20).map_err(TailError::Redaction)?;
+    let redacted = zeroize::Zeroizing::new(
+        matcher
+            .scrub_if_matched(&bytes, (WINDOW * 2) as usize)
+            .map_err(TailError::Redaction)?,
+    );
     let text = std::str::from_utf8(redacted.as_deref().unwrap_or(&bytes))
         .map_err(|_| TailError::Redaction(ScrubError::InvalidText))?;
     let mut source = text.lines().rev();
@@ -126,9 +128,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("output.log");
         fs::write(&log, "token=hunter2hunter2 ok\n").unwrap();
-        let secrets = [
-            ("api-key", b"hunter2hunter2".as_slice()),
-        ];
+        let secrets = [("api-key", b"hunter2hunter2".as_slice())];
         let (lines, _) = tail(&log, 10, &secrets).unwrap();
         assert_eq!(lines, ["token=[secret:api-key] ok"]);
     }
@@ -145,7 +145,12 @@ mod tests {
             ("deleted", b"retained".as_slice()),
         ];
         let (lines, _) = tail(&log, 10, &secrets).unwrap();
-        assert_eq!(lines, ["[secret:long] [secret:short-a] [secret:truth] [secret:liter[secret:short-a]l] [secret:deleted]"]);
+        assert_eq!(
+            lines,
+            [
+                "[secret:long] [secret:short-a] [secret:truth] [secret:liter[secret:short-a]l] [secret:deleted]"
+            ]
+        );
     }
 
     #[test]
@@ -153,7 +158,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("output.log");
         fs::write(&log, b"\xff\n").unwrap();
-        assert!(matches!(tail(&log, 10, &[]), Err(TailError::Redaction(ScrubError::InvalidText))));
+        assert!(matches!(
+            tail(&log, 10, &[]),
+            Err(TailError::Redaction(ScrubError::InvalidText))
+        ));
         fs::write(&log, "é\n").unwrap();
         assert!(matches!(
             tail(&log, 10, &[("partial", &[0xc3])]),
@@ -167,7 +175,10 @@ mod tests {
         let log = dir.path().join("output.log");
         fs::write(&log, vec![b'a'; (ROTATE_BYTES / 4) as usize]).unwrap();
         let error = tail(&log, 10, &[("expansion", b"a".as_slice())]).unwrap_err();
-        assert!(matches!(error, TailError::Redaction(ScrubError::OutputLimit)));
+        assert!(matches!(
+            error,
+            TailError::Redaction(ScrubError::OutputLimit)
+        ));
     }
 
     #[test]

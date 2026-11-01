@@ -64,19 +64,29 @@ impl Harness {
     }
 }
 impl Net for Harness {
-    fn http_authorized(&self, req: HttpRequest, original: kronik_core::authority::AuthLease)
-        -> BoxFuture<'static, Result<HttpResponse, NetError>>
-    {
+    fn http_authorized(
+        &self,
+        req: HttpRequest,
+        original: kronik_core::authority::AuthLease,
+    ) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
         let mut response = None;
         let admitted = original.admit(&mut || {
-            let step = self.steps.lock().unwrap().pop_front().expect("unexpected provider request");
+            let step = self
+                .steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected provider request");
             assert_eq!(req.method, step.method);
             assert_eq!(req.url, step.url);
             response = Some(step.response);
             Ok(())
         });
-        Box::pin(std::future::ready(admitted.map(|()| response.expect("scripted response was not admitted"))
-            .map_err(|_| NetError::Connect("test provider authority ended".into()))))
+        Box::pin(std::future::ready(
+            admitted
+                .map(|()| response.expect("scripted response was not admitted"))
+                .map_err(|_| NetError::Connect("test provider authority ended".into())),
+        ))
     }
     fn http(&self, req: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
         let step = self
@@ -357,9 +367,11 @@ fn timeout_uses_env_clock_and_transport_errors_are_redacted() {
     }
     struct Unavailable(bool);
     impl Net for Unavailable {
-        fn http_authorized(&self, _: HttpRequest, _: kronik_core::authority::AuthLease)
-            -> BoxFuture<'static, Result<HttpResponse, NetError>>
-        {
+        fn http_authorized(
+            &self,
+            _: HttpRequest,
+            _: kronik_core::authority::AuthLease,
+        ) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
             panic!("fixed-cause B1 timeout fixture must not receive ordinary HTTP")
         }
         fn http(&self, _: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {

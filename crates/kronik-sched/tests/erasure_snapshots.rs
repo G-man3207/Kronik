@@ -67,14 +67,16 @@ fn erasure_replaces_older_snapshots_and_a_rebuild_drops_the_subject() {
     let erasure_lsn = {
         let p = start(dir.path());
         let wasm = std::fs::read(COUNTER).unwrap();
-        p.rt.block_on(p.node.deploy(&wasm, audit(), false)).unwrap();
+        let owner = || p.node.local_operator_authority().unwrap();
+        p.rt.block_on(p.node.deploy(&wasm, audit(), false, owner()))
+            .unwrap();
         let actor = kronik_core::ids::ActorRef::parse("counter/a").unwrap();
         let turn =
-            p.rt.block_on(p.node.send(actor, msg("subject"), audit(), false))
+            p.rt.block_on(p.node.send(actor, msg("subject"), audit(), false, owner()))
                 .unwrap()
                 .unwrap();
         assert!(turn.committed());
-        let old = p.rt.block_on(p.node.snapshot("manual")).unwrap();
+        let old = p.rt.block_on(p.node.snapshot("manual", owner())).unwrap();
         let old_dir = dir
             .path()
             .join("snapshots/main")
@@ -82,7 +84,7 @@ fn erasure_replaces_older_snapshots_and_a_rebuild_drops_the_subject() {
         assert!(old_dir.join("manifest.json").is_file());
 
         let done =
-            p.rt.block_on(p.node.erase_subject("user:1", audit(), false))
+            p.rt.block_on(p.node.erase_subject("user:1", audit(), false, owner()))
                 .unwrap();
         assert!(done.complete_after_ms > 0);
         assert!(!old_dir.exists(), "the pre-erasure snapshot should be gone");

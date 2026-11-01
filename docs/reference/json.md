@@ -38,7 +38,7 @@ against both.
 | `kronik actors list` | [`ActorsResponse`](#actorsresponse) (`GET /v1/actors`) |
 | `kronik actors inspect` | [`InspectResponse`](#inspectresponse) (`GET /v1/actors/{kind}/{key}`) |
 | `kronik actors timers` | [`TimersResponse`](#timersresponse) (`GET /v1/actors/{kind}/{key}/timers`) |
-| `kronik history` | [`HistoryResponse`](#historyresponse) (`GET /v1/actors/{kind}/{key}/history`); with --orphans: [`OrphansResponse`](#orphansresponse) (`GET /v1/orphans`) |
+| `kronik history` | [`HistoryResponse`](#historyresponse) (`GET /v1/actors/{kind}/{key}/history`); with --orphans: [`OrphansResponse`](#orphansresponse) (`GET /v1/orphans`); with --operations: [`AuditResponse`](#auditresponse) (`GET /v1/audit`) |
 | `kronik trace` | [`TraceResponse`](#traceresponse) (`GET /v1/turns/{id}/trace`) |
 | `kronik dead-letters list` | [`DeadLettersResponse`](#deadlettersresponse) (`GET /v1/dead-letters`) |
 | `kronik dead-letters resend` | [`TurnResponse`](#turnresponse) (`POST /v1/dead-letters/{id}/resend`) |
@@ -50,9 +50,15 @@ against both.
 | `kronik secret set` | [`SecretResponse`](#secretresponse) (`PUT /v1/secrets/{name}`) |
 | `kronik secret list` | [`SecretsResponse`](#secretsresponse) (`GET /v1/secrets`) |
 | `kronik secret delete` | [`SecretDeleteResponse`](#secretdeleteresponse) (`DELETE /v1/secrets/{name}`) |
+| `kronik secret link` | [`SecretLinkResponse`](#secretlinkresponse) (`PUT /v1/secrets/{name}/link`) |
+| `kronik secret unlink` | [`SecretLinkResponse`](#secretlinkresponse) (`DELETE /v1/secrets/{name}/link`) |
+| `kronik secret refresh` | [`SecretResponse`](#secretresponse) (`POST /v1/secrets/{name}/refresh`) |
+| `kronik secret history` | [`SecretHistoryResponse`](#secrethistoryresponse) (`GET /v1/secrets/{name}/history`) |
+| `kronik secret backends` | [`SecretBackendsResponse`](#secretbackendsresponse) (`GET /v1/secrets/backends`) |
 | `kronik keys status` | [`KeyStatus`](#keystatus) (`GET /v1/keys`) |
 | `kronik keys rewrap` | [`KeysChangeResponse`](#keyschangeresponse) (`POST /v1/keys/rewrap`) |
 | `kronik keys wrap` | [`KeysChangeResponse`](#keyschangeresponse), from the CLI itself |
+| `kronik keys enroll` | [`Probe`](#probe), from the CLI itself |
 | `kronik fork create` | [`ForkCreateResponse`](#forkcreateresponse) (`POST /v1/forks`) |
 | `kronik fork list` | [`ForksResponse`](#forksresponse) (`GET /v1/forks`) |
 | `kronik fork deploy` | [`ForkDeployResponse`](#forkdeployresponse) (`POST /v1/forks/{name}/deployments`) |
@@ -98,10 +104,41 @@ against both.
 | `kronik export rewind` | [`ExportRewindResponse`](#exportrewindresponse) (`POST /v1/export/{stream}/rewind`) |
 | `kronik audit show` | [`AuditResponse`](#auditresponse) (`GET /v1/audit`) |
 | `kronik audit verify` | [`Report2`](#report2), from the CLI itself |
+| `kronik fleet enroll` | [`FleetStatus`](#fleetstatus) (`POST /v1/fleet/enroll`) |
+| `kronik fleet status` | [`FleetStatus`](#fleetstatus) (`GET /v1/fleet`) |
+| `kronik fleet revoke` | [`FleetStatus`](#fleetstatus) (`POST /v1/fleet/revoke`) |
+| `kronik events list` | [`Page`](#page) (`GET /v1/events`) |
+| `kronik events tail` | [events tail output](#events-tail-output), from the CLI itself |
+| `kronik events schemas` | [kronik events schemas output](#kronik-events-schemas-output) (`GET /v1/events/schemas`) |
+| `kronik events webhooks status` | [`WebhooksResponse`](#webhooksresponse) (`GET /v1/events/webhooks`) |
+| `kronik events webhooks replay` | [`ReplayResponse2`](#replayresponse2) (`POST /v1/events/webhooks/{name}/replay`) |
 | `kronik mcp` | no JSON: MCP's JSON-RPC on stdout instead |
 | `kronik explain` | [explain output](#explain-output), from the CLI itself |
 
 ## Schemas
+
+### events tail output
+
+```json
+{
+  "oneOf": [
+    {
+      "$ref": "#/components/schemas/Event"
+    },
+    {
+      "$ref": "#/components/schemas/ResumeCursor"
+    }
+  ]
+}
+```
+
+### kronik events schemas output
+
+```json
+{
+  "type": "object"
+}
+```
 
 ### explain output
 
@@ -275,32 +312,99 @@ against both.
 
 ```json
 {
-  "description": "`GET /v1/audit`: `kronik.audit/v2` lines in LSN order (m28-otel §4.3).",
+  "oneOf": [
+    {
+      "allOf": [
+        {
+          "$ref": "#/components/schemas/MemberAuditResponse"
+        },
+        {
+          "not": {
+            "required": [
+              "applied_lsn"
+            ]
+          },
+          "properties": {
+            "covered_from": {
+              "maximum": 9223372036854775807,
+              "minimum": 1
+            },
+            "next": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              ]
+            },
+            "source": {
+              "properties": {
+                "index": {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1
+                },
+                "kind": {
+                  "const": "metadata"
+                }
+              },
+              "required": [
+                "kind",
+                "index"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        {
+          "$ref": "#/components/schemas/NativeAuditResponse"
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "source"
+                ]
+              },
+              {
+                "required": [
+                  "covered_from"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### BlobReference
+
+```json
+{
+  "description": "An output identity, not permission to open a blob.",
   "properties": {
-    "applied_lsn": {
+    "hash": {
+      "type": "string"
+    },
+    "size": {
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
-    },
-    "lines": {
-      "items": {
-        "$ref": "#/components/schemas/Line"
-      },
-      "type": "array"
-    },
-    "next": {
-      "description": "The `from` of the next page; absent at the applied LSN.",
-      "format": "uint64",
-      "minimum": 0,
-      "type": [
-        "integer",
-        "null"
-      ]
     }
   },
   "required": [
-    "lines",
-    "applied_lsn"
+    "hash",
+    "size"
   ],
   "type": "object"
 }
@@ -2562,6 +2666,115 @@ against both.
 }
 ```
 
+### EnrollmentPhase
+
+```json
+{
+  "enum": [
+    "pending",
+    "requested",
+    "active",
+    "revoked"
+  ],
+  "type": "string"
+}
+```
+
+### EnrollmentPlan
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "ca_sha256": {
+      "type": "string"
+    },
+    "controller_url": {
+      "type": "string"
+    },
+    "identity": {
+      "$ref": "#/components/schemas/FleetIdentity"
+    },
+    "scopes": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "controller_url",
+    "identity",
+    "scopes",
+    "ca_sha256"
+  ],
+  "type": "object"
+}
+```
+
+### EnrollmentRecord
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "client_cert_der": {
+      "items": {
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "client_key_sha256": {
+      "type": "string"
+    },
+    "controller_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "csr_der": {
+      "items": {
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "type": "array"
+    },
+    "epoch": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "phase": {
+      "$ref": "#/components/schemas/EnrollmentPhase"
+    },
+    "plan": {
+      "$ref": "#/components/schemas/EnrollmentPlan"
+    },
+    "request_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "plan",
+    "request_id",
+    "epoch",
+    "phase",
+    "csr_der",
+    "client_key_sha256"
+  ],
+  "type": "object"
+}
+```
+
 ### ErasureResponse
 
 ```json
@@ -2649,12 +2862,14 @@ against both.
             "FORK_NOT_FOUND",
             "FUEL_EXHAUSTED",
             "GATEWAY_TIMEOUT",
+            "HOST_REDACTION_FAILURE",
             "IDEMPOTENCY_IN_FLIGHT",
             "IDEMPOTENCY_KEY_REUSED",
             "IMAGE_INVALID",
             "IMPORT_NOT_ALLOWED",
             "INTERNAL",
             "KEYSTORE_INCOMPLETE",
+            "KEY_HELPER_FAILED",
             "KEY_PROTECTION_UNAVAILABLE",
             "KEY_SOURCE_UNAVAILABLE",
             "KVM_UNAVAILABLE",
@@ -2678,8 +2893,13 @@ against both.
             "RUNC_MISSING",
             "RUNSC_MISSING",
             "SCOPE_MISSING",
+            "SECRET_BACKEND_UNKNOWN",
+            "SECRET_EXTERNAL",
             "SECRET_NOT_FOUND",
+            "SECRET_REF_NOT_ALLOWED",
             "SECRET_UNAVAILABLE",
+            "SECRET_VERSION_EXHAUSTED",
+            "SECRET_VERSION_GONE",
             "STORAGE_CORRUPT",
             "SUBJECT_ERASED",
             "TOKEN_NOT_FOUND",
@@ -2713,6 +2933,131 @@ against both.
   },
   "required": [
     "error"
+  ],
+  "type": "object"
+}
+```
+
+### Event
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "branch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "data": {
+      "$ref": "#/components/schemas/EventData"
+    },
+    "id": {
+      "type": "string"
+    },
+    "installation": {
+      "type": "string"
+    },
+    "record_kind": {
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "schema": {
+      "type": "string"
+    },
+    "source": {
+      "$ref": "#/components/schemas/SourcePos"
+    },
+    "subindex": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema",
+    "id",
+    "installation",
+    "source",
+    "subindex",
+    "record_kind",
+    "data"
+  ],
+  "type": "object"
+}
+```
+
+### EventData
+
+```json
+{
+  "additionalProperties": false,
+  "description": "Free text and identity-bearing audit details stay behind the ordinary record API.",
+  "properties": {
+    "action": {
+      "type": "string"
+    },
+    "adoption": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/NativeAdoption"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "at_wall_ms": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "effect": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "epoch": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "kind": {
+      "type": "string"
+    },
+    "phase": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/FleetPhase"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "record_hash": {
+      "description": "Sole shared M28 keyed identity, never a legacy plaintext digest.",
+      "type": "string"
+    },
+    "schema": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "kind",
+    "action",
+    "at_wall_ms",
+    "record_hash"
   ],
   "type": "object"
 }
@@ -2845,6 +3190,106 @@ against both.
     "applied_lsn",
     "lag",
     "gaps"
+  ],
+  "type": "object"
+}
+```
+
+### FleetIdentity
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "installation": {
+      "type": "string"
+    },
+    "node": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "installation"
+  ],
+  "type": "object"
+}
+```
+
+### FleetPhase
+
+```json
+{
+  "enum": [
+    "pending",
+    "requested",
+    "active",
+    "revoked"
+  ],
+  "type": "string"
+}
+```
+
+### FleetStatus
+
+```json
+{
+  "properties": {
+    "admission_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "admitting": {
+      "description": "Current local admission for reads; publication-time admission for mutation ACKs.",
+      "type": "boolean"
+    },
+    "configured": {
+      "type": "boolean"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "plan": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/EnrollmentPlan"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "recovery_hint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "state": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/EnrollmentRecord"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "configured",
+    "dry_run",
+    "admitting"
   ],
   "type": "object"
 }
@@ -3331,6 +3776,27 @@ against both.
 }
 ```
 
+### Gap
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "from": {
+      "$ref": "#/components/schemas/SourcePos"
+    },
+    "through": {
+      "$ref": "#/components/schemas/SourcePos"
+    }
+  },
+  "required": [
+    "from",
+    "through"
+  ],
+  "type": "object"
+}
+```
+
 ### GrantResponse
 
 ```json
@@ -3535,6 +4001,28 @@ against both.
 }
 ```
 
+### Identity
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "branch": {
+      "description": "Actor-feed selection only; metadata has no actor-branch provenance.",
+      "type": "string"
+    },
+    "installation": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "installation",
+    "branch"
+  ],
+  "type": "object"
+}
+```
+
 ### InputSummary
 
 ```json
@@ -3669,6 +4157,10 @@ against both.
     "action": {
       "type": "string"
     },
+    "branch": {
+      "description": "Authoritative logical branch; unverified sink claims remain omitted.",
+      "type": "string"
+    },
     "effect": {
       "format": "uint32",
       "minimum": 0,
@@ -3683,15 +4175,27 @@ against both.
     "lsn": {
       "format": "uint64",
       "minimum": 0,
-      "type": "integer"
+      "type": [
+        "integer",
+        "null"
+      ]
     },
     "record_hash": {
       "description": "The current source hash; absent when no authoritative source item exists.",
       "type": "string"
+    },
+    "source": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/SourcePos"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "required": [
-    "lsn",
     "kind",
     "action"
   ],
@@ -3972,7 +4476,10 @@ against both.
     "lsn": {
       "format": "uint64",
       "minimum": 0,
-      "type": "integer"
+      "type": [
+        "integer",
+        "null"
+      ]
     },
     "reason": {
       "type": "string"
@@ -3986,21 +4493,66 @@ against both.
     "schema": {
       "type": "string"
     },
+    "source": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/SourcePos"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "token_id": {
       "type": "string"
     }
   },
   "required": [
     "schema",
-    "lsn",
     "kind",
     "action",
     "at_wall_ms",
     "token_id",
     "reason",
-    "branch",
     "details",
     "record_hash"
+  ],
+  "type": "object"
+}
+```
+
+### MemberAuditResponse
+
+```json
+{
+  "properties": {
+    "covered_from": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "lines": {
+      "items": {
+        "$ref": "#/components/schemas/Line"
+      },
+      "type": "array"
+    },
+    "next": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "source": {
+      "$ref": "#/components/schemas/SourcePos"
+    }
+  },
+  "required": [
+    "source",
+    "covered_from",
+    "lines"
   ],
   "type": "object"
 }
@@ -4051,6 +4603,58 @@ against both.
   },
   "required": [
     "configured"
+  ],
+  "type": "object"
+}
+```
+
+### NativeAdoption
+
+```json
+{
+  "additionalProperties": false,
+  "description": "Presence marks imported native history, never a new creation or permission\ngrant. False is archival history; true is the captured current projection.",
+  "properties": {
+    "current_projection": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "current_projection"
+  ],
+  "type": "object"
+}
+```
+
+### NativeAuditResponse
+
+```json
+{
+  "properties": {
+    "applied_lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "lines": {
+      "items": {
+        "$ref": "#/components/schemas/Line"
+      },
+      "type": "array"
+    },
+    "next": {
+      "description": "The `from` of the next page; absent at the applied LSN.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "lines",
+    "applied_lsn"
   ],
   "type": "object"
 }
@@ -4149,6 +4753,48 @@ against both.
   },
   "required": [
     "kind"
+  ],
+  "type": "object"
+}
+```
+
+### Page
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "applied": {
+      "$ref": "#/components/schemas/SourcePos"
+    },
+    "cursor": {
+      "$ref": "#/components/schemas/ResumeCursor"
+    },
+    "events": {
+      "items": {
+        "$ref": "#/components/schemas/Event"
+      },
+      "type": "array"
+    },
+    "gap": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/Gap"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "more": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "events",
+    "cursor",
+    "applied",
+    "more"
   ],
   "type": "object"
 }
@@ -4317,6 +4963,30 @@ against both.
     "dry_run",
     "epoch",
     "lsn"
+  ],
+  "type": "object"
+}
+```
+
+### Position
+
+```json
+{
+  "additionalProperties": false,
+  "description": "Next event to read in one actual source, not a synthetic actor LSN.",
+  "properties": {
+    "source": {
+      "$ref": "#/components/schemas/SourcePos"
+    },
+    "subindex": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "source",
+    "subindex"
   ],
   "type": "object"
 }
@@ -4541,6 +5211,27 @@ against both.
 }
 ```
 
+### Probe
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "ciphertext": {
+      "type": "string"
+    },
+    "nonce": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "nonce",
+    "ciphertext"
+  ],
+  "type": "object"
+}
+```
+
 ### PromoteResponse
 
 ```json
@@ -4585,6 +5276,14 @@ against both.
       "default": [],
       "items": {
         "$ref": "#/components/schemas/ApprovalRequestInfo"
+      },
+      "type": "array"
+    },
+    "approvals": {
+      "default": [],
+      "description": "Completed approvals from the log, including the authenticated audit caller.",
+      "items": {
+        "$ref": "#/components/schemas/ReviewedApproval"
       },
       "type": "array"
     },
@@ -4879,17 +5578,85 @@ against both.
 }
 ```
 
+### ReplayResponse2
+
+```json
+{
+  "properties": {
+    "cursor": {
+      "$ref": "#/components/schemas/ResumeCursor"
+    },
+    "dry_run": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "dry_run",
+    "cursor"
+  ],
+  "type": "object"
+}
+```
+
 ### Reply
 
 ```json
 {
-  "description": "Bytes as JSON: `text` when valid UTF-8 (responses), and always `base64`.\nRequests give either one.",
+  "description": "Inline text/base64 or a body blob identity; attachments are separate.",
+  "not": {
+    "anyOf": [
+      {
+        "properties": {
+          "blob": {
+            "type": "object"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "blob",
+          "text"
+        ]
+      },
+      {
+        "properties": {
+          "base64": {
+            "type": "string"
+          },
+          "blob": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "blob",
+          "base64"
+        ]
+      }
+    ]
+  },
   "properties": {
     "base64": {
       "type": [
         "string",
         "null"
       ]
+    },
+    "blob": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/BlobReference"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "blobs": {
+      "items": {
+        "$ref": "#/components/schemas/BlobReference"
+      },
+      "type": "array"
     },
     "content_type": {
       "type": "string"
@@ -4986,6 +5753,16 @@ against both.
       "minimum": 0,
       "type": "integer"
     },
+    "from_source": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/SourcePos"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "lines": {
       "description": "Distinct sink lines in the range.",
       "format": "uint",
@@ -5008,6 +5785,16 @@ against both.
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
+    },
+    "to_source": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/SourcePos"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "required": [
@@ -5194,6 +5981,87 @@ against both.
 }
 ```
 
+### ResumeCursor
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "identity": {
+      "$ref": "#/components/schemas/Identity"
+    },
+    "schema": {
+      "type": "string"
+    },
+    "streams": {
+      "additionalProperties": {
+        "$ref": "#/components/schemas/Position"
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema",
+    "identity",
+    "streams"
+  ],
+  "type": "object"
+}
+```
+
+### ReviewedApproval
+
+```json
+{
+  "properties": {
+    "diff_hash": {
+      "type": "string"
+    },
+    "lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "token_id": {
+      "type": "string"
+    },
+    "verified_identity": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/VerifiedApprovalIdentity"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Present only with pii:read and a stored protected identity; legacy approvals omit it."
+    },
+    "verified_through_lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "wall_time_ms": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "lsn",
+    "diff_hash",
+    "verified_through_lsn",
+    "token_id",
+    "reason",
+    "wall_time_ms"
+  ],
+  "type": "object"
+}
+```
+
 ### RevokeResponse
 
 ```json
@@ -5286,6 +6154,57 @@ against both.
 }
 ```
 
+### SecretBackendView
+
+```json
+{
+  "properties": {
+    "binding": {
+      "type": "string"
+    },
+    "configured": {
+      "type": "boolean"
+    },
+    "id": {
+      "type": "string"
+    },
+    "inventory_complete": {
+      "type": "boolean"
+    },
+    "kind": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "kind",
+    "binding",
+    "configured",
+    "inventory_complete"
+  ],
+  "type": "object"
+}
+```
+
+### SecretBackendsResponse
+
+```json
+{
+  "properties": {
+    "backends": {
+      "items": {
+        "$ref": "#/components/schemas/SecretBackendView"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "backends"
+  ],
+  "type": "object"
+}
+```
+
 ### SecretDeleteResponse
 
 ```json
@@ -5328,6 +6247,102 @@ against both.
 }
 ```
 
+### SecretHistoryResponse
+
+```json
+{
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "versions": {
+      "items": {
+        "$ref": "#/components/schemas/SecretVersionView"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "name",
+    "versions"
+  ],
+  "type": "object"
+}
+```
+
+### SecretLinkResponse
+
+```json
+{
+  "properties": {
+    "dry_run": {
+      "type": "boolean"
+    },
+    "link": {
+      "$ref": "#/components/schemas/SecretLinkView"
+    },
+    "lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "dry_run",
+    "link"
+  ],
+  "type": "object"
+}
+```
+
+### SecretLinkView
+
+```json
+{
+  "properties": {
+    "backend": {
+      "description": "Empty means an explicit unlink back to the built-in store.",
+      "type": "string"
+    },
+    "binding": {
+      "type": "string"
+    },
+    "canonical_ref": {
+      "type": "string"
+    },
+    "epoch": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "generation": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "name": {
+      "type": "string"
+    },
+    "ref": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "backend",
+    "ref",
+    "binding",
+    "canonical_ref",
+    "generation",
+    "epoch"
+  ],
+  "type": "object"
+}
+```
+
 ### SecretResponse
 
 ```json
@@ -5355,6 +6370,99 @@ against both.
 }
 ```
 
+### SecretVersionPhase
+
+```json
+{
+  "enum": [
+    "reserved",
+    "active",
+    "failed"
+  ],
+  "type": "string"
+}
+```
+
+### SecretVersionView
+
+```json
+{
+  "properties": {
+    "backend": {
+      "type": "string"
+    },
+    "binding": {
+      "type": "string"
+    },
+    "canonical_ref": {
+      "type": "string"
+    },
+    "created_wall_ms": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "deleted": {
+      "type": "boolean"
+    },
+    "hash_revision": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "link_generation": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "name": {
+      "type": "string"
+    },
+    "phase": {
+      "$ref": "#/components/schemas/SecretVersionPhase"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "ref": {
+      "type": "string"
+    },
+    "source_version": {
+      "type": "string"
+    },
+    "token_id": {
+      "type": "string"
+    },
+    "version": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "version_hash": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "version",
+    "version_hash",
+    "hash_revision",
+    "backend",
+    "source_version",
+    "ref",
+    "binding",
+    "canonical_ref",
+    "link_generation",
+    "phase",
+    "deleted",
+    "created_wall_ms",
+    "token_id",
+    "reason"
+  ],
+  "type": "object"
+}
+```
+
 ### SecretView
 
 ```json
@@ -5369,7 +6477,7 @@ against both.
       "type": "string"
     },
     "version": {
-      "format": "uint32",
+      "format": "uint64",
       "minimum": 0,
       "type": "integer"
     },
@@ -5393,6 +6501,13 @@ against both.
 ```json
 {
   "properties": {
+    "links": {
+      "description": "Configured bindings, including names whose value has never been observed.",
+      "items": {
+        "$ref": "#/components/schemas/SecretLinkView"
+      },
+      "type": "array"
+    },
     "secrets": {
       "items": {
         "$ref": "#/components/schemas/SecretView"
@@ -5603,6 +6718,61 @@ against both.
     "snapshots"
   ],
   "type": "object"
+}
+```
+
+### SourcePos
+
+```json
+{
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "actor",
+          "type": "string"
+        },
+        "lsn": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "shard": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "lsn"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "const": "metadata",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "index"
+      ],
+      "type": "object"
+    }
+  ]
 }
 ```
 
@@ -6376,6 +7546,47 @@ against both.
 }
 ```
 
+### VerifiedApprovalIdentity
+
+```json
+{
+  "oneOf": [
+    {
+      "properties": {
+        "issuer": {
+          "type": "string"
+        },
+        "state": {
+          "const": "VERIFIED",
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "issuer",
+        "subject"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "state": {
+          "const": "ERASED",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    }
+  ]
+}
+```
+
 ### WatchInfo
 
 ```json
@@ -6580,6 +7791,61 @@ against both.
   },
   "required": [
     "watches"
+  ],
+  "type": "object"
+}
+```
+
+### WebhookStatus
+
+```json
+{
+  "properties": {
+    "cursor": {
+      "$ref": "#/components/schemas/SourcePos"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "gaps": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "last_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "enabled",
+    "cursor",
+    "gaps"
+  ],
+  "type": "object"
+}
+```
+
+### WebhooksResponse
+
+```json
+{
+  "properties": {
+    "webhooks": {
+      "items": {
+        "$ref": "#/components/schemas/WebhookStatus"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "webhooks"
   ],
   "type": "object"
 }

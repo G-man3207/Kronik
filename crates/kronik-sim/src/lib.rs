@@ -126,11 +126,15 @@ impl EntropySource for SimEntropy {
 pub struct SimNoNet;
 
 impl Net for SimNoNet {
-    fn http_authorized(&self, req: HttpRequest, original: kronik_core::authority::AuthLease)
-        -> BoxFuture<'static, Result<HttpResponse, NetError>>
-    {
+    fn http_authorized(
+        &self,
+        req: HttpRequest,
+        original: kronik_core::authority::AuthLease,
+    ) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
         Box::pin(async move {
-            original.check().map_err(|error| NetError::Connect(error.to_string()))?;
+            original
+                .check()
+                .map_err(|error| NetError::Connect(error.to_string()))?;
             Err(NetError::Connect(format!("no network: {}", req.url)))
         })
     }
@@ -168,7 +172,12 @@ impl Process for SimProcess {
         let mut killed = self.killed.subscribe();
         let reaped = self.reaped.clone();
         Box::pin(async move {
-            drop(killed.wait_for(|value| *value).await.map_err(io::Error::other)?);
+            drop(
+                killed
+                    .wait_for(|value| *value)
+                    .await
+                    .map_err(io::Error::other)?,
+            );
             reaped.store(true, Ordering::SeqCst);
             Ok(None)
         })
@@ -212,17 +221,25 @@ fn sensitive_exchange(
         }
     }
     Box::pin(async move {
-        if request.stdin.is_empty() || request.stdin.len() > 4096 || request.timeout.is_zero()
+        if request.stdin.is_empty()
+            || request.stdin.len() > 4096
+            || request.timeout.is_zero()
             || clock.monotonic().checked_add(request.timeout).is_none()
         {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid sensitive helper bounds"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid sensitive helper bounds",
+            ));
         }
         let _reap = Reap(process);
         let timeout = request.timeout;
         // The model never consumes plaintext; erase it before advancing time.
         drop(request);
         clock.sleep(timeout).await;
-        Err(io::Error::new(io::ErrorKind::TimedOut, "sensitive helper timed out"))
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "sensitive helper timed out",
+        ))
     })
 }
 

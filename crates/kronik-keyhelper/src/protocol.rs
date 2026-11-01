@@ -66,7 +66,9 @@ fn text(value: &str, max: usize) -> bool {
 
 pub fn is_hex(value: &str, bytes: usize) -> bool {
     value.len() == bytes * 2
-        && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn parse(input: &[u8]) -> Result<Request<'_>, Error> {
@@ -91,14 +93,27 @@ pub fn parse(input: &[u8]) -> Result<Request<'_>, Error> {
         return Err(Error::Protocol);
     }
     let valid = match request.op {
-        "enroll" => request.probe.is_none() && request.plaintext.is_none()
-            && request.nonce.is_none() && request.ciphertext.is_none(),
-        "wrap" => request.probe.as_ref().is_some_and(|p| is_hex(p.nonce, 12) && is_hex(p.ciphertext, 48))
-            && request.plaintext.is_some_and(|p| is_hex(p, 32))
-            && request.nonce.is_none() && request.ciphertext.is_none(),
-        "unwrap" => request.probe.is_none() && request.plaintext.is_none()
-            && request.nonce.is_some_and(|n| is_hex(n, 12))
-            && request.ciphertext.is_some_and(|c| is_hex(c, 48)),
+        "enroll" => {
+            request.probe.is_none()
+                && request.plaintext.is_none()
+                && request.nonce.is_none()
+                && request.ciphertext.is_none()
+        }
+        "wrap" => {
+            request
+                .probe
+                .as_ref()
+                .is_some_and(|p| is_hex(p.nonce, 12) && is_hex(p.ciphertext, 48))
+                && request.plaintext.is_some_and(|p| is_hex(p, 32))
+                && request.nonce.is_none()
+                && request.ciphertext.is_none()
+        }
+        "unwrap" => {
+            request.probe.is_none()
+                && request.plaintext.is_none()
+                && request.nonce.is_some_and(|n| is_hex(n, 12))
+                && request.ciphertext.is_some_and(|c| is_hex(c, 48))
+        }
         _ => false,
     };
     if !valid {
@@ -131,8 +146,14 @@ pub fn encode(bytes: &[u8]) -> Zeroizing<String> {
 
 pub fn aad(request: &Request<'_>, enrollment: bool) -> Zeroizing<Vec<u8>> {
     // Module integrity is a trusted load gate, not key identity across module security upgrades.
-    let fields = [request.manufacturer.as_ref(), request.model.as_ref(), request.serial.as_ref(),
-        request.key_id, request.key_version.as_ref(), request.purpose.as_ref()];
+    let fields = [
+        request.manufacturer.as_ref(),
+        request.model.as_ref(),
+        request.serial.as_ref(),
+        request.key_id,
+        request.key_version.as_ref(),
+        request.purpose.as_ref(),
+    ];
     let domain: &[u8] = if enrollment {
         b"kronik.pkcs11/enrollment/v1\0"
     } else {
@@ -193,8 +214,13 @@ struct ProbeResponse<'a> {
 impl<'a> Response<'a> {
     pub fn success(op: &str, nonce: &'a str, data: &'a str) -> Self {
         Self {
-            schema: SCHEMA, ok: true, code: None,
-            probe: (op == "enroll").then_some(ProbeResponse { nonce, ciphertext: data }),
+            schema: SCHEMA,
+            ok: true,
+            code: None,
+            probe: (op == "enroll").then_some(ProbeResponse {
+                nonce,
+                ciphertext: data,
+            }),
             nonce: (op == "wrap").then_some(nonce),
             ciphertext: (op == "wrap").then_some(data),
             plaintext: (op == "unwrap").then_some(data),
@@ -202,8 +228,15 @@ impl<'a> Response<'a> {
     }
 
     pub fn failure(code: Error) -> Self {
-        Self { schema: SCHEMA, ok: false, code: Some(code), probe: None,
-            nonce: None, ciphertext: None, plaintext: None }
+        Self {
+            schema: SCHEMA,
+            ok: false,
+            code: Some(code),
+            probe: None,
+            nonce: None,
+            ciphertext: None,
+            plaintext: None,
+        }
     }
 
     pub fn write(&self, mut output: impl Write) -> Result<(), Error> {
@@ -211,7 +244,9 @@ impl<'a> Response<'a> {
         let mut cursor = std::io::Cursor::new(bytes.as_mut_slice());
         serde_json::to_writer(&mut cursor, self).map_err(|_| Error::Protocol)?;
         let len = cursor.position() as usize;
-        output.write_all(&bytes[..len]).map_err(|_| Error::Protocol)?;
+        output
+            .write_all(&bytes[..len])
+            .map_err(|_| Error::Protocol)?;
         output.flush().map_err(|_| Error::Protocol)
     }
 }

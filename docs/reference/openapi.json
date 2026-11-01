@@ -145,6 +145,21 @@
         ],
         "type": "object"
       },
+      "ApproveRequest": {
+        "additionalProperties": false,
+        "description": "Identity and authority come only from the authenticated request, never JSON.",
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "reason": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "ApproveResponse": {
         "properties": {
           "approval": {
@@ -161,32 +176,177 @@
         "type": "object"
       },
       "AuditResponse": {
-        "description": "`GET /v1/audit`: `kronik.audit/v2` lines in LSN order (m28-otel §4.3).",
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/MemberAuditResponse"
+              },
+              {
+                "not": {
+                  "required": [
+                    "applied_lsn"
+                  ]
+                },
+                "properties": {
+                  "covered_from": {
+                    "maximum": 9223372036854775807,
+                    "minimum": 1
+                  },
+                  "next": {
+                    "anyOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "maximum": 9223372036854775807,
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "source": {
+                    "properties": {
+                      "index": {
+                        "maximum": 9223372036854775807,
+                        "minimum": 1
+                      },
+                      "kind": {
+                        "const": "metadata"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "index"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/NativeAuditResponse"
+              },
+              {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "source"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "covered_from"
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "Binding": {
+        "additionalProperties": false,
         "properties": {
-          "applied_lsn": {
+          "subject": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "token"
+        ],
+        "type": "object"
+      },
+      "BlobReference": {
+        "description": "An output identity, not permission to open a blob.",
+        "properties": {
+          "hash": {
+            "type": "string"
+          },
+          "size": {
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          }
+        },
+        "required": [
+          "hash",
+          "size"
+        ],
+        "type": "object"
+      },
+      "Change": {
+        "additionalProperties": false,
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/ProfileInput"
           },
-          "lines": {
-            "items": {
-              "$ref": "#/components/schemas/Line"
-            },
-            "type": "array"
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
           },
-          "next": {
-            "description": "The `from` of the next page; absent at the applied LSN.",
-            "format": "uint64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
+          "reason": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "required": [
+          "config"
+        ],
+        "type": "object"
+      },
+      "Changed": {
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "changed": {
+            "type": "boolean"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "oidc_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OidcReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "restart_required": {
+            "type": "boolean"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourcePos"
+              },
+              {
+                "type": "null"
+              }
             ]
           }
         },
         "required": [
-          "lines",
-          "applied_lsn"
+          "dry_run",
+          "changed",
+          "digest",
+          "restart_required",
+          "active"
         ],
         "type": "object"
       },
@@ -218,6 +378,371 @@
         ],
         "type": "object"
       },
+      "ClusterGroupObservation": {
+        "additionalProperties": false,
+        "properties": {
+          "leader_member_id": {
+            "$ref": "#/components/schemas/ClusterNullableMemberId"
+          },
+          "local": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ClusterLocalGroupStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "shard_id": {
+            "$ref": "#/components/schemas/ClusterNullableIndex"
+          },
+          "under_replicated": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "shard_id",
+          "leader_member_id",
+          "local",
+          "under_replicated"
+        ],
+        "type": "object"
+      },
+      "ClusterHostedGroupStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "lag_reference_commit_index": {
+            "$ref": "#/components/schemas/ClusterNullableIndex"
+          },
+          "replication_lag": {
+            "$ref": "#/components/schemas/ClusterNullableIndex"
+          },
+          "shard_id": {
+            "$ref": "#/components/schemas/ClusterNullableIndex"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ClusterLocalGroupStatus"
+          }
+        },
+        "required": [
+          "shard_id",
+          "status",
+          "lag_reference_commit_index",
+          "replication_lag"
+        ],
+        "type": "object"
+      },
+      "ClusterLocalGroupStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "applied_index": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "backfilling": {
+            "type": "boolean"
+          },
+          "commit_index": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "durable_index": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "leader_member_id": {
+            "$ref": "#/components/schemas/ClusterNullableMemberId"
+          },
+          "leader_term": {
+            "$ref": "#/components/schemas/ClusterNullableIndex"
+          },
+          "learners": {
+            "items": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "type": "array",
+            "uniqueItems": true
+          },
+          "persisted_index": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "role": {
+            "enum": [
+              "LEADER",
+              "FOLLOWER",
+              "CANDIDATE"
+            ]
+          },
+          "term": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "voters": {
+            "items": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "term",
+          "role",
+          "leader_term",
+          "leader_member_id",
+          "commit_index",
+          "applied_index",
+          "persisted_index",
+          "durable_index",
+          "voters",
+          "learners",
+          "backfilling"
+        ],
+        "type": "object"
+      },
+      "ClusterMemberObservation": {
+        "additionalProperties": false,
+        "properties": {
+          "advertise": {
+            "type": "string"
+          },
+          "clock_unix_ms": {
+            "$ref": "#/components/schemas/ClusterNullableIndex"
+          },
+          "committed_engine_version": {
+            "type": "string"
+          },
+          "engine_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "execution_admitted": {
+            "type": "boolean"
+          },
+          "free_disk_bytes": {
+            "$ref": "#/components/schemas/ClusterNullableIndex"
+          },
+          "fresh": {
+            "type": "boolean"
+          },
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/ClusterHostedGroupStatus"
+            },
+            "type": "array"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "live": {
+            "type": "boolean"
+          },
+          "member_id": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "metadata_lag": {
+            "$ref": "#/components/schemas/ClusterNullableIndex"
+          },
+          "metadata_recovery_admitted": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "observation_age_ms": {
+            "$ref": "#/components/schemas/ClusterNullableIndex"
+          },
+          "observed_boot_id": {
+            "$ref": "#/components/schemas/ClusterNullableBoot"
+          },
+          "observed_incarnation": {
+            "$ref": "#/components/schemas/ClusterNullableMemberId"
+          },
+          "persisted_phase": {
+            "enum": [
+              "JOINING",
+              "ACTIVE",
+              "LEAVING",
+              "REMOVED"
+            ]
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "registered_boot_id": {
+            "$ref": "#/components/schemas/ClusterNullableBoot"
+          },
+          "registered_incarnation": {
+            "$ref": "#/components/schemas/ClusterNullableMemberId"
+          },
+          "registration_metadata_index": {
+            "$ref": "#/components/schemas/ClusterNullableMemberId"
+          }
+        },
+        "required": [
+          "member_id",
+          "name",
+          "advertise",
+          "labels",
+          "persisted_phase",
+          "committed_engine_version",
+          "engine_version",
+          "registered_boot_id",
+          "registered_incarnation",
+          "registration_metadata_index",
+          "observed_boot_id",
+          "observed_incarnation",
+          "metadata_recovery_admitted",
+          "execution_admitted",
+          "live",
+          "fresh",
+          "observation_age_ms",
+          "free_disk_bytes",
+          "clock_unix_ms",
+          "metadata_lag",
+          "groups",
+          "ready"
+        ],
+        "type": "object"
+      },
+      "ClusterMemberStatusResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "active_barrier": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "epoch": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "phase": {
+                    "enum": [
+                      "PROPOSED",
+                      "COMMITTING"
+                    ]
+                  }
+                },
+                "required": [
+                  "epoch",
+                  "phase"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "cluster_id": {
+            "type": "string"
+          },
+          "configuration_epoch": {
+            "$ref": "#/components/schemas/ClusterNullableMemberId",
+            "description": "Latest fully APPLIED configuration; null before the first applied epoch."
+          },
+          "local_member_id": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "member": {
+            "const": true
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/ClusterMemberObservation"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ClusterGroupObservation"
+          },
+          "metadata_durable_index": {
+            "description": "Metadata Raft index, never an actor LSN or public SourcePos.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "observation_timeout_ms": {
+            "description": "Existing MetaConfig call timeout; sample age uses Env monotonic time, never wall time.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "shards": {
+            "items": {
+              "$ref": "#/components/schemas/ClusterGroupObservation"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "member",
+          "cluster_id",
+          "local_member_id",
+          "metadata_durable_index",
+          "configuration_epoch",
+          "active_barrier",
+          "observation_timeout_ms",
+          "metadata",
+          "shards",
+          "members"
+        ],
+        "type": "object"
+      },
+      "ClusterNullableBoot": {
+        "pattern": "^[0-9a-f]{64}$",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "ClusterNullableIndex": {
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "ClusterNullableMemberId": {
+        "minimum": 1,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "ClusterStatusResponse": {
+        "description": "Ordinary receiver-local cluster observations, not a ReadIndex certificate or execution authority. Null means unsupported, stale or unobserved; no fields are omitted.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "member": {
+                "const": false
+              }
+            },
+            "required": [
+              "member"
+            ],
+            "type": "object"
+          },
+          {
+            "$ref": "#/components/schemas/ClusterMemberStatusResponse"
+          }
+        ]
+      },
       "Compensation": {
         "properties": {
           "message_id": {
@@ -231,6 +756,39 @@
         "required": [
           "message_id",
           "state"
+        ],
+        "type": "object"
+      },
+      "Config": {
+        "additionalProperties": false,
+        "properties": {
+          "bindings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Binding"
+            },
+            "type": "array"
+          },
+          "ca_file": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "client_id": {
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string"
+          },
+          "redirect_uri": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer",
+          "client_id",
+          "redirect_uri"
         ],
         "type": "object"
       },
@@ -2075,6 +2633,100 @@
         ],
         "type": "object"
       },
+      "EnrollmentPhase": {
+        "enum": [
+          "pending",
+          "requested",
+          "active",
+          "revoked"
+        ],
+        "type": "string"
+      },
+      "EnrollmentPlan": {
+        "additionalProperties": false,
+        "properties": {
+          "ca_sha256": {
+            "type": "string"
+          },
+          "controller_url": {
+            "type": "string"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/FleetIdentity"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "controller_url",
+          "identity",
+          "scopes",
+          "ca_sha256"
+        ],
+        "type": "object"
+      },
+      "EnrollmentRecord": {
+        "additionalProperties": false,
+        "properties": {
+          "client_cert_der": {
+            "items": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "client_key_sha256": {
+            "type": "string"
+          },
+          "controller_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "csr_der": {
+            "items": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "epoch": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/EnrollmentPhase"
+          },
+          "plan": {
+            "$ref": "#/components/schemas/EnrollmentPlan"
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "plan",
+          "request_id",
+          "epoch",
+          "phase",
+          "csr_der",
+          "client_key_sha256"
+        ],
+        "type": "object"
+      },
       "ErasureRequest": {
         "description": "`POST /v1/privacy/erase` (§6).",
         "properties": {
@@ -2174,12 +2826,14 @@
                   "FORK_NOT_FOUND",
                   "FUEL_EXHAUSTED",
                   "GATEWAY_TIMEOUT",
+                  "HOST_REDACTION_FAILURE",
                   "IDEMPOTENCY_IN_FLIGHT",
                   "IDEMPOTENCY_KEY_REUSED",
                   "IMAGE_INVALID",
                   "IMPORT_NOT_ALLOWED",
                   "INTERNAL",
                   "KEYSTORE_INCOMPLETE",
+                  "KEY_HELPER_FAILED",
                   "KEY_PROTECTION_UNAVAILABLE",
                   "KEY_SOURCE_UNAVAILABLE",
                   "KVM_UNAVAILABLE",
@@ -2203,8 +2857,13 @@
                   "RUNC_MISSING",
                   "RUNSC_MISSING",
                   "SCOPE_MISSING",
+                  "SECRET_BACKEND_UNKNOWN",
+                  "SECRET_EXTERNAL",
                   "SECRET_NOT_FOUND",
+                  "SECRET_REF_NOT_ALLOWED",
                   "SECRET_UNAVAILABLE",
+                  "SECRET_VERSION_EXHAUSTED",
+                  "SECRET_VERSION_GONE",
                   "STORAGE_CORRUPT",
                   "SUBJECT_ERASED",
                   "TOKEN_NOT_FOUND",
@@ -2238,6 +2897,121 @@
         },
         "required": [
           "error"
+        ],
+        "type": "object"
+      },
+      "Event": {
+        "additionalProperties": false,
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "$ref": "#/components/schemas/EventData"
+          },
+          "id": {
+            "type": "string"
+          },
+          "installation": {
+            "type": "string"
+          },
+          "record_kind": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SourcePos"
+          },
+          "subindex": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "schema",
+          "id",
+          "installation",
+          "source",
+          "subindex",
+          "record_kind",
+          "data"
+        ],
+        "type": "object"
+      },
+      "EventData": {
+        "additionalProperties": false,
+        "description": "Free text and identity-bearing audit details stay behind the ordinary record API.",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "adoption": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NativeAdoption"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "at_wall_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "effect": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "epoch": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "phase": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FleetPhase"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "record_hash": {
+            "description": "Sole shared M28 keyed identity, never a legacy plaintext digest.",
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema",
+          "kind",
+          "action",
+          "at_wall_ms",
+          "record_hash"
         ],
         "type": "object"
       },
@@ -2379,6 +3153,133 @@
           "applied_lsn",
           "lag",
           "gaps"
+        ],
+        "type": "object"
+      },
+      "FleetEnrollRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "FleetIdentity": {
+        "additionalProperties": false,
+        "properties": {
+          "cluster": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "installation": {
+            "type": "string"
+          },
+          "node": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "installation"
+        ],
+        "type": "object"
+      },
+      "FleetPhase": {
+        "enum": [
+          "pending",
+          "requested",
+          "active",
+          "revoked"
+        ],
+        "type": "string"
+      },
+      "FleetRevokeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "FleetStatus": {
+        "properties": {
+          "admission_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "admitting": {
+            "description": "Current local admission for reads; publication-time admission for mutation ACKs.",
+            "type": "boolean"
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "plan": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EnrollmentPlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "recovery_hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EnrollmentRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "configured",
+          "dry_run",
+          "admitting"
         ],
         "type": "object"
       },
@@ -2934,6 +3835,22 @@
         ],
         "type": "object"
       },
+      "Gap": {
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "$ref": "#/components/schemas/SourcePos"
+          },
+          "through": {
+            "$ref": "#/components/schemas/SourcePos"
+          }
+        },
+        "required": [
+          "from",
+          "through"
+        ],
+        "type": "object"
+      },
       "GrantRequest": {
         "properties": {
           "capability": {
@@ -3196,6 +4113,39 @@
         },
         "required": [
           "turns"
+        ],
+        "type": "object"
+      },
+      "Identity": {
+        "additionalProperties": false,
+        "properties": {
+          "issuer": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer",
+          "subject"
+        ],
+        "type": "object"
+      },
+      "Identity2": {
+        "additionalProperties": false,
+        "properties": {
+          "branch": {
+            "description": "Actor-feed selection only; metadata has no actor-branch provenance.",
+            "type": "string"
+          },
+          "installation": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "installation",
+          "branch"
         ],
         "type": "object"
       },
@@ -3640,7 +4590,10 @@
           "lsn": {
             "format": "uint64",
             "minimum": 0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "reason": {
             "type": "string"
@@ -3654,21 +4607,61 @@
           "schema": {
             "type": "string"
           },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourcePos"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "token_id": {
             "type": "string"
           }
         },
         "required": [
           "schema",
-          "lsn",
           "kind",
           "action",
           "at_wall_ms",
           "token_id",
           "reason",
-          "branch",
           "details",
           "record_hash"
+        ],
+        "type": "object"
+      },
+      "MemberAuditResponse": {
+        "properties": {
+          "covered_from": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lines": {
+            "items": {
+              "$ref": "#/components/schemas/Line"
+            },
+            "type": "array"
+          },
+          "next": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/SourcePos"
+          }
+        },
+        "required": [
+          "source",
+          "covered_from",
+          "lines"
         ],
         "type": "object"
       },
@@ -3711,6 +4704,58 @@
           "configured"
         ],
         "type": "object"
+      },
+      "NativeAdoption": {
+        "additionalProperties": false,
+        "description": "Presence marks imported native history, never a new creation or permission\ngrant. False is archival history; true is the captured current projection.",
+        "properties": {
+          "current_projection": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "current_projection"
+        ],
+        "type": "object"
+      },
+      "NativeAuditResponse": {
+        "properties": {
+          "applied_lsn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lines": {
+            "items": {
+              "$ref": "#/components/schemas/Line"
+            },
+            "type": "array"
+          },
+          "next": {
+            "description": "The `from` of the next page; absent at the applied LSN.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "lines",
+          "applied_lsn"
+        ],
+        "type": "object"
+      },
+      "OidcReason": {
+        "enum": [
+          "not_configured",
+          "profile_mismatch",
+          "provider_unavailable",
+          "configuration_pending",
+          "restart_required"
+        ],
+        "type": "string"
       },
       "Orphan": {
         "properties": {
@@ -3792,6 +4837,43 @@
         },
         "required": [
           "kind"
+        ],
+        "type": "object"
+      },
+      "Page": {
+        "additionalProperties": false,
+        "properties": {
+          "applied": {
+            "$ref": "#/components/schemas/SourcePos"
+          },
+          "cursor": {
+            "$ref": "#/components/schemas/ResumeCursor"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/Event"
+            },
+            "type": "array"
+          },
+          "gap": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Gap"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "more": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "events",
+          "cursor",
+          "applied",
+          "more"
         ],
         "type": "object"
       },
@@ -3980,6 +5062,25 @@
         },
         "required": [
           "proposal"
+        ],
+        "type": "object"
+      },
+      "Position": {
+        "additionalProperties": false,
+        "description": "Next event to read in one actual source, not a synthetic actor LSN.",
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/SourcePos"
+          },
+          "subindex": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source",
+          "subindex"
         ],
         "type": "object"
       },
@@ -4224,6 +5325,16 @@
         ],
         "type": "object"
       },
+      "ProfileInput": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/Config"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
       "PromoteResponse": {
         "properties": {
           "deployment": {
@@ -4260,6 +5371,14 @@
             "default": [],
             "items": {
               "$ref": "#/components/schemas/ApprovalRequestInfo"
+            },
+            "type": "array"
+          },
+          "approvals": {
+            "default": [],
+            "description": "Completed approvals from the log, including the authenticated audit caller.",
+            "items": {
+              "$ref": "#/components/schemas/ReviewedApproval"
             },
             "type": "array"
           },
@@ -4725,6 +5844,26 @@
         },
         "type": "object"
       },
+      "ReplayRequest2": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "$ref": "#/components/schemas/ResumeCursor"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cursor",
+          "reason"
+        ],
+        "type": "object"
+      },
       "ReplayResponse": {
         "properties": {
           "diff_hash": {
@@ -4745,14 +5884,77 @@
         ],
         "type": "object"
       },
+      "ReplayResponse2": {
+        "properties": {
+          "cursor": {
+            "$ref": "#/components/schemas/ResumeCursor"
+          },
+          "dry_run": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dry_run",
+          "cursor"
+        ],
+        "type": "object"
+      },
       "Reply": {
-        "description": "Bytes as JSON: `text` when valid UTF-8 (responses), and always `base64`.\nRequests give either one.",
+        "description": "Inline text/base64 or a body blob identity; attachments are separate.",
+        "not": {
+          "anyOf": [
+            {
+              "properties": {
+                "blob": {
+                  "type": "object"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "blob",
+                "text"
+              ]
+            },
+            {
+              "properties": {
+                "base64": {
+                  "type": "string"
+                },
+                "blob": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "blob",
+                "base64"
+              ]
+            }
+          ]
+        },
         "properties": {
           "base64": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "blob": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BlobReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "blobs": {
+            "items": {
+              "$ref": "#/components/schemas/BlobReference"
+            },
+            "type": "array"
           },
           "content_type": {
             "type": "string"
@@ -4881,6 +6083,77 @@
         },
         "type": "object"
       },
+      "ResumeCursor": {
+        "additionalProperties": false,
+        "properties": {
+          "identity": {
+            "$ref": "#/components/schemas/Identity2"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "streams": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Position"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "schema",
+          "identity",
+          "streams"
+        ],
+        "type": "object"
+      },
+      "ReviewedApproval": {
+        "properties": {
+          "diff_hash": {
+            "type": "string"
+          },
+          "lsn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "token_id": {
+            "type": "string"
+          },
+          "verified_identity": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VerifiedApprovalIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present only with pii:read and a stored protected identity; legacy approvals omit it."
+          },
+          "verified_through_lsn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wall_time_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "lsn",
+          "diff_hash",
+          "verified_through_lsn",
+          "token_id",
+          "reason",
+          "wall_time_ms"
+        ],
+        "type": "object"
+      },
       "RevokeRequest": {
         "properties": {
           "capability": {
@@ -4977,6 +6250,47 @@
         ],
         "type": "object"
       },
+      "SecretBackendView": {
+        "properties": {
+          "binding": {
+            "type": "string"
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "inventory_complete": {
+            "type": "boolean"
+          },
+          "kind": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "binding",
+          "configured",
+          "inventory_complete"
+        ],
+        "type": "object"
+      },
+      "SecretBackendsResponse": {
+        "properties": {
+          "backends": {
+            "items": {
+              "$ref": "#/components/schemas/SecretBackendView"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "backends"
+        ],
+        "type": "object"
+      },
       "SecretDeleteRequest": {
         "properties": {
           "dry_run": {
@@ -5021,6 +6335,123 @@
           "name",
           "versions"
         ],
+        "type": "object"
+      },
+      "SecretHistoryResponse": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "versions": {
+            "items": {
+              "$ref": "#/components/schemas/SecretVersionView"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "versions"
+        ],
+        "type": "object"
+      },
+      "SecretLinkRequest": {
+        "properties": {
+          "backend": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "reason": {
+            "default": "",
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "backend",
+          "ref"
+        ],
+        "type": "object"
+      },
+      "SecretLinkResponse": {
+        "properties": {
+          "dry_run": {
+            "type": "boolean"
+          },
+          "link": {
+            "$ref": "#/components/schemas/SecretLinkView"
+          },
+          "lsn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "dry_run",
+          "link"
+        ],
+        "type": "object"
+      },
+      "SecretLinkView": {
+        "properties": {
+          "backend": {
+            "description": "Empty means an explicit unlink back to the built-in store.",
+            "type": "string"
+          },
+          "binding": {
+            "type": "string"
+          },
+          "canonical_ref": {
+            "type": "string"
+          },
+          "epoch": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "generation": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "backend",
+          "ref",
+          "binding",
+          "canonical_ref",
+          "generation",
+          "epoch"
+        ],
+        "type": "object"
+      },
+      "SecretRefreshRequest": {
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "reason": {
+            "default": "",
+            "type": "string"
+          }
+        },
         "type": "object"
       },
       "SecretResponse": {
@@ -5072,6 +6503,89 @@
         },
         "type": "object"
       },
+      "SecretVersionPhase": {
+        "enum": [
+          "reserved",
+          "active",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "SecretVersionView": {
+        "properties": {
+          "backend": {
+            "type": "string"
+          },
+          "binding": {
+            "type": "string"
+          },
+          "canonical_ref": {
+            "type": "string"
+          },
+          "created_wall_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deleted": {
+            "type": "boolean"
+          },
+          "hash_revision": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "link_generation": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/SecretVersionPhase"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "source_version": {
+            "type": "string"
+          },
+          "token_id": {
+            "type": "string"
+          },
+          "version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version_hash": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "version_hash",
+          "hash_revision",
+          "backend",
+          "source_version",
+          "ref",
+          "binding",
+          "canonical_ref",
+          "link_generation",
+          "phase",
+          "deleted",
+          "created_wall_ms",
+          "token_id",
+          "reason"
+        ],
+        "type": "object"
+      },
       "SecretView": {
         "properties": {
           "created_wall_ms": {
@@ -5083,7 +6597,7 @@
             "type": "string"
           },
           "version": {
-            "format": "uint32",
+            "format": "uint64",
             "minimum": 0,
             "type": "integer"
           },
@@ -5102,6 +6616,13 @@
       },
       "SecretsResponse": {
         "properties": {
+          "links": {
+            "description": "Configured bindings, including names whose value has never been observed.",
+            "items": {
+              "$ref": "#/components/schemas/SecretLinkView"
+            },
+            "type": "array"
+          },
           "secrets": {
             "items": {
               "$ref": "#/components/schemas/SecretView"
@@ -5155,6 +6676,68 @@
         },
         "required": [
           "name"
+        ],
+        "type": "object"
+      },
+      "SessionInfo": {
+        "properties": {
+          "authenticated": {
+            "type": "boolean"
+          },
+          "csrf_token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expires_at_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "identity": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Identity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "oidc_enabled": {
+            "type": "boolean"
+          },
+          "oidc_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OidcReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "principal": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "authenticated",
+          "oidc_enabled",
+          "scopes"
         ],
         "type": "object"
       },
@@ -5380,6 +6963,56 @@
         ],
         "type": "object"
       },
+      "SourcePos": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "actor",
+                "type": "string"
+              },
+              "lsn": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "shard": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "lsn"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "index": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "metadata",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "index"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "SqlSummary": {
         "properties": {
           "tables": {
@@ -5445,6 +7078,47 @@
         "required": [
           "key",
           "lsn"
+        ],
+        "type": "object"
+      },
+      "Status": {
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "digest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "oidc_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OidcReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourcePos"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "enabled",
+          "active"
         ],
         "type": "object"
       },
@@ -6748,6 +8422,42 @@
         ],
         "type": "object"
       },
+      "VerifiedApprovalIdentity": {
+        "oneOf": [
+          {
+            "properties": {
+              "issuer": {
+                "type": "string"
+              },
+              "state": {
+                "const": "VERIFIED",
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "issuer",
+              "subject"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "state": {
+                "const": "ERASED",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "WatchInfo": {
         "description": "A watch of a deployment (M11).",
         "properties": {
@@ -6960,6 +8670,51 @@
         ],
         "type": "object"
       },
+      "WebhookStatus": {
+        "properties": {
+          "cursor": {
+            "$ref": "#/components/schemas/SourcePos"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "gaps": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "enabled",
+          "cursor",
+          "gaps"
+        ],
+        "type": "object"
+      },
+      "WebhooksResponse": {
+        "properties": {
+          "webhooks": {
+            "items": {
+              "$ref": "#/components/schemas/WebhookStatus"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "webhooks"
+        ],
+        "type": "object"
+      },
       "WriteSummary": {
         "properties": {
           "erased": {
@@ -6992,16 +8747,342 @@
         "description": "A token from `kronik token create`; required over TCP, optional on the Unix socket.",
         "scheme": "bearer",
         "type": "http"
+      },
+      "browserSession": {
+        "description": "Opaque admin-listener session; live mapped-token scopes/revocation and expiry are checked on every request. Cookie-authenticated writes require exact configured Origin and X-Kronik-CSRF from /v1/auth/session.",
+        "in": "cookie",
+        "name": "__Host-kronik-session",
+        "type": "apiKey"
       }
     }
   },
   "info": {
-    "description": "The daemon's API, versioned under /v1, on the Unix socket and, with a bearer token, over TCP (`--api-listen`). Every mutation requires `reason` and takes `dry_run`; every error is the stable error JSON. `x-kronik-scope` is the scope an operation needs; without a token, the socket's caller has every scope.",
+    "description": "The daemon's API, versioned under /v1, on the Unix socket and, with a bearer token, over TCP (`--api-listen`). The admin listener serves the same operations to bearer callers or OIDC sessions and the admin-only /v1/auth transport operations. Product mutations require reason and take dry_run; errors use the stable error JSON. x-kronik-scope declares the required scope.",
     "title": "Kronik JSON API",
     "version": "0.4.0-dev"
   },
   "openapi": "3.1.0",
   "paths": {
+    "/ui": {
+      "get": {
+        "operationId": "get_ui",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Embedded static admin asset. Never mounted on application routes."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Embedded admin UI",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "public"
+      },
+      "head": {
+        "operationId": "head_ui",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Embedded static admin asset. Never mounted on application routes."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Embedded admin UI headers",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "public"
+      }
+    },
+    "/ui/": {
+      "get": {
+        "operationId": "get_ui_index",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Embedded static admin asset. Never mounted on application routes."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Embedded admin UI",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "public"
+      },
+      "head": {
+        "operationId": "head_ui_index",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Embedded static admin asset. Never mounted on application routes."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Embedded admin UI headers",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "public"
+      }
+    },
+    "/ui/app.css": {
+      "get": {
+        "operationId": "get_ui_app_css",
+        "responses": {
+          "200": {
+            "content": {
+              "text/css; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Embedded static admin asset. Never mounted on application routes."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Embedded admin UI stylesheet",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "public"
+      },
+      "head": {
+        "operationId": "head_ui_app_css",
+        "responses": {
+          "200": {
+            "content": {
+              "text/css; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Embedded static admin asset. Never mounted on application routes."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Embedded admin UI stylesheet headers",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "public"
+      }
+    },
+    "/ui/app.js": {
+      "get": {
+        "operationId": "get_ui_app_js",
+        "responses": {
+          "200": {
+            "content": {
+              "text/javascript; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Embedded static admin asset. Never mounted on application routes."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Embedded admin UI script",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "public"
+      },
+      "head": {
+        "operationId": "head_ui_app_js",
+        "responses": {
+          "200": {
+            "content": {
+              "text/javascript; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Embedded static admin asset. Never mounted on application routes."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Embedded admin UI script headers",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "public"
+      }
+    },
+    "/ui/icon.svg": {
+      "get": {
+        "operationId": "get_ui_icon_svg",
+        "responses": {
+          "200": {
+            "content": {
+              "image/svg+xml": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Embedded static admin asset. Never mounted on application routes."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Embedded admin UI icon",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "public"
+      },
+      "head": {
+        "operationId": "head_ui_icon_svg",
+        "responses": {
+          "200": {
+            "content": {
+              "image/svg+xml": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Embedded static admin asset. Never mounted on application routes."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Embedded admin UI icon headers",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "public"
+      }
+    },
     "/v1/actors": {
       "get": {
         "operationId": "get_v1_actors",
@@ -7056,6 +9137,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Actors in kind/key order",
         "x-kronik-scope": "read"
       }
@@ -7103,6 +9193,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "An actor's metadata, key-value state and SQL tables",
         "x-kronik-scope": "read"
       }
@@ -7168,6 +9267,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "An actor's turns, newest first",
         "x-kronik-scope": "read"
       }
@@ -7191,6 +9299,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -7225,6 +9353,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Send an operator message and wait for its turn",
         "x-kronik-scope": "operate"
       }
@@ -7272,6 +9409,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "An actor's pending timers",
         "x-kronik-scope": "read"
       }
@@ -7321,8 +9467,379 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The audit lines of main's log (kronik.audit/v2), as an audit sink receives them",
         "x-kronik-scope": "admin"
+      }
+    },
+    "/v1/auth/callback": {
+      "get": {
+        "operationId": "get_v1_auth_callback",
+        "parameters": [
+          {
+            "description": "The provider's single-use authorization code.",
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The exact browser-bound state issued by login.",
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "When present, must exactly equal the configured issuer.",
+            "in": "query",
+            "name": "iss",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Provider denial; no session is created.",
+            "in": "query",
+            "name": "error",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "See Other. Login binds the browser transaction; callback installs the opaque cookie.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Set-Cookie": {
+                "description": "Host-only HttpOnly Secure SameSite=Lax login/session cookie.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Consume the single-use OIDC code and browser-bound state (admin listener)",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "public"
+      }
+    },
+    "/v1/auth/config": {
+      "get": {
+        "operationId": "get_v1_auth_config",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Durably admitted authentication profile source and activation status",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "admin"
+      },
+      "put": {
+        "operationId": "put_v1_auth_config",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Change"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Changed"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Admit a typed authentication profile; null explicitly disables it",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "admin"
+      }
+    },
+    "/v1/auth/login": {
+      "get": {
+        "operationId": "get_v1_auth_login",
+        "responses": {
+          "303": {
+            "description": "See Other. Login binds the browser transaction; callback installs the opaque cookie.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Set-Cookie": {
+                "description": "Host-only HttpOnly Secure SameSite=Lax login/session cookie.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Begin browser-bound OIDC authorization code with PKCE, state and nonce (admin listener)",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "public"
+      }
+    },
+    "/v1/auth/logout": {
+      "post": {
+        "operationId": "post_v1_auth_logout",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Revoke this browser session; cookie authentication requires Origin and X-Kronik-CSRF",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "authenticated"
+      }
+    },
+    "/v1/auth/session": {
+      "get": {
+        "operationId": "get_v1_auth_session",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionInfo"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Current browser session or bearer identity and live scopes (admin listener)",
+        "x-kronik-listener": "admin",
+        "x-kronik-scope": "public"
+      }
+    },
+    "/v1/cluster/status": {
+      "get": {
+        "operationId": "get_v1_cluster_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterStatusResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Ordinary cluster observations, or the actual native non-member response",
+        "x-kronik-scope": "read"
       }
     },
     "/v1/dead-letters": {
@@ -7370,6 +9887,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Failed inputs and uncertain effect outcomes",
         "x-kronik-scope": "read"
       }
@@ -7385,6 +9911,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -7419,6 +9965,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Resend a dead letter as a new root input",
         "x-kronik-scope": "operate"
       }
@@ -7448,11 +10003,42 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Every deployment, oldest first, with its epoch, cause, code and caller",
         "x-kronik-scope": "read"
       },
       "post": {
         "operationId": "post_v1_deployments",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -7485,6 +10071,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Deploy a component as a new actor type (a kind without history)",
         "x-kronik-scope": "promote"
       }
@@ -7500,6 +10095,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -7534,6 +10149,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Roll back a deployment by replay: a proposal with the old code's state and the irreversible effects (needs pii:read besides x-kronik-scope)",
         "x-kronik-scope": "propose"
       }
@@ -7549,6 +10173,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -7583,6 +10227,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Switch back to the code in force before a deployment",
         "x-kronik-scope": "promote"
       }
@@ -7598,6 +10251,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -7632,8 +10305,380 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Watch a deployment's error rate and latency; alert or roll back on a guard",
         "x-kronik-scope": "promote"
+      }
+    },
+    "/v1/events": {
+      "get": {
+        "operationId": "get_v1_events",
+        "parameters": [
+          {
+            "description": "Compact kronik.events-cursor/v1 JSON, or the Last-Event-ID header.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "One actual configured actor-native, actor-N or metadata source; defaults to the first configured source.",
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Events per page, 1 to 256; default 100.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Bounded typed resume cursor; never a cross-source global LSN.",
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Read safe operational events at typed source positions",
+        "x-kronik-scope": "admin"
+      }
+    },
+    "/v1/events/schemas": {
+      "get": {
+        "operationId": "get_v1_events_schemas",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Published versioned operational event schema registry",
+        "x-kronik-scope": "admin"
+      }
+    },
+    "/v1/events/stream": {
+      "get": {
+        "operationId": "get_v1_events_stream",
+        "parameters": [
+          {
+            "description": "Resume cursor, or the Last-Event-ID header; gaps are explicit.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "One actual configured source; omission follows all configured sources.",
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded typed resume cursor; never a cross-source global LSN.",
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                },
+                "x-kronik-event-schema": {
+                  "$ref": "#/components/schemas/Event"
+                }
+              }
+            },
+            "description": "Long-lived SSE; event, typed cursor and explicit gap frames with backpressure and live revocation."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "SSE events and typed resume cursors; no cross-source total order",
+        "x-kronik-scope": "admin"
+      }
+    },
+    "/v1/events/webhooks": {
+      "get": {
+        "operationId": "get_v1_events_webhooks",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhooksResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Durable configured webhook delivery progress",
+        "x-kronik-scope": "admin"
+      }
+    },
+    "/v1/events/webhooks/{name}/replay": {
+      "post": {
+        "operationId": "post_v1_events_webhooks_name_replay",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplayRequest2"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplayResponse2"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Authorized audited replay without changing event identity",
+        "x-kronik-scope": "admin"
+      }
+    },
+    "/v1/events/ws": {
+      "get": {
+        "operationId": "get_v1_events_ws",
+        "parameters": [
+          {
+            "description": "Typed per-source resume cursor; gaps are explicit.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "One actual configured source; omission follows all configured sources.",
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded typed resume cursor; never a cross-source global LSN.",
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade; bounded operational event, typed cursor and gap frames.",
+            "x-kronik-event-schema": {
+              "$ref": "#/components/schemas/Event"
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Bounded WebSocket operational events with live revocation",
+        "x-kronik-scope": "admin"
       }
     },
     "/v1/export": {
@@ -7661,6 +10706,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The export streams (traces, audit): sink scheme and host, cursor, lag, last success and error code, gaps",
         "x-kronik-scope": "read"
       }
@@ -7676,6 +10730,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -7710,8 +10784,195 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Move an export stream's cursor back to resend from after `to` (writes an AuditEvent export.rewind)",
         "x-kronik-scope": "operate"
+      }
+    },
+    "/v1/fleet": {
+      "get": {
+        "operationId": "get_v1_fleet",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FleetStatus"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Show durable fleet enrollment and current local admission",
+        "x-kronik-scope": "admin"
+      }
+    },
+    "/v1/fleet/enroll": {
+      "post": {
+        "operationId": "post_v1_fleet_enroll",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FleetEnrollRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FleetStatus"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Enroll through pinned TLS; dry-run is local only",
+        "x-kronik-scope": "admin"
+      }
+    },
+    "/v1/fleet/revoke": {
+      "post": {
+        "operationId": "post_v1_fleet_revoke",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FleetRevokeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FleetStatus"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Durably revoke fleet admission and cancel old channels",
+        "x-kronik-scope": "admin"
       }
     },
     "/v1/foreign": {
@@ -7739,11 +11000,42 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The foreign actors and their status",
         "x-kronik-scope": "read"
       },
       "post": {
         "operationId": "post_v1_foreign",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -7776,6 +11068,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Add a foreign actor: a Linux program from an OCI image in gVisor",
         "x-kronik-scope": "operate"
       }
@@ -7791,6 +11092,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -7825,6 +11146,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Remove a foreign actor",
         "x-kronik-scope": "operate"
       },
@@ -7862,6 +11192,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "A foreign actor and its status",
         "x-kronik-scope": "read"
       }
@@ -7910,6 +11249,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "A foreign actor's recent log lines",
         "x-kronik-scope": "operate"
       }
@@ -7939,11 +11287,42 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The forks, those of proposals included",
         "x-kronik-scope": "read"
       },
       "post": {
         "operationId": "post_v1_forks",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -7976,6 +11355,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Fork main at an LSN, a logical time or now",
         "x-kronik-scope": "fork"
       }
@@ -7991,6 +11379,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -8025,6 +11433,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Delete a fork and its state",
         "x-kronik-scope": "fork"
       }
@@ -8056,6 +11473,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -8090,6 +11527,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Run one message in a fork",
         "x-kronik-scope": "fork"
       }
@@ -8105,6 +11551,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -8139,6 +11605,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Deploy a component in a fork",
         "x-kronik-scope": "fork"
       }
@@ -8192,6 +11667,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "A fork's behavior diff",
         "x-kronik-scope": "read"
       }
@@ -8207,6 +11691,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -8241,6 +11745,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Replay root inputs through a fork's code and write its diff",
         "x-kronik-scope": "fork"
       }
@@ -8281,11 +11794,42 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The capabilities granted to actor types",
         "x-kronik-scope": "read"
       },
       "post": {
         "operationId": "post_v1_grants",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -8318,6 +11862,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Grant an actor type a capability",
         "x-kronik-scope": "operate"
       }
@@ -8325,6 +11878,28 @@
     "/v1/grants/revoke": {
       "post": {
         "operationId": "post_v1_grants_revoke",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -8357,6 +11932,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Revoke a capability",
         "x-kronik-scope": "operate"
       }
@@ -8386,6 +11970,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The daemon's version, engine, applied LSN and gateway address",
         "x-kronik-scope": "read"
       }
@@ -8426,6 +12019,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The applied LSN, the state hash and a hash of the log, to compare after a restore",
         "x-kronik-scope": "read"
       }
@@ -8455,6 +12057,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The master key source and provider version, never key material",
         "x-kronik-scope": "read"
       }
@@ -8462,6 +12073,28 @@
     "/v1/keys/rewrap": {
       "post": {
         "operationId": "post_v1_keys_rewrap",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -8494,6 +12127,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Wrap the current master seed under the provider's current key version",
         "x-kronik-scope": "admin"
       }
@@ -8534,11 +12176,42 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The limits of actor types",
         "x-kronik-scope": "read"
       },
       "post": {
         "operationId": "post_v1_limits",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -8571,6 +12244,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Set an actor type's limits",
         "x-kronik-scope": "operate"
       }
@@ -8600,6 +12282,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "This document",
         "x-kronik-scope": "read"
       }
@@ -8640,6 +12331,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Orphaned changes: a callee's committed change whose caller failed",
         "x-kronik-scope": "read"
       }
@@ -8669,11 +12369,42 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The policy rules in force",
         "x-kronik-scope": "read"
       },
       "put": {
         "operationId": "put_v1_policy",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -8706,6 +12437,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Replace the policy rules",
         "x-kronik-scope": "admin"
       }
@@ -8713,6 +12453,28 @@
     "/v1/policy/test": {
       "post": {
         "operationId": "post_v1_policy_test",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -8745,6 +12507,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Evaluate rules against a proposal's or a fork's diff",
         "x-kronik-scope": "read"
       }
@@ -8774,11 +12545,42 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The previews that have not expired",
         "x-kronik-scope": "read"
       },
       "post": {
         "operationId": "post_v1_previews",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -8811,6 +12613,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Create a preview: a fork of HEAD with a proposal's code that takes new requests",
         "x-kronik-scope": "fork"
       }
@@ -8826,6 +12637,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -8860,6 +12691,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Delete a preview and its state",
         "x-kronik-scope": "fork"
       }
@@ -8889,6 +12729,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Privacy mode, its epoch and the keystore's counts",
         "x-kronik-scope": "read"
       }
@@ -8896,6 +12745,28 @@
     "/v1/privacy/erase": {
       "post": {
         "operationId": "post_v1_privacy_erase",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -8928,6 +12799,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Erase a subject: its keys, then its state values and SQL rows",
         "x-kronik-scope": "operate"
       }
@@ -8935,6 +12815,28 @@
     "/v1/privacy/mode": {
       "post": {
         "operationId": "post_v1_privacy_mode",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -8967,6 +12869,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Turn privacy mode on or off",
         "x-kronik-scope": "operate"
       }
@@ -8974,6 +12885,28 @@
     "/v1/privacy/reseal": {
       "post": {
         "operationId": "post_v1_privacy_reseal",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -9006,6 +12939,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Seal history written while privacy mode was off, and tombstone erased subjects",
         "x-kronik-scope": "operate"
       }
@@ -9035,11 +12977,42 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The proposals",
         "x-kronik-scope": "read"
       },
       "post": {
         "operationId": "post_v1_proposals",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -9072,6 +13045,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Propose new code: fork, replay recent traffic, diff and evaluate the policy",
         "x-kronik-scope": "propose"
       }
@@ -9111,6 +13093,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "A proposal with its policy outcome, summary and approval requests",
         "x-kronik-scope": "read"
       }
@@ -9126,13 +13117,33 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ResendRequest"
+                "$ref": "#/components/schemas/ApproveRequest"
               }
             }
           },
@@ -9160,6 +13171,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Approve a proposal's diff",
         "x-kronik-scope": "approve"
       }
@@ -9213,6 +13233,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "A proposal's behavior diff",
         "x-kronik-scope": "read"
       }
@@ -9228,6 +13257,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -9262,6 +13311,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Switch to a proposal's code, after catch-up",
         "x-kronik-scope": "promote"
       }
@@ -9277,6 +13335,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -9311,6 +13389,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Record a pending request for a human's approval",
         "x-kronik-scope": "propose"
       }
@@ -9340,7 +13427,54 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Secrets: names, versions and version hashes, never values",
+        "x-kronik-scope": "read"
+      }
+    },
+    "/v1/secrets/backends": {
+      "get": {
+        "operationId": "get_v1_secrets_backends",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretBackendsResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Trusted backend bindings and retained-inventory readiness",
         "x-kronik-scope": "read"
       }
     },
@@ -9355,6 +13489,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -9389,6 +13543,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Delete every version of a secret",
         "x-kronik-scope": "operate"
       },
@@ -9402,6 +13565,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -9436,7 +13619,296 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Store a secret, or a new version of it",
+        "x-kronik-scope": "operate"
+      }
+    },
+    "/v1/secrets/{name}/history": {
+      "get": {
+        "operationId": "get_v1_secrets_name_history",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretHistoryResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Committed secret identities and publication outcomes, never values",
+        "x-kronik-scope": "read"
+      }
+    },
+    "/v1/secrets/{name}/link": {
+      "delete": {
+        "operationId": "delete_v1_secrets_name_link",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretDeleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretLinkResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Return a name to the built-in source",
+        "x-kronik-scope": "admin"
+      },
+      "put": {
+        "operationId": "put_v1_secrets_name_link",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretLinkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretLinkResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Bind a name to a trusted external secret reference",
+        "x-kronik-scope": "admin"
+      }
+    },
+    "/v1/secrets/{name}/refresh": {
+      "post": {
+        "operationId": "post_v1_secrets_name_refresh",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretRefreshRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Observe the current immutable source version",
         "x-kronik-scope": "operate"
       }
     },
@@ -9465,6 +13937,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The effect simulators and each target's simulator configuration",
         "x-kronik-scope": "read"
       }
@@ -9480,6 +13961,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -9514,6 +14015,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Set a target's stub rules, contract, neighbor and model simulators",
         "x-kronik-scope": "operate"
       }
@@ -9543,11 +14053,42 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Snapshots of main, newest first",
         "x-kronik-scope": "read"
       },
       "post": {
         "operationId": "post_v1_snapshots",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -9580,6 +14121,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Take a snapshot now (state, actor databases, secrets at one LSN)",
         "x-kronik-scope": "operate"
       }
@@ -9609,11 +14159,42 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "The tokens, live and revoked, without the tokens themselves",
         "x-kronik-scope": "admin"
       },
       "post": {
         "operationId": "post_v1_tokens",
+        "parameters": [
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -9646,6 +14227,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Create an API token; the token is in the answer, once",
         "x-kronik-scope": "admin"
       }
@@ -9661,6 +14251,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -9695,6 +14305,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Revoke a token",
         "x-kronik-scope": "admin"
       }
@@ -9734,6 +14353,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "A turn record as JSON, on main or in a fork",
         "x-kronik-scope": "read"
       }
@@ -9773,6 +14401,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "A turn's causal tree: its root input, ancestors and descendants",
         "x-kronik-scope": "read"
       }
@@ -9802,6 +14439,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "List the watches",
         "x-kronik-scope": "read"
       }
@@ -9841,6 +14487,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "A watch: its status, the guards that fired and the last metrics",
         "x-kronik-scope": "read"
       }
@@ -9856,6 +14511,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
           }
         ],
         "requestBody": {
@@ -9890,6 +14565,15 @@
             "description": "An error: the stable error JSON."
           }
         },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
         "summary": "Stop a watch: it alerts and rolls back no more",
         "x-kronik-scope": "promote"
       }

@@ -16,10 +16,7 @@ pub fn ed25519_key(seed: &[u8; 32]) -> Result<KeyPair, rcgen::Error> {
     let mut der = Zeroizing::new([0; 48]);
     der[..16].copy_from_slice(&PKCS8_PREFIX);
     der[16..].copy_from_slice(seed);
-    KeyPair::from_pkcs8_der_and_sign_algo(
-        &PrivatePkcs8KeyDer::from(&der[..]),
-        &rcgen::PKCS_ED25519,
-    )
+    KeyPair::from_pkcs8_der_and_sign_algo(&PrivatePkcs8KeyDer::from(&der[..]), &rcgen::PKCS_ED25519)
 }
 
 /// A locally owned TLS leaf key. Persistence belongs to its caller's secure custody.

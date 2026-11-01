@@ -719,7 +719,9 @@ impl follow::Sink for AuditExport {
         let mut body = Vec::new();
         let mut restored = false;
         for (source, c) in records {
-            if source.lsn != c.lsn || source.shard.is_some() { return Err("STORAGE_CORRUPT".into()); }
+            if source.lsn != c.lsn || source.shard.is_some() {
+                return Err("STORAGE_CORRUPT".into());
+            }
             restored |=
                 matches!(&c.record, kronik_proto::Record::AuditEvent(e) if e.action == "restore");
             for l in self
@@ -769,7 +771,12 @@ impl follow::Sink for AuditExport {
         }
     }
 
-    async fn rewind(&mut self, to: Lsn, generation: Generation, _reader: &kronik_sched::ShardReader) -> Result<(), String> {
+    async fn rewind(
+        &mut self,
+        to: Lsn,
+        generation: Generation,
+        _reader: &kronik_sched::ShardReader,
+    ) -> Result<(), String> {
         self.node
             .retention_hold()
             .rewind(generation, to, self.node.env().clock.wall_ms());
@@ -1026,12 +1033,26 @@ mod tests {
             .unwrap();
             let (snapshot, publication) = node.native_secret_snapshot_with_publication().unwrap();
             let reader = Arc::new(rt.block_on(node.capture_system_export_reader()).unwrap());
-            let retained = follow::RetainedDisclosure::native(reader.clone(), snapshot.clone(), publication, original);
-            let records = rt.block_on(reader.local_export_page(from - 1, 256, follow::BATCH_BYTES)).unwrap().records;
-            let prepared = rt.block_on(follow::Sink::prepare(
-                export, &records, generation, &reader, &snapshot, retained.clone(),
-            ))
-            .unwrap();
+            let retained = follow::RetainedDisclosure::native(
+                reader.clone(),
+                snapshot.clone(),
+                publication,
+                original,
+            );
+            let records = rt
+                .block_on(reader.local_export_page(from - 1, 256, follow::BATCH_BYTES))
+                .unwrap()
+                .records;
+            let prepared = rt
+                .block_on(follow::Sink::prepare(
+                    export,
+                    &records,
+                    generation,
+                    &reader,
+                    &snapshot,
+                    retained.clone(),
+                ))
+                .unwrap();
             (prepared, retained)
         }
         let data = tempfile::tempdir().unwrap();
@@ -1051,6 +1072,7 @@ mod tests {
             .block_on(start_local(env, data.path(), NodeConfig::default()))
             .unwrap();
         let original = node.local_operator_authority().unwrap();
+        settled(&rt, &node);
         let remote =
             kronik_ship::Remote::open(&format!("file://{}", objects.path().display()), None)
                 .unwrap();
@@ -1089,7 +1111,11 @@ mod tests {
             b"earlier publication\n"
         );
         assert_eq!(
-            rt.block_on(follow::Sink::deliver(&mut export, &first, first_guard.clone())),
+            rt.block_on(follow::Sink::deliver(
+                &mut export,
+                &first,
+                first_guard.clone()
+            )),
             Delivery::Delivered
         );
         assert_eq!(node.retention_hold().floor(), Some(0));
@@ -1100,7 +1126,11 @@ mod tests {
         export = make_export(None);
         let (mut second, second_guard) = batch(&rt, &node, &mut export, [2; 16], original.clone());
         assert_eq!(
-            rt.block_on(follow::Sink::deliver(&mut export, &second, second_guard.clone())),
+            rt.block_on(follow::Sink::deliver(
+                &mut export,
+                &second,
+                second_guard.clone()
+            )),
             Delivery::Delivered
         );
         let line = |sequence| {
@@ -1112,7 +1142,11 @@ mod tests {
         assert_eq!(line(3).at_wall_ms, 1);
         second.generation = [3; 16];
         assert_eq!(
-            rt.block_on(follow::Sink::deliver(&mut export, &second, second_guard.clone())),
+            rt.block_on(follow::Sink::deliver(
+                &mut export,
+                &second,
+                second_guard.clone()
+            )),
             Delivery::Delivered
         );
         assert_eq!(line(3), line(4));
@@ -1128,13 +1162,21 @@ mod tests {
         std::fs::rename(&namespace, &saved).unwrap();
         std::fs::write(&namespace, b"temporarily blocked").unwrap();
         assert!(matches!(
-            rt.block_on(follow::Sink::deliver(&mut export, &second, second_guard.clone())),
+            rt.block_on(follow::Sink::deliver(
+                &mut export,
+                &second,
+                second_guard.clone()
+            )),
             Delivery::Retry { .. }
         ));
         std::fs::remove_file(&namespace).unwrap();
         std::fs::rename(&saved, &namespace).unwrap();
         assert_eq!(
-            rt.block_on(follow::Sink::deliver(&mut export, &second, second_guard.clone())),
+            rt.block_on(follow::Sink::deliver(
+                &mut export,
+                &second,
+                second_guard.clone()
+            )),
             Delivery::Delivered
         );
         assert!(objects.path().join(object_name(5)).is_file());
@@ -1158,10 +1200,19 @@ mod tests {
         for occupied in [None, Some(5)] {
             let mut stopped = make_export(occupied);
             assert!(matches!(
-                rt.block_on(follow::Sink::deliver(&mut stopped, &second, second_guard.clone())),
+                rt.block_on(follow::Sink::deliver(
+                    &mut stopped,
+                    &second,
+                    second_guard.clone()
+                )),
                 Delivery::Retry { .. }
             ));
-            let Target::S3 { occupied: after, .. } = stopped.target else { unreachable!() };
+            let Target::S3 {
+                occupied: after, ..
+            } = stopped.target
+            else {
+                unreachable!()
+            };
             assert_eq!(after, occupied);
         }
         assert!(!objects.path().join(object_name(6)).exists());
@@ -1178,12 +1229,19 @@ mod tests {
             gap_coverage: None,
         };
         assert!(matches!(
-            rt.block_on(follow::Sink::deliver(&mut stopped, &second, second_guard.clone())),
+            rt.block_on(follow::Sink::deliver(
+                &mut stopped,
+                &second,
+                second_guard.clone()
+            )),
             Delivery::Retry { .. }
         ));
         assert!(!dir.exists());
         let before = node.applied_lsn();
-        assert!(rt.block_on(follow::Sink::gap(&mut stopped, 1, 1, original)).is_err());
+        assert!(
+            rt.block_on(follow::Sink::gap(&mut stopped, 1, 1, original))
+                .is_err()
+        );
         assert_eq!(node.applied_lsn(), before);
     }
 
@@ -1343,7 +1401,8 @@ mod tests {
             "/../../tests/guests/counter.wasm",
         ))
         .unwrap();
-        rt.block_on(node.deploy(&wasm, audit(), false, original.clone())).unwrap();
+        rt.block_on(node.deploy(&wasm, audit(), false, original.clone()))
+            .unwrap();
         let mut writer = FileWriter {
             dir: out.path().join("audit"),
             max_bytes: 1024,
@@ -1377,7 +1436,8 @@ mod tests {
             target: Target::File(writer),
             gap_coverage: None,
         };
-        rt.block_on(follow::Sink::rewind(&mut export, 0, [1; 16]))
+        let reader = rt.block_on(node.capture_system_export_reader()).unwrap();
+        rt.block_on(follow::Sink::rewind(&mut export, 0, [1; 16], &reader))
             .unwrap();
         let empty = Batch {
             first: 1,
@@ -1524,6 +1584,49 @@ mod tests {
         );
     }
 
+    /// A deterministic keyed sealer for line identity outside a node.
+    fn test_sealer() -> &'static kronik_privacy::sealer::Sealer {
+        static SEALER: std::sync::OnceLock<kronik_privacy::sealer::Sealer> =
+            std::sync::OnceLock::new();
+        SEALER.get_or_init(|| {
+            let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+            let owner = kronik_privacy::key_source::lock_data(dir.path()).unwrap();
+            let (master, _) = kronik_privacy::MasterKey::open(
+                &dir.path().join("master.key"),
+                dir.path(),
+                Some([7; 32]),
+            )
+            .unwrap();
+            let keystore = kronik_privacy::keystore::Keystore::open_owned(&owner, &master).unwrap();
+            let pseudonyms = kronik_privacy::keystore::Pseudonyms::new(&master).unwrap();
+            kronik_privacy::sealer::Sealer::new(keystore).with_pseudonyms(pseudonyms)
+        })
+    }
+
+    /// The node's detached initial secret refresh retires a certificate
+    /// captured before it settles; wait until a fresh one stays current.
+    fn settled(rt: &tokio::runtime::Runtime, node: &kronik_sched::Node) {
+        rt.block_on(async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Ok((_, publication)) = node.native_secret_snapshot_with_publication() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    if publication.check_current().is_ok()
+                        && publication.data_is_current_under_publication()
+                    {
+                        return;
+                    }
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the initial secret refresh did not settle"
+                );
+            }
+        });
+    }
+
     /// Review R5: logrotate's `create` (the file renamed away, an empty one
     /// made under its name) and `copytruncate` (the file cut to 0) leave a
     /// file shorter than the sink recorded. The next batch starts a new
@@ -1548,6 +1651,7 @@ mod tests {
                 branch: "main",
                 keys: &ActorKeys::Omit,
                 subject: &|s: &str| s.to_owned(),
+                sealer: test_sealer(),
                 secrets: &[],
             };
             (

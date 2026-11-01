@@ -26,16 +26,19 @@ fn propose(
     let bytes = std::fs::read(guest(wasm)).unwrap();
     p.settle();
     let (prop, dry) =
-        p.rt.block_on(props.propose(ProposeRequest {
-            wasm: vec![bytes],
-            names: Vec::new(),
-            window_ms: None,
-            at: None,
-            options,
-            workers: Some(2),
-            audit: audit(),
-            dry_run: false,
-        }))
+        p.rt.block_on(props.propose(
+            ProposeRequest {
+                wasm: vec![bytes],
+                names: Vec::new(),
+                window_ms: None,
+                at: None,
+                options,
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
         .unwrap();
     assert!(!dry);
     prop
@@ -65,7 +68,7 @@ fn promote_runs_catch_up_switches_code_and_rollback_restores_it() {
     }
     let before_switch = p.settle();
     let r =
-        p.rt.block_on(props.promote(&prop.id, audit(), false))
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();
     assert!(
         r.verified_through_lsn >= before_switch,
@@ -129,7 +132,7 @@ fn promote_runs_catch_up_switches_code_and_rollback_restores_it() {
 
     // Rollback restores the old behaviour: 17 + 1.
     let (epoch, _, kinds) =
-        p.rt.block_on(props.rollback(r.epoch, audit(), false))
+        p.rt.block_on(props.rollback(r.epoch, audit(), false, p.owner()))
             .unwrap();
     assert_eq!(kinds.len(), 1);
     let (_, d) = last_deployment(&p);
@@ -145,7 +148,7 @@ fn promote_runs_catch_up_switches_code_and_rollback_restores_it() {
     let md = String::from_utf8(p.rt.block_on(again.diff(&prop.id, true, false)).unwrap()).unwrap();
     assert!(md.contains("# Behavior diff"), "{md}");
     assert!(
-        p.rt.block_on(again.promote(&prop.id, audit(), false))
+        p.rt.block_on(again.promote(&prop.id, audit(), false, p.owner()))
             .is_err()
     );
 }
@@ -161,12 +164,12 @@ fn rollback_refuses_when_the_schema_version_was_raised() {
     let prop = propose(&p, &props, "counter-schema1", DiffOptions::default());
     assert_eq!(prop.policy["outcome"], "allow", "{}", prop.policy);
     let r =
-        p.rt.block_on(props.promote(&prop.id, audit(), false))
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();
     // The promote raised the schema version 0 -> 1: rolling it back would
     // move the schema version over already-migrated state.
     let err =
-        p.rt.block_on(props.rollback(r.epoch, audit(), false))
+        p.rt.block_on(props.rollback(r.epoch, audit(), false, p.owner()))
             .unwrap_err();
     assert_eq!(
         err.code,
@@ -206,7 +209,7 @@ fn a_catch_up_that_finds_a_new_error_stops_promote() {
     assert_eq!(prop.policy["outcome"], "allow", "{}", prop.policy);
     p.send("counter/a", "get", "");
     let err =
-        p.rt.block_on(props.promote(&prop.id, audit(), false))
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::PolicyDenied, "{}", err.message);
     assert!(err.message.contains("no-new-errors"), "{}", err.message);
@@ -243,17 +246,17 @@ fn approximate_effects_need_an_approval_for_promote() {
         "low-grounding-needs-approval"
     );
     let err =
-        p.rt.block_on(props.promote(&prop.id, audit(), false))
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::ApprovalRequired, "{}", err.message);
     let (approved, _) =
-        p.rt.block_on(props.approve(&prop.id, audit(), false))
+        p.rt.block_on(props.approve(&prop.id, audit(), false, None, p.owner()))
             .unwrap();
     assert!(approved.lsn > 0);
     let approvals = p.node.store().db().approvals(&prop.id).unwrap();
     assert_eq!(approvals.len(), 1);
     let r =
-        p.rt.block_on(props.promote(&prop.id, audit(), false))
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();
     assert!(r.epoch > 0);
     // No replay or catch-up reached the service.
@@ -293,7 +296,7 @@ fn payments_full_coverage_stops_promote_under_a_sample() {
     assert_eq!(prop.status, "rejected");
     assert!(prop.summary["sample"].as_f64().unwrap() < 1.0);
     let err =
-        p.rt.block_on(props.promote(&prop.id, audit(), false))
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap_err();
     assert_eq!(err.code, ErrorCode::PolicyDenied);
     // The same proposal samples the same inputs: its diff is stable.
@@ -327,12 +330,21 @@ fn messages_into_a_fork_reach_the_network_only_as_allowlisted_gets() {
     let p = Proc::start(dir.path());
     p.grant("http:127.0.0.1");
     let fork_lsn = p.settle();
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
-        .unwrap()
-        .with_live_allowlist(vec!["127.0.0.1".into()]);
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_live_allowlist(vec!["127.0.0.1".into()]),
+    );
     let (f, _) =
-        p.rt.block_on(props.create_fork(Some("probe".into()), fork_lsn, true, audit(), false))
-            .unwrap();
+        p.rt.block_on(props.create_fork(
+            Some("probe".into()),
+            fork_lsn,
+            true,
+            audit(),
+            false,
+            p.owner(),
+        ))
+        .unwrap();
     assert!(f.options.no_pii);
     let send = |body: String| {
         let m = pb::Message {
@@ -343,7 +355,8 @@ fn messages_into_a_fork_reach_the_network_only_as_allowlisted_gets() {
             retained_compensation_source: None,
         };
         let actor = kronik_core::ids::ActorRef::parse("counter/x").unwrap();
-        p.rt.block_on(props.fork_send("probe", actor, m)).unwrap()
+        p.rt.block_on(props.fork_send("probe", actor, m, p.owner()))
+            .unwrap()
     };
     // A POST to an allowlisted host stays FailClosed.
     let t = send(format!("POST http://{addr}/charge\n\nx"));
@@ -386,7 +399,7 @@ fn a_schema_change_migrates_in_catch_up_and_in_production_after_promote() {
     // A new actor after the proposal: catch-up migrates it in the fork.
     p.http("c", "increment", "");
     p.settle();
-    p.rt.block_on(props.promote(&prop.id, audit(), false))
+    p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
         .unwrap();
     let mut migrations = Vec::new();
     let mut lsn = prop.fork_lsn + 3;
@@ -445,6 +458,7 @@ fn inputs_inside_the_promote_gap_stay_unverified() {
         p.http("a", "increment", "");
     }
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let authority = p.node.local_operator_authority().unwrap();
     let mut senders = Vec::new();
     for i in 0..8 {
         let (node, actor, stop) = (
@@ -452,6 +466,7 @@ fn inputs_inside_the_promote_gap_stay_unverified() {
             kronik_core::ids::ActorRef::parse(&format!("counter/s{i}")).unwrap(),
             stop.clone(),
         );
+        let authority = authority.clone();
         senders.push(p.rt.spawn(async move {
             let m = pb::Message {
                 name: "increment".into(),
@@ -461,12 +476,14 @@ fn inputs_inside_the_promote_gap_stay_unverified() {
                 retained_compensation_source: None,
             };
             while !stop.load(Ordering::Relaxed) {
-                let _ = node.send(actor.clone(), m.clone(), audit(), false).await;
+                let _ = node
+                    .send(actor.clone(), m.clone(), audit(), false, authority.clone())
+                    .await;
             }
         }));
     }
     let r =
-        p.rt.block_on(props.promote(&prop.id, audit(), false))
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();
     stop.store(true, Ordering::Relaxed);
     for s in senders {
@@ -516,14 +533,18 @@ fn a_promote_or_approval_cut_short_is_recorded_on_the_proposal() {
     // The approval record is committed, the proposal's metadata is not.
     let prop = propose(&p, &props, "counter-step2", DiffOptions::default());
     let diff = std::fs::read(dir.path().join("branches").join(&prop.id).join("diff.json")).unwrap();
-    p.rt.block_on(p.node.record_approval(pb::Approval {
-        proposal_id: prop.id.clone(),
-        diff_hash: blake3::hash(&diff).as_bytes().to_vec(),
-        verified_through_lsn: prop.verified_through_lsn,
-        audit: Some(audit()),
-        request: false,
-        command: String::new(),
-    }))
+    p.rt.block_on(p.node.record_approval(
+        pb::Approval {
+            proposal_id: prop.id.clone(),
+            diff_hash: blake3::hash(&diff).as_bytes().to_vec(),
+            verified_through_lsn: prop.verified_through_lsn,
+            audit: Some(audit()),
+            request: false,
+            command: String::new(),
+            verified_identity: None,
+        },
+        p.owner(),
+    ))
     .unwrap();
     let got = p.rt.block_on(props.get(&prop.id)).unwrap();
     assert!(got.approved.is_some(), "{got:?}");
@@ -543,10 +564,11 @@ fn a_promote_or_approval_cut_short_is_recorded_on_the_proposal() {
             },
             audit(),
             false,
+            p.owner(),
         ))
         .unwrap();
     let err =
-        p.rt.block_on(props.promote(&prop.id, audit(), false))
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap_err();
     assert!(err.message.contains("already promoted"), "{err}");
     let got = p.rt.block_on(props.get(&prop.id)).unwrap();
@@ -584,6 +606,7 @@ fn held_job(
                 dry_run: false,
             },
             false,
+            p.owner(),
         ))
         .unwrap();
     assert!(!dry);
@@ -636,22 +659,26 @@ fn a_running_proposal_refuses_send_approve_request_approval_and_diff() {
     };
     let actor = || kronik_core::ids::ActorRef::parse("counter/a").unwrap();
     let running = ErrorCode::ProposalRunning;
-    let r = p.rt.block_on(props.fork_send(&id, actor(), msg()));
+    let r =
+        p.rt.block_on(props.fork_send(&id, actor(), msg(), p.owner()));
     assert_eq!(r.unwrap_err().code, running);
-    let r = p.rt.block_on(props.approve(&id, audit(), false));
+    let r =
+        p.rt.block_on(props.approve(&id, audit(), false, None, p.owner()));
     assert_eq!(r.unwrap_err().code, running);
-    let r = p.rt.block_on(props.request_approval(&id, audit(), false));
+    let r =
+        p.rt.block_on(props.request_approval(&id, audit(), false, p.owner()));
     assert_eq!(r.unwrap_err().code, running);
     let r = p.rt.block_on(props.diff(&id, false, false));
     assert_eq!(r.unwrap_err().code, running);
-    let r = p.rt.block_on(props.promote(&id, audit(), false));
+    let r = p.rt.block_on(props.promote(&id, audit(), false, p.owner()));
     assert_eq!(r.unwrap_err().code, running);
     assert!(props.progress(&id).is_some());
 
     finish(&props, &gate, &id);
     assert_eq!(p.rt.block_on(props.get(&id)).unwrap().status, "evaluated");
     p.rt.block_on(props.diff(&id, false, false)).unwrap();
-    p.rt.block_on(props.fork_send(&id, actor(), msg())).unwrap();
+    p.rt.block_on(props.fork_send(&id, actor(), msg(), p.owner()))
+        .unwrap();
 }
 
 /// Review L7: a job does not survive the daemon. A proposal still
@@ -669,9 +696,9 @@ fn a_proposal_running_at_a_restart_is_failed_and_refused() {
     assert_eq!(e.code, ErrorCode::Unavailable);
     assert!(e.message.contains("the daemon restarted"), "{e}");
     for err in [
-        p.rt.block_on(again.approve(&id, audit(), false))
+        p.rt.block_on(again.approve(&id, audit(), false, None, p.owner()))
             .unwrap_err(),
-        p.rt.block_on(again.promote(&id, audit(), false))
+        p.rt.block_on(again.promote(&id, audit(), false, p.owner()))
             .unwrap_err(),
     ] {
         assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
@@ -719,7 +746,7 @@ fn a_job_that_fails_leaves_the_proposal_failed() {
     );
     assert_eq!(events[1].audit.as_ref(), Some(&audit()));
     let e =
-        p.rt.block_on(props.promote(&id, audit(), false))
+        p.rt.block_on(props.promote(&id, audit(), false, p.owner()))
             .unwrap_err();
     assert_eq!(e.code, ErrorCode::BadRequest, "{e}");
 }
@@ -760,6 +787,7 @@ fn proposal_save_failure_never_publishes_or_starts_a_job() {
                 dry_run: false,
             },
             false,
+            p.owner(),
         ))
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::Internal, "{e}");

@@ -30,21 +30,24 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kronik_core::authority::AuthLease;
-use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::env::{Env, File, OpenMode};
+use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::Lsn;
 use kronik_proto::Record;
 use tokio::sync::{mpsc, oneshot};
 
 mod native_lifecycle;
-pub use native_lifecycle::NativeWriterState;
 use native_lifecycle::NativeInbox;
+pub use native_lifecycle::NativeWriterState;
 
 mod readset;
 pub use readset::CapturedLogReadset;
 
 mod metadata_audit;
-pub use metadata_audit::{MetadataAuditBatch, MetadataAuditRecord, MetadataAuditGap, MetadataAuditSource, MetadataWebhookKeyChange, MetadataWebhookReplay, MAX_METADATA_AUDIT_RECORDS};
+pub use metadata_audit::{
+    MAX_METADATA_AUDIT_RECORDS, MetadataAuditBatch, MetadataAuditGap, MetadataAuditRecord,
+    MetadataAuditSource, MetadataWebhookKeyChange, MetadataWebhookReplay,
+};
 
 pub const MAGIC: &[u8; 4] = b"KRNK";
 pub const FORMAT_VERSION: u32 = 1;
@@ -898,7 +901,11 @@ impl Log {
         for record in records {
             let (done, rx) = oneshot::channel();
             self.tx
-                .send(Append { record, done, _admission: AppendAdmission::System })
+                .send(Append {
+                    record,
+                    done,
+                    _admission: AppendAdmission::System,
+                })
                 .map_err(|_| LogError::Stopped("writer task ended".into()))?;
             waiting.push(rx);
         }
@@ -917,7 +924,11 @@ impl Log {
     pub async fn append(&self, record: Record) -> Result<Lsn, LogError> {
         let (done, rx) = oneshot::channel();
         self.tx
-            .send(Append { record, done, _admission: AppendAdmission::System })
+            .send(Append {
+                record,
+                done,
+                _admission: AppendAdmission::System,
+            })
             .map_err(|_| LogError::Stopped("writer task ended".into()))?;
         rx.await
             .map_err(|_| LogError::Stopped("writer task ended".into()))?
@@ -942,31 +953,46 @@ impl Log {
         let mut pending = Some(Append {
             record,
             done,
-            _admission: AppendAdmission::Authorized { _authority: authority.clone(), _slot: slot },
+            _admission: AppendAdmission::Authorized {
+                _authority: authority.clone(),
+                _slot: slot,
+            },
         });
         let mut stopped = false;
-        authority.admit(&mut || {
-            let append = pending.take().ok_or_else(|| ApiError::new(
-                ErrorCode::Internal, "Mutation authority admitted an operation more than once",
-            ))?;
-            self.tx.send(append).map_err(|_| {
-                stopped = true;
-                ApiError::new(ErrorCode::Unavailable, "Log writer stopped before mutation enqueue")
+        authority
+            .admit(&mut || {
+                let append = pending.take().ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::Internal,
+                        "Mutation authority admitted an operation more than once",
+                    )
+                })?;
+                self.tx.send(append).map_err(|_| {
+                    stopped = true;
+                    ApiError::new(
+                        ErrorCode::Unavailable,
+                        "Log writer stopped before mutation enqueue",
+                    )
+                })
             })
-        }).map_err(|error| {
-            if stopped {
-                AuthorizedAppendError::Storage(LogError::Stopped("writer task ended".into()))
-            } else {
-                AuthorizedAppendError::Authority(error)
-            }
-        })?;
+            .map_err(|error| {
+                if stopped {
+                    AuthorizedAppendError::Storage(LogError::Stopped("writer task ended".into()))
+                } else {
+                    AuthorizedAppendError::Authority(error)
+                }
+            })?;
         if pending.is_some() {
             return Err(AuthorizedAppendError::Authority(ApiError::new(
-                ErrorCode::Internal, "Mutation authority did not enqueue the operation",
+                ErrorCode::Internal,
+                "Mutation authority did not enqueue the operation",
             )));
         }
-        receive.await.map_err(|_| LogError::Stopped("writer task ended".into()))?
-            .map_err(LogError::Stopped).map_err(AuthorizedAppendError::Storage)
+        receive
+            .await
+            .map_err(|_| LogError::Stopped("writer task ended".into()))?
+            .map_err(LogError::Stopped)
+            .map_err(AuthorizedAppendError::Storage)
     }
 }
 
@@ -1220,7 +1246,8 @@ impl LogReader {
         upto: Lsn,
         mut f: impl FnMut(Committed) -> Result<bool, LogError>,
     ) -> Result<(), LogError> {
-        self.read_while_with_namespace(from, upto, |_, record| f(record)).await
+        self.read_while_with_namespace(from, upto, |_, record| f(record))
+            .await
     }
 
     /// Supplies the validated header namespace from the same held file as each CRC-checked frame.
@@ -1230,24 +1257,47 @@ impl LogReader {
         upto: Lsn,
         mut f: impl FnMut(&str, Committed) -> Result<bool, LogError>,
     ) -> Result<(), LogError> {
-        if from > upto || upto == 0 { return Ok(()); }
+        if from > upto || upto == 0 {
+            return Ok(());
+        }
         let starts = self.starts().await?;
         let mut expected = None;
         for (index, &start) in starts.iter().enumerate() {
-            if starts.get(index + 1).is_some_and(|&next| next <= from) { continue; }
-            if start > upto { break; }
+            if starts.get(index + 1).is_some_and(|&next| next <= from) {
+                continue;
+            }
+            if start > upto {
+                break;
+            }
             let path = self.dir.join(segment_name(start));
             let file = self.env.fs.open(path.clone(), OpenMode::Read).await?;
             let length = file.len().await?;
             let image = file.read_at(0, 24 + self.branch.len()).await?;
-            let header = parse_header(&image).ok_or_else(||
-                corrupt(format!("segment {} has no valid header", path.display())))?;
+            let header = parse_header(&image).ok_or_else(|| {
+                corrupt(format!("segment {} has no valid header", path.display()))
+            })?;
             if header.start_lsn != start || header.branch != self.branch {
-                return Err(corrupt(format!("segment {} header mismatch", path.display())));
+                return Err(corrupt(format!(
+                    "segment {} header mismatch",
+                    path.display()
+                )));
             }
-            let progress = readset::read_segment(file.as_ref(), length, &header, &path,
-                start, from, upto, index + 1 == starts.len(), expected, &mut f).await?;
-            if progress.stopped { return Ok(()); }
+            let progress = readset::read_segment(
+                file.as_ref(),
+                length,
+                &header,
+                &path,
+                start,
+                from,
+                upto,
+                index + 1 == starts.len(),
+                expected,
+                &mut f,
+            )
+            .await?;
+            if progress.stopped {
+                return Ok(());
+            }
             expected = Some(progress.next_lsn);
         }
         if upto != Lsn::MAX && expected.is_none_or(|next| next <= upto) {
@@ -1265,13 +1315,22 @@ impl LogReader {
 
     /// Reads the actual native header namespace and CRC-checked record from the
     /// SAME file. This does not accept another reader format or namespace alias.
-    pub async fn read_at_with_namespace(&self, pos: Position) -> Result<(String, Committed), LogError> {
+    pub async fn read_at_with_namespace(
+        &self,
+        pos: Position,
+    ) -> Result<(String, Committed), LogError> {
         let path = self.dir.join(segment_name(pos.segment));
         let file = self.env.fs.open(path, OpenMode::Read).await?;
         let image = file.read_at(0, 24 + self.branch.len()).await?;
-        let header = parse_header(&image).ok_or_else(|| corrupt(format!("invalid native segment header at {pos:?}")))?;
-        if header.start_lsn != pos.segment || header.branch != self.branch || pos.offset < header.len as u64 {
-            return Err(corrupt(format!("native segment header mismatch at {pos:?}")));
+        let header = parse_header(&image)
+            .ok_or_else(|| corrupt(format!("invalid native segment header at {pos:?}")))?;
+        if header.start_lsn != pos.segment
+            || header.branch != self.branch
+            || pos.offset < header.len as u64
+        {
+            return Err(corrupt(format!(
+                "native segment header mismatch at {pos:?}"
+            )));
         }
         let record = read_entry_at(file.as_ref(), pos).await?;
         Ok((header.branch, record))

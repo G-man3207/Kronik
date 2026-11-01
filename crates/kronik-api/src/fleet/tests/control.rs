@@ -12,7 +12,11 @@ enum ControllerStep {
     Enroll,
     Probe(tokio::sync::oneshot::Sender<bool>),
     Late(Arc<tokio::sync::Notify>, std::sync::mpsc::Receiver<()>),
-    Healthy(Arc<tokio::sync::Notify>, std::sync::mpsc::Receiver<()>, Zeroizing<String>),
+    Healthy(
+        Arc<tokio::sync::Notify>,
+        std::sync::mpsc::Receiver<()>,
+        Zeroizing<String>,
+    ),
     Finish,
 }
 
@@ -21,12 +25,19 @@ fn accept(listener: &std::net::TcpListener) -> std::net::TcpStream {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
-                stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
-                stream.set_write_timeout(Some(Duration::from_secs(15))).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(15)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(15)))
+                    .unwrap();
                 return stream;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(std::time::Instant::now() < deadline, "owned WSS controller accept deadline");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owned WSS controller accept deadline"
+                );
                 std::thread::sleep(Duration::from_millis(2));
             }
             Err(error) => panic!("owned WSS controller accept: {}", error.kind()),
@@ -43,10 +54,14 @@ fn request(stream: &mut TlsStream) -> (String, Zeroizing<Vec<u8>>) {
         header.push(byte[0]);
     }
     let header = String::from_utf8(header).unwrap();
-    let length = header.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
-    }).unwrap();
+    let length = header
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap();
     assert!((1..=enrollment::MAX_ENROLLMENT_BYTES).contains(&length));
     let mut body = Zeroizing::new(vec![0; length]);
     stream.read_exact(&mut body).unwrap();
@@ -62,30 +77,63 @@ fn response(socket: &mut tungstenite::WebSocket<TlsStream>) -> Vec<u8> {
             _ => panic!("HTTP response must remain on the binary byte tunnel"),
         }
         assert!(body.len() <= 128 << 10);
-        let Some(end) = body.windows(4).position(|bytes| bytes == b"\r\n\r\n").map(|at| at + 4) else { continue; };
+        let Some(end) = body
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .map(|at| at + 4)
+        else {
+            continue;
+        };
         let head = std::str::from_utf8(&body[..end]).unwrap();
-        let length = head.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
-        }).unwrap();
-        if body.len() == end + length { return body; }
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        if body.len() == end + length {
+            return body;
+        }
         assert!(body.len() < end + length);
     }
 }
 
-fn upgrade(stream: TlsStream, bearer: &str, record: &EnrollmentRecord)
-    -> tungstenite::WebSocket<TlsStream>
-{
-    match tungstenite::accept_hdr(stream, |request: &tungstenite::handshake::server::Request, response| {
-        assert_eq!(request.uri().path(), "/v1/control");
-        assert!(request.headers().get("authorization").and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.strip_prefix("Bearer ") == Some(bearer)));
-        assert!(request.headers().get("x-kronik-enrollment").and_then(|value| value.to_str().ok())
-            == Some(record.request_id.as_str()));
-        assert!(request.headers().get("x-kronik-epoch").and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok()) == Some(record.epoch));
-        Ok(response)
-    }) {
+fn upgrade(
+    stream: TlsStream,
+    bearer: &str,
+    record: &EnrollmentRecord,
+) -> tungstenite::WebSocket<TlsStream> {
+    match tungstenite::accept_hdr(
+        stream,
+        |request: &tungstenite::handshake::server::Request, response| {
+            assert_eq!(request.uri().path(), "/v1/control");
+            assert!(
+                request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.strip_prefix("Bearer ") == Some(bearer))
+            );
+            assert!(
+                request
+                    .headers()
+                    .get("x-kronik-enrollment")
+                    .and_then(|value| value.to_str().ok())
+                    == Some(record.request_id.as_str())
+            );
+            assert!(
+                request
+                    .headers()
+                    .get("x-kronik-epoch")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    == Some(record.epoch)
+            );
+            Ok(response)
+        },
+    ) {
         Ok(socket) => socket,
         Err(_) => panic!("owned WSS handshake failed"),
     }
@@ -101,7 +149,10 @@ async fn real_owned_wss_opening_and_each_command_keep_the_original_ordinary_auth
     let issuer = Network::default();
     let mut ca_params = rcgen::CertificateParams::default();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign, rcgen::KeyUsagePurpose::CrlSign];
+    ca_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
     let ca_key = kronik_core::identity::ed25519_key(&[41; 32]).unwrap();
     let ca = ca_params.self_signed(&ca_key).unwrap();
     *issuer.issuer.lock().unwrap() = Some(rcgen::Issuer::new(ca_params, ca_key));
@@ -112,23 +163,40 @@ async fn real_owned_wss_opening_and_each_command_keep_the_original_ordinary_auth
     let server_key = kronik_core::identity::ed25519_key(&[42; 32]).unwrap();
     let mut server_params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
     server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
-    let server_cert = server_params.signed_by(&server_key, issuer.issuer.lock().unwrap().as_ref().unwrap()).unwrap();
+    let server_cert = server_params
+        .signed_by(&server_key, issuer.issuer.lock().unwrap().as_ref().unwrap())
+        .unwrap();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
-    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
-        .allow_unauthenticated().build().unwrap();
-    let tls = Arc::new(rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions().unwrap().with_client_cert_verifier(verifier)
-        .with_single_cert(vec![server_cert.der().clone()],
-            rustls_pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()).into()).unwrap());
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .allow_unauthenticated()
+    .build()
+    .unwrap();
+    let tls = Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                rustls_pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+            )
+            .unwrap(),
+    );
     let (step, steps) = std::sync::mpsc::sync_channel(1);
     let tcp_attempts = Arc::new(AtomicUsize::new(0));
     let mtls_handshakes = Arc::new(AtomicUsize::new(0));
     let ws_handshakes = Arc::new(AtomicUsize::new(0));
     let finished = {
-        let (tcp_attempts, mtls_handshakes, ws_handshakes) =
-            (tcp_attempts.clone(), mtls_handshakes.clone(), ws_handshakes.clone());
+        let (tcp_attempts, mtls_handshakes, ws_handshakes) = (
+            tcp_attempts.clone(),
+            mtls_handshakes.clone(),
+            ws_handshakes.clone(),
+        );
         env.blocking("api-real-owned-wss-controller", move || {
             let mut number = 0;
             let mut active: Option<(EnrollmentRecord, Zeroizing<String>)> = None;
@@ -222,35 +290,101 @@ async fn real_owned_wss_opening_and_each_command_keep_the_original_ordinary_auth
         })
     };
     let keys = directory.path().join("keys");
-    std::fs::DirBuilder::new().mode(0o700).create(&keys).unwrap();
-    let node = kronik_sched::start_local(env.clone(), directory.path(), kronik_sched::NodeConfig::default()).await.unwrap();
-    node.record_installation_identity(pb::InstallationIdentity { installation: "installation-real-owned-wss".into() }).await.unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&keys)
+        .unwrap();
+    let node = kronik_sched::start_local(
+        env.clone(),
+        directory.path(),
+        kronik_sched::NodeConfig::default(),
+    )
+    .await
+    .unwrap();
+    node.record_installation_identity(pb::InstallationIdentity {
+        installation: "installation-real-owned-wss".into(),
+    })
+    .await
+    .unwrap();
     let mut store = TokenStore::open_file(&keys.join("tokens.db")).unwrap();
-    store.bind_before_any_issuer(node.publication_domain()).unwrap();
+    store
+        .bind_before_any_issuer(node.publication_domain())
+        .unwrap();
     let startup_original = node.local_operator_authority().unwrap();
-    store.bind_execution_before_any_issuer(&node.publication_domain(), startup_original.clone()).unwrap();
+    store
+        .bind_execution_before_any_issuer(&node.publication_domain(), startup_original.clone())
+        .unwrap();
     let tokens = Arc::new(store);
-    let api = crate::Api::new(node.clone()).with_tokens(tokens.clone()).unwrap();
-    let fleet = Fleet::open(node.clone(), tokens.clone(), FleetConfig {
-        controller: ControllerConfig { url: url.clone(), ca_file, client_key_file: keys.join("fleet/client.key") },
-        identity: FleetIdentity { installation: "installation-real-owned-wss".into(), node: None, cluster: None },
-        scopes: vec!["read".into(), "fork".into()],
-    }, keys.join("fleet/bearer"), startup_original).await.unwrap();
+    let api = crate::Api::new(node.clone())
+        .with_tokens(tokens.clone())
+        .unwrap();
+    let fleet = Fleet::open(
+        node.clone(),
+        tokens.clone(),
+        FleetConfig {
+            controller: ControllerConfig {
+                url: url.clone(),
+                ca_file,
+                client_key_file: keys.join("fleet/client.key"),
+            },
+            identity: FleetIdentity {
+                installation: "installation-real-owned-wss".into(),
+                node: None,
+                cluster: None,
+            },
+            scopes: vec!["read".into(), "fork".into()],
+        },
+        keys.join("fleet/bearer"),
+        startup_original,
+    )
+    .await
+    .unwrap();
     let api = Arc::new(api.with_fleet(fleet.clone()));
-    let (_, stronger) = tokens.create("wss-stronger", [Scope::Admin].into(), [43; 32],
-        &Change { by: "unix:uid=0", reason: "ordinary stronger header fixture", wall_ms: env.clock.wall_ms() }, false).unwrap();
+    let (_, stronger) = tokens
+        .create(
+            "wss-stronger",
+            [Scope::Admin].into(),
+            [43; 32],
+            &Change {
+                by: "unix:uid=0",
+                reason: "ordinary stronger header fixture",
+                wall_ms: env.clock.wall_ms(),
+            },
+            false,
+        )
+        .unwrap();
     let stronger = Zeroizing::new(stronger.unwrap());
     let publications = Arc::new(AtomicUsize::new(0));
     for boundary in 0..5 {
         step.send(ControllerStep::Enroll).unwrap();
-        let enrolled = api.handle(crate::ApiRequest { method: "POST".into(), path: "/v1/fleet/enroll".into(),
-            query: String::new(), token_id: "unix:uid=0".into(), bearer: None,
-            body: serde_json::to_vec(&serde_json::json!({"url":url,"token":format!("wss-once-{}",boundary+1),
-                "reason":"admit real owned WSS fixture", "dry_run":false})).unwrap() });
-        assert_eq!(env.timeout(Duration::from_secs(10), enrolled).await.unwrap().status, 200);
+        let enrolled = api.handle(crate::ApiRequest {
+            method: "POST".into(),
+            path: "/v1/fleet/enroll".into(),
+            query: String::new(),
+            token_id: "unix:uid=0".into(),
+            bearer: None,
+            body: serde_json::to_vec(
+                &serde_json::json!({"url":url,"token":format!("wss-once-{}",boundary+1),
+                "reason":"admit real owned WSS fixture", "dry_run":false}),
+            )
+            .unwrap(),
+        });
+        assert_eq!(
+            env.timeout(Duration::from_secs(10), enrolled)
+                .await
+                .unwrap()
+                .status,
+            200
+        );
         let (client, record, bearer, guard) = fleet.active_connection().await.unwrap().unwrap();
-        let mut binding = crate::ApiRequest { method: "GET".into(), path: "/".into(), query: String::new(),
-            body: Vec::new(), token_id: "fleet".into(), bearer: Some(bearer.to_string()) };
+        let mut binding = crate::ApiRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            query: String::new(),
+            body: Vec::new(),
+            token_id: "fleet".into(),
+            bearer: Some(bearer.to_string()),
+        };
         let captured = api.capture_fleet_binding(&binding, guard.clone()).unwrap();
         binding.bearer.as_mut().unwrap().zeroize();
         captured.require_scope(Scope::Fork).unwrap();
@@ -259,16 +393,37 @@ async fn real_owned_wss_opening_and_each_command_keep_the_original_ordinary_auth
         let intent_start = node.applied_lsn();
         let opening_audit = fleet.control_opening_audit(&captured);
         let opening_capacity = Arc::new(tokio::sync::Semaphore::new(1));
-        let held = if boundary == 0 { Some(opening_capacity.clone().acquire_owned().await.unwrap()) } else { None };
+        let held = if boundary == 0 {
+            Some(opening_capacity.clone().acquire_owned().await.unwrap())
+        } else {
+            None
+        };
         let ready = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let (release_peer, released_peer) = std::sync::mpsc::sync_channel(1);
-        if boundary == 3 { step.send(ControllerStep::Late(ready.clone(), released_peer)).unwrap(); }
-        else if boundary == 4 { step.send(ControllerStep::Healthy(ready.clone(), released_peer, stronger.clone())).unwrap(); }
+        if boundary == 3 {
+            step.send(ControllerStep::Late(ready.clone(), released_peer))
+                .unwrap();
+        } else if boundary == 4 {
+            step.send(ControllerStep::Healthy(
+                ready.clone(),
+                released_peer,
+                stronger.clone(),
+            ))
+            .unwrap();
+        }
         let entered = Arc::new(tokio::sync::Notify::new());
         let work = {
-            let (task_env, api, original, capacity, ready, release, entered, publications) =
-                (env.clone(), api.clone(), original.clone(), opening_capacity.clone(), ready.clone(), release.clone(), entered.clone(), publications.clone());
+            let (task_env, api, original, capacity, ready, release, entered, publications) = (
+                env.clone(),
+                api.clone(),
+                original.clone(),
+                opening_capacity.clone(),
+                ready.clone(),
+                release.clone(),
+                entered.clone(),
+                publications.clone(),
+            );
             env.spawn("api-real-owned-wss-attempt", async move {
                 entered.notify_one();
                 let dispatch = move |prepared: kronik_fleet::transport::PreparedControl|
@@ -297,48 +452,118 @@ async fn real_owned_wss_opening_and_each_command_keep_the_original_ordinary_auth
                     }).await
             })
         };
-        env.timeout(Duration::from_secs(5), entered.notified()).await.unwrap();
-        if boundary != 0 { env.timeout(Duration::from_secs(10), ready.notified()).await.unwrap(); }
+        env.timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        if boundary != 0 {
+            env.timeout(Duration::from_secs(10), ready.notified())
+                .await
+                .unwrap();
+        }
         if boundary == 4 {
-            let available = env.timeout(Duration::from_secs(5), opening_capacity.clone().acquire_owned()).await.unwrap().unwrap();
+            let available = env
+                .timeout(
+                    Duration::from_secs(5),
+                    opening_capacity.clone().acquire_owned(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
             drop(available); // Opening capacity must not remain held for the long-lived channel.
             assert_eq!(publications.load(Ordering::SeqCst), 1);
-        } else { assert_eq!(opening_capacity.available_permits(), 0); }
+        } else {
+            assert_eq!(opening_capacity.available_permits(), 0);
+        }
         let revoked = api.handle(crate::ApiRequest { method: "POST".into(), path: "/v1/fleet/revoke".into(),
             query: String::new(), token_id: "unix:uid=0".into(), bearer: None,
             body: serde_json::to_vec(&serde_json::json!({"reason":"durably revoke the original WSS operation", "dry_run":false})).unwrap() });
-        assert_eq!(env.timeout(Duration::from_secs(5), revoked).await.unwrap().status, 200);
+        assert_eq!(
+            env.timeout(Duration::from_secs(5), revoked)
+                .await
+                .unwrap()
+                .status,
+            200
+        );
         let fenced = node.applied_lsn();
         assert!(original.check().is_err());
-        assert_eq!(fleet.record().unwrap().unwrap().phase, EnrollmentPhase::Revoked);
+        assert_eq!(
+            fleet.record().unwrap().unwrap().phase,
+            EnrollmentPhase::Revoked
+        );
         let mut intents = 0;
-        node.reader().read(intent_start + 1, fenced, |committed| {
-            if let kronik_proto::Record::AuditEvent(event) = committed.record
-                && event.action == "fleet.control.open" {
-                intents += 1;
-                assert!(committed.lsn < fenced);
-                assert_eq!(event.audit.as_ref().unwrap().token_id, opening_caller);
-                assert!(event.operation.is_none());
-                assert!(event.details.is_empty());
-            }
-            Ok(())
-        }).await.unwrap();
+        node.reader()
+            .read(intent_start + 1, fenced, |committed| {
+                if let kronik_proto::Record::AuditEvent(event) = committed.record
+                    && event.action == "fleet.control.open"
+                {
+                    intents += 1;
+                    assert!(committed.lsn < fenced);
+                    assert_eq!(event.audit.as_ref().unwrap().token_id, opening_caller);
+                    assert!(event.operation.is_none());
+                    assert!(event.details.is_empty());
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
         assert_eq!(intents, usize::from(boundary >= 2));
         drop(held);
         release.add_permits(1);
-        if boundary >= 3 { release_peer.send(()).unwrap(); }
-        assert!(env.timeout(Duration::from_secs(10), work).await.unwrap().unwrap().is_err());
-        let completed = env.timeout(Duration::from_secs(10), opening_capacity.clone().acquire_owned()).await.unwrap().unwrap();
+        if boundary >= 3 {
+            release_peer.send(()).unwrap();
+        }
+        assert!(
+            env.timeout(Duration::from_secs(10), work)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        let completed = env
+            .timeout(
+                Duration::from_secs(10),
+                opening_capacity.clone().acquire_owned(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         drop(completed);
         let (probe, probed) = tokio::sync::oneshot::channel();
         step.send(ControllerStep::Probe(probe)).unwrap();
-        assert!(env.timeout(Duration::from_secs(10), probed).await.unwrap().unwrap(), "no denied or extra control TCP/TLS/HTTP attempt may escape");
-        assert_eq!(publications.load(Ordering::SeqCst), usize::from(boundary == 4));
-        let denied = node.record_audit_event_authorized("test.old-wss-command", "must-not-append", Default::default(),
-            fleet.audit("controller", "an old connection is not authority for a future command"), original).await;
+        assert!(
+            env.timeout(Duration::from_secs(10), probed)
+                .await
+                .unwrap()
+                .unwrap(),
+            "no denied or extra control TCP/TLS/HTTP attempt may escape"
+        );
+        assert_eq!(
+            publications.load(Ordering::SeqCst),
+            usize::from(boundary == 4)
+        );
+        let denied = node
+            .record_audit_event_authorized(
+                "test.old-wss-command",
+                "must-not-append",
+                Default::default(),
+                fleet.audit(
+                    "controller",
+                    "an old connection is not authority for a future command",
+                ),
+                original,
+            )
+            .await;
         assert!(denied.is_err());
-        let following = node.record_audit_event_authorized("test.wss-following", "after-owned-WSS-fence", Default::default(),
-            fleet.audit("unix:uid=0", "observe actual following WAL"), authority(&fleet)).await.unwrap();
+        let following = node
+            .record_audit_event_authorized(
+                "test.wss-following",
+                "after-owned-WSS-fence",
+                Default::default(),
+                fleet.audit("unix:uid=0", "observe actual following WAL"),
+                authority(&fleet),
+            )
+            .await
+            .unwrap();
         node.reader().read(fenced + 1, following, |committed| {
             if let kronik_proto::Record::AuditEvent(event) = committed.record {
                 assert_ne!(event.action, "test.old-wss-command");
@@ -349,7 +574,10 @@ async fn real_owned_wss_opening_and_each_command_keep_the_original_ordinary_auth
         }).await.unwrap();
     }
     step.send(ControllerStep::Finish).unwrap();
-    env.timeout(Duration::from_secs(10), finished).await.unwrap().unwrap();
+    env.timeout(Duration::from_secs(10), finished)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(tcp_attempts.load(Ordering::SeqCst), 2);
     assert!((1..=2).contains(&mtls_handshakes.load(Ordering::SeqCst)));
     assert!((1..=2).contains(&ws_handshakes.load(Ordering::SeqCst)));

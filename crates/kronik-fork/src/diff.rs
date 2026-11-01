@@ -2785,8 +2785,7 @@ mod tests {
     #[test]
     fn redacted_values_hash_keyed_and_hide_the_subject() {
         let master = kronik_privacy::MasterKey::from_bytes([1; 32]).unwrap();
-        let ks = kronik_privacy::keystore::Keystore::open_memory(&master)
-        .unwrap();
+        let ks = kronik_privacy::keystore::Keystore::open_memory(&master).unwrap();
         let keyed = Sealer::new(Arc::new(ks))
             .with_pseudonyms(kronik_privacy::keystore::Pseudonyms::new(&master).unwrap());
         let v = redacted(&keyed, "user:9", b"alice");

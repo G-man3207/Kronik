@@ -34,10 +34,16 @@ pub(super) fn exchange(
 ) -> BoxFuture<'static, io::Result<Zeroizing<Vec<u8>>>> {
     Box::pin(async move {
         if request.stdin.is_empty() || request.stdin.len() > LIMIT || request.timeout.is_zero() {
-            return Err(error(io::ErrorKind::InvalidInput, "invalid sensitive helper bounds"));
+            return Err(error(
+                io::ErrorKind::InvalidInput,
+                "invalid sensitive helper bounds",
+            ));
         }
         let deadline = Instant::now().checked_add(request.timeout).ok_or_else(|| {
-            error(io::ErrorKind::InvalidInput, "invalid sensitive helper deadline")
+            error(
+                io::ErrorKind::InvalidInput,
+                "invalid sensitive helper deadline",
+            )
         })?;
         let (tx, rx) = oneshot::channel();
         // A dropped receiver is cancellation. This thread owns kill+wait even
@@ -54,9 +60,10 @@ pub(super) fn exchange(
         // Startup must join this owner before shutting down its temporary
         // runtime and entering a user namespace with exactly one OS thread.
         let joined = if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn_blocking(move || owner.join()).await.map_err(|_| {
-                error(io::ErrorKind::Other, "sensitive helper owner join stopped")
-            })?
+            runtime
+                .spawn_blocking(move || owner.join())
+                .await
+                .map_err(|_| error(io::ErrorKind::Other, "sensitive helper owner join stopped"))?
         } else {
             owner.join()
         };
@@ -75,7 +82,10 @@ fn open_pin(path: &std::path::Path) -> io::Result<File> {
     // root from a translated UID (including the overflow UID).
     let uid = unsafe { libc::geteuid() };
     if !m.is_file() || (m.uid() != uid && m.uid() != 0) || m.mode() & 0o177 != 0 {
-        return Err(error(io::ErrorKind::PermissionDenied, "invalid private PIN file"));
+        return Err(error(
+            io::ErrorKind::PermissionDenied,
+            "invalid private PIN file",
+        ));
     }
     if file.as_raw_fd() >= 3 {
         return Ok(file);
@@ -92,7 +102,10 @@ fn open_pin(path: &std::path::Path) -> io::Result<File> {
 fn prepare_child(pin: i32) -> io::Result<()> {
     // Preserve kill authority across exec; the helper reapplies its own
     // non-dumpability before reading input, since exec resets that flag.
-    let core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &core) } < 0
         || unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0
     {
@@ -100,7 +113,15 @@ fn prepare_child(pin: i32) -> io::Result<()> {
     }
     // CLOEXEC, not close: std's exec-error pipe must report a failed exec.
     // Fail closed on kernels without close_range(CLOEXEC).
-    if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, libc::CLOSE_RANGE_CLOEXEC) } < 0 {
+    if unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3u32,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    } < 0
+    {
         return Err(io::Error::last_os_error());
     }
     if pin != 3 && unsafe { libc::dup2(pin, 3) } < 0 {
@@ -154,12 +175,18 @@ impl Reap {
         };
         if result < 0 {
             let e = io::Error::last_os_error();
-            return if e.kind() == io::ErrorKind::Interrupted { Ok(None) } else { Err(e) };
+            return if e.kind() == io::ErrorKind::Interrupted {
+                Ok(None)
+            } else {
+                Err(e)
+            };
         }
         if unsafe { info.si_pid() } == 0 {
             return Ok(None);
         }
-        Ok(Some(info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0))
+        Ok(Some(
+            info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0,
+        ))
     }
 }
 
@@ -183,7 +210,10 @@ fn run(
 ) -> io::Result<Zeroizing<Vec<u8>>> {
     let check = || {
         if reply.is_closed() {
-            Err(error(io::ErrorKind::Interrupted, "sensitive helper cancelled"))
+            Err(error(
+                io::ErrorKind::Interrupted,
+                "sensitive helper cancelled",
+            ))
         } else if Instant::now() >= deadline {
             Err(error(io::ErrorKind::TimedOut, "sensitive helper timed out"))
         } else {
@@ -193,7 +223,8 @@ fn run(
     check()?;
     let pin = open_pin(&request.pin_file)?;
     let mut command = Command::new(&request.spec.program);
-    command.args(&request.spec.args)
+    command
+        .args(&request.spec.args)
         .env_clear()
         .envs(request.spec.env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
@@ -207,16 +238,24 @@ fn run(
     }
     let fd = pin.as_raw_fd();
     // Only async-signal-safe syscalls, no locks/allocations after fork.
-    unsafe { command.pre_exec(move || prepare_child(fd)); }
+    unsafe {
+        command.pre_exec(move || prepare_child(fd));
+    }
     check()?;
-    let mut child = Reap { child: command.spawn()? };
+    let mut child = Reap {
+        child: command.spawn()?,
+    };
     drop(pin);
-    let stdin = child.child.stdin.take().ok_or_else(|| {
-        error(io::ErrorKind::Other, "sensitive helper stdin unavailable")
-    })?;
-    let mut stdout = child.child.stdout.take().ok_or_else(|| {
-        error(io::ErrorKind::Other, "sensitive helper stdout unavailable")
-    })?;
+    let stdin = child
+        .child
+        .stdin
+        .take()
+        .ok_or_else(|| error(io::ErrorKind::Other, "sensitive helper stdin unavailable"))?;
+    let mut stdout = child
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| error(io::ErrorKind::Other, "sensitive helper stdout unavailable"))?;
     nonblocking(stdin.as_raw_fd())?;
     nonblocking(stdout.as_raw_fd())?;
     let mut input = Some(stdin);
@@ -229,7 +268,12 @@ fn run(
         check()?;
         if let Some(pipe) = input.as_mut() {
             match pipe.write(&request.stdin[written..]) {
-                Ok(0) => return Err(error(io::ErrorKind::WriteZero, "sensitive helper stdin closed")),
+                Ok(0) => {
+                    return Err(error(
+                        io::ErrorKind::WriteZero,
+                        "sensitive helper stdin closed",
+                    ));
+                }
                 Ok(n) => {
                     request.stdin[written..written + n].zeroize();
                     written += n;
@@ -239,7 +283,11 @@ fn run(
                         request.stdin.zeroize();
                     }
                 }
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -249,10 +297,17 @@ fn run(
                 Ok(n) => {
                     used += n;
                     if used > LIMIT {
-                        return Err(error(io::ErrorKind::InvalidData, "sensitive helper output exceeds bound"));
+                        return Err(error(
+                            io::ErrorKind::InvalidData,
+                            "sensitive helper output exceeds bound",
+                        ));
                     }
                 }
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -270,15 +325,26 @@ fn run(
             }
             if eof {
                 if input.is_some() || used == 0 {
-                    return Err(error(io::ErrorKind::InvalidData, "incomplete sensitive helper exchange"));
+                    return Err(error(
+                        io::ErrorKind::InvalidData,
+                        "incomplete sensitive helper exchange",
+                    ));
                 }
                 output.truncate(used);
                 return Ok(output);
             }
         }
         let mut fds = [
-            libc::pollfd { fd: input.as_ref().map_or(-1, |p| p.as_raw_fd()), events: libc::POLLOUT, revents: 0 },
-            libc::pollfd { fd: if eof { -1 } else { stdout.as_raw_fd() }, events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: input.as_ref().map_or(-1, |p| p.as_raw_fd()),
+                events: libc::POLLOUT,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if eof { -1 } else { stdout.as_raw_fd() },
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         let remaining = deadline.saturating_duration_since(Instant::now());
         let millis = remaining.as_millis().clamp(1, POLL_MS as u128) as i32;
@@ -338,7 +404,12 @@ mod tests {
         SensitiveProcessRequest {
             spec: ProcessSpec {
                 program: "/bin/sh".into(),
-                args: vec!["-c".into(), script.into(), "helper".into(), dir.join("pid").display().to_string()],
+                args: vec![
+                    "-c".into(),
+                    script.into(),
+                    "helper".into(),
+                    dir.join("pid").display().to_string(),
+                ],
                 env: vec![("EXPLICIT_SETTING".into(), "configured".into())],
                 cwd: Some(dir.into()),
                 stdout: EnvStdio::Append(dir.join("forbidden-stdout")),
@@ -386,14 +457,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for (name, contents, mode) in [
             ("missing", None, 0o700),
-            ("bad-executable", Some(b"not an executable\n".as_slice()), 0o700),
+            (
+                "bad-executable",
+                Some(b"not an executable\n".as_slice()),
+                0o700,
+            ),
             ("not-executable", Some(b"#!/bin/sh\n".as_slice()), 0o600),
         ] {
             let mut req = request(dir.path(), "exit 99");
             req.spec.program = dir.path().join(name);
             if let Some(bytes) = contents {
                 std::fs::write(&req.spec.program, bytes).unwrap();
-                std::fs::set_permissions(&req.spec.program, std::fs::Permissions::from_mode(mode)).unwrap();
+                std::fs::set_permissions(&req.spec.program, std::fs::Permissions::from_mode(mode))
+                    .unwrap();
             }
             let e = block_on(super::super::RealProcs.exchange(req)).unwrap_err();
             if name == "missing" {
@@ -407,10 +483,22 @@ mod tests {
     fn overflow_timeout_crash_and_empty_response_reap_without_leaking_output() {
         let dir = tempfile::tempdir().unwrap();
         for (script, kind) in [
-            ("printf '%s' \"$$\" > \"$1\"; IFS= read -r value; printf '%s' \"$value\"; printf '%05000d' 0; exec /bin/sleep 30", io::ErrorKind::InvalidData),
-            ("printf '%s' \"$$\" > \"$1\"; exec /bin/sleep 30", io::ErrorKind::TimedOut),
-            ("printf '%s' \"$$\" > \"$1\"; IFS= read -r value; printf '%s' \"$value\"; printf '%s' \"$value\" >&2; kill -TERM \"$$\"", io::ErrorKind::Other),
-            ("printf '%s' \"$$\" > \"$1\"; IFS= read -r value; exit 0", io::ErrorKind::InvalidData),
+            (
+                "printf '%s' \"$$\" > \"$1\"; IFS= read -r value; printf '%s' \"$value\"; printf '%05000d' 0; exec /bin/sleep 30",
+                io::ErrorKind::InvalidData,
+            ),
+            (
+                "printf '%s' \"$$\" > \"$1\"; exec /bin/sleep 30",
+                io::ErrorKind::TimedOut,
+            ),
+            (
+                "printf '%s' \"$$\" > \"$1\"; IFS= read -r value; printf '%s' \"$value\"; printf '%s' \"$value\" >&2; kill -TERM \"$$\"",
+                io::ErrorKind::Other,
+            ),
+            (
+                "printf '%s' \"$$\" > \"$1\"; IFS= read -r value; exit 0",
+                io::ErrorKind::InvalidData,
+            ),
         ] {
             let mut req = request(dir.path(), script);
             req.timeout = Duration::from_millis(300);
@@ -425,10 +513,18 @@ mod tests {
     #[test]
     fn cancellation_keeps_a_supervisor_until_kill_and_reap() {
         let dir = tempfile::tempdir().unwrap();
-        let req = request(dir.path(), "printf '%s' \"$$\" > \"$1\"; exec /bin/sleep 30");
+        let req = request(
+            dir.path(),
+            "printf '%s' \"$$\" > \"$1\"; exec /bin/sleep 30",
+        );
         let mut future = exchange(req);
         let waker = Waker::from(Arc::new(WakeThread(std::thread::current())));
-        assert!(future.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
         let child = pid(dir.path());
         drop(future);
         assert_reaped(child);
@@ -437,8 +533,14 @@ mod tests {
     #[test]
     fn runtime_shutdown_cancels_but_does_not_drop_the_reaper() {
         let dir = tempfile::tempdir().unwrap();
-        let req = request(dir.path(), "printf '%s' \"$$\" > \"$1\"; exec /bin/sleep 30");
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let req = request(
+            dir.path(),
+            "printf '%s' \"$$\" > \"$1\"; exec /bin/sleep 30",
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let task = runtime.block_on(async {
             let task = tokio::spawn(exchange(req));
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -460,7 +562,10 @@ mod tests {
         for variant in 0..7 {
             let mut req = request(dir.path(), "printf '%s' \"$$\" > \"$1\"");
             match variant {
-                0 => std::fs::set_permissions(&req.pin_file, std::fs::Permissions::from_mode(0o644)).unwrap(),
+                0 => {
+                    std::fs::set_permissions(&req.pin_file, std::fs::Permissions::from_mode(0o644))
+                        .unwrap()
+                }
                 1 => {
                     let link = dir.path().join("pin-link");
                     symlink(&req.pin_file, &link).unwrap();
@@ -495,7 +600,10 @@ mod tests {
     #[test]
     fn opaque_malformed_response_is_already_reaped_before_protocol_parsing() {
         let dir = tempfile::tempdir().unwrap();
-        let req = request(dir.path(), "printf '%s' \"$$\" > \"$1\"; IFS= read -r value; printf '{broken'");
+        let req = request(
+            dir.path(),
+            "printf '%s' \"$$\" > \"$1\"; IFS= read -r value; printf '{broken'",
+        );
         let output = block_on(exchange(req)).unwrap();
         assert_reaped(pid(dir.path()));
         assert!(serde_json::from_slice::<serde_json::Value>(&output).is_err());
@@ -505,11 +613,23 @@ mod tests {
     fn fd3_same_number_and_duplicate_cases_keep_only_the_pin() {
         for same in [true, false] {
             let output = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "env::real::exchange::tests::fd3_driver", "--nocapture"])
-                .env("KRONIK_EXCHANGE_FD_DRIVER", if same { "same" } else { "different" })
+                .args([
+                    "--exact",
+                    "env::real::exchange::tests::fd3_driver",
+                    "--nocapture",
+                ])
+                .env(
+                    "KRONIK_EXCHANGE_FD_DRIVER",
+                    if same { "same" } else { "different" },
+                )
                 .env("HOME", "parent-setting-must-not-inherit")
-                .output().unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             for stream in [&output.stdout, &output.stderr] {
                 assert!(!String::from_utf8_lossy(stream).contains(SECRET));
                 assert!(!String::from_utf8_lossy(stream).contains("private-pin"));
@@ -521,7 +641,9 @@ mod tests {
     // descriptors belonging to concurrently running boundary tests.
     #[test]
     fn fd3_driver() {
-        let Ok(mode) = std::env::var("KRONIK_EXCHANGE_FD_DRIVER") else { return };
+        let Ok(mode) = std::env::var("KRONIK_EXCHANGE_FD_DRIVER") else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let req = request(dir.path(), "");
         let pin = open_pin(&req.pin_file).unwrap();
@@ -530,7 +652,10 @@ mod tests {
         let extra = unsafe { File::from_raw_fd(extra) };
         let source = if mode == "same" {
             assert_eq!(unsafe { libc::dup2(pin.as_raw_fd(), 3) }, 3);
-            assert_eq!(unsafe { libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
+            assert_eq!(
+                unsafe { libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
             3
         } else {
             extra.as_raw_fd()
@@ -543,9 +668,16 @@ mod tests {
             extra.as_raw_fd()
         );
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", &script]).env_clear().env("EXPLICIT_SETTING", "configured")
-            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
-        unsafe { command.pre_exec(move || prepare_child(source)); }
+        command
+            .args(["-c", &script])
+            .env_clear()
+            .env("EXPLICIT_SETTING", "configured")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(move || prepare_child(source));
+        }
         let output = command.output().unwrap();
         assert!(output.status.success(), "{:?}", output.status);
         assert_eq!(output.stdout, b"public-result");
@@ -562,10 +694,19 @@ mod tests {
     #[test]
     fn descendants_are_killed_on_cancel_overflow_timeout_crash_and_success() {
         let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "env::real::exchange::tests::group_driver", "--nocapture"])
+            .args([
+                "--exact",
+                "env::real::exchange::tests::group_driver",
+                "--nocapture",
+            ])
             .env("KRONIK_EXCHANGE_GROUP_DRIVER", "1")
-            .output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Isolate the test-only subreaper from every other test and use only the
@@ -575,11 +716,18 @@ mod tests {
         if std::env::var_os("KRONIK_EXCHANGE_GROUP_DRIVER").is_none() {
             return;
         }
-        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) }, 0);
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
         for (case, action, kind) in [
             ("cancel", "wait", Some(io::ErrorKind::Interrupted)),
             ("timeout", "wait", Some(io::ErrorKind::TimedOut)),
-            ("overflow", "printf '%05000d' 0; wait", Some(io::ErrorKind::InvalidData)),
+            (
+                "overflow",
+                "printf '%05000d' 0; wait",
+                Some(io::ErrorKind::InvalidData),
+            ),
             ("crash", "kill -TERM \"$$\"", Some(io::ErrorKind::Other)),
             ("success", "printf public-result; exit 0", None),
         ] {
@@ -593,7 +741,12 @@ mod tests {
             if case == "cancel" {
                 let mut future = exchange(req);
                 let waker = Waker::from(Arc::new(WakeThread(std::thread::current())));
-                assert!(future.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+                assert!(
+                    future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
                 let _ = pid(dir.path());
                 drop(future);
             } else {
@@ -607,7 +760,9 @@ mod tests {
             let child = pid(dir.path());
             assert_reaped(child);
             let descendant: libc::pid_t = std::fs::read_to_string(dir.path().join("descendant"))
-                .unwrap().parse().unwrap();
+                .unwrap()
+                .parse()
+                .unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
                 let mut status = 0;
@@ -626,10 +781,16 @@ mod tests {
                         break;
                     }
                 }
-                assert!(Instant::now() < deadline, "{case}: descendant still live or zombie");
+                assert!(
+                    Instant::now() < deadline,
+                    "{case}: descendant still live or zombie"
+                );
                 std::thread::sleep(Duration::from_millis(2));
             }
-            assert!(!Path::new(&format!("/proc/{descendant}")).exists(), "{case}");
+            assert!(
+                !Path::new(&format!("/proc/{descendant}")).exists(),
+                "{case}"
+            );
         }
     }
 }

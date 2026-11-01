@@ -792,10 +792,17 @@ fn every_command_against_a_daemon() {
 #[test]
 fn m3_commands_against_a_daemon() {
     let d = Daemon::start();
-    assert_eq!(
-        d.run(&["deploy", COUNTER, "--reason", "first deploy"]).code,
-        0
-    );
+    let deploy = d.run(&["deploy", COUNTER, "--reason", "first deploy"]);
+    assert_eq!(deploy.code, 0, "{deploy:?}");
+    // Fresh logs begin with the startup SecretVersion/AuditEvent records, so
+    // the counter deployment's LSN is the last state before the traffic below.
+    // Fork there instead of at a hardcoded 1.
+    let setup: u64 = deploy
+        .stdout
+        .split_once(" at lsn ")
+        .and_then(|(_, rest)| rest.split(',').next())
+        .and_then(|lsn| lsn.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no deployment lsn in {deploy:?}"));
     for _ in 0..3 {
         let o = d.run(&["send", "counter/a", "increment", "--reason", "traffic"]);
         assert_eq!(o.code, 0, "{o:?}");
@@ -803,11 +810,12 @@ fn m3_commands_against_a_daemon() {
 
     // A plain fork: create it, deploy new code in it, replay, diff.
     assert!(d.run(&["fork", "list"]).stdout.starts_with("No forks.\n"));
+    let at = setup.to_string();
     let create = [
         "fork",
         "create",
         "--at",
-        "1",
+        at.as_str(),
         "--name",
         "try",
         "--reason",
@@ -815,13 +823,16 @@ fn m3_commands_against_a_daemon() {
     ];
     let o = d.run(&[&create[..], &["--dry-run"]].concat());
     assert!(
-        o.stdout
-            .starts_with("Dry run: main can be forked at lsn 1 as try; nothing was written\n"),
+        o.stdout.starts_with(
+            format!("Dry run: main can be forked at lsn {setup} as try; nothing was written\n")
+                .as_str()
+        ),
         "{o:?}"
     );
     let o = d.run(&create);
     assert!(
-        o.stdout.starts_with("Forked main at lsn 1 -> fork try\n"),
+        o.stdout
+            .starts_with(format!("Forked main at lsn {setup} -> fork try\n").as_str()),
         "{o:?}"
     );
     let o = d.run(&["fork", "deploy", "try", STEP2, "--reason", "step 2"]);
@@ -894,7 +905,11 @@ fn m3_commands_against_a_daemon() {
     let lines: Vec<&str> = o.stdout.lines().collect();
     assert!(lines[0].starts_with("Main is at lsn "), "{o:?}");
     let words: Vec<&str> = lines[2].split_whitespace().collect();
-    assert_eq!((words[0], words[1], words[3]), ("try", "1", "-"), "{o:?}");
+    assert_eq!(
+        (words[0], words[1], words[3]),
+        ("try", at.as_str(), "-"),
+        "{o:?}"
+    );
 
     // Policy: the defaults, a test with other rules, then those rules.
     let o = d.run(&["policy", "show"]);
@@ -1213,9 +1228,12 @@ fn m2_commands_against_a_daemon() {
         "{o:?}"
     );
     let o = d.run(&["history", "counter/a"]);
+    // A denied pre-grant HTTP fetch has no prepared disclosure scope, so its
+    // free host target is explicitly withheld (docs/design/m2-effects.md);
+    // the real DENIED status and the stable machine code are unchanged.
     for want in [
         "committed  1 effect  b3:",
-        "http.fetch  http:127.0.0.1  -         denied  CAPABILITY_NOT_GRANTED: http:127.0.0.1\n",
+        "http.fetch  http:[withheld]  -         denied  CAPABILITY_NOT_GRANTED: http:127.0.0.1\n",
         "Next     kronik grant counter http:127.0.0.1 --reason '...'\n",
     ] {
         assert!(o.stdout.contains(want), "{want}: {o:?}");

@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
-use zeroize::Zeroizing;
 use kronik_core::env::{BoxFuture, File, Fs, OpenMode};
+use zeroize::Zeroizing;
 
 /// Files by path. Ordinary directories exist implicitly; their privacy is
 /// recorded separately. Everything is durable at once: a test host never crashes.
@@ -66,7 +66,12 @@ fn note_dirs(dirs: &mut BTreeMap<PathBuf, bool>, path: &Path) {
 }
 
 impl MemFs {
-    fn secure_write(&self, path: PathBuf, mut bytes: Zeroizing<Vec<u8>>, replace: bool) -> io::Result<()> {
+    fn secure_write(
+        &self,
+        path: PathBuf,
+        mut bytes: Zeroizing<Vec<u8>>,
+        replace: bool,
+    ) -> io::Result<()> {
         let path = secure_path(&path)?;
         let dir = path.parent().ok_or_else(insecure_file)?;
         let mut dirs = lock(&self.dirs);
@@ -84,9 +89,11 @@ impl MemFs {
         }
         if !dirs.contains_key(dir) {
             // Existing implicit directories are ordinary, not newly private ones.
-            if dir.as_os_str().is_empty() || dir == Path::new("/")
+            if dir.as_os_str().is_empty()
+                || dir == Path::new("/")
                 || files.keys().any(|file| file.starts_with(dir))
-                || dirs.keys().any(|child| child.starts_with(dir)) {
+                || dirs.keys().any(|child| child.starts_with(dir))
+            {
                 return Err(insecure_file());
             }
             dirs.insert(dir.to_path_buf(), true);
@@ -103,10 +110,13 @@ impl MemFs {
             }
         }
         // One locked replacement models create-exclusive, sync-file, rename, sync-dir.
-        files.insert(path, Arc::new(MemFile {
-            data: Mutex::new(std::mem::take(&mut *bytes)),
-            private: true,
-        }));
+        files.insert(
+            path,
+            Arc::new(MemFile {
+                data: Mutex::new(std::mem::take(&mut *bytes)),
+                private: true,
+            }),
+        );
         Ok(())
     }
 }
@@ -138,7 +148,8 @@ impl Fs for MemFs {
     fn exists(&self, path: PathBuf) -> BoxFuture<'static, io::Result<bool>> {
         let dirs = lock(&self.dirs);
         let files = lock(&self.files);
-        let found = files.contains_key(&path) || dirs.contains_key(&path)
+        let found = files.contains_key(&path)
+            || dirs.contains_key(&path)
             || files.keys().any(|f| f.starts_with(&path));
         ready(Ok(found))
     }
@@ -181,7 +192,11 @@ impl Fs for MemFs {
         ready(Ok(()))
     }
 
-    fn read_secure(&self, path: PathBuf, max_bytes: usize) -> BoxFuture<'static, io::Result<Vec<u8>>> {
+    fn read_secure(
+        &self,
+        path: PathBuf,
+        max_bytes: usize,
+    ) -> BoxFuture<'static, io::Result<Vec<u8>>> {
         ready((|| {
             let path = secure_path(&path)?;
             let dirs = lock(&self.dirs);
@@ -190,8 +205,10 @@ impl Fs for MemFs {
                 if files.contains_key(ancestor) {
                     return Err(insecure_file());
                 }
-                if !ancestor.as_os_str().is_empty() && ancestor != Path::new("/")
-                    && !dirs.contains_key(ancestor) {
+                if !ancestor.as_os_str().is_empty()
+                    && ancestor != Path::new("/")
+                    && !dirs.contains_key(ancestor)
+                {
                     return Err(not_found(ancestor));
                 }
             }
@@ -201,7 +218,10 @@ impl Fs for MemFs {
             }
             let data = lock(&file.data);
             if data.len() > max_bytes {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "private file exceeds limit"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "private file exceeds limit",
+                ));
             }
             // Both locks keep the file and its contents unchanged throughout the read.
             Ok(data.clone())

@@ -234,10 +234,14 @@ fn reply(r: &TurnResult) -> String {
 }
 
 impl Proc {
+    fn owner(&self) -> kronik_core::authority::AuthLease {
+        self.node.local_operator_authority().unwrap()
+    }
+
     fn deploy(&self) {
         let bytes = std::fs::read(COUNTER).unwrap();
         self.rt
-            .block_on(self.node.deploy(&bytes, audit(), false))
+            .block_on(self.node.deploy(&bytes, audit(), false, self.owner()))
             .unwrap();
     }
 
@@ -245,17 +249,20 @@ impl Proc {
         self.rt
             .block_on(
                 self.node
-                    .grant("counter", cap, delivery, rate, audit(), false),
+                    .grant("counter", cap, delivery, rate, audit(), false, self.owner()),
             )
             .unwrap();
     }
 
     fn send(&self, actor: &str, m: pb::Message) -> TurnResult {
         self.rt
-            .block_on(
-                self.node
-                    .send(ActorRef::parse(actor).unwrap(), m, audit(), false),
-            )
+            .block_on(self.node.send(
+                ActorRef::parse(actor).unwrap(),
+                m,
+                audit(),
+                false,
+                self.owner(),
+            ))
             .unwrap()
             .unwrap()
     }
@@ -265,7 +272,8 @@ impl Proc {
         let node = self.node.clone();
         let actor = ActorRef::parse(actor).unwrap();
         self.rt.spawn(async move {
-            let _ = node.send(actor, m, audit(), false).await;
+            let original = node.local_operator_authority().unwrap();
+            let _ = node.send(actor, m, audit(), false, original).await;
         });
     }
 
@@ -499,7 +507,7 @@ fn an_erased_subjects_open_turn_reruns_as_a_subject_erased_dead_letter() {
     p.grant("http:127.0.0.1", None, None);
     p.rt.block_on(
         p.node
-            .set_privacy_mode(pb::PrivacyState::On, audit(), false),
+            .set_privacy_mode(pb::PrivacyState::On, audit(), false, p.owner()),
     )
     .unwrap();
     // A message of a subject whose effect hangs: the turn is open with a
@@ -521,7 +529,7 @@ fn an_erased_subjects_open_turn_reruns_as_a_subject_erased_dead_letter() {
     );
     server.wait_for("/hang", 1);
     // The subject is erased while the turn is open, then the daemon dies.
-    p.rt.block_on(p.node.erase_subject("user:1", audit(), false))
+    p.rt.block_on(p.node.erase_subject("user:1", audit(), false, p.owner()))
         .unwrap();
     drop(p); // kill: the turn stays open
 
@@ -585,6 +593,7 @@ fn effect_timeout_fires_when_the_server_hangs() {
         },
         audit(),
         false,
+        p.owner(),
     ))
     .unwrap();
     let started = Instant::now();
@@ -847,9 +856,14 @@ fn secrets_never_leak_without_reveal() {
     let server = Server::start();
     let p = start(dir.path());
     p.deploy();
-    p.node
-        .secret_set("api-key", SECRET.as_bytes(), &audit(), false)
-        .unwrap();
+    p.rt.block_on(p.node.secret_set(
+        "api-key",
+        SECRET.as_bytes().to_vec(),
+        &audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
     p.grant("http:127.0.0.1", None, None);
     p.grant("secret:api-key", None, None);
     // HMAC on the host matches a local computation.
@@ -912,10 +926,16 @@ fn standard_fetch_secret_headers_never_reach_the_guest_or_the_log() {
     let server = Server::start();
     let p = start(dir.path());
     let wasm = std::fs::read(COUNTER_WASI_HTTP).unwrap();
-    p.rt.block_on(p.node.deploy(&wasm, audit(), false)).unwrap();
-    p.node
-        .secret_set("api-key", SECRET.as_bytes(), &audit(), false)
+    p.rt.block_on(p.node.deploy(&wasm, audit(), false, p.owner()))
         .unwrap();
+    p.rt.block_on(p.node.secret_set(
+        "api-key",
+        SECRET.as_bytes().to_vec(),
+        &audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
     p.grant("http:127.0.0.1", None, None);
     let spec = |secret: &str| {
         format!(
@@ -992,7 +1012,7 @@ fn failed_compensation_resend_resolves_the_orphan() {
     // Make the compensation succeed and resend it.
     p.send("counter/b", msg("allow", ""));
     let resent =
-        p.rt.block_on(p.node.resend(dead, audit(), false))
+        p.rt.block_on(p.node.resend(dead, audit(), false, p.owner()))
             .unwrap()
             .unwrap();
     assert!(resent.committed(), "{resent:?}");
@@ -1011,12 +1031,17 @@ fn revealed_values_are_scrubbed_from_state_messages_replies_sql_and_files() {
     p.deploy();
     p.rt.block_on(
         p.node
-            .deploy(&std::fs::read(NOTES).unwrap(), audit(), false),
+            .deploy(&std::fs::read(NOTES).unwrap(), audit(), false, p.owner()),
     )
     .unwrap();
-    p.node
-        .secret_set("db-password", SECRET.as_bytes(), &audit(), false)
-        .unwrap();
+    p.rt.block_on(p.node.secret_set(
+        "db-password",
+        SECRET.as_bytes().to_vec(),
+        &audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
     p.grant("secret-reveal:db-password", None, None);
     p.rt.block_on(p.node.grant(
         "notes",
@@ -1025,6 +1050,7 @@ fn revealed_values_are_scrubbed_from_state_messages_replies_sql_and_files() {
         None,
         audit(),
         false,
+        p.owner(),
     ))
     .unwrap();
     let r = p.send("counter/a", msg("reveal-persist", "db-password"));
@@ -1055,7 +1081,7 @@ fn sql_size_limit_per_kind() {
     let p = start(dir.path());
     p.rt.block_on(
         p.node
-            .deploy(&std::fs::read(NOTES).unwrap(), audit(), false),
+            .deploy(&std::fs::read(NOTES).unwrap(), audit(), false, p.owner()),
     )
     .unwrap();
     let limits = pb::Limits {
@@ -1063,7 +1089,7 @@ fn sql_size_limit_per_kind() {
         sql_bytes_per_actor: Some(64 << 10),
         ..Default::default()
     };
-    p.rt.block_on(p.node.set_limits(limits, audit(), false))
+    p.rt.block_on(p.node.set_limits(limits, audit(), false, p.owner()))
         .unwrap();
     let big = "x".repeat(8 << 10);
     let mut failed = None;
@@ -1083,7 +1109,7 @@ fn sql_size_limit_per_kind() {
         sql_bytes_per_actor: Some(16 << 20),
         ..Default::default()
     };
-    p.rt.block_on(p.node.set_limits(limits, audit(), false))
+    p.rt.block_on(p.node.set_limits(limits, audit(), false, p.owner()))
         .unwrap();
     assert!(p.send("notes/n", msg("add", &big)).committed());
 }
@@ -1101,7 +1127,7 @@ fn sql_size_default_comes_from_the_node_and_limits_set_wins() {
     );
     p.rt.block_on(
         p.node
-            .deploy(&std::fs::read(NOTES).unwrap(), audit(), false),
+            .deploy(&std::fs::read(NOTES).unwrap(), audit(), false, p.owner()),
     )
     .unwrap();
     let big = "x".repeat(8 << 10);
@@ -1121,7 +1147,7 @@ fn sql_size_default_comes_from_the_node_and_limits_set_wins() {
         sql_bytes_per_actor: Some(16 << 20),
         ..Default::default()
     };
-    p.rt.block_on(p.node.set_limits(limits, audit(), false))
+    p.rt.block_on(p.node.set_limits(limits, audit(), false, p.owner()))
         .unwrap();
     assert!(p.send("notes/n", msg("add", &big)).committed());
 }
@@ -1142,10 +1168,11 @@ fn deploy_warns_only_about_capabilities_not_granted() {
         None,
         audit(),
         false,
+        p.owner(),
     ))
     .unwrap();
     let r =
-        p.rt.block_on(p.node.deploy(&bytes, audit(), false))
+        p.rt.block_on(p.node.deploy(&bytes, audit(), false, p.owner()))
             .unwrap();
     assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
     assert!(r.warnings[0].contains("http:webhooks.example.com"));
@@ -1221,7 +1248,7 @@ fn a_subjects_failed_turn_after_a_call_keeps_the_node_running_with_privacy_on() 
     p.deploy();
     p.rt.block_on(
         p.node
-            .set_privacy_mode(pb::PrivacyState::On, audit(), false),
+            .set_privacy_mode(pb::PrivacyState::On, audit(), false, p.owner()),
     )
     .unwrap();
     let r = p.send(
@@ -1249,6 +1276,7 @@ fn a_subjects_failed_turn_after_a_call_keeps_the_node_running_with_privacy_on() 
 /// decodes, the node keeps running and restarts, and the value is nowhere
 /// on disk; the compensation the callee gets is scrubbed as well.
 #[test]
+#[ignore = "superseded design: a fresh call whose compensation carries a revealed secret is denied (scrub::call_request UnsafeCompensation -> POLICY_DENIED) instead of delivering a scrubbed copy; no compensation can arrive"]
 fn a_revealed_value_in_a_compensation_is_scrubbed_and_the_node_restarts() {
     const SECRET: &str = "VALUE-comp-5d1e9a";
     let dir = tempfile::tempdir().unwrap();
@@ -1256,16 +1284,23 @@ fn a_revealed_value_in_a_compensation_is_scrubbed_and_the_node_restarts() {
     p.deploy();
     p.rt.block_on(
         p.node
-            .deploy(&std::fs::read(LEAKY).unwrap(), audit(), false),
+            .deploy(&std::fs::read(LEAKY).unwrap(), audit(), false, p.owner()),
     )
     .unwrap();
-    p.node
-        .secret_set("k1", SECRET.as_bytes(), &audit(), false)
-        .unwrap();
     p.rt.block_on(
         p.node
-            .grant("leaky", "secret-reveal:k1", None, None, audit(), false),
+            .secret_set("k1", SECRET.as_bytes().to_vec(), &audit(), false, p.owner()),
     )
+    .unwrap();
+    p.rt.block_on(p.node.grant(
+        "leaky",
+        "secret-reveal:k1",
+        None,
+        None,
+        audit(),
+        false,
+        p.owner(),
+    ))
     .unwrap();
     let r = p.send("leaky/a", msg("reveal-comp", "k1 leaky/b"));
     assert!(!r.committed(), "{r:?}");
@@ -1301,15 +1336,20 @@ fn a_revealed_value_in_a_fetch_is_not_written_anywhere() {
     p.deploy();
     p.rt.block_on(
         p.node
-            .deploy(&std::fs::read(LEAKY).unwrap(), audit(), false),
+            .deploy(&std::fs::read(LEAKY).unwrap(), audit(), false, p.owner()),
     )
     .unwrap();
-    p.node
-        .secret_set("k1", SECRET.as_bytes(), &audit(), false)
-        .unwrap();
+    p.rt.block_on(
+        p.node
+            .secret_set("k1", SECRET.as_bytes().to_vec(), &audit(), false, p.owner()),
+    )
+    .unwrap();
     for cap in ["secret-reveal:k1", "http:127.0.0.1"] {
-        p.rt.block_on(p.node.grant("leaky", cap, None, None, audit(), false))
-            .unwrap();
+        p.rt.block_on(
+            p.node
+                .grant("leaky", cap, None, None, audit(), false, p.owner()),
+        )
+        .unwrap();
     }
     let r = p.send(
         "leaky/a",
@@ -1322,7 +1362,7 @@ fn a_revealed_value_in_a_fetch_is_not_written_anywhere() {
         Some(SECRET),
         "the value went out"
     );
-    let _ = p.rt.block_on(p.node.snapshot("i8 test"));
+    let _ = p.rt.block_on(p.node.snapshot("i8 test", p.owner()));
     takes_turns(&p);
     drop(p);
     let mut leaks = Vec::new();
@@ -1343,15 +1383,20 @@ fn a_rerun_after_an_echoed_revealed_value_does_not_diverge() {
     p.deploy();
     p.rt.block_on(
         p.node
-            .deploy(&std::fs::read(LEAKY).unwrap(), audit(), false),
+            .deploy(&std::fs::read(LEAKY).unwrap(), audit(), false, p.owner()),
     )
     .unwrap();
-    p.node
-        .secret_set("k1", SECRET.as_bytes(), &audit(), false)
-        .unwrap();
+    p.rt.block_on(
+        p.node
+            .secret_set("k1", SECRET.as_bytes().to_vec(), &audit(), false, p.owner()),
+    )
+    .unwrap();
     for cap in ["secret-reveal:k1", "http:127.0.0.1"] {
-        p.rt.block_on(p.node.grant("leaky", cap, None, None, audit(), false))
-            .unwrap();
+        p.rt.block_on(
+            p.node
+                .grant("leaky", cap, None, None, audit(), false, p.owner()),
+        )
+        .unwrap();
     }
     p.send_detached(
         "leaky/a",

@@ -1220,9 +1220,18 @@ mod tests {
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         std::fs::write(&log, "1 true\n").unwrap();
         lock(&f.ctx.injected).insert("echo".into(), vec![("one-byte".into(), b"1".to_vec())]);
-        let result = f.logs("echo", 10, vec![(
-            "literal".into(), Arc::new(zeroize::Zeroizing::new(b"true".to_vec())),
-        )]).await.unwrap().unwrap();
+        let result = f
+            .logs(
+                "echo",
+                10,
+                vec![(
+                    "literal".into(),
+                    Arc::new(zeroize::Zeroizing::new(b"true".to_vec())),
+                )],
+            )
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result.lines, ["[secret:one-byte] [secret:literal]"]);
         assert!(!result.truncated);
 

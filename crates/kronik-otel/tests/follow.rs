@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use kronik_core::authority::AuthLease;
 use kronik_core::env::Env;
-use kronik_sched::secrets::CertifiedSecretSnapshot;
 use kronik_core::ids::{ActorRef, Lsn};
 use kronik_log::Committed;
 use kronik_otel::audit::{Keys, Mapper};
@@ -31,6 +30,7 @@ use kronik_otel::otlp::trace::v1::Span;
 use kronik_otel::traces::{KeyMode, Settings, TraceSink};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
+use kronik_sched::secrets::CertifiedSecretSnapshot;
 use kronik_sched::snapshots::StorageConfig;
 use kronik_sched::{Node, NodeConfig, start_local};
 use prost::Message as _;
@@ -91,7 +91,8 @@ impl Fixture {
         );
         let wasm = std::fs::read(COUNTER).unwrap();
         let original = node.local_operator_authority().unwrap();
-        rt.block_on(node.deploy(&wasm, audit(), false, original.clone())).unwrap();
+        rt.block_on(node.deploy(&wasm, audit(), false, original.clone()))
+            .unwrap();
         Fixture {
             rt,
             node,
@@ -112,10 +113,13 @@ impl Fixture {
             ..Default::default()
         };
         self.rt
-            .block_on(
-                self.node
-                    .send(ActorRef::parse(to).unwrap(), msg, audit(), false, self.original.clone()),
-            )
+            .block_on(self.node.send(
+                ActorRef::parse(to).unwrap(),
+                msg,
+                audit(),
+                false,
+                self.original.clone(),
+            ))
             .unwrap()
             .unwrap();
     }
@@ -124,10 +128,18 @@ impl Fixture {
     fn follow(&self, name: &'static str, cursor: Lsn, sink: Fake) -> Arc<Stream> {
         let stream = if name == kronik_otel::sink::STREAM {
             Stream::new_audit(name, true, String::new(), cursor, self.cursors.clone())
-        } else { Stream::new(name, true, String::new(), cursor, self.cursors.clone()) };
+        } else {
+            Stream::new(name, true, String::new(), cursor, self.cursors.clone())
+        };
         stream.own_task(self.node.env().spawn(
             "test-follow",
-            follow(self.node.clone(), stream.clone(), OPTS, sink, self.original.clone()),
+            follow(
+                self.node.clone(),
+                stream.clone(),
+                OPTS,
+                sink,
+                self.original.clone(),
+            ),
         ));
         stream
     }
@@ -147,12 +159,25 @@ impl Fixture {
     }
 
     /// Every committed record, in LSN order.
-    fn records(&self, reader: &kronik_sched::ShardReader, from: Lsn) -> Vec<(pb::ActorSource, Committed)> {
-        let kronik_core::ids::SourcePos::Actor { shard: None, lsn: through } = reader.point().source else { panic!("native actor source") };
+    fn records(
+        &self,
+        reader: &kronik_sched::ShardReader,
+        from: Lsn,
+    ) -> Vec<(pb::ActorSource, Committed)> {
+        let kronik_core::ids::SourcePos::Actor {
+            shard: None,
+            lsn: through,
+        } = reader.point().source
+        else {
+            panic!("native actor source")
+        };
         let mut out = Vec::new();
         let mut after = from.saturating_sub(1);
         while after < through {
-            let page = self.rt.block_on(reader.local_export_page(after, 256, kronik_otel::follow::BATCH_BYTES)).unwrap();
+            let page = self
+                .rt
+                .block_on(reader.local_export_page(after, 256, kronik_otel::follow::BATCH_BYTES))
+                .unwrap();
             assert!(page.retention_gap.is_none());
             assert!(page.scanned_through > after);
             after = page.scanned_through;
@@ -201,7 +226,9 @@ impl Sink for Fake {
         _snapshot: &CertifiedSecretSnapshot,
         original: AuthLease,
     ) -> Result<(), String> {
-        original.check().map_err(|error| error.code.as_str().to_owned())?;
+        original
+            .check()
+            .map_err(|error| error.code.as_str().to_owned())?;
         if self.seen.preparation_down.load(Ordering::SeqCst) {
             return Err("SECRET_UNAVAILABLE".into());
         }
@@ -209,7 +236,10 @@ impl Sink for Fake {
             self.seen.panics.fetch_sub(1, Ordering::SeqCst);
             panic!("a bug in a sink");
         }
-        let bytes = records.iter().map(|(_, record)| record.record.encoded_len()).sum();
+        let bytes = records
+            .iter()
+            .map(|(_, record)| record.record.encoded_len())
+            .sum();
         self.seen
             .batches
             .lock()
@@ -220,7 +250,10 @@ impl Sink for Fake {
 
     async fn deliver(&mut self, _: &(), original: AuthLease) -> Delivery {
         if let Err(error) = original.check() {
-            return Delivery::Retry { code: error.code.as_str().to_owned(), after: None };
+            return Delivery::Retry {
+                code: error.code.as_str().to_owned(),
+                after: None,
+            };
         }
         if self.seen.down.load(Ordering::SeqCst) {
             Delivery::Retry {
@@ -233,7 +266,9 @@ impl Sink for Fake {
     }
 
     async fn gap(&mut self, from: Lsn, to: Lsn, original: AuthLease) -> Result<(), String> {
-        original.check().map_err(|error| error.code.as_str().to_owned())?;
+        original
+            .check()
+            .map_err(|error| error.code.as_str().to_owned())?;
         let saved = self.cursors.get(self.name).map(|e| e.lsn);
         self.seen.gaps.lock().unwrap().push((from, to, saved));
         if self.seen.gap_failures.load(Ordering::SeqCst) > 0 {
@@ -268,7 +303,8 @@ fn a_failed_gap_record_keeps_the_cursor_before_the_gap_and_is_retried() {
         !seen.batches.lock().unwrap().is_empty()
     });
     // The first batch is pending; nothing holds retention.
-    f.rt.block_on(f.node.snapshot("manual")).unwrap();
+    f.rt.block_on(f.node.snapshot("manual", f.original.clone()))
+        .unwrap();
     let first = f.node.log_first(f.node.storage_config().unwrap()).unwrap();
     assert!(first > 5, "{first}");
     seen.down.store(false, Ordering::SeqCst);
@@ -409,7 +445,13 @@ fn a_panicked_follower_restarts() {
     };
     stream.own_task(f.node.env().spawn(
         "test-supervise",
-        supervise(f.node.clone(), stream.clone(), OPTS, make, f.original.clone()),
+        supervise(
+            f.node.clone(),
+            stream.clone(),
+            OPTS,
+            make,
+            f.original.clone(),
+        ),
     ));
     f.wait("a restarted follower", || f.caught_up(&stream));
     assert_eq!(f.cursors.get("panics").unwrap().lsn, f.node.applied_lsn());
@@ -474,8 +516,16 @@ fn a_trace_rewind_resends_the_same_spans() {
     // counter/a calls counter/b, which calls counter/x.
     f.send("counter/a", "call", b"counter/b call");
     let (snapshot, publication) = f.node.native_secret_snapshot_with_publication().unwrap();
-    let reader = Arc::new(f.rt.block_on(f.node.capture_system_export_reader()).unwrap());
-    let retained = kronik_otel::follow::RetainedDisclosure::native(reader.clone(), snapshot.clone(), publication, f.original.clone());
+    let reader = Arc::new(
+        f.rt.block_on(f.node.capture_system_export_reader())
+            .unwrap(),
+    );
+    let retained = kronik_otel::follow::RetainedDisclosure::native(
+        reader.clone(),
+        snapshot.clone(),
+        publication,
+        f.original.clone(),
+    );
     let all = f.records(&reader, 1);
     let settings = Settings {
         endpoint: "http://127.0.0.1:9".into(),
@@ -497,12 +547,22 @@ fn a_trace_rewind_resends_the_same_spans() {
         .iter()
         .find(|(_, record)| matches!(record.record, Record::TurnBegin(_)))
         .unwrap()
-        .1.lsn;
-    let first = decode(f.rt.block_on(sink.prepare(&all, [0; 16], &reader, &snapshot, retained.clone())).unwrap());
+        .1
+        .lsn;
+    let first = decode(
+        f.rt.block_on(sink.prepare(&all, [0; 16], &reader, &snapshot, retained.clone()))
+            .unwrap(),
+    );
     f.rt.block_on(sink.rewind(begin, [1; 16], &reader)).unwrap();
     let again = decode(
-        f.rt.block_on(sink.prepare(&f.records(&reader, begin + 1), [1; 16], &reader, &snapshot, retained.clone()))
-            .unwrap(),
+        f.rt.block_on(sink.prepare(
+            &f.records(&reader, begin + 1),
+            [1; 16],
+            &reader,
+            &snapshot,
+            retained.clone(),
+        ))
+        .unwrap(),
     );
     // The two callees' turn spans and their effects, and the caller's.
     assert!(again.len() >= 5, "{again:?}");
@@ -518,7 +578,9 @@ fn a_revoked_native_rewind_cannot_publish_durable_control() {
     let before = f.node.applied_lsn();
     f.node.stop_native_execution().unwrap();
     let expected = f.original.check().unwrap_err().code;
-    let error = f.rt.block_on(stream.rewind(&f.node, 0, f.original.clone())).unwrap_err();
+    let error =
+        f.rt.block_on(stream.rewind(&f.node, 0, f.original.clone()))
+            .unwrap_err();
     assert_eq!(error.code, expected);
     assert!(f.cursors.get("revoked-rewind").is_none());
     assert!(!f._dir.path().join("export.json").exists());
@@ -567,13 +629,15 @@ async fn concurrent_stop_joins_the_real_worker_and_keeps_dynamic_names_and_exact
     let second = stream.stop_and_join();
     tokio::pin!(first, second);
     tokio::select! {
+        biased;
         result = first.as_mut() => panic!("stop returned before its worker completed: {result:?}"),
         () = stream.stopped() => {},
     }
     assert!(!completed.load(Ordering::SeqCst));
     release.send(()).unwrap();
     let (a, b) = tokio::join!(first, second);
-    a.unwrap(); b.unwrap();
+    a.unwrap();
+    b.unwrap();
     assert!(completed.load(Ordering::SeqCst));
     stream.stop_and_join().await.unwrap();
 }
@@ -593,13 +657,17 @@ async fn cancelled_stop_waiter_does_not_lose_the_real_join_handle() {
         released.await.unwrap();
         done.store(true, Ordering::SeqCst);
     }));
-    let waiter = { let stream = stream.clone(); tokio::spawn(async move { stream.stop_and_join().await }) };
+    let waiter = {
+        let stream = stream.clone();
+        tokio::spawn(async move { stream.stop_and_join().await })
+    };
     stream.stopped().await;
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
     let next = stream.stop_and_join();
     tokio::pin!(next);
     tokio::select! {
+        biased;
         result = next.as_mut() => panic!("cancelled waiter detached the real worker: {result:?}"),
         () = tokio::task::yield_now() => {},
     }
@@ -612,48 +680,94 @@ async fn cancelled_stop_waiter_does_not_lose_the_real_join_handle() {
 async fn stopping_drains_actual_control_and_refuses_the_queued_metadata_rewind() {
     let directory = tempfile::tempdir().unwrap();
     let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(env.clone(), directory.path(), NodeConfig::default()).await.unwrap();
+    let node = start_local(env.clone(), directory.path(), NodeConfig::default())
+        .await
+        .unwrap();
     let original = node.local_operator_authority().unwrap();
     let cursors = Arc::new(Cursors::load(env.clone(), directory.path()).await.unwrap());
     // A persisted control fixture, not a fabricated metadata history or authority grant.
-    let entry = Entry { lsn: 17, state: serde_json::json!({"source":kronik_core::ids::SourcePos::Metadata {index:17}}), ..Default::default() };
-    cursors.save("metadata-control", entry.clone()).await.unwrap();
+    let entry = Entry {
+        lsn: 17,
+        state: serde_json::json!({"source":kronik_core::ids::SourcePos::Metadata {index:17}}),
+        ..Default::default()
+    };
+    cursors
+        .save("metadata-control", entry.clone())
+        .await
+        .unwrap();
     let stream = Stream::new("metadata-control", true, String::new(), 17, cursors.clone());
     let held = stream.control_guard().await;
     let queued = stream.rewind_metadata(&env, 3, original.clone());
     tokio::pin!(queued);
     tokio::select! {
+        biased;
         result = queued.as_mut() => panic!("rewind bypassed actual control serialization: {result:?}"),
         () = tokio::task::yield_now() => {},
     }
     let stopped = stream.stop_and_join();
     tokio::pin!(stopped);
     tokio::select! {
+        biased;
         result = stopped.as_mut() => panic!("stop failed to drain active control: {result:?}"),
         () = stream.stopped() => {},
     }
     drop(held);
     let (stop, rewind) = tokio::join!(stopped, queued);
     stop.unwrap();
-    assert_eq!(rewind.unwrap_err().code, kronik_core::error::ErrorCode::Unavailable);
+    assert_eq!(
+        rewind.unwrap_err().code,
+        kronik_core::error::ErrorCode::Unavailable
+    );
     assert_eq!(cursors.get("metadata-control").unwrap(), entry);
-    assert_eq!(Cursors::load(env, directory.path()).await.unwrap().get("metadata-control").unwrap(), entry);
+    assert_eq!(
+        Cursors::load(env.clone(), directory.path())
+            .await
+            .unwrap()
+            .get("metadata-control")
+            .unwrap(),
+        entry
+    );
 }
 
 #[test]
 fn genuine_native_initializer_preserves_existing_rewind_and_refuses_a_future_cut() {
     let f = Fixture::new(false);
-    let stream = Stream::new(format!("events-{}", "native-init"), true, String::new(), 0, f.cursors.clone());
+    let stream = Stream::new(
+        format!("events-{}", "native-init"),
+        true,
+        String::new(),
+        0,
+        f.cursors.clone(),
+    );
     let head = f.node.applied_lsn();
-    let future = Entry { lsn: head + 1, ..Default::default() };
-    assert_eq!(f.rt.block_on(stream.initialize_native_cursor(&f.node, future, f.original.clone())).unwrap_err().code,
-        kronik_core::error::ErrorCode::Unavailable);
+    let future = Entry {
+        lsn: head + 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        f.rt.block_on(stream.initialize_native_cursor(&f.node, future, f.original.clone()))
+            .unwrap_err()
+            .code,
+        kronik_core::error::ErrorCode::Unavailable
+    );
     assert!(f.cursors.get(stream.name.as_ref()).is_none());
-    f.rt.block_on(stream.initialize_native_cursor(&f.node, Entry { lsn: head, ..Default::default() }, f.original.clone())).unwrap();
-    f.rt.block_on(stream.rewind(&f.node, 0, f.original.clone())).unwrap();
+    f.rt.block_on(stream.initialize_native_cursor(
+        &f.node,
+        Entry {
+            lsn: head,
+            ..Default::default()
+        },
+        f.original.clone(),
+    ))
+    .unwrap();
+    f.rt.block_on(stream.rewind(&f.node, 0, f.original.clone()))
+        .unwrap();
     let pending = f.cursors.get(stream.name.as_ref()).unwrap();
     assert!(pending.pending_rewind().is_some());
-    let selected = f.rt.block_on(stream.initialize_native_cursor(&f.node, Entry::default(), f.original.clone())).unwrap();
+    let selected = f
+        .rt
+        .block_on(stream.initialize_native_cursor(&f.node, Entry::default(), f.original.clone()))
+        .unwrap();
     assert_eq!(selected, pending);
     assert_eq!(f.cursors.get(stream.name.as_ref()).unwrap(), pending);
     f.rt.block_on(stream.stop_and_join()).unwrap();
@@ -663,15 +777,30 @@ fn genuine_native_initializer_preserves_existing_rewind_and_refuses_a_future_cut
 async fn real_metric_worker_stops_and_joins_while_waiting_for_its_next_push() {
     let directory = tempfile::tempdir().unwrap();
     let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(env.clone(), directory.path(), NodeConfig::default()).await.unwrap();
+    let node = start_local(env.clone(), directory.path(), NodeConfig::default())
+        .await
+        .unwrap();
     let original = node.local_operator_authority().unwrap();
     let cursors = Arc::new(Cursors::load(env.clone(), directory.path()).await.unwrap());
     let stream = Stream::new("actual-metric-owner", false, String::new(), 0, cursors);
     let pushed = Arc::new(AtomicBool::new(false));
     let before = pushed.clone();
-    stream.own_task(env.spawn("metric-stop-test", kronik_otel::metrics::push_loop(node,
-        "http://127.0.0.1:9".into(), Vec::new(), "kronik".into(), "main".into(), Duration::from_secs(3600),
-        move || { before.store(true, Ordering::SeqCst); }, stream.clone(), original)));
+    stream.own_task(env.spawn(
+        "metric-stop-test",
+        kronik_otel::metrics::push_loop(
+            node,
+            "http://127.0.0.1:9".into(),
+            Vec::new(),
+            "kronik".into(),
+            "main".into(),
+            Duration::from_secs(3600),
+            move || {
+                before.store(true, Ordering::SeqCst);
+            },
+            stream.clone(),
+            original,
+        ),
+    ));
     stream.stop_and_join().await.unwrap();
     assert!(!pushed.load(Ordering::SeqCst));
 }

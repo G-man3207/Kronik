@@ -26,16 +26,19 @@ fn try_propose(p: &Proc, props: &Arc<Proposals>, guests: &[&str]) -> Result<Prop
         .map(|g| std::fs::read(guest(g)).unwrap())
         .collect();
     p.settle();
-    p.rt.block_on(props.propose(ProposeRequest {
-        wasm,
-        names: guests.iter().map(|g| (*g).to_owned()).collect(),
-        window_ms: None,
-        at: None,
-        options: DiffOptions::default(),
-        workers: Some(2),
-        audit: audit(),
-        dry_run: false,
-    }))
+    p.rt.block_on(props.propose(
+        ProposeRequest {
+            wasm,
+            names: guests.iter().map(|g| (*g).to_owned()).collect(),
+            window_ms: None,
+            at: None,
+            options: DiffOptions::default(),
+            workers: Some(2),
+            audit: audit(),
+            dry_run: false,
+        },
+        p.owner(),
+    ))
     .map(|(prop, _)| prop)
 }
 
@@ -105,7 +108,7 @@ fn default_rules_fired(d: &Value) -> Vec<String> {
 fn a_caller_and_its_new_callee_verify_together_and_fail_apart() {
     let dir = tempdir();
     let p = system(dir.path(), None);
-    p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false))
+    p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false, p.owner()))
         .unwrap();
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
 
@@ -242,12 +245,12 @@ fn unchanged_components_are_skipped_and_nothing_changed_is_refused() {
 fn a_component_promoted_inside_the_window_is_not_skipped() {
     let dir = tempdir();
     let p = system(dir.path(), None);
-    p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false))
+    p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false, p.owner()))
         .unwrap();
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     // notes-tally goes live inside the window, after the fork point.
     let callee = try_propose(&p, &props, &["notes-tally"]).unwrap();
-    p.rt.block_on(props.promote(&callee.id, audit(), false))
+    p.rt.block_on(props.promote(&callee.id, audit(), false, p.owner()))
         .unwrap();
     p.http("a", "increment", "");
 
@@ -260,7 +263,7 @@ fn a_component_promoted_inside_the_window_is_not_skipped() {
     assert_eq!(set.policy["outcome"], "allow", "{}", set.policy);
     // Promote then swaps notes to the code it already runs.
     let r =
-        p.rt.block_on(props.promote(&set.id, audit(), false))
+        p.rt.block_on(props.promote(&set.id, audit(), false, p.owner()))
             .unwrap();
     assert_eq!(r.kinds.len(), 2);
 }
@@ -271,20 +274,20 @@ fn a_component_promoted_inside_the_window_is_not_skipped() {
 fn promote_refuses_when_a_skipped_kind_changed_code() {
     let dir = tempdir();
     let p = system(dir.path(), None);
-    p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false))
+    p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false, p.owner()))
         .unwrap();
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let prop = try_propose(&p, &props, &["counter-step2", "notes"]).unwrap();
     assert_eq!(prop.unchanged.len(), 1, "notes is skipped");
     // Another proposal changes notes in between.
     let other = try_propose(&p, &props, &["notes-tally"]).unwrap();
-    p.rt.block_on(props.promote(&other.id, audit(), false))
+    p.rt.block_on(props.promote(&other.id, audit(), false, p.owner()))
         .unwrap();
     let deployments = p.node.store().db().deployments().unwrap().len();
 
     for dry_run in [true, false] {
         let err =
-            p.rt.block_on(props.promote(&prop.id, audit(), dry_run))
+            p.rt.block_on(props.promote(&prop.id, audit(), dry_run, p.owner()))
                 .unwrap_err();
         assert_eq!(err.code, ErrorCode::ProposalStale, "{err}");
         assert!(err.message.contains("\"notes\" no longer runs"), "{err}");
@@ -307,18 +310,18 @@ fn promote_refuses_when_a_skipped_kind_changed_code() {
 fn promote_refuses_when_a_changed_kind_changed_code_since_the_fork() {
     let dir = tempdir();
     let p = system(dir.path(), None);
-    p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false))
+    p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false, p.owner()))
         .unwrap();
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let p1 = try_propose(&p, &props, &["counter-step2"]).unwrap();
     let p2 = try_propose(&p, &props, &["counter-body-v2"]).unwrap();
-    p.rt.block_on(props.promote(&p2.id, audit(), false))
+    p.rt.block_on(props.promote(&p2.id, audit(), false, p.owner()))
         .unwrap();
     let deployments = p.node.store().db().deployments().unwrap().len();
 
     for dry_run in [true, false] {
         let err =
-            p.rt.block_on(props.promote(&p1.id, audit(), dry_run))
+            p.rt.block_on(props.promote(&p1.id, audit(), dry_run, p.owner()))
                 .unwrap_err();
         assert_eq!(err.code, ErrorCode::ProposalStale, "{err}");
         assert!(err.message.contains("\"counter\" no longer runs"), "{err}");
@@ -351,7 +354,7 @@ fn promote_refuses_when_a_changed_kind_changed_code_since_the_fork() {
     let p3 = try_propose(&p, &props, &["counter-step2"]).unwrap();
     assert!(p3.fork_lsn < p.node.store().db().deployments().unwrap().last().unwrap().0);
     for dry_run in [true, false] {
-        p.rt.block_on(props.promote(&p3.id, audit(), dry_run))
+        p.rt.block_on(props.promote(&p3.id, audit(), dry_run, p.owner()))
             .unwrap();
     }
     assert_eq!(
@@ -379,7 +382,7 @@ fn a_rerun_across_a_schema_raising_switch_keeps_its_code_version() {
     // counter/c begins under schema 0 and holds after its call answered.
     p.http_detached("c", "call", "counter/b increment");
     p.wait_kv("counter/b", "n");
-    p.rt.block_on(props.promote(&prop.id, audit(), false))
+    p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
         .unwrap();
     drop(props);
     drop(p);
@@ -451,7 +454,7 @@ fn no_turn_starts_with_old_code_after_a_set_switch() {
     // The promote goes through its hold at once.
     hold.release.add_permits(1);
     let promoted =
-        p.rt.block_on(props.promote(&prop.id, audit(), false))
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();
     assert_eq!(hold.parked.load(Ordering::SeqCst), 1);
     p.settle();
@@ -459,7 +462,8 @@ fn no_turn_starts_with_old_code_after_a_set_switch() {
     // Roll the set back and keep it parked with its Deployment applied.
     let rollback = {
         let props = props.clone();
-        p.rt.spawn(async move { props.rollback(promoted.epoch, audit(), false).await })
+        let owner = p.owner();
+        p.rt.spawn(async move { props.rollback(promoted.epoch, audit(), false, owner).await })
     };
     wait_until("the rollback parks", || {
         hold.parked.load(Ordering::SeqCst) == 2
@@ -520,7 +524,7 @@ fn rolling_back_a_set_restores_every_kind_at_one_lsn() {
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let prop = try_propose(&p, &props, &["counter-calls-tally", "notes-tally"]).unwrap();
     let promoted =
-        p.rt.block_on(props.promote(&prop.id, audit(), false))
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();
 
     // The promote switched both kinds with one record.
@@ -544,7 +548,7 @@ fn rolling_back_a_set_restores_every_kind_at_one_lsn() {
     assert_eq!(reply(&p.send("notes/tally", "count", "")), "1");
 
     let (epoch, lsn, kinds) =
-        p.rt.block_on(props.rollback(promoted.epoch, audit(), false))
+        p.rt.block_on(props.rollback(promoted.epoch, audit(), false, p.owner()))
             .unwrap();
     assert_eq!(kinds.len(), 2);
     let deployments = p.node.store().db().deployments().unwrap();
@@ -598,12 +602,12 @@ fn rolling_back_a_set_that_added_a_kind_is_refused() {
     let prop = try_propose(&p, &props, &["counter-step2", "notes"]).unwrap();
     assert_eq!(kind(&diff(&p, &props, &prop.id), "notes")["code"], "new");
     let promoted =
-        p.rt.block_on(props.promote(&prop.id, audit(), false))
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();
     let deployments = p.node.store().db().deployments().unwrap().len();
     for dry_run in [true, false] {
         let err =
-            p.rt.block_on(props.rollback(promoted.epoch, audit(), dry_run))
+            p.rt.block_on(props.rollback(promoted.epoch, audit(), dry_run, p.owner()))
                 .unwrap_err();
         assert_eq!(err.code, ErrorCode::BadRequest, "{err}");
         assert!(err.message.contains("\"notes\" did not exist"), "{err}");
@@ -625,7 +629,9 @@ fn rolling_back_a_set_that_added_a_kind_is_refused() {
 /// A component's code as a set member, as propose records it.
 fn kind_version(p: &Proc, name: &str) -> pb::KindVersion {
     let bytes = std::fs::read(guest(name)).unwrap();
-    let (hash, _, manifest) = p.rt.block_on(p.node.prepare_code(&bytes)).unwrap();
+    let (hash, _, manifest) =
+        p.rt.block_on(p.node.prepare_code(&bytes, p.owner()))
+            .unwrap();
     pb::KindVersion {
         kind: manifest.kind.clone(),
         code_hash: hash.0.to_vec(),
@@ -672,16 +678,19 @@ fn two_kinds_of_a_set_cannot_claim_one_route() {
             .map(|g| std::fs::read(guest(g)).unwrap())
             .collect();
         let err =
-            p.rt.block_on(props.propose(ProposeRequest {
-                wasm,
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run,
-            }))
+            p.rt.block_on(props.propose(
+                ProposeRequest {
+                    wasm,
+                    names: Vec::new(),
+                    window_ms: None,
+                    at: None,
+                    options: DiffOptions::default(),
+                    workers: Some(2),
+                    audit: audit(),
+                    dry_run,
+                },
+                p.owner(),
+            ))
             .unwrap_err();
         assert_eq!(
             err.code,
@@ -709,6 +718,7 @@ fn two_kinds_of_a_set_cannot_claim_one_route() {
                 },
                 audit(),
                 dry_run,
+                p.owner(),
             ))
             .unwrap_err();
         assert_eq!(
@@ -736,7 +746,7 @@ fn a_set_can_move_a_route_from_one_kind_to_another() {
     p.deploy("notes");
     p.http("a", "increment", "");
     p.send("notes/n", "add", "first");
-    p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false))
+    p.rt.block_on(p.node.set_policy(NO_NEW_ERRORS, audit(), false, p.owner()))
         .unwrap();
     assert_eq!(tally_route(&p).as_deref(), Some("counter"));
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
@@ -747,7 +757,7 @@ fn a_set_can_move_a_route_from_one_kind_to_another() {
     // ...but it can in a set where the counter gives it up.
     let prop = try_propose(&p, &props, &["counter", "notes-route-tally"]).unwrap();
     assert_eq!(prop.policy["outcome"], "allow", "{}", prop.policy);
-    p.rt.block_on(props.promote(&prop.id, audit(), false))
+    p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
         .unwrap();
     assert_eq!(tally_route(&p).as_deref(), Some("notes"));
 }

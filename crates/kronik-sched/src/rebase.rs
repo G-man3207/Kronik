@@ -190,7 +190,12 @@ impl Node {
 
     /// Builds the shadow of rebase `id` at `base_lsn` from main's log, and
     /// feeds it everything main logged since; kept for the switch.
-    pub async fn rebase_prepare(&self, id: &str, base_lsn: Lsn, authority: AuthLease) -> Result<(), ApiError> {
+    pub async fn rebase_prepare(
+        &self,
+        id: &str,
+        base_lsn: Lsn,
+        authority: AuthLease,
+    ) -> Result<(), ApiError> {
         authority.check()?;
         let ready = lock(&self.rebase.live)
             .as_ref()
@@ -200,17 +205,30 @@ impl Node {
             let from = snap.as_ref().map_or(0, |(lsn, _)| *lsn);
             let records = self.rebase.read(from, base_lsn).await.map_err(store_err)?;
             if records.first().is_some_and(|record| record.lsn != from + 1) {
-                return Err(ApiError::new(ErrorCode::BadRequest, format!("the rebase {id} needs the log from lsn {}, but it starts later", from + 1)));
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "the rebase {id} needs the log from lsn {}, but it starts later",
+                        from + 1
+                    ),
+                ));
             }
             let sealer = self.store().sealer_arc();
             let rebase = self.rebase.clone();
             let id = id.to_owned();
             self.authorized_effect(authority.clone(), move || async move {
-                let shadow = Shadow::at_base(&id, base_lsn, snap.as_ref().map(|(lsn, dir)| (*lsn, dir.as_path())), &records, sealer)
-                    .map_err(|error| ApiError::new(ErrorCode::BadRequest, error.to_string()))?;
+                let shadow = Shadow::at_base(
+                    &id,
+                    base_lsn,
+                    snap.as_ref().map(|(lsn, dir)| (*lsn, dir.as_path())),
+                    &records,
+                    sealer,
+                )
+                .map_err(|error| ApiError::new(ErrorCode::BadRequest, error.to_string()))?;
                 *lock(&rebase.live) = Some(shadow);
                 Ok(())
-            }).await?;
+            })
+            .await?;
         }
         self.rebase_refresh(id, authority).await
     }
@@ -231,10 +249,13 @@ impl Node {
         let id = id.to_owned();
         self.authorized_effect(authority, move || async move {
             let mut live = lock(&rebase.live);
-            let shadow = live.as_mut().filter(|shadow| shadow.rebase_id == id)
+            let shadow = live
+                .as_mut()
+                .filter(|shadow| shadow.rebase_id == id)
                 .ok_or_else(|| internal(format!("rebase {id} is not prepared")))?;
             shadow.feed(&records).map_err(store_err)
-        }).await
+        })
+        .await
     }
 
     /// A snapshot at the switch, so later rebuilds start after it (ADR
@@ -321,26 +342,39 @@ impl Node {
                  back the code only: kronik rollback <epoch> --reason \"...\"",
             ));
         }
-        let records = turns
-            .into_iter()
-            .map(|(fork_lsn, record)| {
-                Record::StateRebase(pb::StateRebase {
-                    rebase_id: id.to_owned(),
-                    part: Some(pb::state_rebase::Part::Turn(pb::RebasedTurn {
-                        fork_lsn,
-                        record: Some(record),
-                    })),
-                })
-            });
+        let records = turns.into_iter().map(|(fork_lsn, record)| {
+            Record::StateRebase(pb::StateRebase {
+                rebase_id: id.to_owned(),
+                part: Some(pb::state_rebase::Part::Turn(pb::RebasedTurn {
+                    fork_lsn,
+                    record: Some(record),
+                })),
+            })
+        });
         for record in records {
             if let Some(pause) = pause {
                 if pause.expired() {
-                    return Err(stale("the last round did not fit in rebase.max_pause; nothing was switched"));
+                    return Err(stale(
+                        "the last round did not fit in rebase.max_pause; nothing was switched",
+                    ));
                 }
                 // A timed-out unadmitted append is dropped; records already admitted may finish honestly.
-                match self.env().timeout(pause.remaining(), self.commit_authorized(record, authority.clone())).await {
-                    Ok(result) => { result?; }
-                    Err(_) => return Err(stale("the last round did not fit in rebase.max_pause; nothing was switched")),
+                match self
+                    .env()
+                    .timeout(
+                        pause.remaining(),
+                        self.commit_authorized(record, authority.clone()),
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        result?;
+                    }
+                    Err(_) => {
+                        return Err(stale(
+                            "the last round did not fit in rebase.max_pause; nothing was switched",
+                        ));
+                    }
                 }
             } else {
                 self.commit_authorized(record, authority.clone()).await?;
@@ -482,7 +516,9 @@ impl Node {
         // With the gate held no turn starts; a callee turn whose caller
         // gave up may have started before it.
         if pause.expired() {
-            return Err(stale("the last catch-up did not fit in rebase.max_pause; nothing was switched"));
+            return Err(stale(
+                "the last catch-up did not fit in rebase.max_pause; nothing was switched",
+            ));
         }
         pause.check_quiet()?;
         let record = Record::StateRebase(pb::StateRebase {
@@ -490,7 +526,15 @@ impl Node {
             part: Some(pb::state_rebase::Part::Switch(sw)),
         });
         let lsn = self
-            .finish_switch(pause, gate, record, installs, epoch, true, crate::node::OperationOrigin::Request(authority))
+            .finish_switch(
+                pause,
+                gate,
+                record,
+                installs,
+                epoch,
+                true,
+                crate::node::OperationOrigin::Request(authority),
+            )
             .await?;
         tracing::info!(rebase = id, epoch, lsn, "state rebased");
         Ok((epoch, lsn))

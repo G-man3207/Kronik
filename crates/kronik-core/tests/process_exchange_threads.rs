@@ -1,7 +1,7 @@
 //! Startup's temporary runtime must leave one OS thread before namespace entry.
 
-use kronik_core::env::{ProcessRunner as _, ProcessSpec, SensitiveProcessRequest, Stdio};
 use kronik_core::env::real::RealProcs;
+use kronik_core::env::{ProcessRunner as _, ProcessSpec, SensitiveProcessRequest, Stdio};
 use std::os::unix::fs::PermissionsExt as _;
 use std::time::Duration;
 
@@ -19,7 +19,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args: vec![
                 "-c".into(),
                 "IFS= read -r pin <&3 || exit 7; IFS= read -r request || exit 8; \
-                 if IFS= read -r extra; then exit 9; fi; printf bounded-response".into(),
+                 if IFS= read -r extra; then exit 9; fi; printf bounded-response"
+                    .into(),
             ],
             env: vec![],
             cwd: Some(dir.path().to_owned()),
@@ -30,7 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pin_file: pin,
         timeout: Duration::from_secs(3),
     };
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let result = runtime.block_on(RealProcs.exchange(request));
     #[cfg(target_os = "linux")]
     drop(result?);

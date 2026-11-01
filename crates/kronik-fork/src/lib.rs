@@ -197,15 +197,20 @@ mod atomic_write_tests {
 
         let error = write_atomic_with(&path, |file| {
             file.write_all(b"incomplete replacement")?;
-            Err(Error::new(ErrorKind::InvalidData, "producer rejected the container"))
-        }).unwrap_err();
+            Err(Error::new(
+                ErrorKind::InvalidData,
+                "producer rejected the container",
+            ))
+        })
+        .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidData);
         assert_eq!(std::fs::read(&path).unwrap(), b"previous answers");
 
         write_atomic_with(&path, |file| {
             file.write_all(b"new ")?;
             file.write_all(b"answers")
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new answers");
     }
 }

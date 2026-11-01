@@ -34,11 +34,18 @@ pub fn parse_url(url: &str) -> Result<Target, String> {
 /// Parse the live URL once and retain its original host bytes for exact redaction.
 pub fn parse_request_url(url: &str) -> Result<(Target, &str), String> {
     let (uri, target) = parsed_url(url)?;
-    let host = uri.authority().ok_or("validated URL has no authority")?.host();
+    let host = uri
+        .authority()
+        .ok_or("validated URL has no authority")?
+        .host();
     // The validated authority has no userinfo, so its host starts after "://".
     let start = target.scheme.len() + 3;
-    let end = start.checked_add(host.len()).ok_or("validated URL host span overflow")?;
-    let raw_host = url.get(start..end).ok_or("validated URL host span is invalid")?;
+    let end = start
+        .checked_add(host.len())
+        .ok_or("validated URL host span overflow")?;
+    let raw_host = url
+        .get(start..end)
+        .ok_or("validated URL host span is invalid")?;
     Ok((target, raw_host))
 }
 
@@ -95,9 +102,14 @@ pub fn prepared_target(req: &pb::HttpEffectRequest) -> Result<Target, String> {
     let authority = &rest[..authority_end];
     let (host, port) = if authority.starts_with('[') {
         let parsed: http::uri::Authority = authority.parse().map_err(|_| invalid())?;
-        if parsed.as_str().contains('@') { return Err(invalid()); }
+        if parsed.as_str().contains('@') {
+            return Err(invalid());
+        }
         let host = &authority[..parsed.host().len()];
-        let port = match authority.get(host.len()..).and_then(|suffix| suffix.strip_prefix(':')) {
+        let port = match authority
+            .get(host.len()..)
+            .and_then(|suffix| suffix.strip_prefix(':'))
+        {
             Some(port) => Some(port.parse::<u16>().map_err(|_| invalid())?),
             None => None,
         };
@@ -108,11 +120,14 @@ pub fn prepared_target(req: &pb::HttpEffectRequest) -> Result<Target, String> {
             None => (authority, None),
         };
         let mut bytes = host.as_bytes().iter().copied();
-        if host.is_empty() { return Err(invalid()); }
+        if host.is_empty() {
+            return Err(invalid());
+        }
         while let Some(byte) = bytes.next() {
             if byte == b'%' {
                 if !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
-                    || !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit()) {
+                    || !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+                {
                     return Err(invalid());
                 }
             } else if !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'~' | b'.')) {
@@ -123,9 +138,16 @@ pub fn prepared_target(req: &pb::HttpEffectRequest) -> Result<Target, String> {
     };
     let suffix = &rest[authority_end..];
     let path: http::uri::PathAndQuery = suffix.parse().map_err(|_| invalid())?;
-    if path.as_str() != suffix { return Err(invalid()); }
-    Ok(Target { scheme: scheme.into(), host: host.into(), port: port.filter(|port| Some(*port) != default),
-        path: path.path().into(), query: path.query().unwrap_or("").into() })
+    if path.as_str() != suffix {
+        return Err(invalid());
+    }
+    Ok(Target {
+        scheme: scheme.into(),
+        host: host.into(),
+        port: port.filter(|port| Some(*port) != default),
+        path: path.path().into(),
+        query: path.query().unwrap_or("").into(),
+    })
 }
 
 /// The route pattern of a URL path (docs/design/m3-fork.md §3.5): each
@@ -163,7 +185,8 @@ pub fn target_of(req: &pb::HttpEffectRequest) -> Option<(String, String, String)
         0 => parse_url(&req.url),
         2 => prepared_target(req),
         _ => return None,
-    }.ok()?;
+    }
+    .ok()?;
     Some((
         req.method.to_ascii_uppercase(),
         t.host,
@@ -196,7 +219,11 @@ fn fingerprint_fields(req: &pb::HttpEffectRequest, t: &Target, strict: bool) -> 
         h.update(&(b.len() as u64).to_le_bytes());
         h.update(b);
     };
-    field(if strict { b"kronik.fingerprint.http.v2" } else { b"kronik.fingerprint.http.v1" });
+    field(if strict {
+        b"kronik.fingerprint.http.v2"
+    } else {
+        b"kronik.fingerprint.http.v1"
+    });
     field(req.method.to_ascii_uppercase().as_bytes());
     field(t.scheme.as_bytes());
     field(t.host.as_bytes());
@@ -279,7 +306,11 @@ struct ScrubMatch {
 
 impl From<aho_corasick::Match> for ScrubMatch {
     fn from(matched: aho_corasick::Match) -> Self {
-        Self { start: matched.start(), end: matched.end(), pattern: Some(matched.pattern().as_usize()) }
+        Self {
+            start: matched.start(),
+            end: matched.end(),
+            pattern: Some(matched.pattern().as_usize()),
+        }
     }
 }
 
@@ -316,8 +347,11 @@ impl<'a> CompiledScrubber<'a> {
     /// Own only marker names, not another copy of secret values or the automaton.
     pub fn into_owned(self) -> CompiledScrubber<'static> {
         CompiledScrubber {
-            names: self.names.into_iter()
-                .map(|name| std::borrow::Cow::Owned(name.into_owned())).collect(),
+            names: self
+                .names
+                .into_iter()
+                .map(|name| std::borrow::Cow::Owned(name.into_owned()))
+                .collect(),
             matcher: self.matcher,
             max_len: self.max_len,
             pattern_bytes: self.pattern_bytes,
@@ -340,7 +374,8 @@ impl<'a> CompiledScrubber<'a> {
             if value.is_empty() || !seen.insert(value) {
                 continue;
             }
-            pattern_bytes = pattern_bytes.checked_add(value.len())
+            pattern_bytes = pattern_bytes
+                .checked_add(value.len())
                 .and_then(|bytes| bytes.checked_add(name.len()))
                 .filter(|bytes| *bytes <= pattern_limit)
                 .ok_or(ScrubError::PatternLimit)?;
@@ -351,21 +386,32 @@ impl<'a> CompiledScrubber<'a> {
         }
         let matcher = if credentials {
             max_len = max_len.max(50);
-            Some(CompiledMatcher::Output(credential_output::CredentialMatcher::build(
-                patterns.iter().map(|(value, _)| *value),
-            )?))
+            Some(CompiledMatcher::Output(
+                credential_output::CredentialMatcher::build(
+                    patterns.iter().map(|(value, _)| *value),
+                )?,
+            ))
         } else if patterns.is_empty() {
             None
         } else {
-            Some(CompiledMatcher::Literals(aho_corasick::AhoCorasick::builder()
-                .kind(Some(aho_corasick::AhoCorasickKind::NoncontiguousNFA))
-                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                .build(patterns.iter().map(|(value, _)| *value))
-                .map_err(|_| ScrubError::MatcherUnavailable)?))
+            Some(CompiledMatcher::Literals(
+                aho_corasick::AhoCorasick::builder()
+                    .kind(Some(aho_corasick::AhoCorasickKind::NoncontiguousNFA))
+                    .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+                    .build(patterns.iter().map(|(value, _)| *value))
+                    .map_err(|_| ScrubError::MatcherUnavailable)?,
+            ))
         };
-        let names = patterns.into_iter()
-            .map(|(_, name)| std::borrow::Cow::Borrowed(name)).collect();
-        Ok(Self { names, matcher, max_len, pattern_bytes })
+        let names = patterns
+            .into_iter()
+            .map(|(_, name)| std::borrow::Cow::Borrowed(name))
+            .collect();
+        Ok(Self {
+            names,
+            matcher,
+            max_len,
+            pattern_bytes,
+        })
     }
 
     /// Test original bytes without allocating replacement output.
@@ -384,10 +430,14 @@ impl<'a> CompiledScrubber<'a> {
     ) -> Result<Option<Vec<u8>>, ScrubError> {
         match &self.matcher {
             Some(CompiledMatcher::Literals(matcher)) => self.collect_matches(
-                bytes, matcher.find_iter(bytes).map(ScrubMatch::from), output_limit,
+                bytes,
+                matcher.find_iter(bytes).map(ScrubMatch::from),
+                output_limit,
             ),
             Some(CompiledMatcher::Output(matcher)) => self.collect_matches(
-                bytes, matcher.matches(bytes, &mut credential_output::Scratch::default())?, output_limit,
+                bytes,
+                matcher.matches(bytes, &mut credential_output::Scratch::default())?,
+                output_limit,
             ),
             None => self.collect_matches(bytes, std::iter::empty(), output_limit),
         }
@@ -404,7 +454,11 @@ impl<'a> CompiledScrubber<'a> {
             out.try_reserve_exact(bytes.len().min(output_limit))
                 .map_err(|_| ScrubError::MatcherUnavailable)?;
             self.emit_matches(
-                bytes, bytes.len(), std::iter::once(first).chain(matches), &mut out, output_limit,
+                bytes,
+                bytes.len(),
+                std::iter::once(first).chain(matches),
+                &mut out,
+                output_limit,
             )?;
             return Ok(Some(out));
         }
@@ -425,14 +479,20 @@ impl<'a> CompiledScrubber<'a> {
     ) -> Result<usize, ScrubError> {
         match &self.matcher {
             Some(CompiledMatcher::Literals(matcher)) => self.emit_matches(
-                bytes, stable_through, matcher.find_iter(bytes).map(ScrubMatch::from), out, output_limit,
+                bytes,
+                stable_through,
+                matcher.find_iter(bytes).map(ScrubMatch::from),
+                out,
+                output_limit,
             ),
             Some(CompiledMatcher::Output(matcher)) => self.emit_matches(
-                bytes, stable_through, matcher.matches(bytes, scratch)?, out, output_limit,
+                bytes,
+                stable_through,
+                matcher.matches(bytes, scratch)?,
+                out,
+                output_limit,
             ),
-            None => self.emit_matches(
-                bytes, stable_through, std::iter::empty(), out, output_limit,
-            ),
+            None => self.emit_matches(bytes, stable_through, std::iter::empty(), out, output_limit),
         }
     }
 
@@ -453,7 +513,8 @@ impl<'a> CompiledScrubber<'a> {
                 Some(pattern) => (b"[secret:".as_slice(), self.names[pattern].as_ref()),
                 None => (b"[secret:".as_slice(), b"token".as_slice()),
             };
-            let required = (matched.start - end).checked_add(prefix.len())
+            let required = (matched.start - end)
+                .checked_add(prefix.len())
                 .and_then(|bytes| bytes.checked_add(name.len()))
                 .and_then(|bytes| bytes.checked_add(1))
                 .and_then(|bytes| out.len().checked_add(bytes))
@@ -467,7 +528,9 @@ impl<'a> CompiledScrubber<'a> {
             end = matched.end;
         }
         let consumed = stable_through.max(end);
-        let required = out.len().checked_add(consumed - end)
+        let required = out
+            .len()
+            .checked_add(consumed - end)
             .filter(|bytes| *bytes <= output_limit)
             .ok_or(ScrubError::OutputLimit)?;
         reserve_scrub_output(out, required, output_limit)?;
@@ -482,7 +545,11 @@ fn reserve_scrub_output(
     output_limit: usize,
 ) -> Result<(), ScrubError> {
     if required > out.capacity() {
-        let capacity = out.capacity().saturating_mul(2).max(required).min(output_limit);
+        let capacity = out
+            .capacity()
+            .saturating_mul(2)
+            .max(required)
+            .min(output_limit);
         out.try_reserve_exact(capacity - out.len())
             .map_err(|_| ScrubError::MatcherUnavailable)?;
     }
@@ -503,7 +570,13 @@ pub fn scrub<N: AsRef<str>, V: AsRef<[u8]>>(
     let mut out = Vec::new();
     out.try_reserve_exact(bytes.len().min(limits.output_bytes))
         .map_err(|_| ScrubError::MatcherUnavailable)?;
-    matcher.emit(bytes, bytes.len(), &mut out, limits.output_bytes, &mut credential_output::Scratch::default())?;
+    matcher.emit(
+        bytes,
+        bytes.len(),
+        &mut out,
+        limits.output_bytes,
+        &mut credential_output::Scratch::default(),
+    )?;
     Ok(out)
 }
 
@@ -543,13 +616,21 @@ impl<'a> StreamScrubber<'a> {
         if matcher.pattern_bytes > limits.pattern_bytes {
             return Err(ScrubError::PatternLimit);
         }
-        let pending_limit = matcher.max_len.saturating_sub(1)
+        let pending_limit = matcher
+            .max_len
+            .saturating_sub(1)
             .checked_add(matcher.max_len.max(64 * 1024))
             .ok_or(ScrubError::PatternLimit)?;
         let pending = zeroize::Zeroizing::new(Vec::new());
         Ok(Self {
-            matcher, limits, buffer_bytes, pending_limit, pending, output: Vec::new(),
-            produced: 0, failed: None,
+            matcher,
+            limits,
+            buffer_bytes,
+            pending_limit,
+            pending,
+            output: Vec::new(),
+            produced: 0,
+            failed: None,
             scratch: credential_output::Scratch::default(),
         })
     }
@@ -572,12 +653,19 @@ impl<'a> StreamScrubber<'a> {
     fn push_inner(&mut self, mut bytes: &[u8]) -> Result<(), ScrubError> {
         let output_limit = (self.limits.output_bytes - self.produced).min(self.buffer_bytes);
         if self.matcher.matcher.is_none() {
-            self.matcher.emit(bytes, bytes.len(), &mut self.output, output_limit, &mut self.scratch)?;
+            self.matcher.emit(
+                bytes,
+                bytes.len(),
+                &mut self.output,
+                output_limit,
+                &mut self.scratch,
+            )?;
             return Ok(());
         }
         if !bytes.is_empty() && self.pending.capacity() == 0 {
             // Allocate raw scratch before input so growth cannot leave old raw bytes behind.
-            self.pending.try_reserve_exact(self.pending_limit)
+            self.pending
+                .try_reserve_exact(self.pending_limit)
                 .map_err(|_| ScrubError::MatcherUnavailable)?;
         }
         while !bytes.is_empty() {
@@ -587,7 +675,11 @@ impl<'a> StreamScrubber<'a> {
             if self.pending.len() == self.pending_limit {
                 let stable_through = self.pending.len() - self.matcher.max_len.saturating_sub(1);
                 let consumed = self.matcher.emit(
-                    &self.pending, stable_through, &mut self.output, output_limit, &mut self.scratch,
+                    &self.pending,
+                    stable_through,
+                    &mut self.output,
+                    output_limit,
+                    &mut self.scratch,
                 )?;
                 let retained = self.pending.len() - consumed;
                 self.pending.copy_within(consumed.., 0);
@@ -605,8 +697,11 @@ impl<'a> StreamScrubber<'a> {
         }
         self.output.clear();
         self.matcher.emit(
-            &self.pending, self.pending.len(), &mut self.output,
-            (self.limits.output_bytes - self.produced).min(self.buffer_bytes), &mut self.scratch,
+            &self.pending,
+            self.pending.len(),
+            &mut self.output,
+            (self.limits.output_bytes - self.produced).min(self.buffer_bytes),
+            &mut self.scratch,
         )?;
         Ok(self.output)
     }
@@ -618,8 +713,7 @@ pub fn scrub_str<N: AsRef<str>, V: AsRef<[u8]>>(
     secrets: &[(N, V)],
     limits: ScrubLimits,
 ) -> Result<String, ScrubError> {
-    String::from_utf8(scrub(text.as_bytes(), secrets, limits)?)
-        .map_err(|_| ScrubError::InvalidText)
+    String::from_utf8(scrub(text.as_bytes(), secrets, limits)?).map_err(|_| ScrubError::InvalidText)
 }
 
 #[cfg(test)]
@@ -628,9 +722,14 @@ mod tests {
 
     #[test]
     fn stream_matches_original_leftmost_longest_across_all_chunk_boundaries() {
-        let patterns = [("short", b"ab".as_slice()), ("long", b"abc".as_slice()),
-            ("duplicate", b"abc".as_slice()), ("one", b"1".as_slice()),
-            ("marker-word", b"secret".as_slice()), ("binary", &[0xff])];
+        let patterns = [
+            ("short", b"ab".as_slice()),
+            ("long", b"abc".as_slice()),
+            ("duplicate", b"abc".as_slice()),
+            ("one", b"1".as_slice()),
+            ("marker-word", b"secret".as_slice()),
+            ("binary", &[0xff]),
+        ];
         let input = b"abc ab 1 secret \xff abc";
         let expected = b"[secret:long] [secret:short] [secret:one] [secret:marker-word] [secret:binary] [secret:long]";
         assert_eq!(scrub(input, &patterns, limits(512)).unwrap(), expected);
@@ -670,7 +769,10 @@ mod tests {
         input.push(b'|');
         input.extend_from_slice(&long);
         let patterns = [("short", b"a".as_slice()), ("long", long.as_slice())];
-        let limits = ScrubLimits { output_bytes: 64, pattern_bytes: long.len() + 32 };
+        let limits = ScrubLimits {
+            output_bytes: 64,
+            pattern_bytes: long.len() + 32,
+        };
         let mut stream = StreamScrubber::new(&patterns, limits, 64).unwrap();
         let mut result = Vec::new();
         for chunk in input.chunks(64 * 1024) {
@@ -685,7 +787,12 @@ mod tests {
         let patterns = [("one", b"x".as_slice())];
         let marker = b"[secret:one]";
         let count = 64 * 1024;
-        let mut stream = StreamScrubber::new(&patterns, limits(count * marker.len()), count * marker.len()).unwrap();
+        let mut stream = StreamScrubber::new(
+            &patterns,
+            limits(count * marker.len()),
+            count * marker.len(),
+        )
+        .unwrap();
         let output = stream.push(&vec![b'x'; count]).unwrap();
         assert!(output.chunks_exact(marker.len()).all(|part| part == marker));
         assert_eq!(output.len(), count * marker.len());
@@ -694,7 +801,10 @@ mod tests {
         assert_eq!(stream.finish(), Err(ScrubError::OutputLimit));
 
         let mut failed = StreamScrubber::new(&patterns, limits(1), 1).unwrap();
-        assert_eq!(failed.push(&vec![b'x'; count]), Err(ScrubError::OutputLimit));
+        assert_eq!(
+            failed.push(&vec![b'x'; count]),
+            Err(ScrubError::OutputLimit)
+        );
         assert_eq!(failed.push(b""), Err(ScrubError::OutputLimit));
         assert_eq!(failed.finish(), Err(ScrubError::OutputLimit));
         let empty = &[] as &[(&str, &[u8])];
@@ -707,8 +817,10 @@ mod tests {
     #[test]
     fn compiled_matching_reports_literal_marker_matches_and_outlives_the_inventory() {
         let matcher = {
-            let patterns = vec![(String::from("marker"), b"[secret:marker]".to_vec()),
-                (String::from("one"), b"1".to_vec())];
+            let patterns = vec![
+                (String::from("marker"), b"[secret:marker]".to_vec()),
+                (String::from("one"), b"1".to_vec()),
+            ];
             CompiledScrubber::new(&patterns, 128).unwrap().into_owned()
         };
         let matcher = std::sync::Arc::new(matcher);
@@ -717,45 +829,86 @@ mod tests {
         let callback: Box<dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, ScrubError> + Send + Sync> =
             Box::new(move |bytes| matcher.scrub_if_matched(bytes, 128));
         assert_eq!(callback(b"unchanged").unwrap(), None);
-        assert_eq!(callback(b"[secret:marker]").unwrap(), Some(b"[secret:marker]".to_vec()));
+        assert_eq!(
+            callback(b"[secret:marker]").unwrap(),
+            Some(b"[secret:marker]".to_vec())
+        );
         assert_eq!(callback(b"1").unwrap(), Some(b"[secret:one]".to_vec()));
-        assert_eq!(callback(b"1 [secret:marker]").unwrap(),
-            Some(b"[secret:one] [secret:marker]".to_vec()));
+        assert_eq!(
+            callback(b"1 [secret:marker]").unwrap(),
+            Some(b"[secret:one] [secret:marker]".to_vec())
+        );
         assert_eq!(callback(&[b'x'; 129]), Err(ScrubError::OutputLimit));
     }
 
     #[test]
     fn independent_fields_share_the_compiler_and_budget_not_raw_lookahead() {
-        let patterns = [("cross", b"headerbody".as_slice()), ("one", b"x".as_slice())];
+        let patterns = [
+            ("cross", b"headerbody".as_slice()),
+            ("one", b"x".as_slice()),
+        ];
         let plan = CompiledScrubber::new(&patterns, 128).unwrap().into_owned();
         let total_budget = b"headerbody".len();
-        assert_eq!(plan.scrub_if_matched(b"header", total_budget).unwrap(), None);
-        let mut stream = StreamScrubber::from_compiled(plan,
-            ScrubLimits { output_bytes: total_budget - b"header".len(), pattern_bytes: 128 }, total_budget).unwrap();
+        assert_eq!(
+            plan.scrub_if_matched(b"header", total_budget).unwrap(),
+            None
+        );
+        let mut stream = StreamScrubber::from_compiled(
+            plan,
+            ScrubLimits {
+                output_bytes: total_budget - b"header".len(),
+                pattern_bytes: 128,
+            },
+            total_budget,
+        )
+        .unwrap();
         assert!(stream.push(b"body").unwrap().is_empty());
         assert_eq!(stream.finish().unwrap(), b"body");
 
         let plan = CompiledScrubber::new(&patterns, 128).unwrap().into_owned();
         let total_budget = b"[secret:one]".len() + 1;
         let header = plan.scrub_if_matched(b"x", total_budget).unwrap().unwrap();
-        let mut stream = StreamScrubber::from_compiled(plan,
-            ScrubLimits { output_bytes: total_budget - header.len(), pattern_bytes: 128 }, total_budget).unwrap();
+        let mut stream = StreamScrubber::from_compiled(
+            plan,
+            ScrubLimits {
+                output_bytes: total_budget - header.len(),
+                pattern_bytes: 128,
+            },
+            total_budget,
+        )
+        .unwrap();
         stream.push(b"x").unwrap();
         assert_eq!(stream.finish(), Err(ScrubError::OutputLimit));
 
         let plan = CompiledScrubber::new(&patterns, 128).unwrap();
-        assert_eq!(StreamScrubber::from_compiled(plan,
-            ScrubLimits { output_bytes: 64, pattern_bytes: 1 }, 64).err(), Some(ScrubError::PatternLimit));
+        assert_eq!(
+            StreamScrubber::from_compiled(
+                plan,
+                ScrubLimits {
+                    output_bytes: 64,
+                    pattern_bytes: 1
+                },
+                64
+            )
+            .err(),
+            Some(ScrubError::PatternLimit)
+        );
     }
 
     #[test]
     fn stream_memory_bound_rejects_expanded_windows_and_final_lookahead() {
         let long = vec![b'y'; 4096];
         let patterns = [("unused", long.as_slice()), ("short", b"x".as_slice())];
-        let limits = ScrubLimits { output_bytes: usize::MAX, pattern_bytes: long.len() + 32 };
+        let limits = ScrubLimits {
+            output_bytes: usize::MAX,
+            pattern_bytes: long.len() + 32,
+        };
         let mut stream = StreamScrubber::new(&patterns, limits, 128).unwrap();
         assert!(stream.push(&vec![b'x'; 64 * 1024]).unwrap().is_empty());
-        assert_eq!(stream.push(&vec![b'x'; 64 * 1024]), Err(ScrubError::OutputLimit));
+        assert_eq!(
+            stream.push(&vec![b'x'; 64 * 1024]),
+            Err(ScrubError::OutputLimit)
+        );
         assert_eq!(stream.push(b""), Err(ScrubError::OutputLimit));
         assert_eq!(stream.finish(), Err(ScrubError::OutputLimit));
         let plan = CompiledScrubber::new(&patterns, limits.pattern_bytes).unwrap();
@@ -767,8 +920,15 @@ mod tests {
     #[test]
     fn stream_total_body_can_exceed_its_reused_emission_buffer() {
         let patterns = &[] as &[(&str, &[u8])];
-        let mut stream = StreamScrubber::new(patterns,
-            ScrubLimits { output_bytes: usize::MAX, pattern_bytes: 0 }, 64 * 1024).unwrap();
+        let mut stream = StreamScrubber::new(
+            patterns,
+            ScrubLimits {
+                output_bytes: usize::MAX,
+                pattern_bytes: 0,
+            },
+            64 * 1024,
+        )
+        .unwrap();
         let input = vec![b'q'; 64 * 1024];
         let mut emitted = 0;
         for _ in 0..17 {
@@ -884,7 +1044,10 @@ mod tests {
     }
 
     fn limits(output_bytes: usize) -> ScrubLimits {
-        ScrubLimits { output_bytes, pattern_bytes: 4096 }
+        ScrubLimits {
+            output_bytes,
+            pattern_bytes: 4096,
+        }
     }
 
     #[test]
@@ -898,35 +1061,58 @@ mod tests {
             ("flag", b"true".to_vec()),
         ];
         assert_eq!(
-            scrub(b"sk_live_123 sk_live_9 secret ab true", &secrets, limits(4096)).unwrap(),
+            scrub(
+                b"sk_live_123 sk_live_9 secret ab true",
+                &secrets,
+                limits(4096)
+            )
+            .unwrap(),
             b"[secret:current] [secret:deleted]_9 [secret:word] [secret:tiny] [secret:flag]"
         );
         assert_eq!(scrub(b"nothing", &secrets, limits(7)).unwrap(), b"nothing");
         let names = vec![("secret", b"secret".to_vec()), ("k", b"k".to_vec())];
-        assert_eq!(scrub(b"secret k", &names, limits(64)).unwrap(), b"[secret:secret] [secret:k]");
+        assert_eq!(
+            scrub(b"secret k", &names, limits(64)).unwrap(),
+            b"[secret:secret] [secret:k]"
+        );
     }
 
     #[test]
     fn every_nonempty_free_value_including_literals_utf8_and_binary_is_redacted() {
         for value in ["1", "ab", "true", "false", "null", "é"] {
             let secrets = vec![("value", value.as_bytes().to_vec())];
-            assert_eq!(scrub_str(&format!("before {value} after"), &secrets, limits(64)).unwrap(),
-                "before [secret:value] after");
+            assert_eq!(
+                scrub_str(&format!("before {value} after"), &secrets, limits(64)).unwrap(),
+                "before [secret:value] after"
+            );
         }
-        let secrets = vec![("zero", vec![0]), ("binary", vec![255]),
-            ("empty", Vec::new())];
-        assert_eq!(scrub(&[0, 1, 255], &secrets, limits(64)).unwrap(),
-            b"[secret:zero]\x01[secret:binary]");
+        let secrets = vec![
+            ("zero", vec![0]),
+            ("binary", vec![255]),
+            ("empty", Vec::new()),
+        ];
+        assert_eq!(
+            scrub(&[0, 1, 255], &secrets, limits(64)).unwrap(),
+            b"[secret:zero]\x01[secret:binary]"
+        );
         assert_eq!(scrub(b"", &secrets, limits(0)).unwrap(), b"");
-        assert_eq!(scrub(b"abc", &[("empty", b"".as_slice())], limits(3)).unwrap(), b"abc");
+        assert_eq!(
+            scrub(b"abc", &[("empty", b"".as_slice())], limits(3)).unwrap(),
+            b"abc"
+        );
     }
 
     #[test]
     fn overlaps_choose_leftmost_longest_original_value() {
-        let secrets = vec![("short", b"ab".to_vec()), ("long", b"abc".to_vec()),
-            ("later", b"bc".to_vec())];
-        assert_eq!(scrub(b"abc ab bc", &secrets, limits(64)).unwrap(),
-            b"[secret:long] [secret:short] [secret:later]");
+        let secrets = vec![
+            ("short", b"ab".to_vec()),
+            ("long", b"abc".to_vec()),
+            ("later", b"bc".to_vec()),
+        ];
+        assert_eq!(
+            scrub(b"abc ab bc", &secrets, limits(64)).unwrap(),
+            b"[secret:long] [secret:short] [secret:later]"
+        );
     }
 
     #[test]
@@ -934,30 +1120,72 @@ mod tests {
         let secrets = vec![("k", b"1".to_vec())];
         let marker = b"[secret:k]";
         assert_eq!(scrub(b"1", &secrets, limits(marker.len())).unwrap(), marker);
-        assert_eq!(scrub(b"1", &secrets, limits(marker.len() - 1)), Err(ScrubError::OutputLimit));
-        assert_eq!(scrub(b"1111111111111111", &secrets, limits(16)), Err(ScrubError::OutputLimit));
-        assert_eq!(scrub(b"prefix 1 tail", &secrets, limits(17)), Err(ScrubError::OutputLimit));
-        assert_eq!(scrub(b"abc", &[] as &[(&str, &[u8])], limits(2)), Err(ScrubError::OutputLimit));
-        assert_eq!(scrub(&vec![b'1'; 65_536], &secrets, limits(1024)), Err(ScrubError::OutputLimit));
+        assert_eq!(
+            scrub(b"1", &secrets, limits(marker.len() - 1)),
+            Err(ScrubError::OutputLimit)
+        );
+        assert_eq!(
+            scrub(b"1111111111111111", &secrets, limits(16)),
+            Err(ScrubError::OutputLimit)
+        );
+        assert_eq!(
+            scrub(b"prefix 1 tail", &secrets, limits(17)),
+            Err(ScrubError::OutputLimit)
+        );
+        assert_eq!(
+            scrub(b"abc", &[] as &[(&str, &[u8])], limits(2)),
+            Err(ScrubError::OutputLimit)
+        );
+        assert_eq!(
+            scrub(&vec![b'1'; 65_536], &secrets, limits(1024)),
+            Err(ScrubError::OutputLimit)
+        );
     }
 
     #[test]
     fn pattern_budget_and_diagnostics_never_expose_input_or_names() {
         let needle = "private-name-NEEDLE";
         let secrets = vec![(needle, b"1".to_vec())];
-        let error = scrub(b"1", &secrets, ScrubLimits { output_bytes: 64, pattern_bytes: 1 }).unwrap_err();
+        let error = scrub(
+            b"1",
+            &secrets,
+            ScrubLimits {
+                output_bytes: 64,
+                pattern_bytes: 1,
+            },
+        )
+        .unwrap_err();
         assert_eq!(error, ScrubError::PatternLimit);
         assert!(!error.to_string().contains(needle));
         let secrets = vec![(needle.repeat(100), b"1".to_vec())];
-        assert_eq!(scrub(b"1", &secrets, limits(1)), Err(ScrubError::OutputLimit));
-        let duplicate = vec![("first".into(), b"1".to_vec()), ("ignored-long-name".repeat(100), b"1".to_vec())];
-        assert_eq!(scrub(b"1", &duplicate, ScrubLimits { output_bytes: 32, pattern_bytes: 6 }).unwrap(),
-            b"[secret:first]");
+        assert_eq!(
+            scrub(b"1", &secrets, limits(1)),
+            Err(ScrubError::OutputLimit)
+        );
+        let duplicate = vec![
+            ("first".into(), b"1".to_vec()),
+            ("ignored-long-name".repeat(100), b"1".to_vec()),
+        ];
+        assert_eq!(
+            scrub(
+                b"1",
+                &duplicate,
+                ScrubLimits {
+                    output_bytes: 32,
+                    pattern_bytes: 6
+                }
+            )
+            .unwrap(),
+            b"[secret:first]"
+        );
     }
 
     #[test]
     fn text_does_not_expand_invalid_utf8_after_a_partial_binary_match() {
         let secret = vec![("byte", vec![0xa9])];
-        assert_eq!(scrub_str("é", &secret, limits(64)), Err(ScrubError::InvalidText));
+        assert_eq!(
+            scrub_str("é", &secret, limits(64)),
+            Err(ScrubError::InvalidText)
+        );
     }
 }

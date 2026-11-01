@@ -46,14 +46,19 @@ fn source_error(error: LogError) -> ApiError {
 }
 
 impl ShardReader {
-    pub fn point(&self) -> &ShardReadPoint { &self.point }
+    pub fn point(&self) -> &ShardReadPoint {
+        &self.point
+    }
 
     /// This is the original active execution and configuration, never a fresh
     /// lookup of current authority. No Node is retained by the returned reader.
     pub fn check(&self) -> Result<(), ApiError> {
         self.execution.check()?;
         if !self.data_is_live_under_publication() {
-            return Err(ApiError::new(ErrorCode::Unavailable, "the original native source configuration changed"));
+            return Err(ApiError::new(
+                ErrorCode::Unavailable,
+                "the original native source configuration changed",
+            ));
         }
         Ok(())
     }
@@ -64,39 +69,70 @@ impl ShardReader {
     pub fn data_is_live_under_publication(&self) -> bool {
         self.execution.active_source_is_live_under_publication()
             && self.epoch.load(Ordering::Acquire) == self.expected_epoch
-            && self.root_pin.as_ref().is_none_or(|pin| pin.data_is_live_under_publication())
+            && self
+                .root_pin
+                .as_ref()
+                .is_none_or(|pin| pin.data_is_live_under_publication())
     }
 
-    pub async fn page(&self, after: Lsn, max_records: usize, max_encoded_bytes: usize)
-        -> Result<ShardRecordPage, ApiError>
-    {
-        self.read_page(after, max_records, max_encoded_bytes, false).await
+    pub async fn page(
+        &self,
+        after: Lsn,
+        max_records: usize,
+        max_encoded_bytes: usize,
+    ) -> Result<ShardRecordPage, ApiError> {
+        self.read_page(after, max_records, max_encoded_bytes, false)
+            .await
     }
 
     /// The existing native soft budget: one oversized record may stand alone,
     /// bounded by the canonical decoder's MAX_RECORD, never by an unbounded read.
-    pub async fn local_export_page(&self, after: Lsn, max_records: usize, soft_bytes: usize)
-        -> Result<ShardRecordPage, ApiError>
-    {
+    pub async fn local_export_page(
+        &self,
+        after: Lsn,
+        max_records: usize,
+        soft_bytes: usize,
+    ) -> Result<ShardRecordPage, ApiError> {
         self.read_page(after, max_records, soft_bytes, true).await
     }
 
-    async fn read_page(&self, after: Lsn, max_records: usize, max_encoded_bytes: usize, soft: bool)
-        -> Result<ShardRecordPage, ApiError>
-    {
+    async fn read_page(
+        &self,
+        after: Lsn,
+        max_records: usize,
+        max_encoded_bytes: usize,
+        soft: bool,
+    ) -> Result<ShardRecordPage, ApiError> {
         self.check()?;
         if max_records == 0 || max_encoded_bytes == 0 || max_encoded_bytes > MAX_RECORD_PAGE_BYTES {
-            return Err(ApiError::new(ErrorCode::BadRequest, "source page requires positive bounded record and encoded-byte limits"));
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "source page requires positive bounded record and encoded-byte limits",
+            ));
         }
-        let SourcePos::Actor { shard: None, lsn: through } = self.point.source else {
-            return Err(ApiError::new(ErrorCode::StorageCorrupt, "a native reader lost its original native domain"));
+        let SourcePos::Actor {
+            shard: None,
+            lsn: through,
+        } = self.point.source
+        else {
+            return Err(ApiError::new(
+                ErrorCode::StorageCorrupt,
+                "a native reader lost its original native domain",
+            ));
         };
         if after > through {
-            return Err(ApiError::new(ErrorCode::BadRequest, "source cursor is above its original captured head"));
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "source cursor is above its original captured head",
+            ));
         }
         if after == through {
             self.check()?;
-            return Ok(ShardRecordPage { records: Vec::new(), scanned_through: through, retention_gap: None });
+            return Ok(ShardRecordPage {
+                records: Vec::new(),
+                scanned_through: through,
+                retention_gap: None,
+            });
         }
         let first = self.point.retained_from;
         let requested = after + 1;
@@ -104,57 +140,91 @@ impl ShardReader {
         let mut scanned = gap.map_or(after, |(_, last)| last);
         if scanned == through {
             self.check()?;
-            return Ok(ShardRecordPage { records: Vec::new(), scanned_through: scanned, retention_gap: gap });
+            return Ok(ShardRecordPage {
+                records: Vec::new(),
+                scanned_through: scanned,
+                retention_gap: gap,
+            });
         }
         let mut records = Vec::new();
         let mut bytes = 0usize;
         let mut oversized = None;
-        let read = self.readset.read_while_with_namespace(requested.max(first), through, |namespace, committed| {
-            let mut source = pb::ActorSource { shard: None, lsn: committed.lsn, branch: String::new() };
-            // ActorSource.branch is field 3; count its actual held header before
-            // allocating the owned string, as in the canonical member reader.
-            let source_bytes = source.encoded_len()
-                .saturating_add(1 + prost::length_delimiter_len(namespace.len()) + namespace.len());
-            let record_bytes = committed.record.encoded_len();
-            let frame_bytes = 1 + prost::length_delimiter_len(source_bytes) + source_bytes
-                + 1 + prost::encoding::encoded_len_varint(u64::from(committed.record.kind()))
-                + 1 + prost::length_delimiter_len(record_bytes) + record_bytes;
-            let size = 1 + prost::length_delimiter_len(frame_bytes) + frame_bytes;
-            if size > max_encoded_bytes.saturating_sub(bytes) && (!soft || !records.is_empty()) {
-                if records.is_empty() && size > max_encoded_bytes { oversized = Some(committed.lsn); }
-                return Ok(false);
-            }
-            bytes += size;
-            scanned = committed.lsn;
-            source.branch = namespace.to_owned();
-            source.validate().map_err(|error| LogError::Corrupt(error.to_string()))?;
-            records.push((source, committed));
-            Ok(records.len() < max_records && bytes < max_encoded_bytes)
-        });
+        let read = self.readset.read_while_with_namespace(
+            requested.max(first),
+            through,
+            |namespace, committed| {
+                let mut source = pb::ActorSource {
+                    shard: None,
+                    lsn: committed.lsn,
+                    branch: String::new(),
+                };
+                // ActorSource.branch is field 3; count its actual held header before
+                // allocating the owned string, as in the canonical member reader.
+                let source_bytes = source.encoded_len().saturating_add(
+                    1 + prost::length_delimiter_len(namespace.len()) + namespace.len(),
+                );
+                let record_bytes = committed.record.encoded_len();
+                let frame_bytes = 1
+                    + prost::length_delimiter_len(source_bytes)
+                    + source_bytes
+                    + 1
+                    + prost::encoding::encoded_len_varint(u64::from(committed.record.kind()))
+                    + 1
+                    + prost::length_delimiter_len(record_bytes)
+                    + record_bytes;
+                let size = 1 + prost::length_delimiter_len(frame_bytes) + frame_bytes;
+                if size > max_encoded_bytes.saturating_sub(bytes) && (!soft || !records.is_empty())
+                {
+                    if records.is_empty() && size > max_encoded_bytes {
+                        oversized = Some(committed.lsn);
+                    }
+                    return Ok(false);
+                }
+                bytes += size;
+                scanned = committed.lsn;
+                source.branch = namespace.to_owned();
+                source
+                    .validate()
+                    .map_err(|error| LogError::Corrupt(error.to_string()))?;
+                records.push((source, committed));
+                Ok(records.len() < max_records && bytes < max_encoded_bytes)
+            },
+        );
         tokio::select! {
             biased;
             () = self.execution.cancelled() => return Err(ApiError::new(ErrorCode::Unavailable, "the original native source execution ended")),
             result = read => result.map_err(source_error)?,
         }
         if let Some(lsn) = oversized {
-            return Err(ApiError::new(ErrorCode::BadRequest,
-                format!("source record at LSN {lsn} exceeds this page's encoded-byte bound")));
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                format!("source record at LSN {lsn} exceeds this page's encoded-byte bound"),
+            ));
         }
         self.check()?;
-        Ok(ShardRecordPage { records, scanned_through: scanned, retention_gap: gap })
+        Ok(ShardRecordPage {
+            records,
+            scanned_through: scanned,
+            retention_gap: gap,
+        })
     }
 }
 
 impl Node {
     /// Capture the actual ACTIVE original native role before constructing the
     /// future. This fixed configured source grants no operator mutation scope.
-    pub fn capture_system_export_reader(self: &Arc<Self>)
-        -> impl Future<Output = Result<ShardReader, ApiError>> + Send + 'static
-    {
+    pub fn capture_system_export_reader(
+        self: &Arc<Self>,
+    ) -> impl Future<Output = Result<ShardReader, ApiError>> + Send + 'static {
         let captured = (|| {
             self.native_execution.check()?;
             self.native_execution.native_source_start(self, &self.log)?;
-            Ok::<_, ApiError>((self.clone(), self.native_execution.clone(), self.epoch.clone(), self.epoch()))
+            Ok::<_, ApiError>((
+                self.clone(),
+                self.native_execution.clone(),
+                self.epoch.clone(),
+                self.epoch(),
+            ))
         })();
         async move {
             let (node, execution, epoch, expected_epoch) = captured?;
@@ -168,39 +238,88 @@ impl Node {
             };
             original.check()?;
             if epoch.load(Ordering::Acquire) != expected_epoch {
-                return Err(ApiError::new(ErrorCode::Unavailable, "the original native source configuration changed before capture"));
+                return Err(ApiError::new(
+                    ErrorCode::Unavailable,
+                    "the original native source configuration changed before capture",
+                ));
             }
             let root_pin = if node.cfg.storage.is_some() {
                 let owner = node.clone();
-                Some(node.env.blocking("native-record-reader-roots", move || {
-                    owner.retain_native_source_paths()
-                }).await.ok_or_else(|| ApiError::new(ErrorCode::Unavailable,
-                    "the original native source root capture was interrupted"))??)
+                Some(
+                    node.env
+                        .blocking("native-record-reader-roots", move || {
+                            owner.retain_native_source_paths()
+                        })
+                        .await
+                        .ok_or_else(|| {
+                            ApiError::new(
+                                ErrorCode::Unavailable,
+                                "the original native source root capture was interrupted",
+                            )
+                        })??,
+                )
             } else {
                 None
             };
             let through = node.store.db().applied_lsn().map_err(store_err)?;
-            let readset = node.reader.capture_readset(1, through).await.map_err(source_error)?;
+            let readset = node
+                .reader
+                .capture_readset(1, through)
+                .await
+                .map_err(source_error)?;
             let (branch, retained_from) = if through == 0 {
                 // An empty native writer has no positive frame. This is only
                 // its configured root label, not an invented ActorSource.
-                (node.reader.branch().to_owned(), readset.retained_from().unwrap_or(0))
+                (
+                    node.reader.branch().to_owned(),
+                    readset.retained_from().unwrap_or(0),
+                )
             } else {
-                let first = readset.retained_from().ok_or_else(||
-                    ApiError::new(ErrorCode::StorageCorrupt, "the native applied source has no retained segment"))?;
+                let first = readset.retained_from().ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::StorageCorrupt,
+                        "the native applied source has no retained segment",
+                    )
+                })?;
                 let mut head = None;
-                readset.read_while_with_namespace(through, through, |namespace, committed| {
-                    let actual = pb::ActorSource { shard: None, lsn: committed.lsn, branch: namespace.to_owned() };
-                    actual.validate().map_err(|error| LogError::Corrupt(error.to_string()))?;
-                    head = Some(actual);
-                    Ok(false)
-                }).await.map_err(source_error)?;
-                let head = head.ok_or_else(|| ApiError::new(ErrorCode::StorageCorrupt,
-                    "the held native source has no frame at its acknowledged head"))?;
+                readset
+                    .read_while_with_namespace(through, through, |namespace, committed| {
+                        let actual = pb::ActorSource {
+                            shard: None,
+                            lsn: committed.lsn,
+                            branch: namespace.to_owned(),
+                        };
+                        actual
+                            .validate()
+                            .map_err(|error| LogError::Corrupt(error.to_string()))?;
+                        head = Some(actual);
+                        Ok(false)
+                    })
+                    .await
+                    .map_err(source_error)?;
+                let head = head.ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::StorageCorrupt,
+                        "the held native source has no frame at its acknowledged head",
+                    )
+                })?;
                 (head.branch, first)
             };
-            let reader = ShardReader { readset, execution, epoch, expected_epoch, root_pin,
-                point: ShardReadPoint { branch, source: SourcePos::Actor { shard: None, lsn: through }, retained_from } };
+            let reader = ShardReader {
+                readset,
+                execution,
+                epoch,
+                expected_epoch,
+                root_pin,
+                point: ShardReadPoint {
+                    branch,
+                    source: SourcePos::Actor {
+                        shard: None,
+                        lsn: through,
+                    },
+                    retained_from,
+                },
+            };
             reader.check()?;
             Ok(reader)
         }

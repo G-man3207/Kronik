@@ -21,7 +21,10 @@ async fn auth_response(
     use crate::secret_backend::BackendError::Invalid;
     dispatch.check()?;
     if let Some(file) = &c.service_account_file {
-        let bytes = dispatch.wait(credential(env, file, dispatch)).await?.map_err(|_| Invalid)?;
+        let bytes = dispatch
+            .wait(credential(env, file, dispatch))
+            .await?
+            .map_err(|_| Invalid)?;
         let account = SecretJson(serde_json::from_slice(&bytes).map_err(|_| Invalid)?);
         if field(&account, "type").map_err(|_| Invalid)? != "service_account" {
             return Err(Invalid);
@@ -38,8 +41,13 @@ async fn auth_response(
         {
             return Err(Invalid);
         }
-        let mut keys = pem(field(&account, "private_key").map_err(|_| Invalid)?.as_bytes(), "PRIVATE KEY")
-            .map_err(|_| Invalid)?;
+        let mut keys = pem(
+            field(&account, "private_key")
+                .map_err(|_| Invalid)?
+                .as_bytes(),
+            "PRIVATE KEY",
+        )
+        .map_err(|_| Invalid)?;
         if keys.len() != 1 {
             for key in &mut keys {
                 key.zeroize();
@@ -71,7 +79,10 @@ async fn auth_response(
             env,
             "POST",
             token_url.into(),
-            vec![("content-type".into(), "application/x-www-form-urlencoded".into())],
+            vec![(
+                "content-type".into(),
+                "application/x-www-form-urlencoded".into(),
+            )],
             form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                 ("assertion", assertion.as_str()),
@@ -92,9 +103,14 @@ async fn auth_response(
     }
 }
 async fn auth(env: &Env, c: &Gcp) -> Result<Zeroizing<String>, String> {
-    let response = auth_response(env, c, "https://www.googleapis.com/auth/cloudkms", Dispatch::StartupBootstrap)
-        .await
-        .map_err(|error| error.to_string())?;
+    let response = auth_response(
+        env,
+        c,
+        "https://www.googleapis.com/auth/cloudkms",
+        Dispatch::StartupBootstrap,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     let token = Zeroizing::new(field(&response, "access_token")?.to_owned());
     header_secret(&token)?;
     Ok(token)

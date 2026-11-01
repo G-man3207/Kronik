@@ -9,12 +9,12 @@ use std::ops::{Deref, DerefMut};
 use kronik_effects::http::{CompiledScrubber, ScrubError};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::scrub::{MAX_JSON_OUTPUT_BYTES, MAX_SECRET_PATTERN_BYTES};
-use std::io::{self, Write};
 use serde::Serialize;
 use serde_json::Value;
+use std::io::{self, Write};
 
 use crate::types::*;
-use crate::{Result, internal, ApiError, ErrorCode};
+use crate::{ApiError, ErrorCode, Result, internal};
 
 pub(super) trait ScrubbedOutput: Serialize {
     fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()>;
@@ -52,23 +52,36 @@ pub(super) struct Context<'a> {
 }
 
 impl<'a> Context<'a> {
-    pub(super) fn new<N: AsRef<str>, V: AsRef<[u8]>>(inventory: &'a [(N, V)], remaining: usize) -> Self {
+    pub(super) fn new<N: AsRef<str>, V: AsRef<[u8]>>(
+        inventory: &'a [(N, V)],
+        remaining: usize,
+    ) -> Self {
         match CompiledScrubber::new_output(inventory, MAX_SECRET_PATTERN_BYTES) {
             Ok(matcher) => Self {
-                matcher: Some(matcher), remaining, error: None,
+                matcher: Some(matcher),
+                remaining,
+                error: None,
             },
             Err(error) => Self {
-                matcher: None, remaining, error: Some(error),
+                matcher: None,
+                remaining,
+                error: Some(error),
             },
         }
     }
 
     pub(super) fn finish(self) -> Result<()> {
-        match self.error { Some(error) => Err(scrub_error(error)), None => Ok(()) }
+        match self.error {
+            Some(error) => Err(scrub_error(error)),
+            None => Ok(()),
+        }
     }
 
     /// Validate only this original outcome's scalar phase, without replacing
     /// prepared markers. Opaque bodies and effects need their own source guards.
+    /// Kept from the unbuilt WIP checkpoint: the endpoint that calls it has not
+    /// landed yet.
+    #[allow(dead_code)]
     pub(super) fn prepared_outcome(
         &mut self,
         value: &pb::Outcome,
@@ -82,39 +95,53 @@ impl<'a> Context<'a> {
             }
         }
         let Some(matcher) = self.matcher.as_ref() else {
-            return Err(scrub_error(self.error.take().unwrap_or(ScrubError::MatcherUnavailable)));
+            return Err(scrub_error(
+                self.error.take().unwrap_or(ScrubError::MatcherUnavailable),
+            ));
         };
         let host_code = value.kind == pb::OutcomeKind::Trap as i32
             && ErrorCode::parse(&value.error_code).is_some();
         let free = [
             (!host_code).then_some(value.error_code.as_bytes()),
             Some(value.message.as_bytes()),
-        ].into_iter().flatten();
+        ]
+        .into_iter()
+        .flatten();
         match value.output.as_ref() {
             Some(pb::outcome::Output::Reply(message)) => kronik_sched::scrub::prepared_fields_safe(
-                current, original, matcher, free
-                    .chain([message.name.as_bytes(), message.content_type.as_bytes()])
+                current,
+                original,
+                matcher,
+                free.chain([message.name.as_bytes(), message.content_type.as_bytes()])
                     .chain(plaintext(message.body.as_ref())),
             ),
             Some(pb::outcome::Output::Http(http)) => {
-                let headers = http.headers.iter().flat_map(|header|
-                    std::iter::once(header.name.as_bytes()).chain(plaintext(header.value.as_ref())));
+                let headers = http.headers.iter().flat_map(|header| {
+                    std::iter::once(header.name.as_bytes()).chain(plaintext(header.value.as_ref()))
+                });
                 let body = match http.body.as_ref().and_then(|body| body.value.as_ref()) {
                     Some(pb::body::Value::Inline(value)) => plaintext(Some(value)),
                     _ => None,
                 };
                 kronik_sched::scrub::prepared_fields_safe(
-                    current, original, matcher, free.chain(headers).chain(body),
+                    current,
+                    original,
+                    matcher,
+                    free.chain(headers).chain(body),
                 )
             }
             None => kronik_sched::scrub::prepared_fields_safe(current, original, matcher, free),
-        }.map_err(scrub_error)
+        }
+        .map_err(scrub_error)
     }
 }
 
 pub(super) fn scrub_error(error: ScrubError) -> ApiError {
     match error {
-        ScrubError::OutputLimit => ApiError::new(ErrorCode::PayloadTooLarge, "JSON response exceeds output limit"),
+        ScrubError::OutputLimit => ApiError::new(
+            ErrorCode::PayloadTooLarge,
+            "JSON response exceeds output limit",
+        ),
         _ => ApiError::new(ErrorCode::SecretUnavailable, "secret output unavailable"),
     }
 }
@@ -137,8 +164,14 @@ impl Write for BoundedWriter {
             let required = self.count + bytes.len();
             if required > self.bytes.capacity() {
                 let limit = self.count + self.remaining;
-                let capacity = self.bytes.capacity().saturating_mul(2).max(required).min(limit);
-                self.bytes.try_reserve_exact(capacity - self.bytes.len())
+                let capacity = self
+                    .bytes
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(required)
+                    .min(limit);
+                self.bytes
+                    .try_reserve_exact(capacity - self.bytes.len())
                     .map_err(|_| io::Error::other("JSON output allocation unavailable"))?;
             }
             self.bytes.extend_from_slice(bytes);
@@ -147,17 +180,29 @@ impl Write for BoundedWriter {
         self.count += bytes.len();
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn writer(limit: usize, collect: bool) -> BoundedWriter {
-    BoundedWriter { bytes: Vec::new(), remaining: limit, count: 0, collect, exceeded: false }
+    BoundedWriter {
+        bytes: Vec::new(),
+        remaining: limit,
+        count: 0,
+        collect,
+        exceeded: false,
+    }
 }
 
 fn encoded_len<T: Serialize + ?Sized>(value: &T, limit: usize) -> Result<usize> {
     let mut output = writer(limit, false);
     if let Err(error) = serde_json::to_writer(&mut output, value) {
-        return Err(if output.exceeded { scrub_error(ScrubError::OutputLimit) } else { internal(error) });
+        return Err(if output.exceeded {
+            scrub_error(ScrubError::OutputLimit)
+        } else {
+            internal(error)
+        });
     }
     Ok(output.count)
 }
@@ -165,19 +210,31 @@ fn encoded_len<T: Serialize + ?Sized>(value: &T, limit: usize) -> Result<usize> 
 pub(super) fn bounded_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     let mut output = writer(MAX_JSON_OUTPUT_BYTES, true);
     if let Err(error) = serde_json::to_writer(&mut output, value) {
-        return Err(if output.exceeded { scrub_error(ScrubError::OutputLimit) } else { internal(error) });
+        return Err(if output.exceeded {
+            scrub_error(ScrubError::OutputLimit)
+        } else {
+            internal(error)
+        });
     }
     Ok(output.bytes)
 }
 
 fn text(value: &mut String, context: &mut Context<'_>) {
-    if context.error.is_some() { return; }
-    let result = context.matcher.as_ref().ok_or(ScrubError::MatcherUnavailable)
+    if context.error.is_some() {
+        return;
+    }
+    let result = context
+        .matcher
+        .as_ref()
+        .ok_or(ScrubError::MatcherUnavailable)
         .and_then(|matcher| matcher.scrub_if_matched(value.as_bytes(), context.remaining));
     match result {
         Ok(Some(clean)) => match String::from_utf8(clean) {
             Ok(clean) => match encoded_len(&clean, context.remaining) {
-                Ok(len) => { context.remaining -= len; *value = clean; }
+                Ok(len) => {
+                    context.remaining -= len;
+                    *value = clean;
+                }
                 Err(_) => context.error = Some(ScrubError::OutputLimit),
             },
             Err(_) => context.error = Some(ScrubError::InvalidText),
@@ -191,10 +248,14 @@ fn text(value: &mut String, context: &mut Context<'_>) {
 }
 
 fn persisted_reason(value: &mut String, context: &mut Context<'_>) {
-    if context.error.is_some() { return; }
+    if context.error.is_some() {
+        return;
+    }
     *value = kronik_sched::scrub::persisted_audit_reason(
-        std::mem::take(value).into(), context.matcher.as_ref(),
-    ).into_owned();
+        std::mem::take(value).into(),
+        context.matcher.as_ref(),
+    )
+    .into_owned();
     match encoded_len(value, context.remaining) {
         Ok(len) => context.remaining -= len,
         Err(_) => context.error = Some(ScrubError::OutputLimit),
@@ -202,15 +263,24 @@ fn persisted_reason(value: &mut String, context: &mut Context<'_>) {
 }
 
 fn optional_text(value: &mut Option<String>, secrets: &mut Context<'_>) {
-    if let Some(value) = value { text(value, secrets); }
+    if let Some(value) = value {
+        text(value, secrets);
+    }
 }
 
 fn payload(value: &mut Payload, context: &mut Context<'_>) -> Result<()> {
-    if let Some(error) = context.error { return Err(scrub_error(error)); }
+    if let Some(error) = context.error {
+        return Err(scrub_error(error));
+    }
     // Reject an oversized encoded source before decoding allocates its byte buffer.
     encoded_len(value, MAX_JSON_OUTPUT_BYTES)?;
-    let bytes = value.to_bytes().map_err(|_| scrub_error(ScrubError::InvalidText))?;
-    let clean = context.matcher.as_ref().ok_or(ScrubError::MatcherUnavailable)
+    let bytes = value
+        .to_bytes()
+        .map_err(|_| scrub_error(ScrubError::InvalidText))?;
+    let clean = context
+        .matcher
+        .as_ref()
+        .ok_or(ScrubError::MatcherUnavailable)
         .and_then(|matcher| matcher.scrub_if_matched(&bytes, context.remaining))
         .map_err(scrub_error)?;
     let Some(clean) = clean else {
@@ -218,12 +288,21 @@ fn payload(value: &mut Payload, context: &mut Context<'_>) -> Result<()> {
         return Ok(());
     };
     let text = std::str::from_utf8(&clean).ok();
-    let base64_len = clean.len().checked_add(2).and_then(|n| (n / 3).checked_mul(4))
+    let base64_len = clean
+        .len()
+        .checked_add(2)
+        .and_then(|n| (n / 3).checked_mul(4))
         .ok_or_else(|| scrub_error(ScrubError::OutputLimit))?;
     // Include both encoded twins, field names, punctuation and final JSON escaping.
-    let text_len = match text { Some(text) => encoded_len(text, context.remaining)?, None => 0 };
-    let size = base64_len.checked_add(text_len).and_then(|n| n.checked_add(if text.is_some() { 21 } else { 13 }))
-        .filter(|n| *n <= context.remaining).ok_or_else(|| scrub_error(ScrubError::OutputLimit))?;
+    let text_len = match text {
+        Some(text) => encoded_len(text, context.remaining)?,
+        None => 0,
+    };
+    let size = base64_len
+        .checked_add(text_len)
+        .and_then(|n| n.checked_add(if text.is_some() { 21 } else { 13 }))
+        .filter(|n| *n <= context.remaining)
+        .ok_or_else(|| scrub_error(ScrubError::OutputLimit))?;
     context.remaining -= size;
     *value = Payload::from_bytes(&clean);
     Ok(())
@@ -246,7 +325,10 @@ fn outcome(value: &mut Outcome, secrets: &mut Context<'_>) {
 
 fn reply(value: &mut Reply, secrets: &mut Context<'_>) -> Result<()> {
     if !value.body_is_exclusive() {
-        return Err(ApiError::new(ErrorCode::StorageCorrupt, "a reply contains both inline data and a body blob"));
+        return Err(ApiError::new(
+            ErrorCode::StorageCorrupt,
+            "a reply contains both inline data and a body blob",
+        ));
     }
     let Reply {
         name,
@@ -257,7 +339,9 @@ fn reply(value: &mut Reply, secrets: &mut Context<'_>) -> Result<()> {
     } = value;
     text(name, secrets);
     text(content_type, secrets);
-    if blob.is_none() { payload(body, secrets)?; }
+    if blob.is_none() {
+        payload(body, secrets)?;
+    }
     Ok(())
 }
 
@@ -336,7 +420,11 @@ impl ScrubbedOutput for InspectResponse {
             state,
             sql,
         } = self;
-        if let Some(sql) = sql { for table in &mut sql.tables { text(&mut table.name, secrets); } }
+        if let Some(sql) = sql {
+            for table in &mut sql.tables {
+                text(&mut table.name, secrets);
+            }
+        }
         for StateEntry {
             key,
             value,
@@ -443,9 +531,10 @@ fn text_fields(value: &mut Value, fields: &[&str], secrets: &mut Context<'_>) {
 }
 
 fn json_payload(value: &mut Value, secrets: &mut Context<'_>) -> Result<()> {
-    if let Some(error) = secrets.error { return Err(scrub_error(error)); }
-    let mut decoded: Payload =
-        serde_json::from_value(std::mem::take(value)).map_err(internal)?;
+    if let Some(error) = secrets.error {
+        return Err(scrub_error(error));
+    }
+    let mut decoded: Payload = serde_json::from_value(std::mem::take(value)).map_err(internal)?;
     payload(&mut decoded, secrets)?;
     *value = serde_json::to_value(decoded).map_err(internal)?;
     Ok(())
@@ -458,11 +547,7 @@ fn json_sealable(value: &mut Value, secrets: &mut Context<'_>) -> Result<()> {
     Ok(())
 }
 
-fn sealable_field(
-    value: &mut Value,
-    field: &str,
-    secrets: &mut Context<'_>,
-) -> Result<()> {
+fn sealable_field(value: &mut Value, field: &str, secrets: &mut Context<'_>) -> Result<()> {
     if let Some(value) = value.get_mut(field) {
         json_sealable(value, secrets)?;
     }
@@ -474,11 +559,7 @@ fn json_message(value: &mut Value, secrets: &mut Context<'_>) -> Result<()> {
     sealable_field(value, "body", secrets)
 }
 
-fn message_field(
-    value: &mut Value,
-    field: &str,
-    secrets: &mut Context<'_>,
-) -> Result<()> {
+fn message_field(value: &mut Value, field: &str, secrets: &mut Context<'_>) -> Result<()> {
     if let Some(value) = value.get_mut(field) {
         json_message(value, secrets)?;
     }
@@ -502,14 +583,8 @@ impl ScrubbedOutput for TurnJson {
         if let Some(value) = turn.get_mut("input") {
             match value.get("type").and_then(Value::as_str) {
                 Some("http") => {
-                    text_fields(
-                        value,
-                        &["path", "query", "idempotency_key"],
-                        secrets,
-                    );
-                    if let Some(params) =
-                        value.get_mut("params").and_then(Value::as_array_mut)
-                    {
+                    text_fields(value, &["path", "query", "idempotency_key"], secrets);
+                    if let Some(params) = value.get_mut("params").and_then(Value::as_array_mut) {
                         for param in params {
                             // param_values() emits (schema name, free value).
                             if let Some(value) = param.get_mut(1) {
@@ -551,28 +626,20 @@ impl ScrubbedOutput for TurnJson {
             }
         }
         for field in ["messages", "compensations"] {
-            if let Some(values) =
-                turn.get_mut(field).and_then(Value::as_array_mut)
-            {
+            if let Some(values) = turn.get_mut(field).and_then(Value::as_array_mut) {
                 for value in values {
                     message_field(value, "msg", secrets)?;
                 }
             }
         }
-        if let Some(values) =
-            turn.get_mut("sql_schema").and_then(Value::as_array_mut)
-        {
+        if let Some(values) = turn.get_mut("sql_schema").and_then(Value::as_array_mut) {
             for value in values {
                 json_text(value, secrets);
             }
         }
         if let Some(values) = turn.get_mut("effects").and_then(Value::as_array_mut) {
             for value in values {
-                text_fields(
-                    value,
-                    &["target", "error", "hint", "request"],
-                    secrets,
-                );
+                text_fields(value, &["target", "error", "hint", "request"], secrets);
             }
         }
         if let Some(values) = turn.get_mut("timers").and_then(Value::as_array_mut) {
@@ -584,9 +651,10 @@ impl ScrubbedOutput for TurnJson {
     }
 }
 
-
 impl std::fmt::Display for TurnJson {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 #[cfg(test)]
@@ -607,9 +675,7 @@ mod tests {
     }
 
     fn decoded(value: &Value) -> Vec<u8> {
-        STANDARD
-            .decode(value["base64"].as_str().unwrap())
-            .unwrap()
+        STANDARD.decode(value["base64"].as_str().unwrap()).unwrap()
     }
 
     #[test]
@@ -623,8 +689,7 @@ mod tests {
             ("binary".into(), vec![0xff]),
             ("word".into(), b"secret".to_vec()),
         ];
-        let expected =
-            "[secret:token7]|[secret:yes]|[secret:no]|[secret:nil]|\
+        let expected = "[secret:token7]|[secret:yes]|[secret:no]|[secret:nil]|\
              [secret:utf8]|[secret:binary]|[secret:word]";
 
         let mut value = InspectResponse {
@@ -656,9 +721,15 @@ mod tests {
         assert!(value.actor.sql);
         assert_eq!(value.state[0].key, "[secret:token7]");
         assert_eq!(value.state[0].subject.as_deref(), Some("subject7"));
-        assert_eq!(value.state[0].value.to_bytes().unwrap(), expected.as_bytes());
+        assert_eq!(
+            value.state[0].value.to_bytes().unwrap(),
+            expected.as_bytes()
+        );
         assert_eq!(value.state[0].value.text.as_deref(), Some(expected));
-        assert_eq!(value.sql.as_ref().unwrap().tables[0].name, "[secret:token7]");
+        assert_eq!(
+            value.sql.as_ref().unwrap().tables[0].name,
+            "[secret:token7]"
+        );
     }
 
     #[test]
@@ -759,12 +830,18 @@ mod tests {
         );
         assert_eq!(value["writes"][0]["op"], "set");
         assert_eq!(value["writes"][0]["key"], "[secret:token7]");
-        assert_eq!(decoded(&value["writes"][0]["value"]["value"]), b"[secret:token7]");
+        assert_eq!(
+            decoded(&value["writes"][0]["value"]["value"]),
+            b"[secret:token7]"
+        );
         assert_eq!(value["timers"][0]["id"], "7");
         assert_eq!(value["timers"][0]["name"], "[secret:token7]");
         assert_eq!(value["outcome"]["kind"], "committed");
         assert_eq!(value["output"]["http"]["status"], 207);
-        assert_eq!(value["output"]["http"]["headers"][0]["name"], "x[secret:token7]");
+        assert_eq!(
+            value["output"]["http"]["headers"][0]["name"],
+            "x[secret:token7]"
+        );
         assert_eq!(
             decoded(&value["output"]["http"]["body"]["value"]),
             b"[secret:token7]"
@@ -786,7 +863,10 @@ mod tests {
                 message: Some("failed".into()),
             },
             reply: Some(Reply::inline(
-                "failed".into(), "7".into(), Payload::from_bytes(b"7"), Vec::new(),
+                "failed".into(),
+                "7".into(),
+                Payload::from_bytes(b"7"),
+                Vec::new(),
             )),
             effects: vec![EffectSummary {
                 ordinal: 7,
@@ -806,7 +886,10 @@ mod tests {
         assert_eq!(fork.outcome.kind, "failed");
         assert_eq!(fork.outcome.message.as_deref(), Some("[secret:phase]"));
         assert_eq!(fork.reply.as_ref().unwrap().name, "[secret:phase]");
-        assert_eq!(fork.reply.as_ref().unwrap().body.to_bytes().unwrap(), b"[secret:digit]");
+        assert_eq!(
+            fork.reply.as_ref().unwrap().body.to_bytes().unwrap(),
+            b"[secret:digit]"
+        );
         assert_eq!(fork.effects[0].ordinal, 7);
         assert_eq!(fork.effects[0].status, "failed");
         assert_eq!(fork.effects[0].error.as_deref(), Some("[secret:phase]"));
@@ -875,8 +958,15 @@ mod tests {
         let node = |children| TraceNode {
             turn_id: "main:1".into(),
             actor: "counter/key".into(),
-            input: InputSummary { kind: "message".into(), summary: "x".into() },
-            outcome: Outcome { kind: "committed".into(), error_code: None, message: None },
+            input: InputSummary {
+                kind: "message".into(),
+                summary: "x".into(),
+            },
+            outcome: Outcome {
+                kind: "committed".into(),
+                error_code: None,
+                message: None,
+            },
             children,
         };
         let mut tree = node(vec![node(Vec::new())]);
@@ -931,7 +1021,10 @@ mod tests {
     #[test]
     fn nonmatching_payload_keeps_original_encoding_shape() {
         let inventory: Vec<(String, Vec<u8>)> = vec![("other".into(), b"absent".to_vec())];
-        let mut value = Payload { text: Some("ordinary".into()), base64: None };
+        let mut value = Payload {
+            text: Some("ordinary".into()),
+            base64: None,
+        };
         let size = encoded_len(&value, 100).unwrap();
         let mut context = Context::new(&inventory, size);
         payload(&mut value, &mut context).unwrap();
@@ -946,7 +1039,8 @@ mod tests {
             "retained".to_owned(),
             std::sync::Arc::new(zeroize::Zeroizing::new(b"x".to_vec())),
         )];
-        let index: Vec<(&str, &[u8])> = inventory.iter()
+        let index: Vec<(&str, &[u8])> = inventory
+            .iter()
             .map(|(name, value)| (name.as_str(), value.as_slice()))
             .collect();
         let record = pb::TurnRecord {
@@ -973,7 +1067,10 @@ mod tests {
     #[test]
     fn reply_projection_scrubs_inline_data_without_fabricating_bytes_for_blob_identities() {
         let inventory: Vec<(String, Vec<u8>)> = vec![("digit".into(), b"1".to_vec())];
-        let identity = BlobReference { hash: format!("b3:{}", "11".repeat(32)), size: 31 };
+        let identity = BlobReference {
+            hash: format!("b3:{}", "11".repeat(32)),
+            size: 31,
+        };
         let mut blob = Reply::blob("1".into(), "1".into(), identity.clone());
         reply(&mut blob, &mut Context::new(&inventory, 4096)).unwrap();
         let json = serde_json::to_value(&blob).unwrap();
@@ -983,8 +1080,12 @@ mod tests {
         assert!(json.get("base64").is_none());
         assert_eq!(blob.blob, Some(identity.clone()));
 
-        let mut inline = Reply::inline("reply".into(), "text/plain".into(),
-            Payload::from_bytes(b"1"), vec![identity.clone()]);
+        let mut inline = Reply::inline(
+            "reply".into(),
+            "text/plain".into(),
+            Payload::from_bytes(b"1"),
+            vec![identity.clone()],
+        );
         reply(&mut inline, &mut Context::new(&inventory, 4096)).unwrap();
         let projected = inline.body.to_bytes().unwrap();
         assert!(!projected.is_empty());
@@ -996,7 +1097,10 @@ mod tests {
     fn completed_approval_reasons_use_the_shared_persisted_reason_boundary() {
         for (reason, needle) in [
             ("stored [secret:older] approval reason", "[secret:older]"),
-            ("a later secret equals the complete approval reason", "a later secret equals the complete approval reason"),
+            (
+                "a later secret equals the complete approval reason",
+                "a later secret equals the complete approval reason",
+            ),
         ] {
             let diff_hash = format!("b3:{}", "a".repeat(64));
             let token_id = format!("oidc:{}", "b".repeat(64));
@@ -1008,19 +1112,24 @@ mod tests {
                     "token_id": token_id, "reason": reason, "wall_time_ms": 23,
                     "verified_identity": {"state": "VERIFIED", "issuer": "https://issuer.example", "subject": "verified-subject"}}]
             })).unwrap();
-            response.scrub_free(&[("later", needle.as_bytes())]).unwrap();
+            response
+                .scrub_free(&[("later", needle.as_bytes())])
+                .unwrap();
             let approval = &response.approvals[0];
             assert!(!approval.reason.contains(needle));
             assert_ne!(approval.reason, reason);
             assert_eq!(approval.token_id, token_id);
             assert_eq!(approval.diff_hash, diff_hash);
             assert_eq!(approval.verified_through_lsn, 21);
-            assert_eq!(approval.verified_identity, Some(VerifiedApprovalIdentity::Verified {
-                issuer: "https://issuer.example".into(), subject: "verified-subject".into(),
-            }));
+            assert_eq!(
+                approval.verified_identity,
+                Some(VerifiedApprovalIdentity::Verified {
+                    issuer: "https://issuer.example".into(),
+                    subject: "verified-subject".into(),
+                })
+            );
         }
     }
-
 }
 
 impl ScrubbedOutput for DeploymentsResponse {
@@ -1062,7 +1171,9 @@ impl ScrubbedOutput for TokenView {
 
 impl ScrubbedOutput for TokensResponse {
     fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        for token in &mut self.tokens { token.scrub_fields(secrets)?; }
+        for token in &mut self.tokens {
+            token.scrub_fields(secrets)?;
+        }
         Ok(())
     }
 }
@@ -1081,7 +1192,9 @@ impl ScrubbedOutput for ProposalInfo {
 
 impl ScrubbedOutput for ProposalsResponse {
     fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        for proposal in &mut self.proposals { proposal.scrub_fields(secrets)?; }
+        for proposal in &mut self.proposals {
+            proposal.scrub_fields(secrets)?;
+        }
         Ok(())
     }
 }
@@ -1101,7 +1214,25 @@ impl ScrubbedOutput for WatchInfo {
 
 impl ScrubbedOutput for WatchesResponse {
     fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        for watch in &mut self.watches { watch.scrub_fields(secrets)?; }
+        for watch in &mut self.watches {
+            watch.scrub_fields(secrets)?;
+        }
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for crate::events::WebhookStatus {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        optional_text(&mut self.last_error, secrets);
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for crate::events::WebhooksResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for webhook in &mut self.webhooks {
+            webhook.scrub_fields(secrets)?;
+        }
         Ok(())
     }
 }

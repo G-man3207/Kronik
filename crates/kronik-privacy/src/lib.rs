@@ -10,10 +10,10 @@
 mod key_memory;
 pub mod key_source;
 pub mod keystore;
+mod publication;
 pub mod sealer;
 pub mod secret_backend;
 pub mod secret_selection;
-mod publication;
 pub use publication::PublicationError;
 
 #[cfg(test)]
@@ -339,10 +339,16 @@ impl MasterKey {
     }
 
     /// Pure secret version identities using one protected derivation, without opening a store.
-    pub fn secret_version_hasher(&self)
-        -> Result<impl Fn(&str, u64, &[u8]) -> Result<Vec<u8>, PrivacyError> + Send + Sync + 'static, PrivacyError> {
+    pub fn secret_version_hasher(
+        &self,
+    ) -> Result<
+        impl Fn(&str, u64, &[u8]) -> Result<Vec<u8>, PrivacyError> + Send + Sync + 'static,
+        PrivacyError,
+    > {
         let key = self.derive("kronik secret version v1")?;
-        Ok(move |name: &str, version: u64, value: &[u8]| secret_version_hash(&key, name, version, value))
+        Ok(move |name: &str, version: u64, value: &[u8]| {
+            secret_version_hash(&key, name, version, value)
+        })
     }
 
     /// What each store's `key_check` row holds: a deliberately persisted verifier.
@@ -353,7 +359,12 @@ impl MasterKey {
     }
 }
 
-fn secret_version_hash(key: &ProtectedKey, name: &str, version: u64, value: &[u8]) -> Result<Vec<u8>, PrivacyError> {
+fn secret_version_hash(
+    key: &ProtectedKey,
+    name: &str,
+    version: u64,
+    value: &[u8],
+) -> Result<Vec<u8>, PrivacyError> {
     sql_version(version)?;
     if !valid_name(name) {
         return Err(PrivacyError::InvalidName(name.to_owned()));
@@ -485,23 +496,38 @@ pub struct EncryptedSecretSnapshot {
 }
 
 impl EncryptedSecretSnapshot {
-    pub fn database_path(&self) -> &Path { &self.database }
+    pub fn database_path(&self) -> &Path {
+        &self.database
+    }
 
     /// Only this staged, immutable database is opened; no schema/key check writes.
     pub fn export_encrypted_row(
-        &self, name: &str, physical_version: u64,
+        &self,
+        name: &str,
+        physical_version: u64,
     ) -> Result<Option<EncryptedSecretRow>, PrivacyError> {
         let max_bytes = std::fs::metadata(&self.database)
-            .map_err(|source| PrivacyError::CustodyIo { path: self.database.display().to_string(), source })?
+            .map_err(|source| PrivacyError::CustodyIo {
+                path: self.database.display().to_string(),
+                source,
+            })?
             .len();
         let max_bytes = usize::try_from(max_bytes).map_err(|_| PrivacyError::SecretRowTooLarge)?;
-        SecretStore::export_encrypted_snapshot_row(&self.database, name, physical_version, max_bytes)
+        SecretStore::export_encrypted_snapshot_row(
+            &self.database,
+            name,
+            physical_version,
+            max_bytes,
+        )
     }
 
     /// Retains this completed SQLite backup through the read-only reader's lifetime.
     pub fn open_readonly(self, master: &MasterKey) -> Result<SecretStore, PrivacyError> {
         require_no_snapshot_sidecars(&self.database)?;
-        let conn = Connection::open_with_flags(&self.database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn = Connection::open_with_flags(
+            &self.database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
         let mut store = SecretStore::open_readonly(conn, master)?;
         store._snapshot = Some(self);
         Ok(store)
@@ -515,9 +541,12 @@ fn require_no_snapshot_sidecars(snapshot: &Path) -> Result<(), PrivacyError> {
         match std::fs::symlink_metadata(&sidecar) {
             Ok(_) => return Err(PrivacyError::InvalidSecretRow),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(PrivacyError::CustodyIo {
-                path: Path::new(&sidecar).display().to_string(), source,
-            }),
+            Err(source) => {
+                return Err(PrivacyError::CustodyIo {
+                    path: Path::new(&sidecar).display().to_string(),
+                    source,
+                });
+            }
         }
     }
     Ok(())
@@ -566,8 +595,12 @@ CREATE TABLE IF NOT EXISTS secret_deletion_floors (
 // Keep metadata-only and value reads on exactly the same current-row selector.
 macro_rules! current_secret_query {
     ($columns:literal) => {
-        concat!("SELECT ", $columns, " FROM secrets \
-            WHERE name = ?1 AND deleted_wall_ms IS NULL ORDER BY version DESC LIMIT 1")
+        concat!(
+            "SELECT ",
+            $columns,
+            " FROM secrets \
+            WHERE name = ?1 AND deleted_wall_ms IS NULL ORDER BY version DESC LIMIT 1"
+        )
     };
 }
 
@@ -589,36 +622,52 @@ fn stored_wall(wall: i64) -> Result<u64, PrivacyError> {
 }
 
 fn file_source_version(
-    expected: &kronik_proto::log::v1::SecretVersion, intended: SecretImportDisposition,
+    expected: &kronik_proto::log::v1::SecretVersion,
+    intended: SecretImportDisposition,
 ) -> Result<u64, PrivacyError> {
     use kronik_proto::log::v1::secret_version::Phase;
-    kronik_proto::validate_secret_version(expected)
-        .map_err(|_| PrivacyError::InvalidSecretRow)?;
-    if !valid_name(&expected.name) || !valid_name(&expected.r#ref)
-        || expected.backend != "file" || expected.version_hash.len() != 16
+    kronik_proto::validate_secret_version(expected).map_err(|_| PrivacyError::InvalidSecretRow)?;
+    if !valid_name(&expected.name)
+        || !valid_name(&expected.r#ref)
+        || expected.backend != "file"
+        || expected.version_hash.len() != 16
         || !matches!(expected.phase, p if p == Phase::Reserved as i32 || p == Phase::Active as i32)
-        || (expected.deleted && (intended != SecretImportDisposition::ScrubOnly || expected.phase != Phase::Active as i32))
+        || (expected.deleted
+            && (intended != SecretImportDisposition::ScrubOnly
+                || expected.phase != Phase::Active as i32))
     {
         return Err(PrivacyError::InvalidSecretRow);
     }
-    let source = expected.source_version.parse::<u64>().map_err(|_| PrivacyError::InvalidSecretRow)?;
+    let source = expected
+        .source_version
+        .parse::<u64>()
+        .map_err(|_| PrivacyError::InvalidSecretRow)?;
     sql_version(source)?;
-    let audit = expected.audit.as_ref().ok_or(PrivacyError::InvalidSecretRow)?;
+    let audit = expected
+        .audit
+        .as_ref()
+        .ok_or(PrivacyError::InvalidSecretRow)?;
     i64::try_from(audit.wall_time_ms).map_err(|_| PrivacyError::InvalidTimestamp)?;
     Ok(source)
 }
 
 fn row_disposition(
-    physical: u64, deleted: bool, local: Option<SecretDeletionFloor>, committed: Option<SecretDeletionFloor>,
+    physical: u64,
+    deleted: bool,
+    local: Option<SecretDeletionFloor>,
+    committed: Option<SecretDeletionFloor>,
     intended: SecretImportDisposition,
 ) -> Result<SecretImportDisposition, PrivacyError> {
     if intended == SecretImportDisposition::ScrubOnly
         && committed.is_some_and(|floor| physical <= floor.through_version)
     {
         Ok(SecretImportDisposition::ScrubOnly)
-    } else if intended == SecretImportDisposition::Operational && !deleted
-        && ![local, committed].into_iter().flatten()
-        .any(|floor| physical <= floor.through_version)
+    } else if intended == SecretImportDisposition::Operational
+        && !deleted
+        && ![local, committed]
+            .into_iter()
+            .flatten()
+            .any(|floor| physical <= floor.through_version)
     {
         Ok(SecretImportDisposition::Operational)
     } else {
@@ -626,33 +675,66 @@ fn row_disposition(
     }
 }
 
-fn deletion_floor(conn: &Connection, name: &str) -> Result<Option<SecretDeletionFloor>, PrivacyError> {
-    let row: Option<(i64, i64)> = conn.query_row(
-        "SELECT through_version, deleted_wall_ms FROM secret_deletion_floors WHERE name = ?1",
-        [name], |row| Ok((row.get(0)?, row.get(1)?)),
-    ).optional()?;
-    row.map(|(version, wall)| Ok(SecretDeletionFloor { through_version: stored_version(version)?, applied_wall_ms: stored_wall(wall)? })).transpose()
+fn deletion_floor(
+    conn: &Connection,
+    name: &str,
+) -> Result<Option<SecretDeletionFloor>, PrivacyError> {
+    let row: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT through_version, deleted_wall_ms FROM secret_deletion_floors WHERE name = ?1",
+            [name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(version, wall)| {
+        Ok(SecretDeletionFloor {
+            through_version: stored_version(version)?,
+            applied_wall_ms: stored_wall(wall)?,
+        })
+    })
+    .transpose()
 }
 
 fn encrypted_row(
-    conn: &Connection, name: &str, version: u64, max_bytes: Option<usize>, read_floor: bool,
+    conn: &Connection,
+    name: &str,
+    version: u64,
+    max_bytes: Option<usize>,
+    read_floor: bool,
 ) -> Result<Option<EncryptedSecretRow>, PrivacyError> {
     if let Some(max_bytes) = max_bytes {
-        let lengths: Option<[i64; 6]> = conn.query_row(
-            "SELECT length(CAST(name AS BLOB)), length(nonce), length(ciphertext), \
+        let lengths: Option<[i64; 6]> = conn
+            .query_row(
+                "SELECT length(CAST(name AS BLOB)), length(nonce), length(ciphertext), \
              length(version_hash), length(CAST(token_id AS BLOB)), length(CAST(reason AS BLOB)) \
              FROM secrets WHERE name = ?1 AND version = ?2",
-            params![name, sql_version(version)?],
-            |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?]),
-        ).optional()?;
-        let Some(lengths) = lengths else { return Ok(None); };
+                params![name, sql_version(version)?],
+                |row| {
+                    Ok([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ])
+                },
+            )
+            .optional()?;
+        let Some(lengths) = lengths else {
+            return Ok(None);
+        };
         // Include space for every scalar fact, even absent deletion diagnostics.
         let mut total = 5 * std::mem::size_of::<u64>();
         for length in lengths {
             let length = usize::try_from(length).map_err(|_| PrivacyError::InvalidSecretRow)?;
-            total = total.checked_add(length).ok_or(PrivacyError::SecretRowTooLarge)?;
+            total = total
+                .checked_add(length)
+                .ok_or(PrivacyError::SecretRowTooLarge)?;
         }
-        if total > max_bytes { return Err(PrivacyError::SecretRowTooLarge); }
+        if total > max_bytes {
+            return Err(PrivacyError::SecretRowTooLarge);
+        }
     }
     let mut row = conn.query_row(
         "SELECT nonce, ciphertext, version_hash, created_wall_ms, token_id, reason, deleted_wall_ms \
@@ -668,13 +750,17 @@ fn encrypted_row(
     if let Some((row, created, deleted)) = row.as_mut() {
         row.created_wall_ms = stored_wall(*created)?;
         row.deletion_applied_wall_ms = deleted.map(stored_wall).transpose()?;
-        if read_floor { row.known_floor = deletion_floor(conn, name)?; }
+        if read_floor {
+            row.known_floor = deletion_floor(conn, name)?;
+        }
     }
     Ok(row.map(|(row, _, _)| row))
 }
 
 fn apply_deletion(
-    conn: &Connection, name: &str, floor: SecretDeletionFloor,
+    conn: &Connection,
+    name: &str,
+    floor: SecretDeletionFloor,
 ) -> Result<u32, PrivacyError> {
     let version = sql_version(floor.through_version)?;
     let wall = i64::try_from(floor.applied_wall_ms).map_err(|_| PrivacyError::InvalidTimestamp)?;
@@ -699,7 +785,12 @@ pub trait SecretStoreData: std::any::Any + Send + Sync {
     /// Atomically refuse overlap and keep this physical source pending before SQL.
     fn begin(&self, name: &str, physical_version: u64) -> Result<u64, PrivacyError>;
     /// Record FULL commit only; actual canonical reconciliation still owns readiness.
-    fn sql_committed(&self, name: &str, physical_version: u64, ticket: u64) -> Result<(), PrivacyError>;
+    fn sql_committed(
+        &self,
+        name: &str,
+        physical_version: u64,
+        ticket: u64,
+    ) -> Result<(), PrivacyError>;
     /// End only the running interval on error/drop; keep source/current DATA unknown.
     /// This is not rollback evidence, pending settlement or readiness.
     fn sql_aborted(&self, name: &str, physical_version: u64, ticket: u64);
@@ -715,7 +806,8 @@ struct SecretStoreMutation<'a> {
 
 impl SecretStoreMutation<'_> {
     fn committed(mut self) -> Result<(), PrivacyError> {
-        self.data.sql_committed(self.name, self.physical_version, self.ticket)?;
+        self.data
+            .sql_committed(self.name, self.physical_version, self.ticket)?;
         self.finished = true;
         Ok(())
     }
@@ -724,7 +816,8 @@ impl SecretStoreMutation<'_> {
 impl Drop for SecretStoreMutation<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.data.sql_aborted(self.name, self.physical_version, self.ticket);
+            self.data
+                .sql_aborted(self.name, self.physical_version, self.ticket);
         }
     }
 }
@@ -747,11 +840,17 @@ pub(crate) struct SecretStoreOwner {
 impl SecretStoreOwner {
     fn check(&self) -> Result<(), PrivacyError> {
         self.root.check_location()?;
-        self.root.check_directory(Path::new("keys"), &self.directory)?;
-        let named = rustix::fs::statat(self.directory.as_ref(), "secrets.db", rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|source| self.root.io(source.into()))?;
+        self.root
+            .check_directory(Path::new("keys"), &self.directory)?;
+        let named = rustix::fs::statat(
+            self.directory.as_ref(),
+            "secrets.db",
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|source| self.root.io(source.into()))?;
         if rustix::fs::FileType::from_raw_mode(named.st_mode) != rustix::fs::FileType::RegularFile
-            || named.st_dev as u64 != self.identity.device || named.st_ino as u64 != self.identity.inode
+            || named.st_dev as u64 != self.identity.device
+            || named.st_ino as u64 != self.identity.inode
         {
             return Err(PrivacyError::SecretStoreUnowned);
         }
@@ -776,23 +875,26 @@ pub struct SecretStore {
 impl SecretStore {
     /// Reuses an existing original-root DATA route before opening another live connection.
     /// None means only that no live group exists; it proves no database/history absence.
-    pub fn owned_data(owner: &key_source::DataOwnership)
-        -> Result<Option<std::sync::Arc<dyn SecretStoreData>>, PrivacyError>
-    {
+    pub fn owned_data(
+        owner: &key_source::DataOwnership,
+    ) -> Result<Option<std::sync::Arc<dyn SecretStoreData>>, PrivacyError> {
         let owned = {
             let route = owner.secret_store_route()?;
             route.upgrade()
         };
-        owned.map(|owned| {
-            owned.check()?;
-            Ok(owned.data.clone())
-        }).transpose()
+        owned
+            .map(|owned| {
+                owned.check()?;
+                Ok(owned.data.clone())
+            })
+            .transpose()
     }
 
     /// Opens the original root-owned live FILE store with its existing DATA routing.
     /// Every independent connection must reuse that same owner, identity and DATA state.
     pub fn open_owned(
-        owner: &key_source::DataOwnership, master: &MasterKey,
+        owner: &key_source::DataOwnership,
+        master: &MasterKey,
         data: std::sync::Arc<dyn SecretStoreData>,
     ) -> Result<std::sync::Arc<Self>, PrivacyError> {
         use std::os::unix::fs::PermissionsExt as _;
@@ -807,19 +909,29 @@ impl SecretStore {
         let directory = owner.directory(Path::new("keys"), true)?;
         owner.check_location()?;
         let path = owner.path().join("keys/secrets.db");
-        let conn = Mutex::new(Connection::open_with_flags(&path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?);
-        let identity = keystore::ffi::file_identity(&conn.lock().map_err(|_| PrivacyError::SecretStoreUnknown)?)?;
+        let conn = Mutex::new(Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?);
+        let identity = keystore::ffi::file_identity(
+            &conn.lock().map_err(|_| PrivacyError::SecretStoreUnknown)?,
+        )?;
         let owned = match existing {
             Some(existing) if existing.identity == identity => existing,
             Some(_) => return Err(PrivacyError::SecretStoreUnowned),
             None => std::sync::Arc::new(SecretStoreOwner {
-                root: owner.clone(), directory, identity, data,
+                root: owner.clone(),
+                directory,
+                identity,
+                data,
             }),
         };
         owned.check()?;
-        let conn = conn.into_inner().map_err(|_| PrivacyError::SecretStoreUnknown)?;
+        let conn = conn
+            .into_inner()
+            .map_err(|_| PrivacyError::SecretStoreUnknown)?;
         let store = Self::open_connection(conn, master, SecretStoreCustody::Owned(owned.clone()))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .map_err(|source| owner.io(source))?;
@@ -834,8 +946,10 @@ impl SecretStore {
             return Err(PrivacyError::SecretStoreUnowned);
         };
         owned.check()?;
-        let conn = Mutex::new(Connection::open_with_flags(owned.root.path().join("keys/secrets.db"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?);
+        let conn = Mutex::new(Connection::open_with_flags(
+            owned.root.path().join("keys/secrets.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?);
         {
             let conn = conn.lock().map_err(|_| PrivacyError::SecretStoreUnknown)?;
             if keystore::ffi::file_identity(&conn)? != owned.identity {
@@ -845,8 +959,12 @@ impl SecretStore {
         }
         owned.check()?;
         Ok(std::sync::Arc::new(Self {
-            conn, cipher: self.cipher.clone(), hash_key: self.hash_key.clone(),
-            fresh_at_open: false, has_floor_table: self.has_floor_table, _snapshot: None,
+            conn,
+            cipher: self.cipher.clone(),
+            hash_key: self.hash_key.clone(),
+            fresh_at_open: false,
+            has_floor_table: self.has_floor_table,
+            _snapshot: None,
             custody: SecretStoreCustody::Owned(owned.clone()),
         }))
     }
@@ -858,16 +976,24 @@ impl SecretStore {
             return Err(PrivacyError::SecretStoreUnowned);
         };
         owned.check().map_err(|error| match error {
-            PrivacyError::SecretStoreUnowned =>
-                PrivacyError::Publication(PublicationError::FileIdentity("the original secret-store file changed")),
+            PrivacyError::SecretStoreUnowned => PrivacyError::Publication(
+                PublicationError::FileIdentity("the original secret-store file changed"),
+            ),
             error => error,
         })?;
         Ok(&owned.root)
     }
 
     /// Private memory has no file-owner certificate, but shares its actual runtime DATA state.
-    pub fn open_memory(master: &MasterKey, data: std::sync::Arc<dyn SecretStoreData>) -> Result<Self, PrivacyError> {
-        Self::open_connection(Connection::open_in_memory()?, master, SecretStoreCustody::Memory(data))
+    pub fn open_memory(
+        master: &MasterKey,
+        data: std::sync::Arc<dyn SecretStoreData>,
+    ) -> Result<Self, PrivacyError> {
+        Self::open_connection(
+            Connection::open_in_memory()?,
+            master,
+            SecretStoreCustody::Memory(data),
+        )
     }
 
     /// The existing DATA adapter, never a caller authority or complete source proof.
@@ -881,10 +1007,14 @@ impl SecretStore {
         }
     }
 
-    fn begin_mutation<'a>(&'a self, name: &'a str, physical_version: u64)
-        -> Result<Option<SecretStoreMutation<'a>>, PrivacyError>
-    {
-        if let SecretStoreCustody::Owned(owned) = &self.custody { owned.check()?; }
+    fn begin_mutation<'a>(
+        &'a self,
+        name: &'a str,
+        physical_version: u64,
+    ) -> Result<Option<SecretStoreMutation<'a>>, PrivacyError> {
+        if let SecretStoreCustody::Owned(owned) = &self.custody {
+            owned.check()?;
+        }
         let data = match &self.custody {
             SecretStoreCustody::Owned(owned) => owned.data.as_ref(),
             SecretStoreCustody::Memory(data) => data.as_ref(),
@@ -893,21 +1023,36 @@ impl SecretStore {
             SecretStoreCustody::Fixture => return Ok(None),
         };
         let ticket = data.begin(name, physical_version)?;
-        Ok(Some(SecretStoreMutation { data, name, physical_version, ticket, finished: false }))
+        Ok(Some(SecretStoreMutation {
+            data,
+            name,
+            physical_version,
+            ticket,
+            finished: false,
+        }))
     }
 
     /// Host recovery fact from the persisted name-bound floor, even without a row at its cut.
     /// None means unknown; this is neither deletion authority nor a durability receipt.
-    pub fn stored_deletion_floor(&self, name: &str) -> Result<Option<SecretDeletionFloor>, PrivacyError> {
-        if !valid_name(name) { return Err(PrivacyError::InvalidName(name.to_owned())); }
-        if !self.has_floor_table { return Ok(None); }
+    pub fn stored_deletion_floor(
+        &self,
+        name: &str,
+    ) -> Result<Option<SecretDeletionFloor>, PrivacyError> {
+        if !valid_name(name) {
+            return Err(PrivacyError::InvalidName(name.to_owned()));
+        }
+        if !self.has_floor_table {
+            return Ok(None);
+        }
         deletion_floor(&self.conn(), name)
     }
 
     /// Actual per-name physical maximum, including orphan rows and any persisted floor.
     /// Zero is only an empty lower bound, never fresh/never-used evidence or an allocator.
     pub fn physical_highwater(&self, name: &str) -> Result<u64, PrivacyError> {
-        if !valid_name(name) { return Err(PrivacyError::InvalidName(name.to_owned())); }
+        if !valid_name(name) {
+            return Err(PrivacyError::InvalidName(name.to_owned()));
+        }
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         // Two primary-key edge seeks also reject an invalid low version without
@@ -915,12 +1060,17 @@ impl SecretStore {
         let (low, high): (Option<i64>, Option<i64>) = tx.query_row(
             "SELECT (SELECT version FROM secrets WHERE name=?1 ORDER BY version LIMIT 1), \
              (SELECT version FROM secrets WHERE name=?1 ORDER BY version DESC LIMIT 1)",
-            [name], |row| Ok((row.get(0)?, row.get(1)?)),
+            [name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        if let Some(low) = low { stored_version(low)?; }
+        if let Some(low) = low {
+            stored_version(low)?;
+        }
         let mut high = high.map(stored_version).transpose()?.unwrap_or(0);
         if self.has_floor_table {
-            if let Some(floor) = deletion_floor(&tx, name)? { high = high.max(floor.through_version); }
+            if let Some(floor) = deletion_floor(&tx, name)? {
+                high = high.max(floor.through_version);
+            }
         }
         tx.commit()?;
         Ok(high)
@@ -928,9 +1078,13 @@ impl SecretStore {
 
     /// Reads original row and diagnostic floor from one SQLite snapshot; never decrypts.
     pub fn export_encrypted_row(
-        &self, name: &str, physical_version: u64,
+        &self,
+        name: &str,
+        physical_version: u64,
     ) -> Result<Option<EncryptedSecretRow>, PrivacyError> {
-        if !valid_name(name) { return Err(PrivacyError::InvalidName(name.to_owned())); }
+        if !valid_name(name) {
+            return Err(PrivacyError::InvalidName(name.to_owned()));
+        }
         sql_version(physical_version)?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -942,13 +1096,24 @@ impl SecretStore {
     /// Caps row payload plus scalar facts before allocating any SQLite BLOB/text.
     /// The caller supplies its actual peer budget and still preflights exact wire size.
     pub fn export_encrypted_row_bounded(
-        &self, name: &str, physical_version: u64, max_bytes: usize,
+        &self,
+        name: &str,
+        physical_version: u64,
+        max_bytes: usize,
     ) -> Result<Option<EncryptedSecretRow>, PrivacyError> {
-        if !valid_name(name) { return Err(PrivacyError::InvalidName(name.to_owned())); }
+        if !valid_name(name) {
+            return Err(PrivacyError::InvalidName(name.to_owned()));
+        }
         sql_version(physical_version)?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let row = encrypted_row(&tx, name, physical_version, Some(max_bytes), self.has_floor_table)?;
+        let row = encrypted_row(
+            &tx,
+            name,
+            physical_version,
+            Some(max_bytes),
+            self.has_floor_table,
+        )?;
         tx.commit()?;
         Ok(row)
     }
@@ -957,24 +1122,43 @@ impl SecretStore {
     /// The caller owns snapshot authorization/completion; never pass a live database.
     /// No WAL/journal sidecars, schema writes, or live-store replacement are permitted.
     pub fn export_encrypted_snapshot_row(
-        snapshot: &Path, name: &str, physical_version: u64, max_row_bytes: usize,
+        snapshot: &Path,
+        name: &str,
+        physical_version: u64,
+        max_row_bytes: usize,
     ) -> Result<Option<EncryptedSecretRow>, PrivacyError> {
-        if !valid_name(name) { return Err(PrivacyError::InvalidName(name.to_owned())); }
+        if !valid_name(name) {
+            return Err(PrivacyError::InvalidName(name.to_owned()));
+        }
         sql_version(physical_version)?;
-        let snapshot = snapshot.canonicalize().map_err(|source| PrivacyError::CustodyIo {
-            path: snapshot.display().to_string(), source,
-        })?;
+        let snapshot = snapshot
+            .canonicalize()
+            .map_err(|source| PrivacyError::CustodyIo {
+                path: snapshot.display().to_string(),
+                source,
+            })?;
         require_no_snapshot_sidecars(&snapshot)?;
-        let mut uri = url::Url::from_file_path(&snapshot).map_err(|_| PrivacyError::InvalidSecretRow)?;
-        uri.query_pairs_mut().append_pair("mode", "ro").append_pair("immutable", "1");
-        let mut conn = Connection::open_with_flags(uri.as_str(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI)?;
+        let mut uri =
+            url::Url::from_file_path(&snapshot).map_err(|_| PrivacyError::InvalidSecretRow)?;
+        uri.query_pairs_mut()
+            .append_pair("mode", "ro")
+            .append_pair("immutable", "1");
+        let mut conn = Connection::open_with_flags(
+            uri.as_str(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
         let tx = conn.transaction()?;
         let has_floor_table: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'secret_deletion_floors')",
             [], |row| row.get(0),
         )?;
-        let row = encrypted_row(&tx, name, physical_version, Some(max_row_bytes), has_floor_table)?;
+        let row = encrypted_row(
+            &tx,
+            name,
+            physical_version,
+            Some(max_row_bytes),
+            has_floor_table,
+        )?;
         tx.commit()?;
         Ok(row)
     }
@@ -983,39 +1167,66 @@ impl SecretStore {
     /// This does not replace SQLite's FULL transaction acknowledgement.
     pub fn sync_parent_directory(&self) -> Result<(), PrivacyError> {
         let conn = self.conn();
-        let path = conn.path().filter(|path| !path.is_empty())
+        let path = conn
+            .path()
+            .filter(|path| !path.is_empty())
             .ok_or(PrivacyError::FileStoreRequired)?;
-        let parent = Path::new(path).parent().filter(|path| !path.as_os_str().is_empty())
+        let parent = Path::new(path)
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
             .ok_or(PrivacyError::FileStoreRequired)?;
-        std::fs::File::open(parent).and_then(|directory| directory.sync_all())
-            .map_err(|source| PrivacyError::CustodyIo { path: parent.display().to_string(), source })
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| PrivacyError::CustodyIo {
+                path: parent.display().to_string(),
+                source,
+            })
     }
 
     /// Stages a private, synced encrypted backup for existing snapshot transport.
-    pub fn stage_encrypted_snapshot(&self, parent: &Path) -> Result<EncryptedSecretSnapshot, PrivacyError> {
+    pub fn stage_encrypted_snapshot(
+        &self,
+        parent: &Path,
+    ) -> Result<EncryptedSecretSnapshot, PrivacyError> {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         let io_error = |path: &Path, source| PrivacyError::CustodyIo {
-            path: path.display().to_string(), source,
+            path: path.display().to_string(),
+            source,
         };
-        let directory = tempfile::Builder::new().prefix(".secret-custody-").tempdir_in(parent)
+        let directory = tempfile::Builder::new()
+            .prefix(".secret-custody-")
+            .tempdir_in(parent)
             .map_err(|source| io_error(parent, source))?;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
             .map_err(|source| io_error(directory.path(), source))?;
         let database = directory.path().join("secrets.db");
-        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)
-            .open(&database).map_err(|source| io_error(&database, source))?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&database)
+            .map_err(|source| io_error(&database, source))?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|source| io_error(&database, source))?;
         self.backup_to(&database)?;
         // rusqlite closes its local destination connection before returning.
         require_no_snapshot_sidecars(&database)?;
-        file.sync_all().map_err(|source| io_error(&database, source))?;
-        std::fs::File::open(directory.path()).and_then(|directory| directory.sync_all())
+        file.sync_all()
+            .map_err(|source| io_error(&database, source))?;
+        std::fs::File::open(directory.path())
+            .and_then(|directory| directory.sync_all())
             .map_err(|source| io_error(directory.path(), source))?;
-        std::fs::File::open(parent).and_then(|directory| directory.sync_all())
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
             .map_err(|source| io_error(parent, source))?;
-        let database = database.canonicalize().map_err(|source| io_error(&database, source))?;
-        Ok(EncryptedSecretSnapshot { _directory: directory, database })
+        let database = database
+            .canonicalize()
+            .map_err(|source| io_error(&database, source))?;
+        Ok(EncryptedSecretSnapshot {
+            _directory: directory,
+            database,
+        })
     }
 
     /// Validates both physical and logical identities, then commits the exact envelope.
@@ -1035,26 +1246,43 @@ impl SecretStore {
         committed_floor: Option<(&str, SecretDeletionFloor)>,
         intended: SecretImportDisposition,
     ) -> Result<SecretImportDisposition, PrivacyError> {
-        if !valid_name(&row.name) { return Err(PrivacyError::InvalidName(row.name.clone())); }
+        if !valid_name(&row.name) {
+            return Err(PrivacyError::InvalidName(row.name.clone()));
+        }
         sql_version(row.physical_version)?;
         let mutation = self.begin_mutation(&row.name, row.physical_version)?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let byte_limit = usize::try_from(tx.limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH)?)
             .map_err(|_| PrivacyError::InvalidSecretRow)?;
-        if [row.name.len(), row.nonce.len(), row.ciphertext.len(),
-            row.version_hash.len(), row.token_id.len(), row.reason.len()]
-            .into_iter().any(|length| length > byte_limit)
+        if [
+            row.name.len(),
+            row.nonce.len(),
+            row.ciphertext.len(),
+            row.version_hash.len(),
+            row.token_id.len(),
+            row.reason.len(),
+        ]
+        .into_iter()
+        .any(|length| length > byte_limit)
         {
             return Err(PrivacyError::InvalidSecretRow);
         }
-        let committed_floor = committed_floor.map(|(name, floor)| {
-            if name != row.name { return Err(PrivacyError::InvalidSecretRow); }
-            Ok(floor)
-        }).transpose()?;
+        let committed_floor = committed_floor
+            .map(|(name, floor)| {
+                if name != row.name {
+                    return Err(PrivacyError::InvalidSecretRow);
+                }
+                Ok(floor)
+            })
+            .transpose()?;
         let source = file_source_version(expected, intended)?;
-        let created = i64::try_from(row.created_wall_ms).map_err(|_| PrivacyError::InvalidTimestamp)?;
-        if expected.r#ref != row.name || source != row.physical_version || row.version_hash.len() != 16 {
+        let created =
+            i64::try_from(row.created_wall_ms).map_err(|_| PrivacyError::InvalidTimestamp)?;
+        if expected.r#ref != row.name
+            || source != row.physical_version
+            || row.version_hash.len() != 16
+        {
             return Err(PrivacyError::InvalidSecretRow);
         }
         if let Some(wall) = row.deletion_applied_wall_ms {
@@ -1074,9 +1302,19 @@ impl SecretStore {
         // to ScrubOnly; only the explicit intent plus independent canonical floor permits it.
         let local_floor = deletion_floor(&tx, &row.name)?;
         let disposition = row_disposition(
-            row.physical_version, row.deletion_applied_wall_ms.is_some(), local_floor, committed_floor, intended,
+            row.physical_version,
+            row.deletion_applied_wall_ms.is_some(),
+            local_floor,
+            committed_floor,
+            intended,
         )?;
-        self.check_encrypted_identity(expected, row.physical_version, &row.nonce, &row.ciphertext, &row.version_hash)?;
+        self.check_encrypted_identity(
+            expected,
+            row.physical_version,
+            &row.nonce,
+            &row.ciphertext,
+            &row.version_hash,
+        )?;
         // Compare borrowed SQLite fields without copying a second large ciphertext.
         let existing: Option<(bool, bool, bool, Option<i64>)> = tx.query_row(
             "SELECT nonce, ciphertext, version_hash, created_wall_ms, token_id, reason, deleted_wall_ms \
@@ -1099,8 +1337,12 @@ impl SecretStore {
             if deleted.is_some() && disposition == SecretImportDisposition::Operational {
                 return Err(PrivacyError::SecretDeleted);
             }
-            if !facts_match { return Err(PrivacyError::SecretRowConflict); }
-            if legacy_empty && deleted.is_some() && disposition == SecretImportDisposition::ScrubOnly
+            if !facts_match {
+                return Err(PrivacyError::SecretRowConflict);
+            }
+            if legacy_empty
+                && deleted.is_some()
+                && disposition == SecretImportDisposition::ScrubOnly
             {
                 // Only genuine caller-authenticated original ciphertext may repair
                 // a legacy erased row; its retained audit and deletion facts stay put.
@@ -1119,10 +1361,14 @@ impl SecretStore {
                     row.version_hash, created, row.token_id, row.reason],
             )?;
         }
-        if let Some(floor) = committed_floor { apply_deletion(&tx, &row.name, floor)?; }
+        if let Some(floor) = committed_floor {
+            apply_deletion(&tx, &row.name, floor)?;
+        }
         tx.commit()?;
         drop(conn);
-        if let Some(mutation) = mutation { mutation.committed()?; }
+        if let Some(mutation) = mutation {
+            mutation.committed()?;
+        }
         Ok(disposition)
     }
 
@@ -1140,12 +1386,16 @@ impl SecretStore {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let physical = file_source_version(expected, intended)?;
-        let committed_floor = committed_floor.map(|(name, floor)| {
-            if name != expected.r#ref { return Err(PrivacyError::InvalidSecretRow); }
-            sql_version(floor.through_version)?;
-            i64::try_from(floor.applied_wall_ms).map_err(|_| PrivacyError::InvalidTimestamp)?;
-            Ok(floor)
-        }).transpose()?;
+        let committed_floor = committed_floor
+            .map(|(name, floor)| {
+                if name != expected.r#ref {
+                    return Err(PrivacyError::InvalidSecretRow);
+                }
+                sql_version(floor.through_version)?;
+                i64::try_from(floor.applied_wall_ms).map_err(|_| PrivacyError::InvalidTimestamp)?;
+                Ok(floor)
+            })
+            .transpose()?;
         let local_floor = deletion_floor(&tx, &expected.r#ref)?;
         let byte_limit = usize::try_from(tx.limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH)?)
             .map_err(|_| PrivacyError::InvalidSecretRow)?;
@@ -1156,33 +1406,75 @@ impl SecretStore {
             )?;
             let mut rows = statement.query(params![expected.r#ref, sql_version(physical)?])?;
             if let Some(stored) = rows.next()? {
-                let nonce = stored.get_ref(0)?.as_blob().map_err(|_| PrivacyError::InvalidSecretRow)?;
-                let ciphertext = stored.get_ref(1)?.as_blob().map_err(|_| PrivacyError::InvalidSecretRow)?;
-                let physical_hash = stored.get_ref(2)?.as_blob().map_err(|_| PrivacyError::InvalidSecretRow)?;
+                let nonce = stored
+                    .get_ref(0)?
+                    .as_blob()
+                    .map_err(|_| PrivacyError::InvalidSecretRow)?;
+                let ciphertext = stored
+                    .get_ref(1)?
+                    .as_blob()
+                    .map_err(|_| PrivacyError::InvalidSecretRow)?;
+                let physical_hash = stored
+                    .get_ref(2)?
+                    .as_blob()
+                    .map_err(|_| PrivacyError::InvalidSecretRow)?;
                 stored_wall(stored.get(3)?)?;
-                let token = stored.get_ref(4)?.as_str().map_err(|_| PrivacyError::InvalidSecretRow)?;
-                let reason = stored.get_ref(5)?.as_str().map_err(|_| PrivacyError::InvalidSecretRow)?;
-                let deleted = stored.get::<_, Option<i64>>(6)?.map(stored_wall).transpose()?;
+                let token = stored
+                    .get_ref(4)?
+                    .as_str()
+                    .map_err(|_| PrivacyError::InvalidSecretRow)?;
+                let reason = stored
+                    .get_ref(5)?
+                    .as_str()
+                    .map_err(|_| PrivacyError::InvalidSecretRow)?;
+                let deleted = stored
+                    .get::<_, Option<i64>>(6)?
+                    .map(stored_wall)
+                    .transpose()?;
                 if nonce.is_empty() && ciphertext.is_empty() {
                     return Err(PrivacyError::SecretRowIncomplete);
                 }
-                if nonce.len() != 24 || ciphertext.len() < 16 || physical_hash.len() != 16
-                    || [expected.r#ref.len(), nonce.len(), ciphertext.len(), physical_hash.len(), token.len(), reason.len()]
-                        .into_iter().any(|length| length > byte_limit)
+                if nonce.len() != 24
+                    || ciphertext.len() < 16
+                    || physical_hash.len() != 16
+                    || [
+                        expected.r#ref.len(),
+                        nonce.len(),
+                        ciphertext.len(),
+                        physical_hash.len(),
+                        token.len(),
+                        reason.len(),
+                    ]
+                    .into_iter()
+                    .any(|length| length > byte_limit)
                 {
                     return Err(PrivacyError::InvalidSecretRow);
                 }
-                if committed_floor.is_some_and(|floor| local_floor
-                    .is_none_or(|local| local.through_version < floor.through_version))
-                {
+                if committed_floor.is_some_and(|floor| {
+                    local_floor.is_none_or(|local| local.through_version < floor.through_version)
+                }) {
                     return Err(PrivacyError::SecretRowIncomplete);
                 }
                 if intended == SecretImportDisposition::ScrubOnly && deleted.is_none() {
                     return Err(PrivacyError::SecretRowIncomplete);
                 }
-                let disposition = row_disposition(physical, deleted.is_some(), local_floor, committed_floor, intended)?;
-                if blake3::hash(ciphertext).as_bytes() != ciphertext_hash { return Err(PrivacyError::InvalidSecretRow); }
-                self.check_encrypted_identity(expected, physical, nonce, ciphertext, physical_hash)?;
+                let disposition = row_disposition(
+                    physical,
+                    deleted.is_some(),
+                    local_floor,
+                    committed_floor,
+                    intended,
+                )?;
+                if blake3::hash(ciphertext).as_bytes() != ciphertext_hash {
+                    return Err(PrivacyError::InvalidSecretRow);
+                }
+                self.check_encrypted_identity(
+                    expected,
+                    physical,
+                    nonce,
+                    ciphertext,
+                    physical_hash,
+                )?;
                 Some(disposition)
             } else {
                 None
@@ -1206,12 +1498,19 @@ impl SecretStore {
     /// No schema/key-check writes or mutable/current-source ownership are created.
     /// Live inventory must complete the SQLite backup stage before qualifying its rows.
     pub fn open_readonly(conn: Connection, master: &MasterKey) -> Result<Self, PrivacyError> {
-        if !conn.is_readonly("main")? { return Err(PrivacyError::SecretStoreUnowned); }
-        let invalid: Option<i64> = conn.query_row(
-            "SELECT version FROM secrets WHERE version <= 0 OR version > ?1 LIMIT 1",
-            [sql_version(kronik_proto::secret::MAX_SECRET_VERSION)?], |row| row.get(0),
-        ).optional()?;
-        if let Some(version) = invalid { return Err(PrivacyError::InvalidStoredVersion(version)); }
+        if !conn.is_readonly("main")? {
+            return Err(PrivacyError::SecretStoreUnowned);
+        }
+        let invalid: Option<i64> = conn
+            .query_row(
+                "SELECT version FROM secrets WHERE version <= 0 OR version > ?1 LIMIT 1",
+                [sql_version(kronik_proto::secret::MAX_SECRET_VERSION)?],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(version) = invalid {
+            return Err(PrivacyError::InvalidStoredVersion(version));
+        }
         let (has_check, has_floor_table): (bool, bool) = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='key_check'), \
              EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='secret_deletion_floors')",
@@ -1219,11 +1518,15 @@ impl SecretStore {
         )?;
         if has_check {
             let want = master.check_value();
-            let matches: Option<bool> = conn.query_row("SELECT value FROM key_check WHERE id=1", [], |row| {
-                Ok(row.get_ref(0)? == rusqlite::types::ValueRef::Blob(&want))
-            }).optional()?;
+            let matches: Option<bool> = conn
+                .query_row("SELECT value FROM key_check WHERE id=1", [], |row| {
+                    Ok(row.get_ref(0)? == rusqlite::types::ValueRef::Blob(&want))
+                })
+                .optional()?;
             if matches == Some(false) {
-                return Err(PrivacyError::KeyMismatch("the secret snapshot was encrypted under another master key".into()));
+                return Err(PrivacyError::KeyMismatch(
+                    "the secret snapshot was encrypted under another master key".into(),
+                ));
             }
         }
         // Legacy sources without a verifier prove the key by actual per-row decryption.
@@ -1244,7 +1547,11 @@ impl SecretStore {
         Self::open_connection(conn, master, SecretStoreCustody::Fixture)
     }
 
-    fn open_connection(conn: Connection, master: &MasterKey, custody: SecretStoreCustody) -> Result<SecretStore, PrivacyError> {
+    fn open_connection(
+        conn: Connection,
+        master: &MasterKey,
+        custody: SecretStoreCustody,
+    ) -> Result<SecretStore, PrivacyError> {
         // Lost/deleted rows in an existing schema do not make legacy history fresh.
         let schema_version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
         let fresh_at_open = schema_version == 0
@@ -1268,23 +1575,31 @@ impl SecretStore {
         };
         {
             let conn = store.conn();
-            let invalid: Option<i64> = conn.query_row(
-                "SELECT version FROM secrets WHERE version <= 0 OR version > ?1 LIMIT 1",
-                [sql_version(kronik_proto::secret::MAX_SECRET_VERSION)?],
-                |row| row.get(0),
-            ).optional()?;
+            let invalid: Option<i64> = conn
+                .query_row(
+                    "SELECT version FROM secrets WHERE version <= 0 OR version > ?1 LIMIT 1",
+                    [sql_version(kronik_proto::secret::MAX_SECRET_VERSION)?],
+                    |row| row.get(0),
+                )
+                .optional()?;
             if let Some(version) = invalid {
                 return Err(PrivacyError::InvalidStoredVersion(version));
             }
             let mut floors = conn.prepare(
                 "SELECT name, through_version, deleted_wall_ms FROM secret_deletion_floors",
             )?;
-            let rows = floors.query_map([], |row| Ok((
-                row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
-            )))?;
+            let rows = floors.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
             for row in rows {
                 let (name, version, wall) = row?;
-                if !valid_name(&name) { return Err(PrivacyError::InvalidSecretRow); }
+                if !valid_name(&name) {
+                    return Err(PrivacyError::InvalidSecretRow);
+                }
                 stored_version(version)?;
                 stored_wall(wall)?;
             }
@@ -1301,7 +1616,10 @@ impl SecretStore {
                     return Ok(true);
                 };
                 let version = stored_version(version)?;
-                Ok(store.decrypt(&name, version, &nonce, &ct).map(Zeroizing::new).is_ok())
+                Ok(store
+                    .decrypt(&name, version, &nonce, &ct)
+                    .map(Zeroizing::new)
+                    .is_ok())
             })?;
         }
         Ok(store)
@@ -1345,7 +1663,12 @@ impl SecretStore {
     }
 
     /// The keyed immutable identity; legacy identities retain their exact bytes.
-    pub fn version_hash(&self, name: &str, version: u64, value: &[u8]) -> Result<Vec<u8>, PrivacyError> {
+    pub fn version_hash(
+        &self,
+        name: &str,
+        version: u64,
+        value: &[u8],
+    ) -> Result<Vec<u8>, PrivacyError> {
         secret_version_hash(&self.hash_key, name, version, value)
     }
 
@@ -1354,12 +1677,19 @@ impl SecretStore {
     }
 
     fn encrypt(
-        &self, name: &str, version: u64, value: &[u8], nonce: [u8; 24],
+        &self,
+        name: &str,
+        version: u64,
+        value: &[u8],
+        nonce: [u8; 24],
     ) -> Result<Vec<u8>, PrivacyError> {
         XChaCha20Poly1305::new(self.cipher.bytes().into())
             .encrypt(
                 &XNonce::from(nonce),
-                Payload { msg: value, aad: &Self::aad(name, version) },
+                Payload {
+                    msg: value,
+                    aad: &Self::aad(name, version),
+                },
             )
             .map_err(|_| PrivacyError::Decrypt(name.to_owned()))
     }
@@ -1381,10 +1711,16 @@ impl SecretStore {
         let version_hash = self.version_hash(name, physical_version, value)?;
         let ciphertext = self.encrypt(name, physical_version, value, nonce)?;
         Ok(EncryptedSecretRow {
-            name: name.to_owned(), physical_version, nonce: nonce.to_vec(),
-            ciphertext, version_hash, created_wall_ms: wall_ms,
-            token_id: token_id.to_owned(), reason: reason.to_owned(),
-            deletion_applied_wall_ms: None, known_floor: None,
+            name: name.to_owned(),
+            physical_version,
+            nonce: nonce.to_vec(),
+            ciphertext,
+            version_hash,
+            created_wall_ms: wall_ms,
+            token_id: token_id.to_owned(),
+            reason: reason.to_owned(),
+            deletion_applied_wall_ms: None,
+            known_floor: None,
         })
     }
 
@@ -1419,7 +1755,9 @@ impl SecretStore {
         )?;
         tx.commit()?;
         drop(conn);
-        if let Some(mutation) = mutation { mutation.committed()?; }
+        if let Some(mutation) = mutation {
+            mutation.committed()?;
+        }
         Ok(SecretMeta {
             name: name.to_owned(),
             version,
@@ -1448,29 +1786,44 @@ impl SecretStore {
     }
 
     fn check_encrypted_identity(
-        &self, expected: &kronik_proto::log::v1::SecretVersion, physical: u64,
-        nonce: &[u8], ciphertext: &[u8], stored_hash: &[u8],
+        &self,
+        expected: &kronik_proto::log::v1::SecretVersion,
+        physical: u64,
+        nonce: &[u8],
+        ciphertext: &[u8],
+        stored_hash: &[u8],
     ) -> Result<(), PrivacyError> {
         let value = Zeroizing::new(self.decrypt(&expected.r#ref, physical, nonce, ciphertext)?);
         let physical_hash = self.version_hash(&expected.r#ref, physical, &value)?;
-        if physical_hash.as_slice() != stored_hash { return Err(PrivacyError::InvalidSecretRow); }
+        if physical_hash.as_slice() != stored_hash {
+            return Err(PrivacyError::InvalidSecretRow);
+        }
         let logical_hash = if expected.name == expected.r#ref && expected.version == physical {
             physical_hash
         } else {
             self.version_hash(&expected.name, expected.version, &value)?
         };
-        if logical_hash != expected.version_hash { return Err(PrivacyError::InvalidSecretRow); }
+        if logical_hash != expected.version_hash {
+            return Err(PrivacyError::InvalidSecretRow);
+        }
         Ok(())
     }
 
-    fn read(&self, name: &str, version: Option<u64>, retained_for_scrub: bool) -> Result<Option<SecretValue>, PrivacyError> {
+    fn read(
+        &self,
+        name: &str,
+        version: Option<u64>,
+        retained_for_scrub: bool,
+    ) -> Result<Option<SecretValue>, PrivacyError> {
         let version = version.map(sql_version).transpose()?;
         let conn = self.conn();
         type Row = (i64, Vec<u8>, Vec<u8>, Vec<u8>, i64);
         let row: Option<Row> = match version {
             None => conn
                 .query_row(
-                    current_secret_query!("version, nonce, ciphertext, version_hash, created_wall_ms"),
+                    current_secret_query!(
+                        "version, nonce, ciphertext, version_hash, created_wall_ms"
+                    ),
                     [name],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
@@ -1510,16 +1863,22 @@ impl SecretStore {
     /// Metadata is not custody/authority proof; absence does not establish complete history.
     pub fn current_meta(&self, name: &str) -> Result<Option<SecretMeta>, PrivacyError> {
         let conn = self.conn();
-        let row: Option<(i64, Vec<u8>, i64)> = conn.query_row(
-            current_secret_query!("version, version_hash, created_wall_ms"),
-            [name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).optional()?;
-        row.map(|(version, version_hash, created)| Ok(SecretMeta {
-            name: name.to_owned(),
-            version: stored_version(version)?,
-            version_hash,
-            created_wall_ms: stored_wall(created)?,
-        })).transpose()
+        let row: Option<(i64, Vec<u8>, i64)> = conn
+            .query_row(
+                current_secret_query!("version, version_hash, created_wall_ms"),
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        row.map(|(version, version_hash, created)| {
+            Ok(SecretMeta {
+                name: name.to_owned(),
+                version: stored_version(version)?,
+                version_hash,
+                created_wall_ms: stored_wall(created)?,
+            })
+        })
+        .transpose()
     }
 
     /// One specific version (re-runs use the recorded version).
@@ -1531,7 +1890,9 @@ impl SecretStore {
     /// never operational authorization. Legacy erased rows return a decrypt error.
     /// Do not expose this path through FileBackend, guests, replay, or HMAC.
     pub fn retained_version_for_scrub(
-        &self, name: &str, physical_version: u64,
+        &self,
+        name: &str,
+        physical_version: u64,
     ) -> Result<Option<SecretValue>, PrivacyError> {
         self.read(name, Some(physical_version), true)
     }
@@ -1544,7 +1905,12 @@ impl SecretStore {
              WHERE deleted_wall_ms IS NULL GROUP BY name ORDER BY name",
         )?;
         let rows = st.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, Vec<u8>>(3)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+            ))
         })?;
         rows.map(|row| {
             let (name, version, created, version_hash) = row?;
@@ -1554,7 +1920,8 @@ impl SecretStore {
                 created_wall_ms: stored_wall(created)?,
                 version_hash,
             })
-        }).collect()
+        })
+        .collect()
     }
 
     /// At most 256 rows, ordered by `(name, version)`, without reading values.
@@ -1578,8 +1945,11 @@ impl SecretStore {
         )?;
         let rows = statement.query_map(params![name, version, include_deleted], |row| {
             Ok((
-                row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
-                row.get::<_, Vec<u8>>(3)?, row.get::<_, Option<i64>>(4)?,
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         })?;
         rows.map(|row| {
@@ -1593,25 +1963,40 @@ impl SecretStore {
                 },
                 deletion_applied_wall_ms: deleted.map(stored_wall).transpose()?,
             })
-        }).collect()
+        })
+        .collect()
     }
 
     /// Denies all physical versions through a committed floor; retains encrypted scrub needles.
     /// A missing row is not evidence of no prior deletion; no synthetic row is made.
     /// `applied_wall_ms` is an actual local pin or worker-sampled application time, not audit time.
-    pub fn delete(&self, name: &str, through_version: u64, applied_wall_ms: u64) -> Result<u32, PrivacyError> {
-        if !valid_name(name) { return Err(PrivacyError::InvalidName(name.to_owned())); }
+    pub fn delete(
+        &self,
+        name: &str,
+        through_version: u64,
+        applied_wall_ms: u64,
+    ) -> Result<u32, PrivacyError> {
+        if !valid_name(name) {
+            return Err(PrivacyError::InvalidName(name.to_owned()));
+        }
         sql_version(through_version)?;
         i64::try_from(applied_wall_ms).map_err(|_| PrivacyError::InvalidTimestamp)?;
         let mutation = self.begin_mutation(name, through_version)?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let n = apply_deletion(&tx, name, SecretDeletionFloor {
-            through_version, applied_wall_ms,
-        })?;
+        let n = apply_deletion(
+            &tx,
+            name,
+            SecretDeletionFloor {
+                through_version,
+                applied_wall_ms,
+            },
+        )?;
         tx.commit()?;
         drop(conn);
-        if let Some(mutation) = mutation { mutation.committed()?; }
+        if let Some(mutation) = mutation {
+            mutation.committed()?;
+        }
         Ok(n)
     }
 
@@ -1635,7 +2020,9 @@ impl SecretStore {
             {
                 Ok(value) => value,
                 Err(error) => {
-                    for (_, value) in &mut out { value.zeroize(); }
+                    for (_, value) in &mut out {
+                        value.zeroize();
+                    }
                     return Err(error);
                 }
             };
@@ -1665,7 +2052,9 @@ mod tests {
         {
             let store = SecretStore::open(Connection::open(&path).unwrap(), &master).unwrap();
             assert!(store.fresh_at_open());
-            store.set_at("lost-name", 7, b"retained", [3; 24], 1, "admin", "set").unwrap();
+            store
+                .set_at("lost-name", 7, b"retained", [3; 24], 1, "admin", "set")
+                .unwrap();
             store.conn().execute("DELETE FROM secrets", []).unwrap();
         }
         let reopened = SecretStore::open(Connection::open(&path).unwrap(), &master).unwrap();
@@ -1691,10 +2080,31 @@ mod tests {
             let s = SecretStore::open(Connection::open(&path).unwrap(), &master).unwrap();
             for (i, version) in versions.into_iter().enumerate() {
                 let value = [i as u8; 8];
-                let meta = s.set_at("token", version, &value, [i as u8; 24], 10, "admin", "rotate").unwrap();
+                let meta = s
+                    .set_at(
+                        "token",
+                        version,
+                        &value,
+                        [i as u8; 24],
+                        10,
+                        "admin",
+                        "rotate",
+                    )
+                    .unwrap();
                 assert_eq!(meta.version, version);
                 assert_eq!(s.version("token", version).unwrap().unwrap().value, value);
-                assert!(s.set_at("token", version, b"replacement", [9; 24], 11, "other", "replace").is_err());
+                assert!(
+                    s.set_at(
+                        "token",
+                        version,
+                        b"replacement",
+                        [9; 24],
+                        11,
+                        "other",
+                        "replace"
+                    )
+                    .is_err()
+                );
                 assert_eq!(s.version("token", version).unwrap().unwrap().meta, meta);
                 assert_eq!(s.version("token", version).unwrap().unwrap().value, value);
             }
@@ -1702,14 +2112,20 @@ mod tests {
             assert!(s.version("missing", versions[0]).unwrap().is_none());
         }
         let s = SecretStore::open(Connection::open(&path).unwrap(), &master).unwrap();
-        assert_eq!(s.current("token").unwrap().unwrap().meta.version, versions[2]);
+        assert_eq!(
+            s.current("token").unwrap().unwrap().meta.version,
+            versions[2]
+        );
         assert_eq!(s.list().unwrap()[0].version, versions[2]);
         assert_eq!(s.values().unwrap().len(), 3);
         assert_eq!(s.delete("token", versions[2], 12).unwrap(), 3);
         assert!(s.current("token").unwrap().is_none());
         for version in versions {
             assert!(s.version("token", version).unwrap().is_none());
-            assert!(s.set_at("token", version, b"resurrect", [8; 24], 13, "", "").is_err());
+            assert!(
+                s.set_at("token", version, b"resurrect", [8; 24], 13, "", "")
+                    .is_err()
+            );
         }
         assert_eq!(s.values().unwrap().len(), 3);
         assert_eq!(s.metadata_page(None, true).unwrap().len(), 3);
@@ -1717,67 +2133,123 @@ mod tests {
         drop(s);
         let s = SecretStore::open(Connection::open(&path).unwrap(), &master).unwrap();
         assert!(s.current("token").unwrap().is_none());
-        assert_eq!(s.metadata_page(None, true).unwrap()[2].meta.version, versions[2]);
+        assert_eq!(
+            s.metadata_page(None, true).unwrap()[2].meta.version,
+            versions[2]
+        );
     }
 
     #[test]
     fn wide_hash_domain_and_decimal_aad_are_explicit() {
         let s = store(7);
         let version = u64::from(u32::MAX) + 1;
-        let meta = s.set_at("token", version, b"value", [3; 24], 0, "", "").unwrap();
+        let meta = s
+            .set_at("token", version, b"value", [3; 24], 0, "", "")
+            .unwrap();
         let key = blake3::derive_key("kronik secret version v1", &[7; 32]);
         let mut hash = blake3::Hasher::new_keyed(&key);
         hash.update(b"kronik secret version v2\0token\0");
         hash.update(&[0, 0, 0, 0, 1, 0, 0, 0]);
         hash.update(b"\0value");
         assert_eq!(meta.version_hash, hash.finalize().as_bytes()[..16]);
-        assert_eq!(s.version_hash("token", version, b"value").unwrap(), meta.version_hash);
+        assert_eq!(
+            s.version_hash("token", version, b"value").unwrap(),
+            meta.version_hash
+        );
         let cipher_key = blake3::derive_key("kronik secrets v1", &[7; 32]);
-        let expected = XChaCha20Poly1305::new((&cipher_key).into()).encrypt(
-            &XNonce::from([3; 24]),
-            Payload { msg: b"value", aad: b"token|4294967296" },
-        ).unwrap();
-        let ciphertext: Vec<u8> = s.conn().query_row(
-            "SELECT ciphertext FROM secrets WHERE name='token'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let expected = XChaCha20Poly1305::new((&cipher_key).into())
+            .encrypt(
+                &XNonce::from([3; 24]),
+                Payload {
+                    msg: b"value",
+                    aad: b"token|4294967296",
+                },
+            )
+            .unwrap();
+        let ciphertext: Vec<u8> = s
+            .conn()
+            .query_row(
+                "SELECT ciphertext FROM secrets WHERE name='token'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(ciphertext, expected);
         s.conn().execute_batch("DROP TABLE key_check").unwrap();
-        assert!(SecretStore::validate_legacy_key(&s.conn(), &MasterKey::from_bytes([7; 32]).unwrap()).unwrap());
-        assert!(!SecretStore::validate_legacy_key(&s.conn(), &MasterKey::from_bytes([8; 32]).unwrap()).unwrap());
+        assert!(
+            SecretStore::validate_legacy_key(&s.conn(), &MasterKey::from_bytes([7; 32]).unwrap())
+                .unwrap()
+        );
+        assert!(
+            !SecretStore::validate_legacy_key(&s.conn(), &MasterKey::from_bytes([8; 32]).unwrap())
+                .unwrap()
+        );
     }
 
     #[test]
     fn invalid_versions_and_corrupt_sql_rows_fail_closed() {
         let s = store(7);
         for version in [0, kronik_proto::secret::MAX_SECRET_VERSION + 1, u64::MAX] {
-            assert!(matches!(s.set_at("token", version, b"value", [3; 24], 0, "", ""), Err(PrivacyError::InvalidVersion(v)) if v == version));
-            assert!(matches!(s.version_hash("token", version, b"value"), Err(PrivacyError::InvalidVersion(v)) if v == version));
-            assert!(matches!(s.version("token", version), Err(PrivacyError::InvalidVersion(v)) if v == version));
+            assert!(
+                matches!(s.set_at("token", version, b"value", [3; 24], 0, "", ""), Err(PrivacyError::InvalidVersion(v)) if v == version)
+            );
+            assert!(
+                matches!(s.version_hash("token", version, b"value"), Err(PrivacyError::InvalidVersion(v)) if v == version)
+            );
+            assert!(
+                matches!(s.version("token", version), Err(PrivacyError::InvalidVersion(v)) if v == version)
+            );
         }
         s.set_at("token", 1, b"value", [3; 24], 0, "", "").unwrap();
-        for version in [-1, 0, i64::try_from(kronik_proto::secret::MAX_SECRET_VERSION + 1).unwrap()] {
-            s.conn().execute("UPDATE secrets SET version=?1", [version]).unwrap();
-            assert!(matches!(s.current("token"), Err(PrivacyError::InvalidStoredVersion(v)) if v == version));
+        for version in [
+            -1,
+            0,
+            i64::try_from(kronik_proto::secret::MAX_SECRET_VERSION + 1).unwrap(),
+        ] {
+            s.conn()
+                .execute("UPDATE secrets SET version=?1", [version])
+                .unwrap();
+            assert!(
+                matches!(s.current("token"), Err(PrivacyError::InvalidStoredVersion(v)) if v == version)
+            );
             assert!(matches!(s.list(), Err(PrivacyError::InvalidStoredVersion(v)) if v == version));
-            assert!(matches!(s.values(), Err(PrivacyError::InvalidStoredVersion(v)) if v == version));
-            assert!(matches!(s.metadata_page(None, true), Err(PrivacyError::InvalidStoredVersion(v)) if v == version));
-            assert!(matches!(SecretStore::validate_legacy_key(&s.conn(), &MasterKey::from_bytes([7; 32]).unwrap()), Err(PrivacyError::InvalidStoredVersion(v)) if v == version));
+            assert!(
+                matches!(s.values(), Err(PrivacyError::InvalidStoredVersion(v)) if v == version)
+            );
+            assert!(
+                matches!(s.metadata_page(None, true), Err(PrivacyError::InvalidStoredVersion(v)) if v == version)
+            );
+            assert!(
+                matches!(SecretStore::validate_legacy_key(&s.conn(), &MasterKey::from_bytes([7; 32]).unwrap()), Err(PrivacyError::InvalidStoredVersion(v)) if v == version)
+            );
         }
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         conn.execute(
-            "INSERT INTO secrets VALUES ('token', -1, x'', x'', x'', 0, '', '', NULL)", [],
-        ).unwrap();
-        assert!(matches!(SecretStore::open(conn, &MasterKey::from_bytes([7; 32]).unwrap()), Err(PrivacyError::InvalidStoredVersion(-1))));
+            "INSERT INTO secrets VALUES ('token', -1, x'', x'', x'', 0, '', '', NULL)",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            SecretStore::open(conn, &MasterKey::from_bytes([7; 32]).unwrap()),
+            Err(PrivacyError::InvalidStoredVersion(-1))
+        ));
     }
 
     #[test]
     fn metadata_pages_retain_every_version_and_tombstone_audit() {
         let s = store(7);
         for version in 1..=258 {
-            s.set_at("token", version, b"value", [version as u8; 24], version, "admin", "import").unwrap();
+            s.set_at(
+                "token",
+                version,
+                b"value",
+                [version as u8; 24],
+                version,
+                "admin",
+                "import",
+            )
+            .unwrap();
         }
         let first = s.metadata_page(None, false).unwrap();
         assert_eq!(first.len(), 256);
@@ -1786,7 +2258,11 @@ mod tests {
         let rest = s.metadata_page(Some(("token", 256)), false).unwrap();
         assert_eq!(rest.len(), 2);
         assert_eq!(rest[1].meta.version, 258);
-        assert!(s.metadata_page(Some(("token", 258)), false).unwrap().is_empty());
+        assert!(
+            s.metadata_page(Some(("token", 258)), false)
+                .unwrap()
+                .is_empty()
+        );
         s.delete("token", 258, 300).unwrap();
         let first = s.metadata_page(None, true).unwrap();
         assert_eq!(first.len(), 256);
@@ -1943,8 +2419,16 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         {
             let s = SecretStore::open(Connection::open(&path).unwrap(), &key).unwrap();
-            s.set_at("db-password", 1, b"hunter2-very-secret", [3; 24], 1, "t", "r")
-                .unwrap();
+            s.set_at(
+                "db-password",
+                1,
+                b"hunter2-very-secret",
+                [3; 24],
+                1,
+                "t",
+                "r",
+            )
+            .unwrap();
         }
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let p = entry.unwrap().path();

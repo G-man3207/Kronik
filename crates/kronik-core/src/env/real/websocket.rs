@@ -19,16 +19,30 @@ pub(super) fn connect(
         if req.max_message_bytes == 0 {
             return Err(invalid());
         }
-        let write_limit = req.max_message_bytes.checked_add(1024).ok_or_else(invalid)?;
+        let write_limit = req
+            .max_message_bytes
+            .checked_add(1024)
+            .ok_or_else(invalid)?;
         let mut request = req.url.into_client_request().map_err(|_| invalid())?;
-        let host = request.uri().host().ok_or_else(invalid)?
-            .trim_matches(['[', ']']).to_owned();
+        let host = request
+            .uri()
+            .host()
+            .ok_or_else(invalid)?
+            .trim_matches(['[', ']'])
+            .to_owned();
         let scheme = request.uri().scheme_str().ok_or_else(invalid)?;
-        let port = request.uri().port_u16().unwrap_or(if scheme == "wss" { 443 } else { 80 });
+        let port = request
+            .uri()
+            .port_u16()
+            .unwrap_or(if scheme == "wss" { 443 } else { 80 });
         let encrypted = match scheme {
             "wss" => true,
-            "ws" if host.parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback()) => false,
+            "ws" if host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback()) =>
+            {
+                false
+            }
             _ => return Err(invalid()),
         };
         for (name, value) in req.headers {
@@ -43,13 +57,16 @@ pub(super) fn connect(
             request.headers_mut().append(name, value);
         }
         let socket = tokio::net::TcpStream::connect((host.as_str(), port))
-            .await.map_err(|e| NetError::Connect(e.to_string()))?;
+            .await
+            .map_err(|e| NetError::Connect(e.to_string()))?;
         let stream: Box<dyn WebSocketIo> = if encrypted {
-            let name = rustls::pki_types::ServerName::try_from(host)
-                .map_err(|_| invalid())?;
-            Box::new(tokio_rustls::TlsConnector::from(tls.map_err(NetError::Connect)?)
-                .connect(name, socket).await
-                .map_err(|e| NetError::Connect(e.to_string()))?)
+            let name = rustls::pki_types::ServerName::try_from(host).map_err(|_| invalid())?;
+            Box::new(
+                tokio_rustls::TlsConnector::from(tls.map_err(NetError::Connect)?)
+                    .connect(name, socket)
+                    .await
+                    .map_err(|e| NetError::Connect(e.to_string()))?,
+            )
         } else {
             Box::new(socket)
         };
@@ -59,9 +76,10 @@ pub(super) fn connect(
             .max_write_buffer_size(write_limit)
             .max_message_size(Some(req.max_message_bytes))
             .max_frame_size(Some(req.max_message_bytes));
-        let (stream, _) = tokio_tungstenite::client_async_with_config(
-            request, stream, Some(config),
-        ).await.map_err(websocket_error)?;
+        let (stream, _) =
+            tokio_tungstenite::client_async_with_config(request, stream, Some(config))
+                .await
+                .map_err(websocket_error)?;
         let (send, recv) = stream.split();
         Ok(Arc::new(RealWebSocket {
             send: Arc::new(tokio::sync::Mutex::new(send)),
@@ -95,11 +113,14 @@ impl WebSocket for RealWebSocket {
         Box::pin(async move {
             let mut recv = recv.lock().await;
             loop {
-                let Some(stream) = recv.as_mut() else { return Ok(None); };
+                let Some(stream) = recv.as_mut() else {
+                    return Ok(None);
+                };
                 match stream.next().await {
                     Some(Ok(Message::Binary(bytes))) => return Ok(Some(bytes)),
                     Some(Ok(Message::Text(text))) => return Ok(Some(text.into())),
-                    Some(Ok(Message::Close(_))) | None
+                    Some(Ok(Message::Close(_)))
+                    | None
                     | Some(Err(Error::ConnectionClosed | Error::AlreadyClosed)) => {
                         *recv = None;
                         return Ok(None);
@@ -117,8 +138,11 @@ impl WebSocket for RealWebSocket {
         }
         let send = self.send.clone();
         Box::pin(async move {
-            send.lock().await.send(Message::Binary(message))
-                .await.map_err(websocket_error)
+            send.lock()
+                .await
+                .send(Message::Binary(message))
+                .await
+                .map_err(websocket_error)
         })
     }
 

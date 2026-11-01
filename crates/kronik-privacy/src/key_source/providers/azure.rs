@@ -25,7 +25,10 @@ async fn auth_response(
     use crate::secret_backend::BackendError::Invalid;
     dispatch.check()?;
     if let Some(p) = &c.client_secret_file {
-        let secret = dispatch.wait(credential_text(env, p, dispatch)).await?.map_err(|_| Invalid)?;
+        let secret = dispatch
+            .wait(credential_text(env, p, dispatch))
+            .await?
+            .map_err(|_| Invalid)?;
         let tenant = c.tenant_id.as_deref().ok_or(Invalid)?;
         let client = c.client_id.as_deref().ok_or(Invalid)?;
         let authority = c
@@ -37,7 +40,10 @@ async fn auth_response(
             env,
             "POST",
             format!("{authority}/{tenant}/oauth2/v2.0/token"),
-            vec![("content-type".into(), "application/x-www-form-urlencoded".into())],
+            vec![(
+                "content-type".into(),
+                "application/x-www-form-urlencoded".into(),
+            )],
             form(&[
                 ("grant_type", "client_credentials"),
                 ("client_id", client),
@@ -73,7 +79,9 @@ async fn auth_response(
     }
 }
 async fn auth(env: &Env, c: &Azure) -> Result<Zeroizing<String>, String> {
-    let response = auth_response(env, c, Dispatch::StartupBootstrap).await.map_err(|error| error.to_string())?;
+    let response = auth_response(env, c, Dispatch::StartupBootstrap)
+        .await
+        .map_err(|error| error.to_string())?;
     let token = Zeroizing::new(field(&response, "access_token")?.to_owned());
     header_secret(&token)?;
     Ok(token)

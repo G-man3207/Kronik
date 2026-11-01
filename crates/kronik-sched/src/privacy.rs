@@ -87,7 +87,10 @@ impl Node {
             audit: Some(audit),
             reseal_requested: false,
         });
-        change.lsn = Some(self.commit_config_authorized(guard, epoch, record, authority).await?);
+        change.lsn = Some(
+            self.commit_config_authorized(guard, epoch, record, authority)
+                .await?,
+        );
         Ok(change)
     }
 
@@ -138,16 +141,29 @@ impl Node {
                 complete_after_ms,
             });
         }
-        let node = self.arc().ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self
+            .arc()
+            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
         let subject = subject.to_owned();
-        let (key_version, lsn) = self.authorized_effect(authority, move || async move {
-            // Key deletion is irreversible: this admitted private continuation must finish its record or durable recovery.
-            let key_version = node.sealer.erase(&subject, node.env.clock.wall_ms())
-                .map_err(|error| ApiError::new(ErrorCode::Internal, format!("keystore: {error}")))?;
-            let record = Record::Erasure(pb::Erasure { epoch, subject, key_version, audit: Some(audit) });
-            let lsn = node.commit_config(guard, epoch, record).await?;
-            Ok((key_version, lsn))
-        }).await?;
+        let (key_version, lsn) = self
+            .authorized_effect(authority, move || async move {
+                // Key deletion is irreversible: this admitted private continuation must finish its record or durable recovery.
+                let key_version = node
+                    .sealer
+                    .erase(&subject, node.env.clock.wall_ms())
+                    .map_err(|error| {
+                        ApiError::new(ErrorCode::Internal, format!("keystore: {error}"))
+                    })?;
+                let record = Record::Erasure(pb::Erasure {
+                    epoch,
+                    subject,
+                    key_version,
+                    audit: Some(audit),
+                });
+                let lsn = node.commit_config(guard, epoch, record).await?;
+                Ok((key_version, lsn))
+            })
+            .await?;
         tracing::info!(epoch, lsn, key_version, "subject erased");
         Ok(ErasureDone {
             key_version,

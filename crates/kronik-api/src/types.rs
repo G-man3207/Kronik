@@ -132,7 +132,10 @@ pub struct BlobReference {
 
 impl From<&kronik_proto::log::v1::BlobRef> for BlobReference {
     fn from(reference: &kronik_proto::log::v1::BlobRef) -> Self {
-        Self { hash: reference.hash.clone(), size: reference.size }
+        Self {
+            hash: reference.hash.clone(),
+            size: reference.size,
+        }
     }
 }
 
@@ -156,12 +159,29 @@ pub struct Reply {
 }
 
 impl Reply {
-    pub fn inline(name: String, content_type: String, body: Payload, blobs: Vec<BlobReference>) -> Self {
-        Self { name, content_type, body, blob: None, blobs }
+    pub fn inline(
+        name: String,
+        content_type: String,
+        body: Payload,
+        blobs: Vec<BlobReference>,
+    ) -> Self {
+        Self {
+            name,
+            content_type,
+            body,
+            blob: None,
+            blobs,
+        }
     }
 
     pub fn blob(name: String, content_type: String, blob: BlobReference) -> Self {
-        Self { name, content_type, body: Payload::default(), blob: Some(blob), blobs: Vec::new() }
+        Self {
+            name,
+            content_type,
+            body: Payload::default(),
+            blob: Some(blob),
+            blobs: Vec::new(),
+        }
     }
 
     pub(crate) fn body_is_exclusive(&self) -> bool {
@@ -173,15 +193,25 @@ impl Serialize for Reply {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap as _;
         if !self.body_is_exclusive() {
-            return Err(serde::ser::Error::custom("a reply cannot contain both inline data and a body blob"));
+            return Err(serde::ser::Error::custom(
+                "a reply cannot contain both inline data and a body blob",
+            ));
         }
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("name", &self.name)?;
         map.serialize_entry("content_type", &self.content_type)?;
-        if let Some(text) = &self.body.text { map.serialize_entry("text", text)?; }
-        if let Some(base64) = &self.body.base64 { map.serialize_entry("base64", base64)?; }
-        if let Some(blob) = &self.blob { map.serialize_entry("blob", blob)?; }
-        if !self.blobs.is_empty() { map.serialize_entry("blobs", &self.blobs)?; }
+        if let Some(text) = &self.body.text {
+            map.serialize_entry("text", text)?;
+        }
+        if let Some(base64) = &self.body.base64 {
+            map.serialize_entry("base64", base64)?;
+        }
+        if let Some(blob) = &self.blob {
+            map.serialize_entry("blob", blob)?;
+        }
+        if !self.blobs.is_empty() {
+            map.serialize_entry("blobs", &self.blobs)?;
+        }
         map.end()
     }
 }
@@ -200,10 +230,17 @@ impl<'de> Deserialize<'de> for Reply {
             blobs: Vec<BlobReference>,
         }
         let fields = Fields::deserialize(deserializer)?;
-        let reply = Self { name: fields.name, content_type: fields.content_type,
-            body: fields.body, blob: fields.blob, blobs: fields.blobs };
+        let reply = Self {
+            name: fields.name,
+            content_type: fields.content_type,
+            body: fields.body,
+            blob: fields.blob,
+            blobs: fields.blobs,
+        };
         if !reply.body_is_exclusive() {
-            return Err(serde::de::Error::custom("a reply cannot contain both inline data and a body blob"));
+            return Err(serde::de::Error::custom(
+                "a reply cannot contain both inline data and a body blob",
+            ));
         }
         Ok(reply)
     }
@@ -1484,39 +1521,58 @@ impl<'de> Deserialize<'de> for AuditResponse {
         let value = serde_json::Value::deserialize(deserializer)?;
         if value.get("source").is_some() || value.get("covered_from").is_some() {
             if value.get("applied_lsn").is_some() {
-                return Err(serde::de::Error::custom("metadata audit pages cannot contain a native applied LSN"));
+                return Err(serde::de::Error::custom(
+                    "metadata audit pages cannot contain a native applied LSN",
+                ));
             }
-            let page: MemberAuditResponse = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            let page: MemberAuditResponse =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
             let kronik_core::ids::SourcePos::Metadata { index } = page.source else {
-                return Err(serde::de::Error::custom("a member audit page requires its metadata source"));
+                return Err(serde::de::Error::custom(
+                    "a member audit page requires its metadata source",
+                ));
             };
-            if index == 0 || index > i64::MAX as u64
-                || page.covered_from == 0 || page.covered_from > i64::MAX as u64
+            if index == 0
+                || index > i64::MAX as u64
+                || page.covered_from == 0
+                || page.covered_from > i64::MAX as u64
                 || page.covered_from > index + 1
-                || page.next.is_some_and(|next| next < page.covered_from || next > index) {
-                return Err(serde::de::Error::custom("metadata audit coverage or next page is outside its actual cut"));
+                || page
+                    .next
+                    .is_some_and(|next| next < page.covered_from || next > index)
+            {
+                return Err(serde::de::Error::custom(
+                    "metadata audit coverage or next page is outside its actual cut",
+                ));
             }
             Ok(Self::Member(page))
         } else {
-            serde_json::from_value(value).map(Self::Native).map_err(serde::de::Error::custom)
+            serde_json::from_value(value)
+                .map(Self::Native)
+                .map_err(serde::de::Error::custom)
         }
     }
 }
 
 impl JsonSchema for AuditResponse {
-    fn schema_name() -> std::borrow::Cow<'static, str> { "AuditResponse".into() }
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "AuditResponse".into()
+    }
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         let native = generator.subschema_for::<NativeAuditResponse>();
         let member = generator.subschema_for::<MemberAuditResponse>();
-        schemars::Schema::from(serde_json::Map::from_iter([("oneOf".into(), serde_json::json!([
-            {"allOf":[member,{"not":{"required":["applied_lsn"]},"properties":{
-                "source":{"properties":{"kind":{"const":"metadata"},"index":{"minimum":1,"maximum":i64::MAX}},
-                    "required":["kind","index"]},
-                "covered_from":{"minimum":1,"maximum":i64::MAX},
-                "next":{"anyOf":[{"type":"null"},{"type":"integer","minimum":1,"maximum":i64::MAX}]}
-            }}]},
-            {"allOf":[native,{"not":{"anyOf":[{"required":["source"]},{"required":["covered_from"]}]}}]}
-        ]))]))
+        schemars::Schema::from(serde_json::Map::from_iter([(
+            "oneOf".into(),
+            serde_json::json!([
+                {"allOf":[member,{"not":{"required":["applied_lsn"]},"properties":{
+                    "source":{"properties":{"kind":{"const":"metadata"},"index":{"minimum":1,"maximum":i64::MAX}},
+                        "required":["kind","index"]},
+                    "covered_from":{"minimum":1,"maximum":i64::MAX},
+                    "next":{"anyOf":[{"type":"null"},{"type":"integer","minimum":1,"maximum":i64::MAX}]}
+                }}]},
+                {"allOf":[native,{"not":{"anyOf":[{"required":["source"]},{"required":["covered_from"]}]}}]}
+            ]),
+        )]))
     }
 }
 

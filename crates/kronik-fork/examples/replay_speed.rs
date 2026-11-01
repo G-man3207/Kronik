@@ -58,7 +58,8 @@ fn main() {
             .await
             .unwrap();
         let audit = pb::Audit { token_id: "bench".into(), reason: "replay speed".into(), wall_time_ms: 0 };
-        node.deploy(COUNTER, audit, false).await.unwrap();
+        let authority = node.local_operator_authority().unwrap();
+        node.deploy(COUNTER, audit, false, authority).await.unwrap();
         let fork_lsn = node.applied_lsn();
 
         // Record: open loop at `rate`.

@@ -1230,22 +1230,14 @@ fn no_needle_leaves_in_an_export_request() {
         output: Some(pb::outcome::Output::Reply(needle_msg().unwrap())),
         ..Default::default()
     });
-    let secrets = vec![("api-key".into(), N.as_bytes().to_vec())];
-    let map = |r: &pb::TurnRecord| {
-        spans(
-            &Turn {
-                secrets: &secrets,
-                ..turn(r)
-            },
-            &ActorKeys::Hashed(&hasher),
-        )
-    };
+    let secrets: &[(&str, &[u8])] = &[("api-key", N.as_bytes())];
+    let map = |r: &pb::TurnRecord| spans(&Turn { secrets, ..turn(r) }, &ActorKeys::Hashed(&hasher));
     let mut all = map(&http_root);
     assert_eq!(link(&all[0]).unwrap().1, "traceparent");
     let message_spans = map(&msg_turn);
     assert_eq!(
         str_attr(&message_spans[0], "kronik.message.name"),
-        Some("increment-[secret:api-key]-[token]")
+        Some("increment-[secret:api-key]-[secret:token]")
     );
     all.extend(message_spans);
     for source in [
@@ -1266,7 +1258,7 @@ fn no_needle_leaves_in_an_export_request() {
         assert_eq!(masked[0].span_id, unmasked[0].span_id);
         assert_eq!(
             masked[0].name,
-            "counter message increment-[secret:api-key]-[token]"
+            "counter message increment-[secret:api-key]-[secret:token]"
         );
         all.extend(masked);
     }
@@ -1279,7 +1271,7 @@ fn no_needle_leaves_in_an_export_request() {
     let timer = map(&msg_turn);
     assert_eq!(
         timer[0].name,
-        "counter timer increment-[secret:api-key]-[token]"
+        "counter timer increment-[secret:api-key]-[secret:token]"
     );
     all.extend(timer);
     let bytes = request(&resource(), all).encode_to_vec();

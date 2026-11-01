@@ -1,6 +1,6 @@
 use super::*;
-use config::Aws;
 use crate::secret_backend::BackendError;
+use config::Aws;
 
 mod secrets;
 pub(crate) use secrets::Secrets;
@@ -12,10 +12,17 @@ struct Credentials {
 }
 fn unsupported_source() -> Option<&'static str> {
     [
-        "AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_WEB_IDENTITY_TOKEN_FILE",
-        "AWS_ROLE_ARN", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE",
-        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    ].into_iter().find(|name| std::env::var_os(name).is_some())
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    ]
+    .into_iter()
+    .find(|name| std::env::var_os(name).is_some())
 }
 
 fn env_value(name: &str) -> Result<Option<Zeroizing<String>>, BackendError> {
@@ -42,7 +49,10 @@ fn http_status(status: u16) -> Result<(), BackendError> {
 }
 
 async fn imds(
-    env: &Env, method: &str, url: String, headers: Vec<(String, String)>,
+    env: &Env,
+    method: &str,
+    url: String,
+    headers: Vec<(String, String)>,
     dispatch: Dispatch<'_>,
 ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
     let (status, body) = request_raw(env, method, url, headers, vec![], CAP, dispatch).await?;
@@ -50,15 +60,27 @@ async fn imds(
     Ok(body)
 }
 
-async fn credentials(env: &Env, c: &Aws, dispatch: Dispatch<'_>) -> Result<Credentials, BackendError> {
+async fn credentials(
+    env: &Env,
+    c: &Aws,
+    dispatch: Dispatch<'_>,
+) -> Result<Credentials, BackendError> {
     dispatch.check()?;
-    if unsupported_source().is_some() { return Err(BackendError::Invalid); }
+    if unsupported_source().is_some() {
+        return Err(BackendError::Invalid);
+    }
     if c.auth != "imds" {
         let access = env_value("AWS_ACCESS_KEY_ID")?;
         let secret = env_value("AWS_SECRET_ACCESS_KEY")?;
         let token = env_value("AWS_SESSION_TOKEN")?;
         match (access, secret) {
-            (Some(access), Some(secret)) => return Ok(Credentials { access, secret, token }),
+            (Some(access), Some(secret)) => {
+                return Ok(Credentials {
+                    access,
+                    secret,
+                    token,
+                });
+            }
             (None, None) if token.is_none() && c.auth != "env" => {}
             _ => return Err(BackendError::Invalid),
         }
@@ -66,36 +88,80 @@ async fn credentials(env: &Env, c: &Aws, dispatch: Dispatch<'_>) -> Result<Crede
     if std::env::var("AWS_EC2_METADATA_DISABLED").is_ok_and(|v| v.eq_ignore_ascii_case("true")) {
         return Err(BackendError::Invalid);
     }
-    let base = c.imds_endpoint.as_deref().unwrap_or("http://169.254.169.254").trim_end_matches('/');
-    let token = imds(env, "PUT", format!("{base}/latest/api/token"),
-        vec![("X-aws-ec2-metadata-token-ttl-seconds".into(), "60".into())], dispatch).await?;
+    let base = c
+        .imds_endpoint
+        .as_deref()
+        .unwrap_or("http://169.254.169.254")
+        .trim_end_matches('/');
+    let token = imds(
+        env,
+        "PUT",
+        format!("{base}/latest/api/token"),
+        vec![("X-aws-ec2-metadata-token-ttl-seconds".into(), "60".into())],
+        dispatch,
+    )
+    .await?;
     let token = std::str::from_utf8(&token).map_err(|_| BackendError::Invalid)?;
     header_secret(token).map_err(|_| BackendError::Invalid)?;
     let headers = vec![("X-aws-ec2-metadata-token".into(), token.to_owned())];
-    let role = imds(env, "GET", format!("{base}/latest/meta-data/iam/security-credentials/"),
-        headers.clone(), dispatch).await?;
-    let role = std::str::from_utf8(&role).map_err(|_| BackendError::Invalid)?.trim();
-    if !config::segment(role) { return Err(BackendError::Invalid); }
-    let body = imds(env, "GET", format!("{base}/latest/meta-data/iam/security-credentials/{role}"),
-        headers, dispatch).await?;
+    let role = imds(
+        env,
+        "GET",
+        format!("{base}/latest/meta-data/iam/security-credentials/"),
+        headers.clone(),
+        dispatch,
+    )
+    .await?;
+    let role = std::str::from_utf8(&role)
+        .map_err(|_| BackendError::Invalid)?
+        .trim();
+    if !config::segment(role) {
+        return Err(BackendError::Invalid);
+    }
+    let body = imds(
+        env,
+        "GET",
+        format!("{base}/latest/meta-data/iam/security-credentials/{role}"),
+        headers,
+        dispatch,
+    )
+    .await?;
     let r = SecretJson(serde_json::from_slice(&body).map_err(|_| BackendError::Invalid)?);
     match field(&r, "Code").map_err(|_| BackendError::Invalid)? {
         "Success" => {}
         "AssumeRoleUnauthorizedAccess" => return Err(BackendError::Denied),
         _ => return Err(BackendError::Unavailable),
     }
-    let access = Zeroizing::new(field(&r, "AccessKeyId").map_err(|_| BackendError::Invalid)?.to_owned());
-    let secret = Zeroizing::new(field(&r, "SecretAccessKey").map_err(|_| BackendError::Invalid)?.to_owned());
-    let token = Zeroizing::new(field(&r, "Token").map_err(|_| BackendError::Invalid)?.to_owned());
+    let access = Zeroizing::new(
+        field(&r, "AccessKeyId")
+            .map_err(|_| BackendError::Invalid)?
+            .to_owned(),
+    );
+    let secret = Zeroizing::new(
+        field(&r, "SecretAccessKey")
+            .map_err(|_| BackendError::Invalid)?
+            .to_owned(),
+    );
+    let token = Zeroizing::new(
+        field(&r, "Token")
+            .map_err(|_| BackendError::Invalid)?
+            .to_owned(),
+    );
     header_secret(&access).map_err(|_| BackendError::Invalid)?;
     header_secret(&secret).map_err(|_| BackendError::Invalid)?;
     header_secret(&token).map_err(|_| BackendError::Invalid)?;
-    Ok(Credentials { access, secret, token: Some(token) })
+    Ok(Credentials {
+        access,
+        secret,
+        token: Some(token),
+    })
 }
 async fn kms(env: &Env, c: &Aws, operation: &str, value: SecretJson) -> Result<SecretJson, String> {
     let scoped = tls_env(env, c.ca_file.as_deref(), None, Dispatch::StartupBootstrap).await?;
     let env = &scoped;
-    let creds = credentials(env, c, Dispatch::StartupBootstrap).await.map_err(|error| error.to_string())?;
+    let creds = credentials(env, c, Dispatch::StartupBootstrap)
+        .await
+        .map_err(|error| error.to_string())?;
     let default_endpoint = if c.region.starts_with("cn-") {
         format!("https://kms.{}.amazonaws.com.cn", c.region)
     } else {

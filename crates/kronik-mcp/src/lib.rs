@@ -61,14 +61,17 @@ impl KronikMcp {
         let credentials = credentials(context)?;
         Ok(self
             .api
-            .handle_admitted(ApiRequest {
-                method: method.to_owned(),
-                path: path.to_owned(),
-                query,
-                body,
-                token_id: String::new(),
-                bearer: None,
-            }, credentials)
+            .handle_admitted(
+                ApiRequest {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    query,
+                    body,
+                    token_id: String::new(),
+                    bearer: None,
+                },
+                credentials,
+            )
             .await)
     }
 
@@ -83,9 +86,7 @@ impl KronikMcp {
         let credentials = credentials(context)?;
         let scope = Scope::parse(scope)
             .ok_or_else(|| ErrorData::internal_error(format!("unknown scope {scope:?}"), None))?;
-        Ok(credentials.require_scope(scope)
-            .err()
-            .map(|e| e.to_json()))
+        Ok(credentials.require_scope(scope).err().map(|e| e.to_json()))
     }
 }
 

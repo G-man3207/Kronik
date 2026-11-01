@@ -51,12 +51,14 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`FORK_NOT_FOUND`](#fork_not_found) | 404 | M3 | No such fork |
 | [`FUEL_EXHAUSTED`](#fuel_exhausted) | 500 | M1 | The turn ran out of fuel |
 | [`GATEWAY_TIMEOUT`](#gateway_timeout) | 504 | M1 | The turn outlived the gateway timeout |
+| [`HOST_REDACTION_FAILURE`](#host_redaction_failure) | 500 | M28 | The host could not safely disclose a recorded effect result |
 | [`IDEMPOTENCY_IN_FLIGHT`](#idempotency_in_flight) | 409 | M1 | The original request with this key is still running |
 | [`IDEMPOTENCY_KEY_REUSED`](#idempotency_key_reused) | 422 | M1 | The key was already used for a different request |
 | [`IMAGE_INVALID`](#image_invalid) | 400 | M7 | The image cannot be used |
 | [`IMPORT_NOT_ALLOWED`](#import_not_allowed) | 400 | M1 | The component imports an interface outside the allowlist |
 | [`INTERNAL`](#internal) | 500 | M1 | An internal error in Kronik |
 | [`KEYSTORE_INCOMPLETE`](#keystore_incomplete) | 409 | M8 | A sealed value's subject key is not in the keystore |
+| [`KEY_HELPER_FAILED`](#key_helper_failed) | 503 | M23 | The isolated PKCS#11 key helper did not complete successfully |
 | [`KEY_PROTECTION_UNAVAILABLE`](#key_protection_unavailable) | 503 | M23 | The operating system could not protect the key's memory |
 | [`KEY_SOURCE_UNAVAILABLE`](#key_source_unavailable) | 503 | M23 | The configured KMS key source is unavailable |
 | [`KVM_UNAVAILABLE`](#kvm_unavailable) | 503 | M7 | KVM is not available on this host |
@@ -80,8 +82,13 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`RUNC_MISSING`](#runc_missing) | 503 | M7 | runc is not installed |
 | [`RUNSC_MISSING`](#runsc_missing) | 503 | M7 | gVisor's runsc is not installed |
 | [`SCOPE_MISSING`](#scope_missing) | 403 | M5 | The token lacks the scope for this operation |
+| [`SECRET_BACKEND_UNKNOWN`](#secret_backend_unknown) | 400 | M23 | The requested secret backend is not configured |
+| [`SECRET_EXTERNAL`](#secret_external) | 409 | M23 | The secret is managed by an external backend |
 | [`SECRET_NOT_FOUND`](#secret_not_found) | 404 | M2 | No such secret |
+| [`SECRET_REF_NOT_ALLOWED`](#secret_ref_not_allowed) | 403 | M23 | The secret reference is outside the configured allowlist |
 | [`SECRET_UNAVAILABLE`](#secret_unavailable) | 503 | M23 | Secret values needed by this operation are unavailable |
+| [`SECRET_VERSION_EXHAUSTED`](#secret_version_exhausted) | 409 | M23 | The secret version domain is exhausted |
+| [`SECRET_VERSION_GONE`](#secret_version_gone) | 410 | M23 | The exact recorded secret version is no longer available |
 | [`STORAGE_CORRUPT`](#storage_corrupt) | 500 | M1 | The log or state on disk is corrupt |
 | [`SUBJECT_ERASED`](#subject_erased) | 410 | M8 | The subject's data was erased |
 | [`TOKEN_NOT_FOUND`](#token_not_found) | 404 | M5 | No API token with that name |
@@ -388,6 +395,24 @@ To fix it, repeat the request with the same `Idempotency-Key`, if the original c
 
 See also: [`IDEMPOTENCY_IN_FLIGHT`](#idempotency_in_flight), [`turn`](concepts/glossary.md#turn).
 
+## HOST_REDACTION_FAILURE
+
+HTTP status 500, milestone M28. The host could not safely disclose a recorded effect result.
+
+Default hint: Inspect the turn and its effects; repair the scrub inventory or reduce free output, and check the external system before resending.
+
+Kronik refused to disclose an effect result because it could not safely redact the free data. This is a host-raised trap, not a guest error or a network error. The turn discards its buffered state changes, sends, timers and SQL work; unrelated actors remain usable.
+
+An external request may already have completed. For a new response, Kronik durably records `EFFECT_STATUS_HOST_REDACTION_FAILURE` before terminating the caller. Its HTTP response retains the actual status, but its free headers and body are explicitly withheld. Recovery consumes that recorded failure rather than sending the request again.
+
+A proven unsafe legacy response can also terminate the caller. Its original stored receipt and fingerprint remain unchanged. The new terminal record contains an explicit host-disclosure-failure projection, not another copy of the unsafe plain payload or a claim that the original network request failed. An unavailable key or an incomplete inventory is not proof that a legacy response is unsafe; the existing prerequisite handling still applies.
+
+Inspect the turn and its effects, then resolve the reported redaction resource or data boundary. Do not disable secret matching, discard retained secret versions, or treat a withheld response as an empty successful response. Before resending a dead letter, check whether its external effect already happened; resending is a new attempt and can duplicate that effect.
+
+    kronik dead-letters list
+
+See also: [`EFFECT_OUTCOME_UNKNOWN`](#effect_outcome_unknown), [`SECRET_UNAVAILABLE`](#secret_unavailable), [`dead-letters`](concepts/glossary.md#dead-letters).
+
 ## IDEMPOTENCY_IN_FLIGHT
 
 HTTP status 409, milestone M1. The original request with this key is still running.
@@ -484,6 +509,22 @@ Typical causes:
 To fix it, let the source node ship again (or wait a minute while it runs) and restore again, or restore from another bucket that has a newer backup. If the source is gone, `kronik restore --allow-missing-keys` installs the newest backup anyway: the listed subjects' sealed values stay unreadable, every other subject's stay readable. `--without-keystore` is not the way out here: it installs no backup and drops every subject's key.
 
 See also: [`MASTER_KEY_MISSING`](#master_key_missing), [`SUBJECT_ERASED`](#subject_erased).
+
+## KEY_HELPER_FAILED
+
+HTTP status 503, milestone M23. The isolated PKCS#11 key helper did not complete successfully.
+
+Default hint: Check the helper, trusted module digest, private PIN credential and enrolled token/key; do not replace the key or create a fallback master.
+
+# KEY_HELPER_FAILED
+
+The optional PKCS#11 helper was unavailable or returned a bounded failure code. Kronik did not substitute a file/environment seed, replace the envelope, or continue with an unlocked key. A failed PIN or authentication request is not retried automatically: repeated attempts can lock a token.
+
+Check the configured helper executable, module path and SHA-256 load-integrity digest, private `pin_file`, exact token manufacturer/model/serial, unique AES-256 key ID, key version and enrolled possession probe. The PIN travels only over the helper's private descriptor; one optional final LF is removed. Never put it in arguments, environment variables, configuration text or diagnostics. Fix the cause deliberately before retrying.
+
+Keep the original key and probe. A replacement object with the same label or ID is not the enrolled key. Module security updates may change the trusted path/digest without changing cryptographic key identity; they must still load the same token/key and pass the original probe. The helper is a Linux capability; ordinary file/environment sources remain available on supported development platforms.
+
+`kronik keys enroll --config <file>` verifies an existing configured probe, or prints a non-secret probe for a previously unenrolled configuration. It does not load or change the master seed. Normal startup, wrap, rewrap and restore require the probe. Retained envelopes and backups still need their matching wrapping key; losing it loses the encrypted data.
 
 ## KEY_PROTECTION_UNAVAILABLE
 
@@ -837,6 +878,32 @@ To fix it, use a token that has the scope, or ask someone who has one. Tokens an
 
 See also: [`UNAUTHENTICATED`](#unauthenticated).
 
+## SECRET_BACKEND_UNKNOWN
+
+HTTP status 400, milestone M23. The requested secret backend is not configured.
+
+Default hint: List configured backends with `kronik secret backends`, or ask an administrator to configure the intended backend.
+
+# SECRET_BACKEND_UNKNOWN
+
+The requested link names a backend that this installation has not configured. Backend identity, endpoints, credentials and reference allowlists come from trusted installation configuration, never a link or wrapped envelope supplied by a caller.
+
+Use `kronik secret backends` to inspect configured bindings without contacting providers. Select the intended backend, or have an administrator configure it and restart the installation deliberately. Link and unlink require `admin`; refreshing a configured name requires `operate`.
+
+An unknown backend publishes no link or secret version and does not fall back to the built-in store. Historical resolved references must retain the exact backend binding, canonical resource, link generation and immutable version; changing a name's current link does not rewrite those identities.
+
+## SECRET_EXTERNAL
+
+HTTP status 409, milestone M23. The secret is managed by an external backend.
+
+Default hint: Change the value in its backend, then run `kronik secret refresh <name> --reason '...'`.
+
+# SECRET_EXTERNAL
+
+This name is linked to an external secret manager. Kronik does not write or delete values in that service.
+
+Change or rotate the value using the backend's own authorized tools, then run `kronik secret refresh <name> --reason '...'`. To return future turns to the built-in store, an administrator can explicitly unlink the name. Unlinking does not redirect historical versions or make an old recorded value equal to the current one.
+
 ## SECRET_NOT_FOUND
 
 HTTP status 404, milestone M2. No such secret.
@@ -854,6 +921,18 @@ To fix it, list the secrets that exist, or set the secret; `kronik secret set` r
 
 See also: [`secret-handle`](concepts/glossary.md#secret-handle).
 
+## SECRET_REF_NOT_ALLOWED
+
+HTTP status 403, milestone M23. The secret reference is outside the configured allowlist.
+
+Default hint: Use an allowed reference or have an administrator update this backend's allowed_refs.
+
+# SECRET_REF_NOT_ALLOWED
+
+The requested resource is outside this node's trusted `allowed_refs` for the selected backend. An empty allowlist denies every link.
+
+Use an authorized reference, or ask an administrator to update the node-local backend configuration deliberately. A value recorded in history cannot select a new endpoint, credential or resource to bypass this boundary. Link and unlink require administrator authorization; a dry run never publishes a link or version.
+
 ## SECRET_UNAVAILABLE
 
 HTTP status 503, milestone M23. Secret values needed by this operation are unavailable.
@@ -864,16 +943,33 @@ The secret value or complete retained-secret inventory needed by this operation 
 
 Typical causes include an unavailable external backend, denied access to a required immutable version, or a local secret-store value that cannot be decrypted. A successfully empty inventory is different from a failed or incomplete inventory.
 
-An owned local mutation also makes its DATA publication unavailable before SQL
-and until its committed physical state and actual source facts are reconciled.
-SQL commit or an independent connection's old WAL view is not a complete
-current inventory. A failed/uncertain mutation remains a scoped prerequisite,
-not an empty inventory, a replacement version or permission to bypass the
-original operation's admission.
-
 Check `kronik doctor`, the configured backend and access to the required retained versions. Read-only operations can be retried after coverage is restored; a destroyed old version cannot be replaced with the backend's current value. If a mutation reply says it is already committed, wait for inventory availability and inspect its history before explicitly submitting another mutation; do not automatically repeat SET, DELETE, LINK, UNLINK or REFRESH. Metadata-only health and key status remain available, and turns that need no linked secret do not wait for provider recovery.
 
 This is not `KEY_SOURCE_UNAVAILABLE`: that code concerns loading the master seed. Do not switch master-key sources or create a fallback key to work around missing secret coverage.
+
+## SECRET_VERSION_EXHAUSTED
+
+HTTP status 409, milestone M23. The secret version domain is exhausted.
+
+Default hint: Use a new secret name; never reset or rewrite the durable version ledger.
+
+# SECRET_VERSION_EXHAUSTED
+
+The next immutable version would exceed 9,007,199,254,740,991 (`2^53−1`). This bound is positive in SQLite and exactly representable in the existing numeric JSON API.
+
+Use a new secret name and update the relevant grants and application configuration deliberately. Do not reset a counter, remove failed reservations or rewrite the version ledger: doing so could make an old recorded reference resolve to another value. Migrated legacy data reserves the old `u32` range and can continue above it; that normal migration is not exhaustion.
+
+## SECRET_VERSION_GONE
+
+HTTP status 410, milestone M23. The exact recorded secret version is no longer available.
+
+Default hint: Restore access to the matching source, immutable version and configuration; never substitute the current value.
+
+# SECRET_VERSION_GONE
+
+Kronik cannot recover the exact immutable secret identity recorded for this operation. The value may have been destroyed, an environment value may have changed across restart, access may have been revoked, or the trusted backend binding/reference may no longer match.
+
+Restore access to the matching backend configuration and exact retained version where possible. Never substitute the current value, another reference or a plaintext fallback: that would change an already recorded outcome. A recorded successful reveal or resend stops before exposing a different guest result. Missing values also keep scrub-dependent publication incomplete rather than allowing unsanitized output.
 
 ## STORAGE_CORRUPT
 

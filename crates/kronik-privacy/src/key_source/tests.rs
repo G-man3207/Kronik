@@ -114,9 +114,11 @@ struct Transit {
     hang_decrypt: bool,
 }
 impl Net for Transit {
-    fn http_authorized(&self, _: HttpRequest, _: kronik_core::authority::AuthLease)
-        -> BoxFuture<'static, Result<HttpResponse, NetError>>
-    {
+    fn http_authorized(
+        &self,
+        _: HttpRequest,
+        _: kronik_core::authority::AuthLease,
+    ) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
         panic!("fixed-cause B1 master fixture must not receive an ordinary secret operation")
     }
     fn http(&self, r: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {

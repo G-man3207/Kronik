@@ -270,10 +270,10 @@ fn authorize(s: &mut Shared, ctx: &AuthContext<'_>) -> Authorization {
         }
         Authorization::Deny
     };
-    if let AuthAction::Function {function_name}=&ctx.action {
-        for name in ["sqlite_filestat","sqlite_walstat"] {
+    if let AuthAction::Function { function_name } = &ctx.action {
+        for name in ["sqlite_filestat", "sqlite_walstat"] {
             if function_name.eq_ignore_ascii_case(name) {
-                return deny(s,format!("function {name}() is not allowed"));
+                return deny(s, format!("function {name}() is not allowed"));
             }
         }
     }
@@ -811,7 +811,10 @@ impl SqlActor {
     /// columns of every user table with `[secret:<name>]`, inside the turn,
     /// so the turn's changeset never holds the value. Returns the number of
     /// changed cells.
-    pub fn scrub<N: AsRef<str>, V: AsRef<[u8]>>(&mut self, secrets: &[(N, V)]) -> Result<u64, String> {
+    pub fn scrub<N: AsRef<str>, V: AsRef<[u8]>>(
+        &mut self,
+        secrets: &[(N, V)],
+    ) -> Result<u64, String> {
         if self.session.is_none() || self.poisoned {
             return Ok(0);
         }

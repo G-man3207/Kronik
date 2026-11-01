@@ -216,7 +216,10 @@ impl Disk {
                 if create && ancestor == dir {
                     continue;
                 }
-                return Err(io::Error::new(io::ErrorKind::NotFound, "parent directory missing"));
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "parent directory missing",
+                ));
             }
         }
         if create {
@@ -301,29 +304,45 @@ impl SimFs {
         })
     }
 
-    fn secure_write(&self, path: PathBuf, bytes: Bytes, replace: bool) -> BoxFuture<'static, io::Result<()>> {
+    fn secure_write(
+        &self,
+        path: PathBuf,
+        bytes: Bytes,
+        replace: bool,
+    ) -> BoxFuture<'static, io::Result<()>> {
         let fs = self.clone();
         Box::pin(async move {
             let path = secure_path(&path)?;
             let dir = parent(&path);
             let destination = path.clone();
-            let (ino, temporary) = fs.op(fs.latency(5, 30, 0.0, 0), move |d| {
-                d.secure_parent(&destination, true)?;
-                d.secure_destination(&destination, replace)?;
-                d.next_inode += 1;
-                let ino = d.next_inode;
-                let mut name = std::ffi::OsString::from(".");
-                name.push(destination.file_name().ok_or_else(insecure_file)?);
-                name.push(format!(".{ino}.tmp"));
-                let temp = parent(&destination).join(name);
-                if d.names.contains_key(&temp) || d.dirs.contains(&temp) {
-                    return Err(io::ErrorKind::AlreadyExists.into());
-                }
-                d.inodes.insert(ino, Inode { private: true, ..Inode::default() });
-                d.names.insert(temp.clone(), ino);
-                Ok((ino, temp))
-            }).await?;
-            let file = SimFile { fs: fs.clone(), ino };
+            let (ino, temporary) = fs
+                .op(fs.latency(5, 30, 0.0, 0), move |d| {
+                    d.secure_parent(&destination, true)?;
+                    d.secure_destination(&destination, replace)?;
+                    d.next_inode += 1;
+                    let ino = d.next_inode;
+                    let mut name = std::ffi::OsString::from(".");
+                    name.push(destination.file_name().ok_or_else(insecure_file)?);
+                    name.push(format!(".{ino}.tmp"));
+                    let temp = parent(&destination).join(name);
+                    if d.names.contains_key(&temp) || d.dirs.contains(&temp) {
+                        return Err(io::ErrorKind::AlreadyExists.into());
+                    }
+                    d.inodes.insert(
+                        ino,
+                        Inode {
+                            private: true,
+                            ..Inode::default()
+                        },
+                    );
+                    d.names.insert(temp.clone(), ino);
+                    Ok((ino, temp))
+                })
+                .await?;
+            let file = SimFile {
+                fs: fs.clone(),
+                ino,
+            };
             let result = async {
                 file.write_at(0, bytes).await?;
                 file.sync_data().await?;
@@ -337,16 +356,19 @@ impl SimFs {
                     d.names.remove(&temp);
                     d.names.insert(path, ino);
                     Ok(())
-                }).await?;
+                })
+                .await?;
                 fs.sync_dir(dir).await
-            }.await;
+            }
+            .await;
             if result.is_err() {
                 fs.op(fs.latency(10, 50, 0.0, 0), move |d| {
                     if d.names.get(&temporary) == Some(&ino) {
                         d.names.remove(&temporary);
                     }
                     Ok(())
-                }).await?;
+                })
+                .await?;
             }
             result
         })
@@ -457,7 +479,11 @@ impl Fs for SimFs {
         })
     }
 
-    fn read_secure(&self, path: PathBuf, max_bytes: usize) -> BoxFuture<'static, io::Result<Vec<u8>>> {
+    fn read_secure(
+        &self,
+        path: PathBuf,
+        max_bytes: usize,
+    ) -> BoxFuture<'static, io::Result<Vec<u8>>> {
         self.op(self.latency(5, 40, 0.0, 0), move |d| {
             let path = secure_path(&path)?;
             d.secure_parent(&path, false)?;
@@ -467,7 +493,10 @@ impl Fs for SimFs {
                 return Err(insecure_file());
             }
             if inode.current.len() > max_bytes {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "private file exceeds limit"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "private file exceeds limit",
+                ));
             }
             // The disk lock keeps metadata and contents unchanged throughout the read.
             Ok(inode.current.clone())

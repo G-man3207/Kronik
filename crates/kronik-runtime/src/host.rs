@@ -162,7 +162,6 @@ pub enum GateError {
     Diverged(String),
 }
 
-
 /// A typed trap cause; guest strings cannot forge this downcast.
 #[derive(Debug, thiserror::Error)]
 #[error("HOST_REDACTION_FAILURE")]
@@ -786,7 +785,9 @@ impl http_client::Host for TurnHost {
             FetchOutcome::Timeout => Err(http_client::FetchError::Timeout),
             FetchOutcome::TooLarge => Err(http_client::FetchError::TooLarge),
             FetchOutcome::OutcomeUnknown => Err(http_client::FetchError::OutcomeUnknown),
-            FetchOutcome::HostRedactionFailure => return Err(self.gate_failure(GateError::HostRedactionFailure)),
+            FetchOutcome::HostRedactionFailure => {
+                return Err(self.gate_failure(GateError::HostRedactionFailure));
+            }
         })
     }
 }

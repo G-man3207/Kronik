@@ -8,7 +8,10 @@ use kronik_core::env::{Env, ProcessSpec, SensitiveProcessRequest, Stdio};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::{Wrapped, config::{Pkcs11, Probe}};
+use super::{
+    Wrapped,
+    config::{Pkcs11, Probe},
+};
 
 const SCHEMA: &str = "kronik.pkcs11/v1";
 const PAYLOAD_SCHEMA: &str = "kronik.pkcs11/envelope/v1";
@@ -18,29 +21,46 @@ const CONFIG: &str = "PKCS11_CONFIG";
 const PROTOCOL: &str = "PKCS11_PROTOCOL";
 
 fn text(value: &str, max: usize) -> bool {
-    !value.is_empty() && value.len() <= max && value.trim() == value
+    !value.is_empty()
+        && value.len() <= max
+        && value.trim() == value
         && value.chars().all(|c| !c.is_control())
 }
 
 fn is_hex(value: &str, bytes: usize) -> bool {
     value.len() == bytes * 2
-        && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn path(value: &Path) -> bool {
-    value.is_absolute() && value.file_name().is_some()
+    value.is_absolute()
+        && value.file_name().is_some()
         && value.to_str().is_some_and(|s| text(s, 1024))
-        && value.components().all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+        && value
+            .components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
 }
 
 pub(crate) fn check(cfg: &Pkcs11, require_probe: bool) -> Result<(), String> {
-    if !path(&cfg.helper_path) || !path(&cfg.module) || !path(&cfg.pin_file)
+    if !path(&cfg.helper_path)
+        || !path(&cfg.module)
+        || !path(&cfg.pin_file)
         || !is_hex(&cfg.module_sha256, 32)
-        || !text(&cfg.manufacturer, 32) || !text(&cfg.model, 16) || !text(&cfg.serial, 16)
-        || !text(&cfg.key_version, 128) || cfg.key_id.is_empty() || cfg.key_id.len() > 128
-        || cfg.key_id.len() % 2 != 0 || !is_hex(&cfg.key_id, cfg.key_id.len() / 2)
+        || !text(&cfg.manufacturer, 32)
+        || !text(&cfg.model, 16)
+        || !text(&cfg.serial, 16)
+        || !text(&cfg.key_version, 128)
+        || cfg.key_id.is_empty()
+        || cfg.key_id.len() > 128
+        || cfg.key_id.len() % 2 != 0
+        || !is_hex(&cfg.key_id, cfg.key_id.len() / 2)
         || (require_probe && cfg.probe.is_none())
-        || cfg.probe.as_ref().is_some_and(|p| !is_hex(&p.nonce, 12) || !is_hex(&p.ciphertext, 48))
+        || cfg
+            .probe
+            .as_ref()
+            .is_some_and(|p| !is_hex(&p.nonce, 12) || !is_hex(&p.ciphertext, 48))
     {
         return Err(CONFIG.into());
     }
@@ -53,9 +73,15 @@ pub(crate) fn key_ref(cfg: &Pkcs11) -> Result<String, String> {
     let mut hash = blake3::Hasher::new();
     hash.update(b"kronik.pkcs11/identity/v1\0");
     // Deployment integrity changes must not change cryptographic key identity.
-    for field in [&cfg.manufacturer, &cfg.model, &cfg.serial, &cfg.key_id,
-        &cfg.key_version, &probe.nonce, &probe.ciphertext]
-    {
+    for field in [
+        &cfg.manufacturer,
+        &cfg.model,
+        &cfg.serial,
+        &cfg.key_id,
+        &cfg.key_version,
+        &probe.nonce,
+        &probe.ciphertext,
+    ] {
         hash.update(&(field.len() as u32).to_be_bytes());
         hash.update(field.as_bytes());
     }
@@ -93,7 +119,10 @@ struct ProbeData<'a> {
 
 // Missing is allowed, explicit null is not part of the helper's wire schema.
 fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where D: serde::Deserializer<'de>, T: Deserialize<'de> {
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
     T::deserialize(deserializer).map(Some)
 }
 
@@ -123,7 +152,9 @@ fn response<'a>(bytes: &'a [u8], op: &str) -> Result<Response<'a>, String> {
         return Err(PROTOCOL.into());
     }
     if !result.ok {
-        if result.probe.is_some() || result.nonce.is_some() || result.ciphertext.is_some()
+        if result.probe.is_some()
+            || result.nonce.is_some()
+            || result.ciphertext.is_some()
             || result.plaintext.is_some()
         {
             return Err(PROTOCOL.into());
@@ -139,18 +170,34 @@ fn response<'a>(bytes: &'a [u8], op: &str) -> Result<Response<'a>, String> {
             Some("authentication") => "PKCS11_AUTHENTICATION",
             Some("provider") => "PKCS11_PROVIDER",
             _ => PROTOCOL,
-        }.into());
+        }
+        .into());
     }
-    let valid = result.code.is_none() && match op {
-        "enroll" => result.probe.as_ref().is_some_and(|p| is_hex(p.nonce, 12) && is_hex(p.ciphertext, 48))
-            && result.nonce.is_none() && result.ciphertext.is_none() && result.plaintext.is_none(),
-        "wrap" => result.probe.is_none() && result.plaintext.is_none()
-            && result.nonce.is_some_and(|n| is_hex(n, 12))
-            && result.ciphertext.is_some_and(|c| is_hex(c, 48)),
-        "unwrap" => result.probe.is_none() && result.nonce.is_none() && result.ciphertext.is_none()
-            && result.plaintext.is_some_and(|p| is_hex(p, 32)),
-        _ => false,
-    };
+    let valid = result.code.is_none()
+        && match op {
+            "enroll" => {
+                result
+                    .probe
+                    .as_ref()
+                    .is_some_and(|p| is_hex(p.nonce, 12) && is_hex(p.ciphertext, 48))
+                    && result.nonce.is_none()
+                    && result.ciphertext.is_none()
+                    && result.plaintext.is_none()
+            }
+            "wrap" => {
+                result.probe.is_none()
+                    && result.plaintext.is_none()
+                    && result.nonce.is_some_and(|n| is_hex(n, 12))
+                    && result.ciphertext.is_some_and(|c| is_hex(c, 48))
+            }
+            "unwrap" => {
+                result.probe.is_none()
+                    && result.nonce.is_none()
+                    && result.ciphertext.is_none()
+                    && result.plaintext.is_some_and(|p| is_hex(p, 32))
+            }
+            _ => false,
+        };
     if !valid {
         return Err(PROTOCOL.into());
     }
@@ -160,10 +207,20 @@ fn response<'a>(bytes: &'a [u8], op: &str) -> Result<Response<'a>, String> {
 fn request<'a>(cfg: &'a Pkcs11, op: &'a str) -> Result<Request<'a>, String> {
     check(cfg, op != "enroll")?;
     Ok(Request {
-        schema: SCHEMA, op, module: cfg.module.to_str().ok_or(CONFIG)?,
-        module_sha256: &cfg.module_sha256, manufacturer: &cfg.manufacturer, model: &cfg.model,
-        serial: &cfg.serial, key_id: &cfg.key_id, key_version: &cfg.key_version, purpose: PURPOSE,
-        probe: None, plaintext: None, nonce: None, ciphertext: None,
+        schema: SCHEMA,
+        op,
+        module: cfg.module.to_str().ok_or(CONFIG)?,
+        module_sha256: &cfg.module_sha256,
+        manufacturer: &cfg.manufacturer,
+        model: &cfg.model,
+        serial: &cfg.serial,
+        key_id: &cfg.key_id,
+        key_version: &cfg.key_version,
+        purpose: PURPOSE,
+        probe: None,
+        plaintext: None,
+        nonce: None,
+        ciphertext: None,
     })
 }
 
@@ -176,16 +233,29 @@ fn serialize(request: &Request<'_>) -> Result<Zeroizing<Vec<u8>>, String> {
     Ok(Zeroizing::new(buffer[..len].to_vec()))
 }
 
-async fn exchange(env: &Env, cfg: &Pkcs11, request: &Request<'_>) -> Result<Zeroizing<Vec<u8>>, String> {
+async fn exchange(
+    env: &Env,
+    cfg: &Pkcs11,
+    request: &Request<'_>,
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let stdin = serialize(request)?;
     // ProcessRunner returns only after exit AND reap; never parse a live child's output.
-    env.procs.exchange(SensitiveProcessRequest {
-        spec: ProcessSpec {
-            program: cfg.helper_path.clone(), args: Vec::new(), env: Vec::new(), cwd: None,
-            stdout: Stdio::Null, stderr: Stdio::Null,
-        },
-        stdin, pin_file: cfg.pin_file.clone(), timeout: Duration::from_secs(10),
-    }).await.map_err(|_| "PKCS11_UNAVAILABLE".into())
+    env.procs
+        .exchange(SensitiveProcessRequest {
+            spec: ProcessSpec {
+                program: cfg.helper_path.clone(),
+                args: Vec::new(),
+                env: Vec::new(),
+                cwd: None,
+                stdout: Stdio::Null,
+                stderr: Stdio::Null,
+            },
+            stdin,
+            pin_file: cfg.pin_file.clone(),
+            timeout: Duration::from_secs(10),
+        })
+        .await
+        .map_err(|_| "PKCS11_UNAVAILABLE".into())
 }
 
 fn encode_hex(bytes: &[u8]) -> Zeroizing<String> {
@@ -217,16 +287,25 @@ pub(crate) async fn enroll(env: &Env, cfg: &Pkcs11) -> Result<Probe, String> {
         // Never replace a configured probe with a new key's successful enrollment.
         let public = encode_hex(&[0x4b; 32]);
         let mut req = request(cfg, "wrap")?;
-        req.probe = Some(ProbeData { nonce: &probe.nonce, ciphertext: &probe.ciphertext });
+        req.probe = Some(ProbeData {
+            nonce: &probe.nonce,
+            ciphertext: &probe.ciphertext,
+        });
         req.plaintext = Some(&public);
         let bytes = exchange(env, cfg, &req).await?;
         response(&bytes, "wrap")?;
-        return Ok(Probe { nonce: probe.nonce.clone(), ciphertext: probe.ciphertext.clone() });
+        return Ok(Probe {
+            nonce: probe.nonce.clone(),
+            ciphertext: probe.ciphertext.clone(),
+        });
     }
     let req = request(cfg, "enroll")?;
     let bytes = exchange(env, cfg, &req).await?;
     let probe = response(&bytes, "enroll")?.probe.ok_or(PROTOCOL)?;
-    Ok(Probe { nonce: probe.nonce.into(), ciphertext: probe.ciphertext.into() })
+    Ok(Probe {
+        nonce: probe.nonce.into(),
+        ciphertext: probe.ciphertext.into(),
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -250,9 +329,12 @@ fn payload(bytes: &[u8]) -> Result<Payload<'_>, String> {
 
 fn ciphertext(cfg: &Pkcs11, wrapped: &Wrapped) -> Result<Vec<u8>, String> {
     check(cfg, true)?;
-    if wrapped.schema != "kronik.wrapped-key/v1" || wrapped.source != "pkcs11"
-        || wrapped.key != key_ref(cfg)? || wrapped.key_version != cfg.key_version
-        || wrapped.aad != PURPOSE || wrapped.ciphertext.len() > LIMIT
+    if wrapped.schema != "kronik.wrapped-key/v1"
+        || wrapped.source != "pkcs11"
+        || wrapped.key != key_ref(cfg)?
+        || wrapped.key_version != cfg.key_version
+        || wrapped.aad != PURPOSE
+        || wrapped.ciphertext.len() > LIMIT
     {
         return Err(PROTOCOL.into());
     }
@@ -268,7 +350,12 @@ pub(crate) fn validate_wrapped(cfg: &Pkcs11, wrapped: &Wrapped) -> Result<(), St
     ciphertext(cfg, wrapped).map(|_| ())
 }
 
-pub(crate) async fn encrypt(env: &Env, cfg: &Pkcs11, seed: &[u8; 32], aad: &[u8]) -> Result<Wrapped, String> {
+pub(crate) async fn encrypt(
+    env: &Env,
+    cfg: &Pkcs11,
+    seed: &[u8; 32],
+    aad: &[u8],
+) -> Result<Wrapped, String> {
     check(cfg, true)?;
     if aad != PURPOSE.as_bytes() {
         return Err(PROTOCOL.into());
@@ -276,23 +363,35 @@ pub(crate) async fn encrypt(env: &Env, cfg: &Pkcs11, seed: &[u8; 32], aad: &[u8]
     let probe = cfg.probe.as_ref().ok_or(CONFIG)?;
     let plaintext = encode_hex(seed);
     let mut req = request(cfg, "wrap")?;
-    req.probe = Some(ProbeData { nonce: &probe.nonce, ciphertext: &probe.ciphertext });
+    req.probe = Some(ProbeData {
+        nonce: &probe.nonce,
+        ciphertext: &probe.ciphertext,
+    });
     req.plaintext = Some(&plaintext);
     let bytes = exchange(env, cfg, &req).await?;
     let result = response(&bytes, "wrap")?;
     let payload = Payload {
-        schema: PAYLOAD_SCHEMA, nonce: result.nonce.ok_or(PROTOCOL)?,
+        schema: PAYLOAD_SCHEMA,
+        nonce: result.nonce.ok_or(PROTOCOL)?,
         ciphertext: result.ciphertext.ok_or(PROTOCOL)?,
     };
     let encoded = serde_json::to_vec(&payload).map_err(|_| PROTOCOL)?;
     Ok(Wrapped {
-        schema: "kronik.wrapped-key/v1".into(), source: "pkcs11".into(), key: key_ref(cfg)?,
-        key_version: cfg.key_version.clone(), ciphertext: STANDARD.encode(encoded), aad: PURPOSE.into(),
+        schema: "kronik.wrapped-key/v1".into(),
+        source: "pkcs11".into(),
+        key: key_ref(cfg)?,
+        key_version: cfg.key_version.clone(),
+        ciphertext: STANDARD.encode(encoded),
+        aad: PURPOSE.into(),
         created_wall_ms: env.clock.wall_ms(),
     })
 }
 
-pub(crate) async fn decrypt(env: &Env, cfg: &Pkcs11, wrapped: &Wrapped) -> Result<Zeroizing<Vec<u8>>, String> {
+pub(crate) async fn decrypt(
+    env: &Env,
+    cfg: &Pkcs11,
+    wrapped: &Wrapped,
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let decoded = ciphertext(cfg, wrapped)?;
     let payload = payload(&decoded)?;
     let mut req = request(cfg, "unwrap")?;

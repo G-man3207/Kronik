@@ -122,35 +122,50 @@ impl SimService {
 struct ServiceNet(Arc<SimService>, u32);
 
 impl Net for ServiceNet {
-    fn http_authorized(&self, req: HttpRequest, original: kronik_core::authority::AuthLease)
-        -> BoxFuture<'static, Result<HttpResponse, NetError>>
-    {
+    fn http_authorized(
+        &self,
+        req: HttpRequest,
+        original: kronik_core::authority::AuthLease,
+    ) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
         let svc = self.0.clone();
         let node = self.1;
         Box::pin(async move {
             let denied = |error: kronik_core::error::ApiError| NetError::Connect(error.to_string());
             original.check().map_err(denied)?;
-            let there = svc.rng.duration(Duration::from_micros(200), Duration::from_millis(20));
-            let back = svc.rng.duration(Duration::from_micros(200), Duration::from_millis(20));
+            let there = svc
+                .rng
+                .duration(Duration::from_micros(200), Duration::from_millis(20));
+            let back = svc
+                .rng
+                .duration(Duration::from_micros(200), Duration::from_millis(20));
             let connect_fails = svc.rng.chance(svc.faults.connect_fail);
             let lose = svc.rng.chance(svc.faults.lose_response);
             svc.clock.sleep(there).await;
-            if connect_fails { return Err(NetError::Connect("connection refused".into())); }
+            if connect_fails {
+                return Err(NetError::Connect("connection refused".into()));
+            }
             if !req.url.starts_with("http://payments/") {
                 return Err(NetError::Connect(format!("unknown host in {}", req.url)));
             }
             let mut response = None;
-            original.admit(&mut || {
-                let at = svc.clock.monotonic();
-                svc.lock().sent.push(Sent { at, node });
-                response = Some(svc.handle(&req));
-                Ok(())
-            }).map_err(denied)?;
-            let response = response.ok_or_else(|| NetError::Connect("authority did not admit simulated HTTP".into()))?;
+            original
+                .admit(&mut || {
+                    let at = svc.clock.monotonic();
+                    svc.lock().sent.push(Sent { at, node });
+                    response = Some(svc.handle(&req));
+                    Ok(())
+                })
+                .map_err(denied)?;
+            let response = response.ok_or_else(|| {
+                NetError::Connect("authority did not admit simulated HTTP".into())
+            })?;
             svc.clock.sleep(back).await;
             drop(original);
-            if lose { Err(NetError::Io("connection reset after the request".into())) }
-            else { Ok(response) }
+            if lose {
+                Err(NetError::Io("connection reset after the request".into()))
+            } else {
+                Ok(response)
+            }
         })
     }
 

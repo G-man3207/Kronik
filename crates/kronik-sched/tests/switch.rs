@@ -31,6 +31,11 @@ fn audit() -> pb::Audit {
     }
 }
 
+/// A fresh live operator lease for the fixture's own operations.
+fn owner(node: &Node) -> kronik_core::authority::AuthLease {
+    node.local_operator_authority().unwrap()
+}
+
 /// A node whose code switches park on `hold` (deploys do not), with
 /// counter deployed (epoch 1).
 async fn node(dir: &std::path::Path) -> (Arc<Node>, Arc<SwitchHold>) {
@@ -42,7 +47,7 @@ async fn node(dir: &std::path::Path) -> (Arc<Node>, Arc<SwitchHold>) {
         ..NodeConfig::default()
     };
     let node = start_local(env, dir, config).await.unwrap();
-    node.deploy(&guest("counter"), audit(), false)
+    node.deploy(&guest("counter"), audit(), false, owner(&node))
         .await
         .unwrap();
     (node, hold)
@@ -50,7 +55,7 @@ async fn node(dir: &std::path::Path) -> (Arc<Node>, Arc<SwitchHold>) {
 
 async fn version(node: &Node, name: &str) -> pb::KindVersion {
     let bytes = guest(name);
-    let (hash, _, manifest) = node.prepare_code(&bytes).await.unwrap();
+    let (hash, _, manifest) = node.prepare_code(&bytes, owner(node)).await.unwrap();
     pb::KindVersion {
         kind: manifest.kind.clone(),
         code_hash: hash.0.to_vec(),
@@ -76,7 +81,7 @@ fn promote(v: pb::KindVersion) -> CodeSwitch {
 async fn promote_now(node: &Node, hold: &SwitchHold, name: &str) -> u64 {
     let v = version(node, name).await;
     hold.release.add_permits(1);
-    node.switch_code(promote(v), audit(), false)
+    node.switch_code(promote(v), audit(), false, owner(&node))
         .await
         .unwrap()
         .0
@@ -110,7 +115,7 @@ async fn prepare_rebase(
         .map(|(_, d)| d.kinds.clone())
         .unwrap();
     let base = dlsn - 1;
-    node.rebase_prepare(id, base).await.unwrap();
+    node.rebase_prepare(id, base, owner(node)).await.unwrap();
     let sw = pb::RebaseSwitch {
         base_lsn: base,
         rolled_back_epoch: epoch,
@@ -130,7 +135,10 @@ async fn a_cancelled_set_switch_still_installs_its_code() {
     let switch = {
         let node = node.clone();
         let v = v.clone();
-        tokio::spawn(async move { node.switch_code(promote(v), audit(), false).await })
+        tokio::spawn(async move {
+            node.switch_code(promote(v), audit(), false, owner(&node))
+                .await
+        })
     };
     wait_until("the switch parks", || {
         hold.parked.load(Ordering::SeqCst) == 1
@@ -157,12 +165,23 @@ async fn a_cancelled_rebase_switch_still_finishes() {
     let old = deployed_hash(&node);
     let epoch = promote_now(&node, &hold, "counter-step2").await;
     let (sw, kinds, not_after) = prepare_rebase(&node, "r-cancel", epoch).await;
-    let pause = node.rebase_pause(Duration::from_secs(5)).await.unwrap();
+    let pause = node
+        .rebase_pause(Duration::from_secs(5), owner(&node))
+        .await
+        .unwrap();
     let switch = {
         let node = node.clone();
         tokio::spawn(async move {
-            node.rebase_switch(pause, "r-cancel", sw, kinds, not_after, audit())
-                .await
+            node.rebase_switch(
+                pause,
+                "r-cancel",
+                sw,
+                kinds,
+                not_after,
+                audit(),
+                owner(&node),
+            )
+            .await
         })
     };
     wait_until("the switch parks", || {
@@ -193,12 +212,15 @@ async fn a_rebase_switch_refuses_after_a_later_deployment() {
     let epoch = promote_now(&node, &hold, "counter-step2").await;
     let (sw, kinds, not_after) = prepare_rebase(&node, "r-late", epoch).await;
     promote_now(&node, &hold, "counter-body-v2").await;
-    let pause = node.rebase_pause(Duration::from_secs(5)).await.unwrap();
+    let pause = node
+        .rebase_pause(Duration::from_secs(5), owner(&node))
+        .await
+        .unwrap();
     // Without the re-check the switch would commit and park on the hold:
     // a permit lets it finish, so the test fails instead of hanging.
     hold.release.add_permits(1);
     let err = node
-        .rebase_switch(pause, "r-late", sw, kinds, not_after, audit())
+        .rebase_switch(pause, "r-late", sw, kinds, not_after, audit(), owner(&node))
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::ProposalStale, "{err}");
@@ -212,7 +234,10 @@ async fn nothing_is_staged_after_the_pause_bound() {
     let (node, hold) = node(dir.path()).await;
     let epoch = promote_now(&node, &hold, "counter-step2").await;
     let (_, _, not_after) = prepare_rebase(&node, "r-late", epoch).await;
-    let pause = node.rebase_pause(Duration::from_millis(20)).await.unwrap();
+    let pause = node
+        .rebase_pause(Duration::from_millis(20), owner(&node))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(pause.remaining().is_zero());
     let turn = pb::TurnRecord {
@@ -229,7 +254,13 @@ async fn nothing_is_staged_after_the_pause_bound() {
     };
     let head = node.applied_lsn();
     let err = node
-        .rebase_stage("r-late", vec![(head, turn)], not_after, Some(&pause))
+        .rebase_stage(
+            "r-late",
+            vec![(head, turn)],
+            not_after,
+            Some(&pause),
+            owner(&node),
+        )
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::ProposalStale, "{err}");
@@ -254,6 +285,7 @@ async fn a_held_resend_of_a_dead_letter_gone_by_the_switch_is_dropped() {
             },
             audit(),
             false,
+            owner(&node),
         )
         .await
         .unwrap()
@@ -261,15 +293,18 @@ async fn a_held_resend_of_a_dead_letter_gone_by_the_switch_is_dropped() {
     let dead = failed.turn_id.lsn;
     assert!(node.store().db().dead_letter(dead).unwrap().is_some());
     let (sw, kinds, not_after) = prepare_rebase(&node, "r-dead", epoch).await;
-    let pause = node.rebase_pause(Duration::from_secs(5)).await.unwrap();
+    let pause = node
+        .rebase_pause(Duration::from_secs(5), owner(&node))
+        .await
+        .unwrap();
     let resend = {
         let node = node.clone();
-        tokio::spawn(async move { node.resend(dead, audit(), false).await })
+        tokio::spawn(async move { node.resend(dead, audit(), false, owner(&node)).await })
     };
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!resend.is_finished(), "held by the pause");
     hold.release.add_permits(1);
-    node.rebase_switch(pause, "r-dead", sw, kinds, not_after, audit())
+    node.rebase_switch(pause, "r-dead", sw, kinds, not_after, audit(), owner(&node))
         .await
         .unwrap();
     let r: Result<_, ApiError> = resend.await.unwrap();
@@ -290,15 +325,23 @@ async fn a_cancelled_configuration_change_is_still_applied() {
         ..NodeConfig::default()
     };
     let node = start_local(env, dir.path(), config).await.unwrap();
-    node.deploy(&guest("counter"), audit(), false)
+    node.deploy(&guest("counter"), audit(), false, owner(&node))
         .await
         .unwrap();
     let before = node.applied_lsn();
     let task = {
         let node = node.clone();
         tokio::spawn(async move {
-            node.grant("counter", "http:example.com", None, None, audit(), false)
-                .await
+            node.grant(
+                "counter",
+                "http:example.com",
+                None,
+                None,
+                audit(),
+                false,
+                owner(&node),
+            )
+            .await
         })
     };
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -317,7 +360,7 @@ async fn a_cancelled_configuration_change_is_still_applied() {
     let task = {
         let node = node.clone();
         tokio::spawn(async move {
-            node.set_privacy_mode(pb::PrivacyState::On, audit(), false)
+            node.set_privacy_mode(pb::PrivacyState::On, audit(), false, owner(&node))
                 .await
         })
     };
@@ -332,7 +375,15 @@ async fn a_cancelled_configuration_change_is_still_applied() {
     assert_eq!(node.epoch(), 3);
     // The deploy lock is free, and the next change gets epoch 4.
     let (epoch, _) = node
-        .grant("counter", "http:example.org", None, None, audit(), false)
+        .grant(
+            "counter",
+            "http:example.org",
+            None,
+            None,
+            audit(),
+            false,
+            owner(&node),
+        )
         .await
         .unwrap();
     assert_eq!(epoch, 4);
@@ -370,6 +421,7 @@ async fn send(node: &Node, key: &str) {
             },
             audit(),
             false,
+            owner(&node),
         )
         .await
         .unwrap()
@@ -412,7 +464,7 @@ fn a_crash_between_the_switch_record_and_state_db_repeats_the_switch() {
     let epoch = {
         let (rt, node, hold) = process(dir.path());
         rt.block_on(async {
-            node.deploy(&guest("counter"), audit(), false)
+            node.deploy(&guest("counter"), audit(), false, owner(&node))
                 .await
                 .unwrap();
             let epoch = promote_now(&node, &hold, "counter-step2").await;
@@ -429,11 +481,22 @@ fn a_crash_between_the_switch_record_and_state_db_repeats_the_switch() {
         let (rt, node, hold) = process(dir.path());
         let r = rt.block_on(async {
             let (sw, kinds, not_after) = prepare_rebase(&node, "r-crash", epoch).await;
-            let pause = node.rebase_pause(Duration::from_secs(5)).await.unwrap();
-            hold.release.add_permits(1);
-            node.rebase_switch(pause, "r-crash", sw, kinds, not_after, audit())
+            let pause = node
+                .rebase_pause(Duration::from_secs(5), owner(&node))
                 .await
-                .unwrap()
+                .unwrap();
+            hold.release.add_permits(1);
+            node.rebase_switch(
+                pause,
+                "r-crash",
+                sw,
+                kinds,
+                not_after,
+                audit(),
+                owner(&node),
+            )
+            .await
+            .unwrap()
         });
         assert_eq!(node.store().db().kv_get("counter", "a", "n").unwrap(), None);
         (r, node.store().state_hash().unwrap())

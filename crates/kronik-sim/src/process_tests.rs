@@ -36,23 +36,42 @@ fn sensitive_exchange_deadline_and_node_crash_are_sticky_reaped_states() {
             let child = process.clone();
             let completed = Arc::new(AtomicBool::new(false));
             let result = completed.clone();
-            let exchange = sensitive_exchange(clock(&handle), request(Duration::from_secs(1)), child);
-            handle.spawn(1, "sensitive exchange", Box::pin(async move {
-                assert_eq!(exchange.await.unwrap_err().kind(), io::ErrorKind::TimedOut);
-                result.store(true, Ordering::SeqCst);
-            }));
+            let exchange =
+                sensitive_exchange(clock(&handle), request(Duration::from_secs(1)), child);
+            handle.spawn(
+                1,
+                "sensitive exchange",
+                Box::pin(async move {
+                    assert_eq!(exchange.await.unwrap_err().kind(), io::ErrorKind::TimedOut);
+                    result.store(true, Ordering::SeqCst);
+                }),
+            );
             if cancel {
                 let supervisor = handle.clone();
-                handle.spawn(SUPERVISOR, "crash helper caller", Box::pin(async move {
-                    supervisor.sleep(Duration::from_millis(10)).await;
-                    assert_eq!(supervisor.kill_node(1), 1);
-                }));
+                handle.spawn(
+                    SUPERVISOR,
+                    "crash helper caller",
+                    Box::pin(async move {
+                        supervisor.sleep(Duration::from_millis(10)).await;
+                        assert_eq!(supervisor.kill_node(1), 1);
+                    }),
+                );
             }
-            assert_eq!(executor.run(100, || process.reaped.load(Ordering::SeqCst)), RunEnd::Stopped);
+            assert_eq!(
+                executor.run(100, || process.reaped.load(Ordering::SeqCst)),
+                RunEnd::Stopped
+            );
             assert!(*process.killed.borrow());
             assert!(process.reaped.load(Ordering::SeqCst));
             assert_eq!(completed.load(Ordering::SeqCst), !cancel);
-            assert_eq!(handle.now(), if cancel { Duration::from_millis(10) } else { Duration::from_secs(1) });
+            assert_eq!(
+                handle.now(),
+                if cancel {
+                    Duration::from_millis(10)
+                } else {
+                    Duration::from_secs(1)
+                }
+            );
             assert!(handle.live_tasks(1).is_empty());
         }
     }
@@ -64,11 +83,15 @@ fn ordinary_process_kill_before_wait_and_repeated_wait_cannot_lose_exit() {
     let handle = executor.handle();
     let process = Arc::new(SimProcess::new());
     let child = process.clone();
-    handle.spawn(1, "sticky wait", Box::pin(async move {
-        child.kill().await.unwrap();
-        assert_eq!(child.wait().await.unwrap(), None);
-        assert_eq!(child.wait().await.unwrap(), None);
-    }));
+    handle.spawn(
+        1,
+        "sticky wait",
+        Box::pin(async move {
+            child.kill().await.unwrap();
+            assert_eq!(child.wait().await.unwrap(), None);
+            assert_eq!(child.wait().await.unwrap(), None);
+        }),
+    );
     assert_eq!(executor.run(100, || false), RunEnd::Quiescent);
     assert!(process.reaped.load(Ordering::SeqCst));
     assert!(handle.live_tasks(1).is_empty());

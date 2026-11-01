@@ -33,5 +33,9 @@ fn run() -> Result<(), Error> {
 fn main() -> ExitCode {
     // No panic payload, provider message or protocol body is ever a diagnostic.
     std::panic::set_hook(Box::new(|_| {}));
-    if run().is_ok() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if run().is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }

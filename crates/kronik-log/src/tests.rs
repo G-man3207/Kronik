@@ -106,7 +106,7 @@ fn samples() -> Vec<Record> {
         Record::PrivacyMode(pb::PrivacyMode {
             epoch: 4,
             mode: pb::PrivacyState::On as i32,
-            audit,
+            audit: audit.clone(),
             reseal_requested: false,
         }),
         Record::ForeignActor(pb::ForeignActor {
@@ -148,6 +148,31 @@ fn samples() -> Vec<Record> {
         Record::AuditEvent(pb::AuditEvent {
             action: "secret.set".into(),
             audit: Some(pb::Audit::default()),
+            ..Default::default()
+        }),
+        Record::SecretVersion(pb::SecretVersion {
+            name: "key".into(),
+            version: 1,
+            version_hash: vec![0x55; 16],
+            backend: "file".into(),
+            source_version: "1".into(),
+            r#ref: "key".into(),
+            binding: "file".into(),
+            canonical_ref: "key".into(),
+            phase: pb::secret_version::Phase::Active as i32,
+            hash_revision: 1,
+            audit: audit.clone(),
+            ..Default::default()
+        }),
+        Record::SecretLink(pb::SecretLink {
+            name: "key".into(),
+            backend: "vault".into(),
+            r#ref: "kv/key".into(),
+            binding: "trusted".into(),
+            canonical_ref: "kv/data/key".into(),
+            generation: 1,
+            epoch: 7,
+            audit: audit.clone(),
             ..Default::default()
         }),
     ]
@@ -215,7 +240,10 @@ async fn native_positional_read_binds_the_actual_header_and_record() {
     assert_eq!(actual.pos, committed.pos);
     assert_eq!(actual.record, expected);
     let unrelated = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "replaced-native");
-    assert!(matches!(unrelated.read_at_with_namespace(committed.pos).await, Err(LogError::Corrupt(_))));
+    assert!(matches!(
+        unrelated.read_at_with_namespace(committed.pos).await,
+        Err(LogError::Corrupt(_))
+    ));
 }
 
 struct ReadFs {
@@ -1083,18 +1111,34 @@ async fn canceling_an_unpolled_real_writer_publishes_native_closure_synchronousl
         }
     }
     let mut h = harness();
-    let held = Arc::new(HeldWriter { actual: h.env.spawner.clone(), writer: Mutex::new(None) });
+    let held = Arc::new(HeldWriter {
+        actual: h.env.spawner.clone(),
+        writer: Mutex::new(None),
+    });
     h.env.spawner = held.clone();
     let (log, _, _records) = h.open().await.unwrap();
     let publication = Arc::new(Mutex::new(()));
-    let writer = log.bind_native_execution(publication.clone(), None).unwrap();
+    let writer = log
+        .bind_native_execution(publication.clone(), None)
+        .unwrap();
     assert!(writer.is_open());
-    assert!(log.bind_native_execution(Arc::new(Mutex::new(())), None).is_err());
+    assert!(
+        log.bind_native_execution(Arc::new(Mutex::new(())), None)
+            .is_err()
+    );
     let unpolled = held.writer.lock().unwrap().take().unwrap();
     drop(unpolled);
-    assert!(!writer.is_open(), "receiver cancellation publishes before Drop returns");
-    tokio::time::timeout(Duration::from_secs(2), writer.closed()).await.unwrap();
+    assert!(
+        !writer.is_open(),
+        "receiver cancellation publishes before Drop returns"
+    );
+    tokio::time::timeout(Duration::from_secs(2), writer.closed())
+        .await
+        .unwrap();
     assert!(log.bind_native_execution(publication, None).is_err());
-    assert!(matches!(log.append(begin("canceled-writer")).await, Err(LogError::Stopped(_))));
+    assert!(matches!(
+        log.append(begin("canceled-writer")).await,
+        Err(LogError::Stopped(_))
+    ));
     assert!(h.read_all().await.unwrap().is_empty());
 }

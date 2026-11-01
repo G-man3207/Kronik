@@ -695,7 +695,8 @@ fn secret_settings<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SecretS
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields, default)]
     struct Fields {
-        backends: std::collections::BTreeMap<String, kronik_privacy::secret_backend::config::Definition>,
+        backends:
+            std::collections::BTreeMap<String, kronik_privacy::secret_backend::config::Definition>,
         refresh: Dur,
         max_stale: Dur,
         fetch_timeout: Dur,
@@ -858,20 +859,35 @@ impl Config {
             let canonical = kronik_fleet::enrollment::canonical_controller_url(&fleet.url)
                 .map_err(|error| error.to_string())?;
             if canonical != fleet.url {
-                return Err("[fleet] url must be a canonical HTTPS origin without a trailing slash".into());
+                return Err(
+                    "[fleet] url must be a canonical HTTPS origin without a trailing slash".into(),
+                );
             }
             if !fleet.ca_file.is_absolute() {
                 return Err("[fleet] ca_file must be an absolute protected file path".into());
             }
-            let valid = |value: &str| !value.is_empty() && value.len() <= 256
-                && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte));
+            let valid = |value: &str| {
+                !value.is_empty()
+                    && value.len() <= 256
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+            };
             if !valid(&fleet.installation)
                 || fleet.node.as_deref().is_some_and(|value| !valid(value))
-                || fleet.cluster.as_deref().is_some_and(|value| !valid(value)) {
-                return Err("[fleet] installation/node/cluster must be nonempty identifiers".into());
+                || fleet.cluster.as_deref().is_some_and(|value| !valid(value))
+            {
+                return Err(
+                    "[fleet] installation/node/cluster must be nonempty identifiers".into(),
+                );
             }
-            if kronik_api::tokens::parse_scopes(&fleet.scopes).map_err(|error| error.message)?.is_empty() {
-                return Err("[fleet] scopes must explicitly allow at least one ordinary API scope".into());
+            if kronik_api::tokens::parse_scopes(&fleet.scopes)
+                .map_err(|error| error.message)?
+                .is_empty()
+            {
+                return Err(
+                    "[fleet] scopes must explicitly allow at least one ordinary API scope".into(),
+                );
             }
         }
         if self.events.webhook.len() > 64 {
@@ -883,14 +899,19 @@ impl Config {
                 .map_err(|_| "[events.webhook] url must be HTTPS or loopback HTTP without credentials or fragment".to_owned())?;
             if !kronik_api::tokens::valid_name(&hook.name)
                 || !webhook_names.insert(hook.name.as_str())
-                || hook.secret.trim().is_empty() || hook.version == 0 {
+                || hook.secret.trim().is_empty()
+                || hook.version == 0
+            {
                 return Err("[events.webhook] needs a unique token-style name and explicit immutable secret/version".into());
             }
         }
         if let Some(oidc) = &self.oidc {
             oidc.check().map_err(|error| error.message)?;
             if self.tls.mode == TlsMode::Off {
-                return Err("[oidc] requires [tls] mode = \"files\" or \"acme\" on the admin listener".into());
+                return Err(
+                    "[oidc] requires [tls] mode = \"files\" or \"acme\" on the admin listener"
+                        .into(),
+                );
             }
         }
         if !self.server.admin_listen.ip().is_loopback() && self.tls.mode == TlsMode::Off {
@@ -1453,13 +1474,29 @@ mod tests {
         let oidc = "[oidc]\nissuer = \"https://identity.example\"\nclient_id = \"admin\"\n\
                     redirect_uri = \"https://admin.example/v1/auth/callback\"\n";
         let tls = "[tls]\nmode = \"files\"\ncert_file = \"/c.pem\"\nkey_file = \"/k.pem\"\n";
-        assert!(parse(oidc).unwrap_err().message.contains("[oidc] requires [tls]"));
+        assert!(
+            parse(oidc)
+                .unwrap_err()
+                .message
+                .contains("[oidc] requires [tls]")
+        );
         let configured = parse(&format!("{tls}{oidc}")).unwrap();
         assert_eq!(configured.oidc.as_ref().unwrap().client_id, "admin");
-        assert!(parse(&format!("{tls}{}", oidc.replace("https://identity", "http://identity"))).is_err());
+        assert!(
+            parse(&format!(
+                "{tls}{}",
+                oidc.replace("https://identity", "http://identity")
+            ))
+            .is_err()
+        );
         for address in ["0.0.0.0:9464", "[::]:9464"] {
             let server = format!("[server]\nadmin_listen = \"{address}\"\n");
-            assert!(parse(&server).unwrap_err().message.contains("admin listener requires TLS"));
+            assert!(
+                parse(&server)
+                    .unwrap_err()
+                    .message
+                    .contains("admin listener requires TLS")
+            );
             assert!(parse(&format!("{server}{tls}")).is_ok());
         }
         let mut overridden = Config::default().with(Overrides {

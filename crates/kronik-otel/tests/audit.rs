@@ -12,6 +12,7 @@ use kronik_otel::audit::{
     Class, Ctx, Expected, Line, REASON_MAX, class, expected, lines, record_hash, verify,
 };
 use kronik_otel::spans::ActorKeys;
+use kronik_privacy::sealer::Sealer;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use prost::Message as _;
@@ -40,8 +41,32 @@ fn subject(s: &str) -> String {
     format!("s:{}", &blake3::hash(s.as_bytes()).to_hex()[..12])
 }
 
-fn secrets() -> Vec<(String, Vec<u8>)> {
-    vec![("api-key".into(), SECRET_VALUE.as_bytes().to_vec())]
+/// The audit line helpers' stored secret values, borrowed for `Ctx.secrets`.
+fn secrets() -> Vec<(&'static str, &'static [u8])> {
+    vec![("api-key", SECRET_VALUE.as_bytes())]
+}
+
+fn sealer_with(fresh: [u8; 32]) -> Sealer {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let owner = kronik_privacy::key_source::lock_data(dir.path()).unwrap();
+    let (master, _) =
+        kronik_privacy::MasterKey::open(&dir.path().join("master.key"), dir.path(), Some(fresh))
+            .unwrap();
+    let keystore = kronik_privacy::keystore::Keystore::open_owned(&owner, &master).unwrap();
+    let pseudonyms = kronik_privacy::keystore::Pseudonyms::new(&master).unwrap();
+    Sealer::new(keystore).with_pseudonyms(pseudonyms)
+}
+
+/// The deterministic identity key the exported lines' private hashes use.
+fn sealer() -> &'static Sealer {
+    static SEALER: std::sync::OnceLock<Sealer> = std::sync::OnceLock::new();
+    SEALER.get_or_init(|| sealer_with([7; 32]))
+}
+
+/// A second key: the same record must not hash the same under another one.
+fn other_sealer() -> &'static Sealer {
+    static SEALER: std::sync::OnceLock<Sealer> = std::sync::OnceLock::new();
+    SEALER.get_or_init(|| sealer_with([9; 32]))
 }
 
 fn export(lsn: u64, record: &Record) -> Vec<Line> {
@@ -54,6 +79,7 @@ fn export(lsn: u64, record: &Record) -> Vec<Line> {
             branch: "main",
             keys: &keys,
             subject: &subject,
+            sealer: sealer(),
             secrets: &secrets,
         },
     )
@@ -68,6 +94,7 @@ fn expected_record(lsn: u64, record: &Record) -> Vec<Expected> {
             branch: "main",
             keys: &ActorKeys::Omit,
             subject: &subject,
+            sealer: sealer(),
             secrets: &[],
         },
     )
@@ -104,6 +131,7 @@ fn operator_turn(source: pb::MessageSource, reveal: bool) -> pb::TurnRecord {
                         secret: Some(pb::SecretRef {
                             name: "api-key".into(),
                             version: 3,
+                            version_hash: vec![0x11; 16],
                             ..Default::default()
                         }),
                     }
@@ -233,6 +261,7 @@ fn samples() -> Vec<Record> {
                 ("message".into(), "increment".into()),
             ]),
             audit: audit(&format!("try it; the key was {SECRET_VALUE}")),
+            ..Default::default()
         }),
         Record::AuditEvent(pb::AuditEvent {
             action: "token.create".into(),
@@ -242,6 +271,7 @@ fn samples() -> Vec<Record> {
                 ("token_id".into(), "token:ci".into()),
             ]),
             audit: audit("for CI"),
+            ..Default::default()
         }),
         Record::TurnRecord(operator_turn(pb::MessageSource::Operator, true)),
         Record::TurnRecord(operator_turn(pb::MessageSource::DeadLetterResend, false)),
@@ -270,6 +300,27 @@ fn samples() -> Vec<Record> {
             rollback_epoch: 16,
             reason: BODY.into(),
             audit: audit("guard rollback"),
+            ..Default::default()
+        }),
+        Record::SecretVersion(pb::SecretVersion {
+            name: "api-key".into(),
+            version: 1,
+            version_hash: vec![0x55; 16],
+            backend: "file".into(),
+            source_version: "1".into(),
+            r#ref: "api-key".into(),
+            binding: "file".into(),
+            canonical_ref: "api-key".into(),
+            phase: pb::secret_version::Phase::Active as i32,
+            hash_revision: 1,
+            audit: audit("secret version"),
+            ..Default::default()
+        }),
+        Record::SecretLink(pb::SecretLink {
+            name: "api-key".into(),
+            generation: 1,
+            epoch: 7,
+            audit: audit("secret link"),
             ..Default::default()
         }),
         Record::StateRebase(pb::StateRebase {
@@ -364,21 +415,36 @@ fn needles_never_leave() {
 fn operator_names_and_free_text_scrub_values_and_tokens() {
     let token = format!("kronik_{}", "A".repeat(43));
     let text = format!("operate {SECRET_VALUE} {token}");
+    let scrubbed = "operate [secret:api-key] [secret:token]";
     for source in [
         pb::MessageSource::Operator,
         pb::MessageSource::DeadLetterResend,
     ] {
         let mut turn = operator_turn(source, false);
+        {
+            let Some(pb::input::Kind::Message(message)) =
+                turn.input.as_mut().and_then(|i| i.kind.as_mut())
+            else {
+                unreachable!()
+            };
+            message.msg.as_mut().unwrap().name = text.clone();
+            message.audit = audit(&text);
+        }
+        let line = export(1, &Record::TurnRecord(turn.clone())).remove(0);
+        // Free message text is scrubbed from this turn's actual stored values.
+        assert_eq!(line.details["message"], scrubbed);
+        // A persisted reason that still matches a value or credential is
+        // withheld whole: the mapper never re-scrubs text whose provenance it
+        // cannot prove.
+        assert_eq!(line.reason, "[withheld: secrets could not be loaded]");
         let Some(pb::input::Kind::Message(message)) =
             turn.input.as_mut().and_then(|i| i.kind.as_mut())
         else {
             unreachable!()
         };
-        message.msg.as_mut().unwrap().name = text.clone();
-        message.audit = audit(&text);
+        message.audit = audit(scrubbed);
         let line = export(1, &Record::TurnRecord(turn)).remove(0);
-        assert_eq!(line.details["message"], "operate [secret:api-key] [token]");
-        assert_eq!(line.reason, "operate [secret:api-key] [token]");
+        assert_eq!(line.reason, scrubbed);
     }
     let event = Record::AuditEvent(pb::AuditEvent {
         action: "fork.send".into(),
@@ -388,6 +454,7 @@ fn operator_names_and_free_text_scrub_values_and_tokens() {
             (text.clone(), text.clone()),
         ]),
         audit: audit(&text),
+        ..Default::default()
     });
     let output = export(1, &event).remove(0).to_json();
     assert!(!output.contains(SECRET_VALUE));
@@ -402,7 +469,7 @@ fn operator_names_and_free_text_scrub_values_and_tokens() {
     let line = export(2, &deployment).remove(0);
     assert_eq!(
         line.details["kinds"][0]["kind"],
-        "operate [secret:api-key] [token]"
+        "operate [secret:api-key] [secret:token]"
     );
 }
 
@@ -513,13 +580,19 @@ fn record_hash_ignores_sealed_payloads() {
             })),
         });
     }
-    let a = record_hash(&Record::TurnRecord(t.clone()), &subject);
-    assert_eq!(a, record_hash(&Record::TurnRecord(resealed), &subject));
-    assert!(a.starts_with("b3:") && a.len() == 67, "{a}");
+    let a = record_hash(&Record::TurnRecord(t.clone()), sealer()).unwrap();
+    assert_eq!(
+        a,
+        record_hash(&Record::TurnRecord(resealed), sealer()).unwrap()
+    );
+    assert!(a.starts_with("b3k:v3:") && a.len() == 71, "{a}");
     // Anything else changes it.
     let mut other = t;
     other.logical_time_ms += 1;
-    assert_ne!(a, record_hash(&Record::TurnRecord(other), &subject));
+    assert_ne!(
+        a,
+        record_hash(&Record::TurnRecord(other), sealer()).unwrap()
+    );
 }
 
 /// Review M6: an erasure's line leaves its subject out, and its hash covers
@@ -541,9 +614,8 @@ fn an_erasure_hash_confirms_no_guessed_subject() {
     );
     assert_ne!(line.record_hash, guess);
     // Stable under the same key (verify recomputes it), not under another.
-    assert_eq!(line.record_hash, record_hash(&e, &subject));
-    let other = |s: &str| subject(&format!("other key {s}"));
-    assert_ne!(line.record_hash, record_hash(&e, &other));
+    assert_eq!(line.record_hash, record_hash(&e, sealer()).unwrap());
+    assert_ne!(line.record_hash, record_hash(&e, other_sealer()).unwrap());
 }
 
 #[test]
@@ -570,11 +642,14 @@ fn erasure_subject_spellings_share_the_canonical_hash_without_matching_other_ids
         let expected_reason = canonical.audit.as_ref().unwrap().reason.clone();
         canonical.subject = subject(id);
         let canonical = Record::Erasure(canonical);
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"kronik.audit/v2\0");
-        hash.update(&[canonical.kind()]);
-        hash.update(&canonical.encode());
-        let expected_hash = format!("b3:{}", hash.finalize().to_hex());
+        // A backend can rebuild this public digest from a guessed subject; the
+        // private identity must never equal it.
+        let mut public = blake3::Hasher::new();
+        public.update(b"kronik.audit/v2\0");
+        public.update(&[canonical.kind()]);
+        public.update(&canonical.encode());
+        let public_hash = format!("b3:{}", public.finalize().to_hex());
+        let mut hashes = BTreeSet::new();
         for spelling in spellings {
             let record = Record::Erasure(pb::Erasure {
                 epoch: 13,
@@ -584,9 +659,15 @@ fn erasure_subject_spellings_share_the_canonical_hash_without_matching_other_ids
             });
             let line = export(1, &record).remove(0);
             assert_eq!(line.reason, expected_reason);
-            assert_eq!(line.record_hash, expected_hash);
-            assert_eq!(line.record_hash, record_hash(&record, &subject));
+            assert_ne!(line.record_hash, public_hash);
+            assert_eq!(line.record_hash, record_hash(&record, sealer()).unwrap());
+            hashes.insert(line.record_hash);
         }
+        assert_eq!(
+            hashes.len(),
+            1,
+            "spellings must share one canonical identity"
+        );
     }
 }
 
@@ -603,6 +684,7 @@ fn a_fork_send_hash_confirms_no_guessed_actor() {
             ("message".into(), "increment".into()),
         ]),
         audit: audit("try it"),
+        ..Default::default()
     });
     let line = export(5, &e).remove(0);
     assert_ne!(line.details["actor"], format!("counter/{SUBJECT}"));
@@ -614,9 +696,8 @@ fn a_fork_send_hash_confirms_no_guessed_actor() {
     assert_ne!(line.record_hash, guess);
     // Stable under the same key (verify recomputes it), not under another,
     // and it still covers the actor.
-    assert_eq!(line.record_hash, record_hash(&e, &subject));
-    let other = |s: &str| subject(&format!("other key {s}"));
-    assert_ne!(line.record_hash, record_hash(&e, &other));
+    assert_eq!(line.record_hash, record_hash(&e, sealer()).unwrap());
+    assert_ne!(line.record_hash, record_hash(&e, other_sealer()).unwrap());
     let Record::AuditEvent(mut moved) = e.clone() else {
         unreachable!()
     };
@@ -625,7 +706,7 @@ fn a_fork_send_hash_confirms_no_guessed_actor() {
         .insert("actor".into(), "counter/dave@example.com".into());
     assert_ne!(
         line.record_hash,
-        record_hash(&Record::AuditEvent(moved), &subject)
+        record_hash(&Record::AuditEvent(moved), sealer()).unwrap()
     );
 }
 
@@ -642,6 +723,37 @@ fn long_reasons_are_capped() {
     assert!(l.reason_truncated);
     assert!(l.reason.len() <= REASON_MAX && l.reason.len() > REASON_MAX - 2);
     assert!(l.to_json().contains("\"reason_truncated\":true"));
+}
+
+/// ADR 0106: an explicit reseal request (validated mode ON) publishes the
+/// request action, never a completion action; ordinary records keep
+/// `privacy.mode`.
+#[test]
+fn privacy_reseal_request_projects_the_request_action_not_a_completion() {
+    for (reseal_requested, action) in [(false, "privacy.mode"), (true, "privacy.reseal.request")] {
+        let record = Record::PrivacyMode(pb::PrivacyMode {
+            epoch: 7,
+            mode: pb::PrivacyState::On as i32,
+            audit: audit("reseal"),
+            reseal_requested,
+        });
+        let line = export(1, &record).remove(0);
+        assert_eq!(
+            (line.kind.as_str(), line.action.as_str()),
+            ("privacy_mode", action)
+        );
+        assert_ne!(line.action, "privacy.reseal");
+        assert_eq!(line.epoch, Some(7));
+    }
+    // The proto validator owns the combination: a request with mode off is
+    // not a valid record, so the mapper never invents the request action.
+    let request = Record::PrivacyMode(pb::PrivacyMode {
+        epoch: 8,
+        mode: pb::PrivacyState::Off as i32,
+        audit: audit("off"),
+        reseal_requested: true,
+    });
+    assert!(request.validate().is_err());
 }
 
 /// Review M4: every record message that carries an `Audit` (directly or
@@ -700,6 +812,8 @@ fn every_record_with_an_audit_is_classified() {
         StateRebase,
         GuardTriggered,
         AuditEvent,
+        SecretVersion,
+        SecretLink,
     ];
     let kinds: Vec<u8> = all.iter().map(|(r, _)| r.kind()).collect();
     assert_eq!(
@@ -739,11 +853,12 @@ fn verify_accepts_a_complete_sink_with_repeats() {
     let want = all_lines();
     let mut sink = want.clone();
     sink.extend(want[3..6].iter().cloned());
-    let r = verify(&all_expected(), &sink, 0, 16);
+    let end = samples().len() as u64;
+    let r = verify(&all_expected(), &sink, 0, end);
     assert!(r.complete, "{r:?}");
     assert_eq!((r.expected, r.lines), (want.len(), want.len()));
     // Outside (from, to] nothing counts.
-    let r = verify(&all_expected(), &want[2..], 2, 16);
+    let r = verify(&all_expected(), &want[2..], 2, end);
     assert!(r.complete, "{r:?}");
 }
 
@@ -751,9 +866,9 @@ fn verify_accepts_a_complete_sink_with_repeats() {
 #[test]
 fn verify_reports_missing_extra_and_conflicting_lines() {
     let want = all_lines();
-    let mut sink: Vec<Line> = want.iter().filter(|l| l.lsn != 4).cloned().collect();
+    let mut sink: Vec<Line> = want.iter().filter(|l| l.lsn != Some(4)).cloned().collect();
     let mut extra = want[0].clone();
-    extra.lsn = 99;
+    extra.lsn = Some(99);
     let mut conflict = want[1].clone();
     conflict.record_hash = format!("b3:{}", "0".repeat(64));
     let mut other_token = want[2].clone();
@@ -762,9 +877,9 @@ fn verify_reports_missing_extra_and_conflicting_lines() {
     let r = verify(&all_expected(), &sink, 0, 200);
     assert!(!r.complete);
     let lsns = |items: &[kronik_otel::audit::Item]| items.iter().map(|i| i.lsn).collect::<Vec<_>>();
-    assert_eq!(lsns(&r.missing), [4]);
-    assert_eq!(lsns(&r.extra), [99]);
-    assert_eq!(lsns(&r.conflicting), [2, 3]);
+    assert_eq!(lsns(&r.missing), [Some(4)]);
+    assert_eq!(lsns(&r.extra), [Some(99)]);
+    assert_eq!(lsns(&r.conflicting), [Some(2), Some(3)]);
 }
 
 /// Review H4: after a restore from an older ship point, LSNs past its
@@ -798,11 +913,11 @@ fn verify_tells_a_restored_tail_apart_by_hash() {
     sink.extend(new.iter().cloned());
     let r = verify(&want, &sink, 0, 11);
     assert!(r.complete, "{r:?}");
-    assert_eq!(r.superseded, old.iter().filter(|l| l.lsn > 9).count());
+    assert_eq!(r.superseded, old.iter().filter(|l| l.lsn > Some(9)).count());
     // LSN 10 and 11 were both used twice, with different hashes.
     let ten: BTreeSet<_> = sink
         .iter()
-        .filter(|l| l.lsn == 10)
+        .filter(|l| l.lsn == Some(10))
         .map(|l| &l.record_hash)
         .collect();
     assert_eq!(ten.len(), 2);
@@ -922,13 +1037,13 @@ fn golden_hash_versions_verify_historical_records_without_exporting_old_hashes()
     assert!(remainder.is_empty());
     for pair in pairs {
         assert_eq!(pair[0].schema, "kronik.audit/v1");
-        assert_eq!(pair[1].schema, "kronik.audit/v2");
+        assert_eq!(pair[1].schema, "kronik.audit/v3");
         assert_ne!(pair[0].record_hash, pair[1].record_hash);
-        assert!(
-            pair[1]
-                .reason
-                .contains(&subject(if pair[1].lsn == 3 { "42" } else { SUBJECT }))
-        );
+        assert!(pair[1].reason.contains(&subject(if pair[1].lsn == Some(3) {
+            "42"
+        } else {
+            SUBJECT
+        })));
         for (source, wrong_schema) in [
             (&pair[0], "kronik.audit/v2"),
             (&pair[1], "kronik.audit/v1"),
@@ -986,7 +1101,7 @@ fn only_source_matched_in_range_restores_can_supersede_a_tail() {
     ]
     .concat();
     for mutate in [
-        |line: &mut Line| line.lsn = 99,
+        |line: &mut Line| line.lsn = Some(99),
         |line: &mut Line| line.schema = "kronik.audit/v999".into(),
         |line: &mut Line| line.record_hash = "b3:forged".into(),
     ] {
@@ -1041,7 +1156,7 @@ fn only_source_matched_in_range_restores_can_supersede_a_tail() {
     assert!(!verify(&want, &corrupted, 0, 2).complete);
     let mut unknown = sink[0].clone();
     unknown.schema = "kronik.audit/v999".into();
-    unknown.lsn = 2;
+    unknown.lsn = Some(2);
     sink.insert(1, unknown);
     assert!(!verify(&want, &sink, 0, 2).complete);
 }
@@ -1057,18 +1172,20 @@ fn unsupported_schema_diagnostics_never_echo_sink_text_or_legacy_hashes() {
     injected.action = needle.into();
     injected.record_hash = needle.into();
     injected.token_id = needle.into();
-    injected.branch = needle.into();
     injected.reason = needle.into();
     injected.details.insert(needle.into(), needle.into());
+    // Identity fields (branch, source, lsn, effect) stay intact so the line is
+    // reported as conflicting with the expected private identity; only its
+    // non-identity sink text is untrusted.
     let mut extra = injected.clone();
-    extra.lsn = 2;
+    extra.lsn = Some(2);
     let report = verify(&expected, &[injected, extra], 0, 2);
     assert!(!report.complete);
     let serialized = serde_json::to_string(&report).unwrap();
     assert!(!serialized.contains(needle));
     assert_eq!(
         report.conflicting[0].record_hash,
-        record_hash(record, &subject)
+        record_hash(record, sealer()).unwrap()
     );
     assert!(report.extra[0].record_hash.is_empty());
     let mut historical = legacy_line(1, record);
@@ -1085,12 +1202,13 @@ fn unsupported_schema_diagnostics_never_echo_sink_text_or_legacy_hashes() {
 #[test]
 fn typed_positions_survive_secret_coincidence_and_versions_have_explicit_types() {
     use kronik_sched::scrub::AuditPositions;
-    let values = vec![("digits".into(), b"1234".to_vec())];
+    let values: &[(&str, &[u8])] = &[("digits", b"1234")];
     let ctx = Ctx {
         branch: "main",
         keys: &ActorKeys::Omit,
         subject: &subject,
-        secrets: &values,
+        sealer: sealer(),
+        secrets: values,
     };
     for (action, details) in [
         (
@@ -1176,6 +1294,7 @@ fn malformed_source_positions_are_corruption_not_empty_or_redacted_projections()
         branch: "main",
         keys: &ActorKeys::Omit,
         subject: &subject,
+        sealer: sealer(),
         secrets: &[],
     };
     for (action, fields) in [
@@ -1204,11 +1323,11 @@ fn malformed_source_positions_are_corruption_not_empty_or_redacted_projections()
         });
         assert!(matches!(
             lines(1, &record, &ctx),
-            Err(kronik_log::LogError::Corrupt(_))
+            Err(error) if error.code == kronik_core::error::ErrorCode::StorageCorrupt
         ));
         assert!(matches!(
             expected(1, &record, &ctx),
-            Err(kronik_log::LogError::Corrupt(_))
+            Err(error) if error.code == kronik_core::error::ErrorCode::StorageCorrupt
         ));
     }
 }

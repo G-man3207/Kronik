@@ -573,25 +573,38 @@ impl StateDb {
     /// Immutable installation identity, including when fleet control is disabled.
     pub fn installation_id(&self) -> Result<Option<String>, StoreError> {
         match self.control_state(kronik_proto::control::ControlKind::Installation)? {
-            Some((_, pb::audit_event::Operation::InstallationIdentity(identity))) => Ok(Some(identity.installation)),
+            Some((_, pb::audit_event::Operation::InstallationIdentity(identity))) => {
+                Ok(Some(identity.installation))
+            }
             None => Ok(None),
             _ => Err(corrupt("installation control family mismatch")),
         }
     }
 
     /// The same native self-session validation used by durable apply.
-    pub fn validate_auth_session_revoked(&self, session: &pb::AuthSessionRevoked) -> Result<(), StoreError> {
+    pub fn validate_auth_session_revoked(
+        &self,
+        session: &pb::AuthSessionRevoked,
+    ) -> Result<(), StoreError> {
         validate_native_session_revoked(&self.conn, session)
     }
 
     /// Current state of the incoming typed family, for the shared transition check.
-    pub fn control_operation(&self, incoming: &pb::audit_event::Operation) -> Result<Option<pb::audit_event::Operation>, StoreError> {
-        let kind = incoming.kind().ok_or_else(|| corrupt("session tombstones are not a current control family"))?;
+    pub fn control_operation(
+        &self,
+        incoming: &pb::audit_event::Operation,
+    ) -> Result<Option<pb::audit_event::Operation>, StoreError> {
+        let kind = incoming
+            .kind()
+            .ok_or_else(|| corrupt("session tombstones are not a current control family"))?;
         Ok(self.control_state(kind)?.map(|(_, operation)| operation))
     }
 
     /// The last record in this family, never the unrelated current applied LSN.
-    pub fn control_state(&self, kind: kronik_proto::control::ControlKind) -> Result<Option<(Lsn, pb::audit_event::Operation)>, StoreError> {
+    pub fn control_state(
+        &self,
+        kind: kronik_proto::control::ControlKind,
+    ) -> Result<Option<(Lsn, pb::audit_event::Operation)>, StoreError> {
         current_control_state(&self.conn, kind)
     }
 
@@ -602,7 +615,10 @@ impl StateDb {
 
     /// Latest phase of every durable version, including pending/failed intents.
     /// FENCE is a global nonvalue and is returned only by `secret_format_floor`.
-    pub fn secret_versions(&self, name: Option<&str>) -> Result<Vec<pb::SecretVersion>, StoreError> {
+    pub fn secret_versions(
+        &self,
+        name: Option<&str>,
+    ) -> Result<Vec<pb::SecretVersion>, StoreError> {
         let mut st = self.conn.prepare_cached(
             "SELECT record FROM secret_versions WHERE (?1 IS NULL OR name = ?1) ORDER BY name, version",
         )?;
@@ -623,7 +639,9 @@ impl StateDb {
     /// Current link/unlink barrier of each name. Exact historical generations
     /// remain in `secret_link_history` and the ordinary `config_records` stream.
     pub fn secret_links(&self) -> Result<Vec<pb::SecretLink>, StoreError> {
-        let mut st = self.conn.prepare_cached("SELECT record FROM secret_links ORDER BY name")?;
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT record FROM secret_links ORDER BY name")?;
         let rows = st.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
         rows.map(|row| secret_link_decode(&row?)).collect()
     }
@@ -2405,7 +2423,9 @@ fn secret_link_decode(bytes: &[u8]) -> Result<pb::SecretLink, StoreError> {
 
 fn secret_format_floor(conn: &Connection) -> Result<Option<u64>, StoreError> {
     let floor: Option<i64> = conn
-        .query_row("SELECT floor FROM secret_format WHERE id = 1", [], |r| r.get(0))
+        .query_row("SELECT floor FROM secret_format WHERE id = 1", [], |r| {
+            r.get(0)
+        })
         .optional()?;
     Ok(floor.map(|v| v as u64))
 }
@@ -2415,7 +2435,9 @@ fn secret_highwater(conn: &Connection, name: &str) -> Result<u64, StoreError> {
         .prepare_cached("SELECT version FROM secret_highwater WHERE name = ?1")?
         .query_row([name], |r| r.get(0))
         .optional()?;
-    Ok(own.map_or(0, |v| v as u64).max(secret_format_floor(conn)?.unwrap_or(0)))
+    Ok(own
+        .map_or(0, |v| v as u64)
+        .max(secret_format_floor(conn)?.unwrap_or(0)))
 }
 
 fn secret_link(conn: &Connection, name: &str) -> Result<Option<pb::SecretLink>, StoreError> {
@@ -2427,27 +2449,43 @@ fn secret_link(conn: &Connection, name: &str) -> Result<Option<pb::SecretLink>, 
 }
 
 fn same_secret_identity(a: &pb::SecretVersion, b: &pb::SecretVersion) -> bool {
-    a.name == b.name && a.version == b.version && a.version_hash == b.version_hash
-        && a.backend == b.backend && a.source_version == b.source_version
-        && a.deleted == b.deleted && a.r#ref == b.r#ref && a.binding == b.binding
-        && a.link_generation == b.link_generation && a.canonical_ref == b.canonical_ref
-        && a.hash_revision == b.hash_revision && a.audit == b.audit
+    a.name == b.name
+        && a.version == b.version
+        && a.version_hash == b.version_hash
+        && a.backend == b.backend
+        && a.source_version == b.source_version
+        && a.deleted == b.deleted
+        && a.r#ref == b.r#ref
+        && a.binding == b.binding
+        && a.link_generation == b.link_generation
+        && a.canonical_ref == b.canonical_ref
+        && a.hash_revision == b.hash_revision
+        && a.audit == b.audit
 }
 
 fn check_secret_link(conn: &Connection, m: &pb::SecretVersion) -> Result<(), StoreError> {
-    let bytes: Option<Vec<u8>> = conn.prepare_cached(
-        "SELECT record FROM secret_link_history WHERE name = ?1 AND generation = ?2",
-    )?.query_row(params![m.name, i(m.link_generation)], |r| r.get(0)).optional()?;
+    let bytes: Option<Vec<u8>> = conn
+        .prepare_cached(
+            "SELECT record FROM secret_link_history WHERE name = ?1 AND generation = ?2",
+        )?
+        .query_row(params![m.name, i(m.link_generation)], |r| r.get(0))
+        .optional()?;
     let link = bytes.map(|b| secret_link_decode(&b)).transpose()?;
     let matches = if m.backend == "file" {
         m.link_generation == 0 || link.as_ref().is_some_and(|l| l.backend.is_empty())
     } else {
-        link.as_ref().is_some_and(|l| l.backend == m.backend && l.binding == m.binding
-            && l.r#ref == m.r#ref && l.canonical_ref == m.canonical_ref
-            && l.generation == m.link_generation)
+        link.as_ref().is_some_and(|l| {
+            l.backend == m.backend
+                && l.binding == m.binding
+                && l.r#ref == m.r#ref
+                && l.canonical_ref == m.canonical_ref
+                && l.generation == m.link_generation
+        })
     };
     if !matches {
-        return Err(corrupt("secret version does not match its historical link barrier"));
+        return Err(corrupt(
+            "secret version does not match its historical link barrier",
+        ));
     }
     Ok(())
 }
@@ -2456,7 +2494,9 @@ fn apply_secret_version(conn: &Connection, m: &pb::SecretVersion) -> Result<(), 
     use pb::secret_version::Phase;
     if m.phase == Phase::Fence as i32 {
         let old: Option<Vec<u8>> = conn
-            .query_row("SELECT record FROM secret_format WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT record FROM secret_format WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .optional()?;
         if let Some(old) = old {
             if secret_version_decode(&old)? != *m {
@@ -2465,20 +2505,24 @@ fn apply_secret_version(conn: &Connection, m: &pb::SecretVersion) -> Result<(), 
             return Ok(());
         }
         if m.version == 0 {
-            let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM secret_versions)", [], |r| r.get(0),
-            )?;
+            let exists: bool =
+                conn.query_row("SELECT EXISTS(SELECT 1 FROM secret_versions)", [], |r| {
+                    r.get(0)
+                })?;
             if exists {
                 return Err(corrupt("fresh secret fence over existing versions"));
             }
         }
-        conn.execute("INSERT INTO secret_format VALUES (1, ?1, ?2)",
-            params![i(m.version), m.encode_to_vec()])?;
+        conn.execute(
+            "INSERT INTO secret_format VALUES (1, ?1, ?2)",
+            params![i(m.version), m.encode_to_vec()],
+        )?;
         return Ok(());
     }
-    let old: Option<Vec<u8>> = conn.prepare_cached(
-        "SELECT record FROM secret_versions WHERE name = ?1 AND version = ?2",
-    )?.query_row(params![m.name, i(m.version)], |r| r.get(0)).optional()?;
+    let old: Option<Vec<u8>> = conn
+        .prepare_cached("SELECT record FROM secret_versions WHERE name = ?1 AND version = ?2")?
+        .query_row(params![m.name, i(m.version)], |r| r.get(0))
+        .optional()?;
     if let Some(old) = old {
         let old = secret_version_decode(&old)?;
         if old == *m {
@@ -2488,22 +2532,28 @@ fn apply_secret_version(conn: &Connection, m: &pb::SecretVersion) -> Result<(), 
             || old.phase != Phase::Reserved as i32
             || !matches!(Phase::try_from(m.phase), Ok(Phase::Active | Phase::Failed))
         {
-            return Err(corrupt("secret version identity mismatch or phase regression"));
+            return Err(corrupt(
+                "secret version identity mismatch or phase regression",
+            ));
         }
         if m.phase == Phase::Active as i32 {
             check_secret_link(conn, m)?;
         }
         conn.prepare_cached(
             "UPDATE secret_versions SET phase = ?3, record = ?4 WHERE name = ?1 AND version = ?2",
-        )?.execute(params![m.name, i(m.version), m.phase, m.encode_to_vec()])?;
+        )?
+        .execute(params![m.name, i(m.version), m.phase, m.encode_to_vec()])?;
         return Ok(());
     }
-    let legacy_import = m.phase == Phase::Active as i32 && m.backend == "file"
+    let legacy_import = m.phase == Phase::Active as i32
+        && m.backend == "file"
         && m.version <= kronik_proto::secret::LEGACY_SECRET_VERSION_MAX
-        && m.link_generation == 0 && m.source_version.parse::<u64>().ok() == Some(m.version)
+        && m.link_generation == 0
+        && m.source_version.parse::<u64>().ok() == Some(m.version)
         && m.audit.as_ref().is_some_and(|a| a.token_id == "system");
     if !legacy_import {
-        if m.phase != Phase::Reserved as i32 || secret_format_floor(conn)?.is_none()
+        if m.phase != Phase::Reserved as i32
+            || secret_format_floor(conn)?.is_none()
             || m.version <= secret_highwater(conn, &m.name)?
         {
             return Err(corrupt("secret version lacks a new durable reservation"));
@@ -2512,17 +2562,25 @@ fn apply_secret_version(conn: &Connection, m: &pb::SecretVersion) -> Result<(), 
     }
     conn.prepare_cached(
         "INSERT INTO secret_versions (name, version, phase, record) VALUES (?1, ?2, ?3, ?4)",
-    )?.execute(params![m.name, i(m.version), m.phase, m.encode_to_vec()])?;
+    )?
+    .execute(params![m.name, i(m.version), m.phase, m.encode_to_vec()])?;
     conn.prepare_cached(
         "INSERT INTO secret_highwater (name, version) VALUES (?1, ?2) \
          ON CONFLICT(name) DO UPDATE SET version = max(version, excluded.version)",
-    )?.execute(params![m.name, i(m.version)])?;
+    )?
+    .execute(params![m.name, i(m.version)])?;
     Ok(())
 }
 
-fn apply_secret_link(conn: &Connection, m: &pb::SecretLink, epoch: u64) -> Result<bool, StoreError> {
+fn apply_secret_link(
+    conn: &Connection,
+    m: &pb::SecretLink,
+    epoch: u64,
+) -> Result<bool, StoreError> {
     if secret_format_floor(conn)?.is_none() {
-        return Err(corrupt("secret link precedes durable format initialization"));
+        return Err(corrupt(
+            "secret link precedes durable format initialization",
+        ));
     }
     if let Some(old) = secret_link(conn, &m.name)? {
         if old == *m {
@@ -2533,17 +2591,21 @@ fn apply_secret_link(conn: &Connection, m: &pb::SecretLink, epoch: u64) -> Resul
         }
     }
     if m.epoch <= epoch {
-        return Err(corrupt("secret link did not advance the configuration epoch"));
+        return Err(corrupt(
+            "secret link did not advance the configuration epoch",
+        ));
     }
     let bytes = m.encode_to_vec();
     conn.prepare_cached(
         "INSERT INTO secret_link_history (name, generation, epoch, record) VALUES (?1, ?2, ?3, ?4)",
-    )?.execute(params![m.name, i(m.generation), i(m.epoch), bytes])?;
+    )?
+    .execute(params![m.name, i(m.generation), i(m.epoch), bytes])?;
     conn.prepare_cached(
         "INSERT INTO secret_links (name, generation, epoch, record) VALUES (?1, ?2, ?3, ?4) \
          ON CONFLICT(name) DO UPDATE SET generation = excluded.generation, \
          epoch = excluded.epoch, record = excluded.record",
-    )?.execute(params![m.name, i(m.generation), i(m.epoch), bytes])?;
+    )?
+    .execute(params![m.name, i(m.generation), i(m.epoch), bytes])?;
     Ok(true)
 }
 
@@ -2572,74 +2634,149 @@ fn copy_rows(
 
 fn control_position_key(kind: kronik_proto::control::ControlKind) -> &'static str {
     use kronik_proto::control::ControlKind;
-    match kind { ControlKind::Fleet => "fleet.state.lsn", ControlKind::Installation => "installation.identity.lsn", ControlKind::Auth => "auth.config.lsn" }
+    match kind {
+        ControlKind::Fleet => "fleet.state.lsn",
+        ControlKind::Installation => "installation.identity.lsn",
+        ControlKind::Auth => "auth.config.lsn",
+    }
 }
 
-fn current_control_state(conn: &Connection, kind: kronik_proto::control::ControlKind) -> Result<Option<(Lsn, pb::audit_event::Operation)>, StoreError> {
+fn current_control_state(
+    conn: &Connection,
+    kind: kronik_proto::control::ControlKind,
+) -> Result<Option<(Lsn, pb::audit_event::Operation)>, StoreError> {
     use kronik_proto::control::ControlKind;
     use pb::audit_event::Operation;
     let (bytes, position): (Option<Vec<u8>>, Option<i64>) = conn.query_row(
         "SELECT (SELECT v FROM meta WHERE k=?1),(SELECT v FROM meta WHERE k=?2)",
-        params![kind.action(), control_position_key(kind)], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        params![kind.action(), control_position_key(kind)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
     match (bytes, position) {
         (None, None) => Ok(None),
         (Some(bytes), Some(position)) if position > 0 => {
             let operation = match kind {
                 ControlKind::Fleet => Operation::FleetState(decode(&bytes, "typed fleet state")?),
-                ControlKind::Installation => Operation::InstallationIdentity(decode(&bytes, "typed installation identity")?),
-                ControlKind::Auth => Operation::AuthConfig(decode(&bytes, "typed auth configuration")?),
+                ControlKind::Installation => {
+                    Operation::InstallationIdentity(decode(&bytes, "typed installation identity")?)
+                }
+                ControlKind::Auth => {
+                    Operation::AuthConfig(decode(&bytes, "typed auth configuration")?)
+                }
             };
-            operation.validate().map_err(|error| corrupt(error.to_string()))?;
+            operation
+                .validate()
+                .map_err(|error| corrupt(error.to_string()))?;
             Ok(Some((position as u64, operation)))
         }
-        _ => Err(corrupt("typed control state and its exact record position must be atomic")),
+        _ => Err(corrupt(
+            "typed control state and its exact record position must be atomic",
+        )),
     }
 }
 
-fn validate_native_session_revoked(conn: &Connection, session: &pb::AuthSessionRevoked) -> Result<(), StoreError> {
-    kronik_proto::control::validate_auth_session_revoked(session).map_err(|error| corrupt(error.to_string()))?;
-    let Some(pb::auth_session_revoked::ConfigSource::NativeLsn(source)) = session.config_source.as_ref() else {
-        return Err(corrupt("metadata session tombstones require their metadata owner"));
+fn validate_native_session_revoked(
+    conn: &Connection,
+    session: &pb::AuthSessionRevoked,
+) -> Result<(), StoreError> {
+    kronik_proto::control::validate_auth_session_revoked(session)
+        .map_err(|error| corrupt(error.to_string()))?;
+    let Some(pb::auth_session_revoked::ConfigSource::NativeLsn(source)) =
+        session.config_source.as_ref()
+    else {
+        return Err(corrupt(
+            "metadata session tombstones require their metadata owner",
+        ));
     };
-    validate_native_auth_binding(conn, *source, &session.config_digest, &session.principal_hash, &session.token_name)
+    validate_native_auth_binding(
+        conn,
+        *source,
+        &session.config_digest,
+        &session.principal_hash,
+        &session.token_name,
+    )
 }
 
-fn validate_native_oidc_login(conn: &Connection, login: &pb::AuthOidcLogin) -> Result<(), StoreError> {
-    kronik_proto::control::validate_auth_oidc_login(login).map_err(|error| corrupt(error.to_string()))?;
-    let Some(pb::auth_oidc_login::ConfigSource::NativeLsn(source)) = login.config_source.as_ref() else {
-        return Err(corrupt("metadata login receipts require their metadata owner"));
+fn validate_native_oidc_login(
+    conn: &Connection,
+    login: &pb::AuthOidcLogin,
+) -> Result<(), StoreError> {
+    kronik_proto::control::validate_auth_oidc_login(login)
+        .map_err(|error| corrupt(error.to_string()))?;
+    let Some(pb::auth_oidc_login::ConfigSource::NativeLsn(source)) = login.config_source.as_ref()
+    else {
+        return Err(corrupt(
+            "metadata login receipts require their metadata owner",
+        ));
     };
-    validate_native_auth_binding(conn, *source, &login.config_digest, &login.principal_hash, &login.token_name)
+    validate_native_auth_binding(
+        conn,
+        *source,
+        &login.config_digest,
+        &login.principal_hash,
+        &login.token_name,
+    )
 }
 
-fn validate_native_auth_binding(conn: &Connection, source: Lsn, digest: &[u8], principal_hash: &[u8], token_name: &str) -> Result<(), StoreError> {
+fn validate_native_auth_binding(
+    conn: &Connection,
+    source: Lsn,
+    digest: &[u8],
+    principal_hash: &[u8],
+    token_name: &str,
+) -> Result<(), StoreError> {
     use pb::audit_event::Operation;
-    let Some((lsn, Operation::AuthConfig(profile))) = current_control_state(conn, kronik_proto::control::ControlKind::Auth)? else {
-        return Err(corrupt("session history requires its admitted authentication profile"));
+    let Some((lsn, Operation::AuthConfig(profile))) =
+        current_control_state(conn, kronik_proto::control::ControlKind::Auth)?
+    else {
+        return Err(corrupt(
+            "session history requires its admitted authentication profile",
+        ));
     };
-    if source != lsn || !profile.enabled || digest != profile.digest
-        || !profile.bindings.iter().any(|binding| binding.principal_hash == principal_hash && binding.token_name == token_name) {
-        return Err(corrupt("session history differs from its admitted authentication binding"));
+    if source != lsn
+        || !profile.enabled
+        || digest != profile.digest
+        || !profile.bindings.iter().any(|binding| {
+            binding.principal_hash == principal_hash && binding.token_name == token_name
+        })
+    {
+        return Err(corrupt(
+            "session history differs from its admitted authentication binding",
+        ));
     }
     Ok(())
 }
 
-fn apply_control_operation(tx: &Connection, lsn: Lsn, event: &pb::AuditEvent) -> Result<(), StoreError> {
+fn apply_control_operation(
+    tx: &Connection,
+    lsn: Lsn,
+    event: &pb::AuditEvent,
+) -> Result<(), StoreError> {
     use pb::audit_event::Operation;
     kronik_proto::control::validate_event(event).map_err(|e| corrupt(e.to_string()))?;
-    let operation = event.operation.as_ref().ok_or_else(|| corrupt("missing typed control operation"))?;
+    let operation = event
+        .operation
+        .as_ref()
+        .ok_or_else(|| corrupt("missing typed control operation"))?;
     match operation {
         Operation::AuthOidcLogin(login) => return validate_native_oidc_login(tx, login),
-        Operation::AuthSessionRevoked(session) => return validate_native_session_revoked(tx, session),
+        Operation::AuthSessionRevoked(session) => {
+            return validate_native_session_revoked(tx, session);
+        }
         _ => {}
     }
-    let kind = operation.kind().ok_or_else(|| corrupt("session tombstones require their dedicated materializer"))?;
+    let kind = operation
+        .kind()
+        .ok_or_else(|| corrupt("session tombstones require their dedicated materializer"))?;
     let previous = current_control_state(tx, kind)?.map(|(_, operation)| operation);
-    operation.validate_transition(previous.as_ref()).map_err(|e| corrupt(e.to_string()))?;
+    operation
+        .validate_transition(previous.as_ref())
+        .map_err(|e| corrupt(e.to_string()))?;
     if let Operation::FleetState(state) = operation {
         let identity = current_control_state(tx, kronik_proto::control::ControlKind::Installation)?
             .ok_or_else(|| corrupt("fleet state requires durable installation identity"))?;
-        if !matches!(identity.1, Operation::InstallationIdentity(identity) if identity.installation == state.installation) {
+        if !matches!(identity.1, Operation::InstallationIdentity(identity) if identity.installation == state.installation)
+        {
             return Err(corrupt("fleet installation identity cannot change"));
         }
     }
@@ -2647,12 +2784,22 @@ fn apply_control_operation(tx: &Connection, lsn: Lsn, event: &pb::AuditEvent) ->
         Operation::FleetState(state) => state.encode_to_vec(),
         Operation::InstallationIdentity(identity) => identity.encode_to_vec(),
         Operation::AuthConfig(config) => config.encode_to_vec(),
-        Operation::AuthSessionRevoked(_) | Operation::AuthOidcLogin(_) => return Err(corrupt("session operations have no current control state")),
+        Operation::AuthSessionRevoked(_) | Operation::AuthOidcLogin(_) => {
+            return Err(corrupt("session operations have no current control state"));
+        }
     };
-    tx.execute("INSERT INTO meta(k,v) VALUES (?1,?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v", params![operation.action(), bytes])?;
-    let position = i64::try_from(lsn).ok().filter(|position| *position > 0)
+    tx.execute(
+        "INSERT INTO meta(k,v) VALUES (?1,?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        params![operation.action(), bytes],
+    )?;
+    let position = i64::try_from(lsn)
+        .ok()
+        .filter(|position| *position > 0)
         .ok_or_else(|| corrupt("control record position is outside the SQLite domain"))?;
-    tx.execute("INSERT INTO meta(k,v) VALUES (?1,?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v", params![control_position_key(kind), position])?;
+    tx.execute(
+        "INSERT INTO meta(k,v) VALUES (?1,?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        params![control_position_key(kind), position],
+    )?;
     Ok(())
 }
 
@@ -3122,24 +3269,31 @@ mod tests {
         let source_path = original.path().join("state.db");
         let source_wal = original.path().join("state.db-wal");
         let source = StateDb::open(Connection::open(&source_path).unwrap()).unwrap();
-        source.conn.execute_batch("PRAGMA wal_autocheckpoint = 0").unwrap();
-        source.conn.execute(
-            "UPDATE meta SET v = 7 WHERE k = 'applied_lsn'", [],
-        ).unwrap();
+        source
+            .conn
+            .execute_batch("PRAGMA wal_autocheckpoint = 0")
+            .unwrap();
+        source
+            .conn
+            .execute("UPDATE meta SET v = 7 WHERE k = 'applied_lsn'", [])
+            .unwrap();
         let original_db = std::fs::read(&source_path).unwrap();
         let original_wal = std::fs::read(&source_wal).unwrap();
         let staged = tempfile::tempdir().unwrap();
         let staged_path = staged.path().join("state.db");
         std::fs::copy(&source_path, &staged_path).unwrap();
         std::fs::copy(&source_wal, staged.path().join("state.db-wal")).unwrap();
-        let connection = Connection::open_with_flags(
-            &staged_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ).unwrap();
+        let connection =
+            Connection::open_with_flags(&staged_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
         let reader = StateDb::read_only(connection).unwrap();
         assert_eq!(reader.applied_lsn().unwrap(), 7);
-        assert!(reader.conn.execute(
-            "UPDATE meta SET v = 8 WHERE k = 'applied_lsn'", [],
-        ).is_err());
+        assert!(
+            reader
+                .conn
+                .execute("UPDATE meta SET v = 8 WHERE k = 'applied_lsn'", [],)
+                .is_err()
+        );
         assert_eq!(reader.applied_lsn().unwrap(), 7);
         drop(reader);
         assert_eq!(std::fs::read(&source_path).unwrap(), original_db);
@@ -3149,64 +3303,123 @@ mod tests {
 
     #[test]
     fn login_receipt_preserves_profile_and_rejects_stale_or_foreign_bindings_atomically() {
-        use kronik_proto::control::{ControlKind, AUTH_CONFIG_VERSION, AUTH_FLOW_TTL_MS, AUTH_SESSION_TTL_MS};
+        use kronik_proto::control::{
+            AUTH_CONFIG_VERSION, AUTH_FLOW_TTL_MS, AUTH_SESSION_TTL_MS, ControlKind,
+        };
         use pb::audit_event::Operation;
         let mut profile = pb::AuthConfig {
-            version: AUTH_CONFIG_VERSION, enabled: true, issuer: "https://issuer.example".into(),
-            client_id: "public-client".into(), redirect_uri: "https://app.example/v1/auth/callback".into(),
-            system_roots: true, flow_ttl_ms: AUTH_FLOW_TTL_MS, session_ttl_ms: AUTH_SESSION_TTL_MS,
-            bindings: vec![pb::AuthBinding { principal_hash: vec![0x22; 32], token_name: "reader".into() }],
+            version: AUTH_CONFIG_VERSION,
+            enabled: true,
+            issuer: "https://issuer.example".into(),
+            client_id: "public-client".into(),
+            redirect_uri: "https://app.example/v1/auth/callback".into(),
+            system_roots: true,
+            flow_ttl_ms: AUTH_FLOW_TTL_MS,
+            session_ttl_ms: AUTH_SESSION_TTL_MS,
+            bindings: vec![pb::AuthBinding {
+                principal_hash: vec![0x22; 32],
+                token_name: "reader".into(),
+            }],
             ..Default::default()
         };
         profile.digest = kronik_proto::control::auth_config_digest(&profile).to_vec();
-        let event = |operation: Operation, token_id: String| Record::AuditEvent(pb::AuditEvent {
-            action: operation.action().into(), target: operation.target().into(),
-            audit: Some(pb::Audit { token_id, ..Default::default() }),
-            operation: Some(operation), ..Default::default()
-        });
+        let event = |operation: Operation, token_id: String| {
+            Record::AuditEvent(pb::AuditEvent {
+                action: operation.action().into(),
+                target: operation.target().into(),
+                audit: Some(pb::Audit {
+                    token_id,
+                    ..Default::default()
+                }),
+                operation: Some(operation),
+                ..Default::default()
+            })
+        };
         let login = pb::AuthOidcLogin {
-            principal_hash: vec![0x22; 32], config_digest: profile.digest.clone(),
+            principal_hash: vec![0x22; 32],
+            config_digest: profile.digest.clone(),
             config_source: Some(pb::auth_oidc_login::ConfigSource::NativeLsn(1)),
             token_name: "reader".into(),
         };
         let principal = format!("oidc:{}", "22".repeat(32));
         let mut db = StateDb::open(Connection::open_in_memory().unwrap()).unwrap();
         assert!(db.validate_auth_oidc_login(&login).is_err());
-        db.apply(&[committed(1, event(Operation::AuthConfig(profile.clone()), "admin".into()))]).unwrap();
-        assert!(db.control_operation(&Operation::AuthOidcLogin(login.clone())).is_err());
-        db.apply(&[committed(2, event(Operation::AuthOidcLogin(login.clone()), principal.clone()))]).unwrap();
-        assert_eq!(db.control_state(ControlKind::Auth).unwrap(), Some((1, Operation::AuthConfig(profile.clone()))));
+        db.apply(&[committed(
+            1,
+            event(Operation::AuthConfig(profile.clone()), "admin".into()),
+        )])
+        .unwrap();
+        assert!(
+            db.control_operation(&Operation::AuthOidcLogin(login.clone()))
+                .is_err()
+        );
+        db.apply(&[committed(
+            2,
+            event(Operation::AuthOidcLogin(login.clone()), principal.clone()),
+        )])
+        .unwrap();
+        assert_eq!(
+            db.control_state(ControlKind::Auth).unwrap(),
+            Some((1, Operation::AuthConfig(profile.clone())))
+        );
         for changed in 0..6 {
             let mut invalid = login.clone();
             let mut origin = principal.clone();
             match changed {
                 0 => invalid.token_name = "other".into(),
                 1 => invalid.config_digest[0] ^= 1,
-                2 => invalid.config_source = Some(pb::auth_oidc_login::ConfigSource::MetadataIndex(1)),
+                2 => {
+                    invalid.config_source =
+                        Some(pb::auth_oidc_login::ConfigSource::MetadataIndex(1))
+                }
                 3 => invalid.config_source = Some(pb::auth_oidc_login::ConfigSource::NativeLsn(2)),
                 4 => invalid.principal_hash[0] ^= 1,
                 _ => origin = "admin".into(),
             }
-            assert!(db.apply(&[committed(3, event(Operation::AuthOidcLogin(invalid), origin))]).is_err());
+            assert!(
+                db.apply(&[committed(
+                    3,
+                    event(Operation::AuthOidcLogin(invalid), origin)
+                )])
+                .is_err()
+            );
             assert_eq!(db.applied_lsn().unwrap(), 2);
-            assert_eq!(db.control_state(ControlKind::Auth).unwrap(), Some((1, Operation::AuthConfig(profile.clone()))));
+            assert_eq!(
+                db.control_state(ControlKind::Auth).unwrap(),
+                Some((1, Operation::AuthConfig(profile.clone())))
+            );
         }
         let mut replacement = profile.clone();
         replacement.previous_digest = profile.digest.clone();
         replacement.bindings[0].token_name = "replacement".into();
         replacement.digest = kronik_proto::control::auth_config_digest(&replacement).to_vec();
-        db.apply(&[committed(3, event(Operation::AuthConfig(replacement.clone()), "admin".into()))]).unwrap();
-        assert!(db.apply(&[committed(4, event(Operation::AuthOidcLogin(login), principal))]).is_err());
+        db.apply(&[committed(
+            3,
+            event(Operation::AuthConfig(replacement.clone()), "admin".into()),
+        )])
+        .unwrap();
+        assert!(
+            db.apply(&[committed(
+                4,
+                event(Operation::AuthOidcLogin(login), principal)
+            )])
+            .is_err()
+        );
         assert_eq!(db.applied_lsn().unwrap(), 3);
-        assert_eq!(db.control_state(ControlKind::Auth).unwrap(), Some((3, Operation::AuthConfig(replacement))));
+        assert_eq!(
+            db.control_state(ControlKind::Auth).unwrap(),
+            Some((3, Operation::AuthConfig(replacement)))
+        );
         let dir = tempfile::tempdir().unwrap();
         let snapshot = dir.path().join("state.db");
         db.backup_to(&snapshot).unwrap();
         let restored = StateDb::open(Connection::open(snapshot).unwrap()).unwrap();
         assert_eq!(restored.applied_lsn().unwrap(), 3);
-        assert_eq!(restored.control_state(ControlKind::Auth).unwrap(), db.control_state(ControlKind::Auth).unwrap());
+        assert_eq!(
+            restored.control_state(ControlKind::Auth).unwrap(),
+            db.control_state(ControlKind::Auth).unwrap()
+        );
     }
-
 
     fn actor() -> Option<pb::ActorRef> {
         Some(pb::ActorRef {

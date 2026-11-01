@@ -90,8 +90,11 @@ fn write(data: &Path, gib: f64, actors: usize) -> (u64, u64) {
             reason: "startup speed".into(),
             wall_time_ms: 0,
         };
-        node.deploy(COUNTER, audit, false).await.unwrap();
-        let manifest = node.snapshot("manual").await.unwrap();
+        let original = node.local_operator_authority().unwrap();
+        node.deploy(COUNTER, audit, false, original.clone())
+            .await
+            .unwrap();
+        let manifest = node.snapshot("manual", original).await.unwrap();
         node.store().db().backup_to(&saved_state(data)).unwrap();
         let at_snapshot = log_bytes(data);
         let target = at_snapshot + (gib * GIB) as u64;

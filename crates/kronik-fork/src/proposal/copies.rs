@@ -261,6 +261,7 @@ mod tests {
         let req = pb::HttpEffectRequest {
             method: "POST".into(),
             url: "foreign://pg/sql".into(),
+            fingerprint_version: 0,
             headers: vec![
                 pb::HttpEffectHeader {
                     name: "content-type".into(),

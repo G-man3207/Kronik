@@ -93,11 +93,26 @@ const COMMANDS: &[(&str, Output)] = &[
         "secret delete",
         Output::Api(&[("", "DELETE", "/v1/secrets/{name}")]),
     ),
-    ("secret link", Output::Api(&[("", "PUT", "/v1/secrets/{name}/link")])),
-    ("secret unlink", Output::Api(&[("", "DELETE", "/v1/secrets/{name}/link")])),
-    ("secret refresh", Output::Api(&[("", "POST", "/v1/secrets/{name}/refresh")])),
-    ("secret history", Output::Api(&[("", "GET", "/v1/secrets/{name}/history")])),
-    ("secret backends", Output::Api(&[("", "GET", "/v1/secrets/backends")])),
+    (
+        "secret link",
+        Output::Api(&[("", "PUT", "/v1/secrets/{name}/link")]),
+    ),
+    (
+        "secret unlink",
+        Output::Api(&[("", "DELETE", "/v1/secrets/{name}/link")]),
+    ),
+    (
+        "secret refresh",
+        Output::Api(&[("", "POST", "/v1/secrets/{name}/refresh")]),
+    ),
+    (
+        "secret history",
+        Output::Api(&[("", "GET", "/v1/secrets/{name}/history")]),
+    ),
+    (
+        "secret backends",
+        Output::Api(&[("", "GET", "/v1/secrets/backends")]),
+    ),
     ("keys status", Output::Api(&[("", "GET", "/v1/keys")])),
     (
         "keys rewrap",
@@ -250,14 +265,29 @@ const COMMANDS: &[(&str, Output)] = &[
     ),
     ("audit show", Output::Api(&[("", "GET", "/v1/audit")])),
     ("audit verify", Output::Local(super::audit::verify_schema)),
-    ("fleet enroll", Output::Api(&[("", "POST", "/v1/fleet/enroll")])),
+    (
+        "fleet enroll",
+        Output::Api(&[("", "POST", "/v1/fleet/enroll")]),
+    ),
     ("fleet status", Output::Api(&[("", "GET", "/v1/fleet")])),
-    ("fleet revoke", Output::Api(&[("", "POST", "/v1/fleet/revoke")])),
+    (
+        "fleet revoke",
+        Output::Api(&[("", "POST", "/v1/fleet/revoke")]),
+    ),
     ("events list", Output::Api(&[("", "GET", "/v1/events")])),
     ("events tail", Output::Local(super::events::tail_schema)),
-    ("events schemas", Output::Api(&[("", "GET", "/v1/events/schemas")])),
-    ("events webhooks status", Output::Api(&[("", "GET", "/v1/events/webhooks")])),
-    ("events webhooks replay", Output::Api(&[("", "POST", "/v1/events/webhooks/{name}/replay")])),
+    (
+        "events schemas",
+        Output::Api(&[("", "GET", "/v1/events/schemas")]),
+    ),
+    (
+        "events webhooks status",
+        Output::Api(&[("", "GET", "/v1/events/webhooks")]),
+    ),
+    (
+        "events webhooks replay",
+        Output::Api(&[("", "POST", "/v1/events/webhooks/{name}/replay")]),
+    ),
     ("mcp", Output::None("MCP's JSON-RPC on stdout instead")),
     ("explain", Output::Local(explain_schema)),
 ];
@@ -309,7 +339,9 @@ fn api_schema(g: &mut SchemaGenerator, method: &str, path: &str) -> Option<Schem
     Some(match &op.answer {
         Answer::Json(body) => body(g),
         Answer::Diff => openapi::diff(g),
-        Answer::EventsSse | Answer::EventsWebSocket => g.subschema_for::<kronik_fleet::events::Event>(),
+        Answer::EventsSse | Answer::EventsWebSocket => {
+            g.subschema_for::<kronik_fleet::events::Event>()
+        }
         Answer::Redirect | Answer::Asset(_) => return None,
     })
 }

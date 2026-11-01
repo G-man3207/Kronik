@@ -22,6 +22,10 @@ pub enum BackendError {
     VersionGone,
     #[error("the secret backend denied access")]
     Denied,
+    /// The caller's original request authority ended. This is never a provider
+    /// answer: a provider 401/403 response stays `Denied`.
+    #[error("the original request authority ended")]
+    Unauthorized,
     #[error("the secret backend returned an invalid identity or value")]
     Invalid,
 }
@@ -53,7 +57,11 @@ pub struct VersionPage {
 /// Every operation carries its original caller/boot lease through credential
 /// renewal and final HTTP enqueue; backends never capture a replacement scope.
 pub trait SecretBackend: Send + Sync + 'static {
-    fn current<'a>(&'a self, path: &'a str, original: AuthLease) -> BoxFuture<'a, Result<Fetched, BackendError>>;
+    fn current<'a>(
+        &'a self,
+        path: &'a str,
+        original: AuthLease,
+    ) -> BoxFuture<'a, Result<Fetched, BackendError>>;
     fn version<'a>(
         &'a self,
         path: &'a str,
@@ -103,8 +111,15 @@ impl EnvBackend {
     }
 }
 impl SecretBackend for EnvBackend {
-    fn current<'a>(&'a self, path: &'a str, original: AuthLease) -> BoxFuture<'a, Result<Fetched, BackendError>> {
-        Box::pin(async move { original.check().map_err(|_| BackendError::Denied)?; self.fetched(path) })
+    fn current<'a>(
+        &'a self,
+        path: &'a str,
+        original: AuthLease,
+    ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
+        Box::pin(async move {
+            original.check().map_err(|_| BackendError::Unauthorized)?;
+            self.fetched(path)
+        })
     }
 
     fn version<'a>(
@@ -114,7 +129,7 @@ impl SecretBackend for EnvBackend {
         original: AuthLease,
     ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
         Box::pin(async move {
-            original.check().map_err(|_| BackendError::Denied)?;
+            original.check().map_err(|_| BackendError::Unauthorized)?;
             let value = self.values.get(path).ok_or(BackendError::VersionGone)?;
             if self.identity(path, value) != id {
                 return Err(BackendError::VersionGone);
@@ -134,7 +149,7 @@ impl SecretBackend for EnvBackend {
         original: AuthLease,
     ) -> BoxFuture<'a, Result<VersionPage, BackendError>> {
         Box::pin(async move {
-            original.check().map_err(|_| BackendError::Denied)?;
+            original.check().map_err(|_| BackendError::Unauthorized)?;
             if cursor.is_some() {
                 return Err(BackendError::Invalid);
             }
@@ -165,15 +180,23 @@ mod tests {
         };
         let old = snapshot(b"old-environment-secret");
         let original = test_authority();
-        let old_id = old.current("SERVICE_TOKEN", original.clone()).await.unwrap().source_version;
+        let old_id = old
+            .current("SERVICE_TOKEN", original.clone())
+            .await
+            .unwrap()
+            .source_version;
         let changed = snapshot(b"new-environment-secret");
         assert!(matches!(
-            changed.version("SERVICE_TOKEN", &old_id, original.clone()).await,
+            changed
+                .version("SERVICE_TOKEN", &old_id, original.clone())
+                .await,
             Err(BackendError::VersionGone)
         ));
         let missing = EnvBackend::new(BTreeMap::new(), &master).unwrap();
         assert!(matches!(
-            missing.version("SERVICE_TOKEN", &old_id, original.clone()).await,
+            missing
+                .version("SERVICE_TOKEN", &old_id, original.clone())
+                .await,
             Err(BackendError::VersionGone)
         ));
         let other = EnvBackend::new(

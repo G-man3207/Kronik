@@ -432,14 +432,15 @@ fn reserved_admin_cookie(cookie: &str) -> bool {
 
 fn strip_admin_cookies(headers: &mut Vec<(String, String)>) {
     headers.retain_mut(|(name, value)| {
-        if !name.eq_ignore_ascii_case("cookie")
-            || !value.split(';').any(reserved_admin_cookie)
-        {
+        if !name.eq_ignore_ascii_case("cookie") || !value.split(';').any(reserved_admin_cookie) {
             return true;
         }
         // Cookies cross ports on the same hostname; never admit admin credentials to a guest.
         let mut kept = String::new();
-        for cookie in value.split(';').filter(|cookie| !reserved_admin_cookie(cookie)) {
+        for cookie in value
+            .split(';')
+            .filter(|cookie| !reserved_admin_cookie(cookie))
+        {
             if cookie.trim().is_empty() {
                 continue;
             }

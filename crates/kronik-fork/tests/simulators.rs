@@ -9,6 +9,7 @@ mod common;
 use std::sync::Arc;
 
 use common::*;
+use kronik_core::error::ErrorCode;
 use kronik_fork::diff::DiffOptions;
 use kronik_fork::proposal::Proposals;
 use kronik_fork::simulators::{ModelAccess, ModelCache, ModelSecretSnapshot, SimulatorOverride};
@@ -32,7 +33,7 @@ fn three_charges(p: &Proc, addr: &str) -> u64 {
 }
 
 fn set(p: &Proc, m: pb::SimulatorConfig) {
-    p.rt.block_on(p.node.set_simulators(m, audit(), false))
+    p.rt.block_on(p.node.set_simulators(m, audit(), false, p.owner()))
         .unwrap();
 }
 
@@ -74,22 +75,29 @@ fn overrides(
 
 /// A fork of the fetch-extra build (it also GETs `<url>/extra`, never
 /// recorded) at `fork_lsn`.
-fn fork(p: &Proc, props: &Proposals, name: &str, fork_lsn: u64) {
-    p.rt.block_on(props.create_fork(Some(name.into()), fork_lsn, false, audit(), false))
-        .unwrap();
+fn fork(p: &Proc, props: &Arc<Proposals>, name: &str, fork_lsn: u64) {
+    p.rt.block_on(props.create_fork(
+        Some(name.into()),
+        fork_lsn,
+        false,
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
     let bytes = std::fs::read(guest("counter-fetch-extra")).unwrap();
-    p.rt.block_on(props.fork_deploy(name, &bytes, false))
+    p.rt.block_on(props.fork_deploy(name, &bytes, false, p.owner()))
         .unwrap();
 }
 
 /// Replays the fork over everything so far; the diff's bytes.
-fn replay(p: &Proc, props: &Proposals, name: &str) -> Vec<u8> {
+fn replay(p: &Proc, props: &Arc<Proposals>, name: &str) -> Vec<u8> {
     replay_with(p, props, name, DiffOptions::default())
 }
 
-fn replay_with(p: &Proc, props: &Proposals, name: &str, options: DiffOptions) -> Vec<u8> {
+fn replay_with(p: &Proc, props: &Arc<Proposals>, name: &str, options: DiffOptions) -> Vec<u8> {
     p.settle();
-    p.rt.block_on(props.fork_replay(name, None, options, Some(2)))
+    p.rt.block_on(props.fork_replay(name, None, options, Some(2), p.owner()))
         .unwrap();
     p.rt.block_on(props.diff(name, false, false)).unwrap()
 }
@@ -147,7 +155,7 @@ fn simulators_label_every_synthetic_answer() {
     let dir = tempdir();
     let p = Proc::start(dir.path());
     let fork_lsn = three_charges(&p, &addr);
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     fork(&p, &props, "try", fork_lsn);
 
     // Nothing configured: the extra GETs fail closed, labeled so.
@@ -286,7 +294,7 @@ fn simulator_configuration_is_taken_at_the_fork_point() {
     let dir = tempdir();
     let p = Proc::start(dir.path());
     let fork_lsn = three_charges(&p, &addr);
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     fork(&p, &props, "try", fork_lsn);
     let first = replay(&p, &props, "try");
 
@@ -295,7 +303,7 @@ fn simulator_configuration_is_taken_at_the_fork_point() {
     set(&p, target(vec![], CONTRACT.as_bytes(), false, false));
     p.settle();
     let to = p.node.applied_lsn();
-    p.rt.block_on(props.fork_replay("try", Some(to), DiffOptions::default(), Some(2)))
+    p.rt.block_on(props.fork_replay("try", Some(to), DiffOptions::default(), Some(2), p.owner()))
         .unwrap();
     let d: Value =
         serde_json::from_slice(&p.rt.block_on(props.diff("try", false, false)).unwrap()).unwrap();
@@ -321,7 +329,7 @@ fn simulator_configuration_is_taken_at_the_fork_point() {
         "{d}"
     );
     drop(props);
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     assert_eq!(replay(&p, &props, "try"), longer);
     assert_ne!(longer, first);
 
@@ -352,9 +360,11 @@ fn model_answers_are_cached_per_proposal() {
     set(&p, target(vec![], b"", false, true));
     let fork_lsn = three_charges(&p, &addr);
     let open = || {
-        Proposals::open(p.node.clone(), dir.path().to_path_buf())
-            .unwrap()
-            .with_model(Some(model(&model_addr)))
+        Arc::new(
+            Proposals::open(p.node.clone(), dir.path().to_path_buf())
+                .unwrap()
+                .with_model(Some(model(&model_addr))),
+        )
     };
     let props = open();
     fork(&p, &props, "try", fork_lsn);
@@ -400,14 +410,16 @@ fn model_answers_are_cached_per_proposal() {
     std::fs::write(dir.path().join("branches/try/simulator-cache.json"), b"{").unwrap();
     p.settle();
     let e =
-        p.rt.block_on(props.fork_replay("try", None, DiffOptions::default(), Some(2)))
+        p.rt.block_on(props.fork_replay("try", None, DiffOptions::default(), Some(2), p.owner()))
             .unwrap_err();
     assert!(e.message.contains("simulator-cache.json"), "{e:?}");
     assert_eq!(seen.lock().unwrap().len(), calls);
 }
 
 /// Review L1 (I12): a dry-run proposal never calls the model and writes
-/// nothing under `branches/`.
+/// nothing under `branches/`. ADR 0015: a dry run is `RecordedOnly`, so a
+/// model cache miss is a typed host prerequisite before any credentials or
+/// network I/O, not a fail-closed synthetic answer.
 #[test]
 fn a_dry_run_proposal_calls_no_model_and_writes_nothing() {
     let (addr, _hits) = server();
@@ -417,30 +429,33 @@ fn a_dry_run_proposal_calls_no_model_and_writes_nothing() {
     set(&p, target(vec![], b"", false, true));
     let fork_lsn = three_charges(&p, &addr);
     p.settle();
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
-        .unwrap()
-        .with_model(Some(model(&model_addr)));
-    let props = Arc::new(props);
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_model(Some(model(&model_addr))),
+    );
     let branches = |p: &std::path::Path| {
         std::fs::read_dir(p.join("branches"))
             .map(|d| d.count())
             .unwrap_or(0)
     };
     let before = branches(dir.path());
-    let (meta, dry) =
-        p.rt.block_on(props.propose(kronik_fork::proposal::ProposeRequest {
-            wasm: vec![std::fs::read(guest("counter-fetch-extra")).unwrap()],
-            names: vec![],
-            window_ms: None,
-            at: Some(fork_lsn),
-            options: DiffOptions::default(),
-            workers: Some(2),
-            audit: audit(),
-            dry_run: true,
-        }))
-        .unwrap();
-    assert!(dry);
-    assert_eq!(meta.summary["synthetic_by"], json!({"fail-closed": 3}));
+    let err =
+        p.rt.block_on(props.propose(
+            kronik_fork::proposal::ProposeRequest {
+                wasm: vec![std::fs::read(guest("counter-fetch-extra")).unwrap()],
+                names: vec![],
+                window_ms: None,
+                at: Some(fork_lsn),
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: true,
+            },
+            p.owner(),
+        ))
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
     assert_eq!(seen.lock().unwrap().len(), 0, "no model call");
     assert_eq!(branches(dir.path()), before, "nothing under branches/");
 }
@@ -475,21 +490,25 @@ fn a_dry_run_promote_calls_no_model_and_writes_nothing() {
     set(&p, target(vec![], b"", false, true));
     let fork_lsn = three_charges(&p, &addr);
     p.settle();
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
-        .unwrap()
-        .with_model(Some(model(&model_addr)));
-    let props = Arc::new(props);
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_model(Some(model(&model_addr))),
+    );
     let (meta, _) =
-        p.rt.block_on(props.propose(kronik_fork::proposal::ProposeRequest {
-            wasm: vec![std::fs::read(guest("counter-fetch-extra")).unwrap()],
-            names: vec![],
-            window_ms: None,
-            at: Some(fork_lsn),
-            options: DiffOptions::default(),
-            workers: Some(2),
-            audit: audit(),
-            dry_run: false,
-        }))
+        p.rt.block_on(props.propose(
+            kronik_fork::proposal::ProposeRequest {
+                wasm: vec![std::fs::read(guest("counter-fetch-extra")).unwrap()],
+                names: vec![],
+                window_ms: None,
+                at: Some(fork_lsn),
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
         .unwrap();
     let calls = seen.lock().unwrap().len();
     assert_eq!(calls, 3);
@@ -510,7 +529,8 @@ fn a_dry_run_promote_calls_no_model_and_writes_nothing() {
             .collect()
     };
     let before = forks(dir.path());
-    let _ = p.rt.block_on(props.promote(&meta.id, audit(), true));
+    let _ =
+        p.rt.block_on(props.promote(&meta.id, audit(), true, p.owner()));
     assert_eq!(seen.lock().unwrap().len(), calls, "no model call");
     let after = forks(dir.path());
     let changed: Vec<_> = after
@@ -541,7 +561,7 @@ fn model_never_sees_personal_data() {
     p.grant("http:127.0.0.1");
     p.rt.block_on(
         p.node
-            .set_privacy_mode(pb::PrivacyState::On, audit(), false),
+            .set_privacy_mode(pb::PrivacyState::On, audit(), false, p.owner()),
     )
     .unwrap();
     set(&p, target(vec![], b"", false, true));
@@ -566,9 +586,11 @@ fn model_never_sees_personal_data() {
         let (model_addr, seen) = model_server();
         let mut config = model(&model_addr);
         config.examples_under_privacy = opt_in;
-        let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
-            .unwrap()
-            .with_model(Some(config));
+        let props = Arc::new(
+            Proposals::open(p.node.clone(), dir.path().to_path_buf())
+                .unwrap()
+                .with_model(Some(config)),
+        );
         fork(&p, &props, name, fork_lsn);
         let d: Value = serde_json::from_slice(&replay(&p, &props, name)).unwrap();
 
@@ -599,12 +621,25 @@ fn the_model_never_sees_or_caches_secret_values() {
     let dir = tempdir();
     let p = Proc::start(dir.path());
     let original = p.node.local_operator_authority().unwrap();
-    p.rt.block_on(p.node.secret_set("api-key", b"sk-live-0123456789".to_vec(), &audit(),
-        false, original.clone())).unwrap();
+    p.rt.block_on(p.node.secret_set(
+        "api-key",
+        b"sk-live-0123456789".to_vec(),
+        &audit(),
+        false,
+        original.clone(),
+    ))
+    .unwrap();
     // Use actual committed source rows and the certified inventory producer.
-    p.rt.block_on(p.node.secret_set("echo", b"answer 1".to_vec(), &audit(),
-        false, original.clone())).unwrap();
-    p.rt.block_on(p.node.refresh_secret_inventory(original.clone())).unwrap();
+    p.rt.block_on(p.node.secret_set(
+        "echo",
+        b"answer 1".to_vec(),
+        &audit(),
+        false,
+        original.clone(),
+    ))
+    .unwrap();
+    p.rt.block_on(p.node.refresh_secret_inventory(original.clone()))
+        .unwrap();
     let original_node = Arc::downgrade(&p.node);
     let access = ModelAccess {
         config: model(&model_addr),
@@ -612,10 +647,17 @@ fn the_model_never_sees_or_caches_secret_values() {
         cache: Arc::new(ModelCache::memory()),
         privacy: false,
         secret_snapshot: Arc::new(move || {
-            let node = original_node.upgrade().ok_or_else(|| kronik_core::error::ApiError::new(
-                kronik_core::error::ErrorCode::SecretUnavailable, "the original model node ended"))?;
-            node.native_secret_snapshot_with_publication().map(|(snapshot, publication)|
-                ModelSecretSnapshot::Live { snapshot, publication })
+            let node = original_node.upgrade().ok_or_else(|| {
+                kronik_core::error::ApiError::new(
+                    kronik_core::error::ErrorCode::SecretUnavailable,
+                    "the original model node ended",
+                )
+            })?;
+            node.native_secret_snapshot_with_publication()
+                .map(|(snapshot, publication)| ModelSecretSnapshot::Live {
+                    snapshot,
+                    publication,
+                })
         }),
         offline: false,
     };
@@ -631,25 +673,55 @@ fn the_model_never_sees_or_caches_secret_values() {
     let unprepared = req("key=sk-live-0123456789");
     let target = kronik_effects::http::parse_url(&unprepared.url).unwrap();
     let fingerprint = kronik_effects::http::fingerprint(&unprepared).unwrap();
-    let answer = p.rt.block_on(access.answer("http:127.0.0.1", &fingerprint, &unprepared,
-        &target, None, |_, _| Vec::new(), &original)).unwrap();
+    let answer =
+        p.rt.block_on(access.answer(
+            "http:127.0.0.1",
+            &fingerprint,
+            &unprepared,
+            &target,
+            None,
+            |_, _| Vec::new(),
+            &original,
+        ))
+        .unwrap();
     assert_eq!(answer, None);
     assert_eq!(seen.lock().unwrap().len(), 0, "nothing was sent");
     let source = (access.secret_snapshot)().unwrap();
     let snapshot = match &source {
-        ModelSecretSnapshot::Recorded(snapshot) | ModelSecretSnapshot::Live { snapshot, .. } => snapshot,
+        ModelSecretSnapshot::Recorded(snapshot) | ModelSecretSnapshot::Live { snapshot, .. } => {
+            snapshot
+        }
     };
     let patterns = kronik_sched::effects::secret_patterns(&snapshot.values);
-    let matcher = kronik_effects::http::CompiledScrubber::new(&patterns,
-        kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES).unwrap();
+    let matcher = kronik_effects::http::CompiledScrubber::new(
+        &patterns,
+        kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES,
+    )
+    .unwrap();
     let raw = req("amount=1");
     let (target, raw_host) = kronik_effects::http::parse_request_url(&raw.url).unwrap();
     let mut prepared = raw.clone();
-    let target = kronik_sched::scrub::http_request(&mut prepared, &target, raw_host, &matcher,
-        kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES).unwrap();
+    let target = kronik_sched::scrub::http_request(
+        &mut prepared,
+        &target,
+        raw_host,
+        &matcher,
+        kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES,
+    )
+    .unwrap();
     let fingerprint = kronik_effects::http::fingerprint_v2(&prepared, &target).unwrap();
-    let answer = p.rt.block_on(access.answer("http:127.0.0.1", &fingerprint, &prepared, &target,
-        snapshot.references.as_deref(), |_, _| Vec::new(), &original)).unwrap().unwrap();
+    let answer =
+        p.rt.block_on(access.answer(
+            "http:127.0.0.1",
+            &fingerprint,
+            &prepared,
+            &target,
+            snapshot.references.as_deref(),
+            |_, _| Vec::new(),
+            &original,
+        ))
+        .unwrap()
+        .unwrap();
     assert_eq!(answer.body, "model [secret:echo]");
 }
 
@@ -662,8 +734,8 @@ fn fork_call_replies_keep_their_subject() {
     let fork_lsn = p.settle();
     p.http("caller", "call", "counter/callee subject");
     p.settle();
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
-    p.rt.block_on(props.create_fork(Some("f".into()), fork_lsn, false, audit(), false))
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    p.rt.block_on(props.create_fork(Some("f".into()), fork_lsn, false, audit(), false, p.owner()))
         .unwrap();
     let options = DiffOptions {
         mode: kronik_fork::diff::Mode::Continuous,
@@ -709,7 +781,7 @@ fn policy_forbids_synthetic_answers_per_target() {
     let p = Proc::start(dir.path());
     set(&p, target(vec![], CONTRACT.as_bytes(), false, false));
     let fork_lsn = three_charges(&p, &addr);
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     fork(&p, &props, "try", fork_lsn);
     let d: Value = serde_json::from_slice(&replay(&p, &props, "try")).unwrap();
 
@@ -760,9 +832,11 @@ fn an_override_cannot_turn_the_model_on() {
     let p = Proc::start(dir.path());
     let fork_lsn = three_charges(&p, &addr);
     let (model_addr, seen) = model_server();
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
-        .unwrap()
-        .with_model(Some(model(&model_addr)));
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_model(Some(model(&model_addr))),
+    );
     fork(&p, &props, "try", fork_lsn);
     let d: Value = serde_json::from_slice(&replay_with(
         &p,
@@ -788,10 +862,18 @@ fn the_model_declines_after_personal_data_from_any_path() {
     p.deploy("notes");
     p.grant("http:127.0.0.1");
     p.grant("secret:api-key");
-    p.node
-        .secrets()
-        .unwrap()
-        .set_at("api-key", 1, b"sk-1", [7; 24], 0, "t", "r")
+    // The production secret path: the certified inventory a replay's gate
+    // uses must hold the committed value.
+    let original = p.node.local_operator_authority().unwrap();
+    p.rt.block_on(p.node.secret_set(
+        "api-key",
+        b"sk-1".to_vec(),
+        &audit(),
+        false,
+        original.clone(),
+    ))
+    .unwrap();
+    p.rt.block_on(p.node.refresh_secret_inventory(original))
         .unwrap();
     set(&p, target(vec![], b"", false, true));
     // Tagged state for the state-read cases, and a notes row for SQL.
@@ -814,9 +896,11 @@ fn the_model_declines_after_personal_data_from_any_path() {
     charge("cr", "\nT call counter/b read");
     p.settle();
     let (model_addr, seen) = model_server();
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
-        .unwrap()
-        .with_model(Some(model(&model_addr)));
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_model(Some(model(&model_addr))),
+    );
     fork(&p, &props, "try", fork_lsn);
     let d: Value = serde_json::from_slice(&replay(&p, &props, "try")).unwrap();
     let by_route: Vec<(String, String)> = d["effects"]["items"]
@@ -861,7 +945,7 @@ fn an_unmatched_fork_reveal_is_labeled() {
         &format!("POST http://{addr}/v1/charges/a\nT reveal k\n\namount=1"),
     );
     p.settle();
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     fork(&p, &props, "try", fork_lsn);
     let d: Value = serde_json::from_slice(&replay(&p, &props, "try")).unwrap();
     assert_eq!(
@@ -894,11 +978,11 @@ fn privacy_at_the_fork_point_keeps_examples_out() {
     set(&p, target(vec![], b"", false, true));
     p.rt.block_on(
         p.node
-            .set_privacy_mode(pb::PrivacyState::On, audit(), false),
+            .set_privacy_mode(pb::PrivacyState::On, audit(), false, p.owner()),
     )
     .unwrap();
     p.settle();
-    p.rt.block_on(p.node.snapshot("manual")).unwrap();
+    p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
     let fork_lsn = p.settle();
     for i in 0..2 {
         p.http(
@@ -910,16 +994,18 @@ fn privacy_at_the_fork_point_keeps_examples_out() {
     let to = p.settle();
     p.rt.block_on(
         p.node
-            .set_privacy_mode(pb::PrivacyState::Off, audit(), false),
+            .set_privacy_mode(pb::PrivacyState::Off, audit(), false, p.owner()),
     )
     .unwrap();
     p.settle();
     let (model_addr, seen) = model_server();
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
-        .unwrap()
-        .with_model(Some(model(&model_addr)));
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_model(Some(model(&model_addr))),
+    );
     fork(&p, &props, "try", fork_lsn);
-    p.rt.block_on(props.fork_replay("try", Some(to), DiffOptions::default(), Some(2)))
+    p.rt.block_on(props.fork_replay("try", Some(to), DiffOptions::default(), Some(2), p.owner()))
         .unwrap();
     let seen = seen.lock().unwrap();
     assert!(!seen.is_empty(), "the model was not asked");
@@ -953,9 +1039,11 @@ fn the_model_declines_for_timers_pending_at_the_fork_point() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let (model_addr, seen) = model_server();
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
-        .unwrap()
-        .with_model(Some(model(&model_addr)));
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_model(Some(model(&model_addr))),
+    );
     // The fetch-extra build also GETs <url>/extra: a simulator answers.
     fork(&p, &props, "try", fork_lsn);
     replay(&p, &props, "try");
@@ -996,23 +1084,37 @@ fn standard_fetch_is_matched_in_replay_and_meets_the_simulators() {
         );
         assert!(http_body(&r).starts_with("200 "), "{r:?}");
     }
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
 
     // The same code: every request matches its recording.
-    p.rt.block_on(props.create_fork(Some("same".into()), fork_lsn, false, audit(), false))
-        .unwrap();
+    p.rt.block_on(props.create_fork(
+        Some("same".into()),
+        fork_lsn,
+        false,
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
     let bytes = std::fs::read(guest("counter-wasi-http")).unwrap();
-    p.rt.block_on(props.fork_deploy("same", &bytes, false))
+    p.rt.block_on(props.fork_deploy("same", &bytes, false, p.owner()))
         .unwrap();
     let d: Value = serde_json::from_slice(&replay(&p, &props, "same")).unwrap();
     assert_eq!(d["summary"]["changed"], false, "{d}");
     assert_eq!(d["summary"]["exact"], 3, "{d}");
 
     // A build that also GETs <url>/extra: a target stub answers those.
-    p.rt.block_on(props.create_fork(Some("extra".into()), fork_lsn, false, audit(), false))
-        .unwrap();
+    p.rt.block_on(props.create_fork(
+        Some("extra".into()),
+        fork_lsn,
+        false,
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
     let bytes = std::fs::read(guest("counter-wasi-http-extra")).unwrap();
-    p.rt.block_on(props.fork_deploy("extra", &bytes, false))
+    p.rt.block_on(props.fork_deploy("extra", &bytes, false, p.owner()))
         .unwrap();
     let stub = StubRule {
         method: Some("GET".into()),

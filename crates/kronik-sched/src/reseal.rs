@@ -296,7 +296,12 @@ impl Node {
     /// `kronik privacy reseal` (docs/design/m8-privacy.md §8). Requires the
     /// mode to be `on`. Rewrites closed segments only; the active segment
     /// waits for the next roll. A dry run writes nothing.
-    pub async fn reseal(&self, audit: pb::Audit, dry_run: bool, authority: AuthLease) -> Result<ResealDone, ApiError> {
+    pub async fn reseal(
+        &self,
+        audit: pb::Audit,
+        dry_run: bool,
+        authority: AuthLease,
+    ) -> Result<ResealDone, ApiError> {
         authority.check()?;
         self.check_running()?;
         if self.privacy_mode().0 != pb::PrivacyState::On {
@@ -341,10 +346,13 @@ impl Node {
             audit: Some(audit),
             reseal_requested: true,
         });
-        let node = self.arc().ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self
+            .arc()
+            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
         self.authorized_effect(authority, move || async move {
             // The exact request and segment set were admitted together.
-            node.commit_config_locked(&held, epoch, request, OperationOrigin::Internal).await?;
+            node.commit_config_locked(&held, epoch, request, OperationOrigin::Internal)
+                .await?;
             if todo.is_empty() {
                 return Ok(ResealDone {
                     started: false,
@@ -354,7 +362,8 @@ impl Node {
                 });
             }
             node.reseal_closed(todo).await
-        }).await
+        })
+        .await
     }
 
     async fn reseal_closed(&self, todo: Vec<Lsn>) -> Result<ResealDone, ApiError> {

@@ -18,15 +18,23 @@ pub struct NativeWriterState {
 
 impl NativeWriterState {
     pub(super) fn new() -> Self {
-        Self { open: AtomicBool::new(true), changed: Notify::new(), binding: Mutex::new(None) }
+        Self {
+            open: AtomicBool::new(true),
+            changed: Notify::new(),
+            binding: Mutex::new(None),
+        }
     }
-    pub fn is_open(&self) -> bool { self.open.load(Ordering::Acquire) }
+    pub fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
     pub async fn closed(&self) {
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if !self.is_open() { return; }
+            if !self.is_open() {
+                return;
+            }
             changed.await;
         }
     }
@@ -37,20 +45,39 @@ impl Log {
     /// serializes with an UNBOUND writer close, so no close publisher can escape
     /// into an unfenced store after binding and activation.
     pub fn bind_native_execution(
-        &self, publication: Arc<Mutex<()>>, ownership: Option<Arc<std::fs::File>>,
+        &self,
+        publication: Arc<Mutex<()>>,
+        ownership: Option<Arc<std::fs::File>>,
     ) -> Result<Arc<NativeWriterState>, LogError> {
-        let mut binding = self.native_writer.binding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !self.native_writer.is_open() { return Err(LogError::Stopped("native writer already ended".into())); }
+        let mut binding = self
+            .native_writer
+            .binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.native_writer.is_open() {
+            return Err(LogError::Stopped("native writer already ended".into()));
+        }
         match binding.as_mut() {
-            Some(bound) if !Arc::ptr_eq(&bound.publication, &publication) =>
-                return Err(LogError::Stopped("native writer has a different physical publication domain".into())),
+            Some(bound) if !Arc::ptr_eq(&bound.publication, &publication) => {
+                return Err(LogError::Stopped(
+                    "native writer has a different physical publication domain".into(),
+                ));
+            }
             Some(bound) => match (&bound._ownership, ownership) {
-                (Some(original), Some(owner)) if !Arc::ptr_eq(original, &owner) =>
-                    return Err(LogError::Stopped("native writer has a different ownership file".into())),
+                (Some(original), Some(owner)) if !Arc::ptr_eq(original, &owner) => {
+                    return Err(LogError::Stopped(
+                        "native writer has a different ownership file".into(),
+                    ));
+                }
                 (None, owner) => bound._ownership = owner,
-                _ => {},
+                _ => {}
             },
-            None => *binding = Some(Binding { publication, _ownership: ownership }),
+            None => {
+                *binding = Some(Binding {
+                    publication,
+                    _ownership: ownership,
+                })
+            }
         }
         Ok(self.native_writer.clone())
     }
@@ -71,20 +98,37 @@ pub(super) struct NativeInbox<T> {
 
 impl<T> NativeInbox<T> {
     pub(super) fn new(receiver: mpsc::UnboundedReceiver<T>, life: Arc<NativeWriterState>) -> Self {
-        Self { receiver, life, closed: false }
+        Self {
+            receiver,
+            life,
+            closed: false,
+        }
     }
-    pub(super) async fn recv(&mut self) -> Option<T> { self.receiver.recv().await }
-    pub(super) fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> { self.receiver.try_recv() }
+    pub(super) async fn recv(&mut self) -> Option<T> {
+        self.receiver.recv().await
+    }
+    pub(super) fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
+        self.receiver.try_recv()
+    }
     pub(super) fn close(&mut self) {
-        if self.closed { return; }
-        let binding = self.life.binding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed {
+            return;
+        }
+        let binding = self
+            .life
+            .binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut publish = || {
             self.life.open.store(false, Ordering::Release);
             self.receiver.close();
             self.life.changed.notify_waiters();
         };
         if let Some(bound) = binding.as_ref() {
-            let _publication = bound.publication.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _publication = bound
+                .publication
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             publish();
         } else {
             // Keep the binding mutex through this store. A later binder observes
@@ -96,5 +140,7 @@ impl<T> NativeInbox<T> {
 }
 
 impl<T> Drop for NativeInbox<T> {
-    fn drop(&mut self) { self.close(); }
+    fn drop(&mut self) {
+        self.close();
+    }
 }

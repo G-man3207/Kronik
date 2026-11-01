@@ -55,13 +55,17 @@ pub(super) fn fleet(ctx: &Ctx, command: FleetCommand) -> Result<ExitCode, Error>
                 (None, None, false) => None,
                 (None, file, _) => {
                     let mut input: Box<dyn io::Read> = match file {
-                        Some(path) => Box::new(std::fs::File::open(path).map_err(|_| {
-                            bad("cannot open the enrollment credential file")
-                        })?),
+                        Some(path) => Box::new(
+                            std::fs::File::open(path)
+                                .map_err(|_| bad("cannot open the enrollment credential file"))?,
+                        ),
                         None => Box::new(io::stdin()),
                     };
                     let mut bytes = Vec::new();
-                    input.by_ref().take(4097).read_to_end(&mut bytes)
+                    input
+                        .by_ref()
+                        .take(4097)
+                        .read_to_end(&mut bytes)
                         .map_err(|_| bad("cannot read the enrollment credential"))?;
                     Some(credential(bytes)?)
                 }
@@ -87,7 +91,9 @@ fn credential(bytes: Vec<u8>) -> Result<String, ApiError> {
         .map_err(|_| bad("the enrollment credential must be printable ASCII"))?;
     let token = value.trim();
     if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
-        return Err(bad("the enrollment credential must be nonempty printable ASCII without spaces"));
+        return Err(bad(
+            "the enrollment credential must be nonempty printable ASCII without spaces",
+        ));
     }
     Ok(token.to_owned())
 }
@@ -112,12 +118,23 @@ mod tests {
     #[test]
     fn enrollment_token_is_not_the_api_bearer() {
         let cli = crate::Cli::try_parse_from([
-            "kronik", "--token", "api-secret", "fleet", "enroll", "https://controller:443",
-            "--token", "one-time", "--reason", "join",
-        ]).unwrap();
+            "kronik",
+            "--token",
+            "api-secret",
+            "fleet",
+            "enroll",
+            "https://controller:443",
+            "--token",
+            "one-time",
+            "--reason",
+            "join",
+        ])
+        .unwrap();
         assert_eq!(cli.client.token.as_deref(), Some("api-secret"));
         assert!(cli.client.url.is_none());
-        let crate::Command::Client(super::super::Command::Fleet(FleetCommand::Enroll(args))) = cli.command else {
+        let crate::Command::Client(super::super::Command::Fleet(FleetCommand::Enroll(args))) =
+            cli.command
+        else {
             panic!("expected enrollment");
         };
         assert_eq!(args.enrollment_token.as_deref(), Some("one-time"));
@@ -127,22 +144,57 @@ mod tests {
     #[test]
     fn fleet_bearer_alias_and_ordinary_global_token_work() {
         let cli = crate::Cli::try_parse_from([
-            "kronik", "fleet", "--api-token", "api-secret", "enroll", "https://controller:443",
-            "--token-stdin", "--reason", "join",
-        ]).unwrap();
+            "kronik",
+            "fleet",
+            "--api-token",
+            "api-secret",
+            "enroll",
+            "https://controller:443",
+            "--token-stdin",
+            "--reason",
+            "join",
+        ])
+        .unwrap();
         assert_eq!(cli.client.token.as_deref(), Some("api-secret"));
-        let cli = crate::Cli::try_parse_from(["kronik", "actors", "list", "--token", "ordinary"]).unwrap();
+        let cli = crate::Cli::try_parse_from(["kronik", "actors", "list", "--token", "ordinary"])
+            .unwrap();
         assert_eq!(cli.client.token.as_deref(), Some("ordinary"));
-        assert!(crate::Cli::try_parse_from([
-            "kronik", "fleet", "enroll", "https://controller:443", "--reason", "resume"
-        ]).is_ok());
-        assert!(crate::Cli::try_parse_from([
-            "kronik", "fleet", "enroll", "https://controller:443", "--token", "one-time", "--token-stdin"
-        ]).is_err());
+        assert!(
+            crate::Cli::try_parse_from([
+                "kronik",
+                "fleet",
+                "enroll",
+                "https://controller:443",
+                "--reason",
+                "resume"
+            ])
+            .is_ok()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "kronik",
+                "fleet",
+                "enroll",
+                "https://controller:443",
+                "--token",
+                "one-time",
+                "--token-stdin"
+            ])
+            .is_err()
+        );
         let cli = crate::Cli::try_parse_from([
-            "kronik", "--url", "https://daemon:7443", "fleet", "enroll", "https://controller:443",
-            "--token", "one-time", "--reason", "join",
-        ]).unwrap();
+            "kronik",
+            "--url",
+            "https://daemon:7443",
+            "fleet",
+            "enroll",
+            "https://controller:443",
+            "--token",
+            "one-time",
+            "--reason",
+            "join",
+        ])
+        .unwrap();
         assert_eq!(cli.client.url.as_deref(), Some("https://daemon:7443"));
         assert!(cli.client.token.is_none());
     }
@@ -150,12 +202,24 @@ mod tests {
     #[test]
     fn preview_and_durable_recovery_never_reuse_the_api_bearer_as_enrollment_token() {
         for dry_run in [false, true] {
-            let mut argv = vec!["kronik", "--token", "api-only", "fleet", "enroll",
-                "https://controller:443", "--reason", "recover"];
-            if dry_run { argv.push("--dry-run"); }
+            let mut argv = vec![
+                "kronik",
+                "--token",
+                "api-only",
+                "fleet",
+                "enroll",
+                "https://controller:443",
+                "--reason",
+                "recover",
+            ];
+            if dry_run {
+                argv.push("--dry-run");
+            }
             let cli = crate::Cli::try_parse_from(argv).unwrap();
             assert_eq!(cli.client.token.as_deref(), Some("api-only"));
-            let crate::Command::Client(super::super::Command::Fleet(FleetCommand::Enroll(args))) = cli.command else {
+            let crate::Command::Client(super::super::Command::Fleet(FleetCommand::Enroll(args))) =
+                cli.command
+            else {
                 panic!("expected enrollment");
             };
             assert!(args.enrollment_token.is_none());
@@ -168,7 +232,13 @@ mod tests {
     #[test]
     fn credential_validation_never_echoes_secrets() {
         assert_eq!(credential(b"secret\n".to_vec()).unwrap(), "secret");
-        for bytes in [vec![], b"private value".to_vec(), b"private\0value".to_vec(), vec![b'x'; 4097], vec![255]] {
+        for bytes in [
+            vec![],
+            b"private value".to_vec(),
+            b"private\0value".to_vec(),
+            vec![b'x'; 4097],
+            vec![255],
+        ] {
             let message = credential(bytes).unwrap_err().message;
             assert!(!message.contains("private"));
         }

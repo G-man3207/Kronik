@@ -4,7 +4,7 @@ use kronik_core::error::{ApiError, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Api, AuthorizedRequest, ApiResponse, Result, json, ok, reason};
+use crate::{Api, ApiResponse, AuthorizedRequest, Result, json, ok, reason};
 
 /// `PUT /v1/simulators/{target}`: the target's whole simulator
 /// configuration; everything empty or false clears it.
@@ -194,9 +194,11 @@ impl Api {
                 model: None,
             },
         };
-        self.ok_scrubbed(SimulatorsResponse { simulators: simulator_infos(),
-        targets,
-        model, })
+        self.ok_scrubbed(SimulatorsResponse {
+            simulators: simulator_infos(),
+            targets,
+            model,
+        })
     }
 
     async fn simulators_set(&self, req: &AuthorizedRequest, target: &str) -> Result<ApiResponse> {
@@ -212,7 +214,10 @@ impl Api {
         .record()
         .map_err(|m| ApiError::new(ErrorCode::BadRequest, m))?;
         let audit = self.audit(req, r.reason.clone());
-        let (epoch, lsn) = self.node.set_simulators(record, audit, r.dry_run, req.authority.clone()).await?;
+        let (epoch, lsn) = self
+            .node
+            .set_simulators(record, audit, r.dry_run, req.authority.clone())
+            .await?;
         ok(&SimulatorsSetResponse {
             dry_run: r.dry_run,
             target: target.to_owned(),

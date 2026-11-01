@@ -66,7 +66,8 @@ pub(super) fn read_secure_file(path: &std::path::Path, max_bytes: usize) -> io::
     use std::io::Read as _;
     let (parent, name) = secure_parent(path, false)?;
     let mut file = std::fs::File::from(rustix::fs::openat(
-        &parent, &name,
+        &parent,
+        &name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )?);
@@ -75,21 +76,33 @@ pub(super) fn read_secure_file(path: &std::path::Path, max_bytes: usize) -> io::
         return Err(insecure_file());
     }
     if before.len() > max_bytes as u64 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "private file exceeds limit"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private file exceeds limit",
+        ));
     }
     let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(before.len() as usize));
-    (&mut file).take((max_bytes as u64).saturating_add(1)).read_to_end(&mut bytes)?;
+    (&mut file)
+        .take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
     let after = file.metadata()?;
     if !unchanged_private_file(&before, &after) {
         return Err(insecure_file());
     }
     if bytes.len() > max_bytes || bytes.len() as u64 != after.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "private file exceeds limit or changed"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private file exceeds limit or changed",
+        ));
     }
     Ok(std::mem::take(&mut *bytes))
 }
 
-pub(super) fn write_secure_file(path: &std::path::Path, bytes: &[u8], replace: bool) -> io::Result<()> {
+pub(super) fn write_secure_file(
+    path: &std::path::Path,
+    bytes: &[u8],
+    replace: bool,
+) -> io::Result<()> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
     use std::io::Write as _;
     let (parent, name) = secure_parent(path, true)?;
@@ -99,8 +112,11 @@ pub(super) fn write_secure_file(path: &std::path::Path, bytes: &[u8], replace: b
     }
     match rustix::fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(_) if !replace => return Err(io::ErrorKind::AlreadyExists.into()),
-        Ok(m) if FileType::from_raw_mode(m.st_mode) == FileType::RegularFile
-            && m.st_nlink == 1 && m.st_uid == dir.st_uid && m.st_mode & 0o077 == 0 => {}
+        Ok(m)
+            if FileType::from_raw_mode(m.st_mode) == FileType::RegularFile
+                && m.st_nlink == 1
+                && m.st_uid == dir.st_uid
+                && m.st_mode & 0o077 == 0 => {}
         Err(rustix::io::Errno::NOENT) => {}
         Ok(_) => return Err(insecure_file()),
         Err(error) => return Err(error.into()),
@@ -111,7 +127,8 @@ pub(super) fn write_secure_file(path: &std::path::Path, bytes: &[u8], replace: b
     temporary.push(&name);
     temporary.push(format!(".{:032x}.tmp", u128::from_le_bytes(nonce)));
     let mut file = std::fs::File::from(rustix::fs::openat(
-        &parent, &temporary,
+        &parent,
+        &temporary,
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
     )?);

@@ -6,10 +6,10 @@
 mod audit;
 pub mod auth;
 pub mod auth_config;
-pub mod events;
+mod cluster_status;
 #[cfg(feature = "server")]
 pub mod event_stream;
-mod cluster_status;
+pub mod events;
 pub use cluster_status::ClusterStatusRead;
 pub mod fleet;
 pub use fleet::Fleet;
@@ -19,9 +19,9 @@ pub mod m12;
 mod m3;
 mod m6;
 pub mod m7;
-pub mod openapi;
 pub mod oidc;
 mod oidc_crypto;
+pub mod openapi;
 mod output_scrub;
 mod preview;
 pub mod privacy;
@@ -84,9 +84,15 @@ pub struct CapturedRequest {
     pub(crate) session: Option<kronik_core::authority::SessionLease>,
 }
 impl CapturedRequest {
-    pub fn authority(&self) -> &kronik_core::authority::AuthLease { &self.authority }
-    pub fn principal(&self) -> Option<&tokens::ForwardedPrincipal> { self.principal.as_ref() }
-    pub fn session(&self) -> Option<&kronik_core::authority::SessionLease> { self.session.as_ref() }
+    pub fn authority(&self) -> &kronik_core::authority::AuthLease {
+        &self.authority
+    }
+    pub fn principal(&self) -> Option<&tokens::ForwardedPrincipal> {
+        self.principal.as_ref()
+    }
+    pub fn session(&self) -> Option<&kronik_core::authority::SessionLease> {
+        self.session.as_ref()
+    }
     pub fn require_scope(&self, scope: auth::Scope) -> Result<()> {
         self.authority.check()?;
         self.caller.require(scope)
@@ -97,12 +103,17 @@ pub(crate) struct AuthorizedRequest {
     request: ApiRequest,
     pub(crate) caller: auth::Caller,
     pub(crate) authority: kronik_core::authority::AuthLease,
+    /// Forwarded-principal seam kept from the unbuilt WIP checkpoint; the
+    /// handler that reads it has not landed, so it is not wired to routing yet.
+    #[allow(dead_code)]
     pub(crate) principal: Option<tokens::ForwardedPrincipal>,
     pub(crate) verified_identity: Option<Arc<pb::Sealable>>,
 }
 impl std::ops::Deref for AuthorizedRequest {
     type Target = ApiRequest;
-    fn deref(&self) -> &Self::Target { &self.request }
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,7 +289,10 @@ fn outcome(o: &pb::Outcome) -> Outcome {
 fn output_bytes(value: Option<&pb::Sealable>) -> Result<&[u8]> {
     match value.and_then(|value| value.value.as_ref()) {
         Some(pb::sealable::Value::Plain(bytes)) => Ok(bytes),
-        _ => Err(ApiError::new(ErrorCode::Unavailable, "the reply bytes are unavailable in this source projection")),
+        _ => Err(ApiError::new(
+            ErrorCode::Unavailable,
+            "the reply bytes are unavailable in this source projection",
+        )),
     }
 }
 
@@ -291,21 +305,41 @@ fn turn_response(r: Option<TurnResult>) -> Result<TurnResponse> {
             reply: None,
         });
     };
-    let missing_custody = || ApiError::new(ErrorCode::Unavailable,
-        "the reply requires its original operation-held blob source, which this source projection does not carry");
+    let missing_custody = || {
+        ApiError::new(
+            ErrorCode::Unavailable,
+            "the reply requires its original operation-held blob source, which this source projection does not carry",
+        )
+    };
     let reply = match &r.outcome.output {
         Some(pb::outcome::Output::Reply(message)) => {
-            if !message.blobs.is_empty() { return Err(missing_custody()); }
-            Some(Reply::inline(message.name.clone(), message.content_type.clone(),
-                Payload::from_bytes(output_bytes(message.body.as_ref())?), Vec::new()))
+            if !message.blobs.is_empty() {
+                return Err(missing_custody());
+            }
+            Some(Reply::inline(
+                message.name.clone(),
+                message.content_type.clone(),
+                Payload::from_bytes(output_bytes(message.body.as_ref())?),
+                Vec::new(),
+            ))
         }
-        Some(pb::outcome::Output::Http(http)) => match http.body.as_ref().and_then(|body| body.value.as_ref()) {
-            Some(pb::body::Value::Inline(value)) => Some(Reply::inline(
-                format!("http {}", http.status), String::new(),
-                Payload::from_bytes(output_bytes(Some(value))?), Vec::new())),
-            Some(pb::body::Value::Blob(_)) => return Err(missing_custody()),
-            None => return Err(ApiError::new(ErrorCode::Unavailable, "the reply has no available body source")),
-        },
+        Some(pb::outcome::Output::Http(http)) => {
+            match http.body.as_ref().and_then(|body| body.value.as_ref()) {
+                Some(pb::body::Value::Inline(value)) => Some(Reply::inline(
+                    format!("http {}", http.status),
+                    String::new(),
+                    Payload::from_bytes(output_bytes(Some(value))?),
+                    Vec::new(),
+                )),
+                Some(pb::body::Value::Blob(_)) => return Err(missing_custody()),
+                None => {
+                    return Err(ApiError::new(
+                        ErrorCode::Unavailable,
+                        "the reply has no available body source",
+                    ));
+                }
+            }
+        }
         None => None,
     };
     Ok(TurnResponse {
@@ -694,15 +728,15 @@ impl Api {
         }
     }
 
-
     pub fn with_fleet(mut self, fleet: Arc<Fleet>) -> Self {
         self.fleet = Some(fleet);
         self
     }
 
     fn fleet_service(&self) -> Result<&Arc<Fleet>> {
-        let fleet = self.fleet.as_ref().ok_or_else(||
-            ApiError::new(ErrorCode::Unavailable, "fleet controller is not configured"))?;
+        let fleet = self.fleet.as_ref().ok_or_else(|| {
+            ApiError::new(ErrorCode::Unavailable, "fleet controller is not configured")
+        })?;
         fleet.validate_attachment(self)?;
         Ok(fleet)
     }
@@ -755,7 +789,10 @@ impl Api {
     }
 
     fn request_scope(req: &ApiRequest) -> Result<auth::Scope> {
-        let segments = req.path.split('/').skip(1)
+        let segments = req
+            .path
+            .split('/')
+            .skip(1)
             .map(|segment| decode(segment).ok_or_else(|| bad("invalid API path")))
             .collect::<Result<Vec<_>>>()?;
         let segments = segments.iter().map(String::as_str).collect::<Vec<_>>();
@@ -767,40 +804,86 @@ impl Api {
         self.capture_for_scope(req, Self::request_scope(req)?)
     }
 
-    pub(crate) fn authorize_captured_request(&self, req: &ApiRequest, captured: &CapturedRequest) -> Result<()> {
+    /// Only the hyper transport reaches this: the service function authorizes
+    /// through [`Api::capture`] before calling [`Api::handle`].
+    #[cfg(feature = "server")]
+    pub(crate) fn authorize_captured_request(
+        &self,
+        req: &ApiRequest,
+        captured: &CapturedRequest,
+    ) -> Result<()> {
         captured.require_scope(Self::request_scope(req)?)
     }
-    pub fn capture_for_scope(&self, req: &ApiRequest, scope: auth::Scope) -> Result<CapturedRequest> {
+    pub fn capture_for_scope(
+        &self,
+        req: &ApiRequest,
+        scope: auth::Scope,
+    ) -> Result<CapturedRequest> {
         self.capture_context(self.auth.capture(req, scope)?, None)
     }
 
     /// Ordinary bearer, named and OIDC identities share the actual live fleet policy.
-    pub(crate) fn capture_context(&self, mut captured: CapturedRequest,
-        fleet_guard: Option<kronik_fleet::transport::EpochGuard>) -> Result<CapturedRequest> {
-        let session_source = captured.session.as_ref().map(|session|
-            tokens::token_id(&session.revocation().token_name));
+    pub(crate) fn capture_context(
+        &self,
+        mut captured: CapturedRequest,
+        fleet_guard: Option<kronik_fleet::transport::EpochGuard>,
+    ) -> Result<CapturedRequest> {
+        let session_source = captured
+            .session
+            .as_ref()
+            .map(|session| tokens::token_id(&session.revocation().token_name));
         if session_source.is_some() && self.tokens.is_none() {
-            return Err(ApiError::new(ErrorCode::Unauthenticated, "Original session token authority is unavailable"));
+            return Err(ApiError::new(
+                ErrorCode::Unauthenticated,
+                "Original session token authority is unavailable",
+            ));
         }
-        let source = session_source.as_deref().unwrap_or(&captured.caller.token_id);
-        let managed = self.tokens.as_ref().and_then(|tokens| tokens.fleet_token(source));
+        let source = session_source
+            .as_deref()
+            .unwrap_or(&captured.caller.token_id);
+        let managed = self
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.fleet_token(source));
         if let Some(guard) = &fleet_guard {
-            let receipt = managed.as_ref().ok_or_else(|| ApiError::new(ErrorCode::Unauthenticated,
-                "Fleet connections require the original managed token authority"))?;
-            if guard.epoch() != receipt.epoch || guard.request_id() != Some(receipt.request_id.as_str()) {
-                return Err(ApiError::new(ErrorCode::Unauthenticated, "Fleet connection binding differs from original token authority"));
+            let receipt = managed.as_ref().ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::Unauthenticated,
+                    "Fleet connections require the original managed token authority",
+                )
+            })?;
+            if guard.epoch() != receipt.epoch
+                || guard.request_id() != Some(receipt.request_id.as_str())
+            {
+                return Err(ApiError::new(
+                    ErrorCode::Unauthenticated,
+                    "Fleet connection binding differs from original token authority",
+                ));
             }
-            guard.check().map_err(|_| ApiError::new(ErrorCode::Unauthenticated, "Fleet connection binding revoked"))?;
+            guard.check().map_err(|_| {
+                ApiError::new(
+                    ErrorCode::Unauthenticated,
+                    "Fleet connection binding revoked",
+                )
+            })?;
         }
         if let Some(receipt) = managed {
-            let fleet = self.fleet_service().map_err(|_| ApiError::new(ErrorCode::Unauthenticated,
-                "Managed fleet credentials require the active fleet authority"))?;
+            let fleet = self.fleet_service().map_err(|_| {
+                ApiError::new(
+                    ErrorCode::Unauthenticated,
+                    "Managed fleet credentials require the active fleet authority",
+                )
+            })?;
             if !fleet.allows_token_id(source) {
-                return Err(ApiError::new(ErrorCode::Unauthenticated, "fleet authority is not active"));
+                return Err(ApiError::new(
+                    ErrorCode::Unauthenticated,
+                    "fleet authority is not active",
+                ));
             }
             captured.authority = fleet.lease(captured.authority.clone(), fleet_guard, receipt);
             if let Some(session) = captured.session.take() {
-                let session = kronik_core::authority::guard_session(session, captured.authority.clone());
+                let session =
+                    kronik_core::authority::guard_session(session, captured.authority.clone());
                 captured.authority = session.clone();
                 captured.session = Some(session);
             }
@@ -810,50 +893,76 @@ impl Api {
     }
     pub fn capture_binding(&self, req: &ApiRequest) -> Result<CapturedRequest> {
         let selector = self.auth.caller(req)?;
-        let scope = selector.scopes.iter().next().copied()
-            .ok_or_else(|| ApiError::new(ErrorCode::ScopeMissing, "The caller has no API scopes"))?;
+        let scope = selector.scopes.iter().next().copied().ok_or_else(|| {
+            ApiError::new(ErrorCode::ScopeMissing, "The caller has no API scopes")
+        })?;
         self.capture_for_scope(req, scope)
     }
 
     /// Bind once before opening the outbound connection; remote frames cannot choose credentials.
-    pub fn capture_fleet_binding(&self, req: &ApiRequest,
-        guard: kronik_fleet::transport::EpochGuard) -> Result<CapturedRequest> {
+    pub fn capture_fleet_binding(
+        &self,
+        req: &ApiRequest,
+        guard: kronik_fleet::transport::EpochGuard,
+    ) -> Result<CapturedRequest> {
         let selector = self.auth.caller(req)?;
-        let scope = selector.scopes.iter().next().copied()
-            .ok_or_else(|| ApiError::new(ErrorCode::ScopeMissing, "The caller has no API scopes"))?;
+        let scope = selector.scopes.iter().next().copied().ok_or_else(|| {
+            ApiError::new(ErrorCode::ScopeMissing, "The caller has no API scopes")
+        })?;
         self.capture_context(self.auth.capture(req, scope)?, Some(guard))
     }
     /// Native custody stays local; this tuple is never a forwarding payload.
     pub(crate) fn record_native_oidc_login(
-        &self, audit: pb::Audit, session: kronik_core::authority::SessionLease,
-    ) -> kronik_core::env::BoxFuture<'static, Result<(kronik_core::ids::SourcePos, kronik_sched::SubjectKeyPlan)>> {
+        &self,
+        audit: pb::Audit,
+        session: kronik_core::authority::SessionLease,
+    ) -> kronik_core::env::BoxFuture<
+        'static,
+        Result<(kronik_core::ids::SourcePos, kronik_sched::SubjectKeyPlan)>,
+    > {
         let node = self.node.clone();
         Box::pin(async move { node.record_oidc_login(audit, session).await })
     }
 
     pub(crate) fn seal_native_oidc_identity<F>(
-        &self, sealer: Arc<kronik_privacy::sealer::Sealer>, value: pb::Sealable,
+        &self,
+        sealer: Arc<kronik_privacy::sealer::Sealer>,
+        value: pb::Sealable,
         plan: kronik_sched::SubjectKeyPlan,
-        original: kronik_core::authority::SessionLease, publish: F,
+        original: kronik_core::authority::SessionLease,
+        publish: F,
     ) -> kronik_core::env::BoxFuture<'static, Result<()>>
-    where F: FnOnce(pb::Sealable) -> Result<()> + Send + 'static {
+    where
+        F: FnOnce(pb::Sealable) -> Result<()> + Send + 'static,
+    {
         let node = self.node.clone();
         let env = node.env().clone();
         Box::pin(async move {
             env.blocking("oidc-identity", move || {
-                let refined = node.seal_native_identity_at(sealer, value, plan, original.clone(), publish)?;
+                let refined =
+                    node.seal_native_identity_at(sealer, value, plan, original.clone(), publish)?;
                 refined.check()?;
                 original.check()
-            }).await.ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "verified identity worker stopped"))?
+            })
+            .await
+            .ok_or_else(|| {
+                ApiError::new(ErrorCode::Unavailable, "verified identity worker stopped")
+            })?
         })
     }
 
     pub(crate) async fn complete_browser_response(
-        &self, response: oidc::Response, original: CapturedRequest,
+        &self,
+        response: oidc::Response,
+        original: CapturedRequest,
     ) -> Result<oidc::Response> {
-        self.node.authorized_effect(original.authority().clone(), move || async move { Ok(response) }).await
+        self.node
+            .authorized_effect(
+                original.authority().clone(),
+                move || async move { Ok(response) },
+            )
+            .await
     }
-
 
     /// Serves the M3 endpoints (forks, proposals, policy) from `proposals`.
     pub fn with_proposals(mut self, proposals: Arc<kronik_fork::proposal::Proposals>) -> Api {
@@ -898,7 +1007,9 @@ impl Api {
     /// good. Withheld when the secrets cannot be loaded.
     fn audit(&self, req: &ApiRequest, reason: String) -> pb::Audit {
         let secrets = self.node.secret_values().ok();
-        let patterns = secrets.as_ref().map(|values| kronik_sched::effects::secret_patterns(values));
+        let patterns = secrets
+            .as_ref()
+            .map(|values| kronik_sched::effects::secret_patterns(values));
         pb::Audit {
             token_id: req.token_id.clone(),
             reason: kronik_sched::scrub::for_log(&reason, patterns.as_deref()),
@@ -947,10 +1058,15 @@ impl Api {
         self.audit_event(req, action, target, details, reason.to_owned())
             .await?;
         let env = self.node.env().clone();
-        let e = match self.node.authorized_effect(req.authority.clone(), move || async move {
-            env.blocking("token-change", change).await
-                .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "token change worker stopped"))?
-        }).await {
+        let e = match self
+            .node
+            .authorized_effect(req.authority.clone(), move || async move {
+                env.blocking("token-change", change).await.ok_or_else(|| {
+                    ApiError::new(ErrorCode::Unavailable, "token change worker stopped")
+                })?
+            })
+            .await
+        {
             Ok(v) => return Ok(v),
             Err(e) => e,
         };
@@ -979,29 +1095,53 @@ impl Api {
     pub async fn handle_admitted(&self, req: ApiRequest, captured: CapturedRequest) -> ApiResponse {
         Self::answer(self.handle_captured(req, captured).await)
     }
-    async fn handle_captured(&self, mut request: ApiRequest, captured: CapturedRequest) -> Result<ApiResponse> {
+    async fn handle_captured(
+        &self,
+        mut request: ApiRequest,
+        captured: CapturedRequest,
+    ) -> Result<ApiResponse> {
         captured.authority.check()?;
         request.token_id = captured.caller.token_id.clone();
         request.bearer = None;
-        let CapturedRequest { caller, authority, principal, verified_identity, session: _ } = captured;
-        let request = AuthorizedRequest { request, caller, authority, principal, verified_identity };
+        let CapturedRequest {
+            caller,
+            authority,
+            principal,
+            verified_identity,
+            session: _,
+        } = captured;
+        let request = AuthorizedRequest {
+            request,
+            caller,
+            authority,
+            principal,
+            verified_identity,
+        };
+        // Box the dispatch future: the route match embeds every endpoint body, and
+        // an unboxed chain overflows a bounded worker/test stack in debug builds.
         if matches!(request.method.as_str(), "GET" | "HEAD") {
             let result = tokio::select! {
                 biased;
                 () = request.authority.cancelled() => Err(ApiError::new(ErrorCode::Unauthenticated, "The request authority was revoked")),
-                response = self.route(&request, &request.caller) => response,
+                response = Box::pin(self.route(&request, &request.caller)) => response,
             };
             let response = Self::answer(result);
-            self.node.authorized_effect(request.authority.clone(), move || async move { Ok(response) }).await
+            self.node
+                .authorized_effect(
+                    request.authority.clone(),
+                    move || async move { Ok(response) },
+                )
+                .await
         } else {
-            self.route(&request, &request.caller).await
+            Box::pin(self.route(&request, &request.caller)).await
         }
     }
     fn answer(result: Result<ApiResponse>) -> ApiResponse {
         match result {
             Ok(response) => response,
             Err(error) => ApiResponse {
-                status: error.code.http_status(), content_type: "application/json",
+                status: error.code.http_status(),
+                content_type: "application/json",
                 body: error.to_json().to_string().into_bytes(),
             },
         }
@@ -1026,7 +1166,9 @@ impl Api {
             ("GET", ["v1", "events"]) => self.event_page(req, &q).await,
             ("GET", ["v1", "events", "schemas"]) => self.event_schemas(),
             ("GET", ["v1", "events", "webhooks"]) => self.event_webhooks(),
-            ("POST", ["v1", "events", "webhooks", name, "replay"]) => self.event_replay(req, name).await,
+            ("POST", ["v1", "events", "webhooks", name, "replay"]) => {
+                self.event_replay(req, name).await
+            }
             ("GET", ["v1", "fleet"]) => self.fleet_status(),
             ("POST", ["v1", "fleet", "enroll"]) => self.fleet_enroll(req).await,
             ("POST", ["v1", "fleet", "revoke"]) => self.fleet_revoke(req).await,
@@ -1136,7 +1278,12 @@ impl Api {
             .map_err(|e| bad(format!("wasm_base64 is not valid base64: {e}")))?;
         let d = self
             .node
-            .deploy(&wasm, self.audit(req, r.reason), r.dry_run, req.authority.clone())
+            .deploy(
+                &wasm,
+                self.audit(req, r.reason),
+                r.dry_run,
+                req.authority.clone(),
+            )
             .await?;
         ok(&DeployResponse {
             dry_run: d.dry_run,
@@ -1164,32 +1311,34 @@ impl Api {
 
     fn deployments(&self) -> Result<ApiResponse> {
         let rows = self.node.store().db().deployments().map_err(internal)?;
-        self.ok_scrubbed(DeploymentsResponse { deployments: rows
-            .into_iter()
-            .map(|(lsn, d)| DeploymentEntry {
-                epoch: d.epoch,
-                lsn,
-                cause: pb::DeploymentCause::try_from(d.cause)
-                    .map_or("unspecified", |c| c.as_str_name())
-                    .trim_start_matches("DEPLOYMENT_CAUSE_")
-                    .to_ascii_lowercase(),
-                kinds: d
-                    .kinds
-                    .iter()
-                    .map(|k| DeploymentKind {
-                        kind: k.kind.clone(),
-                        code_hash: short_hash(&k.code_hash),
-                        schema_version: k.schema_version,
-                    })
-                    .collect(),
-                reason: d
-                    .audit
-                    .as_ref()
-                    .map(|a| a.reason.clone())
-                    .unwrap_or_default(),
-                token_id: d.audit.map(|a| a.token_id).unwrap_or_default(),
-            })
-            .collect(), })
+        self.ok_scrubbed(DeploymentsResponse {
+            deployments: rows
+                .into_iter()
+                .map(|(lsn, d)| DeploymentEntry {
+                    epoch: d.epoch,
+                    lsn,
+                    cause: pb::DeploymentCause::try_from(d.cause)
+                        .map_or("unspecified", |c| c.as_str_name())
+                        .trim_start_matches("DEPLOYMENT_CAUSE_")
+                        .to_ascii_lowercase(),
+                    kinds: d
+                        .kinds
+                        .iter()
+                        .map(|k| DeploymentKind {
+                            kind: k.kind.clone(),
+                            code_hash: short_hash(&k.code_hash),
+                            schema_version: k.schema_version,
+                        })
+                        .collect(),
+                    reason: d
+                        .audit
+                        .as_ref()
+                        .map(|a| a.reason.clone())
+                        .unwrap_or_default(),
+                    token_id: d.audit.map(|a| a.token_id).unwrap_or_default(),
+                })
+                .collect(),
+        })
     }
 
     fn actor_ref(kind: &str, key: &str) -> Result<ActorRef> {
@@ -1220,7 +1369,13 @@ impl Api {
         };
         let t = self
             .node
-            .send(actor, msg, self.audit(req, r.reason), r.dry_run, req.authority.clone())
+            .send(
+                actor,
+                msg,
+                self.audit(req, r.reason),
+                r.dry_run,
+                req.authority.clone(),
+            )
             .await?;
         ok(&turn_response(t)?)
     }
@@ -1428,16 +1583,18 @@ impl Api {
             .await?;
         let capability = kronik_effects::Capability::parse(&r.capability)
             .map_or(r.capability.clone(), |c| c.render());
-        self.ok_scrubbed(GrantResponse { dry_run: r.dry_run,
-        grant: GrantView {
-            kind: r.kind,
-            capability,
-            delivery: delivery.map(|d| d.as_str().to_owned()),
-            rate: rate.map(|x| x.render()),
-            epoch,
-            lsn,
-            reason: r.reason,
-        }, })
+        self.ok_scrubbed(GrantResponse {
+            dry_run: r.dry_run,
+            grant: GrantView {
+                kind: r.kind,
+                capability,
+                delivery: delivery.map(|d| d.as_str().to_owned()),
+                rate: rate.map(|x| x.render()),
+                epoch,
+                lsn,
+                reason: r.reason,
+            },
+        })
     }
 
     async fn revoke(&self, req: &AuthorizedRequest) -> Result<ApiResponse> {
@@ -1445,7 +1602,13 @@ impl Api {
         reason(&r.reason)?;
         let (epoch, lsn) = self
             .node
-            .revoke(&r.kind, &r.capability, self.audit(req, r.reason), r.dry_run, req.authority.clone())
+            .revoke(
+                &r.kind,
+                &r.capability,
+                self.audit(req, r.reason),
+                r.dry_run,
+                req.authority.clone(),
+            )
             .await?;
         ok(&RevokeResponse {
             dry_run: r.dry_run,
@@ -1462,11 +1625,13 @@ impl Api {
     fn grants(&self, q: &Query) -> Result<ApiResponse> {
         let config = self.node.config_now();
         let lsns = self.config_lsns();
-        self.ok_scrubbed(GrantsResponse { grants: config
-            .grants()
-            .filter(|g| q.get("kind").is_none_or(|k| k == g.kind))
-            .map(|g| Self::grant_view(g, lsns.get(&g.epoch).copied().unwrap_or(0)))
-            .collect(), })
+        self.ok_scrubbed(GrantsResponse {
+            grants: config
+                .grants()
+                .filter(|g| q.get("kind").is_none_or(|k| k == g.kind))
+                .map(|g| Self::grant_view(g, lsns.get(&g.epoch).copied().unwrap_or(0)))
+                .collect(),
+        })
     }
 
     /// epoch -> lsn of the configuration records.
@@ -1511,7 +1676,12 @@ impl Api {
         };
         let (epoch, lsn, effective) = self
             .node
-            .set_limits(limits, self.audit(req, r.reason), r.dry_run, req.authority.clone())
+            .set_limits(
+                limits,
+                self.audit(req, r.reason),
+                r.dry_run,
+                req.authority.clone(),
+            )
             .await?;
         let mut view = Self::limits_view(&r.kind, &effective);
         view.epoch = Some(epoch);
@@ -1557,12 +1727,23 @@ impl Api {
         let r: SecretSetRequest = json(&req.body)?;
         reason(&r.reason)?;
         let value = r.value.to_bytes().map_err(bad)?;
-        if value.is_empty() { return Err(bad("The secret value is empty")); }
+        if value.is_empty() {
+            return Err(bad("The secret value is empty"));
+        }
         // The secret producer scrubs once with both the candidate and retained values.
-        let audit = pb::Audit { token_id: req.token_id.clone(), reason: r.reason,
-            wall_time_ms: self.node.env().clock.wall_ms() };
-        let metadata = self.node.secret_set(name, value, &audit, r.dry_run, req.authority.clone()).await?;
-        ok(&SecretResponse { dry_run: r.dry_run, secret: metadata.as_ref().map(Self::secret_view) })
+        let audit = pb::Audit {
+            token_id: req.token_id.clone(),
+            reason: r.reason,
+            wall_time_ms: self.node.env().clock.wall_ms(),
+        };
+        let metadata = self
+            .node
+            .secret_set(name, value, &audit, r.dry_run, req.authority.clone())
+            .await?;
+        ok(&SecretResponse {
+            dry_run: r.dry_run,
+            secret: metadata.as_ref().map(Self::secret_view),
+        })
     }
 
     async fn secrets(&self) -> Result<ApiResponse> {
@@ -1576,64 +1757,153 @@ impl Api {
     async fn secret_delete(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: SecretDeleteRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let audit = pb::Audit { token_id: req.token_id.clone(), reason: r.reason,
-            wall_time_ms: self.node.env().clock.wall_ms() };
-        let versions = self.node.secret_delete(name, &audit, r.dry_run, req.authority.clone()).await?;
-        ok(&SecretDeleteResponse { dry_run: r.dry_run, deleted: SecretDeleted { name: name.to_owned(), versions } })
+        let audit = pb::Audit {
+            token_id: req.token_id.clone(),
+            reason: r.reason,
+            wall_time_ms: self.node.env().clock.wall_ms(),
+        };
+        let versions = self
+            .node
+            .secret_delete(name, &audit, r.dry_run, req.authority.clone())
+            .await?;
+        ok(&SecretDeleteResponse {
+            dry_run: r.dry_run,
+            deleted: SecretDeleted {
+                name: name.to_owned(),
+                versions,
+            },
+        })
     }
 
     fn secret_link_view(link: &pb::SecretLink) -> SecretLinkView {
-        SecretLinkView { name: link.name.clone(), backend: link.backend.clone(), r#ref: link.r#ref.clone(),
-            binding: link.binding.clone(), canonical_ref: link.canonical_ref.clone(),
-            generation: link.generation, epoch: link.epoch }
+        SecretLinkView {
+            name: link.name.clone(),
+            backend: link.backend.clone(),
+            r#ref: link.r#ref.clone(),
+            binding: link.binding.clone(),
+            canonical_ref: link.canonical_ref.clone(),
+            generation: link.generation,
+            epoch: link.epoch,
+        }
     }
     async fn secret_link(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: SecretLinkRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let audit = pb::Audit { token_id: req.token_id.clone(), reason: r.reason,
-            wall_time_ms: self.node.env().clock.wall_ms() };
-        let (link, lsn) = self.node.secret_link(name, &r.backend, &r.r#ref, &audit, r.dry_run, req.authority.clone()).await?;
-        ok(&SecretLinkResponse { dry_run: r.dry_run, link: Self::secret_link_view(&link), lsn })
+        let audit = pb::Audit {
+            token_id: req.token_id.clone(),
+            reason: r.reason,
+            wall_time_ms: self.node.env().clock.wall_ms(),
+        };
+        let (link, lsn) = self
+            .node
+            .secret_link(
+                name,
+                &r.backend,
+                &r.r#ref,
+                &audit,
+                r.dry_run,
+                req.authority.clone(),
+            )
+            .await?;
+        ok(&SecretLinkResponse {
+            dry_run: r.dry_run,
+            link: Self::secret_link_view(&link),
+            lsn,
+        })
     }
     async fn secret_unlink(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: SecretDeleteRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let audit = pb::Audit { token_id: req.token_id.clone(), reason: r.reason,
-            wall_time_ms: self.node.env().clock.wall_ms() };
-        let (link, lsn) = self.node.secret_unlink(name, &audit, r.dry_run, req.authority.clone()).await?;
-        ok(&SecretLinkResponse { dry_run: r.dry_run, link: Self::secret_link_view(&link), lsn })
+        let audit = pb::Audit {
+            token_id: req.token_id.clone(),
+            reason: r.reason,
+            wall_time_ms: self.node.env().clock.wall_ms(),
+        };
+        let (link, lsn) = self
+            .node
+            .secret_unlink(name, &audit, r.dry_run, req.authority.clone())
+            .await?;
+        ok(&SecretLinkResponse {
+            dry_run: r.dry_run,
+            link: Self::secret_link_view(&link),
+            lsn,
+        })
     }
     async fn secret_refresh(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: SecretRefreshRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let audit = pb::Audit { token_id: req.token_id.clone(), reason: r.reason,
-            wall_time_ms: self.node.env().clock.wall_ms() };
-        let metadata = self.node.secret_refresh(name, &audit, r.dry_run, req.authority.clone()).await?;
-        ok(&SecretResponse { dry_run: r.dry_run, secret: metadata.as_ref().map(Self::secret_view) })
+        let audit = pb::Audit {
+            token_id: req.token_id.clone(),
+            reason: r.reason,
+            wall_time_ms: self.node.env().clock.wall_ms(),
+        };
+        let metadata = self
+            .node
+            .secret_refresh(name, &audit, r.dry_run, req.authority.clone())
+            .await?;
+        ok(&SecretResponse {
+            dry_run: r.dry_run,
+            secret: metadata.as_ref().map(Self::secret_view),
+        })
     }
     async fn secret_history(&self, name: &str) -> Result<ApiResponse> {
         let rows = self.node.secret_history(name).await?;
-        let versions = rows.into_iter().map(|row| {
-            let phase = match pb::secret_version::Phase::try_from(row.phase) {
-                Ok(pb::secret_version::Phase::Reserved) => SecretVersionPhase::Reserved,
-                Ok(pb::secret_version::Phase::Active) => SecretVersionPhase::Active,
-                Ok(pb::secret_version::Phase::Failed) => SecretVersionPhase::Failed,
-                _ => return Err(ApiError::new(ErrorCode::StorageCorrupt, "Invalid secret history phase")),
-            };
-            let audit = row.audit.ok_or_else(|| ApiError::new(ErrorCode::StorageCorrupt, "Missing secret history audit"))?;
-            Ok(SecretVersionView { name: row.name, version: row.version,
-                version_hash: kronik_core::ids::hex(&row.version_hash), hash_revision: row.hash_revision,
-                backend: row.backend, source_version: row.source_version, r#ref: row.r#ref, binding: row.binding,
-                canonical_ref: row.canonical_ref, link_generation: row.link_generation, phase, deleted: row.deleted,
-                created_wall_ms: audit.wall_time_ms, token_id: audit.token_id,
-                reason: audit.reason })
-        }).collect::<Result<Vec<_>>>()?;
-        self.ok_scrubbed(SecretHistoryResponse { name: name.to_owned(), versions })
+        let versions = rows
+            .into_iter()
+            .map(|row| {
+                let phase = match pb::secret_version::Phase::try_from(row.phase) {
+                    Ok(pb::secret_version::Phase::Reserved) => SecretVersionPhase::Reserved,
+                    Ok(pb::secret_version::Phase::Active) => SecretVersionPhase::Active,
+                    Ok(pb::secret_version::Phase::Failed) => SecretVersionPhase::Failed,
+                    _ => {
+                        return Err(ApiError::new(
+                            ErrorCode::StorageCorrupt,
+                            "Invalid secret history phase",
+                        ));
+                    }
+                };
+                let audit = row.audit.ok_or_else(|| {
+                    ApiError::new(ErrorCode::StorageCorrupt, "Missing secret history audit")
+                })?;
+                Ok(SecretVersionView {
+                    name: row.name,
+                    version: row.version,
+                    version_hash: kronik_core::ids::hex(&row.version_hash),
+                    hash_revision: row.hash_revision,
+                    backend: row.backend,
+                    source_version: row.source_version,
+                    r#ref: row.r#ref,
+                    binding: row.binding,
+                    canonical_ref: row.canonical_ref,
+                    link_generation: row.link_generation,
+                    phase,
+                    deleted: row.deleted,
+                    created_wall_ms: audit.wall_time_ms,
+                    token_id: audit.token_id,
+                    reason: audit.reason,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.ok_scrubbed(SecretHistoryResponse {
+            name: name.to_owned(),
+            versions,
+        })
     }
     fn secret_backends(&self) -> Result<ApiResponse> {
-        ok(&SecretBackendsResponse { backends: self.node.secret_backends().into_iter().map(|source|
-            SecretBackendView { id: source.id, kind: source.kind, binding: source.binding,
-                configured: source.configured, inventory_complete: source.inventory_complete }).collect() })
+        ok(&SecretBackendsResponse {
+            backends: self
+                .node
+                .secret_backends()
+                .into_iter()
+                .map(|source| SecretBackendView {
+                    id: source.id,
+                    kind: source.kind,
+                    binding: source.binding,
+                    configured: source.configured,
+                    inventory_complete: source.inventory_complete,
+                })
+                .collect(),
+        })
     }
 
     fn token_store(&self) -> Result<&Arc<tokens::TokenStore>> {
@@ -1689,23 +1959,44 @@ impl Api {
             let name = r.name.clone();
             let by = req.token_id.clone();
             let wall_ms = change.wall_ms;
-            self.intent(req, "token.create", &r.name, &details, &r.reason, move || {
-                store.create(&name, scopes, random, &tokens::Change { wall_ms, by: &by, reason: &safe_reason }, false)
-            })
+            self.intent(
+                req,
+                "token.create",
+                &r.name,
+                &details,
+                &r.reason,
+                move || {
+                    store.create(
+                        &name,
+                        scopes,
+                        random,
+                        &tokens::Change {
+                            wall_ms,
+                            by: &by,
+                            reason: &safe_reason,
+                        },
+                        false,
+                    )
+                },
+            )
             .await?
         };
-        self.ok_scrubbed(TokenCreateResponse { dry_run: r.dry_run,
-        token: Self::token_view(&meta),
-        secret, })
+        self.ok_scrubbed(TokenCreateResponse {
+            dry_run: r.dry_run,
+            token: Self::token_view(&meta),
+            secret,
+        })
     }
 
     fn tokens(&self) -> Result<ApiResponse> {
-        self.ok_scrubbed(TokensResponse { tokens: self
-            .token_store()?
-            .list()?
-            .iter()
-            .map(Self::token_view)
-            .collect(), })
+        self.ok_scrubbed(TokensResponse {
+            tokens: self
+                .token_store()?
+                .list()?
+                .iter()
+                .map(Self::token_view)
+                .collect(),
+        })
     }
 
     async fn token_revoke(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
@@ -1727,12 +2018,22 @@ impl Api {
             let wall_ms = change.wall_ms;
             meta = self
                 .intent(req, "token.revoke", name, &details, &r.reason, move || {
-                    store.revoke(&revoke_name, &tokens::Change { wall_ms, by: &by, reason: &safe_reason }, false)
+                    store.revoke(
+                        &revoke_name,
+                        &tokens::Change {
+                            wall_ms,
+                            by: &by,
+                            reason: &safe_reason,
+                        },
+                        false,
+                    )
                 })
                 .await?;
         }
-        self.ok_scrubbed(TokenRevokeResponse { dry_run: r.dry_run,
-        token: Self::token_view(&meta), })
+        self.ok_scrubbed(TokenRevokeResponse {
+            dry_run: r.dry_run,
+            token: Self::token_view(&meta),
+        })
     }
 
     fn orphans(&self, q: &Query) -> Result<ApiResponse> {
@@ -1916,12 +2217,16 @@ impl Api {
         reason(&r.reason)?;
         let t = self
             .node
-            .resend(lsn, self.audit(req, r.reason), r.dry_run, req.authority.clone())
+            .resend(
+                lsn,
+                self.audit(req, r.reason),
+                r.dry_run,
+                req.authority.clone(),
+            )
             .await?;
         ok(&turn_response(t)?)
     }
 }
-
 
 /// Whether an input holds a sealed value (privacy mode `on` with a subject).
 pub(crate) fn input_has_sealed(input: Option<&pb::Input>) -> bool {

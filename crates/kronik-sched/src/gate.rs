@@ -130,7 +130,11 @@ impl Node {
     /// set switch never lands between the rebase's last round and its
     /// switch, and waits for the switch instead). Its error is
     /// `PROPOSAL_STALE` naming `rebase.max_pause`.
-    pub async fn rebase_pause(&self, max: Duration, authority: AuthLease) -> Result<Drain, ApiError> {
+    pub async fn rebase_pause(
+        &self,
+        max: Duration,
+        authority: AuthLease,
+    ) -> Result<Drain, ApiError> {
         authority.check()?;
         let deploy = self.lock_deploy_authorized(&authority).await?;
         tokio::select! {

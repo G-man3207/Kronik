@@ -159,7 +159,9 @@ pub async fn push_loop(
     let start = env.clock.wall_ms().saturating_mul(1_000_000);
     let url = format!("{endpoint}/v1/metrics");
     loop {
-        if stop.is_stopping() { return; }
+        if stop.is_stopping() {
+            return;
+        }
         tokio::select! {
             biased;
             () = stop.stopped() => return,

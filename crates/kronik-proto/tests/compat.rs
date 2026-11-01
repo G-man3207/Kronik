@@ -281,18 +281,43 @@ fn secret_version(version: u64, phase: pb::secret_version::Phase) -> pb::SecretV
 fn secret_identity_committed_formats() {
     use pb::secret_version::Phase;
     let cases = [
-        ("secret-version-legacy-v1", secret_version(4_294_967_295, Phase::Active)),
-        ("secret-version-wide-reserved-v1", secret_version(4_294_967_296, Phase::Reserved)),
-        ("secret-version-wide-active-v1", secret_version(4_294_967_296, Phase::Active)),
-        ("secret-version-wide-failed-v1", secret_version(4_294_967_296, Phase::Failed)),
-        ("secret-version-max-v1", secret_version(9_007_199_254_740_991, Phase::Active)),
-        ("secret-fence-fresh-v1", pb::SecretVersion {
-            audit: secret_audit(), phase: Phase::Fence as i32, ..Default::default()
-        }),
-        ("secret-fence-legacy-v1", pb::SecretVersion {
-            version: 4_294_967_295, audit: secret_audit(),
-            phase: Phase::Fence as i32, ..Default::default()
-        }),
+        (
+            "secret-version-legacy-v1",
+            secret_version(4_294_967_295, Phase::Active),
+        ),
+        (
+            "secret-version-wide-reserved-v1",
+            secret_version(4_294_967_296, Phase::Reserved),
+        ),
+        (
+            "secret-version-wide-active-v1",
+            secret_version(4_294_967_296, Phase::Active),
+        ),
+        (
+            "secret-version-wide-failed-v1",
+            secret_version(4_294_967_296, Phase::Failed),
+        ),
+        (
+            "secret-version-max-v1",
+            secret_version(9_007_199_254_740_991, Phase::Active),
+        ),
+        (
+            "secret-fence-fresh-v1",
+            pb::SecretVersion {
+                audit: secret_audit(),
+                phase: Phase::Fence as i32,
+                ..Default::default()
+            },
+        ),
+        (
+            "secret-fence-legacy-v1",
+            pb::SecretVersion {
+                version: 4_294_967_295,
+                audit: secret_audit(),
+                phase: Phase::Fence as i32,
+                ..Default::default()
+            },
+        ),
     ];
     for (name, m) in cases {
         let record = Record::SecretVersion(m);
@@ -302,12 +327,25 @@ fn secret_identity_committed_formats() {
         assert_eq!(Record::decode(45, &bytes).unwrap(), record);
     }
     for (name, backend, reference, binding, canonical, generation, epoch) in [
-        ("secret-link-v1", "vault", "kv/key", "trusted", "kv/data/key", 1, 7),
+        (
+            "secret-link-v1",
+            "vault",
+            "kv/key",
+            "trusted",
+            "kv/data/key",
+            1,
+            7,
+        ),
         ("secret-unlink-v1", "", "", "", "", 2, 8),
     ] {
         let record = Record::SecretLink(pb::SecretLink {
-            name: "key".into(), backend: backend.into(), r#ref: reference.into(),
-            audit: secret_audit(), binding: binding.into(), generation, epoch,
+            name: "key".into(),
+            backend: backend.into(),
+            r#ref: reference.into(),
+            audit: secret_audit(),
+            binding: binding.into(),
+            generation,
+            epoch,
             canonical_ref: canonical.into(),
         });
         let bytes = fixture(name, &record);
@@ -323,37 +361,65 @@ fn secret_identity_rejects_invalid_boundaries_and_provenance() {
     let valid = secret_version(4_294_967_296, Phase::Reserved);
     let mut bad = Vec::new();
     for version in [0, 9_007_199_254_740_992, u64::MAX] {
-        let mut m = valid.clone(); m.version = version; bad.push(m);
+        let mut m = valid.clone();
+        m.version = version;
+        bad.push(m);
     }
     for phase in [0, 5, -1] {
-        let mut m = valid.clone(); m.phase = phase; bad.push(m);
+        let mut m = valid.clone();
+        m.phase = phase;
+        bad.push(m);
     }
-    let mut m = valid.clone(); m.audit = None; bad.push(m);
-    let mut m = valid.clone(); m.hash_revision = 1; bad.push(m);
-    let mut m = valid.clone(); m.version_hash.pop(); bad.push(m);
-    let mut m = valid.clone(); m.canonical_ref.clear(); bad.push(m);
-    let mut m = valid.clone(); m.binding.clear(); bad.push(m);
-    let mut m = valid.clone(); m.source_version = "01".into(); bad.push(m);
-    let mut m = valid.clone(); m.phase = Phase::Fence as i32; bad.push(m);
+    let mut m = valid.clone();
+    m.audit = None;
+    bad.push(m);
+    let mut m = valid.clone();
+    m.hash_revision = 1;
+    bad.push(m);
+    let mut m = valid.clone();
+    m.version_hash.pop();
+    bad.push(m);
+    let mut m = valid.clone();
+    m.canonical_ref.clear();
+    bad.push(m);
+    let mut m = valid.clone();
+    m.binding.clear();
+    bad.push(m);
+    let mut m = valid.clone();
+    m.source_version = "01".into();
+    bad.push(m);
+    let mut m = valid.clone();
+    m.phase = Phase::Fence as i32;
+    bad.push(m);
     for m in bad {
         let record = Record::SecretVersion(m);
         assert!(Record::decode(45, &record.encode()).is_err(), "{record:?}");
     }
     let fence = pb::SecretVersion {
-        audit: secret_audit(), phase: Phase::Fence as i32, ..Default::default()
+        audit: secret_audit(),
+        phase: Phase::Fence as i32,
+        ..Default::default()
     };
     for version in [1, 4_294_967_296, u64::MAX] {
-        let mut m = fence.clone(); m.version = version;
+        let mut m = fence.clone();
+        m.version = version;
         assert!(Record::SecretVersion(m).validate().is_err());
     }
-    let mut m = fence.clone(); m.audit.as_mut().unwrap().token_id = "admin".into();
+    let mut m = fence.clone();
+    m.audit.as_mut().unwrap().token_id = "admin".into();
     assert!(Record::SecretVersion(m).validate().is_err());
-    let mut tombstone = valid.clone(); tombstone.deleted = true; tombstone.version_hash.clear();
+    let mut tombstone = valid.clone();
+    tombstone.deleted = true;
+    tombstone.version_hash.clear();
     assert!(Record::SecretVersion(tombstone.clone()).validate().is_ok());
-    tombstone.backend = "vault".into(); tombstone.link_generation = 1;
+    tombstone.backend = "vault".into();
+    tombstone.link_generation = 1;
     assert!(Record::SecretVersion(tombstone).validate().is_err());
     let mut link = pb::SecretLink {
-        name: "key".into(), generation: 1, epoch: 1, audit: secret_audit(),
+        name: "key".into(),
+        generation: 1,
+        epoch: 1,
+        audit: secret_audit(),
         ..Default::default()
     };
     assert!(Record::SecretLink(link.clone()).validate().is_ok());
@@ -382,12 +448,24 @@ fn file_alias_records_preserve_distinct_logical_and_physical_identity() {
     identity.source_version = "7".into();
     identity.link_generation = 3;
     let link = pb::SecretLink {
-        name: identity.name.clone(), backend: "file".into(), r#ref: identity.r#ref.clone(),
-        audit: secret_audit(), binding: "file".into(), generation: 3, epoch: 4,
+        name: identity.name.clone(),
+        backend: "file".into(),
+        r#ref: identity.r#ref.clone(),
+        audit: secret_audit(),
+        binding: "file".into(),
+        generation: 3,
+        epoch: 4,
         canonical_ref: identity.canonical_ref.clone(),
     };
-    for record in [Record::SecretVersion(identity.clone()), Record::SecretLink(link.clone())] {
-        let kind = if matches!(&record, Record::SecretVersion(_)) { 45 } else { 46 };
+    for record in [
+        Record::SecretVersion(identity.clone()),
+        Record::SecretLink(link.clone()),
+    ] {
+        let kind = if matches!(&record, Record::SecretVersion(_)) {
+            45
+        } else {
+            46
+        };
         assert_eq!(Record::decode(kind, &record.encode()).unwrap(), record);
     }
     for physical in ["", "Uppercase", "/path", "contains space", "_prefix"] {
@@ -444,43 +522,84 @@ fn privacy_mode_and_explicit_reseal_request_formats() {
 #[test]
 fn portable_metadata_history_validators_read_real_record_bytes_in_their_own_namespace() {
     use kronik_proto::control;
-    let audit = Some(pb::Audit { token_id: "system:metadata".into(),
-        reason: "the exact registered metadata control request".into(), wall_time_ms: 17 });
+    let audit = Some(pb::Audit {
+        token_id: "system:metadata".into(),
+        reason: "the exact registered metadata control request".into(),
+        wall_time_ms: 17,
+    });
     let fixtures = [
-        pb::AuditEvent { action: "audit.gap".into(),
-            details: [("namespace".into(), "metadata".into()), ("stream".into(), "events-control:metadata".into()),
-                ("from_index".into(), "1".into()), ("through_index".into(), "17".into())].into(),
-            audit: audit.clone(), ..Default::default() },
-        pb::AuditEvent { action: "audit.config".into(), target: "events-control:metadata".into(),
-            details: [("change".into(), "webhook.signing_key".into()), ("source".into(), "metadata".into()),
-                ("from_version".into(), "4294967296".into()), ("to_version".into(), "9007199254740991".into())].into(),
-            audit: audit.clone(), ..Default::default() },
-        pb::AuditEvent { action: "events.webhook.replay".into(), target: "events-control:metadata".into(),
-            details: [("source".into(), "metadata".into()), ("position".into(), "9223372036854775807".into())].into(),
-            audit, ..Default::default() },
+        pb::AuditEvent {
+            action: "audit.gap".into(),
+            details: [
+                ("namespace".into(), "metadata".into()),
+                ("stream".into(), "events-control:metadata".into()),
+                ("from_index".into(), "1".into()),
+                ("through_index".into(), "17".into()),
+            ]
+            .into(),
+            audit: audit.clone(),
+            ..Default::default()
+        },
+        pb::AuditEvent {
+            action: "audit.config".into(),
+            target: "events-control:metadata".into(),
+            details: [
+                ("change".into(), "webhook.signing_key".into()),
+                ("source".into(), "metadata".into()),
+                ("from_version".into(), "4294967296".into()),
+                ("to_version".into(), "9007199254740991".into()),
+            ]
+            .into(),
+            audit: audit.clone(),
+            ..Default::default()
+        },
+        pb::AuditEvent {
+            action: "events.webhook.replay".into(),
+            target: "events-control:metadata".into(),
+            details: [
+                ("source".into(), "metadata".into()),
+                ("position".into(), "9223372036854775807".into()),
+            ]
+            .into(),
+            audit,
+            ..Default::default()
+        },
     ];
     for event in fixtures {
         let record = Record::AuditEvent(event.clone());
         let exact = record.encode();
         let decoded = Record::decode(record.kind(), &exact).unwrap();
         assert_eq!(decoded.encode(), exact);
-        let Record::AuditEvent(mut decoded) = decoded else { panic!("actual Record40 fixture") };
+        let Record::AuditEvent(mut decoded) = decoded else {
+            panic!("actual Record40 fixture")
+        };
         match event.action.as_str() {
             "audit.gap" => {
                 control::validate_metadata_gap_event(&decoded).unwrap();
-                assert_eq!(control::metadata_audit_gap_details(&decoded.details).unwrap(), ("events-control:metadata", 1, 17));
+                assert_eq!(
+                    control::metadata_audit_gap_details(&decoded.details).unwrap(),
+                    ("events-control:metadata", 1, 17)
+                );
                 decoded.details.insert("from_lsn".into(), "1".into());
                 assert!(control::validate_metadata_gap_event(&decoded).is_err());
             }
             "audit.config" => {
                 control::validate_metadata_webhook_key_change_event(&decoded).unwrap();
-                assert_eq!(control::metadata_webhook_key_change_details(&decoded.details).unwrap(), (4294967296, 9007199254740991));
-                decoded.details.insert("secret_value".into(), "not public metadata".into());
+                assert_eq!(
+                    control::metadata_webhook_key_change_details(&decoded.details).unwrap(),
+                    (4294967296, 9007199254740991)
+                );
+                decoded
+                    .details
+                    .insert("secret_value".into(), "not public metadata".into());
                 assert!(control::validate_metadata_webhook_key_change_event(&decoded).is_err());
             }
             _ => {
                 control::validate_metadata_webhook_replay_event(&decoded).unwrap();
-                assert_eq!(control::metadata_webhook_replay_details(&decoded.details).unwrap(), i64::MAX as u64);
+                assert_eq!(
+                    control::metadata_webhook_replay_details(&decoded.details).unwrap(),
+                    i64::MAX as u64
+                );
                 decoded.details.insert("from_lsn".into(), "1".into());
                 assert!(control::validate_metadata_webhook_replay_event(&decoded).is_err());
             }
@@ -492,39 +611,73 @@ fn portable_metadata_history_validators_read_real_record_bytes_in_their_own_name
 fn metadata_approval_read_domain_checks_all_fields_without_changing_native_record_bytes() {
     use prost::Message as _;
     let owner = format!("oidc:{}", "ab".repeat(32));
-    let base = pb::Approval { proposal_id: "p-real-history".into(), diff_hash: vec![7;32],
+    let base = pb::Approval {
+        proposal_id: "p-real-history".into(),
+        diff_hash: vec![7; 32],
         verified_through_lsn: 17,
-        audit: Some(pb::Audit { token_id: owner.clone(), reason: "actual protocol history fixture".into(), wall_time_ms: 19 }),
-        ..Default::default() };
+        audit: Some(pb::Audit {
+            token_id: owner.clone(),
+            reason: "actual protocol history fixture".into(),
+            wall_time_ms: 19,
+        }),
+        ..Default::default()
+    };
     kronik_proto::validate_proposal_approval(&base).unwrap();
-    for (nonce, ciphertext) in [(vec![3;24], vec![5;16]), (vec![0;24], Vec::new())] {
-        let approval = pb::Approval { verified_identity: Some(pb::Sealable { subject: Some(owner.clone()),
-            value: Some(pb::sealable::Value::Sealed(pb::Sealed { key_version: 2, nonce, ciphertext })) }), ..base.clone() };
+    for (nonce, ciphertext) in [(vec![3; 24], vec![5; 16]), (vec![0; 24], Vec::new())] {
+        let approval = pb::Approval {
+            verified_identity: Some(pb::Sealable {
+                subject: Some(owner.clone()),
+                value: Some(pb::sealable::Value::Sealed(pb::Sealed {
+                    key_version: 2,
+                    nonce,
+                    ciphertext,
+                })),
+            }),
+            ..base.clone()
+        };
         let record = Record::Approval(approval.clone());
         let exact = record.encode();
         let decoded = Record::decode(kronik_proto::kind::APPROVAL, &exact).unwrap();
-        let Record::Approval(decoded) = decoded else { panic!("actual Record8 fixture") };
+        let Record::Approval(decoded) = decoded else {
+            panic!("actual Record8 fixture")
+        };
         kronik_proto::validate_proposal_approval(&decoded).unwrap();
         assert_eq!(Record::Approval(decoded).encode(), exact);
         for mutation in 0..7 {
             let mut invalid = approval.clone();
             match mutation {
                 0 => invalid.proposal_id.clear(),
-                1 => { invalid.diff_hash.pop(); },
+                1 => {
+                    invalid.diff_hash.pop();
+                }
                 2 => invalid.audit = None,
                 3 => invalid.audit.as_mut().unwrap().token_id.clear(),
-                4 => invalid.verified_identity.as_mut().unwrap().subject = Some("different-owner".into()),
-                5 => invalid.verified_identity.as_mut().unwrap().value = Some(pb::sealable::Value::Plain(b"not a protected identity".to_vec())),
+                4 => {
+                    invalid.verified_identity.as_mut().unwrap().subject =
+                        Some("different-owner".into())
+                }
+                5 => {
+                    invalid.verified_identity.as_mut().unwrap().value = Some(
+                        pb::sealable::Value::Plain(b"not a protected identity".to_vec()),
+                    )
+                }
                 _ => invalid.verified_identity.as_mut().unwrap().value = None,
             }
             assert!(kronik_proto::validate_proposal_approval(&invalid).is_err());
         }
     }
-    let mut future = pb::Sealable { subject: Some(owner), value: None }.encode_to_vec();
+    let mut future = pb::Sealable {
+        subject: Some(owner),
+        value: None,
+    }
+    .encode_to_vec();
     future.extend_from_slice(&[0x22, 0]); // Unsupported value field, not a new reader capability.
     let future = pb::Sealable::decode(future.as_slice()).unwrap();
     assert!(future.value.is_none());
-    let invalid = pb::Approval { verified_identity: Some(future), ..base };
+    let invalid = pb::Approval {
+        verified_identity: Some(future),
+        ..base
+    };
     assert!(kronik_proto::validate_proposal_approval(&invalid).is_err());
 }
 
@@ -534,17 +687,43 @@ fn native_origin_message_is_data_only_and_field10_is_not_an_old_reader_write_fen
     // Existing approved future carrier: action, known original audit, then NativeAuthorityOrigin field10.
     // This reader deliberately does NOT attach field10; decoding is not permission to emit/import it.
     let text = "0a0d6f70657261746f722e6e6f7465221c0a0e746f6b656e3a6f726967696e616c12086f726967696e616c18075231122f0a0a756e69783a7569643d30121f6e617469766520617574686f7269747920696e697469616c697a6174696f6e1801";
-    let wire: Vec<u8> = text.as_bytes().chunks_exact(2).map(|pair|
-        u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect();
+    let wire: Vec<u8> = text
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
     let Record::AuditEvent(old) = Record::decode(kronik_proto::kind::AUDIT_EVENT, &wire).unwrap()
-        else { panic!("actual old-layout Record40 decoder") };
-    let expected = pb::AuditEvent { action: "operator.note".into(), audit: Some(pb::Audit {
-        token_id: "token:original".into(), reason: "original".into(), wall_time_ms: 7 }), ..Default::default() };
+    else {
+        panic!("actual old-layout Record40 decoder")
+    };
+    let expected = pb::AuditEvent {
+        action: "operator.note".into(),
+        audit: Some(pb::Audit {
+            token_id: "token:original".into(),
+            reason: "original".into(),
+            wall_time_ms: 7,
+        }),
+        ..Default::default()
+    };
     assert_eq!(old, expected);
-    assert_ne!(old.encode_to_vec(), wire, "the actual old reader silently drops field10; it is NOT a compatibility fence");
-    let mut origin = pb::NativeAuthorityOrigin { source: Some(pb::ActorSource { shard: None, lsn: 37,
-        branch: "actual-native".into() }), adoption_audit: Some(pb::Audit { token_id: "unix:uid=0".into(),
-        reason: "actual initialization operator".into(), wall_time_ms: 23 }), current_projection: true };
+    assert_ne!(
+        old.encode_to_vec(),
+        wire,
+        "the actual old reader silently drops field10; it is NOT a compatibility fence"
+    );
+    let mut origin = pb::NativeAuthorityOrigin {
+        source: Some(pb::ActorSource {
+            shard: None,
+            lsn: 37,
+            branch: "actual-native".into(),
+        }),
+        adoption_audit: Some(pb::Audit {
+            token_id: "unix:uid=0".into(),
+            reason: "actual initialization operator".into(),
+            wall_time_ms: 23,
+        }),
+        current_projection: true,
+    };
     let exact = origin.encode_to_vec();
     let decoded = pb::NativeAuthorityOrigin::decode(exact.as_slice()).unwrap();
     kronik_proto::control::validate_native_authority_origin(&decoded).unwrap();

@@ -12,10 +12,21 @@ struct RsaVerifier {
 }
 
 impl signature::Verifier<Vec<u8>> for RsaVerifier {
-    fn verify(&self, message: &[u8], signature: &Vec<u8>) -> std::result::Result<(), signature::Error> {
-        ring::signature::RsaPublicKeyComponents { n: &self.n, e: &self.e }
-            .verify(&ring::signature::RSA_PKCS1_2048_8192_SHA256, message, signature)
-            .map_err(|_| signature::Error::new())
+    fn verify(
+        &self,
+        message: &[u8],
+        signature: &Vec<u8>,
+    ) -> std::result::Result<(), signature::Error> {
+        ring::signature::RsaPublicKeyComponents {
+            n: &self.n,
+            e: &self.e,
+        }
+        .verify(
+            &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+            message,
+            signature,
+        )
+        .map_err(|_| signature::Error::new())
     }
 }
 
@@ -67,11 +78,21 @@ mod tests {
     #[test]
     fn provider_has_no_signing_or_symmetric_verification() {
         assert!(verifier(&Algorithm::HS256, &DecodingKey::from_secret(b"untrusted")).is_err());
-        assert!((PROVIDER.signer_factory)(
-            &Algorithm::RS256,
-            &jsonwebtoken::EncodingKey::from_secret(b"not-a-private-key")
-        ).is_err());
-        assert!(verifier(&Algorithm::RS256, &DecodingKey::from_rsa_raw_components(&[1], &[3]))
-            .unwrap().verify(b"payload", &vec![0; 256]).is_err());
+        assert!(
+            (PROVIDER.signer_factory)(
+                &Algorithm::RS256,
+                &jsonwebtoken::EncodingKey::from_secret(b"not-a-private-key")
+            )
+            .is_err()
+        );
+        assert!(
+            verifier(
+                &Algorithm::RS256,
+                &DecodingKey::from_rsa_raw_components(&[1], &[3])
+            )
+            .unwrap()
+            .verify(b"payload", &vec![0; 256])
+            .is_err()
+        );
     }
 }

@@ -402,9 +402,16 @@ impl Proposals {
         }
         .await;
         if let Err(e) = &result {
-            if let Err(audit_error) =
-                super::audit_failed(&self.node, "preview.create", &id, details, audit, e, authority)
-                    .await
+            if let Err(audit_error) = super::audit_failed(
+                &self.node,
+                "preview.create",
+                &id,
+                details,
+                audit,
+                e,
+                authority,
+            )
+            .await
             {
                 tracing::warn!(preview = %id, code = %audit_error.code.as_str(), "preview failure audit denied or unavailable");
             }
@@ -601,7 +608,9 @@ impl Proposals {
         let erasure = self.erasures();
         self.drop_erased(&mut entry);
         let max = self.max_preview_requests;
-        let live = self.continuous_for(id, &mut entry, &actor.kind, authority.clone()).await?;
+        let live = self
+            .continuous_for(id, &mut entry, &actor.kind, authority.clone())
+            .await?;
         if live.preview_requests >= max {
             return Err(ApiError::new(
                 ErrorCode::PreviewFull,
@@ -626,17 +635,27 @@ impl Proposals {
         forget_logged(live);
         // The reply leaves the fork: no real SQL rows in it (M5), as
         // fork_send's, and no secret value (I8), as any answer.
-        let outcome = shown_record(&turn).outcome
+        let outcome = shown_record(&turn)
+            .outcome
             .ok_or_else(|| internal("The committed preview outcome is missing"))?;
         let secrets = self.node.secret_values()?;
         let patterns = kronik_sched::effects::secret_patterns(&secrets);
         let matcher = kronik_effects::http::CompiledScrubber::new(
-            &patterns, kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES,
-        ).map_err(|_| ApiError::new(ErrorCode::SecretUnavailable,
-            "The credential policy cannot verify this prepared preview response"))?;
-        crate::replay::prepared_outcome_safe(&outcome, &matcher)
-            .map_err(|_| ApiError::new(ErrorCode::SecretUnavailable,
-                "The current credential source cannot verify this prepared preview response"))?;
+            &patterns,
+            kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES,
+        )
+        .map_err(|_| {
+            ApiError::new(
+                ErrorCode::SecretUnavailable,
+                "The credential policy cannot verify this prepared preview response",
+            )
+        })?;
+        crate::replay::prepared_outcome_safe(&outcome, &matcher).map_err(|_| {
+            ApiError::new(
+                ErrorCode::SecretUnavailable,
+                "The current credential source cannot verify this prepared preview response",
+            )
+        })?;
         Ok(TurnResult {
             turn_id: TurnId {
                 branch: id.to_owned(),
@@ -675,7 +694,8 @@ impl kronik_gateway::PreviewRouter for Proposals {
         // Its own task: a client that stops waiting does not cut the turn
         // short between the fork's store and its log.
         let turn = env.spawn("preview-send", async move {
-            self.preview_send(&id, actor, http, subject, authority).await
+            self.preview_send(&id, actor, http, subject, authority)
+                .await
         });
         Box::pin(async move {
             turn.await.unwrap_or_else(|| {

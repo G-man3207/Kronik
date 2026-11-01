@@ -1,21 +1,40 @@
 //! Prepared durable metadata, published by the existing TokenStore fence.
 use super::*;
-use std::collections::BTreeMap;
 use kronik_core::authority::AuthLease;
 use kronik_core::ids::SourcePos;
+use std::collections::BTreeMap;
 
 /// Immutable proof, not a bearer credential or a forwarded scope snapshot.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ForwardedPrincipal {
-    Bearer { hash: [u8; 32], expected: ExpectedRevision },
-    Local { owner_member: u64, uid: u32, expected: ExpectedRevision },
+    Bearer {
+        hash: [u8; 32],
+        expected: ExpectedRevision,
+    },
+    Local {
+        owner_member: u64,
+        uid: u32,
+        expected: ExpectedRevision,
+    },
 }
 
 impl std::fmt::Debug for ForwardedPrincipal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Bearer { expected, .. } => f.debug_struct("BearerPrincipal").field("expected", expected).finish(),
-            Self::Local { owner_member, uid, expected } => f.debug_struct("LocalPrincipal").field("owner_member", owner_member).field("uid", uid).field("expected", expected).finish(),
+            Self::Bearer { expected, .. } => f
+                .debug_struct("BearerPrincipal")
+                .field("expected", expected)
+                .finish(),
+            Self::Local {
+                owner_member,
+                uid,
+                expected,
+            } => f
+                .debug_struct("LocalPrincipal")
+                .field("owner_member", owner_member)
+                .field("uid", uid)
+                .field("expected", expected)
+                .finish(),
         }
     }
 }
@@ -41,11 +60,12 @@ pub struct OidcSessionProof {
 
 impl std::fmt::Debug for OidcSessionProof {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OidcSessionProof").field("config_source", &self.config_source)
-            .field("expires_wall_ms", &self.expires_wall_ms).finish_non_exhaustive()
+        f.debug_struct("OidcSessionProof")
+            .field("config_source", &self.config_source)
+            .field("expires_wall_ms", &self.expires_wall_ms)
+            .finish_non_exhaustive()
     }
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataToken {
@@ -82,7 +102,10 @@ pub(super) enum MetadataState {
 }
 
 pub(super) fn unavailable() -> ApiError {
-    ApiError::new(ErrorCode::Unavailable, "durable member authentication is unavailable")
+    ApiError::new(
+        ErrorCode::Unavailable,
+        "durable member authentication is unavailable",
+    )
 }
 
 impl MetadataSource {
@@ -96,7 +119,11 @@ impl MetadataSource {
         }
     }
 
-    pub(super) fn matches(&self, expected: ExpectedRevision, token: Option<&MetadataToken>) -> bool {
+    pub(super) fn matches(
+        &self,
+        expected: ExpectedRevision,
+        token: Option<&MetadataToken>,
+    ) -> bool {
         let current = self.expected(token);
         self.revision >= expected.metadata_revision
             && current.created_index == expected.created_index
@@ -105,14 +132,23 @@ impl MetadataSource {
             && current.fleet_revision == expected.fleet_revision
     }
 
-    pub(super) fn current_fleet_receipt(&self, epoch: u64, request_id: &str) -> Result<&kronik_proto::log::v1::FleetState, ApiError> {
-        let state = self.fleet.as_ref().ok_or_else(|| unauthenticated("managed fleet authority is unavailable"))?;
+    pub(super) fn current_fleet_receipt(
+        &self,
+        epoch: u64,
+        request_id: &str,
+    ) -> Result<&kronik_proto::log::v1::FleetState, ApiError> {
+        let state = self
+            .fleet
+            .as_ref()
+            .ok_or_else(|| unauthenticated("managed fleet authority is unavailable"))?;
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let request = request_id.as_bytes();
-        let same_request = request.len() == 64 && state.request_id.len() == 32
-            && state.request_id.iter().enumerate().all(|(index, byte)|
+        let same_request = request.len() == 64
+            && state.request_id.len() == 32
+            && state.request_id.iter().enumerate().all(|(index, byte)| {
                 request[index * 2] == HEX[(byte >> 4) as usize]
-                    && request[index * 2 + 1] == HEX[(byte & 15) as usize]);
+                    && request[index * 2 + 1] == HEX[(byte & 15) as usize]
+            });
         if state.epoch != epoch || !same_request {
             return Err(unauthenticated("the managed fleet receipt was superseded"));
         }
@@ -120,12 +156,21 @@ impl MetadataSource {
     }
 
     pub(super) fn require_fleet(&self, token: &MetadataToken) -> Result<(), ApiError> {
-        let Some(provenance) = &token.meta.fleet else { return Ok(()); };
+        let Some(provenance) = &token.meta.fleet else {
+            return Ok(());
+        };
         let state = self.current_fleet_receipt(provenance.epoch, &provenance.request_id)?;
         if state.phase != kronik_proto::log::v1::fleet_state::Phase::Active as i32
             || token.meta.scopes.len() != state.scopes.len()
-            || !token.meta.scopes.iter().all(|scope| state.scopes.iter().any(|value| value == scope.as_str())) {
-            return Err(unauthenticated("the managed fleet receipt is no longer active"));
+            || !token
+                .meta
+                .scopes
+                .iter()
+                .all(|scope| state.scopes.iter().any(|value| value == scope.as_str()))
+        {
+            return Err(unauthenticated(
+                "the managed fleet receipt is no longer active",
+            ));
         }
         Ok(())
     }
@@ -133,7 +178,9 @@ impl MetadataSource {
 
 impl TokenStore {
     pub(super) fn metadata(&self) -> MutexGuard<'_, MetadataState> {
-        self.metadata.lock().unwrap_or_else(|error| error.into_inner())
+        self.metadata
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     /// Call before exposing a member listener; native SQLite can never authorize it.
@@ -141,7 +188,10 @@ impl TokenStore {
         self.publish_auth_change(&mut || {
             let mut state = self.metadata();
             match &*state {
-                MetadataState::Native => { *state = MetadataState::Pending; Ok(()) }
+                MetadataState::Native => {
+                    *state = MetadataState::Pending;
+                    Ok(())
+                }
                 _ => Err(internal("member authentication was already attached")),
             }
         })
@@ -149,11 +199,16 @@ impl TokenStore {
 
     /// Parse and allocate outside the publisher, before acquiring any admission fence.
     pub fn prepare_metadata(source: MetadataSource) -> Result<PreparedMetadata, ApiError> {
-        if source.owner_member == 0 || source.auth_config_revision > source.revision || source.fleet_revision > source.revision {
+        if source.owner_member == 0
+            || source.auth_config_revision > source.revision
+            || source.fleet_revision > source.revision
+        {
             return Err(internal("invalid metadata authentication revision"));
         }
         if source.auth_config.is_some() != (source.auth_config_revision > 0) {
-            return Err(internal("metadata authentication profile lacks its exact source"));
+            return Err(internal(
+                "metadata authentication profile lacks its exact source",
+            ));
         }
         if source.fleet.is_some() != (source.fleet_revision > 0) {
             return Err(internal("metadata fleet receipt lacks its exact source"));
@@ -167,17 +222,28 @@ impl TokenStore {
         let (mut live, mut managed) = (HashMap::new(), HashMap::new());
         let mut hashes = BTreeSet::new();
         for (name, row) in &source.tokens {
-            if name != &row.meta.name || !valid_name(name) || row.meta.scopes.is_empty()
-                || row.created_index == 0 || row.created_index > row.revision || row.revision > source.revision
+            if name != &row.meta.name
+                || !valid_name(name)
+                || row.meta.scopes.is_empty()
+                || row.created_index == 0
+                || row.created_index > row.revision
+                || row.revision > source.revision
                 || row.revoked_index.is_some_and(|index| index != row.revision)
-                || row.meta.revoked.is_some() != row.revoked_index.is_some() {
+                || row.meta.revoked.is_some() != row.revoked_index.is_some()
+            {
                 return Err(internal("invalid metadata token row"));
             }
             if !hashes.insert(row.hash) {
                 return Err(internal("duplicate metadata token identity"));
             }
             if let Some(fleet) = &row.meta.fleet {
-                if fleet.epoch == 0 || fleet.request_id.len() != 64 || !fleet.request_id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+                if fleet.epoch == 0
+                    || fleet.request_id.len() != 64
+                    || !fleet
+                        .request_id
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                {
                     return Err(internal("invalid metadata fleet provenance"));
                 }
                 managed.insert(name.clone(), Arc::new(fleet.clone()));
@@ -186,19 +252,29 @@ impl TokenStore {
                 live.insert(row.hash, (name.clone(), row.meta.scopes.clone()));
             }
         }
-        Ok(PreparedMetadata { source: Arc::new(source), live, managed })
+        Ok(PreparedMetadata {
+            source: Arc::new(source),
+            live,
+            managed,
+        })
     }
 
     /// The image and parent directory are durable before this bounded swap.
     pub fn publish_prepared(&self, prepared: PreparedMetadata) -> Result<(), ApiError> {
-        let PreparedMetadata { source, live, managed } = prepared;
+        let PreparedMetadata {
+            source,
+            live,
+            managed,
+        } = prepared;
         let previous = match &*self.metadata() {
             MetadataState::Pending => None,
             MetadataState::Ready(previous) => Some(previous.clone()),
             _ => return Err(unavailable()),
         };
-        if previous.as_ref().is_some_and(|previous| source.revision < previous.revision
-            || (source.revision == previous.revision && source != *previous)) {
+        if previous.as_ref().is_some_and(|previous| {
+            source.revision < previous.revision
+                || (source.revision == previous.revision && source != *previous)
+        }) {
             return Err(unavailable());
         }
         let publication = self.publication();
@@ -208,7 +284,13 @@ impl TokenStore {
             (MetadataState::Ready(current), Some(previous)) if Arc::ptr_eq(current, previous) => {}
             _ => return Err(unavailable()),
         }
-        let retired_managed = std::mem::replace(&mut *self.managed.lock().unwrap_or_else(|error| error.into_inner()), managed);
+        let retired_managed = std::mem::replace(
+            &mut *self
+                .managed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            managed,
+        );
         let retired_live = std::mem::replace(&mut *self.live(), live);
         let retired_state = std::mem::replace(&mut *state, MetadataState::Ready(source));
         self.notify_auth_change();
@@ -237,12 +319,18 @@ impl TokenStore {
 
     /// Read-only receipt check for one admitted enrollment continuation.
     /// Native state is held by Fleet; an unavailable member is never native.
-    pub(crate) fn fleet_phase(&self, epoch: u64, request_id: &str) -> Result<Option<kronik_proto::log::v1::fleet_state::Phase>, ApiError> {
+    pub(crate) fn fleet_phase(
+        &self,
+        epoch: u64,
+        request_id: &str,
+    ) -> Result<Option<kronik_proto::log::v1::fleet_state::Phase>, ApiError> {
         match &*self.metadata() {
             MetadataState::Native => Ok(None),
             MetadataState::Ready(source) => {
                 let state = source.current_fleet_receipt(epoch, request_id)?;
-                kronik_proto::log::v1::fleet_state::Phase::try_from(state.phase).map(Some).map_err(internal)
+                kronik_proto::log::v1::fleet_state::Phase::try_from(state.phase)
+                    .map(Some)
+                    .map_err(internal)
             }
             _ => Err(unavailable()),
         }
@@ -250,12 +338,21 @@ impl TokenStore {
 
     pub fn lookup(&self, name: &str) -> Result<Option<TokenMeta>, ApiError> {
         match &*self.metadata() {
-            MetadataState::Ready(source) => return Ok(source.tokens.get(name).map(|row| row.meta.clone())),
+            MetadataState::Ready(source) => {
+                return Ok(source.tokens.get(name).map(|row| row.meta.clone()));
+            }
             MetadataState::Native => {}
             _ => return Err(unavailable()),
         }
-        self.inner()?.conn.query_row(&format!("SELECT {COLUMNS} FROM tokens WHERE name = ?1"), [name], meta)
-            .optional().map_err(internal)
+        self.inner()?
+            .conn
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM tokens WHERE name = ?1"),
+                [name],
+                meta,
+            )
+            .optional()
+            .map_err(internal)
     }
 
     pub fn lookup_metadata(&self, name: &str) -> Result<Option<MetadataToken>, ApiError> {
@@ -266,18 +363,29 @@ impl TokenStore {
         }
     }
 
-    pub fn token_source(&self, name: &str) -> Result<Option<(SourcePos, Option<SourcePos>)>, ApiError> {
+    pub fn token_source(
+        &self,
+        name: &str,
+    ) -> Result<Option<(SourcePos, Option<SourcePos>)>, ApiError> {
         match &*self.metadata() {
-            MetadataState::Ready(source) => Ok(source.tokens.get(name).map(|row| (
-                SourcePos::Metadata { index: row.created_index },
-                row.revoked_index.map(|index| SourcePos::Metadata { index }),
-            ))),
+            MetadataState::Ready(source) => Ok(source.tokens.get(name).map(|row| {
+                (
+                    SourcePos::Metadata {
+                        index: row.created_index,
+                    },
+                    row.revoked_index.map(|index| SourcePos::Metadata { index }),
+                )
+            })),
             MetadataState::Native => Ok(None),
             _ => Err(unavailable()),
         }
     }
 
-    pub fn capture_token(self: &Arc<Self>, token: &str, required: Scope) -> Result<crate::CapturedRequest, ApiError> {
+    pub fn capture_token(
+        self: &Arc<Self>,
+        token: &str,
+        required: Scope,
+    ) -> Result<crate::CapturedRequest, ApiError> {
         let digest = hash(token);
         let _publication = self.publication();
         let execution = self.capture_execution()?;
@@ -285,14 +393,23 @@ impl TokenStore {
     }
 
     /// Capture one actual named row and all its grants under the same publisher.
-    pub(crate) fn capture_name(self: &Arc<Self>, name: &str, required: Scope) -> Result<crate::CapturedRequest, ApiError> {
+    pub(crate) fn capture_name(
+        self: &Arc<Self>,
+        name: &str,
+        required: Scope,
+    ) -> Result<crate::CapturedRequest, ApiError> {
         let _publication = self.publication();
         let execution = self.capture_execution()?;
         let digest = match &*self.metadata() {
-            MetadataState::Ready(source) => source.tokens.get(name).map(|row| row.hash)
+            MetadataState::Ready(source) => source
+                .tokens
+                .get(name)
+                .map(|row| row.hash)
                 .ok_or_else(|| unauthenticated("the named token is unknown or revoked"))?,
-            MetadataState::Native => self.live().iter().find_map(|(hash, (candidate, _))|
-                (candidate == name).then_some(*hash))
+            MetadataState::Native => self
+                .live()
+                .iter()
+                .find_map(|(hash, (candidate, _))| (candidate == name).then_some(*hash))
                 .ok_or_else(|| unauthenticated("the named token is unknown or revoked"))?,
             _ => return Err(unavailable()),
         };
@@ -300,15 +417,24 @@ impl TokenStore {
     }
 
     /// The caller holds publication; bearer and named capture share this path.
-    fn capture_hash_under_publication(self: &Arc<Self>, digest: [u8; 32], required: Scope,
-        execution: kronik_core::authority::AuthLease) -> Result<crate::CapturedRequest, ApiError> {
+    fn capture_hash_under_publication(
+        self: &Arc<Self>,
+        digest: [u8; 32],
+        required: Scope,
+        execution: kronik_core::authority::AuthLease,
+    ) -> Result<crate::CapturedRequest, ApiError> {
         let state = self.metadata();
         if !matches!(&*state, MetadataState::Native | MetadataState::Ready(_)) {
             return Err(unavailable());
         }
         let live = self.live();
-        let (name, scopes) = live.get(&digest).ok_or_else(|| unauthenticated("the bearer token is unknown or revoked"))?;
-        let caller = Caller { token_id: token_id(name), scopes: scopes.clone() };
+        let (name, scopes) = live
+            .get(&digest)
+            .ok_or_else(|| unauthenticated("the bearer token is unknown or revoked"))?;
+        let caller = Caller {
+            token_id: token_id(name),
+            scopes: scopes.clone(),
+        };
         caller.require(required)?;
         let expected = match &*state {
             MetadataState::Native => None,
@@ -319,12 +445,32 @@ impl TokenStore {
             }
             _ => return Err(unavailable()),
         };
-        let principal = expected.map(|expected| ForwardedPrincipal::Bearer { hash: digest, expected });
-        let authority = Arc::new(TokenAuthority { store: self.clone(), execution, identity: TokenIdentity::Hash(digest), required, expected, peer: None });
-        Ok(crate::CapturedRequest { caller, authority, principal, verified_identity: None, session: None })
+        let principal = expected.map(|expected| ForwardedPrincipal::Bearer {
+            hash: digest,
+            expected,
+        });
+        let authority = Arc::new(TokenAuthority {
+            store: self.clone(),
+            execution,
+            identity: TokenIdentity::Hash(digest),
+            required,
+            expected,
+            peer: None,
+        });
+        Ok(crate::CapturedRequest {
+            caller,
+            authority,
+            principal,
+            verified_identity: None,
+            session: None,
+        })
     }
 
-    pub(super) fn capture_local(self: &Arc<Self>, req: &ApiRequest, required: Scope) -> Result<crate::CapturedRequest, ApiError> {
+    pub(super) fn capture_local(
+        self: &Arc<Self>,
+        req: &ApiRequest,
+        required: Scope,
+    ) -> Result<crate::CapturedRequest, ApiError> {
         let uid = crate::auth::local_uid(req)?;
         let _publication = self.publication();
         let execution = self.capture_execution()?;
@@ -332,20 +478,43 @@ impl TokenStore {
             MetadataState::Native => (None, None),
             MetadataState::Ready(source) => {
                 let expected = source.expected(None);
-                (Some(expected), Some(ForwardedPrincipal::Local { owner_member: source.owner_member, uid, expected }))
+                (
+                    Some(expected),
+                    Some(ForwardedPrincipal::Local {
+                        owner_member: source.owner_member,
+                        uid,
+                        expected,
+                    }),
+                )
             }
             _ => return Err(unavailable()),
         };
         let caller = Caller::local(format!("unix:uid={uid}"));
-        let authority: AuthLease = Arc::new(TokenAuthority { store: self.clone(), execution, identity: TokenIdentity::Local, required, expected, peer: None });
-        Ok(crate::CapturedRequest { caller, authority, principal, verified_identity: None, session: None })
+        let authority: AuthLease = Arc::new(TokenAuthority {
+            store: self.clone(),
+            execution,
+            identity: TokenIdentity::Local,
+            required,
+            expected,
+            peer: None,
+        });
+        Ok(crate::CapturedRequest {
+            caller,
+            authority,
+            principal,
+            verified_identity: None,
+            session: None,
+        })
     }
 
     /// Native browser capture retains its original sticky session lease.
     /// A member without its real session-proof provider is explicitly unavailable.
     pub(crate) fn capture_oidc(
-        self: &Arc<Self>, required: Scope, original_session: kronik_core::authority::SessionLease,
-        clock: Arc<dyn kronik_core::env::Clock>, verified_identity: Option<Arc<kronik_proto::log::v1::Sealable>>,
+        self: &Arc<Self>,
+        required: Scope,
+        original_session: kronik_core::authority::SessionLease,
+        clock: Arc<dyn kronik_core::env::Clock>,
+        verified_identity: Option<Arc<kronik_proto::log::v1::Sealable>>,
     ) -> Result<crate::CapturedRequest, ApiError> {
         let _publication = self.publication();
         let execution = self.capture_execution()?;
@@ -358,55 +527,130 @@ impl TokenStore {
         }
         let state = self.metadata();
         match &*state {
-            MetadataState::Native if matches!(revocation.config_source,
-                Some(kronik_proto::log::v1::auth_session_revoked::ConfigSource::NativeLsn(_))) => {}
+            MetadataState::Native
+                if matches!(
+                    revocation.config_source,
+                    Some(kronik_proto::log::v1::auth_session_revoked::ConfigSource::NativeLsn(_))
+                ) => {}
             _ => return Err(unavailable()),
         }
         let live = self.live();
-        let (digest, (_, scopes)) = live.iter().find(|(_, (token, _))| token == &revocation.token_name)
+        let (digest, (_, scopes)) = live
+            .iter()
+            .find(|(_, (token, _))| token == &revocation.token_name)
             .ok_or_else(|| unauthenticated("the browser token binding is revoked"))?;
-        let principal_hash: &[u8; 32] = revocation.principal_hash.as_slice().try_into()
+        let principal_hash: &[u8; 32] = revocation
+            .principal_hash
+            .as_slice()
+            .try_into()
             .map_err(|_| unauthenticated("the original browser principal binding is invalid"))?;
         let audit_id = format!("oidc:{}", kronik_core::ids::hex(principal_hash));
-        if verified_identity.as_ref().is_some_and(|value| value.subject.as_deref() != Some(audit_id.as_str())
-            || !matches!(value.value, Some(kronik_proto::log::v1::sealable::Value::Sealed(_)))) {
-            return Err(unauthenticated("the original verified identity protection is invalid"));
+        if verified_identity.as_ref().is_some_and(|value| {
+            value.subject.as_deref() != Some(audit_id.as_str())
+                || !matches!(
+                    value.value,
+                    Some(kronik_proto::log::v1::sealable::Value::Sealed(_))
+                )
+        }) {
+            return Err(unauthenticated(
+                "the original verified identity protection is invalid",
+            ));
         }
-        let caller = Caller { token_id: audit_id, scopes: scopes.clone() };
+        let caller = Caller {
+            token_id: audit_id,
+            scopes: scopes.clone(),
+        };
         caller.require(required)?;
-        let ordinary: AuthLease = Arc::new(TokenAuthority { store: self.clone(), execution,
-            identity: TokenIdentity::Hash(*digest), required, expected: None, peer: None });
+        let ordinary: AuthLease = Arc::new(TokenAuthority {
+            store: self.clone(),
+            execution,
+            identity: TokenIdentity::Hash(*digest),
+            required,
+            expected: None,
+            peer: None,
+        });
         let session = kronik_core::authority::guard_session(original_session, ordinary);
         let authority: AuthLease = session.clone();
-        Ok(crate::CapturedRequest { caller, authority, principal: None, verified_identity,
-            session: Some(session) })
+        Ok(crate::CapturedRequest {
+            caller,
+            authority,
+            principal: None,
+            verified_identity,
+            session: Some(session),
+        })
     }
 
-    pub fn resolve_forwarded(self: &Arc<Self>, proof: &ForwardedPrincipal, required: Scope, peer_owner: u64, peer: AuthLease) -> Result<crate::CapturedRequest, ApiError> {
+    pub fn resolve_forwarded(
+        self: &Arc<Self>,
+        proof: &ForwardedPrincipal,
+        required: Scope,
+        peer_owner: u64,
+        peer: AuthLease,
+    ) -> Result<crate::CapturedRequest, ApiError> {
         peer.check()?;
-        if peer_owner == 0 { return Err(unauthenticated("the forwarding peer is not a registered owner")); }
+        if peer_owner == 0 {
+            return Err(unauthenticated(
+                "the forwarding peer is not a registered owner",
+            ));
+        }
         let _publication = self.publication();
         let execution = self.capture_execution()?;
         let state = self.metadata();
-        let MetadataState::Ready(source) = &*state else { return Err(unavailable()); };
+        let MetadataState::Ready(source) = &*state else {
+            return Err(unavailable());
+        };
         let (caller, identity, expected) = match proof {
             ForwardedPrincipal::Bearer { hash, expected } => {
                 let live = self.live();
-                let (name, _) = live.get(hash).ok_or_else(|| unauthenticated("the forwarded token is revoked or unknown"))?;
+                let (name, _) = live
+                    .get(hash)
+                    .ok_or_else(|| unauthenticated("the forwarded token is revoked or unknown"))?;
                 let row = source.tokens.get(name).ok_or_else(unavailable)?;
-                if !source.matches(*expected, Some(row)) { return Err(unauthenticated("the forwarded token authority changed")); }
-                source.require_fleet(row)?;
-                (Caller { token_id: row.meta.token_id(), scopes: row.meta.scopes.clone() }, TokenIdentity::Hash(*hash), *expected)
-            }
-            ForwardedPrincipal::Local { owner_member, uid, expected } => {
-                if *owner_member != peer_owner || !source.matches(*expected, None) {
-                    return Err(unauthenticated("the forwarded local owner authority changed"));
+                if !source.matches(*expected, Some(row)) {
+                    return Err(unauthenticated("the forwarded token authority changed"));
                 }
-                (Caller::local(format!("unix:uid={uid}")), TokenIdentity::Local, *expected)
+                source.require_fleet(row)?;
+                (
+                    Caller {
+                        token_id: row.meta.token_id(),
+                        scopes: row.meta.scopes.clone(),
+                    },
+                    TokenIdentity::Hash(*hash),
+                    *expected,
+                )
+            }
+            ForwardedPrincipal::Local {
+                owner_member,
+                uid,
+                expected,
+            } => {
+                if *owner_member != peer_owner || !source.matches(*expected, None) {
+                    return Err(unauthenticated(
+                        "the forwarded local owner authority changed",
+                    ));
+                }
+                (
+                    Caller::local(format!("unix:uid={uid}")),
+                    TokenIdentity::Local,
+                    *expected,
+                )
             }
         };
         caller.require(required)?;
-        let authority: AuthLease = Arc::new(TokenAuthority { store: self.clone(), execution, identity, required, expected: Some(expected), peer: Some(peer) });
-        Ok(crate::CapturedRequest { caller, authority, principal: Some(proof.clone()), verified_identity: None, session: None })
+        let authority: AuthLease = Arc::new(TokenAuthority {
+            store: self.clone(),
+            execution,
+            identity,
+            required,
+            expected: Some(expected),
+            peer: Some(peer),
+        });
+        Ok(crate::CapturedRequest {
+            caller,
+            authority,
+            principal: Some(proof.clone()),
+            verified_identity: None,
+            session: None,
+        })
     }
 }

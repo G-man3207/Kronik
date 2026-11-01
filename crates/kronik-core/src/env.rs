@@ -93,21 +93,41 @@ pub trait Fs: Send + Sync + 'static {
     }
     /// Read a singly linked regular file owned by the effective user, with no
     /// group/world permissions. Recheck identity and contents after reading.
-    fn read_secure(&self, _path: PathBuf, _max_bytes: usize)
-        -> BoxFuture<'static, io::Result<Vec<u8>>> {
-        Box::pin(async { Err(io::Error::new(io::ErrorKind::Unsupported, "secure file reads are not supported")) })
+    fn read_secure(
+        &self,
+        _path: PathBuf,
+        _max_bytes: usize,
+    ) -> BoxFuture<'static, io::Result<Vec<u8>>> {
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secure file reads are not supported",
+            ))
+        })
     }
     /// Atomically replace a 0600 file beneath a private owned parent and sync
     /// file and directory. Only a missing immediate 0700 parent may be created.
-    fn write_secure(&self, _path: PathBuf, bytes: Vec<u8>)
-        -> BoxFuture<'static, io::Result<()>> {
+    fn write_secure(&self, _path: PathBuf, bytes: Vec<u8>) -> BoxFuture<'static, io::Result<()>> {
         drop(zeroize::Zeroizing::new(bytes));
-        Box::pin(async { Err(io::Error::new(io::ErrorKind::Unsupported, "secure file writes are not supported")) })
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secure file writes are not supported",
+            ))
+        })
     }
     /// As write_secure, but an existing destination must never be replaced.
-    fn write_secure_new(&self, _path: PathBuf, _bytes: Bytes)
-        -> BoxFuture<'static, io::Result<()>> {
-        Box::pin(async { Err(io::Error::new(io::ErrorKind::Unsupported, "exclusive secure file writes are not supported")) })
+    fn write_secure_new(
+        &self,
+        _path: PathBuf,
+        _bytes: Bytes,
+    ) -> BoxFuture<'static, io::Result<()>> {
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "exclusive secure file writes are not supported",
+            ))
+        })
     }
 }
 
@@ -177,6 +197,24 @@ pub struct TlsConfig {
     pub identity: Option<(Vec<Vec<u8>>, Vec<u8>)>,
 }
 
+impl std::fmt::Debug for TlsConfig {
+    /// Structural metadata only: certificate and key bytes never reach a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ca = format!("[redacted] {} certificate(s)", self.ca.len());
+        let identity = match &self.identity {
+            None => None,
+            Some((chain, _key)) => Some(format!(
+                "[redacted] {} certificate(s) and a private key",
+                chain.len()
+            )),
+        };
+        f.debug_struct("TlsConfig")
+            .field("ca", &ca)
+            .field("identity", &identity)
+            .finish()
+    }
+}
+
 /// Outbound network at the HTTP level. Inbound HTTP is not part of `Net`: the
 /// gateway's service function is called directly in simulation and bound to a
 /// hyper listener in production.
@@ -185,8 +223,11 @@ pub trait Net: Send + Sync + 'static {
     /// Recheck the SAME original authority at the actual synchronous request
     /// enqueue, after connection/capacity waits; retain it through response EOF.
     /// Implementations must not admit construction of a lazy HTTP future.
-    fn http_authorized(&self, req: HttpRequest, original: crate::authority::AuthLease)
-        -> BoxFuture<'static, Result<HttpResponse, NetError>>;
+    fn http_authorized(
+        &self,
+        req: HttpRequest,
+        original: crate::authority::AuthLease,
+    ) -> BoxFuture<'static, Result<HttpResponse, NetError>>;
     /// Builds a separate provider client; simulated networks may implement
     /// this without changing their deterministic request boundary.
     /// Supplied roots augment the system roots; this never changes guest trust.
@@ -197,11 +238,19 @@ pub trait Net: Send + Sync + 'static {
     }
     /// A separate provider client trusting only the supplied CA certificates.
     fn with_pinned_tls(&self, _tls: TlsConfig) -> Result<Arc<dyn Net>, NetError> {
-        Err(NetError::Connect("pinned TLS configuration is not supported".into()))
+        Err(NetError::Connect(
+            "pinned TLS configuration is not supported".into(),
+        ))
     }
-    fn websocket(&self, _request: WebSocketRequest)
-        -> BoxFuture<'static, Result<Arc<dyn WebSocket>, NetError>> {
-        Box::pin(async { Err(NetError::Connect("WebSocket connections are not supported".into())) })
+    fn websocket(
+        &self,
+        _request: WebSocketRequest,
+    ) -> BoxFuture<'static, Result<Arc<dyn WebSocket>, NetError>> {
+        Box::pin(async {
+            Err(NetError::Connect(
+                "WebSocket connections are not supported".into(),
+            ))
+        })
     }
 }
 

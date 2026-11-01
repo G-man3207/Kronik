@@ -605,7 +605,12 @@ mod secret_link_tests {
                 name: "service-token".into(),
                 backend: backend.into(),
                 r#ref: reference.into(),
-                binding: if backend.is_empty() { "file" } else { "trusted-provider" }.into(),
+                binding: if backend.is_empty() {
+                    "file"
+                } else {
+                    "trusted-provider"
+                }
+                .into(),
                 canonical_ref: reference.into(),
                 epoch,
                 generation,
@@ -617,10 +622,16 @@ mod secret_link_tests {
         history.push(link(2, 2, "bao", "secret/new#token"));
         history.push(link(3, 3, "", ""));
         let old = admitted.secret_link("service-token").unwrap();
-        assert_eq!((old.generation, old.r#ref.as_str()), (1, "secret/old#token"));
+        assert_eq!(
+            (old.generation, old.r#ref.as_str()),
+            (1, "secret/old#token")
+        );
         let changed = history.at(2);
         let changed = changed.secret_link("service-token").unwrap();
-        assert_eq!((changed.generation, changed.r#ref.as_str()), (2, "secret/new#token"));
+        assert_eq!(
+            (changed.generation, changed.r#ref.as_str()),
+            (2, "secret/new#token")
+        );
         let unlinked = history.at(3);
         let unlinked = unlinked.secret_link("service-token").unwrap();
         assert!(unlinked.backend.is_empty());

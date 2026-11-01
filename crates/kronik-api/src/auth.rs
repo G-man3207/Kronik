@@ -97,21 +97,42 @@ pub trait Authenticator: Send + Sync {
     fn caller(&self, req: &ApiRequest) -> Result<Caller, ApiError>;
 
     /// Mutable authenticators override this to use one publication fence.
-    fn capture(&self, req: &ApiRequest, required: Scope) -> Result<crate::CapturedRequest, ApiError> {
+    fn capture(
+        &self,
+        req: &ApiRequest,
+        required: Scope,
+    ) -> Result<crate::CapturedRequest, ApiError> {
         let caller = self.caller(req)?;
         caller.require(required)?;
         let authority = self.authority(req, required)?;
-        Ok(crate::CapturedRequest { caller, authority, principal: None, verified_identity: None, session: None })
+        Ok(crate::CapturedRequest {
+            caller,
+            authority,
+            principal: None,
+            verified_identity: None,
+            session: None,
+        })
     }
     fn token_source(&self, req: &ApiRequest) -> Result<Option<String>, ApiError> {
         let identity = self.caller(req)?.token_id;
         Ok(identity.starts_with("token:").then_some(identity))
     }
-    fn authority(&self, _req: &ApiRequest, _required: Scope) -> Result<kronik_core::authority::AuthLease, ApiError> {
-        Err(ApiError::new(ErrorCode::Unauthenticated, "This authenticator cannot admit mutations"))
+    fn authority(
+        &self,
+        _req: &ApiRequest,
+        _required: Scope,
+    ) -> Result<kronik_core::authority::AuthLease, ApiError> {
+        Err(ApiError::new(
+            ErrorCode::Unauthenticated,
+            "This authenticator cannot admit mutations",
+        ))
     }
-    fn changes(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> { None }
-    fn expires_at_ms(&self, _req: &ApiRequest) -> Option<u64> { None }
+    fn changes(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
+    fn expires_at_ms(&self, _req: &ApiRequest) -> Option<u64> {
+        None
+    }
 }
 
 /// The local socket: file permissions decide who connects, and that caller
@@ -120,7 +141,9 @@ pub struct LocalAuthenticator {
     node: std::sync::Arc<kronik_sched::Node>,
 }
 impl LocalAuthenticator {
-    pub fn new(node: std::sync::Arc<kronik_sched::Node>) -> Self { Self { node } }
+    pub fn new(node: std::sync::Arc<kronik_sched::Node>) -> Self {
+        Self { node }
+    }
 }
 
 impl Authenticator for LocalAuthenticator {
@@ -128,15 +151,26 @@ impl Authenticator for LocalAuthenticator {
         local_uid(req)?;
         Ok(Caller::local(req.token_id.clone()))
     }
-    fn authority(&self, req: &ApiRequest, required: Scope) -> Result<kronik_core::authority::AuthLease, ApiError> {
+    fn authority(
+        &self,
+        req: &ApiRequest,
+        required: Scope,
+    ) -> Result<kronik_core::authority::AuthLease, ApiError> {
         self.caller(req)?.require(required)?;
         self.node.local_operator_authority()
     }
 }
 
 pub(crate) fn local_uid(req: &ApiRequest) -> Result<u32, ApiError> {
-    req.token_id.strip_prefix("unix:uid=").and_then(|value| value.parse().ok())
-        .ok_or_else(|| ApiError::new(ErrorCode::Unauthenticated, "Verified Unix peer credentials are required"))
+    req.token_id
+        .strip_prefix("unix:uid=")
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::Unauthenticated,
+                "Verified Unix peer credentials are required",
+            )
+        })
 }
 
 /// The scope a request needs (decoded path segments without the leading

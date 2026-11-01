@@ -641,7 +641,13 @@ impl Watches {
             ("for_ms".to_owned(), for_ms.to_string()),
         ];
         self.node
-            .record_audit_event_authorized("watch.start", &w.id, details.into(), audit, authority.clone())
+            .record_audit_event_authorized(
+                "watch.start",
+                &w.id,
+                details.into(),
+                audit,
+                authority.clone(),
+            )
             .await?;
         self.save(&w)?;
         let id = w.id.clone();
@@ -686,7 +692,13 @@ impl Watches {
             return Ok(w);
         }
         self.node
-            .record_audit_event_authorized("watch.stop", id, Default::default(), audit.clone(), authority.clone())
+            .record_audit_event_authorized(
+                "watch.stop",
+                id,
+                Default::default(),
+                audit.clone(),
+                authority.clone(),
+            )
             .await?;
         let mut w = w;
         w.status = "stopped".into();

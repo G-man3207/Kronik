@@ -6,7 +6,7 @@ use kronik_proto::log::v1 as pb;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Api, AuthorizedRequest, ApiResponse, Result, json, ok, reason};
+use crate::{Api, ApiResponse, AuthorizedRequest, Result, json, ok, reason};
 
 /// A privacy mode as the API writes it: `"off"` or `"on"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -214,7 +214,14 @@ impl Api {
     async fn privacy_reseal(&self, req: &AuthorizedRequest) -> Result<ApiResponse> {
         let r: ResealRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let done = self.node.reseal(self.audit(req, r.reason.clone()), r.dry_run, req.authority.clone()).await?;
+        let done = self
+            .node
+            .reseal(
+                self.audit(req, r.reason.clone()),
+                r.dry_run,
+                req.authority.clone(),
+            )
+            .await?;
         if !r.dry_run {
             let details = [
                 ("segments", done.segments.to_string()),

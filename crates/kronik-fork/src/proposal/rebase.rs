@@ -90,7 +90,11 @@ impl Proposals {
 
     /// `kronik rollback <epoch> --by-replay`: a rebase proposal that replays
     /// every root input since the deployment through the code before it.
-    pub async fn rebase(self: &Arc<Self>, req: RebaseRequest, authority: AuthLease) -> Result<(Proposal, bool), ApiError> {
+    pub async fn rebase(
+        self: &Arc<Self>,
+        req: RebaseRequest,
+        authority: AuthLease,
+    ) -> Result<(Proposal, bool), ApiError> {
         let this = self.clone();
         self.node.authorized_effect(authority.clone(), move || async move {
             // New work (a replay of a window, a fork log): refused below
@@ -355,7 +359,16 @@ impl Proposals {
                 .await?;
             let mut consistent = true;
             return self
-                .promote_rebase_live(&mut meta, &mut live, None, &mut consistent, id, audit, true, authority)
+                .promote_rebase_live(
+                    &mut meta,
+                    &mut live,
+                    None,
+                    &mut consistent,
+                    id,
+                    audit,
+                    true,
+                    authority,
+                )
                 .await;
         }
         // A round that fails or is cancelled leaves the replay half-way, so
@@ -426,7 +439,9 @@ impl Proposals {
         let not_after = meta.created_lsn;
         // 1. Catch-up and the policy, as promote.
         *consistent = false;
-        let converged = self.catch_up_to_gap(id, live, &options, false, authority.clone()).await?;
+        let converged = self
+            .catch_up_to_gap(id, live, &options, false, authority.clone())
+            .await?;
         *consistent = true;
         if !converged {
             meta.status = "stale".into();
@@ -569,21 +584,41 @@ impl Proposals {
         self.save(meta, Some(&bytes))?;
         self.save_samples(id, live, &d)?;
         // 3. Staging while main runs, then the pause and the last round.
-        self.node.rebase_prepare(id, fork_lsn, authority.clone()).await?;
-        self.stage(id, live, info.rolled_back_epoch, not_after, None, authority.clone())
+        self.node
+            .rebase_prepare(id, fork_lsn, authority.clone())
             .await?;
+        self.stage(
+            id,
+            live,
+            info.rolled_back_epoch,
+            not_after,
+            None,
+            authority.clone(),
+        )
+        .await?;
         // The deploy lock, then the drain: no set switch lands before ours.
-        let pause = self.node.rebase_pause(self.rebase_max_pause, authority.clone()).await?;
+        let pause = self
+            .node
+            .rebase_pause(self.rebase_max_pause, authority.clone())
+            .await?;
         // The whole pause is bounded (H5): the last round reads only main's
         // records since the catch-up, and gives up at the deadline.
         *consistent = false;
         let last = async {
             let head = self.node.applied_lsn();
             if head > live.index.to_lsn {
-                self.catch_up(id, live, head, &options, false, authority.clone()).await?;
+                self.catch_up(id, live, head, &options, false, authority.clone())
+                    .await?;
             }
-            self.stage(id, live, info.rolled_back_epoch, not_after, Some(&pause), authority.clone())
-                .await
+            self.stage(
+                id,
+                live,
+                info.rolled_back_epoch,
+                not_after,
+                Some(&pause),
+                authority.clone(),
+            )
+            .await
         };
         match self
             .node

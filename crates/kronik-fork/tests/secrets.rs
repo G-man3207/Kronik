@@ -6,6 +6,8 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use common::*;
 use kronik_fork::diff::{DiffOptions, Mode};
 use kronik_fork::proposal::Proposals;
@@ -32,26 +34,40 @@ fn a_fork_reveals_only_the_placeholder_and_writes_no_secret_value() {
     let (addr, _) = server();
     let dir = tempdir();
     let p = Proc::start(dir.path());
+    p.rt.block_on(p.node.deploy(
+        &std::fs::read(guest("leaky")).unwrap(),
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
     p.rt.block_on(
         p.node
-            .deploy(&std::fs::read(guest("leaky")).unwrap(), audit(), false),
+            .secret_set("k1", SECRET.as_bytes().to_vec(), &audit(), false, p.owner()),
     )
     .unwrap();
-    p.node
-        .secret_set("k1", SECRET.as_bytes(), &audit(), false)
-        .unwrap();
     for cap in ["secret-reveal:k1", "http:127.0.0.1"] {
-        p.rt.block_on(p.node.grant("leaky", cap, None, None, audit(), false))
-            .unwrap();
+        p.rt.block_on(
+            p.node
+                .grant("leaky", cap, None, None, audit(), false, p.owner()),
+        )
+        .unwrap();
     }
     let fork_lsn = p.settle();
     let r = p.send("leaky/a", "reveal-fetch", &format!("k1 http://{addr}/x"));
     assert!(r.committed(), "{r:?}");
     p.settle();
 
-    let props = Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap();
-    p.rt.block_on(props.create_fork(Some("probe".into()), fork_lsn, false, audit(), false))
-        .unwrap();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    p.rt.block_on(props.create_fork(
+        Some("probe".into()),
+        fork_lsn,
+        false,
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
     for mode in [Mode::Isolated, Mode::Continuous] {
         p.rt.block_on(props.fork_replay(
             "probe",
@@ -61,6 +77,7 @@ fn a_fork_reveals_only_the_placeholder_and_writes_no_secret_value() {
                 ..DiffOptions::default()
             },
             None,
+            p.owner(),
         ))
         .unwrap();
         let d: serde_json::Value =

@@ -256,7 +256,10 @@ impl Record {
             Record::PrivacyMode(m) => {
                 enum_value::<pb::PrivacyState>(m.mode, "PrivacyMode.mode")?;
                 if m.reseal_requested && m.mode != pb::PrivacyState::On as i32 {
-                    return Err(invalid("PrivacyMode.reseal_requested", "requires privacy mode on"));
+                    return Err(invalid(
+                        "PrivacyMode.reseal_requested",
+                        "requires privacy mode on",
+                    ));
                 }
                 Ok(())
             }
@@ -366,31 +369,58 @@ impl Record {
 
 /// Validates the protected historical identity envelope without opening it.
 pub fn validate_approval(m: &pb::Approval) -> Result<(), DecodeError> {
-    let Some(identity) = &m.verified_identity else { return Ok(()) };
+    let Some(identity) = &m.verified_identity else {
+        return Ok(());
+    };
     let what = "Approval.verified_identity";
     let owner = some(m.audit.as_ref(), what)?.token_id.as_str();
-    if m.request || owner.len() != 69 || !owner.starts_with("oidc:")
-        || !owner.as_bytes()[5..].iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    if m.request
+        || owner.len() != 69
+        || !owner.starts_with("oidc:")
+        || !owner.as_bytes()[5..]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
         || identity.subject.as_deref() != Some(owner)
     {
-        return Err(invalid(what, "requires the exact opaque approval audit owner"));
+        return Err(invalid(
+            what,
+            "requires the exact opaque approval audit owner",
+        ));
     }
     match &identity.value {
         Some(pb::sealable::Value::Sealed(s))
-            if s.key_version > 0 && s.nonce.len() == 24
-                && (s.ciphertext.len() >= 16 || (s.ciphertext.is_empty() && s.nonce.iter().all(|b| *b == 0)))
-                && s.ciphertext.len() <= 8192 => Ok(()),
-        _ => Err(invalid(what, "requires a bounded authenticated sealed value")),
+            if s.key_version > 0
+                && s.nonce.len() == 24
+                && (s.ciphertext.len() >= 16
+                    || (s.ciphertext.is_empty() && s.nonce.iter().all(|b| *b == 0)))
+                && s.ciphertext.len() <= 8192 =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid(
+            what,
+            "requires a bounded authenticated sealed value",
+        )),
     }
 }
 
 /// Protocol/history approval structure in this reader's supported closed schema.
 /// The native Record 8 validator and its stored bytes remain unchanged.
 pub fn validate_proposal_approval(m: &pb::Approval) -> Result<(), DecodeError> {
-    if m.proposal_id.is_empty() { return Err(invalid("Approval.proposal_id", "empty")); }
-    if m.diff_hash.len() != 32 { return Err(invalid("Approval.diff_hash", "requires BLAKE3-256")); }
-    if some(m.audit.as_ref(), "Approval.audit")?.token_id.is_empty() {
-        return Err(invalid("Approval.audit", "the actual caller audit is required"));
+    if m.proposal_id.is_empty() {
+        return Err(invalid("Approval.proposal_id", "empty"));
+    }
+    if m.diff_hash.len() != 32 {
+        return Err(invalid("Approval.diff_hash", "requires BLAKE3-256"));
+    }
+    if some(m.audit.as_ref(), "Approval.audit")?
+        .token_id
+        .is_empty()
+    {
+        return Err(invalid(
+            "Approval.audit",
+            "the actual caller audit is required",
+        ));
     }
     // Reuse the full opaque-owner, subject, bound and historical-tombstone predicate.
     // Unsupported/unknown value carriers fail closed; this adds no held wire variant.
@@ -416,34 +446,57 @@ pub fn validate_secret_version(m: &pb::SecretVersion) -> Result<(), DecodeError>
             || m.hash_revision != 0
             || audit.token_id != "system"
         {
-            return Err(invalid("SecretVersion.fence", "system nonvalue format floor required"));
+            return Err(invalid(
+                "SecretVersion.fence",
+                "system nonvalue format floor required",
+            ));
         }
         return Ok(());
     }
     if m.name.is_empty() || !(1..=secret::MAX_SECRET_VERSION).contains(&m.version) {
-        return Err(invalid("SecretVersion.version", "name and exact positive version required"));
+        return Err(invalid(
+            "SecretVersion.version",
+            "name and exact positive version required",
+        ));
     }
-    let revision = if m.version <= secret::LEGACY_SECRET_VERSION_MAX { 1 } else { 2 };
+    let revision = if m.version <= secret::LEGACY_SECRET_VERSION_MAX {
+        1
+    } else {
+        2
+    };
     if m.hash_revision != revision
         || !(m.version_hash.len() == 16 || (m.deleted && m.version_hash.is_empty()))
     {
-        return Err(invalid("SecretVersion.hash", "value hash or tombstone and matching revision required"));
+        return Err(invalid(
+            "SecretVersion.hash",
+            "value hash or tombstone and matching revision required",
+        ));
     }
-    if m.backend.is_empty() || m.binding.is_empty() || m.r#ref.is_empty()
-        || m.canonical_ref.is_empty() || m.source_version.is_empty()
+    if m.backend.is_empty()
+        || m.binding.is_empty()
+        || m.r#ref.is_empty()
+        || m.canonical_ref.is_empty()
+        || m.source_version.is_empty()
         || (m.backend != "file" && (m.link_generation == 0 || m.deleted))
         || m.link_generation > i64::MAX as u64
     {
-        return Err(invalid("SecretVersion.provenance", "complete immutable provenance required"));
+        return Err(invalid(
+            "SecretVersion.provenance",
+            "complete immutable provenance required",
+        ));
     }
     if m.backend == "file" {
         let source = m.source_version.parse::<u64>().ok();
-        if m.binding != "file" || m.r#ref != m.canonical_ref
+        if m.binding != "file"
+            || m.r#ref != m.canonical_ref
             || !source.is_some_and(|v| (1..=secret::MAX_SECRET_VERSION).contains(&v))
             || !m.source_version.bytes().all(|b| b.is_ascii_digit())
             || m.source_version.starts_with('0')
         {
-            return Err(invalid("SecretVersion.file", "canonical file provenance required"));
+            return Err(invalid(
+                "SecretVersion.file",
+                "canonical file provenance required",
+            ));
         }
         secret::peer_name(&m.canonical_ref)?;
     }
@@ -453,21 +506,31 @@ pub fn validate_secret_version(m: &pb::SecretVersion) -> Result<(), DecodeError>
 /// Validates a borrowed durable secret link without cloning its protobuf.
 pub fn validate_secret_link(m: &pb::SecretLink) -> Result<(), DecodeError> {
     some(m.audit.as_ref(), "SecretLink.audit")?;
-    if m.name.is_empty() || m.generation == 0 || m.epoch == 0
-        || m.generation > i64::MAX as u64 || m.epoch > i64::MAX as u64
+    if m.name.is_empty()
+        || m.generation == 0
+        || m.epoch == 0
+        || m.generation > i64::MAX as u64
+        || m.epoch > i64::MAX as u64
     {
-        return Err(invalid("SecretLink.identity", "name and positive generation/epoch required"));
+        return Err(invalid(
+            "SecretLink.identity",
+            "name and positive generation/epoch required",
+        ));
     }
     let empty = m.r#ref.is_empty() && m.binding.is_empty() && m.canonical_ref.is_empty();
     let complete = !m.r#ref.is_empty() && !m.binding.is_empty() && !m.canonical_ref.is_empty();
-    if (m.backend.is_empty() && !empty)
-        || (!m.backend.is_empty() && !complete)
-    {
-        return Err(invalid("SecretLink.provenance", "complete link or empty unlink required"));
+    if (m.backend.is_empty() && !empty) || (!m.backend.is_empty() && !complete) {
+        return Err(invalid(
+            "SecretLink.provenance",
+            "complete link or empty unlink required",
+        ));
     }
     if m.backend == "file" {
         if m.binding != "file" || m.r#ref != m.canonical_ref {
-            return Err(invalid("SecretLink.file", "canonical file binding and reference required"));
+            return Err(invalid(
+                "SecretLink.file",
+                "canonical file binding and reference required",
+            ));
         }
         secret::peer_name(&m.canonical_ref)?;
     }
@@ -544,20 +607,40 @@ fn headers(headers: &[pb::Header]) -> Result<(), DecodeError> {
 
 /// Inspect the closed host-only whole-message cleanup reference.
 /// Structure is not authority, a source factory, or permission to resolve a frame.
-pub fn retained_compensation_source(message: &pb::Message) -> Result<Option<&pb::ActorSource>, DecodeError> {
-    let Some(source) = &message.retained_compensation_source else { return Ok(None) };
-    if !message.name.is_empty() || !message.content_type.is_empty() || message.body.is_some() || !message.blobs.is_empty() {
-        return Err(invalid("Message.retained_compensation_source", "ordinary message fields must be empty"));
+pub fn retained_compensation_source(
+    message: &pb::Message,
+) -> Result<Option<&pb::ActorSource>, DecodeError> {
+    let Some(source) = &message.retained_compensation_source else {
+        return Ok(None);
+    };
+    if !message.name.is_empty()
+        || !message.content_type.is_empty()
+        || message.body.is_some()
+        || !message.blobs.is_empty()
+    {
+        return Err(invalid(
+            "Message.retained_compensation_source",
+            "ordinary message fields must be empty",
+        ));
     }
     source.validate()?;
     Ok(Some(source))
 }
 
-fn message(value: Option<&pb::Message>, what: &'static str, retained_allowed: bool) -> Result<(), DecodeError> {
+fn message(
+    value: Option<&pb::Message>,
+    what: &'static str,
+    retained_allowed: bool,
+) -> Result<(), DecodeError> {
     let message = some(value, what)?;
     if retained_compensation_source(message)?.is_some() {
-        return if retained_allowed { Ok(()) } else {
-            Err(invalid(what, "a retained cleanup reference is not allowed in this context"))
+        return if retained_allowed {
+            Ok(())
+        } else {
+            Err(invalid(
+                what,
+                "a retained cleanup reference is not allowed in this context",
+            ))
         };
     }
     sealable(message.body.as_ref(), what)
@@ -590,7 +673,11 @@ fn input(value: Option<&pb::Input>, what: &'static str) -> Result<(), DecodeErro
             if m.source == pb::MessageSource::Actor as i32 {
                 actor(m.sender.as_ref(), "MessageInput.sender")?;
             }
-            message(m.msg.as_ref(), "MessageInput.msg", m.source == pb::MessageSource::Compensation as i32)
+            message(
+                m.msg.as_ref(),
+                "MessageInput.msg",
+                m.source == pb::MessageSource::Compensation as i32,
+            )
         }
         Some(Kind::Timer(t)) => message(t.msg.as_ref(), "TimerInput.msg", false),
         Some(Kind::Migrate(_)) => Ok(()),
@@ -616,23 +703,46 @@ fn effect(value: Option<&pb::EffectRecord>, what: &'static str) -> Result<(), De
     enum_value::<pb::Grounding>(e.grounding, "EffectRecord.grounding")?;
     if let Some(source) = &e.callee_source {
         if e.kind != "actor.call"
-            || !matches!(pb::EffectStatus::try_from(e.status),
-                Ok(pb::EffectStatus::Ok | pb::EffectStatus::Rejected | pb::EffectStatus::Failed
-                    | pb::EffectStatus::HostRedactionFailure))
+            || !matches!(
+                pb::EffectStatus::try_from(e.status),
+                Ok(pb::EffectStatus::Ok
+                    | pb::EffectStatus::Rejected
+                    | pb::EffectStatus::Failed
+                    | pb::EffectStatus::HostRedactionFailure)
+            )
         {
-            return Err(invalid("EffectRecord.callee_source", "requires committed actor.call outcome"));
+            return Err(invalid(
+                "EffectRecord.callee_source",
+                "requires committed actor.call outcome",
+            ));
         }
         source.validate()?;
     }
     match e.observed_callee_status {
-        Some(status) if e.kind == "actor.call"
-            && e.status == pb::EffectStatus::HostRedactionFailure as i32
-            && e.callee_source.is_some()
-            && matches!(pb::EffectStatus::try_from(status),
-                Ok(pb::EffectStatus::Ok | pb::EffectStatus::Rejected | pb::EffectStatus::Failed)) => {}
-        Some(_) => return Err(invalid("EffectRecord.observed_callee_status", "requires a withheld committed callee outcome")),
-        None if e.status == pb::EffectStatus::HostRedactionFailure as i32 && e.callee_source.is_some() =>
-            return Err(invalid("EffectRecord.observed_callee_status", "missing original committed callee outcome")),
+        Some(status)
+            if e.kind == "actor.call"
+                && e.status == pb::EffectStatus::HostRedactionFailure as i32
+                && e.callee_source.is_some()
+                && matches!(
+                    pb::EffectStatus::try_from(status),
+                    Ok(pb::EffectStatus::Ok
+                        | pb::EffectStatus::Rejected
+                        | pb::EffectStatus::Failed)
+                ) => {}
+        Some(_) => {
+            return Err(invalid(
+                "EffectRecord.observed_callee_status",
+                "requires a withheld committed callee outcome",
+            ));
+        }
+        None if e.status == pb::EffectStatus::HostRedactionFailure as i32
+            && e.callee_source.is_some() =>
+        {
+            return Err(invalid(
+                "EffectRecord.observed_callee_status",
+                "missing original committed callee outcome",
+            ));
+        }
         None => {}
     }
     match e.delivery.as_str() {
@@ -648,21 +758,44 @@ impl pb::ActorSource {
     /// An original durable source position, never current sending authority.
     pub fn validate(&self) -> Result<(), DecodeError> {
         if self.lsn == 0 || self.lsn > i64::MAX as u64 {
-            return Err(invalid("ActorSource.lsn", "outside positive persisted domain"));
+            return Err(invalid(
+                "ActorSource.lsn",
+                "outside positive persisted domain",
+            ));
         }
         if self.shard.is_some_and(|shard| shard >= MAX_SHARD_COUNT) {
             return Err(invalid("ActorSource.shard", "outside shard domain"));
         }
-        if self.branch.is_empty() || self.branch.len() > 256
-            || self.branch.bytes().any(|b| b.is_ascii_control() || matches!(b, b':' | b'/' | b'\\'))
-        {
-            return Err(invalid("ActorSource.branch", "outside canonical source namespace"));
-        }
+        validate_source_branch(&self.branch)?;
         Ok(())
     }
 }
 
-fn outbound(m: &pb::OutboundMessage, what: &'static str, retained_allowed: bool) -> Result<(), DecodeError> {
+/// Whether `branch` is a canonical original source-log namespace: non-empty,
+/// at most 256 bytes and free of control bytes and of the `:`, `/` or `\`
+/// separators that would alias another domain. This is the one rule the
+/// committed [`pb::ActorSource`] envelope and every source-position consumer
+/// share.
+pub fn validate_source_branch(branch: &str) -> Result<(), DecodeError> {
+    if branch.is_empty()
+        || branch.len() > 256
+        || branch
+            .bytes()
+            .any(|b| b.is_ascii_control() || matches!(b, b':' | b'/' | b'\\'))
+    {
+        return Err(invalid(
+            "ActorSource.branch",
+            "outside canonical source namespace",
+        ));
+    }
+    Ok(())
+}
+
+fn outbound(
+    m: &pb::OutboundMessage,
+    what: &'static str,
+    retained_allowed: bool,
+) -> Result<(), DecodeError> {
     actor(m.to.as_ref(), what)?;
     message(m.msg.as_ref(), what, retained_allowed)
 }
@@ -966,16 +1099,22 @@ mod successful_call_consumer_tests {
 
     fn roundtrip(effect: &pb::EffectRecord) -> Result<Record, DecodeError> {
         let record = Record::EffectResult(pb::EffectResult {
-            execution_id: "0".repeat(32), effect: Some(effect.clone()),
+            execution_id: "0".repeat(32),
+            effect: Some(effect.clone()),
         });
         Record::decode(record.kind(), &record.encode())
     }
 
     #[test]
     fn legacy_success_needs_no_invented_callee_but_withheld_success_requires_qualified_source() {
+        // A live grounding is the valid legacy form: no historical callee
+        // source may be invented for a successful call that predates it.
         let mut effect = pb::EffectRecord {
-            kind: "actor.call".into(), status: pb::EffectStatus::Ok as i32,
-            fingerprint: vec![7; 32], ..Default::default()
+            kind: "actor.call".into(),
+            status: pb::EffectStatus::Ok as i32,
+            fingerprint: vec![7; 32],
+            grounding: pb::Grounding::Live as i32,
+            ..Default::default()
         };
         assert!(effect.successful_call());
         assert!(roundtrip(&effect).is_ok());
@@ -985,10 +1124,19 @@ mod successful_call_consumer_tests {
         effect.observed_callee_status = Some(pb::EffectStatus::Ok as i32);
         assert!(!effect.successful_call());
         assert!(roundtrip(&effect).is_err());
-        effect.callee_source = Some(pb::ActorSource { shard: Some(0), lsn: 7, branch: "main".into() });
+        effect.callee_source = Some(pb::ActorSource {
+            shard: Some(0),
+            lsn: 7,
+            branch: "main".into(),
+        });
         assert!(effect.successful_call());
-        let Record::EffectResult(decoded) = roundtrip(&effect).unwrap() else { unreachable!() };
-        assert_eq!(decoded.effect.unwrap().callee_source.unwrap().shard, Some(0));
+        let Record::EffectResult(decoded) = roundtrip(&effect).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            decoded.effect.unwrap().callee_source.unwrap().shard,
+            Some(0)
+        );
         for status in [pb::EffectStatus::Rejected, pb::EffectStatus::Failed] {
             effect.observed_callee_status = Some(status as i32);
             assert!(!effect.successful_call());
@@ -1001,9 +1149,15 @@ mod successful_call_consumer_tests {
     #[test]
     fn observed_callee_outcome_is_not_allowed_on_other_effects_or_nonwithheld_calls() {
         let mut effect = pb::EffectRecord {
-            kind: "actor.call".into(), status: pb::EffectStatus::Ok as i32,
-            callee_source: Some(pb::ActorSource { shard: None, lsn: 7, branch: "main".into() }),
-            observed_callee_status: Some(pb::EffectStatus::Ok as i32), ..Default::default()
+            kind: "actor.call".into(),
+            status: pb::EffectStatus::Ok as i32,
+            callee_source: Some(pb::ActorSource {
+                shard: None,
+                lsn: 7,
+                branch: "main".into(),
+            }),
+            observed_callee_status: Some(pb::EffectStatus::Ok as i32),
+            ..Default::default()
         };
         assert!(roundtrip(&effect).is_err());
         effect.status = pb::EffectStatus::HostRedactionFailure as i32;

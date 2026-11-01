@@ -449,16 +449,26 @@ fn webhook_relay_with_a_changed_body() {
     let p = Proc::start(dir.path());
     let a = audit();
     let wasm = std::fs::read(guest("webhook-relay")).unwrap();
-    p.rt.block_on(p.node.deploy(&wasm, a.clone(), false))
+    p.rt.block_on(p.node.deploy(&wasm, a.clone(), false, p.owner()))
         .unwrap();
-    p.node
-        .secret_set("relay-signing-key", b"test-signing-key", &a, false)
-        .unwrap();
+    p.rt.block_on(p.node.secret_set(
+        "relay-signing-key",
+        b"test-signing-key".to_vec(),
+        &a,
+        false,
+        p.owner(),
+    ))
+    .unwrap();
     for cap in ["http:127.0.0.1", "secret:relay-signing-key"] {
-        p.rt.block_on(
-            p.node
-                .grant("webhook-relay", cap, None, None, a.clone(), false),
-        )
+        p.rt.block_on(p.node.grant(
+            "webhook-relay",
+            cap,
+            None,
+            None,
+            a.clone(),
+            false,
+            p.owner(),
+        ))
         .unwrap();
     }
     let target = format!("{{\"target\":\"http://{addr}/relay\"}}");
@@ -474,6 +484,7 @@ fn webhook_relay_with_a_changed_body() {
         m,
         a,
         false,
+        p.owner(),
     ));
     assert!(r.unwrap().unwrap().committed());
     let fork_lsn = p.settle();
@@ -712,7 +723,7 @@ fn replay_from_a_snapshot_equals_replay_from_the_start() {
     let dir = tempdir();
     let p = Proc::start(dir.path());
     let notes = std::fs::read(guest("notes")).unwrap();
-    p.rt.block_on(p.node.deploy(&notes, audit(), false))
+    p.rt.block_on(p.node.deploy(&notes, audit(), false, p.owner()))
         .unwrap();
     let note = |key: &str, text: &str| {
         let m = kronik_proto::log::v1::Message {
@@ -723,7 +734,7 @@ fn replay_from_a_snapshot_equals_replay_from_the_start() {
             retained_compensation_source: None,
         };
         let actor = kronik_core::ids::ActorRef::parse(&format!("notes/{key}")).unwrap();
-        p.rt.block_on(p.node.send(actor, m, audit(), false))
+        p.rt.block_on(p.node.send(actor, m, audit(), false, p.owner()))
             .unwrap()
             .unwrap();
     };
@@ -732,7 +743,7 @@ fn replay_from_a_snapshot_equals_replay_from_the_start() {
         note(&format!("n{}", i % 2), &format!("before {i}"));
     }
     p.settle();
-    let snap = p.rt.block_on(p.node.snapshot("manual")).unwrap();
+    let snap = p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
     for i in 0..4 {
         p.http(&format!("k{}", i % 3), "increment", "");
         note("n0", &format!("between {i}"));
@@ -791,6 +802,7 @@ fn identity_replay_over_outcome_unknown_turns_is_empty() {
     let fork_lsn = p.settle();
     let node = p.node.clone();
     let spec = format!("POST http://{addr}/charge\n\nx");
+    let authority = p.node.local_operator_authority().unwrap();
     p.rt.spawn(async move {
         let m = kronik_proto::log::v1::Message {
             name: "fetch".into(),
@@ -805,6 +817,7 @@ fn identity_replay_over_outcome_unknown_turns_is_empty() {
                 m,
                 audit(),
                 false,
+                authority,
             )
             .await;
     });

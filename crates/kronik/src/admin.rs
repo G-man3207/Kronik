@@ -17,8 +17,8 @@ use kronik_api::oidc::BrowserAuth;
 use kronik_api::{Api, ApiRequest};
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_sched::Node;
-use tokio::net::TcpListener;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio_rustls::rustls::ServerConfig;
 
 /// How long a client may take to send a request head.
@@ -97,7 +97,12 @@ async fn connection<S>(
     builder
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(HEADER_TIMEOUT);
-    if builder.serve_connection(TokioIo::new(stream), service).with_upgrades().await.is_err() {
+    if builder
+        .serve_connection(TokioIo::new(stream), service)
+        .with_upgrades()
+        .await
+        .is_err()
+    {
         // Hyper errors can contain OAuth codes from malformed requests.
         tracing::debug!("admin connection ended");
     }
@@ -107,13 +112,16 @@ fn header<'a>(headers: &'a hyper::HeaderMap, name: &str) -> Result<Option<&'a st
     let mut values = headers.get_all(name).iter();
     let value = values.next();
     if values.next().is_some() {
-        return Err(ApiError::new(ErrorCode::BadRequest, "duplicate authentication header"));
+        return Err(ApiError::new(
+            ErrorCode::BadRequest,
+            "duplicate authentication header",
+        ));
     }
     value
         .map(|value| {
-            value.to_str().map_err(|_| {
-                ApiError::new(ErrorCode::BadRequest, "invalid authentication header")
-            })
+            value
+                .to_str()
+                .map_err(|_| ApiError::new(ErrorCode::BadRequest, "invalid authentication header"))
         })
         .transpose()
 }
@@ -121,9 +129,9 @@ fn header<'a>(headers: &'a hyper::HeaderMap, name: &str) -> Result<Option<&'a st
 async fn browser_request(
     request: hyper::Request<hyper::body::Incoming>,
     node: &Node,
-    api: &Api,
+    api: &Arc<Api>,
     browser: &BrowserAuth,
-) -> Result<hyper::Response<Full<Bytes>>, ApiError> {
+) -> Result<hyper::Response<kronik_api::server::Body>, ApiError> {
     let (parts, body) = request.into_parts();
     if let Some(origin) = browser.origin() {
         let host = origin.strip_prefix("https://").unwrap_or("");
@@ -140,7 +148,10 @@ async fn browser_request(
     }
     if let Some(asset) = kronik_ui::asset(path) {
         if parts.method != hyper::Method::GET && parts.method != hyper::Method::HEAD {
-            return Err(ApiError::new(ErrorCode::BadRequest, "static UI assets accept GET and HEAD only"));
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "static UI assets accept GET and HEAD only",
+            ));
         }
         return Ok(bytes_response(
             200,
@@ -202,7 +213,12 @@ async fn browser_request(
         )
         .await
         .map_err(|_| ApiError::new(ErrorCode::BadRequest, "admin request body timed out"))?
-        .map_err(|_| ApiError::new(ErrorCode::PayloadTooLarge, "admin request body exceeds the API limit"))
+        .map_err(|_| {
+            ApiError::new(
+                ErrorCode::PayloadTooLarge,
+                "admin request body exceeds the API limit",
+            )
+        })
     };
     let body = if let Some(captured) = &captured {
         tokio::select! {
@@ -223,27 +239,47 @@ async fn browser_request(
         let result = browser
             .route(&req, cookies, api, captured)
             .await
-            .ok_or_else(|| ApiError::new(ErrorCode::NotImplemented, "unknown authentication operation"))??;
+            .ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::NotImplemented,
+                    "unknown authentication operation",
+                )
+            })??;
         let mut response = bytes_response(result.status, result.content_type, result.body);
         for (name, value) in result.headers.iter() {
             response.headers_mut().append(
                 hyper::header::HeaderName::from_static(*name),
-                hyper::header::HeaderValue::from_str(value)
-                    .map_err(|_| ApiError::new(ErrorCode::Internal, "invalid authentication response header"))?,
+                hyper::header::HeaderValue::from_str(value).map_err(|_| {
+                    ApiError::new(
+                        ErrorCode::Internal,
+                        "invalid authentication response header",
+                    )
+                })?,
             );
         }
         return Ok(response);
     }
     let captured = captured.ok_or_else(|| {
-        ApiError::new(ErrorCode::Unauthenticated, "request lacks its original authority")
+        ApiError::new(
+            ErrorCode::Unauthenticated,
+            "request lacks its original authority",
+        )
     })?;
     req.bearer = None;
     let result = api.handle_admitted(req, captured).await;
-    Ok(bytes_response(result.status, result.content_type, result.body.into()))
+    Ok(bytes_response(
+        result.status,
+        result.content_type,
+        result.body.into(),
+    ))
 }
 
-fn bytes_response(status: u16, content_type: &'static str, body: Bytes) -> hyper::Response<Full<Bytes>> {
-    let mut response = hyper::Response::new(Full::new(body));
+fn bytes_response(
+    status: u16,
+    content_type: &'static str,
+    body: Bytes,
+) -> hyper::Response<kronik_api::server::Body> {
+    let mut response = hyper::Response::new(Full::new(body).boxed());
     *response.status_mut() =
         hyper::StatusCode::from_u16(status).unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
     response.headers_mut().insert(
@@ -253,7 +289,9 @@ fn bytes_response(status: u16, content_type: &'static str, body: Bytes) -> hyper
     response
 }
 
-fn secure(mut response: hyper::Response<Full<Bytes>>) -> hyper::Response<Full<Bytes>> {
+fn secure(
+    mut response: hyper::Response<kronik_api::server::Body>,
+) -> hyper::Response<kronik_api::server::Body> {
     for (name, value) in [
         ("cache-control", "no-store"),
         ("pragma", "no-cache"),
@@ -261,7 +299,10 @@ fn secure(mut response: hyper::Response<Full<Bytes>>) -> hyper::Response<Full<By
         ("x-content-type-options", "nosniff"),
         ("cross-origin-opener-policy", "same-origin"),
         ("cross-origin-resource-policy", "same-origin"),
-        ("content-security-policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"),
+        (
+            "content-security-policy",
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        ),
     ] {
         response.headers_mut().insert(
             hyper::header::HeaderName::from_static(name),
@@ -271,8 +312,12 @@ fn secure(mut response: hyper::Response<Full<Bytes>>) -> hyper::Response<Full<By
     response
 }
 
-fn response(status: u16, content_type: &'static str, body: String) -> hyper::Response<Full<Bytes>> {
-    let mut resp = hyper::Response::new(Full::new(Bytes::from(body)));
+fn response(
+    status: u16,
+    content_type: &'static str,
+    body: String,
+) -> hyper::Response<kronik_api::server::Body> {
+    let mut resp = hyper::Response::new(Full::new(Bytes::from(body)).boxed());
     *resp.status_mut() =
         hyper::StatusCode::from_u16(status).unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
     resp.headers_mut().insert(
@@ -306,7 +351,11 @@ pub fn set_scrape_gauges(node: &Node) {
     }
 }
 
-fn answer(method: &hyper::Method, path: &str, node: &Node) -> hyper::Response<Full<Bytes>> {
+fn answer(
+    method: &hyper::Method,
+    path: &str,
+    node: &Node,
+) -> hyper::Response<kronik_api::server::Body> {
     if method != hyper::Method::GET {
         let e = ApiError::new(ErrorCode::BadRequest, format!("{method} {path}: only GET"));
         return response(405, "application/json", e.to_json().to_string());
@@ -360,7 +409,10 @@ mod tests {
             assert_eq!(header(&headers, name).unwrap(), Some("one"));
             headers.append(name, hyper::header::HeaderValue::from_static("two"));
             assert!(header(&headers, name).is_err());
-            headers.insert(name, hyper::header::HeaderValue::from_bytes(b"\xff").unwrap());
+            headers.insert(
+                name,
+                hyper::header::HeaderValue::from_bytes(b"\xff").unwrap(),
+            );
             assert!(header(&headers, name).is_err());
             headers.remove(name);
         }
@@ -371,8 +423,15 @@ mod tests {
         let response = secure(bytes_response(200, "text/html", Bytes::new()));
         assert_eq!(response.headers()["cache-control"], "no-store");
         assert_eq!(response.headers()["referrer-policy"], "no-referrer");
-        assert_eq!(response.headers()["cross-origin-resource-policy"], "same-origin");
-        assert!(response.headers()["content-security-policy"]
-            .to_str().unwrap().contains("frame-ancestors 'none'"));
+        assert_eq!(
+            response.headers()["cross-origin-resource-policy"],
+            "same-origin"
+        );
+        assert!(
+            response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("frame-ancestors 'none'")
+        );
     }
 }

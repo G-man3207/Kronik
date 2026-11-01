@@ -234,13 +234,17 @@ async fn compare(
                     Ok(items) => expected.extend(items),
                     Err(error) => {
                         identity_error = Some(error);
-                        return Err(kronik_log::LogError::Corrupt("audit identity unavailable".into()));
+                        return Err(kronik_log::LogError::Corrupt(
+                            "audit identity unavailable".into(),
+                        ));
                     }
                 }
                 Ok(())
             })
             .await;
-        if let Some(error) = identity_error { return Err(error); }
+        if let Some(error) = identity_error {
+            return Err(error);
+        }
         read.map_err(corrupt)?;
     }
     let lines = read_sink(sink).await?;
@@ -372,17 +376,31 @@ fn render_verify(r: &Report, sink: &str) -> String {
     out
 }
 
-fn position(branch: &str, source: Option<SourcePos>, lsn: Option<u64>, effect: Option<u32>) -> String {
+fn position(
+    branch: &str,
+    source: Option<SourcePos>,
+    lsn: Option<u64>,
+    effect: Option<u32>,
+) -> String {
     let value = match source {
         Some(SourcePos::Metadata { index }) => format!("metadata:{index}"),
-        Some(SourcePos::Actor { shard: Some(shard), lsn }) => {
-            if branch.is_empty() { format!("actor:{shard}:{lsn}") }
-            else { format!("{branch}:{shard}:{lsn}") }
-        },
+        Some(SourcePos::Actor {
+            shard: Some(shard),
+            lsn,
+        }) => {
+            if branch.is_empty() {
+                format!("actor:{shard}:{lsn}")
+            } else {
+                format!("{branch}:{shard}:{lsn}")
+            }
+        }
         Some(SourcePos::Actor { shard: None, lsn }) => lsn.to_string(),
         None => lsn.map_or_else(|| "-".to_owned(), |lsn| lsn.to_string()),
     };
-    match effect { Some(effect) => format!("{value}#{effect}"), None => value }
+    match effect {
+        Some(effect) => format!("{value}#{effect}"),
+        None => value,
+    }
 }
 
 fn item_row(i: &Item) -> Vec<String> {
@@ -401,19 +419,28 @@ mod tests {
 
     #[test]
     fn audit_show_rejects_mixed_domains_in_json_and_human_output_but_accepts_legacy_native() {
+        use super::super::http;
+        use kronik_api::types::{MemberAuditResponse, NativeAuditResponse};
         use std::io::{self, Write as _};
         use std::os::unix::net::UnixListener;
         use std::time::{Duration, Instant};
-        use kronik_api::types::{MemberAuditResponse, NativeAuditResponse};
-        use super::super::http;
 
-        let native = NativeAuditResponse { lines: Vec::new(), next: None, applied_lsn: 7 };
+        let native = NativeAuditResponse {
+            lines: Vec::new(),
+            next: None,
+            applied_lsn: 7,
+        };
         let legacy = serde_json::to_vec(&native).unwrap();
         let mut mixed = serde_json::to_value(&native).unwrap();
         let serde_json::Value::Object(member) = serde_json::to_value(MemberAuditResponse {
-            source: SourcePos::Metadata { index: 7 }, covered_from: 1,
-            next: None, lines: Vec::new(),
-        }).unwrap() else { unreachable!() };
+            source: SourcePos::Metadata { index: 7 },
+            covered_from: 1,
+            next: None,
+            lines: Vec::new(),
+        })
+        .unwrap() else {
+            unreachable!()
+        };
         mixed.as_object_mut().unwrap().extend(member);
         let mixed = serde_json::to_vec(&mixed).unwrap();
 
@@ -449,14 +476,30 @@ mod tests {
                         stream.get_mut().write_all(body).unwrap();
                         stream.get_mut().flush().unwrap();
                     });
-                    let ctx = Ctx { endpoint: Ok(http::Endpoint::Unix(socket)), json,
-                        token: Ok(None), url_flag: None };
-                    let result = audit(&ctx, AuditCommand::Show { from: None, limit: None });
+                    let ctx = Ctx {
+                        endpoint: Ok(http::Endpoint::Unix(socket)),
+                        json,
+                        token: Ok(None),
+                        url_flag: None,
+                    };
+                    let result = audit(
+                        &ctx,
+                        AuditCommand::Show {
+                            from: None,
+                            limit: None,
+                        },
+                    );
                     receiver.join().unwrap();
                     if valid {
-                        assert!(result.is_ok(), "legacy Native response must remain consumable: {result:?}");
+                        assert!(
+                            result.is_ok(),
+                            "legacy Native response must remain consumable: {result:?}"
+                        );
                     } else {
-                        assert!(result.is_err(), "mixed audit domains must not bypass decoding in either output mode");
+                        assert!(
+                            result.is_err(),
+                            "mixed audit domains must not bypass decoding in either output mode"
+                        );
                     }
                 });
             }

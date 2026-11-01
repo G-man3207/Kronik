@@ -8,7 +8,7 @@ use kronik_core::error::{ApiError, ErrorCode};
 use kronik_sched::snapshots::Manifest;
 
 use crate::types::*;
-use crate::{Api, AuthorizedRequest, ApiResponse, Result, internal, json, ok, reason};
+use crate::{Api, ApiResponse, AuthorizedRequest, Result, internal, json, ok, reason};
 
 fn entry(m: &Manifest, shipped: bool) -> SnapshotEntry {
     SnapshotEntry {

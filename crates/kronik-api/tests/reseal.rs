@@ -108,6 +108,13 @@ async fn reseal_seals_off_mode_history_and_an_identity_replay_is_empty() {
     .await;
     assert_eq!(s, 200, "{v}");
 
+    // The fork point after the deployments and before the privacy work. A
+    // fresh log now starts with a SecretVersion record and a startup
+    // AuditEvent, so the counter deployment is not at lsn 1.
+    let setup = call(&api, "GET", "/v1/health", Value::Null).await.1["applied_lsn"]
+        .as_u64()
+        .unwrap();
+
     let (s, v) = call(
         &api,
         "POST",
@@ -209,7 +216,7 @@ async fn reseal_seals_off_mode_history_and_an_identity_replay_is_empty() {
         &api,
         "POST",
         "/v1/forks",
-        json!({"at": 1, "reason": "identity after reseal"}),
+        json!({"at": setup, "reason": "identity after reseal"}),
     )
     .await;
     assert_eq!(s, 200, "{fork}");

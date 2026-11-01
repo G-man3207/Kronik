@@ -29,8 +29,8 @@ mod exchange;
 
 mod authorized;
 
-mod websocket;
 mod private_files;
+mod websocket;
 
 pub struct RealClock {
     origin: tokio::time::Instant,
@@ -152,18 +152,25 @@ impl Fs for RealFs {
             Ok(s.f_bavail.saturating_mul(s.f_frsize))
         })
     }
-    fn read_secure(&self, path: PathBuf, max_bytes: usize)
-        -> BoxFuture<'static, io::Result<Vec<u8>>> {
-        blocking(&self.0, move || private_files::read_secure_file(&path, max_bytes))
+    fn read_secure(
+        &self,
+        path: PathBuf,
+        max_bytes: usize,
+    ) -> BoxFuture<'static, io::Result<Vec<u8>>> {
+        blocking(&self.0, move || {
+            private_files::read_secure_file(&path, max_bytes)
+        })
     }
-    fn write_secure(&self, path: PathBuf, bytes: Vec<u8>)
-        -> BoxFuture<'static, io::Result<()>> {
+    fn write_secure(&self, path: PathBuf, bytes: Vec<u8>) -> BoxFuture<'static, io::Result<()>> {
         let bytes = zeroize::Zeroizing::new(bytes);
-        blocking(&self.0, move || private_files::write_secure_file(&path, &bytes, true))
+        blocking(&self.0, move || {
+            private_files::write_secure_file(&path, &bytes, true)
+        })
     }
-    fn write_secure_new(&self, path: PathBuf, bytes: Bytes)
-        -> BoxFuture<'static, io::Result<()>> {
-        blocking(&self.0, move || private_files::write_secure_file(&path, &bytes, false))
+    fn write_secure_new(&self, path: PathBuf, bytes: Bytes) -> BoxFuture<'static, io::Result<()>> {
+        blocking(&self.0, move || {
+            private_files::write_secure_file(&path, &bytes, false)
+        })
     }
 }
 
@@ -383,12 +390,18 @@ impl RealNet {
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
                 .build(connector)
         });
-        RealNet { client, connector, tls }
+        RealNet {
+            client,
+            connector,
+            tls,
+        }
     }
     fn scoped(tls: crate::env::TlsConfig, pinned: bool) -> Result<Self, NetError> {
         let bad = |_| NetError::Connect("invalid provider TLS configuration".into());
         if pinned && tls.ca.is_empty() {
-            return Err(NetError::Connect("pinned TLS requires a CA certificate".into()));
+            return Err(NetError::Connect(
+                "pinned TLS requires a CA certificate".into(),
+            ));
         }
         let mut roots = rustls::RootCertStore::empty();
         if !pinned {
@@ -423,7 +436,9 @@ impl RealNet {
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
                 .build(connector.clone());
         Ok(RealNet {
-            client: Ok(client), connector: Ok(connector), tls: Ok(Arc::new(config)),
+            client: Ok(client),
+            connector: Ok(connector),
+            tls: Ok(Arc::new(config)),
         })
     }
 }
@@ -450,9 +465,11 @@ impl Net for RealNet {
         websocket::connect(self.tls.clone(), req)
     }
 
-    fn http_authorized(&self, req: HttpRequest, original: crate::authority::AuthLease)
-        -> BoxFuture<'static, Result<HttpResponse, NetError>>
-    {
+    fn http_authorized(
+        &self,
+        req: HttpRequest,
+        original: crate::authority::AuthLease,
+    ) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
         authorized::send(self.connector.clone(), req, original)
     }
 
@@ -535,10 +552,14 @@ mod filesystem_tests {
         let unpolled_path = directory.path().join("unpolled");
         let polled_path = directory.path().join("polled");
         let runtime = tokio::runtime::Builder::new_current_thread()
-            .max_blocking_threads(1).build().unwrap();
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
         let fs = RealFs(runtime.handle().clone());
         let unpolled = fs.open(unpolled_path.clone(), OpenMode::ReadWriteCreate);
-        let file = runtime.block_on(fs.open(polled_path.clone(), OpenMode::ReadWriteCreate)).unwrap();
+        let file = runtime
+            .block_on(fs.open(polled_path.clone(), OpenMode::ReadWriteCreate))
+            .unwrap();
         drop(unpolled);
         drop(file);
         drop(fs);

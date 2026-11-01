@@ -185,7 +185,12 @@ impl World {
             memory_peak_bytes: out.memory_peak_bytes,
             ..Default::default()
         };
-        if let Some(t) = sql.lock().unwrap().end(committed, &[]).unwrap() {
+        if let Some(t) = sql
+            .lock()
+            .unwrap()
+            .end::<&str, &[u8]>(committed, &[])
+            .unwrap()
+        {
             record.sql_schema = t
                 .ddl
                 .into_iter()

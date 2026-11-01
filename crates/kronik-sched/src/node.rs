@@ -29,11 +29,11 @@ use crate::timers::Wheel;
 use crate::{NodeConfig, TurnResult};
 
 mod native;
-mod native_subject_keys;
 mod native_installation;
 mod native_metadata_audit;
-mod source_gc;
+mod native_subject_keys;
 mod records;
+mod source_gc;
 pub use records::{ShardReadPoint, ShardReader, ShardRecordPage};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -271,8 +271,16 @@ struct Fatal {
 }
 
 impl Fatal {
-    fn new(publication: Arc<Mutex<()>>, lifecycle: Arc<crate::native_execution::Lifecycle>) -> Self {
-        Self { msg: Mutex::new(None), notify: Notify::new(), publication, lifecycle }
+    fn new(
+        publication: Arc<Mutex<()>>,
+        lifecycle: Arc<crate::native_execution::Lifecycle>,
+    ) -> Self {
+        Self {
+            msg: Mutex::new(None),
+            notify: Notify::new(),
+            publication,
+            lifecycle,
+        }
     }
 
     fn set(&self, msg: String) {
@@ -315,7 +323,10 @@ pub(crate) enum OperationOrigin {
 
 impl OperationOrigin {
     fn check(&self) -> Result<(), ApiError> {
-        match self { Self::Internal => Ok(()), Self::Request(authority) => authority.check() }
+        match self {
+            Self::Internal => Ok(()),
+            Self::Request(authority) => authority.check(),
+        }
     }
 }
 
@@ -552,7 +563,8 @@ struct NativeStartupGuard(Option<Arc<Node>>);
 impl Drop for NativeStartupGuard {
     fn drop(&mut self) {
         if let Some(node) = &self.0
-            && let Err(error) = node.stop_native_execution() {
+            && let Err(error) = node.stop_native_execution()
+        {
             tracing::error!(error = %error.message, "stopping unfinished native startup failed");
         }
     }
@@ -585,15 +597,27 @@ impl Node {
                 )
                 .await
                 .map_err(StartError::SecretConfig)?;
-                Some(crate::secrets::SecretRuntime::new(
-                    env.clone(), file.clone(), backends, config.secret_settings.clone(),
-                    publication.clone(), &lifecycle,
-                ).map_err(|error| StartError::Corrupt(error.to_string()))?)
+                Some(
+                    crate::secrets::SecretRuntime::new(
+                        env.clone(),
+                        file.clone(),
+                        backends,
+                        config.secret_settings.clone(),
+                        publication.clone(),
+                        &lifecycle,
+                    )
+                    .map_err(|error| StartError::Corrupt(error.to_string()))?,
+                )
             }
             None => {
-                config.secret_settings.check().map_err(StartError::SecretConfig)?;
+                config
+                    .secret_settings
+                    .check()
+                    .map_err(StartError::SecretConfig)?;
                 if !config.secret_settings.backends.is_empty() {
-                    return Err(StartError::SecretConfig("Secret backends require the loaded encrypted secret store".into()));
+                    return Err(StartError::SecretConfig(
+                        "Secret backends require the loaded encrypted secret store".into(),
+                    ));
                 }
                 None
             }
@@ -611,9 +635,13 @@ impl Node {
         let (log, opened) = Log::open(&env, log_cfg, committed_tx, fatal_tx).await?;
         let writer = log.bind_native_execution(publication.clone(), lifecycle.ownership())?;
         let native_execution = crate::native_execution::NativeExecution::new(
-            publication.clone(), lifecycle.clone(), writer, native_source_first_lsn,
+            publication.clone(),
+            lifecycle.clone(),
+            writer,
+            native_source_first_lsn,
         );
-        let native_recovery = native_execution.recovery_authority()
+        let native_recovery = native_execution
+            .recovery_authority()
             .map_err(|error| StartError::Corrupt(error.to_string()))?;
         if opened.truncated_bytes > 0 {
             tracing::warn!(
@@ -769,11 +797,19 @@ impl Node {
             foreign: config.foreign.0.clone(),
             cfg: config,
         });
-        native_execution.bind_node(Arc::downgrade(&node))
+        native_execution
+            .bind_node(Arc::downgrade(&node))
             .map_err(|error| StartError::Corrupt(error.to_string()))?;
         let mut startup = NativeStartupGuard(Some(node.clone()));
         if let Some(runtime) = &node.secret_runtime {
-            runtime.bind_native_current_execution(&native_execution, &node.store, &node.reader, node.epoch()).await
+            runtime
+                .bind_native_current_execution(
+                    &native_execution,
+                    &node.store,
+                    &node.reader,
+                    node.epoch(),
+                )
+                .await
                 .map_err(|error| StartError::Corrupt(error.to_string()))?;
             let _publication = lock(&node.publication);
             runtime.publish_native_current_config_under_publication(node.epoch());
@@ -821,10 +857,13 @@ impl Node {
         node.recover_erasures()
             .await
             .map_err(|e| StartError::Erasure(e.message))?;
-        node.initialize_secret_versions(last == 0, node.native_recovery.clone()).await?;
+        node.initialize_secret_versions(last == 0, node.native_recovery.clone())
+            .await?;
         node.start_secret_refresh(node.native_recovery.clone());
         // Physical ACTIVE precedes Foreign recovery; public readiness is still the final Ok(node).
-        native_execution.activate().map_err(|error| StartError::Corrupt(error.to_string()))?;
+        native_execution
+            .activate()
+            .map_err(|error| StartError::Corrupt(error.to_string()))?;
         // Foreign actors run before open turns are re-run: a re-run may redo
         // a foreign call (docs/design/m7-foreign.md §5).
         node.reconcile_foreign().await;
@@ -1065,26 +1104,48 @@ impl Node {
             if let Some(begin) = retry_begin {
                 let mut delay = crate::secrets::recovery::RETRY_INITIAL;
                 let mut stalled = None;
-                while result.as_ref().is_err_and(|error| error.code == ErrorCode::SecretUnavailable) {
+                while result
+                    .as_ref()
+                    .is_err_and(|error| error.code == ErrorCode::SecretUnavailable)
+                {
                     stalled.get_or_insert_with(crate::secrets::recovery::Stalled::new);
                     self.env.clock.sleep(delay).await;
-                    delay = delay.saturating_mul(2).min(crate::secrets::recovery::RETRY_MAX);
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(crate::secrets::recovery::RETRY_MAX);
                     let recorded = match self.store.db().open_effects(&begin.execution_id) {
                         Ok(recorded) => recorded,
-                        Err(error) => { result = Err(store_err(error)); break; }
+                        Err(error) => {
+                            result = Err(store_err(error));
+                            break;
+                        }
                     };
                     let (Some(input), Some(key)) = (&begin.input, &begin.causal_key) else {
-                        result = Err(ApiError::new(ErrorCode::StorageCorrupt, "An open turn has no canonical input or causal key"));
+                        result = Err(ApiError::new(
+                            ErrorCode::StorageCorrupt,
+                            "An open turn has no canonical input or causal key",
+                        ));
                         break;
                     };
-                    result = self.run_job(
-                        &actor, input.clone(), key.clone(), job.parent_time, retry_subject.clone(),
-                        Some(Rerun { begin: begin.clone(), recorded }),
-                        OperationOrigin::Internal,
-                    ).await;
+                    result = self
+                        .run_job(
+                            &actor,
+                            input.clone(),
+                            key.clone(),
+                            job.parent_time,
+                            retry_subject.clone(),
+                            Some(Rerun {
+                                begin: begin.clone(),
+                                recorded,
+                            }),
+                            OperationOrigin::Internal,
+                        )
+                        .await;
                 }
             }
-            if let Some(lsn) = resend { lock(&self.resending).remove(&lsn); }
+            if let Some(lsn) = resend {
+                lock(&self.resending).remove(&lsn);
+            }
             if let Some(id) = timer {
                 lock(&self.wheel).done(&actor, id);
             }
@@ -1491,7 +1552,11 @@ impl Node {
 
     /// A turn's code and configuration epoch, taken together under the
     /// switch gate (ADR 0013).
-    async fn start_code(&self, kind: &str, origin: &OperationOrigin) -> Result<(Option<Arc<Kind>>, u64), ApiError> {
+    async fn start_code(
+        &self,
+        kind: &str,
+        origin: &OperationOrigin,
+    ) -> Result<(Option<Arc<Kind>>, u64), ApiError> {
         let _start = match origin {
             OperationOrigin::Internal => self.gate.start().await,
             OperationOrigin::Request(authority) => tokio::select! {
@@ -1555,55 +1620,67 @@ impl Node {
                 "the node is stopping",
             ));
         };
-        let (execution_id, seed, time, epoch, program, code_hash, recorded, recovery_begin) = match rerun {
-            Some(r) => {
-                let config = self.config_at(r.begin.config_epoch);
-                if let Err(error) = self.prepare_recorded_secrets(&r.begin, &r.recorded, &config, original_execution.clone()).await {
-                    if error.code == ErrorCode::SecretVersionGone {
-                        return self.fail_recorded_secret(r.begin, r.recorded, error.code).await;
+        let (execution_id, seed, time, epoch, program, code_hash, recorded, recovery_begin) =
+            match rerun {
+                Some(r) => {
+                    let config = self.config_at(r.begin.config_epoch);
+                    if let Err(error) = self
+                        .prepare_recorded_secrets(
+                            &r.begin,
+                            &r.recorded,
+                            &config,
+                            original_execution.clone(),
+                        )
+                        .await
+                    {
+                        if error.code == ErrorCode::SecretVersionGone {
+                            return self
+                                .fail_recorded_secret(r.begin, r.recorded, error.code)
+                                .await;
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
+                    let seed: [u8; 32] =
+                        r.begin.random_seed.as_slice().try_into().map_err(|_| {
+                            ApiError::new(ErrorCode::StorageCorrupt, "TurnBegin with a bad seed")
+                        })?;
+                    let hash = CodeHash::from_slice(&r.begin.code_hash).ok_or_else(|| {
+                        ApiError::new(ErrorCode::StorageCorrupt, "TurnBegin with a bad code hash")
+                    })?;
+                    if r.begin.engine_version != kronik_runtime::ENGINE_VERSION {
+                        tracing::warn!(
+                            recorded = %r.begin.engine_version,
+                            running = kronik_runtime::ENGINE_VERSION,
+                            "re-running a turn recorded by another engine version"
+                        );
+                    }
+                    let program = self.code.get(&hash).map_err(internal)?;
+                    (
+                        r.begin.execution_id.clone(),
+                        seed,
+                        r.begin.logical_time_ms,
+                        r.begin.config_epoch,
+                        program,
+                        hash,
+                        Some({
+                            let mut recorded = r.recorded;
+                            self.unseal_effects(&mut recorded);
+                            recorded
+                        }),
+                        Some(r.begin),
+                    )
                 }
-                let seed: [u8; 32] = r.begin.random_seed.as_slice().try_into().map_err(|_| {
-                    ApiError::new(ErrorCode::StorageCorrupt, "TurnBegin with a bad seed")
-                })?;
-                let hash = CodeHash::from_slice(&r.begin.code_hash).ok_or_else(|| {
-                    ApiError::new(ErrorCode::StorageCorrupt, "TurnBegin with a bad code hash")
-                })?;
-                if r.begin.engine_version != kronik_runtime::ENGINE_VERSION {
-                    tracing::warn!(
-                        recorded = %r.begin.engine_version,
-                        running = kronik_runtime::ENGINE_VERSION,
-                        "re-running a turn recorded by another engine version"
-                    );
-                }
-                let program = self.code.get(&hash).map_err(internal)?;
-                (
-                    r.begin.execution_id.clone(),
-                    seed,
-                    r.begin.logical_time_ms,
-                    r.begin.config_epoch,
-                    program,
-                    hash,
-                    Some({
-                        let mut recorded = r.recorded;
-                        self.unseal_effects(&mut recorded);
-                        recorded
-                    }),
-                    Some(r.begin),
-                )
-            }
-            None => (
-                random_id(&self.env),
-                self.env.random_bytes::<32>(),
-                self.clock.next(self.env.clock.as_ref(), parent_time),
-                epoch,
-                kind.program.clone(),
-                kind.hash,
-                None,
-                None,
-            ),
-        };
+                None => (
+                    random_id(&self.env),
+                    self.env.random_bytes::<32>(),
+                    self.clock.next(self.env.clock.as_ref(), parent_time),
+                    epoch,
+                    kind.program.clone(),
+                    kind.hash,
+                    None,
+                    None,
+                ),
+            };
         let config = self.config_at(epoch);
         let kind_limits = config.limits(&actor.kind);
         let limits = turn_limits(&kind_limits);
@@ -1692,7 +1769,10 @@ impl Node {
                     return Err(ApiError::new(ErrorCode::Unavailable, message));
                 }
                 if matches!(code, ErrorCode::SecretUnavailable | ErrorCode::Unavailable) {
-                    return Err(ApiError::new(code, "An immutable recorded effect prerequisite is temporarily unavailable"));
+                    return Err(ApiError::new(
+                        code,
+                        "An immutable recorded effect prerequisite is temporarily unavailable",
+                    ));
                 }
                 let last = lock(&fx.state).last_result_lsn;
                 tokio::select! {
@@ -1700,17 +1780,28 @@ impl Node {
                     () = self.store.applied.wait(last) => {},
                     message = self.fatal.wait() => return Err(ApiError::new(ErrorCode::Unavailable, message)),
                 }
-                let mut canonical = self.store.db().open_effects(&execution_id).map_err(store_err)?;
+                let mut canonical = self
+                    .store
+                    .db()
+                    .open_effects(&execution_id)
+                    .map_err(store_err)?;
                 let state = std::mem::take(&mut *lock(&fx.state));
                 for effect in state.records {
-                    if !canonical.iter().any(|record| record.ordinal == effect.ordinal) {
+                    if !canonical
+                        .iter()
+                        .any(|record| record.ordinal == effect.ordinal)
+                    {
                         canonical.push(effect);
                     }
                 }
                 canonical.sort_by_key(|effect| effect.ordinal);
-                return self.fail_recorded_secret(
-                    fx.admitted_begin().clone(), canonical, ErrorCode::SecretVersionGone,
-                ).await;
+                return self
+                    .fail_recorded_secret(
+                        fx.admitted_begin().clone(),
+                        canonical,
+                        ErrorCode::SecretVersionGone,
+                    )
+                    .await;
             }
             Err(e) => {
                 let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
@@ -1721,7 +1812,13 @@ impl Node {
         let mut fxs = std::mem::take(&mut *lock(&fx.state));
         let causal_id = causal::causal_id(&key);
         let secret_patterns = crate::effects::secret_patterns(&fxs.secrets);
-        emit_logs(actor, &causal_id, &execution_id, std::mem::take(&mut out.logs), &secret_patterns);
+        emit_logs(
+            actor,
+            &causal_id,
+            &execution_id,
+            std::mem::take(&mut out.logs),
+            &secret_patterns,
+        );
 
         let mut sql_changes = Vec::new();
         let mut sql_schema = Vec::new();
@@ -1760,16 +1857,21 @@ impl Node {
         // already carry their immutable disclosure policy.
         let closed_host_trap = out.outcome.kind == pb::OutcomeKind::Trap as i32
             && out.outcome.error_code == ErrorCode::HostRedactionFailure.as_str()
-            && out.outcome.message.is_empty() && out.outcome.output.is_none()
-            && out.writes.is_empty() && out.messages.is_empty() && out.timers.is_empty();
+            && out.outcome.message.is_empty()
+            && out.outcome.output.is_none()
+            && out.writes.is_empty()
+            && out.messages.is_empty()
+            && out.timers.is_empty();
         let disclosure = if closed_host_trap {
             // The common runtime trap already discarded all unjournaled data.
             // Do not repeat a failed matcher construction and strand the turn.
             Ok(())
         } else {
             kronik_effects::http::CompiledScrubber::new_output(
-                &secret_patterns, crate::scrub::MAX_SECRET_PATTERN_BYTES,
-            ).and_then(|matcher| crate::scrub::output(&mut out, &matcher))
+                &secret_patterns,
+                crate::scrub::MAX_SECRET_PATTERN_BYTES,
+            )
+            .and_then(|matcher| crate::scrub::output(&mut out, &matcher))
         };
         let strict_preparation = disclosure.is_ok() && !closed_host_trap;
         if let Err(error) = disclosure {
@@ -1780,7 +1882,14 @@ impl Node {
             return Err(internal(error));
         }
         drop(secret_patterns);
-        let scrubbed_with = if strict_preparation { fxs.take_secret_scope() } else { None };
+        // An empty proven scope carries no scrubbed identity: report absence so
+        // a live result equals the same turn's idempotent replay (which cannot
+        // reconstruct a distinguishably empty scope from its saved outcome).
+        let scrubbed_with = if strict_preparation {
+            fxs.take_secret_scope().filter(|scope| !scope.is_empty())
+        } else {
+            None
+        };
         let committed = out.committed();
         if !committed && fxs.outcome_unknown {
             out.outcome.kind = pb::OutcomeKind::EffectOutcomeUnknown as i32;
@@ -1833,9 +1942,17 @@ impl Node {
             .unwrap_or(u64::MAX),
         };
         let authorized = !fxs.begun && matches!(&origin, OperationOrigin::Request(_));
-        let completion = if fxs.begun { OperationOrigin::Internal } else { origin };
-        let lsn = self.commit_origin(Record::TurnRecord(record), completion).await?;
-        if authorized { Self::observe_turn(&actor.kind, Some(&outcome)); }
+        let completion = if fxs.begun {
+            OperationOrigin::Internal
+        } else {
+            origin
+        };
+        let lsn = self
+            .commit_origin(Record::TurnRecord(record), completion)
+            .await?;
+        if authorized {
+            Self::observe_turn(&actor.kind, Some(&outcome));
+        }
         for m in messages {
             self.deliver(actor, &key, time, m, pb::MessageSource::Actor, "");
         }
@@ -1911,8 +2028,12 @@ impl Node {
             ..Default::default()
         };
         let authorized = matches!(&origin, OperationOrigin::Request(_));
-        let lsn = self.commit_origin(Record::TurnRecord(record), origin).await?;
-        if authorized { Self::observe_turn(&actor.kind, Some(&outcome)); }
+        let lsn = self
+            .commit_origin(Record::TurnRecord(record), origin)
+            .await?;
+        if authorized {
+            Self::observe_turn(&actor.kind, Some(&outcome));
+        }
         Ok(TurnResult {
             turn_id: TurnId {
                 branch: self.cfg.branch.clone(),
@@ -1925,15 +2046,26 @@ impl Node {
 
     /// Appends a record and waits until it is applied.
     fn observe_turn(kind: &str, outcome: Option<&pb::Outcome>) {
-        let outcome = outcome.and_then(|outcome| pb::OutcomeKind::try_from(outcome.kind).ok())
-            .map(|kind| kronik_metrics::enum_label(kind.as_str_name(), "OUTCOME_KIND_")).unwrap_or_default();
-        kronik_metrics::inc("kronik_turns_total", &[("kind", kind), ("outcome", &outcome)]);
+        let outcome = outcome
+            .and_then(|outcome| pb::OutcomeKind::try_from(outcome.kind).ok())
+            .map(|kind| kronik_metrics::enum_label(kind.as_str_name(), "OUTCOME_KIND_"))
+            .unwrap_or_default();
+        kronik_metrics::inc(
+            "kronik_turns_total",
+            &[("kind", kind), ("outcome", &outcome)],
+        );
     }
 
     pub(crate) async fn commit(&self, mut record: Record) -> Result<Lsn, ApiError> {
         self.seal(&mut record)?;
         if let Record::TurnRecord(turn) = &record {
-            Self::observe_turn(turn.actor.as_ref().map(|actor| actor.kind.as_str()).unwrap_or_default(), turn.outcome.as_ref());
+            Self::observe_turn(
+                turn.actor
+                    .as_ref()
+                    .map(|actor| actor.kind.as_str())
+                    .unwrap_or_default(),
+                turn.outcome.as_ref(),
+            );
         }
         let lsn = match self.log.append(record).await {
             Ok(lsn) => lsn,
@@ -1970,7 +2102,11 @@ impl Node {
         }
     }
 
-    async fn seal_authorized(&self, mut record: Record, authority: AuthLease) -> Result<Record, ApiError> {
+    async fn seal_authorized(
+        &self,
+        mut record: Record,
+        authority: AuthLease,
+    ) -> Result<Record, ApiError> {
         if !self.sealer.is_on() || self.sealer.keystore().is_none() {
             return Ok(record);
         }
@@ -1982,21 +2118,32 @@ impl Node {
         if !tagged {
             return Ok(record);
         }
-        let node = self.me().ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "The node is stopping"))?;
+        let node = self
+            .me()
+            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "The node is stopping"))?;
         self.authorized_effect(authority, move || async move {
             node.seal(&mut record)?;
             Ok(record)
-        }).await
+        })
+        .await
     }
 
-    pub(crate) async fn commit_origin(&self, record: Record, origin: OperationOrigin) -> Result<Lsn, ApiError> {
+    pub(crate) async fn commit_origin(
+        &self,
+        record: Record,
+        origin: OperationOrigin,
+    ) -> Result<Lsn, ApiError> {
         match origin {
             OperationOrigin::Internal => self.commit(record).await,
             OperationOrigin::Request(authority) => self.commit_authorized(record, authority).await,
         }
     }
 
-    pub(crate) async fn append_origin(&self, record: Record, origin: OperationOrigin) -> Result<Lsn, ApiError> {
+    pub(crate) async fn append_origin(
+        &self,
+        record: Record,
+        origin: OperationOrigin,
+    ) -> Result<Lsn, ApiError> {
         match origin {
             OperationOrigin::Internal => self.append(record).await,
             OperationOrigin::Request(authority) => {
@@ -2013,7 +2160,10 @@ impl Node {
         }
     }
 
-    pub(crate) async fn switch_authorized(&self, authority: &AuthLease) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, ApiError> {
+    pub(crate) async fn switch_authorized(
+        &self,
+        authority: &AuthLease,
+    ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, ApiError> {
         tokio::select! {
             biased;
             () = authority.cancelled() => Err(ApiError::new(ErrorCode::Unauthenticated, "request revoked while waiting for switch gate")),
@@ -2061,13 +2211,18 @@ impl Node {
         });
         let mut pending = Some(send);
         authority.admit(&mut || {
-            pending.take().ok_or_else(|| internal("Side effect admitted twice"))?
-                .send(()).map_err(|_| ApiError::new(ErrorCode::Unavailable, "Side-effect worker stopped"))
+            pending
+                .take()
+                .ok_or_else(|| internal("Side effect admitted twice"))?
+                .send(())
+                .map_err(|_| ApiError::new(ErrorCode::Unavailable, "Side-effect worker stopped"))
         })?;
         if pending.is_some() {
             return Err(internal("Authority did not admit the side effect"));
         }
-        result.await.map_err(|_| ApiError::new(ErrorCode::Unavailable, "Side-effect worker stopped"))?
+        result
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::Unavailable, "Side-effect worker stopped"))?
     }
 
     pub(crate) fn deliver(
@@ -2201,7 +2356,12 @@ impl Node {
         rx
     }
 
-    async fn wait_root(&self, mut reply: oneshot::Receiver<Result<TurnResult, ApiError>>, root: &str, authority: AuthLease) -> Result<TurnResult, ApiError> {
+    async fn wait_root(
+        &self,
+        mut reply: oneshot::Receiver<Result<TurnResult, ApiError>>,
+        root: &str,
+        authority: AuthLease,
+    ) -> Result<TurnResult, ApiError> {
         tokio::select! {
             biased;
             () = authority.cancelled() => {
@@ -2326,7 +2486,13 @@ impl Node {
         };
         if http.idempotency_key.is_empty() {
             self.check_running()?;
-            let rx = self.start_root(actor, random_id(&self.env), input(http), subject, OperationOrigin::Internal);
+            let rx = self.start_root(
+                actor,
+                random_id(&self.env),
+                input(http),
+                subject,
+                OperationOrigin::Internal,
+            );
             self.complete_later(rx, waiter.clone(), None);
             return Ok(Ingress::Started(waiter));
         }
@@ -2382,7 +2548,13 @@ impl Node {
             },
         );
         drop(inflight);
-        let rx = self.start_root(actor, random_id(&self.env), input(http), subject, OperationOrigin::Internal);
+        let rx = self.start_root(
+            actor,
+            random_id(&self.env),
+            input(http),
+            subject,
+            OperationOrigin::Internal,
+        );
         self.complete_later(rx, waiter.clone(), Some(entry));
         Ok(Ingress::Started(waiter))
     }
@@ -2467,7 +2639,13 @@ impl Node {
                 ..Default::default()
             })),
         };
-        let rx = self.start_root(actor, root.clone(), input, subject, OperationOrigin::Request(authority.clone()));
+        let rx = self.start_root(
+            actor,
+            root.clone(),
+            input,
+            subject,
+            OperationOrigin::Request(authority.clone()),
+        );
         self.wait_root(rx, &root, authority).await.map(Some)
     }
 
@@ -2546,7 +2724,13 @@ impl Node {
                 ..Default::default()
             })),
         };
-        let rx = self.start_root(dl.actor, root.clone(), input, subject, OperationOrigin::Request(authority.clone()));
+        let rx = self.start_root(
+            dl.actor,
+            root.clone(),
+            input,
+            subject,
+            OperationOrigin::Request(authority.clone()),
+        );
         self.wait_root(rx, &root, authority).await.map(Some)
     }
 
@@ -2659,21 +2843,30 @@ impl Node {
 
     /// Compiles, checks and describes a component without deploying it
     /// (deploy and proposals).
-    pub async fn prepare_code(&self, bytes: &[u8], authority: AuthLease) -> Result<(CodeHash, Arc<Program>, pb::Manifest), ApiError> {
+    pub async fn prepare_code(
+        &self,
+        bytes: &[u8],
+        authority: AuthLease,
+    ) -> Result<(CodeHash, Arc<Program>, pb::Manifest), ApiError> {
         authority.check()?;
         let code = self.code.clone();
         let bytes = bytes.to_vec();
         self.authorized_effect(authority, move || async move {
             let (hash, program) = code.add(&bytes).map_err(|e| match e {
-                CodeError::ImportNotAllowed(bad) => ApiError::new(ErrorCode::ImportNotAllowed, format!("the component imports {}", bad.join(", "))),
+                CodeError::ImportNotAllowed(bad) => ApiError::new(
+                    ErrorCode::ImportNotAllowed,
+                    format!("the component imports {}", bad.join(", ")),
+                ),
                 CodeError::Invalid(m) => ApiError::new(ErrorCode::BadRequest, m),
                 other => internal(other),
             })?;
-            let manifest = program.describe(TurnLimits::default()).await
-                .map_err(|m| ApiError::new(ErrorCode::TurnFailed, format!("describe failed: {m}")))?;
+            let manifest = program.describe(TurnLimits::default()).await.map_err(|m| {
+                ApiError::new(ErrorCode::TurnFailed, format!("describe failed: {m}"))
+            })?;
             validate_manifest(&manifest)?;
             Ok((hash, program, manifest))
-        }).await
+        })
+        .await
     }
 
     /// ROUTE_CONFLICT when another kind serves one of the manifest's routes.
@@ -2772,37 +2965,75 @@ impl Node {
     /// rollback): one epoch and one LSN for the whole set. Turns that start
     /// after it run the new code of every kind in the set, running turns
     /// finish with the old. Returns (epoch, lsn); lsn is 0 for a dry run.
-    pub async fn switch_code(&self, switch: CodeSwitch, audit: pb::Audit, dry_run: bool, authority: AuthLease) -> Result<(u64, Lsn), ApiError> {
+    pub async fn switch_code(
+        &self,
+        switch: CodeSwitch,
+        audit: pb::Audit,
+        dry_run: bool,
+        authority: AuthLease,
+    ) -> Result<(u64, Lsn), ApiError> {
         authority.check()?;
-        self.switch_code_impl(switch, audit, dry_run, OperationOrigin::Request(authority)).await
+        self.switch_code_impl(switch, audit, dry_run, OperationOrigin::Request(authority))
+            .await
     }
 
     /// Configured Watch rollback only; ordinary requests cannot choose this host origin.
-    pub async fn switch_code_from_guard(&self, mut switch: CodeSwitch, mut audit: pb::Audit) -> Result<(u64, Lsn), ApiError> {
-        let reason = audit.reason.strip_prefix("watch ")
+    pub async fn switch_code_from_guard(
+        &self,
+        mut switch: CodeSwitch,
+        mut audit: pb::Audit,
+    ) -> Result<(u64, Lsn), ApiError> {
+        let reason = audit
+            .reason
+            .strip_prefix("watch ")
             .and_then(|reason| reason.split_once(": guard `"))
             .and_then(|(watch, rest)| rest.strip_suffix("` fired").map(|guard| (watch, guard)))
             .is_some_and(|(watch, guard)| !watch.is_empty() && !guard.is_empty());
         let exact_pins = switch.kinds.len() == switch.pinned.len()
             && switch.kinds.iter().enumerate().all(|(i, kind)| {
-                !switch.kinds[..i].iter().any(|previous| previous.kind == kind.kind)
-                    && switch.pinned.iter().filter(|pin| pin.kind == kind.kind).count() == 1
+                !switch.kinds[..i]
+                    .iter()
+                    .any(|previous| previous.kind == kind.kind)
+                    && switch
+                        .pinned
+                        .iter()
+                        .filter(|pin| pin.kind == kind.kind)
+                        .count()
+                        == 1
             });
-        if switch.cause != pb::DeploymentCause::Rollback || switch.rollback_of_epoch == 0
-            || switch.kinds.is_empty() || !exact_pins
-            || switch.pinned.iter().any(|pin| CodeHash::from_slice(&pin.code_hash).is_none())
-            || !switch.proposal_id.is_empty() || switch.verified_through_lsn != 0 || switch.unverified_inputs != 0 || !reason
+        if switch.cause != pb::DeploymentCause::Rollback
+            || switch.rollback_of_epoch == 0
+            || switch.kinds.is_empty()
+            || !exact_pins
+            || switch
+                .pinned
+                .iter()
+                .any(|pin| CodeHash::from_slice(&pin.code_hash).is_none())
+            || !switch.proposal_id.is_empty()
+            || switch.verified_through_lsn != 0
+            || switch.unverified_inputs != 0
+            || !reason
         {
-            return Err(ApiError::new(ErrorCode::BadRequest, "invalid configured watch rollback"));
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "invalid configured watch rollback",
+            ));
         }
         // Audit fields are metadata, never the capability selecting this fixed host path.
         switch.cause = pb::DeploymentCause::Rollback;
         audit.token_id.clear();
         audit.token_id.push_str("kronik");
-        self.switch_code_impl(switch, audit, false, OperationOrigin::Internal).await
+        self.switch_code_impl(switch, audit, false, OperationOrigin::Internal)
+            .await
     }
 
-    async fn switch_code_impl(&self, switch: CodeSwitch, audit: pb::Audit, dry_run: bool, origin: OperationOrigin) -> Result<(u64, Lsn), ApiError> {
+    async fn switch_code_impl(
+        &self,
+        switch: CodeSwitch,
+        audit: pb::Audit,
+        dry_run: bool,
+        origin: OperationOrigin,
+    ) -> Result<(u64, Lsn), ApiError> {
         origin.check()?;
         // Promote and rollback: needed in an incident, also on a full disk.
         self.check_alive()?;
@@ -2855,42 +3086,92 @@ impl Node {
             .await?;
         tracing::info!(epoch, lsn, "switched code");
         Ok((epoch, lsn))
-        }
+    }
 
     /// Writes an `Approval` record in this branch's log, its command
     /// scrubbed of stored secret values and tokens (review M5).
-    pub async fn record_approval(&self, mut approval: pb::Approval, authority: AuthLease) -> Result<Lsn, ApiError> {
+    pub async fn record_approval(
+        &self,
+        mut approval: pb::Approval,
+        authority: AuthLease,
+    ) -> Result<Lsn, ApiError> {
         authority.check()?;
         self.check_alive()?;
-        let owner = approval.audit.as_ref().map(|a| a.token_id.as_str()).unwrap_or_default();
+        let owner = approval
+            .audit
+            .as_ref()
+            .map(|a| a.token_id.as_str())
+            .unwrap_or_default();
         if !approval.request && owner.starts_with("oidc:") && approval.verified_identity.is_none() {
-            return Err(ApiError::new(ErrorCode::Unauthenticated, "OIDC approval requires protected historical identity"));
+            return Err(ApiError::new(
+                ErrorCode::Unauthenticated,
+                "OIDC approval requires protected historical identity",
+            ));
         }
         if let Some(identity) = &approval.verified_identity {
-            kronik_proto::validate_approval(&approval)
-                .map_err(|_| ApiError::new(ErrorCode::Unauthenticated, "invalid protected approval identity"))?;
+            kronik_proto::validate_approval(&approval).map_err(|_| {
+                ApiError::new(
+                    ErrorCode::Unauthenticated,
+                    "invalid protected approval identity",
+                )
+            })?;
             #[derive(serde::Deserialize)]
             #[serde(deny_unknown_fields)]
-            struct Identity { issuer: String, subject: String }
-            let opened = self.sealer().open(identity);
-            let bytes = opened.bytes().ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "protected approval identity cannot be authenticated"))?;
-            let pair: Identity = serde_json::from_slice(bytes)
-                .map_err(|_| ApiError::new(ErrorCode::Unauthenticated, "invalid protected approval identity"))?;
-            if pair.issuer.is_empty() || pair.issuer.len() > 1024 || pair.issuer.chars().any(char::is_control)
-                || pair.subject.is_empty() || pair.subject.len() > 255 || pair.subject.chars().any(char::is_control)
-            {
-                return Err(ApiError::new(ErrorCode::Unauthenticated, "invalid protected approval identity"));
+            struct Identity {
+                issuer: String,
+                subject: String,
             }
-            let binding = self.sealer().keyed_hash("kronik oidc binding v1", &[pair.issuer.as_bytes(), pair.subject.as_bytes()])
-                .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "approval identity binding key is unavailable"))?;
+            let opened = self.sealer().open(identity);
+            let bytes = opened.bytes().ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::Unavailable,
+                    "protected approval identity cannot be authenticated",
+                )
+            })?;
+            let pair: Identity = serde_json::from_slice(bytes).map_err(|_| {
+                ApiError::new(
+                    ErrorCode::Unauthenticated,
+                    "invalid protected approval identity",
+                )
+            })?;
+            if pair.issuer.is_empty()
+                || pair.issuer.len() > 1024
+                || pair.issuer.chars().any(char::is_control)
+                || pair.subject.is_empty()
+                || pair.subject.len() > 255
+                || pair.subject.chars().any(char::is_control)
+            {
+                return Err(ApiError::new(
+                    ErrorCode::Unauthenticated,
+                    "invalid protected approval identity",
+                ));
+            }
+            let binding = self
+                .sealer()
+                .keyed_hash(
+                    "kronik oidc binding v1",
+                    &[pair.issuer.as_bytes(), pair.subject.as_bytes()],
+                )
+                .ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::Unavailable,
+                        "approval identity binding key is unavailable",
+                    )
+                })?;
             if owner.strip_prefix("oidc:") != Some(kronik_core::ids::hex(&binding).as_str()) {
-                return Err(ApiError::new(ErrorCode::Unauthenticated, "protected approval identity does not match its audit principal"));
+                return Err(ApiError::new(
+                    ErrorCode::Unauthenticated,
+                    "protected approval identity does not match its audit principal",
+                ));
             }
         }
         let secrets = self.secret_values().ok();
-        let patterns = secrets.as_ref().map(|values| crate::effects::secret_patterns(values));
+        let patterns = secrets
+            .as_ref()
+            .map(|values| crate::effects::secret_patterns(values));
         approval.command = crate::scrub::for_log(&approval.command, patterns.as_deref());
-        self.commit_authorized(Record::Approval(approval), authority).await
+        self.commit_authorized(Record::Approval(approval), authority)
+            .await
     }
 
     /// Writes a `GuardTriggered` record (`kronik watch`, M11) in this
@@ -2898,7 +3179,12 @@ impl Node {
     /// incident (a rollback that already happened, or an alert).
     pub async fn record_guard(&self, mut guard: pb::GuardTriggered) -> Result<Lsn, ApiError> {
         self.check_alive()?;
-        let audit = guard.audit.as_mut().ok_or_else(|| ApiError::new(ErrorCode::BadRequest, "guard observation has no audit metadata"))?;
+        let audit = guard.audit.as_mut().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::BadRequest,
+                "guard observation has no audit metadata",
+            )
+        })?;
         audit.token_id.clear();
         audit.token_id.push_str("kronik");
         self.commit(Record::GuardTriggered(guard)).await
@@ -2906,7 +3192,14 @@ impl Node {
 
     /// Writes a canonically scrubbed `AuditEvent`, including mutation intents
     /// before effects. Allowed below the disk reserve; waits for apply.
-    pub async fn record_system_audit_event(&self, origin: SystemAudit, target: &str, details: BTreeMap<String, String>, mut audit: pb::Audit, authority: AuthLease) -> Result<Lsn, ApiError> {
+    pub async fn record_system_audit_event(
+        &self,
+        origin: SystemAudit,
+        target: &str,
+        details: BTreeMap<String, String>,
+        mut audit: pb::Audit,
+        authority: AuthLease,
+    ) -> Result<Lsn, ApiError> {
         authority.check()?;
         let (action, identity) = origin.identity();
         audit.token_id.clear();
@@ -2937,13 +3230,17 @@ impl Node {
     ) -> Result<Record, ApiError> {
         self.check_alive()?;
         if action == "audit.gap" && details.contains_key("namespace") {
-            return Err(ApiError::new(ErrorCode::BadRequest,
-                "namespaced metadata coverage has a fixed original-execution producer"));
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "namespaced metadata coverage has a fixed original-execution producer",
+            ));
         }
         let positions = crate::scrub::AuditPositions::parse(action, &details)
             .map_err(|message| ApiError::new(ErrorCode::BadRequest, message))?;
         let secrets = self.secret_values().ok();
-        let patterns = secrets.as_ref().map(|values| crate::effects::secret_patterns(values));
+        let patterns = secrets
+            .as_ref()
+            .map(|values| crate::effects::secret_patterns(values));
         audit.reason = crate::scrub::for_log(&audit.reason, patterns.as_deref());
         let target = crate::scrub::for_target(target, patterns.as_deref());
         for (field, value) in &mut details {
@@ -2961,7 +3258,8 @@ impl Node {
             audit: Some(audit),
             operation: None,
         };
-        kronik_proto::control::validate_event(&event).map_err(|error| ApiError::new(ErrorCode::BadRequest, error.to_string()))?;
+        kronik_proto::control::validate_event(&event)
+            .map_err(|error| ApiError::new(ErrorCode::BadRequest, error.to_string()))?;
         Ok(Record::AuditEvent(event))
     }
 
@@ -2972,8 +3270,18 @@ impl Node {
     ) -> Result<Option<(kronik_core::ids::SourcePos, pb::audit_event::Operation)>, ApiError> {
         self.local_operator_authority()?;
         self.check_alive()?;
-        self.store.db().control_state(kind).map(|state| state.map(|(lsn, operation)|
-            (kronik_core::ids::SourcePos::Actor { shard: None, lsn }, operation))).map_err(store_err)
+        self.store
+            .db()
+            .control_state(kind)
+            .map(|state| {
+                state.map(|(lsn, operation)| {
+                    (
+                        kronik_core::ids::SourcePos::Actor { shard: None, lsn },
+                        operation,
+                    )
+                })
+            })
+            .map_err(store_err)
     }
 
     /// Own this exact ordinary configuration mutation through real fsync and apply.
@@ -2987,14 +3295,27 @@ impl Node {
         self.local_operator_authority()?;
         authority.check()?;
         if operation.kind().is_none() {
-            return Err(ApiError::new(ErrorCode::BadRequest, "this control operation has a dedicated producer"));
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "this control operation has a dedicated producer",
+            ));
         }
-        operation.validate().map_err(|error| ApiError::new(ErrorCode::BadRequest, error.to_string()))?;
-        if matches!(&operation, pb::audit_event::Operation::InstallationIdentity(_)) {
-            return Err(ApiError::new(ErrorCode::BadRequest, "installation identity has a fixed startup producer"));
+        operation
+            .validate()
+            .map_err(|error| ApiError::new(ErrorCode::BadRequest, error.to_string()))?;
+        if matches!(
+            &operation,
+            pb::audit_event::Operation::InstallationIdentity(_)
+        ) {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "installation identity has a fixed startup producer",
+            ));
         }
         let held = self.lock_deploy_authorized(&authority).await?;
-        let node = self.arc().ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self
+            .arc()
+            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
         let (done, result) = oneshot::channel();
         self.env().spawn("control-operation", async move {
             let _held = held;
@@ -3010,7 +3331,9 @@ impl Node {
             }.await;
             let _ = done.send(outcome);
         });
-        result.await.map_err(|_| ApiError::new(ErrorCode::Unavailable, "control operation worker stopped"))?
+        result.await.map_err(|_| {
+            ApiError::new(ErrorCode::Unavailable, "control operation worker stopped")
+        })?
     }
 
     /// Only the original private browser-session capability can derive this tombstone.
@@ -3025,23 +3348,50 @@ impl Node {
         let authority: AuthLease = session;
         authority.check()?;
         self.check_alive()?;
-        if !matches!(revoked.config_source, Some(pb::auth_session_revoked::ConfigSource::NativeLsn(_))) {
-            return Err(ApiError::new(ErrorCode::Unavailable, "session revocation requires its metadata owner"));
+        if !matches!(
+            revoked.config_source,
+            Some(pb::auth_session_revoked::ConfigSource::NativeLsn(_))
+        ) {
+            return Err(ApiError::new(
+                ErrorCode::Unavailable,
+                "session revocation requires its metadata owner",
+            ));
         }
-        self.store.db().validate_auth_session_revoked(&revoked).map_err(store_err)?;
+        self.store
+            .db()
+            .validate_auth_session_revoked(&revoked)
+            .map_err(store_err)?;
         if revoked.expires_at_ms <= self.env().clock.wall_ms() {
-            return Err(ApiError::new(ErrorCode::Unauthenticated, "the original browser session expired"));
+            return Err(ApiError::new(
+                ErrorCode::Unauthenticated,
+                "the original browser session expired",
+            ));
         }
-        let record = self.control_audit_record(pb::audit_event::Operation::AuthSessionRevoked(revoked), audit)?;
-        if dry_run { authority.check()?; return Ok(None); }
+        let record = self.control_audit_record(
+            pb::audit_event::Operation::AuthSessionRevoked(revoked),
+            audit,
+        )?;
+        if dry_run {
+            authority.check()?;
+            return Ok(None);
+        }
         let lsn = self.commit_authorized(record, authority).await?;
-        Ok(Some(kronik_core::ids::SourcePos::Actor { shard: None, lsn }))
+        Ok(Some(kronik_core::ids::SourcePos::Actor {
+            shard: None,
+            lsn,
+        }))
     }
 
-    fn control_audit_record(&self, operation: pb::audit_event::Operation, mut audit: pb::Audit) -> Result<Record, ApiError> {
+    fn control_audit_record(
+        &self,
+        operation: pb::audit_event::Operation,
+        mut audit: pb::Audit,
+    ) -> Result<Record, ApiError> {
         self.check_alive()?;
         let secrets = self.secret_values().ok();
-        let patterns = secrets.as_ref().map(|values| crate::effects::secret_patterns(values));
+        let patterns = secrets
+            .as_ref()
+            .map(|values| crate::effects::secret_patterns(values));
         audit.reason = crate::scrub::for_log(&audit.reason, patterns.as_deref());
         let event = pb::AuditEvent {
             action: operation.action().into(),
@@ -3078,7 +3428,9 @@ impl Node {
             rules_hash: blake3::hash(rules_toml.as_bytes()).as_bytes().to_vec(),
             audit: Some(audit),
         });
-        let lsn = self.commit_config_authorized(guard, epoch, record, authority).await?;
+        let lsn = self
+            .commit_config_authorized(guard, epoch, record, authority)
+            .await?;
         Ok((epoch, lsn))
     }
 
@@ -3152,7 +3504,8 @@ impl Node {
         epoch: u64,
         record: Record,
     ) -> Result<Lsn, ApiError> {
-        self.commit_config_origin(guard, epoch, record, OperationOrigin::Internal).await
+        self.commit_config_origin(guard, epoch, record, OperationOrigin::Internal)
+            .await
     }
 
     pub(crate) async fn commit_config_authorized(
@@ -3162,7 +3515,8 @@ impl Node {
         record: Record,
         authority: AuthLease,
     ) -> Result<Lsn, ApiError> {
-        self.commit_config_origin(guard, epoch, record, OperationOrigin::Request(authority)).await
+        self.commit_config_origin(guard, epoch, record, OperationOrigin::Request(authority))
+            .await
     }
 
     async fn commit_config_origin(
@@ -3176,7 +3530,8 @@ impl Node {
             .me()
             .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
         let task = self.env.spawn("config", async move {
-            node.commit_config_locked(&guard, epoch, record, origin).await
+            node.commit_config_locked(&guard, epoch, record, origin)
+                .await
         });
         task.await.unwrap_or_else(|| {
             Err(ApiError::new(
@@ -3291,7 +3646,9 @@ impl Node {
             rate: rate.map(|r| r.to_pb()),
             audit: Some(audit),
         });
-        let lsn = self.commit_config_authorized(guard, epoch, record, authority).await?;
+        let lsn = self
+            .commit_config_authorized(guard, epoch, record, authority)
+            .await?;
         tracing::info!(kind, capability = %cap.render(), epoch, lsn, "granted");
         Ok((epoch, lsn))
     }
@@ -3359,7 +3716,9 @@ impl Node {
             rate: None,
             audit: Some(audit),
         });
-        let lsn = self.commit_config_authorized(guard, epoch, record, authority).await?;
+        let lsn = self
+            .commit_config_authorized(guard, epoch, record, authority)
+            .await?;
         tracing::info!(kind, capability = %cap, epoch, lsn, "revoked");
         Ok((epoch, lsn))
     }
@@ -3452,7 +3811,9 @@ impl Node {
                 audit: Some(audit),
                 ..Default::default()
             });
-            let lsn = self.commit_config_authorized(guard, epoch, record, authority).await?;
+            let lsn = self
+                .commit_config_authorized(guard, epoch, record, authority)
+                .await?;
             tracing::info!(name, epoch, lsn, "foreign actor removed");
             (epoch, lsn)
         };
@@ -3487,10 +3848,11 @@ impl Node {
         if dry_run {
             return Ok((epoch, 0, effective));
         }
-        let lsn = self.commit_config_authorized(guard, epoch, record, authority).await?;
+        let lsn = self
+            .commit_config_authorized(guard, epoch, record, authority)
+            .await?;
         Ok((epoch, lsn, effective))
     }
-
 
     /// Reads one record of this branch's log.
     pub async fn read_record(&self, lsn: Lsn) -> Result<Option<Committed>, ApiError> {
@@ -3586,18 +3948,31 @@ fn emit_logs<N: AsRef<str>, V: AsRef<[u8]>>(
     if crate::scrub::logs(&mut logs, secrets).is_err() {
         for event in &mut logs {
             event.message.zeroize();
-            for (name, value) in &mut event.fields { name.zeroize(); value.zeroize(); }
+            for (name, value) in &mut event.fields {
+                name.zeroize();
+                value.zeroize();
+            }
         }
         logs.clear();
-        logs.push(LogEvent { level: "warn", message: crate::scrub::WITHHELD.into(), fields: Vec::new() });
+        logs.push(LogEvent {
+            level: "warn",
+            message: crate::scrub::WITHHELD.into(),
+            fields: Vec::new(),
+        });
     }
     for event in logs {
         // All free fields are already prepared. Rendering does not rescan
         // generated markers or concatenate raw data before the bound check.
-        let size = event.fields.iter().map(|(name, value)| name.len() + value.len() + 2).sum();
+        let size = event
+            .fields
+            .iter()
+            .map(|(name, value)| name.len() + value.len() + 2)
+            .sum();
         let mut fields = String::with_capacity(size);
         for (index, (name, value)) in event.fields.iter().enumerate() {
-            if index != 0 { fields.push(' '); }
+            if index != 0 {
+                fields.push(' ');
+            }
             fields.push_str(name);
             fields.push('=');
             fields.push_str(value);
@@ -3780,12 +4155,18 @@ async fn applier(
             }
         }
         let current = match &runtime {
-            Some(runtime) => match runtime.begin_native_current_apply(&batch, &store, &rebase.reader).await {
+            Some(runtime) => match runtime
+                .begin_native_current_apply(&batch, &store, &rebase.reader)
+                .await
+            {
                 Ok(current) => current,
                 Err(error) => {
-                    fatal.set(format!("preparing current secret data at lsn {}: {}", batch[0].lsn, error.message));
+                    fatal.set(format!(
+                        "preparing current secret data at lsn {}: {}",
+                        batch[0].lsn, error.message
+                    ));
                     return;
-                },
+                }
             },
             None => None,
         };
@@ -3794,8 +4175,12 @@ async fn applier(
             return;
         }
         if let (Some(runtime), Some(current)) = (&runtime, current)
-            && let Err(error) = runtime.finish_native_current_apply(current, &store) {
-            fatal.set(format!("publishing current secret data at lsn {}: {}", batch[0].lsn, error.message));
+            && let Err(error) = runtime.finish_native_current_apply(current, &store)
+        {
+            fatal.set(format!(
+                "publishing current secret data at lsn {}: {}",
+                batch[0].lsn, error.message
+            ));
             return;
         }
     }

@@ -1,6 +1,10 @@
 //! Reuses the browser acceptance's real TLS/code/PKCE/JWT provider, not an auth bypass.
 //! Uses the prepared Python runtime pinned in scripts/requirements-oidc-tests.txt; no installs.
 
+// A shared test helper carries the browser-acceptance surface; the integration
+// test that calls every part of it does not live in this file.
+#![allow(dead_code)]
+
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -78,25 +82,54 @@ pub struct BrowserLogin {
 
 impl OwnedOidc {
     pub fn start(origin: String) -> Self {
-        let root = tempfile::Builder::new().prefix("kronik-oidc-consumer-").tempdir().unwrap();
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("kronik-oidc-consumer-")
+            .tempdir()
+            .unwrap();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let python = std::env::var_os("KRONIK_TEST_PYTHON")
             .expect("set KRONIK_TEST_PYTHON to the private pinned runtime from CONTRIBUTING.md");
-        let mut child = Command::new(python).args(["-I", "-u", "-c", PROVIDER])
-            .arg(repository.join("scripts/e2e-ui-oidc.py")).arg(root.path()).arg(&origin)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+        let mut child = Command::new(python)
+            .args(["-I", "-u", "-c", PROVIDER])
+            .arg(repository.join("scripts/e2e-ui-oidc.py"))
+            .arg(root.path())
+            .arg(&origin)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .expect("start the prepared KRONIK_TEST_PYTHON from CONTRIBUTING.md");
         let input = child.stdin.take();
         let output = BufReader::new(child.stdout.take().unwrap());
-        let mut owned = Self { child, input, output, root, issuer: String::new(), origin };
+        let mut owned = Self {
+            child,
+            input,
+            output,
+            root,
+            issuer: String::new(),
+            origin,
+        };
         let ready = owned.receive();
-        owned.issuer = ready["issuer"].as_str().expect("real owned OIDC provider readiness").to_owned();
+        owned.issuer = ready["issuer"]
+            .as_str()
+            .expect("real owned OIDC provider readiness")
+            .to_owned();
         owned
     }
 
-    pub fn ca(&self) -> PathBuf { self.root.path().join("ca.pem") }
-    pub fn certificate(&self) -> PathBuf { self.root.path().join("server.pem") }
-    pub fn key(&self) -> PathBuf { self.root.path().join("server.key") }
+    pub fn ca(&self) -> PathBuf {
+        self.root.path().join("ca.pem")
+    }
+    pub fn certificate(&self) -> PathBuf {
+        self.root.path().join("server.pem")
+    }
+    pub fn key(&self) -> PathBuf {
+        self.root.path().join("server.key")
+    }
 
     pub fn profile(&self, token: &str) -> Value {
         json!({"issuer": self.issuer, "client_id": "kronik-ui",
@@ -104,9 +137,19 @@ impl OwnedOidc {
             "bindings": [{"subject": "fixture-reviewer", "token": token}]})
     }
 
-    pub fn request(&mut self, method: &str, url: &str, headers: Value, body: Option<Value>) -> Value {
-        serde_json::to_writer(self.input.as_mut().unwrap(), &json!({"method": method, "url": url,
-            "headers": headers, "body": body})).unwrap();
+    pub fn request(
+        &mut self,
+        method: &str,
+        url: &str,
+        headers: Value,
+        body: Option<Value>,
+    ) -> Value {
+        serde_json::to_writer(
+            self.input.as_mut().unwrap(),
+            &json!({"method": method, "url": url,
+            "headers": headers, "body": body}),
+        )
+        .unwrap();
         let input = self.input.as_mut().unwrap();
         input.write_all(b"\n").unwrap();
         input.flush().unwrap();
@@ -120,22 +163,46 @@ impl OwnedOidc {
         let bound = cookie(&start, "__Host-kronik-login");
         let authorize = self.request("GET", &header(&start, "location"), json!({}), None);
         assert_eq!(authorize["status"], 302);
-        let callback = self.request("GET", &header(&authorize, "location"), json!({"Cookie": bound}), None);
+        let callback = self.request(
+            "GET",
+            &header(&authorize, "location"),
+            json!({"Cookie": bound}),
+            None,
+        );
         assert_eq!(callback["status"], 303);
         let cookie = cookie(&callback, "__Host-kronik-session");
-        let info = self.request("GET", &format!("{origin}/v1/auth/session"), json!({"Cookie": cookie}), None);
+        let info = self.request(
+            "GET",
+            &format!("{origin}/v1/auth/session"),
+            json!({"Cookie": cookie}),
+            None,
+        );
         assert_eq!(info["status"], 200);
         let info: Value = serde_json::from_str(info["body"].as_str().unwrap()).unwrap();
-        BrowserLogin { cookie, csrf: info["csrf_token"].as_str().unwrap().to_owned(),
-            principal: info["principal"].as_str().unwrap().to_owned() }
+        BrowserLogin {
+            cookie,
+            csrf: info["csrf_token"].as_str().unwrap().to_owned(),
+            principal: info["principal"].as_str().unwrap().to_owned(),
+        }
     }
 
     fn receive(&mut self) -> Value {
         let mut line = String::new();
-        let bytes = self.output.by_ref().take(1_048_577).read_line(&mut line).unwrap();
-        assert!(bytes > 0 && bytes <= 1_048_576, "bounded owned OIDC response; prepare pinned cryptography/PyJWT from CONTRIBUTING.md");
+        let bytes = self
+            .output
+            .by_ref()
+            .take(1_048_577)
+            .read_line(&mut line)
+            .unwrap();
+        assert!(
+            bytes > 0 && bytes <= 1_048_576,
+            "bounded owned OIDC response; prepare pinned cryptography/PyJWT from CONTRIBUTING.md"
+        );
         let value: Value = serde_json::from_str(&line).expect("owned OIDC fixture response JSON");
-        assert!(value.get("fixture_error").is_none(), "owned OIDC fixture transport failed");
+        assert!(
+            value.get("fixture_error").is_none(),
+            "owned OIDC fixture transport failed"
+        );
         value
     }
 }
@@ -149,14 +216,25 @@ impl Drop for OwnedOidc {
 }
 
 pub fn header(response: &Value, name: &str) -> String {
-    response["headers"].as_array().unwrap().iter()
-        .find(|row| row[0].as_str().unwrap().eq_ignore_ascii_case(name)).unwrap()[1]
-        .as_str().unwrap().to_owned()
+    response["headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row[0].as_str().unwrap().eq_ignore_ascii_case(name))
+        .unwrap()[1]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 fn cookie(response: &Value, name: &str) -> String {
-    response["headers"].as_array().unwrap().iter().filter(|row|
-        row[0].as_str().unwrap().eq_ignore_ascii_case("set-cookie"))
+    response["headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row[0].as_str().unwrap().eq_ignore_ascii_case("set-cookie"))
         .map(|row| row[1].as_str().unwrap().split(';').next().unwrap())
-        .find(|value| value.split_once('=').is_some_and(|(key, _)| key == name)).unwrap().to_owned()
+        .find(|value| value.split_once('=').is_some_and(|(key, _)| key == name))
+        .unwrap()
+        .to_owned()
 }

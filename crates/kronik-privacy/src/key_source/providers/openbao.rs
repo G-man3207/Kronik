@@ -1,6 +1,6 @@
 use super::*;
-use config::OpenBao;
 use crate::secret_backend::BackendError;
+use config::OpenBao;
 
 mod secrets;
 pub(crate) use secrets::Secrets;
@@ -33,16 +33,24 @@ struct Session {
 }
 
 fn lease(env: &Env, value: &Value) -> Result<(Duration, Duration, bool), BackendError> {
-    let ttl = value.get("lease_duration").or_else(|| value.get("ttl"))
-        .and_then(Value::as_u64).ok_or(BackendError::Invalid)?;
-    let renewable = value.get("renewable").and_then(Value::as_bool)
+    let ttl = value
+        .get("lease_duration")
+        .or_else(|| value.get("ttl"))
+        .and_then(Value::as_u64)
+        .ok_or(BackendError::Invalid)?;
+    let renewable = value
+        .get("renewable")
+        .and_then(Value::as_bool)
         .ok_or(BackendError::Invalid)?;
     let now = env.clock.monotonic();
     Ok(if ttl == 0 {
         (Duration::MAX, Duration::MAX, false)
     } else {
-        (now.saturating_add(Duration::from_secs((ttl / 2).max(1))),
-         now.saturating_add(Duration::from_secs(ttl)), renewable)
+        (
+            now.saturating_add(Duration::from_secs((ttl / 2).max(1))),
+            now.saturating_add(Duration::from_secs(ttl)),
+            renewable,
+        )
     })
 }
 
@@ -56,31 +64,63 @@ async fn login(env: &Env, c: &OpenBao, dispatch: Dispatch<'_>) -> Result<Session
     } else {
         None
     };
-    let env = dispatch.wait(tls_env(env, c.ca_file.as_deref(), identity, dispatch)).await?
+    let env = dispatch
+        .wait(tls_env(env, c.ca_file.as_deref(), identity, dispatch))
+        .await?
         .map_err(|_| BackendError::Invalid)?;
     let (token, renew_at, expires_at, renewable) = match c.auth.as_str() {
         "token" => (
-            dispatch.wait(credential_text(&env, c.token_file.as_deref().ok_or(BackendError::Invalid)?, dispatch))
-                .await?.map_err(|_| BackendError::Invalid)?,
-            Duration::MAX, Duration::MAX, false,
+            dispatch
+                .wait(credential_text(
+                    &env,
+                    c.token_file.as_deref().ok_or(BackendError::Invalid)?,
+                    dispatch,
+                ))
+                .await?
+                .map_err(|_| BackendError::Invalid)?,
+            Duration::MAX,
+            Duration::MAX,
+            false,
         ),
         "approle" | "cert" => {
             let body = if c.auth == "approle" {
-                let role = dispatch.wait(credential_text(&env, c.role_id_file.as_deref().ok_or(BackendError::Invalid)?, dispatch))
-                    .await?.map_err(|_| BackendError::Invalid)?;
-                let secret = dispatch.wait(credential_text(&env, c.secret_id_file.as_deref().ok_or(BackendError::Invalid)?, dispatch))
-                    .await?.map_err(|_| BackendError::Invalid)?;
+                let role = dispatch
+                    .wait(credential_text(
+                        &env,
+                        c.role_id_file.as_deref().ok_or(BackendError::Invalid)?,
+                        dispatch,
+                    ))
+                    .await?
+                    .map_err(|_| BackendError::Invalid)?;
+                let secret = dispatch
+                    .wait(credential_text(
+                        &env,
+                        c.secret_id_file.as_deref().ok_or(BackendError::Invalid)?,
+                        dispatch,
+                    ))
+                    .await?
+                    .map_err(|_| BackendError::Invalid)?;
                 SecretJson(json!({"role_id":role.as_str(),"secret_id":secret.as_str()}))
             } else {
-                SecretJson(c.role.as_ref().map_or_else(|| json!({}), |role| json!({"name":role})))
+                SecretJson(
+                    c.role
+                        .as_ref()
+                        .map_or_else(|| json!({}), |role| json!({"name":role})),
+                )
             };
             let path = c.auth_mount.as_deref().unwrap_or(&c.auth);
-            let mut body = Zeroizing::new(serde_json::to_vec(&body.0).map_err(|_| BackendError::Invalid)?);
+            let mut body =
+                Zeroizing::new(serde_json::to_vec(&body.0).map_err(|_| BackendError::Invalid)?);
             let (status, bytes) = request_raw(
-                &env, "POST",
+                &env,
+                "POST",
                 format!("{}/v1/auth/{path}/login", c.address.trim_end_matches('/')),
-                vec![("content-type".into(), "application/json".into())], std::mem::take(&mut *body), CAP, dispatch,
-            ).await?;
+                vec![("content-type".into(), "application/json".into())],
+                std::mem::take(&mut *body),
+                CAP,
+                dispatch,
+            )
+            .await?;
             match status {
                 200..=299 => {}
                 401 | 403 => return Err(BackendError::Denied),
@@ -88,8 +128,11 @@ async fn login(env: &Env, c: &OpenBao, dispatch: Dispatch<'_>) -> Result<Session
                 _ => return Err(BackendError::Invalid),
             }
             let r = SecretJson(serde_json::from_slice(&bytes).map_err(|_| BackendError::Invalid)?);
-            let token = Zeroizing::new(field(&r["auth"], "client_token")
-                .map_err(|_| BackendError::Invalid)?.to_owned());
+            let token = Zeroizing::new(
+                field(&r["auth"], "client_token")
+                    .map_err(|_| BackendError::Invalid)?
+                    .to_owned(),
+            );
             // Transit does not retain sessions; secrets require lease metadata.
             let (renew_at, expires_at, renewable) = if r["auth"].get("lease_duration").is_some() {
                 lease(&env, &r["auth"])?
@@ -101,11 +144,19 @@ async fn login(env: &Env, c: &OpenBao, dispatch: Dispatch<'_>) -> Result<Session
         _ => return Err(BackendError::Invalid),
     };
     header_secret(&token).map_err(|_| BackendError::Invalid)?;
-    Ok(Session { env, token, renew_at, expires_at, renewable })
+    Ok(Session {
+        env,
+        token,
+        renew_at,
+        expires_at,
+        renewable,
+    })
 }
 
 async fn auth(env: &Env, c: &OpenBao) -> Result<(Env, Zeroizing<String>), String> {
-    let session = login(env, c, Dispatch::StartupBootstrap).await.map_err(|error| error.to_string())?;
+    let session = login(env, c, Dispatch::StartupBootstrap)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok((session.env, session.token))
 }
 pub(super) async fn encrypt(

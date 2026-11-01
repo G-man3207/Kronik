@@ -3,10 +3,10 @@
 //! as pure functions of the record. The exporter, `kronik audit show` and
 //! `kronik audit verify` all build lines here.
 
-use kronik_core::ids::{SourcePos, hex};
 use kronik_core::error::{ApiError, ErrorCode};
-use kronik_privacy::sealer::Sealer;
+use kronik_core::ids::{SourcePos, hex};
 use kronik_log::LogError;
+use kronik_privacy::sealer::Sealer;
 use kronik_proto::log::v1 as pb;
 use kronik_proto::{Record, sealables};
 use kronik_sched::scrub::AuditPositions;
@@ -151,9 +151,12 @@ pub struct Mapper {
 
 impl Mapper {
     /// [`lines`] of a committed record, with `secrets` scrubbed.
-    pub fn lines(&self, lsn: u64, record: &Record, secrets: &[(&str, &[u8])])
-        -> Result<Vec<Line>, ApiError>
-    {
+    pub fn lines(
+        &self,
+        lsn: u64,
+        record: &Record,
+        secrets: &[(&str, &[u8])],
+    ) -> Result<Vec<Line>, ApiError> {
         self.lines_at(SourcePos::Actor { shard: None, lsn }, record, secrets)
     }
 
@@ -166,21 +169,44 @@ impl Mapper {
         self.lines_in(source, &self.branch, record, secrets)
     }
 
-    pub fn lines_actor_at(&self, source: &pb::ActorSource, record: &Record,
-        secrets: &[(&str, &[u8])]) -> Result<Vec<Line>, ApiError> {
-        source.validate().map_err(|_| corruption(LogError::Corrupt("invalid actor source".into())))?;
-        self.lines_in(SourcePos::Actor { shard: source.shard, lsn: source.lsn }, &source.branch, record, secrets)
+    pub fn lines_actor_at(
+        &self,
+        source: &pb::ActorSource,
+        record: &Record,
+        secrets: &[(&str, &[u8])],
+    ) -> Result<Vec<Line>, ApiError> {
+        source
+            .validate()
+            .map_err(|_| corruption(LogError::Corrupt("invalid actor source".into())))?;
+        self.lines_in(
+            SourcePos::Actor {
+                shard: source.shard,
+                lsn: source.lsn,
+            },
+            &source.branch,
+            record,
+            secrets,
+        )
     }
 
     /// Consume the record and adoption facts from one authoritative metadata image.
-    pub fn lines_metadata(&self, source: &kronik_log::MetadataAuditRecord,
-        secrets: &[(&str, &[u8])]) -> Result<Vec<Line>, ApiError>
-    {
+    pub fn lines_metadata(
+        &self,
+        source: &kronik_log::MetadataAuditRecord,
+        secrets: &[(&str, &[u8])],
+    ) -> Result<Vec<Line>, ApiError> {
         source.validate()?;
-        let mut lines = self.lines_at(SourcePos::Metadata { index: source.index }, &source.record, secrets)?;
+        let mut lines = self.lines_at(
+            SourcePos::Metadata {
+                index: source.index,
+            },
+            &source.record,
+            secrets,
+        )?;
         if let Some(origin) = &source.native_origin {
             for line in &mut lines {
-                line.details.insert("native_origin".into(), native_origin_details(origin)?);
+                line.details
+                    .insert("native_origin".into(), native_origin_details(origin)?);
                 line.native_adoption_current_projection = Some(origin.current_projection);
             }
         }
@@ -188,14 +214,21 @@ impl Mapper {
     }
 
     /// The metadata union contains no actor turns or separate dead-letter events.
-    pub fn operational_lines_metadata(&self, source: &kronik_log::MetadataAuditRecord,
-        secrets: &[(&str, &[u8])]) -> Result<Vec<Line>, ApiError>
-    {
+    pub fn operational_lines_metadata(
+        &self,
+        source: &kronik_log::MetadataAuditRecord,
+        secrets: &[(&str, &[u8])],
+    ) -> Result<Vec<Line>, ApiError> {
         self.lines_metadata(source, secrets)
     }
 
-    fn lines_in(&self, source: SourcePos, branch: &str, record: &Record,
-        secrets: &[(&str, &[u8])]) -> Result<Vec<Line>, ApiError> {
+    fn lines_in(
+        &self,
+        source: SourcePos,
+        branch: &str,
+        record: &Record,
+        secrets: &[(&str, &[u8])],
+    ) -> Result<Vec<Line>, ApiError> {
         let hashed = |kind: &str, key: &str| match &self.keys {
             Keys::Hashed(h) => h.label(kind, key),
             _ => String::new(),
@@ -219,33 +252,63 @@ impl Mapper {
         )
     }
 
-    pub fn operational_lines(&self, lsn: u64, record: &Record, secrets: &[(&str, &[u8])])
-        -> Result<Vec<Line>, ApiError>
-    {
+    pub fn operational_lines(
+        &self,
+        lsn: u64,
+        record: &Record,
+        secrets: &[(&str, &[u8])],
+    ) -> Result<Vec<Line>, ApiError> {
         self.operational_lines_at(SourcePos::Actor { shard: None, lsn }, record, secrets)
     }
 
     /// The same Mapper pipeline, with actual actor or metadata source positions.
-    pub fn operational_lines_at(&self, source: SourcePos, record: &Record,
-        secrets: &[(&str, &[u8])]) -> Result<Vec<Line>, ApiError>
-    {
+    pub fn operational_lines_at(
+        &self,
+        source: SourcePos,
+        record: &Record,
+        secrets: &[(&str, &[u8])],
+    ) -> Result<Vec<Line>, ApiError> {
         self.operational_lines_in(source, &self.branch, record, secrets)
     }
 
-    pub fn operational_lines_actor_at(&self, source: &pb::ActorSource, record: &Record,
-        secrets: &[(&str, &[u8])]) -> Result<Vec<Line>, ApiError> {
-        source.validate().map_err(|_| corruption(LogError::Corrupt("invalid actor source".into())))?;
-        self.operational_lines_in(SourcePos::Actor { shard: source.shard, lsn: source.lsn }, &source.branch, record, secrets)
+    pub fn operational_lines_actor_at(
+        &self,
+        source: &pb::ActorSource,
+        record: &Record,
+        secrets: &[(&str, &[u8])],
+    ) -> Result<Vec<Line>, ApiError> {
+        source
+            .validate()
+            .map_err(|_| corruption(LogError::Corrupt("invalid actor source".into())))?;
+        self.operational_lines_in(
+            SourcePos::Actor {
+                shard: source.shard,
+                lsn: source.lsn,
+            },
+            &source.branch,
+            record,
+            secrets,
+        )
     }
 
-    fn operational_lines_in(&self, source: SourcePos, branch: &str, record: &Record,
-        secrets: &[(&str, &[u8])]) -> Result<Vec<Line>, ApiError> {
+    fn operational_lines_in(
+        &self,
+        source: SourcePos,
+        branch: &str,
+        record: &Record,
+        secrets: &[(&str, &[u8])],
+    ) -> Result<Vec<Line>, ApiError> {
         let mut out = self.lines_in(source, branch, record, secrets)?;
-        let Record::TurnRecord(turn) = record else { return Ok(out) };
-        let Some((outcome_kind, outcome, input_class)) = dead_letter(turn) else { return Ok(out) };
+        let Record::TurnRecord(turn) = record else {
+            return Ok(out);
+        };
+        let Some((outcome_kind, outcome, input_class)) = dead_letter(turn) else {
+            return Ok(out);
+        };
         // Runtime producers use CoreErrorCode; guest rejection text is never projected.
-        let error_code = ErrorCode::parse(&outcome.error_code)
-            .ok_or_else(|| corruption(LogError::Corrupt("invalid dead-letter error code".into())))?;
+        let error_code = ErrorCode::parse(&outcome.error_code).ok_or_else(|| {
+            corruption(LogError::Corrupt("invalid dead-letter error code".into()))
+        })?;
         let hash = match out.first() {
             Some(line) => line.record_hash.clone(),
             None => record_hash(record, &self.sealer).ok_or_else(identity_unavailable)?,
@@ -256,8 +319,12 @@ impl Mapper {
             "error_code": error_code.as_str(),
         }));
         if let Some(actor) = &turn.actor {
-            if !kronik_core::ids::valid_kind(&actor.kind) || !kronik_core::ids::valid_key(&actor.key) {
-                return Err(corruption(LogError::Corrupt("invalid dead-letter actor identity".into())));
+            if !kronik_core::ids::valid_kind(&actor.kind)
+                || !kronik_core::ids::valid_key(&actor.key)
+            {
+                return Err(corruption(LogError::Corrupt(
+                    "invalid dead-letter actor identity".into(),
+                )));
             }
             let key = match &self.keys {
                 Keys::Hashed(hasher) => Some(hasher.label(&actor.kind, &actor.key)),
@@ -274,14 +341,23 @@ impl Mapper {
         };
         out.push(Line {
             schema: OPERATIONAL_SCHEMA.into(),
-            lsn: match source { SourcePos::Actor { lsn, .. } => Some(lsn), SourcePos::Metadata { .. } => None },
-            source: match source { SourcePos::Actor { shard: None, .. } => None, _ => Some(source) },
+            lsn: match source {
+                SourcePos::Actor { lsn, .. } => Some(lsn),
+                SourcePos::Metadata { .. } => None,
+            },
+            source: match source {
+                SourcePos::Actor { shard: None, .. } => None,
+                _ => Some(source),
+            },
             effect: None,
             kind: "deadletter".into(),
             action: "created".into(),
             at_wall_ms: turn.logical_time_ms,
-            token_id: audit.map(|audit| audit.token_id.as_str()).filter(|token| !token.is_empty())
-                .unwrap_or("system").into(),
+            token_id: audit
+                .map(|audit| audit.token_id.as_str())
+                .filter(|token| !token.is_empty())
+                .unwrap_or("system")
+                .into(),
             reason: "failed input stored as dead letter".into(),
             reason_truncated: false,
             branch: branch.to_owned(),
@@ -298,28 +374,60 @@ impl Mapper {
         self.expected_at(SourcePos::Actor { shard: None, lsn }, record)
     }
 
-    pub fn expected_at(&self, source: SourcePos, record: &Record) -> Result<Vec<Expected>, ApiError> {
+    pub fn expected_at(
+        &self,
+        source: SourcePos,
+        record: &Record,
+    ) -> Result<Vec<Expected>, ApiError> {
         self.expected_in(source, &self.branch, record)
     }
 
-    pub fn expected_actor_at(&self, source: &pb::ActorSource, record: &Record) -> Result<Vec<Expected>, ApiError> {
-        source.validate().map_err(|_| corruption(LogError::Corrupt("invalid actor source".into())))?;
-        self.expected_in(SourcePos::Actor { shard: source.shard, lsn: source.lsn }, &source.branch, record)
+    pub fn expected_actor_at(
+        &self,
+        source: &pb::ActorSource,
+        record: &Record,
+    ) -> Result<Vec<Expected>, ApiError> {
+        source
+            .validate()
+            .map_err(|_| corruption(LogError::Corrupt("invalid actor source".into())))?;
+        self.expected_in(
+            SourcePos::Actor {
+                shard: source.shard,
+                lsn: source.lsn,
+            },
+            &source.branch,
+            record,
+        )
     }
 
-    pub fn expected_metadata(&self, source: &kronik_log::MetadataAuditRecord) -> Result<Vec<Expected>, ApiError> {
+    pub fn expected_metadata(
+        &self,
+        source: &kronik_log::MetadataAuditRecord,
+    ) -> Result<Vec<Expected>, ApiError> {
         source.validate()?;
-        let mut expected = self.expected_at(SourcePos::Metadata { index: source.index }, &source.record)?;
+        let mut expected = self.expected_at(
+            SourcePos::Metadata {
+                index: source.index,
+            },
+            &source.record,
+        )?;
         if let Some(origin) = &source.native_origin {
             for item in &mut expected {
-                item.line.details.insert("native_origin".into(), native_origin_details(origin)?);
+                item.line
+                    .details
+                    .insert("native_origin".into(), native_origin_details(origin)?);
                 item.line.native_adoption_current_projection = Some(origin.current_projection);
             }
         }
         Ok(expected)
     }
 
-    fn expected_in(&self, source: SourcePos, branch: &str, record: &Record) -> Result<Vec<Expected>, ApiError> {
+    fn expected_in(
+        &self,
+        source: SourcePos,
+        branch: &str,
+        record: &Record,
+    ) -> Result<Vec<Expected>, ApiError> {
         expected_at(
             source,
             record,
@@ -351,7 +459,8 @@ pub fn record_hash(record: &Record, sealer: &Sealer) -> Option<String> {
 }
 
 fn private_identity(kind: u8, encoded: &[u8], sealer: &Sealer) -> Option<String> {
-    sealer.keyed_hash("kronik audit record v3", &[&[kind], encoded])
+    sealer
+        .keyed_hash("kronik audit record v3", &[&[kind], encoded])
         .map(|hash| format!("b3k:v3:{}", hex(&hash)))
 }
 
@@ -362,9 +471,11 @@ fn canonical_record(record: &Record, subject: &dyn Fn(&str) -> String) -> Record
     canon
 }
 
-fn canonical_subjects(record: &Record, canon: &mut Record,
-    subject: &dyn Fn(&str) -> String) -> bool
-{
+fn canonical_subjects(
+    record: &Record,
+    canon: &mut Record,
+    subject: &dyn Fn(&str) -> String,
+) -> bool {
     let mut changed = false;
     match (record, canon) {
         (Record::Erasure(original), Record::Erasure(canonical)) => {
@@ -373,17 +484,27 @@ fn canonical_subjects(record: &Record, canon: &mut Record,
                 && !original.subject.is_empty()
             {
                 let reason = mask_subject(&original_audit.reason, &original.subject, &label);
-                if audit.reason != reason { audit.reason = reason; changed = true; }
+                if audit.reason != reason {
+                    audit.reason = reason;
+                    changed = true;
+                }
             }
-            if canonical.subject != label { canonical.subject = label; changed = true; }
+            if canonical.subject != label {
+                canonical.subject = label;
+                changed = true;
+            }
         }
         (Record::AuditEvent(original), Record::AuditEvent(canonical)) => {
-            if let (Some(original), Some(value)) =
-                (original.details.get("actor"), canonical.details.get_mut("actor"))
-            {
+            if let (Some(original), Some(value)) = (
+                original.details.get("actor"),
+                canonical.details.get_mut("actor"),
+            ) {
                 let (kind, key) = original.split_once('/').unwrap_or((original.as_str(), ""));
                 let label = format!("{kind}/{}", subject(key));
-                if *value != label { *value = label; changed = true; }
+                if *value != label {
+                    *value = label;
+                    changed = true;
+                }
             }
         }
         _ => {}
@@ -392,10 +513,15 @@ fn canonical_subjects(record: &Record, canon: &mut Record,
 }
 
 /// Historical digests stay source-derived, private and read-only.
-fn legacy_hashes(record: &Record, canon: &mut Record, encoded: &mut Vec<u8>,
-    subject: &dyn Fn(&str) -> String) -> (String, String)
-{
-    if canonical_subjects(record, canon, subject) { *encoded = canon.encode(); }
+fn legacy_hashes(
+    record: &Record,
+    canon: &mut Record,
+    encoded: &mut Vec<u8>,
+    subject: &dyn Fn(&str) -> String,
+) -> (String, String) {
+    if canonical_subjects(record, canon, subject) {
+        *encoded = canon.encode();
+    }
     let kind = canon.kind();
     let v2 = encoded_hash(kind, encoded, false);
     if let (Record::Erasure(original), Record::Erasure(canonical)) = (record, &mut *canon)
@@ -504,24 +630,41 @@ pub fn lines_at(source: SourcePos, record: &Record, ctx: &Ctx) -> Result<Vec<Lin
 }
 
 fn validate_source(source: SourcePos, record: &Record) -> Result<(), ApiError> {
-    if matches!(source, SourcePos::Metadata { .. }) && let Record::Approval(approval) = record {
-        kronik_proto::validate_proposal_approval(approval)
-            .map_err(|_| corruption(LogError::Corrupt("invalid canonical metadata approval".into())))?;
+    if matches!(source, SourcePos::Metadata { .. })
+        && let Record::Approval(approval) = record
+    {
+        kronik_proto::validate_proposal_approval(approval).map_err(|_| {
+            corruption(LogError::Corrupt(
+                "invalid canonical metadata approval".into(),
+            ))
+        })?;
     }
     let valid = match source {
-        SourcePos::Actor { shard, lsn } => lsn > 0
-            && shard.is_none_or(|shard| shard < 4096),
-        SourcePos::Metadata { index } => index > 0 && index <= i64::MAX as u64
-            && (matches!(record, Record::AuditEvent(_))
-                || matches!(record, Record::SecretVersion(_) | Record::SecretLink(_) | Record::Approval(_))),
+        SourcePos::Actor { shard, lsn } => lsn > 0 && shard.is_none_or(|shard| shard < 4096),
+        SourcePos::Metadata { index } => {
+            index > 0
+                && index <= i64::MAX as u64
+                && (matches!(record, Record::AuditEvent(_))
+                    || matches!(
+                        record,
+                        Record::SecretVersion(_) | Record::SecretLink(_) | Record::Approval(_)
+                    ))
+        }
     };
-    if valid { Ok(()) } else {
-        Err(corruption(LogError::Corrupt("invalid audit source position".into())))
+    if valid {
+        Ok(())
+    } else {
+        Err(corruption(LogError::Corrupt(
+            "invalid audit source position".into(),
+        )))
     }
 }
 
 fn identity_unavailable() -> ApiError {
-    ApiError::new(ErrorCode::Unavailable, "audit identity requires the protected master key")
+    ApiError::new(
+        ErrorCode::Unavailable,
+        "audit identity requires the protected master key",
+    )
 }
 
 fn corruption(_: LogError) -> ApiError {
@@ -530,23 +673,28 @@ fn corruption(_: LogError) -> ApiError {
 
 fn audit_positions(record: &Record) -> Result<Option<AuditPositions>, LogError> {
     if matches!(record, Record::SecretVersion(_) | Record::SecretLink(_)) {
-        record.validate().map_err(|_| LogError::Corrupt("invalid typed secret metadata".into()))?;
+        record
+            .validate()
+            .map_err(|_| LogError::Corrupt("invalid typed secret metadata".into()))?;
     }
     match record {
         Record::AuditEvent(event) => {
             kronik_proto::control::validate_event(event)
                 .map_err(|_| LogError::Corrupt("invalid typed audit operation".into()))?;
             if event.action == "audit.gap" && event.details.contains_key("namespace") {
-                kronik_proto::control::validate_metadata_gap_event(event)
-                    .map_err(|_| LogError::Corrupt("invalid closed metadata coverage gap".into()))?;
+                kronik_proto::control::validate_metadata_gap_event(event).map_err(|_| {
+                    LogError::Corrupt("invalid closed metadata coverage gap".into())
+                })?;
             }
             if metadata_key_change(event) {
-                kronik_proto::control::validate_metadata_webhook_key_change_event(event)
-                    .map_err(|_| LogError::Corrupt("invalid closed metadata signing-key change".into()))?;
+                kronik_proto::control::validate_metadata_webhook_key_change_event(event).map_err(
+                    |_| LogError::Corrupt("invalid closed metadata signing-key change".into()),
+                )?;
             }
             if metadata_replay(event) {
-                kronik_proto::control::validate_metadata_webhook_replay_event(event)
-                    .map_err(|_| LogError::Corrupt("invalid closed metadata replay receipt".into()))?;
+                kronik_proto::control::validate_metadata_webhook_replay_event(event).map_err(
+                    |_| LogError::Corrupt("invalid closed metadata replay receipt".into()),
+                )?;
             }
             AuditPositions::parse(&event.action, &event.details)
                 .map_err(|error| LogError::Corrupt(error.into()))
@@ -557,13 +705,22 @@ fn audit_positions(record: &Record) -> Result<Option<AuditPositions>, LogError> 
 
 fn metadata_key_change(event: &pb::AuditEvent) -> bool {
     event.action == "audit.config"
-        && event.details.get("change").is_some_and(|change| change == "webhook.signing_key")
-        && event.details.get("source").is_some_and(|source| source == "metadata")
+        && event
+            .details
+            .get("change")
+            .is_some_and(|change| change == "webhook.signing_key")
+        && event
+            .details
+            .get("source")
+            .is_some_and(|source| source == "metadata")
 }
 
 fn metadata_replay(event: &pb::AuditEvent) -> bool {
     event.action == "events.webhook.replay"
-        && event.details.get("source").is_some_and(|source| source == "metadata")
+        && event
+            .details
+            .get("source")
+            .is_some_and(|source| source == "metadata")
 }
 
 fn projected_lines(
@@ -576,7 +733,9 @@ fn projected_lines(
     let mut out = Vec::new();
     // The same subject label serves the typed identity and reason projection.
     let erasure_subject = match record {
-        Record::Erasure(erasure) => Some((erasure.subject.as_str(), (ctx.subject)(&erasure.subject))),
+        Record::Erasure(erasure) => {
+            Some((erasure.subject.as_str(), (ctx.subject)(&erasure.subject)))
+        }
         _ => None,
     };
     // Compile once, only for actual persisted Audit fields. Operational lines
@@ -584,26 +743,42 @@ fn projected_lines(
     let reason_plan = std::cell::OnceCell::new();
     let line = |kind: &str, action: &str, audit: Option<&pb::Audit>, epoch, details| Line {
         schema: SCHEMA.into(),
-        lsn: match source { SourcePos::Actor { lsn, .. } => Some(lsn), SourcePos::Metadata { .. } => None },
-        source: match source { SourcePos::Actor { shard: None, .. } => None, _ => Some(source) },
+        lsn: match source {
+            SourcePos::Actor { lsn, .. } => Some(lsn),
+            SourcePos::Metadata { .. } => None,
+        },
+        source: match source {
+            SourcePos::Actor { shard: None, .. } => None,
+            _ => Some(source),
+        },
         effect: None,
         kind: kind.into(),
         action: action.into(),
         at_wall_ms: audit.map_or(0, |a| a.wall_time_ms),
         token_id: audit.map(|a| a.token_id.clone()).unwrap_or_default(),
-        reason: audit.map(|audit| {
-            let reason = match &erasure_subject {
-                Some((subject, label)) if !subject.is_empty() =>
-                    std::borrow::Cow::Owned(mask_subject(&audit.reason, subject, label)),
-                _ => std::borrow::Cow::Borrowed(audit.reason.as_str()),
-            };
-            let plan = reason_plan.get_or_init(|| kronik_effects::http::CompiledScrubber::new_output(
-                ctx.secrets, kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES,
-            ).ok());
-            kronik_sched::scrub::persisted_audit_reason(reason, plan.as_ref()).into_owned()
-        }).unwrap_or_default(),
+        reason: audit
+            .map(|audit| {
+                let reason = match &erasure_subject {
+                    Some((subject, label)) if !subject.is_empty() => {
+                        std::borrow::Cow::Owned(mask_subject(&audit.reason, subject, label))
+                    }
+                    _ => std::borrow::Cow::Borrowed(audit.reason.as_str()),
+                };
+                let plan = reason_plan.get_or_init(|| {
+                    kronik_effects::http::CompiledScrubber::new_output(
+                        ctx.secrets,
+                        kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES,
+                    )
+                    .ok()
+                });
+                kronik_sched::scrub::persisted_audit_reason(reason, plan.as_ref()).into_owned()
+            })
+            .unwrap_or_default(),
         reason_truncated: false,
-        branch: match source { SourcePos::Actor { .. } => ctx.branch.into(), SourcePos::Metadata { .. } => String::new() },
+        branch: match source {
+            SourcePos::Actor { .. } => ctx.branch.into(),
+            SourcePos::Metadata { .. } => String::new(),
+        },
         epoch,
         details,
         record_hash: String::new(),
@@ -699,10 +874,17 @@ fn projected_lines(
         }
         Record::PrivacyMode(p) => {
             let mode = pb::PrivacyState::try_from(p.mode).unwrap_or(pb::PrivacyState::Unspecified);
+            // ADR 0106: an explicit, validated reseal request (mode ON) is a
+            // request event; it is never evidence that history was rewritten.
+            let action = if p.reseal_requested && mode == pb::PrivacyState::On {
+                "privacy.reseal.request"
+            } else {
+                "privacy.mode"
+            };
             let details = obj(json!({"mode": label(mode.as_str_name(), "PRIVACY_STATE_")}));
             out.push(line(
                 "privacy_mode",
-                "privacy.mode",
+                action,
                 p.audit.as_ref(),
                 Some(p.epoch),
                 details,
@@ -823,14 +1005,32 @@ fn projected_lines(
                 "backend":version.backend, "source_version":version.source_version,
                 "ref":version.r#ref, "binding":version.binding, "link_generation":version.link_generation,
                 "canonical_ref":version.canonical_ref, "deleted":version.deleted, "phase":phase}));
-            out.push(line("secret_version", action, version.audit.as_ref(), None, details));
+            out.push(line(
+                "secret_version",
+                action,
+                version.audit.as_ref(),
+                None,
+                details,
+            ));
         }
         Record::SecretLink(link) => {
             if !matches!(source, SourcePos::Actor { shard: Some(_), .. }) {
-                let action = if link.backend.is_empty() { "secret.unlink" } else { "secret.link" };
-                let details = obj(json!({"name":link.name, "backend":link.backend, "ref":link.r#ref,
-                    "binding":link.binding, "generation":link.generation, "canonical_ref":link.canonical_ref}));
-                out.push(line("secret_link", action, link.audit.as_ref(), Some(link.epoch), details));
+                let action = if link.backend.is_empty() {
+                    "secret.unlink"
+                } else {
+                    "secret.link"
+                };
+                let details = obj(
+                    json!({"name":link.name, "backend":link.backend, "ref":link.r#ref,
+                    "binding":link.binding, "generation":link.generation, "canonical_ref":link.canonical_ref}),
+                );
+                out.push(line(
+                    "secret_link",
+                    action,
+                    link.audit.as_ref(),
+                    Some(link.epoch),
+                    details,
+                ));
             }
         }
         Record::AuditEvent(a) => {
@@ -840,52 +1040,80 @@ fn projected_lines(
                     pb::audit_event::Operation::FleetState(state) => Some(state.epoch),
                     _ => None,
                 };
-                out.push(line("audit_event", operation.action(), a.audit.as_ref(), epoch, details));
+                out.push(line(
+                    "audit_event",
+                    operation.action(),
+                    a.audit.as_ref(),
+                    epoch,
+                    details,
+                ));
             } else if matches!(positions, Some(AuditPositions::MetadataGap { .. })) {
                 let (stream, from_index, through_index) =
-                    kronik_proto::control::metadata_audit_gap_details(&a.details)
-                        .map_err(|_| corruption(LogError::Corrupt("invalid metadata gap schema".into())))?;
-                out.push(line("audit_event", "audit.gap", a.audit.as_ref(), None,
+                    kronik_proto::control::metadata_audit_gap_details(&a.details).map_err(
+                        |_| corruption(LogError::Corrupt("invalid metadata gap schema".into())),
+                    )?;
+                out.push(line(
+                    "audit_event",
+                    "audit.gap",
+                    a.audit.as_ref(),
+                    None,
                     obj(json!({"namespace":"metadata", "stream":stream,
-                        "from_index":from_index, "through_index":through_index}))));
+                        "from_index":from_index, "through_index":through_index})),
+                ));
             } else if metadata_key_change(a) {
                 let (from_version, to_version) =
                     kronik_proto::control::metadata_webhook_key_change_details(&a.details)
-                        .map_err(|_| corruption(LogError::Corrupt("invalid metadata signing-key schema".into())))?;
-                out.push(line("audit_event", "audit.config", a.audit.as_ref(), None,
+                        .map_err(|_| {
+                            corruption(LogError::Corrupt(
+                                "invalid metadata signing-key schema".into(),
+                            ))
+                        })?;
+                out.push(line(
+                    "audit_event",
+                    "audit.config",
+                    a.audit.as_ref(),
+                    None,
                     obj(json!({"change":"webhook.signing_key", "source":"metadata",
-                        "from_version":from_version, "to_version":to_version, "target":a.target}))));
+                        "from_version":from_version, "to_version":to_version, "target":a.target})),
+                ));
             } else if metadata_replay(a) {
                 let position = kronik_proto::control::metadata_webhook_replay_details(&a.details)
-                    .map_err(|_| corruption(LogError::Corrupt("invalid metadata replay schema".into())))?;
-                out.push(line("audit_event", "events.webhook.replay", a.audit.as_ref(), None,
-                    obj(json!({"source":"metadata", "position":position, "target":a.target}))));
+                    .map_err(|_| {
+                    corruption(LogError::Corrupt("invalid metadata replay schema".into()))
+                })?;
+                out.push(line(
+                    "audit_event",
+                    "events.webhook.replay",
+                    a.audit.as_ref(),
+                    None,
+                    obj(json!({"source":"metadata", "position":position, "target":a.target})),
+                ));
             } else {
-            let mut details = Map::new();
-            for (k, v) in &a.details {
-                if let Some(value) = positions.and_then(|positions| positions.value(k)) {
-                    details.insert(k.clone(), value.into());
-                    continue;
-                }
-                let v = v.as_str();
-                // fork.send names its actor plain (kronik-api m3.rs).
-                if k == "actor" {
-                    let (kind, key) = v.split_once('/').unwrap_or((v, ""));
-                    if let Some(key) = ctx.keys.export(kind, key) {
-                        details.insert(k.clone(), format!("{kind}/{key}").into());
+                let mut details = Map::new();
+                for (k, v) in &a.details {
+                    if let Some(value) = positions.and_then(|positions| positions.value(k)) {
+                        details.insert(k.clone(), value.into());
+                        continue;
                     }
-                    continue;
+                    let v = v.as_str();
+                    // fork.send names its actor plain (kronik-api m3.rs).
+                    if k == "actor" {
+                        let (kind, key) = v.split_once('/').unwrap_or((v, ""));
+                        if let Some(key) = ctx.keys.export(kind, key) {
+                            details.insert(k.clone(), format!("{kind}/{key}").into());
+                        }
+                        continue;
+                    }
+                    details.insert(k.clone(), v.into());
                 }
-                details.insert(k.clone(), v.into());
-            }
-            details.insert("target".into(), a.target.clone().into());
-            out.push(line(
-                "audit_event",
-                &a.action,
-                a.audit.as_ref(),
-                None,
-                details,
-            ));
+                details.insert("target".into(), a.target.clone().into());
+                out.push(line(
+                    "audit_event",
+                    &a.action,
+                    a.audit.as_ref(),
+                    None,
+                    details,
+                ));
             }
         }
         Record::TurnRecord(t) => turn_lines(t, ctx, &line, &mut out)?,
@@ -922,21 +1150,27 @@ fn projected_lines(
 
 /// Only the shared validated NativeAuthorityOrigin schema reaches this projection.
 fn native_origin_details(origin: &pb::NativeAuthorityOrigin) -> Result<Value, ApiError> {
-    let adoption = origin.adoption_audit.as_ref()
+    let adoption = origin
+        .adoption_audit
+        .as_ref()
         .ok_or_else(|| corruption(LogError::Corrupt("missing native adoption audit".into())))?;
     let mut public = obj(json!({
         "adopted_at_wall_ms": adoption.wall_time_ms,
         "current_projection": origin.current_projection,
     }));
     if let Some(original) = &origin.source {
-        public.insert("original_source".into(), json!({
-            "shard": original.shard, "lsn": original.lsn, "branch": original.branch,
-        }));
+        public.insert(
+            "original_source".into(),
+            json!({
+                "shard": original.shard, "lsn": original.lsn, "branch": original.branch,
+            }),
+        );
     }
     Ok(public.into())
 }
-fn operation_details(operation: &pb::audit_event::Operation) -> Result<Map<String, Value>, ApiError>
-{
+fn operation_details(
+    operation: &pb::audit_event::Operation,
+) -> Result<Map<String, Value>, ApiError> {
     use pb::audit_event::Operation;
     Ok(match operation {
         Operation::FleetState(state) => {
@@ -947,11 +1181,13 @@ fn operation_details(operation: &pb::audit_event::Operation) -> Result<Map<Strin
                 Ok(pb::fleet_state::Phase::Revoked) => "revoked",
                 _ => return Err(corruption(LogError::Corrupt("invalid fleet phase".into()))),
             };
-            obj(json!({"operation":"fleet_state", "phase":phase, "epoch":state.epoch,
+            obj(
+                json!({"operation":"fleet_state", "phase":phase, "epoch":state.epoch,
                 "installation":state.installation, "node":state.node, "cluster":state.cluster,
                 "controller_origin":state.controller_origin, "scopes":state.scopes,
                 "ca_sha256":hex(&state.ca_sha256), "request_id":hex(&state.request_id),
-                "controller_id":state.controller_id, "client_key_sha256":hex(&state.client_key_sha256)}))
+                "controller_id":state.controller_id, "client_key_sha256":hex(&state.client_key_sha256)}),
+            )
         }
         Operation::InstallationIdentity(identity) => obj(json!({
             "operation":"installation_identity", "installation":identity.installation,
@@ -969,9 +1205,17 @@ fn operation_details(operation: &pb::audit_event::Operation) -> Result<Map<Strin
         })),
         Operation::AuthSessionRevoked(session) => {
             let config_source = match &session.config_source {
-                Some(pb::auth_session_revoked::ConfigSource::NativeLsn(lsn)) => json!({"native_lsn":lsn}),
-                Some(pb::auth_session_revoked::ConfigSource::MetadataIndex(index)) => json!({"metadata_index":index}),
-                None => return Err(corruption(LogError::Corrupt("missing session config source".into()))),
+                Some(pb::auth_session_revoked::ConfigSource::NativeLsn(lsn)) => {
+                    json!({"native_lsn":lsn})
+                }
+                Some(pb::auth_session_revoked::ConfigSource::MetadataIndex(index)) => {
+                    json!({"metadata_index":index})
+                }
+                None => {
+                    return Err(corruption(LogError::Corrupt(
+                        "missing session config source".into(),
+                    )));
+                }
             };
             obj(json!({
                 "operation":"auth_session_revoked", "session_hash":hex(&session.session_hash),
@@ -990,9 +1234,17 @@ fn operation_details(operation: &pb::audit_event::Operation) -> Result<Map<Strin
         }
         Operation::AuthOidcLogin(login) => {
             let config_source = match &login.config_source {
-                Some(pb::auth_oidc_login::ConfigSource::NativeLsn(lsn)) => json!({"native_lsn":lsn}),
-                Some(pb::auth_oidc_login::ConfigSource::MetadataIndex(index)) => json!({"metadata_index":index}),
-                None => return Err(corruption(LogError::Corrupt("missing login config source".into()))),
+                Some(pb::auth_oidc_login::ConfigSource::NativeLsn(lsn)) => {
+                    json!({"native_lsn":lsn})
+                }
+                Some(pb::auth_oidc_login::ConfigSource::MetadataIndex(index)) => {
+                    json!({"metadata_index":index})
+                }
+                None => {
+                    return Err(corruption(LogError::Corrupt(
+                        "missing login config source".into(),
+                    )));
+                }
             };
             obj(json!({
                 "operation":"auth_oidc_login", "principal_hash":hex(&login.principal_hash),
@@ -1008,7 +1260,12 @@ type LineFn<'a> =
 
 /// An operator send or resend, then one line per `secret.reveal` effect
 /// (review H3).
-fn turn_lines(t: &pb::TurnRecord, ctx: &Ctx, line: &LineFn, out: &mut Vec<Line>) -> Result<(), ApiError> {
+fn turn_lines(
+    t: &pb::TurnRecord,
+    ctx: &Ctx,
+    line: &LineFn,
+    out: &mut Vec<Line>,
+) -> Result<(), ApiError> {
     let actor = t.actor.clone().unwrap_or_default();
     let actor_label = |details: &mut Map<String, Value>| {
         if let Some(key) = ctx.keys.export(&actor.kind, &actor.key) {
@@ -1056,15 +1313,22 @@ fn turn_lines(t: &pb::TurnRecord, ctx: &Ctx, line: &LineFn, out: &mut Vec<Line>)
         if let Some(pb::Sealable {
             value: Some(pb::sealable::Value::Plain(b)),
             ..
-        }) = &e.request {
+        }) = &e.request
+        {
             let request = pb::RevealEffectRequest::decode(b.as_slice()).map_err(|_| {
                 ApiError::new(ErrorCode::StorageCorrupt, "invalid secret reveal request")
             })?;
             let secret = request.secret.ok_or_else(|| {
-                ApiError::new(ErrorCode::StorageCorrupt, "secret reveal has no resolved identity")
+                ApiError::new(
+                    ErrorCode::StorageCorrupt,
+                    "secret reveal has no resolved identity",
+                )
             })?;
             let version = secret.resolved_version().map_err(|_| {
-                ApiError::new(ErrorCode::StorageCorrupt, "invalid resolved secret reveal identity")
+                ApiError::new(
+                    ErrorCode::StorageCorrupt,
+                    "invalid resolved secret reveal identity",
+                )
             })?;
             details.insert("version".into(), version.into());
         }
@@ -1225,7 +1489,11 @@ pub fn expected(lsn: u64, record: &Record, ctx: &Ctx) -> Result<Vec<Expected>, A
     expected_at(SourcePos::Actor { shard: None, lsn }, record, ctx)
 }
 
-pub fn expected_at(source: SourcePos, record: &Record, ctx: &Ctx) -> Result<Vec<Expected>, ApiError> {
+pub fn expected_at(
+    source: SourcePos,
+    record: &Record,
+    ctx: &Ctx,
+) -> Result<Vec<Expected>, ApiError> {
     validate_source(source, record)?;
     let positions = audit_positions(record).map_err(corruption)?;
     let (mut legacy_v2_hash, mut legacy_hash) = (String::new(), String::new());
@@ -1234,7 +1502,8 @@ pub fn expected_at(source: SourcePos, record: &Record, ctx: &Ctx) -> Result<Vec<
         let mut encoded = canon.encode();
         let current = private_identity(canon.kind(), &encoded, ctx.sealer)
             .ok_or_else(identity_unavailable)?;
-        (legacy_v2_hash, legacy_hash) = legacy_hashes(record, &mut canon, &mut encoded, ctx.subject);
+        (legacy_v2_hash, legacy_hash) =
+            legacy_hashes(record, &mut canon, &mut encoded, ctx.subject);
         Ok(current)
     })?;
     if projected.is_empty() {
@@ -1247,7 +1516,10 @@ pub fn expected_at(source: SourcePos, record: &Record, ctx: &Ctx) -> Result<Vec<
             legacy_hash: legacy_hash.clone(),
             legacy_v2_hash: legacy_v2_hash.clone(),
             positions,
-            verify_native_origin: matches!(record, Record::SecretVersion(_) | Record::SecretLink(_)),
+            verify_native_origin: matches!(
+                record,
+                Record::SecretVersion(_) | Record::SecretLink(_)
+            ),
         })
         .collect())
 }
@@ -1309,15 +1581,22 @@ fn dead_letter(turn: &pb::TurnRecord) -> Option<(pb::OutcomeKind, &pb::Outcome, 
     turn.actor.as_ref()?;
     let outcome = turn.outcome.as_ref()?;
     let kind = pb::OutcomeKind::try_from(outcome.kind).ok()?;
-    if matches!(kind, pb::OutcomeKind::Committed | pb::OutcomeKind::Unspecified) { return None; }
+    if matches!(
+        kind,
+        pb::OutcomeKind::Committed | pb::OutcomeKind::Unspecified
+    ) {
+        return None;
+    }
     let input_class = match turn.input.as_ref()?.kind.as_ref()? {
-        pb::input::Kind::Message(message) => match pb::MessageSource::try_from(message.source).ok()? {
-            pb::MessageSource::Actor => "message.actor",
-            pb::MessageSource::Operator => "message.operator",
-            pb::MessageSource::DeadLetterResend => "message.dead_letter_resend",
-            pb::MessageSource::Compensation => "message.compensation",
-            pb::MessageSource::Call | pb::MessageSource::Unspecified => return None,
-        },
+        pb::input::Kind::Message(message) => {
+            match pb::MessageSource::try_from(message.source).ok()? {
+                pb::MessageSource::Actor => "message.actor",
+                pb::MessageSource::Operator => "message.operator",
+                pb::MessageSource::DeadLetterResend => "message.dead_letter_resend",
+                pb::MessageSource::Compensation => "message.compensation",
+                pb::MessageSource::Call | pb::MessageSource::Unspecified => return None,
+            }
+        }
         pb::input::Kind::Timer(_) => "timer",
         pb::input::Kind::Http(_) | pb::input::Kind::Migrate(_) => return None,
     };
@@ -1325,10 +1604,14 @@ fn dead_letter(turn: &pb::TurnRecord) -> Option<(pb::OutcomeKind, &pb::Outcome, 
 }
 
 fn same_namespace(a: &Line, b: &Line) -> bool {
-    if a.branch != b.branch { return false; }
+    if a.branch != b.branch {
+        return false;
+    }
     match (a.source, b.source) {
         (None, None) => true,
-        (Some(SourcePos::Actor { shard: a, .. }), Some(SourcePos::Actor { shard: b, .. })) => a == b,
+        (Some(SourcePos::Actor { shard: a, .. }), Some(SourcePos::Actor { shard: b, .. })) => {
+            a == b
+        }
         (Some(SourcePos::Metadata { .. }), Some(SourcePos::Metadata { .. })) => true,
         _ => false,
     }
@@ -1341,34 +1624,63 @@ pub fn verify(expected: &[Expected], sink: &[Line], from: u64, to: u64) -> Repor
 }
 
 /// Verifies an explicit actor-shard or metadata-index range without aliasing domains.
-pub fn verify_at(expected: &[Expected], sink: &[Line], from: SourcePos, to: SourcePos)
-    -> Result<Report, ApiError>
-{
+pub fn verify_at(
+    expected: &[Expected],
+    sink: &[Line],
+    from: SourcePos,
+    to: SourcePos,
+) -> Result<Report, ApiError> {
     let positions = match (from, to) {
-        (SourcePos::Actor { shard:a, lsn:from }, SourcePos::Actor { shard:b, lsn:to })
-            if a == b && a.is_none_or(|shard| shard < 4096) && from <= to => (from, to),
-        (SourcePos::Metadata { index:from }, SourcePos::Metadata { index:to }) if from <= to => (from, to),
-        _ => return Err(ApiError::new(ErrorCode::BadRequest, "audit range requires one source namespace")),
+        (
+            SourcePos::Actor {
+                shard: a,
+                lsn: from,
+            },
+            SourcePos::Actor { shard: b, lsn: to },
+        ) if a == b && a.is_none_or(|shard| shard < 4096) && from <= to => (from, to),
+        (SourcePos::Metadata { index: from }, SourcePos::Metadata { index: to }) if from <= to => {
+            (from, to)
+        }
+        _ => {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "audit range requires one source namespace",
+            ));
+        }
     };
-    Ok(verify_range(expected, sink, positions.0, positions.1, Some((from, to))))
+    Ok(verify_range(
+        expected,
+        sink,
+        positions.0,
+        positions.1,
+        Some((from, to)),
+    ))
 }
 
-fn verify_range(expected: &[Expected], sink: &[Line], from: u64, to: u64,
-    sources: Option<(SourcePos, SourcePos)>) -> Report
-{
+fn verify_range(
+    expected: &[Expected],
+    sink: &[Line],
+    from: u64,
+    to: u64,
+    sources: Option<(SourcePos, SourcePos)>,
+) -> Report {
     use std::collections::{BTreeMap, BTreeSet};
     let in_range = |line: &Line| match sources.map(|(from, _)| from) {
         None => line.lsn.is_some_and(|lsn| lsn > from && lsn <= to),
         Some(SourcePos::Actor { shard, .. }) => {
             let namespace = match line.source {
                 None => shard.is_none(),
-                Some(SourcePos::Actor { shard:actual, lsn }) => actual == shard && line.lsn == Some(lsn),
+                Some(SourcePos::Actor { shard: actual, lsn }) => {
+                    actual == shard && line.lsn == Some(lsn)
+                }
                 _ => false,
             };
             namespace && line.lsn.is_some_and(|lsn| lsn > from && lsn <= to)
         }
-        Some(SourcePos::Metadata { .. }) => line.lsn.is_none()
-            && matches!(line.source, Some(SourcePos::Metadata { index }) if index > from && index <= to),
+        Some(SourcePos::Metadata { .. }) => {
+            line.lsn.is_none()
+                && matches!(line.source, Some(SourcePos::Metadata { index }) if index > from && index <= to)
+        }
     };
     let want: BTreeMap<_, _> = expected
         .iter()
@@ -1395,7 +1707,10 @@ fn verify_range(expected: &[Expected], sink: &[Line], from: u64, to: u64,
                 });
                 superseded[j] |= prior.lsn.is_some_and(|lsn| lsn > through)
                     && same_namespace(prior, line)
-                    && matches!(prior.schema.as_str(), SCHEMA | LEGACY_V2_SCHEMA | LEGACY_SCHEMA)
+                    && matches!(
+                        prior.schema.as_str(),
+                        SCHEMA | LEGACY_V2_SCHEMA | LEGACY_SCHEMA
+                    )
                     && !invalid_current;
             }
         }
