@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kronik:event:v1",
+  "title": "Kronik committed operational event v1",
+  "description": "Metadata from the sole shared keyed M28 operational projection. Free audit text, token identities, details, bodies and secret values are excluded. Sources are actual native/sharded actor LSNs or actual metadata commit indexes, never a global ordering. Actor IDs are ke1.installHex.branchHex.actor.native-or-shard.lsn.subindex.keyedHashHex; metadata IDs are ke1.installHex.metadata.index.subindex.keyedHashHex and have no actor branch. Canonical operational identity is retry/replay/reseal stable; sealable-value-only changes with identical published metadata intentionally retain identity. Webhook signing-key rotation does not change event identity: each prepared batch retains its full immutable signing pin until acknowledgement, while configured key changes select the next batch and explicit replay may sign the same event identity with that new pin. A configured metadata signing-pin change requires its fixed durable registered-stream configuration notice before activation. Metadata delivery uses an explicit host environment and the sole physical M23 runtime's certified retained privacy catalogue, without an actor-node fallback; unavailable certification holds delivery and its cursor. Privacy certification is not authority: the original execution lease gates actual transport dispatch after MAC resolution, not merely creation of an owned job. Revocation cancels metadata resolver/backoff waits and admits no later request; an already-admitted HTTP job may finish after revocation or waiter cancellation, so a lost acknowledgement may produce the same stable event ID again. Actor delivery acknowledges any previously prepared durable body with its original signing pin before auditing or checkpointing a retention gap, including after restart; retry preserves both pending body and cursor. Legacy plaintext record hashes are never accepted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "installation", "source", "subindex", "record_kind", "data"],
+  "properties": {
+    "schema": {"const": "kronik.event/v1"},
+    "id": {"type": "string", "pattern": "^ke1\\.[0-9a-f]+\\.(?:[0-9a-f]+\\.actor\\.(?:native|0|[1-9][0-9]*)|metadata)\\.[1-9][0-9]*\\.(?:0|[1-9][0-9]*)\\.[0-9a-f]{64}$"},
+    "installation": {"$ref": "#/$defs/label"},
+    "branch": {"$ref": "#/$defs/source_branch"},
+    "source": {"$ref": "#/$defs/source"},
+    "subindex": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+    "record_kind": {"type": "integer", "minimum": 1, "maximum": 255},
+    "data": {"$ref": "#/$defs/metadata"}
+  },
+  "allOf": [
+    {"if": {"properties": {"source": {"properties": {"kind": {"const": "actor"}}}}}, "then": {"required": ["branch"]}, "else": {"not": {"required": ["branch"]}}},
+    {"if": {"properties": {"data": {"required": ["adoption"]}}}, "then": {"properties": {"source": {"properties": {"kind": {"const": "metadata"}}}, "data": {"properties": {"schema": {"const": "kronik.audit/v3"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 3}}}, "then": {"properties": {"data": {"properties": {"kind": {"enum": ["turn", "deadletter"]}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 4}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "deployment"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 5}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "grant"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 6}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "limits"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 7}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "policy"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 8}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "approval"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 9}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "privacy_mode"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 10}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "foreign_actor"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 12}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "erasure"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 13}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "engine_upgrade"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 15}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "simulator_config"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 16}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "state_rebase"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 17}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "guard_triggered"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 20}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "shard_term"}, "action": {"const": "shard.term"}, "at_wall_ms": {"const": 0}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 21}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "shard_membership"}, "action": {"const": "shard.membership"}, "at_wall_ms": {"const": 0}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 22}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "inbox"}, "action": {"const": "shard.inbox"}, "at_wall_ms": {"const": 0}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 23}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "outbox_ack"}, "action": {"const": "shard.outbox_ack"}, "at_wall_ms": {"const": 0}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 24}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "epoch_barrier"}, "action": {"const": "shard.epoch_barrier"}, "at_wall_ms": {"const": 0}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 25}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "shard_origin"}, "action": {"const": "shard.origin"}, "at_wall_ms": {"const": 0}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 40}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "audit_event"}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 45}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "secret_version"}, "action": {"enum": ["secret.version.reserved", "secret.version", "secret.version.failed", "secret.range"]}}}}}},
+    {"if": {"properties": {"record_kind": {"const": 46}}}, "then": {"properties": {"data": {"properties": {"kind": {"const": "secret_link"}, "action": {"enum": ["secret.link", "secret.unlink"]}}}}}}
+  ],
+  "$defs": {
+    "label": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_.:-]+$"},
+    "source_branch": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^\\u0000-\\u001f\\u007f:/\\\\]+$", "description": "Actual actor frame namespace, not the configured feed-selection label or reader head. The canonical ActorSource validator enforces 1–256 UTF-8 bytes and forbids ASCII controls, colon, slash and backslash. JSON Schema length counts Unicode code points; the runtime UTF-8 byte bound remains authoritative."},
+    "uint64": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+    "positive": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+    "native_adoption": {"description": "Presence is the sole M28 mapper's closed typed fact after it validates the actual source and origin. The common event consumer never reads an AuditEvent origin field or derives provenance from free details, source labels, boot state or schema versions. It marks imported native history, not a new creation or permission grant. False is archived history; true is the captured current projection. Original source, issuer, reason and adoption audit are not published. Full supported canonical Record40 origin and Record45 authoritative metadata-sidecar validation remain in that mapper; an unsupported import factory is not made ready by this event schema. The Record45 body hash does not include the sidecar: the same position and record can retain an ID despite a changed sidecar. Canonical metadata verification separately checks the closed origin; pending delivery rejects a consumer-visible adoption change by exact prepared-body comparison. No universal changed-provenance ID-separation claim is made.", "type": "object", "additionalProperties": false, "required": ["current_projection"], "properties": {"current_projection": {"type": "boolean"}}},
+    "shard": {"anyOf": [{"type": "null"}, {"type": "integer", "minimum": 0, "maximum": 4095}]},
+    "source": {"oneOf": [
+      {"type": "object", "additionalProperties": false, "required": ["kind", "shard", "lsn"], "properties": {"kind": {"const": "actor"}, "shard": {"$ref": "#/$defs/shard"}, "lsn": {"$ref": "#/$defs/positive"}}},
+      {"type": "object", "additionalProperties": false, "required": ["kind", "index"], "properties": {"kind": {"const": "metadata"}, "index": {"$ref": "#/$defs/positive"}}}
+    ]},
+    "head": {"oneOf": [
+      {"type": "object", "additionalProperties": false, "required": ["kind", "shard", "lsn"], "properties": {"kind": {"const": "actor"}, "shard": {"$ref": "#/$defs/shard"}, "lsn": {"$ref": "#/$defs/uint64"}}},
+      {"type": "object", "additionalProperties": false, "required": ["kind", "index"], "properties": {"kind": {"const": "metadata"}, "index": {"$ref": "#/$defs/uint64"}}}
+    ]},
+    "metadata": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "kind", "action", "at_wall_ms", "record_hash"],
+      "properties": {
+        "schema": {"enum": ["kronik.audit/v3", "kronik.operation/v1"]},
+        "effect": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "kind": {"type": "string", "minLength": 1}, "action": {"type": "string", "minLength": 1},
+        "at_wall_ms": {"$ref": "#/$defs/uint64"}, "epoch": {"$ref": "#/$defs/uint64"},
+        "adoption": {"$ref": "#/$defs/native_adoption"},
+        "phase": {"enum": ["pending", "requested", "active", "revoked"]},
+        "record_hash": {"type": "string", "pattern": "^b3k:v3:[0-9a-f]{64}$", "description": "Keyed public identity from the sole shared M28 projection; legacy plaintext b3 hashes are never accepted."}
+      },
+      "allOf": [
+        {"if": {"properties": {"kind": {"const": "audit_event"}, "action": {"const": "fleet.state"}}}, "then": {"required": ["phase", "epoch"]}, "else": {"not": {"required": ["phase"]}}},
+        {"if": {"properties": {"schema": {"const": "kronik.operation/v1"}}}, "then": {"properties": {"kind": {"const": "deadletter"}, "action": {"const": "created"}}}, "else": {"properties": {"kind": {"not": {"const": "deadletter"}}}}},
+        {"if": {"properties": {"kind": {"const": "deadletter"}}}, "then": {"properties": {"schema": {"const": "kronik.operation/v1"}, "action": {"const": "created"}}}},
+        {"if": {"properties": {"kind": {"const": "deployment"}}}, "then": {"properties": {"action": {"enum": ["deploy", "promote", "rollback"]}}}},
+        {"if": {"properties": {"kind": {"const": "grant"}}}, "then": {"properties": {"action": {"enum": ["grant", "revoke"]}}}},
+        {"if": {"properties": {"kind": {"const": "limits"}}}, "then": {"properties": {"action": {"const": "limits"}}}},
+        {"if": {"properties": {"kind": {"const": "policy"}}}, "then": {"properties": {"action": {"const": "policy"}}}},
+        {"if": {"properties": {"kind": {"const": "approval"}}}, "then": {"properties": {"action": {"enum": ["approve", "request_approval"]}}}},
+        {"if": {"properties": {"kind": {"const": "privacy_mode"}}}, "then": {"properties": {"action": {"enum": ["privacy.mode", "privacy.reseal.request"]}}}},
+        {"if": {"properties": {"kind": {"const": "foreign_actor"}}}, "then": {"properties": {"action": {"enum": ["foreign.add", "foreign.remove"]}}}},
+        {"if": {"properties": {"kind": {"const": "erasure"}}}, "then": {"properties": {"action": {"const": "privacy.erase"}}}},
+        {"if": {"properties": {"kind": {"const": "engine_upgrade"}}}, "then": {"properties": {"action": {"const": "engine.upgrade"}}}},
+        {"if": {"properties": {"kind": {"const": "simulator_config"}}}, "then": {"properties": {"action": {"const": "simulators.set"}}}},
+        {"if": {"properties": {"kind": {"const": "state_rebase"}}}, "then": {"properties": {"action": {"const": "rollback.rebase"}}}},
+        {"if": {"properties": {"kind": {"const": "guard_triggered"}}}, "then": {"properties": {"action": {"const": "watch.guard"}}}}
+      ]
+    },
+    "position": {"type": "object", "additionalProperties": false, "required": ["source", "subindex"], "properties": {"source": {"$ref": "#/$defs/source"}, "subindex": {"type": "integer", "minimum": 0, "maximum": 4294967295}}},
+    "cursor": {"type": "object", "additionalProperties": false, "required": ["schema", "identity", "streams"], "properties": {
+      "schema": {"const": "kronik.events-cursor/v1"},
+      "identity": {"type": "object", "additionalProperties": false, "required": ["installation", "branch"], "description": "Branch selects actor feeds only and is not metadata provenance.", "properties": {"installation": {"$ref": "#/$defs/label"}, "branch": {"$ref": "#/$defs/label"}}},
+      "streams": {"type": "object", "maxProperties": 4098, "propertyNames": {"pattern": "^(actor-native|actor-(0|[1-9][0-9]*)|metadata)$"}, "additionalProperties": {"$ref": "#/$defs/position"}, "description": "Every key must equal the typed source domain: actor-native, actor-N with the exact numeric shard, or metadata; runtime validation rejects mismatches. The bound covers all 4096 numeric shards plus native and metadata. A full cursor exceeds 64 KiB; transport-specific request/header limits remain separate and this schema does not assert full-topology Last-Event-ID support."}
+    }},
+    "gap": {"description": "An explicit incomplete range in one source namespace, not a global ordering. A metadata schema-coverage floor does not imply physical retention deletion: known historical rows remain available for exact read-only verification. Webhooks retry durable pending bodies first, then require the fixed, durably committed metadata coverage notice before a forward checkpoint; this continuation preserves the applied replay generation. A same-coordinate canonical record rewrite is a conflict hold, never a coverage gap.", "type": "object", "additionalProperties": false, "required": ["from", "through"], "properties": {"from": {"$ref": "#/$defs/source"}, "through": {"$ref": "#/$defs/source"}}},
+    "page": {"type": "object", "additionalProperties": false, "required": ["events", "cursor", "applied", "gap", "more"], "properties": {"events": {"type": "array", "maxItems": 256, "items": {"$ref": "#"}}, "cursor": {"$ref": "#/$defs/cursor"}, "applied": {"$ref": "#/$defs/head"}, "gap": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/gap"}]}, "more": {"type": "boolean"}}}
+  }
+}

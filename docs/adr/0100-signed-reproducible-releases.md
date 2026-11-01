@@ -31,6 +31,23 @@ Before upload or draft creation, that same job must install its actual attested
 x86_64 archive through both the standalone installer and Action. A public
 upstream fixture is not a substitute for this real Kronik gate.
 
+`KRONIK_RELEASE_KEYHELPER=yes` (the manual workflow's default-off `keyhelper`
+input) adds one separate x86_64 GNU `kronik-keyhelper` archive, not a cryptoki
+dependency in either musl daemon. Both independent builds compile and compare
+the selected helper's actual ELF, SBOM, original normal-root/Rust notices and
+archive bytes. Their raw Cargo logs, hashes and compiled paths remain in the
+reproduction report. This is not a cache-repackaging claim.
+
+The selected helper archive gets the same standard attestation as the daemon
+archives. `KRONIK_INSTALL_KEYHELPER=yes` explicitly selects it through the
+standalone installer and the same strict signature routine; absence or a bad
+bundle never falls back to an unsigned helper. All authentication and staging
+writes precede either executable replacement; each rename is atomic, not a
+multi-file crash transaction. The actual attested helper is installed and
+compared before publication when selected. Its GNU system libraries and vendor
+PKCS#11 module remain unbundled; no glibc floor or HSM compatibility follows
+from ELF symbol versions or local software-token evidence.
+
 The installer and Action use the standard GitHub CLI/Sigstore verifier, with:
 
 - the exact certificate identity

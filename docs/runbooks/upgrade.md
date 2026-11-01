@@ -1,0 +1,52 @@
+# Upgrade
+
+Goal: change the executing binary only after the new engine has replayed the
+actual retained history without a behavior change. A patch version is not an
+engine-compatibility exemption.
+
+## Procedure
+
+1. Record old and candidate `kronik --version` output and binary SHA-256.
+   Obtain the candidate through the release verification process; do not
+   weaken signature verification for an upgrade. Make a recoverable backup
+   using the [backup runbook](backup.md), including its independent key source.
+2. With the **candidate binary**, check the actual data and configured keys:
+
+   ```sh
+   /owned/candidate/kronik --json upgrade check \
+     --data-dir /owned/installation/data --config /owned/installation/kronik.toml \
+     --workers 2 --dry-run
+   /owned/candidate/kronik --json upgrade check \
+     --data-dir /owned/installation/data --config /owned/installation/kronik.toml \
+     --workers 2
+   ```
+
+   Select a retained traffic window that covers the application's important
+   behavior. Check the actual old/new engine pair, root and turn counts and
+   empty behavior diff. A zero-input check is not application evidence.
+3. If `ENGINE_UPGRADE_DIVERGED`, missing keys or another prerequisite is
+   reported, keep the current binary. Read the saved report/diff. Never edit
+   historical engine strings, suppress divergence, or copy a report from
+   another directory/pair. An unavailable prerequisite is not a passing check.
+4. Stop only the owned old process/service using its recorded lifecycle handle,
+   replace its binary through the normal verified installation mechanism, and
+   start the candidate with the same owned data/config/key source. In a local
+   fixture, do not install/reload/restart a global host service.
+5. Check health, the real `engine.upgrade` audit event and integrity through
+   the old recorded LSN. Read the fixture's known SQL/key-value state and
+   repeat a key-backed effect. Restart the owned candidate once and ensure it
+   does not append a second upgrade event for the same completed transition.
+6. Identity replay in both modes must remain complete and unchanged. A rollback
+   is an engine transition in the opposite direction and needs its own passing
+   check; restoring the old binary over new data without a check is unsafe.
+
+## Compatibility drill
+
+`scripts/compatibility-corpus.py` preserves actual released producer data and
+uses the candidate's real public upgrade check, integrity and isolated/continuous
+identity replay. Its source alone is not a drill result. Keep the immutable
+producer's release/revision/binary digest and exact candidate proof, including
+failed/refused transitions. The actual v0.1.0 release reports `0.1.0-dev`;
+retain that historical identity rather than relabeling it. The
+[compatibility policy](../guides/compatibility.md) describes the broader corpus
+and notice requirements.

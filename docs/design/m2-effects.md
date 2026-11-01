@@ -46,9 +46,13 @@ turn's gate:
    specific `*.suffix` wildcard; a wildcard never matches the apex);
    a secret header or `crypto.*` needs `secret:<name>`; `secrets.reveal`
    needs `secret-reveal:<name>`. Without it the guest gets
-   `denied("CAPABILITY_NOT_GRANTED: <capability>")` and an `EffectRecord`
+   `denied("CAPABILITY_NOT_GRANTED")` and an `EffectRecord`
    with status `DENIED` goes into the turn record (deterministic from the
    configuration, so no fsync). `foreign://` targets are denied until M7.
+   A new pre-grant HTTP/foreign denial has no prepared disclosure scope:
+   its free host target is explicitly withheld, not copied from the original
+   URL or reconstructed through a cold secret lookup. The real `DENIED`
+   status and stable machine code remain unchanged; no HTTP receipt is invented.
 2. **`TurnBegin` first (I14).** Before the turn's first external effect,
    first `call`, or first secret use (crypto, reveal), the gate appends and
    fsyncs a `TurnBegin` with execution id, actor, code hash, engine version,
@@ -75,18 +79,95 @@ turn's gate:
    `EffectResult` and fsynced; only then does the host return to the guest.
    For reveal the record holds the secret's name and version hash only.
 6. **Turn record.** The turn record repeats every `EffectRecord` (denied
-   ones included), so history and forks need only the turn record.
+   ones included), so history and forks need only the turn record. The
+   narrowly defined host-disclosure projection below is the exception to
+   byte-identical repetition.
 
 Effect kinds (`EffectRecord.kind`): `http.fetch`, `actor.call`,
 `crypto.hmac-sha256`, `crypto.sign-ed25519`, `secret.reveal`.
 
-**Fingerprint (HTTP).** `blake3` over: method, scheme, lowercase host, port
+**Legacy fingerprint (HTTP, version 0).** `blake3` over: method, scheme, lowercase host, port
 (when not the default), path, query parameters sorted by name then value,
 `blake3(body)`, and the headers sorted by lowercase name, without
 `authorization`, `cookie`, `date`, `idempotency-key`, `user-agent` and
 `x-request-id`; a secret header contributes its name, secret name and
 version hash. Per-kind rules come with forks (M3). Other kinds fingerprint
 their encoded request.
+
+New HTTP requests use fingerprint version 2 and the canonical
+`kronik.fingerprint.http.v2` domain. The producer parses the ORIGINAL URL
+once, prepares its free components with one literal-secret matcher, and
+hashes the already-prepared typed target without reparsing generated
+markers. Protocol delimiters remain syntax; host labels, path/query data,
+header names and values, and bodies are free data. Version 0 remains an
+exact, private historical verifier, never a new writer or hash alias.
+Raw host data is matched before case normalization. A raw no-match falls
+back only to that original component's existing canonical v2 normalization;
+unmatched host case and its existing fingerprint bytes remain unchanged.
+
+**Disclosure failure after a durable external result.** An actual HTTP
+response whose structured redaction fails records status
+`HOST_REDACTION_FAILURE` (11), the real numeric HTTP status, and explicitly
+withheld free payloads before returning the runtime's typed host failure.
+A genuine transport failure remains `NETWORK`; it does not invent an HTTP
+response. A qualified call observation preserves its actual callee source
+and original `OK`/`REJECTED`/`FAILED` status separately. The common runtime
+host-trap path keeps real meters, discards buffered guest writes, messages,
+timers, connection operations and SQL, and closes the turn once.
+
+An already durable, valid-fingerprint legacy result proven unsafe to
+disclose is not resent or rewritten. Its ORIGINAL EffectResult bytes,
+status and fingerprint remain facts. Only the NEW terminal observation is
+projected to status 11 with fixed safe diagnostics and withheld unsafe free
+fields, including a free HTTP/foreign host target. An unknown inventory or
+unreadable source is a prerequisite failure, not proof of unsafe disclosure.
+Already-prepared version-2 requests and replies are not scrubbed again.
+Native cold recovery, replay, recorded neighbors and model examples first
+select the original fact. A covering identity prefix comes only from the
+actual original input and same-source effects through that ordinal; future
+references and today's inventory cannot manufacture it. Without coverage,
+a current match is an actor-local prerequisite before guest disclosure or
+new external I/O, not a changed return, a new status 11, or a resend.
+No-match fields pass unchanged; a covering source scope preserves genuine
+generated markers unchanged. Missing bodies or source custody remain
+prerequisites, never empty success or a proved empty inventory.
+The scope is ephemeral current-producer evidence, not a new wire field or
+permission to dispatch. Public HTTP completions drop that internal evidence;
+fresh internal call completions retain it. A durable cached response without
+its original scope remains unknown and must pass the canonical disclosure
+guard, never a scope reconstructed from engine version or today's inventory.
+
+Persisted `Audit.reason` is not mutable operator input. Typed read views
+reuse one current credential-aware OUTPUT matcher: a match (even identical
+marker bytes), or a missing field plan, withholds the whole reason rather
+than replacing text inside generated markers. No-match reasons retain
+exact bytes; who, time and committed source facts remain unchanged.
+A withheld field does not certify inventory completeness or convert a
+source/certificate error into read success. Raw operator input still uses
+the existing one-pass `for_log` policy before persistence.
+
+Fresh call messages and compensations containing known plaintext secret
+matches are denied before callee admission, without changing their intent.
+A subject label alone is not protection. A successful legacy call with an
+unsafe declared compensation instead requires the closed host-only whole
+Message reference to its genuine prior durable EffectResult, plus admitted
+source/blob/key custody. Only actual compensation containers accept this
+reference; ordinary sent messages, call arguments/replies, timers and public
+selectors do not. The original cleanup payload is resolved only in memory,
+never copied raw into new log or index records. Missing custody is an
+explicit prerequisite failure, not an empty cleanup or a dropped action.
+
+**Persisted audit reasons.** Read views and exports apply the current
+credential-aware output matcher to an already stored `Audit.reason`. If it
+matches and marker provenance is not proved, the whole reason is the canonical
+withheld cell, not a replacement inside a previous generated marker. A reason
+that was free text when recorded can therefore be wholly withheld after a later
+secret is added. No-match reasons retain their exact bytes; who, time, version,
+hash and committed source facts remain unchanged. The immutable original audit
+is not rewritten. The withheld cell is final typed output and is not scrubbed
+again. This projection neither contacts providers during GET nor certifies an
+unavailable inventory; source and certificate failures still fail closed.
+
 
 **Delivery class** of an HTTP effect: the matching grant's `--delivery`,
 else `replay-safe` for GET, HEAD and OPTIONS and `unsafe` otherwise.
@@ -213,8 +294,9 @@ Request and response types live in `kronik_api::types`.
 
 History entries and the turn JSON gain `"effects":[{"ordinal","kind",
 "target","status","delivery","error","hint"}]`, where `hint` for a
-`DENIED` effect is the exact command, e.g. `kronik grant billing
-http:api.example.com --reason '...'`. Secret names must match
+`DENIED` effect may name an exact grant only when its capability is known and
+safe to disclose. A withheld free host is not a grant locator and does not
+produce an exact grant command. Secret names must match
 `[a-z0-9][a-z0-9_.-]{0,63}`.
 
 ## 9. Testing

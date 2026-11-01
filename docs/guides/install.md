@@ -75,6 +75,10 @@ supplement was licensing work, not a new version, signature or security patch.
    `<install-directory>/kronik-licenses/` and stages the executable privately on
    the destination filesystem before renaming it. A notice, copy or sync failure
    leaves the existing executable unchanged;
+   When the GNU helper is explicitly selected, it authenticates and stages that
+   separate archive too before replacing either executable. Copy/notice/sync
+   failures keep both existing executables; each replacement uses same-filesystem
+   rename. This is not a multi-file power-loss transaction.
 5. offers to install gVisor's `runsc`, which only foreign actors need
    ([ADR 0003](../adr/0003-gvisor-bridge.md)): the pinned release
    `release-20261019.0`, checked against a SHA-512 written into the script,
@@ -90,6 +94,7 @@ The environment changes what it does:
 | `KRONIK_VERSION` | Exact signed version; defaults to the published installer's own version |
 | `KRONIK_INSTALL_DIR` | Where `kronik` goes |
 | `KRONIK_INSTALL_RUNSC` | `yes`, `no`, or `ask` (the default) |
+| `KRONIK_INSTALL_KEYHELPER` | `yes` to select the separate signed x86_64 GNU PKCS#11 helper; `no` by default |
 | `TMPDIR` | Parent for private `mktemp` directories; must be writable and executable because the verified candidate runs before installation. With a `noexec` `/tmp`, use an already owned executable directory such as the install directory |
 
 For manual installation, first establish a trusted modern GitHub verifier and
@@ -112,11 +117,47 @@ Use the installer for atomic replacement. Retain the original notices whenever
 redistributing the binary. The trusted verifier checks signatures; the downloaded
 product is never executed to verify itself.
 
+### Optional GNU PKCS#11 helper
+
+The musl daemon does not link cryptoki or load a vendor module. A release may
+also contain `kronik-keyhelper-x86_64-unknown-linux-gnu.tar.gz`, built separately
+with the explicit `pkcs11` feature. It is never selected by default. For a
+release that actually carries its standard signature bundle:
+
+```sh
+curl -fsSL https://<project>/install.sh | KRONIK_INSTALL_KEYHELPER=yes sh
+```
+
+The same pinned verifier, repository **1432583300**, workflow, exact tag/source
+ref and issuer authenticate both archives. Missing or unsigned helper assets
+fail closed; there is no raw-binary, checksum-only or unsigned fallback. The
+installer retains its original notices in `kronik-keyhelper-licenses/` beside
+`kronik-keyhelper`, on the same destination filesystem as the daemon.
+
+The helper requires the system x86_64 GNU loader, libc and libgcc_s. The selected
+vendor PKCS#11 module, its own dependencies, token/key and access configuration
+are **not bundled**. ELF symbol versions are observations, not a supported
+glibc floor or proof on Ubuntu, ARM or physical HSMs. Configure the actual
+`helper_path`, hash-validated `module`, token manufacturer/model/serial,
+enrolled `key_id`/`key_version` and private `pin_file` under `[keys.pkcs11]`;
+obtain its non-secret possession probe through the real operator command:
+
+```sh
+kronik --json keys enroll --config /owned/hsm/kronik.toml
+```
+
+Save that returned probe in `[keys.pkcs11.probe]`; labels and slot numbers
+are not key identities. See [ADR 0093](../adr/0093-pkcs11-through-a-helper-process.md).
+Local unsigned candidates are exercised only as owned build artifacts, not by
+weakening this production installer. A public signed helper/tag and complete
+B6 lifecycle require their own actual release evidence.
+
 ## What a release contains
 
 | File | |
 | --- | --- |
 | `kronik-<target>.tar.gz` | Static, stripped musl `kronik`, `LICENSE`, `NOTICE`, `THIRD_PARTY_LICENSES.txt` and a target-specific `kronik.cdx.json` |
+| `kronik-keyhelper-x86_64-unknown-linux-gnu.tar.gz` | Optional GNU helper, its own `kronik-keyhelper.cdx.json` and original `LICENSE`, `NOTICE`, `THIRD_PARTY_LICENSES.txt`; same checksum/signature sidecars |
 | `kronik-<target>.tar.gz.sha256` | Human/archive checksum, not authentication |
 | `kronik-<target>.tar.gz.sigstore.json` | Standard keyless bundle authenticated against exact source policy |
 | `install.sh` | Standalone archive installer, exact version/base URL and embedded shared gVisor setup |
@@ -172,12 +213,20 @@ cross-compiles both architectures with pinned Rust, Zig 0.17.0,
 cargo-zigbuild 0.24.0 and cargo-cyclonedx 0.5.9, retaining original notices and
 per-target SBOMs. `SOURCE_DATE_EPOCH` controls the existing SBOM generator;
 archive metadata is deterministic. This alone is not reproduction or signing.
+Set `KRONIK_RELEASE_KEYHELPER=yes` to add the separate x86_64 GNU helper;
+the default daemon targets and normal dependency closures stay unchanged.
+Its normal-root/Rust notices do not borrow the daemon's Zig, musl or embedded
+SDK inputs. GNU packaging verifies the ELF architecture, dynamic loader and
+system-library dependency set without executing it; binutils `readelf` is needed.
 
 For a committed source snapshot, `scripts/reproduce-release.py` builds twice
 in independent source/target directories without reusing compiled Kronik output.
 It requires equal ELF bytes, each archive payload and the final unsigned
 distribution. Only pinned tools/source inputs are shared. Actual results are
 recorded in `reproducibility.json`; differences fail the release.
+The same `KRONIK_RELEASE_KEYHELPER=yes` selection reaches both independent
+builds. The report retains their actual Cargo logs, hashes and compiled paths,
+not just a source archive or re-packed cached debug binary.
 
 ```sh
 KRONIK_BASE_URL="https://<public-exact-release-url>" python3 scripts/reproduce-release.py

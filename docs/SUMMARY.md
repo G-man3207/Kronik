@@ -10,9 +10,12 @@
 # Reference
 
 - [CLI](reference/cli.md)
+- [API examples and coverage](reference/api-examples.md)
 - [JSON output](reference/json.md)
 - [WIT](reference/wit.md)
+- [WIT usage examples](reference/wit-examples.md)
 - [Error codes](errors.md)
+- [Error scenario examples](reference/error-examples.md)
 
 # Guides
 
@@ -24,6 +27,15 @@
 - [Agent guide](guides/agent.md)
 - [GitHub Action](guides/github-action.md)
 - [Security model](guides/security.md)
+- [Compatibility and deprecation](guides/compatibility.md)
+
+# Runbooks
+
+- [Backup](runbooks/backup.md)
+- [Restore](runbooks/restore.md)
+- [Upgrade](runbooks/upgrade.md)
+- [Node loss](runbooks/node-loss.md)
+- [Leaked secret](runbooks/leaked-secret.md)
 
 # Design
 
@@ -44,6 +56,7 @@
 - [M15 Python and Go SDKs design](design/m15-sdks.md)
 - [M23 key backends: B1 and parked remaining design](design/m23-secret-backends.md)
 - [M28 OpenTelemetry and audit export design](design/m28-otel.md)
+- [Threat model and integration limits](design/threat-model.md)
 - [Performance](perf.md)
 
 # Decisions
@@ -84,5 +97,11 @@
 - [ADR 0083: The audit export: the log is the audit trail](adr/0083-audit-export.md)
 - [ADR 0084: Export cursors, and the audit export holds retention](adr/0084-export-cursors-and-retention.md)
 - [ADR 0092: The master seed wrapped by a KMS](adr/0092-master-key-wrapped-by-a-kms.md)
+- [ADR 0093: PKCS#11 through an optional helper process](adr/0093-pkcs11-through-a-helper-process.md)
 - [ADR 0094: Key providers without SDKs](adr/0094-secret-providers-without-sdks.md)
 - [ADR 0100: Keyless signed and reproducible releases](adr/0100-signed-reproducible-releases.md)
+- [ADR 0103: OIDC principals and private browser sessions](adr/0103-oidc-principals-and-browser-sessions.md)
+- [ADR 0104: The admin UI is a public API client](adr/0104-admin-ui-as-a-public-api-client.md)
+- [ADR 0105: Fleet enrollment uses ordinary authority](adr/0105-fleet-ordinary-authority.md)
+- [ADR 0106: Operational events follow committed records](adr/0106-operational-events.md)
+- [ADR 0107: Original authority through final enqueue](adr/0107-original-authority-final-admission.md)

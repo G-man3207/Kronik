@@ -414,6 +414,46 @@ The classifier is one function in `kronik-otel`. A unit test walks every
 record message of `kronik-proto` and fails when one with an `Audit` field
 is not classified (review M4), so a new audited kind cannot be missed.
 
+The same Mapper accepts validated ActorSource values from each held native
+frame. Its actor-specific line, operational and verification entrypoints borrow
+that actual WAL-header branch, not the target Mapper's configured branch. The
+classification and private record identity pipeline are unchanged; no Mapper
+copy, new public hash or native/member position alias is introduced.
+
+The portable read-only metadata audit contract carries a real metadata index,
+canonical record and optional same-image native adoption view; it never turns
+metadata into an actor LSN. The source must report its actual coverage and durable
+cut from one image. Its declaration provides neither a producer nor metadata
+readiness. NativeAuthorityOrigin is only the existing sidecar message here;
+AuditEvent field 10 and native import/emission are not activated by this port.
+A reader that silently drops field 10 is not a governing old-reader fence.
+
+The same Mapper consumes that captured record/index/origin through
+`lines_metadata`, `operational_lines_metadata` and `expected_metadata`. An
+imported Record45 keeps its exact canonical body and v3 private identity; the
+closed public adoption view exposes only the actual adoption wall time, proven
+current/historical purpose and, when known, its original native branch and LSN.
+Verification checks this same-image view separately from the unchanged record
+hash, including the distinction between absent and known original provenance.
+The existing metadata coverage-gap, signing-key-change and replay schemas
+preserve only their strictly validated public coordinates and stream identity.
+Persisted free audit reasons retain the shared whole-cell withholding policy;
+no protected approval identity, adoption token or adoption reason is published.
+
+The operational-event projection consumes the Mapper's private typed adoption
+fact through `Line::native_adoption_current_projection`, never free JSON details
+or an unselected protobuf carrier. The fact is absent from serialized audit
+lines and their schema. Historical JSON lines remain verification inputs;
+freshly mapped source records supply this internal operational-event fact.
+
+This portable reader fragment does not activate metadata export. Imported
+AuditEvent40 origins still require the unselected field10/import/fence closure;
+actor-feed replay, fleet-control-open and registered-export-rewind also retain
+their exact unselected validator dependencies. A known supplied Record40
+origin is rejected by the sidecar contract, not replaced by unknown or dropped.
+No metadata producer, source factory, readiness, governing reader fence or
+full-member support follows from these read-only declarations.
+
 Not exported:
 - `TurnBegin` copies of that audit, because `TurnRecord` is the
   authoritative one;
@@ -673,6 +713,46 @@ the export cursor equals the applied LSN.
 
 - **Batches:** the exporter reads from its cursor, builds a batch, delivers
   it to the sink, then advances the cursor.
+- **Native admission (current source, not a new runtime receipt):** startup
+  captures the genuine local operator once before exporter awaits; configured
+  exporters retain that same original. Operator rewinds use the actual request
+  original. HTTP dispatch, file/S3 writes, trace checkpoints and cursor writes
+  use their existing bounded owned queue. A revoked original cannot hand off a
+  new command; one exact command already admitted may finish.
+- **Retained disclosure:** records preparation captures the native certified
+  snapshot and publication together. The records guard owns that exact Arc
+  through the actual HTTP response EOF or owned file/checkpoint/cursor job;
+  keeping bytes alive is not permission to send them. Final admission checks
+  the original and current publication atomically, without I/O under the fence.
+  The same records guard also owns its genuine captured native reader and checks
+  its active original role, held-root and same configuration epoch inside that
+  final admission. A pathname descriptor is not a retained file proof.
+  Control-only checkpoints contain causal IDs and cursor coordinates, not a
+  grant to disclose records.
+  Configured metadata workers use the same guard's `metadata_records` mode,
+  retaining the real stream and paired certificate through delivery/cursor jobs;
+  sticky stream stop is checked inside the same original publication admission.
+  Metadata responses use the same guard's metadata projection to retain the
+  actual producer's paired snapshot and publication without an actor reader;
+  the original metadata authority and actual metadata source remain required.
+- **Changed publication:** a fingerprint alone never reattaches old prepared
+  bytes to a new publication. The follower captures a fresh actual pair and
+  rereads the same bounded LSN coordinates from a fresh genuine captured reader,
+  then rebuilds using its actual per-frame source and the durable cursor. Only
+  exactly equal prepared bytes can resume; encoded raw-record equality is not
+  required because legitimate value-only resealing may change stored bytes. A changed projection holds the
+  pending batch with `disclosure_conflict` until explicit rewind/control; it
+  neither changes the immutable source nor silently retries different bytes.
+  After remote acknowledgement, local persistence can requalify the same
+  preparation but does not resend the acknowledged request.
+- **Worker lifecycle:** names are owned `Arc<str>` values, not leaked static
+  strings. A stream is bound to its exact Cursors Arc. Configured audit, trace
+  supervisor and metric workers register their real Env join handles before
+  publication. Stop is sticky and wakes idle/backoff/control waits; concurrent
+  or cancelled stop callers retain the same join receipt. Already admitted
+  bounded sends finish at their owned EOF rather than being detached by stop or
+  rewind. Stop joins workers and drains active control before returning; it is
+  not a replacement authority or a claim that a failed worker completed.
 - **Cursor:** `<data>/export.json` holds per-stream entries, written by
   temp file, sync, rename and directory sync. Optional version-1 `control`
   contains the applied 128-bit generation and durable pending replay's
@@ -733,8 +813,9 @@ older than `[retention] history`. A slow sink would otherwise lose records.
   - Gaps are derived from authoritative retained source positions even
     while remote delivery retries. `audit.gap` notices deduplicate across
     checkpoint failure/restart, and the skipped range is durably saved
-    before later preparation. The append uses `check_alive` (never
-    refused by the reserve); the metric counts it and the node serves.
+    before later preparation. Its typed native append retains the same
+    original admission and essential-audit reserve policy; the metric counts
+    it and the node serves.
   - A sink that stays down shows in the export status,
     `kronik_export_lag_records{stream="audit"}`, and `kronik doctor`, which
     warns once the hold is older than `[retention] history`.

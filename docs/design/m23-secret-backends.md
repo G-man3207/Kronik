@@ -1,8 +1,8 @@
 # M23: Key and secret backends (design)
 
-Status: B1 KMS lifecycle is implemented for OpenBao, AWS, GCP and Azure
-after design re-review and the non-B6 spike. B2–B5 remain planned; B6 and
-ADR 0093 remain maintainer-gated.
+Status: B1 KMS lifecycle is implemented for OpenBao, AWS, GCP and Azure.
+B2–B6 are approved and in active implementation; the current native product
+checkpoint and its remaining acceptance gaps are recorded in STATUS.md.
 Sections 1–13 preserve the revised parked `m23-design` proposal from main
 6c04dea, including its historical loader inventory and future acceptance
 plan. The resumed B1 gate below supersedes stale B1 details. Observed
@@ -180,7 +180,7 @@ stays the 32-byte seed, and the KMS or HSM key **wraps** it:
 | `aws` | KMS `Encrypt`/`Decrypt` (`X-Amz-Target: TrentService.*`) with `EncryptionContext` | SigV4 with credentials from `AWS_*` env or IMDSv2 instance role |
 | `gcp` | Cloud KMS `cryptoKeys:encrypt` / `:decrypt` | service-account JSON key (RS256 JWT, signed with ring) or the metadata server |
 | `azure` | Key Vault keys `wrapkey`/`unwrapkey`, RSA-OAEP-256 | client credentials (secret file) or managed identity (IMDS) |
-| `pkcs11` (B6 proposed; maintainer-gated) | proposed `kronik-keyhelper` process (§3.4): `CKM_AES_GCM` on a non-extractable AES-256 key | proposed PIN file; not a B1 source |
+| `pkcs11` (B6, accepted design; integration/release acceptance separately gated) | optional `kronik-keyhelper` process (§3.4): `CKM_AES_GCM` on a non-extractable AES-256 key | private PIN file; not a B1 source |
 
 Credentials are never in `kronik.toml`, only paths to files (or env names).
 Systemd's `LoadCredential=` fits: `$CREDENTIALS_DIRECTORY` is read where a
@@ -247,7 +247,7 @@ redacting `Debug`, and the shared `Env::net` client never logs headers.
   `keys.source` (M28's restore-marker pattern). Both need M28's kind 40, so
   M23 Phase B merges after M28.
 
-### 3.4 PKCS#11 helper proposal (B6, ADR 0093 maintainer-gated)
+### 3.4 Optional PKCS#11 helper (B6, accepted ADR 0093)
 
 PKCS#11 is a C ABI: the vendor's module (`libsofthsm2.so`, a YubiHSM or
 Luna library) must be `dlopen`ed. **The release `kronik` is a static musl
@@ -255,31 +255,35 @@ binary, which cannot `dlopen` at all** (review B1, probed: "Dynamic loading
 not supported"), and the vendor modules are glibc-linked. So the daemon
 never loads one:
 
-- **`kronik-keyhelper`**, a second, small binary: dynamically linked
-  against glibc, built for `x86_64-unknown-linux-gnu`, containing only
-  `cryptoki` and the protocol. It is a separate release artifact
-  (`kronik-keyhelper-<version>-x86_64-linux-gnu`), installed only by
-  operators who use an HSM.
-- **Run only when `[keys] source = "pkcs11"`**: at start, and by
-  `keys wrap` and `keys rewrap`. The daemon spawns it with a cleared
-  environment, `PR_SET_DUMPABLE 0` set by the helper first thing, stdin
-  and stdout as pipes, and the PIN file's descriptor passed as fd 3 (the
-  helper never reads config or paths of its own choosing).
-- **Protocol:** one request line of JSON, one answer line, then exit:
-  `{"op":"unwrap","module":"/usr/lib/softhsm/libsofthsm2.so",
-  "token_label":"kronik","key_label":"kronik-master","iv":"…","aad":"…",
-  "ciphertext":"…"}` → `{"ok":"<base64 seed>"}` or `{"error":{"code":…,
-  "message":…}}`; `wrap` is the mirror. The daemon reads at most 4 KiB with
-  a timeout and kills the helper on overrun.
+- **`kronik-keyhelper`**, a separate x86_64 GNU binary with exact
+  `cryptoki = 0.12.1`. Its default-off `pkcs11` feature never enters the
+  daemon's normal dependency closure. `KRONIK_RELEASE_KEYHELPER=yes` adds
+  `kronik-keyhelper-x86_64-unknown-linux-gnu.tar.gz`, its own SBOM, original
+  normal-root/Rust notices, LICENSE/NOTICE and checksum. The manual release
+  workflow reproduces it before the same keyless attestation as the daemon.
+  `KRONIK_INSTALL_KEYHELPER=yes` selects only a correctly attested archive;
+  see the [installation guide](../guides/install.md#optional-gnu-pkcs11-helper).
+- **Run only for explicit PKCS#11 operations:** startup, `keys wrap`,
+  `keys rewrap` and `keys enroll`. The helper disables dumps before sensitive
+  input, uses private stdin/stdout and the trusted PIN-file descriptor at fd3,
+  then finalizes and exits. The module, its dependencies and the token/key
+  configuration are unbundled operator prerequisites.
+- **One bounded existing protocol:** `kronik.pkcs11/v1`, defined by
+  `crates/kronik-keyhelper/src/protocol.rs`, with a 4-KiB request/response
+  boundary and kill-and-reap on failure. Actual token manufacturer/model/serial,
+  enrolled key ID/version and a non-secret possession probe replace the old
+  label/slot assumptions; use the real `kronik keys enroll --config ...` path.
+  No seed/PIN in argv, environment or an invented protocol file.
 - **Why a process even if a glibc build existed:** vendor C runs for one
   call in a process that exits right after; memory corruption, threads left
   after `C_Finalize`, signal or atfork handlers and a second libcrypto never
   reach the daemon or its `runsc` spawns.
-- The daemon keeps the rule "no C beyond bundled SQLite". The helper is the
-  narrow exception ADR 0093 asks the maintainers to confirm; the alternative is
-  PKCS#11 as a documented gap.
-- **Proof** runs against the daemon and helper extracted from release archives
-  (`dist/release/*.tar.gz`), never a dev build: SoftHSM2 in `e2e-keys.sh`.
+- This is ADR 0093's accepted narrow process exception, not a promise about a
+  vendor's C implementation or full B6 acceptance.
+- Proof must name the actual extracted artifact, source, profile and platform.
+  An owned GNU helper/software-token exercise with a matching GNU debug CLI is
+  local evidence, not the final musl-daemon/helper release lifecycle, supported
+  glibc floor, Ubuntu/ARM execution or physical-HSM acceptance.
 - M21's unit has `PrivateDevices=yes`, which hides USB HSMs: the guide
   ships a `DeviceAllow=` drop-in for them (review, Low).
 
@@ -365,11 +369,16 @@ message SecretLink {
   a ref outside it is `SECRET_REF_NOT_ALLOWED` (403), and `link`/`unlink`
   need scope `admin`.
 - `kronik secret unlink <name> --reason R [--dry-run]`.
-- A linked name has no built-in value. `secret set` on it answers
-  `SECRET_EXTERNAL` (409), with the hint "set it in the backend, then `kronik
-  secret refresh <name>`". Grants stay `secret:<name>` and
-  `secret-reveal:<name>`, so guest code does not know or care where a value
-  lives.
+- An **active link**, including `backend = "file"` and a same-name file link,
+  has no owned built-in value. Both `secret set` and `secret delete` return
+  `SECRET_EXTERNAL` (409) before allocating a version or changing any physical
+  row, floor, provider or audit history. Unlink first; a subsequent built-in
+  mutation affects that logical name's own file row only, never the old target
+  or another alias. An unlink record may remain in configuration with an empty
+  backend; that is not an active link. Grants stay `secret:<name>` and
+  `secret-reveal:<name>`, so guest code does not know or care where a value lives.
+  Logical revocation is not physical deletion: the target's original encrypted
+  history and qualified host-only scrub custody remain independent of aliases.
 - `SecretLink` is applied to a `secret_links` table in `state.db`, so it is
   rebuilt from the log.
 
@@ -560,6 +569,163 @@ secrets, and only once Kronik has no usable value.
 - **Doctor:** each backend's last success and error, and linked names with
   no cached value.
 
+### 6.1 Configured immutable host MACs
+
+A configured native signer validates the committed logical identity, selected
+link and trusted backend before reading its exact immutable `source_version`.
+It uses only an already operational held value or the verified provider/FILE
+version; retained scrub-only inventory is not operational permission. This
+read neither observes a new version nor inserts or promotes a cache value.
+Only `Unavailable` can use the existing bounded operational last-good value;
+other provider failures invalidate operational use outside admission.
+
+Provider/file reads, identity checks and HMAC calculation finish before the
+caller's original final admission. Its callback only moves one prepared MAC.
+An exporter retains its actual inventory publication separately through that
+same original admission; the data publication is not a new authority. Avoiding
+cache publication here prevents re-entering the exporter's held cache fence.
+The focused native cold-FILE/cache consumer is authored but not yet executed.
+
+### 6.2 Private native execution versus public readiness
+
+The original native execution is activated once after unchanged erasure
+recovery and secret-version initialization/refresh setup, before Foreign
+reconciliation and open-turn rerun enqueue. This preserves Foreign-before-rerun
+ordering. Public readiness remains the final successful `Node::start` return;
+private ACTIVE is not a new listener, issuer, recovery permission or proof
+that an operational current-name selection is available.
+
+The native constructor arms its private startup guard immediately after the
+real Node/writer binding, before spawning work. An error or cancelled startup
+invokes the existing physical stop even if background work still retains a
+Node Arc; final-Arc `Node::drop` alone cannot cover that case. The guard is
+disarmed only immediately before the successful return. If the writer has
+already closed, its existing liveness predicate denies use even when cleanup
+cannot report a successful stop; no fallback authority is created.
+After the actual Foreign await, the same retained native execution is checked
+again before any rerun is enqueued or readiness can be returned. A physical
+stop during reconciliation therefore fails startup rather than returning a
+stopped Node. The startup observer used by the error/cancellation consumer
+fixtures is private, task-scoped and compiled out of production.
+
+The ordinary Native Foreign courier must retain that same ACTIVE execution
+and actual committed configuration Arc/epoch/declarations. Its operational
+current-name DATA publication is separate from historical scrub inventory.
+Final start/send handoff must fence current configuration and all required
+selections under one original admission; provider/file work, capacity waits
+and destruction stay outside that fence. Even a declaration with no secret
+bindings must check/watch the actual committed configuration and use the same
+configuration-DATA callback at final start or call enqueue. An old retained
+configuration Arc or an ACTIVE execution alone cannot authorize a removed run.
+The common manager/ForeignHost/Node courier adoption is held: its mandatory
+actual Cluster dependency eagerly includes the stopped native-import producer,
+not just an independently readable origin codec. Root keeps its existing Host
+ABI and callers; it does not add that producer, a Member facade, optional
+authority, a feature gate or an unused replacement courier. Native operational
+Foreign hot-rebind acceptance, as well as Member historical closure, remains
+unproved. The private startup guard and ordinary storage DATA work are separate.
+
+The shared `CurrentSecretSelection` primitive retains the actual active logical
+row, zeroizing value, original expiry and original publisher notification. A
+retired selection never revives. Its final DATA callback checks all selections
+under one actual publisher with a denial prepared before original admission;
+it is not an authority or historical inventory certificate. Retiring one
+logical alias must not retire another binding to the same still-live physical
+row or extend its expiry. The global scrub-corpus certificate stays global.
+
+FILE row verification uses the canonical physical reference and physical
+`source_version` for SQLite, AEAD and the original physical keyed hash. The
+logical name/version has its own independently checked M23 keyed identity,
+even when the version numbers are equal. Cipher custody descriptors keep the
+unchanged raw-ciphertext BLAKE3 domain. These crypto checks do not qualify a
+source, authorize an import or prove absence of deletion: physical floors still
+require a real closed physical-name/cut/purpose/source proof. No logical alias
+tombstone or a missing floor becomes shared physical deletion permission.
+
+The borrowed Record45 validator uses that same logical/physical split; an
+explicit FILE link, including a self-link, is still an external definition.
+Its immutable physical reference must match its canonical FILE reference and
+the existing physical-name grammar. LINK and retained UNLINK remain distinct.
+`SecretStore::current_meta` shares `current`'s single-row selector but reads only
+version/hash/creation metadata, never nonce or ciphertext. It can detect that a
+retained immutable version is no longer physical CURRENT without decrypting it;
+it is not a custody, complete-history, no-deletion or logical-permission proof.
+Its new real SQLite/retention/reopen/corrupt-cipher regression remains unrun.
+The candidate-value regression inspects both actual Reserved/Active WAL audit
+facts and encrypted-row operator facts, then reopens the real store and checks
+the redacted history and unchanged encrypted row. It does not pin marker wording.
+
+### 6.3 Original-owner mutable stores and private readers
+
+Live file-backed secret and subject-key stores retain the original
+`DataOwnership` directory-lock resource. Independent connections use
+`reopen_owned`, sharing that same owner and DATA publisher; neither a new path
+lookup nor a second directory lock creates currentness. The keystore publisher
+selects only `keystore.db`. Secret-file mutations use the existing cache's
+separate physical-name mutation interval, installed before the store is exposed.
+Memory and actual read-only connections are distinct modes, not live owners.
+Raw mutable-connection constructors/imports and the arbitrary public secret
+backup destination have been removed from production callers.
+
+A secret mutation invalidates affected operational bindings and the global
+scrub certificate before SQL. Its non-clone stack guard spans SQL and reports
+commit or ended-but-unknown failure; SQL commit alone does not certify CURRENT.
+The owning native mutation joins its real ACTIVE record to physical metadata,
+floor and keyed value identity before acknowledging inventory publication.
+Concurrent mutations of the same physical name refuse before SQL rather than
+minting a new selection from an independent connection's older WAL view.
+Inventory capture and its final cache publication compare the same mutation
+tickets, native apply cut, actual epoch and cache revision. Apply/config
+incompleteness cannot be hidden by reusing an old scrub certificate.
+
+Before any kind-45/46 application, native DATA retires the global certificate;
+only actual ACTIVE/link changes retire current-name bindings. A failed apply or
+unpublished configuration remains negative across reuse of the owned store.
+After real startup replay, clearing that pending state requires the original
+log directory, exact record/header namespace and the actual applied/configuration
+cuts—not merely larger counters from another source. A healthy completed source
+does not require reopening an already compacted metadata frame.
+
+The physical SQLite identity is obtained with public FILESTAT through the live
+connection: borrow its reported Unix descriptor only for `fstat`, and retain
+the same Connection/owner. Never duplicate, separately open or close a database
+descriptor for this check: that can release process-wide POSIX locks.
+The paired FILESTAT/WALSTAT build flags do not expose either diagnostic SQL
+function to guests. The observed bounded C-only ABI/locking proof is separate
+from the still-unrun Rust FFI, owned-store and daemon integration regressions.
+
+A live secret reader stages the existing Connection's completed encrypted
+SQLite backup and consumes that private stage into `open_readonly`; it does
+not byte-copy a live database or its WAL. The stage remains owned by the reader.
+An already closed private destination can instead supply its actual read-only
+Connection directly. Offline key wrapping and ship restore acquire fresh
+exclusive original ownership before validating their private inputs.
+
+The public `validate_staged_stores` → `KeySource::load(false)` path still
+copies main/WAL files. Its path-only offline-sealer/M19, audit-verifier,
+doctor-fallback and existing-key init-rerun callers are not thereby frozen
+or qualified; the latter three are separate ordinary source-contract gaps.
+Source DB/WAL preservation and absent source SHM remain required. These
+callers retain their old behavior pending a genuine compatible source boundary;
+neither a blind live SQLite reopen nor the held H/replay producer was added.
+
+Compliant file writers must retain the original exclusive owner. This is not a
+process-local claim to fence arbitrary external raw SQL; existing identity,
+master, floor and corruption checks remain necessary. The Root source cutover
+and authored regressions are unbuilt/unrun, and do not establish the held
+Foreign, historical-source or complete M23 acceptance criteria.
+The later Native FILE current/alias/observation/regression source task also
+stopped at `cyber_policy`. Its pre-stop packets and applied Root source are
+preserved, not completed through another owner or label. Known unclosed
+interfaces and the no-execution cleanup receipt are retained in
+`<internal-evidence>`.
+
+Local source checkpoint `10b60d52c53ccdb10ba869eede8b65f7a0f4e467` preserves
+these already-landed changes without verification or completion of those seams.
+It does not close public Path-only live candidate validation, operational
+Foreign hot-rebind or complete M23. Main publication is blocked by the existing
+broad CI event; the stopped work is not rerun through a push.
+
 ## 7. Providers without SDKs (ADR 0094)
 
 Every provider is a small REST client over `Env::net()` (hyper and rustls
@@ -608,12 +774,10 @@ auth = "cert"                 # token | approle | cert
 cert_file = "bao-client.pem"  # relative: $CREDENTIALS_DIRECTORY
 key_file = "bao-client.key"
 
-[keys.pkcs11]
-helper = "/usr/local/libexec/kronik-keyhelper"   # the glibc helper (§3.4)
-module = "/usr/lib/softhsm/libsofthsm2.so"
-token_label = "kronik"
-key_label = "kronik-master"
-pin_file = "kronik-hsm-pin"
+# Optional PKCS#11 uses [keys.pkcs11] with helper_path, module and its SHA-256,
+# private pin_file, actual manufacturer/model/serial, key_id/key_version and
+# the real CLI-returned possession probe. See §3.4 and accepted ADR 0093;
+# the former helper/token_label/key_label prototype is not this contract.
 
 [secrets]
 refresh = "5m"
@@ -854,10 +1018,11 @@ Gates run through `kronik-slot`.
    - the security guide's at-rest map;
    - cli.md, json.md, openapi.json, errors.md.
 
-6. **B6 PKCS#11, last and separable:** `kronik-keyhelper` (glibc, its own
-   release artifact), the daemon side of its protocol, the SoftHSM2 e2e
-   run against the release artifacts, and the `DeviceAllow=` drop-in. It
-   can be dropped to a documented gap without touching B1–B5.
+6. **B6 PKCS#11, last and separable:** the default-off GNU helper archive,
+   its own original normal-root/Rust notices and SBOM, two actual compilations
+   and strict keyless consumer authentication. Exercise extracted helper
+   enrollment/probe with owned SoftHSM; retain exact scope separately from the
+   complete matching musl release lifecycle and device/vendor acceptance.
 
 B1 and B2 are independent. B3 and B4 need B2's trait. M23 merges after M28
 (kind 40 for the key-source audit events, and M28's classifier for kinds 45
@@ -901,6 +1066,11 @@ shipping and restore; offline upgrade and audit verify are additional callers.
   snapshot secret store in staging before installing anything. The newest
   keystore rule remains: snapshot time does not restrict backup selection.
   No rejected restore replaces the target envelope or creates a fresh seed.
+- Native snapshots reuse the existing private encrypted staging backup. Its
+  SQLite destination is closed and has no WAL, SHM or journal before a
+  non-overwriting hard link installs it in the snapshot's already-owned new
+  directory. The stage is discarded before hashing and publishing the manifest;
+  live secret rows and the existing snapshot cut, lock and retention stay intact.
 - Wrap preserves the old key file unless explicit --remove-file is given.
   Rewrap checks the loaded seed and existing stores before replacing the
   envelope; the seed itself is never rotated.

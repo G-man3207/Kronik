@@ -26,9 +26,25 @@ paid API.
   the object store endpoint: infrastructure, and the key never enters the log.
   Whether a target may use the model is history (`SimulatorConfig.model`,
   ADR 0014). Both are needed.
-- **Calls** go through `Env::net` like `[fork] live_allowlist` GETs, so the
-  daemon's network seam (and DST) applies. Forks still make no live
-  effect for the guest (I7): the model's answer is synthetic.
+- **Calls** go through `Env::net.http_authorized` using the operation's
+  original physical dispatch lease, captured before its first wait and
+  passed unchanged through proposals, replay, recursive turns and new
+  continuous inputs. The daemon's network seam (and DST) still applies.
+  A synthetic guest answer does not exempt provider I/O from authority.
+- **Two execution profiles** are internal, not configuration flags:
+  `RecordedOnly` retains actual historical source/custody and matches saved
+  facts without minting an ordinary operation lease; a model cache miss is
+  a typed host prerequisite before credentials, capacity or network I/O.
+  `Authorized(original)` may dispatch a miss only with that same original.
+  A new explicit operation supplies its own original; retained setup data
+  and caches never refresh or replace an older operation's authority.
+- **One model source getter** returns either a real qualified, read-only
+  certified snapshot or the actual live snapshot/publication pair captured
+  atomically from its producer. A new provider call needs both authorized
+  dispatch and the live publication fence. A read-only snapshot, source
+  position, native baseline, or cache entry is data, not a network grant.
+  Native and member factories remain bound to their actual source owners;
+  neither substitutes for the other.
 - **No personal data**: recorded examples qualify only from production
   turns that show no subject or sealed value anywhere (input, effects,
   writes, messages, timers, reply) and ran no SQL, with a plain,
@@ -53,6 +69,10 @@ paid API.
   refusals are cached too. A cache file that cannot be read or parsed fails
   the replay rather than silently asking the model again. A dry run never
   calls the model and writes no cache.
+  Transport, deadline, non-success status and response-size failures remain
+  host availability prerequisites, not cached refusals. Invalid model
+  protocol remains a host failure with fixed safe text; it likewise creates
+  no initialized cache fact.
 
 ## Alternatives
 

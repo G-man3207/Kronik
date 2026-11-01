@@ -39,6 +39,69 @@ one subject.
 - `key_for_sealing(subject, fresh, nonce, wall)` returns the newest key,
   creating version 1 on first use. `key(subject, version)` returns `Found`,
   `Erased` or `Missing`. `rotate` adds a version, and older ones still unseal.
+  Subject-key versions remain positive `u32`; an exhausted version or erased
+  floor refuses creation/rotation without wrapping to zero or changing rows.
+- The keystore exposes a persistent, checked integer `revision()` for semantic
+  change detection, independently of database/WAL timestamps or lengths. Key and erasure
+  writes advance it in their SQLite transaction, including backup installation.
+  Sealer caches also observe SQLite's connection-local `data_version`; a loaded
+  key and its revision come from the same read snapshot. A failed revision read
+  clears cached keys and fails closed. Replacing a loaded database's device/inode
+  requires reopening it; arbitrary raw in-place writes outside SQLite are not a
+  supported concurrent update path. These revisions are housekeeping metadata:
+  `KRKSTOR1` backups and master-keyed audit identity remain unchanged.
+- `Sealer::seal_value_at(value, version, fill)` protects a tagged plaintext
+  snapshot value under its required positive original subject-key version,
+  independently of the current mode. It refuses missing or erased versions and
+  never creates a key or promotes a value to a newer version; callers must first
+  validate the original row's source and erasure provenance.
+  `require_key_version(subject, version)` is the noncreating read-only admission
+  check: snapshot callers must check every original positive reference across
+  all actors before minting any first-protection key.
+- `Sealer::key_availability(subject, version)` reports `Found`, `Missing`, or
+  `Erased` for an exact positive original reference through the same opening
+  cache and revision/floor checks. It exposes no key material, creates no key,
+  and never selects the newest version. Database and wrapped-key MAC failures
+  remain errors. `Found` still requires payload/source/schema authentication;
+  a missing outer key leaves nested references unknown, not proved complete.
+- `Sealer::erasure_floor(subject)` is a noncreating point read through the same
+  revision-bound cache. `Some(0)` is actual erasure history; `None` only observes
+  no local row and is not a complete-history or OriginalSourcePos proof. Missing
+  storage or a revision/read failure returns an error, never fabricated absence.
+  Generic historical plaintext after any erasure needs the caller's actual
+  source-position/floor proof or remains incomplete; a current A2 key is not
+  that proof. `seal_plain_source` compares the proved floor expectation
+  atomically with key selection at protection.
+- `Sealer::seal_plain_source(value, expected_erasure_floor, fill, wall)`
+  protects plaintext only after its caller verifies the current ready proof:
+  matching erasure receipt and namespace, source/materialized coverage, and no
+  old plaintext across cells, schema and sequence data. The required argument
+  is an expectation, not that proof: `None` means proved never-erased;
+  `Some(0)` is a real receipt. A mismatch fails before any key creation or
+  plaintext replacement. It bypasses newest-cache selection, and original
+  sealed versions still use `seal_value_at(original_version)`, never promotion.
+  Ordinary privacy-off handling does not mint a key. Missing source proof
+  leaves the operation incomplete while preserving keys and data.
+- Internal shard bootstrap can export one original wrapped subject-key version
+  and its observed erasure floor from one SQLite read snapshot. It exports
+  neither a master nor a plaintext data key and never creates a fallback key.
+  The receiver asserts the separately committed expected subject/version,
+  verifies the existing wrap/AAD under the already shared protected master,
+  and preserves an existing equivalent raw key's original envelope and times.
+  Only a separately proved, subject-bound global floor can advance local state;
+  physical shared-key deletion requires the actual GLOBAL epoch/all-required-
+  replica barrier and LOCAL hosted-shard cuts, not one shard's erasure/intent.
+  The method's floor tuple is an expectation/projection, not that proof. An
+  unproved packet floor cannot authorize deletion, and absence is not floor zero.
+  The already-admitted receiving host supplies its actual clock only to stamp
+  a newly applied local floor; unchanged/lower floors preserve their old time,
+  and the capsule's erasure time is diagnostic, not authority. Floor advancement
+  and noncovered envelope insertion share one transaction/revision; conflicts
+  and failures leave both unchanged.
+  The cluster caller owns authoritative SourcePos/epoch/barrier, current member
+  and registered install assignment, and final term/principal admission after
+  all waits/body/capacity. These primitives do not bootstrap the shared master,
+  prove a complete source cut, or grant production access while recovering.
 - `seal(subject, key, nonce, plaintext)` / `unseal(..)` handle one value:
   XChaCha20-Poly1305, associated data `"kronik sealed v1" \0 subject \0
   version`, so a sealed value can't be replayed under another subject or
@@ -250,7 +313,10 @@ starts a background compaction that requires the mode to be `on`:
 `Keystore::export_backup(nonce)` produces one blob: `KRKSTOR1`, a 24-byte
 nonce, and XChaCha20-Poly1305 under `derive_key("kronik keystore backup v1",
 master)` of every key row and erasure row. Subject ids are therefore hidden
-too. `Keystore::import_backup(conn, master, blob)` restores it.
+too. `Keystore::restore_owned(original_owner, master, blob)` restores it using
+the same exclusive data-directory owner and shared negative publication as all
+other mutable handles. `reopen_owned()` shares that owner; private memory and
+actual read-only connections are distinct modes, not file-owner substitutes.
 
 The M6 shipper uploads a backup after keystore changes (debounced, at most
 once a minute) and daily, as `keystore/<wall_ms>.bin`. It deletes backups
@@ -485,6 +551,15 @@ sections above:
   A second reseal with nothing plain left rewrites nothing. No guest code
   runs. `kronik privacy reseal [--dry-run] --reason '...'` is the CLI
   wrapper.
+
+  An explicit request now records `PrivacyMode.reseal_requested = true`
+  (field 4) with mode `on` before rewriting. Ordinary mode changes and
+  historical records leave it false; being in `on` mode does not request a
+  reseal. This record is the request, **not completion**. The native worker
+  keeps the deploy lock through request publication and rewriting, without
+  draining open turns for an unchanged mode. The `privacy.reseal` audit is
+  still emitted only after successful work. A dry run records neither.
+  A requested reseal with no eligible closed segments rewrites nothing.
 - **Snapshots after erasure (§6.6).** Applying an `Erasure` record takes
   a snapshot (`reason: erasure`) and deletes local snapshots older than
   that LSN once the new one exists. `pick_base` will not use a snapshot

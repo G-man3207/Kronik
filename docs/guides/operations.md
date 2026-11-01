@@ -79,7 +79,7 @@ release still parses; unknown keys are errors.
 | `data_dir` | `"/var/lib/kronik"` | The data directory: the log, the materialized state, actor databases, code, keys and the ACME cache | `--data-dir`, `KRONIK_DATA_DIR` |
 | `api_socket` | `"/run/kronik/api.sock"` | The Unix socket of the JSON API, for the CLI and `kronik mcp` | `--api-socket`, `KRONIK_API_SOCKET` |
 | `http_listen` | `"0.0.0.0:443"` with TLS, `"127.0.0.1:8080"` without | The gateway's address | `--http-listen`, `KRONIK_HTTP_LISTEN` |
-| `admin_listen` | `"127.0.0.1:9464"` | `/metrics` and `/healthz`. If the port can't be bound, the daemon logs a warning and runs without them | `--admin-listen`, `KRONIK_ADMIN_LISTEN` |
+| `admin_listen` | `"127.0.0.1:9464"` | With TLS: embedded `/ui/`, same-origin public `/v1`, `/metrics` and `/healthz`, using the gateway certificate. Plain loopback HTTP serves only metrics/health. A bind failure is fatal when OIDC is configured; otherwise the daemon warns and runs without this listener | `--admin-listen`, `KRONIK_ADMIN_LISTEN` |
 | `api_listen` | none (off) | The JSON API and MCP over TCP, where every request needs a bearer token (`kronik token`). Without TLS only a loopback address is accepted, so tokens never cross a network in the clear; with TLS the API uses the gateway's certificate. A remote CLI (CI, the [GitHub Action](github-action.md)) reaches it with `--url https://<name>:<port>` or `KRONIK_URL`, and `KRONIK_TOKEN` | `--api-listen`, `KRONIK_API_LISTEN` |
 
 ### [tls]
@@ -98,6 +98,106 @@ release still parses; unknown keys are errors.
 
 `acme` needs `domains` and `acme_email`, and `files` needs `cert_file` and
 `key_file`. `dns01_hook` needs `acme` and `[gateway] preview_domain`.
+
+### [oidc] and the embedded UI
+
+Open `/ui/` on the TLS `server.admin_listen`, never on the application gateway.
+There is no frontend build/install or additional UI service. The embedded app
+uses the same published API, scopes, PII projection and policy as CLI and MCP.
+It shows actor history, turn details/causal trees, proposal response, effect and
+state differences, grounding per target, approvals, dead letters, deployments
+and cluster observations. A native node reports `member: false`; an installed
+member status producer's error is never replaced with a healthy native result.
+
+Register an OIDC **public authorization-code + S256 PKCE client**, with one
+exact redirect URI. The admin certificate must cover its hostname. Provision
+an ordinary scoped token, then map the provider's stable subject, not an email
+or display name, to that token name:
+
+```sh
+kronik token create --name ui-reviewer --scopes read,approve,promote \
+  --reason "Allow the explicitly bound reviewer to inspect and approve changes"
+```
+
+The raw token is not put in the browser or OIDC configuration:
+
+```toml
+[oidc]
+issuer = "https://login.example.com"
+client_id = "kronik-ui"
+redirect_uri = "https://admin.example.com:9464/v1/auth/callback"
+# ca_file = "/etc/kronik/issuer-ca.pem"  # Optional private CA for this provider only.
+
+[[oidc.bindings]]
+subject = "the-provider-assigned-stable-subject"
+token = "ui-reviewer"
+```
+
+No binding, missing token or revoked token means no access. Provider `scope`,
+email, groups and roles grant nothing. Sessions use the mapped token's live
+scopes; revoking that token revokes its sessions. Add `pii:read` only when
+required; neither UI nor OIDC grants it implicitly. Without an installed
+active Fleet authority, managed Fleet credentials remain denied.
+
+Issuer authority and bindings require ordinary durable configuration admission.
+Typed `AuthConfig` stores protected principal hashes, not raw subjects or
+serialized private configuration. Startup reads its durable admission and
+never replaces it merely because a file changed. Ordinary admin-scoped
+`GET /v1/auth/config` and `PUT /v1/auth/config` inspect/admit it. PUT accepts
+`{"config":{...the private OIDC profile...},"reason":"...","dry_run":true}`;
+`config: null` disables OIDC. Dry-run does not contact the provider or publish
+an epoch change. A real change preflights under the original administrator,
+then uses the sole typed publisher and actual committed source. Member
+publication requires its real metadata authority and barrier.
+
+An unreachable provider, wrong exclusive CA or valid startup-profile mismatch
+leaves OIDC inactive with a sanitized status reason and login 503. Ordinary
+bearer and verified Unix administration remain available to admit a corrected
+profile through the same PUT; an explicit unchanged-profile PUT can reinitialize
+a recovered provider. There is no repair endpoint, anonymous fallback or
+automatic file-based replacement. Pending callbacks and sessions retain their
+original source/epoch and cannot upgrade to a new one. Corrupt durable
+authority, missing required master keys and invalid global configuration remain
+fatal as appropriate. Actual integrated acceptance is recorded in `STATUS.md`.
+
+Discovery must return the exact configured issuer and HTTPS authorization,
+token and JWKS URLs on its authority. Redirects and token-directed key URLs
+are not followed. The public-client profile requires RS256, S256 PKCE and nonce.
+Another endpoint authority is rejected instead of silently widening trust.
+
+Cookies are host-only, Secure, HttpOnly and SameSite=Lax. Login state is
+single-use and browser-bound. Sessions expire by the verified ID token or one
+hour and disappear on restart/logout. Cookie-authenticated writes require
+exact Origin and `X-Kronik-CSRF` from `GET /v1/auth/session`; the UI sends both.
+Do not copy raw tokens or authorization codes into logs; proxies must not log
+the callback query. Responses are no-store/no-referrer. Logout clears the UI.
+
+Cookies are scoped to a hostname, **not a port**. Use a dedicated trusted admin
+hostname; do not share it with untrusted services on another port. Gateway
+ingress removes `__Host-kronik-session` and `__Host-kronik-login` before guest
+input/WAL, and response delivery filters guest attempts to set these names.
+Ordinary application cookies and Authorization remain intact. This does not
+isolate unrelated processes sharing the admin hostname.
+
+Ordinary OIDC caller/approval IDs are opaque `oidc:<protected binding HMAC hex>`,
+never Base64 issuer/subject. An approval additionally stores the exact original
+verified pair in optional `Approval.verified_identity` field 7, authenticated
+and encrypted under that principal's existing subject key even with Actor
+privacy off. Only `pii:read` reveals the stored historical pair; no-read responses
+omit it, erased keys produce `ERASED`, and unknown/unreadable keys fail closed.
+A current session is not historical proof. Native approvals keep this field absent.
+
+Bearer tokens keep working. The optional password field holds a bearer only in
+memory and sends Authorization without cookies; clearing it does not revoke it.
+No credential is stored in localStorage, sessionStorage or offline caches.
+Mutations retain reason/dry-run, proposal hashes, catch-up and required approvals.
+
+`scripts/e2e-ui-oidc.py` runs the finite owned TLS/code/JWT fixture. Its browser
+observes actual network operations against generated OpenAPI, axe-core WCAG 2.2 AA
+and keyboard/focus semantics. Run it only in its documented OS-enforced sandbox.
+Dummy subjects and automated clicks are not real-human review, public M10 flow
+or healthy-cluster acceptance. See ADRs [0103](../adr/0103-oidc-principals-and-browser-sessions.md)
+and [0104](../adr/0104-admin-ui-as-a-public-api-client.md).
 
 ### [gateway]
 
@@ -485,8 +585,9 @@ rather than fail, unless `kronik.toml` asks for what is missing
 
 ### /metrics and /healthz
 
-On `admin_listen` (`127.0.0.1:9464` by default; keep it local or behind a
-firewall):
+On `admin_listen` (`127.0.0.1:9464` by default; keep it local or restrict
+operator access). With TLS, scrape HTTPS using the certificate hostname;
+with OIDC, Host must match the configured admin origin:
 
 - `GET /healthz` answers `200 {"status": "ok", "applied_lsn": N}` while the
   node runs (with `"low_disk": true` below `[log] disk_reserve`), and `503`

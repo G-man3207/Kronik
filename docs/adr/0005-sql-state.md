@@ -191,6 +191,18 @@ So the brief's condition is met, and `PRIMARY KEY` is not required.
 
 ### 5. Deny list, allow list and limits
 
+The pinned SQLite 3.54.0 registration references `walstatFunc` under `SQLITE_ENABLE_FILESTAT`, so `SQLITE_ENABLE_WALSTAT` is paired with it; both SQL diagnostics are denied before actor host/probe bypasses.
+
+The public `FILESTAT` 45 ABI was exercised separately against that exact
+amalgamation: borrowed Unix fd `h=4` matched directory-relative `fstatat`, the
+builder error/finish/free path worked, and fresh-process `BEGIN IMMEDIATE`
+remained `BUSY` before and after the diagnostics, then succeeded after the
+parent's rollback. Both diagnostic callbacks returned valid JSON. This was a
+bounded C-only immutable-read-only-input check (build/run exit 0, 4.990776 s),
+not a Rust FFI, Keystore, guest-authorizer or current-product test.
+Exact source, argv, output, limits and cleanup:
+`<internal-evidence>`.
+
 All checks go through the authorizer unless noted. Every denial returns
 `sql-error::denied(reason)`. The 31 denied statements (`deny/list`):
 

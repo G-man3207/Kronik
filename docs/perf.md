@@ -512,3 +512,251 @@ Crash test details:
 
 DST long run details: 68 147 requests, 109 582 turns, 273 crashes and
 188.8 s of virtual time.
+
+## M32 benchmark and regression contract
+
+The M32 targets are unchanged:
+
+| Scenario | Required physical test VPS and target |
+| --- | --- |
+| Counter | Three separate nodes, each 4 vCPU and 8 GB: at least 20,000 committed turns/s |
+| Gateway | 5,000 requests/s with p99 below 50 ms |
+| Distributed replay | At least 50 times the recorded production window's real duration |
+| Leader replacement | A replacement leader within 10 s of node loss |
+| State | 100 GB per node, including working snapshots and compaction |
+
+Three processes on one host are not three machines or failure zones. The
+historical single-node results above and the runner below do not close these
+targets. No target is adjusted without an ADR and actual measurements.
+
+### Reproducible public single-node control
+
+`scripts/benchmark-single-node.py` exercises an already-built real daemon via
+its public CLI/API and HTTP gateway. It starts only its own fresh fixture
+directory and process group; it never installs a service, deletes an existing
+data directory or loads an unrelated application. It measures committed
+counter throughput, open-loop gateway p99, an identity replay in both modes,
+and snapshot creation. Replay timing includes the public CLI round trip and
+diff construction, and its production window is the fixed open-loop row,
+not a faster release's variable-throughput row. This is **single-node
+replay**, not distributed replay, and no leader-replacement or 100-GB result
+is synthesized from it.
+
+Example after building the binary and dependency-free load generator:
+
+```sh
+python3 scripts/benchmark-single-node.py \
+  --binary target/release/kronik \
+  --loadgen tools/loadgen/target/release/kronik-loadgen \
+  --guest tests/guests/counter.wasm \
+  --revision <exact-40-hex-source-commit> --rig-id <stable-owned-test VPS-id> \
+  --workdir /var/tmp/kronik-benchmark-new --port 47813
+```
+
+Run it in an isolated owned test VPS with explicit resource limits. The
+assurance runner `scripts/assurance-sandbox.sh` supplies an offline,
+read-only-source/toolchain container with 3 CPUs, 8 GiB memory, 128 processes,
+6 GiB bounded scratch and a 900-s wall deadline; its scratch is **tmpfs**.
+That runner is suitable for a functional smoke, not disk/fsync or physical
+M32 acceptance. It only uses an already-local image and cached dependencies;
+it never pulls an image or fetches a tool. Source, toolchain and local image
+are explicit arguments. Its UID 0 has all capabilities dropped and no host
+home, socket or host process/network namespace.
+
+The emitted `benchmark.json` is `kronik.benchmark/v1`. It records the exact
+binary and guest SHA-256, source revision, rig id, placement, kernel,
+architecture, filesystem, CPU/memory limits, generator and harness SHA-256, and
+workload settings. Raw command results remain in the owned fixture. Repeated samples
+use their median; errors, a missing result, a changed identity diff or omitted
+root input fail the run. Preserve the binary, revision and raw results when
+publishing a measurement. Do not publish a partial/failed run as a benchmark.
+
+The maintained load generator keeps a fixed histogram instead of every
+request's latency. Its path/header/body templates are parsed once per worker;
+constant values remain borrowed and key substitutions reuse preallocated
+buffers rather than allocating on every request. Quantiles conservatively
+round upward by no more than 3.125%, with an exact maximum; response bodies are
+drained through a bounded buffer. Numeric loopback/IP endpoints avoid unbounded DNS time. A complete
+request has a five-second deadline. Unsupported framing, capped responses,
+network failures, worker failures and unsent open-loop slots are errors, not
+successful requests omitted from the denominator. `elapsed_seconds` is actual
+measurement time including in-flight drain, and throughput uses that value,
+not an invented duration.
+
+### Between-release regression enforcement
+
+```sh
+python3 scripts/check-performance.py baseline/benchmark.json candidate/benchmark.json
+```
+
+The comparator fails a decrease greater than 10% for a higher-is-better
+measurement or an increase greater than 10% for a lower-is-better measurement.
+Exactly 10% is allowed. It refuses invalid/nonfinite numbers, duplicate or
+missing scenarios, error-bearing measurements, incompatible units/directions,
+changed guests, and changed rig/profile/workload configuration. A smoke
+artifact cannot be compared to a physical-cluster artifact. Source/binary
+provenance may differ between releases; the workload and generator must not.
+It does not download, invent or silently skip a missing release baseline.
+
+The comparator's synthetic tests are checks of enforcement, not performance
+measurements. Current proof: the bounded offline sandbox invocation of
+`python3 -B -m unittest discover -s scripts/tests -p test_check_performance.py`
+passed 25 tests on 2026-10-31. This is not a physical benchmark result.
+The release owner integrated the comparator and its cheap required test hook
+on Main at `2d2b50c7`. The adopted broader Python suite now runs in the same
+existing CI step; the existing examples step tests the standalone generator,
+and the existing SDK/product step gates actual documentation and compatibility.
+Comparing real release artifacts still requires the actual baseline/candidate
+measurements from the same provisioned rig and workload.
+
+The full public cluster benchmark depends on the cluster's actual startup,
+join, routing, distributed replay and lifecycle consumers. At this source
+checkpoint those consumers remain in the cluster maintainers' worktree; a private
+RawNode fixture is not substituted. Provisioning the three physical nodes and
+space for 100-GB state plus snapshots/compaction remains necessary. The
+runner/comparator above preserve that distinction rather than reducing M32's
+scope.
+
+### Exercised local control, 2026-10-31
+
+The real public-binary runner completed with exit 0 in the bounded offline
+sandbox. This is a **debug-build functional smoke on tmpfs**, not an M32
+hardware measurement or release-regression baseline. Source was the owned
+assurance worktree based on `0b84ab0fe853d8913792504f6aef916184f8b5bc`, with
+the ordinary benchmark sources and additive assurance code still pending;
+the exact executing binary digest is retained rather than calling it a
+release build.
+
+| Actual smoke setting/result | Observed |
+| --- | --- |
+| Resources | 3 CPU quota, 8 GiB memory, one process/node, tmpfs |
+| Rows | 0.5 s requested, 0.1 s warmup, 4 clients, 8 keys, one repetition |
+| Counter acknowledged throughput | 726.298 turns/s |
+| Gateway | 20 requests/s; p99 8.912895 ms |
+| Single-node identity replay, both modes | 5.378978928170382x; complete and unchanged |
+| Snapshot creation through public CLI | 32.470348989591 ms |
+| Load-generator boundary tests | 5 passed, 0 failed, 0 ignored |
+
+The actual emitted artifact is
+[`benchmarks/single-node-smoke-2026-10-31.json`](benchmarks/single-node-smoke-2026-10-31.json).
+Binary SHA-256:
+`149fe62fe088267992a1eec40853947c89daab9c38b58acb44cf0bf6a1fc5408`;
+load generator:
+`d5694ef72b0dc6158eea937af9c9aa2fda5e615c06de33010135f895095cfb25`;
+counter guest:
+`747c8630dfe34766b8b29f81787145b0c5061acef875be5c2c04c8da4ea70fb5`.
+
+The exercised inner commands were:
+
+```sh
+cargo test --locked --offline --manifest-path tools/loadgen/Cargo.toml
+cargo build --locked --offline --manifest-path tools/loadgen/Cargo.toml
+cargo build --locked --offline -p kronik
+python3 -B scripts/benchmark-single-node.py \
+  --binary /scratch/target/debug/kronik \
+  --loadgen /scratch/target/debug/kronik-loadgen \
+  --guest /source/tests/guests/counter.wasm \
+  --revision 0b84ab0fe853d8913792504f6aef916184f8b5bc \
+  --rig-id docker-3cpu-8g-tmpfs \
+  --workdir /scratch/bench --port 47813 \
+  --seconds 0.5 --warmup 0.1 --gateway-rate 20 \
+  --repetitions 1 --concurrency 4 --keys 8
+```
+
+The existing one-slot wrapper waited 60 s before execution; the native build
+took 2 min 52 s and the complete outer group 237.34 s. These are resource and
+proof-command timings, **not** substituted production/replay durations. The
+runner measured those scenarios with actual monotonic clocks.
+
+### Request-buffer and caller regression proof, 2026-10-31
+
+The later bounded run used the actual published v0.3.0 musl binary
+`1681833ad84da60622a6c196b8084bbe52a2deb8f6860a26c81dc9ea4f4a3947`
+and the optimized, updated generator
+`e9cebaee012ee0b000ef5c3c7055326ba62a2b4a6b0d4ae65dc6a69b2ce378b4`.
+All seven generator boundary tests passed, including borrowed constant
+templates and stable buffers across multiple key substitutions. The actual
+public single-node smoke recorded 1002.206 committed turns/s, gateway p99
+4.718591 ms at 20 requests/s, complete unchanged replay at
+18.446705178995746x, and a snapshot in 16.251779161393642 ms. Its exact artifact
+is [the released-v0.3 control](benchmarks/single-node-released-v03-2026-10-31.json).
+Different binary/build and generator provenance make it **not comparable**
+to the earlier debug smoke as a between-release regression baseline, and
+neither is physical M32 acceptance.
+
+The same run reproduced the existing shell caller's failure masking using
+its actual committed `0b84ab0f` source, SHA-256
+`7a5ff7ed8c8956ff49cea7cf65f852e04bcc6717e93adbaf6f49d0dafd6d3d19`.
+With the real daemon and generator under the owned process limit, it printed
+HTTP 503 and worker-spawn failures but returned **0** after all five rows.
+The changed caller printed its first failing 64-client row, returned **1**,
+and did not run the later rows. This is observed failing-before/passing-after
+error propagation, not a fabricated success or a throughput result. Retained
+raw measurements and statuses are in
+[the caller proof](benchmarks/benchmark-caller-failure-2026-10-31.json).
+
+That combined group's outer exit was 1: 60 of 61 Python tests passed and the
+new source-dispatch inventory exposed six missing comma-less block arms in
+its parser; its book command also selected the wrong directory, and the
+historical v0.3 binary lacks the modern bounded-integrity candidate API.
+Those separate failures were not hidden by the successful generator, caller
+and benchmark checks. The dispatch parser was corrected with a permanent
+block-arm regression case; book invocation and candidate prerequisites were
+corrected without weakening the checks or regenerating the old corpus.
+
+### Actual historical between-release gate, 2026-10-31
+
+The final generator formats only the first recorded failure cause, rather
+than allocating another diagnostic for every subsequent failed request.
+All **eight** generator boundary tests passed, with no failed/ignored tests.
+Its optimized binary SHA-256 is
+`04ef44c2d970eaf9232ffa6f4ff43a92fd8174bc473a406ec94cbf8a6d878ef9`.
+
+The real v0.1.0 and v0.3.0 published musl binaries then ran the same public
+harness, guest, generator and isolated rig: 3 CPUs, 8 GiB, tmpfs, four clients,
+eight keys, 2 s per measured row, 0.25 s warmup, 100 gateway requests/s, three
+repetitions. Both completed with zero request errors. The actual comparator
+returned **1**, correctly refusing the greater-than-10% gateway regression:
+
+| Measured control | v0.1.0 | v0.3.0 | Gate |
+| --- | ---: | ---: | --- |
+| Committed counter turns/s | 996.503 | 926.867 | -6.98804%, pass |
+| Gateway p99, ms | 5.111807 | 6.160383 | +20.5128%, **regression** |
+| Single-node replay ratio | 19.80287999354438 | 19.604726621660145 | -1.00063%, pass |
+| Snapshot creation, ms | 16.411247896030545 | 16.480289865285158 | +0.420699%, pass |
+
+The retained actual reports make the failed gate independently runnable:
+
+```sh
+python3 scripts/check-performance.py \
+  docs/benchmarks/released-v010-regression-baseline-2026-10-31.json \
+  docs/benchmarks/released-v030-regression-candidate-2026-10-31.json
+```
+
+This is an exercised historical release comparison, **not a causal diagnosis,
+latest-product regression baseline or physical M32 acceptance**. The short
+same-host control does not explain the latency difference. It was not rerun
+until green, and neither the threshold nor workload was relaxed. The complete
+[actual gate report](benchmarks/historical-release-regression-control-2026-10-31.json)
+records `comparator_status: 1` and `gate_passed: false`; the combined outer group
+also returned 1 rather than hiding that failure.
+
+The retained `0b84ab0f`-based debug binary separately completed the final
+generator smoke: 701.484 committed turns/s, p99 8.257535 ms at 20 requests/s,
+complete unchanged single-node replay at 5.350388559264805x, and a snapshot in
+32.40831685252488 ms. Its
+[exact report](benchmarks/single-node-current-final-generator-2026-10-31.json)
+has different workload settings and is not compared to the historical pair.
+
+
+### Adoption boundary and latest semantic tests
+
+These reports preserve the completed ordinary workstream's actual `0b84ab0f`-based
+and historical release observations, not the current integrated Root binary.
+The immutable follow-up `d6759bc28a0724eb4a8ed1bd09eeb2685966ff30` removes
+implementation-only pointer/borrow/call-count assertions. Its seven tests check
+rendered bytes across all slots and shrinking substitutions, failure totals and
+first cause, histogram bounds, HTTP framing, invalid settings and missed slots.
+The older eight-test receipt remains unchanged. Current-product compatibility,
+documentation generation and real release-regression results must use the
+final coherent built product; physical M32 targets remain open.

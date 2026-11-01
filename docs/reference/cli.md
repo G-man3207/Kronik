@@ -21,8 +21,8 @@ except where a sample names another address.
 | --- | --- |
 | `--socket <PATH>` | The daemon's API socket. Default: `$KRONIK_API_SOCKET`, else `server.api_socket` in `/etc/kronik/kronik.toml` when that file exists, else `/run/kronik/api.sock` (the same as `kronik serve`). Not with `--url`. |
 | `--url <URL>` | A remote API (M10): `https://host:port`, the daemon's `server.api_listen` with TLS on. The port is required: 443 or 80 is usually the gateway, which would record the token with the request. Default: `$KRONIK_URL`. Plain `http://` is accepted only to `localhost` or a loopback address; anything else is refused before a connection is made, so a token never crosses a network in the clear. `localhost` is never looked up: the CLI dials `[::1]`, then `127.0.0.1` (RFC 6761), and over plain HTTP it dials only loopback addresses. The scheme is lower case. An error about the URL names only its scheme, host and port, never user info, a path or a query. |
-| `--token <TOKEN>` | The bearer token. Default: `$KRONIK_TOKEN`, which is preferred: a flag shows in the shell history and in the process list. An empty `$KRONIK_TOKEN` means no token; an empty or blank `--token` is refused (`BAD_REQUEST`), since over the socket no token means every scope. `kronik mcp` takes it too. |
-| `--json` | Print one JSON object on stdout: the API's response body unchanged for a client command, the result of `init`, `build`, `doctor`, `keys wrap`, `restore`, `upgrade check` and `explain`, and the error JSON on failure. An error answer that is not the API's (a proxy's HTML page, an empty body) becomes an `UNAVAILABLE` error JSON, so stdout is always JSON. [JSON output](json.md) gives every command's schema; [openapi.json](openapi.json) describes the API (M5). `upgrade check` prints its report even when it exits 1. |
+| `--token <TOKEN>` | The ordinary API bearer. Default: `$KRONIK_TOKEN`, preferred because flags appear in shell history and process listings. A blank explicit bearer is refused. Within `fleet`, use `--api-token` for this bearer; `fleet enroll --token` is the distinct one-time enrollment credential. `kronik mcp` also accepts the ordinary bearer. |
+| `--json` | Print the unchanged API response or local result, and stable error JSON on failure. `events tail` instead writes NDJSON event envelopes and a final typed resume checkpoint. Other commands print one object; non-API error responses become `UNAVAILABLE`. [JSON output](json.md) gives the schemas and [openapi.json](openapi.json) the API. `upgrade check` prints its report even when it exits 1. |
 
 They can go before or after the command: `kronik --json actors list` and
 `kronik actors list --json` are the same. `kronik serve` takes none of
@@ -72,7 +72,8 @@ Every mutation (`deploy`, `send`, `dead-letters resend`, `grant`, `revoke`,
 `fork delete`, `propose`, `approve`, `promote`, `rollback`, `policy set`,
 `foreign add`, `foreign remove`, `privacy mode`, `privacy erase`,
 `privacy reseal`, `keys wrap`, `keys rewrap`,
-`token create`, `token revoke`, `snapshot create`) requires `--reason`,
+`token create`, `token revoke`, `snapshot create`, `fleet enroll`, `fleet revoke`,
+`events webhooks replay`) requires `--reason`,
 which the history records with the change, and supports `--dry-run`, which
 checks the request and writes nothing (I12). `replay` writes only in its
 fork, and `send --fork` only in the fork; both require `--reason` and have
@@ -617,6 +618,25 @@ main:2  http.fetch  http:api.example.com  -         denied  CAPABILITY_NOT_GRANT
 Next     kronik grant counter http:api.example.com --reason '...'
 ```
 
+## kronik history --operations
+
+`kronik history --operations [--limit <N>]`
+
+Shows the durable operator audit through the existing `GET /v1/audit` consumer,
+with the same `admin` scope as `kronik audit show`. This is not actor-turn or
+orphan history: it takes no actor, `--before`, `--orphans` or `--all`.
+The limit is 1–1000, default 100. Native pages retain their original LSNs;
+Member pages retain the actual metadata source/cut rather than inventing an
+actor LSN. JSON preserves the server response after validating the page's
+domain; mixed native/metadata fields are rejected.
+
+The principal, reason, time and immutable audit identity come from the recorded
+mutation. Reading this history neither appends an audit nor retries a mutation.
+Current read-time privacy can withhold a historical flat reason without changing
+the durable original. Pagination uses the existing `kronik audit show --from`
+hint. This read command does not enable maintenance drain or a metadata reader
+capability.
+
 ## kronik history --orphans
 
 `kronik history --orphans [--all]`
@@ -871,6 +891,81 @@ Deleted secret stripe-key: 1 version
 Next     kronik secret list
 ```
 
+## M23 external-secret CLI additions: source contract
+
+The following five commands match the current M23 source declarations, not
+availability in the `0b84ab0f` proof binary or published v0.3.0. The final
+integrated binary must pass the real help/surface check before availability is
+claimed. See the [API examples](api-examples.md) for the owned `demo-env`
+backend configuration, permitted dummy environment reference and startup
+snapshot semantics. The link, unlink and refresh mutations require a nonblank
+reason; a dry run does not commit them.
+
+## kronik secret backends
+
+`kronik secret backends`
+
+List configured backend identities without contacting providers. Inspect
+`configured` and `inventory_complete` separately; neither the command's
+presence nor an identity listing proves an external service is healthy.
+
+```sh
+kronik --socket /owned/fixture/api.sock secret backends
+```
+
+## kronik secret link
+
+`kronik secret link <NAME> --backend <ID> --ref <REFERENCE> --reason <REASON> [--dry-run]`
+
+Preview an admin binding to an explicitly configured backend and an allowed
+reference. This does not set the remote provider's value or establish a
+committed link. Use only the fixture's allowed dummy environment reference.
+
+```sh
+kronik --socket /owned/fixture/api.sock secret link demo-api-key \
+  --backend demo-env --ref KRONIK_DEMO_API_KEY \
+  --reason "preview owned fixture binding" --dry-run
+```
+
+## kronik secret refresh
+
+`kronik secret refresh <NAME> --reason <REASON> [--dry-run]`
+
+For a separately approved, committed fixture link, preview observing its
+current external version without replacing recorded historical identities.
+The preceding dry-run link alone does not establish that prerequisite.
+
+```sh
+kronik --socket /owned/fixture/api.sock secret refresh demo-api-key \
+  --reason "preview owned fixture refresh" --dry-run
+```
+
+## kronik secret history
+
+`kronik secret history <NAME>`
+
+Read committed immutable version identities and provenance, not secret values.
+Inspect recorded phases and deletion markers; a reserved or failed row is not
+proof of an activated version. Never rewrite the ledger to make it fit a
+provider's current value.
+
+```sh
+kronik --socket /owned/fixture/api.sock secret history demo-api-key
+```
+
+## kronik secret unlink
+
+`kronik secret unlink <NAME> --reason <REASON> [--dry-run]`
+
+Preview the admin change that returns future turns to the built-in store.
+This does not delete the provider's value, erase recorded version identities
+or permit historical replay to substitute a different source version.
+
+```sh
+kronik --socket /owned/fixture/api.sock secret unlink demo-api-key \
+  --reason "preview owned fixture unlink" --dry-run
+```
+
 ## kronik keys status
 
 `kronik keys status`
@@ -880,6 +975,10 @@ are any, and whether the seed passed the local store checks. Needs `read`;
 calls `GET /v1/keys`. It never returns key bytes, ciphertext or credentials.
 `check_ok` describes the loaded key, not current provider reachability:
 the running node does not unwrap again for this command.
+
+```sh
+kronik keys status
+```
 
 ## kronik keys wrap
 
@@ -945,6 +1044,13 @@ depends on them. Shipping publishes the current envelope independently of
 keystore changes and pairs each encrypted keystore backup with an envelope;
 restore checks the chosen material before installing it. Rewrap is not
 master-seed rotation.
+
+On an already configured KMS-backed installation, validate the new wrapping
+operation without publishing it:
+
+```sh
+kronik keys rewrap --reason "validate the provider key rotation" --dry-run
+```
 
 ## kronik fork create
 
@@ -1548,6 +1654,10 @@ Shows a watch: its status, the last metrics and the guards that fired. An
 unknown id gives `WATCH_NOT_FOUND`. Exits 1 when the watch rolled back or
 failed, or a rollback guard's rollback did not happen, also with `--json`.
 
+```sh
+kronik watches show w-3k9x2a7b1c0d
+```
+
 ## kronik watches stop
 
 `kronik watches stop <ID> --reason <REASON> [--dry-run]`
@@ -1734,6 +1844,10 @@ The declared foreign actors with their state (`starting`, `running`,
 (`FORKS`: `recorded`, `sandbox`, or `sandbox (lsn N)` with the newest
 checkpoint).
 
+```sh
+kronik foreign list
+```
+
 ## kronik foreign cleanup
 
 `kronik foreign cleanup [--config <PATH>] [--data-dir <PATH>] [--json]`
@@ -1750,12 +1864,22 @@ configuration, as for `serve`. What it could not remove or list is printed
 as a warning on stderr, counted in `failed` (`--json`), and makes the exit
 code 1 (the unit's `ExecStopPost=-` ignores it).
 
+For a stopped, allocated fixture only (never a shared runtime directory):
+
+```sh
+kronik foreign cleanup --config /owned/fixture/kronik.toml --data-dir /owned/fixture/data --json
+```
+
 ## kronik foreign logs
 
 `kronik foreign logs <NAME> [--tail <N>]`
 
 The last lines (default 200) the program and its runtime wrote; values of
 secrets are replaced by `[secret:<name>]`. Needs `operate`.
+
+```sh
+kronik foreign logs echo --tail 20
+```
 
 ## kronik foreign remove
 
@@ -1764,6 +1888,10 @@ secrets are replaced by `[secret:<name>]`. Needs `operate`.
 Stops the sandbox and writes a `ForeignActor` remove record; the data
 directory `foreign/actors/<NAME>/data` is kept, its checkpoints are
 deleted. Needs `operate`.
+
+```sh
+kronik foreign remove echo --reason "retire the owned echo fixture" --dry-run
+```
 
 ## kronik stubs set
 
@@ -1827,6 +1955,10 @@ The simulators in the order they are tried, whether the model simulator is
 configured (endpoint host and model, never the key), and each target's
 configuration: stub rules, contract title, neighbor, model, epoch and
 reason.
+
+```sh
+kronik simulators list
+```
 
 ## kronik privacy mode
 
@@ -2175,6 +2307,179 @@ hint:  Send a live token as `Authorization: Bearer <token>` (KRONIK_TOKEN for th
 docs:  kronik explain UNAUTHENTICATED
 ```
 
+## kronik fleet enroll
+
+`kronik fleet enroll <URL> [--token <ONE_TIME> | --token-file <PATH> | --token-stdin] --reason <REASON> [--dry-run]`
+
+Asks the local daemon to enroll with a fleet controller, through the ordinary
+authenticated `POST /v1/fleet/enroll` API. Local operator configuration pins the
+controller's server trust, canonical origin, installation identity and exact
+ordinary scopes. Before the first request the daemon durably creates its owned
+private leaf key and CSR; normal bootstrap does not require a manually supplied
+client certificate. The trusted issuer's returned certificate must match that
+exact request and CSR. No private key is sent to the controller or generated
+production root introduced. Dry-run creates no key, certificate, durable grant or
+remote enrollment and consumes no one-time credential.
+
+Initial enrollment requires exactly one explicit credential source; the daemon
+rejects a missing credential with `BAD_REQUEST`. Prefer `--token-file` or
+`--token-stdin`: a literal `--token` appears in process listings and shell history.
+File and stdin input are bounded to 4096 bytes; surrounding whitespace is
+removed, and the remaining credential must be nonempty printable ASCII without
+spaces. Neither input errors nor normal output print the credential.
+
+Omit all credential flags only for a dry-run preview, or to recover the exact
+existing durable requested enrollment after a lost controller reply. The CLI
+sends `token: null`, never reuses the API bearer or invents an empty credential.
+The daemon decides whether recovery matches its existing durable request;
+omission cannot create a new grant, consume another credential or fall back to
+permissive enrollment.
+
+Within `fleet enroll`, `--token` is the **one-time enrollment credential**, not
+the ordinary API bearer. Supply the API bearer in `$KRONIK_TOKEN`, in
+`kronik --token <API_BEARER> fleet ...` before `fleet`, or as
+`kronik fleet --api-token <API_BEARER> ...`. Outside the `fleet` command tree,
+the global `--token` keeps its ordinary meaning and placement.
+
+```sh
+kronik fleet enroll https://controller.example.com:7443 \
+  --token-file /run/secrets/fleet-enrollment --reason "join this installation"
+```
+
+## kronik fleet status
+
+`kronik fleet status`
+
+Reads `GET /v1/fleet`, showing the daemon's actual enrollment status. This is
+an ordinary API request, not an offline configuration inspection. `--socket`
+still selects a reachable local Unix API when the controller is unavailable.
+Human output renders the API response as indented JSON; `--json` prints the
+response unchanged, without inventing an installation identity.
+
+## kronik fleet revoke
+
+`kronik fleet revoke --reason <REASON> [--dry-run]`
+
+Revokes enrollment using the ordinary `POST /v1/fleet/revoke` API. It remains
+available through the daemon's Unix socket and has no alternate privileged
+offline path. The daemon checks the API caller's authorization, records the
+reason and enforces dry-run semantics.
+
+## kronik events list
+
+`kronik events list [--source actor-native|actor-N|metadata] [--cursor <CURSOR>] [--limit <N>]`
+
+Reads a bounded page from `GET /v1/events`; the limit is 1–256 (default 100).
+Pass the returned opaque cursor unchanged to continue. Cursors track installation,
+branch and typed source positions, never a fabricated global LSN: actor positions
+use the actual native/sharded actor-log LSN; metadata positions use the actual
+consensus index. Cursor keys are canonical `actor-native`, `actor-<u32>` or
+`metadata`, not arbitrary shard labels.
+`--source` selects only an actual configured source. An unavailable source fails;
+it is never substituted with actor zero, a native node or an empty metadata feed.
+The response exposes history gaps rather than claiming uninterrupted delivery.
+Both `events list` and `events tail` send `--cursor` in the standard
+`Last-Event-ID` header, never in the URL. This preserves the complete bounded
+cursor across all source streams without exceeding HTTP URI-length limits.
+Small cursors can be literal JSON values. For a full cursor, use `--cursor -`
+to read bounded JSON from stdin, including a file redirected by the shell:
+`kronik events list --cursor - < checkpoint.json`. The CLI checks the published
+cursor schema, source domains and 525568-byte bound locally before any HTTP
+request. Invalid input errors never echo the input. There is no `@file` syntax,
+extra cursor-file option or automatic disk cache.
+
+## kronik events tail
+
+`kronik events tail [--source actor-native|actor-N|metadata] [--cursor <CURSOR>] [--limit <N>] [--json]`
+
+Opens the actual long-lived `GET /v1/events/stream` SSE response over the same
+Unix socket or verified TLS transport as every other API command. It does not
+poll JSON pages. With no limit it follows until Ctrl-C, which exits normally;
+a positive `--limit` exits successfully only after that many complete operational
+events. Heartbeats and cursor-only frames do not count. EOF before completion,
+malformed or oversized frames, disconnects and explicit gaps fail visibly.
+Startup API failures retain their stable error codes.
+Omitting `--source` follows all configured sources without inventing an order
+between them. Selecting a source preserves the original full typed cursor.
+
+Each SSE `id` is an opaque resume cursor **after** its event. It is not the
+event envelope's replay-stable `id`. Cursor-only frames may advance past records
+that emit no event. A checkpoint advances only after a complete valid frame and
+successful event output, never when an `id` line precedes incomplete or invalid
+data. Finite completion, Ctrl-C and disconnects publish the last acknowledged
+checkpoint when available; a failed write still exits with an error. No reconnect
+is automatic, and gaps are reported rather than silently skipped.
+
+`--json` writes one published `kronik.event/v1` envelope per line (NDJSON),
+then a final published `kronik.events-cursor/v1` checkpoint. Its per-line schema
+is `Event | ResumeCursor`; failures may additionally print the stable error JSON.
+Save the cursor footer bytes unchanged and resume through stdin, not a potentially
+oversized shell argument. A line filter preserves the cursor's full integer
+coordinates without reserializing them:
+
+```sh
+kronik events tail --json --limit 100 |
+  grep '^{"schema":"kronik.events-cursor/v1",' > checkpoint.json
+kronik events tail --cursor - --json --limit 100 < checkpoint.json |
+  grep '^{"schema":"kronik.events-cursor/v1",' > next-checkpoint.json
+```
+
+Human output labels the complete JSON checkpoint and gives the same feasible
+`--cursor - < checkpoint.json` hint. Event lines show stable event identity,
+the actual actor branch when applicable, typed actor-log or metadata-consensus
+position and record kind, not raw
+operational metadata. `source` in JSON is a tagged `kind: actor` (optional numeric
+shard and LSN) or `kind: metadata` (consensus index), with no legacy top-level LSN
+or shard aliases.
+Actor events carry their actual `branch`; metadata events omit `branch` entirely,
+never claiming `main` or an empty synthetic branch. The cursor identity's branch
+selects the actor feed only and does not assign branch provenance to metadata.
+Imported native-history events include `data.adoption`. Human output explicitly
+marks `adoption=archive (imported history)` or
+`adoption=current-projection (imported history)`. The latter means a captured
+current projection, not a newly created installation or grant; neither marker
+changes the original action or invents an original issuer.
+Resume IDs use the shared 525568-byte cursor budget. Complete frames permit two
+full cursors plus a 1 MiB event page and 8192 bytes of envelope/framing overhead;
+individual lines permit one cursor plus a 1 MiB page and 4096 bytes of overhead.
+Oversized or invalid header values fail instead of truncating or dropping streams.
+The consumer writes each event before reading more, so slow stdout applies
+backpressure.
+
+## kronik events schemas
+
+`kronik events schemas`
+
+Reads `GET /v1/events/schemas`, the daemon's published schema registry.
+See also [JSON output](json.md).
+
+## kronik events webhooks status
+
+`kronik events webhooks status`
+
+Reads `GET /v1/events/webhooks`, showing delivery status for configured webhook
+names. It does not expose webhook signing secrets.
+
+## kronik events webhooks replay
+
+`kronik events webhooks replay <NAME> --cursor <CURSOR> --reason <REASON> [--dry-run]`
+
+As with list and tail, `--cursor -` reads and validates the bounded cursor JSON
+from stdin; file input uses shell redirection.
+The CLI sends the validated cursor as the API's typed JSON object, not a quoted
+JSON string. List and tail still encode that same cursor in `Last-Event-ID`.
+
+Calls `POST /v1/events/webhooks/<name>/replay` with the opaque cursor, reason and
+dry-run flag. The destination and signing key remain daemon configuration;
+the command cannot choose a new destination or supply a signing secret.
+Replay is an ordinary authenticated and audited mutation, not a direct sender.
+
+The current Root integration is source-only. Its actual Native producers and
+ordinary API/CLI adapters are separate from the genuine Member/registered-source
+factories; no absent factory is a working empty source or a native fallback.
+Historical native scenario receipts do not establish this newer source cohort.
+
+
 ## kronik mcp
 
 `kronik mcp [--socket <PATH>] [--token <TOKEN>]`
@@ -2221,6 +2526,13 @@ JSON, `SCOPE_MISSING` included. The resources, which need `read`, are
 Stdout carries only JSON-RPC; when no daemon answers, the command exits
 with 1 and an `UNAVAILABLE` error on stderr.
 
+With `KRONIK_TOKEN` already set to the allocated agent's scoped token, connect
+the MCP client to the owned fixture socket:
+
+```sh
+kronik mcp --socket /owned/fixture/api.sock
+```
+
 ## kronik explain
 
 `kronik explain <TOPIC>` or `kronik explain --list`
@@ -2247,3 +2559,30 @@ See also: `turn`, `root-input`, `TURN_FAILED`, `EFFECT_OUTCOME_UNKNOWN`.
 
 Milestone: M1
 ```
+
+## kronik test-host
+
+`kronik test-host [--dir <PROJECT>] [--entry <ENTRY>]... [--wasm <COMPONENT>]... [--seed <N>] [--start-ms <MS>]`
+
+This hidden command is the SDK testkits' real in-memory host, not a production
+deployment command. `--dir` builds/deploys the project; `--entry` requires it.
+`--wasm` deploys an existing component and can be repeated. The host prints a
+ready JSON line, then consumes one request per stdin line and returns one JSON
+line per request. Progress/errors go to stderr. The clock and randomness are
+seeded; the host settles work caused by a request before responding.
+
+From a source checkout with the maintained counter component:
+
+```sh
+printf '%s\n' '{"op":"http","method":"POST","path":"/counter/a/increment","body":""}' | \
+  kronik test-host --wasm tests/guests/counter.wasm --seed 0
+```
+
+The JSON-lines operations are `http`, `api`, `advance`, `stub`, `requests` and
+`settle`; their actual request/response contract is
+`crates/kronik-testhost/src/protocol.rs`. An `http` request uses the gateway;
+an `api` request uses the management API; `advance` drives due timers;
+`stub` supplies recorded fixture responses, and `requests` inspects them.
+This protocol is not MCP, a network deployment, or evidence that a new app has
+been deployed by a fresh agent. IO protocol changes must update the actual
+consumer examples and documentation-surface check together.

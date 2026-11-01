@@ -19,7 +19,7 @@ them per target.
 | Crate | M12 adds |
 | --- | --- |
 | `kronik-proto` | The `SimulatorConfig` record (kind 15) and `EffectRecord.simulator`. |
-| `kronik-effects` | `ContractFake` (OpenAPI → schema-valid JSON, deterministic by fingerprint) and `RecordedNeighbor` (the most similar recorded request to the same route), both `EffectSimulator`s; simulator configuration per target in `Config`. |
+| `kronik-effects` | `ContractFake` (OpenAPI → schema-valid JSON, deterministic by fingerprint) and `RecordedNeighbor` (the most similar recorded request to the same route), the latter exposing its original source/provenance instead of an unchecked response; simulator configuration per target in `Config`. |
 | `kronik-store` | `SimulatorConfig` records go into `config_records` like grants. |
 | `kronik-sched` | `Node::set_simulators` (under the deploy lock, through `commit_config`). |
 | `kronik-fork` | The per-replay `Simulators` (configuration as of the fork point plus the request's overrides), the `ModelSimulator` (an HTTP client of an OpenAI-compatible endpoint, with the per-proposal cache), the new order in the replay gate, labels and per-simulator counts in the diff. |
@@ -145,6 +145,15 @@ value), and the JSON body's leaves (path, value), or the body's hash when it
 is not JSON. The highest score wins, then the highest LSN, then the lowest
 ordinal. The answer is the candidate's recorded response.
 
+The answer retains its original EffectRecord, request fingerprint version,
+and genuine secret-use identity prefix through its source ordinal. Future
+turn references and today's inventory cannot manufacture that prefix.
+Legacy disclosure uses the same exact-version verifier and safe terminal
+projection as the native gate. Prepared version-2 bytes remain unchanged
+only with a covering source scope or a no-match proof; unknown scope never
+means a proved empty set. Referenced bodies require actual scoped body
+resolution rather than an empty inline-body substitute.
+
 ### 3.3 ModelSimulator (ADR 0015)
 
 Off by default. It answers only when the target's record has `model` and
@@ -197,20 +206,54 @@ max_examples = 5
   answer are replaced by `[secret:<name>]` before it is cached. Privacy
   mode counts when it is on now, was on at the fork point, or changed in
   the window.
-- **Cache**: answers are cached per proposal (each proposal and plain fork
-  has one) and per (target, fingerprint) in
-  `branches/<id>/simulator-cache.json`; a failure or a refusal is cached as
-  a refusal. Concurrent workers asking for the same key share one call.
-  Replaying the same proposal again, and promote's catch-up, read the cache
-  first, so the same proposal run twice gives byte-identical diffs. The
-  cache is written durably (synced file, rename, directory sync) after each
-  replay, catch-up round and message into the fork; a cache file that does
-  not parse fails the replay. Deleting the fork deletes the cache.
-- **Dry runs** (`propose --dry-run`, `promote --dry-run`) never call the
-  model and write nothing (I12): the model answers from the saved cache
-  only, and a miss is a refusal (the next step answers, often
-  `fail-closed`). `promote --dry-run` replays and catches up on its own
-  state and leaves the proposal, its fork log and its cache as they were.
+- **Cache**: answers are immutable per proposal and (target, fingerprint)
+  in `branches/<id>/simulator-cache.json`. New format-2 facts bind the
+  physical runtime's certified source fingerprint. Stamped facts require
+  that exact current source. Old actual `{"answers": ...}` captures retain
+  unknown provenance, never a made-up old or current certificate. An exact
+  old answer is disclosed unchanged only when the complete current plan
+  finds no match in any free body/header field. Any match or unavailable
+  proof is a prerequisite, never a provider call or fabricated refusal.
+  Reads and dry runs preserve old file bytes. Only a genuinely new
+  authorized fact permits the atomic format-2 save, retaining every old
+  key, value, fingerprint and explicit unknown stamp.
+  Bounds apply per JSON cell/request/control, not to the proposal aggregate.
+  Streaming input charges each cell before its keys or values can grow;
+  streaming output keeps the existing fsync/rename/directory-sync protocol
+  without a whole-cache buffer. Workers for one key share initialization;
+  only container persistence is separately serialized. Dirty state is
+  taken before the snapshot, restored on I/O failure, and set inside cell
+  publication so a concurrent new fact cannot be lost after fsync.
+  Transport, deadline, non-2xx, protocol and redaction failures add no fact.
+  Existing answers/refusals/errors are never rewritten. Only an uninitialized
+  old-stamp slot is replaceable; equal fingerprints never revive an old guard.
+- **Authority**: physical model HTTP and every lazy response-body poll retain
+  the SAME original request authority and absolute Env deadline. A private
+  per-HTTP-job conjunction enters that original admission exactly once and
+  uses the source's nonblocking publication fence through the concrete HTTP
+  enqueue or synchronous immutable cache-cell set, never an async initializer.
+  Typed original/data denials survive transport string mapping and stay local
+  to that job. No denial initializes a cache refusal; a fresh operation needs
+  a fresh genuine source capture. Error construction and retired-value
+  destruction stay outside publication. Secret values share their cache Arcs.
+- **Output**: old cached answers and fresh model replies use the canonical
+  credential-aware output policy, including unknown 50-byte Kronik credentials.
+  Request normalization and private old fingerprints retain their literal policy.
+  Historical quotes are checked after JSON decoding; sensitive optional examples
+  are omitted whole, not rescrubbed or marked complete. Prepared markers stay intact.
+- **Source contexts**: one getter returns qualified pinned read-only facts or
+  the actual atomic live snapshot/publication pair. Read-only data grants no
+  dispatch. Member live execution needs its own real publisher; a native
+  publication resource is not a member proof.
+  Unsaved legacy-v0 metadata may produce only the existing known-sensitive
+  policy refusal after private inspection and final original/data admission,
+  without a cache fact. Safe new requests use the real v2 producer;
+  no version-0 request is sent or rewritten as a new writer.
+- **Recorded-only/dry runs** never issue model HTTP or write cache facts.
+  Saved answers and refusals remain readable after certificate validation.
+  A missing fact requires an explicit prerequisite rather than a new model
+  request or a fabricated refusal. Promotion dry runs preserve the proposal,
+  fork log and cache.
 
 ## 4. The diff (`kronik.diff/v1`, additive)
 

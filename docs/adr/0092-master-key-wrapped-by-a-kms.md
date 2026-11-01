@@ -1,13 +1,13 @@
 # 0092. The master key is a seed wrapped by a KMS or HSM
 
-- **Status:** Accepted for B1 KMS lifecycle; PKCS#11 remains maintainer-gated.
+- **Status:** Accepted for B1 KMS lifecycle and the reviewed optional PKCS#11 helper design in ADR 0093; helper implementation evidence is recorded separately.
 - **Date:** 2026-10-28; B1 re-reviewed 2026-10-30
 
 ## Context
 
-M23: "Huvudnyckeln kan ligga i en KMS eller i en HSM via PKCS#11 och skrivs
-då aldrig till disk." Criterion: "Kronik startar med huvudnyckeln i en KMS
-utan att nyckeln skrivs till disk."
+M23 requires the master key to live in a KMS or an HSM through PKCS#11
+without writing its plaintext to disk. The acceptance criterion is startup
+with a KMS-held key and no plaintext key file (English translation in the build brief).
 
 Before B1 the master key was a 32-byte seed in a hex file or in
 `KRONIK_MASTER_KEY`. Six local keys are derived from it with keyed BLAKE3:
@@ -53,7 +53,7 @@ readers and must use the provider-aware source too.
   | `aws` | KMS Encrypt/Decrypt with an encryption context |
   | `gcp` | Cloud KMS encrypt/decrypt with AAD |
   | `azure` | Key Vault wrapkey/unwrapkey, RSA-OAEP-256 |
-  | `pkcs11` (planned, maintainer-gated) | proposed AES-256-GCM through `kronik-keyhelper`, ADR 0093 |
+  | `pkcs11` (accepted design; implementation pending) | AES-256-GCM byte encryption/decryption through the optional `kronik-keyhelper`, ADR 0093 |
 
 - **The provider is needed at start only.** Start retries for `[keys]
   start_timeout` (default 60 s), then stops with `KEY_SOURCE_UNAVAILABLE`.

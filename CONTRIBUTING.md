@@ -18,6 +18,25 @@ You need [rustup](https://rustup.rs) and
 (`cargo install --locked cargo-deny`). The Rust toolchain is pinned in
 `rust-toolchain.toml`, and rustup installs it on first use.
 
+Default Cargo API mutation and real CLI audit tests also run the existing
+owned TLS/code/PKCE/JWT provider. Prepare Python 3.11+ with the pinned test-only
+dependencies before `cargo test` or the `test` step; no target test installs
+packages, skips missing dependencies, or substitutes a mock identity:
+
+```sh
+python3 -m venv target/oidc-test-python
+target/oidc-test-python/bin/python3 -m pip install --only-binary=:all: \
+    -r scripts/requirements-oidc-tests.txt
+export KRONIK_TEST_PYTHON="$PWD/target/oidc-test-python/bin/python3"
+```
+
+On Debian/Ubuntu, creating that environment requires the `python3-venv` system
+package. The fixture uses that exact interpreter in isolated mode and checks
+the pinned packages, including PyJWT and cryptography. Do not globally activate
+the environment or replace Python for unrelated action/PyYAML or SDK steps;
+CI prepares its own private environment and scopes it to the existing test
+step. These are development dependencies, not daemon/runtime requirements.
+
 Run the same checks as CI before you push:
 
 ```sh
@@ -37,13 +56,23 @@ including wrong-identity/artifact refusal and real authenticated EFBIG faults.
 It needs HTTPS access for official fixed-hash verifier archives and maintained
 TUF roots, but no account or GitHub token. Fixture identities are private SOURCE
 copies, never production runtime trust overrides.
-It also runs the bounded performance-comparator self-tests in `scripts/tests`.
-Those synthetic reports check the strict greater-than-10% regression boundary
-and input/workload/rig matching; they are not real benchmark results or
-between-release performance acceptance, and fetch no baseline or target.
+It also runs the pure-Python documentation-surface, frozen released-corpus,
+corpus-promotion and performance-comparator boundary tests in `scripts/tests`.
+These are semantic checks of parsers, provenance, tampering and regression
+enforcement, not real benchmark results or between-release performance acceptance.
+The `examples` step tests the dependency-free standalone `tools/loadgen`.
+The `ts` step reuses its already-built real product for the CLI/API/WIT/error
+documentation-surface gate and the frozen v0.1.0/v0.3.0 log and genuine tagged
+component consumers. A newly routed operation or authoritative error requires
+the real product's regenerated reference and usage examples in the same change;
+old-checkpoint receipts are not evidence for the integrated product. Compatibility
+failures retain their fresh, printed fixture directory; success removes only that
+owned temporary parent. See [compatibility](docs/guides/compatibility.md) and
+[performance](docs/perf.md) for the historical results and remaining physical gates.
 `hygiene` checks every argument of literal workflow `ci.sh` calls against
 the default step inventory; missing, unknown, duplicate or reordered steps
 fail. Pull requests must keep it green.
+
 The opt-in cluster server keeps its runtime/server dependencies behind the
 exact `server` feature; there is no whole-crate hygiene exemption. Vendored
 third-party Rust is included in the unsafe scan and still needs a per-file
@@ -57,6 +86,14 @@ before keyless attestation. No compiled Kronik output is shared; pinned tools
 and source inputs may be. Actual comparison evidence and a real signed
 Kronik run are required before release claims. See
 [ADR 0100](docs/adr/0100-signed-reproducible-releases.md).
+Set `KRONIK_RELEASE_KEYHELPER=yes` for the separate default-off x86_64 GNU
+PKCS#11 helper. Both real builds must compile and compare it, preserving actual
+Cargo logs and compiled artifact identities. Its notices/SBOM select the helper
+normal root; daemon musl/static checks and cryptoki-free closure are unchanged.
+`KRONIK_INSTALL_KEYHELPER=yes` selects only a correctly attested helper through
+the same strict standalone verification path. Source tests cover GNU loader/
+dependency rejection, independent helper ELF/payload comparison and real
+consumer signature/write-failure boundaries; tests are not release/HSM claims.
 
 Only `examples/github-flow/proof/change.json` is ignored by aggregate CI.
 Kronik's separate three-job synthetic M10 workflow handles that exact path;

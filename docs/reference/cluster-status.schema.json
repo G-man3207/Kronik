@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Ordinary receiver-local cluster observations, not a ReadIndex certificate or execution authority. Null means unsupported, stale or unobserved; no fields are omitted.",
+  "oneOf": [
+    {"type":"object","additionalProperties":false,"required":["member"],"properties":{"member":{"const":false}}},
+    {"$ref":"#/$defs/ClusterMemberStatusResponse"}
+  ],
+  "$defs": {
+    "ClusterNullableIndex": {"type":["integer","null"],"minimum":0},
+    "ClusterNullableMemberId": {"type":["integer","null"],"minimum":1},
+    "ClusterNullableBoot": {"type":["string","null"],"pattern":"^[0-9a-f]{64}$"},
+    "ClusterLocalGroupStatus": {
+      "type":"object","additionalProperties":false,
+      "required":["term","role","leader_term","leader_member_id","commit_index","applied_index","persisted_index","durable_index","voters","learners","backfilling"],
+      "properties":{
+        "term":{"type":"integer","minimum":0},
+        "role":{"enum":["LEADER","FOLLOWER","CANDIDATE"]},
+        "leader_term":{"$ref":"#/$defs/ClusterNullableIndex"},
+        "leader_member_id":{"$ref":"#/$defs/ClusterNullableMemberId"},
+        "commit_index":{"type":"integer","minimum":0},
+        "applied_index":{"type":"integer","minimum":0},
+        "persisted_index":{"type":"integer","minimum":0},
+        "durable_index":{"type":"integer","minimum":0},
+        "voters":{"type":"array","uniqueItems":true,"items":{"type":"integer","minimum":1}},
+        "learners":{"type":"array","uniqueItems":true,"items":{"type":"integer","minimum":1}},
+        "backfilling":{"type":"boolean"}
+      }
+    },
+    "ClusterGroupObservation": {
+      "type":"object","additionalProperties":false,
+      "required":["shard_id","leader_member_id","local","under_replicated"],
+      "properties":{
+        "shard_id":{"$ref":"#/$defs/ClusterNullableIndex"},
+        "leader_member_id":{"$ref":"#/$defs/ClusterNullableMemberId"},
+        "local":{"anyOf":[{"$ref":"#/$defs/ClusterLocalGroupStatus"},{"type":"null"}]},
+        "under_replicated":{"type":["boolean","null"]}
+      }
+    },
+    "ClusterHostedGroupStatus": {
+      "type":"object","additionalProperties":false,
+      "required":["shard_id","status","lag_reference_commit_index","replication_lag"],
+      "properties":{
+        "shard_id":{"$ref":"#/$defs/ClusterNullableIndex"},
+        "status":{"$ref":"#/$defs/ClusterLocalGroupStatus"},
+        "lag_reference_commit_index":{"$ref":"#/$defs/ClusterNullableIndex"},
+        "replication_lag":{"$ref":"#/$defs/ClusterNullableIndex"}
+      }
+    },
+    "ClusterMemberObservation": {
+      "type":"object","additionalProperties":false,
+      "required":["member_id","name","advertise","labels","persisted_phase","committed_engine_version","engine_version","registered_boot_id","registered_incarnation","registration_metadata_index","observed_boot_id","observed_incarnation","metadata_recovery_admitted","execution_admitted","live","fresh","observation_age_ms","free_disk_bytes","clock_unix_ms","metadata_lag","groups","ready"],
+      "properties":{
+        "member_id":{"type":"integer","minimum":1},
+        "name":{"type":"string"},
+        "advertise":{"type":"string"},
+        "labels":{"type":"object","additionalProperties":{"type":"string"}},
+        "persisted_phase":{"enum":["JOINING","ACTIVE","LEAVING","REMOVED"]},
+        "committed_engine_version":{"type":"string"},
+        "engine_version":{"type":["string","null"]},
+        "registered_boot_id":{"$ref":"#/$defs/ClusterNullableBoot"},
+        "registered_incarnation":{"$ref":"#/$defs/ClusterNullableMemberId"},
+        "registration_metadata_index":{"$ref":"#/$defs/ClusterNullableMemberId"},
+        "observed_boot_id":{"$ref":"#/$defs/ClusterNullableBoot"},
+        "observed_incarnation":{"$ref":"#/$defs/ClusterNullableMemberId"},
+        "metadata_recovery_admitted":{"type":"boolean"},
+        "execution_admitted":{"type":"boolean"},
+        "live":{"type":"boolean"},
+        "fresh":{"type":"boolean"},
+        "observation_age_ms":{"$ref":"#/$defs/ClusterNullableIndex"},
+        "free_disk_bytes":{"$ref":"#/$defs/ClusterNullableIndex"},
+        "clock_unix_ms":{"$ref":"#/$defs/ClusterNullableIndex"},
+        "metadata_lag":{"$ref":"#/$defs/ClusterNullableIndex"},
+        "groups":{"type":"array","items":{"$ref":"#/$defs/ClusterHostedGroupStatus"}},
+        "ready":{"type":"boolean"}
+      }
+    },
+    "ClusterMemberStatusResponse": {
+      "type":"object","additionalProperties":false,
+      "required":["member","cluster_id","local_member_id","metadata_durable_index","configuration_epoch","active_barrier","observation_timeout_ms","metadata","shards","members"],
+      "properties":{
+        "member":{"const":true},
+        "cluster_id":{"type":"string"},
+        "local_member_id":{"type":"integer","minimum":1},
+        "metadata_durable_index":{"type":"integer","minimum":0,"description":"Metadata Raft index, never an actor LSN or public SourcePos."},
+        "configuration_epoch":{"$ref":"#/$defs/ClusterNullableMemberId","description":"Latest fully APPLIED configuration; null before the first applied epoch."},
+        "active_barrier":{"anyOf":[{"type":"null"},{"type":"object","additionalProperties":false,"required":["epoch","phase"],"properties":{"epoch":{"type":"integer","minimum":1},"phase":{"enum":["PROPOSED","COMMITTING"]}}}]},
+        "observation_timeout_ms":{"type":"integer","minimum":0,"description":"Existing MetaConfig call timeout; sample age uses Env monotonic time, never wall time."},
+        "metadata":{"$ref":"#/$defs/ClusterGroupObservation"},
+        "shards":{"type":"array","items":{"$ref":"#/$defs/ClusterGroupObservation"}},
+        "members":{"type":"array","items":{"$ref":"#/$defs/ClusterMemberObservation"}}
+      }
+    }
+  }
+}
