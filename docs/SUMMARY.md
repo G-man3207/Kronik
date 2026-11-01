@@ -58,6 +58,7 @@
 - [M28 OpenTelemetry and audit export design](design/m28-otel.md)
 - [Threat model and integration limits](design/threat-model.md)
 - [Performance](perf.md)
+- [Brief compliance audit](audit/brief-compliance.md)
 
 # Decisions
 

@@ -13,8 +13,9 @@ live.
 The runtime is a single `kronik` binary. It runs actors: Wasm components with
 built-in key-value state and their own SQLite database. Actors are written in
 TypeScript, Rust, Python or Go, or run as Linux programs from OCI images in
-gVisor. There is no web interface: the CLI, the JSON API and the MCP server
-are the surface.
+gVisor. The CLI, the JSON API and the MCP server are the primary surface; the
+embedded admin UI (M27) is served on the admin listener and is partial and
+unreleased.
 
 ## Status
 
@@ -32,21 +33,27 @@ The new checkout installer/Action require exact-tag GitHub OIDC attestations;
 no public Kronik signing event has yet been run for that cutover. Since the tag, `main`
 has added OpenTelemetry traces and a verifiable audit export, standard
 `fetch` through `wasi:http`, and KMS master-key custody; these are unreleased.
-M23 B1 custody (OpenBao/AWS/GCP/Azure) is complete; its emulator and
-static-musl acceptance is recorded in `STATUS.md`. External secret backends
-are later M23 work, not part of that custody change.
+M23 B1 custody (OpenBao/AWS/GCP/Azure) is complete but is not M23 closure;
+its emulator and static-musl acceptance is recorded in `STATUS.md`. The
+remaining M23 work (B2–B6: external secret-value backends, cache/outage
+handling, PKCS#11) has work in progress source on `main` but is not part of that B1 custody
+change and is not accepted.
 
-Two criteria remain open:
-
-- An example repository running the whole propose, approve and promote flow in
-  GitHub Actions. The action itself is tested against a fake `kronik` and a
-  fake GitHub API.
-- WASI 0.3 components, blocked on Wasmtime shipping the preview 3 interfaces
-  as stable.
-
-The cluster, the rootless daemon, microVMs, connections and external secret
-backends are designed or started on parked branches; none of them is on
-`main`.
+`main` is an unreleased `0.4.0-dev` work in progress. Major areas remain
+absent or partial: the cluster (M16–M19), microVMs (M20), the rootless daemon
+(M21), the WASI 0.3 remainder (M22), long-lived connections (M24), blobs
+(M25–M26), and the UI, OpenTelemetry, fleet and hardening tracks (M27–M34).
+M10's criterion 4 (a real GitHub Actions run) and M22's criterion 3 (WASI 0.3)
+remain open. The cluster, the rootless daemon, microVMs and connections are
+not on `main`; external secret backends, the admin UI, the fleet API and the
+OpenTelemetry/audit export have unaccepted work in progress source on `main`, and presence
+of source is not acceptance. On this checkout the binary and all test targets
+compile after a 2026-11-01 repair work; the full workspace run is not green:
+1426 passed, 7 failed, 12 ignored (3 tests gated on a missing
+`KRONIK_TEST_PYTHON`, 2 known API fail-closed privacy expectations, and 2
+parallel-load flakes that pass serially; `kronik-sim` excluded). See
+[`docs/audit/brief-compliance.md`](docs/audit/brief-compliance.md), which maps
+the brief to the tree.
 
 [`STATUS.md`](STATUS.md) records the evidence for each milestone, the open
 questions and the known gaps.
@@ -161,7 +168,8 @@ layout and the decisions behind them.
 
 | Path | Contents |
 | --- | --- |
-| `crates/` | The daemon and its libraries: gateway, JSON API, scheduler, runtime, log, state, fork engine, MCP server, policy, privacy, shipping |
+| `crates/` | The daemon and its libraries: gateway, JSON API, scheduler, runtime, log, state, fork engine, MCP server, policy, privacy, shipping, admin UI, fleet API and OpenTelemetry/audit export |
+| `ui/` | The dependency-free admin UI source embedded into the binary by `kronik-ui` |
 | `sdk/` | The TypeScript, Rust, Python and Go SDKs; `kronik init` vendors one into a project |
 | `examples/` | Example actors and apps in all four languages |
 | `docs/` | The book: concepts, guides, reference, design notes and ADRs, indexed by `docs/SUMMARY.md` |
