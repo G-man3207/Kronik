@@ -19,6 +19,15 @@ message ActorRef {
   string key = 2;
 }
 
+// The original committed source of an actor edge, never current authority.
+// An absent shard is native; present zero is member shard 0. LSN is positive.
+message ActorSource {
+  optional uint32 shard = 1;
+  uint64 lsn = 2;
+  // Canonical original source-log namespace for this particular edge.
+  string branch = 3;
+}
+
 // A value that may be sealed with its subject's key (privacy mode). The
 // subject tag is recorded in both modes.
 message Sealable {
@@ -93,6 +102,10 @@ message Message {
   Sealable body = 3;
   // Always empty before M26.
   repeated BlobRef blobs = 4;
+  // Host-only whole-message cleanup intent retained in a genuine previous
+  // legacy EffectResult. All ordinary Message fields MUST be empty. Never a
+  // caller-selected locator, callee turn position, or new secret-value store.
+  ActorSource retained_compensation_source = 5;
 }
 
 // An HTTP response produced by a turn or received from an effect.

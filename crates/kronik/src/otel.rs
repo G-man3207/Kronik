@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use kronik_core::authority::AuthLease;
 use kronik_otel::audit::{Keys, Mapper};
 use kronik_otel::cursor::{Cursors, Entry};
 use kronik_otel::follow::{Options, Stream, supervise};
@@ -26,6 +27,7 @@ pub async fn start(
     node: &Arc<Node>,
     cursors: &Arc<Cursors>,
     data_dir: &Path,
+    original: AuthLease,
 ) -> anyhow::Result<Arc<Stream>> {
     let otel = &config.otel;
     let endpoint = otel.endpoint();
@@ -39,15 +41,11 @@ pub async fn start(
         None => 0,
     };
     if on && saved.is_none() {
-        cursors
-            .save(
-                TRACES,
-                Entry {
-                    lsn: cursor,
-                    ..Entry::default()
-                },
-            )
-            .await
+        let owned = cursors.clone();
+        let entry = Entry { lsn: cursor, ..Entry::default() };
+        node.authorized_effect(original.clone(), move || async move {
+            Ok(owned.save(TRACES, entry).await)
+        }).await.context("admitting the first trace cursor")?
             .context("saving the first trace cursor")?;
     }
     let sink_name = endpoint
@@ -97,21 +95,23 @@ pub async fn start(
                     })
             }
         };
-        drop(env.spawn("otel-traces", supervise(node, stream, options, make)));
+        stream.own_task(env.spawn("otel-traces", supervise(node.clone(), stream.clone(), options, make, original.clone())));
     }
     if otel.metrics {
         let gauges = node.clone();
         tracing::info!(endpoint = %kronik_otel::http::scheme_host(endpoint), "pushing metrics over OTLP");
-        drop(env.spawn(
+        stream.own_task(env.spawn(
             "otel-metrics",
             kronik_otel::metrics::push_loop(
-                env.clone(),
+                node.clone(),
                 endpoint.to_owned(),
                 headers,
                 otel.service_name.clone(),
                 node.branch().to_owned(),
                 otel.metrics_interval.0,
                 move || crate::admin::set_scrape_gauges(&gauges),
+                stream.clone(),
+                original.clone(),
             ),
         ));
     }
@@ -124,6 +124,7 @@ pub async fn migrate_trace_state(
     node: &Arc<Node>,
     cursors: &Arc<Cursors>,
     data_dir: &Path,
+    original: AuthLease,
 ) -> anyhow::Result<()> {
     let Some(mut saved) = cursors
         .get(TRACES)
@@ -131,9 +132,10 @@ pub async fn migrate_trace_state(
     else {
         return Ok(());
     };
-    cursors
-        .stabilize()
-        .await
+    let owned = cursors.clone();
+    node.authorized_effect(original.clone(), move || async move {
+        Ok(owned.stabilize().await)
+    }).await.context("admitting export cursor stabilization")?
         .context("stabilizing the export cursors")?;
     let env = node.env().clone();
     let hasher = KeyHasher::open(node.sealer().clone(), data_dir, || env.random_bytes())?;
@@ -141,13 +143,16 @@ pub async fn migrate_trace_state(
         kronik_otel::trace_state::load(env, data_dir, &saved.state, saved.lsn, hasher.id_key())
             .await
             .context("reading the historical trace metadata")?;
-    saved.state = writer
-        .checkpoint(&mut open, saved.lsn)
-        .await
-        .context("migrating the historical trace metadata")?;
-    cursors
-        .save(TRACES, saved)
-        .await
+    let lsn = saved.lsn;
+    let (mut writer, mut open, state) = node.authorized_effect(original.clone(), move || async move {
+        let state = writer.checkpoint(&mut open, lsn).await;
+        Ok((writer, open, state))
+    }).await.context("admitting trace metadata migration")?;
+    saved.state = state.context("migrating the historical trace metadata")?;
+    let owned = cursors.clone();
+    node.authorized_effect(original, move || async move {
+        Ok(owned.save(TRACES, saved).await)
+    }).await.context("admitting migrated export cursors")?
         .context("saving the export cursors")?;
     writer.committed(&mut open);
     Ok(())
@@ -167,6 +172,7 @@ pub async fn start_audit(
     node: &Arc<Node>,
     cursors: &Arc<Cursors>,
     data_dir: &Path,
+    original: AuthLease,
 ) -> anyhow::Result<(Arc<Mapper>, Arc<Stream>)> {
     let env = node.env().clone();
     let keys = match config.otel.actor_keys {
@@ -195,7 +201,7 @@ pub async fn start_audit(
     );
     let hash = format!("b3:{}", blake3::hash(settings.as_bytes()).to_hex());
     let stream = match sink {
-        None => Stream::new(
+        None => Stream::new_audit(
             kronik_otel::sink::STREAM,
             false,
             String::new(),
@@ -214,7 +220,7 @@ pub async fn start_audit(
                 max_hold: a.max_hold.0,
                 hold_release: a.hold_release_bytes(config.log.disk_reserve.0),
             };
-            kronik_otel::sink::start(node.clone(), cursors.clone(), settings, mapper.clone())
+            kronik_otel::sink::start(node.clone(), cursors.clone(), settings, mapper.clone(), original.clone())
                 .await
                 .map_err(anyhow::Error::msg)?
         }
@@ -239,7 +245,7 @@ pub async fn start_audit(
             ("sink".to_owned(), stream.sink.clone()),
         ]
         .into();
-        node.record_audit_event("audit.config", "", details, audit)
+        node.record_system_audit_event(kronik_sched::SystemAudit::ExportConfiguration, "", details, audit, original.clone())
             .await
             .map_err(|e| anyhow::anyhow!("recording the audit settings: {}", e.message))?;
         let entry = kronik_otel::cursor::Entry {
@@ -248,9 +254,10 @@ pub async fn start_audit(
             ..Entry::default()
         };
         if cursors.is_active() {
-            cursors
-                .save(AUDIT_CONFIG, entry)
-                .await
+            let owned = cursors.clone();
+            node.authorized_effect(original.clone(), move || async move {
+                Ok(owned.save(AUDIT_CONFIG, entry).await)
+            }).await.context("admitting audit configuration cursor")?
                 .context("saving the export cursors")?;
         }
     }

@@ -158,6 +158,7 @@ PY
 
 step_test() {
     cargo test --workspace --locked
+    "${KRONIK_TEST_PYTHON:?Prepare the pinned Python runtime in CONTRIBUTING.md}" -I -c 'import jwt; from cryptography import x509'
 }
 
 # The error catalog (docs/errors.md) and the concepts page
@@ -214,6 +215,7 @@ step_examples() {
     scripts/build-examples.sh
     cargo run --quiet --locked -p kronik-runtime --example check_imports -- examples/dist/*.wasm
 }
+    cargo test --locked --manifest-path tools/loadgen/Cargo.toml
 
 # The TypeScript SDK (sdk/ts): its types (the guest code and the Node.js
 # testkit), its unit tests, and the types/ that `jco guest-types` generates
@@ -227,13 +229,21 @@ step_examples() {
 # host, and the release dependencies are shared with the dst step. Needs
 # Node.js 22.20 or later and network access.
 step_ts() {
-    local kronik
+    local kronik compatibility_root
     npm ci --prefix sdk/ts --no-audit --no-fund
     (cd sdk/ts && npm run --silent check && node --test test/*.test.ts && npm run --silent types && git diff --exit-code -- types)
     cargo build --locked --release -p kronik
     # Where cargo put it, also with CARGO_TARGET_DIR set.
     kronik="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/kronik"
     KRONIK_BIN="$kronik" scripts/build-examples-ts.sh
+    python3 -B scripts/check-doc-surface.py --binary "$kronik"
+    compatibility_root="$(mktemp -d)"
+    printf 'Released compatibility fixture: %s\n' "$compatibility_root"
+    python3 -B scripts/verify-compatibility.py \
+        --index tests/compatibility/releases.json --binary "$kronik" \
+        --revision "$(git rev-parse HEAD)" \
+        --workdir "$compatibility_root/corpus" --port 47831 || return
+    rm -rf -- "$compatibility_root"
     cargo run --quiet --locked -p kronik-runtime --example check_imports -- examples/dist/*-ts*.wasm
     (cd examples && KRONIK_BIN="$kronik" npm test --workspaces)
     KRONIK_BIN="$kronik" E2E_INIT_LANGS="ts rust" scripts/e2e-init.sh
@@ -362,7 +372,7 @@ step_action() {
     actionlint="$(scripts/install-actionlint.sh)"
     "$actionlint"
     PATH="$(dirname "$actionlint"):$PATH" python3 -B -m unittest discover -v -s action/tests
-    python3 -B -m unittest discover -s scripts/tests -p test_check_performance.py
+    python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
     python3 -B scripts/e2e-release-signatures.py
 }
 

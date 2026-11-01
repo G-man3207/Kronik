@@ -17,38 +17,42 @@ fn kid_version<'a>(c: &Azure, kid: &'a str) -> Result<&'a str, String> {
     }
     Ok(v)
 }
-async fn auth(env: &Env, c: &Azure) -> Result<Zeroizing<String>, String> {
-    let response = if let Some(p) = &c.client_secret_file {
-        let secret = credential_text(env, p).await?;
-        let tenant = c.tenant_id.as_deref().ok_or("missing Azure tenant")?;
-        let client = c.client_id.as_deref().ok_or("missing Azure client ID")?;
+async fn auth_response(
+    env: &Env,
+    c: &Azure,
+    dispatch: Dispatch<'_>,
+) -> Result<SecretJson, crate::secret_backend::BackendError> {
+    use crate::secret_backend::BackendError::Invalid;
+    dispatch.check()?;
+    if let Some(p) = &c.client_secret_file {
+        let secret = dispatch.wait(credential_text(env, p, dispatch)).await?.map_err(|_| Invalid)?;
+        let tenant = c.tenant_id.as_deref().ok_or(Invalid)?;
+        let client = c.client_id.as_deref().ok_or(Invalid)?;
         let authority = c
             .authority_endpoint
             .as_deref()
             .unwrap_or("https://login.microsoftonline.com")
             .trim_end_matches('/');
-        request(
+        secret_request(
             env,
             "POST",
             format!("{authority}/{tenant}/oauth2/v2.0/token"),
-            vec![(
-                "content-type".into(),
-                "application/x-www-form-urlencoded".into(),
-            )],
+            vec![("content-type".into(), "application/x-www-form-urlencoded".into())],
             form(&[
                 ("grant_type", "client_credentials"),
                 ("client_id", client),
                 ("client_secret", secret.as_str()),
                 ("scope", "https://vault.azure.net/.default"),
             ]),
+            dispatch,
         )
-        .await?
+        .await
     } else {
         let base = c
             .metadata_endpoint
             .as_deref()
             .unwrap_or("http://169.254.169.254/metadata/identity/oauth2/token");
-        let mut u = url::Url::parse(base).map_err(|_| "invalid Azure metadata endpoint")?;
+        let mut u = url::Url::parse(base).map_err(|_| Invalid)?;
         {
             let mut q = u.query_pairs_mut();
             q.append_pair("api-version", "2018-02-01")
@@ -57,15 +61,19 @@ async fn auth(env: &Env, c: &Azure) -> Result<Zeroizing<String>, String> {
                 q.append_pair("client_id", client);
             }
         }
-        request(
+        secret_request(
             env,
             "GET",
             u.into(),
             vec![("Metadata".into(), "true".into())],
             vec![],
+            dispatch,
         )
-        .await?
-    };
+        .await
+    }
+}
+async fn auth(env: &Env, c: &Azure) -> Result<Zeroizing<String>, String> {
+    let response = auth_response(env, c, Dispatch::StartupBootstrap).await.map_err(|error| error.to_string())?;
     let token = Zeroizing::new(field(&response, "access_token")?.to_owned());
     header_secret(&token)?;
     Ok(token)
@@ -95,7 +103,7 @@ async fn wrap(
 }
 pub(super) async fn encrypt(env: &Env, cfg: &Keys, seed: &[u8; 32]) -> Result<Wrapped, String> {
     let c = cfg.azure.as_ref().ok_or("missing Azure configuration")?;
-    let net = tls_env(env, c.ca_file.as_deref(), None).await?;
+    let net = tls_env(env, c.ca_file.as_deref(), None, Dispatch::StartupBootstrap).await?;
     let token = auth(&net, c).await?;
     let key = request(
         &net,
@@ -120,7 +128,7 @@ pub(super) async fn decrypt(
     w: &Wrapped,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
     let c = cfg.azure.as_ref().ok_or("missing Azure configuration")?;
-    let net = tls_env(env, c.ca_file.as_deref(), None).await?;
+    let net = tls_env(env, c.ca_file.as_deref(), None, Dispatch::StartupBootstrap).await?;
     let token = auth(&net, c).await?;
     let r = wrap(&net, c, &token, &w.key_version, "unwrapkey", &w.ciphertext).await?;
     URL_SAFE_NO_PAD
@@ -128,6 +136,9 @@ pub(super) async fn decrypt(
         .map(Zeroizing::new)
         .map_err(|_| "invalid Azure plaintext encoding".into())
 }
+
+mod secrets;
+pub(crate) use secrets::Secrets;
 #[cfg(test)]
 mod tests {
     use super::*;

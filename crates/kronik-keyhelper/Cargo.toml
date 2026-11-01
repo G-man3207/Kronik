@@ -1,0 +1,29 @@
+[package]
+name = "kronik-keyhelper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# A separate GNU artifact; no PKCS#11 dependency enters the daemon graph.
+pkcs11 = ["dep:cryptoki"]
+
+[[bin]]
+name = "kronik-keyhelper"
+path = "src/main.rs"
+required-features = ["pkcs11"]
+
+[dependencies]
+cryptoki = { workspace = true, optional = true }
+getrandom = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

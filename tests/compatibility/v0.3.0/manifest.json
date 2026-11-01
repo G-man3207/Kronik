@@ -1,0 +1,210 @@
+{
+  "format": "kronik.compatibility-corpus/v1",
+  "release": "v0.3.0",
+  "producer_revision": "86d5a4bb92432d1acaf2cf8bec3188f9963dff76",
+  "producer_binary_sha256": "1681833ad84da60622a6c196b8084bbe52a2deb8f6860a26c81dc9ea4f4a3947",
+  "producer_version": "kronik 0.3.0\nwasmtime 50.0.0\nengine kronik-0.3.0+wasmtime-50.0.0\n",
+  "engine": "kronik-0.3.0+wasmtime-50.0.0",
+  "dummy_master_key": "4444444444444444444444444444444444444444444444444444444444444444",
+  "stable_lsn": 3,
+  "integrity": {
+    "applied_lsn": 17,
+    "state_hash": "b3:e593759ccea323ede307414379e529dfb3f96867bc775a288896e8e7d60b1c4e",
+    "log_first_lsn": 1,
+    "log_hash": "b3:804b9c936bb0dca0c7b58c08456a6abbc9b05d2b5b2a8510a3c7bcba575afc56",
+    "retention_history_ms": 604800000,
+    "newest_logical_time_ms": 1793415847745,
+    "retention_cutoff_ms": 1792811047745,
+    "keys_missing": []
+  },
+  "observations": {
+    "counter": {
+      "actor": {
+        "key": "a",
+        "kind": "counter",
+        "last_turn_id": "main:15",
+        "schema_version": 0,
+        "sql": false,
+        "turns": 7
+      },
+      "sql": null,
+      "state": [
+        {
+          "base64": "Ng==",
+          "key": "n",
+          "lsn": 15,
+          "subject": null,
+          "text": "6"
+        }
+      ]
+    },
+    "notes": {
+      "actor": {
+        "key": "a",
+        "kind": "notes",
+        "last_turn_id": "main:11",
+        "schema_version": 1,
+        "sql": true,
+        "turns": 3
+      },
+      "sql": {
+        "tables": [
+          {
+            "name": "notes",
+            "rows": 2
+          }
+        ]
+      },
+      "state": []
+    },
+    "sink": {
+      "actor": {
+        "key": "sink",
+        "kind": "counter",
+        "last_turn_id": "main:16",
+        "schema_version": 0,
+        "sql": false,
+        "turns": 1
+      },
+      "sql": null,
+      "state": [
+        {
+          "base64": "MQ==",
+          "key": "n",
+          "lsn": 16,
+          "subject": null,
+          "text": "1"
+        }
+      ]
+    },
+    "hmac": "0c5be0aaef6ecbed3227d381df9702c16ae4cd2aa7d205669db45fdfc7c3099b"
+  },
+  "components": [
+    {
+      "filename": "counter.wasm",
+      "sha256": "747c8630dfe34766b8b29f81787145b0c5061acef875be5c2c04c8da4ea70fb5",
+      "deployment": {
+        "dry_run": false,
+        "unchanged": false,
+        "deployment": {
+          "epoch": 1,
+          "lsn": 1,
+          "kind": "counter",
+          "code_hash": "b3:b310bc634637",
+          "schema_version": 0,
+          "routes": [
+            {
+              "method": "POST",
+              "pattern": "/counter/{key}/{op}"
+            },
+            {
+              "method": "GET",
+              "pattern": "/counter/{key}"
+            }
+          ],
+          "capabilities": []
+        },
+        "warnings": []
+      }
+    },
+    {
+      "filename": "notes.wasm",
+      "sha256": "250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423",
+      "deployment": {
+        "dry_run": false,
+        "unchanged": false,
+        "deployment": {
+          "epoch": 2,
+          "lsn": 2,
+          "kind": "notes",
+          "code_hash": "b3:c0c6b06edd01",
+          "schema_version": 1,
+          "routes": [
+            {
+              "method": "POST",
+              "pattern": "/notes/{key}"
+            },
+            {
+              "method": "GET",
+              "pattern": "/notes/{key}"
+            }
+          ],
+          "capabilities": []
+        },
+        "warnings": []
+      }
+    }
+  ],
+  "files": [
+    {
+      "path": "branches/main/log/00000000000000000001.seg",
+      "bytes": 6197,
+      "sha256": "73b89e9b72553ff84c787e684ead0fbcc61981a034f0d5c9470aafc3e0d07caf"
+    },
+    {
+      "path": "branches/main/sql/df/notes~a-df924404.db",
+      "bytes": 4096,
+      "sha256": "2e96884c16791c7d4bde90a6db2c9da33c2a2aab3e52088adc148c368552a423"
+    },
+    {
+      "path": "branches/main/sql/df/notes~a-df924404.db-wal",
+      "bytes": 61832,
+      "sha256": "4ef043c2351fa0ca5cf550d3fec87112e756c9dbee721462efdb467997e63536"
+    },
+    {
+      "path": "branches/main/state.db",
+      "bytes": 118784,
+      "sha256": "5a6370f685ced8cea267becdfea15ad4a80fff9295138f79815fecaaed745290"
+    },
+    {
+      "path": "code/b310bc634637383f31f8c82ab9adcbf27a8736c874e70bb5b47d4a461e8a4498.wasm",
+      "bytes": 109079,
+      "sha256": "747c8630dfe34766b8b29f81787145b0c5061acef875be5c2c04c8da4ea70fb5"
+    },
+    {
+      "path": "code/c0c6b06edd0178d0868b760e4a5a76c10f7c78598077cc127f0d9370043106f9.wasm",
+      "bytes": 76877,
+      "sha256": "250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423"
+    },
+    {
+      "path": "keys/keystore.db",
+      "bytes": 16384,
+      "sha256": "909a132c0a3b1fd1e5fcdd266b5f68148175d070c0b071f2a49156a84bb3f8f9"
+    },
+    {
+      "path": "keys/secrets.db",
+      "bytes": 12288,
+      "sha256": "949f3f7f82799deb7f88cf6b1442ae323bc1f156c399f7bb1243934248d43d64"
+    },
+    {
+      "path": "keys/tokens.db",
+      "bytes": 12288,
+      "sha256": "e41661086643c1f37f1988b1b2471826aeadb739115bd01e5cc95e70f830b9f4"
+    },
+    {
+      "path": "privacy/keystore_retention_ms",
+      "bytes": 10,
+      "sha256": "8961f1920779b1680abb30edb239ec4823c6694f6eb4db43e865c07936f2eeca"
+    },
+    {
+      "path": "snapshots/main/00000000000000000016/manifest.json",
+      "bytes": 839,
+      "sha256": "0030dd7cdb4caecf31bb20906ee053cbb220887da631166747c1831e85f8163b"
+    },
+    {
+      "path": "snapshots/main/00000000000000000016/secrets.db",
+      "bytes": 12288,
+      "sha256": "eedafa43c428976671ceb3897dad3d6a53c5633413d303494431b0893701a159"
+    },
+    {
+      "path": "snapshots/main/00000000000000000016/sql/df/notes~a-df924404.db",
+      "bytes": 16384,
+      "sha256": "5dd056fe06b8c30fdf03cb5699a84217a2dbfa6fa0c95bddec287f0d8ff14c2b"
+    },
+    {
+      "path": "snapshots/main/00000000000000000016/state.db",
+      "bytes": 118784,
+      "sha256": "efe75fd9475995a6713a8d975baee4b656bf30bae6457770c4b58750f4a222ac"
+    }
+  ]
+}

@@ -19,6 +19,13 @@ use zeroize::Zeroizing;
 use crate::key_memory::ProtectedKey;
 use crate::{MasterKey, PrivacyError, hex};
 
+mod prepared;
+pub use prepared::PreparedSubjectKey;
+mod owned;
+pub(crate) mod ffi;
+pub use owned::KeystoreRestore;
+use owned::Custody;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS subject_keys (
   subject TEXT NOT NULL, version INTEGER NOT NULL, nonce BLOB NOT NULL,
@@ -27,6 +34,22 @@ CREATE TABLE IF NOT EXISTS subject_keys (
 CREATE TABLE IF NOT EXISTS erasures (
   subject TEXT PRIMARY KEY, last_version INTEGER NOT NULL,
   erased_wall_ms INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS keystore_revision (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision >= 0));
+INSERT OR IGNORE INTO keystore_revision VALUES (1, 0);
+CREATE TRIGGER IF NOT EXISTS subject_keys_revision_insert AFTER INSERT ON subject_keys
+BEGIN UPDATE keystore_revision SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS subject_keys_revision_update AFTER UPDATE ON subject_keys
+BEGIN UPDATE keystore_revision SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS subject_keys_revision_delete AFTER DELETE ON subject_keys
+BEGIN UPDATE keystore_revision SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS erasures_revision_insert AFTER INSERT ON erasures
+BEGIN UPDATE keystore_revision SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS erasures_revision_update AFTER UPDATE ON erasures
+BEGIN UPDATE keystore_revision SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS erasures_revision_delete AFTER DELETE ON erasures
+BEGIN UPDATE keystore_revision SET revision = revision + 1 WHERE id = 1; END;
 ";
 
 /// The start of an exported backup; also its associated data.
@@ -84,7 +107,43 @@ pub struct ErasureInfo {
     pub subject: String,
     /// Versions up to this one are erased.
     pub last_version: u32,
+    /// This host's physical floor-application time, not a global proof clock.
     pub erased_wall_ms: u64,
+}
+
+/// One existing subject-key envelope, never an unwrapped data key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedSubjectKey {
+    pub nonce: [u8; 24],
+    pub wrapped: [u8; 48],
+    pub created_wall_ms: u64,
+}
+
+/// An exporter's observed erasure metadata, not authority to erase locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubjectErasure {
+    pub last_version: u32,
+    pub erased_wall_ms: u64,
+}
+
+/// A same-read-snapshot view of one requested original subject-key version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedSubjectVersion {
+    pub subject: String,
+    pub version: u32,
+    pub key: Option<WrappedSubjectKey>,
+    pub erasure: Option<SubjectErasure>,
+}
+
+/// The receiver's local state after a wrapped-version merge. This is not a
+/// production/key grant or proof that a follower's source cut is complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrappedVersionStatus {
+    Imported,
+    Present,
+    Erased,
+    /// An expected, noncovered original key is still absent.
+    Missing,
 }
 
 /// Counts for `privacy status`.
@@ -101,6 +160,49 @@ pub struct Keystore {
     conn: Mutex<Connection>,
     wrap: ProtectedKey,
     backup: ProtectedKey,
+    check: [u8; 32],
+    custody: Custody,
+}
+
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeyRevision {
+    revision: u64,
+    data_version: u64,
+}
+
+fn semantic_revision(conn: &Connection) -> Result<u64, PrivacyError> {
+    let value: i64 = conn.query_row("SELECT revision FROM keystore_revision WHERE id = 1", [], |row| row.get(0))?;
+    u64::try_from(value).map_err(|_| PrivacyError::Sqlite(rusqlite::Error::IntegralValueOutOfRange(0, value)))
+}
+
+fn data_version(conn: &Connection) -> Result<u64, PrivacyError> {
+    let value: i64 = conn.pragma_query_value(None, "data_version", |row| row.get(0))?;
+    u64::try_from(value).map_err(|_| PrivacyError::Sqlite(rusqlite::Error::IntegralValueOutOfRange(0, value)))
+}
+
+fn subject_key_version(version: u32) -> Result<u32, PrivacyError> {
+    if version == 0 {
+        return Err(PrivacyError::Sqlite(rusqlite::Error::IntegralValueOutOfRange(0, 0)));
+    }
+    Ok(version)
+}
+
+fn next_subject_key_version(version: u32) -> Result<u32, PrivacyError> {
+    version.checked_add(1).ok_or_else(|| {
+        PrivacyError::Sqlite(rusqlite::Error::IntegralValueOutOfRange(0, i64::from(version) + 1))
+    })
+}
+
+fn row_wall_ms(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(column)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
+}
+
+fn sql_wall_ms(value: u64) -> Result<i64, PrivacyError> {
+    i64::try_from(value).map_err(|error| {
+        PrivacyError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    })
 }
 
 impl std::fmt::Debug for Keystore {
@@ -156,42 +258,97 @@ impl Keystore {
             .is_ok_and(|bytes| bytes.len() == 32))
     }
 
-    pub fn open(conn: Connection, master: &MasterKey) -> Result<Keystore, PrivacyError> {
-        let wrap = master.derive("kronik keystore v1")?;
-        let backup = master.derive("kronik keystore backup v1")?;
-        // secure_delete: an erased key's bytes are zeroed in its page, and
-        // `erase` truncates the WAL that still holds older copies.
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA secure_delete = ON;",
-        )?;
-        conn.execute_batch(SCHEMA)?;
+    fn open_connection(conn: Mutex<Connection>, master: &MasterKey, custody: Custody) -> Result<Keystore, PrivacyError> {
         let store = Keystore {
-            conn: Mutex::new(conn),
-            wrap,
-            backup,
+            conn,
+            wrap: master.derive("kronik keystore v1")?,
+            backup: master.derive("kronik keystore backup v1")?,
+            check: master.check_value(),
+            custody,
         };
         {
             let conn = store.conn();
-            crate::check_key(&conn, master, "the privacy keystore", || {
-                let row: Option<(String, u32, Vec<u8>, Vec<u8>)> = conn
-                    .query_row(
-                        "SELECT subject, version, nonce, wrapped FROM subject_keys LIMIT 1",
-                        [],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                    )
-                    .optional()?;
-                Ok(row.is_none_or(|(subject, version, nonce, wrapped)| {
-                    store
-                        .unwrap_key(&subject, version, &nonce, &wrapped)
-                        .is_ok()
-                }))
-            })?;
+            if store.custody.readonly() {
+                store.check_master(&conn)?;
+            } else {
+                conn.execute_batch(
+                    "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA secure_delete = ON;",
+                )?;
+                conn.execute_batch(SCHEMA)?;
+                crate::check_key(&conn, master, "the privacy keystore", || {
+                    let row: Option<(String, u32, Vec<u8>, Vec<u8>)> = conn
+                        .query_row(
+                            "SELECT subject, version, nonce, wrapped FROM subject_keys LIMIT 1",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        )
+                        .optional()?;
+                    Ok(row.is_none_or(|(subject, version, nonce, wrapped)| {
+                        store.unwrap_key(&subject, version, &nonce, &wrapped).is_ok()
+                    }))
+                })?;
+            }
         }
+        Ok(store)
+    }
+
+    fn reopen_connection(&self, conn: Mutex<Connection>, custody: Custody) -> Result<Self, PrivacyError> {
+        let store = Self {
+            conn, wrap: self.wrap.clone(), backup: self.backup.clone(),
+            check: self.check, custody,
+        };
+        drop(store.checked_conn()?);
         Ok(store)
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn checked_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, PrivacyError> {
+        let conn = self.conn();
+        self.custody.check()?;
+        self.check_master(&conn)?;
+        Ok(conn)
+    }
+
+    fn check_master(&self, conn: &Connection) -> Result<(), PrivacyError> {
+        let matches = conn.query_row("SELECT value FROM key_check WHERE id = 1", [], |row| {
+            Ok(matches!(row.get_ref(0)?, rusqlite::types::ValueRef::Blob(value) if value == self.check))
+        })?;
+        if matches { Ok(()) } else {
+            Err(PrivacyError::KeyMismatch("the privacy keystore was replaced under another master key".into()))
+        }
+    }
+
+    /// Persistent semantic change counter; checkpointing and file timestamps do
+    /// not determine whether a keystore backup or retained inventory changed.
+    pub fn revision(&self) -> Result<u64, PrivacyError> {
+        let conn = self.checked_conn()?;
+        semantic_revision(&conn)
+    }
+
+    pub(crate) fn cache_revision(&self) -> Result<KeyRevision, PrivacyError> {
+        let conn = self.checked_conn()?;
+        let data_version = data_version(&conn)?;
+        Ok(KeyRevision { revision: semantic_revision(&conn)?, data_version })
+    }
+
+    pub(crate) fn erasure_floor_at_revision(
+        &self,
+        subject: &str,
+    ) -> Result<(KeyRevision, Option<u32>), PrivacyError> {
+        if !valid_subject(subject) {
+            return Err(PrivacyError::InvalidSubject(subject.to_owned()));
+        }
+        let mut conn = self.checked_conn()?;
+        let data_version = data_version(&conn)?;
+        let tx = conn.transaction()?;
+        self.check_master(&tx)?;
+        let floor = Self::erased_through(&tx, subject)?;
+        let revision = KeyRevision { revision: semantic_revision(&tx)?, data_version };
+        tx.commit()?;
+        Ok((revision, floor))
     }
 
     fn unwrap_key(
@@ -201,6 +358,7 @@ impl Keystore {
         nonce: &[u8],
         wrapped: &[u8],
     ) -> Result<SubjectKey, PrivacyError> {
+        let version = subject_key_version(version)?;
         let decrypt = || PrivacyError::Decrypt(format!("the key of {subject} (version {version})"));
         let nonce = XNonce::try_from(nonce).map_err(|_| decrypt())?;
         let bytes = Zeroizing::new(
@@ -220,14 +378,167 @@ impl Keystore {
     }
 
     fn erased_through(conn: &Connection, subject: &str) -> Result<Option<u32>, PrivacyError> {
-        let last: Option<i64> = conn
+        let last: Option<u32> = conn
             .query_row(
                 "SELECT last_version FROM erasures WHERE subject = ?1",
                 [subject],
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(last.map(|v| v as u32))
+        Ok(last)
+    }
+
+    fn subject_erasure(conn: &Connection, subject: &str) -> Result<Option<SubjectErasure>, PrivacyError> {
+        Ok(conn.query_row(
+            "SELECT last_version, erased_wall_ms FROM erasures WHERE subject = ?1",
+            [subject],
+            |row| Ok(SubjectErasure { last_version: row.get(0)?, erased_wall_ms: row_wall_ms(row, 1)? }),
+        ).optional()?)
+    }
+
+    fn wrapped_subject_key(
+        conn: &Connection,
+        subject: &str,
+        version: u32,
+    ) -> Result<Option<WrappedSubjectKey>, PrivacyError> {
+        Ok(conn.query_row(
+            "SELECT nonce, wrapped, created_wall_ms FROM subject_keys WHERE subject = ?1 AND version = ?2",
+            params![subject, version],
+            |row| Ok(WrappedSubjectKey {
+                nonce: row.get(0)?,
+                wrapped: row.get(1)?,
+                created_wall_ms: row_wall_ms(row, 2)?,
+            }),
+        ).optional()?)
+    }
+
+    /// Internal shard-bootstrap export. The requested identity must come from
+    /// an already committed assigned-shard record/snapshot. This read neither
+    /// creates keys nor exports the master or an unwrapped subject key.
+    pub fn export_wrapped_version(
+        &self,
+        expected_subject: &str,
+        expected_version: u32,
+    ) -> Result<WrappedSubjectVersion, PrivacyError> {
+        if !valid_subject(expected_subject) {
+            return Err(PrivacyError::InvalidSubject(expected_subject.to_owned()));
+        }
+        let version = subject_key_version(expected_version)?;
+        let mut conn = self.checked_conn()?;
+        let tx = conn.transaction()?;
+        self.check_master(&tx)?;
+        let erasure = Self::subject_erasure(&tx, expected_subject)?;
+        let key = if erasure.is_some_and(|floor| version <= floor.last_version) {
+            None
+        } else {
+            Self::wrapped_subject_key(&tx, expected_subject, version)?
+        };
+        tx.commit()?;
+        Ok(WrappedSubjectVersion { subject: expected_subject.to_owned(), version, key, erasure })
+    }
+
+    /// Internal shard-bootstrap merge under the already shared protected master.
+    /// The caller admits an immutable identity/capsule/proved-floor command at
+    /// its bounded queue under the original member/install/source-cut/term fence.
+    /// This admitted continuation may wait for SQLite and finish after revocation;
+    /// data installation/readiness needs its own original assignment admission.
+    /// This does not bootstrap a master or grant authority to the imported key.
+    ///
+    /// `proved_floor` is a subject-bound projection, not the deletion proof.
+    /// The caller must verify the actual GLOBAL epoch/all-required-replica
+    /// barrier plus LOCAL hosted-shard cuts before authorizing physical key
+    /// deletion; one shard's erasure/intent is insufficient. Never derive the
+    /// floor from the capsule. Absence proves neither zero nor complete history.
+    /// The already-admitted receiving worker samples `receiving_host_applied_wall_ms`;
+    /// it stamps only a newly advanced local floor, not global/wire authority.
+    pub fn merge_wrapped_version(
+        &self,
+        expected_subject: &str,
+        expected_version: u32,
+        capsule: &WrappedSubjectVersion,
+        proved_floor: Option<(&str, u32)>,
+        receiving_host_applied_wall_ms: u64,
+    ) -> Result<WrappedVersionStatus, PrivacyError> {
+        if !valid_subject(expected_subject) {
+            return Err(PrivacyError::InvalidSubject(expected_subject.to_owned()));
+        }
+        let version = subject_key_version(expected_version)?;
+        if capsule.subject != expected_subject || capsule.version != version {
+            return Err(PrivacyError::Decrypt("wrapped key identity does not match committed source".into()));
+        }
+        let proved = if let Some((subject, floor)) = proved_floor {
+            if subject != expected_subject {
+                return Err(PrivacyError::Decrypt("erasure proof does not match committed subject".into()));
+            }
+            Some(floor)
+        } else { None };
+        let applied_wall_ms = sql_wall_ms(receiving_host_applied_wall_ms)?;
+        if let Some(observed) = capsule.erasure { sql_wall_ms(observed.erased_wall_ms)?; }
+        let incoming = match capsule.key.as_ref() {
+            Some(key) => Some((key, sql_wall_ms(key.created_wall_ms)?)),
+            None => None,
+        };
+        self.custody.require_mutable()?;
+        let mut conn = self.checked_conn()?;
+        let tx = conn.transaction()?;
+        self.check_master(&tx)?;
+        semantic_revision(&tx)?;
+        let local = Self::subject_erasure(&tx, expected_subject)?;
+        let advance = proved.filter(|floor| local.is_none_or(|local| *floor > local.last_version));
+        let floor = advance.or(local.map(|local| local.last_version));
+        if capsule.erasure.is_some_and(|observed| floor.is_none_or(|floor| observed.last_version > floor)) {
+            return Err(PrivacyError::Decrypt("wrapped erasure floor lacks committed source proof".into()));
+        }
+        let covered = floor.is_some_and(|floor| version <= floor);
+        let existing = if covered {
+            None
+        } else {
+            Self::wrapped_subject_key(&tx, expected_subject, version)?
+        };
+        let existing_key = existing.as_ref().map(|key| {
+            self.unwrap_key(expected_subject, version, &key.nonce, &key.wrapped)
+        }).transpose()?;
+        let incoming_key = if covered {
+            None
+        } else {
+            incoming.as_ref().map(|(key, _)| {
+                self.unwrap_key(expected_subject, version, &key.nonce, &key.wrapped)
+            }).transpose()?
+        };
+        if let (Some(existing), Some(incoming)) = (&existing_key, &incoming_key)
+            && existing.key[..] != incoming.key[..]
+        {
+            return Err(PrivacyError::Decrypt("subject key version has a different key lineage".into()));
+        }
+        // Covered versions are never read or unwrapped. Validate only uncovered
+        // lineage before applying the proved erasure and original envelope.
+        let mutation = advance.map(|_| self.begin_erasure()).transpose()?;
+        if let Some(floor) = advance {
+            tx.execute(
+                "DELETE FROM subject_keys WHERE subject = ?1 AND version <= ?2",
+                params![expected_subject, floor],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO erasures (subject, last_version, erased_wall_ms) VALUES (?1, ?2, ?3)",
+                params![expected_subject, floor, applied_wall_ms],
+            )?;
+        }
+        let status = if covered {
+            WrappedVersionStatus::Erased
+        } else if existing.is_some() {
+            WrappedVersionStatus::Present
+        } else if let Some((key, wall_ms)) = incoming {
+            tx.execute(
+                "INSERT INTO subject_keys (subject, version, nonce, wrapped, created_wall_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![expected_subject, version, &key.nonce[..], &key.wrapped[..], wall_ms],
+            )?;
+            WrappedVersionStatus::Imported
+        } else {
+            WrappedVersionStatus::Missing
+        };
+        tx.commit()?;
+        if let Some(mutation) = mutation { mutation.finish()?; }
+        Ok(status)
     }
 
     fn insert_key(
@@ -239,6 +550,8 @@ impl Keystore {
         nonce: [u8; 24],
         wall_ms: u64,
     ) -> Result<SubjectKey, PrivacyError> {
+        self.custody.require_mutable()?;
+        let version = subject_key_version(version)?;
         let wrapped = XChaCha20Poly1305::new(self.wrap.bytes().into())
             .encrypt(
                 &XNonce::from(nonce),
@@ -269,45 +582,105 @@ impl Keystore {
         wall_ms: u64,
     ) -> Result<SubjectKey, PrivacyError> {
         let fresh = Zeroizing::new(fresh);
+        self.sealing_key_inner(subject, &fresh, nonce, wall_ms, None).map(|(_, key)| key)
+    }
+
+    pub(crate) fn sealing_key_at_revision(
+        &self,
+        subject: &str,
+        fresh: [u8; 32],
+        nonce: [u8; 24],
+        wall_ms: u64,
+    ) -> Result<(KeyRevision, SubjectKey), PrivacyError> {
+        let fresh = Zeroizing::new(fresh);
+        self.sealing_key_inner(subject, &fresh, nonce, wall_ms, None)
+    }
+
+    pub(crate) fn plain_source_key_at_revision(
+        &self,
+        subject: &str,
+        expected_erasure_floor: Option<u32>,
+        fresh: [u8; 32],
+        nonce: [u8; 24],
+        wall_ms: u64,
+    ) -> Result<(KeyRevision, SubjectKey), PrivacyError> {
+        let fresh = Zeroizing::new(fresh);
+        self.sealing_key_inner(subject, &fresh, nonce, wall_ms, Some(expected_erasure_floor))
+    }
+
+    fn sealing_key_inner(
+        &self,
+        subject: &str,
+        fresh: &[u8; 32],
+        nonce: [u8; 24],
+        wall_ms: u64,
+        expected_erasure_floor: Option<Option<u32>>,
+    ) -> Result<(KeyRevision, SubjectKey), PrivacyError> {
         if !valid_subject(subject) {
             return Err(PrivacyError::InvalidSubject(subject.to_owned()));
         }
-        let conn = self.conn();
-        type Row = (i64, Vec<u8>, Vec<u8>);
-        let newest: Option<Row> = conn
+        let mut conn = self.checked_conn()?;
+        // Sample before the snapshot: a later commit must never tag an older key.
+        let data_version = data_version(&conn)?;
+        let tx = conn.transaction()?;
+        self.check_master(&tx)?;
+        // None is ordinary live sealing; Some(expected) is a source receipt CAS.
+        let source_floor = if let Some(expected) = expected_erasure_floor {
+            let actual = Self::erased_through(&tx, subject)?;
+            if actual != expected {
+                return Err(PrivacyError::Decrypt("historical plaintext erasure floor changed".into()));
+            }
+            actual
+        } else { None };
+        type Row = (u32, Vec<u8>, Vec<u8>);
+        let newest: Option<Row> = tx
             .query_row(
                 "SELECT version, nonce, wrapped FROM subject_keys WHERE subject = ?1 ORDER BY version DESC LIMIT 1",
                 [subject],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        if let Some((version, n, wrapped)) = newest {
-            return self.unwrap_key(subject, version as u32, &n, &wrapped);
-        }
-        let version = Self::erased_through(&conn, subject)?.unwrap_or(0) + 1;
-        self.insert_key(&conn, subject, version, &fresh, nonce, wall_ms)
+        let key = if let Some((version, nonce, wrapped)) = newest {
+            self.unwrap_key(subject, version, &nonce, &wrapped)?
+        } else {
+            let floor = if expected_erasure_floor.is_some() { source_floor.unwrap_or(0) } else { Self::erased_through(&tx, subject)?.unwrap_or(0) };
+            let version = next_subject_key_version(floor)?;
+            self.insert_key(&tx, subject, version, fresh, nonce, wall_ms)?
+        };
+        let revision = KeyRevision { revision: semantic_revision(&tx)?, data_version };
+        tx.commit()?;
+        Ok((revision, key))
     }
 
     /// One version of a subject's key, to unseal with.
     pub fn key(&self, subject: &str, version: u32) -> Result<KeyLookup, PrivacyError> {
-        let conn = self.conn();
-        if Self::erased_through(&conn, subject)?.is_some_and(|last| version <= last) {
-            return Ok(KeyLookup::Erased);
-        }
-        let row: Option<(Vec<u8>, Vec<u8>)> = conn
-            .query_row(
-                "SELECT nonce, wrapped FROM subject_keys WHERE subject = ?1 AND version = ?2",
-                params![subject, version],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        drop(conn);
-        match row {
-            Some((nonce, wrapped)) => Ok(KeyLookup::Found(
-                self.unwrap_key(subject, version, &nonce, &wrapped)?,
-            )),
-            None => Ok(KeyLookup::Missing),
-        }
+        self.key_at_revision(subject, version).map(|(_, key)| key)
+    }
+
+    pub(crate) fn key_at_revision(&self, subject: &str, version: u32) -> Result<(KeyRevision, KeyLookup), PrivacyError> {
+        let version = subject_key_version(version)?;
+        let mut conn = self.checked_conn()?;
+        let data_version = data_version(&conn)?;
+        let tx = conn.transaction()?;
+        self.check_master(&tx)?;
+        let revision = KeyRevision { revision: semantic_revision(&tx)?, data_version };
+        let key = if Self::erased_through(&tx, subject)?.is_some_and(|last| version <= last) {
+            KeyLookup::Erased
+        } else {
+            let row: Option<(Vec<u8>, Vec<u8>)> = tx
+                .query_row(
+                    "SELECT nonce, wrapped FROM subject_keys WHERE subject = ?1 AND version = ?2",
+                    params![subject, version],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match row {
+                Some((nonce, wrapped)) => KeyLookup::Found(self.unwrap_key(subject, version, &nonce, &wrapped)?),
+                None => KeyLookup::Missing,
+            }
+        };
+        tx.commit()?;
+        Ok((revision, key))
     }
 
     /// Adds a new version of the subject's key, which seals from now on;
@@ -323,8 +696,8 @@ impl Keystore {
         if !valid_subject(subject) {
             return Err(PrivacyError::InvalidSubject(subject.to_owned()));
         }
-        let conn = self.conn();
-        let newest: Option<i64> = conn
+        let conn = self.checked_conn()?;
+        let newest: Option<u32> = conn
             .query_row(
                 "SELECT max(version) FROM subject_keys WHERE subject = ?1",
                 [subject],
@@ -333,7 +706,7 @@ impl Keystore {
             .optional()?
             .flatten();
         let floor = Self::erased_through(&conn, subject)?.unwrap_or(0);
-        let version = newest.map_or(floor, |v| v as u32).max(floor) + 1;
+        let version = next_subject_key_version(newest.map(subject_key_version).transpose()?.unwrap_or(floor).max(floor))?;
         self.insert_key(&conn, subject, version, &fresh, nonce, wall_ms)
             .map(|k| k.version)
     }
@@ -347,11 +720,13 @@ impl Keystore {
         version: u32,
         wall_ms: u64,
     ) -> Result<(), PrivacyError> {
-        let mut conn = self.conn();
+        self.custody.require_mutable()?;
+        let mut conn = self.checked_conn()?;
         let tx = conn.transaction()?;
         if Self::erased_through(&tx, subject)?.is_some_and(|v| v >= version) {
             return Ok(());
         }
+        let mutation = self.begin_erasure()?;
         tx.execute(
             "DELETE FROM subject_keys WHERE subject = ?1 AND version <= ?2",
             params![subject, version],
@@ -361,6 +736,7 @@ impl Keystore {
             params![subject, version, wall_ms as i64],
         )?;
         tx.commit()?;
+        mutation.finish()?;
         Ok(())
     }
 
@@ -375,7 +751,11 @@ impl Keystore {
         version: u32,
         sample: &kronik_proto::log::v1::Sealed,
     ) -> Result<bool, PrivacyError> {
-        if Self::erased_through(&self.conn(), subject)?.is_some_and(|v| v >= version) {
+        let erased = {
+            let conn = self.checked_conn()?;
+            Self::erased_through(&conn, subject)?
+        };
+        if erased.is_some_and(|last| last >= version) {
             return Ok(true);
         }
         let Ok(nonce) = <[u8; 24]>::try_from(sample.nonce.as_slice()) else {
@@ -400,9 +780,10 @@ impl Keystore {
         if !valid_subject(subject) {
             return Err(PrivacyError::InvalidSubject(subject.to_owned()));
         }
-        let mut conn = self.conn();
+        self.custody.require_mutable()?;
+        let mut conn = self.checked_conn()?;
         let tx = conn.transaction()?;
-        let newest: Option<i64> = tx
+        let newest: Option<u32> = tx
             .query_row(
                 "SELECT max(version) FROM subject_keys WHERE subject = ?1",
                 [subject],
@@ -411,13 +792,15 @@ impl Keystore {
             .optional()?
             .flatten();
         let floor = Self::erased_through(&tx, subject)?.unwrap_or(0);
-        let last = newest.map_or(floor, |v| v as u32).max(floor);
+        let last = newest.map(subject_key_version).transpose()?.unwrap_or(floor).max(floor);
+        let mutation = self.begin_erasure()?;
         tx.execute("DELETE FROM subject_keys WHERE subject = ?1", [subject])?;
         tx.execute(
             "INSERT OR REPLACE INTO erasures (subject, last_version, erased_wall_ms) VALUES (?1, ?2, ?3)",
             params![subject, last, wall_ms as i64],
         )?;
         tx.commit()?;
+        mutation.finish()?;
         // The WAL still holds the pages with the wrapped keys; the key is
         // deleted durably already, so a failure here is only logged.
         match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
@@ -432,14 +815,14 @@ impl Keystore {
 
     /// Every erased subject, oldest erasure first.
     pub fn erasures(&self) -> Result<Vec<ErasureInfo>, PrivacyError> {
-        let conn = self.conn();
+        let conn = self.checked_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT subject, last_version, erased_wall_ms FROM erasures ORDER BY erased_wall_ms, subject",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(ErasureInfo {
                 subject: r.get(0)?,
-                last_version: r.get::<_, i64>(1)? as u32,
+                last_version: r.get(1)?,
                 erased_wall_ms: r.get::<_, i64>(2)? as u64,
             })
         })?;
@@ -447,7 +830,7 @@ impl Keystore {
     }
 
     pub fn stats(&self) -> Result<KeystoreStats, PrivacyError> {
-        let conn = self.conn();
+        let conn = self.checked_conn()?;
         let (subjects, keys): (i64, i64) = conn.query_row(
             "SELECT count(DISTINCT subject), count(*) FROM subject_keys",
             [],
@@ -463,9 +846,9 @@ impl Keystore {
 
     /// The whole keystore, encrypted under a key derived from the master key
     /// with the fresh `nonce`, for shipping: subject ids and erasures are
-    /// hidden too. [`Keystore::import_backup`] reads it.
+    /// hidden too. [`Keystore::restore_owned`] restores it under the original owner.
     pub fn export_backup(&self, nonce: [u8; 24]) -> Result<Vec<u8>, PrivacyError> {
-        let conn = self.conn();
+        let conn = self.checked_conn()?;
         let mut payload = Zeroizing::new(Vec::new());
         {
             let mut stmt = conn.prepare_cached(
@@ -475,7 +858,7 @@ impl Keystore {
             while let Some(r) = rows.next()? {
                 payload.push(1u8);
                 put(&mut payload, r.get::<_, String>(0)?.as_bytes());
-                payload.extend_from_slice(&(r.get::<_, i64>(1)? as u32).to_le_bytes());
+                payload.extend_from_slice(&subject_key_version(r.get(1)?)?.to_le_bytes());
                 put(&mut payload, &r.get::<_, Vec<u8>>(2)?);
                 put(&mut payload, &r.get::<_, Vec<u8>>(3)?);
                 payload.extend_from_slice(&(r.get::<_, i64>(4)? as u64).to_le_bytes());
@@ -487,7 +870,7 @@ impl Keystore {
             while let Some(r) = rows.next()? {
                 payload.push(2u8);
                 put(&mut payload, r.get::<_, String>(0)?.as_bytes());
-                payload.extend_from_slice(&(r.get::<_, i64>(1)? as u32).to_le_bytes());
+                payload.extend_from_slice(&r.get::<_, u32>(1)?.to_le_bytes());
                 payload.extend_from_slice(&(r.get::<_, i64>(2)? as u64).to_le_bytes());
             }
         }
@@ -536,7 +919,7 @@ impl Keystore {
             match tag {
                 1 => rows
                     .keys
-                    .push((r.string()?, r.u32()?, r.bytes()?, r.bytes()?, r.u64()?)),
+                    .push((r.string()?, subject_key_version(r.u32()?).map_err(|_| bad())?, r.bytes()?, r.bytes()?, r.u64()?)),
                 2 => rows.erasures.push((r.string()?, r.u32()?, r.u64()?)),
                 _ => return Err(bad()),
             }
@@ -544,30 +927,27 @@ impl Keystore {
         Ok(rows)
     }
 
-    /// Opens `conn` as a keystore holding exactly the backup's keys and
-    /// erasures (a restore); the backup must come from the same master key.
-    /// The store is replaced in one transaction after the backup decrypted,
-    /// so a failure leaves it as it was, key check included.
-    pub fn import_backup(
-        mut conn: Connection,
+    /// The owned restore phase authenticates and invalidates publication first.
+    fn replace_backup(
+        conn: &mut Connection,
         master: &MasterKey,
-        backup: &[u8],
-    ) -> Result<Keystore, PrivacyError> {
-        let rows = Self::read_backup(master, backup)?;
+        rows: &BackupRows,
+    ) -> Result<(), PrivacyError> {
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(crate::KEY_CHECK)?;
         let tx = conn.transaction()?;
+        tx.execute("UPDATE keystore_revision SET revision = revision + 1 WHERE id = 1", [])?;
         tx.execute_batch("DELETE FROM subject_keys; DELETE FROM erasures; DELETE FROM key_check;")?;
         for (subject, version, nonce, wrapped, created) in &rows.keys {
             tx.execute(
                 "INSERT INTO subject_keys (subject, version, nonce, wrapped, created_wall_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![subject, version, nonce, wrapped, *created as i64],
+                params![subject, version, nonce, wrapped, sql_wall_ms(*created)?],
             )?;
         }
         for (subject, last, erased) in &rows.erasures {
             tx.execute(
                 "INSERT INTO erasures (subject, last_version, erased_wall_ms) VALUES (?1, ?2, ?3)",
-                params![subject, last, *erased as i64],
+                params![subject, last, sql_wall_ms(*erased)?],
             )?;
         }
         tx.execute(
@@ -575,34 +955,7 @@ impl Keystore {
             [&master.check_value()[..]],
         )?;
         tx.commit()?;
-        Keystore::open(conn, master)
-    }
-    /// Opens the keystore file at `path` (created if missing).
-    pub fn open_file(path: &std::path::Path, master: &MasterKey) -> Result<Keystore, PrivacyError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| PrivacyError::Io {
-                path: parent.display().to_string(),
-                source,
-            })?;
-        }
-        let conn = Connection::open(path)?;
-        Self::open(conn, master)
-    }
-
-    /// [`Keystore::import_backup`] into `path`, replacing whatever is there.
-    pub fn import_backup_file(
-        path: &std::path::Path,
-        master: &MasterKey,
-        backup: &[u8],
-    ) -> Result<Keystore, PrivacyError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| PrivacyError::Io {
-                path: parent.display().to_string(),
-                source,
-            })?;
-        }
-        let conn = Connection::open(path)?;
-        Self::import_backup(conn, master, backup)
+        Ok(())
     }
 }
 
@@ -754,10 +1107,7 @@ mod tests {
     use super::*;
 
     fn store(master: u8) -> Keystore {
-        Keystore::open(
-            Connection::open_in_memory().unwrap(),
-            &MasterKey::from_bytes([master; 32]).unwrap(),
-        )
+        Keystore::open_memory(&MasterKey::from_bytes([master; 32]).unwrap())
         .unwrap()
     }
 
@@ -872,22 +1222,20 @@ mod tests {
     #[test]
     fn keys_are_stored_wrapped_under_the_master_key() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keystore.db");
-        let ks = Keystore::open(
-            Connection::open(&path).unwrap(),
-            &MasterKey::from_bytes([1; 32]).unwrap(),
-        )
-        .unwrap();
+        let owner = crate::key_source::lock_data(dir.path()).unwrap();
+        let path = dir.path().join("keys/keystore.db");
+        let ks = Keystore::open_owned(&owner, &MasterKey::from_bytes([1; 32]).unwrap()).unwrap();
         ks.key_for_sealing("user:1", [0xab; 32], [1; 24], 0)
             .unwrap();
         drop(ks);
-        let conn = Connection::open(&path).unwrap();
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let wrapped: Vec<u8> = conn
             .query_row("SELECT wrapped FROM subject_keys", [], |r| r.get(0))
             .unwrap();
         assert!(!wrapped.windows(4).any(|w| w == [0xab; 4]));
         // Another master key is refused before it can try to unwrap.
-        let other = Keystore::open(conn, &MasterKey::from_bytes([2; 32]).unwrap());
+        drop(conn);
+        let other = Keystore::open_owned(&owner, &MasterKey::from_bytes([2; 32]).unwrap());
         assert!(matches!(other, Err(PrivacyError::KeyMismatch(_))));
     }
 
@@ -902,11 +1250,7 @@ mod tests {
         assert!(backup.starts_with(BACKUP_MAGIC));
         assert!(!backup.windows(6).any(|w| w == b"user:1" || w == b"user:2"));
 
-        let restored = Keystore::import_backup(
-            Connection::open_in_memory().unwrap(),
-            &MasterKey::from_bytes([1; 32]).unwrap(),
-            &backup,
-        )
+        let restored = Keystore::restore_memory(&MasterKey::from_bytes([1; 32]).unwrap(), &backup)
         .unwrap();
         assert_eq!(
             unseal(
@@ -923,55 +1267,41 @@ mod tests {
         ));
         assert_eq!(restored.stats().unwrap(), ks.stats().unwrap());
 
-        let wrong = Keystore::import_backup(
-            Connection::open_in_memory().unwrap(),
-            &MasterKey::from_bytes([2; 32]).unwrap(),
-            &backup,
-        );
+        let wrong = Keystore::restore_memory(&MasterKey::from_bytes([2; 32]).unwrap(), &backup);
         assert!(matches!(wrong, Err(PrivacyError::Decrypt(_))));
         let mut tampered = backup.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 1;
-        let tampered = Keystore::import_backup(
-            Connection::open_in_memory().unwrap(),
-            &MasterKey::from_bytes([1; 32]).unwrap(),
-            &tampered,
-        );
+        let tampered = Keystore::restore_memory(&MasterKey::from_bytes([1; 32]).unwrap(), &tampered);
         assert!(matches!(tampered, Err(PrivacyError::Decrypt(_))));
-        let junk = Keystore::import_backup(
-            Connection::open_in_memory().unwrap(),
-            &MasterKey::from_bytes([1; 32]).unwrap(),
-            b"junk",
-        );
+        let junk = Keystore::restore_memory(&MasterKey::from_bytes([1; 32]).unwrap(), b"junk");
         assert!(matches!(junk, Err(PrivacyError::BadBackup)));
 
         // A backup under another key leaves an existing store untouched,
         // its key check included.
         let dir = tempfile::tempdir().unwrap();
-        let kept = dir.path().join("kept.db");
-        Keystore::open_file(&kept, &MasterKey::from_bytes([3; 32]).unwrap())
-            .unwrap()
-            .key_for_sealing("user:7", [7; 32], [7; 24], 0)
-            .unwrap();
+        let owner = crate::key_source::lock_data(dir.path()).unwrap();
+        let kept_master = MasterKey::from_bytes([3; 32]).unwrap();
+        let kept = Keystore::open_owned(&owner, &kept_master).unwrap();
+        kept.key_for_sealing("user:7", [7; 32], [7; 24], 0).unwrap();
         assert!(matches!(
-            Keystore::import_backup_file(&kept, &MasterKey::from_bytes([3; 32]).unwrap(), &backup),
+            Keystore::restore_owned(&owner, &kept_master, &backup),
             Err(PrivacyError::Decrypt(_))
         ));
-        let still = Keystore::open_file(&kept, &MasterKey::from_bytes([3; 32]).unwrap()).unwrap();
-        found(still.key("user:7", 1).unwrap());
+        found(kept.key("user:7", 1).unwrap());
+        found(kept.reopen_owned().unwrap().key("user:7", 1).unwrap());
 
         // A restore over a keystore of another key replaces it, key included.
-        let path = dir.path().join("keystore.db");
-        Keystore::open_file(&path, &MasterKey::from_bytes([3; 32]).unwrap())
-            .unwrap()
-            .key_for_sealing("user:9", [9; 32], [9; 24], 0)
-            .unwrap();
-        let replaced =
-            Keystore::import_backup_file(&path, &MasterKey::from_bytes([1; 32]).unwrap(), &backup)
-                .unwrap();
+        let replacement = tempfile::tempdir().unwrap();
+        let replacement_owner = crate::key_source::lock_data(replacement.path()).unwrap();
+        let old = Keystore::open_owned(&replacement_owner, &kept_master).unwrap();
+        old.key_for_sealing("user:9", [9; 32], [9; 24], 0).unwrap();
+        let restored_master = MasterKey::from_bytes([1; 32]).unwrap();
+        let replaced = Keystore::restore_owned(&replacement_owner, &restored_master, &backup).unwrap();
         found(replaced.key("user:1", 1).unwrap());
+        assert!(matches!(old.key("user:9", 1), Err(PrivacyError::KeyMismatch(_))));
         drop(replaced);
-        Keystore::open_file(&path, &MasterKey::from_bytes([1; 32]).unwrap()).unwrap();
+        Keystore::open_owned(&replacement_owner, &restored_master).unwrap();
     }
 
     /// Review F4: a key of the right version from another lineage (a new
@@ -1045,3 +1375,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "keystore/revision_tests.rs"]
+mod revision_tests;

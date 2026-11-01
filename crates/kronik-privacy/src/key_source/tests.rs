@@ -114,6 +114,11 @@ struct Transit {
     hang_decrypt: bool,
 }
 impl Net for Transit {
+    fn http_authorized(&self, _: HttpRequest, _: kronik_core::authority::AuthLease)
+        -> BoxFuture<'static, Result<HttpResponse, NetError>>
+    {
+        panic!("fixed-cause B1 master fixture must not receive an ordinary secret operation")
+    }
     fn http(&self, r: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
@@ -314,7 +319,7 @@ fn offline_validation_preserves_crashed_wal_and_absent_shm() {
     )
     .unwrap();
     store
-        .set("signing", b"secret-value", [9; 24], 1, "t", "r")
+        .set_at("signing", 1, b"secret-value", [9; 24], 1, "t", "r")
         .unwrap();
     let db = std::fs::read(keys.join("secrets.db")).unwrap();
     let wal = std::fs::read(keys.join("secrets.db-wal")).unwrap();

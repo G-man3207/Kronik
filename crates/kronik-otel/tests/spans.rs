@@ -1136,6 +1136,7 @@ fn no_needle_leaves_in_an_export_request() {
             content_type: "text/plain".into(),
             body: sealed(&format!("body-{N}")),
             blobs: vec![],
+            retained_compensation_source: None,
         })
     };
     let effect = pb::EffectRecord {

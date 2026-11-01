@@ -5,19 +5,22 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use kronik_core::authority::AuthLease;
 use kronik_core::env::{Env, HttpRequest, HttpResponse, NetError};
+use kronik_sched::Node;
 
 /// A collector or webhook slower than this counts as a failed attempt.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// POSTs `body`. The error is a status code: `connect` (not sent), `io`
-/// (maybe delivered) or `timeout`.
+/// (maybe delivered), `timeout`, or the actual original-admission error code.
 pub async fn post(
-    env: &Env,
+    node: &Node,
     url: String,
     mut headers: Vec<(String, String)>,
     content_type: &str,
     body: Bytes,
+    original: AuthLease,
 ) -> Result<HttpResponse, &'static str> {
     headers.push(("content-type".into(), content_type.into()));
     let req = HttpRequest {
@@ -27,8 +30,48 @@ pub async fn post(
         body,
         max_response_bytes: 1 << 20,
     };
-    match env.timeout(TIMEOUT, env.net.http(req)).await {
-        Ok(Ok(resp)) => Ok(resp),
+    let env = node.env().clone();
+    let deadline = env.clock.monotonic().saturating_add(TIMEOUT);
+    let owned_env = env.clone();
+    let work = node.authorized_effect(original.clone(), move || async move {
+        let remaining = deadline.saturating_sub(owned_env.clock.monotonic());
+        if remaining.is_zero() { return Ok(Err("timeout")); }
+        Ok(match owned_env.timeout(remaining, owned_env.net.http_authorized(req, original)).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(NetError::Connect(_))) => Err("connect"),
+            Ok(Err(NetError::Io(_) | NetError::TooLarge)) => Err("io"),
+            Err(_) => Err("timeout"),
+        })
+    });
+    match env.timeout(TIMEOUT, work).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(error.code.as_str()),
+        Err(_) => Err("timeout"),
+    }
+}
+
+/// Actor-free delivery from an existing owned export job. The same original
+/// admits Net's actual final enqueue; the total timeout includes response EOF.
+/// Root Net returns buffered bytes, so no body adapter or second client is used.
+pub async fn post_authorized(
+    env: &Env,
+    url: String,
+    mut headers: Vec<(String, String)>,
+    content_type: &str,
+    body: Bytes,
+    original: AuthLease,
+) -> Result<HttpResponse, &'static str> {
+    headers.push(("content-type".into(), content_type.into()));
+    let request = HttpRequest {
+        method: "POST".into(),
+        url,
+        headers,
+        body,
+        max_response_bytes: 1 << 20,
+    };
+    match env.timeout(TIMEOUT, env.net.http_authorized(request, original)).await {
+        Ok(Ok(response)) if response.body.len() <= 1 << 20 => Ok(response),
+        Ok(Ok(_)) => Err("io"),
         Ok(Err(NetError::Connect(_))) => Err("connect"),
         Ok(Err(NetError::Io(_) | NetError::TooLarge)) => Err("io"),
         Err(_) => Err("timeout"),

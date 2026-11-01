@@ -12,10 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use kronik_core::authority::AuthLease;
 use kronik_core::ids::Lsn;
 use kronik_log::Committed;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::Node;
+use kronik_sched::secrets::CertifiedSecretSnapshot;
 
 use crate::audit::Mapper;
 use crate::cursor::{Cursors, Generation};
@@ -534,6 +536,7 @@ pub struct Settings {
 }
 
 /// One prepared batch.
+#[derive(PartialEq, Eq)]
 pub struct Batch {
     /// The record range it covers.
     first: Lsn,
@@ -566,7 +569,11 @@ fn cover_gap(coverage: &mut Vec<(Lsn, Lsn)>, mut from: Lsn, mut to: Lsn) {
 }
 
 impl AuditExport {
-    async fn put(&mut self, batch: &Batch) -> Result<(), (String, Option<Duration>)> {
+    async fn put(
+        &mut self,
+        batch: &Batch,
+        original: AuthLease,
+    ) -> Result<(), (String, Option<Duration>)> {
         let env = self.node.env();
         match &mut self.target {
             Target::File(writer) => {
@@ -574,9 +581,20 @@ impl AuditExport {
                     return Err(("storage_sync".into(), None));
                 }
                 let (writer, body) = (writer.clone(), batch.body.clone());
-                let done = env
-                    .blocking("audit-file", move || follow_lock(&writer).append(&body))
-                    .await;
+                let env = env.clone();
+                let retained = original.clone();
+                let done = self
+                    .node
+                    .authorized_effect(original, move || async move {
+                        Ok(env
+                            .blocking("audit-file", move || {
+                                let _retained = retained;
+                                follow_lock(&writer).append(&body)
+                            })
+                            .await)
+                    })
+                    .await
+                    .map_err(|e| (e.code.as_str().to_owned(), None))?;
                 match done {
                     Some(Ok(())) => Ok(()),
                     Some(Err(e)) => {
@@ -598,11 +616,12 @@ impl AuditExport {
                 h.push(("kronik-audit-range".into(), range));
                 h.push(("idempotency-key".into(), key));
                 match http::post(
-                    env,
+                    &self.node,
                     url.clone(),
                     h,
                     "application/x-ndjson",
                     batch.body.clone(),
+                    original,
                 )
                 .await
                 {
@@ -628,27 +647,43 @@ impl AuditExport {
                     (e.code().into(), None)
                 };
                 if occupied.is_none() {
-                    let mut last = 0;
-                    remote
-                        .list_each(OBJECT_PREFIX, |name| {
-                            let sequence = object_sequence(name).ok_or_else(|| {
-                                kronik_ship::ShipError::Config(
-                                    "invalid audit/v2 object name".into(),
-                                )
-                            })?;
-                            last = last.max(sequence);
-                            Ok(())
+                    let remote = remote.clone();
+                    let prefix = OBJECT_PREFIX.to_owned();
+                    let last = self
+                        .node
+                        .authorized_effect(original.clone(), move || async move {
+                            let mut last = 0;
+                            let listed = remote
+                                .list_each(&prefix, |name| {
+                                    let sequence = object_sequence(name).ok_or_else(|| {
+                                        kronik_ship::ShipError::Config(
+                                            "invalid audit/v2 object name".into(),
+                                        )
+                                    })?;
+                                    last = last.max(sequence);
+                                    Ok(())
+                                })
+                                .await;
+                            Ok(listed.map(|()| last))
                         })
                         .await
+                        .map_err(|e| (e.code.as_str().to_owned(), None))?
                         .map_err(error)?;
                     *occupied = Some(last);
                 }
                 let sequence = occupied
                     .and_then(|last| last.checked_add(1))
                     .ok_or_else(|| ("s3_order_exhausted".into(), None))?;
-                let created = remote
-                    .put_create(&object_name(sequence), batch.body.clone().into())
+                let remote = remote.clone();
+                let name = object_name(sequence);
+                let body = batch.body.clone();
+                let created = self
+                    .node
+                    .authorized_effect(original, move || async move {
+                        Ok(remote.put_create(&name, body.into()).await)
+                    })
                     .await
+                    .map_err(|e| (e.code.as_str().to_owned(), None))?
                     .map_err(error)?;
                 // Both results prove the slot exists. An unknown write error does not.
                 *occupied = Some(sequence);
@@ -671,24 +706,26 @@ impl follow::Sink for AuditExport {
 
     async fn prepare(
         &mut self,
-        records: Vec<Committed>,
+        records: &[(pb::ActorSource, Committed)],
         generation: Generation,
+        _reader: &kronik_sched::ShardReader,
+        snapshot: &CertifiedSecretSnapshot,
+        original: AuthLease,
     ) -> Result<Batch, String> {
-        let first = records.first().map_or(0, |c| c.lsn);
-        let last = records.last().map_or(0, |c| c.lsn);
-        let secrets = self
-            .node
-            .secret_values()
-            .map_err(|e| e.code.as_str().to_owned())?;
+        original.check().map_err(|e| e.code.as_str().to_owned())?;
+        let first = records.first().map_or(0, |(_, record)| record.lsn);
+        let last = records.last().map_or(0, |(_, record)| record.lsn);
+        let secrets = kronik_sched::effects::secret_patterns(&snapshot.values);
         let mut body = Vec::new();
         let mut restored = false;
-        for c in &records {
+        for (source, c) in records {
+            if source.lsn != c.lsn || source.shard.is_some() { return Err("STORAGE_CORRUPT".into()); }
             restored |=
                 matches!(&c.record, kronik_proto::Record::AuditEvent(e) if e.action == "restore");
             for l in self
                 .mapper
-                .lines(c.lsn, &c.record, &secrets)
-                .map_err(|_| "STORAGE_CORRUPT".to_owned())?
+                .lines_actor_at(source, &c.record, &secrets)
+                .map_err(|error| error.code.as_str().to_owned())?
             {
                 body.extend_from_slice(l.to_json().as_bytes());
                 body.push(b'\n');
@@ -705,7 +742,7 @@ impl follow::Sink for AuditExport {
         })
     }
 
-    async fn deliver(&mut self, batch: &Batch) -> Delivery {
+    async fn deliver(&mut self, batch: &Batch, original: AuthLease) -> Delivery {
         if let Target::File(writer) = &self.target
             && follow_lock(writer).failed
         {
@@ -715,7 +752,7 @@ impl follow::Sink for AuditExport {
             };
         }
         if !batch.body.is_empty()
-            && let Err((code, after)) = self.put(batch).await
+            && let Err((code, after)) = self.put(batch, original).await
         {
             return Delivery::Retry { code, after };
         }
@@ -732,7 +769,7 @@ impl follow::Sink for AuditExport {
         }
     }
 
-    async fn rewind(&mut self, to: Lsn, generation: Generation) -> Result<(), String> {
+    async fn rewind(&mut self, to: Lsn, generation: Generation, _reader: &kronik_sched::ShardReader) -> Result<(), String> {
         self.node
             .retention_hold()
             .rewind(generation, to, self.node.env().clock.wall_ms());
@@ -742,7 +779,7 @@ impl follow::Sink for AuditExport {
     /// Records the gap as an `audit.gap` event. A failure is returned, so
     /// that the follower keeps its cursor before the gap and tries again
     /// (review M2).
-    async fn gap(&mut self, from: Lsn, to: Lsn) -> Result<(), String> {
+    async fn gap(&mut self, from: Lsn, to: Lsn, original: AuthLease) -> Result<(), String> {
         if self.gap_coverage.is_none() {
             let mut coverage = Vec::new();
             self.node
@@ -790,7 +827,13 @@ impl follow::Sink for AuditExport {
         .into();
         if let Err(e) = self
             .node
-            .record_audit_event("audit.gap", STREAM, details, audit)
+            .record_system_audit_event(
+                kronik_sched::SystemAudit::RetentionGap,
+                STREAM,
+                details,
+                audit,
+                original,
+            )
             .await
         {
             tracing::error!(from, to, error = %e.message, "audit export: recording the gap failed");
@@ -829,6 +872,7 @@ pub async fn start(
     cursors: Arc<Cursors>,
     settings: Settings,
     mapper: Arc<Mapper>,
+    original: AuthLease,
 ) -> Result<Arc<Stream>, String> {
     if matches!(&settings.sink, Sink::File(_)) {
         validate_file_max_bytes(settings.file_max_bytes).map_err(|e| e.to_string())?;
@@ -842,17 +886,18 @@ pub async fn start(
     let saved = saved_entry.as_ref().map(|entry| entry.lsn);
     let cursor = start_cursor(saved, settings.from_now, log_first, node.applied_lsn());
     if Some(cursor) != saved {
-        cursors
-            .save(
-                STREAM,
-                crate::cursor::Entry {
-                    lsn: cursor,
-                    state: serde_json::Value::Null,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| format!("saving the audit cursor: {e}"))?;
+        let cursors = cursors.clone();
+        let entry = crate::cursor::Entry {
+            lsn: cursor,
+            state: serde_json::Value::Null,
+            ..Default::default()
+        };
+        node.authorized_effect(original.clone(), move || async move {
+            Ok(cursors.save(STREAM, entry).await)
+        })
+        .await
+        .map_err(|e| e.code.as_str().to_owned())?
+        .map_err(|_| "cursor_save".to_owned())?;
     }
     let hold = node.retention_hold();
     hold.configure(settings.hold_release, settings.max_hold);
@@ -881,7 +926,7 @@ pub async fn start(
             occupied: None,
         },
     };
-    let stream = Stream::new(STREAM, true, settings.sink.shown(), cursor, cursors.clone());
+    let stream = Stream::new_audit(STREAM, true, settings.sink.shown(), cursor, cursors.clone());
     let export = AuditExport {
         node: node.clone(),
         mapper,
@@ -892,9 +937,9 @@ pub async fn start(
         batch: settings.batch_records.max(1),
         interval: settings.interval,
     };
-    drop(node.env().spawn(
+    stream.own_task(node.env().spawn(
         "audit-export",
-        follow::follow(node.clone(), stream.clone(), opts, export),
+        follow::follow(node.clone(), stream.clone(), opts, export, original),
     ));
     tracing::info!(sink = %settings.sink.shown(), cursor, "exporting the audit log");
     Ok(stream)
@@ -961,12 +1006,13 @@ mod tests {
         }
         fn batch(
             rt: &tokio::runtime::Runtime,
-            node: &Node,
+            node: &Arc<Node>,
             export: &mut AuditExport,
             generation: Generation,
-        ) -> Batch {
+            original: AuthLease,
+        ) -> (Batch, AuthLease) {
             let from = node.applied_lsn() + 1;
-            rt.block_on(node.record_audit_event(
+            rt.block_on(node.record_audit_event_authorized(
                 "keys.rewrap",
                 "",
                 Default::default(),
@@ -975,16 +1021,18 @@ mod tests {
                     reason: String::new(),
                     wall_time_ms: node.env().clock.wall_ms(),
                 },
+                original.clone(),
             ))
             .unwrap();
-            let mut records = Vec::new();
-            rt.block_on(node.reader().read(from, node.applied_lsn(), |record| {
-                records.push(record);
-                Ok(())
-            }))
+            let (snapshot, publication) = node.native_secret_snapshot_with_publication().unwrap();
+            let reader = Arc::new(rt.block_on(node.capture_system_export_reader()).unwrap());
+            let retained = follow::RetainedDisclosure::native(reader.clone(), snapshot.clone(), publication, original);
+            let records = rt.block_on(reader.local_export_page(from - 1, 256, follow::BATCH_BYTES)).unwrap().records;
+            let prepared = rt.block_on(follow::Sink::prepare(
+                export, &records, generation, &reader, &snapshot, retained.clone(),
+            ))
             .unwrap();
-            rt.block_on(follow::Sink::prepare(export, records, generation))
-                .unwrap()
+            (prepared, retained)
         }
         let data = tempfile::tempdir().unwrap();
         let objects = tempfile::tempdir().unwrap();
@@ -1002,6 +1050,7 @@ mod tests {
         let node = rt
             .block_on(start_local(env, data.path(), NodeConfig::default()))
             .unwrap();
+        let original = node.local_operator_authority().unwrap();
         let remote =
             kronik_ship::Remote::open(&format!("file://{}", objects.path().display()), None)
                 .unwrap();
@@ -1028,10 +1077,10 @@ mod tests {
         );
         // A stale listing cannot acknowledge somebody else's occupied slot.
         let mut export = make_export(Some(0));
-        let first = batch(&rt, &node, &mut export, [1; 16]);
+        let (first, first_guard) = batch(&rt, &node, &mut export, [1; 16], original.clone());
         node.retention_hold().set(0, node.env().clock.wall_ms());
         assert!(matches!(
-            rt.block_on(follow::Sink::deliver(&mut export, &first)),
+            rt.block_on(follow::Sink::deliver(&mut export, &first, first_guard.clone())),
             Delivery::Retry { code, .. } if code == "s3_conflict"
         ));
         assert_eq!(node.retention_hold().floor(), Some(0));
@@ -1040,7 +1089,7 @@ mod tests {
             b"earlier publication\n"
         );
         assert_eq!(
-            rt.block_on(follow::Sink::deliver(&mut export, &first)),
+            rt.block_on(follow::Sink::deliver(&mut export, &first, first_guard.clone())),
             Delivery::Delivered
         );
         assert_eq!(node.retention_hold().floor(), Some(0));
@@ -1049,9 +1098,9 @@ mod tests {
 
         wall.value.store(1, Ordering::SeqCst);
         export = make_export(None);
-        let mut second = batch(&rt, &node, &mut export, [2; 16]);
+        let (mut second, second_guard) = batch(&rt, &node, &mut export, [2; 16], original.clone());
         assert_eq!(
-            rt.block_on(follow::Sink::deliver(&mut export, &second)),
+            rt.block_on(follow::Sink::deliver(&mut export, &second, second_guard.clone())),
             Delivery::Delivered
         );
         let line = |sequence| {
@@ -1063,7 +1112,7 @@ mod tests {
         assert_eq!(line(3).at_wall_ms, 1);
         second.generation = [3; 16];
         assert_eq!(
-            rt.block_on(follow::Sink::deliver(&mut export, &second)),
+            rt.block_on(follow::Sink::deliver(&mut export, &second, second_guard.clone())),
             Delivery::Delivered
         );
         assert_eq!(line(3), line(4));
@@ -1079,13 +1128,13 @@ mod tests {
         std::fs::rename(&namespace, &saved).unwrap();
         std::fs::write(&namespace, b"temporarily blocked").unwrap();
         assert!(matches!(
-            rt.block_on(follow::Sink::deliver(&mut export, &second)),
+            rt.block_on(follow::Sink::deliver(&mut export, &second, second_guard.clone())),
             Delivery::Retry { .. }
         ));
         std::fs::remove_file(&namespace).unwrap();
         std::fs::rename(&saved, &namespace).unwrap();
         assert_eq!(
-            rt.block_on(follow::Sink::deliver(&mut export, &second)),
+            rt.block_on(follow::Sink::deliver(&mut export, &second, second_guard.clone())),
             Delivery::Delivered
         );
         assert!(objects.path().join(object_name(5)).is_file());
@@ -1101,10 +1150,41 @@ mod tests {
         );
         export = make_export(None);
         assert!(matches!(
-            rt.block_on(follow::Sink::deliver(&mut export, &second)),
+            rt.block_on(follow::Sink::deliver(&mut export, &second, second_guard.clone())),
             Delivery::Retry { code, .. } if code == "s3_order_exhausted"
         ));
         assert_eq!(node.retention_hold().floor(), Some(first.last));
+        node.stop_native_execution().unwrap();
+        for occupied in [None, Some(5)] {
+            let mut stopped = make_export(occupied);
+            assert!(matches!(
+                rt.block_on(follow::Sink::deliver(&mut stopped, &second, second_guard.clone())),
+                Delivery::Retry { .. }
+            ));
+            let Target::S3 { occupied: after, .. } = stopped.target else { unreachable!() };
+            assert_eq!(after, occupied);
+        }
+        assert!(!objects.path().join(object_name(6)).exists());
+        let dir = objects.path().join("denied-file");
+        let mut stopped = AuditExport {
+            node: node.clone(),
+            mapper: mapper.clone(),
+            target: Target::File(Arc::new(Mutex::new(FileWriter {
+                dir: dir.clone(),
+                max_bytes: 1024,
+                sink: None,
+                failed: false,
+            }))),
+            gap_coverage: None,
+        };
+        assert!(matches!(
+            rt.block_on(follow::Sink::deliver(&mut stopped, &second, second_guard.clone())),
+            Delivery::Retry { .. }
+        ));
+        assert!(!dir.exists());
+        let before = node.applied_lsn();
+        assert!(rt.block_on(follow::Sink::gap(&mut stopped, 1, 1, original)).is_err());
+        assert_eq!(node.applied_lsn(), before);
     }
 
     #[test]
@@ -1252,6 +1332,7 @@ mod tests {
             .await
             .unwrap()
         });
+        let original = node.local_operator_authority().unwrap();
         let audit = || pb::Audit {
             token_id: "token:test".into(),
             reason: "durability failure".into(),
@@ -1262,7 +1343,7 @@ mod tests {
             "/../../tests/guests/counter.wasm",
         ))
         .unwrap();
-        rt.block_on(node.deploy(&wasm, audit(), false)).unwrap();
+        rt.block_on(node.deploy(&wasm, audit(), false, original.clone())).unwrap();
         let mut writer = FileWriter {
             dir: out.path().join("audit"),
             max_bytes: 1024,
@@ -1285,7 +1366,7 @@ mod tests {
             },
         ))
         .unwrap();
-        let stream = Stream::new(STREAM, true, "file://".into(), 0, cursors.clone());
+        let stream = Stream::new_audit(STREAM, true, "file://".into(), 0, cursors.clone());
         let mut export = AuditExport {
             node: node.clone(),
             mapper: Arc::new(Mapper {
@@ -1305,10 +1386,10 @@ mod tests {
             body: Bytes::new(),
         };
         assert!(matches!(
-            rt.block_on(follow::Sink::deliver(&mut export, &empty)),
+            rt.block_on(follow::Sink::deliver(&mut export, &empty, original.clone())),
             Delivery::Retry { .. },
         ));
-        drop(node.env().spawn(
+        stream.own_task(node.env().spawn(
             "poisoned-export-test",
             follow::follow(
                 node.clone(),
@@ -1318,6 +1399,7 @@ mod tests {
                     interval: Duration::from_millis(10),
                 },
                 export,
+                original.clone(),
             ),
         ));
         for _ in 0..200 {
@@ -1340,6 +1422,7 @@ mod tests {
             },
             audit(),
             false,
+            original.clone(),
         ))
         .unwrap()
         .unwrap();
@@ -1454,6 +1537,7 @@ mod tests {
             let r = kronik_proto::Record::PrivacyMode(pb::PrivacyMode {
                 epoch: lsn,
                 mode: pb::PrivacyState::Off as i32,
+                reseal_requested: false,
                 audit: Some(pb::Audit {
                     token_id: "token:ci".into(),
                     reason: "rotate".into(),

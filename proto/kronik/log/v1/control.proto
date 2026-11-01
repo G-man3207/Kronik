@@ -1,0 +1,101 @@
+syntax = "proto3";
+package kronik.log.v1;
+
+// Public authority metadata, never an enrollment credential or private key.
+// These fields have closed domain validation; they are not scrubbed free text.
+message FleetState {
+  string installation = 1;
+  optional string node = 2;
+  optional string cluster = 3;
+  string controller_origin = 4;
+  repeated string scopes = 5;
+  bytes ca_sha256 = 6;
+  bytes request_id = 7;
+  // Certificate/enrollment generation. Revoke retains it; only a new request advances.
+  uint64 epoch = 8;
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PENDING = 1;
+    REQUESTED = 2;
+    ACTIVE = 3;
+    REVOKED = 4;
+  }
+  Phase phase = 9;
+  optional string controller_id = 10; // Exact lowercase hex(ca_sha256), never response-selected text.
+  bytes csr_der = 11;
+  bytes client_key_sha256 = 12;
+  optional bytes client_cert_der = 13;
+}
+
+// The installation identity is immutable; node/cluster bind an enrollment.
+message InstallationIdentity {
+  string installation = 1;
+}
+
+// Public canonical-profile digest; only principal identifiers are keyed.
+// Bindings contain no raw OIDC subject, email, name, JWT, or client secret.
+message AuthConfig {
+  uint32 version = 1;
+  bool enabled = 2;
+  bytes digest = 3;
+  bytes previous_digest = 4;
+  string issuer = 5;
+  string client_id = 6;
+  string redirect_uri = 7;
+  bool system_roots = 8;
+  repeated bytes trust_roots_sha256 = 9;
+  repeated AuthBinding bindings = 10;
+  uint64 flow_ttl_ms = 11;
+  uint64 session_ttl_ms = 12;
+}
+message AuthBinding {
+  bytes principal_hash = 1;
+  string token_name = 2;
+}
+
+// Self-only logout tombstone. There is deliberately no SessionCreated ledger.
+// session_hash is BLAKE3 of the opaque credential; principal_hash is the
+// protected "kronik oidc binding v1" issuer/subject commitment.
+message AuthSessionRevoked {
+  bytes session_hash = 1;
+  bytes principal_hash = 2;
+  bytes config_digest = 3;
+  oneof config_source {
+    uint64 native_lsn = 4;
+    uint64 metadata_index = 5;
+  }
+  string token_name = 6;
+  uint64 expires_at_ms = 7;
+  SessionMetadataToken metadata_token = 8;
+  SessionPeerBoot peer_boot = 9;
+}
+
+// The exact original token row, not cached scopes or a refreshed principal.
+// auth_config_revision is represented by config_source.metadata_index.
+message SessionMetadataToken {
+  uint64 metadata_revision = 1;
+  uint64 created_index = 2;
+  uint64 token_revision = 3;
+  uint64 fleet_revision = 4; // Zero only when no fleet state was present.
+}
+
+// Exact registered execution boot from the original authenticated peer.
+message SessionPeerBoot {
+  uint64 member_id = 1;
+  uint64 incarnation = 2;
+  bytes boot_id = 3; // The existing PeerContext boot identifier is 32 bytes.
+  // Original registration position, independent of last-effective-auth revision.
+  uint64 registration_index = 4;
+}
+
+// Durable login history, not session creation or an authorization grant.
+// The dedicated producer derives this from the original SessionLease.
+message AuthOidcLogin {
+  bytes principal_hash = 1;
+  bytes config_digest = 2;
+  oneof config_source {
+    uint64 native_lsn = 3;
+    uint64 metadata_index = 4;
+  }
+  string token_name = 5;
+}

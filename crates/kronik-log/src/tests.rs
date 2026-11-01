@@ -107,6 +107,7 @@ fn samples() -> Vec<Record> {
             epoch: 4,
             mode: pb::PrivacyState::On as i32,
             audit,
+            reseal_requested: false,
         }),
         Record::ForeignActor(pb::ForeignActor {
             op: pb::ForeignOp::Remove as i32,
@@ -197,6 +198,24 @@ impl Harness {
         v.sort();
         v
     }
+}
+
+#[tokio::test]
+async fn native_positional_read_binds_the_actual_header_and_record() {
+    let mut h = harness();
+    h.cfg.branch = "retained-native".into();
+    let (log, _, mut committed) = h.open().await.unwrap();
+    let expected = Record::Policy(pb::Policy::default());
+    log.append(expected.clone()).await.unwrap();
+    let committed = committed.recv().await.unwrap();
+    let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), h.cfg.branch.clone());
+    let (namespace, actual) = reader.read_at_with_namespace(committed.pos).await.unwrap();
+    assert_eq!(namespace, "retained-native");
+    assert_eq!(actual.lsn, committed.lsn);
+    assert_eq!(actual.pos, committed.pos);
+    assert_eq!(actual.record, expected);
+    let unrelated = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "replaced-native");
+    assert!(matches!(unrelated.read_at_with_namespace(committed.pos).await, Err(LogError::Corrupt(_))));
 }
 
 struct ReadFs {
@@ -753,6 +772,7 @@ async fn invalid_record_with_valid_crc_is_storage_corrupt() {
                 epoch: 1,
                 mode: 77,
                 audit: None,
+                reseal_requested: false,
             })
             .encode(),
         ),
@@ -1042,4 +1062,39 @@ fn footer_index_rejects_a_footer_that_does_not_parse() {
     std::fs::write(&path, &image).unwrap();
     let err = footer_index(&path).unwrap_err();
     assert!(err.to_string().contains("outside the segment"), "{err}");
+}
+
+#[tokio::test]
+async fn canceling_an_unpolled_real_writer_publishes_native_closure_synchronously() {
+    struct HeldWriter {
+        actual: Arc<dyn kronik_core::env::Spawner>,
+        writer: Mutex<Option<BoxFuture<'static, ()>>>,
+    }
+    impl kronik_core::env::Spawner for HeldWriter {
+        fn spawn(&self, name: &'static str, future: BoxFuture<'static, ()>) {
+            if name == "log-writer" {
+                *self.writer.lock().unwrap() = Some(future);
+            } else {
+                self.actual.spawn(name, future);
+            }
+        }
+        fn spawn_blocking(&self, name: &'static str, work: Box<dyn FnOnce() + Send + 'static>) {
+            self.actual.spawn_blocking(name, work);
+        }
+    }
+    let mut h = harness();
+    let held = Arc::new(HeldWriter { actual: h.env.spawner.clone(), writer: Mutex::new(None) });
+    h.env.spawner = held.clone();
+    let (log, _, _records) = h.open().await.unwrap();
+    let publication = Arc::new(Mutex::new(()));
+    let writer = log.bind_native_execution(publication.clone(), None).unwrap();
+    assert!(writer.is_open());
+    assert!(log.bind_native_execution(Arc::new(Mutex::new(())), None).is_err());
+    let unpolled = held.writer.lock().unwrap().take().unwrap();
+    drop(unpolled);
+    assert!(!writer.is_open(), "receiver cancellation publishes before Drop returns");
+    tokio::time::timeout(Duration::from_secs(2), writer.closed()).await.unwrap();
+    assert!(log.bind_native_execution(publication, None).is_err());
+    assert!(matches!(log.append(begin("canceled-writer")).await, Err(LogError::Stopped(_))));
+    assert!(h.read_all().await.unwrap().is_empty());
 }

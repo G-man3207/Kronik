@@ -19,6 +19,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kronik_core::authority::AuthLease;
 use kronik_core::error::{ApiError, ErrorCode};
 
 use tokio::sync::{Notify, OwnedMutexGuard, OwnedRwLockWriteGuard, RwLock, RwLockReadGuard};
@@ -129,9 +130,14 @@ impl Node {
     /// set switch never lands between the rebase's last round and its
     /// switch, and waits for the switch instead). Its error is
     /// `PROPOSAL_STALE` naming `rebase.max_pause`.
-    pub async fn rebase_pause(&self, max: Duration) -> Result<Drain, ApiError> {
-        let deploy = self.deploy_lock.clone().lock_owned().await;
-        self.drain_with(max, Some(deploy)).await
+    pub async fn rebase_pause(&self, max: Duration, authority: AuthLease) -> Result<Drain, ApiError> {
+        authority.check()?;
+        let deploy = self.lock_deploy_authorized(&authority).await?;
+        tokio::select! {
+            biased;
+            () = authority.cancelled() => Err(ApiError::new(ErrorCode::Unauthenticated, "rebase request revoked while draining")),
+            drain = self.drain_with(max, Some(deploy)) => drain,
+        }
     }
 
     async fn drain_with(

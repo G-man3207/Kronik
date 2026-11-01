@@ -28,6 +28,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 # Proposal jobs run on their own task (M10); their failures are logged.
 tracing = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 kronik-core = { workspace = true, features = ["real"] }

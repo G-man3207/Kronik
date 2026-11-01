@@ -701,16 +701,14 @@ impl Foreign {
         &self,
         name: &str,
         tail: usize,
-        secrets: Vec<(String, Vec<u8>)>,
+        secrets: Vec<(String, Arc<zeroize::Zeroizing<Vec<u8>>>)>,
     ) -> Result<Option<LogTail>, ApiError> {
         if !valid_name(name) {
             return Ok(None);
         }
-        let mut secrets = secrets;
-        if let Some(values) = lock(&self.ctx.injected).get(name) {
-            secrets.extend(values.iter().cloned());
-        }
-        let log = self.ctx.paths.log(name);
+        let ctx = self.ctx.clone();
+        let name = name.to_owned();
+        let log = self.ctx.paths.log(&name);
         let log2 = log.clone();
         let r = self
             .ctx
@@ -719,15 +717,25 @@ impl Foreign {
                 if !log2.exists() && !crate::logs::rotated(&log2).exists() {
                     return Ok(None);
                 }
+                let injected = lock(&ctx.injected);
+                let secrets: Vec<_> = secrets.iter()
+                    .map(|(name, value)| (name.as_str(), value.as_slice()))
+                    .chain(injected.get(&name).into_iter().flatten()
+                        .map(|(name, value)| (name.as_str(), value.as_slice())))
+                    .collect();
                 crate::logs::tail(&log2, tail, &secrets).map(Some)
             })
             .await
             .ok_or_else(|| ApiError::new(ErrorCode::Internal, "the log task was dropped"))?
-            .map_err(|e| {
-                ApiError::new(
+            .map_err(|error| match error {
+                crate::logs::TailError::Redaction(error) => ApiError::new(
+                    ErrorCode::SecretUnavailable,
+                    format!("foreign log redaction failed: {error}; check `kronik doctor` and restore complete redaction within the existing log and secret inventory budgets before retrying"),
+                ),
+                crate::logs::TailError::Io(error) => ApiError::new(
                     ErrorCode::ForeignUnavailable,
-                    format!("reading {}: {e}", log.display()),
-                )
+                    format!("reading {}: {error}", log.display()),
+                ),
             })?;
         Ok(r.map(|(lines, truncated)| LogTail { lines, truncated }))
     }
@@ -1199,6 +1207,29 @@ mod tests {
             pull_timeout: Duration::from_secs(5),
             checkpoints_kept: 3,
         }
+    }
+
+    #[tokio::test]
+    async fn logs_redact_short_literals_and_propagate_limit_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = Foreign::new(
+            Env::real(tokio::runtime::Handle::current()),
+            config(tmp.path()),
+        );
+        let log = f.ctx.paths.log("echo");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "1 true\n").unwrap();
+        lock(&f.ctx.injected).insert("echo".into(), vec![("one-byte".into(), b"1".to_vec())]);
+        let result = f.logs("echo", 10, vec![(
+            "literal".into(), Arc::new(zeroize::Zeroizing::new(b"true".to_vec())),
+        )]).await.unwrap().unwrap();
+        assert_eq!(result.lines, ["[secret:one-byte] [secret:literal]"]);
+        assert!(!result.truncated);
+
+        std::fs::write(&log, vec![b'1'; (crate::logs::ROTATE_BYTES / 4) as usize]).unwrap();
+        let error = f.logs("echo", 1, Vec::new()).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::SecretUnavailable);
+        assert!(error.message.contains("REDACTION_OUTPUT_LIMIT"));
     }
 
     /// A runtime's state file holds the spec with resolved secret values,

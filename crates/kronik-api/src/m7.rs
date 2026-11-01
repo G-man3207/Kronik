@@ -7,7 +7,7 @@ use kronik_proto::log::v1 as pb;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Api, ApiRequest, ApiResponse, Query, Result, json, ok, reason};
+use crate::{Api, AuthorizedRequest, ApiResponse, Query, Result, json, ok, reason};
 
 /// How long `add` waits for the actor to leave `starting`.
 const ADD_WAIT: Duration = Duration::from_secs(10);
@@ -171,7 +171,7 @@ fn not_found(name: &str) -> ApiError {
 impl Api {
     pub(crate) async fn route_m7(
         &self,
-        req: &ApiRequest,
+        req: &AuthorizedRequest,
         segs: &[&str],
         q: &Query,
     ) -> Option<Result<ApiResponse>> {
@@ -236,7 +236,7 @@ impl Api {
         }
     }
 
-    async fn foreign_add(&self, req: &ApiRequest) -> Result<ApiResponse> {
+    async fn foreign_add(&self, req: &AuthorizedRequest) -> Result<ApiResponse> {
         let r: ForeignAddRequest = json(&req.body)?;
         reason(&r.reason)?;
         let foreign = self.foreign_manager()?.clone();
@@ -271,7 +271,7 @@ impl Api {
         record.audit = Some(audit.clone());
         let added = self
             .node
-            .foreign_add(plan.record.clone(), audit, r.dry_run)
+            .foreign_add(plan.record.clone(), audit, r.dry_run, req.authority.clone())
             .await;
         let warnings = plan.warnings.clone();
         // A dry run or a refused write keeps no blob of the image.
@@ -285,32 +285,26 @@ impl Api {
         if r.dry_run {
             view.status = None;
         }
-        ok(&ForeignAddResponse {
-            dry_run: r.dry_run,
-            foreign: view,
-            warnings,
-        })
+        self.ok_scrubbed(ForeignAddResponse { dry_run: r.dry_run,
+        foreign: view,
+        warnings, })
     }
 
     fn foreign_list(&self) -> Result<ApiResponse> {
         let config = self.node.config_now();
         let lsns = self.config_lsns();
-        ok(&ForeignListResponse {
-            foreign: config
-                .foreign_actors()
-                .map(|r| self.foreign_view(r, lsns.get(&r.epoch).copied().unwrap_or(0)))
-                .collect(),
-            unavailable: self.foreign.as_ref().and_then(|f| f.off()),
-        })
+        self.ok_scrubbed(ForeignListResponse { foreign: config
+            .foreign_actors()
+            .map(|r| self.foreign_view(r, lsns.get(&r.epoch).copied().unwrap_or(0)))
+            .collect(),
+        unavailable: self.foreign.as_ref().and_then(|f| f.off()), })
     }
 
     fn foreign_show(&self, name: &str) -> Result<ApiResponse> {
         let config = self.node.config_now();
         let r = config.foreign(name).ok_or_else(|| not_found(name))?;
         let lsn = self.config_lsns().get(&r.epoch).copied().unwrap_or(0);
-        ok(&ForeignShowResponse {
-            foreign: self.foreign_view(r, lsn),
-        })
+        self.ok_scrubbed(ForeignShowResponse { foreign: self.foreign_view(r, lsn), })
     }
 
     async fn foreign_logs(&self, name: &str, q: &Query) -> Result<ApiResponse> {
@@ -330,11 +324,11 @@ impl Api {
         })
     }
 
-    async fn foreign_remove(&self, req: &ApiRequest, name: &str) -> Result<ApiResponse> {
+    async fn foreign_remove(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: ForeignRemoveRequest = json(&req.body)?;
         reason(&r.reason)?;
         let audit = self.audit(req, r.reason.clone());
-        let (epoch, lsn) = self.node.foreign_remove(name, audit, r.dry_run).await?;
+        let (epoch, lsn) = self.node.foreign_remove(name, audit, r.dry_run, req.authority.clone()).await?;
         ok(&ForeignRemoveResponse {
             dry_run: r.dry_run,
             removed: ForeignRemoved {

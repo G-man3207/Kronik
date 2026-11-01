@@ -217,6 +217,7 @@ impl Proc {
             content_type: "text/plain".into(),
             body: plain(body),
             blobs: vec![],
+            retained_compensation_source: None,
         };
         self.rt
             .block_on(

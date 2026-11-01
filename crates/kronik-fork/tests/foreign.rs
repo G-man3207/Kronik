@@ -168,6 +168,7 @@ fn message(body: &str) -> pb::Message {
         content_type: "text/plain".into(),
         body: plain(body),
         blobs: vec![],
+        retained_compensation_source: None,
     }
 }
 

@@ -982,7 +982,7 @@ fn wait_done(
             d.saturating_duration_since(Instant::now())
                 .min(super::REQUEST_TIMEOUT)
         });
-        let delay = match ctx.request_within("GET", &proposal_path(id), None, limit) {
+        let delay = match ctx.request_within("GET", &proposal_path(id), None, None, limit) {
             Ok(body) => {
                 let p: ProposalInfo = ctx.decode(&body)?;
                 if p.status != "running" {

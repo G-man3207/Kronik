@@ -8,9 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kronik_core::causal;
+use kronik_core::authority::AuthLease;
 use kronik_core::env::{BoxFuture, Env};
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
-use kronik_effects::http::{fingerprint, parse_url, target_of};
+use kronik_core::error::ErrorCode;
+use kronik_effects::http::{CompiledScrubber, fingerprint, fingerprint_v2, parse_request_url, target_of};
 use kronik_effects::{Config, ConfigHistory};
 use kronik_log::{Committed, Position};
 use kronik_privacy::SecretStore;
@@ -20,7 +22,7 @@ use kronik_runtime::{
     CallOutcome, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchHeader, FetchOutcome,
     FetchRequest, GateError, Program, TurnLimits, TurnRequest,
 };
-use kronik_sched::effects::{map_call_outcome, outcome_of_call, outcome_of_fetch};
+use kronik_sched::effects::{map_call_outcome, outcome_of_fetch};
 use kronik_sched::host::{SqlHandle, SqlTurn};
 use kronik_store::Store;
 use kronik_store::sql::{Limits, MemOpener, SqlPool, TurnOpts};
@@ -38,6 +40,8 @@ pub enum ReplayError {
     Store(#[from] kronik_store::StoreError),
     #[error("replay failed: {0}")]
     Host(String),
+    #[error("replay prerequisite is unavailable: {0:?}")]
+    Prerequisite(ErrorCode),
     /// A recorded input holds a sealed value whose subject key this node's
     /// keystore lacks.
     #[error("replay failed: {0}")]
@@ -50,6 +54,12 @@ pub struct ForkKind {
     pub hash: CodeHash,
     pub program: Arc<Program>,
     pub schema_version: u32,
+}
+
+#[derive(Clone)]
+enum ReplayDispatch {
+    RecordedOnly,
+    Authorized(AuthLease),
 }
 
 /// Everything a replay needs besides the stores.
@@ -87,6 +97,7 @@ pub struct ReplaySetup {
     /// The fork's copies of `fork_mode = "sandbox"` foreign actors (M14,
     /// ADR 0019), used by continuous replay only.
     pub copies: Option<ForkCopies>,
+    dispatch: ReplayDispatch,
 }
 
 /// The copies of foreign actors a fork's continuous replay talks to, and
@@ -113,6 +124,29 @@ impl ReplaySetup {
         kinds: BTreeMap<String, ForkKind>,
         config: Config,
         secrets: Option<Arc<SecretStore>>,
+        original: AuthLease,
+    ) -> ReplaySetup {
+        Self::with_dispatch(fork, index, kinds, config, secrets, ReplayDispatch::Authorized(original))
+    }
+
+    /// Uses actual historical source data without granting ordinary physical I/O.
+    pub fn recorded(
+        fork: String,
+        index: Arc<ProductionIndex>,
+        kinds: BTreeMap<String, ForkKind>,
+        config: Config,
+        secrets: Option<Arc<SecretStore>>,
+    ) -> ReplaySetup {
+        Self::with_dispatch(fork, index, kinds, config, secrets, ReplayDispatch::RecordedOnly)
+    }
+
+    fn with_dispatch(
+        fork: String,
+        index: Arc<ProductionIndex>,
+        kinds: BTreeMap<String, ForkKind>,
+        config: Config,
+        secrets: Option<Arc<SecretStore>>,
+        dispatch: ReplayDispatch,
     ) -> ReplaySetup {
         let simulators = Arc::new(crate::simulators::Simulators::new(&index, &[]));
         ReplaySetup {
@@ -133,6 +167,7 @@ impl ReplaySetup {
             prod_store: None,
             progress: None,
             rebase: false,
+            dispatch,
         }
     }
 
@@ -405,7 +440,7 @@ impl Runner {
     }
 
     /// Runs queued turns in order until the queue is empty.
-    async fn drain(self: Arc<Self>) -> Result<(), ReplayError> {
+    async fn drain(self: Arc<Self>, dispatch: ReplayDispatch) -> Result<(), ReplayError> {
         loop {
             let next = lock(&self.queue).pop_first();
             let Some((order, p)) = next else {
@@ -426,7 +461,7 @@ impl Runner {
                 _ => false,
             } || self.resend_not_needed(&p);
             if !skip {
-                self.clone().run(p, order).await?;
+                self.clone().run(p, order, dispatch.clone()).await?;
             }
             if root
                 && !self.isolated
@@ -659,6 +694,7 @@ impl Runner {
         self: Arc<Self>,
         p: Pending,
         order: Vec<u64>,
+        dispatch: ReplayDispatch,
     ) -> BoxFuture<'static, Result<ForkTurn, ReplayError>> {
         Box::pin(async move {
             self.flush_leaves()?;
@@ -704,7 +740,7 @@ impl Runner {
                 };
                 let mut morder = order.clone();
                 morder.push(0);
-                let mt = self.clone().run(m, morder).await?;
+                let mt = self.clone().run(m, morder, dispatch.clone()).await?;
                 if mt
                     .record
                     .outcome
@@ -726,7 +762,7 @@ impl Runner {
                 Some(pb::input::Kind::Migrate(m)) => m.to_schema_version,
                 _ => target,
             };
-            self.run_turn(p, order, kind, version, migrate_input).await
+            self.run_turn(p, order, kind, version, migrate_input, dispatch).await
         })
     }
 
@@ -737,6 +773,7 @@ impl Runner {
         kind: ForkKind,
         schema_version: u32,
         migrate: bool,
+        dispatch: ReplayDispatch,
     ) -> Result<ForkTurn, ReplayError> {
         let prod = self.setup.index.turn(&p.key);
         let prod_lsn = prod.map(|(l, _)| l);
@@ -792,6 +829,7 @@ impl Runner {
             self.setup.privacy.clone(),
         ));
         let gate = Arc::new(ReplayGate {
+            dispatch,
             runner: self.clone(),
             config,
             actor: p.actor.clone(),
@@ -828,15 +866,27 @@ impl Runner {
         let mut out = match run {
             Ok(o) => o,
             Err(e) => {
-                let _ = lock(&sql).end(false, &[]);
+                let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
                 return Err(match e {
+                    kronik_runtime::RunError::Prerequisite(code) => ReplayError::Prerequisite(code),
                     e @ kronik_runtime::RunError::KeyMissing(_) => ReplayError::KeyMissing(e),
                     e => ReplayError::Host(e.to_string()),
                 });
             }
         };
         drop(out.sql.take());
-        let mut gs = std::mem::take(&mut *lock(&gate.state));
+        let gs = std::mem::take(&mut *lock(&gate.state));
+        let matcher = match CompiledScrubber::new(&gs.secrets, kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES) {
+            Ok(matcher) => matcher.into_owned(),
+            Err(_) => {
+                let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
+                return Err(ReplayError::Prerequisite(ErrorCode::SecretUnavailable));
+            }
+        };
+        if kronik_sched::scrub::output(&mut out, &matcher).is_err() {
+            let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
+            return Err(ReplayError::Prerequisite(ErrorCode::SecretUnavailable));
+        }
         let mut sql_changes = Vec::new();
         let mut sql_schema = Vec::new();
         let ended = lock(&sql).end(out.committed(), &gs.secrets);
@@ -860,7 +910,9 @@ impl Runner {
                     .collect();
             }
             Ok(None) => {}
-            Err(msg) => {
+            Err(mut msg) => {
+                kronik_sched::scrub::text(&mut msg, &matcher, kronik_log::MAX_RECORD as usize)
+                    .map_err(|_| ReplayError::Prerequisite(ErrorCode::SecretUnavailable))?;
                 out.outcome = pb::Outcome {
                     kind: pb::OutcomeKind::Failed as i32,
                     error_code: "TURN_FAILED".into(),
@@ -871,15 +923,6 @@ impl Runner {
                 out.messages.clear();
                 out.timers.clear();
             }
-        }
-        // I8, exactly as production: secret values the turn used are
-        // replaced in its outputs, effect records and compensations.
-        kronik_sched::scrub::output(&mut out, &gs.secrets);
-        for e in &mut gs.records {
-            kronik_sched::scrub::effect(e, &gs.secrets);
-        }
-        for m in &mut gs.compensations {
-            kronik_sched::scrub::message(&mut m.msg, &gs.secrets);
         }
         let real_rows = self.setup.privacy.no_pii && (used_sql || gs.sql || p.sql);
         let personal = gate.saw_personal_with(&gs) || used_sql;
@@ -1065,6 +1108,7 @@ struct GateState {
 
 /// The replay effect gate of one fork turn.
 struct ReplayGate {
+    dispatch: ReplayDispatch,
     runner: Arc<Runner>,
     config: Option<Arc<Config>>,
     actor: ActorRef,
@@ -1096,6 +1140,41 @@ fn tagged(subject: &Option<String>, bytes: Vec<u8>) -> Option<pb::Sealable> {
     })
 }
 
+fn prepared_plain(value: &pb::Sealable) -> Result<&[u8], GateError> {
+    match value.value.as_ref() {
+        Some(pb::sealable::Value::Plain(bytes)) => Ok(bytes.as_slice()),
+        _ => Err(GateError::Prerequisite(ErrorCode::SecretUnavailable)),
+    }
+}
+
+/// A prepared response may be checked for ambiguity, never rewritten.
+pub(crate) fn prepared_outcome_safe(
+    outcome: &pb::Outcome, matcher: &CompiledScrubber<'_>,
+) -> Result<(), GateError> {
+    let mut fields = vec![outcome.message.as_bytes()];
+    match outcome.output.as_ref() {
+        Some(pb::outcome::Output::Reply(message)) => {
+            fields.push(message.name.as_bytes());
+            fields.push(message.content_type.as_bytes());
+            if let Some(body) = &message.body { fields.push(prepared_plain(body)?); }
+        }
+        Some(pb::outcome::Output::Http(response)) => {
+            for header in &response.headers {
+                fields.push(header.name.as_bytes());
+                if let Some(value) = &header.value { fields.push(prepared_plain(value)?); }
+            }
+            match response.body.as_ref().and_then(|body| body.value.as_ref()) {
+                Some(pb::body::Value::Inline(value)) => fields.push(prepared_plain(value)?),
+                Some(pb::body::Value::Blob(_)) => return Err(GateError::Prerequisite(ErrorCode::Unavailable)),
+                None => {}
+            }
+        }
+        None => {}
+    }
+    kronik_sched::scrub::prepared_fields_safe(None, None, matcher, fields)
+        .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))
+}
+
 fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
     match s.and_then(|s| s.value.as_ref()) {
         Some(pb::sealable::Value::Plain(b)) => b.clone(),
@@ -1106,9 +1185,84 @@ fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
 /// The guest-visible text of a replay without a recording (FailClosed).
 pub const NO_RECORDING: &str = "replay: no recording";
 
+fn model_error(error: kronik_core::error::ApiError) -> GateError {
+    match error.code {
+        ErrorCode::Internal | ErrorCode::StorageCorrupt => GateError::Host(error.message),
+        _ => GateError::Prerequisite(error.code),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn model_failures_keep_host_vs_prerequisite_semantics() {
+    for code in [ErrorCode::Internal, ErrorCode::StorageCorrupt] {
+        let error = kronik_core::error::ApiError::new(code, "The model response is invalid");
+        assert!(matches!(model_error(error), GateError::Host(message)
+            if message == "The model response is invalid"));
+    }
+    let error = kronik_core::error::ApiError::new(ErrorCode::Unavailable, "The model endpoint is unavailable");
+    assert!(matches!(model_error(error), GateError::Prerequisite(ErrorCode::Unavailable)));
+}
+
 impl ReplayGate {
+    fn original(&self) -> Result<&AuthLease, GateError> {
+        match &self.dispatch {
+            ReplayDispatch::Authorized(original) => Ok(original),
+            ReplayDispatch::RecordedOnly => Err(GateError::Prerequisite(ErrorCode::Unavailable)),
+        }
+    }
+
     fn config(&self) -> &Config {
         self.config.as_deref().unwrap_or(&self.runner.setup.config)
+    }
+
+    fn matcher(&self) -> Result<CompiledScrubber<'static>, GateError> {
+        self.matcher_with_scope().map(|(matcher, _)| matcher)
+    }
+
+    fn matcher_with_scope(&self) -> Result<(CompiledScrubber<'static>, Option<Arc<[pb::SecretRef]>>), GateError> {
+        if let ReplayDispatch::Authorized(original) = &self.dispatch {
+            original.check().map_err(|error| GateError::Prerequisite(error.code))?;
+        }
+        let source = self.runner.setup.model.as_ref().map(|model| (model.secret_snapshot)())
+            .transpose().map_err(|error| GateError::Prerequisite(error.code))?;
+        let snapshot = source.as_ref().map(crate::simulators::ModelSecretSnapshot::snapshot);
+        let state = lock(&self.state);
+        let patterns: Vec<_> = snapshot.into_iter()
+            .flat_map(|snapshot| snapshot.values.iter().map(|(name, value)| (name.as_str(), value.as_slice())))
+            .chain(state.secrets.iter().map(|(name, value)| (name.as_str(), value.as_slice())))
+            .collect();
+        let scope = if state.secrets.is_empty() {
+            snapshot.and_then(|snapshot| snapshot.references.clone())
+        } else {
+            // These older observations have no certified identity in this
+            // profile; do not invent an empty complete source scope.
+            None
+        };
+        let matcher = CompiledScrubber::new(&patterns, kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES)
+            .map(CompiledScrubber::into_owned)
+            .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?;
+        Ok((matcher, scope))
+    }
+
+    fn prepare_http_record(&self, record: &mut pb::EffectRecord, matcher: &CompiledScrubber<'_>)
+        -> Result<FetchOutcome, GateError>
+    {
+        if record.status == pb::EffectStatus::Ok as i32 {
+            let payload = record.response.as_ref().ok_or_else(|| GateError::Host("The HTTP response is missing".into()))?;
+            let subject = payload.subject.clone();
+            let Some(pb::sealable::Value::Plain(bytes)) = payload.value.as_ref() else {
+                return Err(GateError::Prerequisite(ErrorCode::SecretUnavailable));
+            };
+            let response = pb::HttpEffectResponse::decode(bytes.as_slice())
+                .map_err(|_| GateError::Host("The HTTP response is invalid".into()))?;
+            return kronik_sched::effects::prepare_inline_fetch_response(record, &subject, response, matcher,
+                usize::try_from(self.config().limits(&self.actor.kind).effect_response_bytes)
+                    .unwrap_or(usize::MAX).min(kronik_log::MAX_RECORD as usize));
+        }
+        kronik_sched::scrub::text(&mut record.error, matcher, kronik_log::MAX_RECORD as usize)
+            .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?;
+        outcome_of_fetch(record)
     }
 
     fn prod_at(&self, ordinal: u32) -> Option<&pb::EffectRecord> {
@@ -1180,12 +1334,20 @@ impl ReplayGate {
             })
     }
 
-    async fn fetch(&self, ordinal: u32, req: FetchRequest) -> FetchOutcome {
-        let t = match parse_url(&req.url) {
+    async fn fetch(&self, ordinal: u32, req: FetchRequest) -> Result<FetchOutcome, GateError> {
+        if let Some(record) = self.prod_at(ordinal).filter(|record|
+            matches!(record.kind.as_str(), "http.fetch" | "foreign.http")
+                && record.status == pb::EffectStatus::HostRedactionFailure as i32
+        ).cloned() {
+            self.push(record);
+            return Err(GateError::HostRedactionFailure);
+        }
+        let (matcher, prepared_scope) = self.matcher_with_scope()?;
+        let (t, raw_host) = match parse_request_url(&req.url) {
             Ok(t) => t,
             Err(e) => {
                 self.push(self.denied(ordinal, "http.fetch", String::new(), e.clone()));
-                return FetchOutcome::Denied(e);
+                return Ok(FetchOutcome::Denied(e));
             }
         };
         // foreign:// is a call to a foreign actor (docs/design/m7-foreign.md
@@ -1211,12 +1373,12 @@ impl ReplayGate {
         if !granted {
             let e = format!("CAPABILITY_NOT_GRANTED: {cap}");
             self.push(self.denied(ordinal, kind, cap, e.clone()));
-            return FetchOutcome::Denied(e);
+            return Ok(FetchOutcome::Denied(e));
         }
         if foreign && self.config().foreign(&t.host).is_none() {
             let e = format!("FOREIGN_NOT_FOUND: no foreign actor {}", t.host);
             self.push(self.denied(ordinal, kind, cap, e.clone()));
-            return FetchOutcome::Denied(e);
+            return Ok(FetchOutcome::Denied(e));
         }
         let prod = self.prod_at(ordinal).cloned();
         let prod_req = prod.as_ref().filter(|p| p.kind == kind).and_then(|p| {
@@ -1237,7 +1399,7 @@ impl ReplayGate {
                     if self.config().grant(&self.actor.kind, &scap).is_none() {
                         let e = format!("CAPABILITY_NOT_GRANTED: {scap}");
                         self.push(self.denied(ordinal, kind, scap, e.clone()));
-                        return FetchOutcome::Denied(e);
+                        return Ok(FetchOutcome::Denied(e));
                     }
                     let recorded = prod_req.as_ref().and_then(|r| {
                         r.headers.iter().find_map(|h| match &h.value {
@@ -1249,11 +1411,19 @@ impl ReplayGate {
                             _ => None,
                         })
                     });
+                    if let Some(reference) = &recorded
+                        && let Err(error) = reference.resolved_version()
+                    {
+                        let error = error.to_string();
+                        self.push(self.denied(ordinal, kind, scap, error.clone()));
+                        return Err(GateError::Prerequisite(ErrorCode::SecretUnavailable));
+                    }
                     pb::http_effect_header::Value::Secret(recorded.unwrap_or(pb::SecretRef {
                         name: secret.clone(),
                         template: template.clone(),
                         version: 0,
                         version_hash: Vec::new(),
+                        wide_version: 0,
                     }))
                 }
             };
@@ -1262,16 +1432,47 @@ impl ReplayGate {
                 value: Some(v),
             });
         }
-        let request = pb::HttpEffectRequest {
+        let mut request = pb::HttpEffectRequest {
             method: req.method.clone(),
             url: req.url.clone(),
             headers,
             body: req.body.clone(),
+            fingerprint_version: 2,
         };
         // Keyed for a subject's request, as production records it.
         let sealer = &self.runner.setup.privacy.sealer;
-        let plain_fp = fingerprint(&request).unwrap_or_default();
+        if let (Some(record), Some(source)) = (&prod, &prod_req) {
+            match source.fingerprint_version {
+                0 => {
+                    let candidate = {
+                        let state = lock(&self.state);
+                        kronik_sched::scrub::legacy_verification_fingerprint(&mut request, source, &state.secrets)
+                            .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?
+                    };
+                    let source_fp = fingerprint(source).map_err(GateError::Host)?;
+                    let subject = record.request.as_ref().and_then(|value| value.subject.as_deref());
+                    if !sealer.fingerprint_matches(subject, &record.fingerprint, &source_fp) {
+                        return Err(GateError::Host("The legacy HTTP source fingerprint is invalid".into()));
+                    }
+                    if candidate != source_fp {
+                        return Err(GateError::Prerequisite(ErrorCode::SecretUnavailable));
+                    }
+                    let record = kronik_sched::effects::legacy_http_disclosure(record.clone(), source, &matcher)?;
+                    let outcome = outcome_of_fetch(&record);
+                    self.push(record);
+                    return outcome;
+                }
+                2 => {}
+                _ => return Err(GateError::Host("The HTTP fingerprint policy is invalid".into())),
+            }
+        }
+        let recorded_target = kronik_sched::scrub::http_request(
+            &mut request, &t, raw_host, &matcher, kronik_log::MAX_RECORD as usize,
+        ).map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?;
+        let plain_fp = fingerprint_v2(&request, &recorded_target).map_err(GateError::Host)?;
         let fp = sealer.effect_fingerprint(req.subject.as_deref(), plain_fp.clone());
+        let original_cap = cap;
+        let cap = format!("{}:{}", if foreign { "foreign" } else { "http" }, recorded_target.host);
         let encoded = tagged(&req.subject, request.encode_to_vec());
         // A copy of the foreign actor answers in continuous replay (M14).
         if t.scheme == "foreign"
@@ -1289,6 +1490,7 @@ impl ReplayGate {
                     prod,
                     copy,
                     copies.env,
+                    &matcher,
                 )
                 .await;
         }
@@ -1311,7 +1513,7 @@ impl ReplayGate {
             }
         }
         let setup = &self.runner.setup;
-        let sims = setup.simulators.target(&cap);
+        let sims = setup.simulators.target(&original_cap);
         // Synthetic: a stub rule of the request, then of the target.
         let rule = crate::stubs::find(&setup.stubs, &req.method, &req.url)
             .or_else(|| sims.and_then(|s| crate::stubs::find(&s.stubs, &req.method, &req.url)));
@@ -1329,24 +1531,22 @@ impl ReplayGate {
             if rule.error.is_some() {
                 rec.error = format!("stub: {}", rule.error.as_deref().unwrap_or_default());
             } else {
-                rec.response = tagged(
-                    &req.subject,
-                    pb::HttpEffectResponse {
-                        status: u32::from(rule.status),
-                        headers: rule
-                            .headers
-                            .iter()
-                            .map(|(name, value)| pb::HeaderPair {
-                                name: name.clone(),
-                                value: value.clone(),
-                            })
-                            .collect(),
-                        body: rule.body.clone().into_bytes(),
-                    }
-                    .encode_to_vec(),
+                let response = pb::HttpEffectResponse {
+                    status: u32::from(rule.status),
+                    headers: rule.headers.iter().map(|(name, value)| pb::HeaderPair {
+                        name: name.clone(), value: value.clone(),
+                    }).collect(),
+                    body: rule.body.clone().into_bytes(),
+                };
+                let out = kronik_sched::effects::prepare_inline_fetch_response(
+                    &mut rec, &req.subject, response, &matcher,
+                    usize::try_from(self.config().limits(&self.actor.kind).effect_response_bytes)
+                        .unwrap_or(usize::MAX).min(kronik_log::MAX_RECORD as usize),
                 );
+                self.push(rec);
+                return out;
             }
-            let out = outcome_of_fetch(&rec);
+            let out = self.prepare_http_record(&mut rec, &matcher);
             self.push(rec);
             return out;
         }
@@ -1362,7 +1562,7 @@ impl ReplayGate {
             && live.hosts.contains(&t.host)
         {
             let env = live.env.clone();
-            return self.fetch_live(ordinal, cap, fp, encoded, req, env).await;
+            return self.fetch_live(ordinal, cap, fp, encoded, req, env, &matcher).await;
         }
         if let Some(s) = sims {
             use kronik_effects::simulator::{EffectRequest, EffectSimulator, ReplayContext};
@@ -1377,31 +1577,51 @@ impl ReplayGate {
             let neighbor = s
                 .neighbor
                 .then(|| setup.simulators.neighbor(&setup.index, &cap));
-            let answer = s
-                .contract
-                .as_ref()
-                .and_then(|c| c.respond(&ereq, &ctx))
-                .or_else(|| neighbor.and_then(|n| n.respond(&ereq, &ctx)));
+            let contract = s.contract.as_ref().and_then(|contract| contract.respond(&ereq, &ctx));
+            let raw_contract = contract.is_some();
+            let answer = contract.or_else(|| neighbor.and_then(|neighbor| neighbor.respond(&ereq, &ctx)));
             if let Some(a) = answer {
                 let mut rec = a.record;
                 rec.request = encoded;
-                let out = outcome_of_fetch(&rec);
+                let out = if raw_contract { self.prepare_http_record(&mut rec, &matcher) } else {
+                    let outcome = outcome_of_fetch(&rec)?;
+                    if let FetchOutcome::Ok(response) = &outcome {
+                        let fields = std::iter::once(response.body.as_slice())
+                            .chain(response.headers.iter().flat_map(|(name, value)| [name.as_bytes(), value.as_bytes()]));
+                        kronik_sched::scrub::prepared_fields_safe(None, None, &matcher, fields)
+                            .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?;
+                    }
+                    Ok(outcome)
+                };
                 self.push(rec);
                 return out;
             }
-            if s.model
-                && let Some(model) = &setup.model
-                && !self.tainted(&req)
-            {
+            if s.model && let Some(model) = &setup.model {
+                let cached = model.has_cached_answer(&cap, &fp)
+                    .map_err(model_error)?;
+                if !cached {
+                    self.original()?.check().map_err(|error| GateError::Prerequisite(error.code))?;
+                    if self.tainted(&req) {
+                        self.push(self.synthetic(ordinal, kind, cap, fp, encoded));
+                        return Ok(FetchOutcome::Denied(NO_RECORDING.into()));
+                    }
+                }
                 let max = model.config.max_examples;
-                let examples = |holds: &dyn Fn(&[u8]) -> bool| {
+                let examples = |matcher: &CompiledScrubber<'_>, scope: Option<&[pb::SecretRef]>| {
                     crate::simulators::model_examples(
                         &crate::simulators::Simulators::model_sources(&setup.index, &cap),
-                        max,
-                        holds,
+                        max, matcher, scope,
                     )
                 };
-                if let Some(a) = model.answer(&cap, &fp, &request, examples).await {
+                let answer = match &self.dispatch {
+                    ReplayDispatch::RecordedOnly => model.cached_answer(&cap, &fp)
+                        .map_err(model_error)?
+                        .ok_or(GateError::Prerequisite(ErrorCode::Unavailable))?,
+                    ReplayDispatch::Authorized(original) => model.answer(&cap, &fp, &request,
+                        &recorded_target, prepared_scope.as_deref(), examples, original)
+                        .await.map_err(model_error)?,
+                };
+                if let Some(a) = answer {
                     let rec = pb::EffectRecord {
                         ordinal,
                         kind: kind.into(),
@@ -1432,7 +1652,7 @@ impl ReplayGate {
             }
         }
         self.push(self.synthetic(ordinal, kind, cap, fp, encoded));
-        FetchOutcome::Denied(NO_RECORDING.into())
+        Ok(FetchOutcome::Denied(NO_RECORDING.into()))
     }
 
     /// A call to a fork's copy of a foreign actor (M14): sent to the copy
@@ -1450,7 +1670,9 @@ impl ReplayGate {
         prod: Option<pb::EffectRecord>,
         copy: Arc<dyn kronik_effects::foreign::ForeignCopy>,
         env: Env,
-    ) -> FetchOutcome {
+        matcher: &CompiledScrubber<'_>,
+    ) -> Result<FetchOutcome, GateError> {
+        self.original()?.check().map_err(|error| GateError::Prerequisite(error.code))?;
         let limits = self.config().limits(&self.actor.kind);
         let sealer = &self.runner.setup.privacy.sealer;
         let exact = prod.as_ref().is_some_and(|p| {
@@ -1508,22 +1730,20 @@ impl ReplayGate {
                 pb::EffectStatus::Network
             }
             Ok(Ok(resp)) => {
-                rec.response = plain(
-                    pb::HttpEffectResponse {
-                        status: u32::from(resp.status),
-                        headers: resp
-                            .headers
-                            .into_iter()
-                            .map(|(name, value)| pb::HeaderPair { name, value })
-                            .collect(),
-                        body: resp.body.to_vec(),
-                    }
-                    .encode_to_vec(),
+                let response = pb::HttpEffectResponse {
+                    status: u32::from(resp.status),
+                    headers: resp.headers.into_iter().map(|(name, value)| pb::HeaderPair { name, value }).collect(),
+                    body: resp.body.to_vec(),
+                };
+                let out = kronik_sched::effects::prepare_inline_fetch_response(
+                    &mut rec, &req.subject, response, matcher,
+                    usize::try_from(limits.effect_response_bytes).unwrap_or(usize::MAX).min(kronik_log::MAX_RECORD as usize),
                 );
-                pb::EffectStatus::Ok
+                self.push(rec);
+                return out;
             }
         } as i32;
-        let out = outcome_of_fetch(&rec);
+        let out = self.prepare_http_record(&mut rec, matcher);
         self.push(rec);
         out
     }
@@ -1537,7 +1757,8 @@ impl ReplayGate {
         encoded: Option<pb::Sealable>,
         req: FetchRequest,
         env: Env,
-    ) -> FetchOutcome {
+        matcher: &CompiledScrubber<'_>,
+    ) -> Result<FetchOutcome, GateError> {
         let limits = self.config().limits(&self.actor.kind);
         let headers = req
             .headers
@@ -1557,13 +1778,13 @@ impl ReplayGate {
             grounding: pb::Grounding::Live as i32,
             ..Default::default()
         };
-        let call = env.net.http(kronik_core::env::HttpRequest {
+        let call = env.net.http_authorized(kronik_core::env::HttpRequest {
             method: req.method,
             url: req.url,
             headers,
             body: req.body.into(),
             max_response_bytes: limits.effect_response_bytes,
-        });
+        }, self.original()?.clone());
         rec.status = match env.timeout(limits.effect_timeout, call).await {
             Err(_) => {
                 rec.error = format!(
@@ -1584,23 +1805,20 @@ impl ReplayGate {
                 pb::EffectStatus::Network
             }
             Ok(Ok(resp)) => {
-                rec.response = tagged(
-                    &req.subject,
-                    pb::HttpEffectResponse {
-                        status: u32::from(resp.status),
-                        headers: resp
-                            .headers
-                            .into_iter()
-                            .map(|(name, value)| pb::HeaderPair { name, value })
-                            .collect(),
-                        body: resp.body.to_vec(),
-                    }
-                    .encode_to_vec(),
+                let response = pb::HttpEffectResponse {
+                    status: u32::from(resp.status),
+                    headers: resp.headers.into_iter().map(|(name, value)| pb::HeaderPair { name, value }).collect(),
+                    body: resp.body.to_vec(),
+                };
+                let out = kronik_sched::effects::prepare_inline_fetch_response(
+                    &mut rec, &req.subject, response, matcher,
+                    usize::try_from(limits.effect_response_bytes).unwrap_or(usize::MAX).min(kronik_log::MAX_RECORD as usize),
                 );
-                pb::EffectStatus::Ok
+                self.push(rec);
+                return out;
             }
         } as i32;
-        let out = outcome_of_fetch(&rec);
+        let out = self.prepare_http_record(&mut rec, matcher);
         self.push(rec);
         out
     }
@@ -1613,13 +1831,25 @@ impl ReplayGate {
         compensate: Option<pb::Message>,
     ) -> Result<CallOutcome, GateError> {
         let message_id = causal::message_id(&self.key, ordinal);
-        let request = pb::CallEffectRequest {
-            to: Some(to.to_pb()),
-            msg: Some(msg.clone()),
-            compensate: compensate.clone(),
-            message_id: message_id.clone(),
+        let matcher = self.matcher()?;
+        let mut request = pb::CallEffectRequest {
+            to: Some(to.to_pb()), msg: Some(msg), compensate,
+            message_id: message_id.clone(), fingerprint_version: 2,
         };
+        match kronik_sched::scrub::call_request(&mut request, &matcher, kronik_log::MAX_RECORD as usize) {
+            Ok(()) => {}
+            Err(kronik_sched::scrub::CallRequestError::UnsafeMessage
+                | kronik_sched::scrub::CallRequestError::UnsafeCompensation) => {
+                let error = ErrorCode::PolicyDenied.as_str().to_owned();
+                self.push(self.denied(ordinal, "actor.call", format!("actor:{to}"), error.clone()));
+                return Ok(CallOutcome::Failed(error));
+            }
+            Err(kronik_sched::scrub::CallRequestError::Redaction(_)) =>
+                return Err(GateError::Prerequisite(ErrorCode::SecretUnavailable)),
+        }
         let encoded = request.encode_to_vec();
+        let compensate = request.compensate.take();
+        let msg = request.msg.take().ok_or_else(|| GateError::Host("The call message is missing".into()))?;
         // The request holds the message: it is the message's subject's data.
         let msg_subject = msg.body.as_ref().and_then(|b| b.subject.clone());
         let mut rec = pb::EffectRecord {
@@ -1655,7 +1885,7 @@ impl ReplayGate {
                     ..Default::default()
                 })),
             };
-            let turn = self
+            let mut turn = self
                 .runner
                 .clone()
                 .run(
@@ -1669,47 +1899,29 @@ impl ReplayGate {
                         personal: self.saw_personal(),
                     },
                     order,
+                    self.dispatch.clone(),
                 )
                 .await
                 .map_err(|e| GateError::Host(e.to_string()))?;
-            let o = turn.record.outcome.clone().unwrap_or_default();
+            let o = turn.record.outcome.take()
+                .ok_or_else(|| GateError::Host("The committed callee outcome is missing".into()))?;
             {
                 let mut state = lock(&self.state);
                 state.sql |= turn.sql;
                 state.personal |= turn.personal;
             }
-            (map_call_outcome(&o), turn.id)
+            (map_call_outcome(o)?, turn.id)
         };
-        rec.status = match &outcome {
-            CallOutcome::Ok(reply) => {
-                let reply_subject = reply
-                    .as_ref()
-                    .and_then(|m| m.body.as_ref())
-                    .and_then(|b| b.subject.clone());
-                rec.response = tagged(
-                    &reply_subject,
-                    pb::CallEffectResponse {
-                        reply: reply.clone(),
-                        turn_id,
-                    }
-                    .encode_to_vec(),
-                );
-                pb::EffectStatus::Ok
-            }
-            CallOutcome::NotFound => pb::EffectStatus::NotFound,
-            CallOutcome::Rejected(m) => {
-                rec.error = m.clone();
-                pb::EffectStatus::Rejected
-            }
-            CallOutcome::Failed(m) => {
-                rec.error = m.clone();
-                pb::EffectStatus::Failed
-            }
-            CallOutcome::Reentrant => pb::EffectStatus::Reentrant,
-            CallOutcome::Timeout => pb::EffectStatus::Timeout,
-        } as i32;
-        let out = outcome_of_call(&rec);
-        if let (CallOutcome::Ok(_), Some(c)) = (&outcome, compensate) {
+        let out = kronik_sched::effects::prepare_call_outcome(
+            &mut rec, outcome, turn_id, &matcher,
+            usize::try_from(self.config().limits(&self.actor.kind).effect_response_bytes)
+                .unwrap_or(usize::MAX).min(kronik_log::MAX_RECORD as usize),
+            None, None,
+        );
+        if out.as_ref().is_err_and(|error| !matches!(error, GateError::HostRedactionFailure)) {
+            return out;
+        }
+        if rec.successful_call() && let Some(c) = compensate {
             let key = causal::compensation(&self.key, &self.actor, ordinal, &to);
             lock(&self.state).compensations.push(pb::OutboundMessage {
                 to: Some(to.to_pb()),
@@ -1719,7 +1931,7 @@ impl ReplayGate {
             });
         }
         self.push(rec);
-        Ok(out)
+        out
     }
 
     fn crypto(
@@ -1775,13 +1987,11 @@ impl ReplayGate {
             self.push(self.synthetic(ordinal, kind, cap, fp, None));
             return CryptoOutcome::Denied(NO_RECORDING.into());
         };
-        lock(&self.state)
-            .secrets
-            .push((secret.clone(), v.value.clone()));
         let result = match algorithm {
             CryptoAlgorithm::HmacSha256 => Ok(kronik_effects::crypto::hmac_sha256(&v.value, &data)),
             CryptoAlgorithm::SignEd25519 => kronik_effects::crypto::sign_ed25519(&v.value, &data),
         };
+        lock(&self.state).secrets.push((secret.clone(), v.value));
         let mut rec = pb::EffectRecord {
             ordinal,
             kind: kind.into(),
@@ -1853,7 +2063,7 @@ impl EffectGate for GateHandle {
         req: FetchRequest,
     ) -> BoxFuture<'static, Result<FetchOutcome, GateError>> {
         let g = self.0.clone();
-        Box::pin(async move { Ok(g.fetch(ordinal, req).await) })
+        Box::pin(async move { g.fetch(ordinal, req).await })
     }
 
     fn call(
@@ -2002,7 +2212,7 @@ impl Shares {
                 true,
             );
             runner.push(vec![r.lsn], root_pending(r));
-            let res = runner.clone().drain().await;
+            let res = runner.clone().drain(setup.dispatch.clone()).await;
             store.overlay_rollback(applied)?;
             res?;
             let turns = std::mem::take(&mut *lock(&runner.turns));
@@ -2145,7 +2355,7 @@ impl Continuous {
                     Progress::add(&progress.continuous_total, 1);
                 }
             }
-            self.runner.clone().drain().await?;
+            self.runner.clone().drain(self.setup.dispatch.clone()).await?;
             self.replayed_to = self.setup.index.to_lsn;
             Ok(())
         }
@@ -2214,6 +2424,7 @@ impl Continuous {
         msg: pb::Message,
         root_id: String,
         time: u64,
+        original: AuthLease,
     ) -> Result<ForkTurn, ReplayError> {
         let key = causal::root(root_id);
         let subject = msg.body.as_ref().and_then(|b| b.subject.clone());
@@ -2226,7 +2437,7 @@ impl Continuous {
                 ..Default::default()
             })),
         };
-        self.send_input(actor, input, key, time, subject).await
+        self.send_input(actor, input, key, time, subject, original).await
     }
 
     /// Any input into an actor of the fork as a new root input with `key`,
@@ -2239,7 +2450,9 @@ impl Continuous {
         key: pb::CausalKey,
         time: u64,
         subject: Option<String>,
+        original: AuthLease,
     ) -> Result<ForkTurn, ReplayError> {
+        let dispatch = ReplayDispatch::Authorized(original);
         let order = vec![
             u64::MAX,
             self.runner.timer_seq.fetch_add(1, Ordering::Relaxed),
@@ -2258,9 +2471,10 @@ impl Continuous {
                     personal: false,
                 },
                 order,
+                dispatch.clone(),
             )
             .await?;
-        self.runner.clone().drain().await?;
+        self.runner.clone().drain(dispatch).await?;
         Ok(turn)
     }
 }

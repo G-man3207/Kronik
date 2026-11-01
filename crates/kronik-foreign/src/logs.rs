@@ -6,6 +6,20 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use kronik_effects::http::{CompiledScrubber, ScrubError};
+
+#[derive(Debug)]
+pub(crate) enum TailError {
+    Io(io::Error),
+    Redaction(ScrubError),
+}
+
+impl From<io::Error> for TailError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 /// A log over this size is rotated.
 pub(crate) const ROTATE_BYTES: u64 = 8 << 20;
 
@@ -34,17 +48,18 @@ pub(crate) fn rotate(log: &Path, limit: u64) -> io::Result<bool> {
 
 /// The last `n` lines of the rotated and the current log, with exact
 /// occurrences of `secrets` replaced by `[secret:<name>]`. Returns the lines
-/// and whether older lines exist.
+/// and whether older lines exist; redaction failure returns no lines.
 pub(crate) fn tail(
     log: &Path,
     n: usize,
-    secrets: &[(String, Vec<u8>)],
-) -> io::Result<(Vec<String>, bool)> {
+    secrets: &[(&str, &[u8])],
+) -> Result<(Vec<String>, bool), TailError> {
     // Reading at most this much keeps a tail cheap; lines beyond it count
     // as truncated.
     const WINDOW: u64 = 4 << 20;
-    let mut bytes = Vec::new();
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
     let mut truncated = false;
+    let mut cut_prefix = false;
     for path in [rotated(log), log.to_path_buf()] {
         match File::open(&path) {
             Ok(mut f) => {
@@ -53,25 +68,34 @@ pub(crate) fn tail(
                     f.seek(SeekFrom::Start(len - WINDOW))?;
                     truncated = true;
                     bytes.clear();
+                    cut_prefix = true;
                 }
-                f.read_to_end(&mut bytes)?;
+                f.take(len.min(WINDOW)).read_to_end(&mut bytes)?;
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
-    let scrubbed = kronik_effects::http::scrub(&bytes, secrets);
-    let text = String::from_utf8_lossy(&scrubbed);
-    let mut lines: Vec<&str> = text.lines().collect();
-    if truncated && !lines.is_empty() {
-        // The first line of a window is probably cut.
-        lines.remove(0);
+    if cut_prefix {
+        match bytes.iter().position(|byte| *byte == b'\n') {
+            Some(end) => { bytes.drain(..=end); }
+            None => bytes.clear(),
+        }
     }
-    if lines.len() > n {
-        truncated = true;
-        lines.drain(..lines.len() - n);
-    }
-    Ok((lines.into_iter().map(str::to_owned).collect(), truncated))
+    std::str::from_utf8(&bytes)
+        .map_err(|_| TailError::Redaction(ScrubError::InvalidText))?;
+    let matcher = CompiledScrubber::new_output(secrets, 64 << 20)
+        .map_err(TailError::Redaction)?;
+    let redacted = zeroize::Zeroizing::new(matcher
+        .scrub_if_matched(&bytes, (WINDOW * 2) as usize)
+        .map_err(TailError::Redaction)?);
+    let text = std::str::from_utf8(redacted.as_deref().unwrap_or(&bytes))
+        .map_err(|_| TailError::Redaction(ScrubError::InvalidText))?;
+    let mut source = text.lines().rev();
+    let mut lines: Vec<_> = source.by_ref().take(n).map(str::to_owned).collect();
+    truncated |= source.next().is_some();
+    lines.reverse();
+    Ok((lines, truncated))
 }
 
 #[cfg(test)]
@@ -101,12 +125,61 @@ mod tests {
     fn secrets_are_scrubbed_from_the_tail() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("output.log");
-        fs::write(&log, "token=hunter2hunter2 ok\nshort=ab\n").unwrap();
-        let secrets = vec![
-            ("api-key".to_owned(), b"hunter2hunter2".to_vec()),
-            ("tiny".to_owned(), b"ab".to_vec()),
+        fs::write(&log, "token=hunter2hunter2 ok\n").unwrap();
+        let secrets = [
+            ("api-key", b"hunter2hunter2".as_slice()),
         ];
         let (lines, _) = tail(&log, 10, &secrets).unwrap();
-        assert_eq!(lines, ["token=[secret:api-key] ok", "short=ab"]);
+        assert_eq!(lines, ["token=[secret:api-key] ok"]);
+    }
+
+    #[test]
+    fn original_tail_literals_overlap_and_one_byte_values_are_redacted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("output.log");
+        fs::write(&log, "ab a true [secret:literal] retained\n").unwrap();
+        let secrets = [
+            ("short-a", b"a".as_slice()),
+            ("long", b"ab".as_slice()),
+            ("truth", b"true".as_slice()),
+            ("deleted", b"retained".as_slice()),
+        ];
+        let (lines, _) = tail(&log, 10, &secrets).unwrap();
+        assert_eq!(lines, ["[secret:long] [secret:short-a] [secret:truth] [secret:liter[secret:short-a]l] [secret:deleted]"]);
+    }
+
+    #[test]
+    fn invalid_text_or_partial_utf8_secret_never_returns_lossy_or_raw_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("output.log");
+        fs::write(&log, b"\xff\n").unwrap();
+        assert!(matches!(tail(&log, 10, &[]), Err(TailError::Redaction(ScrubError::InvalidText))));
+        fs::write(&log, "é\n").unwrap();
+        assert!(matches!(
+            tail(&log, 10, &[("partial", &[0xc3])]),
+            Err(TailError::Redaction(ScrubError::InvalidText))
+        ));
+    }
+
+    #[test]
+    fn marker_expansion_obeys_the_existing_bounded_tail_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("output.log");
+        fs::write(&log, vec![b'a'; (ROTATE_BYTES / 4) as usize]).unwrap();
+        let error = tail(&log, 10, &[("expansion", b"a".as_slice())]).unwrap_err();
+        assert!(matches!(error, TailError::Redaction(ScrubError::OutputLimit)));
+    }
+
+    #[test]
+    fn complete_empty_inventory_still_redacts_credentials_in_a_bounded_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("output.log");
+        let token = format!("kronik_{}", "A".repeat(43));
+        fs::write(&log, format!("older\n{token}\nnewer\n")).unwrap();
+        let (lines, truncated) = tail(&log, 2, &[]).unwrap();
+        assert_eq!(lines, ["[secret:token]", "newer"]);
+        assert!(truncated);
+        let (lines, truncated) = tail(&log, 0, &[]).unwrap();
+        assert!(lines.is_empty() && truncated);
     }
 }

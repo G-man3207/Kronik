@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Kronik · History</title>
+  <link rel="stylesheet" href="/ui/app.css">
+  <link rel="icon" href="/ui/icon.svg" type="image/svg+xml">
+  <script src="/ui/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header>
+    <p class="brand">Kronik <span>Operations & review</span></p>
+    <section aria-labelledby="auth-title" id="authentication">
+      <h2 id="auth-title">Authentication</h2>
+      <p id="session-status">Checking session…</p>
+      <a id="login-link" href="/v1/auth/login" hidden>Sign in with OIDC</a>
+      <details id="token-alternative">
+        <summary>Use a bearer token instead</summary>
+        <p>Tokens stay in memory in this tab only. They are not saved or added to URLs. OIDC is preferred for human approvals.</p>
+        <form id="token-form">
+          <label for="bearer-token">Bearer token</label>
+          <input id="bearer-token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required>
+          <button id="token-connect" type="submit">Use token</button>
+        </form>
+      </details>
+      <form id="logout-form" hidden>
+        <label for="logout-reason">Logout reason</label>
+        <input id="logout-reason" required maxlength="4096" autocomplete="off">
+        <label class="check"><input id="logout-dry-run" type="checkbox"> Dry run (do not sign out)</label>
+        <button id="logout-button" type="submit">Sign out</button>
+      </form>
+    </section>
+    <nav aria-label="Views">
+      <a id="nav-history" href="#history">History</a>
+      <a id="nav-turn" href="#turn">Turn & causal tree</a>
+      <a id="nav-proposals" href="#proposals">Proposals</a>
+      <a id="nav-deadletters" href="#deadletters">Dead letters</a>
+      <a id="nav-deployments" href="#deployments">Deployments</a>
+      <a id="nav-cluster" href="#cluster">Cluster</a>
+    </nav>
+  </header>
+  <main id="main" tabindex="-1">
+    <div id="status" role="status" aria-live="polite" aria-atomic="true"></div>
+    <div id="error" role="alert" aria-atomic="true" hidden></div>
+    <h1 id="view-title" tabindex="-1">History</h1>
+    <div id="view-content" aria-busy="true"></div>
+    <noscript>This interface requires JavaScript to call the public Kronik API. No data is available without it.</noscript>
+  </main>
+  <footer>Data is returned by the public API under your current scopes. Redacted and erased values remain redacted.</footer>
+</body>
+</html>

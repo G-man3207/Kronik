@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Throughput and latency of committed counter turns (docs/perf.md).
 #
-# Usage: scripts/perf-m1.sh [WORKDIR] [PORT] [SECONDS]
+# Usage: [KRONIK_BIN=path] [LOADGEN=path] scripts/perf-m1.sh [NEW_WORKDIR] [PORT] [SECONDS]
 # Defaults: /var/tmp/kronik-perf (a real disk, not tmpfs), port 47813, 10 s
 # per measurement. Needs a release build of kronik and of tools/loadgen
 # (cargo build --release --manifest-path tools/loadgen/Cargo.toml).
@@ -11,13 +11,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 dir="${1:-/var/tmp/kronik-perf}"
 port="${2:-47813}"
 secs="${3:-10}"
-bin=target/release/kronik
+bin="$(realpath "${KRONIK_BIN:-${CARGO_TARGET_DIR:-target}/release/kronik}")"
 load="${LOADGEN:-tools/loadgen/target/release/kronik-loadgen}"
 sock="$dir/api.sock"
 pid=""
 
-rm -rf "$dir"
-mkdir -p "$dir"
+mkdir -m 700 "$dir"
 setsid "$bin" serve --data-dir "$dir/data" --http-listen "127.0.0.1:$port" \
     --api-socket "$sock" >>"$dir/serve.log" 2>&1 &
 pid=$!
@@ -33,7 +32,10 @@ echo "# $(uname -n) $(nproc) vCPU, load average $(cut -d' ' -f1-3 /proc/loadavg)
 run() { # run <label> <loadgen args...>
     local label="$1"
     shift
-    printf '%-28s %s\n' "$label" "$("$load" --addr "127.0.0.1:$port" --seconds "$secs" --warmup 2 "$@")"
+    local output status=0
+    output=$("$load" --addr "127.0.0.1:$port" --seconds "$secs" --warmup 2 "$@") || status=$?
+    printf '%-28s %s\n' "$label" "$output"
+    return "$status"
 }
 run "1 actor, 1 client" --keys 1 --concurrency 1
 run "1 actor, 16 clients" --keys 1 --concurrency 16

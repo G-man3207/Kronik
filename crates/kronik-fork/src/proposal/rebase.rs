@@ -90,143 +90,147 @@ impl Proposals {
 
     /// `kronik rollback <epoch> --by-replay`: a rebase proposal that replays
     /// every root input since the deployment through the code before it.
-    pub async fn rebase(&self, req: RebaseRequest) -> Result<(Proposal, bool), ApiError> {
-        // New work (a replay of a window, a fork log): refused below
-        // `[log] disk_reserve`, like proposals.
-        self.node.check_running()?;
-        diff::check_options(&req.options).map_err(bad)?;
-        if !req.options.mode.continuous() {
-            return Err(bad(
-                "a rollback via replay needs continuous replay: --mode continuous or both",
-            ));
-        }
-        // Its turns become main's state: recordings only, no simulators,
-        // model or live GETs (m13-rebase §8; `setup` with `rebase`).
-        if !req.options.stubs.is_empty()
-            || !req.options.live_allowlist.is_empty()
-            || !req.options.simulator_overrides.is_empty()
-        {
-            return Err(bad(
-                "a rollback via replay answers effects from recordings only: no stubs, simulator overrides or live hosts",
-            ));
-        }
-        let options = req.options.clone();
-        let deployments = self.node.store().db().deployments().map_err(internal)?;
-        let Some((dlsn, target)) = deployments.iter().find(|(_, d)| d.epoch == req.epoch) else {
-            return Err(ApiError::new(
-                ErrorCode::DeploymentNotFound,
-                format!(
-                    "no deployment with epoch {}; run: kronik deployments list",
+    pub async fn rebase(self: &Arc<Self>, req: RebaseRequest, authority: AuthLease) -> Result<(Proposal, bool), ApiError> {
+        let this = self.clone();
+        self.node.authorized_effect(authority.clone(), move || async move {
+            // New work (a replay of a window, a fork log): refused below
+            // `[log] disk_reserve`, like proposals.
+            this.node.check_running()?;
+            diff::check_options(&req.options).map_err(bad)?;
+            if !req.options.mode.continuous() {
+                return Err(bad(
+                    "a rollback via replay needs continuous replay: --mode continuous or both",
+                ));
+            }
+            // Its turns become main's state: recordings only, no simulators,
+            // model or live GETs (m13-rebase §8; `setup` with `rebase`).
+            if !req.options.stubs.is_empty()
+                || !req.options.live_allowlist.is_empty()
+                || !req.options.simulator_overrides.is_empty()
+            {
+                return Err(bad(
+                    "a rollback via replay answers effects from recordings only: no stubs, simulator overrides or live hosts",
+                ));
+            }
+            let options = req.options.clone();
+            let deployments = this.node.store().db().deployments().map_err(internal)?;
+            let Some((dlsn, target)) = deployments.iter().find(|(_, d)| d.epoch == req.epoch) else {
+                return Err(ApiError::new(
+                    ErrorCode::DeploymentNotFound,
+                    format!(
+                        "no deployment with epoch {}; run: kronik deployments list",
+                        req.epoch
+                    ),
+                ));
+            };
+            if let Some((_, newer)) = deployments.iter().find(|(_, d)| d.epoch > req.epoch) {
+                return Err(bad(format!(
+                    "deployment {} came after {}: a rollback via replay undoes main's newest code \
+                     change only",
+                    newer.epoch, req.epoch
+                ))
+                .with_hint(format!(
+                    "Roll back deployment {} first: kronik rollback {} --by-replay --reason \"...\"",
+                    newer.epoch, newer.epoch
+                )));
+            }
+            if target.cause == pb::DeploymentCause::Rollback as i32
+                && target.proposal_id.starts_with("r-")
+            {
+                return Err(bad(format!(
+                    "deployment {} is itself a rollback via replay; propose new code instead",
                     req.epoch
-                ),
-            ));
-        };
-        if let Some((_, newer)) = deployments.iter().find(|(_, d)| d.epoch > req.epoch) {
-            return Err(bad(format!(
-                "deployment {} came after {}: a rollback via replay undoes main's newest code \
-                 change only",
-                newer.epoch, req.epoch
-            ))
-            .with_hint(format!(
-                "Roll back deployment {} first: kronik rollback {} --by-replay --reason \"...\"",
-                newer.epoch, newer.epoch
-            )));
-        }
-        if target.cause == pb::DeploymentCause::Rollback as i32
-            && target.proposal_id.starts_with("r-")
-        {
-            return Err(bad(format!(
-                "deployment {} is itself a rollback via replay; propose new code instead",
-                req.epoch
-            )));
-        }
-        let mut before: BTreeMap<String, pb::KindVersion> = BTreeMap::new();
-        for (_, d) in &deployments {
-            if d.epoch < req.epoch {
-                for k in &d.kinds {
-                    before.insert(k.kind.clone(), k.clone());
+                )));
+            }
+            let mut before: BTreeMap<String, pb::KindVersion> = BTreeMap::new();
+            for (_, d) in &deployments {
+                if d.epoch < req.epoch {
+                    for k in &d.kinds {
+                        before.insert(k.kind.clone(), k.clone());
+                    }
                 }
             }
-        }
-        let mut kinds = Vec::with_capacity(target.kinds.len());
-        for k in &target.kinds {
-            let Some(prev) = before.get(&k.kind) else {
-                return Err(bad(format!(
-                    "kind {:?} did not exist before epoch {}; a deployment cannot remove it",
-                    k.kind, req.epoch
-                )));
+            let mut kinds = Vec::with_capacity(target.kinds.len());
+            for k in &target.kinds {
+                let Some(prev) = before.get(&k.kind) else {
+                    return Err(bad(format!(
+                        "kind {:?} did not exist before epoch {}; a deployment cannot remove it",
+                        k.kind, req.epoch
+                    )));
+                };
+                kinds.push(prev.clone());
+            }
+            let base_lsn = match target.effective_lsn {
+                0 => dlsn - 1,
+                e => e - 1,
             };
-            kinds.push(prev.clone());
-        }
-        let base_lsn = match target.effective_lsn {
-            0 => dlsn - 1,
-            e => e - 1,
-        };
-        crate::ensure_fork_retained(&self.node, &self.data, base_lsn).await?;
-        let head = self.node.applied_lsn();
-        let id = format!("r-{}", &random_id(self.node.env())[..12]);
-        let workers = req.workers.unwrap_or(self.workers).clamp(1, 64);
-        let mut live = self
-            .replay(
-                &id,
-                base_lsn,
-                head,
-                &[],
-                &options,
-                workers,
-                None,
-                req.dry_run,
-                true,
-                Some(copies::REBASE),
-            )
-            .await?;
-        let (d, bytes, hash) = self.build(&id, &live, &options)?;
-        let policy = self.evaluate(&bytes)?;
-        let denied = policy["outcome"] == "deny";
-        let meta = Proposal {
-            id: id.clone(),
-            fork: id.clone(),
-            status: if denied { "rejected" } else { "evaluated" }.into(),
-            fork_lsn: base_lsn,
-            created_lsn: head,
-            verified_through_lsn: d.summary.verified_through_lsn,
-            diff_hash: hash,
-            policy,
-            summary: serde_json::to_value(&d.summary).map_err(internal)?,
-            options,
-            kinds: kinds
-                .iter()
-                .map(|k| base64::engine::general_purpose::STANDARD.encode(k.encode_to_vec()))
-                .collect(),
-            reason: req.audit.reason.clone(),
-            approved: None,
-            promoted: None,
-            plain_fork: false,
-            unchanged: Vec::new(),
-            window_cut: None,
-            error: None,
-            preview: None,
-            rebase: Some(RebaseInfo {
-                rolled_back_epoch: req.epoch,
-                base_lsn,
-                irreversible_effects: d.irreversible.as_ref().map_or(0, |i| i.count),
-                switch_lsn: None,
-            }),
-        };
-        if req.dry_run {
-            return Ok((meta, true));
-        }
-        self.write_log(&id, &mut live).await?;
-        self.save(&meta, Some(&bytes))?;
-        self.save_samples(&id, &live, &d)?;
-        self.entries.lock().await.insert(
-            id,
-            Entry {
-                meta: meta.clone(),
-                live: Some(live),
-            },
-        );
-        Ok((meta, false))
+            crate::ensure_fork_retained(&this.node, &this.data, base_lsn).await?;
+            let head = this.node.applied_lsn();
+            let id = format!("r-{}", &random_id(this.node.env())[..12]);
+            let workers = req.workers.unwrap_or(this.workers).clamp(1, 64);
+            let mut live = this
+                .replay(
+                    &id,
+                    base_lsn,
+                    head,
+                    &[],
+                    &options,
+                    workers,
+                    None,
+                    req.dry_run,
+                    true,
+                    Some(copies::REBASE),
+                    authority.clone(),
+                )
+                .await?;
+            let (d, bytes, hash) = this.build(&id, &live, &options)?;
+            let policy = this.evaluate(&bytes)?;
+            let denied = policy["outcome"] == "deny";
+            let meta = Proposal {
+                id: id.clone(),
+                fork: id.clone(),
+                status: if denied { "rejected" } else { "evaluated" }.into(),
+                fork_lsn: base_lsn,
+                created_lsn: head,
+                verified_through_lsn: d.summary.verified_through_lsn,
+                diff_hash: hash,
+                policy,
+                summary: serde_json::to_value(&d.summary).map_err(internal)?,
+                options,
+                kinds: kinds
+                    .iter()
+                    .map(|k| base64::engine::general_purpose::STANDARD.encode(k.encode_to_vec()))
+                    .collect(),
+                reason: req.audit.reason.clone(),
+                approved: None,
+                promoted: None,
+                plain_fork: false,
+                unchanged: Vec::new(),
+                window_cut: None,
+                error: None,
+                preview: None,
+                rebase: Some(RebaseInfo {
+                    rolled_back_epoch: req.epoch,
+                    base_lsn,
+                    irreversible_effects: d.irreversible.as_ref().map_or(0, |i| i.count),
+                    switch_lsn: None,
+                }),
+            };
+            if req.dry_run {
+                return Ok((meta, true));
+            }
+            this.write_log(&id, &mut live).await?;
+            this.save(&meta, Some(&bytes))?;
+            this.save_samples(&id, &live, &d)?;
+            this.entries.lock().await.insert(
+                id,
+                Entry {
+                    meta: meta.clone(),
+                    live: Some(live),
+                },
+            );
+            Ok((meta, false))
+        }).await
     }
 
     /// Writes the fork's continuous turns not yet in main's log, each after
@@ -238,6 +242,7 @@ impl Proposals {
         rolled_back_epoch: u64,
         not_after: Lsn,
         pause: Option<&kronik_sched::Drain>,
+        authority: AuthLease,
     ) -> Result<(), ApiError> {
         self.write_log(id, live).await?;
         self.check_newest(rolled_back_epoch)?;
@@ -253,7 +258,7 @@ impl Proposals {
             .collect();
         for batch in turns.chunks(512) {
             self.node
-                .rebase_stage(id, batch.to_vec(), not_after, pause)
+                .rebase_stage(id, batch.to_vec(), not_after, pause, authority.clone())
                 .await?;
         }
         Ok(())
@@ -313,6 +318,7 @@ impl Proposals {
         id: &str,
         audit: pb::Audit,
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<PromoteResult, ApiError> {
         let epoch = entry
             .meta
@@ -344,11 +350,12 @@ impl Proposals {
                     true,
                     true,
                     Some(copies::REBASE),
+                    authority.clone(),
                 )
                 .await?;
             let mut consistent = true;
             return self
-                .promote_rebase_live(&mut meta, &mut live, None, &mut consistent, id, audit, true)
+                .promote_rebase_live(&mut meta, &mut live, None, &mut consistent, id, audit, true, authority)
                 .await;
         }
         // A round that fails or is cancelled leaves the replay half-way, so
@@ -371,6 +378,7 @@ impl Proposals {
                         false,
                         true,
                         Some(copies::REBASE),
+                        authority.clone(),
                     )
                     .await?;
                 (live, Some(logged))
@@ -386,6 +394,7 @@ impl Proposals {
                 id,
                 audit,
                 dry_run,
+                authority,
             )
             .await;
         let switched = result.as_ref().is_ok_and(|r| r.lsn != 0);
@@ -405,6 +414,7 @@ impl Proposals {
         id: &str,
         audit: pb::Audit,
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<PromoteResult, ApiError> {
         let info = meta
             .rebase
@@ -416,7 +426,7 @@ impl Proposals {
         let not_after = meta.created_lsn;
         // 1. Catch-up and the policy, as promote.
         *consistent = false;
-        let converged = self.catch_up_to_gap(id, live, &options, false).await?;
+        let converged = self.catch_up_to_gap(id, live, &options, false, authority.clone()).await?;
         *consistent = true;
         if !converged {
             meta.status = "stale".into();
@@ -559,20 +569,20 @@ impl Proposals {
         self.save(meta, Some(&bytes))?;
         self.save_samples(id, live, &d)?;
         // 3. Staging while main runs, then the pause and the last round.
-        self.node.rebase_prepare(id, fork_lsn).await?;
-        self.stage(id, live, info.rolled_back_epoch, not_after, None)
+        self.node.rebase_prepare(id, fork_lsn, authority.clone()).await?;
+        self.stage(id, live, info.rolled_back_epoch, not_after, None, authority.clone())
             .await?;
         // The deploy lock, then the drain: no set switch lands before ours.
-        let pause = self.node.rebase_pause(self.rebase_max_pause).await?;
+        let pause = self.node.rebase_pause(self.rebase_max_pause, authority.clone()).await?;
         // The whole pause is bounded (H5): the last round reads only main's
         // records since the catch-up, and gives up at the deadline.
         *consistent = false;
         let last = async {
             let head = self.node.applied_lsn();
             if head > live.index.to_lsn {
-                self.catch_up(id, live, head, &options, false).await?;
+                self.catch_up(id, live, head, &options, false, authority.clone()).await?;
             }
-            self.stage(id, live, info.rolled_back_epoch, not_after, Some(&pause))
+            self.stage(id, live, info.rolled_back_epoch, not_after, Some(&pause), authority.clone())
                 .await
         };
         match self
@@ -606,7 +616,7 @@ impl Proposals {
         };
         let (epoch, lsn) = self
             .node
-            .rebase_switch(pause, id, sw, kinds.clone(), not_after, audit)
+            .rebase_switch(pause, id, sw, kinds.clone(), not_after, audit, authority)
             .await?;
         // 4. The saved diff covers main's turns up to the switch.
         self.write_log(id, live).await?;

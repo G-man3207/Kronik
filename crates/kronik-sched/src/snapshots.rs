@@ -3,6 +3,7 @@
 //! and choosing state at startup when `state.db` is missing or behind the
 //! log.
 
+use kronik_core::authority::AuthLease;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -405,7 +406,27 @@ impl Node {
     /// there (then returns it). `reason`: `interval`, `shutdown`, `manual`.
     /// Refused below `[log] disk_reserve`; retention still runs then (it
     /// only deletes), so the node can climb back above the reserve.
-    pub async fn snapshot(&self, reason: &str) -> Result<Manifest, ApiError> {
+    pub async fn snapshot(&self, reason: &str, authority: AuthLease) -> Result<Manifest, ApiError> {
+        authority.check()?;
+        let held = tokio::select! {
+            biased;
+            () = authority.cancelled() => return Err(ApiError::new(ErrorCode::Unauthenticated, "request revoked while waiting for snapshot lock")),
+            held = self.snapshot_lock.clone().lock_owned() => held,
+        };
+        let node = self.arc().ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let reason = reason.to_owned();
+        self.authorized_effect(authority, move || async move {
+            let _held = held;
+            if let Err(error) = node.check_running() {
+                if node.fatal().is_none() && let Ok(storage) = node.storage() { node.retain(storage); }
+                return Err(error);
+            }
+            node.take_snapshot_locked(&reason).await
+        }).await
+    }
+
+    /// Fixed configured interval/shutdown path, never an operator fallback.
+    async fn snapshot_configured(&self, reason: &str) -> Result<Manifest, ApiError> {
         if let Err(e) = self.check_running() {
             if self.fatal().is_none()
                 && let Ok(storage) = self.storage()
@@ -423,9 +444,13 @@ impl Node {
     /// too. A copy that fails (no space, I/O) is deleted at once, so a
     /// failed attempt never keeps what little space is left.
     pub(crate) async fn take_snapshot(&self, reason: &str) -> Result<Manifest, ApiError> {
+        let _one = self.snapshot_lock.lock().await;
+        self.take_snapshot_locked(reason).await
+    }
+
+    async fn take_snapshot_locked(&self, reason: &str) -> Result<Manifest, ApiError> {
         self.check_alive()?;
         let storage = self.storage()?.clone();
-        let _one = self.snapshot_lock.lock().await;
         let branch = self.branch().to_owned();
         let root = snapshots_dir(&storage.data_dir, &branch);
         sweep_partial(&root);
@@ -488,9 +513,11 @@ impl Node {
             .map_err(|e| ApiError::new(ErrorCode::Internal, format!("snapshot: {e}")))?;
         let mut rel: Vec<PathBuf> = copy.files.clone();
         if let Some(s) = &self.secrets {
-            s.backup_to(&tmp.join("secrets.db")).map_err(|e| {
+            let stage = s.stage_encrypted_snapshot(tmp).map_err(|e| {
                 ApiError::new(ErrorCode::Internal, format!("snapshot of secrets: {e}"))
             })?;
+            std::fs::hard_link(stage.database_path(), tmp.join("secrets.db"))
+                .map_err(|e| io_err("snapshot of secrets", e))?;
             rel.push(PathBuf::from("secrets.db"));
         }
         let mut files = Vec::with_capacity(rel.len());
@@ -599,7 +626,7 @@ impl Node {
                 return Ok(None);
             }
         }
-        self.snapshot(reason).await.map(Some)
+        self.snapshot_configured(reason).await.map(Some)
     }
 
     /// Checkpoints every running `fork_mode = "sandbox"` foreign actor (M14,

@@ -240,6 +240,8 @@ pub struct Config {
     /// Simulator configuration by target (M12): the latest
     /// `SimulatorConfig` record of each.
     simulators: BTreeMap<String, pb::SimulatorConfig>,
+    /// Links are configuration: even unlink retains its admitted generation.
+    secret_links: BTreeMap<String, pb::SecretLink>,
     /// Installation default for `sql_bytes_per_actor` when a kind has no
     /// value in a `Limits` record. `None` keeps [`KindLimits::default`]
     /// (1 GiB), which DST and tests rely on.
@@ -300,8 +302,20 @@ impl Config {
                     self.simulators.insert(m.target.clone(), m.clone());
                 }
             }
+            Record::SecretLink(link) => {
+                self.epoch = self.epoch.max(link.epoch);
+                self.secret_links.insert(link.name.clone(), link.clone());
+            }
             _ => {}
         }
+    }
+
+    pub fn secret_link(&self, name: &str) -> Option<&pb::SecretLink> {
+        self.secret_links.get(name)
+    }
+
+    pub fn secret_links(&self) -> impl Iterator<Item = &pb::SecretLink> {
+        self.secret_links.values()
     }
 
     pub fn grants(&self) -> impl Iterator<Item = &Grant> {
@@ -424,6 +438,7 @@ impl ConfigHistory {
                 Record::ForeignActor(f) => f.epoch,
                 Record::PrivacyMode(p) => p.epoch,
                 Record::SimulatorConfig(m) => m.epoch,
+                Record::SecretLink(link) => link.epoch,
                 _ => continue,
             };
             if e <= epoch {
@@ -563,6 +578,7 @@ mod tests {
                 epoch,
                 mode: mode as i32,
                 audit: None,
+                reseal_requested: false,
             })
         };
         let mut h = ConfigHistory::default();
@@ -574,5 +590,41 @@ mod tests {
         assert_eq!(h.at(3).privacy(), (pb::PrivacyState::On, Some(2)));
         assert_eq!(h.at(4).privacy(), (pb::PrivacyState::Off, Some(4)));
         assert_eq!(h.at(4).epoch, 4);
+    }
+}
+
+#[cfg(test)]
+mod secret_link_tests {
+    use super::*;
+
+    #[test]
+    fn admitted_epoch_keeps_its_link_and_unlink_keeps_the_new_generation() {
+        let mut history = ConfigHistory::default();
+        let link = |epoch, generation, backend: &str, reference: &str| {
+            Record::SecretLink(pb::SecretLink {
+                name: "service-token".into(),
+                backend: backend.into(),
+                r#ref: reference.into(),
+                binding: if backend.is_empty() { "file" } else { "trusted-provider" }.into(),
+                canonical_ref: reference.into(),
+                epoch,
+                generation,
+                audit: None,
+            })
+        };
+        history.push(link(1, 1, "bao", "secret/old#token"));
+        let admitted = history.at(1);
+        history.push(link(2, 2, "bao", "secret/new#token"));
+        history.push(link(3, 3, "", ""));
+        let old = admitted.secret_link("service-token").unwrap();
+        assert_eq!((old.generation, old.r#ref.as_str()), (1, "secret/old#token"));
+        let changed = history.at(2);
+        let changed = changed.secret_link("service-token").unwrap();
+        assert_eq!((changed.generation, changed.r#ref.as_str()), (2, "secret/new#token"));
+        let unlinked = history.at(3);
+        let unlinked = unlinked.secret_link("service-token").unwrap();
+        assert!(unlinked.backend.is_empty());
+        assert_eq!(unlinked.generation, 3);
+        assert_eq!(history.at(1).secret_link("service-token"), Some(old));
     }
 }

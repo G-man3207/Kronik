@@ -3,13 +3,15 @@
 //! `<endpoint>/v1/metrics`, cumulative since the daemon's start. Each push
 //! replaces the last, so a failed one is only logged.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use kronik_core::env::Env;
+use kronik_core::authority::AuthLease;
 use kronik_metrics::{BUCKETS, Sample, SampleValue, Type};
+use kronik_sched::Node;
 use prost::Message as _;
 
-use crate::follow::Delivery;
+use crate::follow::{Delivery, Stream};
 use crate::otlp::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
@@ -143,18 +145,27 @@ pub fn request(
 /// Pushes the registry every `interval`, forever. `before` sets the
 /// scrape-time gauges first, as the admin endpoint does.
 pub async fn push_loop(
-    env: Env,
+    node: Arc<Node>,
     endpoint: String,
     headers: Vec<(String, String)>,
     service_name: String,
     branch: String,
     interval: Duration,
     before: impl Fn() + Send,
+    stop: Arc<Stream>,
+    original: AuthLease,
 ) {
+    let env = node.env().clone();
     let start = env.clock.wall_ms().saturating_mul(1_000_000);
     let url = format!("{endpoint}/v1/metrics");
     loop {
-        env.clock.sleep(interval).await;
+        if stop.is_stopping() { return; }
+        tokio::select! {
+            biased;
+            () = stop.stopped() => return,
+            () = original.cancelled() => return,
+            () = env.clock.sleep(interval) => {}
+        }
         before();
         let resource = Resource {
             service_name: &service_name,
@@ -165,11 +176,12 @@ pub async fn push_loop(
         let now = env.clock.wall_ms().saturating_mul(1_000_000);
         let body = request(&resource, &kronik_metrics::snapshot(), start, now).encode_to_vec();
         let resp = crate::http::post(
-            &env,
+            &node,
             url.clone(),
             headers.clone(),
             "application/x-protobuf",
             body.into(),
+            original.clone(),
         )
         .await;
         let delivery = crate::traces::otlp_delivery(resp, |b| {

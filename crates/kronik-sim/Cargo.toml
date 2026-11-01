@@ -22,6 +22,7 @@ kronik-store = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "macros"] }
+zeroize = { workspace = true }
 
 [[test]]
 name = "dst"

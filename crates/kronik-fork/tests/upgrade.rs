@@ -41,6 +41,7 @@ fn msg(name: &str, body: &str) -> pb::Message {
             value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
         }),
         blobs: vec![],
+        retained_compensation_source: None,
     }
 }
 
@@ -321,7 +322,7 @@ fn upgrade_replays_grant_and_revoke_but_fork_overrides_stay_fixed() {
             capability: "secret:key".into(),
             ..Default::default()
         }));
-        let setup = Arc::new(kronik_fork::ReplaySetup::new(
+        let setup = Arc::new(kronik_fork::ReplaySetup::recorded(
             "fixed-policy".into(),
             index,
             code.kinds,

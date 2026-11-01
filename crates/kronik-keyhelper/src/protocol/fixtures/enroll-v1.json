@@ -1,0 +1,1 @@
+{"schema":"kronik.pkcs11/v1","op":"enroll","module":"/usr/lib/softhsm/libsofthsm2.so","module_sha256":"0000000000000000000000000000000000000000000000000000000000000000","manufacturer":"SoftHSM project","model":"SoftHSM v2","serial":"244b62a631d0dce3","key_id":"58809dacd6a0a338e60c233610601d75","key_version":"fixture-v1","purpose":"kronik master v1"}

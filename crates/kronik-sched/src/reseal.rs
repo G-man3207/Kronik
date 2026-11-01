@@ -3,6 +3,7 @@
 //! tombstones, then fix offsets and the state.db rows those records still
 //! own (`kv`, saved responses, dead letters).
 
+use kronik_core::authority::AuthLease;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,7 @@ use kronik_proto::log::v1 as pb;
 use serde::{Deserialize, Serialize};
 
 use crate::Node;
+use crate::node::OperationOrigin;
 
 /// What `kronik privacy reseal` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,7 +296,8 @@ impl Node {
     /// `kronik privacy reseal` (docs/design/m8-privacy.md §8). Requires the
     /// mode to be `on`. Rewrites closed segments only; the active segment
     /// waits for the next roll. A dry run writes nothing.
-    pub async fn reseal(&self, dry_run: bool) -> Result<ResealDone, ApiError> {
+    pub async fn reseal(&self, audit: pb::Audit, dry_run: bool, authority: AuthLease) -> Result<ResealDone, ApiError> {
+        authority.check()?;
         self.check_running()?;
         if self.privacy_mode().0 != pb::PrivacyState::On {
             return Err(ApiError::new(
@@ -318,18 +321,43 @@ impl Node {
                 tombstones: 0,
             });
         }
-        let _guard = self.deploy_lock.lock().await;
+        let held = self.lock_deploy_authorized(&authority).await?;
+        if self.privacy_mode().0 != pb::PrivacyState::On {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "privacy mode changed to off while waiting to reseal",
+            )
+            .with_hint("kronik privacy mode on --reason '...'"));
+        }
         let active = self.wait_closed_applied().await?;
         let todo = self.segments_to_reseal().await?;
         let todo: Vec<Lsn> = todo.into_iter().filter(|s| *s != active).collect();
-        if todo.is_empty() {
-            return Ok(ResealDone {
-                started: false,
-                segments: 0,
-                values_sealed: 0,
-                tombstones: 0,
-            });
-        }
+        let epoch = self.epoch().checked_add(1).ok_or_else(|| {
+            ApiError::new(ErrorCode::Unavailable, "configuration epoch exhausted")
+        })?;
+        let request = Record::PrivacyMode(pb::PrivacyMode {
+            epoch,
+            mode: pb::PrivacyState::On as i32,
+            audit: Some(audit),
+            reseal_requested: true,
+        });
+        let node = self.arc().ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        self.authorized_effect(authority, move || async move {
+            // The exact request and segment set were admitted together.
+            node.commit_config_locked(&held, epoch, request, OperationOrigin::Internal).await?;
+            if todo.is_empty() {
+                return Ok(ResealDone {
+                    started: false,
+                    segments: 0,
+                    values_sealed: 0,
+                    tombstones: 0,
+                });
+            }
+            node.reseal_closed(todo).await
+        }).await
+    }
+
+    async fn reseal_closed(&self, todo: Vec<Lsn>) -> Result<ResealDone, ApiError> {
         let data = self.data_dir().map(Path::to_path_buf);
         let total = todo.len() as u64;
         if let Some(data) = &data {

@@ -123,12 +123,90 @@ pub struct Outcome {
     pub message: Option<String>,
 }
 
+/// An output identity, not permission to open a blob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BlobReference {
+    pub hash: String,
+    pub size: u64,
+}
+
+impl From<&kronik_proto::log::v1::BlobRef> for BlobReference {
+    fn from(reference: &kronik_proto::log::v1::BlobRef) -> Self {
+        Self { hash: reference.hash.clone(), size: reference.size }
+    }
+}
+
+/// Inline text/base64 or a body blob identity; attachments are separate.
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(extend("not" = {
+    "anyOf": [
+        {"required": ["blob", "text"], "properties": {"blob": {"type": "object"}, "text": {"type": "string"}}},
+        {"required": ["blob", "base64"], "properties": {"blob": {"type": "object"}, "base64": {"type": "string"}}}
+    ]
+}))]
 pub struct Reply {
     pub name: String,
     pub content_type: String,
     #[serde(flatten)]
     pub body: Payload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<BlobReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blobs: Vec<BlobReference>,
+}
+
+impl Reply {
+    pub fn inline(name: String, content_type: String, body: Payload, blobs: Vec<BlobReference>) -> Self {
+        Self { name, content_type, body, blob: None, blobs }
+    }
+
+    pub fn blob(name: String, content_type: String, blob: BlobReference) -> Self {
+        Self { name, content_type, body: Payload::default(), blob: Some(blob), blobs: Vec::new() }
+    }
+
+    pub(crate) fn body_is_exclusive(&self) -> bool {
+        self.blob.is_none() || (self.body.text.is_none() && self.body.base64.is_none())
+    }
+}
+
+impl Serialize for Reply {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        if !self.body_is_exclusive() {
+            return Err(serde::ser::Error::custom("a reply cannot contain both inline data and a body blob"));
+        }
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("name", &self.name)?;
+        map.serialize_entry("content_type", &self.content_type)?;
+        if let Some(text) = &self.body.text { map.serialize_entry("text", text)?; }
+        if let Some(base64) = &self.body.base64 { map.serialize_entry("base64", base64)?; }
+        if let Some(blob) = &self.blob { map.serialize_entry("blob", blob)?; }
+        if !self.blobs.is_empty() { map.serialize_entry("blobs", &self.blobs)?; }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Reply {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            name: String,
+            content_type: String,
+            #[serde(flatten)]
+            body: Payload,
+            #[serde(default)]
+            blob: Option<BlobReference>,
+            #[serde(default)]
+            blobs: Vec<BlobReference>,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let reply = Self { name: fields.name, content_type: fields.content_type,
+            body: fields.body, blob: fields.blob, blobs: fields.blobs };
+        if !reply.body_is_exclusive() {
+            return Err(serde::de::Error::custom("a reply cannot contain both inline data and a body blob"));
+        }
+        Ok(reply)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -143,6 +221,16 @@ pub struct TurnResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ResendRequest {
     /// Required: missing or blank answers REASON_REQUIRED.
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Identity and authority come only from the authenticated request, never JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApproveRequest {
     #[serde(default)]
     pub reason: String,
     #[serde(default)]
@@ -416,7 +504,7 @@ pub struct SecretSetRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SecretView {
     pub name: String,
-    pub version: u32,
+    pub version: u64,
     /// Hex of the keyed version hash; never the value.
     pub version_hash: String,
     pub created_wall_ms: u64,
@@ -432,6 +520,9 @@ pub struct SecretResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SecretsResponse {
     pub secrets: Vec<SecretView>,
+    /// Configured bindings, including names whose value has never been observed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<SecretLinkView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -453,6 +544,90 @@ pub struct SecretDeleted {
 pub struct SecretDeleteResponse {
     pub dry_run: bool,
     pub deleted: SecretDeleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SecretLinkRequest {
+    pub backend: String,
+    pub r#ref: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SecretRefreshRequest {
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SecretLinkView {
+    pub name: String,
+    /// Empty means an explicit unlink back to the built-in store.
+    pub backend: String,
+    pub r#ref: String,
+    pub binding: String,
+    pub canonical_ref: String,
+    pub generation: u64,
+    pub epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SecretLinkResponse {
+    pub dry_run: bool,
+    pub link: SecretLinkView,
+    pub lsn: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretVersionPhase {
+    Reserved,
+    Active,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SecretVersionView {
+    pub name: String,
+    pub version: u64,
+    pub version_hash: String,
+    pub hash_revision: u32,
+    pub backend: String,
+    pub source_version: String,
+    pub r#ref: String,
+    pub binding: String,
+    pub canonical_ref: String,
+    pub link_generation: u64,
+    pub phase: SecretVersionPhase,
+    pub deleted: bool,
+    pub created_wall_ms: u64,
+    pub token_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SecretHistoryResponse {
+    pub name: String,
+    pub versions: Vec<SecretVersionView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SecretBackendView {
+    pub id: String,
+    pub kind: String,
+    pub binding: String,
+    pub configured: bool,
+    pub inventory_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SecretBackendsResponse {
+    pub backends: Vec<SecretBackendView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -767,6 +942,9 @@ pub struct ProposalInfo {
     pub unchanged: Vec<DeploymentKind>,
     #[serde(default)]
     pub approval_requests: Vec<ApprovalRequestInfo>,
+    /// Completed approvals from the log, including the authenticated audit caller.
+    #[serde(default)]
+    pub approvals: Vec<ReviewedApproval>,
     /// What a reader must know about how the proposal was verified, e.g.
     /// that retention cut its window short.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -851,6 +1029,26 @@ pub struct ApprovalInfo {
     pub diff_hash: String,
     pub verified_through_lsn: u64,
     pub lsn: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewedApproval {
+    pub lsn: u64,
+    pub diff_hash: String,
+    pub verified_through_lsn: u64,
+    pub token_id: String,
+    pub reason: String,
+    pub wall_time_ms: u64,
+    /// Present only with pii:read and a stored protected identity; legacy approvals omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_identity: Option<VerifiedApprovalIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VerifiedApprovalIdentity {
+    Verified { issuer: String, subject: String },
+    Erased,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1257,13 +1455,69 @@ pub struct IntegrityResponse {
     pub keys_missing: Vec<String>,
 }
 
-/// `GET /v1/audit`: `kronik.audit/v2` lines in LSN order (m28-otel §4.3).
+/// `GET /v1/audit`: native log positions or the actual metadata audit cut.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum AuditResponse {
+    Member(MemberAuditResponse),
+    Native(NativeAuditResponse),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct AuditResponse {
+pub struct NativeAuditResponse {
     pub lines: Vec<kronik_otel::audit::Line>,
     /// The `from` of the next page; absent at the applied LSN.
     pub next: Option<u64>,
     pub applied_lsn: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MemberAuditResponse {
+    pub source: kronik_core::ids::SourcePos,
+    pub covered_from: u64,
+    pub next: Option<u64>,
+    pub lines: Vec<kronik_otel::audit::Line>,
+}
+
+impl<'de> Deserialize<'de> for AuditResponse {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("source").is_some() || value.get("covered_from").is_some() {
+            if value.get("applied_lsn").is_some() {
+                return Err(serde::de::Error::custom("metadata audit pages cannot contain a native applied LSN"));
+            }
+            let page: MemberAuditResponse = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            let kronik_core::ids::SourcePos::Metadata { index } = page.source else {
+                return Err(serde::de::Error::custom("a member audit page requires its metadata source"));
+            };
+            if index == 0 || index > i64::MAX as u64
+                || page.covered_from == 0 || page.covered_from > i64::MAX as u64
+                || page.covered_from > index + 1
+                || page.next.is_some_and(|next| next < page.covered_from || next > index) {
+                return Err(serde::de::Error::custom("metadata audit coverage or next page is outside its actual cut"));
+            }
+            Ok(Self::Member(page))
+        } else {
+            serde_json::from_value(value).map(Self::Native).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+impl JsonSchema for AuditResponse {
+    fn schema_name() -> std::borrow::Cow<'static, str> { "AuditResponse".into() }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let native = generator.subschema_for::<NativeAuditResponse>();
+        let member = generator.subschema_for::<MemberAuditResponse>();
+        schemars::Schema::from(serde_json::Map::from_iter([("oneOf".into(), serde_json::json!([
+            {"allOf":[member,{"not":{"required":["applied_lsn"]},"properties":{
+                "source":{"properties":{"kind":{"const":"metadata"},"index":{"minimum":1,"maximum":i64::MAX}},
+                    "required":["kind","index"]},
+                "covered_from":{"minimum":1,"maximum":i64::MAX},
+                "next":{"anyOf":[{"type":"null"},{"type":"integer","minimum":1,"maximum":i64::MAX}]}
+            }}]},
+            {"allOf":[native,{"not":{"anyOf":[{"required":["source"]},{"required":["covered_from"]}]}}]}
+        ]))]))
+    }
 }
 
 // Export (docs/design/m28-otel.md §6.2).

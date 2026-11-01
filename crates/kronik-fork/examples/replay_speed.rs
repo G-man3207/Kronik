@@ -106,7 +106,7 @@ fn main() {
         let code = node.code().clone();
         let fc = fork_kinds(&index, fork_lsn, |h| code.get(h).map_err(|e| e.to_string()), &[]).unwrap();
         let config = config_at(&index, fork_lsn);
-        let mut setup = ReplaySetup::new("f-bench".into(), index.clone(), fc.kinds, config, None);
+        let mut setup = ReplaySetup::recorded("f-bench".into(), index.clone(), fc.kinds, config, None);
         let t = Instant::now();
         let rebuilt = kronik_fork::replay::production_store(&index).unwrap();
         println!("applying the window to a fresh cursor: {:.3} s", t.elapsed().as_secs_f64());

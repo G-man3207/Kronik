@@ -91,6 +91,24 @@ pub trait Fs: Send + Sync + 'static {
     fn available(&self, _path: PathBuf) -> BoxFuture<'static, io::Result<u64>> {
         Box::pin(async { Ok(u64::MAX) })
     }
+    /// Read a singly linked regular file owned by the effective user, with no
+    /// group/world permissions. Recheck identity and contents after reading.
+    fn read_secure(&self, _path: PathBuf, _max_bytes: usize)
+        -> BoxFuture<'static, io::Result<Vec<u8>>> {
+        Box::pin(async { Err(io::Error::new(io::ErrorKind::Unsupported, "secure file reads are not supported")) })
+    }
+    /// Atomically replace a 0600 file beneath a private owned parent and sync
+    /// file and directory. Only a missing immediate 0700 parent may be created.
+    fn write_secure(&self, _path: PathBuf, bytes: Vec<u8>)
+        -> BoxFuture<'static, io::Result<()>> {
+        drop(zeroize::Zeroizing::new(bytes));
+        Box::pin(async { Err(io::Error::new(io::ErrorKind::Unsupported, "secure file writes are not supported")) })
+    }
+    /// As write_secure, but an existing destination must never be replaced.
+    fn write_secure_new(&self, _path: PathBuf, _bytes: Bytes)
+        -> BoxFuture<'static, io::Result<()>> {
+        Box::pin(async { Err(io::Error::new(io::ErrorKind::Unsupported, "exclusive secure file writes are not supported")) })
+    }
 }
 
 /// An open file. Buffers are owned (`Bytes`/`Vec<u8>`) so real
@@ -125,6 +143,21 @@ pub struct HttpResponse {
     pub body: Bytes,
 }
 
+/// An outbound bounded WebSocket handshake; redirects are never followed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WebSocketRequest {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub max_message_bytes: usize,
+}
+
+/// A bounded full-duplex socket. Peer close is sticky across subsequent recv.
+pub trait WebSocket: Send + Sync {
+    fn recv(&self) -> BoxFuture<'static, Result<Option<Bytes>, NetError>>;
+    fn send(&self, message: Bytes) -> BoxFuture<'static, Result<(), NetError>>;
+    fn close(&self) -> BoxFuture<'static, Result<(), NetError>>;
+}
+
 /// Why a request failed. The distinction matters for I17: only `Connect`
 /// proves the request never left the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,16 +182,30 @@ pub struct TlsConfig {
 /// hyper listener in production.
 pub trait Net: Send + Sync + 'static {
     fn http(&self, req: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>>;
+    /// Recheck the SAME original authority at the actual synchronous request
+    /// enqueue, after connection/capacity waits; retain it through response EOF.
+    /// Implementations must not admit construction of a lazy HTTP future.
+    fn http_authorized(&self, req: HttpRequest, original: crate::authority::AuthLease)
+        -> BoxFuture<'static, Result<HttpResponse, NetError>>;
     /// Builds a separate provider client; simulated networks may implement
     /// this without changing their deterministic request boundary.
+    /// Supplied roots augment the system roots; this never changes guest trust.
     fn with_tls(&self, _tls: TlsConfig) -> Result<Arc<dyn Net>, NetError> {
         Err(NetError::Connect(
             "TLS configuration is not supported".into(),
         ))
     }
+    /// A separate provider client trusting only the supplied CA certificates.
+    fn with_pinned_tls(&self, _tls: TlsConfig) -> Result<Arc<dyn Net>, NetError> {
+        Err(NetError::Connect("pinned TLS configuration is not supported".into()))
+    }
+    fn websocket(&self, _request: WebSocketRequest)
+        -> BoxFuture<'static, Result<Arc<dyn WebSocket>, NetError>> {
+        Box::pin(async { Err(NetError::Connect("WebSocket connections are not supported".into())) })
+    }
 }
 
-/// A child process (`runsc`, later Firecracker). Its stdin is always
+/// An ordinary child process (`runsc`, later Firecracker). Its stdin is
 /// `/dev/null`, and it never gets the daemon's own stdout or stderr.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSpec {
@@ -191,8 +238,34 @@ pub trait Process: Send + Sync + 'static {
     fn kill(&self) -> BoxFuture<'static, io::Result<()>>;
 }
 
+/// One private helper operation. Never put sensitive bytes in `spec`:
+/// argv/environment are explicit configuration, not secret transports.
+/// Both streams are bounded to 4096 bytes; `spec.stdout/stderr` are ignored.
+/// The trusted, private regular PIN file is opened read-only and mapped to fd3.
+/// Ownership is the effective caller or current-namespace root, not an
+/// initial-host-root identity assertion. Group/other access and execute bits
+/// are rejected. Standard streams remain private regardless of `spec`.
+pub struct SensitiveProcessRequest {
+    pub spec: ProcessSpec,
+    pub stdin: zeroize::Zeroizing<Vec<u8>>,
+    pub pin_file: PathBuf,
+    pub timeout: Duration,
+}
+
 pub trait ProcessRunner: Send + Sync + 'static {
     fn spawn(&self, spec: ProcessSpec) -> BoxFuture<'static, io::Result<Arc<dyn Process>>>;
+    /// Send one bounded request followed by EOF, discard stderr, and return
+    /// bounded stdout only after successful exit and reap. Dropping the future
+    /// cancels the operation; the supervisor still kills and reaps the child.
+    /// Response parsing stays with the caller; keep its zeroizing ownership
+    /// when rejecting malformed protocol bytes.
+    /// Linux uses an owned process group, killed before the leader's final
+    /// reap. Descendants deliberately escaping that group are not sandboxed.
+    /// Other platforms return `Unsupported`; ordinary spawning is unchanged.
+    fn exchange(
+        &self,
+        request: SensitiveProcessRequest,
+    ) -> BoxFuture<'static, io::Result<zeroize::Zeroizing<Vec<u8>>>>;
 }
 
 /// The bundle handed to every daemon component. Cheap to clone.

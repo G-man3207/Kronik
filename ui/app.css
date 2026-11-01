@@ -1,0 +1,74 @@
+:root {
+  color-scheme: light;
+  font: 1rem/1.5 system-ui, sans-serif;
+  color: #17212f;
+  background: #f4f6f8;
+}
+* { box-sizing: border-box; }
+body { margin: 0 auto; max-width: 90rem; }
+header, main, footer { padding: 1rem clamp(1rem, 3vw, 2.5rem); }
+header { background: #fff; border-bottom: 2px solid #596779; }
+.brand { font-size: 1.8rem; font-weight: 750; margin: 0 0 1rem; }
+.brand span { font-size: 1rem; font-weight: 400; display: inline-block; }
+#authentication { padding: 1rem; background: #f4f6f8; }
+#auth-title { font-size: 1.1rem; margin: 0; }
+#session-status { margin: .5rem 0; overflow-wrap: anywhere; }
+nav { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1rem; }
+a { color: #17459f; text-underline-offset: .2em; }
+nav a { padding: .6rem .9rem; border: 1px solid #596779; border-radius: .25rem; }
+nav a[aria-current="page"] { color: #fff; background: #173e75; border-color: #173e75; }
+:focus-visible { outline: 3px solid #7c3100; outline-offset: 3px; }
+.skip-link { position: absolute; top: -10rem; left: 1rem; padding: 1rem; background: white; z-index: 1; }
+.skip-link:focus { top: .5rem; }
+h1 { font-size: 1.8rem; }
+h2 { font-size: 1.35rem; }
+h3 { font-size: 1.1rem; }
+h1, h2, h3 { line-height: 1.3; overflow-wrap: anywhere; }
+section { margin-block: 1.25rem; }
+form { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; margin-block: 1rem; }
+label { font-weight: 600; }
+input, button { font: inherit; min-height: 2.75rem; border: 1px solid #596779; border-radius: .2rem; }
+input { padding: .5rem; color: #17212f; background: white; max-width: 100%; }
+input[type="password"] { width: 24rem; }
+input[type="checkbox"] { min-height: 1.3rem; width: 1.3rem; height: 1.3rem; accent-color: #173e75; }
+button { padding: .5rem 1rem; color: #fff; background: #173e75; cursor: pointer; }
+button:hover:not(:disabled) { background: #0c2953; }
+button:disabled { color: #414b58; background: #e0e4e9; cursor: not-allowed; border-color: #596779; }
+.check { display: inline-flex; gap: .5rem; align-items: center; }
+[hidden] { display: none !important; }
+#status:not(:empty), #error:not([hidden]), .notice { padding: .8rem 1rem; margin-block: 1rem; border-left: .35rem solid #17459f; background: #e8effa; }
+#error:not([hidden]) { color: #631717; background: #fff0ef; border-color: #a22222; white-space: pre-wrap; overflow-wrap: anywhere; }
+.table-scroll { overflow-x: auto; margin-block: 1rem; }
+table { width: 100%; border-collapse: collapse; background: #fff; text-align: left; }
+caption { text-align: left; font-weight: 650; margin-bottom: .5rem; }
+th, td { border: 1px solid #8b96a5; padding: .6rem; vertical-align: top; overflow-wrap: anywhere; min-width: 5rem; }
+th { background: #e7ecf3; }
+tbody tr:nth-child(even) { background: #f4f6f8; }
+dl { display: grid; grid-template-columns: minmax(8rem, 1fr) minmax(0, 3fr); gap: .4rem 1rem; }
+dt { font-weight: 650; overflow-wrap: anywhere; }
+dd { margin: 0; overflow-wrap: anywhere; }
+pre, code { font: .9rem/1.5 ui-monospace, monospace; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: .25rem 0; }
+details { border: 1px solid #8b96a5; padding: .7rem 1rem; margin-block: .8rem; background: #fff; }
+summary { cursor: pointer; font-weight: 650; min-height: 1.8rem; }
+article { border: 1px solid #8b96a5; border-radius: .25rem; background: #fff; padding: 1rem; margin-block: 1rem; }
+article > :first-child { margin-top: 0; }
+.causal-tree ul { border-left: 2px solid #8b96a5; padding-left: 1.4rem; }
+.causal-tree li { margin-block: .7rem; overflow-wrap: anywhere; }
+.timeline > li { padding-left: .5rem; margin-block: 1rem; }
+.mutation { border: 1px solid #596779; padding: 1rem; background: #fff; }
+.mutation form { align-items: flex-start; flex-direction: column; }
+.mutation input:not([type="checkbox"]) { width: 100%; }
+footer { border-top: 1px solid #8b96a5; font-size: .9rem; }
+@media (max-width: 40rem) {
+  form { align-items: stretch; flex-direction: column; }
+  nav a { flex: 1 1 40%; }
+  dl { grid-template-columns: 1fr; }
+  dd { margin-bottom: .6rem; }
+  .brand span { display: block; }
+  .table-scroll table { min-width: 35rem; }
+}
+@media (forced-colors: active) {
+  nav a[aria-current="page"] { border: 3px solid LinkText; }
+  :focus-visible { outline-color: Highlight; }
+}

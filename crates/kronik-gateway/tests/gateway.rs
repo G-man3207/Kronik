@@ -23,6 +23,10 @@ const COUNTER: &str = concat!(
 );
 
 async fn node(dir: &std::path::Path) -> Arc<Node> {
+    node_with_guest(dir, COUNTER).await
+}
+
+async fn node_with_guest(dir: &std::path::Path, guest: &str) -> Arc<Node> {
     let env = Env::real(tokio::runtime::Handle::current());
     let node = start_local(env, dir, NodeConfig::default()).await.unwrap();
     let audit = pb::Audit {
@@ -30,7 +34,7 @@ async fn node(dir: &std::path::Path) -> Arc<Node> {
         reason: "test".into(),
         wall_time_ms: 0,
     };
-    node.deploy(&std::fs::read(COUNTER).unwrap(), audit, false)
+    node.deploy(&std::fs::read(guest).unwrap(), audit, false, node.local_operator_authority().unwrap())
         .await
         .unwrap();
     node
@@ -94,6 +98,61 @@ async fn routes_outcomes_and_errors() {
 
     let r = gw.handle(post("/nothing/here", None, b"")).await;
     assert_eq!((r.status, code(&r)), (404, "ROUTE_NOT_FOUND".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_cookies_never_reach_the_guest_input_or_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(dir.path()).await;
+    let gw = Gateway::new(node.clone(), GatewayConfig::default());
+    let mut req = post("/counter/a/increment", Some("cookie-boundary"), b"");
+    req.headers.extend([
+        ("Cookie".into(), "app=one; __Host-kronik-session=secret; other=two".into()),
+        ("cOoKiE".into(), " \t__Host-kronik-login \t=private; app2=three".into()),
+        ("COOKIE".into(), "__Host-kronik-session=only".into()),
+        ("cookie".into(), "__host-kronik-session=case; __Host-kronik-session-extra=suffix".into()),
+        ("Authorization".into(), "Bearer app-token".into()),
+    ]);
+    let response = gw.handle(req).await;
+    assert_eq!((response.status, response.body.as_slice()), (200, b"1".as_slice()));
+    let lsn = header(&response, TURN_ID_HEADER).unwrap().rsplit(':').next().unwrap().parse().unwrap();
+    let record = node.read_record(lsn).await.unwrap().unwrap();
+    let kronik_proto::Record::TurnRecord(turn) = record.record else { panic!("not a turn") };
+    let Some(pb::input::Kind::Http(http)) = turn.input.and_then(|input| input.kind) else { panic!("not the guest HTTP input") };
+    let headers: Vec<_> = http.headers.iter().map(|header| {
+        let Some(pb::sealable::Value::Plain(value)) = header.value.as_ref().and_then(|value| value.value.as_ref())
+            else { panic!("not a plain header") };
+        (header.name.as_str(), std::str::from_utf8(value).unwrap())
+    }).collect();
+    assert_eq!(headers, vec![
+        ("Idempotency-Key", "cookie-boundary"),
+        ("Cookie", "app=one; other=two"),
+        ("cOoKiE", " app2=three"),
+        ("cookie", "__host-kronik-session=case; __Host-kronik-session-extra=suffix"),
+        ("Authorization", "Bearer app-token"),
+    ]);
+    assert_eq!(http.idempotency_key, "cookie-boundary");
+    assert!(!http.request_hash.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_admin_cookie_assignments_are_filtered_on_fresh_and_cached_responses() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_with_guest(dir.path(),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/counter-respond.wasm")).await;
+    let gw = Gateway::new(node.clone(), GatewayConfig::default());
+    let body = b"201\nSet-Cookie: __Host-kronik-session=guest; Secure; Path=/\nsEt-CoOkIe: \t__Host-kronik-login \t=guest; Secure; Path=/\nSet-Cookie: app=kept; HttpOnly\nSet-Cookie: __host-kronik-session=case\nSet-Cookie: __Host-kronik-session-extra=suffix\nX-App: kept\n\nfrom guest";
+    let first = gw.handle(post("/counter/a/respond", Some("cookie-response"), body)).await;
+    let cached = gw.handle(post("/counter/a/respond", Some("cookie-response"), body)).await;
+    for response in [&first, &cached] {
+        assert_eq!((response.status, response.body.as_slice()), (201, b"from guest".as_slice()));
+        let cookies: Vec<_> = response.headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, value)| value.as_str()).collect();
+        assert_eq!(cookies, ["app=kept; HttpOnly", "__host-kronik-session=case", "__Host-kronik-session-extra=suffix"]);
+        assert_eq!(header(response, "x-app"), Some("kept"));
+    }
+    assert_eq!(header(&first, TURN_ID_HEADER), header(&cached, TURN_ID_HEADER));
+    assert_eq!(node.store().db().actor("counter", "a").unwrap().unwrap().turns, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -399,6 +458,7 @@ impl PreviewRouter for CookiePreview {
         _actor: ActorRef,
         http: pb::HttpInput,
         _subject: Option<String>,
+        _authority: kronik_core::authority::AuthLease,
     ) -> BoxFuture<'static, Result<TurnResult, ApiError>> {
         self.0.lock().unwrap().push(http);
         let h = |n: &str, v: &[u8]| pb::Header {
@@ -426,6 +486,7 @@ impl PreviewRouter for CookiePreview {
                     })),
                     ..Default::default()
                 },
+                scrubbed_with: None,
             })
         })
     }

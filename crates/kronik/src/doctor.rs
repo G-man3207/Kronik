@@ -786,6 +786,7 @@ fn export(config: &Config) -> Check {
         "/v1/export",
         None,
         token.as_deref(),
+        None,
         std::time::Duration::from_secs(5),
     ) {
         Ok(r) if r.status == 200 => {
@@ -884,6 +885,7 @@ fn key_source(config: &Config) -> Check {
         "/v1/keys",
         None,
         token.as_deref(),
+        None,
         Duration::from_secs(5),
     ) && r.status == 200
         && let Ok(status) = serde_json::from_slice::<kronik_privacy::key_source::KeyStatus>(&r.body)

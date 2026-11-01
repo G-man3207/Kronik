@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use zeroize::Zeroizing;
 
 use super::SimRng;
 use kronik_core::env::Clock;
@@ -40,6 +41,8 @@ struct Inode {
     current: Vec<u8>,
     durable: Vec<u8>,
     pending: Vec<Op>,
+    // Inodes are owned, singly linked regular files; ordinary creation is not private.
+    private: bool,
 }
 
 fn apply(buf: &mut Vec<u8>, op: &Op, keep: Option<usize>) {
@@ -70,6 +73,7 @@ pub struct Disk {
     names: BTreeMap<PathBuf, u64>,
     durable_names: BTreeMap<PathBuf, u64>,
     dirs: BTreeSet<PathBuf>,
+    private_dirs: BTreeSet<PathBuf>,
     next_inode: u64,
     pub fsyncs: u64,
     pub torn_writes: u64,
@@ -78,6 +82,26 @@ pub struct Disk {
 
 fn parent(p: &Path) -> PathBuf {
     p.parent().map(Path::to_path_buf).unwrap_or_default()
+}
+
+fn secure_path(path: &Path) -> io::Result<PathBuf> {
+    use std::path::Component;
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Normal(_) => clean.push(component.as_os_str()),
+            Component::CurDir => {}
+            _ => return Err(insecure_file()),
+        }
+    }
+    if clean.file_name().is_none() {
+        return Err(insecure_file());
+    }
+    Ok(clean)
+}
+
+fn insecure_file() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "insecure private file")
 }
 
 impl Disk {
@@ -178,6 +202,55 @@ impl Disk {
             .copied()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.display().to_string()))
     }
+
+    fn secure_parent(&mut self, path: &Path, create: bool) -> io::Result<()> {
+        let dir = parent(path);
+        for ancestor in dir.ancestors() {
+            if self.names.contains_key(ancestor) {
+                return Err(insecure_file());
+            }
+            if ancestor.as_os_str().is_empty() || ancestor == Path::new("/") {
+                continue;
+            }
+            if !self.dirs.contains(ancestor) {
+                if create && ancestor == dir {
+                    continue;
+                }
+                return Err(io::Error::new(io::ErrorKind::NotFound, "parent directory missing"));
+            }
+        }
+        if create {
+            if self.dirs.contains(&dir) || dir.as_os_str().is_empty() || dir == Path::new("/") {
+                if !self.private_dirs.contains(&dir) {
+                    return Err(insecure_file());
+                }
+            } else {
+                // Directories, including their privacy metadata, are always durable.
+                self.dirs.insert(dir.clone());
+                self.private_dirs.insert(dir);
+            }
+        }
+        Ok(())
+    }
+
+    fn secure_destination(&self, path: &Path, replace: bool) -> io::Result<()> {
+        if self.dirs.contains(path) {
+            return Err(if replace {
+                insecure_file()
+            } else {
+                io::ErrorKind::AlreadyExists.into()
+            });
+        }
+        if let Some(ino) = self.names.get(path) {
+            if !replace {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            if !self.inodes.get(ino).is_some_and(|inode| inode.private) {
+                return Err(insecure_file());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `Fs` over a shared [`Disk`]; every operation takes simulated time and is
@@ -225,6 +298,57 @@ impl SimFs {
             sleep.await;
             let mut d = disk.lock().unwrap_or_else(|e| e.into_inner());
             f(&mut d)
+        })
+    }
+
+    fn secure_write(&self, path: PathBuf, bytes: Bytes, replace: bool) -> BoxFuture<'static, io::Result<()>> {
+        let fs = self.clone();
+        Box::pin(async move {
+            let path = secure_path(&path)?;
+            let dir = parent(&path);
+            let destination = path.clone();
+            let (ino, temporary) = fs.op(fs.latency(5, 30, 0.0, 0), move |d| {
+                d.secure_parent(&destination, true)?;
+                d.secure_destination(&destination, replace)?;
+                d.next_inode += 1;
+                let ino = d.next_inode;
+                let mut name = std::ffi::OsString::from(".");
+                name.push(destination.file_name().ok_or_else(insecure_file)?);
+                name.push(format!(".{ino}.tmp"));
+                let temp = parent(&destination).join(name);
+                if d.names.contains_key(&temp) || d.dirs.contains(&temp) {
+                    return Err(io::ErrorKind::AlreadyExists.into());
+                }
+                d.inodes.insert(ino, Inode { private: true, ..Inode::default() });
+                d.names.insert(temp.clone(), ino);
+                Ok((ino, temp))
+            }).await?;
+            let file = SimFile { fs: fs.clone(), ino };
+            let result = async {
+                file.write_at(0, bytes).await?;
+                file.sync_data().await?;
+                let temp = temporary.clone();
+                fs.op(fs.latency(10, 50, 0.0, 0), move |d| {
+                    d.secure_parent(&path, true)?;
+                    d.secure_destination(&path, replace)?;
+                    if d.inode_of(&temp)? != ino {
+                        return Err(insecure_file());
+                    }
+                    d.names.remove(&temp);
+                    d.names.insert(path, ino);
+                    Ok(())
+                }).await?;
+                fs.sync_dir(dir).await
+            }.await;
+            if result.is_err() {
+                fs.op(fs.latency(10, 50, 0.0, 0), move |d| {
+                    if d.names.get(&temporary) == Some(&ino) {
+                        d.names.remove(&temporary);
+                    }
+                    Ok(())
+                }).await?;
+            }
+            result
         })
     }
 }
@@ -331,6 +455,31 @@ impl Fs for SimFs {
             d.durable_names.extend(cur);
             Ok(())
         })
+    }
+
+    fn read_secure(&self, path: PathBuf, max_bytes: usize) -> BoxFuture<'static, io::Result<Vec<u8>>> {
+        self.op(self.latency(5, 40, 0.0, 0), move |d| {
+            let path = secure_path(&path)?;
+            d.secure_parent(&path, false)?;
+            let ino = d.inode_of(&path)?;
+            let inode = &d.inodes[&ino];
+            if !inode.private {
+                return Err(insecure_file());
+            }
+            if inode.current.len() > max_bytes {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "private file exceeds limit"));
+            }
+            // The disk lock keeps metadata and contents unchanged throughout the read.
+            Ok(inode.current.clone())
+        })
+    }
+
+    fn write_secure(&self, path: PathBuf, bytes: Vec<u8>) -> BoxFuture<'static, io::Result<()>> {
+        self.secure_write(path, Bytes::from_owner(Zeroizing::new(bytes)), true)
+    }
+
+    fn write_secure_new(&self, path: PathBuf, bytes: Bytes) -> BoxFuture<'static, io::Result<()>> {
+        self.secure_write(path, bytes, false)
     }
 }
 

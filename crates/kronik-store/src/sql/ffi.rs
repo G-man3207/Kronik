@@ -139,7 +139,7 @@ unsafe extern "C" fn utc_localtime(t: *const c_void, tm: *mut c_void) -> c_int {
     // SAFETY: SQLite passes a `time_t*` and a `struct tm*` (see
     // SQLITE_TESTCTRL_LOCALTIME_FAULT); gmtime_r is thread-safe.
     unsafe {
-        if libc::gmtime_r(t.cast::<libc::time_t>(), tm.cast::<libc::tm>()).is_null() {
+        if libc::gmtime_r(t.cast(), tm.cast()).is_null() {
             1
         } else {
             0

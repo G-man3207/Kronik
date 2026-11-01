@@ -57,6 +57,7 @@ fn msg(name: &str) -> pb::Message {
             value: Some(pb::sealable::Value::Plain(Vec::new())),
         }),
         blobs: vec![],
+        retained_compensation_source: None,
     }
 }
 

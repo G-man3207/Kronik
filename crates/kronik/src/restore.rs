@@ -430,6 +430,11 @@ fn ship_error(e: ShipError) -> ApiError {
             kronik_privacy::key_source::KeySourceError::Key(e).api_error()
         }
         ShipError::Key(e) => ApiError::new(ErrorCode::BadRequest, format!("restore: {e}")),
+        ShipError::Keystore(_) => ApiError::new(
+            ErrorCode::Unavailable,
+            "The privacy keystore could not be read safely for shipping.",
+        )
+        .with_hint("Check the privacy keystore and storage access before attempting the operation again."),
         ShipError::KeystoreIncomplete(m) => ApiError::new(
             ErrorCode::KeystoreIncomplete,
             format!("restore: KEYSTORE_INCOMPLETE: {m}"),

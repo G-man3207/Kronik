@@ -1,0 +1,118 @@
+{
+  "format": "kronik.compatibility-index/v2",
+  "published_releases": ["v0.1.0", "v0.3.0"],
+  "releases": [
+    {
+      "release": "v0.1.0",
+      "producer_revision": "4353863c275e1ddbe978c7701181cc7ac26f9db5",
+      "producer_binary_sha256": "0cae31380774ef2b346d79ea234f6244e89b3f59d9c259a6d034b24e999b1db9",
+      "manifest": "v0.1.0/manifest.json",
+      "manifest_sha256": "d46be2768467aa0f8e8c853df76c40b45e281a6468011168fa1aa1cec4d58df1",
+      "root_inputs": 9,
+      "contracts": {
+        "api": {
+          "path": "v0.1.0/contracts/openapi.json",
+          "source_path": "docs/reference/openapi.json",
+          "git_blob": "1fd4eb5936a26f876a57989a8e5c407ddf4f0237",
+          "sha256": "e298828bc8d9ed075bde5c883975ec3f11ce3b86a594bfb16aad1bfae663bc64",
+          "bytes": 208419
+        },
+        "cli": {
+          "path": "v0.1.0/contracts/cli-json.txt",
+          "source_path": "docs/reference/json.md",
+          "git_blob": "bd68d0afc0ab11be1a9edb1fd421826707076bc7",
+          "sha256": "b5c56663ed0a135b9772890b8594180edc0902a325aeacd0e8eae4300212658d",
+          "bytes": 98135
+        },
+        "diff": {
+          "path": "v0.1.0/contracts/diff-v1.schema.json",
+          "source_path": "docs/reference/diff-v1.schema.json",
+          "git_blob": "5d6bb788200f6294090b5b82e92aa66812661182",
+          "sha256": "c90235f0009f201c13eff94216ef7c0711f9ff6290cb015f6271c37a23ba347d",
+          "bytes": 35286
+        },
+        "wit": {
+          "path": "v0.1.0/contracts/actor.wit",
+          "source_path": "wit/kronik-actor.wit",
+          "git_blob": "86c3f0e739057aa08c460bda06f1a42c9679d87e",
+          "sha256": "c2e7336a41b18405b5dfa26dad95600de79a21c133c61ec9ba516e0a63b32af6",
+          "bytes": 5832
+        }
+      },
+      "components": [
+        {
+          "role": "counter",
+          "path": "components/ea3d52e546f9d0a1cff7aa2cad23cf71cd2047565e8f3829b31261776ac4bfdd.wasm",
+          "source_path": "tests/guests/counter.wasm",
+          "git_blob": "ff7d10e731fc55624190c0780e57077be1bb9197",
+          "sha256": "ea3d52e546f9d0a1cff7aa2cad23cf71cd2047565e8f3829b31261776ac4bfdd",
+          "bytes": 108766
+        },
+        {
+          "role": "notes",
+          "path": "components/9bdea6d79ec534ddc0f41e2ff573b463ab66dbcf37f22c19dda737786cf22c4d.wasm",
+          "source_path": "tests/guests/notes.wasm",
+          "git_blob": "1df68586664725f4b93f21440f858f86455f0b31",
+          "sha256": "9bdea6d79ec534ddc0f41e2ff573b463ab66dbcf37f22c19dda737786cf22c4d",
+          "bytes": 76879
+        }
+      ]
+    },
+    {
+      "release": "v0.3.0",
+      "producer_revision": "86d5a4bb92432d1acaf2cf8bec3188f9963dff76",
+      "producer_binary_sha256": "1681833ad84da60622a6c196b8084bbe52a2deb8f6860a26c81dc9ea4f4a3947",
+      "manifest": "v0.3.0/manifest.json",
+      "manifest_sha256": "07b81b5b73668f8d6757ba450ffa6f6e9e25475be7a5e9b554fa54462591e692",
+      "root_inputs": 9,
+      "contracts": {
+        "api": {
+          "path": "v0.3.0/contracts/openapi.json",
+          "source_path": "docs/reference/openapi.json",
+          "git_blob": "0720e9f79f43aaeb9ffe03dd5581d44677124e04",
+          "sha256": "ce9a3412dc2a4f012066eb6f32a15fa0714c3a7a4ebc0013edc4d20824ec611f",
+          "bytes": 257351
+        },
+        "cli": {
+          "path": "v0.3.0/contracts/cli-json.txt",
+          "source_path": "docs/reference/json.md",
+          "git_blob": "cb3800de18ca204e7baf5d7810c90cc7b01cf0b7",
+          "sha256": "c00add9d415cd42d0161bc33943cff1ab9971ccab0921b5cef928d1ebaf801ba",
+          "bytes": 124386
+        },
+        "diff": {
+          "path": "v0.3.0/contracts/diff-v1.schema.json",
+          "source_path": "docs/reference/diff-v1.schema.json",
+          "git_blob": "8a9f7feb0f3f258ca6010170ace23e452ad9d3a4",
+          "sha256": "cc2087050a2f5502f06cae54bf9c90cb868d112819667d1cc4206b7788912ff1",
+          "bytes": 43870
+        },
+        "wit": {
+          "path": "v0.3.0/contracts/actor.wit",
+          "source_path": "wit/kronik-actor.wit",
+          "git_blob": "86c3f0e739057aa08c460bda06f1a42c9679d87e",
+          "sha256": "c2e7336a41b18405b5dfa26dad95600de79a21c133c61ec9ba516e0a63b32af6",
+          "bytes": 5832
+        }
+      },
+      "components": [
+        {
+          "role": "counter",
+          "path": "components/1f989c2895d6374c5c4d46a94462487d307b100fe12c716fd55fc965b17383d1.wasm",
+          "source_path": "tests/guests/counter.wasm",
+          "git_blob": "5e60c741cbeb65c5824c3d6c33c3ac2cce3a1694",
+          "sha256": "1f989c2895d6374c5c4d46a94462487d307b100fe12c716fd55fc965b17383d1",
+          "bytes": 109079
+        },
+        {
+          "role": "notes",
+          "path": "components/250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423.wasm",
+          "source_path": "tests/guests/notes.wasm",
+          "git_blob": "c3147d12ffc2f3838809b3e20cf8dab8948f7216",
+          "sha256": "250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423",
+          "bytes": 76877
+        }
+      ]
+    }
+  ]
+}

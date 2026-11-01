@@ -123,7 +123,7 @@ pub async fn check(
     )
     .map_err(|e| e.to_string())?;
     let config = config_at(&index, fork_lsn);
-    let mut setup = ReplaySetup::new(
+    let mut setup = ReplaySetup::recorded(
         format!("upgrade-{ENGINE_VERSION}"),
         index.clone(),
         fc.kinds,

@@ -145,6 +145,7 @@ async fn run(program: &Program, op: &str, body: &str, seed: u64) -> Run {
                     value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
                 }),
                 blobs: vec![],
+                retained_compensation_source: None,
             }),
             message_id: "m".into(),
             ..Default::default()

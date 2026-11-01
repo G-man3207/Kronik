@@ -4,7 +4,7 @@ use kronik_core::error::{ApiError, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Api, ApiRequest, ApiResponse, Result, json, ok, reason};
+use crate::{Api, AuthorizedRequest, ApiResponse, Result, json, ok, reason};
 
 /// `PUT /v1/simulators/{target}`: the target's whole simulator
 /// configuration; everything empty or false clears it.
@@ -143,7 +143,7 @@ pub fn simulator_infos() -> Vec<SimulatorInfo> {
 impl Api {
     pub(crate) async fn route_m12(
         &self,
-        req: &ApiRequest,
+        req: &AuthorizedRequest,
         segs: &[&str],
     ) -> Option<Result<ApiResponse>> {
         Some(match (req.method.as_str(), segs) {
@@ -194,14 +194,12 @@ impl Api {
                 model: None,
             },
         };
-        ok(&SimulatorsResponse {
-            simulators: simulator_infos(),
-            targets,
-            model,
-        })
+        self.ok_scrubbed(SimulatorsResponse { simulators: simulator_infos(),
+        targets,
+        model, })
     }
 
-    async fn simulators_set(&self, req: &ApiRequest, target: &str) -> Result<ApiResponse> {
+    async fn simulators_set(&self, req: &AuthorizedRequest, target: &str) -> Result<ApiResponse> {
         let r: SimulatorsSetRequest = json(&req.body)?;
         reason(&r.reason)?;
         let record = kronik_fork::simulators::SimulatorOverride {
@@ -214,7 +212,7 @@ impl Api {
         .record()
         .map_err(|m| ApiError::new(ErrorCode::BadRequest, m))?;
         let audit = self.audit(req, r.reason.clone());
-        let (epoch, lsn) = self.node.set_simulators(record, audit, r.dry_run).await?;
+        let (epoch, lsn) = self.node.set_simulators(record, audit, r.dry_run, req.authority.clone()).await?;
         ok(&SimulatorsSetResponse {
             dry_run: r.dry_run,
             target: target.to_owned(),

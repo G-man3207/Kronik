@@ -8,7 +8,7 @@ use kronik_core::error::{ApiError, ErrorCode};
 use kronik_sched::snapshots::Manifest;
 
 use crate::types::*;
-use crate::{Api, ApiRequest, ApiResponse, Result, internal, json, ok, reason};
+use crate::{Api, AuthorizedRequest, ApiResponse, Result, internal, json, ok, reason};
 
 fn entry(m: &Manifest, shipped: bool) -> SnapshotEntry {
     SnapshotEntry {
@@ -41,7 +41,7 @@ fn shipped_snapshots(data: &Path) -> BTreeSet<u64> {
 impl Api {
     pub(crate) async fn route_m6(
         &self,
-        req: &ApiRequest,
+        req: &AuthorizedRequest,
         segs: &[&str],
     ) -> Option<Result<ApiResponse>> {
         Some(match (req.method.as_str(), segs) {
@@ -71,7 +71,7 @@ impl Api {
             .unwrap_or_default()
     }
 
-    async fn snapshot_create(&self, req: &ApiRequest) -> Result<ApiResponse> {
+    async fn snapshot_create(&self, req: &AuthorizedRequest) -> Result<ApiResponse> {
         let r: SnapshotCreateRequest = json(&req.body)?;
         reason(&r.reason)?;
         if r.dry_run {
@@ -81,7 +81,7 @@ impl Api {
                 lsn: self.node.applied_lsn(),
             });
         }
-        let m = self.node.snapshot("manual").await?;
+        let m = self.node.snapshot("manual", req.authority.clone()).await?;
         let details = [("lsn", m.lsn.to_string())];
         self.audit_event(req, "snapshot.create", &m.id, &details, r.reason)
             .await?;
@@ -96,7 +96,7 @@ impl Api {
     /// `through`: hash the log only through that LSN, to compare a
     /// restored node, whose first start adds its `restore` event, with the
     /// source up to the source's applied LSN.
-    async fn integrity(&self, req: &ApiRequest) -> Result<ApiResponse> {
+    async fn integrity(&self, req: &AuthorizedRequest) -> Result<ApiResponse> {
         let through = crate::Query::parse(&req.query)?.num("through")?;
         let store = self.node.store();
         let state_hash = store.state_hash().map_err(internal)?;

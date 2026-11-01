@@ -1,0 +1,41 @@
+[package]
+name = "kronik-fleet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+hmac = { workspace = true }
+http = { workspace = true }
+kronik-core = { workspace = true, features = ["host-identity", "schemars"] }
+kronik-log = { workspace = true }
+kronik-otel = { workspace = true }
+kronik-proto = { workspace = true }
+kronik-sched = { workspace = true }
+rustls-pki-types = { workspace = true }
+rustls = { workspace = true }
+x509-parser = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros", "io-util"] }
+url = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+kronik-core = { workspace = true, features = ["real"] }
+kronik-privacy = { workspace = true }
+kronik-store = { workspace = true }
+prost = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

@@ -169,6 +169,76 @@ fn storage_affecting_statements_are_denied() {
 }
 
 #[test]
+fn physical_diagnostics_are_denied_in_guest_private_prepare_and_schema_replay() {
+    let raw = rusqlite::Connection::open_in_memory().unwrap();
+    for function in ["sqlite_filestat", "sqlite_walstat"] {
+        let available: String = raw.query_row(
+            &format!("SELECT {function}('__missing_kronik_schema__')"), [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(available, "{}", "the real pinned builtin must be enabled");
+    }
+    let root = tempfile::tempdir().unwrap();
+    for pool in [
+        SqlPool::new(Arc::new(MemOpener), Limits::default(), 8),
+        SqlPool::new(Arc::new(FileOpener {root: root.path().to_owned()}), Limits::default(), 8),
+    ] {
+        let actor = pool.get("diagnostics/denied").unwrap();
+        let mut actor = actor.lock().unwrap();
+        actor.conn.execute_batch(
+            "CREATE TABLE kept(id INTEGER PRIMARY KEY, value INTEGER NOT NULL);
+             INSERT INTO kept VALUES(1,7);
+             CREATE TABLE watched(id INTEGER PRIMARY KEY);",
+        ).unwrap();
+        for function in ["sqlite_filestat", "sqlite_walstat"] {
+            let direct = format!("SELECT {function}('main')");
+            assert!(actor.conn.prepare(&direct).is_err(), "host preparation must not bypass denial");
+            assert!(actor.conn.prepare_cached(&direct).is_err(), "private statement caching must not bypass denial");
+            for (setup, query) in [
+                (String::new(), direct),
+                (String::new(), format!("SELECT {}('main')", function.to_ascii_uppercase())),
+                (String::new(), format!("WITH diagnostic(value) AS (SELECT {function}('main')) SELECT value FROM diagnostic")),
+                (format!("CREATE VIEW diagnostic_view AS SELECT {function}('main') AS value"),
+                    "SELECT value FROM diagnostic_view".into()),
+                (format!("CREATE TRIGGER diagnostic_trigger AFTER INSERT ON watched BEGIN SELECT {function}('main'); END"),
+                    "INSERT INTO watched VALUES(1)".into()),
+            ] {
+                actor.begin_turn(&opts(9, 9, true)).unwrap();
+                let setup = if setup.is_empty() { Ok(0) } else { actor.execute(&setup, &[]) };
+                let result = setup.and_then(|_| {
+                    actor.execute("UPDATE kept SET value=99 WHERE id=1", &[])?;
+                    actor.query(&query, &[])
+                });
+                assert!(matches!(&result,
+                    Err(SqlError::Denied(message) | SqlError::Syntax(message))
+                        if message.to_ascii_lowercase().contains(function)
+                            && !message.contains("no such function")),
+                    "{query}: {result:?}");
+                actor.end_turn(false).unwrap();
+                actor.begin_turn(&opts(10, 10, false)).unwrap();
+                let ordinary = actor.query(
+                    "SELECT abs(-7), value, (SELECT count(*) FROM watched), 'sqlite_filestat', 'sqlite_walstat' FROM kept", &[],
+                ).unwrap();
+                assert_eq!(ordinary.values, vec![vec![Value::Integer(7), Value::Integer(7), Value::Integer(0),
+                    Value::Text("sqlite_filestat".into()), Value::Text("sqlite_walstat".into())]]);
+                actor.end_turn(false).unwrap();
+            }
+            let statement = format!("CREATE TABLE diagnostic_replay AS SELECT {function}('main') AS value");
+            let replay = TurnSql {
+                ddl: vec![statement],
+                ..Default::default()
+            };
+            let error = actor.apply(&replay, 1, &BTreeSet::new()).unwrap_err();
+            assert!(error.to_ascii_lowercase().contains(function), "{error}");
+            assert_eq!(actor.applied_lsn().unwrap(), 0, "denied schema replay must roll back its checkpoint");
+            assert!(!actor.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='diagnostic_replay')", [], |row| row.get::<_,bool>(0),
+            ).unwrap());
+        }
+    }
+}
+
+
+#[test]
 fn a_caught_sql_error_does_not_fail_the_turn() {
     let mut a = actor("recover");
     let (_, res) = commit(&mut a, &opts(1, 1, true), &SCHEMA[..1], 1);

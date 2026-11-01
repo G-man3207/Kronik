@@ -6,6 +6,10 @@
 //! `branches/<id>/` (`proposal.json`, `diff.json`) and are read back at
 //! startup; the replay state needed for catch-up is kept in memory and
 //! rebuilt by replaying again after a restart.
+//!
+//! User lifecycle intents use the request's original revocable authority,
+//! retained by detached jobs; revocation prevents later failure audit records,
+//! but never undoes an already-admitted durable intent.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -13,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
+use kronik_core::authority::AuthLease;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{CodeHash, Lsn, random_id};
 use kronik_policy::RuleSet;
@@ -41,11 +46,18 @@ pub(crate) async fn audit_failed(
     mut details: BTreeMap<String, String>,
     audit: pb::Audit,
     error: &ApiError,
-) {
+    authority: AuthLease,
+) -> Result<(), ApiError> {
     details.insert("code".into(), error.code.as_str().into());
-    let _ = node
-        .record_audit_event(&format!("{action}.failed"), target, details, audit)
-        .await;
+    node.record_audit_event_authorized(
+        &format!("{action}.failed"),
+        target,
+        details,
+        audit,
+        authority,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Catch-up converges when the newest root input is at most this far (in
@@ -321,6 +333,9 @@ fn internal(m: impl std::fmt::Display) -> ApiError {
 /// A replay's error: a sealed value without its key has its own code.
 fn replay_error(e: replay::ReplayError) -> ApiError {
     match e {
+        replay::ReplayError::Prerequisite(code) => ApiError::new(code,
+            "The recorded operation cannot be verified with the available source data")
+            .with_hint("Restore the original certified source or create a fresh replay with the required operation context."),
         replay::ReplayError::KeyMissing(run) => {
             ApiError::new(ErrorCode::KeystoreIncomplete, run.to_string()).with_hint(
                 "The node's privacy keystore lacks a subject's key; `kronik integrity` lists \
@@ -701,6 +716,7 @@ impl Proposals {
         dry_run: bool,
         rebase: bool,
         copies: Option<crate::replay::ForkCopies>,
+        authority: AuthLease,
     ) -> Result<Arc<ReplaySetup>, ApiError> {
         let config = crate::config_at_with(&index, index.fork_lsn, self.node.sql_bytes_per_actor());
         // A preview answers whoever has its URL: no production key computes
@@ -710,7 +726,11 @@ impl Proposals {
         } else {
             self.node.secrets().cloned()
         };
-        let mut setup = ReplaySetup::new(id.to_owned(), index, kinds, config, secrets);
+        let mut setup = if rebase {
+            ReplaySetup::recorded(id.to_owned(), index, kinds, config, secrets)
+        } else {
+            ReplaySetup::new(id.to_owned(), index, kinds, config, secrets, authority)
+        };
         setup.simulators = Arc::new(crate::simulators::Simulators::new(
             &setup.index,
             &options.simulator_overrides,
@@ -739,6 +759,19 @@ impl Proposals {
                     .iter()
                     .any(|c| matches!(c.record, Record::PrivacyMode(_)));
             let path = self.dir(id).join("simulator-cache.json");
+            let original_node = Arc::downgrade(&self.node);
+            let secret_snapshot: Arc<dyn Fn() -> Result<crate::simulators::ModelSecretSnapshot, ApiError> + Send + Sync>
+                = Arc::new(move || {
+                    let node = original_node.upgrade().ok_or_else(||
+                        ApiError::new(ErrorCode::SecretUnavailable, "The original model source node is unavailable"))?;
+                    if dry_run {
+                        node.native_secret_snapshot().map(Arc::new)
+                            .map(crate::simulators::ModelSecretSnapshot::Recorded)
+                    } else {
+                        node.native_secret_snapshot_with_publication().map(|(snapshot, publication)|
+                            crate::simulators::ModelSecretSnapshot::Live { snapshot, publication })
+                    }
+                });
             setup.model = Some(crate::simulators::ModelAccess {
                 config,
                 env: self.node.env().clone(),
@@ -751,7 +784,7 @@ impl Proposals {
                     .map_err(internal)?,
                 ),
                 privacy,
-                secrets: self.node.secrets().cloned(),
+                secret_snapshot,
                 offline: dry_run,
             });
         }
@@ -841,6 +874,7 @@ impl Proposals {
         dry_run: bool,
         rebase: bool,
         no_copies: Option<&str>,
+        authority: AuthLease,
     ) -> Result<Live, ApiError> {
         crate::ensure_fork_retained(&self.node, &self.data, fork_lsn).await?;
         let index = Arc::new(self.index(fork_lsn, to, options.no_pii).await?);
@@ -882,6 +916,7 @@ impl Proposals {
             dry_run,
             rebase,
             copies.as_ref().map(copies::Copies::fork),
+            authority,
         )?;
         let head = [
             Record::BranchCreated(pb::BranchCreated {
@@ -1017,8 +1052,9 @@ impl Proposals {
     pub async fn propose(
         self: &Arc<Self>,
         req: ProposeRequest,
+        authority: AuthLease,
     ) -> Result<(Proposal, bool), ApiError> {
-        self.propose_job(req, true).await
+        self.propose_job(req, true, authority).await
     }
 
     /// `kronik propose` as a job (M10, ADR 0022): the checks run now, the
@@ -1030,17 +1066,18 @@ impl Proposals {
         self: &Arc<Self>,
         req: ProposeRequest,
         wait: bool,
+        authority: AuthLease,
     ) -> Result<(Proposal, bool), ApiError> {
         let dry_run = req.dry_run;
         let audit = req.audit.clone();
-        let p = self.prepare(req).await?;
+        let p = self.prepare(req, authority.clone()).await?;
         if dry_run {
             let this = self.clone();
             let meta = self
                 .node
                 .env()
                 .spawn("propose-dry-run", async move {
-                    this.execute(&p, None, true).await
+                    this.execute(&p, None, true, authority).await
                 })
                 .await
                 .ok_or_else(|| internal("the dry run was dropped"))??;
@@ -1053,7 +1090,7 @@ impl Proposals {
             .node
             .env()
             .spawn("propose-start", async move {
-                this.start_proposal(p, audit).await
+                this.start_proposal(p, audit, authority).await
             })
             .await
             .ok_or_else(|| internal("the proposal start was dropped"))??;
@@ -1067,6 +1104,7 @@ impl Proposals {
         self: &Arc<Self>,
         p: Prepared,
         audit: pb::Audit,
+        authority: AuthLease,
     ) -> Result<Proposal, ApiError> {
         let running = Proposal {
             id: p.id.clone(),
@@ -1105,10 +1143,21 @@ impl Proposals {
         // Keep the publication lock across the durable intent.
         let mut entries = self.entries.lock().await;
         self.node
-            .record_audit_event("proposal.create", &p.id, details.clone(), audit.clone())
+            .record_audit_event_authorized(
+                "proposal.create",
+                &p.id,
+                details.clone(),
+                audit.clone(),
+                authority.clone(),
+            )
             .await?;
         if let Err(e) = self.save(&running, None) {
-            audit_failed(&self.node, "proposal.create", &p.id, details, audit, &e).await;
+            if let Err(audit_error) =
+                audit_failed(&self.node, "proposal.create", &p.id, details, audit, &e, authority)
+                    .await
+            {
+                tracing::warn!(proposal = %p.id, code = %audit_error.code.as_str(), "proposal failure audit denied or unavailable");
+            }
             return Err(e);
         }
         entries.insert(
@@ -1136,13 +1185,14 @@ impl Proposals {
         drop(self.node.env().spawn("propose-job", async move {
             let job = this.clone();
             let id = p.id.clone();
+            let replay_authority = authority.clone();
             // An inner task, so a panic in the replay fails the proposal
             // instead of leaving it `running` and its waiters waiting.
             let result = this
                 .node
                 .env()
                 .spawn("propose-replay", async move {
-                    job.execute(&p, Some(progress), false).await
+                    job.execute(&p, Some(progress), false, replay_authority).await
                 })
                 .await
                 .unwrap_or_else(|| {
@@ -1152,7 +1202,12 @@ impl Proposals {
                 });
             if let Err(e) = result {
                 tracing::warn!(proposal = %id, error = %e, "proposal failed");
-                audit_failed(&this.node, "proposal.create", &id, details, audit, &e).await;
+                if let Err(audit_error) =
+                    audit_failed(&this.node, "proposal.create", &id, details, audit, &e, authority)
+                        .await
+                {
+                    tracing::warn!(proposal = %id, code = %audit_error.code.as_str(), "proposal failure audit denied or unavailable");
+                }
                 let mut entries = this.entries.lock().await;
                 if let Some(entry) = entries.get_mut(&id) {
                     entry.meta.status = "failed".into();
@@ -1197,7 +1252,7 @@ impl Proposals {
 
     /// The checks of `propose` and its choices: the fork point, the set,
     /// the proposal id.
-    async fn prepare(&self, req: ProposeRequest) -> Result<Prepared, ApiError> {
+    async fn prepare(&self, req: ProposeRequest, authority: AuthLease) -> Result<Prepared, ApiError> {
         diff::check_options(&req.options).map_err(|m| ApiError::new(ErrorCode::BadRequest, m))?;
         let options = self.with_allowlist(&req.options);
         if req.wasm.is_empty() {
@@ -1238,7 +1293,7 @@ impl Proposals {
         let mut unchanged = Vec::new();
         let mut seen: Vec<(String, usize)> = Vec::new();
         for (i, bytes) in req.wasm.iter().enumerate() {
-            let (hash, _, manifest) = self.node.prepare_code(bytes).await?;
+            let (hash, _, manifest) = self.node.prepare_code(bytes, authority.clone()).await?;
             if let Some((_, first)) = seen.iter().find(|(k, _)| *k == manifest.kind) {
                 let name = |n: usize| {
                     req.names
@@ -1314,13 +1369,14 @@ impl Proposals {
         p: &Prepared,
         progress: Option<Arc<replay::Progress>>,
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<Proposal, ApiError> {
         let id = &p.id;
         let dry = dry_run.then_some(copies::DRY_RUN);
         let mut live = self
             .replay(
                 id, p.fork_lsn, p.head, &p.kinds, &p.options, p.workers, progress, dry_run, false,
-                dry,
+                dry, authority,
             )
             .await?;
         live.window_cut = p.window_cut.clone();
@@ -1539,7 +1595,12 @@ impl Proposals {
         id: &str,
         audit: pb::Audit,
         dry_run: bool,
+        verified_identity: Option<pb::Sealable>,
+        authority: AuthLease,
     ) -> Result<(Approved, Lsn), ApiError> {
+        if audit.token_id.starts_with("oidc:") && verified_identity.is_none() {
+            return Err(ApiError::new(ErrorCode::Unauthenticated, "OIDC approval requires protected historical identity"));
+        }
         let mut entries = self.entries.lock().await;
         let entry = entries
             .get_mut(id)
@@ -1571,14 +1632,18 @@ impl Proposals {
         }
         let lsn = self
             .node
-            .record_approval(pb::Approval {
-                proposal_id: id.to_owned(),
-                diff_hash: hash_bytes,
-                verified_through_lsn: meta.verified_through_lsn,
-                audit: Some(audit),
-                request: false,
-                command: String::new(),
-            })
+            .record_approval(
+                pb::Approval {
+                    proposal_id: id.to_owned(),
+                    diff_hash: hash_bytes,
+                    verified_through_lsn: meta.verified_through_lsn,
+                    audit: Some(audit),
+                    request: false,
+                    command: String::new(),
+                    verified_identity,
+                },
+                authority,
+            )
             .await?;
         approved.lsn = lsn;
         meta.approved = Some(approved.clone());
@@ -1595,6 +1660,7 @@ impl Proposals {
         id: &str,
         audit: pb::Audit,
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<PromoteResult, ApiError> {
         let mut entries = self.entries.lock().await;
         let entry = entries
@@ -1639,7 +1705,7 @@ impl Proposals {
             return Err(e);
         }
         if entry.meta.rebase.is_some() {
-            return self.promote_rebase(entry, id, audit, dry_run).await;
+            return self.promote_rebase(entry, id, audit, dry_run, authority).await;
         }
         let kinds = entry.meta.kind_versions()?;
         let options = entry.meta.options.clone();
@@ -1660,6 +1726,7 @@ impl Proposals {
                     dry_run,
                     false,
                     dry_run.then_some(copies::DRY_RUN),
+                    authority.clone(),
                 )
                 .await?;
             live.window_cut = entry.meta.window_cut.clone();
@@ -1714,7 +1781,7 @@ impl Proposals {
             return Err(e);
         }
         // 1. Catch-up.
-        if !self.catch_up_to_gap(id, live, &options, dry_run).await? {
+        if !self.catch_up_to_gap(id, live, &options, dry_run, authority.clone()).await? {
             if !dry_run {
                 entry.meta.status = "stale".into();
                 self.save(&entry.meta, None)?;
@@ -1798,6 +1865,7 @@ impl Proposals {
                 },
                 audit,
                 dry_run,
+                authority,
             )
             .await;
         let (epoch, lsn) = match switched {
@@ -1837,13 +1905,14 @@ impl Proposals {
         live: &mut Live,
         options: &DiffOptions,
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<bool, ApiError> {
         let env = self.node.env().clone();
         let started = env.clock.monotonic();
         loop {
             let head = self.node.applied_lsn();
             if head > live.index.to_lsn {
-                self.catch_up(id, live, head, options, dry_run).await?;
+                self.catch_up(id, live, head, options, dry_run, authority.clone()).await?;
             }
             let now = self.node.applied_lsn();
             let pending = self.index(live.index.to_lsn, now, true).await?;
@@ -1870,6 +1939,7 @@ impl Proposals {
         head: Lsn,
         options: &DiffOptions,
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<(), ApiError> {
         let old_to = live.index.to_lsn;
         let index = live
@@ -1887,6 +1957,7 @@ impl Proposals {
             dry_run,
             live.rebase,
             live.copies.as_ref().map(copies::Copies::fork),
+            authority,
         )?;
         if options.mode.isolated() {
             let fresh: Vec<_> = index
@@ -1912,95 +1983,99 @@ impl Proposals {
     /// `kronik fork create`: a fork at `fork_lsn` (at most HEAD) without
     /// code changes yet.
     pub async fn create_fork(
-        &self,
+        self: &Arc<Self>,
         name: Option<String>,
         fork_lsn: Lsn,
         no_pii: bool,
         audit: pb::Audit,
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<(Proposal, bool), ApiError> {
-        let head = self.node.applied_lsn();
-        if fork_lsn > head {
-            return Err(ApiError::new(
-                ErrorCode::BadRequest,
-                format!("fork point {fork_lsn} is after HEAD ({head})"),
-            ));
-        }
-        let floor = self.fork_floor()?;
-        if fork_lsn < floor {
-            return Err(ApiError::new(
-                ErrorCode::BadRequest,
-                format!("fork point {fork_lsn} is before main's state rebase at lsn {floor}"),
-            ));
-        }
-        // Before a name is allocated or a directory is written, including
-        // dry-run: a point outside the window must write nothing.
-        crate::ensure_fork_retained(&self.node, &self.data, fork_lsn).await?;
-        let name = match name {
-            Some(n) => {
-                let ok = n.len() <= 63
-                    && n.starts_with(|c: char| c.is_ascii_lowercase())
-                    && n.chars()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-                    && !n.starts_with("p-")
-                    && !n.starts_with(preview::ID_PREFIX)
-                    && n != "main";
-                if !ok {
-                    return Err(ApiError::new(
-                        ErrorCode::BadRequest,
-                        format!(
-                            "{n:?} is not a valid fork name ([a-z][a-z0-9-]*, not main, p-... or v-...)"
-                        ),
-                    ));
-                }
-                n
+        let this = self.clone();
+        self.node.authorized_effect(authority, move || async move {
+            let head = this.node.applied_lsn();
+            if fork_lsn > head {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!("fork point {fork_lsn} is after HEAD ({head})"),
+                ));
             }
-            None => format!("f-{}", &random_id(self.node.env())[..12]),
-        };
-        let mut entries = self.entries.lock().await;
-        if entries.contains_key(&name) {
-            return Err(ApiError::new(
-                ErrorCode::BadRequest,
-                format!("fork {name} exists"),
-            ));
-        }
-        let meta = Proposal {
-            id: name.clone(),
-            fork: name.clone(),
-            status: "fork".into(),
-            fork_lsn,
-            created_lsn: head,
-            verified_through_lsn: fork_lsn,
-            diff_hash: String::new(),
-            policy: Value::Null,
-            summary: Value::Null,
-            options: DiffOptions {
-                no_pii,
-                ..DiffOptions::default()
-            },
-            kinds: Vec::new(),
-            reason: audit.reason,
-            approved: None,
-            promoted: None,
-            plain_fork: true,
-            error: None,
-            preview: None,
-            unchanged: Vec::new(),
-            window_cut: None,
-            rebase: None,
-        };
-        if dry_run {
-            return Ok((meta, true));
-        }
-        self.save(&meta, None)?;
-        entries.insert(
-            name,
-            Entry {
-                meta: meta.clone(),
-                live: None,
-            },
-        );
-        Ok((meta, false))
+            let floor = this.fork_floor()?;
+            if fork_lsn < floor {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!("fork point {fork_lsn} is before main's state rebase at lsn {floor}"),
+                ));
+            }
+            // Before a name is allocated or a directory is written, including
+            // dry-run: a point outside the window must write nothing.
+            crate::ensure_fork_retained(&this.node, &this.data, fork_lsn).await?;
+            let name = match name {
+                Some(n) => {
+                    let ok = n.len() <= 63
+                        && n.starts_with(|c: char| c.is_ascii_lowercase())
+                        && n.chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                        && !n.starts_with("p-")
+                        && !n.starts_with(preview::ID_PREFIX)
+                        && n != "main";
+                    if !ok {
+                        return Err(ApiError::new(
+                            ErrorCode::BadRequest,
+                            format!(
+                                "{n:?} is not a valid fork name ([a-z][a-z0-9-]*, not main, p-... or v-...)"
+                            ),
+                        ));
+                    }
+                    n
+                }
+                None => format!("f-{}", &random_id(this.node.env())[..12]),
+            };
+            let mut entries = this.entries.lock().await;
+            if entries.contains_key(&name) {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!("fork {name} exists"),
+                ));
+            }
+            let meta = Proposal {
+                id: name.clone(),
+                fork: name.clone(),
+                status: "fork".into(),
+                fork_lsn,
+                created_lsn: head,
+                verified_through_lsn: fork_lsn,
+                diff_hash: String::new(),
+                policy: Value::Null,
+                summary: Value::Null,
+                options: DiffOptions {
+                    no_pii,
+                    ..DiffOptions::default()
+                },
+                kinds: Vec::new(),
+                reason: audit.reason,
+                approved: None,
+                promoted: None,
+                plain_fork: true,
+                error: None,
+                preview: None,
+                unchanged: Vec::new(),
+                window_cut: None,
+                rebase: None,
+            };
+            if dry_run {
+                return Ok((meta, true));
+            }
+            this.save(&meta, None)?;
+            entries.insert(
+                name,
+                Entry {
+                    meta: meta.clone(),
+                    live: None,
+                },
+            );
+            Ok((meta, false))
+        }).await
     }
 
     /// A plain fork that is not a preview (P-F9: a preview's code, options
@@ -2027,12 +2102,13 @@ impl Proposals {
     /// `kronik deploy --fork`: code for one kind in the fork (allowed over
     /// history: forks never touch main).
     pub async fn fork_deploy(
-        &self,
+        self: &Arc<Self>,
         name: &str,
         wasm: &[u8],
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<pb::KindVersion, ApiError> {
-        let (hash, _, manifest) = self.node.prepare_code(wasm).await?;
+        let (hash, _, manifest) = self.node.prepare_code(wasm, authority.clone()).await?;
         let version = pb::KindVersion {
             kind: manifest.kind.clone(),
             code_hash: hash.0.to_vec(),
@@ -2040,117 +2116,132 @@ impl Proposals {
             manifest: Some(manifest),
             code_size: wasm.len() as u64,
         };
-        let mut entries = self.entries.lock().await;
-        let entry = Self::fork_entry(&mut entries, name)?;
-        if dry_run {
-            return Ok(version);
-        }
-        let mut kinds = entry.meta.kind_versions()?;
-        kinds.retain(|k| k.kind != version.kind);
-        kinds.push(version.clone());
-        entry.meta.kinds = kinds
-            .iter()
-            .map(|k| base64::engine::general_purpose::STANDARD.encode(k.encode_to_vec()))
-            .collect();
-        copies::retire(entry.live.take()).await;
-        self.save(&entry.meta, None)?;
-        Ok(version)
+        let this = self.clone();
+        let name = name.to_owned();
+        self.node.authorized_effect(authority, move || async move {
+            let mut entries = this.entries.lock().await;
+            let entry = Self::fork_entry(&mut entries, &name)?;
+            if dry_run {
+                return Ok(version);
+            }
+            let mut kinds = entry.meta.kind_versions()?;
+            kinds.retain(|k| k.kind != version.kind);
+            kinds.push(version.clone());
+            entry.meta.kinds = kinds
+                .iter()
+                .map(|k| base64::engine::general_purpose::STANDARD.encode(k.encode_to_vec()))
+                .collect();
+            copies::retire(entry.live.take()).await;
+            this.save(&entry.meta, None)?;
+            Ok(version)
+        }).await
     }
 
     /// `kronik replay`: replays the fork's code over `(fork_lsn, to]`.
     pub async fn fork_replay(
-        &self,
+        self: &Arc<Self>,
         name: &str,
         to: Option<Lsn>,
         options: DiffOptions,
         workers: Option<usize>,
+        authority: AuthLease,
     ) -> Result<Proposal, ApiError> {
-        diff::check_options(&options).map_err(|m| ApiError::new(ErrorCode::BadRequest, m))?;
-        let mut options = self.with_allowlist(&options);
-        let head = self.node.applied_lsn();
-        let mut entries = self.entries.lock().await;
-        let entry = Self::fork_entry(&mut entries, name)?;
-        options.no_pii = entry.meta.options.no_pii;
-        let to = to.unwrap_or(head);
-        if to > head || to < entry.meta.fork_lsn {
-            return Err(ApiError::new(
-                ErrorCode::BadRequest,
-                format!("to_lsn must be within {}..={head}", entry.meta.fork_lsn),
-            ));
-        }
-        let kinds = entry.meta.kind_versions()?;
-        let workers = workers.unwrap_or(self.workers).clamp(1, 64);
-        // The old copies stop before the new ones start (review H11).
-        copies::retire(entry.live.take()).await;
-        let mut live = self
-            .replay(
-                name,
-                entry.meta.fork_lsn,
-                to,
-                &kinds,
-                &options,
-                workers,
-                None,
-                false,
-                false,
-                None,
-            )
-            .await?;
-        self.write_log(name, &mut live).await?;
-        let (d, bytes, hash) = self.build(name, &live, &options)?;
-        entry.meta.verified_through_lsn = d.summary.verified_through_lsn;
-        entry.meta.diff_hash = hash;
-        entry.meta.summary = serde_json::to_value(&d.summary).map_err(internal)?;
-        entry.meta.options = options;
-        self.save(&entry.meta, Some(&bytes))?;
-        self.save_samples(name, &live, &d)?;
-        entry.live = Some(live);
-        Ok(entry.meta.clone())
+        let this = self.clone();
+        let name = name.to_owned();
+        self.node.authorized_effect(authority.clone(), move || async move {
+            diff::check_options(&options).map_err(|m| ApiError::new(ErrorCode::BadRequest, m))?;
+            let mut options = this.with_allowlist(&options);
+            let head = this.node.applied_lsn();
+            let mut entries = this.entries.lock().await;
+            let entry = Self::fork_entry(&mut entries, &name)?;
+            options.no_pii = entry.meta.options.no_pii;
+            let to = to.unwrap_or(head);
+            if to > head || to < entry.meta.fork_lsn {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!("to_lsn must be within {}..={head}", entry.meta.fork_lsn),
+                ));
+            }
+            let kinds = entry.meta.kind_versions()?;
+            let workers = workers.unwrap_or(this.workers).clamp(1, 64);
+            // The old copies stop before the new ones start (review H11).
+            copies::retire(entry.live.take()).await;
+            let mut live = this
+                .replay(
+                    &name,
+                    entry.meta.fork_lsn,
+                    to,
+                    &kinds,
+                    &options,
+                    workers,
+                    None,
+                    false,
+                    false,
+                    None,
+                    authority,
+                )
+                .await?;
+            this.write_log(&name, &mut live).await?;
+            let (d, bytes, hash) = this.build(&name, &live, &options)?;
+            entry.meta.verified_through_lsn = d.summary.verified_through_lsn;
+            entry.meta.diff_hash = hash;
+            entry.meta.summary = serde_json::to_value(&d.summary).map_err(internal)?;
+            entry.meta.options = options;
+            this.save(&entry.meta, Some(&bytes))?;
+            this.save_samples(&name, &live, &d)?;
+            entry.live = Some(live);
+            Ok(entry.meta.clone())
+        }).await
     }
 
     /// A message into an actor of a fork (MCP `send_to_fork`): run under
     /// the fork's code on its continuous store, with no live effects (I7).
     /// Starts the fork's continuous state at the fork point when it has none.
     pub async fn fork_send(
-        &self,
+        self: &Arc<Self>,
         name: &str,
         actor: kronik_core::ids::ActorRef,
         msg: pb::Message,
+        authority: AuthLease,
     ) -> Result<crate::ForkTurn, ApiError> {
-        let mut entries = self.entries.lock().await;
-        let entry = entries.get_mut(name).ok_or_else(|| {
-            ApiError::new(
-                ErrorCode::ForkNotFound,
-                format!("no fork {name:?}; run: kronik fork list"),
-            )
-        })?;
-        if let Some(e) = unfinished(&entry.meta) {
-            return Err(e);
-        }
-        // Its state is the preview's, behind the preview's own lock.
-        if entry.meta.preview.is_some() {
-            return Err(preview::not_a_fork(name));
-        }
-        if entry.meta.rebase.is_some() {
-            // Its continuous turns become main's state when promoted.
-            return Err(ApiError::new(
-                ErrorCode::BadRequest,
-                format!("{name} is a rollback via replay; messages into it are not allowed"),
-            ));
-        }
-        let env = self.node.env();
-        let root = random_id(env);
-        let time = env.clock.wall_ms();
-        let live = self.continuous_for(name, entry, &actor.kind).await?;
-        let Some(c) = live.continuous.as_mut() else {
-            return Err(internal("fork state missing"));
-        };
-        let mut turn = c.send(actor, msg, root, time).await.map_err(internal)?;
-        self.save_model_cache(c.setup())?;
-        // The reply leaves the fork: no real SQL rows in it (M5).
-        turn.record = shown_record(&turn);
-        self.write_log(name, live).await?;
-        Ok(turn)
+        let this = self.clone();
+        let name = name.to_owned();
+        self.node.authorized_effect(authority.clone(), move || async move {
+            let mut entries = this.entries.lock().await;
+            let entry = entries.get_mut(&name).ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::ForkNotFound,
+                    format!("no fork {name:?}; run: kronik fork list"),
+                )
+            })?;
+            if let Some(e) = unfinished(&entry.meta) {
+                return Err(e);
+            }
+            // Its state is the preview's, behind the preview's own lock.
+            if entry.meta.preview.is_some() {
+                return Err(preview::not_a_fork(&name));
+            }
+            if entry.meta.rebase.is_some() {
+                // Its continuous turns become main's state when promoted.
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!("{name} is a rollback via replay; messages into it are not allowed"),
+                ));
+            }
+            let env = this.node.env();
+            let root = random_id(env);
+            let time = env.clock.wall_ms();
+            let live = this.continuous_for(&name, entry, &actor.kind, authority.clone()).await?;
+            let Some(c) = live.continuous.as_mut() else {
+                return Err(internal("fork state missing"));
+            };
+            let mut turn = c.send(actor, msg, root, time, authority).await.map_err(internal)?;
+            this.save_model_cache(c.setup())?;
+            // The reply leaves the fork: no real SQL rows in it (M5).
+            turn.record = shown_record(&turn);
+            this.write_log(&name, live).await?;
+            Ok(turn)
+        }).await
     }
 
     /// The fork's live state with its continuous store, started at the fork
@@ -2161,6 +2252,7 @@ impl Proposals {
         name: &str,
         entry: &'e mut Entry,
         kind: &str,
+        authority: AuthLease,
     ) -> Result<&'e mut Live, ApiError> {
         if entry.live.as_ref().is_none_or(|l| l.continuous.is_none()) {
             let kinds = entry.meta.kind_versions()?;
@@ -2176,7 +2268,7 @@ impl Proposals {
             copies::retire(entry.live.take()).await;
             let live = self
                 .replay(
-                    name, fork_lsn, fork_lsn, &kinds, &options, 1, None, false, false, None,
+                    name, fork_lsn, fork_lsn, &kinds, &options, 1, None, false, false, None, authority,
                 )
                 .await?;
             entry.live = Some(live);
@@ -2201,6 +2293,7 @@ impl Proposals {
         id: &str,
         audit: pb::Audit,
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<(Lsn, String, Proposal), ApiError> {
         let meta = self.get(id).await?;
         if let Some(e) = unfinished(&meta) {
@@ -2229,16 +2322,26 @@ impl Proposals {
         let bytes = std::fs::read(self.dir(id).join("diff.json")).map_err(internal)?;
         let lsn = self
             .node
-            .record_approval(pb::Approval {
-                proposal_id: id.to_owned(),
-                diff_hash: blake3::hash(&bytes).as_bytes().to_vec(),
-                verified_through_lsn: meta.verified_through_lsn,
-                audit: Some(audit),
-                request: true,
-                command: command.clone(),
-            })
+            .record_approval(
+                pb::Approval {
+                    proposal_id: id.to_owned(),
+                    diff_hash: blake3::hash(&bytes).as_bytes().to_vec(),
+                    verified_through_lsn: meta.verified_through_lsn,
+                    audit: Some(audit),
+                    request: true,
+                    command: command.clone(),
+                    verified_identity: None,
+                },
+                authority,
+            )
             .await?;
         Ok((lsn, command, meta))
+    }
+
+    /// Completed approvals, with their ordinary verified audit principal.
+    pub fn approvals(&self, id: &str) -> Result<Vec<(Lsn, pb::Approval)>, ApiError> {
+        Ok(self.node.store().db().approvals(id).map_err(internal)?
+            .into_iter().filter(|(_, approval)| !approval.request).collect())
     }
 
     /// The approval requests of a proposal, in log order.
@@ -2267,15 +2370,19 @@ impl Proposals {
     }
 
     /// `kronik fork delete`.
-    pub async fn delete_fork(&self, name: &str, dry_run: bool) -> Result<(), ApiError> {
-        let mut entries = self.entries.lock().await;
-        Self::fork_entry(&mut entries, name)?;
-        if dry_run {
-            return Ok(());
-        }
-        // The copies stop and their disks go with the fork (M14).
-        copies::retire(entries.remove(name).and_then(|e| e.live)).await;
-        std::fs::remove_dir_all(self.dir(name)).map_err(internal)
+    pub async fn delete_fork(self: &Arc<Self>, name: &str, dry_run: bool, authority: AuthLease) -> Result<(), ApiError> {
+        let this = self.clone();
+        let name = name.to_owned();
+        self.node.authorized_effect(authority, move || async move {
+            let mut entries = this.entries.lock().await;
+            Self::fork_entry(&mut entries, &name)?;
+            if dry_run {
+                return Ok(());
+            }
+            // The copies stop and their disks go with the fork (M14).
+            copies::retire(entries.remove(&name).and_then(|e| e.live)).await;
+            std::fs::remove_dir_all(this.dir(&name)).map_err(internal)
+        }).await
     }
 
     /// `kronik rollback <epoch>`: the kinds in force before `epoch` again.
@@ -2284,8 +2391,27 @@ impl Proposals {
         epoch: u64,
         audit: pb::Audit,
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<(u64, Lsn, Vec<pb::KindVersion>), ApiError> {
-        self.switch_back(epoch, false, audit, dry_run).await
+        let (_, kinds) = self.plan_rollback(epoch)?;
+        let (new_epoch, lsn) = self
+            .node
+            .switch_code(
+                CodeSwitch {
+                    kinds: kinds.clone(),
+                    pinned: Vec::new(),
+                    cause: pb::DeploymentCause::Rollback,
+                    verified_through_lsn: 0,
+                    unverified_inputs: 0,
+                    proposal_id: String::new(),
+                    rollback_of_epoch: epoch,
+                },
+                audit,
+                dry_run,
+                authority,
+            )
+            .await?;
+        Ok((new_epoch, lsn, kinds))
     }
 
     /// A watch's rollback of `epoch` (M11): pins the deployment's kinds at
@@ -2297,23 +2423,14 @@ impl Proposals {
         epoch: u64,
         audit: pb::Audit,
     ) -> Result<(u64, Lsn, Vec<pb::KindVersion>), ApiError> {
-        self.switch_back(epoch, true, audit, false).await
-    }
-
-    async fn switch_back(
-        &self,
-        epoch: u64,
-        pin: bool,
-        audit: pb::Audit,
-        dry_run: bool,
-    ) -> Result<(u64, Lsn, Vec<pb::KindVersion>), ApiError> {
+        // Only the configured daemon guard may use the fixed-origin producer.
         let (target, kinds) = self.plan_rollback(epoch)?;
         let (new_epoch, lsn) = self
             .node
-            .switch_code(
+            .switch_code_from_guard(
                 CodeSwitch {
                     kinds: kinds.clone(),
-                    pinned: if pin { target } else { Vec::new() },
+                    pinned: target,
                     cause: pb::DeploymentCause::Rollback,
                     verified_through_lsn: 0,
                     unverified_inputs: 0,
@@ -2321,7 +2438,6 @@ impl Proposals {
                     rollback_of_epoch: epoch,
                 },
                 audit,
-                dry_run,
             )
             .await?;
         Ok((new_epoch, lsn, kinds))

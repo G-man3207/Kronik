@@ -8,17 +8,28 @@
 //! messages delivered and the caller answered. Everything here uses only
 //! [`Env`] and `tokio::sync`, so the same code runs in production and in the
 //! simulator (ADR 0004).
+//!
+//! Operator send, resend, deploy, code preparation and approval capture an
+//! `AuthLease` and retain it through queue/lock waits to final log admission.
+//! An already-admitted durable turn finishes under its original continuation.
+//! Other ordinary configuration/privacy/snapshot/rebase mutations likewise require
+//! the original captured lease as their last argument. Fixed configured Watch,
+//! interval/shutdown and irreversible recovery continuations are separate host paths;
+//! audit metadata never chooses operation authority.
 
 pub mod effects;
 mod gate;
 pub mod host;
 mod node;
+mod native_execution;
 mod privacy;
 mod rebase;
 pub use rebase::rebase_turn_bytes;
 mod reseal;
 pub mod scrub;
+pub mod secrets;
 mod sealing;
+mod subject_keys;
 pub mod snapshots;
 mod timers;
 pub mod upgrade;
@@ -35,13 +46,15 @@ use kronik_store::sql::{FileOpener, Limits, SqlPool};
 
 pub use gate::Drain;
 pub use node::{
-    CodeSwitch, DeployResult, Ingress, METHODS, Node, NodeParts, Probe, RouteEntry, StartError,
+    CodeSwitch, DeployResult, Ingress, METHODS, Node, NodeParts, Probe, RouteEntry, StartError, SystemAudit,
+    ShardReadPoint, ShardReader, ShardRecordPage,
     Waiter, normalize_pattern,
 };
 pub use privacy::{ErasureDone, PrivacyModeChange};
 pub use reseal::{
     ResealDone, ResealProgress, clear_reupload, keystore_retention_ms, reupload_ready,
 };
+pub use subject_keys::SubjectKeyPlan;
 
 /// The first byte of an ingress `request_hash` (the gateway's): 3, the
 /// requester is the request's subject, or its `Authorization` value without
@@ -61,6 +74,8 @@ pub struct NodeConfig {
     pub apply_batch: usize,
     /// File/env or KMS source; the same configuration serves offline readers.
     pub keys: kronik_privacy::key_source::Keys,
+    /// Optional secret managers; credentials remain node-local, links are logged.
+    pub secret_settings: kronik_privacy::secret_backend::config::Settings,
     /// The sandboxes behind `foreign://` (M7); none in DST, forks and the
     /// test host, where foreign calls are never live.
     pub foreign: kronik_effects::foreign::ForeignSlot,
@@ -112,6 +127,7 @@ impl Default for NodeConfig {
             ingress_ttl: Duration::from_secs(24 * 3600),
             apply_batch: 512,
             keys: Default::default(),
+            secret_settings: Default::default(),
             foreign: kronik_effects::foreign::ForeignSlot::default(),
             storage: None,
             segment_max_bytes: None,
@@ -154,6 +170,9 @@ impl Default for SwitchHold {
 pub struct TurnResult {
     pub turn_id: kronik_core::ids::TurnId,
     pub outcome: kronik_proto::log::v1::Outcome,
+    /// Current-producer disclosure provenance, never serialized or authority.
+    #[doc(hidden)]
+    pub scrubbed_with: Option<std::sync::Arc<[kronik_proto::log::v1::SecretRef]>>,
 }
 
 impl TurnResult {
@@ -213,22 +232,19 @@ pub async fn start_local(
     let keys = data.join("keys");
     private_files(&keys, &["secrets.db", "keystore.db"])
         .map_err(|e| StartError::Log(kronik_log::LogError::Io(e)))?;
-    let secrets_conn = rusqlite::Connection::open(keys.join("secrets.db"))
-        .map_err(|e| StartError::Store(e.into()))?;
-    let secrets = kronik_privacy::SecretStore::open(secrets_conn, master).map_err(key_error)?;
-    let keystore_conn = rusqlite::Connection::open(keys.join("keystore.db"))
-        .map_err(|e| StartError::Store(e.into()))?;
-    let keystore =
-        kronik_privacy::keystore::Keystore::open(keystore_conn, master).map_err(key_error)?;
+    let data = kronik_privacy::SecretStore::owned_data(&ownership).map_err(key_error)?
+        .unwrap_or_else(|| secrets::SecretCacheData::new());
+    let secrets = kronik_privacy::SecretStore::open_owned(&ownership, master, data).map_err(key_error)?;
+    let keystore = kronik_privacy::keystore::Keystore::open_owned(&ownership, master).map_err(key_error)?;
     Node::start(NodeParts {
         env,
         config,
         log,
         store,
         code,
-        secrets: Some(Arc::new(secrets)),
+        secrets: Some(secrets),
         sealer: Some(Arc::new(
-            kronik_privacy::sealer::Sealer::new(Arc::new(keystore)).with_pseudonyms(
+            kronik_privacy::sealer::Sealer::new(keystore).with_pseudonyms(
                 kronik_privacy::keystore::Pseudonyms::new(master).map_err(key_error)?,
             ),
         )),
@@ -251,7 +267,9 @@ pub async fn offline_sealer(
         return Ok(None);
     }
     let source = kronik_privacy::key_source::KeySource::load(env, config, data, false).await?;
-    let keystore = kronik_privacy::keystore::Keystore::open_file(&file, source.master())?;
+    let connection = rusqlite::Connection::open_with_flags(&file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(kronik_privacy::PrivacyError::from)?;
+    let keystore = kronik_privacy::keystore::Keystore::open_readonly(connection, source.master())?;
     Ok(Some(Arc::new(
         kronik_privacy::sealer::Sealer::new(Arc::new(keystore))
             .with_pseudonyms(kronik_privacy::keystore::Pseudonyms::new(source.master())?),

@@ -7,6 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [features]
+# Host leaf-key/CSR custody is not enabled by the default guest SDK core.
+host-identity = ["dep:rcgen", "dep:rustls-pki-types"]
 # Production implementations of the Env traits (tokio runtime and std).
 real = [
     "dep:getrandom",
@@ -14,10 +16,17 @@ real = [
     "dep:hyper",
     "dep:hyper-rustls",
     "dep:hyper-util",
+    "dep:tower-service",
+    "dep:libc",
     "dep:rustix",
     "dep:rustls",
     "dep:rustls-native-certs",
     "dep:ring",
+    "dep:tokio-rustls",
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+    "tokio/net",
+    "tokio/io-util",
     "tokio/rt",
     "tokio/fs",
     "tokio/time",
@@ -25,22 +34,39 @@ real = [
 ]
 
 [dependencies]
+schemars = { workspace = true, optional = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
+futures-util = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true, features = ["client"] }
 hyper-rustls = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true, features = ["client-legacy", "http1"] }
+tower-service = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 ring = { workspace = true, optional = true }
 kronik-proto = { workspace = true }
+rcgen = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "macros"] }
+tokio-rustls = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[test]]
+name = "process_exchange_threads"
+harness = false
+required-features = ["real"]
 
 [lints]
 workspace = true

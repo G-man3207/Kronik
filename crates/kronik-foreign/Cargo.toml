@@ -35,6 +35,7 @@ thiserror = { workspace = true }
 # registry pull.
 tokio = { workspace = true, features = ["sync", "macros", "net", "fs", "io-util"] }
 tracing = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 kronik-core = { workspace = true, features = ["real"] }

@@ -24,6 +24,14 @@ use crate::env::{
     Process, ProcessRunner, ProcessSpec, Spawner,
 };
 
+#[cfg(target_os = "linux")]
+mod exchange;
+
+mod authorized;
+
+mod websocket;
+mod private_files;
+
 pub struct RealClock {
     origin: tokio::time::Instant,
 }
@@ -86,14 +94,15 @@ impl EntropySource for RealEntropy {
     }
 }
 
+/// Filesystem jobs start on first poll, after their caller can admit and own them.
 pub struct RealFs(pub Handle);
 
 fn blocking<T: Send + 'static>(
     h: &Handle,
     f: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> BoxFuture<'static, io::Result<T>> {
-    let task = h.spawn_blocking(f);
-    Box::pin(async move { task.await.map_err(io::Error::other)? })
+    let h = h.clone();
+    Box::pin(async move { h.spawn_blocking(f).await.map_err(io::Error::other)? })
 }
 
 impl Fs for RealFs {
@@ -142,6 +151,19 @@ impl Fs for RealFs {
             let s = rustix::fs::statvfs(&path).map_err(io::Error::from)?;
             Ok(s.f_bavail.saturating_mul(s.f_frsize))
         })
+    }
+    fn read_secure(&self, path: PathBuf, max_bytes: usize)
+        -> BoxFuture<'static, io::Result<Vec<u8>>> {
+        blocking(&self.0, move || private_files::read_secure_file(&path, max_bytes))
+    }
+    fn write_secure(&self, path: PathBuf, bytes: Vec<u8>)
+        -> BoxFuture<'static, io::Result<()>> {
+        let bytes = zeroize::Zeroizing::new(bytes);
+        blocking(&self.0, move || private_files::write_secure_file(&path, &bytes, true))
+    }
+    fn write_secure_new(&self, path: PathBuf, bytes: Bytes)
+        -> BoxFuture<'static, io::Result<()>> {
+        blocking(&self.0, move || private_files::write_secure_file(&path, &bytes, false))
     }
 }
 
@@ -310,6 +332,24 @@ impl ProcessRunner for RealProcs {
             }) as Arc<dyn Process>)
         })
     }
+
+    fn exchange(
+        &self,
+        request: crate::env::SensitiveProcessRequest,
+    ) -> BoxFuture<'static, io::Result<zeroize::Zeroizing<Vec<u8>>>> {
+        #[cfg(target_os = "linux")]
+        {
+            exchange::exchange(request)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            drop(request);
+            Box::pin(std::future::ready(Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "sensitive helper exchange requires Linux",
+            ))))
+        }
+    }
 }
 
 /// Outbound HTTP(S): hyper over rustls with the system's root
@@ -318,43 +358,43 @@ impl ProcessRunner for RealProcs {
 /// have been delivered, I17).
 pub struct RealNet {
     client: Result<HttpClient, String>,
+    connector: Result<Connector, String>,
+    tls: Result<Arc<rustls::ClientConfig>, String>,
 }
 
-type HttpClient = hyper_util::client::legacy::Client<
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-    http_body_util::Full<Bytes>,
->;
+type Connector = hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
+type HttpClient = hyper_util::client::legacy::Client<Connector, http_body_util::Full<Bytes>>;
 
 impl RealNet {
     pub fn new() -> RealNet {
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        use hyper_rustls::ConfigBuilderExt as _;
+        let tls = rustls::ClientConfig::builder()
             .with_native_roots()
-            .map(|b| b.https_or_http().enable_http1().build());
-        RealNet {
-            client: connector
-                .map(|c| {
-                    hyper_util::client::legacy::Client::builder(
-                        hyper_util::rt::TokioExecutor::new(),
-                    )
-                    .build(c)
-                })
-                .map_err(|e| format!("loading the system root certificates: {e}")),
-        }
+            .map(|builder| Arc::new(builder.with_no_client_auth()))
+            .map_err(|error| format!("loading the system root certificates: {error}"));
+        let connector = tls.clone().map(|config| {
+            hyper_rustls::HttpsConnectorBuilder::new()
+                .with_tls_config((*config).clone())
+                .https_or_http()
+                .enable_http1()
+                .build()
+        });
+        let client = connector.clone().map(|connector| {
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(connector)
+        });
+        RealNet { client, connector, tls }
     }
-}
-
-impl Default for RealNet {
-    fn default() -> Self {
-        RealNet::new()
-    }
-}
-
-impl Net for RealNet {
-    fn with_tls(&self, tls: crate::env::TlsConfig) -> Result<Arc<dyn Net>, NetError> {
+    fn scoped(tls: crate::env::TlsConfig, pinned: bool) -> Result<Self, NetError> {
         let bad = |_| NetError::Connect("invalid provider TLS configuration".into());
+        if pinned && tls.ca.is_empty() {
+            return Err(NetError::Connect("pinned TLS requires a CA certificate".into()));
+        }
         let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs {
-            roots.add(cert).map_err(bad)?;
+        if !pinned {
+            for cert in rustls_native_certs::load_native_certs().certs {
+                roots.add(cert).map_err(bad)?;
+            }
         }
         for cert in tls.ca {
             roots.add(cert.into()).map_err(bad)?;
@@ -375,14 +415,45 @@ impl Net for RealNet {
             None => builder.with_no_client_auth(),
         };
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(config)
+            .with_tls_config(config.clone())
             .https_or_http()
             .enable_http1()
             .build();
         let client =
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-                .build(connector);
-        Ok(Arc::new(RealNet { client: Ok(client) }))
+                .build(connector.clone());
+        Ok(RealNet {
+            client: Ok(client), connector: Ok(connector), tls: Ok(Arc::new(config)),
+        })
+    }
+}
+
+impl Default for RealNet {
+    fn default() -> Self {
+        RealNet::new()
+    }
+}
+
+impl Net for RealNet {
+    fn with_tls(&self, tls: crate::env::TlsConfig) -> Result<Arc<dyn Net>, NetError> {
+        Ok(Arc::new(Self::scoped(tls, false)?))
+    }
+
+    fn with_pinned_tls(&self, tls: crate::env::TlsConfig) -> Result<Arc<dyn Net>, NetError> {
+        Ok(Arc::new(Self::scoped(tls, true)?))
+    }
+
+    fn websocket(
+        &self,
+        req: crate::env::WebSocketRequest,
+    ) -> BoxFuture<'static, Result<Arc<dyn crate::env::WebSocket>, NetError>> {
+        websocket::connect(self.tls.clone(), req)
+    }
+
+    fn http_authorized(&self, req: HttpRequest, original: crate::authority::AuthLease)
+        -> BoxFuture<'static, Result<HttpResponse, NetError>>
+    {
+        authorized::send(self.connector.clone(), req, original)
     }
 
     fn http(&self, req: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
@@ -451,5 +522,29 @@ impl crate::env::Env {
             net: Arc::new(RealNet::new()),
             procs: Arc::new(RealProcs),
         }
+    }
+}
+
+#[cfg(test)]
+mod filesystem_tests {
+    use super::*;
+
+    #[test]
+    fn unpolled_filesystem_creates_do_not_touch_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let unpolled_path = directory.path().join("unpolled");
+        let polled_path = directory.path().join("polled");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1).build().unwrap();
+        let fs = RealFs(runtime.handle().clone());
+        let unpolled = fs.open(unpolled_path.clone(), OpenMode::ReadWriteCreate);
+        let file = runtime.block_on(fs.open(polled_path.clone(), OpenMode::ReadWriteCreate)).unwrap();
+        drop(unpolled);
+        drop(file);
+        drop(fs);
+        drop(runtime);
+
+        assert!(!unpolled_path.try_exists().unwrap());
+        assert!(polled_path.try_exists().unwrap());
     }
 }

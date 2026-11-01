@@ -16,6 +16,11 @@ on:
         required: false
         type: boolean
         default: false
+      keyhelper:
+        description: "Also build the separate optional x86_64 GNU PKCS#11 helper"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -59,6 +64,7 @@ jobs:
       - name: Reproduce the actual compiled release
         env:
           KRONIK_BASE_URL: ${{ inputs.base_url }}
+          KRONIK_RELEASE_KEYHELPER: ${{ inputs.keyhelper && 'yes' || 'no' }}
         run: python3 scripts/reproduce-release.py
 
       - name: Check the x86_64 archive
@@ -73,8 +79,7 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
-            dist/release/kronik-x86_64-unknown-linux-musl.tar.gz
-            dist/release/kronik-aarch64-unknown-linux-musl.tar.gz
+            dist/release/kronik-*.tar.gz
             dist/release/install.sh
             dist/release/reproducibility.json
             dist/release/SHA256SUMS
@@ -84,10 +89,13 @@ jobs:
         env:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: |
-          cp "$BUNDLE_PATH" dist/release/kronik-x86_64-unknown-linux-musl.tar.gz.sigstore.json
-          cp "$BUNDLE_PATH" dist/release/kronik-aarch64-unknown-linux-musl.tar.gz.sigstore.json
+          for archive in dist/release/kronik-*.tar.gz; do
+            cp "$BUNDLE_PATH" "$archive.sigstore.json"
+          done
 
-      - name: Verify and install the actual attested x86_64 archive
+      - name: Verify and install the actual attested x86_64 archives
+        env:
+          KRONIK_INSTALL_KEYHELPER: ${{ inputs.keyhelper && 'yes' || 'no' }}
         run: |
           set -o pipefail
           version="${GITHUB_REF_NAME#v}"
@@ -95,6 +103,10 @@ jobs:
             KRONIK_BASE_URL="file://$PWD/dist/release" \
               KRONIK_INSTALL_DIR="$RUNNER_TEMP/kronik-verified-standalone" \
               KRONIK_INSTALL_RUNSC=no sh
+          if [ "$KRONIK_INSTALL_KEYHELPER" = yes ]; then
+            tar -xzOf dist/release/kronik-keyhelper-x86_64-unknown-linux-gnu.tar.gz kronik-keyhelper |
+              cmp - "$RUNNER_TEMP/kronik-verified-standalone/kronik-keyhelper"
+          fi
           INPUT_COMMAND=install INPUT_VERSION="$version" \
             INPUT_BASE_URL="file://$PWD/dist/release" \
             RUNNER_TEMP="$RUNNER_TEMP/kronik-verified-action" \
@@ -114,5 +126,5 @@ jobs:
           version="$("$RUNNER_TEMP/kronik-release/kronik" --version | head -n 1 | cut -d ' ' -f 2)"
           gh release create "v$version" --draft --target "$GITHUB_SHA" \
             --title "kronik $version" \
-            --notes "Reproduced static musl archives for x86_64/aarch64 Linux with GitHub OIDC/Sigstore attestations, original license notices, per-target CycloneDX SBOMs and actual two-build evidence." \
+            --notes "Reproduced static musl daemon archives and, when selected, the separate optional x86_64 GNU PKCS#11 helper; GitHub OIDC/Sigstore attestations, original notices, per-artifact CycloneDX SBOMs and actual two-build evidence." \
             dist/release/*

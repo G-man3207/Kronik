@@ -241,6 +241,7 @@ fn message(name: &str, body: &[u8]) -> pb::Input {
                 content_type: "application/json".into(),
                 body: sealable(body),
                 blobs: vec![],
+                retained_compensation_source: None,
             }),
             message_id: format!("m-{name}"),
             ..Default::default()

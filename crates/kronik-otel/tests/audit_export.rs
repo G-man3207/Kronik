@@ -107,6 +107,7 @@ fn a_released_hold_records_a_gap_and_the_node_keeps_serving() {
         .await
         .unwrap()
     });
+    let original = node.local_operator_authority().unwrap();
     let (up, got) = (Arc::new(AtomicBool::new(false)), Arc::default());
     let url = webhook(up.clone(), Arc::clone(&got), Arc::default());
     let cursors = Arc::new(
@@ -130,21 +131,21 @@ fn a_released_hold_records_a_gap_and_the_node_keeps_serving() {
         branch: "main".into(),
     });
     let stream = rt
-        .block_on(start(node.clone(), cursors, settings, mapper))
+        .block_on(start(node.clone(), cursors, settings, mapper, original.clone()))
         .unwrap();
     let wasm = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/guests/counter.wasm"
     ))
     .unwrap();
-    rt.block_on(node.deploy(&wasm, audit(), false)).unwrap();
+    rt.block_on(node.deploy(&wasm, audit(), false, node.local_operator_authority().unwrap())).unwrap();
     let send = || {
         let msg = pb::Message {
             name: "increment".into(),
             content_type: "text/plain".into(),
             ..Default::default()
         };
-        rt.block_on(node.send(ActorRef::parse("counter/a").unwrap(), msg, audit(), false))
+        rt.block_on(node.send(ActorRef::parse("counter/a").unwrap(), msg, audit(), false, original.clone()))
             .unwrap()
             .unwrap();
     };
@@ -256,11 +257,12 @@ fn node_at(dir: &Path) -> (tokio::runtime::Runtime, Arc<Node>) {
 }
 
 fn grant(rt: &tokio::runtime::Runtime, node: &Node, host: &str, reason: &str) {
+    let original = node.local_operator_authority().unwrap();
     let audit = pb::Audit {
         reason: reason.into(),
         ..audit()
     };
-    rt.block_on(node.grant("counter", &format!("http:{host}"), None, None, audit, false))
+    rt.block_on(node.grant("counter", &format!("http:{host}"), None, None, audit, false, original))
         .unwrap();
 }
 
@@ -300,6 +302,7 @@ fn retries_keep_the_key_but_an_identical_rewind_reaches_the_receiver_again() {
                 hold_release: 0,
             },
             mapper(&node),
+            node.local_operator_authority().unwrap(),
         ))
         .unwrap();
     for _ in 0..400 {
@@ -330,7 +333,7 @@ fn retries_keep_the_key_but_an_identical_rewind_reaches_the_receiver_again() {
     assert_eq!(cursors.get("audit").unwrap().lsn, node.applied_lsn());
     assert_eq!(got.lock().unwrap().len(), 1);
     let old_generation = cursors.get("audit").unwrap().generation();
-    rt.block_on(stream.rewind(&node, 0)).unwrap();
+    rt.block_on(stream.rewind(&node, 0, node.local_operator_authority().unwrap())).unwrap();
     for _ in 0..600 {
         if cursors.get("audit").is_some_and(|entry| {
             entry.lsn == node.applied_lsn()
@@ -440,8 +443,9 @@ fn source_gap_coverage_survives_a_failed_checkpoint_but_not_a_new_incarnation() 
         "/../../tests/guests/counter.wasm"
     ))
     .unwrap();
-    rt.block_on(node.deploy(&wasm, audit(), false)).unwrap();
+    rt.block_on(node.deploy(&wasm, audit(), false, node.local_operator_authority().unwrap())).unwrap();
     let advance = |rt: &tokio::runtime::Runtime, node: &Node| {
+        let original = node.local_operator_authority().unwrap();
         for i in 0..80 {
             rt.block_on(node.send(
                 ActorRef::parse("counter/a").unwrap(),
@@ -451,6 +455,7 @@ fn source_gap_coverage_survives_a_failed_checkpoint_but_not_a_new_incarnation() 
                 },
                 audit(),
                 false,
+                original.clone(),
             ))
             .unwrap()
             .unwrap();
@@ -477,6 +482,7 @@ fn source_gap_coverage_survives_a_failed_checkpoint_but_not_a_new_incarnation() 
             cursors.clone(),
             settings(),
             mapper(&node),
+            node.local_operator_authority().unwrap(),
         ))
         .unwrap();
     for _ in 0..400 {
@@ -523,6 +529,7 @@ fn source_gap_coverage_survives_a_failed_checkpoint_but_not_a_new_incarnation() 
             cursors.clone(),
             settings(),
             mapper(&node),
+            node.local_operator_authority().unwrap(),
         ))
         .unwrap();
     wait(&cursors, &node);
@@ -566,6 +573,7 @@ fn source_gap_coverage_survives_a_failed_checkpoint_but_not_a_new_incarnation() 
             cursors.clone(),
             settings(),
             mapper(&node),
+            node.local_operator_authority().unwrap(),
         ))
         .unwrap();
     wait(&cursors, &node);
@@ -582,14 +590,15 @@ fn source_gap_coverage_survives_a_failed_checkpoint_but_not_a_new_incarnation() 
     // notice with the identical range remains in the restored source.
     let (rt, node) = open();
     let through = node.applied_lsn();
-    rt.block_on(node.record_audit_event(
-        "restore",
+    rt.block_on(node.record_system_audit_event(
+        kronik_sched::SystemAudit::Restore,
         "",
         [("through_lsn".into(), through.to_string())].into(),
         pb::Audit {
             token_id: "system".into(),
             ..audit()
         },
+        node.local_operator_authority().unwrap(),
     ))
     .unwrap();
     let cursors = Arc::new(
@@ -610,6 +619,7 @@ fn source_gap_coverage_survives_a_failed_checkpoint_but_not_a_new_incarnation() 
             cursors.clone(),
             settings(),
             mapper(&node),
+            node.local_operator_authority().unwrap(),
         ))
         .unwrap();
     wait(&cursors, &node);
@@ -636,7 +646,7 @@ fn export(rt: &tokio::runtime::Runtime, node: &Arc<Node>, dir: &Path, sink: Sink
         hold_release: 0,
     };
     let stream = rt
-        .block_on(start(node.clone(), cursors, settings, mapper(node)))
+        .block_on(start(node.clone(), cursors, settings, mapper(node), node.local_operator_authority().unwrap()))
         .unwrap();
     for _ in 0..600 {
         if stream.progress().cursor >= node.applied_lsn() {
@@ -706,6 +716,7 @@ fn an_initially_unavailable_file_sink_retries_without_blocking_the_node() {
             cursors.clone(),
             settings,
             mapper(&node),
+            node.local_operator_authority().unwrap(),
         ))
         .unwrap();
     let initial = stream.progress().cursor;
@@ -809,7 +820,7 @@ fn a_restore_that_reuses_lsns_loses_no_exported_line() {
             wall_time_ms: 2,
         };
         let details = [("through_lsn".to_owned(), through.to_string())].into();
-        rt.block_on(node.record_audit_event("restore", "", details, restore))
+        rt.block_on(node.record_system_audit_event(kronik_sched::SystemAudit::Restore, "", details, restore, node.local_operator_authority().unwrap()))
             .unwrap();
         for host in ["example.io", "example.dev", "example.app"] {
             grant(&rt, &node, host, "after restore");
@@ -834,4 +845,423 @@ fn a_restore_that_reuses_lsns_loses_no_exported_line() {
         assert!(r.complete, "{sink:?}: {r:?}");
         assert_eq!(r.superseded, 3, "{sink:?}: {r:?}");
     }
+}
+
+#[test]
+fn changed_persisted_reason_holds_a_pending_delivery_until_explicit_rewind() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let data = tempfile::tempdir().unwrap();
+    let (rt, node) = node_at(data.path());
+    let original = node.local_operator_authority().unwrap();
+    let needle = "reason-that-later-becomes-a-secret";
+    grant(&rt, &node, "pending.example", needle);
+    let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+    let url = format!("http://{}/audit", listener.local_addr().unwrap());
+    let (first_send, first_receive) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let (second_send, mut second_receive) = tokio::sync::oneshot::channel();
+    let server = rt.spawn(async move {
+        let (mut first_send, mut second_send, mut released) =
+            (Some(first_send), Some(second_send), Some(released));
+        for attempt in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                let mut length = None;
+                loop {
+                    line.clear();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" { break; }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    { length = Some(value.trim().parse::<usize>().unwrap()); }
+                }
+                let mut body = vec![0; length.unwrap()];
+                socket.read_exact(&mut body).await.unwrap();
+                if attempt == 0 {
+                    first_send.take().unwrap().send(body).unwrap();
+                    released.take().unwrap().await.unwrap();
+                    socket.get_mut().write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    ).await.unwrap();
+                } else {
+                    second_send.take().unwrap().send(body).unwrap();
+                    socket.get_mut().write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    ).await.unwrap();
+                }
+            }).await.expect("the controlled real webhook must finish");
+        }
+    });
+    let cursors = Arc::new(rt.block_on(Cursors::load(node.env().clone(), data.path())).unwrap());
+    let stream = rt.block_on(start(
+        node.clone(), cursors.clone(),
+        Settings {
+            sink: Sink::Webhook(url), batch_records: 1000,
+            interval: Duration::from_millis(10), file_max_bytes: 1024,
+            headers_env: None, from_now: false, max_hold: Duration::ZERO, hold_release: 0,
+        },
+        mapper(&node), original.clone(),
+    )).unwrap();
+    let first = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), first_receive).await.unwrap().unwrap()
+    });
+    let lines = |body: &[u8]| std::str::from_utf8(body).unwrap().lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
+    let first_lines = lines(&first);
+    let source = first_lines.iter().find(|line| line["reason"] == needle).unwrap();
+    let audit = pb::Audit { reason: "new FILE value".into(), ..audit() };
+    rt.block_on(node.secret_set("pending-reason", needle.as_bytes().to_vec(), &audit, false,
+        original.clone())).unwrap().unwrap();
+    release.send(()).unwrap();
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stream.progress().last_error.as_deref() != Some("disclosure_conflict") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("a changed projection must visibly hold the original pending bytes");
+    });
+    assert!(matches!(second_receive.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+    assert!(cursors.get("audit").is_none_or(|entry| entry.lsn == 0));
+    rt.block_on(stream.rewind(&node, 0, original)).unwrap();
+    let second = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), &mut second_receive).await.unwrap().unwrap()
+    });
+    let second_lines = lines(&second);
+    let projected = second_lines.iter().find(|line| line["lsn"] == source["lsn"]).unwrap();
+    assert!(!projected["reason"].as_str().unwrap().contains(needle));
+    for field in ["lsn", "kind", "action", "at_wall_ms", "token_id", "branch", "record_hash"] {
+        assert_eq!(projected[field], source[field], "{field}");
+    }
+    rt.block_on(server).unwrap();
+    node.stop_native_execution().unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_native_reader_maps_the_actual_committed_frame_not_the_mapper_target_branch() {
+    let data = tempfile::tempdir().unwrap();
+    let node = start_local(Env::real(tokio::runtime::Handle::current()), data.path(),
+        NodeConfig { branch: "actual-frame".into(), ..NodeConfig::default() }).await.unwrap();
+    let original = node.local_operator_authority().unwrap();
+    let lsn = node.record_audit_event_authorized("keys.rewrap", "actual-key", Default::default(),
+        audit(), original.clone()).await.unwrap();
+    let reader = node.capture_system_export_reader().await.unwrap();
+    let page = reader.page(lsn - 1, 1, 1 << 20).await.unwrap();
+    assert_eq!(page.records.len(), 1);
+    let (source, committed) = &page.records[0];
+    assert_eq!((source.shard, source.lsn, source.branch.as_str()), (None, lsn, "actual-frame"));
+    assert_eq!(committed.lsn, lsn);
+    let exact = committed.record.encode();
+    let mapper = Mapper { keys: Keys::Omit, sealer: node.sealer().clone(), branch: "not-the-frame".into() };
+    let ordinary = mapper.lines_actor_at(source, &committed.record, &[]).unwrap();
+    let operational = mapper.operational_lines_actor_at(source, &committed.record, &[]).unwrap();
+    assert_eq!(ordinary.len(), 1);
+    assert_eq!(ordinary, operational);
+    assert_eq!(ordinary[0].branch, "actual-frame");
+    assert_eq!(ordinary[0].lsn, Some(lsn));
+    assert_eq!(ordinary[0].record_hash,
+        kronik_otel::audit::record_hash(&committed.record, &mapper.sealer).unwrap());
+    assert_eq!(committed.record.encode(), exact);
+    let expected = mapper.expected_actor_at(source, &committed.record).unwrap();
+    assert!(verify(&expected, &ordinary, lsn, lsn).complete);
+    assert_eq!(mapper.branch, "not-the-frame");
+    assert_eq!(mapper.lines(lsn, &committed.record, &[]).unwrap()[0].branch, "not-the-frame");
+    for field in 0..3 {
+        let mut invalid = source.clone();
+        match field { 0 => invalid.branch.clear(), 1 => invalid.lsn = 0, _ => invalid.shard = Some(u32::MAX) }
+        assert!(mapper.lines_actor_at(&invalid, &committed.record, &[]).is_err());
+        assert!(mapper.operational_lines_actor_at(&invalid, &committed.record, &[]).is_err());
+        assert!(mapper.expected_actor_at(&invalid, &committed.record).is_err());
+    }
+}
+
+
+// Read-only metadata view fixtures, not Raft/SQLite commits or member readiness.
+// The Record45 body is the actual immutable protobuf golden fixture; all mappers
+// use this suite's real local node and loaded protected master.
+fn metadata_identity_fixture() -> Record {
+    let wire = kronik_core::ids::unhex(include_str!(
+        "../../kronik-proto/tests/fixtures/secret-version-wide-active-v1.hex").trim()).unwrap();
+    let record = Record::decode(45, &wire).unwrap();
+    assert_eq!(record.encode(), wire);
+    record
+}
+
+fn metadata_origin_fixture(known: bool, current: bool) -> kronik_log::MetadataAuditRecord {
+    kronik_log::MetadataAuditRecord {
+        index: 97, record: metadata_identity_fixture(),
+        native_origin: Some(pb::NativeAuthorityOrigin {
+            source: known.then(|| pb::ActorSource {
+                shard: None, lsn: 41, branch: "original-fork".into(),
+            }),
+            adoption_audit: Some(pb::Audit { token_id: "unix:uid=0".into(),
+                reason: "private-adoption-reason-NEEDLE".into(), wall_time_ms: 37 }),
+            current_projection: current,
+        }),
+    }
+}
+
+fn metadata_view_complete(mapper: &Mapper, source: &kronik_log::MetadataAuditRecord,
+    lines: &[Line]) -> bool {
+    use kronik_core::ids::SourcePos;
+    kronik_otel::audit::verify_at(&mapper.expected_metadata(source).unwrap(), lines,
+        SourcePos::Metadata { index: 96 }, SourcePos::Metadata { index: 97 }).unwrap().complete
+}
+
+#[test]
+fn metadata_identity_origin_keeps_known_facts_and_unknown_absence_out_of_the_body_hash() {
+    use kronik_core::ids::SourcePos;
+    let data = tempfile::tempdir().unwrap();
+    let (_rt, node) = node_at(data.path());
+    let mapper = mapper(&node);
+    let secrets: &[(&str, &[u8])] = &[
+        ("field", b"native_origin"), ("source", b"original_source"),
+        ("branch", b"original-fork"), ("one", b"1"), ("wall", b"37"),
+        ("lsn", b"41"), ("adoption", b"private-adoption-reason-NEEDLE"),
+    ];
+    for known in [false, true] {
+        for current in [false, true] {
+            let source = metadata_origin_fixture(known, current);
+            let exact = source.record.encode();
+            let ordinary = mapper.lines_at(SourcePos::Metadata { index: 97 }, &source.record, secrets).unwrap();
+            let lines = mapper.lines_metadata(&source, secrets).unwrap();
+            let line = &lines[0];
+            assert_eq!((&*line.schema, &*line.kind, &*line.action),
+                ("kronik.audit/v3", "secret_version", "secret.version"));
+            assert_eq!((line.lsn, line.source), (None, Some(SourcePos::Metadata { index: 97 })));
+            assert!(line.branch.is_empty());
+            let mut expected = serde_json::json!({"adopted_at_wall_ms":37,"current_projection":current});
+            if known {
+                expected["original_source"] = serde_json::json!({"shard":null,"lsn":41,"branch":"original-fork"});
+            }
+            assert_eq!(line.details["native_origin"], expected);
+            assert_eq!((line.at_wall_ms, &line.token_id, &line.reason),
+                (ordinary[0].at_wall_ms, &ordinary[0].token_id, &ordinary[0].reason));
+            assert_eq!(line.record_hash,
+                kronik_otel::audit::record_hash(&source.record, &mapper.sealer).unwrap());
+            assert_eq!(line.record_hash, ordinary[0].record_hash);
+            assert_eq!(source.record.encode(), exact);
+            assert!(!line.to_json().contains("private-adoption-reason-NEEDLE"));
+            assert!(!line.to_json().contains("unix:uid=0"));
+            assert!(metadata_view_complete(&mapper, &source, &lines));
+        }
+    }
+}
+
+#[test]
+fn metadata_verification_checks_the_same_image_origin_even_when_record_identity_is_unchanged() {
+    let data = tempfile::tempdir().unwrap();
+    let (_rt, node) = node_at(data.path());
+    let mapper = mapper(&node);
+    let original = metadata_origin_fixture(true, true);
+    let original_lines = mapper.lines_metadata(&original, &[]).unwrap();
+    for mutation in 0..6 {
+        let mut changed = metadata_origin_fixture(true, true);
+        let origin = changed.native_origin.as_mut().unwrap();
+        match mutation {
+            0 => origin.source.as_mut().unwrap().lsn = 42,
+            1 => origin.source.as_mut().unwrap().branch = "different-real-branch".into(),
+            2 => origin.source = None,
+            3 => origin.current_projection = false,
+            4 => origin.adoption_audit.as_mut().unwrap().wall_time_ms = 38,
+            _ => changed.native_origin = None,
+        }
+        let lines = mapper.lines_metadata(&changed, &[]).unwrap();
+        assert_eq!(lines[0].record_hash, original_lines[0].record_hash);
+        assert!(!metadata_view_complete(&mapper, &original, &lines));
+    }
+    let mut missing = original_lines.clone();
+    missing[0].details.remove("native_origin");
+    assert!(!metadata_view_complete(&mapper, &original, &missing));
+    let ordinary = kronik_log::MetadataAuditRecord {
+        index: 97, record: metadata_identity_fixture(), native_origin: None,
+    };
+    assert!(!metadata_view_complete(&mapper, &ordinary, &original_lines));
+}
+
+#[test]
+fn metadata_view_rejects_malformed_or_unrepresentable_supplied_origin_instead_of_dropping_it() {
+    use kronik_core::error::ErrorCode;
+    let data = tempfile::tempdir().unwrap();
+    let (_rt, node) = node_at(data.path());
+    let mapper = mapper(&node);
+    for mutation in 0..9 {
+        let mut source = metadata_origin_fixture(true, true);
+        match mutation {
+            0 => source.index = 0,
+            1 => source.index = i64::MAX as u64 + 1,
+            2 => source.native_origin.as_mut().unwrap().source.as_mut().unwrap().shard = Some(0),
+            3 => source.native_origin.as_mut().unwrap().source.as_mut().unwrap().lsn = 0,
+            4 => source.native_origin.as_mut().unwrap().source.as_mut().unwrap().branch.clear(),
+            5 => source.native_origin.as_mut().unwrap().adoption_audit = None,
+            6 => source.native_origin.as_mut().unwrap().adoption_audit.as_mut().unwrap().token_id.clear(),
+            7 => source.record = Record::decode(46, &kronik_core::ids::unhex(include_str!(
+                "../../kronik-proto/tests/fixtures/secret-link-v1.hex").trim()).unwrap()).unwrap(),
+            _ => source.record = Record::AuditEvent(pb::AuditEvent {
+                action: "operator.note".into(), audit: Some(audit()), ..Default::default()
+            }),
+        }
+        assert_eq!(mapper.lines_metadata(&source, &[]).unwrap_err().code, ErrorCode::StorageCorrupt);
+        assert_eq!(mapper.operational_lines_metadata(&source, &[]).unwrap_err().code, ErrorCode::StorageCorrupt);
+        assert_eq!(mapper.expected_metadata(&source).err().unwrap().code, ErrorCode::StorageCorrupt);
+    }
+}
+
+fn portable_metadata_control_fixtures() -> [(Record, serde_json::Value); 3] {
+    let audit = Some(pb::Audit { token_id: "system:metadata".into(),
+        reason: "exact-prefix private-NEEDLE exact-suffix".into(), wall_time_ms: 19 });
+    [
+        (Record::AuditEvent(pb::AuditEvent { action: "audit.gap".into(),
+            details: [("namespace".into(), "metadata".into()), ("stream".into(), "events-control:metadata".into()),
+                ("from_index".into(), "1".into()), ("through_index".into(), "17".into())].into(),
+            audit: audit.clone(), ..Default::default() }),
+            serde_json::json!({"namespace":"metadata","stream":"events-control:metadata","from_index":1,"through_index":17})),
+        (Record::AuditEvent(pb::AuditEvent { action: "audit.config".into(), target: "events-control:metadata".into(),
+            details: [("change".into(), "webhook.signing_key".into()), ("source".into(), "metadata".into()),
+                ("from_version".into(), "4294967296".into()), ("to_version".into(), "9007199254740991".into())].into(),
+            audit: audit.clone(), ..Default::default() }),
+            serde_json::json!({"change":"webhook.signing_key","source":"metadata","from_version":4294967296u64,
+                "to_version":9007199254740991u64,"target":"events-control:metadata"})),
+        (Record::AuditEvent(pb::AuditEvent { action: "events.webhook.replay".into(), target: "events-control:metadata".into(),
+            details: [("source".into(), "metadata".into()), ("position".into(), "9223372036854775807".into())].into(),
+            audit, ..Default::default() }),
+            serde_json::json!({"source":"metadata","position":9223372036854775807u64,"target":"events-control:metadata"})),
+    ]
+}
+
+#[test]
+fn decoded_metadata_control_views_preserve_only_closed_facts_and_the_whole_persisted_reason_policy() {
+    use kronik_core::ids::SourcePos;
+    let data = tempfile::tempdir().unwrap();
+    let (_rt, node) = node_at(data.path());
+    let mapper = mapper(&node);
+    let secrets: &[(&str, &[u8])] = &[
+        ("domain", b"metadata"), ("stream", b"events-control:metadata"), ("one", b"1"),
+        ("seventeen", b"17"), ("wide", b"4294967296"), ("wider", b"9007199254740991"),
+        ("maximum", b"9223372036854775807"), ("private", b"private-NEEDLE"),
+    ];
+    for (record, details) in portable_metadata_control_fixtures() {
+        let exact = record.encode();
+        let decoded = Record::decode(40, &exact).unwrap();
+        let source = kronik_log::MetadataAuditRecord { index: 97, record: decoded, native_origin: None };
+        let lines = mapper.lines_metadata(&source, secrets).unwrap();
+        assert_eq!((lines[0].lsn, lines[0].source), (None, Some(SourcePos::Metadata { index: 97 })));
+        assert!(lines[0].branch.is_empty());
+        assert_eq!((&*lines[0].schema, &*lines[0].kind), ("kronik.audit/v3", "audit_event"));
+        let Record::AuditEvent(event) = &source.record else { unreachable!() };
+        assert_eq!(lines[0].action, event.action);
+        assert_eq!(lines[0].details, details.as_object().unwrap().clone());
+        assert!(!lines[0].reason.contains("private-NEEDLE"));
+        assert!(!lines[0].reason.contains("exact-prefix"));
+        assert!(!lines[0].reason.contains("exact-suffix"));
+        let unambiguous = mapper.lines_metadata(&source, &[]).unwrap();
+        assert_eq!(unambiguous[0].reason, event.audit.as_ref().unwrap().reason);
+        assert_eq!(lines[0].record_hash, unambiguous[0].record_hash);
+        assert_eq!(lines[0].at_wall_ms, 19);
+        assert_eq!(lines[0].token_id, "system:metadata");
+        assert_eq!(source.record.encode(), exact);
+        assert!(metadata_view_complete(&mapper, &source, &lines));
+        let mut invalid = source;
+        let Record::AuditEvent(event) = &mut invalid.record else { unreachable!() };
+        event.details.insert("secret_value".into(), "private-NEEDLE".into());
+        assert!(mapper.lines_metadata(&invalid, secrets).is_err());
+        assert!(mapper.expected_metadata(&invalid).is_err());
+    }
+    let (gap, _) = portable_metadata_control_fixtures().into_iter().next().unwrap();
+    let source = kronik_log::MetadataAuditRecord { index: 97, record: gap, native_origin: None };
+    let lines = mapper.lines_metadata(&source, secrets).unwrap();
+    for field in ["from_index", "through_index"] {
+        let mut changed = lines.clone();
+        changed[0].details.insert(field.into(), serde_json::json!(18));
+        assert_eq!(changed[0].record_hash, lines[0].record_hash);
+        assert!(!metadata_view_complete(&mapper, &source, &changed));
+    }
+    let mut ordinary = source;
+    let Record::AuditEvent(event) = &mut ordinary.record else { unreachable!() };
+    event.action = "operator.note".into();
+    let lines = mapper.lines_metadata(&ordinary, secrets).unwrap();
+    assert_ne!(lines[0].details.get("namespace"), Some(&serde_json::json!("metadata")));
+    assert_ne!(lines[0].details.get("stream"), Some(&serde_json::json!("events-control:metadata")));
+    assert_ne!(lines[0].details.get("from_index"), Some(&serde_json::json!(1)));
+}
+
+#[test]
+fn decoded_protected_approval_uses_the_metadata_receipt_without_publishing_its_identity_payload() {
+    use kronik_core::ids::SourcePos;
+    let data = tempfile::tempdir().unwrap();
+    let (_rt, node) = node_at(data.path());
+    let mapper = mapper(&node);
+    let owner = format!("oidc:{}", "ab".repeat(32));
+    let record = Record::Approval(pb::Approval {
+        proposal_id: "p-real-history".into(), diff_hash: vec![7;32], verified_through_lsn: 17,
+        audit: Some(pb::Audit { token_id: owner.clone(), reason: "approval private-NEEDLE".into(), wall_time_ms: 19 }),
+        verified_identity: Some(pb::Sealable { subject: Some(owner),
+            value: Some(pb::sealable::Value::Sealed(pb::Sealed {
+                key_version: 2, nonce: vec![3;24], ciphertext: vec![5;16],
+            })) }), ..Default::default()
+    });
+    let exact = record.encode();
+    let source = kronik_log::MetadataAuditRecord {
+        index: 97, record: Record::decode(8, &exact).unwrap(), native_origin: None,
+    };
+    let lines = mapper.lines_metadata(&source, &[("private", b"private-NEEDLE")]).unwrap();
+    assert_eq!((&*lines[0].schema, &*lines[0].kind, &*lines[0].action),
+        ("kronik.audit/v3", "approval", "approve"));
+    assert_eq!((lines[0].lsn, lines[0].source), (None, Some(SourcePos::Metadata { index: 97 })));
+    assert!(lines[0].branch.is_empty());
+    assert!(!lines[0].to_json().contains("private-NEEDLE"));
+    assert!(!lines[0].details.contains_key("verified_identity"));
+    assert!(!lines[0].details.contains_key("ciphertext"));
+    assert!(metadata_view_complete(&mapper, &source, &lines));
+    assert_eq!(source.record.encode(), exact);
+    for mutation in 0..3 {
+        let mut invalid = Record::decode(8, &exact).unwrap();
+        let Record::Approval(approval) = &mut invalid else { unreachable!() };
+        match mutation {
+            0 => approval.verified_identity.as_mut().unwrap().subject = Some("different-owner".into()),
+            1 => approval.verified_identity.as_mut().unwrap().value = Some(pb::sealable::Value::Plain(b"private identity".to_vec())),
+            _ => approval.verified_identity.as_mut().unwrap().value = None,
+        }
+        let invalid = kronik_log::MetadataAuditRecord { index: 97, record: invalid, native_origin: None };
+        assert!(mapper.lines_metadata(&invalid, &[]).is_err());
+        assert!(mapper.expected_metadata(&invalid).is_err());
+    }
+}
+
+
+#[test]
+fn metadata_coverage_notice_in_native_log_keeps_its_actual_fsynced_actor_receipt() {
+    let data = tempfile::tempdir().unwrap();
+    let (rt, node) = node_at(data.path());
+    let original = node.local_operator_authority().unwrap();
+    let (record, details) = portable_metadata_control_fixtures().into_iter().next().unwrap();
+    let Record::AuditEvent(event) = record else { unreachable!() };
+    let lsn = rt.block_on(node.record_audit_event_authorized(
+        &event.action, &event.target, event.details, event.audit.unwrap(), original,
+    )).unwrap();
+    let reader = rt.block_on(node.capture_system_export_reader()).unwrap();
+    let page = rt.block_on(reader.page(lsn - 1, 1, 1 << 20)).unwrap();
+    let (source, committed) = &page.records[0];
+    assert_eq!((source.shard, source.lsn), (None, lsn));
+    assert_eq!(committed.lsn, lsn);
+    let exact = committed.record.encode();
+    let mapper = mapper(&node);
+    let lines = mapper.lines_actor_at(source, &committed.record,
+        &[("domain", b"metadata"), ("stream", b"events-control:metadata"),
+          ("one", b"1"), ("seventeen", b"17"), ("private", b"private-NEEDLE")]).unwrap();
+    assert_eq!((&*lines[0].kind, &*lines[0].action), ("audit_event", "audit.gap"));
+    assert_eq!(lines[0].details, details.as_object().unwrap().clone());
+    assert_eq!((lines[0].lsn, lines[0].source), (Some(lsn), None));
+    assert_eq!(lines[0].branch, source.branch);
+    let expected = mapper.expected_actor_at(source, &committed.record).unwrap();
+    assert!(verify(&expected, &lines, lsn, lsn).complete);
+    assert_eq!(mapper.operational_lines_actor_at(source, &committed.record, &[]).unwrap()[0].source, None);
+    assert_eq!(committed.record.encode(), exact);
+    // The metadata index range in the notice is not an actor-log coverage range.
+    assert_eq!(kronik_sched::scrub::AuditPositions::parse("audit.gap",
+        &kronik_log::MetadataAuditGap { stream: "events-control:metadata".into(),
+            from_index: 1, through_index: 17 }.into_details()).unwrap().unwrap().value("from"), None);
 }

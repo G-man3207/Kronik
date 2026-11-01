@@ -10,6 +10,7 @@ use std::process::ExitCode;
 
 use kronik_api::types::AuditResponse;
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::ids::SourcePos;
 use kronik_otel::audit::{Ctx as LineCtx, Item, Line, Report};
 use kronik_otel::sink::Sink;
 use kronik_otel::spans::ActorKeys;
@@ -86,29 +87,30 @@ fn show(ctx: &Ctx, from: Option<u64>, limit: Option<u64>) -> Result<ExitCode, Er
         format!("/v1/audit?{}", query.join("&"))
     };
     let body = ctx.get(&target)?;
+    let r: AuditResponse = ctx.decode(&body)?;
     if ctx.json {
         ctx.print_raw(&body);
         return Ok(ExitCode::SUCCESS);
     }
-    let r: AuditResponse = ctx.decode(&body)?;
     ctx.print(&render_show(&r));
     Ok(ExitCode::SUCCESS)
 }
 
 fn render_show(r: &AuditResponse) -> String {
-    let mut out = if r.lines.is_empty() {
+    let (lines, next_page) = match r {
+        AuditResponse::Native(page) => (&page.lines, page.next),
+        AuditResponse::Member(page) => (&page.lines, page.next),
+    };
+    let mut out = if lines.is_empty() {
         "No audit lines.\n".to_owned()
     } else {
         table(
             &["lsn", "action", "at", "token", "reason"],
-            r.lines
+            lines
                 .iter()
                 .map(|l| {
                     vec![
-                        match l.effect {
-                            Some(e) => format!("{}#{e}", l.lsn),
-                            None => l.lsn.to_string(),
-                        },
+                        position(&l.branch, l.source, l.lsn, l.effect),
                         l.action.clone(),
                         units::utc(l.at_wall_ms),
                         l.token_id.clone(),
@@ -118,7 +120,7 @@ fn render_show(r: &AuditResponse) -> String {
                 .collect(),
         )
     };
-    if let Some(n) = r.next {
+    if let Some(n) = next_page {
         out.push_str(&next(&[format!("kronik audit show --from {n}")]));
     }
     out
@@ -219,18 +221,27 @@ async fn compare(
         keys: &keys,
         subject: &subject,
         secrets: &[],
+        sealer: &sealer,
     };
     let mut expected = Vec::new();
     let mut last = from;
     if to > from {
-        reader
+        let mut identity_error = None;
+        let read = reader
             .read(from + 1, to, |c| {
                 last = c.lsn;
-                expected.extend(kronik_otel::audit::expected(c.lsn, &c.record, &line_ctx)?);
+                match kronik_otel::audit::expected(c.lsn, &c.record, &line_ctx) {
+                    Ok(items) => expected.extend(items),
+                    Err(error) => {
+                        identity_error = Some(error);
+                        return Err(kronik_log::LogError::Corrupt("audit identity unavailable".into()));
+                    }
+                }
                 Ok(())
             })
-            .await
-            .map_err(corrupt)?;
+            .await;
+        if let Some(error) = identity_error { return Err(error); }
+        read.map_err(corrupt)?;
     }
     let lines = read_sink(sink).await?;
     Ok(kronik_otel::audit::verify(
@@ -361,9 +372,22 @@ fn render_verify(r: &Report, sink: &str) -> String {
     out
 }
 
+fn position(branch: &str, source: Option<SourcePos>, lsn: Option<u64>, effect: Option<u32>) -> String {
+    let value = match source {
+        Some(SourcePos::Metadata { index }) => format!("metadata:{index}"),
+        Some(SourcePos::Actor { shard: Some(shard), lsn }) => {
+            if branch.is_empty() { format!("actor:{shard}:{lsn}") }
+            else { format!("{branch}:{shard}:{lsn}") }
+        },
+        Some(SourcePos::Actor { shard: None, lsn }) => lsn.to_string(),
+        None => lsn.map_or_else(|| "-".to_owned(), |lsn| lsn.to_string()),
+    };
+    match effect { Some(effect) => format!("{value}#{effect}"), None => value }
+}
+
 fn item_row(i: &Item) -> Vec<String> {
     vec![
-        i.lsn.to_string(),
+        position(&i.branch, i.source, i.lsn, None),
         i.effect.map_or_else(|| "-".to_owned(), |e| e.to_string()),
         i.kind.clone(),
         i.action.clone(),
@@ -376,9 +400,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn audit_show_rejects_mixed_domains_in_json_and_human_output_but_accepts_legacy_native() {
+        use std::io::{self, Write as _};
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+        use kronik_api::types::{MemberAuditResponse, NativeAuditResponse};
+        use super::super::http;
+
+        let native = NativeAuditResponse { lines: Vec::new(), next: None, applied_lsn: 7 };
+        let legacy = serde_json::to_vec(&native).unwrap();
+        let mut mixed = serde_json::to_value(&native).unwrap();
+        let serde_json::Value::Object(member) = serde_json::to_value(MemberAuditResponse {
+            source: SourcePos::Metadata { index: 7 }, covered_from: 1,
+            next: None, lines: Vec::new(),
+        }).unwrap() else { unreachable!() };
+        mixed.as_object_mut().unwrap().extend(member);
+        let mixed = serde_json::to_vec(&mixed).unwrap();
+
+        for (body, valid) in [(legacy.as_slice(), true), (mixed.as_slice(), false)] {
+            for json in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let socket = directory.path().join("audit.sock");
+                let listener = UnixListener::bind(&socket).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                std::thread::scope(|scope| {
+                    let receiver = scope.spawn(|| {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        let stream = loop {
+                            match listener.accept() {
+                                Ok((stream, _)) => break stream,
+                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                    assert!(Instant::now() < deadline, "audit response receiver accept deadline");
+                                    std::thread::sleep(Duration::from_millis(2));
+                                }
+                                Err(error) => panic!("audit response receiver accept failed: {error}"),
+                            }
+                        };
+                        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let mut stream = io::BufReader::new(stream);
+                        loop {
+                            let line = http::bounded_line(&mut stream, 8192).unwrap().unwrap();
+                            if line == b"\r\n" { break; }
+                        }
+                        write!(stream.get_mut(),
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()).unwrap();
+                        stream.get_mut().write_all(body).unwrap();
+                        stream.get_mut().flush().unwrap();
+                    });
+                    let ctx = Ctx { endpoint: Ok(http::Endpoint::Unix(socket)), json,
+                        token: Ok(None), url_flag: None };
+                    let result = audit(&ctx, AuditCommand::Show { from: None, limit: None });
+                    receiver.join().unwrap();
+                    if valid {
+                        assert!(result.is_ok(), "legacy Native response must remain consumable: {result:?}");
+                    } else {
+                        assert!(result.is_err(), "mixed audit domains must not bypass decoding in either output mode");
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
     fn a_report_names_what_is_missing() {
         let item = Item {
-            lsn: 7,
+            branch: "main".into(),
+            lsn: Some(7),
+            source: None,
             effect: None,
             kind: "grant".into(),
             action: "grant".into(),

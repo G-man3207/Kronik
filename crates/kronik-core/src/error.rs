@@ -152,6 +152,9 @@ codes! {
     GatewayTimeout = "GATEWAY_TIMEOUT", 504, "M1",
         "The turn outlived the gateway timeout",
         "The turn still completes; repeat the request with the same Idempotency-Key to get its response.";
+    HostRedactionFailure = "HOST_REDACTION_FAILURE", 500, "M28",
+        "The host could not safely disclose a recorded effect result",
+        "Inspect the turn and its effects; repair the scrub inventory or reduce free output, and check the external system before resending.";
     IdempotencyInFlight = "IDEMPOTENCY_IN_FLIGHT", 409, "M1",
         "The original request with this key is still running",
         "Retry later with the same Idempotency-Key and the same request.";
@@ -170,6 +173,9 @@ codes! {
     KeystoreIncomplete = "KEYSTORE_INCOMPLETE", 409, "M8",
         "A sealed value's subject key is not in the keystore",
         "Let the source ship its keystore again and restore again; if it is gone, `kronik restore --allow-missing-keys` keeps every other subject readable.";
+    KeyHelperFailed = "KEY_HELPER_FAILED", 503, "M23",
+        "The isolated PKCS#11 key helper did not complete successfully",
+        "Check the helper, trusted module digest, private PIN credential and enrolled token/key; do not replace the key or create a fallback master.";
     KeyProtectionUnavailable = "KEY_PROTECTION_UNAVAILABLE", 503, "M23",
         "The operating system could not protect the key's memory",
         "Check RLIMIT_MEMLOCK and available memory; key loading fails closed rather than keeping an unlocked key.";
@@ -239,12 +245,27 @@ codes! {
     ScopeMissing = "SCOPE_MISSING", 403, "M5",
         "The token lacks the scope for this operation",
         "Use a token with the required scope.";
+    SecretBackendUnknown = "SECRET_BACKEND_UNKNOWN", 400, "M23",
+        "The requested secret backend is not configured",
+        "List configured backends with `kronik secret backends`, or ask an administrator to configure the intended backend.";
+    SecretExternal = "SECRET_EXTERNAL", 409, "M23",
+        "The secret is managed by an external backend",
+        "Change the value in its backend, then run `kronik secret refresh <name> --reason '...'`.";
     SecretNotFound = "SECRET_NOT_FOUND", 404, "M2",
         "No such secret",
         "List secrets with `kronik secret list`.";
+    SecretRefNotAllowed = "SECRET_REF_NOT_ALLOWED", 403, "M23",
+        "The secret reference is outside the configured allowlist",
+        "Use an allowed reference or have an administrator update this backend's allowed_refs.";
     SecretUnavailable = "SECRET_UNAVAILABLE", 503, "M23",
         "Secret values needed by this operation are unavailable",
         "Check `kronik doctor`, the secret backend and access to retained versions; retry after complete secret coverage is restored.";
+    SecretVersionExhausted = "SECRET_VERSION_EXHAUSTED", 409, "M23",
+        "The secret version domain is exhausted",
+        "Use a new secret name; never reset or rewrite the durable version ledger.";
+    SecretVersionGone = "SECRET_VERSION_GONE", 410, "M23",
+        "The exact recorded secret version is no longer available",
+        "Restore access to the matching source, immutable version and configuration; never substitute the current value.";
     StorageCorrupt = "STORAGE_CORRUPT", 500, "M1",
         "The log or state on disk is corrupt",
         "Stop the daemon and keep the data directory; do not delete log segments.";

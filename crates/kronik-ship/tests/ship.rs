@@ -41,6 +41,7 @@ fn msg(name: &str, body: &str) -> pb::Message {
             value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
         }),
         blobs: vec![],
+        retained_compensation_source: None,
     }
 }
 
@@ -105,7 +106,7 @@ impl Proc {
     }
 
     fn ship(&self, remote: &Remote, dir: &Path) -> kronik_ship::ShipReport {
-        let mut st = ShipState::load(dir);
+        let mut st = ShipState::load(dir).unwrap();
         self.rt
             .block_on(ship_once(remote, dir, "main", &mut st))
             .unwrap()

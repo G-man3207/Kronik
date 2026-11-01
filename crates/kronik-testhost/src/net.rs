@@ -138,6 +138,22 @@ impl StubNet {
 }
 
 impl Net for StubNet {
+    fn http_authorized(&self, req: HttpRequest, original: kronik_core::authority::AuthLease)
+        -> BoxFuture<'static, Result<HttpResponse, NetError>>
+    {
+        let mut response = None;
+        let admitted = original.admit(&mut || {
+            response = Some(self.answer(&req));
+            Ok(())
+        });
+        let response = admitted.map_err(|error| NetError::Connect(error.to_string()))
+            .and_then(|()| response.unwrap_or_else(|| Err(NetError::Connect("authority did not admit stub HTTP".into()))));
+        Box::pin(async move {
+            drop(original);
+            response
+        })
+    }
+
     fn http(&self, req: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
         Box::pin(std::future::ready(self.answer(&req)))
     }

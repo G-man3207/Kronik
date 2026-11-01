@@ -29,10 +29,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use kronik_core::authority::AuthLease;
+use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::env::{Env, File, OpenMode};
 use kronik_core::ids::Lsn;
 use kronik_proto::Record;
 use tokio::sync::{mpsc, oneshot};
+
+mod native_lifecycle;
+pub use native_lifecycle::NativeWriterState;
+use native_lifecycle::NativeInbox;
+
+mod readset;
+pub use readset::CapturedLogReadset;
+
+mod metadata_audit;
+pub use metadata_audit::{MetadataAuditBatch, MetadataAuditRecord, MetadataAuditGap, MetadataAuditSource, MetadataWebhookKeyChange, MetadataWebhookReplay, MAX_METADATA_AUDIT_RECORDS};
 
 pub const MAGIC: &[u8; 4] = b"KRNK";
 pub const FORMAT_VERSION: u32 = 1;
@@ -97,6 +109,17 @@ pub enum LogError {
     #[error("log writer stopped: {0}")]
     Stopped(String),
 }
+
+/// Authorization refusal is not storage failure and must not make the node fatal.
+#[derive(Debug, thiserror::Error)]
+pub enum AuthorizedAppendError {
+    #[error("{0}")]
+    Authority(ApiError),
+    #[error("{0}")]
+    Storage(#[from] LogError),
+}
+
+const AUTHORIZED_QUEUE_CAPACITY: usize = 64;
 
 fn corrupt(msg: impl Into<String>) -> LogError {
     LogError::Corrupt(msg.into())
@@ -703,12 +726,23 @@ pub struct Opened {
 struct Append {
     record: Record,
     done: oneshot::Sender<Result<Lsn, String>>,
+    _admission: AppendAdmission,
+}
+
+enum AppendAdmission {
+    System,
+    Authorized {
+        _authority: AuthLease,
+        _slot: tokio::sync::OwnedSemaphorePermit,
+    },
 }
 
 /// Handle to the group-commit writer task. Cheap to clone.
 #[derive(Clone)]
 pub struct Log {
     tx: mpsc::UnboundedSender<Append>,
+    authorized_slots: Arc<tokio::sync::Semaphore>,
+    native_writer: Arc<NativeWriterState>,
 }
 
 struct Segment {
@@ -835,12 +869,18 @@ impl Log {
         let segments = starts.len() + usize::from(extra_segment);
         let first_lsn = starts.first().copied().unwrap_or(cfg.first_lsn);
         let (tx, rx) = mpsc::unbounded_channel();
+        let native_writer = Arc::new(NativeWriterState::new());
+        let rx = NativeInbox::new(rx, native_writer.clone());
         env.spawn(
             "log-writer",
             writer(env.clone(), cfg, segment, rx, next_lsn, committed, fatal),
         );
         Ok((
-            Log { tx },
+            Log {
+                tx,
+                authorized_slots: Arc::new(tokio::sync::Semaphore::new(AUTHORIZED_QUEUE_CAPACITY)),
+                native_writer,
+            },
             Opened {
                 next_lsn,
                 truncated_bytes,
@@ -858,7 +898,7 @@ impl Log {
         for record in records {
             let (done, rx) = oneshot::channel();
             self.tx
-                .send(Append { record, done })
+                .send(Append { record, done, _admission: AppendAdmission::System })
                 .map_err(|_| LogError::Stopped("writer task ended".into()))?;
             waiting.push(rx);
         }
@@ -877,11 +917,56 @@ impl Log {
     pub async fn append(&self, record: Record) -> Result<Lsn, LogError> {
         let (done, rx) = oneshot::channel();
         self.tx
-            .send(Append { record, done })
+            .send(Append { record, done, _admission: AppendAdmission::System })
             .map_err(|_| LogError::Stopped("writer task ended".into()))?;
         rx.await
             .map_err(|_| LogError::Stopped("writer task ended".into()))?
             .map_err(LogError::Stopped)
+    }
+
+    /// Capacity waits precede the revocation fence; an admitted writer owns the effect.
+    pub async fn append_authorized(
+        &self,
+        record: Record,
+        authority: AuthLease,
+    ) -> Result<Lsn, AuthorizedAppendError> {
+        let slot = tokio::select! {
+            biased;
+            () = authority.cancelled() => return Err(AuthorizedAppendError::Authority(ApiError::new(
+                ErrorCode::Unauthenticated, "Mutation authority was revoked while waiting for log capacity",
+            ))),
+            slot = self.authorized_slots.clone().acquire_owned() => slot
+                .map_err(|_| LogError::Stopped("writer admission closed".into()))?,
+        };
+        let (done, receive) = oneshot::channel();
+        let mut pending = Some(Append {
+            record,
+            done,
+            _admission: AppendAdmission::Authorized { _authority: authority.clone(), _slot: slot },
+        });
+        let mut stopped = false;
+        authority.admit(&mut || {
+            let append = pending.take().ok_or_else(|| ApiError::new(
+                ErrorCode::Internal, "Mutation authority admitted an operation more than once",
+            ))?;
+            self.tx.send(append).map_err(|_| {
+                stopped = true;
+                ApiError::new(ErrorCode::Unavailable, "Log writer stopped before mutation enqueue")
+            })
+        }).map_err(|error| {
+            if stopped {
+                AuthorizedAppendError::Storage(LogError::Stopped("writer task ended".into()))
+            } else {
+                AuthorizedAppendError::Authority(error)
+            }
+        })?;
+        if pending.is_some() {
+            return Err(AuthorizedAppendError::Authority(ApiError::new(
+                ErrorCode::Internal, "Mutation authority did not enqueue the operation",
+            )));
+        }
+        receive.await.map_err(|_| LogError::Stopped("writer task ended".into()))?
+            .map_err(LogError::Stopped).map_err(AuthorizedAppendError::Storage)
     }
 }
 
@@ -889,7 +974,7 @@ async fn writer(
     env: Env,
     cfg: LogConfig,
     mut seg: Segment,
-    mut rx: mpsc::UnboundedReceiver<Append>,
+    mut rx: NativeInbox<Append>,
     mut next_lsn: Lsn,
     committed: mpsc::UnboundedSender<Committed>,
     fatal: oneshot::Sender<String>,
@@ -904,6 +989,7 @@ async fn writer(
         }
         let result = write_batch(&env, &cfg, &mut seg, &mut next_lsn, batch, &committed).await;
         if let Err((msg, batch)) = result {
+            rx.close();
             // Never retry a failed write or fsync: fail every waiter and stop.
             for a in batch {
                 let _ = a.done.send(Err(msg.clone()));
@@ -1134,127 +1220,35 @@ impl LogReader {
         upto: Lsn,
         mut f: impl FnMut(Committed) -> Result<bool, LogError>,
     ) -> Result<(), LogError> {
-        if from > upto || upto == 0 {
-            return Ok(());
-        }
+        self.read_while_with_namespace(from, upto, |_, record| f(record)).await
+    }
+
+    /// Supplies the validated header namespace from the same held file as each CRC-checked frame.
+    pub async fn read_while_with_namespace(
+        &self,
+        from: Lsn,
+        upto: Lsn,
+        mut f: impl FnMut(&str, Committed) -> Result<bool, LogError>,
+    ) -> Result<(), LogError> {
+        if from > upto || upto == 0 { return Ok(()); }
         let starts = self.starts().await?;
         let mut expected = None;
-        for (i, &start) in starts.iter().enumerate() {
-            if starts.get(i + 1).is_some_and(|&next| next <= from) {
-                continue;
-            }
-            if start > upto {
-                break;
-            }
+        for (index, &start) in starts.iter().enumerate() {
+            if starts.get(index + 1).is_some_and(|&next| next <= from) { continue; }
+            if start > upto { break; }
             let path = self.dir.join(segment_name(start));
             let file = self.env.fs.open(path.clone(), OpenMode::Read).await?;
-            let file_len = file.len().await?;
-            // A valid header must name this branch; never allocate from an
-            // untrusted on-disk branch length.
+            let length = file.len().await?;
             let image = file.read_at(0, 24 + self.branch.len()).await?;
-            let header = parse_header(&image).ok_or_else(|| {
-                corrupt(format!("segment {} has no valid header", path.display()))
-            })?;
+            let header = parse_header(&image).ok_or_else(||
+                corrupt(format!("segment {} has no valid header", path.display())))?;
             if header.start_lsn != start || header.branch != self.branch {
-                return Err(corrupt(format!(
-                    "segment {} header mismatch",
-                    path.display()
-                )));
+                return Err(corrupt(format!("segment {} header mismatch", path.display())));
             }
-            if let Some(exp) = expected
-                && exp != start
-            {
-                return Err(corrupt(format!(
-                    "segment {} starts at lsn {start}, expected {exp}",
-                    path.display()
-                )));
-            }
-            let mut next_lsn = start;
-            let mut off = header.len as u64;
-            while off < file_len {
-                if next_lsn > upto {
-                    return Ok(());
-                }
-                let envelope = file.read_at(off, ENVELOPE_LEN).await?;
-                if envelope.len() != ENVELOPE_LEN {
-                    break;
-                }
-                let (Some(len), Some(stored_crc), Some(lsn)) = (
-                    u32_at(&envelope, 0),
-                    u32_at(&envelope, 4),
-                    u64_at(&envelope, 8),
-                ) else {
-                    break;
-                };
-                if len > MAX_RECORD || ENVELOPE_LEN as u64 + len as u64 > file_len - off {
-                    break;
-                }
-                let kind = envelope[16];
-                if kind != FOOTER_KIND && lsn != next_lsn {
-                    break;
-                }
-                let mut crc = crc32c::crc32c(&envelope[8..]);
-                let mut payload = Vec::new();
-                if kind != FOOTER_KIND && lsn >= from {
-                    payload = file
-                        .read_at(off + ENVELOPE_LEN as u64, len as usize)
-                        .await?;
-                    if payload.len() != len as usize {
-                        break;
-                    }
-                    crc = crc32c::crc32c_append(crc, &payload);
-                } else {
-                    let mut read = 0;
-                    while read < len as usize {
-                        let size = (len as usize - read).min(64 << 10);
-                        let chunk = file
-                            .read_at(off + ENVELOPE_LEN as u64 + read as u64, size)
-                            .await?;
-                        if chunk.len() != size {
-                            break;
-                        }
-                        crc = crc32c::crc32c_append(crc, &chunk);
-                        read += size;
-                    }
-                    if read != len as usize {
-                        break;
-                    }
-                }
-                if crc != stored_crc {
-                    break;
-                }
-                if kind == FOOTER_KIND {
-                    off += ENVELOPE_LEN as u64 + len as u64;
-                    continue;
-                }
-                if lsn >= from {
-                    let record = Record::decode(kind, &payload)
-                        .map_err(|err| corrupt(format!("record at lsn {lsn}: {err}")))?;
-                    if !f(Committed {
-                        lsn,
-                        pos: Position {
-                            segment: start,
-                            offset: off,
-                        },
-                        record,
-                    })? {
-                        return Ok(());
-                    }
-                } else if kind == 0 || !kronik_proto::kind::ALL.contains(&kind) {
-                    return Err(corrupt(format!("record at lsn {lsn} has kind {kind}")));
-                }
-                next_lsn += 1;
-                off += ENVELOPE_LEN as u64 + len as u64;
-            }
-            if (off < file_len && i + 1 != starts.len())
-                || (i + 1 == starts.len() && upto != Lsn::MAX && next_lsn <= upto)
-            {
-                return Err(corrupt(format!(
-                    "segment {} is invalid at offset {off}",
-                    path.display()
-                )));
-            }
-            expected = Some(next_lsn);
+            let progress = readset::read_segment(file.as_ref(), length, &header, &path,
+                start, from, upto, index + 1 == starts.len(), expected, &mut f).await?;
+            if progress.stopped { return Ok(()); }
+            expected = Some(progress.next_lsn);
         }
         if upto != Lsn::MAX && expected.is_none_or(|next| next <= upto) {
             return Err(corrupt(format!("log has no record at lsn {upto}")));
@@ -1266,25 +1260,43 @@ impl LogReader {
     pub async fn read_at(&self, pos: Position) -> Result<Committed, LogError> {
         let path = self.dir.join(segment_name(pos.segment));
         let file = self.env.fs.open(path, OpenMode::Read).await?;
-        let head = file.read_at(pos.offset, ENVELOPE_LEN).await?;
-        let len = u32_at(&head, 0).ok_or_else(|| corrupt("short entry header"))?;
-        if len > MAX_RECORD {
-            return Err(corrupt(format!("entry length {len} at {pos:?}")));
-        }
-        let mut image = head;
-        image.extend(
-            file.read_at(pos.offset + ENVELOPE_LEN as u64, len as usize)
-                .await?,
-        );
-        let e = parse_entry(&image, 0).ok_or_else(|| corrupt(format!("bad entry at {pos:?}")))?;
-        let record = Record::decode(e.kind, e.payload)
-            .map_err(|err| corrupt(format!("record at lsn {}: {err}", e.lsn)))?;
-        Ok(Committed {
-            lsn: e.lsn,
-            pos,
-            record,
-        })
+        read_entry_at(file.as_ref(), pos).await
     }
+
+    /// Reads the actual native header namespace and CRC-checked record from the
+    /// SAME file. This does not accept another reader format or namespace alias.
+    pub async fn read_at_with_namespace(&self, pos: Position) -> Result<(String, Committed), LogError> {
+        let path = self.dir.join(segment_name(pos.segment));
+        let file = self.env.fs.open(path, OpenMode::Read).await?;
+        let image = file.read_at(0, 24 + self.branch.len()).await?;
+        let header = parse_header(&image).ok_or_else(|| corrupt(format!("invalid native segment header at {pos:?}")))?;
+        if header.start_lsn != pos.segment || header.branch != self.branch || pos.offset < header.len as u64 {
+            return Err(corrupt(format!("native segment header mismatch at {pos:?}")));
+        }
+        let record = read_entry_at(file.as_ref(), pos).await?;
+        Ok((header.branch, record))
+    }
+}
+
+async fn read_entry_at(file: &dyn File, pos: Position) -> Result<Committed, LogError> {
+    let head = file.read_at(pos.offset, ENVELOPE_LEN).await?;
+    let len = u32_at(&head, 0).ok_or_else(|| corrupt("short entry header"))?;
+    if len > MAX_RECORD {
+        return Err(corrupt(format!("entry length {len} at {pos:?}")));
+    }
+    let mut image = head;
+    image.extend(
+        file.read_at(pos.offset + ENVELOPE_LEN as u64, len as usize)
+            .await?,
+    );
+    let e = parse_entry(&image, 0).ok_or_else(|| corrupt(format!("bad entry at {pos:?}")))?;
+    let record = Record::decode(e.kind, e.payload)
+        .map_err(|err| corrupt(format!("record at lsn {}: {err}", e.lsn)))?;
+    Ok(Committed {
+        lsn: e.lsn,
+        pos,
+        record,
+    })
 }
 
 #[cfg(test)]

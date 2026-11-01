@@ -1,6 +1,6 @@
 //! KMS source metadata and audited online rewrap (M23 B1).
 use crate::types::{KeysChangeResponse, KeysRewrapRequest};
-use crate::{Api, ApiRequest, ApiResponse, Result, json, ok, reason};
+use crate::{Api, AuthorizedRequest, ApiResponse, Result, json, ok, reason};
 use kronik_core::error::{ApiError, ErrorCode};
 
 impl Api {
@@ -11,7 +11,7 @@ impl Api {
         ok(&source.status())
     }
 
-    pub(crate) async fn keys_rewrap(&self, req: &ApiRequest) -> Result<ApiResponse> {
+    pub(crate) async fn keys_rewrap(&self, req: &AuthorizedRequest) -> Result<ApiResponse> {
         let r: KeysRewrapRequest = json(&req.body)?;
         reason(&r.reason)?;
         let source = self.node.key_source().ok_or_else(|| {
@@ -33,10 +33,13 @@ impl Api {
             )
             .await?;
         }
-        let keys = match source.rewrap(r.dry_run).await {
+        let wrapping = source.clone();
+        let dry_run = r.dry_run;
+        let keys = match self.node.authorized_effect(req.authority.clone(), move || async move {
+            wrapping.rewrap(dry_run).await.map_err(|error| error.api_error())
+        }).await {
             Ok(keys) => keys,
             Err(e) => {
-                let e = e.api_error();
                 if !r.dry_run {
                     let _ = self
                         .audit_event(

@@ -29,6 +29,8 @@ use crate::{Api, ApiRequest};
 
 /// Largest API request body (a deploy carries the component as base64).
 pub const MAX_REQUEST: usize = 64 << 20;
+/// One maximum typed resume cursor plus bounded request headroom.
+pub const MAX_HEADER_BYTES: usize = 2 * kronik_fleet::events::MAX_CURSOR_BYTES + 8192;
 
 /// Over TCP, how long a client may take to send a request head, then its
 /// body. The Unix socket is local, and has no limit.
@@ -39,15 +41,10 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(120);
 /// [`Mount`].
 pub type Body = BoxBody<Bytes, Infallible>;
 
-/// A service mounted at a path of the API listener, such as the MCP
-/// endpoint at `/mcp`. It gets the connection's identity (`unix:uid=<n>` or
-/// `tcp:<peer>`) and the request with its body read (at most
-/// [`MAX_REQUEST`] bytes). The listener has already checked a bearer token in
-/// the request's `Authorization` header, and refused requests without one
-/// over TCP.
+/// A mounted service receives the original pre-body authority, never a bearer.
 pub type Mount = Arc<
     dyn Fn(
-            String,
+            crate::CapturedRequest,
             hyper::Request<Full<Bytes>>,
         ) -> Pin<Box<dyn Future<Output = hyper::Response<Body>> + Send>>
         + Send
@@ -92,6 +89,19 @@ fn error_response(e: &ApiError) -> hyper::Response<Body> {
         "application/json",
         e.to_json().to_string().into_bytes(),
     )
+}
+
+pub(crate) fn event_cursor_header(headers: &hyper::HeaderMap) -> Result<Option<&str>, ApiError> {
+    let mut values = headers.get_all("last-event-id").iter();
+    let Some(value) = values.next() else { return Ok(None); };
+    if values.next().is_some() {
+        return Err(ApiError::new(ErrorCode::BadRequest, "duplicate Last-Event-ID headers"));
+    }
+    let value = value.to_str().map_err(|_| ApiError::new(ErrorCode::BadRequest, "invalid Last-Event-ID"))?;
+    if value.len() > kronik_fleet::events::MAX_CURSOR_BYTES || value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(ApiError::new(ErrorCode::BadRequest, "invalid Last-Event-ID"));
+    }
+    Ok(Some(value))
 }
 
 /// The token of an `Authorization: Bearer <token>` header; an error when
@@ -161,6 +171,7 @@ pub async fn serve_with(
             identity,
             api.clone(),
             mount.clone(),
+            None,
         ));
     }
 }
@@ -196,7 +207,7 @@ pub async fn serve_tcp(
         match &acceptor {
             None => {
                 tokio::spawn(async move {
-                    serve_connection(stream, identity, api, mount).await;
+                    serve_connection(stream, identity, api, mount, None).await;
                     drop(slot);
                 });
             }
@@ -206,7 +217,7 @@ pub async fn serve_tcp(
                     match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream))
                         .await
                     {
-                        Ok(Ok(tls)) => serve_connection(tls, identity, api, mount).await,
+                        Ok(Ok(tls)) => serve_connection(tls, identity, api, mount, None).await,
                         Ok(Err(e)) => {
                             tracing::debug!(%peer, error = %e, "API TLS handshake failed")
                         }
@@ -219,12 +230,31 @@ pub async fn serve_tcp(
     }
 }
 
+/// The outbound controller receives only this already captured ordinary credential.
+/// No remote header, cookie, request field or fresh post-handoff lookup selects identity.
+pub async fn serve_fleet_connection(
+    stream: tokio::io::DuplexStream,
+    api: Arc<Api>,
+    captured: crate::CapturedRequest,
+    mount: Option<(&'static str, Mount)>,
+) -> Result<(), ApiError> {
+    captured.authority().check()?;
+    let lifetime = captured.authority().clone();
+    tokio::select! {
+        biased;
+        () = lifetime.cancelled() => {},
+        () = serve_connection(stream, "tcp:fleet".into(), api, mount, Some(captured)) => {},
+    }
+    Ok(())
+}
+
 /// One connection: HTTP/1.1 requests to the JSON API or to `mount`.
 async fn serve_connection<S>(
     stream: S,
     identity: String,
     api: Arc<Api>,
     mount: Option<(&'static str, Mount)>,
+    trusted: Option<crate::CapturedRequest>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -233,13 +263,17 @@ async fn serve_connection<S>(
         let api = api.clone();
         let identity = identity.clone();
         let mount = mount.clone();
+        let trusted = trusted.clone();
         async move {
-            let (parts, body) = req.into_parts();
-            let bearer = match bearer(&parts.headers) {
-                Ok(bearer) => bearer,
-                Err(e) => return Ok::<_, Infallible>(error_response(&e)),
+            let (mut parts, body) = req.into_parts();
+            let identity_is_fleet = trusted.is_some();
+            let bearer = if trusted.is_some() { None } else {
+                match bearer(&parts.headers) {
+                    Ok(bearer) => bearer,
+                    Err(e) => return Ok::<_, Infallible>(error_response(&e)),
+                }
             };
-            if tcp && bearer.is_none() {
+            if tcp && trusted.is_none() && bearer.is_none() {
                 let e = ApiError::new(
                     ErrorCode::Unauthenticated,
                     "the API over TCP needs a bearer token",
@@ -249,7 +283,7 @@ async fn serve_connection<S>(
                 );
                 return Ok(error_response(&e));
             }
-            let req = ApiRequest {
+            let mut req = ApiRequest {
                 method: parts.method.as_str().to_owned(),
                 path: parts.uri.path().to_owned(),
                 query: parts.uri.query().unwrap_or("").to_owned(),
@@ -257,63 +291,91 @@ async fn serve_connection<S>(
                 token_id: identity,
                 bearer,
             };
-            // The caller first: a bad token gets no further than the
-            // listener, and never makes it read a body. The mount makes its
-            // own API requests as this caller.
-            if let Err(e) = api.caller(&req) {
-                return Ok(error_response(&e));
-            }
-            let read = Limited::new(body, MAX_REQUEST).collect();
-            let read = if tcp {
-                match tokio::time::timeout(BODY_TIMEOUT, read).await {
-                    Ok(read) => read,
-                    Err(_) => {
-                        let e = ApiError::new(
-                            ErrorCode::BadRequest,
-                            format!(
-                                "the request body did not arrive within {} s",
-                                BODY_TIMEOUT.as_secs()
-                            ),
-                        );
-                        return Ok(error_response(&e));
-                    }
-                }
+            let mounted = mount.as_ref().is_some_and(|(path, _)| {
+                req.path.strip_prefix(path).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            });
+            let captured = match if let Some(captured) = trusted {
+                let authorization = if mounted { captured.authority().check() }
+                    else { api.authorize_captured_request(&req, &captured) };
+                authorization.map(|()| captured)
+            } else if mounted {
+                api.capture_binding(&req)
             } else {
-                read.await
+                api.capture(&req)
+            } {
+                Ok(captured) => captured,
+                Err(error) => return Ok(error_response(&error)),
+            };
+            let authority = captured.authority().clone();
+            parts.headers.remove(hyper::header::AUTHORIZATION);
+            if identity_is_fleet { parts.headers.remove(hyper::header::COOKIE); }
+            req.bearer = None;
+            if matches!(req.path.as_str(), "/v1/events/stream" | "/v1/events/ws") {
+                let incoming = hyper::Request::from_parts(parts, body);
+                return Ok(crate::event_stream::serve_captured(api, req, captured, incoming).await);
+            }
+            if req.method == "GET" && req.path == "/v1/events" {
+                let incoming = hyper::Request::from_parts(parts, body);
+                return Ok(crate::event_stream::serve_page_captured(api, req, captured, incoming).await);
+            }
+            let read = async {
+                let read = Limited::new(body, MAX_REQUEST).collect();
+                if tcp {
+                    match tokio::time::timeout(BODY_TIMEOUT, read).await {
+                        Ok(read) => read.map_err(|_| ApiError::new(ErrorCode::PayloadTooLarge, "API request body exceeds its limit")),
+                        Err(_) => Err(ApiError::new(ErrorCode::BadRequest, "API request body timed out")),
+                    }
+                } else {
+                    read.await.map_err(|_| ApiError::new(ErrorCode::PayloadTooLarge, "API request body exceeds its limit"))
+                }
+            };
+            let read = tokio::select! {
+                biased;
+                () = authority.cancelled() => return Ok(error_response(&ApiError::new(ErrorCode::Unauthenticated, "Request authority revoked while reading the body"))),
+                read = read => read,
             };
             let body = match read {
-                Ok(b) => b.to_bytes(),
-                Err(_) => {
-                    let e = ApiError::new(
-                        ErrorCode::PayloadTooLarge,
-                        format!("API requests are limited to {MAX_REQUEST} bytes"),
-                    );
-                    return Ok(error_response(&e));
-                }
+                Ok(body) => body.to_bytes(),
+                Err(error) => return Ok(error_response(&error)),
             };
-            if let Some((path, mount)) = &mount {
-                let under = parts.uri.path().strip_prefix(path);
-                if under.is_some_and(|rest| rest.is_empty() || rest.starts_with('/')) {
-                    let request = hyper::Request::from_parts(parts, Full::new(body));
-                    return Ok(mount(req.token_id, request).await);
-                }
+            if let Err(error) = authority.check() {
+                return Ok(error_response(&error));
             }
-            let r = api
-                .handle(ApiRequest {
-                    body: body.to_vec(),
-                    ..req
-                })
-                .await;
+            if mounted && let Some((_, mount)) = &mount {
+                return Ok(mount(captured, hyper::Request::from_parts(parts, Full::new(body))).await);
+            }
+            let r = api.handle_admitted(ApiRequest { body: body.to_vec(), ..req }, captured).await;
             Ok(response(r.status, r.content_type, r.body))
         }
     });
     let mut builder = http1::Builder::new();
+    builder.max_buf_size(MAX_HEADER_BYTES);
     if tcp {
         builder
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(HEADER_TIMEOUT);
     }
-    if let Err(e) = builder.serve_connection(TokioIo::new(stream), svc).await {
+    if let Err(e) = builder.serve_connection(TokioIo::new(stream), svc).with_upgrades().await {
         tracing::debug!(error = %e, "API connection ended");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod event_cursor_tests {
+    use super::*;
+    #[test]
+    fn full_cursor_header_is_bounded_and_duplicate_headers_are_rejected() {
+        let mut headers = hyper::HeaderMap::new();
+        let cursor = "x".repeat(kronik_fleet::events::MAX_CURSOR_BYTES);
+        headers.insert("last-event-id", hyper::header::HeaderValue::from_str(&cursor).unwrap());
+        assert_eq!(event_cursor_header(&headers).unwrap(), Some(cursor.as_str()));
+        headers.append("last-event-id", hyper::header::HeaderValue::from_static("other"));
+        assert!(event_cursor_header(&headers).is_err());
+        headers.clear();
+        headers.insert("last-event-id", hyper::header::HeaderValue::from_str(&(cursor + "x")).unwrap());
+        assert!(event_cursor_header(&headers).is_err());
+        headers.insert("last-event-id", hyper::header::HeaderValue::from_static("bad\tcursor"));
+        assert!(event_cursor_header(&headers).is_err());
     }
 }

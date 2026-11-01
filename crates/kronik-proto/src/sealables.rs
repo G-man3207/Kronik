@@ -107,10 +107,14 @@ pub fn turn_mut(t: &mut pb::TurnRecord, f: Visit<'_>) {
     outcome_mut(t.outcome.as_mut(), f);
 }
 
-/// Every `Sealable` of a record: turn begins, effect results and turn
-/// records carry user data; configuration records carry none.
+/// Every `Sealable` of a record, including protected historical approval identity.
 pub fn record_mut(r: &mut Record, f: Visit<'_>) {
     match r {
+        Record::Approval(approval) => {
+            if let Some(identity) = approval.verified_identity.as_mut() {
+                f(identity);
+            }
+        }
         Record::TurnBegin(b) => input_mut(b.input.as_mut(), f),
         Record::EffectResult(e) => {
             if let Some(e) = e.effect.as_mut() {
@@ -126,6 +130,8 @@ pub fn record_mut(r: &mut Record, f: Visit<'_>) {
                 turn_mut(t, f);
             }
         }
+        // Provenance contains public resource identities, never secret bytes.
+        Record::SecretVersion(_) | Record::SecretLink(_) => {}
         _ => {}
     }
 }

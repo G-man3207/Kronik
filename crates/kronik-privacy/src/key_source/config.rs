@@ -15,6 +15,7 @@ pub enum Source {
     Aws,
     Gcp,
     Azure,
+    Pkcs11,
 }
 impl Source {
     pub fn as_str(self) -> &'static str {
@@ -25,6 +26,7 @@ impl Source {
             Self::Aws => "aws",
             Self::Gcp => "gcp",
             Self::Azure => "azure",
+            Self::Pkcs11 => "pkcs11",
         }
     }
     pub fn is_kms(self) -> bool {
@@ -43,6 +45,7 @@ pub struct Keys {
     pub aws: Option<Aws>,
     pub gcp: Option<Gcp>,
     pub azure: Option<Azure>,
+    pub pkcs11: Option<Pkcs11>,
 }
 impl Default for Keys {
     fn default() -> Self {
@@ -55,6 +58,7 @@ impl Default for Keys {
             aws: None,
             gcp: None,
             azure: None,
+            pkcs11: None,
         }
     }
 }
@@ -136,6 +140,27 @@ pub struct Azure {
     pub ca_file: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pkcs11 {
+    pub helper_path: PathBuf,
+    pub module: PathBuf,
+    pub module_sha256: String,
+    pub pin_file: PathBuf,
+    pub manufacturer: String,
+    pub model: String,
+    pub serial: String,
+    pub key_id: String,
+    pub key_version: String,
+    pub probe: Option<Probe>,
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Probe {
+    pub nonce: String,
+    pub ciphertext: String,
+}
+
 pub(super) fn segment(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 256
@@ -150,7 +175,7 @@ pub(super) fn positive_version(s: &str) -> bool {
         && s.bytes().all(|c| c.is_ascii_digit())
         && s.parse::<u64>().is_ok_and(|n| n > 0 && n.to_string() == s)
 }
-pub(super) fn endpoint(s: &str) -> Result<Url, String> {
+pub(crate) fn endpoint(s: &str) -> Result<Url, String> {
     let u = Url::parse(s).map_err(|_| "invalid provider endpoint".to_owned())?;
     let loopback = u.host_str().is_some_and(|h| {
         h == "localhost"
@@ -222,6 +247,15 @@ impl Keys {
         Ok(Duration::from_millis(ms))
     }
     pub fn check(&self) -> Result<(), String> {
+        self.check_with_probe(true)
+    }
+    pub fn check_pkcs11_enrollment(&self) -> Result<(), String> {
+        if self.source != Source::Pkcs11 {
+            return Err("PKCS11_CONFIG".into());
+        }
+        self.check_with_probe(false)
+    }
+    fn check_with_probe(&self, require_probe: bool) -> Result<(), String> {
         self.start_timeout()?;
         if self.wrapped_file.as_os_str().is_empty()
             || self
@@ -236,6 +270,7 @@ impl Keys {
             (Source::Aws, self.aws.is_some()),
             (Source::Gcp, self.gcp.is_some()),
             (Source::Azure, self.azure.is_some()),
+            (Source::Pkcs11, self.pkcs11.is_some()),
         ] {
             if present != (self.source == source) {
                 return Err("keys provider configuration must match source".into());
@@ -384,10 +419,16 @@ impl Keys {
                 path(p)?;
             }
         }
+        if let Some(c) = &self.pkcs11 {
+            super::pkcs11::check(c, require_probe)?;
+        }
         Ok(())
     }
     pub fn key_ref(&self) -> Result<String, String> {
         self.check()?;
+        if let Some(c) = &self.pkcs11 {
+            return super::pkcs11::key_ref(c);
+        }
         match self.source {
             Source::Openbao => self
                 .openbao
@@ -423,7 +464,7 @@ mod tests {
     #[test]
     fn inline_credentials_and_unsupported_sources_are_refused() {
         for bad in [
-            r#"{"source":"pkcs11"}"#,
+            r#"{"source":"pkcs11","pkcs11":{"pin":"secret"}}"#,
             r#"{"aws":{"secret_access_key":"secret"}}"#,
             r#"{"openbao":{"token":"secret"}}"#,
             r#"{"gcp":{"credentials":"inline"}}"#,

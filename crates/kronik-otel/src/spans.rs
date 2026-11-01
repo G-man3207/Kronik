@@ -501,7 +501,7 @@ pub struct Turn<'a> {
     pub lsn: u64,
     pub branch: &'a str,
     /// Complete retained-secret inventory; unavailable coverage must not be mapped.
-    pub secrets: &'a [(String, Vec<u8>)],
+    pub secrets: &'a [(&'a str, &'a [u8])],
     /// The exporter's open turns, this turn's own entry included while its
     /// record is mapped.
     pub open: &'a OpenTurns,

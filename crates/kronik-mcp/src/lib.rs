@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use kronik_api::auth::Scope;
 use kronik_api::server::{MAX_REQUEST, Mount};
-use kronik_api::{Api, ApiRequest, ApiResponse};
+use kronik_api::{Api, ApiRequest, ApiResponse, CapturedRequest};
 use kronik_core::error::{ApiError, ErrorCode};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListResourcesResult, ListToolsResult,
@@ -38,15 +38,6 @@ diff with get_diff; when the policy requires approval, ask a human with request_
 Every tool that changes something requires a `reason`. Errors carry a stable `code` and a \
 `hint` with the next step; explain documents concepts and codes.";
 
-/// The caller, as the API listener tells the mount: the connection's
-/// identity and the request's bearer token, which every API request of the
-/// MCP call carries again (so a revoked token stops at once).
-#[derive(Clone)]
-struct Credentials {
-    token_id: String,
-    bearer: Option<String>,
-}
-
 /// The MCP service for one request: Streamable HTTP is served statelessly.
 #[derive(Clone)]
 pub struct KronikMcp {
@@ -70,14 +61,14 @@ impl KronikMcp {
         let credentials = credentials(context)?;
         Ok(self
             .api
-            .handle(ApiRequest {
+            .handle_admitted(ApiRequest {
                 method: method.to_owned(),
                 path: path.to_owned(),
                 query,
                 body,
-                token_id: credentials.token_id,
-                bearer: credentials.bearer,
-            })
+                token_id: String::new(),
+                bearer: None,
+            }, credentials)
             .await)
     }
 
@@ -92,29 +83,18 @@ impl KronikMcp {
         let credentials = credentials(context)?;
         let scope = Scope::parse(scope)
             .ok_or_else(|| ErrorData::internal_error(format!("unknown scope {scope:?}"), None))?;
-        let probe = ApiRequest {
-            method: "GET".into(),
-            path: PATH.into(),
-            query: String::new(),
-            body: Vec::new(),
-            token_id: credentials.token_id,
-            bearer: credentials.bearer,
-        };
-        Ok(self
-            .api
-            .caller(&probe)
-            .and_then(|caller| caller.require(scope))
+        Ok(credentials.require_scope(scope)
             .err()
             .map(|e| e.to_json()))
     }
 }
 
 /// The caller the API listener resolved for the HTTP request.
-fn credentials(context: &RequestContext<RoleServer>) -> Result<Credentials, ErrorData> {
+fn credentials(context: &RequestContext<RoleServer>) -> Result<CapturedRequest, ErrorData> {
     context
         .extensions
         .get::<http::request::Parts>()
-        .and_then(|parts| parts.extensions.get::<Credentials>())
+        .and_then(|parts| parts.extensions.get::<CapturedRequest>())
         .cloned()
         .ok_or_else(|| ErrorData::internal_error("the request has no caller identity", None))
 }
@@ -207,12 +187,8 @@ fn serve(api: Arc<Api>, config: StreamableHttpServerConfig) -> (&'static str, Mo
         Arc::new(NeverSessionManager::default()),
         config,
     );
-    let mount: Mount = Arc::new(move |token_id, mut request| {
-        // The listener has checked the token already.
-        let bearer = kronik_api::server::bearer(request.headers()).ok().flatten();
-        request
-            .extensions_mut()
-            .insert(Credentials { token_id, bearer });
+    let mount: Mount = Arc::new(move |captured, mut request| {
+        request.extensions_mut().insert(captured);
         let mut service = service.clone();
         Box::pin(async move {
             match service.call(request).await {

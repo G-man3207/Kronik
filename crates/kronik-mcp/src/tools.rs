@@ -212,7 +212,7 @@ const TOOLS: &[Spec] = &[
                 "fork": {"type": "string"},
                 "turn_id": {"type": "string"},
                 "outcome": {"type": "object", "description": "{kind: committed | failed, error_code, message}"},
-                "reply": {"type": ["object", "null"], "description": "{content_type, text, base64}"},
+                "reply": {"type": ["object", "null"], "description": "{name, content_type, text/base64 or blob:{hash,size}, optional blobs:[{hash,size}]}; blob identities do not grant reads"},
                 "effects": {"type": "array", "items": {"type": "object", "description": "{kind, target, delivery, status, error_code}"}}
             }))
         },

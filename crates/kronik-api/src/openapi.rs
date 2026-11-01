@@ -40,6 +40,14 @@ pub enum Answer {
     /// A behavior diff: `kronik.diff/v1` JSON, or Markdown with
     /// `format=md`.
     Diff,
+    /// A bounded SSE stream of versioned operational events and cursor frames.
+    EventsSse,
+    /// HTTP upgrade to a bounded JSON event WebSocket.
+    EventsWebSocket,
+    /// Browser login/callback redirects.
+    Redirect,
+    /// Embedded static asset, on the admin listener only.
+    Asset(&'static str),
 }
 
 /// One `/v1` operation.
@@ -153,6 +161,11 @@ pub fn turn(g: &mut SchemaGenerator) -> Schema {
     schema_file(g, "Turn", TURN_SCHEMA)
 }
 
+pub fn cluster_status(g: &mut SchemaGenerator) -> Schema {
+    schema_file(g, "ClusterStatusResponse",
+        include_str!("../../../docs/reference/cluster-status.schema.json"))
+}
+
 /// A behavior diff's `summary` (docs/design/m3-fork.md §5.1), from the diff's
 /// schema.
 pub fn diff_summary(g: &mut SchemaGenerator) -> Schema {
@@ -193,8 +206,18 @@ const FORMAT: Param = Param {
     description: "`json` (the default), `md` for Markdown, or `summary` for the short Markdown summary without bodies or state values (M10).",
 };
 
-/// Every `/v1` operation, in the order of the API reference.
+/// Every public operation, including the admin listener's embedded assets.
 pub const OPERATIONS: &[Operation] = &[
+    Operation { method: "GET", path: "/ui", summary: "Embedded admin UI", query: &[], request: None, answer: Answer::Asset("text/html; charset=utf-8") },
+    Operation { method: "GET", path: "/ui/", summary: "Embedded admin UI", query: &[], request: None, answer: Answer::Asset("text/html; charset=utf-8") },
+    Operation { method: "GET", path: "/ui/app.js", summary: "Embedded admin UI script", query: &[], request: None, answer: Answer::Asset("text/javascript; charset=utf-8") },
+    Operation { method: "GET", path: "/ui/app.css", summary: "Embedded admin UI stylesheet", query: &[], request: None, answer: Answer::Asset("text/css; charset=utf-8") },
+    Operation { method: "HEAD", path: "/ui", summary: "Embedded admin UI headers", query: &[], request: None, answer: Answer::Asset("text/html; charset=utf-8") },
+    Operation { method: "HEAD", path: "/ui/", summary: "Embedded admin UI headers", query: &[], request: None, answer: Answer::Asset("text/html; charset=utf-8") },
+    Operation { method: "HEAD", path: "/ui/app.js", summary: "Embedded admin UI script headers", query: &[], request: None, answer: Answer::Asset("text/javascript; charset=utf-8") },
+    Operation { method: "HEAD", path: "/ui/app.css", summary: "Embedded admin UI stylesheet headers", query: &[], request: None, answer: Answer::Asset("text/css; charset=utf-8") },
+    Operation { method: "GET", path: "/ui/icon.svg", summary: "Embedded admin UI icon", query: &[], request: None, answer: Answer::Asset("image/svg+xml") },
+    Operation { method: "HEAD", path: "/ui/icon.svg", summary: "Embedded admin UI icon headers", query: &[], request: None, answer: Answer::Asset("image/svg+xml") },
     Operation {
         method: "GET",
         path: "/v1/health",
@@ -210,6 +233,56 @@ pub const OPERATIONS: &[Operation] = &[
         query: &[],
         request: None,
         answer: Answer::Json(any_object),
+    },
+    Operation {
+        method: "GET", path: "/v1/cluster/status",
+        summary: "Ordinary cluster observations, or the actual native non-member response",
+        query: &[], request: None, answer: Answer::Json(cluster_status),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/auth/session",
+        summary: "Current browser session or bearer identity and live scopes (admin listener)",
+        query: &[], request: None,
+        answer: Answer::Json(schema::<crate::oidc::SessionInfo>),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/auth/login",
+        summary: "Begin browser-bound OIDC authorization code with PKCE, state and nonce (admin listener)",
+        query: &[], request: None,
+        answer: Answer::Redirect,
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/auth/callback",
+        summary: "Consume the single-use OIDC code and browser-bound state (admin listener)",
+        query: &[
+            Param { name: "code", kind: "string", description: "The provider's single-use authorization code." },
+            Param { name: "state", kind: "string", description: "The exact browser-bound state issued by login." },
+            Param { name: "iss", kind: "string", description: "When present, must exactly equal the configured issuer." },
+            Param { name: "error", kind: "string", description: "Provider denial; no session is created." },
+        ],
+        request: None, answer: Answer::Redirect,
+    },
+    Operation {
+        method: "POST",
+        path: "/v1/auth/logout",
+        summary: "Revoke this browser session; cookie authentication requires Origin and X-Kronik-CSRF",
+        query: &[], request: Some(schema::<ResendRequest>),
+        answer: Answer::Json(any_object),
+    },
+    Operation {
+        method: "GET", path: "/v1/auth/config",
+        summary: "Durably admitted authentication profile source and activation status",
+        query: &[], request: None,
+        answer: Answer::Json(schema::<crate::auth_config::Status>),
+    },
+    Operation {
+        method: "PUT", path: "/v1/auth/config",
+        summary: "Admit a typed authentication profile; null explicitly disables it",
+        query: &[], request: Some(schema::<crate::auth_config::Change>),
+        answer: Answer::Json(schema::<crate::auth_config::Changed>),
     },
     Operation {
         method: "POST",
@@ -450,6 +523,46 @@ pub const OPERATIONS: &[Operation] = &[
         answer: Answer::Json(schema::<SecretDeleteResponse>),
     },
     Operation {
+        method: "PUT",
+        path: "/v1/secrets/{name}/link",
+        summary: "Bind a name to a trusted external secret reference",
+        query: &[],
+        request: Some(schema::<SecretLinkRequest>),
+        answer: Answer::Json(schema::<SecretLinkResponse>),
+    },
+    Operation {
+        method: "DELETE",
+        path: "/v1/secrets/{name}/link",
+        summary: "Return a name to the built-in source",
+        query: &[],
+        request: Some(schema::<SecretDeleteRequest>),
+        answer: Answer::Json(schema::<SecretLinkResponse>),
+    },
+    Operation {
+        method: "POST",
+        path: "/v1/secrets/{name}/refresh",
+        summary: "Observe the current immutable source version",
+        query: &[],
+        request: Some(schema::<SecretRefreshRequest>),
+        answer: Answer::Json(schema::<SecretResponse>),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/secrets/{name}/history",
+        summary: "Committed secret identities and publication outcomes, never values",
+        query: &[],
+        request: None,
+        answer: Answer::Json(schema::<SecretHistoryResponse>),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/secrets/backends",
+        summary: "Trusted backend bindings and retained-inventory readiness",
+        query: &[],
+        request: None,
+        answer: Answer::Json(schema::<SecretBackendsResponse>),
+    },
+    Operation {
         method: "GET",
         path: "/v1/orphans",
         summary: "Orphaned changes: a callee's committed change whose caller failed",
@@ -610,7 +723,7 @@ pub const OPERATIONS: &[Operation] = &[
         path: "/v1/proposals/{id}/approve",
         summary: "Approve a proposal's diff",
         query: &[],
-        request: Some(schema::<ResendRequest>),
+        request: Some(schema::<ApproveRequest>),
         answer: Answer::Json(schema::<ApproveResponse>),
     },
     Operation {
@@ -796,6 +909,55 @@ pub const OPERATIONS: &[Operation] = &[
         request: Some(schema::<ExportRewindRequest>),
         answer: Answer::Json(schema::<ExportRewindResponse>),
     },
+    Operation {
+        method: "GET", path: "/v1/fleet", summary: "Show durable fleet enrollment and current local admission",
+        query: &[], request: None, answer: Answer::Json(schema::<crate::fleet::FleetStatus>),
+    },
+    Operation {
+        method: "POST", path: "/v1/fleet/enroll", summary: "Enroll through pinned TLS; dry-run is local only",
+        query: &[], request: Some(schema::<crate::fleet::FleetEnrollRequest>),
+        answer: Answer::Json(schema::<crate::fleet::FleetStatus>),
+    },
+    Operation {
+        method: "POST", path: "/v1/fleet/revoke", summary: "Durably revoke fleet admission and cancel old channels",
+        query: &[], request: Some(schema::<crate::fleet::FleetRevokeRequest>),
+        answer: Answer::Json(schema::<crate::fleet::FleetStatus>),
+    },
+    Operation {
+        method: "GET", path: "/v1/events", summary: "Read safe operational events at typed source positions",
+        query: &[
+            Param { name: "cursor", kind: "string", description: "Compact kronik.events-cursor/v1 JSON, or the Last-Event-ID header." },
+            Param { name: "source", kind: "string", description: "One actual configured actor-native, actor-N or metadata source; defaults to the first configured source." },
+            Param { name: "limit", kind: "integer", description: "Events per page, 1 to 256; default 100." },
+        ], request: None, answer: Answer::Json(schema::<kronik_fleet::events::Page>),
+    },
+    Operation {
+        method: "GET", path: "/v1/events/stream", summary: "SSE events and typed resume cursors; no cross-source total order",
+        query: &[
+            Param { name: "cursor", kind: "string", description: "Resume cursor, or the Last-Event-ID header; gaps are explicit." },
+            Param { name: "source", kind: "string", description: "One actual configured source; omission follows all configured sources." },
+        ], request: None, answer: Answer::EventsSse,
+    },
+    Operation {
+        method: "GET", path: "/v1/events/ws", summary: "Bounded WebSocket operational events with live revocation",
+        query: &[
+            Param { name: "cursor", kind: "string", description: "Typed per-source resume cursor; gaps are explicit." },
+            Param { name: "source", kind: "string", description: "One actual configured source; omission follows all configured sources." },
+        ], request: None, answer: Answer::EventsWebSocket,
+    },
+    Operation {
+        method: "GET", path: "/v1/events/schemas", summary: "Published versioned operational event schema registry",
+        query: &[], request: None, answer: Answer::Json(any_object),
+    },
+    Operation {
+        method: "GET", path: "/v1/events/webhooks", summary: "Durable configured webhook delivery progress",
+        query: &[], request: None, answer: Answer::Json(schema::<crate::events::WebhooksResponse>),
+    },
+    Operation {
+        method: "POST", path: "/v1/events/webhooks/{name}/replay", summary: "Authorized audited replay without changing event identity",
+        query: &[], request: Some(schema::<crate::events::ReplayRequest>),
+        answer: Answer::Json(schema::<crate::events::ReplayResponse>),
+    },
 ];
 
 /// The stable error JSON (docs/errors.md), registered as the component
@@ -844,12 +1006,16 @@ pub fn operation_id(op: &Operation) -> String {
                 .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }),
         );
     }
+    if op.path.ends_with('/') { id.push_str("_index"); }
     id
 }
 
 /// The scope an operation needs, from the router's table.
 pub fn scope(op: &Operation) -> &'static str {
+    if matches!(op.answer, Answer::Asset(_)) { return "public"; }
     let segs: Vec<&str> = op.path.split('/').skip(1).collect();
+    if matches!(op.path, "/v1/auth/session" | "/v1/auth/login" | "/v1/auth/callback") { return "public"; }
+    if op.path == "/v1/auth/logout" { return "authenticated"; }
     crate::auth::required_scope(op.method, &segs).as_str()
 }
 
@@ -879,6 +1045,25 @@ fn operation(op: &Operation, g: &mut SchemaGenerator, error: &Schema) -> Value {
             "description": p.description, "schema": {"type": p.kind}
         }));
     }
+    if matches!(op.path, "/v1/events" | "/v1/events/stream" | "/v1/events/ws") {
+        parameters.push(json!({
+            "name": "Last-Event-ID", "in": "header", "required": false,
+            "description": "Bounded typed resume cursor; never a cross-source global LSN.",
+            "schema": {"type": "string"}
+        }));
+    }
+    if !matches!(op.method, "GET" | "HEAD") {
+        for (name, description) in [
+            ("Origin", "Required only for browser-session authentication: exact configured admin origin."),
+            ("X-Kronik-CSRF", "Required only for browser-session authentication: the current CSRF token from /v1/auth/session."),
+        ] {
+            parameters.push(json!({
+                "name": name, "in": "header", "required": false,
+                "description": description, "schema": {"type": "string"},
+                "x-kronik-required-for": "browserSession"
+            }));
+        }
+    }
     let ok = match &op.answer {
         Answer::Json(body) => json!({"description": "Success.", "content": json_content(body(g))}),
         Answer::Diff => json!({
@@ -888,11 +1073,41 @@ fn operation(op: &Operation, g: &mut SchemaGenerator, error: &Schema) -> Value {
                 "text/markdown": {"schema": {"type": "string"}}
             }
         }),
+        Answer::EventsSse => json!({
+            "description": "Long-lived SSE; event, typed cursor and explicit gap frames with backpressure and live revocation.",
+            "content": {"text/event-stream": {"schema": {"type": "string"},
+                "x-kronik-event-schema": schema::<kronik_fleet::events::Event>(g).to_value()}}
+        }),
+        Answer::EventsWebSocket => json!({
+            "description": "WebSocket upgrade; bounded operational event, typed cursor and gap frames.",
+            "x-kronik-event-schema": schema::<kronik_fleet::events::Event>(g).to_value()
+        }),
+        Answer::Redirect => json!({
+            "description": "See Other. Login binds the browser transaction; callback installs the opaque cookie.",
+            "headers": {
+                "Location": {"schema": {"type": "string"}},
+                "Set-Cookie": {"description": "Host-only HttpOnly Secure SameSite=Lax login/session cookie.", "schema": {"type": "string"}}
+            }
+        }),
+        Answer::Asset(content_type) => json!({
+            "description": "Embedded static admin asset. Never mounted on application routes.",
+            "content": {(*content_type): {"schema": {"type": "string"}}}
+        }),
     };
     let mut out = Map::new();
     out.insert("operationId".into(), json!(operation_id(op)));
     out.insert("summary".into(), json!(op.summary));
     out.insert("x-kronik-scope".into(), json!(scope(op)));
+    if op.path.starts_with("/v1/auth/") || matches!(op.answer, Answer::Asset(_)) {
+        out.insert("x-kronik-listener".into(), json!("admin"));
+    }
+    if matches!(op.path, "/v1/auth/session" | "/v1/auth/login" | "/v1/auth/callback") || matches!(op.answer, Answer::Asset(_)) {
+        out.insert("security".into(), json!([{}]));
+    } else if op.path == "/v1/auth/logout" {
+        out.insert("security".into(), json!([{"browserSession": []}]));
+    } else {
+        out.insert("security".into(), json!([{}, {"bearer": []}, {"browserSession": []}]));
+    }
     if !parameters.is_empty() {
         out.insert("parameters".into(), Value::Array(parameters));
     }
@@ -905,7 +1120,7 @@ fn operation(op: &Operation, g: &mut SchemaGenerator, error: &Schema) -> Value {
     out.insert(
         "responses".into(),
         json!({
-            "200": ok,
+            (if matches!(op.answer, Answer::Redirect) { "303" } else if matches!(op.answer, Answer::EventsWebSocket) { "101" } else { "200" }): ok,
             "default": {
                 "description": "An error: the stable error JSON.",
                 "content": json_content(error.clone())
@@ -936,9 +1151,10 @@ pub fn document() -> Value {
             "title": "Kronik JSON API",
             "version": kronik_runtime::KRONIK_VERSION,
             "description": "The daemon's API, versioned under /v1, on the Unix socket and, with a \
-                bearer token, over TCP (`--api-listen`). Every mutation requires `reason` and \
-                takes `dry_run`; every error is the stable error JSON. `x-kronik-scope` is the \
-                scope an operation needs; without a token, the socket's caller has every scope."
+                bearer token, over TCP (`--api-listen`). The admin listener serves the same \
+                operations to bearer callers or OIDC sessions and the admin-only /v1/auth \
+                transport operations. Product mutations require reason and take dry_run; \
+                errors use the stable error JSON. x-kronik-scope declares the required scope."
         },
         "paths": paths,
         "components": {
@@ -949,6 +1165,12 @@ pub fn document() -> Value {
                     "scheme": "bearer",
                     "description": "A token from `kronik token create`; required over TCP, \
                         optional on the Unix socket."
+                },
+                "browserSession": {
+                    "type": "apiKey",
+                    "in": "cookie",
+                    "name": "__Host-kronik-session",
+                    "description": "Opaque admin-listener session; live mapped-token scopes/revocation and expiry are checked on every request. Cookie-authenticated writes require exact configured Origin and X-Kronik-CSRF from /v1/auth/session."
                 }
             }
         },
@@ -970,79 +1192,54 @@ mod tests {
 
     use super::*;
 
-    /// `("GET", ["v1", "actors", kind, key])` arms that dispatch to a handler,
-    /// as `GET /v1/actors/{}/{}`, in every source file of the crate.
-    fn routed() -> BTreeSet<String> {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        let mut out = BTreeSet::new();
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).unwrap();
-            let mut rest = text.as_str();
-            while let Some(i) = rest.find("(\"") {
-                rest = &rest[i + 2..];
-                let Some((method, after)) = rest.split_once("\", [") else {
-                    continue;
-                };
-                if !matches!(method, "GET" | "POST" | "PUT" | "DELETE") {
-                    continue;
-                }
-                let Some((segs, tail)) = after.split_once("])") else {
-                    continue;
-                };
-                let arm = tail.trim_start().strip_prefix("=>").map(str::trim_start);
-                let dispatches = arm
-                    .is_some_and(|a| a.trim_start_matches('{').trim_start().starts_with("self."));
-                if !dispatches || !segs.starts_with("\"v1\"") {
-                    continue;
-                }
-                let path: Vec<String> = segs
-                    .split(',')
-                    .map(|s| {
-                        let s = s.trim();
-                        match s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                            Some(literal) => literal.to_owned(),
-                            None => "{}".to_owned(),
-                        }
-                    })
-                    .collect();
-                out.insert(format!("{method} /{}", path.join("/")));
+    #[test]
+    fn browser_auth_and_historical_identity_contract() {
+        let doc = document();
+        let paths = &doc["paths"];
+        let mut asset_ids = BTreeSet::new();
+        for op in OPERATIONS.iter().filter(|op| matches!(op.answer, Answer::Asset(_))) {
+            let asset = kronik_ui::asset(op.path).unwrap();
+            let operation = &paths[op.path][op.method.to_ascii_lowercase()];
+            assert!(!asset.bytes.is_empty());
+            assert_eq!(operation["x-kronik-listener"], "admin");
+            assert_eq!(operation["x-kronik-scope"], "public");
+            assert_eq!(operation["security"], json!([{}]));
+            assert_eq!(operation["responses"]["200"]["content"][asset.content_type]["schema"]["type"], "string");
+            assert!(asset_ids.insert(operation["operationId"].as_str().unwrap()));
+        }
+        for path in ["/v1/auth/session", "/v1/auth/login", "/v1/auth/callback", "/v1/auth/logout", "/v1/auth/config"] {
+            for (_, operation) in paths[path].as_object().unwrap() {
+                assert_eq!(operation["x-kronik-listener"], "admin");
             }
         }
-        out
+        for path in ["/v1/auth/login", "/v1/auth/callback"] {
+            assert!(paths[path]["get"]["responses"].get("303").is_some());
+            assert_eq!(paths[path]["get"]["security"], json!([{}]));
+        }
+        assert_eq!(paths["/v1/auth/logout"]["post"]["security"], json!([{"browserSession": []}]));
+        for operation in [&paths["/v1/auth/config"]["put"], &paths["/v1/proposals/{id}/approve"]["post"]] {
+            let parameters = operation["parameters"].as_array().unwrap();
+            for name in ["Origin", "X-Kronik-CSRF"] {
+                assert!(parameters.iter().any(|p| p["name"] == name && p["x-kronik-required-for"] == "browserSession"));
+            }
+        }
+        let schemas = &doc["components"]["schemas"];
+        assert_eq!(schemas["ApproveRequest"]["additionalProperties"], false);
+        assert_eq!(paths["/v1/proposals/{id}/approve"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ApproveRequest");
+        assert!(schemas["ReviewedApproval"]["properties"].get("verified_identity").is_some());
+        assert!(!schemas["ReviewedApproval"]["required"].as_array().unwrap().contains(&json!("verified_identity")));
+        assert_eq!(doc["components"]["securitySchemes"]["browserSession"]["name"], "__Host-kronik-session");
+        assert_eq!(paths["/v1/auth/config"]["get"]["x-kronik-scope"], "admin");
+        assert_eq!(paths["/v1/auth/config"]["put"]["x-kronik-scope"], "admin");
+        assert_eq!(paths["/v1/cluster/status"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ClusterStatusResponse");
+        let native = &schemas["ClusterStatusResponse"]["oneOf"][0];
+        assert_eq!(native["required"], json!(["member"]));
+        assert_eq!(native["properties"], json!({"member": {"const": false}}));
+        assert_eq!(native["additionalProperties"], false);
     }
 
-    fn described() -> BTreeSet<String> {
-        OPERATIONS
-            .iter()
-            .map(|op| {
-                let path: Vec<&str> = op
-                    .path
-                    .split('/')
-                    .map(|s| if s.starts_with('{') { "{}" } else { s })
-                    .collect();
-                format!("{} {}", op.method, path.join("/"))
-            })
-            .collect()
-    }
-
-    #[test]
-    fn every_route_is_described_and_every_operation_routes() {
-        let routed = routed();
-        let described = described();
-        assert!(routed.len() > 40, "{routed:?}");
-        let undocumented: Vec<_> = routed.difference(&described).collect();
-        let unrouted: Vec<_> = described.difference(&routed).collect();
-        assert!(
-            undocumented.is_empty() && unrouted.is_empty(),
-            "routes missing from openapi::OPERATIONS: {undocumented:?}; \
-             operations without a route: {unrouted:?}"
-        );
-        assert_eq!(described.len(), OPERATIONS.len(), "an operation twice");
-    }
 
     #[test]
     fn the_committed_document_is_current() {

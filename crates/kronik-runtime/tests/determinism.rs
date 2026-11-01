@@ -47,6 +47,7 @@ fn message(name: &str, body: &[u8]) -> pb::Input {
                     value: Some(pb::sealable::Value::Plain(body.to_vec())),
                 }),
                 blobs: vec![],
+                retained_compensation_source: None,
             }),
             message_id: "m".into(),
             ..Default::default()

@@ -193,11 +193,13 @@ fn samples() -> Vec<Record> {
             audit: audit("looks good"),
             request: false,
             command: format!("kronik promote p-1 --token {SECRET_VALUE}"),
+            verified_identity: None,
         }),
         Record::PrivacyMode(pb::PrivacyMode {
             epoch: 11,
             mode: pb::PrivacyState::On as i32,
             audit: audit("GDPR"),
+            reseal_requested: false,
         }),
         Record::ForeignActor(pb::ForeignActor {
             epoch: 12,
@@ -634,6 +636,7 @@ fn long_reasons_are_capped() {
         epoch: 1,
         mode: pb::PrivacyState::Off as i32,
         audit: audit(&"é".repeat(REASON_MAX)),
+        reseal_requested: false,
     });
     let l = &export(1, &r)[0];
     assert!(l.reason_truncated);

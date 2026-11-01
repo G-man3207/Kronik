@@ -7,6 +7,8 @@
 
 mod audit;
 mod export;
+mod events;
+mod fleet;
 mod foreign;
 mod fork;
 pub(crate) mod http;
@@ -32,9 +34,10 @@ use kronik_api::types::{
     ActorsResponse, DeadLettersResponse, DeployRequest, DeployResponse, DeploymentsResponse,
     ForkTurnResponse, GrantRequest, GrantResponse, GrantsResponse, HistoryResponse,
     InspectResponse, LimitsListResponse, LimitsRequest, LimitsResponse, OrphansResponse, Payload,
-    ResendRequest, RevokeRequest, RevokeResponse, SecretDeleteRequest, SecretDeleteResponse,
-    SecretResponse, SecretSetRequest, SecretsResponse, SendRequest, TimersResponse, TraceResponse,
-    TurnResponse,
+    ResendRequest, RevokeRequest, RevokeResponse, SecretBackendsResponse, SecretDeleteRequest,
+    SecretDeleteResponse, SecretHistoryResponse, SecretLinkRequest, SecretLinkResponse,
+    SecretRefreshRequest, SecretResponse, SecretSetRequest, SecretsResponse, SendRequest,
+    TimersResponse, TraceResponse, TurnResponse,
 };
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::explain;
@@ -92,6 +95,13 @@ impl Global {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Enroll, inspect or revoke this installation's fleet membership.
+    #[command(subcommand)]
+    #[command(arg(clap::Arg::new("token").long("api-token").global(true).value_name("TOKEN").help("The ordinary API bearer (prefer $KRONIK_TOKEN)")))]
+    Fleet(fleet::FleetCommand),
+    /// Read operational events, follow SSE or replay configured webhooks.
+    #[command(subcommand)]
+    Events(events::EventsCommand),
     /// Deploy a component as a new actor type (a kind without history).
     Deploy(DeployArgs),
     /// List the deployments: the code switches, with their epochs.
@@ -276,9 +286,9 @@ pub struct ListActorsArgs {
 #[derive(Debug, Args)]
 pub struct HistoryArgs {
     /// The actor, as kind/key.
-    #[arg(required_unless_present = "orphans")]
+    #[arg(required_unless_present_any = ["orphans", "operations"])]
     actor: Option<String>,
-    /// At most this many turns (1-1000) [default: 100].
+    /// At most this many turns or audit lines (1-1000) [default: 100].
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
     limit: Option<u32>,
     /// Only turns before this LSN, for the next page.
@@ -289,6 +299,9 @@ pub struct HistoryArgs {
     /// succeeds.
     #[arg(long, conflicts_with_all = ["actor", "limit", "before"])]
     orphans: bool,
+    /// Show operator audit history through the existing audit consumer.
+    #[arg(long, conflicts_with_all = ["actor", "orphans", "all", "before"])]
+    operations: bool,
     /// With --orphans: also the resolved ones.
     #[arg(long, requires = "orphans")]
     all: bool,
@@ -461,13 +474,44 @@ pub enum SecretCommand {
         #[command(flatten)]
         mutation: Mutation,
     },
+    /// Link a name to an allowed external secret manager reference (admin).
+    Link {
+        name: String,
+        #[arg(long)]
+        backend: String,
+        #[arg(long = "ref")]
+        reference: String,
+        #[command(flatten)]
+        mutation: Mutation,
+    },
+    /// Return future turns to the built-in store (admin).
+    Unlink {
+        name: String,
+        #[command(flatten)]
+        mutation: Mutation,
+    },
+    /// Observe the current external version without replacing historical identities.
+    Refresh {
+        name: String,
+        #[command(flatten)]
+        mutation: Mutation,
+    },
+    /// Show committed immutable versions and their provenance, never values.
+    History { name: String },
+    /// List configured secret managers without contacting them.
+    Backends,
 }
 
 /// Runs a client command and returns the process exit code: 0 on success,
 /// 1 on an error or a failed turn.
 pub fn run(command: Command, global: &Global) -> ExitCode {
-    if matches!(&command, Command::Keys(keys::KeysCommand::Wrap(_)))
-        && let Some(exit) = global.refuse_remote("keys wrap")
+    let offline_keys = match &command {
+        Command::Keys(keys::KeysCommand::Wrap(_)) => Some("keys wrap"),
+        Command::Keys(keys::KeysCommand::Enroll { .. }) => Some("keys enroll"),
+        _ => None,
+    };
+    if let Some(name) = offline_keys
+        && let Some(exit) = global.refuse_remote(name)
     {
         return exit;
     }
@@ -482,6 +526,8 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
         token: client_token_from(global.token.as_deref()),
     };
     let result = match command {
+        Command::Fleet(command) => fleet::fleet(&ctx, command),
+        Command::Events(command) => events::events(&ctx, command),
         Command::Deploy(a) => deploy(&ctx, a),
         Command::Deployments(DeploymentsCommand::List) => deployments(&ctx),
         Command::Send(a) => send(&ctx, a),
@@ -489,6 +535,9 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
         Command::Actors(ActorsCommand::Inspect { actor }) => inspect(&ctx, &actor),
         Command::Actors(ActorsCommand::Timers { actor }) => timers(&ctx, &actor),
         Command::History(a) if a.orphans => orphans(&ctx, a.all),
+        Command::History(a) if a.operations => audit::audit(&ctx, audit::AuditCommand::Show {
+            from: None, limit: a.limit.map(u64::from),
+        }),
         Command::History(a) => history(&ctx, a),
         Command::Trace { turn_id } => trace(&ctx, &turn_id),
         Command::DeadLetters(DeadLettersCommand::List { after, limit }) => {
@@ -507,6 +556,13 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
         Command::Secret(SecretCommand::Delete { name, mutation }) => {
             secret_delete(&ctx, &name, mutation)
         }
+        Command::Secret(SecretCommand::Link { name, backend, reference, mutation }) => {
+            secret_link(&ctx, &name, &backend, &reference, mutation)
+        }
+        Command::Secret(SecretCommand::Unlink { name, mutation }) => secret_unlink(&ctx, &name, mutation),
+        Command::Secret(SecretCommand::Refresh { name, mutation }) => secret_refresh(&ctx, &name, mutation),
+        Command::Secret(SecretCommand::History { name }) => secret_history(&ctx, &name),
+        Command::Secret(SecretCommand::Backends) => secret_backends(&ctx),
         Command::Keys(c) => keys::keys(&ctx, c),
         Command::Fork(c) => fork::fork(&ctx, c),
         Command::Replay(a) => fork::replay(&ctx, a),
@@ -634,7 +690,7 @@ pub(crate) fn client_token_from(flag: Option<&str>) -> Result<Option<String>, Ap
 
 impl Ctx {
     fn get(&self, target: &str) -> Result<Vec<u8>, Error> {
-        self.request("GET", target, None)
+        self.request("GET", target, None, None)
     }
 
     fn post<B: Serialize>(&self, target: &str, body: &B) -> Result<Vec<u8>, Error> {
@@ -654,13 +710,13 @@ impl Ctx {
                 format!("encoding the request failed: {e}"),
             )
         })?;
-        self.request(method, target, Some(&body))
+        self.request(method, target, Some(&body), None)
     }
 
     /// Sends a request; a 2xx response gives its body, any other status an
     /// [`Error::Remote`].
-    fn request(&self, method: &str, target: &str, body: Option<&[u8]>) -> Result<Vec<u8>, Error> {
-        self.request_within(method, target, body, REQUEST_TIMEOUT)
+    fn request(&self, method: &str, target: &str, body: Option<&[u8]>, cursor: Option<&str>) -> Result<Vec<u8>, Error> {
+        self.request_within(method, target, body, cursor, REQUEST_TIMEOUT)
     }
 
     /// [`Ctx::request`] with the daemon silent for at most `timeout`.
@@ -669,6 +725,7 @@ impl Ctx {
         method: &str,
         target: &str,
         body: Option<&[u8]>,
+        cursor: Option<&str>,
         timeout: std::time::Duration,
     ) -> Result<Vec<u8>, Error> {
         let endpoint = self
@@ -677,7 +734,7 @@ impl Ctx {
             .map_err(|e| Error::Local(e.clone()))?;
         let token = self.token.as_ref().map_err(|e| Error::Local(e.clone()))?;
         let shown = endpoint.shown();
-        let r = http::request(endpoint, method, target, body, token.as_deref(), timeout).map_err(
+        let r = http::request(endpoint, method, target, body, token.as_deref(), cursor, timeout).map_err(
             |f| match f {
                 http::Failure::Connect(e) => connect_error(endpoint, &e),
                 http::Failure::Tls(m) => ApiError::new(
@@ -1422,6 +1479,57 @@ fn secret_delete(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode, 
     Ok(ExitCode::SUCCESS)
 }
 
+fn secret_link(ctx: &Ctx, name: &str, backend: &str, reference: &str, mutation: Mutation) -> Result<ExitCode, Error> {
+    let body = ctx.send_json("PUT", &format!("{}/link", secret_path(name)), &SecretLinkRequest {
+        backend: backend.to_owned(), r#ref: reference.to_owned(),
+        reason: reason(&mutation)?.to_owned(), dry_run: mutation.dry_run,
+    })?;
+    if ctx.json { ctx.print_raw(&body); return Ok(ExitCode::SUCCESS); }
+    let response: SecretLinkResponse = ctx.decode(&body)?;
+    let rerun = format!("kronik secret link {} --backend {} --ref {} --reason \"...\"",
+        shell_quote(name), shell_quote(backend), shell_quote(reference));
+    ctx.print(&render::secret_link(&response, &rerun));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn secret_unlink(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode, Error> {
+    let body = ctx.send_json("DELETE", &format!("{}/link", secret_path(name)), &SecretDeleteRequest {
+        reason: reason(&mutation)?.to_owned(), dry_run: mutation.dry_run,
+    })?;
+    if ctx.json { ctx.print_raw(&body); return Ok(ExitCode::SUCCESS); }
+    let response: SecretLinkResponse = ctx.decode(&body)?;
+    let rerun = format!("kronik secret unlink {} --reason \"...\"", shell_quote(name));
+    ctx.print(&render::secret_link(&response, &rerun));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn secret_refresh(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode, Error> {
+    let body = ctx.send_json("POST", &format!("{}/refresh", secret_path(name)), &SecretRefreshRequest {
+        reason: reason(&mutation)?.to_owned(), dry_run: mutation.dry_run,
+    })?;
+    if ctx.json { ctx.print_raw(&body); return Ok(ExitCode::SUCCESS); }
+    let response: SecretResponse = ctx.decode(&body)?;
+    let rerun = format!("kronik secret refresh {} --reason \"...\"", shell_quote(name));
+    ctx.print(&render::secret_refreshed(name, &response, &rerun));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn secret_history(ctx: &Ctx, name: &str) -> Result<ExitCode, Error> {
+    let body = ctx.get(&format!("{}/history", secret_path(name)))?;
+    if ctx.json { ctx.print_raw(&body); return Ok(ExitCode::SUCCESS); }
+    let response: SecretHistoryResponse = ctx.decode(&body)?;
+    ctx.print(&render::secret_history(&response));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn secret_backends(ctx: &Ctx) -> Result<ExitCode, Error> {
+    let body = ctx.get("/v1/secrets/backends")?;
+    if ctx.json { ctx.print_raw(&body); return Ok(ExitCode::SUCCESS); }
+    let response: SecretBackendsResponse = ctx.decode(&body)?;
+    ctx.print(&render::secret_backends(&response));
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Reads a secret's value from stdin, never from the command line: one line
 /// with echo off when stdin is a terminal, otherwise everything up to the
 /// end of input. One trailing newline is removed from a value that is text,
@@ -1623,6 +1731,22 @@ mod tests {
             let e = client_token_from(Some(blank)).unwrap_err();
             assert_eq!(e.code, ErrorCode::BadRequest);
             assert_eq!(e.message, "--token is empty");
+        }
+    }
+
+    #[test]
+    fn operations_history_rejects_actor_paging_or_orphan_selectors_and_invalid_limits() {
+        use clap::Parser as _;
+        for args in [
+            vec!["kronik", "history", "--operations", "counter/a"],
+            vec!["kronik", "history", "--operations", "--orphans"],
+            vec!["kronik", "history", "--operations", "--all"],
+            vec!["kronik", "history", "--operations", "--before", "7"],
+            vec!["kronik", "history", "--operations", "--limit", "0"],
+            vec!["kronik", "history", "--operations", "--limit", "1001"],
+            vec!["kronik", "history"],
+        ] {
+            assert!(crate::Cli::try_parse_from(args).is_err());
         }
     }
 }

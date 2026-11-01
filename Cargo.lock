@@ -416,7 +416,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.3.1",
- "rand_core",
+ "rand_core 0.10.1",
  "zeroize",
 ]
 
@@ -831,6 +831,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "cryptoki"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "625cf4599c43d69a16996ce2573fc80745a0b0300c962f0bfa11d55b6cab2b2d"
+dependencies = [
+ "bitflags",
+ "cryptoki-sys",
+ "libloading",
+ "log",
+ "secrecy",
+]
+
+[[package]]
+name = "cryptoki-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1fd850498411e4057f1cba79e6e2bc7cbe960544c1046ab46d4685c403a1121"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "ctutils"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1003,7 +1025,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
 dependencies = [
- "signature",
+ "signature 3.0.0",
 ]
 
 [[package]]
@@ -1291,7 +1313,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
- "rand_core",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -1818,6 +1840,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonwebtoken"
+version = "10.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.2.17",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "signature 2.2.0",
+ "zeroize",
+]
+
+[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1848,6 +1885,7 @@ dependencies = [
  "kronik-api",
  "kronik-core",
  "kronik-effects",
+ "kronik-fleet",
  "kronik-foreign",
  "kronik-fork",
  "kronik-gateway",
@@ -1861,6 +1899,7 @@ dependencies = [
  "kronik-sched",
  "kronik-ship",
  "kronik-testhost",
+ "kronik-ui",
  "prost",
  "rcgen",
  "rmcp",
@@ -1874,9 +1913,11 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -1886,13 +1927,17 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "bytes",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "jsonwebtoken",
  "kronik-core",
  "kronik-effects",
+ "kronik-fleet",
  "kronik-foreign",
  "kronik-fork",
+ "kronik-log",
  "kronik-otel",
  "kronik-policy",
  "kronik-privacy",
@@ -1900,15 +1945,25 @@ dependencies = [
  "kronik-runtime",
  "kronik-sched",
  "kronik-store",
+ "kronik-ui",
  "prost",
+ "rcgen",
+ "ring",
  "rusqlite",
+ "rustls",
+ "rustls-pki-types",
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
+ "signature 2.2.0",
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "tracing",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -1917,20 +1972,30 @@ version = "0.4.0-dev"
 dependencies = [
  "blake3",
  "bytes",
+ "futures-util",
  "getrandom 0.4.3",
  "http-body-util",
  "hyper",
  "hyper-rustls",
  "hyper-util",
  "kronik-proto",
+ "libc",
+ "rcgen",
  "ring",
  "rustix",
  "rustls",
  "rustls-native-certs",
+ "rustls-pki-types",
+ "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tower-service",
+ "zeroize",
 ]
 
 [[package]]
@@ -1946,9 +2011,42 @@ dependencies = [
  "kronik-privacy",
  "kronik-proto",
  "prost",
+ "serde",
  "serde_json",
  "sha2 0.11.1",
  "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "kronik-fleet"
+version = "0.4.0-dev"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "hmac",
+ "http",
+ "kronik-core",
+ "kronik-log",
+ "kronik-otel",
+ "kronik-privacy",
+ "kronik-proto",
+ "kronik-sched",
+ "kronik-store",
+ "prost",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+ "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -1978,6 +2076,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -2005,6 +2104,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -2033,6 +2133,19 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "x509-parser",
+]
+
+[[package]]
+name = "kronik-keyhelper"
+version = "0.4.0-dev"
+dependencies = [
+ "cryptoki",
+ "getrandom 0.4.3",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -2136,10 +2249,15 @@ dependencies = [
 name = "kronik-proto"
 version = "0.4.0-dev"
 dependencies = [
+ "blake3",
  "prost",
  "prost-build",
  "protox",
+ "serde_json",
+ "sha2 0.11.1",
  "thiserror",
+ "url",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2188,6 +2306,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -2232,6 +2351,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -2241,6 +2361,7 @@ dependencies = [
  "blake3",
  "chacha20",
  "kronik-core",
+ "kronik-effects",
  "kronik-log",
  "kronik-privacy",
  "kronik-proto",
@@ -2273,7 +2394,12 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "zeroize",
 ]
+
+[[package]]
+name = "kronik-ui"
+version = "0.4.0-dev"
 
 [[package]]
 name = "lazy_static"
@@ -2292,6 +2418,16 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libm"
@@ -2581,7 +2717,7 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "quick-xml",
- "rand",
+ "rand 0.10.3",
  "reqwest",
  "ring",
  "rustls-pki-types",
@@ -2785,6 +2921,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a6394b9e965e73d0a289ee54f589087e2c676aedf60885baf52c76b771e4958"
 
 [[package]]
+name = "ppv-lite86"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
+dependencies = [
+ "zerocopy",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2958,13 +3103,51 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
+dependencies = [
+ "rand_chacha",
+ "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
- "rand_core",
+ "rand_core 0.10.1",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+dependencies = [
+ "getrandom 0.2.17",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
+dependencies = [
+ "getrandom 0.3.4",
 ]
 
 [[package]]
@@ -3155,7 +3338,7 @@ dependencies = [
  "libc",
  "pastey",
  "pin-project-lite",
- "rand",
+ "rand 0.10.3",
  "schemars",
  "serde",
  "serde_json",
@@ -3391,6 +3574,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3499,6 +3691,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3543,6 +3746,15 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "signature"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
+dependencies = [
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -3879,6 +4091,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4057,6 +4281,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8628dcc84e5a09eb3d8423d6cb682965dea9133204e8fb3efee74c2a0c259442"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.9.5",
+ "sha1",
+ "thiserror 2.0.21",
+ "utf-8",
+]
+
+[[package]]
 name = "twox-hash"
 version = "2.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4134,6 +4375,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf-8"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf8_iter"
@@ -4537,7 +4784,7 @@ dependencies = [
  "bitflags",
  "bytes",
  "futures",
- "rand",
+ "rand 0.10.3",
  "rustix",
  "rustix-linux-procfs",
  "thiserror",
@@ -4929,6 +5176,20 @@ name = "zeroize"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "zerotrie"

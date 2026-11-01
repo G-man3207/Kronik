@@ -5,7 +5,7 @@
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_otel::audit::{Keys, Mapper};
 
-use crate::types::AuditResponse;
+use crate::types::{AuditResponse, NativeAuditResponse};
 use crate::{Api, ApiResponse, Query, Result, internal, ok};
 
 /// Records read per step while filling a page.
@@ -30,7 +30,8 @@ impl Api {
             None => first,
         };
         let applied = self.node.applied_lsn();
-        let secrets = self.node.secret_values()?;
+        let values = self.node.secret_values()?;
+        let secrets = kronik_sched::effects::secret_patterns(&values);
         let fallback;
         let mapper = match &self.audit_mapper {
             Some(m) => m.as_ref(),
@@ -59,7 +60,7 @@ impl Api {
                 .map_err(internal)?;
             for c in records {
                 let more = if lines.len() < limit {
-                    mapper.lines(c.lsn, &c.record, &secrets).map_err(internal)?
+                    mapper.lines(c.lsn, &c.record, &secrets)?
                 } else {
                     Vec::new()
                 };
@@ -72,11 +73,11 @@ impl Api {
             }
             at = at.max(upto + 1);
         }
-        ok(&AuditResponse {
+        ok(&AuditResponse::Native(NativeAuditResponse {
             next: (at <= applied).then_some(at),
             applied_lsn: applied,
             lines,
-        })
+        }))
     }
 }
 

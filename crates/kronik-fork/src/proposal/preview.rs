@@ -11,10 +11,14 @@
 //! and route lookup waits for no lock held across an await (P-F4). Its
 //! requests' turns leave memory once logged, but for the few the diff lists
 //! (P-F3).
+//!
+//! Creation/deletion retain the original request authority through intent
+//! admission and failure auditing; daemon-driven expiry needs no user authority.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use kronik_core::authority::AuthLease;
 use kronik_core::causal;
 use kronik_core::env::BoxFuture;
 use kronik_core::error::{ApiError, ErrorCode};
@@ -254,6 +258,7 @@ impl Proposals {
         no_pii: bool,
         audit: pb::Audit,
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<(Proposal, bool), ApiError> {
         let p = self.get(proposal).await?;
         if let Some(e) = unfinished(&p) {
@@ -333,7 +338,13 @@ impl Proposals {
         ]
         .into();
         self.node
-            .record_audit_event("preview.create", &id, details.clone(), audit.clone())
+            .record_audit_event_authorized(
+                "preview.create",
+                &id,
+                details.clone(),
+                audit.clone(),
+                authority.clone(),
+            )
             .await?;
         let result = async {
             // Read before the replay: an erasure from now on makes this state
@@ -352,6 +363,7 @@ impl Proposals {
                     false,
                     // Copies would outlive the request that made them (M14).
                     Some(super::copies::PREVIEW),
+                    authority.clone(),
                 )
                 .await?;
             live.erasure = erasure;
@@ -390,7 +402,12 @@ impl Proposals {
         }
         .await;
         if let Err(e) = &result {
-            super::audit_failed(&self.node, "preview.create", &id, details, audit, e).await;
+            if let Err(audit_error) =
+                super::audit_failed(&self.node, "preview.create", &id, details, audit, e, authority)
+                    .await
+            {
+                tracing::warn!(preview = %id, code = %audit_error.code.as_str(), "preview failure audit denied or unavailable");
+            }
         }
         result
     }
@@ -452,6 +469,7 @@ impl Proposals {
         id: &str,
         audit: pb::Audit,
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<Proposal, ApiError> {
         let served = self.served(id)?;
         // After the request in flight, if any.
@@ -464,7 +482,13 @@ impl Proposals {
             return Ok(meta);
         }
         self.node
-            .record_audit_event("preview.delete", id, Default::default(), audit.clone())
+            .record_audit_event_authorized(
+                "preview.delete",
+                id,
+                Default::default(),
+                audit.clone(),
+                authority.clone(),
+            )
             .await?;
         // Gone for every request, also one already waiting for the lock.
         state.meta.preview = None;
@@ -473,15 +497,19 @@ impl Proposals {
         drop(state);
         self.entries.lock().await.remove(id);
         if let Err(e) = std::fs::remove_dir_all(self.dir(id)).map_err(internal) {
-            super::audit_failed(
+            if let Err(audit_error) = super::audit_failed(
                 &self.node,
                 "preview.delete",
                 id,
                 Default::default(),
                 audit,
                 &e,
+                authority,
             )
-            .await;
+            .await
+            {
+                tracing::warn!(preview = %id, code = %audit_error.code.as_str(), "preview failure audit denied or unavailable");
+            }
             return Err(e);
         }
         Ok(meta)
@@ -550,6 +578,7 @@ impl Proposals {
         actor: ActorRef,
         http: pb::HttpInput,
         subject: Option<String>,
+        authority: AuthLease,
     ) -> Result<TurnResult, ApiError> {
         let served = self.served(id)?;
         let env = self.node.env();
@@ -572,7 +601,7 @@ impl Proposals {
         let erasure = self.erasures();
         self.drop_erased(&mut entry);
         let max = self.max_preview_requests;
-        let live = self.continuous_for(id, &mut entry, &actor.kind).await?;
+        let live = self.continuous_for(id, &mut entry, &actor.kind, authority.clone()).await?;
         if live.preview_requests >= max {
             return Err(ApiError::new(
                 ErrorCode::PreviewFull,
@@ -590,25 +619,31 @@ impl Proposals {
             kind: Some(pb::input::Kind::Http(http)),
         };
         let turn = c
-            .send_input(actor, input, key, now, subject)
+            .send_input(actor, input, key, now, subject, authority)
             .await
             .map_err(internal)?;
         self.write_log(id, live).await?;
         forget_logged(live);
         // The reply leaves the fork: no real SQL rows in it (M5), as
         // fork_send's, and no secret value (I8), as any answer.
-        let mut outcome = shown_record(&turn).outcome.unwrap_or_default();
+        let outcome = shown_record(&turn).outcome
+            .ok_or_else(|| internal("The committed preview outcome is missing"))?;
         let secrets = self.node.secret_values()?;
-        if !secrets.is_empty() {
-            kronik_sched::scrub::outcome_output(&mut outcome.output, &secrets);
-            outcome.message = kronik_effects::http::scrub_str(&outcome.message, &secrets);
-        }
+        let patterns = kronik_sched::effects::secret_patterns(&secrets);
+        let matcher = kronik_effects::http::CompiledScrubber::new(
+            &patterns, kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES,
+        ).map_err(|_| ApiError::new(ErrorCode::SecretUnavailable,
+            "The credential policy cannot verify this prepared preview response"))?;
+        crate::replay::prepared_outcome_safe(&outcome, &matcher)
+            .map_err(|_| ApiError::new(ErrorCode::SecretUnavailable,
+                "The current credential source cannot verify this prepared preview response"))?;
         Ok(TurnResult {
             turn_id: TurnId {
                 branch: id.to_owned(),
                 lsn: turn.lsn,
             },
             outcome,
+            scrubbed_with: None,
         })
     }
 }
@@ -634,12 +669,13 @@ impl kronik_gateway::PreviewRouter for Proposals {
         actor: ActorRef,
         http: pb::HttpInput,
         subject: Option<String>,
+        authority: AuthLease,
     ) -> BoxFuture<'static, Result<TurnResult, ApiError>> {
         let env = self.node.env().clone();
         // Its own task: a client that stops waiting does not cut the turn
         // short between the fork's store and its log.
         let turn = env.spawn("preview-send", async move {
-            self.preview_send(&id, actor, http, subject).await
+            self.preview_send(&id, actor, http, subject, authority).await
         });
         Box::pin(async move {
             turn.await.unwrap_or_else(|| {

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, CodeHash};
 use kronik_proto::log::v1 as pb;
 use wasmtime::component::Component;
@@ -53,6 +54,8 @@ impl TurnOutput {
 pub enum RunError {
     #[error("host failure during turn: {0}")]
     Host(String),
+    #[error("{0}: an immutable recorded prerequisite is no longer available")]
+    Prerequisite(ErrorCode),
     #[error("invalid input: {0}")]
     Input(String),
     /// A sealed value reached the turn unopened: its subject's key is not
@@ -180,7 +183,7 @@ impl Program {
         let fuel_used = fuel - store.get_fuel().unwrap_or(0);
         let mut host = store.into_data();
         if let Some(fatal) = host.fatal.take() {
-            return Err(RunError::Host(fatal));
+            return Err(fatal);
         }
         host.warn_unsent();
         let subject = host.subject.clone();
@@ -316,6 +319,11 @@ fn plain(subject: Option<String>, bytes: Vec<u8>) -> pb::Sealable {
 /// Maps a guest failure to a deterministic description: trap codes and
 /// host-raised messages only, never backtraces or addresses.
 fn classify_error(e: &wasmtime::Error, memory_limit_hit: bool) -> pb::Outcome {
+    if e.downcast_ref::<crate::host::HostRedactionFailure>().is_some() {
+        // The ordinary finalizer below retains real meters and discards all
+        // buffered writes/messages/timers. The durable effect stays in FxState.
+        return failed(pb::OutcomeKind::Trap, "HOST_REDACTION_FAILURE", String::new());
+    }
     if let Some(trap) = e.downcast_ref::<Trap>() {
         if *trap == Trap::OutOfFuel {
             return failed(

@@ -78,12 +78,14 @@ fn request(op: &str, body: &str) -> (ActorRef, pb::HttpInput) {
 
 fn send(p: &Proc, props: &Arc<Proposals>, id: &str, op: &str, body: &str) -> TurnResult {
     let (actor, http) = request(op, body);
+    let original = p.node.local_operator_authority().unwrap();
     p.rt.block_on(PreviewRouter::send(
         props.clone(),
         id.to_owned(),
         actor,
         http,
         None,
+        original,
     ))
     .unwrap()
 }
@@ -237,8 +239,9 @@ fn preview_output_is_unavailable_when_retained_secret_loading_fails() {
         .execute("UPDATE secrets SET ciphertext = x'00'", [])
         .unwrap();
     let (actor, http) = request("get", "");
+    let original = p.node.local_operator_authority().unwrap();
     let e =
-        p.rt.block_on(PreviewRouter::send(props, id, actor, http, None))
+        p.rt.block_on(PreviewRouter::send(props, id, actor, http, None, original))
             .unwrap_err();
     assert_eq!(e.code.as_str(), "SECRET_UNAVAILABLE", "{e}");
 }
@@ -274,12 +277,14 @@ fn a_held_preview_request_blocks_no_operator_command() {
     let id = create(&p, &props, &proposal);
 
     let (actor, http) = request("fetch-ok", &format!("GET http://{addr}/ping"));
+    let original = p.node.local_operator_authority().unwrap();
     let held = p.rt.spawn(PreviewRouter::send(
         props.clone(),
         id.clone(),
         actor,
         http,
         None,
+        original,
     ));
     got_rx.recv_timeout(Duration::from_secs(60)).unwrap();
     let env = p.node.env().clone();
@@ -325,6 +330,7 @@ fn fork_commands_refuse_a_preview() {
         content_type: "text/plain".into(),
         body: plain(""),
         blobs: vec![],
+        retained_compensation_source: None,
     };
     let errors = [
         p.rt.block_on(props.fork_deploy(&id, &wasm, false))
@@ -402,6 +408,7 @@ fn a_preview_takes_a_bounded_number_of_requests() {
     send(&p, &props, &id, "increment", "");
     assert_eq!(http_body(&send(&p, &props, &id, "increment", "")), "5");
     let (actor, http) = request("increment", "");
+    let original = p.node.local_operator_authority().unwrap();
     let e =
         p.rt.block_on(PreviewRouter::send(
             props.clone(),
@@ -409,6 +416,7 @@ fn a_preview_takes_a_bounded_number_of_requests() {
             actor,
             http,
             None,
+            original,
         ))
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::PreviewFull, "{e}");

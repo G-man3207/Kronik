@@ -11,7 +11,7 @@ use std::sync::Arc;
 use common::*;
 use kronik_fork::diff::DiffOptions;
 use kronik_fork::proposal::Proposals;
-use kronik_fork::simulators::{ModelAccess, ModelCache, SimulatorOverride};
+use kronik_fork::simulators::{ModelAccess, ModelCache, ModelSecretSnapshot, SimulatorOverride};
 use kronik_fork::stubs::StubRule;
 use kronik_policy::{Action, RuleSet};
 use kronik_proto::log::v1 as pb;
@@ -598,20 +598,25 @@ fn the_model_never_sees_or_caches_secret_values() {
     let (model_addr, seen) = model_server();
     let dir = tempdir();
     let p = Proc::start(dir.path());
-    let secrets = p.node.secrets().unwrap().clone();
-    secrets
-        .set("api-key", b"sk-live-0123456789", [7; 24], 0, "t", "r")
-        .unwrap();
-    // The fake model's first answer is "model answer 1".
-    secrets
-        .set("echo", b"answer 1", [8; 24], 0, "t", "r")
-        .unwrap();
+    let original = p.node.local_operator_authority().unwrap();
+    p.rt.block_on(p.node.secret_set("api-key", b"sk-live-0123456789".to_vec(), &audit(),
+        false, original.clone())).unwrap();
+    // Use actual committed source rows and the certified inventory producer.
+    p.rt.block_on(p.node.secret_set("echo", b"answer 1".to_vec(), &audit(),
+        false, original.clone())).unwrap();
+    p.rt.block_on(p.node.refresh_secret_inventory(original.clone())).unwrap();
+    let original_node = Arc::downgrade(&p.node);
     let access = ModelAccess {
         config: model(&model_addr),
         env: p.node.env().clone(),
         cache: Arc::new(ModelCache::memory()),
         privacy: false,
-        secrets: Some(secrets),
+        secret_snapshot: Arc::new(move || {
+            let node = original_node.upgrade().ok_or_else(|| kronik_core::error::ApiError::new(
+                kronik_core::error::ErrorCode::SecretUnavailable, "the original model node ended"))?;
+            node.native_secret_snapshot_with_publication().map(|(snapshot, publication)|
+                ModelSecretSnapshot::Live { snapshot, publication })
+        }),
         offline: false,
     };
     let req = |body: &str| pb::HttpEffectRequest {
@@ -619,19 +624,33 @@ fn the_model_never_sees_or_caches_secret_values() {
         url: "http://127.0.0.1/v1/charges".into(),
         headers: vec![],
         body: body.as_bytes().to_vec(),
+        fingerprint_version: 0,
+        ..Default::default()
     };
-    let a = p.rt.block_on(access.answer(
-        "http:127.0.0.1",
-        b"fp1",
-        &req("key=sk-live-0123456789"),
-        |_| Vec::new(),
-    ));
-    assert_eq!(a, None);
+    // Preserve the existing known-literal legacy refusal/no-wire contract.
+    let unprepared = req("key=sk-live-0123456789");
+    let target = kronik_effects::http::parse_url(&unprepared.url).unwrap();
+    let fingerprint = kronik_effects::http::fingerprint(&unprepared).unwrap();
+    let answer = p.rt.block_on(access.answer("http:127.0.0.1", &fingerprint, &unprepared,
+        &target, None, |_, _| Vec::new(), &original)).unwrap();
+    assert_eq!(answer, None);
     assert_eq!(seen.lock().unwrap().len(), 0, "nothing was sent");
-    let a =
-        p.rt.block_on(access.answer("http:127.0.0.1", b"fp2", &req("amount=1"), |_| Vec::new()))
-            .unwrap();
-    assert_eq!(a.body, "model [secret:echo]");
+    let source = (access.secret_snapshot)().unwrap();
+    let snapshot = match &source {
+        ModelSecretSnapshot::Recorded(snapshot) | ModelSecretSnapshot::Live { snapshot, .. } => snapshot,
+    };
+    let patterns = kronik_sched::effects::secret_patterns(&snapshot.values);
+    let matcher = kronik_effects::http::CompiledScrubber::new(&patterns,
+        kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES).unwrap();
+    let raw = req("amount=1");
+    let (target, raw_host) = kronik_effects::http::parse_request_url(&raw.url).unwrap();
+    let mut prepared = raw.clone();
+    let target = kronik_sched::scrub::http_request(&mut prepared, &target, raw_host, &matcher,
+        kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES).unwrap();
+    let fingerprint = kronik_effects::http::fingerprint_v2(&prepared, &target).unwrap();
+    let answer = p.rt.block_on(access.answer("http:127.0.0.1", &fingerprint, &prepared, &target,
+        snapshot.references.as_deref(), |_, _| Vec::new(), &original)).unwrap().unwrap();
+    assert_eq!(answer.body, "model [secret:echo]");
 }
 
 /// Review M5: a fork records an `actor.call` reply with the reply's subject,
@@ -772,7 +791,7 @@ fn the_model_declines_after_personal_data_from_any_path() {
     p.node
         .secrets()
         .unwrap()
-        .set("api-key", b"sk-1", [7; 24], 0, "t", "r")
+        .set_at("api-key", 1, b"sk-1", [7; 24], 0, "t", "r")
         .unwrap();
     set(&p, target(vec![], b"", false, true));
     // Tagged state for the state-read cases, and a notes row for SQL.
@@ -833,7 +852,7 @@ fn an_unmatched_fork_reveal_is_labeled() {
     p.node
         .secrets()
         .unwrap()
-        .set("k", b"v-1", [7; 24], 0, "t", "r")
+        .set_at("k", 1, b"v-1", [7; 24], 0, "t", "r")
         .unwrap();
     let fork_lsn = p.settle();
     p.http(

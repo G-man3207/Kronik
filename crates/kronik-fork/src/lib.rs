@@ -164,15 +164,50 @@ pub async fn ensure_fork_retained(node: &Node, data: &Path, fork_lsn: Lsn) -> Re
 /// then syncs the directory so the rename survives a crash.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
+    write_atomic_with(path, |file| file.write_all(bytes))
+}
+
+/// Streams a container through the same durable replacement protocol.
+/// A failed producer never replaces the existing file.
+pub(crate) fn write_atomic_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
+    let mut file = std::fs::File::create(&tmp)?;
+    write(&mut file)?;
+    file.sync_all()?;
     std::fs::rename(&tmp, path)?;
     if let Some(dir) = path.parent() {
         std::fs::File::open(dir)?.sync_all()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::{write_atomic, write_atomic_with};
+    use std::io::{Error, ErrorKind, Write as _};
+
+    #[test]
+    fn streamed_replacement_preserves_previous_file_on_producer_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("answers.json");
+        write_atomic(&path, b"previous answers").unwrap();
+
+        let error = write_atomic_with(&path, |file| {
+            file.write_all(b"incomplete replacement")?;
+            Err(Error::new(ErrorKind::InvalidData, "producer rejected the container"))
+        }).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous answers");
+
+        write_atomic_with(&path, |file| {
+            file.write_all(b"new ")?;
+            file.write_all(b"answers")
+        }).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new answers");
+    }
 }
 
 /// The configuration (grants, limits) after main's records up to `lsn`.

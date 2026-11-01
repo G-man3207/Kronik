@@ -218,6 +218,7 @@ fn msg(name: &str, body: &str) -> pb::Message {
             value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
         }),
         blobs: vec![],
+        retained_compensation_source: None,
     }
 }
 
@@ -515,6 +516,7 @@ fn an_erased_subjects_open_turn_reruns_as_a_subject_erased_dead_letter() {
                 )),
             }),
             blobs: vec![],
+            retained_compensation_source: None,
         },
     );
     server.wait_for("/hang", 1);
@@ -1159,6 +1161,7 @@ fn bodiless_requests_and_messages_are_readable_from_the_log() {
         content_type: String::new(),
         body: None,
         blobs: vec![],
+        retained_compensation_source: None,
     };
     assert!(p.send("counter/a", m).committed());
     let http = pb::HttpInput {

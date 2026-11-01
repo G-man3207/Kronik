@@ -1,0 +1,69 @@
+{
+  "format": "kronik.policy-compatibility/v1",
+  "cases": [
+    {
+      "id": "strictest-action-not-last-writer",
+      "rules": [
+        {"name": "allow-first", "when": "true", "action": "allow"},
+        {"name": "approval", "when": "true", "action": "require_approval"},
+        {"name": "deny", "when": "true", "action": "deny"},
+        {"name": "allow-last", "when": "true", "action": "allow"}
+      ],
+      "outcome": "deny",
+      "fired": [{"name": "allow-first", "action": "allow"}, {"name": "approval", "action": "require_approval"}, {"name": "deny", "action": "deny"}, {"name": "allow-last", "action": "allow"}],
+      "errors": []
+    },
+    {
+      "id": "no-matching-rule",
+      "rules": [{"name": "not-fired", "when": "false", "action": "deny"}],
+      "outcome": "allow", "fired": [], "errors": []
+    },
+    {
+      "id": "missing-field-fails-closed",
+      "rules": [{"name": "missing-field", "when": "diff.summary.no_such_field > 0", "action": "allow"}],
+      "outcome": "require_approval",
+      "fired": [{"name": "missing-field", "action": "require_approval"}], "errors": ["missing-field"]
+    },
+    {
+      "id": "non-boolean-fails-closed",
+      "rules": [{"name": "not-a-boolean", "when": "1 + 2", "action": "allow"}],
+      "outcome": "require_approval",
+      "fired": [{"name": "not-a-boolean", "action": "require_approval"}], "errors": ["not-a-boolean"]
+    },
+    {
+      "id": "or-short-circuits",
+      "rules": [{"name": "short-or", "when": "true || diff.summary.no_such_field", "action": "deny"}],
+      "outcome": "deny", "fired": [{"name": "short-or", "action": "deny"}], "errors": []
+    },
+    {
+      "id": "and-short-circuits",
+      "rules": [{"name": "short-and", "when": "false && diff.summary.no_such_field", "action": "deny"}],
+      "outcome": "allow", "fired": [], "errors": []
+    },
+    {
+      "id": "actual-diff-types-and-values",
+      "rules": [{"name": "exact-replay", "when": "diff.summary.root_inputs == 5 && diff.summary.replayed == 5 && !diff.summary.changed", "action": "require_approval"}],
+      "outcome": "require_approval", "fired": [{"name": "exact-replay", "action": "require_approval"}], "errors": []
+    },
+    {
+      "id": "membership-arithmetic-and-size",
+      "rules": [{"name": "collection", "when": "2 in [1, 2, 3] && size([1, 2, 3]) == 1 + 2 && 'summary' in diff", "action": "allow"}],
+      "outcome": "allow", "fired": [{"name": "collection", "action": "allow"}], "errors": []
+    },
+    {
+      "id": "list-macro",
+      "rules": [{"name": "unique", "when": "[1, 2, 3].exists_one(x, x > 2)", "action": "allow"}],
+      "outcome": "allow", "fired": [{"name": "unique", "action": "allow"}], "errors": []
+    },
+    {
+      "id": "string-methods",
+      "rules": [{"name": "text", "when": "'released-components'.startsWith('released') && 'released-components'.endsWith('components') && 'component'.contains('pon')", "action": "allow"}],
+      "outcome": "allow", "fired": [{"name": "text", "action": "allow"}], "errors": []
+    },
+    {
+      "id": "presence-test",
+      "rules": [{"name": "presence", "when": "has(diff.summary.root_inputs) && !has(diff.summary.no_such_field)", "action": "allow"}],
+      "outcome": "allow", "fired": [{"name": "presence", "action": "allow"}], "errors": []
+    }
+  ]
+}

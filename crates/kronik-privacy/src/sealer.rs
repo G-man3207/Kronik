@@ -14,12 +14,15 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use zeroize::{Zeroize, Zeroizing};
 
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 
 use crate::PrivacyError;
-use crate::keystore::{KeyLookup, Keystore, Pseudonyms, SealedValue, SubjectKey, seal, unseal};
+use crate::keystore::{KeyLookup, KeyRevision, Keystore, Pseudonyms, SealedValue, SubjectKey, seal, unseal};
+
+mod prepared;
 
 /// Unwrapped keys kept in memory at most.
 const CACHE_KEYS: usize = 4096;
@@ -68,15 +71,47 @@ pub enum Unreadable {
     Missing { subject: String, why: String },
 }
 
+/// Availability of one positive original subject key, never its material.
+/// `Found` does not authenticate any particular sealed payload or source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAvailability {
+    Found,
+    Missing,
+    Erased,
+}
+
 /// The node's sealing state: the mode and the keystore.
 pub struct Sealer {
     on: AtomicBool,
     keystore: Option<Arc<Keystore>>,
-    /// (subject, version) → key; the newest version per subject seals.
-    cache: Mutex<BTreeMap<(String, u32), SubjectKey>>,
-    newest: Mutex<BTreeMap<String, u32>>,
+    /// Keys, their newest-version index, and erasure history share one revision.
+    cache: Mutex<KeyCache>,
     /// For `--no-pii` forks (§9).
     pseudonyms: Option<Pseudonyms>,
+}
+
+#[derive(Default)]
+struct KeyCache {
+    revision: Option<KeyRevision>,
+    keys: BTreeMap<String, BTreeMap<u32, SubjectKey>>,
+    key_count: usize,
+    newest: BTreeMap<String, u32>,
+    erasure_floors: BTreeMap<String, Option<u32>>,
+}
+impl KeyCache {
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.key_count = 0;
+        self.newest.clear();
+        self.erasure_floors.clear();
+        self.revision = None;
+    }
+    fn at(&mut self, revision: KeyRevision) {
+        if self.revision != Some(revision) {
+            self.clear();
+            self.revision = Some(revision);
+        }
+    }
 }
 
 impl std::fmt::Debug for Sealer {
@@ -124,8 +159,7 @@ impl Sealer {
         Sealer {
             on: AtomicBool::new(false),
             keystore: Some(keystore),
-            cache: Mutex::new(BTreeMap::new()),
-            newest: Mutex::new(BTreeMap::new()),
+            cache: Mutex::new(KeyCache::default()),
             pseudonyms: None,
         }
     }
@@ -181,8 +215,7 @@ impl Sealer {
         Sealer {
             on: AtomicBool::new(false),
             keystore: None,
-            cache: Mutex::new(BTreeMap::new()),
-            newest: Mutex::new(BTreeMap::new()),
+            cache: Mutex::new(KeyCache::default()),
             pseudonyms: None,
         }
     }
@@ -205,17 +238,45 @@ impl Sealer {
 
     /// Drops a subject's cached keys (after erase or rotate).
     pub fn forget(&self, subject: &str) {
-        lock(&self.cache).retain(|(s, _), _| s != subject);
-        lock(&self.newest).remove(subject);
+        let mut cache = lock(&self.cache);
+        if let Some(versions) = cache.keys.remove(subject) { cache.key_count -= versions.len(); }
+        cache.newest.remove(subject);
+        cache.erasure_floors.remove(subject);
     }
 
-    fn cache_put(&self, subject: &str, key: &SubjectKey) {
-        let mut c = lock(&self.cache);
-        if c.len() >= CACHE_KEYS {
-            c.clear();
-            lock(&self.newest).clear();
+    fn cache_at_revision(&self, ks: &Keystore) -> Result<std::sync::MutexGuard<'_, KeyCache>, PrivacyError> {
+        let revision = match ks.cache_revision() {
+            Ok(revision) => revision,
+            Err(error) => { lock(&self.cache).clear(); return Err(error); }
+        };
+        let mut cache = lock(&self.cache);
+        cache.at(revision);
+        Ok(cache)
+    }
+
+    fn cache_put(&self, subject: &str, key: &SubjectKey, revision: KeyRevision, sealing: bool) {
+        let mut cache = lock(&self.cache);
+        if cache.key_count >= CACHE_KEYS { cache.clear(); }
+        cache.at(revision);
+        let added = if let Some(versions) = cache.keys.get_mut(subject) {
+            if let std::collections::btree_map::Entry::Vacant(entry) = versions.entry(key.version) {
+                entry.insert(key.clone());
+                true
+            } else {
+                false
+            }
+        } else {
+            cache.keys.insert(subject.to_owned(), BTreeMap::from([(key.version, key.clone())]));
+            true
+        };
+        cache.key_count += usize::from(added);
+        if sealing {
+            if let Some(version) = cache.newest.get_mut(subject) {
+                *version = key.version;
+            } else {
+                cache.newest.insert(subject.to_owned(), key.version);
+            }
         }
-        c.insert((subject.to_owned(), key.version), key.clone());
     }
 
     fn sealing_key(
@@ -225,33 +286,73 @@ impl Sealer {
         fill: Fill<'_>,
         wall_ms: u64,
     ) -> Result<SubjectKey, PrivacyError> {
-        if let Some(v) = lock(&self.newest).get(subject).copied()
-            && let Some(k) = lock(&self.cache).get(&(subject.to_owned(), v))
         {
-            return Ok(k.clone());
+            let cache = self.cache_at_revision(ks)?;
+            if let Some(version) = cache.newest.get(subject)
+                && let Some(key) = cache.keys.get(subject).and_then(|versions| versions.get(version))
+            { return Ok(key.clone()); }
         }
-        let mut fresh = [0u8; 32];
+        self.load_sealing_key(ks, subject, fill, wall_ms, None)
+    }
+
+    fn load_sealing_key(
+        &self,
+        ks: &Keystore,
+        subject: &str,
+        fill: Fill<'_>,
+        wall_ms: u64,
+        expected_erasure_floor: Option<Option<u32>>,
+    ) -> Result<SubjectKey, PrivacyError> {
+        let mut fresh = Zeroizing::new([0u8; 32]);
         let mut nonce = [0u8; 24];
-        fill(&mut fresh);
+        fill(&mut fresh[..]);
         fill(&mut nonce);
-        let key = ks.key_for_sealing(subject, fresh, nonce, wall_ms)?;
-        self.cache_put(subject, &key);
-        lock(&self.newest).insert(subject.to_owned(), key.version);
+        let loaded = if let Some(expected) = expected_erasure_floor {
+            ks.plain_source_key_at_revision(subject, expected, *fresh, nonce, wall_ms)
+        } else {
+            ks.sealing_key_at_revision(subject, *fresh, nonce, wall_ms)
+        };
+        let (revision, key) = match loaded {
+            Ok(found) => found,
+            Err(error) => { lock(&self.cache).clear(); return Err(error); }
+        };
+        self.cache_put(subject, &key, revision, true);
         Ok(key)
     }
 
     fn opening_key(&self, subject: &str, version: u32) -> Result<KeyLookup, PrivacyError> {
-        if let Some(k) = lock(&self.cache).get(&(subject.to_owned(), version)) {
-            return Ok(KeyLookup::Found(k.clone()));
+        let Some(ks) = &self.keystore else { return Ok(KeyLookup::Missing); };
+        {
+            let cache = self.cache_at_revision(ks)?;
+            if let Some(key) = cache.keys.get(subject).and_then(|versions| versions.get(&version)) {
+                return Ok(KeyLookup::Found(key.clone()));
+            }
         }
-        let Some(ks) = &self.keystore else {
-            return Ok(KeyLookup::Missing);
+        self.load_opening_key(ks, subject, version)
+    }
+
+    fn load_opening_key(&self, ks: &Keystore, subject: &str, version: u32) -> Result<KeyLookup, PrivacyError> {
+        let (revision, found) = match ks.key_at_revision(subject, version) {
+            Ok(found) => found,
+            Err(error) => { lock(&self.cache).clear(); return Err(error); }
         };
-        let found = ks.key(subject, version)?;
-        if let KeyLookup::Found(k) = &found {
-            self.cache_put(subject, k);
-        }
+        if let KeyLookup::Found(key) = &found { self.cache_put(subject, key, revision, false); }
         Ok(found)
+    }
+
+    fn required_opening_key(&self, subject: &str, version: u32) -> Result<SubjectKey, PrivacyError> {
+        if version == 0 {
+            return Err(PrivacyError::Decrypt("fixed-version sealing requires a positive subject key version".into()));
+        }
+        if !crate::keystore::valid_subject(subject) {
+            return Err(PrivacyError::InvalidSubject(subject.to_owned()));
+        }
+        match self.opening_key(subject, version)? {
+            KeyLookup::Found(key) => Ok(key),
+            KeyLookup::Erased | KeyLookup::Missing => {
+                Err(PrivacyError::Decrypt("the original subject key version is missing or erased".into()))
+            }
+        }
     }
 
     /// Seals one value in place if the mode is on, the value has a subject
@@ -276,11 +377,145 @@ impl Sealer {
         let mut nonce = [0u8; 24];
         fill(&mut nonce);
         let sealed = seal(subject, &key, nonce, plain)?;
-        s.value = Some(pb::sealable::Value::Sealed(pb::Sealed {
+        let previous = s.value.replace(pb::sealable::Value::Sealed(pb::Sealed {
             key_version: sealed.key_version,
             nonce: sealed.nonce.to_vec(),
             ciphertext: sealed.ciphertext,
         }));
+        if let Some(pb::sealable::Value::Plain(mut plain)) = previous { plain.zeroize(); }
+        Ok(())
+    }
+
+    /// Requires an existing positive original key without creating a key,
+    /// requesting randomness, or changing the cache's selected newest version.
+    pub fn require_key_version(&self, subject: &str, version: u32) -> Result<(), PrivacyError> {
+        self.required_opening_key(subject, version).map(|_| ())
+    }
+
+    /// Read-only availability for the exact positive original key version.
+    /// Uses the opening cache and its revision/floor checks, never the newest
+    /// key, randomness, or key creation. Database and wrapped-key MAC failures
+    /// remain errors; absence does not authenticate hidden nested references.
+    pub fn key_availability(&self, subject: &str, version: u32) -> Result<KeyAvailability, PrivacyError> {
+        if version == 0 {
+            return Err(PrivacyError::Decrypt("key availability requires a positive original subject key version".into()));
+        }
+        if !crate::keystore::valid_subject(subject) {
+            return Err(PrivacyError::InvalidSubject(subject.to_owned()));
+        }
+        let Some(ks) = &self.keystore else { return Ok(KeyAvailability::Missing); };
+        {
+            let cache = self.cache_at_revision(ks)?;
+            if cache.keys.get(subject).is_some_and(|versions| versions.contains_key(&version)) {
+                return Ok(KeyAvailability::Found);
+            }
+        }
+        match self.load_opening_key(ks, subject, version)? {
+            KeyLookup::Found(_) => Ok(KeyAvailability::Found),
+            KeyLookup::Missing => Ok(KeyAvailability::Missing),
+            KeyLookup::Erased => Ok(KeyAvailability::Erased),
+        }
+    }
+
+    /// Returns this local keystore's observed historical erasure floor. A real
+    /// zero floor is `Some(0)`; `None` is not a SourcePos or complete-history
+    /// proof. An active newer key never proves old plaintext was post-erasure.
+    pub fn erasure_floor(&self, subject: &str) -> Result<Option<u32>, PrivacyError> {
+        if !crate::keystore::valid_subject(subject) {
+            return Err(PrivacyError::InvalidSubject(subject.to_owned()));
+        }
+        let Some(ks) = &self.keystore else {
+            return Err(PrivacyError::Decrypt("erasure history needs a keystore".into()));
+        };
+        {
+            let cache = self.cache_at_revision(ks)?;
+            if let Some(floor) = cache.erasure_floors.get(subject) { return Ok(*floor); }
+        }
+        let (revision, floor) = match ks.erasure_floor_at_revision(subject) {
+            Ok(found) => found,
+            Err(error) => { lock(&self.cache).clear(); return Err(error); }
+        };
+        let mut cache = lock(&self.cache);
+        cache.at(revision);
+        if cache.erasure_floors.len() >= CACHE_KEYS { cache.erasure_floors.clear(); }
+        cache.erasure_floors.insert(subject.to_owned(), floor);
+        Ok(floor)
+    }
+
+    /// Selects the real key version before a multi-owner source context is
+    /// encoded. Requires the same complete source proof as `seal_plain_source`.
+    /// This may retain an unused new key on later failure; it exports no key.
+    pub fn prepare_plain_source_version(
+        &self,
+        subject: &str,
+        expected_erasure_floor: Option<u32>,
+        fill: Fill<'_>,
+        wall_ms: u64,
+    ) -> Result<u32, PrivacyError> {
+        if !crate::keystore::valid_subject(subject) {
+            return Err(PrivacyError::InvalidSubject(subject.to_owned()));
+        }
+        let ks = self.keystore.as_ref()
+            .ok_or_else(|| PrivacyError::Decrypt("historical plaintext protection needs a keystore".into()))?;
+        self.load_sealing_key(ks, subject, fill, wall_ms, Some(expected_erasure_floor))
+            .map(|key| key.version)
+    }
+
+    /// Protects plaintext only after the caller verifies the current ready
+    /// receipt/namespace and complete source/materialized coverage, with no
+    /// old Plain across cells, schema and sequence data. The required floor
+    /// expectation is not that proof: None means proved never-erased;
+    /// Some(0) is a real erasure receipt.
+    pub fn seal_plain_source(
+        &self,
+        s: &mut pb::Sealable,
+        expected_erasure_floor: Option<u32>,
+        fill: Fill<'_>,
+        wall_ms: u64,
+    ) -> Result<(), PrivacyError> {
+        let (Some(subject), Some(pb::sealable::Value::Plain(plain))) = (&s.subject, &s.value) else {
+            return Err(PrivacyError::Decrypt("historical plaintext protection requires tagged plaintext".into()));
+        };
+        if !crate::keystore::valid_subject(subject) {
+            return Err(PrivacyError::InvalidSubject(subject.clone()));
+        }
+        let Some(ks) = &self.keystore else {
+            return Err(PrivacyError::Decrypt("historical plaintext protection needs a keystore".into()));
+        };
+        let key = self.load_sealing_key(ks, subject, fill, wall_ms, Some(expected_erasure_floor))?;
+        let mut nonce = [0; 24];
+        fill(&mut nonce);
+        let sealed = seal(subject, &key, nonce, plain)?;
+        let previous = s.value.replace(pb::sealable::Value::Sealed(pb::Sealed {
+            key_version: sealed.key_version,
+            nonce: sealed.nonce.to_vec(),
+            ciphertext: sealed.ciphertext,
+        }));
+        if let Some(pb::sealable::Value::Plain(mut plain)) = previous { plain.zeroize(); }
+        Ok(())
+    }
+
+    /// Protects a logical snapshot row under its original subject key version,
+    /// regardless of the current mode. This never creates or selects a newer key.
+    pub fn seal_value_at(
+        &self,
+        s: &mut pb::Sealable,
+        version: u32,
+        fill: Fill<'_>,
+    ) -> Result<(), PrivacyError> {
+        let (Some(subject), Some(pb::sealable::Value::Plain(plain))) = (&s.subject, &s.value) else {
+            return Err(PrivacyError::Decrypt("fixed-version sealing requires tagged plaintext".into()));
+        };
+        let key = self.required_opening_key(subject, version)?;
+        let mut nonce = [0; 24];
+        fill(&mut nonce);
+        let sealed = seal(subject, &key, nonce, plain)?;
+        let previous = s.value.replace(pb::sealable::Value::Sealed(pb::Sealed {
+            key_version: sealed.key_version,
+            nonce: sealed.nonce.to_vec(),
+            ciphertext: sealed.ciphertext,
+        }));
+        if let Some(pb::sealable::Value::Plain(mut plain)) = previous { plain.zeroize(); }
         Ok(())
     }
 
@@ -449,9 +684,9 @@ impl Sealer {
         let Some(ks) = &self.keystore else {
             return Ok(0);
         };
-        let v = ks.erase(subject, wall_ms)?;
-        self.forget(subject);
-        Ok(v)
+        let result = ks.erase(subject, wall_ms);
+        lock(&self.cache).clear();
+        result
     }
 }
 
@@ -461,9 +696,9 @@ mod tests {
     use crate::MasterKey;
 
     fn sealer(dir: &std::path::Path) -> Sealer {
+        let owner = crate::key_source::lock_data(dir).unwrap();
         let (master, _) = MasterKey::open(&dir.join("master.key"), dir, Some([7; 32])).unwrap();
-        let conn = rusqlite::Connection::open(dir.join("keystore.db")).unwrap();
-        Sealer::new(Arc::new(Keystore::open(conn, &master).unwrap()))
+        Sealer::new(Keystore::open_owned(&owner, &master).unwrap())
     }
 
     fn counter_fill() -> impl Fn(&mut [u8]) {
@@ -583,5 +818,132 @@ mod tests {
         assert!(keyed.fingerprint_matches(Some("user:1"), &k, &fp));
         assert!(keyed.fingerprint_matches(Some("user:1"), &fp, &fp));
         assert!(!other.fingerprint_matches(Some("user:1"), &k, &fp));
+    }
+
+    #[test]
+    fn revision_tests_bound_erasure_floor_metadata_without_evicting_keys() {
+        let master = MasterKey::from_bytes([7; 32]).unwrap();
+        let ks = Arc::new(Keystore::open_memory(&master).unwrap());
+        let s = Sealer::new(ks.clone());
+        s.set_on(true);
+        let mut value = val(Some("user:1"), b"cached key survives metadata eviction");
+        s.seal_value(&mut value, &counter_fill(), 1).unwrap();
+        let revision = ks.revision().unwrap();
+        for index in 0..=CACHE_KEYS {
+            assert_eq!(s.erasure_floor(&format!("probe:{index}")).unwrap(), None);
+        }
+        {
+            let cache = lock(&s.cache);
+            assert!(cache.erasure_floors.len() <= CACHE_KEYS);
+        }
+        assert_eq!(s.open(&value).bytes(), Some(b"cached key survives metadata eviction".as_slice()));
+        assert_eq!(s.erasure_floor("user:1").unwrap(), None);
+        assert!(lock(&s.cache).erasure_floors.contains_key("user:1"));
+        s.forget("user:1");
+        {
+            let cache = lock(&s.cache);
+            assert!(!cache.erasure_floors.contains_key("user:1"));
+            assert!(cache.erasure_floors.contains_key(&format!("probe:{CACHE_KEYS}")));
+            assert!(cache.keys.is_empty());
+            assert!(!cache.newest.contains_key("user:1"));
+        }
+        assert_eq!(s.erasure_floor("user:1").unwrap(), None);
+        assert_eq!(s.open(&value).bytes(), Some(b"cached key survives metadata eviction".as_slice()));
+        assert_eq!(ks.revision().unwrap(), revision);
+        assert_eq!(ks.stats().unwrap().keys, 1);
+        assert_eq!(ks.stats().unwrap().erased, 0);
+    }
+
+    #[test]
+    fn key_availability_is_readonly_and_never_selects_a_historical_key_for_sealing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sealer(dir.path());
+        let ks = s.keystore.as_ref().unwrap();
+        let initial_revision = ks.revision().unwrap();
+        assert_eq!(s.key_availability("user:1", 1).unwrap(), KeyAvailability::Missing);
+        assert_eq!(ks.revision().unwrap(), initial_revision);
+        assert_eq!(ks.stats().unwrap().keys, 0);
+        s.set_on(true);
+        let fill = counter_fill();
+        let mut first = val(Some("user:1"), b"original");
+        s.seal_value(&mut first, &fill, 1).unwrap();
+        assert_eq!(ks.rotate("user:1", [31; 32], [32; 24], 2).unwrap(), 2);
+        let revision = ks.revision().unwrap();
+        assert_eq!(s.key_availability("user:1", 1).unwrap(), KeyAvailability::Found);
+        assert_eq!(s.key_availability("user:1", 1).unwrap(), KeyAvailability::Found);
+        assert_eq!(s.key_availability("user:1", 99).unwrap(), KeyAvailability::Missing);
+        assert!(s.require_key_version("user:1", 99).is_err());
+        assert_eq!(ks.revision().unwrap(), revision);
+        assert_eq!(ks.stats().unwrap().keys, 2);
+        let mut next = val(Some("user:1"), b"still uses newest");
+        s.seal_value(&mut next, &fill, 3).unwrap();
+        assert!(matches!(next.value.as_ref(), Some(pb::sealable::Value::Sealed(value)) if value.key_version == 2));
+        assert_eq!(s.open(&first).bytes(), Some(b"original".as_slice()));
+        s.forget("user:1");
+        assert_eq!(s.key_availability("user:1", 1).unwrap(), KeyAvailability::Found);
+        assert_eq!(s.key_availability("user:1", 2).unwrap(), KeyAvailability::Found);
+        assert_eq!(ks.revision().unwrap(), revision);
+    }
+
+    #[test]
+    fn key_availability_observes_erasure_through_the_same_loaded_opening_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sealer(dir.path());
+        let ks = s.keystore.as_ref().unwrap();
+        s.set_on(true);
+        let mut first = val(Some("user:1"), b"original");
+        s.seal_value(&mut first, &counter_fill(), 1).unwrap();
+        assert_eq!(ks.rotate("user:1", [41; 32], [42; 24], 2).unwrap(), 2);
+        assert_eq!(s.key_availability("user:1", 1).unwrap(), KeyAvailability::Found);
+        ks.erase_through("user:1", 1, 3).unwrap();
+        let revision = ks.revision().unwrap();
+        assert_eq!(s.key_availability("user:1", 1).unwrap(), KeyAvailability::Erased);
+        assert_eq!(s.key_availability("user:1", 2).unwrap(), KeyAvailability::Found);
+        assert_eq!(s.key_availability("user:1", 3).unwrap(), KeyAvailability::Missing);
+        assert!(s.require_key_version("user:1", 1).is_err());
+        assert!(matches!(s.open(&first), Opened::Erased { .. }));
+        assert_eq!(ks.revision().unwrap(), revision);
+        assert_eq!(ks.stats().unwrap().keys, 1);
+    }
+
+    #[test]
+    fn key_availability_propagates_wrapped_key_mac_failure_after_cached_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sealer(dir.path());
+        s.set_on(true);
+        let mut value = val(Some("user:1"), b"protected");
+        s.seal_value(&mut value, &counter_fill(), 1).unwrap();
+        assert_eq!(s.key_availability("user:1", 1).unwrap(), KeyAvailability::Found);
+        let writer = rusqlite::Connection::open(dir.path().join("keystore.db")).unwrap();
+        assert_eq!(writer.execute(
+            "UPDATE subject_keys SET wrapped = zeroblob(length(wrapped)) WHERE subject = ?1 AND version = 1",
+            ["user:1"],
+        ).unwrap(), 1);
+        assert!(matches!(s.key_availability("user:1", 1), Err(PrivacyError::Decrypt(_))));
+        assert!(matches!(s.open(&value), Opened::Unreadable { .. }));
+    }
+
+    #[test]
+    fn key_availability_propagates_revision_read_failure_instead_of_using_cached_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sealer(dir.path());
+        s.set_on(true);
+        let mut value = val(Some("user:1"), b"protected");
+        s.seal_value(&mut value, &counter_fill(), 1).unwrap();
+        assert_eq!(s.key_availability("user:1", 1).unwrap(), KeyAvailability::Found);
+        let writer = rusqlite::Connection::open(dir.path().join("keystore.db")).unwrap();
+        assert_eq!(writer.execute("DELETE FROM keystore_revision WHERE id = 1", []).unwrap(), 1);
+        assert!(matches!(s.key_availability("user:1", 1), Err(PrivacyError::Sqlite(_))));
+        assert!(matches!(s.open(&value), Opened::Unreadable { .. }));
+    }
+
+    #[test]
+    fn key_availability_rejects_invalid_original_identity_even_without_a_keystore() {
+        let s = Sealer::plain();
+        assert_eq!(s.key_availability("user:1", 1).unwrap(), KeyAvailability::Missing);
+        assert!(s.key_availability("user:1", 0).is_err());
+        for subject in ["", "white space", "control\nbyte"] {
+            assert!(matches!(s.key_availability(subject, 1), Err(PrivacyError::InvalidSubject(_))));
+        }
     }
 }

@@ -2,7 +2,10 @@
 //! is persisted for KMS sources; the loaded key is shared with shipping.
 
 pub mod config;
-mod providers;
+pub(crate) mod providers;
+mod pkcs11;
+mod ownership;
+pub use ownership::DataOwnership;
 
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
@@ -27,6 +30,8 @@ pub enum KeySourceError {
     Config(String),
     #[error("KEY_SOURCE_UNAVAILABLE: the configured key source did not answer successfully")]
     Unavailable,
+    #[error("KEY_HELPER_FAILED: PKCS#11 helper returned {0}")]
+    Pkcs11(String),
     #[error(
         "UNAVAILABLE: the data directory is owned by serve, restore or keys wrap; stop the owning process or choose a different --data-dir"
     )]
@@ -47,6 +52,7 @@ impl KeySourceError {
         let code = match &self {
             Self::Config(_) => ErrorCode::BadRequest,
             Self::Unavailable => ErrorCode::KeySourceUnavailable,
+            Self::Pkcs11(_) => ErrorCode::KeyHelperFailed,
             Self::InvalidEnvelope => ErrorCode::MasterKeyMismatch,
             Self::Key(PrivacyError::KeyMissing(_)) => ErrorCode::MasterKeyMissing,
             Self::Key(PrivacyError::KeyMismatch(_)) => ErrorCode::MasterKeyMismatch,
@@ -304,6 +310,17 @@ impl KeySource {
     }
 }
 
+/// Produce a non-secret key-possession probe without loading or changing a seed.
+pub async fn enroll_pkcs11(env: &Env, config: &Keys) -> Result<config::Probe, KeySourceError> {
+    protect_process()?;
+    config.check_pkcs11_enrollment().map_err(KeySourceError::Config)?;
+    if !cfg!(target_os = "linux") {
+        return Err(KeySourceError::Config("PKCS11_UNSUPPORTED_PLATFORM".into()));
+    }
+    pkcs11::enroll(env, config.pkcs11.as_ref().ok_or_else(|| KeySourceError::Config("PKCS11_CONFIG".into()))?)
+        .await.map_err(KeySourceError::Pkcs11)
+}
+
 pub async fn unwrap_envelope(
     env: &Env,
     config: &Keys,
@@ -419,7 +436,7 @@ pub fn read_envelope(path: &Path) -> std::io::Result<Vec<u8>> {
 }
 /// Lock the data directory itself, not a sibling (systemd only permits
 /// writes inside it). Directory descriptors keep the same lock inode.
-pub fn lock_data(data: &Path) -> Result<std::fs::File, KeySourceError> {
+pub fn lock_data(data: &Path) -> Result<DataOwnership, KeySourceError> {
     use std::os::unix::fs::MetadataExt as _;
     let file = std::fs::File::open(data)?;
     file.try_lock().map_err(|e| match e {
@@ -434,7 +451,7 @@ pub fn lock_data(data: &Path) -> Result<std::fs::File, KeySourceError> {
         )
         .into());
     }
-    Ok(file)
+    Ok(DataOwnership::locked(file, data.to_owned()))
 }
 
 /// Durable private ciphertext/marker installation. Creation uses a hard link
@@ -505,6 +522,8 @@ async fn encrypt_retry(
                 Wrapped::parse(&w.bytes()?, config)?;
                 return Ok(w);
             }
+            Ok(Err(code)) if config.source == Source::Pkcs11 => return Err(KeySourceError::Pkcs11(code)),
+            _ if config.source == Source::Pkcs11 => return Err(KeySourceError::Unavailable),
             _ if env.clock.monotonic() < deadline => {
                 env.clock
                     .sleep(delay.min(deadline.saturating_sub(env.clock.monotonic())))
@@ -549,6 +568,8 @@ async fn unwrap_retry(
                 bytes.zeroize();
                 return MasterKey::from_bytes(*seed).map_err(Into::into);
             }
+            Ok(Err(code)) if config.source == Source::Pkcs11 => return Err(KeySourceError::Pkcs11(code)),
+            _ if config.source == Source::Pkcs11 => return Err(KeySourceError::Unavailable),
             _ if env.clock.monotonic() < deadline => {
                 env.clock
                     .sleep(delay.min(deadline.saturating_sub(env.clock.monotonic())))

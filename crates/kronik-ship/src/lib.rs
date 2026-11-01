@@ -11,6 +11,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +38,8 @@ pub enum ShipError {
     #[error(transparent)]
     Key(kronik_privacy::PrivacyError),
     #[error(transparent)]
+    Keystore(kronik_privacy::PrivacyError),
+    #[error(transparent)]
     KeySource(#[from] KeySourceError),
     /// A sealed value in the restored data has no key in the keystore the
     /// bucket can provide.
@@ -55,6 +58,7 @@ impl ShipError {
             ShipError::Io(_) => "io",
             ShipError::Restore(_) => "restore",
             ShipError::Key(_) => "master_key",
+            ShipError::Keystore(_) => "keystore",
             ShipError::KeySource(_) => "key_source",
             ShipError::KeystoreIncomplete(_) => "keystore_incomplete",
             ShipError::Store(e) => match e {
@@ -217,6 +221,40 @@ fn decompress(bytes: &[u8]) -> Result<Vec<u8>, ShipError> {
     Ok(zstd::stream::decode_all(bytes)?)
 }
 
+/// Semantic database revision, bound to the supported persistent file lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "schema", deny_unknown_fields)]
+pub enum KeystoreRevision {
+    #[serde(rename = "kronik.keystore-revision/v1")]
+    V1 { revision: u64, device: u64, inode: u64 },
+}
+
+impl KeystoreRevision {
+    /// An acknowledged change frontier, not proof that an erased key is available.
+    pub fn covers(self, required: Self) -> bool {
+        match (self, required) {
+            (Self::V1 { revision, device, inode }, Self::V1 {
+                revision: required_revision, device: required_device, inode: required_inode,
+            }) => device == required_device && inode == required_inode && revision >= required_revision,
+        }
+    }
+}
+
+/// Reads a persistent semantic revision and its supported file lineage without KMS I/O.
+pub async fn current_keystore_revision(
+    env: &Env,
+    data: &Path,
+    keystore: &Arc<kronik_privacy::keystore::Keystore>,
+) -> Result<KeystoreRevision, ShipError> {
+    let path = data.join("keys").join("keystore.db");
+    let store = keystore.clone();
+    env.blocking("keystore-backup-revision", move || {
+        let file = std::fs::metadata(path)?;
+        let revision = store.revision().map_err(ShipError::Keystore)?;
+        Ok::<_, ShipError>(KeystoreRevision::V1 { revision, device: file.dev(), inode: file.ino() })
+    }).await.ok_or_else(|| ShipError::Io(std::io::Error::other("keystore revision work was dropped")))?
+}
+
 /// What has been uploaded (`<data>/ship.json`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShipState {
@@ -229,9 +267,9 @@ pub struct ShipState {
     /// Wall time of the last uploaded keystore backup.
     #[serde(default)]
     pub keystore_backup_ms: Option<u64>,
-    /// mtime/size stamp of `keys/keystore.db` at that backup.
+    /// Unknown for legacy weak stamps, which must force a new semantic backup.
     #[serde(default)]
-    pub keystore_stamp: Option<u64>,
+    pub keystore_revision: Option<KeystoreRevision>,
     /// Digest of independently published wrapped ciphertext (rewraps too).
     #[serde(default)]
     pub wrapped_hash: Option<String>,
@@ -242,18 +280,51 @@ impl ShipState {
         data.join("ship.json")
     }
 
-    pub fn load(data: &Path) -> ShipState {
-        std::fs::read(Self::path(data))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+    pub fn load(data: &Path) -> Result<ShipState, ShipError> {
+        let bytes = match std::fs::read(Self::path(data)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error.into()),
+        };
+        serde_json::from_slice(&bytes).map_err(|error| ShipError::Config(format!(
+            "invalid persisted shipping state at line {}, column {}", error.line(), error.column()
+        )))
     }
 
     fn save(&self, data: &Path) -> Result<(), ShipError> {
-        let tmp = Self::path(data).with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self).unwrap_or_default())?;
-        std::fs::rename(tmp, Self::path(data))?;
-        Ok(())
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = Self::path(data);
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| ShipError::Config(format!("encode shipping state: {error}")))?;
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = data.join(format!(".ship-state-{}-{serial}.tmp", std::process::id()));
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp)?;
+        let held = file.metadata()?;
+        let result = (|| -> Result<(), ShipError> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            let named = std::fs::symlink_metadata(&temp)?;
+            if !named.is_file() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+                return Err(std::io::Error::other("owned shipping-state temporary changed before publication").into());
+            }
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if !metadata.is_file() => return Err(std::io::Error::other("shipping-state target is not a regular file").into()),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            std::fs::rename(&temp, &path)?;
+            std::fs::File::open(data)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err()
+            && std::fs::symlink_metadata(&temp).is_ok_and(|metadata| metadata.is_file()
+                && (held.dev(), held.ino()) == (metadata.dev(), metadata.ino())) {
+            std::fs::remove_file(&temp)?;
+        }
+        result
     }
 }
 
@@ -386,25 +457,6 @@ pub const KEYSTORE_BACKUP_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// The daily backup, independent of changes.
 pub const KEYSTORE_BACKUP_DAILY: Duration = Duration::from_secs(86_400);
 
-/// A change stamp of the keystore: its file and its WAL, where SQLite
-/// writes a new key until the next checkpoint (so the file alone can look
-/// unchanged for long after a key was added).
-fn keystore_stamp(path: &Path) -> Option<u64> {
-    let one = |p: &Path| -> Option<u64> {
-        let meta = std::fs::metadata(p).ok()?;
-        let nanos = meta
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos() as u64;
-        Some(nanos.wrapping_mul(0x9E37_79B9).wrapping_add(meta.len()))
-    };
-    let mut wal = path.as_os_str().to_owned();
-    wal.push("-wal");
-    let wal = one(Path::new(&wal)).unwrap_or(0);
-    Some(one(path)?.wrapping_mul(31).wrapping_add(wal))
-}
 
 /// Uploads `keystore/<wall_ms>.bin` (the export bytes, not zstd) and deletes
 /// backups older than `retention`. The newest is always kept. The master
@@ -412,6 +464,7 @@ fn keystore_stamp(path: &Path) -> Option<u64> {
 // Keep the loaded source and keystore explicit; no per-backup key loader.
 #[allow(clippy::too_many_arguments)]
 pub async fn ship_keystore(
+    env: &Env,
     remote: &Remote,
     data: &Path,
     state: &mut ShipState,
@@ -419,7 +472,7 @@ pub async fn ship_keystore(
     retention: Duration,
     nonce: [u8; 24],
     source: &KeySource,
-    keystore: &kronik_privacy::keystore::Keystore,
+    keystore: &Arc<kronik_privacy::keystore::Keystore>,
 ) -> Result<ShipReport, ShipError> {
     let mut report = ShipReport::default();
     let wrapped = source.wrapped_bytes()?;
@@ -433,16 +486,17 @@ pub async fn ship_keystore(
             report.bytes += bytes.len() as u64;
         }
     }
-    let path = data.join("keys").join("keystore.db");
-    let stamp = keystore_stamp(&path);
+    let revision = current_keystore_revision(env, data, keystore).await?;
     let since = state.keystore_backup_ms.map(|t| wall_ms.saturating_sub(t));
-    let changed = stamp.is_some() && stamp != state.keystore_stamp;
-    let interval_ok = since.is_none_or(|s| s >= KEYSTORE_BACKUP_MIN_INTERVAL.as_millis() as u64);
+    let changed = state.keystore_revision != Some(revision);
+    let interval_ok = state.keystore_revision.is_none()
+        || since.is_none_or(|s| s >= KEYSTORE_BACKUP_MIN_INTERVAL.as_millis() as u64);
     let daily_due = since.is_some_and(|s| s >= KEYSTORE_BACKUP_DAILY.as_millis() as u64);
-    if stamp.is_some() && ((changed && interval_ok) || daily_due) {
-        let blob = keystore
-            .export_backup(nonce)
-            .map_err(|e| ShipError::Config(e.to_string()))?;
+    if (changed && interval_ok) || daily_due {
+        let store = keystore.clone();
+        let blob = env.blocking("keystore-backup-export", move || {
+            store.export_backup(nonce).map_err(ShipError::Keystore)
+        }).await.ok_or_else(|| ShipError::Io(std::io::Error::other("keystore export work was dropped")))??;
         report.bytes += blob.len() as u64;
         report.objects += 1;
         // The .bin commits its pair: an interrupted wrapper upload cannot
@@ -456,17 +510,11 @@ pub async fn ship_keystore(
         }
         remote.put(&format!("keystore/{wall_ms}.bin"), blob).await?;
         state.keystore_backup_ms = Some(wall_ms);
-        state.keystore_stamp = stamp;
+        state.keystore_revision = Some(revision);
         state.save(data)?;
         tracing::info!(wall_ms, "shipped a keystore backup");
     }
-    let (names, _) = match remote.list("keystore").await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(code = e.code(), "could not list keystore backups");
-            return Ok(report);
-        }
-    };
+    let (names, _) = remote.list("keystore").await?;
     let mut walls: Vec<u64> = names
         .iter()
         .filter_map(|n| n.strip_suffix(".bin")?.parse().ok())
@@ -499,8 +547,16 @@ pub async fn ship_loop(
     source: Arc<KeySource>,
     keystore: Arc<kronik_privacy::keystore::Keystore>,
 ) {
-    let mut state = ShipState::load(&data);
     loop {
+        let mut state = match ShipState::load(&data) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(code = error.code(), "shipping state unavailable; sidecar stalled");
+                env.clock.sleep(interval).await;
+                continue;
+            }
+        };
+        let mut reload = false;
         match ship_once(&remote, &data, &branch, &mut state).await {
             Ok(r) if r.objects + r.deleted > 0 => {
                 tracing::info!(
@@ -511,12 +567,26 @@ pub async fn ship_loop(
                 );
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!(code = e.code(), "shipping failed; retrying next round"),
+            Err(error) => {
+                tracing::warn!(code = error.code(), "shipping failed; retrying next round");
+                reload = true;
+            }
+        }
+        if reload {
+            state = match ShipState::load(&data) {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::warn!(code = error.code(), "shipping state unavailable; sidecar stalled");
+                    env.clock.sleep(interval).await;
+                    continue;
+                }
+            };
         }
         let mut nonce = [0u8; 24];
         env.entropy.fill(&mut nonce);
         let retention = Duration::from_millis(kronik_sched::keystore_retention_ms(&data));
         match ship_keystore(
+            &env,
             &remote,
             &data,
             &mut state,
@@ -628,7 +698,7 @@ pub async fn restore_with_fault(
         .take_while(|d| !d.exists())
         .collect();
     std::fs::create_dir_all(data)?;
-    let _ownership = kronik_privacy::key_source::lock_data(data)?;
+    let ownership = kronik_privacy::key_source::lock_data(data)?;
     let branch_dir = data.join("branches").join(branch);
     if branch_dir.join("state.db").exists() && !force {
         return Err(ShipError::Restore(format!(
@@ -639,13 +709,15 @@ pub async fn restore_with_fault(
     // Everything is downloaded, checked and written in a staging directory
     // first: a restore that fails there leaves the data directory as it was,
     // and moving the result into place is only renames (install_staged).
+    // One DATA phase retains the real root owner and stage readset until install.
+    let keystore_restore = ownership.begin_keystore_restore().map_err(ShipError::Key)?;
     let stage = data.join(".restore");
     if stage.exists() {
         std::fs::remove_dir_all(&stage)?;
     }
-    let staged = stage_restore(remote, data, &stage, branch, env, keys, mode).await;
+    let staged = stage_restore(remote, data, &stage, branch, env, keys, mode, &keystore_restore).await;
     let result = match staged {
-        Ok(s) => install_staged(data, &stage, branch, &branch_dir, s, fault),
+        Ok(s) => install_staged(data, &stage, branch, &branch_dir, s, keystore_restore, fault),
         Err(e) => {
             let _ = std::fs::remove_dir_all(&stage);
             // Empty only: never anything else that appeared meanwhile.
@@ -666,6 +738,7 @@ struct Staged {
     components: Vec<String>,
     keystore: &'static str,
     keystore_backup_ms: Option<u64>,
+    keystore_master: Option<kronik_privacy::MasterKey>,
     keys_missing: Vec<String>,
     /// The snapshot at or before a later rebase switch's base (M13).
     older: Option<Manifest>,
@@ -674,6 +747,7 @@ struct Staged {
     wrapped_path: Option<PathBuf>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stage_restore(
     remote: &Remote,
     data: &Path,
@@ -682,6 +756,7 @@ async fn stage_restore(
     env: &Env,
     keys: &Keys,
     mode: KeystoreMode,
+    keystore_restore: &kronik_privacy::keystore::KeystoreRestore,
 ) -> Result<Staged, ShipError> {
     // 1. The newest complete remote snapshot.
     let (_, lsns) = remote.list(&format!("{branch}/snapshots")).await?;
@@ -839,10 +914,12 @@ async fn stage_restore(
         s.dedup();
         s
     };
+    let keystore_master = keystore.as_ref().ok().map(|backup| backup.master.clone());
     let (keystore, keystore_backup_ms, keys_missing) = match keystore {
         Ok(k) => {
-            let ks = kronik_privacy::keystore::Keystore::import_backup_file(
-                &stage.join("keystore.db"),
+            let ks = kronik_privacy::keystore::Keystore::restore_staged(
+                keystore_restore,
+                Path::new(".restore"),
                 &k.master,
                 &k.blob,
             )
@@ -872,6 +949,7 @@ async fn stage_restore(
                     list_some(&shown)
                 )));
             }
+            keystore_restore.close_stage(ks).map_err(ShipError::Key)?;
             ("installed", Some(k.wall), subjects_of(&missing))
         }
         Err("none_in_bucket") if !needed.is_empty() => {
@@ -933,6 +1011,7 @@ async fn stage_restore(
         components,
         keystore,
         keystore_backup_ms,
+        keystore_master,
         keys_missing,
         older,
         through_lsn,
@@ -976,6 +1055,7 @@ fn install_staged(
     branch: &str,
     branch_dir: &Path,
     s: Staged,
+    keystore_restore: kronik_privacy::keystore::KeystoreRestore,
     fault: &dyn Fn(&str) -> std::io::Result<()>,
 ) -> Result<RestoreReport, ShipError> {
     let replace_dir = |from: &Path, to: &Path| -> std::io::Result<()> {
@@ -1060,6 +1140,14 @@ fn install_staged(
         stage.join("branch").join("state.db"),
         branch_dir.join("state.db"),
     )?;
+    // Certify only the installed keystore, not the archive's broader durability.
+    if keys.exists() {
+        std::fs::File::open(&keys)?.sync_all()?;
+    }
+    std::fs::File::open(branch_dir)?.sync_all()?;
+    std::fs::File::open(data.join("branches"))?.sync_all()?;
+    std::fs::File::open(data)?.sync_all()?;
+    drop(keystore_restore.finish(s.keystore_master.as_ref()).map_err(ShipError::Key)?);
     fault("committed")?;
     let first = kronik_log::segment_starts(&log_dir)?
         .first()

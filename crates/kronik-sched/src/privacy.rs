@@ -1,6 +1,7 @@
 //! Privacy mode (docs/design/m8-privacy.md §3): the `PrivacyMode` record and
 //! the per-subject keystore.
 
+use kronik_core::authority::AuthLease;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::Lsn;
 use kronik_privacy::keystore::KeystoreStats;
@@ -53,7 +54,9 @@ impl Node {
         mode: pb::PrivacyState,
         audit: pb::Audit,
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<PrivacyModeChange, ApiError> {
+        authority.check()?;
         self.check_running()?;
         if mode == pb::PrivacyState::Unspecified {
             return Err(ApiError::new(
@@ -61,7 +64,7 @@ impl Node {
                 "the privacy mode is on or off",
             ));
         }
-        let guard = self.deploy_lock.clone().lock_owned().await;
+        let guard = self.lock_deploy_authorized(&authority).await?;
         let (previous, current) = self.privacy_mode();
         let mut change = PrivacyModeChange {
             changed: previous != mode,
@@ -82,14 +85,9 @@ impl Node {
             epoch,
             mode: mode as i32,
             audit: Some(audit),
+            reseal_requested: false,
         });
-        // Turning on seals from before the record is durable, so no value
-        // written after it is left plain; turning off waits for it.
-        if mode == pb::PrivacyState::On {
-            self.sealer.set_on(true);
-        }
-        // commit_config sets the sealer to the mode in force afterwards.
-        change.lsn = Some(self.commit_config(guard, epoch, record).await?);
+        change.lsn = Some(self.commit_config_authorized(guard, epoch, record, authority).await?);
         Ok(change)
     }
 
@@ -111,7 +109,9 @@ impl Node {
         subject: &str,
         audit: pb::Audit,
         dry_run: bool,
+        authority: AuthLease,
     ) -> Result<ErasureDone, ApiError> {
+        authority.check()?;
         self.check_alive()?;
         if !kronik_privacy::keystore::valid_subject(subject) {
             return Err(ApiError::new(
@@ -122,7 +122,7 @@ impl Node {
             ));
         }
         let plain_values = self.plain_values_of(subject).await?;
-        let guard = self.deploy_lock.clone().lock_owned().await;
+        let guard = self.lock_deploy_authorized(&authority).await?;
         let epoch = self.epoch() + 1;
         let complete_after_ms = self
             .env
@@ -138,17 +138,16 @@ impl Node {
                 complete_after_ms,
             });
         }
-        let key_version = self
-            .sealer
-            .erase(subject, self.env.clock.wall_ms())
-            .map_err(|e| ApiError::new(ErrorCode::Internal, format!("keystore: {e}")))?;
-        let record = Record::Erasure(pb::Erasure {
-            epoch,
-            subject: subject.to_owned(),
-            key_version,
-            audit: Some(audit),
-        });
-        let lsn = self.commit_config(guard, epoch, record).await?;
+        let node = self.arc().ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let subject = subject.to_owned();
+        let (key_version, lsn) = self.authorized_effect(authority, move || async move {
+            // Key deletion is irreversible: this admitted private continuation must finish its record or durable recovery.
+            let key_version = node.sealer.erase(&subject, node.env.clock.wall_ms())
+                .map_err(|error| ApiError::new(ErrorCode::Internal, format!("keystore: {error}")))?;
+            let record = Record::Erasure(pb::Erasure { epoch, subject, key_version, audit: Some(audit) });
+            let lsn = node.commit_config(guard, epoch, record).await?;
+            Ok((key_version, lsn))
+        }).await?;
         tracing::info!(epoch, lsn, key_version, "subject erased");
         Ok(ErasureDone {
             key_version,

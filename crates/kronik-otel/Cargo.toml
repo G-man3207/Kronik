@@ -10,7 +10,7 @@ publish.workspace = true
 blake3 = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
-kronik-core = { workspace = true }
+kronik-core = { workspace = true, features = ["schemars"] }
 kronik-effects = { workspace = true }
 kronik-log = { workspace = true }
 kronik-metrics = { workspace = true }

@@ -40,6 +40,7 @@ pub trait PreviewRouter: Send + Sync {
         actor: ActorRef,
         http: pb::HttpInput,
         subject: Option<String>,
+        authority: kronik_core::authority::AuthLease,
     ) -> BoxFuture<'static, Result<TurnResult, ApiError>>;
 }
 
@@ -423,6 +424,35 @@ pub fn request_hash(
 
 pub use kronik_sched::INGRESS_HASH_VERSION;
 
+fn reserved_admin_cookie(cookie: &str) -> bool {
+    cookie.split_once('=').is_some_and(|(name, _)| {
+        matches!(name.trim(), "__Host-kronik-session" | "__Host-kronik-login")
+    })
+}
+
+fn strip_admin_cookies(headers: &mut Vec<(String, String)>) {
+    headers.retain_mut(|(name, value)| {
+        if !name.eq_ignore_ascii_case("cookie")
+            || !value.split(';').any(reserved_admin_cookie)
+        {
+            return true;
+        }
+        // Cookies cross ports on the same hostname; never admit admin credentials to a guest.
+        let mut kept = String::new();
+        for cookie in value.split(';').filter(|cookie| !reserved_admin_cookie(cookie)) {
+            if cookie.trim().is_empty() {
+                continue;
+            }
+            if !kept.is_empty() {
+                kept.push(';');
+            }
+            kept.push_str(cookie);
+        }
+        *value = kept;
+        !value.is_empty()
+    });
+}
+
 /// The HTTP response for a finished turn.
 pub fn turn_response(r: &TurnResult) -> HttpResponse {
     let id = (TURN_ID_HEADER.to_owned(), r.turn_id.to_string());
@@ -472,6 +502,9 @@ pub fn turn_response(r: &TurnResult) -> HttpResponse {
                     )
                 })
                 .collect();
+            headers.retain(|(name, value)| {
+                !name.eq_ignore_ascii_case("set-cookie") || !reserved_admin_cookie(value)
+            });
             headers.push(id);
             let body = match h.body.as_ref().and_then(|b| b.value.as_ref()) {
                 Some(pb::body::Value::Inline(s)) => sealable_bytes(Some(s)),
@@ -610,6 +643,9 @@ impl Gateway {
     ) -> Result<HttpResponse, ApiError> {
         // New input, refused like main's on a fatal node or a full disk.
         self.node.check_running()?;
+        // This public host request starts a new native operation. The factory
+        // returns the stored NativeExecution lease, never a new token issuer.
+        let authority = self.node.local_operator_authority()?;
         let routes = to_routes(router.routes(&id).await?);
         req.path = path;
         let m = find(&routes, &req.method, &req.path)?;
@@ -625,7 +661,7 @@ impl Gateway {
                     .any(|n| h.name.eq_ignore_ascii_case(n))
             });
         }
-        let turn = router.send(id, actor, http, subject);
+        let turn = router.send(id, actor, http, subject, authority);
         let resp = match self.node.env().timeout(self.cfg.timeout, turn).await {
             Ok(r) => turn_response(&r?),
             Err(_) => return Err(self.timed_out()),
@@ -640,9 +676,10 @@ impl Gateway {
     /// its subject.
     fn input(
         &self,
-        req: HttpRequest,
+        mut req: HttpRequest,
         m: Matched,
     ) -> Result<(ActorRef, pb::HttpInput, Option<String>), ApiError> {
+        strip_admin_cookies(&mut req.headers);
         let key = m
             .params
             .iter()

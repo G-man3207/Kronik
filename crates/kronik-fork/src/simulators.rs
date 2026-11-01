@@ -5,19 +5,28 @@
 //! its per-proposal cache (ADR 0015).
 
 use std::collections::BTreeMap;
+use std::cell::Cell;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use kronik_core::authority::{AuthLease, Authority};
 use kronik_core::env::Env;
+use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::Lsn;
 use kronik_effects::contract::Contract;
-use kronik_effects::http::{parse_url, route_pattern};
+use kronik_effects::http::{CompiledScrubber, Target, parse_request_url, parse_url, route_pattern};
+use kronik_effects::http::ScrubError;
 use kronik_effects::simulator::{ContractFake, RecordedNeighbor};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
+use kronik_sched::scrub::original_secret_prefix;
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::index::ProductionIndex;
 use crate::stubs::StubRule;
@@ -225,8 +234,8 @@ impl Simulators {
     /// the input, effects, writes, messages, timers, reply or SQL, and no
     /// SQL at all). State reads are not recorded, so this is not enough
     /// under privacy mode (see [`ModelAccess::privacy`]).
-    pub fn model_sources(index: &ProductionIndex, target: &str) -> Vec<(Lsn, pb::EffectRecord)> {
-        Self::recorded_where(index, target, |t| !turn_tainted(t))
+    pub fn model_sources<'a>(index: &'a ProductionIndex, target: &str) -> Vec<(Lsn, &'a pb::EffectRecord, Option<Arc<[pb::SecretRef]>>)> {
+        Self::recorded_sources(index, target, |turn| !turn_tainted(turn))
     }
 
     fn recorded_where(
@@ -254,6 +263,27 @@ impl Simulators {
         out
     }
 
+    fn recorded_sources<'a>(
+        index: &'a ProductionIndex,
+        target: &str,
+        keep: impl Fn(&pb::TurnRecord) -> bool,
+    ) -> Vec<(Lsn, &'a pb::EffectRecord, Option<Arc<[pb::SecretRef]>>)> {
+        let mut candidates = Vec::new();
+        for item in &index.records {
+            let Record::TurnRecord(turn) = &item.record else { continue };
+            let mut matching = turn.effects.iter().filter(|effect| effect.target == target);
+            let Some(first) = matching.next() else { continue };
+            if !keep(turn) { continue; }
+            for effect in std::iter::once(first).chain(matching) {
+                let prefix = turn.input.as_ref().and_then(|input|
+                    original_secret_prefix(input, &turn.effects, effect.ordinal));
+                candidates.push((item.lsn, effect, prefix));
+            }
+        }
+        candidates.reverse();
+        candidates
+    }
+
     pub fn neighbor(&self, index: &ProductionIndex, target: &str) -> Arc<RecordedNeighbor> {
         let mut n = lock(&self.neighbors);
         n.entry(target.to_owned())
@@ -262,9 +292,18 @@ impl Simulators {
     }
 }
 
+
 /// Whether a production turn shows personal data or SQL anywhere.
 fn turn_tainted(t: &pb::TurnRecord) -> bool {
     if !t.sql_changes.is_empty() || !t.sql_schema.is_empty() {
+        return true;
+    }
+    if matches!(t.input.as_ref().and_then(|input| input.kind.as_ref()),
+        Some(pb::input::Kind::Message(input))
+            if input.msg.as_ref().is_some_and(|message| message.retained_compensation_source.is_some()))
+        || t.messages.iter().chain(&t.compensations).any(|outbound|
+            outbound.msg.as_ref().is_some_and(|message| message.retained_compensation_source.is_some()))
+    {
         return true;
     }
     let mut tainted = false;
@@ -299,81 +338,421 @@ pub struct ModelAnswer {
     pub body: String,
 }
 
-type Slot = Arc<tokio::sync::OnceCell<Option<ModelAnswer>>>;
-
-/// Model answers of one proposal by (target, fingerprint), loaded from and
-/// saved to `branches/<id>/simulator-cache.json`. Workers that ask for the
-/// same key at once share one call.
-#[derive(Default)]
-pub struct ModelCache {
-    path: Option<PathBuf>,
-    slots: Mutex<BTreeMap<String, Slot>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ModelCacheError {
+    Redaction(ScrubError),
+    SourceUnavailable,
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct CacheFile {
-    /// key -> answer (`null` for a refusal).
-    answers: BTreeMap<String, Option<ModelAnswer>>,
+type ModelResult = Result<Option<ModelAnswer>, ModelCacheError>;
+
+enum ModelAdmissionDenial {
+    Original(ApiError),
+    Source(ApiError),
 }
 
-impl ModelCache {
-    /// The cache at `path`, with what an earlier replay saved. A file that
-    /// cannot be read or parsed is an error: answering again would silently
-    /// change the proposal's diff.
-    pub fn open(path: &Path) -> Result<ModelCache, String> {
-        let file: CacheFile = match std::fs::read(path) {
-            Ok(b) => serde_json::from_slice(&b)
-                .map_err(|e| format!("{}: not a model cache: {e}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => CacheFile::default(),
-            Err(e) => return Err(format!("{}: {e}", path.display())),
-        };
-        let slots = file
-            .answers
-            .into_iter()
-            .map(|(k, v)| (k, Arc::new(tokio::sync::OnceCell::new_with(Some(v)))))
-            .collect();
-        Ok(ModelCache {
-            path: Some(path.to_owned()),
-            slots: Mutex::new(slots),
+impl ModelAdmissionDenial {
+    fn error(&self) -> &ApiError {
+        match self { Self::Original(error) | Self::Source(error) => error }
+    }
+}
+
+fn source_scope_error() -> ApiError {
+    ApiError::new(ErrorCode::SecretUnavailable, ScrubError::SourceScopeUnavailable.to_string())
+}
+
+/// One concrete handoff: the original physical publisher precedes the actual
+/// source try-lock. Error construction and denial-state publication happen
+/// after BOTH fences have been released.
+fn admit_model_data(
+    original: &AuthLease,
+    publication: &kronik_sched::secrets::SecretSnapshotPublication,
+    effect: &mut dyn FnMut() -> Result<(), ApiError>,
+) -> Result<(), ModelAdmissionDenial> {
+    let mut denied = ApiError { code: ErrorCode::SecretUnavailable, message: String::new(), hint: None };
+    let mut original_entered = false;
+    let mut data_entered = false;
+    let result = original.admit(&mut || {
+        original_entered = true;
+        publication.with_current_publication(&mut denied, || {
+            data_entered = true;
+            effect()
+        })
+    });
+    result.map_err(|error| {
+        if original_entered && !data_entered {
+            ModelAdmissionDenial::Source(source_scope_error())
+        } else {
+            ModelAdmissionDenial::Original(error)
+        }
+    })
+}
+
+/// A conjunction for ONE owned model HTTP job, never a new issuer or a field
+/// of shared ModelAccess. Retain the actual typed failure when Core Net maps
+/// admission errors into Connect strings; a later live check cannot erase it.
+struct ModelHttpAdmission {
+    original: AuthLease,
+    publication: kronik_sched::secrets::SecretSnapshotPublication,
+    denial: OnceLock<ModelAdmissionDenial>,
+    me: std::sync::Weak<Self>,
+}
+
+impl ModelHttpAdmission {
+    fn new(original: AuthLease, publication: kronik_sched::secrets::SecretSnapshotPublication) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self { original, publication, denial: OnceLock::new(), me: me.clone() })
+    }
+
+    fn denied(&self) -> Option<ApiError> {
+        self.denial.get().map(|denial| denial.error().clone())
+    }
+
+    fn record_denial(&self, denial: ModelAdmissionDenial) -> &ModelAdmissionDenial {
+        self.denial.get_or_init(|| denial)
+    }
+}
+
+impl Authority for ModelHttpAdmission {
+    fn check(&self) -> Result<(), ApiError> {
+        if let Some(error) = self.denied() { return Err(error); }
+        if let Err(error) = self.original.check() {
+            return Err(self.record_denial(ModelAdmissionDenial::Original(error)).error().clone());
+        }
+        if let Err(error) = self.publication.check_current() {
+            return Err(self.record_denial(ModelAdmissionDenial::Source(error)).error().clone());
+        }
+        Ok(())
+    }
+
+    fn cancelled(&self) -> kronik_core::env::BoxFuture<'static, ()> {
+        let Some(held) = self.me.upgrade() else { return Box::pin(std::future::ready(())); };
+        Box::pin(async move {
+            if held.denial.get().is_some() { return; }
+            tokio::select! {
+                biased;
+                () = held.original.cancelled() => {
+                    let error = held.original.check().err().unwrap_or_else(||
+                        ApiError::new(ErrorCode::Unavailable, "The original model operation was cancelled"));
+                    held.record_denial(ModelAdmissionDenial::Original(error));
+                }
+                () = held.publication.cancelled() => {
+                    let error = held.publication.check_current().err().unwrap_or_else(source_scope_error);
+                    held.record_denial(ModelAdmissionDenial::Source(error));
+                }
+            }
         })
     }
 
-    /// What an earlier replay saved at `path`, never written back (dry runs).
-    pub fn read_only(path: &Path) -> Result<ModelCache, String> {
-        let mut c = ModelCache::open(path)?;
-        c.path = None;
-        Ok(c)
+    fn admit(&self, effect: &mut dyn FnMut() -> Result<(), ApiError>) -> Result<(), ApiError> {
+        if let Some(error) = self.denied() { return Err(error); }
+        match admit_model_data(&self.original, &self.publication, effect) {
+            Ok(()) => Ok(()),
+            Err(denial) => Err(self.record_denial(denial).error().clone()),
+        }
+    }
+}
+
+struct Slot {
+    source_fingerprint: Option<[u8; 32]>,
+    answer: tokio::sync::OnceCell<ModelResult>,
+    initialization: tokio::sync::Mutex<()>,
+}
+
+/// Immutable per-proposal facts, certified against the exact secret source
+/// snapshot which scrubbed them. A different snapshot cannot reuse or rewrite
+/// these answers, including refusals and redaction failures.
+#[derive(Default)]
+pub struct ModelCache {
+    path: Option<PathBuf>,
+    slots: Mutex<BTreeMap<String, Arc<Slot>>>,
+    dirty: AtomicBool,
+    save: Mutex<()>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedAnswer<T> {
+    source_fingerprint: Option<[u8; 32]>,
+    answer: T,
+}
+
+/// Serde remains the JSON parser. Its input budget is reset for each cell,
+/// before a key or value can grow; the whole proposal has no byte cap.
+struct CacheRead<R> {
+    inner: R,
+    remaining: Rc<Cell<usize>>,
+}
+
+impl<R: std::io::Read> std::io::Read for CacheRead<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() { return Ok(0); }
+        let available = self.remaining.get();
+        let allowed = bytes.len().min(available);
+        if allowed == 0 { return Err(std::io::Error::other("model cache cell limit")); }
+        let count = self.inner.read(&mut bytes[..allowed])?;
+        self.remaining.set(available - count);
+        Ok(count)
+    }
+}
+
+struct CacheSeed { remaining: Rc<Cell<usize>> }
+
+impl<'de> serde::de::DeserializeSeed<'de> for CacheSeed {
+    type Value = BTreeMap<String, Arc<Slot>>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, decoder: D) -> Result<Self::Value, D::Error> {
+        decoder.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for CacheSeed {
+    type Value = BTreeMap<String, Arc<Slot>>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a model cache envelope")
     }
 
-    /// An in-memory cache (tests, a fork without a directory).
-    pub fn memory() -> ModelCache {
-        ModelCache::default()
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut version = None;
+        let mut answers = None;
+        loop {
+            self.remaining.set(kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES);
+            let Some(field) = map.next_key::<String>()? else { break };
+            match field.as_str() {
+                "version" => {
+                    if version.is_some() { return Err(serde::de::Error::duplicate_field("version")); }
+                    let value = map.next_value::<u32>()?;
+                    if value != 2 { return Err(serde::de::Error::custom("unsupported model cache version")); }
+                    version = Some(value);
+                }
+                "answers" => {
+                    if answers.is_some() { return Err(serde::de::Error::duplicate_field("answers")); }
+                    answers = Some(map.next_value_seed(CacheCellsSeed { remaining: self.remaining.clone() })?);
+                }
+                _ => return Err(serde::de::Error::unknown_field(&field, &["version", "answers"])),
+            }
+        }
+        let answers = answers.ok_or_else(|| serde::de::Error::missing_field("answers"))?;
+        if (version.is_none() && answers.stamped) || (version.is_some() && answers.legacy) {
+            return Err(serde::de::Error::custom("model cache cells do not match their envelope"));
+        }
+        Ok(answers.slots)
+    }
+}
+
+struct CacheCells {
+    slots: BTreeMap<String, Arc<Slot>>,
+    legacy: bool,
+    stamped: bool,
+}
+
+struct CacheCellsSeed { remaining: Rc<Cell<usize>> }
+
+impl<'de> serde::de::DeserializeSeed<'de> for CacheCellsSeed {
+    type Value = CacheCells;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, decoder: D) -> Result<Self::Value, D::Error> {
+        decoder.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for CacheCellsSeed {
+    type Value = CacheCells;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("model cache answers")
     }
 
-    fn slot(&self, key: &str) -> Slot {
-        lock(&self.slots).entry(key.to_owned()).or_default().clone()
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut answers = CacheCells { slots: BTreeMap::new(), legacy: false, stamped: false };
+        loop {
+            self.remaining.set(kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES);
+            let Some(key) = map.next_key::<String>()? else { break };
+            // Only one bounded cell is materialized. Consuming from_value
+            // moves its strings into the one retained immutable slot map.
+            let value = map.next_value::<serde_json::Value>()?;
+            let current = value.as_object().is_some_and(|object|
+                object.contains_key("source_fingerprint") || object.contains_key("answer"));
+            let (source_fingerprint, answer) = if current {
+                let object = value.as_object().ok_or_else(|| serde::de::Error::custom("invalid model cache cell"))?;
+                if !object.contains_key("source_fingerprint") || !object.contains_key("answer") {
+                    return Err(serde::de::Error::custom("incomplete model cache cell"));
+                }
+                let cell: CachedAnswer<ModelResult> = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                answers.stamped = true;
+                (cell.source_fingerprint, cell.answer)
+            } else {
+                let answer: Option<ModelAnswer> = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                answers.legacy = true;
+                (None, Ok(answer))
+            };
+            match answers.slots.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(Arc::new(Slot {
+                        source_fingerprint,
+                        answer: tokio::sync::OnceCell::new_with(Some(answer)),
+                        initialization: tokio::sync::Mutex::new(()),
+                    }));
+                }
+                std::collections::btree_map::Entry::Occupied(_) =>
+                    return Err(serde::de::Error::custom("duplicate model cache key")),
+            }
+        }
+        Ok(answers)
+    }
+}
+
+struct CacheWrite<'a, W> {
+    inner: &'a mut W,
+    remaining: usize,
+}
+
+impl<W: std::io::Write> std::io::Write for CacheWrite<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.remaining.checked_sub(bytes.len())
+            .ok_or_else(|| std::io::Error::other("model cache cell limit"))?;
+        self.inner.write_all(bytes)?;
+        self.remaining = remaining;
+        Ok(bytes.len())
     }
 
-    /// Writes every answer obtained so far, durably.
-    pub fn save(&self) -> Result<(), String> {
-        let Some(path) = &self.path else {
-            return Ok(());
+    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
+}
+
+/// The existing record bound applies before serialization grows a buffer,
+/// not after an unbounded serde_json::to_vec has already allocated it.
+struct JsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Drop for JsonWriter {
+    fn drop(&mut self) { self.bytes.zeroize(); }
+}
+
+impl std::io::Write for JsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let needed = self.bytes.len().checked_add(bytes.len()).filter(|&n| n <= self.limit)
+            .ok_or_else(|| std::io::Error::other("model JSON output limit"))?;
+        if needed > self.bytes.capacity() {
+            let capacity = needed.max(self.bytes.capacity().saturating_mul(2)).max(64).min(self.limit);
+            self.bytes.try_reserve_exact(capacity - self.bytes.len())
+                .map_err(|_| std::io::Error::other("model JSON output limit"))?;
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>, ScrubError> {
+    let mut writer = JsonWriter { bytes: Vec::new(), limit: kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES };
+    serde_json::to_writer(&mut writer, value).map_err(|_| ScrubError::OutputLimit)?;
+    Ok(std::mem::take(&mut writer.bytes))
+}
+
+fn unavailable(message: &'static str) -> ApiError {
+    ApiError::new(ErrorCode::SecretUnavailable, message)
+}
+
+impl ModelCache {
+    /// Parse old captures without inventing a producer certificate. Their
+    /// exact saved disclosure is qualified separately at lookup time.
+    pub fn open(path: &Path) -> Result<ModelCache, String> {
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ModelCache { path: Some(path.to_owned()), dirty: AtomicBool::new(true), ..Self::default() });
+            }
+            Err(e) => return Err(format!("{}: {e}", path.display())),
         };
-        let answers: BTreeMap<String, Option<ModelAnswer>> = lock(&self.slots)
-            .iter()
-            .filter_map(|(k, v)| v.get().map(|a| (k.clone(), a.clone())))
-            .collect();
-        let bytes = serde_json::to_vec_pretty(&CacheFile { answers }).map_err(|e| e.to_string())?;
-        crate::write_atomic(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
+        let remaining = Rc::new(Cell::new(kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES));
+        let reader = CacheRead { inner: std::io::BufReader::new(file), remaining: remaining.clone() };
+        let mut decoder = serde_json::Deserializer::from_reader(reader);
+        let slots = serde::de::DeserializeSeed::deserialize(CacheSeed { remaining: remaining.clone() }, &mut decoder)
+            .map_err(|_| format!("{}: not a model cache", path.display()))?;
+        remaining.set(kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES);
+        decoder.end().map_err(|_| format!("{}: trailing model cache data", path.display()))?;
+        Ok(ModelCache { path: Some(path.to_owned()), slots: Mutex::new(slots), ..Self::default() })
     }
 
-    /// How many keys the cache holds.
-    pub fn len(&self) -> usize {
-        lock(&self.slots).len()
+    pub fn read_only(path: &Path) -> Result<ModelCache, String> {
+        let mut cache = Self::open(path)?;
+        cache.path = None;
+        Ok(cache)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn memory() -> ModelCache { ModelCache::default() }
+
+    fn slot(&self, key: &str, source_fingerprint: [u8; 32]) -> Result<Arc<Slot>, ApiError> {
+        let mut slots = lock(&self.slots);
+        if let Some(slot) = slots.get(key) {
+            if slot.source_fingerprint == Some(source_fingerprint) { return Ok(slot.clone()); }
+            if slot.answer.get().is_some() {
+                return Err(unavailable("The model cache belongs to a different certified secret snapshot"));
+            }
+        }
+        let slot = Arc::new(Slot { source_fingerprint: Some(source_fingerprint), answer: tokio::sync::OnceCell::new(), initialization: tokio::sync::Mutex::new(()) });
+        // An uninitialized slot is not an immutable model fact. A new genuine
+        // operation may replace it after source change; never rewrite an answer.
+        let retired = if let Some(current) = slots.get_mut(key) {
+            Some(std::mem::replace(current, slot.clone()))
+        } else {
+            slots.insert(key.to_owned(), slot.clone());
+            None
+        };
+        drop(slots);
+        drop(retired);
+        Ok(slot)
+    }
+
+    /// Stream immutable cells through the existing atomic file protocol.
+    /// Bounds apply to each cell, never to the proposal's aggregate capture.
+    pub fn save(&self) -> Result<(), String> {
+        let Some(path) = &self.path else { return Ok(()) };
+        let _save = lock(&self.save);
+        if !self.dirty.swap(false, Ordering::AcqRel) { return Ok(()); }
+        let result = crate::write_atomic_with(path, |file| {
+            let mut writer = std::io::BufWriter::new(file);
+            writer.write_all(b"{\"version\":2,\"answers\":{")?;
+            let slots = lock(&self.slots);
+            let mut first = true;
+            for (key, slot) in slots.iter() {
+                let Some(answer) = slot.answer.get() else { continue };
+                if !first { writer.write_all(b",")?; }
+                first = false;
+                let mut cell = CacheWrite { inner: &mut writer, remaining: kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES };
+                serde_json::to_writer(&mut cell, key).map_err(std::io::Error::other)?;
+                cell.write_all(b":")?;
+                serde_json::to_writer(&mut cell, &CachedAnswer { source_fingerprint: slot.source_fingerprint, answer })
+                    .map_err(std::io::Error::other)?;
+            }
+            drop(slots);
+            writer.write_all(b"}}")?;
+            writer.flush()
+        });
+        if result.is_err() { self.dirty.store(true, Ordering::Release); }
+        result.map_err(|error| format!("{}: {error}", path.display()))
+    }
+
+    pub fn len(&self) -> usize { lock(&self.slots).len() }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+}
+
+/// Source facts alone never authorize a new model request.
+pub enum ModelSecretSnapshot {
+    Recorded(Arc<kronik_sched::secrets::CertifiedSecretSnapshot>),
+    Live {
+        snapshot: Arc<kronik_sched::secrets::CertifiedSecretSnapshot>,
+        publication: kronik_sched::secrets::SecretSnapshotPublication,
+    },
+}
+
+impl ModelSecretSnapshot {
+    pub(crate) fn snapshot(&self) -> &Arc<kronik_sched::secrets::CertifiedSecretSnapshot> {
+        match self { Self::Recorded(snapshot) | Self::Live { snapshot, .. } => snapshot }
     }
 }
 
@@ -386,20 +765,19 @@ pub struct ModelAccess {
     /// Privacy mode is on, or was on in the replay's window: no recorded
     /// examples unless `config.examples_under_privacy`.
     pub privacy: bool,
-    /// The node's secrets: a request that holds one is never sent, and an
-    /// answer is scrubbed of them before it is cached (I8).
-    pub secrets: Option<Arc<kronik_privacy::SecretStore>>,
-    /// A dry run (I12): answers come from the cache only; a miss is a
-    /// refusal without a call.
+    /// ONE qualified source getter: pinned read-only facts, or the actual
+    /// atomic snapshot/publication pair. No source facts mint dispatch authority.
+    pub secret_snapshot: Arc<dyn Fn() -> Result<ModelSecretSnapshot, ApiError> + Send + Sync>,
+    /// A dry run (I12): answers come from saved facts only. A miss is an
+    /// explicit prerequisite, never a call, slot creation, or saved refusal.
     pub offline: bool,
 }
 
 /// The longest body of an example or the request sent to the model.
 const MAX_BODY: usize = 4096;
 
-fn text(b: &[u8]) -> String {
-    let s = String::from_utf8_lossy(b);
-    s.chars().take(MAX_BODY).collect()
+fn text(b: &[u8]) -> Option<String> {
+    Some(std::str::from_utf8(b).ok()?.chars().take(MAX_BODY).collect())
 }
 
 /// A plain value without a subject, else `None`: the model never sees a
@@ -424,104 +802,183 @@ fn request_view(req: &pb::HttpEffectRequest) -> Option<serde_json::Value> {
                 // Credentials never go to the model: the list API readers
                 // without pii:read are also spared (kronik-core http).
                 if !kronik_core::http::credential_header(&h.name) {
-                    headers.insert(h.name.to_ascii_lowercase(), v.clone());
+                    let name = if req.fingerprint_version == 2 { h.name.clone() } else { h.name.to_ascii_lowercase() };
+                    headers.insert(name, v.clone());
                 }
             }
             // A secret header (I8): never described to the model.
             _ => return None,
         }
     }
-    let t = parse_url(&req.url).ok()?;
-    let port = t.port.map(|p| format!(":{p}")).unwrap_or_default();
-    let query = if t.query.is_empty() {
-        String::new()
-    } else {
-        format!("?{}", t.query)
-    };
+    // Version 2 already rendered its typed, scrubbed components. Never
+    // lowercase or otherwise reparse a generated marker in its host.
+    if req.fingerprint_version == 0 {
+        parse_url(&req.url).ok()?;
+    } else if req.fingerprint_version != 2 {
+        return None;
+    }
+    let body = text(&req.body)?;
     Some(serde_json::json!({
-        "method": req.method.to_ascii_uppercase(),
-        "url": format!("{}://{}{port}{}{query}", t.scheme, t.host, t.path),
+        "method": if req.fingerprint_version == 2 { req.method.clone() } else { req.method.to_ascii_uppercase() },
+        "url": req.url,
         "headers": headers,
-        "body": text(&req.body),
+        "body": body,
     }))
 }
 
-/// Whether a request holds a secret value anywhere, scanned raw (before
-/// any encoding or truncation): its URL, text header values and body.
-fn request_holds(req: &pb::HttpEffectRequest, holds: &dyn Fn(&[u8]) -> bool) -> bool {
-    holds(req.url.as_bytes())
+/// Private inspection of original legacy fields, never a version-2 model
+/// request or a second scan of a prepared request's generated markers.
+fn request_holds(req: &pb::HttpEffectRequest, holds: &dyn Fn(&[u8]) -> bool) -> Result<bool, ScrubError> {
+    // A caller with a scoped Ready body resolves it before building this
+    // model-only view. An opaque reference is never an empty request body.
+    if req.fingerprint_version != 0 { return Err(ScrubError::SourceScopeUnavailable); }
+    let (target, raw_host) = parse_request_url(&req.url).map_err(|_| ScrubError::InvalidText)?;
+    Ok(kronik_sched::scrub::http_url_contains(&target, raw_host, holds)?
         || holds(&req.body)
-        || req.headers.iter().any(|h| match &h.value {
-            Some(pb::http_effect_header::Value::Text(v)) => holds(v.as_bytes()),
-            _ => false,
-        })
+        || req.headers.iter().any(|header| {
+            holds(header.name.as_bytes()) || match &header.value {
+                Some(pb::http_effect_header::Value::Text(value)) => holds(value.as_bytes()),
+                _ => true,
+            }
+        }))
 }
 
-/// Recorded exchanges with a target that the model may see (subject-free,
-/// plain, no secret value per `holds`), newest first, at most `max`.
+/// Validate already-prepared request data without reparsing its rendered URI.
+/// A genuine covering scope bypasses matching; otherwise the canonical guard
+/// treats a match as ambiguous rather than producing replacement markers.
+fn prepared_request_safe(
+    req: &pb::HttpEffectRequest,
+    target: &Target,
+    matcher: &CompiledScrubber<'_>,
+    current_scope: Option<&[pb::SecretRef]>,
+    prepared_scope: Option<&[pb::SecretRef]>,
+) -> Result<(), ScrubError> {
+    if req.fingerprint_version != 2 {
+        return Err(ScrubError::SourceScopeUnavailable);
+    }
+    if req.encoded_len() > kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES {
+        return Err(ScrubError::OutputLimit);
+    }
+    if kronik_sched::scrub::secret_scope_is_subset(current_scope, prepared_scope)? { return Ok(()); }
+    if kronik_sched::scrub::http_url_contains(target, &target.host, &|bytes| matcher.is_match(bytes))? {
+        return Err(ScrubError::SourceScopeUnavailable);
+    }
+    let method = (!kronik_sched::scrub::protocol_method(&req.method)).then_some(req.method.as_bytes());
+    let fields = method.into_iter().chain(std::iter::once(req.body.as_slice()))
+        .chain(req.headers.iter().flat_map(|header| {
+            [header.name.as_bytes(), match &header.value {
+                Some(pb::http_effect_header::Value::Text(value)) => value.as_bytes(),
+                _ => &[],
+            }]
+        }));
+    // Coverage was checked above. No second metadata sort or matcher is needed.
+    kronik_sched::scrub::prepared_fields_safe(None, None, matcher, fields)
+}
+
+fn model_scope(
+    snapshot: &kronik_sched::secrets::CertifiedSecretSnapshot,
+    prepared_scope: Option<&[pb::SecretRef]>,
+) -> Result<Arc<[pb::SecretRef]>, ScrubError> {
+    let current = kronik_sched::effects::combined_secret_scope(snapshot, &[], Some(&[]))?
+        .ok_or(ScrubError::SourceScopeUnavailable)?;
+    // The cache certificate covers its actual matcher. It cannot certify an
+    // additional held historical value absent from that physical source.
+    if !kronik_sched::scrub::secret_scope_is_subset(prepared_scope, Some(&current))? {
+        return Err(ScrubError::SourceScopeUnavailable);
+    }
+    Ok(current)
+}
+
+/// Optional subject-free exchanges, using their original source identity
+/// prefix. Unknown/ambiguous examples are omitted, never marked complete.
 pub fn model_examples(
-    recorded: &[(Lsn, pb::EffectRecord)],
+    recorded: &[(Lsn, &pb::EffectRecord, Option<Arc<[pb::SecretRef]>>)],
     max: usize,
-    holds: &dyn Fn(&[u8]) -> bool,
+    matcher: &CompiledScrubber<'_>,
+    current_scope: Option<&[pb::SecretRef]>,
 ) -> Vec<serde_json::Value> {
-    recorded
-        .iter()
-        .filter(|(_, e)| e.status == pb::EffectStatus::Ok as i32)
-        .filter_map(|(_, e)| {
-            let req = pb::HttpEffectRequest::decode(subject_free(e.request.as_ref())?).ok()?;
-            let resp = pb::HttpEffectResponse::decode(subject_free(e.response.as_ref())?).ok()?;
-            if request_holds(&req, holds)
-                || holds(&resp.body)
-                || resp.headers.iter().any(|h| holds(h.value.as_bytes()))
-            {
-                return None;
+    let no_literals: &[(&str, &[u8])] = &[];
+    let Ok(credentials) = CompiledScrubber::new_output(no_literals, 0) else { return Vec::new() };
+    fn contains_credential(value: &serde_json::Value, matcher: &CompiledScrubber<'_>) -> bool {
+        match value {
+            serde_json::Value::String(value) => matcher.is_match(value.as_bytes()),
+            serde_json::Value::Array(values) => values.iter().any(|value| contains_credential(value, matcher)),
+            serde_json::Value::Object(values) => values.iter().any(|(key, value)|
+                matcher.is_match(key.as_bytes()) || contains_credential(value, matcher)),
+            _ => false,
+        }
+    }
+    recorded.iter().filter(|(_, effect, _)| effect.status == pb::EffectStatus::Ok as i32)
+        .filter_map(|(_, effect, prefix)| {
+            let req = pb::HttpEffectRequest::decode(subject_free(effect.request.as_ref())?).ok()?;
+            let resp = pb::HttpEffectResponse::decode(subject_free(effect.response.as_ref())?).ok()?;
+            match req.fingerprint_version {
+                0 => {
+                    let holds = |bytes: &[u8]| matcher.is_match(bytes);
+                    if request_holds(&req, &holds).ok()? || holds(&resp.body)
+                        || resp.headers.iter().any(|header| holds(header.name.as_bytes()) || holds(header.value.as_bytes()))
+                    { return None; }
+                }
+                2 => {
+                    let target = kronik_effects::http::prepared_target(&req).ok()?;
+                    prepared_request_safe(&req, &target, matcher, current_scope, prefix.as_deref()).ok()?;
+                    kronik_sched::scrub::prepared_fields_safe(
+                        current_scope, prefix.as_deref(), matcher,
+                        std::iter::once(resp.body.as_slice()).chain(resp.headers.iter()
+                            .flat_map(|header| [header.name.as_bytes(), header.value.as_bytes()])),
+                    ).ok()?;
+                }
+                _ => return None,
             }
+            let response_body = text(&resp.body)?;
             let request = request_view(&req)?;
-            Some(serde_json::json!({
+            let quote = serde_json::json!({
                 "request": request,
                 "response": {
                     "status": resp.status,
-                    // Only the content type: cookies and other headers are
-                    // not the model's business.
                     "headers": resp.headers.iter()
-                        .filter(|h| h.name.eq_ignore_ascii_case("content-type"))
-                        .map(|h| (h.name.to_ascii_lowercase(), h.value.clone()))
+                        .filter(|header| header.name.eq_ignore_ascii_case("content-type"))
+                        .map(|header| (header.name.to_ascii_lowercase(), header.value.clone()))
                         .collect::<BTreeMap<_, _>>(),
-                    "body": text(&resp.body),
+                    "body": response_body,
                 },
-            }))
-        })
-        .take(max)
-        .collect()
+            });
+            // This is output to another model, not a new request policy.
+            // Check the actual decoded quote; JSON escapes may introduce a
+            // credential absent from the original encoded body bytes.
+            if contains_credential(&quote, &credentials) { return None; }
+            Some(quote)
+        }).take(max).collect()
 }
 
 /// The chat completions request for one effect, or `None` when the request
 /// may not be shown (a secret header).
 pub fn model_request(
     config: &ModelConfig,
-    target: &str,
+    target: &Target,
     examples: &[serde_json::Value],
     req: &pb::HttpEffectRequest,
-) -> Option<serde_json::Value> {
-    let request = request_view(req)?;
-    let route = parse_url(&req.url)
-        .map(|t| route_pattern(&t.path))
-        .unwrap_or_default();
+) -> Result<Option<serde_json::Value>, ScrubError> {
+    let Some(request) = request_view(req) else { return Ok(None) };
+    let route = route_pattern(&target.path);
+    let kind = if target.scheme == "foreign" { "foreign" } else { "http" };
     let system = format!(
-        "You simulate the HTTP API {target} for a deterministic replay. Answer the \
+        "You simulate the HTTP API {kind}:{} for a deterministic replay. Answer the \
          request with one JSON object and nothing else: {{\"status\": <int>, \
          \"headers\": {{<name>: <value>}}, \"body\": <string>}}. Follow the recorded \
-         examples for this API (route {route}) as closely as possible."
+         examples for this API (route {route}) as closely as possible.",
+        target.host,
     );
     let user = serde_json::json!({ "examples": examples, "request": request });
-    Some(serde_json::json!({
+    let content = String::from_utf8(json_bytes(&user)?).map_err(|_| ScrubError::InvalidText)?;
+    Ok(Some(serde_json::json!({
         "model": config.model,
         "temperature": 0,
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": user.to_string()},
+            {"role": "user", "content": content},
         ],
-    }))
+    })))
 }
 
 /// Parses a chat completions response into an answer.
@@ -562,73 +1019,305 @@ pub fn parse_model_reply(bytes: &[u8]) -> Option<ModelAnswer> {
     })
 }
 
+fn model_result(result: ModelResult) -> Result<Option<ModelAnswer>, ApiError> {
+    match result {
+        Ok(answer) => Ok(answer),
+        Err(ModelCacheError::Redaction(error)) => Err(ApiError::new(ErrorCode::SecretUnavailable, error.to_string())),
+        Err(ModelCacheError::SourceUnavailable) => Err(unavailable("The certified model secret source changed before publication")),
+    }
+}
+
+fn wipe_model_result(result: &mut ModelResult) {
+    if let Ok(Some(answer)) = result {
+        answer.body.zeroize();
+        for (name, value) in &mut answer.headers { name.zeroize(); value.zeroize(); }
+    }
+}
+
+/// An unstamped historical answer is not producer-scope evidence. It can be
+/// disclosed unchanged only when the actual complete current plan finds no
+/// sensitive occurrence; even an identical generated marker is ambiguous.
+fn qualify_legacy_answer(
+    snapshot: &kronik_sched::secrets::CertifiedSecretSnapshot,
+    result: &ModelResult,
+) -> Result<(), ApiError> {
+    let Ok(Some(answer)) = result else { return Ok(()) };
+    let patterns = kronik_sched::effects::secret_patterns(&snapshot.values);
+    let matcher = CompiledScrubber::new_output(&patterns, kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES)
+        .map_err(|error| ApiError::new(ErrorCode::SecretUnavailable, error.to_string()))?;
+    kronik_sched::scrub::prepared_fields_safe(None, None, &matcher,
+        std::iter::once(answer.body.as_bytes()).chain(answer.headers.iter()
+            .flat_map(|(name, value)| [name.as_bytes(), value.as_bytes()])))
+        .map_err(|error| ApiError::new(ErrorCode::SecretUnavailable, error.to_string()))
+}
+
+/// Read immutable cache data before publication; its final callback only moves.
+fn deliver_model_result(
+    source: &ModelSecretSnapshot,
+    original: &AuthLease,
+    result: ModelResult,
+) -> Result<Option<ModelAnswer>, ApiError> {
+    let mut pending = Some(result);
+    let mut delivered = None;
+    let mut transfer = || { delivered = pending.take(); Ok(()) };
+    let admitted = match source {
+        ModelSecretSnapshot::Recorded(_) => original.admit(&mut transfer),
+        ModelSecretSnapshot::Live { publication, .. } =>
+            admit_model_data(original, publication, &mut transfer).map_err(|denial| denial.error().clone()),
+    };
+    if let Err(error) = admitted {
+        if let Some(result) = &mut pending { wipe_model_result(result); }
+        if let Some(result) = &mut delivered { wipe_model_result(result); }
+        return Err(error);
+    }
+    model_result(delivered.ok_or_else(|| unavailable("The model result was not admitted"))?)
+}
+
 impl ModelAccess {
-    /// The model's answer for `req` to `target`, from the cache or one call.
-    /// `examples` is computed only on a cache miss, and not at all under
-    /// privacy mode without `examples_under_privacy`. A request holding a
-    /// secret's value is never sent (a refusal), and an answer is scrubbed
-    /// of secret values before it is cached.
+    fn cached_slot(&self, target: &str, fingerprint: &[u8]) -> Result<(ModelSecretSnapshot, Option<Arc<Slot>>), ApiError> {
+        let source = (self.secret_snapshot)()?;
+        let key = format!("{target} {}", hex(fingerprint));
+        let slot = { lock(&self.cache.slots).get(&key).cloned() };
+        if let Some(found) = &slot
+            && found.source_fingerprint.is_some_and(|fingerprint| fingerprint != source.snapshot().fingerprint)
+        {
+            if found.answer.get().is_none() {
+                return Ok((source, None));
+            }
+            return Err(unavailable("The model cache belongs to a different certified secret snapshot"));
+        }
+        Ok((source, slot))
+    }
+
+    /// Metadata-only saved-fact probe; never creates a slot or clones a body.
+    pub fn has_cached_answer(&self, target: &str, fingerprint: &[u8]) -> Result<bool, ApiError> {
+        let (_, slot) = self.cached_slot(target, fingerprint)?;
+        Ok(slot.is_some_and(|slot| slot.answer.get().is_some()))
+    }
+
+    /// RecordedOnly lookup uses genuinely qualified source facts, not authority.
+    pub fn cached_answer(&self, target: &str, fingerprint: &[u8]) -> Result<Option<Option<ModelAnswer>>, ApiError> {
+        let (source, slot) = self.cached_slot(target, fingerprint)?;
+        let mut result = None;
+        if let Some(slot) = slot
+            && let Some(saved) = slot.answer.get()
+        {
+            if slot.source_fingerprint.is_none() { qualify_legacy_answer(source.snapshot(), saved)?; }
+            result = Some(saved.clone());
+        }
+        if let ModelSecretSnapshot::Live { publication, .. } = &source {
+            if let Err(error) = publication.check_current() {
+                if let Some(result) = &mut result { wipe_model_result(result); }
+                return Err(error);
+            }
+        }
+        result.map(model_result).transpose()
+    }
+
+    async fn fetch_body(
+        &self,
+        body: Vec<u8>,
+        job: &Arc<ModelHttpAdmission>,
+    ) -> Result<Zeroizing<Vec<u8>>, ApiError> {
+        job.check()?;
+        let deadline = self.env.clock.monotonic().checked_add(self.config.timeout)
+            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "The model deadline is invalid"))?;
+        let mut headers = vec![("content-type".to_owned(), "application/json".to_owned())];
+        if let Some(key) = &self.config.api_key {
+            headers.push(("authorization".to_owned(), format!("Bearer {key}")));
+        }
+        let authority: AuthLease = job.clone();
+        let call = self.env.net.http_authorized(kronik_core::env::HttpRequest {
+            method: "POST".into(), url: self.config.endpoint.clone(), headers,
+            body: body.into(), max_response_bytes: 1 << 20,
+        }, authority);
+        let Some(remaining) = deadline.checked_sub(self.env.clock.monotonic()).filter(|remaining| !remaining.is_zero()) else {
+            job.check()?;
+            return Err(ApiError::new(ErrorCode::Unavailable, "The model deadline expired before dispatch"));
+        };
+        let response = tokio::select! {
+            biased;
+            () = job.cancelled() => {
+                return Err(job.check().err().unwrap_or_else(source_scope_error));
+            }
+            response = self.env.timeout(remaining, call) => response,
+        };
+        let response = match response {
+            Ok(Ok(response)) => response,
+            failed => {
+                // Net's Connect string must not erase the exact job denial.
+                job.check()?;
+                return Err(ApiError::new(ErrorCode::Unavailable, if failed.is_err() {
+                    "The model request timed out"
+                } else {
+                    "The model request failed"
+                }));
+            }
+        };
+        // Native Core Net owns the bounded materialized response future.
+        // The same job and absolute deadline above span its entire body.
+        let output = Zeroizing::new(Vec::from(response.body));
+        job.check()?;
+        if !(200..300).contains(&response.status) {
+            return Err(ApiError::new(ErrorCode::Unavailable, "The model service returned an unsuccessful status"));
+        }
+        if output.len() > 1 << 20 {
+            return Err(ApiError::new(ErrorCode::Unavailable, "The model response exceeded its size limit"));
+        }
+        Ok(output)
+    }
+
+    /// Saved facts match first. A new request needs BOTH the caller's original
+    /// dispatch lease and the source's actual atomic live publication resource.
     pub async fn answer(
         &self,
         target: &str,
         fingerprint: &[u8],
         req: &pb::HttpEffectRequest,
-        examples: impl FnOnce(&dyn Fn(&[u8]) -> bool) -> Vec<serde_json::Value>,
-    ) -> Option<ModelAnswer> {
+        prepared_target: &Target,
+        prepared_scope: Option<&[pb::SecretRef]>,
+        examples: impl FnOnce(&CompiledScrubber<'_>, Option<&[pb::SecretRef]>) -> Vec<serde_json::Value>,
+        original: &AuthLease,
+    ) -> Result<Option<ModelAnswer>, ApiError> {
+        original.check()?;
+        let (source, existing) = self.cached_slot(target, fingerprint)?;
+        if let Some(slot) = existing.as_ref()
+            && let Some(saved) = slot.answer.get()
+        {
+            if slot.source_fingerprint.is_none() { qualify_legacy_answer(source.snapshot(), saved)?; }
+            return deliver_model_result(&source, original, saved.clone());
+        }
+        if self.offline {
+            return Err(ApiError::new(ErrorCode::Unavailable, "A recorded model answer is required"));
+        }
+        let ModelSecretSnapshot::Live { snapshot, publication } = &source else {
+            return Err(source_scope_error());
+        };
+        publication.check_current()?;
+        if req.headers.iter().any(|header| matches!(header.value.as_ref(), Some(pb::http_effect_header::Value::Secret(_)))) {
+            return deliver_model_result(&source, original, Ok(None));
+        }
+        let redact_error = |error: ScrubError| ApiError::new(ErrorCode::SecretUnavailable, error.to_string());
+        let patterns = kronik_sched::effects::secret_patterns(&snapshot.values);
+        let matcher = CompiledScrubber::new(&patterns, kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES)
+            .map_err(redact_error)?;
+        if req.fingerprint_version == 0 {
+            if req.encoded_len() > kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES {
+                return Err(redact_error(ScrubError::OutputLimit));
+            }
+            // Private inspection may preserve a genuine old known-sensitive
+            // refusal, but never emits version-0 request data or a new fact.
+            if request_holds(req, &|bytes| matcher.is_match(bytes)).map_err(redact_error)? {
+                return deliver_model_result(&source, original, Ok(None));
+            }
+        }
+        let current_scope = model_scope(snapshot, prepared_scope).map_err(redact_error)?;
+        prepared_request_safe(req, prepared_target, &matcher, Some(&current_scope), prepared_scope)
+            .map_err(redact_error)?;
+        publication.check_current()?;
         let key = format!("{target} {}", hex(fingerprint));
-        let slot = self.cache.slot(&key);
-        slot.get_or_init(|| async {
-            let secrets = match &self.secrets {
-                Some(s) => s.values().ok()?,
-                None => Vec::new(),
+        let slot = match existing {
+            Some(slot) => slot,
+            None => self.cache.slot(&key, snapshot.fingerprint)?,
+        };
+        let _initialization = match slot.initialization.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => tokio::select! {
+                biased;
+                () = original.cancelled() => {
+                    return Err(original.check().err().unwrap_or_else(||
+                        ApiError::new(ErrorCode::Unavailable, "The original model operation was cancelled")));
+                }
+                () = publication.cancelled() => {
+                    return Err(publication.check_current().err().unwrap_or_else(source_scope_error));
+                }
+                guard = slot.initialization.lock() => guard,
+            },
+        };
+        // Same fingerprint does not revive a retired generation after a wait.
+        publication.check_current()?;
+        if slot.answer.get().is_none() {
+            let prepared = (|| -> Result<_, ScrubError> {
+                let examples = if self.privacy && !self.config.examples_under_privacy { Vec::new() }
+                    else { examples(&matcher, Some(&current_scope)) };
+                let Some(body) = model_request(&self.config, prepared_target, &examples, req)? else { return Ok(None) };
+                Ok(Some(json_bytes(&body)?))
+            })().map_err(|error| ApiError::new(ErrorCode::SecretUnavailable, error.to_string()))?;
+            drop(matcher);
+            let mut job = None;
+            let result: ModelResult = match prepared {
+                None => Ok(None),
+                Some(request_body) => {
+                    let output = CompiledScrubber::new_output(&patterns, kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES)
+                        .map_err(redact_error)?;
+                    let request = ModelHttpAdmission::new(original.clone(), publication.clone());
+                    let fetched = self.fetch_body(request_body, &request).await?;
+                    job = Some(request);
+                    match parse_model_reply(&fetched) {
+                            None => return Err(ApiError::new(ErrorCode::Internal, "The model response is invalid")),
+                            Some(answer) => {
+                                let mut response = pb::HttpEffectResponse {
+                                    status: u32::from(answer.status),
+                                    headers: answer.headers.into_iter().map(|(name, value)| pb::HeaderPair { name, value }).collect(),
+                                    body: answer.body.into_bytes(), ..Default::default()
+                                };
+                                match kronik_sched::scrub::http_response(&mut response, &output, 1 << 20) {
+                                    Err(error) => {
+                                        response.body.zeroize();
+                                        for header in &mut response.headers { header.name.zeroize(); header.value.zeroize(); }
+                                        return Err(ApiError::new(ErrorCode::SecretUnavailable, error.to_string()));
+                                    }
+                                    Ok(()) => match String::from_utf8(response.body) {
+                                        Err(error) => {
+                                            let _bytes = Zeroizing::new(error.into_bytes());
+                                            return Err(ApiError::new(ErrorCode::SecretUnavailable, ScrubError::InvalidText.to_string()));
+                                        }
+                                        Ok(body) => Ok(Some(ModelAnswer {
+                                            status: answer.status,
+                                            headers: response.headers.into_iter().map(|header| (header.name, header.value)).collect(),
+                                            body,
+                                        })),
+                                    },
+                                }
+                            }
+                    }
+                }
             };
-            // Raw values are scanned, before JSON encoding and truncation
-            // could hide a secret that holds quotes, backslashes or control
-            // characters, or that sits past the cut.
-            let holds_secret = |b: &[u8]| kronik_effects::http::scrub(b, &secrets) != b;
-            if request_holds(req, &holds_secret) {
-                return None;
-            }
-            let examples = if self.privacy && !self.config.examples_under_privacy {
-                Vec::new()
-            } else {
-                examples(&holds_secret)
+            let mut pending = Some(result);
+            let mut repeated = false;
+            let mut publish = || {
+                let Some(result) = pending.take() else {
+                    repeated = true;
+                    return Err(ApiError { code: ErrorCode::StorageCorrupt, message: String::new(), hint: None });
+                };
+                match slot.answer.set(result) {
+                    Ok(()) => {
+                        self.cache.dirty.store(true, Ordering::Release);
+                        Ok(())
+                    }
+                    Err(tokio::sync::SetError::AlreadyInitializedError(result)
+                        | tokio::sync::SetError::InitializingError(result)) => {
+                        pending = Some(result);
+                        repeated = true;
+                        Err(ApiError { code: ErrorCode::StorageCorrupt, message: String::new(), hint: None })
+                    }
+                }
             };
-            if self.offline {
-                return None;
+            let admitted = match &job {
+                Some(job) => job.admit(&mut publish),
+                None => admit_model_data(original, publication, &mut publish)
+                    .map_err(|denial| denial.error().clone()),
+            };
+            // Retired/unadmitted payloads and SetError values are kept until
+            // after BOTH publication fences have been released.
+            if let Some(result) = &mut pending { wipe_model_result(result); }
+            if repeated {
+                return Err(ApiError::new(ErrorCode::StorageCorrupt, "The immutable model result was already initialized"));
             }
-            let body = model_request(&self.config, target, &examples, req)?;
-            let body = serde_json::to_vec(&body).ok()?;
-            let mut headers = vec![("content-type".to_owned(), "application/json".to_owned())];
-            if let Some(k) = &self.config.api_key {
-                headers.push(("authorization".to_owned(), format!("Bearer {k}")));
-            }
-            let call = self.env.net.http(kronik_core::env::HttpRequest {
-                method: "POST".into(),
-                url: self.config.endpoint.clone(),
-                headers,
-                body: body.into(),
-                max_response_bytes: 1 << 20,
-            });
-            let resp = self
-                .env
-                .timeout(self.config.timeout, call)
-                .await
-                .ok()?
-                .ok()?;
-            if !(200..300).contains(&resp.status) {
-                return None;
-            }
-            let mut a = parse_model_reply(&resp.body)?;
-            let scrub = |s: &str| kronik_effects::http::scrub_str(s, &secrets);
-            a.body = scrub(&a.body);
-            for (_, v) in &mut a.headers {
-                *v = scrub(v);
-            }
-            Some(a)
-        })
-        .await
-        .clone()
+            admitted?;
+        }
+        let saved = slot.answer.get().cloned().ok_or_else(|| unavailable("The model result is unavailable"))?;
+        deliver_model_result(&source, original, saved)
     }
 }
 
@@ -669,9 +1358,11 @@ mod tests {
                 text_header("x-b", "2"),
             ],
             body: b"hello".to_vec(),
+            ..Default::default()
         };
-        let body = model_request(&cfg, "http:api.example.com", &[], &req)
-            .unwrap()
+        let target = parse_url(&req.url).unwrap();
+        let body = model_request(&cfg, &target, &[], &req)
+            .unwrap().unwrap()
             .to_string();
         assert!(!body.contains("t0p"));
         assert!(body.contains("x-b") && body.contains("hello"));
@@ -685,7 +1376,7 @@ mod tests {
             }],
             ..req
         };
-        assert!(model_request(&cfg, "http:api.example.com", &[], &secret).is_none());
+        assert!(model_request(&cfg, &target, &[], &secret).unwrap().is_none());
     }
 
     fn plain(b: Vec<u8>) -> Option<pb::Sealable> {
@@ -722,6 +1413,7 @@ mod tests {
                         },
                     ],
                     body: b"ok".to_vec(),
+                    ..Default::default()
                 }
                 .encode_to_vec(),
             ),
@@ -732,7 +1424,9 @@ mod tests {
     /// L4: examples show the model only the content type of a response.
     #[test]
     fn examples_keep_only_the_content_type() {
-        let ex = model_examples(&[(1, exchange())], 5, &|_| false);
+        let patterns: &[(&str, &[u8])] = &[];
+        let matcher = CompiledScrubber::new(patterns, 0).unwrap();
+        let ex = model_examples(&[(1, &exchange(), None)], 5, &matcher, Some(&[]));
         assert_eq!(
             ex[0]["response"]["headers"],
             serde_json::json!({"content-type": "text/plain"})
@@ -758,6 +1452,7 @@ mod tests {
                 text("Accept", "application/json"),
             ],
             body: Vec::new(),
+            ..Default::default()
         };
         let view = request_view(&req).unwrap();
         assert_eq!(
@@ -772,7 +1467,8 @@ mod tests {
     #[test]
     fn examples_holding_a_secret_raw_are_left_out() {
         let secret: &[u8] = b"s\"q";
-        let holds = |b: &[u8]| b.windows(secret.len()).any(|w| w == secret);
+        let patterns = [("secret", secret)];
+        let matcher = CompiledScrubber::new(&patterns, 1024).unwrap();
         let mut quoted = exchange();
         quoted.request = plain(
             pb::HttpEffectRequest {
@@ -783,6 +1479,7 @@ mod tests {
                     value: Some(pb::http_effect_header::Value::Text("a s\"q b".into())),
                 }],
                 body: Vec::new(),
+                ..Default::default()
             }
             .encode_to_vec(),
         );
@@ -794,10 +1491,12 @@ mod tests {
                 status: 200,
                 headers: vec![],
                 body,
+                ..Default::default()
             }
             .encode_to_vec(),
         );
-        let ex = model_examples(&[(1, quoted), (2, long), (3, exchange())], 5, &holds);
+        let ex = model_examples(&[(1, &quoted, None), (2, &long, None), (3, &exchange(), None)],
+            5, &matcher, None);
         assert_eq!(ex.len(), 1, "{ex:?}");
     }
 
@@ -830,12 +1529,212 @@ mod tests {
     /// M3: a cache file that does not parse is an error, not an empty cache.
     #[test]
     fn a_corrupt_cache_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("kronik-cache-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("simulator-cache.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("simulator-cache.json");
         assert!(ModelCache::open(&path).unwrap().is_empty());
         std::fs::write(&path, b"{not json").unwrap();
         assert!(ModelCache::open(&path).is_err());
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_invalid_cache_envelope_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        let original = br#"{"http:h fp":{"status":200,"headers":[],"body":"old fact"}}"#;
+        std::fs::write(&path, original).unwrap();
+        assert!(ModelCache::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn stamped_cache_roundtrips_refusal_and_typed_failure_without_rewriting_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        let cache = ModelCache::open(&path).unwrap();
+        let source = [9; 32];
+        let answer = ModelAnswer { status: 206, headers: Vec::new(), body: "[secret:E]".into() };
+        cache.slot("answer", source).unwrap().answer.set(Ok(Some(answer.clone()))).unwrap();
+        cache.slot("refusal", source).unwrap().answer.set(Ok(None)).unwrap();
+        cache.slot("failure", source).unwrap().answer.set(Err(ModelCacheError::Redaction(ScrubError::SourceScopeUnavailable))).unwrap();
+        cache.save().unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let reopened = ModelCache::read_only(&path).unwrap();
+        assert_eq!(reopened.slot("answer", source).unwrap().answer.get(), Some(&Ok(Some(answer))));
+        assert_eq!(reopened.slot("refusal", source).unwrap().answer.get(), Some(&Ok(None)));
+        assert_eq!(reopened.slot("failure", source).unwrap().answer.get(),
+            Some(&Err(ModelCacheError::Redaction(ScrubError::SourceScopeUnavailable))));
+        assert!(reopened.slot("answer", [10; 32]).is_err());
+        reopened.save().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn recorded_only_cache_checks_source_before_hit_and_never_creates_a_miss() {
+        let cache = Arc::new(ModelCache::memory());
+        let snapshot = Arc::new(Mutex::new(Arc::new(kronik_sched::secrets::CertifiedSecretSnapshot {
+            values: Vec::new(), references: Some(Arc::from([])), fingerprint: [3; 32],
+        })));
+        let source = snapshot.clone();
+        let access = ModelAccess {
+            config: ModelConfig {
+                endpoint: "http://127.0.0.1:1/never-used".into(), model: "test".into(), api_key: None,
+                timeout: Duration::from_secs(1), max_examples: 1, examples_under_privacy: false,
+            },
+            env: Env::real(tokio::runtime::Handle::current()), cache: cache.clone(), privacy: false, offline: true,
+            secret_snapshot: Arc::new(move || Ok(ModelSecretSnapshot::Recorded(lock(&source).clone()))),
+        };
+        assert_eq!(access.cached_answer("http:h", &[1]).unwrap(), None);
+        assert!(!access.has_cached_answer("http:h", &[1]).unwrap());
+        assert_eq!(cache.len(), 0);
+        let key = "http:h 01";
+        cache.slot(key, [3; 32]).unwrap().answer.set(Ok(None)).unwrap();
+        assert_eq!(access.cached_answer("http:h", &[1]).unwrap(), Some(None));
+        assert!(access.has_cached_answer("http:h", &[1]).unwrap());
+        *lock(&snapshot) = Arc::new(kronik_sched::secrets::CertifiedSecretSnapshot {
+            values: Vec::new(), references: Some(Arc::from([])), fingerprint: [4; 32],
+        });
+        assert!(access.cached_answer("http:h", &[1]).is_err());
+        assert!(access.has_cached_answer("http:h", &[1]).is_err());
+        assert_eq!(cache.len(), 1);
+        assert_eq!(lock(&cache.slots)[key].answer.get(), Some(&Ok(None)));
+    }
+
+    #[test]
+    fn json_writer_refuses_growth_before_allocation_and_does_not_lose_accepted_bytes() {
+        let mut writer = JsonWriter { bytes: Vec::new(), limit: 4 };
+        writer.write_all(b"1234").unwrap();
+        assert!(writer.write_all(b"5").is_err());
+        assert_eq!(writer.bytes, b"1234");
+    }
+
+    #[test]
+    fn neighbor_scope_contains_only_original_prefix_not_future_references() {
+        let reference = |name: &str| pb::SecretRef {
+            name: name.into(), version: 1, version_hash: vec![1; 16], ..Default::default()
+        };
+        let reveal = |ordinal, name| pb::EffectRecord {
+            ordinal, kind: "secret.reveal".into(), status: pb::EffectStatus::Ok as i32,
+            request: plain(pb::RevealEffectRequest { secret: Some(reference(name)) }.encode_to_vec()), ..Default::default()
+        };
+        let mut source = exchange();
+        source.ordinal = 2;
+        let mut request = pb::HttpEffectRequest::decode(subject_free(source.request.as_ref()).unwrap()).unwrap();
+        request.fingerprint_version = 2;
+        source.request = plain(request.encode_to_vec());
+        let mut turn = pb::TurnRecord {
+            input: Some(pb::Input { kind: Some(pb::input::Kind::Migrate(pb::MigrateInput {
+                from_schema_version: 1, to_schema_version: 2,
+            })) }),
+            effects: vec![reveal(1, "before"), source, reveal(3, "future")], ..Default::default()
+        };
+        let prefix = original_secret_prefix(turn.input.as_ref().unwrap(), &turn.effects, 2).unwrap();
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(prefix[0].name, "before");
+        turn.effects[0].request = None;
+        assert!(original_secret_prefix(turn.input.as_ref().unwrap(), &turn.effects, 2).is_none());
+        turn.effects = vec![exchange()];
+        assert!(original_secret_prefix(turn.input.as_ref().unwrap(), &turn.effects, 0).is_none());
+    }
+
+    #[test]
+    fn prepared_model_capture_keeps_the_actual_producer_markers_and_typed_target() {
+        let value = Arc::new(Zeroizing::new(b"e".to_vec()));
+        let reference = pb::SecretRef { name: "UPPER".into(), version: 1, version_hash: vec![7; 16], ..Default::default() };
+        let scope: Arc<[pb::SecretRef]> = Arc::from([reference]);
+        let snapshot = kronik_sched::secrets::CertifiedSecretSnapshot {
+            values: vec![("UPPER".into(), value)], references: Some(scope.clone()), fingerprint: [1; 32],
+        };
+        let patterns = kronik_sched::effects::secret_patterns(&snapshot.values);
+        let matcher = CompiledScrubber::new(&patterns, kronik_sched::scrub::MAX_SECRET_PATTERN_BYTES).unwrap();
+        let mut request = pb::HttpEffectRequest {
+            method: "POST".into(), url: "https://example.test/e".into(), body: b"e".to_vec(), ..Default::default()
+        };
+        let original_url = Zeroizing::new(std::mem::take(&mut request.url));
+        let (original, raw_host) = parse_request_url(&original_url).unwrap();
+        let target = kronik_sched::scrub::http_request(&mut request, &original, raw_host, &matcher, 4096).unwrap();
+        assert!(matcher.is_match(&request.body), "the generated marker deliberately overlaps a needle");
+        let current = model_scope(&snapshot, Some(&scope)).unwrap();
+        prepared_request_safe(&request, &target, &matcher, Some(&current), Some(&scope)).unwrap();
+        let config = ModelConfig {
+            endpoint: "http://127.0.0.1:1/unused".into(), model: "m".into(), api_key: None,
+            timeout: Duration::from_secs(1), max_examples: 1, examples_under_privacy: false,
+        };
+        let captured = model_request(&config, &target, &[], &request).unwrap().unwrap();
+        let content: serde_json::Value = serde_json::from_str(captured["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content["request"]["body"], "[secret:UPPER]");
+        assert_eq!(content["request"]["url"], request.url);
+        assert!(captured["messages"][0]["content"].as_str().unwrap().contains(&target.host));
+        assert_eq!(request.body, b"[secret:UPPER]");
+    }
+
+    #[test]
+    fn new_identity_ambiguity_is_a_prerequisite_before_a_model_slot_exists() {
+        let old = pb::SecretRef { name: "old".into(), version: 1, version_hash: vec![1; 16], ..Default::default() };
+        let new = pb::SecretRef { name: "new".into(), version: 1, version_hash: vec![2; 16], ..Default::default() };
+        let previous_scope = [old.clone()];
+        let previous_values = [("old", b"a".as_slice())];
+        let previous_matcher = CompiledScrubber::new(&previous_values, 1024).unwrap();
+        let mut request = pb::HttpEffectRequest {
+            method: "POST".into(), url: "http://h/".into(), body: b"a".to_vec(), ..Default::default()
+        };
+        let original_url = Zeroizing::new(std::mem::take(&mut request.url));
+        let (original, raw_host) = parse_request_url(&original_url).unwrap();
+        let target = kronik_sched::scrub::http_request(&mut request, &original, raw_host, &previous_matcher, 4096).unwrap();
+        let snapshot = kronik_sched::secrets::CertifiedSecretSnapshot {
+            values: vec![("old".into(), Arc::new(Zeroizing::new(b"a".to_vec()))),
+                ("new".into(), Arc::new(Zeroizing::new(b"secret".to_vec())))],
+            references: Some(Arc::from([old, new])), fingerprint: [2; 32],
+        };
+        let current = model_scope(&snapshot, Some(&previous_scope)).unwrap();
+        let patterns = kronik_sched::effects::secret_patterns(&snapshot.values);
+        let matcher = CompiledScrubber::new(&patterns, 1024).unwrap();
+        let cache = ModelCache::memory();
+        assert_eq!(prepared_request_safe(&request, &target, &matcher, Some(&current), Some(&previous_scope)),
+            Err(ScrubError::SourceScopeUnavailable));
+        assert!(cache.is_empty());
+        assert_eq!(request.body, b"[secret:old]");
+        assert!(model_scope(&snapshot, None).is_err());
+    }
+
+    #[test]
+    fn prepared_examples_use_the_actual_original_prefix_without_rematching_markers() {
+        let reference = pb::SecretRef { name: "UPPER".into(), version: 1, version_hash: vec![7; 16], ..Default::default() };
+        let scope: Arc<[pb::SecretRef]> = Arc::from([reference.clone()]);
+        let patterns = [("UPPER", b"e".as_slice())];
+        let matcher = CompiledScrubber::new(&patterns, 1024).unwrap();
+        let mut request = pb::HttpEffectRequest {
+            method: "POST".into(), url: "https://example.test/e".into(), body: b"e".to_vec(), ..Default::default()
+        };
+        let original_url = Zeroizing::new(std::mem::take(&mut request.url));
+        let (original, raw_host) = parse_request_url(&original_url).unwrap();
+        let target = kronik_sched::scrub::http_request(&mut request, &original, raw_host, &matcher, 4096).unwrap();
+        let reveal = pb::EffectRecord {
+            ordinal: 1, kind: "secret.reveal".into(), status: pb::EffectStatus::Ok as i32,
+            request: plain(pb::RevealEffectRequest { secret: Some(reference) }.encode_to_vec()), ..Default::default()
+        };
+        let source = pb::EffectRecord {
+            ordinal: 2, kind: "http.fetch".into(), target: "http:example.test".into(),
+            status: pb::EffectStatus::Ok as i32, request: plain(request.encode_to_vec()),
+            response: plain(pb::HttpEffectResponse {
+                status: 200, body: b"[secret:UPPER]".to_vec(), ..Default::default()
+            }.encode_to_vec()), ..Default::default()
+        };
+        let turn = pb::TurnRecord {
+            input: Some(pb::Input { kind: Some(pb::input::Kind::Migrate(pb::MigrateInput {
+                from_schema_version: 1, to_schema_version: 2,
+            })) }),
+            effects: vec![reveal, source], ..Default::default()
+        };
+        let prefix = original_secret_prefix(turn.input.as_ref().unwrap(), &turn.effects, 2).unwrap();
+        let examples = model_examples(&[(2, &turn.effects[1], Some(prefix))], 1, &matcher, Some(&scope));
+        assert_eq!(examples.len(), 1);
+        assert_eq!(examples[0]["request"]["url"], request.url);
+        assert_eq!(examples[0]["request"]["body"], "[secret:UPPER]");
+        assert_eq!(examples[0]["response"]["body"], "[secret:UPPER]");
+        assert_eq!(kronik_effects::http::prepared_target(&request).unwrap(), target);
+        assert!(model_examples(&[(2, &turn.effects[1], None)], 1, &matcher, Some(&scope)).is_empty());
     }
 }
+
+#[cfg(test)]
+mod publication_tests;

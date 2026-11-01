@@ -407,6 +407,7 @@ mod tests {
                         url: url.into(),
                         headers: vec![],
                         body: body.as_bytes().to_vec(),
+                        ..Default::default()
                     }
                     .encode_to_vec(),
                 ),
@@ -456,6 +457,7 @@ mod tests {
             url: url.into(),
             headers: vec![],
             body: body.as_bytes().to_vec(),
+            ..Default::default()
         };
         let body = |r: Option<&pb::HttpEffectResponse>| {
             r.map(|r| String::from_utf8_lossy(&r.body).into_owned())

@@ -4,12 +4,12 @@
 use kronik_core::error::{ApiError, ErrorCode};
 
 use crate::types::{ExportRewindRequest, ExportRewindResponse, ExportStatusResponse, ExportStream};
-use crate::{Api, ApiRequest, ApiResponse, Result, json, ok, reason};
+use crate::{Api, AuthorizedRequest, ApiResponse, Result, json, ok, reason};
 
 impl Api {
     pub(crate) async fn route_export(
         &self,
-        req: &ApiRequest,
+        req: &AuthorizedRequest,
         segs: &[&str],
     ) -> Option<Result<ApiResponse>> {
         Some(match (req.method.as_str(), segs) {
@@ -35,7 +35,7 @@ impl Api {
                     0
                 };
                 ExportStream {
-                    name: s.name.into(),
+                    name: s.name.to_string(),
                     enabled: s.enabled,
                     sink: s.sink.clone(),
                     cursor: p.cursor,
@@ -57,10 +57,10 @@ impl Api {
     /// `POST /v1/export/{stream}/rewind` (scope `operate`): resend from
     /// after `to`, after a sink lost data. For the audit stream, retention
     /// is held from `to` at once, before the follower picks the rewind up.
-    async fn export_rewind(&self, req: &ApiRequest, name: &str) -> Result<ApiResponse> {
+    async fn export_rewind(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: ExportRewindRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let Some(stream) = self.exports.iter().find(|s| s.name == name && s.enabled) else {
+        let Some(stream) = self.exports.iter().find(|s| s.name.as_ref() == name && s.enabled) else {
             return Err(ApiError::new(
                 ErrorCode::ExportNotConfigured,
                 format!("the export stream {name:?} is not on in this daemon"),
@@ -93,13 +93,11 @@ impl Api {
         let details = [("from", from.to_string()), ("to", r.to.to_string())];
         self.audit_event(req, "export.rewind", name, &details, r.reason.clone())
             .await?;
-        if let Err(error) = stream.rewind(&self.node, r.to).await {
-            let error = if error.kind() == std::io::ErrorKind::InvalidInput {
-                ApiError::new(ErrorCode::BadRequest, "the rewind no longer matches the durable export cursor")
-                    .with_hint("Run `kronik export status`, choose a retained point at or before its cursor, and retry.")
-            } else {
-                ApiError::new(ErrorCode::Unavailable, "the export rewind could not be made durable")
-                    .with_hint("Check storage health and write access to the data directory, then retry; the rewind was not acknowledged.")
+        if let Err(error) = stream.rewind(&self.node, r.to, req.authority()).await {
+            let error = match error.code {
+                ErrorCode::BadRequest => error.with_hint("Run `kronik export status`, choose a retained point at or before its cursor, and retry."),
+                ErrorCode::Unavailable => error.with_hint("Check storage health and write access to the data directory, then retry; the rewind was not acknowledged."),
+                _ => error,
             };
             let mut failed = details.to_vec();
             failed.push(("code", error.code.as_str().to_owned()));

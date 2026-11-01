@@ -23,6 +23,9 @@ use kronik_proto::log::v1 as pb;
 use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
 
+#[path = "common/oidc_provider.rs"]
+mod oidc_provider;
+
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/guests/counter.wasm"
@@ -255,6 +258,18 @@ fn cases() -> Vec<Case> {
             writes: "export.rewind",
             extra: json!({"to": 0}),
         },
+        Case {
+            method: "POST",
+            path: "/v1/auth/logout",
+            writes: "auth.logout",
+            extra: json!({}),
+        },
+        Case {
+            method: "PUT",
+            path: "/v1/auth/config",
+            writes: "auth.config",
+            extra: json!({"config": null}),
+        },
     ]
 }
 
@@ -287,6 +302,75 @@ async fn call(api: &Api, method: &str, path: &str, body: Value) -> (u16, Value) 
         })
         .await;
     (r.status, serde_json::from_slice(&r.body).unwrap())
+}
+
+struct BrowserSession {
+    auth: Arc<kronik_api::oidc::BrowserAuth>,
+    cookie: String,
+    csrf: String,
+    _provider: oidc_provider::OwnedOidc,
+}
+
+async fn browser_fixture(api: Api, node: &kronik_sched::Node,
+    tokens: Arc<kronik_api::tokens::TokenStore>) -> (Arc<Api>, BrowserSession)
+{
+    let api = api.with_tokens(tokens.clone()).unwrap();
+    tokens.create("ui-reviewer", kronik_api::auth::Scope::ALL.into_iter().collect(), [17; 32],
+        &kronik_api::tokens::Change { wall_ms: node.env().clock.wall_ms(),
+            by: "unix:uid=0", reason: "audit" }, false).unwrap();
+    let mut provider = oidc_provider::OwnedOidc::start("https://localhost:19444".into());
+    let profile = provider.profile("ui-reviewer");
+    let config = serde_json::from_value(profile.clone()).unwrap();
+    let auth = kronik_api::oidc::BrowserAuth::open(node.env().clone(), tokens, Some(config), None,
+        node.sealer().clone(), true).await.unwrap();
+    let api = Arc::new(api.with_browser(auth.clone()));
+    assert_eq!(call(&api, "PUT", "/v1/auth/config",
+        json!({"config": profile, "reason": "audit", "dry_run": false})).await.0, 200);
+    let request = |path: &str, query: String, bearer: Option<String>| ApiRequest {
+        method: "GET".into(), path: path.into(), query, body: Vec::new(),
+        token_id: "admin:browser".into(), bearer,
+    };
+    let start = auth.route(&request("/v1/auth/login", String::new(), None), None, &api, None)
+        .await.unwrap().unwrap();
+    assert_eq!(start.status, 303);
+    let location = start.headers.iter().find(|(name, _)| *name == "location").unwrap().1.clone();
+    let login_cookie = start.headers.iter().find(|(name, value)| *name == "set-cookie" && value.starts_with("__Host-kronik-login=")).unwrap().1
+        .split(';').next().unwrap().to_owned();
+    let authorize = provider.request("GET", &location, json!({}), None);
+    assert_eq!(authorize["status"], 302);
+    let callback = url::Url::parse(&oidc_provider::header(&authorize, "location")).unwrap();
+    let callback = auth.route(&request(callback.path(), callback.query().unwrap().into(), None),
+        Some(&login_cookie), &api, None).await.unwrap().unwrap();
+    assert_eq!(callback.status, 303);
+    let cookie = callback.headers.iter().find(|(name, value)| *name == "set-cookie" && value.starts_with("__Host-kronik-session=")).unwrap().1
+        .split(';').next().unwrap().to_owned();
+    let credential = auth.credential(None, Some(&cookie), "GET", None, None).unwrap();
+    let info = request("/v1/auth/session", String::new(), credential);
+    let captured = auth.capture_protocol_request(&info, &api).unwrap();
+    let info = auth.route(&info, Some(&cookie), &api, captured).await.unwrap().unwrap();
+    let info: Value = serde_json::from_slice(&info.body).unwrap();
+    let csrf = info["csrf_token"].as_str().unwrap().to_owned();
+    (api, BrowserSession { auth, cookie, csrf, _provider: provider })
+}
+
+async fn mutation_call(api: &Api, browser: &BrowserSession, method: &str, path: &str,
+    body: Value) -> (u16, Value)
+{
+    if path != "/v1/auth/logout" { return call(api, method, path, body).await; }
+    let invoke = async {
+        let credential = browser.auth.credential(None, Some(&browser.cookie), method,
+            Some("https://localhost:19444"), Some(&browser.csrf))?;
+        let mut request = ApiRequest { method: method.into(), path: path.into(), query: String::new(),
+            body: Vec::new(), token_id: "admin:browser".into(), bearer: credential };
+        let captured = browser.auth.capture_protocol_request(&request, api)?;
+        request.body = body.to_string().into_bytes();
+        browser.auth.route(&request, Some(&browser.cookie), api, captured).await
+            .expect("published browser mutation")
+    };
+    match invoke.await {
+        Ok(response) => (response.status, serde_json::from_slice(&response.body).unwrap()),
+        Err(error) => (error.code.http_status(), error.to_json()),
+    }
 }
 
 async fn applied(api: &Api) -> u64 {
@@ -345,23 +429,19 @@ async fn every_mutation_requires_a_reason_and_a_dry_run_writes_nothing() {
             .await
             .unwrap(),
     );
-    let api = Arc::new(
-        Api::new(node)
-            .with_proposals(proposals)
-            .with_watches(watches)
-            .with_exports(vec![kronik_otel::follow::Stream::new(
-                "audit",
-                true,
-                "file://".into(),
-                0,
-                cursors,
-            )]),
-    );
+    let api = Api::new(node.clone())
+        .with_proposals(proposals)
+        .with_watches(watches)
+        .with_exports(vec![kronik_otel::follow::Stream::new_audit(
+            "audit", true, "file://".into(), 0, cursors,
+        )]);
+    let tokens = Arc::new(kronik_api::tokens::TokenStore::open_file(&dir.path().join("tokens.db")).unwrap());
+    let (api, browser) = browser_fixture(api, &node, tokens).await;
     let start = applied(&api).await;
 
     for case in &cases {
-        let (status, body) = call(
-            &api,
+        let (status, body) = mutation_call(
+            &api, &browser,
             case.method,
             &concrete(case.path),
             with_reason(&case.extra, " ", false),
@@ -392,8 +472,8 @@ async fn every_mutation_requires_a_reason_and_a_dry_run_writes_nothing() {
 
     for case in &cases {
         let before = applied(&api).await;
-        let (status, body) = call(
-            &api,
+        let (status, body) = mutation_call(
+            &api, &browser,
             case.method,
             &concrete(case.path),
             with_reason(&case.extra, "dry run", true),
@@ -406,6 +486,10 @@ async fn every_mutation_requires_a_reason_and_a_dry_run_writes_nothing() {
             case.method,
             case.path
         );
+        if case.path.starts_with("/v1/auth/") {
+            assert_eq!(status, 200, "real authenticated auth mutation dry run");
+            assert!(browser.auth.credential(None, Some(&browser.cookie), "GET", None, None).unwrap().is_some());
+        }
         if status == 200 {
             assert_eq!(
                 body["dry_run"], true,
@@ -586,26 +670,21 @@ async fn every_mutation_writes_its_audited_record() {
     )
     .unwrap()
     .start();
-    let tokens = kronik_api::tokens::TokenStore::open_file(&dir.path().join("tokens.db")).unwrap();
+    let mut tokens = kronik_api::tokens::TokenStore::open_file(&dir.path().join("tokens.db")).unwrap();
+    tokens.bind_before_any_issuer(node.publication_domain()).unwrap();
     let cursors = Arc::new(
         kronik_otel::cursor::Cursors::load(node.env().clone(), dir.path())
             .await
             .unwrap(),
     );
-    let api = Arc::new(
-        Api::new(node.clone())
-            .with_proposals(proposals)
-            .with_watches(watches)
-            .with_tokens(Arc::new(tokens))
-            // A stream without a follower: the rewind is only requested.
-            .with_exports(vec![kronik_otel::follow::Stream::new(
-                "audit",
-                true,
-                "file://".into(),
-                0,
-                cursors,
-            )]),
-    );
+    let api = Api::new(node.clone())
+        .with_proposals(proposals)
+        .with_watches(watches)
+        // A stream without a follower: the rewind is only requested.
+        .with_exports(vec![kronik_otel::follow::Stream::new_audit(
+            "audit", true, "file://".into(), 0, cursors,
+        )]);
+    let (api, browser) = browser_fixture(api, &node, Arc::new(tokens)).await;
     let b64 = |p: &str| base64::engine::general_purpose::STANDARD.encode(std::fs::read(p).unwrap());
     let step2 = b64(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -813,6 +892,8 @@ async fn every_mutation_writes_its_audited_record() {
             json!({}),
         ),
         ("POST", "/v1/keys/rewrap", "/v1/keys/rewrap", json!({})),
+        ("POST", "/v1/auth/logout", "/v1/auth/logout", json!({})),
+        ("PUT", "/v1/auth/config", "/v1/auth/config", json!({"config": null})),
     ];
     let run: std::collections::BTreeSet<(&str, &str)> =
         steps.iter().map(|(m, t, _, _)| (*m, *t)).collect();
@@ -838,7 +919,7 @@ async fn every_mutation_writes_its_audited_record() {
             )
             .replace("{epoch}", &epoch);
         let before = node.applied_lsn();
-        let (status, v) = call(&api, method, &path, with_reason(&extra, "audit", false)).await;
+        let (status, v) = mutation_call(&api, &browser, method, &path, with_reason(&extra, "audit", false)).await;
         let got = audited_since(&node, before).await;
         if UNDRIVEN.contains(&(method, template)) {
             assert_ne!(status, 200, "{method} {path}: {v}");
@@ -884,7 +965,9 @@ async fn every_mutation_writes_its_audited_record() {
     assert!(
         events
             .iter()
-            .all(|e| e.audit.as_ref().unwrap().reason == "audit")
+            .all(|e| e.audit.as_ref().unwrap().reason == if e.action == "auth.oidc.login" {
+                "verified OIDC authorization-code login"
+            } else { "audit" })
     );
 }
 
@@ -907,8 +990,9 @@ async fn a_failed_token_create_writes_its_intent_and_failed() {
     let read_only =
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
-    let tokens = kronik_api::tokens::TokenStore::open(read_only).unwrap();
-    let api = Api::new(node.clone()).with_tokens(Arc::new(tokens));
+    let mut tokens = kronik_api::tokens::TokenStore::open(read_only).unwrap();
+    tokens.bind_before_any_issuer(node.publication_domain()).unwrap();
+    let api = Api::new(node.clone()).with_tokens(Arc::new(tokens)).unwrap();
     let before = node.applied_lsn();
     let (status, v) = call(
         &api,

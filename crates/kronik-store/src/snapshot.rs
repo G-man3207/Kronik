@@ -28,6 +28,11 @@ const HASHED_TABLES: &[&str] = &[
     "config_records",
     "policies",
     "approvals",
+    "secret_versions",
+    "secret_highwater",
+    "secret_format",
+    "secret_links",
+    "secret_link_history",
 ];
 
 /// What `Store::snapshot_to` wrote.

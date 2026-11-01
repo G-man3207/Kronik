@@ -11,8 +11,10 @@ import shutil
 import sys
 import tarfile
 import struct
+import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGER = runpy.run_path(str(ROOT / "scripts/package-release.py"))
@@ -39,6 +41,76 @@ class PackagingTest(unittest.TestCase):
                     binary.write_bytes(header + struct.pack("<I", 3) + bytes(52))
                     with self.assertRaisesRegex(ValueError, "dynamic"):
                         PACKAGER["check_binary"](binary, target)
+
+    def test_gnu_helper_requires_the_expected_loader_and_only_system_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "kronik-keyhelper"
+            original = Path(shutil.which("true")).read_bytes()
+            binary.write_bytes(original)
+            PACKAGER["check_binary"](binary, "x86_64-unknown-linux-gnu")
+            with self.assertRaisesRegex(ValueError, "dynamic"):
+                PACKAGER["check_binary"](binary, "x86_64-unknown-linux-musl")
+            loader = b"/lib64/ld-linux-x86-64.so.2"
+            self.assertIn(loader, original)
+            binary.write_bytes(original.replace(loader, b"/bad64/ld-linux-x86-64.so.2", 1))
+            with self.assertRaisesRegex(ValueError, "loader"):
+                PACKAGER["check_binary"](binary, "x86_64-unknown-linux-gnu")
+            self.assertIn(b"libc.so.6", original)
+            binary.write_bytes(original.replace(b"libc.so.6", b"libx.so.6", 1))
+            with self.assertRaisesRegex(ValueError, "dependencies"):
+                PACKAGER["check_binary"](binary, "x86_64-unknown-linux-gnu")
+
+    def test_gnu_archive_contains_only_the_helper_and_its_own_sbom(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("LICENSE", "NOTICE"):
+                shutil.copyfile(ROOT / name, root / name)
+            binary = root / "helper-input"
+            shutil.copyfile(shutil.which("true"), binary)
+            sbom = root / "helper.cdx.json"
+            bom = {"bomFormat": "CycloneDX",
+                   "metadata": {"component": {"name": "kronik-keyhelper", "version": "1.0.0"}}}
+            sbom.write_text(json.dumps(bom))
+            metadata = {"workspace_root": str(root), "workspace_members": ["helper"],
+                        "packages": [{"id": "helper", "name": "kronik-keyhelper",
+                                      "version": "1.0.0", "source": None}],
+                        "resolve": {"nodes": [{"id": "helper", "deps": []}]}}
+            package = PACKAGER["package"]
+            out = root / "out"
+            # This unit isolates archive selection; real collector/CLI proof uses the compiled helper.
+            with patch.dict(package.__globals__, notices=lambda *_: (ROOT / "LICENSE").read_bytes()):
+                package("x86_64-unknown-linux-gnu", binary, sbom, metadata, root / "no-zig", out)
+                archive = out / "kronik-keyhelper-x86_64-unknown-linux-gnu.tar.gz"
+                digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+                with tarfile.open(archive, "r:gz") as tar:
+                    self.assertEqual(set(tar.getnames()), {"kronik-keyhelper", "kronik-keyhelper.cdx.json",
+                                                          "LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.txt"})
+                    self.assertEqual(tar.extractfile("kronik-keyhelper").read(), binary.read_bytes())
+                    self.assertEqual(json.load(tar.extractfile("kronik-keyhelper.cdx.json")), bom)
+                    self.assertEqual({member.name: member.mode for member in tar},
+                                     {name: 0o755 if name == "kronik-keyhelper" else 0o644
+                                      for name in tar.getnames()})
+                self.assertEqual(archive.with_name(archive.name + ".sha256").read_text(),
+                                 f"{digest}  {archive.name}\n")
+                bom["metadata"]["component"]["name"] = "kronik"
+                sbom.write_text(json.dumps(bom))
+                with self.assertRaises(ValueError):
+                    package("x86_64-unknown-linux-gnu", binary, sbom, metadata, root / "no-zig", out)
+                self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), digest)
+
+    def test_helper_root_never_enables_cryptoki_in_the_daemon_closure(self):
+        def node(name, dependencies=()):
+            return {"id": name, "deps": [{"pkg": child, "dep_kinds": [{"kind": None}]}
+                                        for child in dependencies]}
+        names = ("kronik", "kronik-keyhelper", "daemon-only", "cryptoki")
+        metadata = {"workspace_root": str(ROOT), "workspace_members": list(names[:2]),
+                    "packages": [{"id": name, "name": name, "version": "1", "source": None if name in names[:2] else "registry"}
+                                 for name in names],
+                    "resolve": {"nodes": [node("kronik", ("daemon-only",)),
+                                          node("kronik-keyhelper", ("cryptoki",)),
+                                          node("daemon-only"), node("cryptoki")]}}
+        self.assertEqual([p["name"] for p in PACKAGER["packages"](metadata)[1]], ["daemon-only"])
+        self.assertEqual([p["name"] for p in PACKAGER["packages"](metadata, "kronik-keyhelper")[1]], ["cryptoki"])
 
     def test_only_normal_dependency_closure_is_distributed(self):
         def node(name, dependencies=()):
@@ -305,18 +377,21 @@ class ReproducibilityTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         PACKAGER["reproducible_sbom"](path, source)
 
-    def fixture(self, root):
+    def fixture(self, root, with_keyhelper=False):
         binary = Path(sys.executable).read_bytes()
         output = root / "source/dist/release"
         output.mkdir(parents=True)
-        for target in REPRO["TARGETS"]:
-            path = root / "target" / target / "release/kronik"
+        artifacts = [("kronik", target) for target in REPRO["TARGETS"]]
+        if with_keyhelper:
+            artifacts.append(("kronik-keyhelper", "x86_64-unknown-linux-gnu"))
+        for name, target in artifacts:
+            path = root / "target" / target / "release" / name
             path.parent.mkdir(parents=True)
             path.write_bytes(binary)
-            archive = output / f"kronik-{target}.tar.gz"
+            archive = output / f"{name}-{target}.tar.gz"
             with archive.open("wb") as raw, gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as compressed:
                 with tarfile.open(fileobj=compressed, mode="w") as tar:
-                    for name, data in (("kronik", binary), ("NOTICE", (ROOT / "NOTICE").read_bytes())):
+                    for name, data in ((name, binary), ("NOTICE", (ROOT / "NOTICE").read_bytes())):
                         member = tarfile.TarInfo(name)
                         member.size = len(data)
                         tar.addfile(member, io.BytesIO(data))
@@ -351,6 +426,39 @@ class ReproducibilityTest(unittest.TestCase):
             (second / "source/dist/release/unexpected").write_bytes(b"unlisted")
             with self.assertRaises(ValueError):
                 REPRO["compare_builds"](first, second)
+
+    def test_optional_helper_compilation_and_payload_are_compared_too(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = (Path(directory) / name for name in ("first", "second"))
+            original = self.fixture(first, with_keyhelper=True)
+            shutil.copytree(first, second)
+            target = "x86_64-unknown-linux-gnu"
+            proof = REPRO["compare_builds"](first, second, with_keyhelper=True)
+            self.assertIn(target, proof["targets"])
+            self.assertIn("kronik-keyhelper", proof["targets"][target]["members"])
+            binary = second / "target" / target / "release/kronik-keyhelper"
+            binary.write_bytes(original + b"changed")
+            with self.assertRaisesRegex(ValueError, "compiled"):
+                REPRO["compare_builds"](first, second, with_keyhelper=True)
+            binary.write_bytes(original)
+            archive = second / "source/dist/release" / f"kronik-keyhelper-{target}.tar.gz"
+            with tarfile.open(archive, "w:gz") as tar:
+                member = tarfile.TarInfo("kronik-keyhelper")
+                member.size = 5
+                tar.addfile(member, io.BytesIO(b"other"))
+            with self.assertRaisesRegex(ValueError, "actual ELF"):
+                REPRO["compare_builds"](first, second, with_keyhelper=True)
+
+    def test_compile_failure_keeps_the_actual_log_and_exit_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            (root / "scripts/release.sh").write_text("printf 'owned compile failure\\n'; exit 7\n")
+            log = root / "cargo-build.log"
+            with self.assertRaises(subprocess.CalledProcessError) as failure:
+                REPRO["build"](root, {"PATH": "/usr/bin:/bin"}, log)
+            self.assertEqual(failure.exception.returncode, 7)
+            self.assertEqual(log.read_text(), "owned compile failure\n")
 
 
 if __name__ == "__main__":

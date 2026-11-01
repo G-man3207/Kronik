@@ -44,6 +44,7 @@ fn msg(name: &str, body: &str) -> pb::Message {
             value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
         }),
         blobs: vec![],
+        retained_compensation_source: None,
     }
 }
 

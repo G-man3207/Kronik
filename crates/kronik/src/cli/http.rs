@@ -1,8 +1,8 @@
 //! A minimal HTTP/1.1 client for the JSON API: on the daemon's Unix socket,
 //! or over TCP (M10) to `https://host:port`, or plain `http://` to a
 //! loopback address only. Each request uses its own connection
-//! (`Connection: close`), and the response is read to the end, within a
-//! timeout.
+//! (`Connection: close`). Ordinary JSON responses are read to the end within
+//! a timeout; SSE uses the same transport with incremental bounded decoding.
 
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs 
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Where the API is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +229,8 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>, Failure> {
 
 /// Sends one request and reads the response. `target` is the path and
 /// query, already encoded; `bearer` is sent as `Authorization: Bearer`.
+/// `last_event_id` is an opaque bounded event cursor, sent as Last-Event-ID,
+/// never interpolated into the request target.
 /// `timeout` bounds the connect and every read and write: a daemon that
 /// stays silent that long is a [`Failure::Timeout`].
 pub fn request(
@@ -237,6 +239,7 @@ pub fn request(
     target: &str,
     body: Option<&[u8]>,
     bearer: Option<&str>,
+    last_event_id: Option<&str>,
     timeout: Duration,
 ) -> Result<Response, Failure> {
     // A zero timeout means none to the socket options.
@@ -262,6 +265,7 @@ pub fn request(
         head.push_str(token);
         head.push_str("\r\n");
     }
+    append_event_cursor(&mut head, last_event_id)?;
     head.push_str("\r\n");
     match endpoint {
         Endpoint::Unix(path) => {
@@ -290,6 +294,21 @@ pub fn request(
             exchange(tls, head.as_bytes(), body)
         }
     }
+}
+
+/// Cursor text is opaque, but must remain one bounded HTTP field value.
+fn append_event_cursor(head: &mut String, cursor: Option<&str>) -> Result<(), Failure> {
+    let Some(cursor) = cursor else { return Ok(()); };
+    if cursor.is_empty() || cursor.len() > kronik_fleet::events::MAX_CURSOR_BYTES
+        || !cursor.bytes().all(|byte| byte == b' ' || byte.is_ascii_graphic())
+    {
+        return Err(Failure::Malformed("invalid event resume cursor header".into()));
+    }
+    head.reserve(cursor.len() + "Last-Event-ID: \r\n\r\n".len());
+    head.push_str("Last-Event-ID: ");
+    head.push_str(cursor);
+    head.push_str("\r\n");
+    Ok(())
 }
 
 /// Completes the handshake first, so that a certificate problem is reported
@@ -432,9 +451,504 @@ pub fn encode(s: &str) -> String {
     out
 }
 
+/// An incremental response: reading the body applies HTTP transfer framing.
+pub(super) struct StreamResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Box<dyn Read + Send>,
+}
+
+/// Opens the same Unix/TLS API transport as ordinary requests, without buffering
+/// an unbounded event stream. Cancellation interrupts idle socket reads.
+/// Resume cursors use the standard Last-Event-ID header, not the URI.
+/// CONNECT_TIMEOUT bounds TLS, request and response headers; only a successful
+/// SSE body may remain idle indefinitely, still polling cancellation.
+pub(super) fn stream(
+    endpoint: &Endpoint,
+    target: &str,
+    bearer: Option<&str>,
+    last_event_id: Option<&str>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<StreamResponse, Failure> {
+    let timeout = Duration::from_millis(250);
+    let opening = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let opening_deadline = Instant::now() + CONNECT_TIMEOUT;
+    let transport: Box<dyn ReadWrite> = match endpoint {
+        Endpoint::Unix(path) => {
+            let socket = UnixStream::connect(path).map_err(Failure::Connect)?;
+            socket.set_read_timeout(Some(timeout))
+                .and_then(|()| socket.set_write_timeout(Some(timeout)))
+                .map_err(Failure::Io)?;
+            Box::new(Cancellable { inner: socket, cancelled, opening: opening.clone(), opening_deadline })
+        }
+        Endpoint::Tcp { host, port, tls } => {
+            let socket = connect(host, *port, *tls, CONNECT_TIMEOUT).map_err(Failure::Connect)?;
+            socket.set_read_timeout(Some(timeout))
+                .and_then(|()| socket.set_write_timeout(Some(timeout)))
+                .map_err(Failure::Io)?;
+            let mut socket = Cancellable { inner: socket, cancelled, opening: opening.clone(), opening_deadline };
+            if *tls {
+                let name = rustls::pki_types::ServerName::try_from(host.clone())
+                    .map_err(|_| Failure::Tls("invalid TLS server name".into()))?;
+                let mut conn = rustls::ClientConnection::new(tls_config()?, name)
+                    .map_err(|e| Failure::Tls(e.to_string()))?;
+                handshake(&mut conn, &mut socket)?;
+                Box::new(rustls::StreamOwned::new(conn, socket))
+            } else {
+                Box::new(socket)
+            }
+        }
+    };
+    stream_exchange(transport, endpoint, target, bearer, last_event_id, opening.as_ref())
+}
+
+trait ReadWrite: Read + Write + Send {}
+impl<T: Read + Write + Send> ReadWrite for T {}
+
+struct Cancellable<T> {
+    inner: T,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    opening: Arc<std::sync::atomic::AtomicBool>,
+    opening_deadline: Instant,
+}
+
+impl<T> Cancellable<T> {
+    fn check(&self) -> io::Result<()> {
+        if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "event tail cancelled"));
+        }
+        if self.opening.load(std::sync::atomic::Ordering::Relaxed)
+            && Instant::now() >= self.opening_deadline
+        {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "event stream opening deadline elapsed"));
+        }
+        Ok(())
+    }
+}
+
+impl<T: Read> Read for Cancellable<T> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            self.check()?;
+            match self.inner.read(out) {
+                Err(e) if timed_out(&e) => continue,
+                result => return result,
+            }
+        }
+    }
+}
+
+impl<T: Write> Write for Cancellable<T> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        loop {
+            self.check()?;
+            match self.inner.write(bytes) {
+                Err(error) if timed_out(&error) => continue,
+                result => return result,
+            }
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        loop {
+            self.check()?;
+            match self.inner.flush() {
+                Err(error) if timed_out(&error) => continue,
+                result => return result,
+            }
+        }
+    }
+}
+
+fn stream_exchange(
+    mut socket: Box<dyn ReadWrite>,
+    endpoint: &Endpoint,
+    target: &str,
+    bearer: Option<&str>,
+    last_event_id: Option<&str>,
+    opening: &std::sync::atomic::AtomicBool,
+) -> Result<StreamResponse, Failure> {
+    // Targets are built from constant paths and encoded query values, never raw input.
+    if target.bytes().any(|b| b <= b' ' || b == 127)
+        || bearer.is_some_and(|token| !token.bytes().all(|b| b.is_ascii_graphic()))
+    {
+        return Err(Failure::Malformed("invalid streaming request".into()));
+    }
+    let host = match endpoint {
+        Endpoint::Unix(_) => "kronik".to_owned(),
+        Endpoint::Tcp { .. } => endpoint.shown().split_once("://")
+            .map_or_else(String::new, |(_, host)| host.to_owned()),
+    };
+    let mut head = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nAccept: text/event-stream\r\nConnection: close\r\n");
+    if let Some(token) = bearer {
+        head.push_str("Authorization: Bearer ");
+        head.push_str(token);
+        head.push_str("\r\n");
+    }
+    append_event_cursor(&mut head, last_event_id)?;
+    head.push_str("\r\n");
+    socket.write_all(head.as_bytes()).and_then(|()| socket.flush()).map_err(Failure::Io)?;
+    let mut reader = std::io::BufReader::new(socket);
+    let first = bounded_line(&mut reader, 8192).map_err(Failure::Io)?
+        .ok_or_else(|| Failure::Malformed("empty streaming response".into()))?;
+    let first = std::str::from_utf8(&first)
+        .map_err(|_| Failure::Malformed("invalid streaming response status".into()))?;
+    let mut fields = first.split_whitespace();
+    if !matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
+        return Err(Failure::Malformed("invalid streaming response version".into()));
+    }
+    let status = fields.next().and_then(|value| value.parse::<u16>().ok())
+        .filter(|code| (100..600).contains(code))
+        .ok_or_else(|| Failure::Malformed("invalid streaming response status".into()))?;
+    let mut size = first.len();
+    let mut length = None;
+    let mut chunked = false;
+    let mut content_type = None;
+    loop {
+        let line = bounded_line(&mut reader, 8192).map_err(Failure::Io)?
+            .ok_or_else(|| Failure::Malformed("truncated streaming headers".into()))?;
+        size += line.len();
+        if size > 65536 {
+            return Err(Failure::Malformed("streaming headers exceed 64 KiB".into()));
+        }
+        if line == b"\r\n" { break; }
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| Failure::Malformed("invalid streaming headers".into()))?;
+        let (name, value) = line.trim_end_matches("\r\n").split_once(':')
+            .ok_or_else(|| Failure::Malformed("invalid streaming header".into()))?;
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-length") {
+            if length.is_some() {
+                return Err(Failure::Malformed("duplicate streaming Content-Length".into()));
+            }
+            length = Some(value.parse::<u64>()
+                .map_err(|_| Failure::Malformed("invalid streaming Content-Length".into()))?);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            if chunked || !value.eq_ignore_ascii_case("chunked") {
+                return Err(Failure::Malformed("unsupported streaming transfer encoding".into()));
+            }
+            chunked = true;
+        } else if name.eq_ignore_ascii_case("content-type") {
+            content_type = Some(value.to_owned());
+        }
+    }
+    if chunked && length.is_some() {
+        return Err(Failure::Malformed("ambiguous streaming response framing".into()));
+    }
+    let body = Box::new(StreamBody { reader, remaining: length, chunked, done: false });
+    // API error bodies retain the opening deadline instead of hanging at startup.
+    if (200..300).contains(&status) && content_type.as_deref().is_some_and(|value| {
+        value.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+    }) {
+        opening.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(StreamResponse { status, content_type, body })
+}
+
+/// Reads at most `max` bytes, including LF, without an unbounded read_until.
+pub(super) fn bounded_line(
+    reader: &mut impl std::io::BufRead,
+    max: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if line.is_empty() { Ok(None) } else {
+                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated stream line"))
+            };
+        }
+        let count = available.iter().position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if count > max.saturating_sub(line.len()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "stream line exceeds its bound"));
+        }
+        line.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if line.last() == Some(&b'\n') { return Ok(Some(line)); }
+    }
+}
+
+struct StreamBody<R> {
+    reader: R,
+    remaining: Option<u64>,
+    chunked: bool,
+    done: bool,
+}
+
+impl<R: std::io::BufRead> Read for StreamBody<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() || self.done { return Ok(0); }
+        if self.chunked && self.remaining.unwrap_or(0) == 0 {
+            let line = bounded_line(&mut self.reader, 8192)?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing chunk size"))?;
+            let size = std::str::from_utf8(&line).ok()
+                .and_then(|line| line.strip_suffix("\r\n"))
+                .and_then(|line| line.split(';').next())
+                .and_then(|size| u64::from_str_radix(size.trim(), 16).ok())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
+            self.remaining = Some(size);
+            if size == 0 {
+                let mut total = 0;
+                loop {
+                    let line = bounded_line(&mut self.reader, 8192)?
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "truncated trailers"))?;
+                    total += line.len();
+                    if total > 65536 {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "trailers exceed 64 KiB"));
+                    }
+                    if line == b"\r\n" { break; }
+                }
+                self.done = true;
+                return Ok(0);
+            }
+        }
+        let count = self.remaining.map_or(out.len(), |left| left.min(out.len() as u64) as usize);
+        if count == 0 { self.done = true; return Ok(0); }
+        let read = self.reader.read(&mut out[..count])?;
+        if read == 0 && self.remaining.is_some() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated streaming body"));
+        }
+        if let Some(left) = &mut self.remaining {
+            *left -= read as u64;
+            if self.chunked && *left == 0 {
+                let mut crlf = [0; 2];
+                self.reader.read_exact(&mut crlf)?;
+                if crlf != *b"\r\n" {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "missing chunk delimiter"));
+                }
+            }
+        }
+        Ok(read)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connected_stream_bounds_opening_and_keeps_live_body_beyond_its_deadline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for head in [
+            &b""[..],
+            &b"HTTP/1.1 403 Forbidden\r\nContent-Length: 1\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"[..],
+        ] {
+            let (socket, mut silent_peer) = UnixStream::pair().unwrap();
+            socket.set_read_timeout(Some(Duration::from_millis(2))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_millis(2))).unwrap();
+            silent_peer.write_all(head).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let reader = Cancellable { inner: socket, cancelled: cancelled.clone(),
+                opening: Arc::new(AtomicBool::new(true)),
+                opening_deadline: Instant::now() + Duration::from_millis(20) };
+            let phase = reader.opening.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = stream_exchange(Box::new(reader), &Endpoint::Unix("/fixture".into()),
+                    "/v1/events/stream", None, None, phase.as_ref());
+                let expired = match result {
+                    Err(Failure::Io(error)) => timed_out(&error),
+                    Err(Failure::Timeout) => true,
+                    Ok(mut response) => response.body.read(&mut [0; 1]).is_err_and(|error| timed_out(&error)),
+                    _ => false,
+                };
+                let _ = send.send(expired);
+            });
+            // The watchdog bounds a regression that would otherwise loop on an idle peer.
+            let expired = receive.recv_timeout(Duration::from_secs(2));
+            cancelled.store(true, Ordering::Relaxed);
+            worker.join().unwrap();
+            assert!(matches!(expired, Ok(true)));
+        }
+
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(2))).unwrap();
+        socket.set_write_timeout(Some(Duration::from_millis(2))).unwrap();
+        peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n").unwrap();
+        let opening = Arc::new(AtomicBool::new(true));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let reader = Cancellable { inner: socket, cancelled: cancelled.clone(),
+            opening: opening.clone(), opening_deadline: deadline };
+        let mut response = stream_exchange(Box::new(reader), &Endpoint::Unix("/fixture".into()),
+            "/v1/events/stream", None, None, opening.as_ref()).unwrap();
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1));
+        assert!(Instant::now() >= deadline);
+        peer.write_all(b": live\n\n").unwrap();
+        let mut heartbeat = [0; 8];
+        response.body.read_exact(&mut heartbeat).unwrap();
+        assert_eq!(&heartbeat, b": live\n\n");
+        cancelled.store(true, Ordering::Relaxed);
+        assert_eq!(response.body.read(&mut [0; 1]).unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+
+        let mut expired_writer = Cancellable { inner: Vec::new(),
+            cancelled: Arc::new(AtomicBool::new(false)), opening: Arc::new(AtomicBool::new(true)),
+            opening_deadline: Instant::now() };
+        assert_eq!(expired_writer.write(b"request").unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(expired_writer.flush().unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn ordinary_and_streaming_requests_resume_full_cursors_in_headers_not_uris() {
+        let bytes = serde_json::to_vec(&super::super::events::full_event_cursor()).unwrap();
+        let cursor = super::super::events::read_cursor("-", &mut bytes.as_slice()).unwrap();
+        let encoded = serde_json::to_string(&cursor).unwrap();
+        assert!(encoded.len() > 65_534, "the old Hyper URI limit must actually be crossed");
+        assert!(encoded.len() <= kronik_fleet::events::MAX_CURSOR_BYTES);
+        for streaming in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("api.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = std::io::BufReader::new(socket);
+                // An oversized URI fails this existing public request-line bound;
+                // the full typed cursor must instead arrive in Last-Event-ID.
+                bounded_line(&mut reader, 8192).unwrap().unwrap();
+                let mut cursor = None;
+                loop {
+                    let line = bounded_line(&mut reader, kronik_fleet::events::MAX_CURSOR_BYTES + 1024)
+                        .unwrap().unwrap();
+                    if line == b"\r\n" { break; }
+                    let line = String::from_utf8(line).unwrap();
+                    if let Some(value) = line.strip_prefix("Last-Event-ID: ") {
+                        assert!(cursor.is_none(), "one cursor field, not duplicates");
+                        cursor = Some(value.strip_suffix("\r\n").unwrap().to_owned());
+                    }
+                }
+                let observed = serde_json::from_str::<kronik_fleet::events::ResumeCursor>(
+                    &cursor.unwrap()).unwrap();
+                reader.get_mut().write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 2\r\n\r\n{}"
+                ).unwrap();
+                observed
+            });
+            let endpoint = Endpoint::Unix(path);
+            let target = if streaming { "/v1/events/stream" } else { "/v1/events?limit=1" };
+            if streaming {
+                let mut response = stream(&endpoint, target, Some("bearer"), Some(&encoded),
+                    Arc::new(std::sync::atomic::AtomicBool::new(false))).unwrap();
+                assert_eq!(response.status, 200);
+                let mut body = Vec::new();
+                response.body.read_to_end(&mut body).unwrap();
+                assert_eq!(body, b"{}");
+            } else {
+                let response = request(&endpoint, "GET", target, None, Some("bearer"),
+                    Some(&encoded), Duration::from_secs(5)).unwrap();
+                assert_eq!(response.status, 200);
+                assert_eq!(response.body, b"{}");
+            }
+            let observed = server.join().unwrap();
+            assert_eq!(observed, cursor);
+        }
+    }
+
+    #[test]
+    fn cursor_header_bounds_and_injection_fail_closed_without_echoing_input() {
+        for cursor in [
+            String::new(), "private\r\nAuthorization: secret".into(), "private\0secret".into(),
+            "privateé".into(), "x".repeat(kronik_fleet::events::MAX_CURSOR_BYTES + 1),
+        ] {
+            let result = request(&Endpoint::Unix(PathBuf::from("/unused")), "GET", "/v1/events",
+                None, None, Some(&cursor), Duration::from_secs(1));
+            let Err(Failure::Malformed(message)) = result else { panic!("expected header refusal"); };
+            assert!(!message.contains("private"));
+            assert!(!message.contains("secret"));
+            let result = stream_exchange(
+                Box::new(StreamingFixture(std::io::Cursor::new(Vec::new()))),
+                &Endpoint::Unix(PathBuf::from("/unused")), "/v1/events/stream", None, Some(&cursor),
+                &std::sync::atomic::AtomicBool::new(true));
+            assert!(matches!(result, Err(Failure::Malformed(_))));
+        }
+    }
+
+    struct StreamingFixture(std::io::Cursor<Vec<u8>>);
+    impl Read for StreamingFixture {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            // Split HTTP/SSE delimiters across real reads, not just complete buffers.
+            let count = out.len().min(3);
+            self.0.read(&mut out[..count])
+        }
+    }
+    impl Write for StreamingFixture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { Ok(bytes.len()) }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
+    fn streamed(raw: &[u8]) -> Result<StreamResponse, Failure> {
+        stream_exchange(Box::new(StreamingFixture(std::io::Cursor::new(raw.to_vec()))),
+            &Endpoint::Unix(PathBuf::from("/unused")), "/v1/events/stream", Some("bearer"), None,
+            &std::sync::atomic::AtomicBool::new(true))
+    }
+
+    #[test]
+    fn streaming_decodes_chunks_content_length_and_connection_close_incrementally() {
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n3;ext=1\r\nid:\r\n4\r\n x\n\n\r\n0\r\nTrailer: ignored\r\n\r\n"[..],
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 7\r\n\r\nid: x\n\nignored",
+            b"HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\n\r\nid: x\n\n",
+        ] {
+            let mut response = streamed(raw).unwrap();
+            assert_eq!(response.status, 200);
+            assert_eq!(response.content_type.as_deref(), Some("text/event-stream"));
+            let mut body = String::new();
+            response.body.read_to_string(&mut body).unwrap();
+            assert_eq!(body, "id: x\n\n");
+        }
+        let response = streamed(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+        assert_eq!(response.status, 403);
+    }
+
+    #[test]
+    fn streaming_rejects_ambiguous_and_oversized_headers_and_truncated_bodies() {
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx"[..],
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+            b"HTTP/1.1 private\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nprivate malformed\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nHeader: private",
+        ] {
+            assert!(streamed(raw).is_err());
+        }
+        let raw = format!("HTTP/1.1 200 OK\r\nX: {}\r\n\r\n", "private".repeat(2000));
+        assert!(streamed(raw.as_bytes()).is_err());
+        let raw = format!("HTTP/1.1 200 OK\r\n{}\r\n", "X: value\r\n".repeat(10000));
+        assert!(streamed(raw.as_bytes()).is_err());
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort"[..],
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nz\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nxx",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nxXX",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nTrailer: unfinished",
+        ] {
+            let mut response = streamed(raw).unwrap();
+            assert!(response.body.read_to_end(&mut Vec::new()).is_err());
+        }
+    }
+
+    #[test]
+    fn stream_cancellation_and_request_injection_fail_without_echoing_input() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut reader = Cancellable { inner: &b"data"[..], cancelled,
+            opening: Arc::new(std::sync::atomic::AtomicBool::new(false)), opening_deadline: Instant::now() };
+        assert_eq!(reader.read(&mut [0; 1]).unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        for (target, token) in [
+            ("/v1/events/stream\r\nprivate: secret", Some("bearer")),
+            ("/v1/events/stream", Some("private\r\nsecret")),
+        ] {
+            let result = stream_exchange(
+                Box::new(StreamingFixture(std::io::Cursor::new(Vec::new()))),
+                &Endpoint::Unix(PathBuf::from("/unused")), target, token, None,
+                &std::sync::atomic::AtomicBool::new(true));
+            let Err(Failure::Malformed(message)) = result else { panic!("expected refusal"); };
+            assert!(!message.contains("private"));
+            assert!(!message.contains("secret"));
+        }
+    }
 
     #[test]
     fn parses_content_length_bodies() {

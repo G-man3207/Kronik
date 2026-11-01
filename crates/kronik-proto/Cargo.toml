@@ -9,6 +9,10 @@ publish.workspace = true
 [dependencies]
 prost = { workspace = true }
 thiserror = { workspace = true }
+url = { workspace = true }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+x509-parser = { workspace = true, default-features = false }
 
 [build-dependencies]
 prost-build = { workspace = true }
@@ -16,3 +20,6 @@ protox = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -172,7 +172,7 @@ type Answer =
     wasmtime_wasi_http::Result<(http::Response<HyperIncomingBody>, AbortOnDropJoinHandle<()>)>;
 
 /// The effect's result as `wasi:http` sees it (ADR 0070 §3).
-fn answer(outcome: FetchOutcome) -> Answer {
+fn answer(outcome: FetchOutcome) -> Result<Answer, super::HostRedactionFailure> {
     match outcome {
         FetchOutcome::Ok(r) => {
             let mut b = http::Response::builder().status(r.status);
@@ -184,15 +184,16 @@ fn answer(outcome: FetchOutcome) -> Answer {
                 .boxed_unsync();
             let response = b
                 .body(body)
-                .map_err(|e| HttpErr::InternalError(Some(e.to_string())))?;
+                .map_err(|e| HttpErr::InternalError(Some(e.to_string())));
             // The body is in memory: the worker task has nothing to do.
-            Ok((response, wasmtime_wasi::runtime::spawn(async {})))
+            Ok(response.map(|response| (response, wasmtime_wasi::runtime::spawn(async {}))))
         }
-        FetchOutcome::Denied(_) => Err(HttpErr::HttpRequestDenied),
-        FetchOutcome::Timeout => Err(HttpErr::HttpResponseTimeout),
-        FetchOutcome::TooLarge => Err(HttpErr::HttpResponseBodySize(None)),
-        FetchOutcome::Network(m) => Err(HttpErr::InternalError(Some(m))),
-        FetchOutcome::OutcomeUnknown => Err(HttpErr::InternalError(Some("outcome-unknown".into()))),
+        FetchOutcome::Denied(_) => Ok(Err(HttpErr::HttpRequestDenied)),
+        FetchOutcome::Timeout => Ok(Err(HttpErr::HttpResponseTimeout)),
+        FetchOutcome::TooLarge => Ok(Err(HttpErr::HttpResponseBodySize(None))),
+        FetchOutcome::Network(m) => Ok(Err(HttpErr::InternalError(Some(m)))),
+        FetchOutcome::OutcomeUnknown => Ok(Err(HttpErr::InternalError(Some("outcome-unknown".into())))),
+        FetchOutcome::HostRedactionFailure => Err(super::HostRedactionFailure),
     }
 }
 
@@ -317,7 +318,7 @@ impl TurnHost {
                         .fetch(ordinal, req)
                         .await
                         .map_err(|e| self.gate_failure(e))?;
-                    answer(outcome)
+                    answer(outcome).map_err(wasmtime::Error::new)?
                 }
             };
             *self.table.get_mut(&future)? = HostFutureIncomingResponse::Ready(result);

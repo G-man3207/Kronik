@@ -12,8 +12,11 @@ pub mod fs;
 pub mod scenario;
 pub mod service;
 
+#[cfg(test)]
+mod process_tests;
+
 use std::io;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,7 +24,7 @@ use chacha20::ChaCha8Rng;
 use chacha20::rand_core::{Rng, SeedableRng};
 use kronik_core::env::{
     BoxFuture, Clock, EntropySource, HttpRequest, HttpResponse, Net, NetError, Process,
-    ProcessRunner, ProcessSpec, Spawner,
+    ProcessRunner, ProcessSpec, SensitiveProcessRequest, Spawner,
 };
 
 use exec::{Handle, NodeId};
@@ -123,6 +126,15 @@ impl EntropySource for SimEntropy {
 pub struct SimNoNet;
 
 impl Net for SimNoNet {
+    fn http_authorized(&self, req: HttpRequest, original: kronik_core::authority::AuthLease)
+        -> BoxFuture<'static, Result<HttpResponse, NetError>>
+    {
+        Box::pin(async move {
+            original.check().map_err(|error| NetError::Connect(error.to_string()))?;
+            Err(NetError::Connect(format!("no network: {}", req.url)))
+        })
+    }
+
     fn http(&self, req: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
         Box::pin(async move { Err(NetError::Connect(format!("no network: {}", req.url))) })
     }
@@ -134,7 +146,17 @@ pub struct SimProcs {
 }
 
 struct SimProcess {
-    killed: Arc<tokio::sync::Notify>,
+    killed: tokio::sync::watch::Sender<bool>,
+    reaped: Arc<AtomicBool>,
+}
+
+impl SimProcess {
+    fn new() -> Self {
+        Self {
+            killed: tokio::sync::watch::channel(false).0,
+            reaped: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl Process for SimProcess {
@@ -143,15 +165,17 @@ impl Process for SimProcess {
     }
 
     fn wait(&self) -> BoxFuture<'static, io::Result<Option<i32>>> {
-        let killed = self.killed.clone();
+        let mut killed = self.killed.subscribe();
+        let reaped = self.reaped.clone();
         Box::pin(async move {
-            killed.notified().await;
+            drop(killed.wait_for(|value| *value).await.map_err(io::Error::other)?);
+            reaped.store(true, Ordering::SeqCst);
             Ok(None)
         })
     }
 
     fn kill(&self) -> BoxFuture<'static, io::Result<()>> {
-        self.killed.notify_waiters();
+        self.killed.send_replace(true);
         Box::pin(async { Ok(()) })
     }
 }
@@ -161,11 +185,45 @@ impl ProcessRunner for SimProcs {
         let sleep = self.clock.sleep(Duration::from_millis(5));
         Box::pin(async move {
             sleep.await;
-            Ok(Arc::new(SimProcess {
-                killed: Arc::new(tokio::sync::Notify::new()),
-            }) as Arc<dyn Process>)
+            Ok(Arc::new(SimProcess::new()) as Arc<dyn Process>)
         })
     }
+
+    fn exchange(
+        &self,
+        request: SensitiveProcessRequest,
+    ) -> BoxFuture<'static, io::Result<zeroize::Zeroizing<Vec<u8>>>> {
+        sensitive_exchange(self.clock.clone(), request, Arc::new(SimProcess::new()))
+    }
+}
+
+// Like ordinary simulated children, this helper runs until killed. No fake
+// cryptography: its only completion is the caller's virtual-time deadline.
+fn sensitive_exchange(
+    clock: Arc<dyn Clock>,
+    request: SensitiveProcessRequest,
+    process: Arc<SimProcess>,
+) -> BoxFuture<'static, io::Result<zeroize::Zeroizing<Vec<u8>>>> {
+    struct Reap(Arc<SimProcess>);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            self.0.killed.send_replace(true);
+            self.0.reaped.store(true, Ordering::SeqCst);
+        }
+    }
+    Box::pin(async move {
+        if request.stdin.is_empty() || request.stdin.len() > 4096 || request.timeout.is_zero()
+            || clock.monotonic().checked_add(request.timeout).is_none()
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid sensitive helper bounds"));
+        }
+        let _reap = Reap(process);
+        let timeout = request.timeout;
+        // The model never consumes plaintext; erase it before advancing time.
+        drop(request);
+        clock.sleep(timeout).await;
+        Err(io::Error::new(io::ErrorKind::TimedOut, "sensitive helper timed out"))
+    })
 }
 
 /// Ordered, hashed event trace: the determinism fingerprint of a run.

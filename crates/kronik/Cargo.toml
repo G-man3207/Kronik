@@ -20,6 +20,7 @@ kronik-core = { workspace = true, features = ["real"] }
 kronik-fork = { workspace = true }
 kronik-foreign = { workspace = true }
 kronik-effects = { workspace = true }
+kronik-fleet = { workspace = true }
 kronik-gateway = { workspace = true, features = ["server"] }
 kronik-mcp = { workspace = true }
 kronik-log = { workspace = true }
@@ -31,6 +32,7 @@ kronik-runtime = { workspace = true }
 kronik-sched = { workspace = true }
 kronik-ship = { workspace = true }
 kronik-testhost = { workspace = true }
+kronik-ui = { workspace = true }
 # `kronik mcp`: an MCP stdio server proxying to the daemon's /mcp over the
 # API socket (ADR 0008).
 rmcp = { workspace = true, features = ["server", "transport-io", "client", "transport-streamable-http-client-unix-socket"] }
@@ -46,11 +48,13 @@ schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "time", "io-std", "io-util", "sync"] }
-toml = { workspace = true, features = ["std", "parse", "serde"] }
+tokio-rustls = { workspace = true }
+toml = { workspace = true, features = ["std", "parse", "serde", "display"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # kronik doctor: temporary directories for the namespace and sandbox checks.
 tempfile = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 boon = { workspace = true }

@@ -116,27 +116,42 @@ def main():
                  ("wrong-issuer", {"RELEASE_ISSUER": "https://example.invalid/issuer"}),
                  ("changed-verifier", {}), ("wrong-elf-architecture", {}),
                  ("real-write-failure", {}), ("real-notice-write-failure", {})]
+        helper_cases = [("helper-" + case, changes) for case, changes in cases if case != "changed-verifier"]
+        helper_cases.append(("helper-wrong-artifact", {}))
         consumers = ("standalone", "source", "action") if args.with_runsc else ("source", "standalone", "action")
         for consumer in consumers:
-            selected = cases[:1] if args.with_runsc or consumer == "source" else cases
+            selected = cases[:1] if args.with_runsc or consumer == "source" else cases[:]
+            if not args.with_runsc and consumer != "action":
+                selected += helper_cases[:1] if consumer == "source" else helper_cases
             for case, changes in selected:
+                case_label = case
+                helper_selected = case.startswith("helper-")
+                case = case.removeprefix("helper-")
                 fault_limit = 512 if case == "real-notice-write-failure" else 1048576
-                root = work / f"{consumer}-{case}"
+                root = work / f"{consumer}-{case_label}"
                 root.mkdir()
                 mirror = root / "mirror"
                 mirror.mkdir()
                 archive_name = archives["amd64"].name
                 arch = "arm64" if case == "wrong-elf-architecture" else "amd64"
-                (mirror / archive_name).symlink_to(archives[arch])
+                daemon_arch = "amd64" if helper_selected else arch
+                (mirror / archive_name).symlink_to(archives[daemon_arch])
                 bundle_path = mirror / (archive_name + ".sigstore.json")
-                if case != "unsigned":
+                if helper_selected or case != "unsigned":
                     shutil.copyfile(bundle, bundle_path)
+                artifact_name = archive_name
+                if helper_selected:
+                    artifact_name = "helper-fixture.tar.gz"
+                    (mirror / artifact_name).symlink_to(archives[arch])
+                    bundle_path = mirror / (artifact_name + ".sigstore.json")
+                    if case != "unsigned":
+                        shutil.copyfile(bundle, bundle_path)
                 if case == "changed-artifact":
-                    (mirror / archive_name).unlink()
-                    shutil.copyfile(archives["amd64"], mirror / archive_name)
-                    with (mirror / archive_name).open("ab") as stream:
+                    (mirror / artifact_name).unlink()
+                    shutil.copyfile(archives["amd64"], mirror / artifact_name)
+                    with (mirror / artifact_name).open("ab") as stream:
                         stream.write(b"changed artifact")
-                    (mirror / (archive_name + ".sha256")).write_text(f"{digest(mirror / archive_name)}  {archive_name}\n")
+                    (mirror / (artifact_name + ".sha256")).write_text(f"{digest(mirror / artifact_name)}  {artifact_name}\n")
                 if case == "changed-signature":
                     item = json.loads(bundle.read_text())
                     for signature in item["dsseEnvelope"]["signatures"]:
@@ -151,15 +166,24 @@ def main():
                     with bad_path.open("ab") as stream:
                         stream.write(b"changed verifier")
                     verifier_url = bad.as_uri()
-                prefix = f"gh_{FIXTURE_VERSION}_linux_{arch}/"
+                prefix = f"gh_{FIXTURE_VERSION}_linux_{daemon_arch}/"
                 files = {"kronik": prefix + "bin/gh", "LICENSE": prefix + "LICENSE",
                          "NOTICE": prefix + "LICENSE", "THIRD_PARTY_LICENSES.txt": prefix + "LICENSE"}
                 values = {"RELEASE_REPOSITORY": FIXTURE_REPO, "RELEASE_REPOSITORY_ID": FIXTURE_REPO_ID,
                           "RELEASE_WORKFLOW": FIXTURE_WORKFLOW, "RELEASE_REF": FIXTURE_REF,
                           "RELEASE_ARCHIVE": archive_name, "RELEASE_FILES": files,
-                          "RELEASE_EXTRA_FILES": tuple(name for name in members[arch] if name not in files.values()),
+                          "RELEASE_EXTRA_FILES": tuple(name for name in members[daemon_arch] if name not in files.values()),
                           "VERIFIER_URL": verifier_url}
-                values.update(changes)
+                if helper_selected:
+                    helper_prefix = f"gh_{FIXTURE_VERSION}_linux_{arch}/"
+                    helper_files = {"kronik-keyhelper": helper_prefix + "bin/gh",
+                                    "LICENSE": helper_prefix + "LICENSE", "NOTICE": helper_prefix + "LICENSE",
+                                    "THIRD_PARTY_LICENSES.txt": helper_prefix + "LICENSE"}
+                    if case == "wrong-artifact":
+                        helper_files["kronik-keyhelper"] = "kronik-keyhelper"
+                    values.update(HELPER_ARCHIVE=artifact_name, HELPER_FILES=helper_files)
+                else:
+                    values.update(changes)
                 if args.with_runsc:
                     values.pop("VERIFIER_URL")
                 destination = root / "runner/kronik-bin"
@@ -168,6 +192,10 @@ def main():
                 old.write_bytes(Path(sys.executable).read_bytes())
                 old.chmod(0o755)
                 before = digest(old)
+                old_helper = destination / "kronik-keyhelper"
+                old_helper.write_bytes(Path(sys.executable).read_bytes())
+                old_helper.chmod(0o755)
+                helper_before = digest(old_helper)
                 notices = destination / "kronik-licenses"
                 notices.mkdir()
                 original_notices = {name: ("existing-" + name).encode() for name in ("LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.txt")}
@@ -178,7 +206,8 @@ def main():
                 env = dict(private, TMPDIR=str(temporary), RUNNER_TEMP=str(root / "runner"),
                            INPUT_COMMAND="install", INPUT_BASE_URL=mirror.as_uri(), INPUT_VERSION=FIXTURE_VERSION,
                            KRONIK_BASE_URL=mirror.as_uri(), KRONIK_VERSION=FIXTURE_VERSION,
-                           KRONIK_INSTALL_DIR=str(destination), KRONIK_INSTALL_RUNSC="yes" if args.with_runsc and case == "valid" else "no")
+                           KRONIK_INSTALL_DIR=str(destination), KRONIK_INSTALL_RUNSC="yes" if args.with_runsc and case == "valid" else "no",
+                           KRONIK_INSTALL_KEYHELPER="yes" if helper_selected else "no")
                 if consumer == "action":
                     source = root / "action.py"
                     source.write_text(action_source(values))
@@ -197,27 +226,41 @@ def main():
                         command = [sys.executable, "-B", str(fault), str(source)]
                 else:
                     shell_values = {name: value for name, value in values.items()
-                                    if name not in ("RELEASE_ARCHIVE", "RELEASE_EXTRA_FILES", "RELEASE_FILES")}
+                                    if name not in ("RELEASE_ARCHIVE", "RELEASE_EXTRA_FILES", "RELEASE_FILES", "HELPER_FILES")}
                     shell_values.update(RELEASE_FILES="\n".join(f"{name} {path}" for name, path in files.items()),
                                         archive=archive_name)
+                    if helper_selected:
+                        shell_values["HELPER_FILES"] = "\n".join(f"{name} {path}" for name, path in helper_files.items())
                     source = root / "install.sh"
                     text = template if consumer == "source" else render(ROOT, FIXTURE_VERSION, mirror.as_uri())
-                    source.write_text(shell_source(text, shell_values))
+                    text = shell_source(text, shell_values)
+                    if helper_selected and changes:
+                        # Change only trusted fixture SOURCE policy after the daemon is verified.
+                        call = '    verify_release "$tmp/helper.tar.gz" "$tmp/helper.bundle.json"'
+                        assert text.count(call) == 1
+                        assignments = "\n".join("    " + name + "=" + shlex.quote(value)
+                                                for name, value in changes.items())
+                        text = text.replace(call, assignments + "\n" + call, 1)
+                    source.write_text(text)
                     if consumer == "source":
                         (root / "install-runsc.sh").write_text(helper)
                     else:
                         env.pop("KRONIK_BASE_URL")
                         env.pop("KRONIK_VERSION")
                     command = ["sh", str(source)]
-                    if args.with_runsc and consumer == "standalone":
+                    if consumer == "standalone":
                         command = ["bash", "-o", "pipefail", "-c",
                                    'curl -q -fsSL --max-time 30 "$1" | sh', "fixture", source.as_uri()]
                     if case in ("real-write-failure", "real-notice-write-failure"):
                         fault_bin = root / "fault-bin"
                         fault_bin.mkdir()
                         cp = fault_bin / "cp"
+                        fault_name = "LICENSE" if case == "real-notice-write-failure" else "kronik-keyhelper" if helper_selected else "kronik"
+                        fault_condition = f"os.path.basename(sys.argv[1]) == {fault_name!r}"
+                        if helper_selected:
+                            fault_condition += " and os.path.basename(os.path.dirname(sys.argv[1])) == 'helper'"
                         cp.write_text(f"#!{sys.executable}\nimport os,resource,signal,sys\n"
-                                      f"if os.path.basename(sys.argv[1]) == {('LICENSE' if case == 'real-notice-write-failure' else 'kronik')!r}:\n"
+                                      f"if {fault_condition}:\n"
                                       " signal.signal(signal.SIGXFSZ,signal.SIG_IGN)\n"
                                       f" resource.setrlimit(resource.RLIMIT_FSIZE,({fault_limit},{fault_limit}))\n"
                                       f"os.execv({shutil.which('cp')!r},sys.argv)\n")
@@ -232,23 +275,34 @@ def main():
                     assert old.stat().st_mode & 0o777 == 0o755
                     actual_version = subprocess.check_output([str(old), "--version"], env=private).decode().splitlines()[0]
                     assert "2.103.3" in actual_version
+                    if helper_selected:
+                        assert old_helper.read_bytes() == real_binary["amd64"]
+                        assert old_helper.stat().st_mode & 0o777 == 0o755
+                        assert "2.103.3" in subprocess.check_output([str(old_helper), "--version"], env=private).decode()
+                    else:
+                        assert digest(old_helper) == helper_before, "default install changed the unselected helper"
                 else:
                     assert process.returncode != 0, (consumer, case, process.stdout, process.stderr)
                     assert digest(old) == before, (consumer, case, "existing executable changed")
                     assert subprocess.check_output([str(old), "--version"], env=private) == old_version
+                    assert digest(old_helper) == helper_before, "existing helper changed on refusal/write failure"
                     if case in ("real-write-failure", "real-notice-write-failure"):
                         assert "File too large" in process.stdout + process.stderr
                     elif case == "wrong-elf-architecture":
                         assert "ELF" in process.stdout + process.stderr
+                    elif case == "wrong-artifact":
+                        assert "kronik-keyhelper" in process.stdout + process.stderr
                     else:
                         assert {name: (notices / name).read_bytes() for name in original_notices} == original_notices
                     assert list(destination.glob(".kronik*")) == []
-                results.append({"consumer": consumer, "case": case, "exit": process.returncode,
+                results.append({"consumer": consumer, "case": case_label, "exit": process.returncode,
                                 "existing_binary_preserved": case != "valid",
+                                "selected_helper": helper_selected,
+                                "existing_helper_preserved": not helper_selected or case != "valid",
                                 "cross_filesystem": temporary.stat().st_dev != destination.stat().st_dev,
                                 "installed_executable_mode": oct(old.stat().st_mode & 0o777),
                                 "official_https_bootstrap": args.with_runsc,
-                                "curl_pipe": args.with_runsc and consumer == "standalone",
+                                "curl_pipe": consumer == "standalone",
                                 "stdout": process.stdout[-800:], "stderr": process.stderr[-800:]})
                 if args.with_runsc:
                     results[-1]["runsc_version"] = subprocess.check_output(["runsc", "--version"], env=private).decode()

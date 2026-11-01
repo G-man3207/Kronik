@@ -4,6 +4,8 @@ mod admin;
 mod cli;
 mod config;
 mod doctor;
+mod events;
+mod fleet;
 mod init;
 mod mcp;
 mod otel;

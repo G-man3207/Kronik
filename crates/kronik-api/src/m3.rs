@@ -13,7 +13,31 @@ use prost::Message as _;
 
 use crate::auth::{Caller, Scope};
 use crate::types::*;
-use crate::{Api, ApiRequest, ApiResponse, Query, Result, bad, internal, json, ok, reason};
+use crate::{Api, AuthorizedRequest, ApiResponse, Query, Result, bad, internal, json, ok, reason};
+
+fn project_approval_identity(
+    sealer: &kronik_privacy::sealer::Sealer,
+    identity: Option<&pb::Sealable>,
+    token_id: &str,
+    pii: bool,
+) -> Result<Option<VerifiedApprovalIdentity>> {
+    if !pii { return Ok(None); }
+    let Some(identity) = identity else { return Ok(None); };
+    Ok(Some(match crate::oidc::open_verified_identity(sealer, identity, token_id)? {
+        Some((issuer, subject)) => VerifiedApprovalIdentity::Verified { issuer, subject },
+        None => VerifiedApprovalIdentity::Erased,
+    }))
+}
+
+fn approval_token_id(value: String, pii: bool) -> String {
+    let visible = if value.starts_with("oidc:") {
+        value.len() == 69
+            && value.as_bytes()[5..].iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    } else {
+        pii
+    };
+    if visible { value } else { "[redacted]".into() }
+}
 
 /// Whether a fork is made without personal data: when asked, and always for
 /// a caller without `pii:read` (brief: "Forks without PII").
@@ -78,6 +102,7 @@ fn kinds_detail<'a>(kinds: impl IntoIterator<Item = &'a pb::KindVersion>) -> Str
 fn proposal_info(p: &Proposal, props: &Proposals) -> ProposalInfo {
     ProposalInfo {
         approval_requests: Vec::new(),
+        approvals: Vec::new(),
         id: p.id.clone(),
         fork: p.fork.clone(),
         status: p.status.clone(),
@@ -187,7 +212,7 @@ impl Api {
 
     pub(crate) async fn route_m3(
         &self,
-        req: &ApiRequest,
+        req: &AuthorizedRequest,
         segs: &[&str],
         q: &Query,
         caller: &Caller,
@@ -226,7 +251,7 @@ impl Api {
             ("GET", ["v1", "forks", name, "diff"]) => self.diff(name, q, caller).await,
             ("POST", ["v1", "proposals"]) => self.propose(req, caller).await,
             ("GET", ["v1", "proposals"]) => self.proposals_list().await,
-            ("GET", ["v1", "proposals", id]) => self.proposal(id).await,
+            ("GET", ["v1", "proposals", id]) => self.proposal(id, caller).await,
             ("GET", ["v1", "proposals", id, "diff"]) => self.proposal_diff(id, q, caller).await,
             ("POST", ["v1", "proposals", id, "approve"]) => self.approve(req, id).await,
             ("POST", ["v1", "proposals", id, "promote"]) => self.promote(req, id).await,
@@ -275,7 +300,7 @@ impl Api {
         }
     }
 
-    async fn fork_create(&self, req: &ApiRequest, caller: &Caller) -> Result<ApiResponse> {
+    async fn fork_create(&self, req: &AuthorizedRequest, caller: &Caller) -> Result<ApiResponse> {
         let r: ForkCreateRequest = json(&req.body)?;
         reason(&r.reason)?;
         let lsn = self.fork_point(&r.at).await?;
@@ -289,6 +314,7 @@ impl Api {
                 no_pii(r.no_pii, caller),
                 self.audit(req, r.reason.clone()),
                 r.dry_run,
+                req.authority.clone(),
             )
             .await?;
         if !dry_run {
@@ -328,10 +354,10 @@ impl Api {
         ok(&ForksResponse { forks })
     }
 
-    async fn fork_delete(&self, req: &ApiRequest, name: &str) -> Result<ApiResponse> {
+    async fn fork_delete(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: ResendRequest = json(&req.body)?;
         reason(&r.reason)?;
-        self.proposals()?.delete_fork(name, r.dry_run).await?;
+        self.proposals()?.delete_fork(name, r.dry_run, req.authority.clone()).await?;
         if !r.dry_run {
             self.audit_event(req, "fork.delete", name, &[], r.reason)
                 .await?;
@@ -342,7 +368,7 @@ impl Api {
         })
     }
 
-    async fn fork_deploy(&self, req: &ApiRequest, name: &str) -> Result<ApiResponse> {
+    async fn fork_deploy(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: DeployRequest = json(&req.body)?;
         reason(&r.reason)?;
         let wasm = STANDARD
@@ -350,7 +376,7 @@ impl Api {
             .map_err(|e| bad(format!("wasm_base64 is not valid base64: {e}")))?;
         let k = self
             .proposals()?
-            .fork_deploy(name, &wasm, r.dry_run)
+            .fork_deploy(name, &wasm, r.dry_run, req.authority.clone())
             .await?;
         if !r.dry_run {
             let details = [("kinds", kinds_detail([&k]))];
@@ -364,13 +390,13 @@ impl Api {
         })
     }
 
-    async fn fork_replay(&self, req: &ApiRequest, name: &str) -> Result<ApiResponse> {
+    async fn fork_replay(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: ReplayRequest = json(&req.body)?;
         reason(&r.reason)?;
         let options = diff_options(&r.options)?;
         let p = self
             .proposals()?
-            .fork_replay(name, r.to_lsn, options, r.options.threads)
+            .fork_replay(name, r.to_lsn, options, r.options.threads, req.authority.clone())
             .await?;
         let details = [("mode", r.options.mode.clone())];
         self.audit_event(req, "fork.replay", name, &details, r.reason)
@@ -411,7 +437,7 @@ impl Api {
         self.diff(id, q, caller).await
     }
 
-    async fn propose(&self, req: &ApiRequest, caller: &Caller) -> Result<ApiResponse> {
+    async fn propose(&self, req: &AuthorizedRequest, caller: &Caller) -> Result<ApiResponse> {
         let r: ProposeRequest = json(&req.body)?;
         reason(&r.reason)?;
         let mut options = diff_options(&r.options)?;
@@ -446,23 +472,20 @@ impl Api {
                     dry_run: r.dry_run,
                 },
                 false,
+                req.authority.clone(),
             )
             .await?;
         if dry_run {
-            return ok(&ProposeResponse {
-                dry_run,
-                proposal: proposal_info(&p, props),
-            });
+            return self.ok_scrubbed(ProposeResponse { dry_run,
+            proposal: proposal_info(&p, props), });
         }
         let p = if r.run_async {
             p
         } else {
             props.wait(&p.id).await?
         };
-        ok(&ProposeResponse {
-            dry_run,
-            proposal: proposal_info(&p, props),
-        })
+        self.ok_scrubbed(ProposeResponse { dry_run,
+        proposal: proposal_info(&p, props), })
     }
 
     async fn proposals_list(&self) -> Result<ApiResponse> {
@@ -474,32 +497,45 @@ impl Api {
             .filter(|p| !p.plain_fork)
             .map(|p| proposal_info(p, props))
             .collect();
-        ok(&ProposalsResponse { proposals })
+        self.ok_scrubbed(ProposalsResponse { proposals })
     }
 
-    async fn proposal(&self, id: &str) -> Result<ApiResponse> {
+    async fn proposal(&self, id: &str, caller: &Caller) -> Result<ApiResponse> {
         let props = self.proposals()?;
         let mut info = proposal_info(&props.get(id).await?, props);
+        let token_id = |value: String| approval_token_id(value, caller.has(Scope::PiiRead));
         info.approval_requests = props
             .approval_requests(id)?
             .into_iter()
             .map(|r| ApprovalRequestInfo {
                 lsn: r.lsn,
                 command: r.command,
-                token_id: r.token_id,
+                token_id: token_id(r.token_id),
                 reason: r.reason,
                 pending: r.pending,
             })
             .collect();
-        ok(&info)
+        info.approvals = props.approvals(id)?.into_iter().map(|(lsn, approval)| {
+            let audit = approval.audit.unwrap_or_default();
+            let verified_identity = project_approval_identity(
+                self.node.sealer(), approval.verified_identity.as_ref(), &audit.token_id, caller.has(Scope::PiiRead),
+            )?;
+            Ok(ReviewedApproval {
+                lsn, diff_hash: format!("b3:{}", kronik_core::ids::hex(&approval.diff_hash)),
+                verified_through_lsn: approval.verified_through_lsn,
+                token_id: token_id(audit.token_id), reason: audit.reason, wall_time_ms: audit.wall_time_ms,
+                verified_identity,
+            })
+        }).collect::<Result<Vec<_>>>()?;
+        self.ok_scrubbed(info)
     }
 
-    async fn request_approval(&self, req: &ApiRequest, id: &str) -> Result<ApiResponse> {
+    async fn request_approval(&self, req: &AuthorizedRequest, id: &str) -> Result<ApiResponse> {
         let r: ResendRequest = json(&req.body)?;
         reason(&r.reason)?;
         let (lsn, command, p) = self
             .proposals()?
-            .request_approval(id, self.audit(req, r.reason.clone()), r.dry_run)
+            .request_approval(id, self.audit(req, r.reason.clone()), r.dry_run, req.authority.clone())
             .await?;
         ok(&RequestApprovalResponse {
             dry_run: r.dry_run,
@@ -529,7 +565,7 @@ impl Api {
 
     async fn fork_send(
         &self,
-        req: &ApiRequest,
+        req: &AuthorizedRequest,
         name: &str,
         kind: &str,
         key: &str,
@@ -560,24 +596,26 @@ impl Api {
                 value: Some(pb::sealable::Value::Plain(body)),
             }),
             blobs: Vec::new(),
+            retained_compensation_source: None,
         };
         // The actor is plain here; the audit export hashes it (M28 §3.5).
         let details = [
             ("actor", format!("{}/{}", actor.kind, actor.key)),
             ("message", msg.name.clone()),
         ];
-        let t = self.proposals()?.fork_send(name, actor, msg).await?;
+        let t = self.proposals()?.fork_send(name, actor, msg, req.authority.clone()).await?;
         self.audit_event(req, "fork.send", name, &details, r.reason)
             .await?;
-        let o = t.record.outcome.clone().unwrap_or_default();
+        let o = t.record.outcome.clone().ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the fork turn has no recorded outcome"))?;
         let tr = crate::turn_response(Some(kronik_sched::TurnResult {
             turn_id: kronik_core::ids::TurnId {
                 branch: name.to_owned(),
                 lsn: t.lsn,
             },
             outcome: o.clone(),
-        }));
-        self.ok_scrubbed(&ForkTurnResponse {
+            scrubbed_with: None,
+        }))?;
+        self.ok_scrubbed(ForkTurnResponse {
             fork: name.to_owned(),
             turn_id: t.id,
             outcome: crate::outcome(&o),
@@ -620,7 +658,7 @@ impl Api {
             crate::hide_http_identity(&mut v);
         }
         v["turn_id"] = serde_json::Value::String(id.to_owned());
-        Ok(Some(self.ok_scrubbed(&v)?))
+        Ok(Some(self.ok_scrubbed(v)?))
     }
 
     async fn trace(&self, id: &str, caller: &Caller) -> Result<ApiResponse> {
@@ -763,7 +801,7 @@ impl Api {
         }
         let descendants = build(&enc(&key), &turns, &children, &mut budget, &mut truncated);
         let lsn = turns.iter().find(|(i, _, _)| i == id).map_or(0, |t| t.1);
-        self.ok_scrubbed(&TraceResponse {
+        self.ok_scrubbed(TraceResponse {
             turn: summary(id, lsn, &target),
             actor: actor(&target),
             root,
@@ -773,12 +811,13 @@ impl Api {
         })
     }
 
-    async fn approve(&self, req: &ApiRequest, id: &str) -> Result<ApiResponse> {
-        let r: ResendRequest = json(&req.body)?;
+    async fn approve(&self, req: &AuthorizedRequest, id: &str) -> Result<ApiResponse> {
+        let r: ApproveRequest = json(&req.body)?;
         reason(&r.reason)?;
         let (a, verified) = self
             .proposals()?
-            .approve(id, self.audit(req, r.reason.clone()), r.dry_run)
+            .approve(id, self.audit(req, r.reason.clone()), r.dry_run,
+                req.verified_identity.as_deref().cloned(), req.authority.clone())
             .await?;
         ok(&ApproveResponse {
             dry_run: r.dry_run,
@@ -791,12 +830,12 @@ impl Api {
         })
     }
 
-    async fn promote(&self, req: &ApiRequest, id: &str) -> Result<ApiResponse> {
+    async fn promote(&self, req: &AuthorizedRequest, id: &str) -> Result<ApiResponse> {
         let r: ResendRequest = json(&req.body)?;
         reason(&r.reason)?;
         let p = self
             .proposals()?
-            .promote(id, self.audit(req, r.reason.clone()), r.dry_run)
+            .promote(id, self.audit(req, r.reason.clone()), r.dry_run, req.authority.clone())
             .await?;
         ok(&PromoteResponse {
             dry_run: r.dry_run,
@@ -819,7 +858,7 @@ impl Api {
     }
 
     /// `kronik rollback <epoch> --by-replay` (M13): a rebase proposal.
-    async fn rebase(&self, req: &ApiRequest, epoch: &str, caller: &Caller) -> Result<ApiResponse> {
+    async fn rebase(&self, req: &AuthorizedRequest, epoch: &str, caller: &Caller) -> Result<ApiResponse> {
         // A rebase runs on full data (its turns become main's state), so it
         // cannot be the --no-pii fork a token without pii:read gets: such a
         // token may not create one (ADR 0018).
@@ -841,7 +880,7 @@ impl Api {
                 workers: r.threads,
                 audit: self.audit(req, r.reason.clone()),
                 dry_run: r.dry_run,
-            })
+            }, req.authority.clone())
             .await?;
         if let (false, Some(info)) = (dry_run, &p.rebase) {
             let details = [
@@ -851,13 +890,11 @@ impl Api {
             self.audit_event(req, "rebase.create", &p.id, &details, r.reason)
                 .await?;
         }
-        ok(&ProposeResponse {
-            dry_run,
-            proposal: proposal_info(&p, props),
-        })
+        self.ok_scrubbed(ProposeResponse { dry_run,
+        proposal: proposal_info(&p, props), })
     }
 
-    async fn rollback(&self, req: &ApiRequest, epoch: &str) -> Result<ApiResponse> {
+    async fn rollback(&self, req: &AuthorizedRequest, epoch: &str) -> Result<ApiResponse> {
         let r: ResendRequest = json(&req.body)?;
         reason(&r.reason)?;
         let epoch: u64 = epoch
@@ -865,7 +902,7 @@ impl Api {
             .map_err(|_| bad(format!("{epoch:?} is not an epoch")))?;
         let (new_epoch, lsn, kinds) = self
             .proposals()?
-            .rollback(epoch, self.audit(req, r.reason.clone()), r.dry_run)
+            .rollback(epoch, self.audit(req, r.reason.clone()), r.dry_run, req.authority.clone())
             .await?;
         ok(&RollbackResponse {
             dry_run: r.dry_run,
@@ -889,7 +926,7 @@ impl Api {
         })
     }
 
-    async fn watch(&self, req: &ApiRequest, epoch: &str) -> Result<ApiResponse> {
+    async fn watch(&self, req: &AuthorizedRequest, epoch: &str) -> Result<ApiResponse> {
         let r: WatchRequest = json(&req.body)?;
         reason(&r.reason)?;
         let epoch: u64 = epoch
@@ -910,12 +947,11 @@ impl Api {
                 self.audit(req, r.reason),
                 r.dry_run,
                 !r.run_async,
+                req.authority.clone(),
             )
             .await?;
-        ok(&WatchResponse {
-            dry_run: r.dry_run,
-            watch: watch_info(&w)?,
-        })
+        self.ok_scrubbed(WatchResponse { dry_run: r.dry_run,
+        watch: watch_info(&w)?, })
     }
 
     fn watches_list(&self) -> Result<ApiResponse> {
@@ -925,24 +961,22 @@ impl Api {
             .iter()
             .map(watch_info)
             .collect::<Result<_>>()?;
-        ok(&WatchesResponse { watches })
+        self.ok_scrubbed(WatchesResponse { watches })
     }
 
     fn watch_get(&self, id: &str) -> Result<ApiResponse> {
-        ok(&watch_info(&self.watches()?.get(id)?)?)
+        self.ok_scrubbed(watch_info(&self.watches()?.get(id)?)?)
     }
 
-    async fn watch_stop(&self, req: &ApiRequest, id: &str) -> Result<ApiResponse> {
+    async fn watch_stop(&self, req: &AuthorizedRequest, id: &str) -> Result<ApiResponse> {
         let r: ResendRequest = json(&req.body)?;
         reason(&r.reason)?;
         let w = self
             .watches()?
-            .stop(id, self.audit(req, r.reason.clone()), r.dry_run)
+            .stop(id, self.audit(req, r.reason.clone()), r.dry_run, req.authority.clone())
             .await?;
-        ok(&WatchResponse {
-            dry_run: r.dry_run,
-            watch: watch_info(&w)?,
-        })
+        self.ok_scrubbed(WatchResponse { dry_run: r.dry_run,
+        watch: watch_info(&w)?, })
     }
 
     fn policy(&self) -> Result<ApiResponse> {
@@ -975,13 +1009,13 @@ impl Api {
         })
     }
 
-    async fn policy_set(&self, req: &ApiRequest) -> Result<ApiResponse> {
+    async fn policy_set(&self, req: &AuthorizedRequest) -> Result<ApiResponse> {
         let r: PolicySetRequest = json(&req.body)?;
         reason(&r.reason)?;
         RuleSet::parse_toml(&r.rules_toml).map_err(|e| bad(e.to_string()))?;
         let (epoch, lsn) = self
             .node
-            .set_policy(&r.rules_toml, self.audit(req, r.reason.clone()), r.dry_run)
+            .set_policy(&r.rules_toml, self.audit(req, r.reason.clone()), r.dry_run, req.authority.clone())
             .await?;
         ok(&PolicySetResponse {
             dry_run: r.dry_run,
@@ -990,7 +1024,7 @@ impl Api {
         })
     }
 
-    async fn policy_test(&self, req: &ApiRequest, caller: &Caller) -> Result<ApiResponse> {
+    async fn policy_test(&self, req: &AuthorizedRequest, caller: &Caller) -> Result<ApiResponse> {
         let r: PolicyTestRequest = json(&req.body)?;
         let rules = match &r.rules_toml {
             Some(t) => RuleSet::parse_toml(t).map_err(|e| bad(e.to_string()))?,
@@ -1011,6 +1045,77 @@ impl Api {
 #[cfg(test)]
 mod tests {
     use super::parse_rfc3339;
+
+    #[test]
+    fn historical_approval_identity_is_authenticated_and_permission_gated() {
+        use super::*;
+        use kronik_privacy::{MasterKey, keystore::{Keystore, Pseudonyms}, sealer::Sealer};
+        use std::sync::Arc;
+        let master = MasterKey::from_bytes([7; 32]).unwrap();
+        let keys = Arc::new(Keystore::open_memory(&master).unwrap());
+        let sealer = Sealer::new(keys).with_pseudonyms(Pseudonyms::new(&master).unwrap());
+        let issuer = "https://historical.example/tenant";
+        let subject = "reviewer";
+        let hash = sealer.keyed_hash("kronik oidc binding v1", &[issuer.as_bytes(), subject.as_bytes()]).unwrap();
+        let owner = format!("oidc:{}", kronik_core::ids::hex(&hash));
+        let plain = pb::Sealable {
+            subject: Some(owner.clone()),
+            value: Some(pb::sealable::Value::Plain(serde_json::to_vec(&serde_json::json!({"issuer":issuer,"subject":subject})).unwrap())),
+        };
+        let mut sealed = plain.clone();
+        sealer.reseal_value(&mut sealed, None, &|b| b.fill(11), 1).unwrap();
+        assert!(!sealer.is_on());
+        assert!(matches!(sealed.value, Some(pb::sealable::Value::Sealed(_))));
+        let stored = pb::Approval {
+            verified_identity: Some(sealed),
+            ..Default::default()
+        }.encode_to_vec();
+        assert!(!stored.windows(issuer.len()).any(|bytes| bytes == issuer.as_bytes()));
+        assert!(!stored.windows(subject.len()).any(|bytes| bytes == subject.as_bytes()));
+        let sealed = pb::Approval::decode(stored.as_slice()).unwrap().verified_identity.unwrap();
+        let expected = Some(VerifiedApprovalIdentity::Verified { issuer: issuer.into(), subject: subject.into() });
+        assert_eq!(project_approval_identity(&sealer, Some(&sealed), &owner, true).unwrap(), expected);
+        assert_eq!(project_approval_identity(&Sealer::plain(), Some(&sealed), &owner, false).unwrap(), None);
+        assert_eq!(project_approval_identity(&sealer, None, "unix:uid=0", true).unwrap(), None);
+        assert!(project_approval_identity(&sealer, Some(&plain), &owner, true).is_err());
+        let mut wrong_owner = sealed.clone();
+        wrong_owner.subject = Some(format!("oidc:{}", "0".repeat(64)));
+        assert!(project_approval_identity(&sealer, Some(&wrong_owner), &owner, true).is_err());
+        assert!(project_approval_identity(&Sealer::plain(), Some(&sealed), &owner, true).is_err());
+        let mut corrupt = sealed.clone();
+        if let Some(pb::sealable::Value::Sealed(value)) = &mut corrupt.value {
+            value.ciphertext[0] ^= 1;
+        }
+        assert!(project_approval_identity(&sealer, Some(&corrupt), &owner, true).is_err());
+        let mut spoof = pb::Sealable {
+            subject: Some(owner.clone()),
+            value: Some(pb::sealable::Value::Plain(br#"{"issuer":"https://attacker.example","subject":"reviewer"}"#.to_vec())),
+        };
+        sealer.reseal_value(&mut spoof, None, &|b| b.fill(12), 2).unwrap();
+        assert!(project_approval_identity(&sealer, Some(&spoof), &owner, true).is_err());
+        let public = ReviewedApproval {
+            lsn: 1, diff_hash: "b3:00".into(), verified_through_lsn: 1,
+            token_id: approval_token_id(owner.clone(), false), reason: "reviewed".into(), wall_time_ms: 1,
+            verified_identity: project_approval_identity(&sealer, Some(&sealed), &owner, false).unwrap(),
+        };
+        let public = serde_json::to_value(public).unwrap();
+        assert!(public.get("verified_identity").is_none());
+        assert!(!public.to_string().contains(issuer));
+        assert!(!public.to_string().contains(subject));
+        sealer.erase(&owner, 3).unwrap();
+        assert_eq!(project_approval_identity(&sealer, Some(&sealed), &owner, true).unwrap(), Some(VerifiedApprovalIdentity::Erased));
+        for field in ["verified_identity", "protected_payload", "identity", "token_id", "issuer", "subject", "authority"] {
+            let mut request = serde_json::json!({"reason":"reviewed"});
+            request[field] = serde_json::json!("spoof");
+            assert!(crate::json::<ApproveRequest>(&serde_json::to_vec(&request).unwrap()).is_err());
+        }
+        assert!(crate::json::<ApproveRequest>(br#"{"reason":"reviewed","dry_run":true}"#).unwrap().dry_run);
+        assert_eq!(serde_json::to_value(VerifiedApprovalIdentity::Erased).unwrap(), serde_json::json!({"state":"ERASED"}));
+        assert_eq!(approval_token_id(owner.clone(), false), owner);
+        assert_eq!(approval_token_id("oidc:legacy:unsealed-pair".into(), true), "[redacted]");
+        assert_eq!(approval_token_id("unix:uid=0".into(), false), "[redacted]");
+        assert_eq!(approval_token_id("unix:uid=0".into(), true), "unix:uid=0");
+    }
 
     #[test]
     fn rfc3339() {

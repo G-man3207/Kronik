@@ -28,7 +28,7 @@ pub struct ServeArgs {
     /// Address of the HTTP gateway [file: server.http_listen].
     #[arg(long, env = "KRONIK_HTTP_LISTEN")]
     http_listen: Option<SocketAddr>,
-    /// Address of /metrics and /healthz [file: server.admin_listen].
+    /// Address of embedded UI, /metrics and /healthz [file: server.admin_listen].
     #[arg(long, env = "KRONIK_ADMIN_LISTEN")]
     admin_listen: Option<SocketAddr>,
     /// Unix socket of the JSON API, mode 0660 [file: server.api_socket].
@@ -301,6 +301,7 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
     let (gateway_connections, api_connections) = connection_caps(open_files);
     // A flag can set it too, so the file's check is not enough.
     let api_listen = config.api_listen().map_err(anyhow::Error::msg)?;
+    config.check().map_err(anyhow::Error::msg)?;
     // The master key is the KRONIK_MASTER_KEY material, or a key file (the
     // flag, KRONIK_MASTER_KEY_FILE or [keys] master_key_file). Both set is
     // ambiguous, so refuse to start rather than silently pick one.
@@ -332,6 +333,7 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
         )))),
         concurrency: args.concurrency.max(1),
         keys: config.keys.clone(),
+        secret_settings: config.secrets.clone(),
         storage: Some(kronik_sched::snapshots::StorageConfig {
             data_dir: data_dir.clone(),
             snapshot_interval: config.retention.snapshot_interval.0,
@@ -351,10 +353,26 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
     let node = start_local(env.clone(), &data_dir, node_config)
         .await
         .with_context(|| format!("recovering {}", data_dir.display()))?;
-    record_key_source(&node, &data_dir).await?;
+    struct NativeExecutionGuard(Option<Arc<kronik_sched::Node>>);
+    impl Drop for NativeExecutionGuard {
+        fn drop(&mut self) {
+            if let Some(node) = &self.0
+                && let Err(error) = node.stop_native_execution()
+            {
+                tracing::error!(error = %error.message, "stopping native execution failed");
+            }
+        }
+    }
+    let mut native_execution = NativeExecutionGuard(Some(node.clone()));
+    let configured_original = node.local_operator_authority()?;
+    record_key_source(&node, &data_dir, configured_original.clone()).await?;
+    let installation = crate::fleet::installation(&node,
+        config.fleet.as_ref().map(|fleet| fleet.installation.as_str())).await
+        .map_err(|error| anyhow::anyhow!("installation identity: {}", error.message))?;
     // Export streams (M28): each follows the log from its cursor.
     let exports_on =
-        config.audit.sink().is_some() || (config.otel.endpoint().is_some() && config.otel.traces);
+        config.audit.sink().is_some() || (config.otel.endpoint().is_some() && config.otel.traces)
+            || !config.events.webhook.is_empty();
     let restore_pending = data_dir
         .join("branches/main")
         .join(kronik_ship::RESTORE_MARKER)
@@ -377,9 +395,10 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
         &data_dir.join("branches/main"),
         &cursors,
         args.test_stop_after_restore_event,
+        configured_original.clone(),
     )
     .await?;
-    if let Err(error) = crate::otel::migrate_trace_state(&node, &cursors, &data_dir).await {
+    if let Err(error) = crate::otel::migrate_trace_state(&node, &cursors, &data_dir, configured_original.clone()).await {
         if exports_on {
             return Err(error);
         }
@@ -393,9 +412,9 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
         ));
     }
     let (audit_mapper, audit) =
-        crate::otel::start_audit(&config, &node, &cursors, &data_dir).await?;
-    let exports = vec![
-        crate::otel::start(&config, &node, &cursors, &data_dir).await?,
+        crate::otel::start_audit(&config, &node, &cursors, &data_dir, configured_original.clone()).await?;
+    let mut exports = vec![
+        crate::otel::start(&config, &node, &cursors, &data_dir, configured_original.clone()).await?,
         audit,
     ];
     // Shipping to object storage (m6-storage §4), when enabled.
@@ -494,15 +513,40 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
         .with_context(|| format!("binding the gateway on {http_listen}"))?;
     let bound = tcp.local_addr().unwrap_or(http_listen);
     let tokens_db = data_dir.join("keys").join("tokens.db");
-    let tokens =
+    let mut tokens =
         kronik_api::tokens::TokenStore::open_file(&tokens_db).map_err(anyhow::Error::msg)?;
+    let publication = node.publication_domain();
+    tokens.bind_before_any_issuer(publication.clone()).map_err(|error| anyhow::anyhow!(error.message))?;
+    tokens.bind_execution_before_any_issuer(
+        &publication,
+        configured_original.clone(),
+    ).map_err(|error| anyhow::anyhow!(error.message))?;
+    let tokens = Arc::new(tokens);
+    // The same captured ACTIVE startup operation owns recovery and initial grants.
+    let fleet = crate::fleet::open(node.clone(), tokens.clone(), &config, configured_original.clone()).await
+        .map_err(|error| anyhow::anyhow!("fleet startup: {}", error.message))?;
+    let (event_feed, event_streams) = crate::events::start_native(
+        node.clone(), &installation, &config.events, cursors.clone(), configured_original.clone()).await
+        .map_err(|error| anyhow::anyhow!("event startup: {}", error.message))?;
+    exports.extend(event_streams);
+    let admission = kronik_api::oidc::BrowserAuth::existing_admission(&node)
+        .map_err(|error| anyhow::anyhow!("OIDC admission: {}", error.message))?;
+    let browser = kronik_api::oidc::BrowserAuth::open(
+        env.clone(),
+        tokens.clone(),
+        config.oidc.clone(),
+        admission,
+        node.sealer().clone(),
+        tls.is_some(),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("OIDC configuration: {}", error.message))?;
     // Unfinished watches resume here (M11).
     let watches =
         kronik_fork::watch::Watches::open(node.clone(), proposals.clone(), data_dir.clone())
             .map_err(|e| anyhow::anyhow!("loading watches: {}", e.message))?
             .start();
-    let api = Arc::new(
-        Api::new(node.clone())
+    let mut api = Api::new(node.clone())
             .with_http_listen(bound.to_string())
             .with_preview_urls(
                 config.gateway.preview_domain.clone(),
@@ -511,11 +555,13 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
             )
             .with_proposals(proposals)
             .with_watches(watches)
-            .with_tokens(Arc::new(tokens))
+            .with_tokens(tokens.clone())?
+            .with_browser(browser.clone())
             .with_foreign(foreign.clone())
             .with_exports(exports)
-            .with_audit_mapper(audit_mapper),
-    );
+            .with_audit_mapper(audit_mapper);
+    if let Some(controller) = &fleet { api = api.with_fleet(controller.clone()); }
+    let api = Arc::new(api.with_event_feed(event_feed));
     let api_socket = &config.server.api_socket;
     let unix = kronik_api::server::bind(api_socket)
         .with_context(|| format!("binding the API on {}", api_socket.display()))?;
@@ -545,6 +591,9 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
         "kronik is serving"
     );
     let mcp = kronik_mcp::mount(api.clone());
+    if let Some(controller) = fleet {
+        crate::fleet::start(&node, controller, &api, Some(kronik_mcp::mount_for_tcp(api.clone())));
+    }
     let api_tcp = {
         let (api, mcp, tls) = (
             api.clone(),
@@ -561,20 +610,27 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
             }
         }
     };
-    // /metrics and /healthz are auxiliary: without the port, Kronik serves
-    // anyway and says why.
+    // Without configured OIDC, an unavailable auxiliary admin port is nonfatal.
     let admin_listen = config.server.admin_listen;
     let admin = match tokio::net::TcpListener::bind(admin_listen).await {
         Ok(listener) => Some(listener),
+        Err(error) if config.oidc.is_some() => {
+            return Err(error).context("binding the configured OIDC admin listener");
+        }
         Err(e) => {
-            tracing::warn!(admin = %admin_listen, error = %e, "no /metrics and /healthz: cannot bind the admin listener");
+            tracing::warn!(admin = %admin_listen, error = %e, "no admin UI, /metrics or /healthz: cannot bind the admin listener");
             None
         }
     };
-    let admin = async {
-        match admin {
-            Some(listener) => crate::admin::serve(listener, node.clone()).await,
-            None => std::future::pending().await,
+    let admin = {
+        let (node, api, browser, tls) = (node.clone(), api.clone(), browser.clone(), tls.clone());
+        async move {
+            match admin {
+                Some(listener) => {
+                    crate::admin::serve(listener, node, api, browser, tls, api_connections).await
+                }
+                None => std::future::pending().await,
+            }
         }
     };
     let mut stopping = false;
@@ -606,9 +662,12 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
             Err(e) => tracing::warn!(error = %e.message, "shutdown snapshot failed"),
         }
     }
+    let stopped = node.stop_native_execution().map_err(|error| anyhow::anyhow!(error.message));
+    native_execution.0 = None;
     // Sandboxes never outlive the daemon (docs/design/m7-foreign.md §5).
     foreign.shutdown().await;
-    served
+    served?;
+    stopped
 }
 
 /// After a `kronik restore`, records the system `AuditEvent` `restore`,
@@ -622,8 +681,9 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
 async fn record_restore(
     node: &kronik_sched::Node,
     branch_dir: &Path,
-    cursors: &kronik_otel::cursor::Cursors,
+    cursors: &Arc<kronik_otel::cursor::Cursors>,
     stop_after_event: bool,
+    original: kronik_core::authority::AuthLease,
 ) -> anyhow::Result<()> {
     let marker = branch_dir.join(kronik_ship::RESTORE_MARKER);
     let body = match std::fs::read(&marker) {
@@ -656,7 +716,7 @@ async fn record_restore(
             wall_time_ms: node.env().clock.wall_ms(),
         };
         let details = [("through_lsn".to_owned(), shown)].into();
-        node.record_audit_event("restore", "", details, audit)
+        node.record_system_audit_event(kronik_sched::SystemAudit::Restore, "", details, audit, original.clone())
             .await
             .map_err(|e| anyhow::anyhow!("recording the restore: {}", e.message))?;
     }
@@ -703,36 +763,42 @@ async fn record_restore(
         } else {
             entry
         };
-        cursors
-            .save(stream, entry)
-            .await
+        let owned = cursors.clone();
+        node.authorized_effect(original.clone(), move || async move {
+            Ok(owned.save(stream, entry).await)
+        }).await.context("admitting restored export cursor")?
             .context("saving the export cursors")?;
     }
     if cursors
         .get(crate::otel::AUDIT_CONFIG)
         .is_some_and(|e| e.lsn > through)
     {
-        cursors
-            .save(
-                crate::otel::AUDIT_CONFIG,
-                kronik_otel::cursor::Entry {
-                    lsn: through,
-                    ..Default::default()
-                },
-            )
-            .await
+        let owned = cursors.clone();
+        let entry = kronik_otel::cursor::Entry {
+            lsn: through,
+            ..Default::default()
+        };
+        node.authorized_effect(original.clone(), move || async move {
+            Ok(owned.save(crate::otel::AUDIT_CONFIG, entry).await)
+        }).await.context("admitting restored audit configuration cursor")?
             .context("resetting the restored audit configuration cache")?;
     }
-    std::fs::remove_file(&marker).with_context(|| format!("removing {}", marker.display()))?;
-    std::fs::File::open(branch_dir)?
-        .sync_all()
+    let fs = node.env().fs.clone();
+    let branch_dir = branch_dir.to_path_buf();
+    node.authorized_effect(original, move || async move {
+        let removed = async {
+            fs.remove_file(marker).await?;
+            fs.sync_dir(branch_dir).await
+        }.await;
+        Ok(removed)
+    }).await.context("admitting completed restore marker removal")?
         .context("syncing the restored branch after removing its marker")?;
     tracing::info!(through_lsn = through, "recorded the restore in the log");
     Ok(())
 }
 
 /// An offline source migration is audited once on its next successful start.
-async fn record_key_source(node: &kronik_sched::Node, data: &Path) -> anyhow::Result<()> {
+async fn record_key_source(node: &kronik_sched::Node, data: &Path, original: kronik_core::authority::AuthLease) -> anyhow::Result<()> {
     let marker = data
         .join("keys")
         .join(kronik_privacy::key_source::SOURCE_MARKER);
@@ -757,7 +823,8 @@ async fn record_key_source(node: &kronik_sched::Node, data: &Path) -> anyhow::Re
         .await?;
     if !recorded {
         let secrets = node.secret_values().ok();
-        let scrub = |s| kronik_sched::scrub::for_log(s, secrets.as_deref());
+        let patterns = secrets.as_ref().map(|values| kronik_sched::effects::secret_patterns(values));
+        let scrub = |s| kronik_sched::scrub::for_log(s, patterns.as_deref());
         let details = [
             ("id".into(), id.into()),
             (
@@ -774,14 +841,19 @@ async fn record_key_source(node: &kronik_sched::Node, data: &Path) -> anyhow::Re
                 .as_u64()
                 .unwrap_or(node.env().clock.wall_ms()),
         };
-        node.record_audit_event("keys.source", "", details, audit)
+        node.record_system_audit_event(kronik_sched::SystemAudit::KeySource, "", details, audit, original.clone())
             .await
             .map_err(|e| anyhow::anyhow!("recording key source: {}", e.message))?;
     }
-    std::fs::remove_file(&marker)?;
-    if let Some(parent) = marker.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
+    let fs = node.env().fs.clone();
+    let directory = data.join("keys");
+    node.authorized_effect(original, move || async move {
+        let removed = async {
+            fs.remove_file(marker).await?;
+            fs.sync_dir(directory).await
+        }.await;
+        Ok(removed)
+    }).await.context("admitting completed key-source marker removal")??;
     Ok(())
 }
 

@@ -8,11 +8,13 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use kronik_core::authority::AuthLease;
 use kronik_core::ids::Lsn;
 use kronik_log::Committed;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::Node;
+use kronik_sched::secrets::CertifiedSecretSnapshot;
 use prost::Message as _;
 
 use crate::cursor::Generation;
@@ -61,6 +63,9 @@ impl TraceSink {
         state: &serde_json::Value,
         lsn: Lsn,
     ) -> io::Result<TraceSink> {
+        let reader = if state.is_null() {
+            Some(node.capture_system_export_reader().await.map_err(|error| io::Error::other(error.code.as_str()))?)
+        } else { None };
         let (checkpoints, open) =
             trace_state::load(node.env().clone(), data_dir, state, lsn, hasher.id_key()).await?;
         let mut sink = TraceSink {
@@ -71,38 +76,34 @@ impl TraceSink {
             hasher,
             capped: false,
         };
-        if state.is_null() {
-            sink.rewind(lsn, [0; 16]).await.map_err(io::Error::other)?;
+        if let Some(reader) = reader {
+            sink.rewind(lsn, [0; 16], &reader).await.map_err(io::Error::other)?;
         }
         Ok(sink)
     }
 
     /// The span of the dead-lettered turn a resend names (`main:<lsn>`),
     /// read from the log; none once retention deleted it.
-    async fn resend_of(&self, input: Option<&pb::Input>) -> Option<SpanRef> {
-        let Some(pb::input::Kind::Message(m)) = input.and_then(|i| i.kind.as_ref()) else {
-            return None;
+    async fn resend_of(&self, input: Option<&pb::Input>, source: &pb::ActorSource,
+        reader: &kronik_sched::ShardReader) -> Result<Option<SpanRef>, String> {
+        let Some(pb::input::Kind::Message(message)) = input.and_then(|input| input.kind.as_ref()) else { return Ok(None) };
+        let Some(id) = kronik_core::ids::TurnId::parse(&message.resend_of) else { return Ok(None) };
+        if id.branch != source.branch || id.shard != source.shard { return Ok(None); }
+        let kronik_core::ids::SourcePos::Actor { shard, lsn: through } = reader.point().source else {
+            return Err("STORAGE_CORRUPT".into());
         };
-        let (branch, lsn) = m.resend_of.split_once(':')?;
-        let lsn: Lsn = lsn.parse().ok()?;
-        if branch != self.node.branch() {
-            return None;
+        if id.shard != shard || id.lsn < reader.point().retained_from.max(1) || id.lsn > through { return Ok(None); }
+        let page = reader.local_export_page(id.lsn - 1, 1, crate::follow::BATCH_BYTES).await
+            .map_err(|error| error.code.as_str().to_owned())?;
+        if page.retention_gap.is_some() { return Ok(None); }
+        let Some((actual, committed)) = page.records.first() else { return Ok(None) };
+        if committed.lsn != id.lsn || actual.lsn != id.lsn || actual.shard != id.shard || actual.branch != id.branch {
+            return Ok(None);
         }
-        let mut found = None;
-        let read = self
-            .node
-            .reader()
-            .read(lsn, lsn, |c| {
-                if let Record::TurnRecord(r) = c.record {
-                    found = Some(r);
-                }
-                Ok(())
-            })
-            .await;
-        if let Err(e) = read {
-            tracing::debug!(error = %e, lsn, "otel: reading a resent turn failed");
-        }
-        found.map(|r| spans::turn_ref(&r, &self.open))
+        Ok(match &committed.record {
+            Record::TurnRecord(record) => Some(spans::turn_ref(record, &self.open)),
+            _ => None,
+        })
     }
 
     /// The record with a sealed `traceparent` opened with the node's
@@ -139,16 +140,19 @@ impl Sink for TraceSink {
 
     async fn prepare(
         &mut self,
-        records: Vec<Committed>,
+        records: &[(pb::ActorSource, Committed)],
         _generation: Generation,
+        reader: &kronik_sched::ShardReader,
+        snapshot: &CertifiedSecretSnapshot,
+        original: AuthLease,
     ) -> Result<Self::Batch, String> {
-        let secrets = self
-            .node
-            .secret_values()
-            .map_err(|e| e.code.as_str().to_owned())?;
+        original.check().map_err(|e| e.code.as_str().to_owned())?;
+        let secrets = kronik_sched::effects::secret_patterns(&snapshot.values);
         let mut out = Vec::new();
-        for c in records {
-            match c.record {
+        for (source, c) in records {
+            source.validate().map_err(|_| "STORAGE_CORRUPT".to_owned())?;
+            if source.lsn != c.lsn || source.shard.is_some() { return Err("STORAGE_CORRUPT".into()); }
+            match &c.record {
                 Record::TurnBegin(b) => {
                     let Some(key) = &b.causal_key else { continue };
                     if !self.open.begin(key, b.input.as_ref()) && !self.capped {
@@ -160,9 +164,9 @@ impl Sink for TraceSink {
                     }
                 }
                 Record::TurnRecord(r) => {
-                    let resend_of = self.resend_of(r.input.as_ref()).await;
-                    let unsealed = self.unseal_traceparent(&r);
-                    let record = unsealed.as_ref().unwrap_or(&r);
+                    let resend_of = self.resend_of(r.input.as_ref(), source, reader).await?;
+                    let unsealed = self.unseal_traceparent(r);
+                    let record = unsealed.as_ref().unwrap_or(r);
                     let hash = |kind: &str, key: &str| self.hasher.label(kind, key);
                     let keys = match self.settings.keys {
                         KeyMode::Hashed => ActorKeys::Hashed(&hash),
@@ -172,13 +176,13 @@ impl Sink for TraceSink {
                     let turn = Turn {
                         record,
                         lsn: c.lsn,
-                        branch: self.node.branch(),
+                        branch: &source.branch,
                         open: &self.open,
                         resend_of,
                         secrets: &secrets,
                     };
                     out.extend(spans::spans(&turn, &keys));
-                    self.open.commit(&r);
+                    self.open.commit(r);
                 }
                 _ => {}
             }
@@ -200,15 +204,14 @@ impl Sink for TraceSink {
         Ok(Some(spans::request(&resource, out).encode_to_vec().into()))
     }
 
-    async fn deliver(&mut self, batch: &Self::Batch) -> Delivery {
+    async fn deliver(&mut self, batch: &Self::Batch, original: AuthLease) -> Delivery {
         let Some(body) = batch else {
             return Delivery::Delivered;
         };
-        let env = self.node.env().clone();
         let url = format!("{}/v1/traces", self.settings.endpoint);
         let headers = self.settings.headers.clone();
         otlp_delivery(
-            crate::http::post(&env, url, headers, "application/x-protobuf", body.clone()).await,
+            crate::http::post(&self.node, url, headers, "application/x-protobuf", body.clone(), original).await,
             |body| {
                 ExportTraceServiceResponse::decode(body)
                     .ok()
@@ -243,32 +246,32 @@ impl Sink for TraceSink {
     /// open or kept after `to` is not known, so what names it falls back as
     /// past the cap; keep set snapshots with the cursor if rewinds past
     /// retention ever matter. Reads the retained log up to `to` once.
-    async fn rewind(&mut self, to: Lsn, _generation: Generation) -> Result<(), String> {
+    async fn rewind(&mut self, to: Lsn, _generation: Generation, reader: &kronik_sched::ShardReader) -> Result<(), String> {
+        reader.check().map_err(|error| error.code.as_str().to_owned())?;
+        let kronik_core::ids::SourcePos::Actor { shard: None, lsn: through } = reader.point().source else {
+            return Err("STORAGE_CORRUPT".into());
+        };
+        if to > through { return Err("BAD_REQUEST".into()); }
         let mut open = OpenTurns::new(*self.open.ids());
         open.tracking = false;
-        let reader = self.node.reader();
-        let first = reader
-            .starts()
-            .await
-            .map_err(|_| "state_read".to_owned())?
-            .first()
-            .copied()
-            .unwrap_or(1);
-        reader
-            .read_while(first, to, |c| {
-                match &c.record {
-                    Record::TurnBegin(b) => {
-                        if let Some(key) = &b.causal_key {
-                            open.begin(key, b.input.as_ref());
-                        }
-                    }
-                    Record::TurnRecord(r) => open.commit(r),
+        let mut after = reader.point().retained_from.max(1) - 1;
+        while after < to {
+            let count = usize::try_from(to - after).unwrap_or(usize::MAX).min(256);
+            let page = reader.local_export_page(after, count, crate::follow::BATCH_BYTES).await
+                .map_err(|error| error.code.as_str().to_owned())?;
+            if page.retention_gap.is_some() || page.records.is_empty() || page.scanned_through > to {
+                return Err("state_read".into());
+            }
+            for (_, committed) in &page.records {
+                match &committed.record {
+                    Record::TurnBegin(begin) => if let Some(key) = &begin.causal_key { open.begin(key, begin.input.as_ref()); },
+                    Record::TurnRecord(record) => open.commit(record),
                     _ => {}
                 }
-                Ok(true)
-            })
-            .await
-            .map_err(|_| "state_read".to_owned())?;
+            }
+            after = page.scanned_through;
+        }
+        reader.check().map_err(|error| error.code.as_str().to_owned())?;
         open.tracking = true;
         self.open = open;
         self.checkpoints.reset();

@@ -9,4 +9,7 @@ crates/kronik-runtime/src/engine.rs   Wasmtime's Component::deserialize_file loa
 crates/kronik-store/src/sql/ffi.rs    the SQLite C API that rusqlite does not wrap: the session extension (changesets), the VFS clock hook and the table filter for sessions
 crates/kronik-foreign/src/sys.rs      the Linux system calls of the gVisor sandboxes: unshare and setns for network namespaces, ioctl to bring loopback up, umount2, geteuid
 crates/kronik-privacy/src/key_memory.rs dedicated page-aligned locked key mappings; audited references, zeroization and unmapping
+crates/kronik-privacy/src/keystore/ffi.rs public SQLite FILESTAT45/sqlite3_str extraction and scoped BorrowedFd/fstat on the same live Connection; never opens, duplicates or closes database descriptors
+crates/kronik-core/src/env/real/exchange.rs owned Linux one-shot process groups, fixed fd3/CLOEXEC isolation, nonblocking pipes and kill-before-reap supervision
+crates/kronik-keyhelper/src/platform.rs optional Linux GNU PKCS11 helper protections and verified module/protocol descriptor ownership; no module loading in daemon
 sdk/rust/src/lib.rs                   the `bindings` module that wit-bindgen generates for the kronik:actor world, which the guest's export! needs

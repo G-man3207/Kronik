@@ -577,6 +577,7 @@ impl World {
                     )),
                 }),
                 blobs: vec![],
+                retained_compensation_source: None,
             };
             let r = node
                 .send(actor, msg, audit(), false)
@@ -1285,9 +1286,8 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
         .effects
         .map(|fx| SimService::new(clock.clone(), SimRng::new(seed, b"service"), fx.faults));
     let secrets = match cfg.effects.filter(|fx| fx.webhook).map(|_| {
-        let conn = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
         let master = kronik_privacy::MasterKey::from_bytes([7; 32]).map_err(|e| e.to_string())?;
-        kronik_privacy::SecretStore::open(conn, &master)
+        kronik_privacy::SecretStore::open_memory(&master, kronik_sched::secrets::SecretCacheData::new())
             .map(Arc::new)
             .map_err(|e| e.to_string())
     }) {

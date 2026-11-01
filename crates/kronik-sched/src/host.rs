@@ -106,10 +106,10 @@ impl SqlTurn {
     /// Values of `secrets` the turn wrote are scrubbed first. `Ok(None)` when
     /// the turn never used SQL; `Err` when SQLite rolled the transaction back
     /// (the turn must fail).
-    pub fn end(
+    pub fn end<N: AsRef<str>, V: AsRef<[u8]>>(
         &mut self,
         commit: bool,
-        secrets: &[(String, Vec<u8>)],
+        secrets: &[(N, V)],
     ) -> Result<Option<TurnSql>, String> {
         let Some(db) = self.db.take() else {
             return Ok(None);

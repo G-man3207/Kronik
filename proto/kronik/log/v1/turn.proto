@@ -83,6 +83,13 @@ message EffectRecord {
   // For GROUNDING_SYNTHETIC: the simulator that answered ("stub",
   // "contract", "neighbor", "model" or "fail-closed"); empty otherwise (M12).
   string simulator = 13;
+  // Host-generated actual committed callee, outside subject-sealed reply data.
+  // Absence is historical unknown, never inferred as native or member shard 0.
+  ActorSource callee_source = 40;
+  reserved 41;
+  // Only actor.call HOST_REDACTION_FAILURE with an actual callee source:
+  // the original Ok/Rejected/Failed outcome before its reply was withheld.
+  optional EffectStatus observed_callee_status = 42;
   // When the effect started, in microseconds from the turn's start on the
   // monotonic clock: the effect span's start (M28, m28-otel §3.3). 0 in
   // records from before it. Timing, never behavior: diffs ignore it.
@@ -102,6 +109,8 @@ enum EffectStatus {
   EFFECT_STATUS_REJECTED = 8;
   EFFECT_STATUS_FAILED = 9;
   EFFECT_STATUS_REENTRANT = 10;
+  // The wire response arrived, but its free text could not be safely recorded.
+  EFFECT_STATUS_HOST_REDACTION_FAILURE = 11;
 }
 
 enum Grounding {

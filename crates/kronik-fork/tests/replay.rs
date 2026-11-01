@@ -40,6 +40,7 @@ fn replay_with(
 ) -> ReplayOutput {
     let to = p.settle();
     let node = p.node.clone();
+    let original = node.local_operator_authority().unwrap();
     p.rt.block_on(async move {
         let index = Arc::new(
             ProductionIndex::load_from(node.reader(), base, fork_lsn, to)
@@ -75,6 +76,7 @@ fn replay_with(
             fc.kinds,
             config,
             node.secrets().cloned(),
+            original,
         );
         setup.stubs = options.stubs.clone();
         setup.live = (!options.live_allowlist.is_empty()).then(|| kronik_fork::LiveAccess {
@@ -277,7 +279,7 @@ fn isolated_split_mid_chunk_gives_the_same_diff() {
             &new,
         )
         .unwrap();
-        let setup = Arc::new(ReplaySetup::new(
+        let setup = Arc::new(ReplaySetup::recorded(
             "f-test".into(),
             index.clone(),
             fc.kinds,
@@ -465,6 +467,7 @@ fn webhook_relay_with_a_changed_body() {
         content_type: "application/json".into(),
         body: plain(&target),
         blobs: vec![],
+        retained_compensation_source: None,
     };
     let r = p.rt.block_on(p.node.send(
         kronik_core::ids::ActorRef::parse("webhook-relay/shop").unwrap(),
@@ -717,6 +720,7 @@ fn replay_from_a_snapshot_equals_replay_from_the_start() {
             content_type: "text/plain".into(),
             body: plain(text),
             blobs: vec![],
+            retained_compensation_source: None,
         };
         let actor = kronik_core::ids::ActorRef::parse(&format!("notes/{key}")).unwrap();
         p.rt.block_on(p.node.send(actor, m, audit(), false))
@@ -793,6 +797,7 @@ fn identity_replay_over_outcome_unknown_turns_is_empty() {
             content_type: "text/plain".into(),
             body: plain(&spec),
             blobs: vec![],
+            retained_compensation_source: None,
         };
         let _ = node
             .send(

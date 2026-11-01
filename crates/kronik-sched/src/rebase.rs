@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use kronik_core::authority::AuthLease;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{CodeHash, Lsn};
 use kronik_log::{Committed, LogReader};
@@ -189,23 +190,33 @@ impl Node {
 
     /// Builds the shadow of rebase `id` at `base_lsn` from main's log, and
     /// feeds it everything main logged since; kept for the switch.
-    pub async fn rebase_prepare(&self, id: &str, base_lsn: Lsn) -> Result<(), ApiError> {
+    pub async fn rebase_prepare(&self, id: &str, base_lsn: Lsn, authority: AuthLease) -> Result<(), ApiError> {
+        authority.check()?;
         let ready = lock(&self.rebase.live)
             .as_ref()
             .is_some_and(|s| s.rebase_id == id && s.base_lsn == base_lsn);
         if !ready {
-            let shadow = self
-                .rebase
-                .at_base(self.store(), id, base_lsn)
-                .await
-                .map_err(|e| ApiError::new(ErrorCode::BadRequest, e.to_string()))?;
-            *lock(&self.rebase.live) = Some(shadow);
+            let snap = self.rebase.snapshot_at_most(base_lsn);
+            let from = snap.as_ref().map_or(0, |(lsn, _)| *lsn);
+            let records = self.rebase.read(from, base_lsn).await.map_err(store_err)?;
+            if records.first().is_some_and(|record| record.lsn != from + 1) {
+                return Err(ApiError::new(ErrorCode::BadRequest, format!("the rebase {id} needs the log from lsn {}, but it starts later", from + 1)));
+            }
+            let sealer = self.store().sealer_arc();
+            let rebase = self.rebase.clone();
+            let id = id.to_owned();
+            self.authorized_effect(authority.clone(), move || async move {
+                let shadow = Shadow::at_base(&id, base_lsn, snap.as_ref().map(|(lsn, dir)| (*lsn, dir.as_path())), &records, sealer)
+                    .map_err(|error| ApiError::new(ErrorCode::BadRequest, error.to_string()))?;
+                *lock(&rebase.live) = Some(shadow);
+                Ok(())
+            }).await?;
         }
-        self.rebase_refresh(id).await
+        self.rebase_refresh(id, authority).await
     }
 
     /// Feeds the live shadow main's records since it last read.
-    async fn rebase_refresh(&self, id: &str) -> Result<(), ApiError> {
+    async fn rebase_refresh(&self, id: &str, authority: AuthLease) -> Result<(), ApiError> {
         let from = lock(&self.rebase.live)
             .as_ref()
             .filter(|s| s.rebase_id == id)
@@ -216,12 +227,14 @@ impl Node {
             .read(from, self.applied_lsn())
             .await
             .map_err(store_err)?;
-        let mut live = lock(&self.rebase.live);
-        let shadow = live
-            .as_mut()
-            .filter(|s| s.rebase_id == id)
-            .ok_or_else(|| internal(format!("rebase {id} is not prepared")))?;
-        shadow.feed(&records).map_err(store_err)
+        let rebase = self.rebase.clone();
+        let id = id.to_owned();
+        self.authorized_effect(authority, move || async move {
+            let mut live = lock(&rebase.live);
+            let shadow = live.as_mut().filter(|shadow| shadow.rebase_id == id)
+                .ok_or_else(|| internal(format!("rebase {id} is not prepared")))?;
+            shadow.feed(&records).map_err(store_err)
+        }).await
     }
 
     /// A snapshot at the switch, so later rebuilds start after it (ADR
@@ -271,11 +284,13 @@ impl Node {
         turns: Vec<(Lsn, pb::TurnRecord)>,
         not_after: Lsn,
         pause: Option<&crate::gate::Drain>,
+        authority: AuthLease,
     ) -> Result<(), ApiError> {
+        authority.check()?;
         // Under the rebase pause the deploy lock is the pause's.
         let _guard = match pause {
             Some(p) if p.holds_deploy_lock() => None,
-            _ => Some(self.deploy_lock.lock().await),
+            _ => Some(self.lock_deploy_authorized(&authority).await?),
         };
         self.rebase_erasure_check(not_after)?;
         // Nothing more is written once the pause's bound has passed (ADR 0018).
@@ -285,7 +300,7 @@ impl Node {
             ));
         }
         let Some(last_fork) = turns.last().map(|(l, _)| *l) else {
-            return self.rebase_refresh(id).await;
+            return self.rebase_refresh(id, authority).await;
         };
         // Every batch keeps to the reserve, not only the estimate before the
         // first: turns staged so far stay unused and are reused by a later
@@ -316,10 +331,22 @@ impl Node {
                         record: Some(record),
                     })),
                 })
-            })
-            .collect();
-        self.commit_all(records).await?;
-        self.rebase_refresh(id).await?;
+            });
+        for record in records {
+            if let Some(pause) = pause {
+                if pause.expired() {
+                    return Err(stale("the last round did not fit in rebase.max_pause; nothing was switched"));
+                }
+                // A timed-out unadmitted append is dropped; records already admitted may finish honestly.
+                match self.env().timeout(pause.remaining(), self.commit_authorized(record, authority.clone())).await {
+                    Ok(result) => { result?; }
+                    Err(_) => return Err(stale("the last round did not fit in rebase.max_pause; nothing was switched")),
+                }
+            } else {
+                self.commit_authorized(record, authority.clone()).await?;
+            }
+        }
+        self.rebase_refresh(id, authority).await?;
         let staged = self.rebase_staged_to(id);
         if staged != Some(last_fork) {
             return Err(internal(format!(
@@ -401,7 +428,9 @@ impl Node {
         kinds: Vec<pb::KindVersion>,
         not_after: Lsn,
         audit: pb::Audit,
+        authority: AuthLease,
     ) -> Result<(u64, Lsn), ApiError> {
+        authority.check()?;
         // The pause holds the deploy lock (lock order: deploy lock, drain,
         // switch gate).
         if !pause.holds_deploy_lock() {
@@ -409,7 +438,7 @@ impl Node {
         }
         self.rebase_erasure_check(not_after)?;
         self.rebase_still_valid(&sw, &kinds)?;
-        self.rebase_refresh(id).await?;
+        self.rebase_refresh(id, authority.clone()).await?;
         let mut installs = Vec::with_capacity(kinds.len());
         for v in &kinds {
             let hash = CodeHash::from_slice(&v.code_hash).ok_or_else(|| {
@@ -449,16 +478,19 @@ impl Node {
                 "the last catch-up did not fit in rebase.max_pause; nothing was switched",
             ));
         }
-        let gate = self.gate.switch().await;
+        let gate = self.switch_authorized(&authority).await?;
         // With the gate held no turn starts; a callee turn whose caller
         // gave up may have started before it.
+        if pause.expired() {
+            return Err(stale("the last catch-up did not fit in rebase.max_pause; nothing was switched"));
+        }
         pause.check_quiet()?;
         let record = Record::StateRebase(pb::StateRebase {
             rebase_id: id.to_owned(),
             part: Some(pb::state_rebase::Part::Switch(sw)),
         });
         let lsn = self
-            .finish_switch(pause, gate, record, installs, epoch, true)
+            .finish_switch(pause, gate, record, installs, epoch, true, crate::node::OperationOrigin::Request(authority))
             .await?;
         tracing::info!(rebase = id, epoch, lsn, "state rebased");
         Ok((epoch, lsn))

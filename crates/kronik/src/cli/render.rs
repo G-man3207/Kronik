@@ -7,7 +7,8 @@ use kronik_api::types::{
     ActorsResponse, DeadLettersResponse, DeployResponse, DeploymentsResponse, EffectSummary,
     ForkTurnResponse, GrantResponse, GrantsResponse, HistoryResponse, InspectResponse,
     LimitsListResponse, LimitsResponse, LimitsView, OrphansResponse, Outcome, Payload,
-    RevokeResponse, Route, SecretDeleteResponse, SecretResponse, SecretsResponse, TimersResponse,
+    Reply, RevokeResponse, Route, SecretBackendsResponse, SecretDeleteResponse, SecretHistoryResponse,
+    SecretLinkResponse, SecretResponse, SecretsResponse, SecretVersionPhase, TimersResponse,
     TraceNode, TraceResponse, TurnResponse, TurnSummary,
 };
 use kronik_core::error::ApiError;
@@ -111,6 +112,15 @@ fn curl(route: &Route, gateway: &str) -> String {
     }
 }
 
+fn reply_lines(reply: &Reply) -> Vec<String> {
+    let mut lines = match &reply.blob {
+        Some(blob) => vec![format!("Blob {} ({} bytes)", blob.hash, blob.size)],
+        None => payload_lines(&reply.body),
+    };
+    lines.extend(reply.blobs.iter().map(|blob| format!("Attachment {} ({} bytes)", blob.hash, blob.size)));
+    lines
+}
+
 pub fn turn(t: &TurnResponse, ctx: &TurnContext) -> String {
     let mut out = String::new();
     let Some(outcome) = &t.outcome else {
@@ -137,7 +147,7 @@ pub fn turn(t: &TurnResponse, ctx: &TurnContext) -> String {
         ),
     };
     if let Some(reply) = &t.reply {
-        field(&mut out, "Reply", &payload_lines(&reply.body), "");
+        field(&mut out, "Reply", &reply_lines(reply), "");
     }
     if committed {
         let cmds = match ctx {
@@ -394,7 +404,7 @@ pub fn fork_turn(t: &ForkTurnResponse, actor: &str) -> String {
         t.fork
     );
     if let Some(reply) = &t.reply {
-        field(&mut out, "Reply", &payload_lines(&reply.body), "");
+        field(&mut out, "Reply", &reply_lines(reply), "");
     }
     if t.outcome.kind != "committed" {
         field(&mut out, "Error", &[failure(&t.outcome)], "");
@@ -816,13 +826,13 @@ pub fn secret_set(name: &str, r: &SecretResponse, rerun: &str) -> String {
 }
 
 pub fn secrets(r: &SecretsResponse) -> String {
-    let Some(first) = r.secrets.first() else {
+    if r.secrets.is_empty() && r.links.is_empty() {
         let mut out = String::from("No secrets.\n");
         out.push_str(&next(&[
             "kronik secret set <name> --reason \"...\"   (value on stdin)".to_owned(),
         ]));
         return out;
-    };
+    }
     let rows = r
         .secrets
         .iter()
@@ -835,11 +845,24 @@ pub fn secrets(r: &SecretsResponse) -> String {
             ]
         })
         .collect();
-    let mut out = table(&["NAME", "VERSION", "VERSION HASH", "CREATED"], rows);
-    out.push_str(&next(&[format!(
-        "kronik grant <kind> {} --reason \"...\"",
-        shell_quote(&format!("secret:{}", first.name))
-    )]));
+    let mut out = if r.secrets.is_empty() {
+        String::from("No observed secret versions.\n")
+    } else {
+        table(&["NAME", "VERSION", "VERSION HASH", "CREATED"], rows)
+    };
+    if !r.links.is_empty() {
+        let _ = writeln!(out, "\nBindings");
+        out.push_str(&table(&["NAME", "BACKEND", "REFERENCE", "GENERATION", "EPOCH"],
+            r.links.iter().map(|link| vec![link.name.clone(),
+                if link.backend.is_empty() { "built-in".into() } else { link.backend.clone() },
+                link.r#ref.clone(), link.generation.to_string(), link.epoch.to_string()]).collect()));
+    }
+    if let Some(first) = r.secrets.first() {
+        out.push_str(&next(&[format!("kronik grant <kind> {} --reason \"...\"",
+            shell_quote(&format!("secret:{}", first.name)))]));
+    } else if let Some(first) = r.links.first() {
+        out.push_str(&next(&[format!("kronik secret refresh {} --reason \"...\"", shell_quote(&first.name))]));
+    }
     out
 }
 
@@ -862,6 +885,72 @@ pub fn secret_deleted(r: &SecretDeleteResponse, rerun: &str) -> String {
         let _ = writeln!(out, "Deleted secret {}: {} {versions}", d.name, d.versions);
         out.push_str(&next(&["kronik secret list".to_owned()]));
     }
+    out
+}
+
+pub fn secret_link(r: &SecretLinkResponse, rerun: &str) -> String {
+    let link = &r.link;
+    let mut out = String::new();
+    if r.dry_run {
+        let _ = writeln!(out, "Dry run: binding {} can change; nothing was written", link.name);
+        out.push_str(&next(&[rerun.to_owned()]));
+        return out;
+    }
+    if link.backend.is_empty() {
+        let _ = writeln!(out, "Secret {} now uses the built-in store, generation {}", link.name, link.generation);
+    } else {
+        let _ = writeln!(out, "Linked {} to {} {}, generation {}", link.name, link.backend, link.r#ref, link.generation);
+    }
+    out.push_str(&next(&[
+        format!("kronik secret refresh {} --reason \"...\"", shell_quote(&link.name)),
+        format!("kronik secret history {}", shell_quote(&link.name)),
+    ]));
+    out
+}
+
+pub fn secret_refreshed(name: &str, r: &SecretResponse, rerun: &str) -> String {
+    let mut out = String::new();
+    if r.dry_run {
+        let _ = writeln!(out, "Dry run: secret {name} can be refreshed; no version or value was cached");
+        out.push_str(&next(&[rerun.to_owned()]));
+    } else if let Some(secret) = &r.secret {
+        let _ = writeln!(out, "Observed secret {}, version {}", secret.name, secret.version);
+        field(&mut out, "Version hash", std::slice::from_ref(&secret.version_hash), "");
+        out.push_str(&next(&[format!("kronik secret history {}", shell_quote(name))]));
+    } else {
+        let _ = writeln!(out, "Secret {name} has no committed observation");
+        out.push_str(&next(&[format!("kronik secret history {}", shell_quote(name))]));
+    }
+    out
+}
+
+pub fn secret_history(r: &SecretHistoryResponse) -> String {
+    if r.versions.is_empty() {
+        return format!("No committed versions for {}.\n{}", r.name,
+            next(&[format!("kronik secret refresh {} --reason \"...\"", shell_quote(&r.name))]));
+    }
+    let rows = r.versions.iter().map(|version| {
+        let phase = match version.phase {
+            SecretVersionPhase::Reserved => "reserved",
+            SecretVersionPhase::Active => "active",
+            SecretVersionPhase::Failed => "failed",
+        };
+        vec![version.version.to_string(), phase.into(), version.version_hash.clone(),
+            version.backend.clone(), version.r#ref.clone(), version.source_version.clone(),
+            version.link_generation.to_string(), version.deleted.to_string(),
+            units::utc(version.created_wall_ms), version.token_id.clone(), version.reason.clone()]
+    }).collect();
+    let mut out = table(&["VERSION", "PHASE", "HASH", "BACKEND", "REFERENCE", "SOURCE VERSION",
+        "GENERATION", "DELETED", "OBSERVED", "WHO", "REASON"], rows);
+    out.push_str(&next(&[format!("kronik secret refresh {} --reason \"...\"", shell_quote(&r.name))]));
+    out
+}
+
+pub fn secret_backends(r: &SecretBackendsResponse) -> String {
+    let rows = r.backends.iter().map(|backend| vec![backend.id.clone(), backend.kind.clone(),
+        backend.binding.clone(), backend.configured.to_string(), backend.inventory_complete.to_string()]).collect();
+    let mut out = table(&["BACKEND", "KIND", "BINDING", "CONFIGURED", "INVENTORY COMPLETE"], rows);
+    out.push_str(&next(&["kronik secret list".to_owned()]));
     out
 }
 
@@ -1271,5 +1360,31 @@ mod tests {
             effects: Vec::new(),
         };
         assert_eq!(changes(&t), "set s [erased], set t");
+    }
+
+    #[test]
+    fn turn_views_show_body_and_attachment_identities_instead_of_empty_replies() {
+        let body = kronik_api::types::BlobReference { hash: format!("b3:{}", "11".repeat(32)), size: 1073741824 };
+        let attachment = kronik_api::types::BlobReference { hash: format!("b3:{}", "22".repeat(32)), size: 29 };
+        let response = TurnResponse {
+            dry_run: false,
+            turn_id: Some("main:9".into()),
+            outcome: Some(Outcome { kind: "committed".into(), error_code: None, message: None }),
+            reply: Some(Reply::blob("http 200".into(), String::new(), body.clone())),
+        };
+        let shown = turn(&response, &TurnContext::Send { actor: "kind/key".into(), rerun: String::new() });
+        assert!(shown.contains(&body.hash));
+        assert!(shown.contains(&body.size.to_string()));
+        let fork = ForkTurnResponse {
+            fork: "preview".into(), turn_id: "preview:9".into(),
+            outcome: response.outcome.unwrap(),
+            reply: Some(Reply::inline("reply".into(), "text/plain".into(),
+                Payload::from_bytes(b"actual inline body"), vec![attachment.clone()])),
+            effects: Vec::new(),
+        };
+        let shown = fork_turn(&fork, "kind/key");
+        assert!(shown.contains("actual inline body"));
+        assert!(shown.contains(&attachment.hash));
+        assert!(shown.contains(&attachment.size.to_string()));
     }
 }

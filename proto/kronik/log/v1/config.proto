@@ -9,6 +9,7 @@ package kronik.log.v1;
 
 import "kronik/log/v1/common.proto";
 import "kronik/log/v1/effects.proto";
+import "kronik/log/v1/control.proto";
 
 message Deployment {
   uint64 epoch = 1;         // configuration epoch
@@ -127,6 +128,9 @@ message Approval {
   // For requests: the exact command for the human, e.g.
   // "kronik approve p-7h3k2a9c1d0e --reason '...'".
   string command = 6;
+  // Exact verified issuer/subject payload for an OIDC approval only. Always
+  // encrypted under the existing protected principal's subject key.
+  optional Sealable verified_identity = 7;
 }
 
 enum PrivacyState {
@@ -139,6 +143,9 @@ message PrivacyMode {
   uint64 epoch = 1;
   PrivacyState mode = 2;
   Audit audit = 3;
+  // An explicit reseal request, not evidence that history has been rewritten.
+  // Only valid with mode ON; historical mode changes leave this false.
+  bool reseal_requested = 4;
 }
 
 enum ForeignOp {
@@ -270,6 +277,18 @@ message StubRuleSpec {
   string error = 6;
 }
 
+// Original native provenance is independent of the new metadata adoption receipt.
+// Presence explicitly preserves historical unknown source/audit; it is accepted
+// only by the proof-bound, already-admitted native initialization continuation.
+message NativeAuthorityOrigin {
+  // When known this is the actual unsharded native frame and its namespace.
+  ActorSource source = 1;
+  // The actual initialization operator, never a fabricated original issuer.
+  Audit adoption_audit = 2;
+  // Archive records never materialize current authority. This explicit flag is
+  // set only for the exact current snapshot from the verified native capture.
+  bool current_projection = 3;
+}
 // A mutation whose effect is not a log record of its own (secrets, tokens,
 // forks and proposals, snapshots, reseal): written after it succeeded, so
 // that the log is the complete audit trail (M28, ADR 0083). Applying it
@@ -279,4 +298,51 @@ message AuditEvent {
   string target = 2;   // the secret's or token's name, the fork or proposal id
   map<string, string> details = 3;  // plain, non-secret facts: scopes, version
   Audit audit = 4;
+  oneof operation {
+    FleetState fleet_state = 5;
+    InstallationIdentity installation_identity = 6;
+    AuthConfig auth_config = 7;
+    AuthSessionRevoked auth_session_revoked = 8;
+    AuthOidcLogin auth_oidc_login = 9;
+  }
+}
+
+// Durable identity, never secret bytes. A reservation consumes its number even
+// if publication fails. Only ACTIVE nondeleted records describe usable values.
+message SecretVersion {
+  string name = 1;
+  uint64 version = 2;
+  bytes version_hash = 3;
+  string backend = 4;
+  string source_version = 5;
+  bool deleted = 6;
+  Audit audit = 7;
+  string ref = 8;
+  string binding = 9;
+  uint64 link_generation = 10;
+  string canonical_ref = 11;
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    RESERVED = 1;
+    ACTIVE = 2;
+    FAILED = 3;
+    // Global nonvalue format floor: version is 0 (fresh) or uint32 max
+    // (legacy migration); all value/provenance fields are empty.
+    FENCE = 4;
+  }
+  Phase phase = 12;
+  uint32 hash_revision = 13;
+}
+
+// Link/unlink creates an ordinary configuration epoch. Empty backend unlinks;
+// prior generations retain their immutable provenance in history.
+message SecretLink {
+  string name = 1;
+  string backend = 2;
+  string ref = 3;
+  Audit audit = 4;
+  string binding = 5;
+  uint64 generation = 6;
+  uint64 epoch = 7;
+  string canonical_ref = 8;
 }

@@ -6,7 +6,7 @@ use kronik_proto::log::v1 as pb;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Api, ApiRequest, ApiResponse, Result, json, ok, reason};
+use crate::{Api, AuthorizedRequest, ApiResponse, Result, json, ok, reason};
 
 /// A privacy mode as the API writes it: `"off"` or `"on"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -150,7 +150,7 @@ pub struct ResealResponse {
 impl Api {
     pub(crate) async fn route_privacy(
         &self,
-        req: &ApiRequest,
+        req: &AuthorizedRequest,
         segs: &[&str],
     ) -> Option<Result<ApiResponse>> {
         Some(match (req.method.as_str(), segs) {
@@ -185,13 +185,13 @@ impl Api {
         })
     }
 
-    async fn privacy_erase(&self, req: &ApiRequest) -> Result<ApiResponse> {
+    async fn privacy_erase(&self, req: &AuthorizedRequest) -> Result<ApiResponse> {
         let r: ErasureRequest = json(&req.body)?;
         reason(&r.reason)?;
         let audit = self.audit(req, r.reason.clone());
         let done = self
             .node
-            .erase_subject(&r.subject, audit, r.dry_run)
+            .erase_subject(&r.subject, audit, r.dry_run, req.authority.clone())
             .await?;
         // Previews hold the values they revealed when they started: they
         // start again without the erased ones (P-F11).
@@ -211,10 +211,10 @@ impl Api {
         })
     }
 
-    async fn privacy_reseal(&self, req: &ApiRequest) -> Result<ApiResponse> {
+    async fn privacy_reseal(&self, req: &AuthorizedRequest) -> Result<ApiResponse> {
         let r: ResealRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let done = self.node.reseal(r.dry_run).await?;
+        let done = self.node.reseal(self.audit(req, r.reason.clone()), r.dry_run, req.authority.clone()).await?;
         if !r.dry_run {
             let details = [
                 ("segments", done.segments.to_string()),
@@ -231,13 +231,13 @@ impl Api {
         })
     }
 
-    async fn privacy_mode(&self, req: &ApiRequest) -> Result<ApiResponse> {
+    async fn privacy_mode(&self, req: &AuthorizedRequest) -> Result<ApiResponse> {
         let r: PrivacyModeRequest = json(&req.body)?;
         reason(&r.reason)?;
         let audit = self.audit(req, r.reason.clone());
         let change = self
             .node
-            .set_privacy_mode(r.mode.into(), audit, r.dry_run)
+            .set_privacy_mode(r.mode.into(), audit, r.dry_run, req.authority.clone())
             .await?;
         ok(&PrivacyModeResponse {
             dry_run: r.dry_run,

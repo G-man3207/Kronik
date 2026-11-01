@@ -13,6 +13,7 @@ use chacha20::ChaCha20Rng;
 use chacha20::rand_core::{Rng, SeedableRng};
 use kronik_core::causal;
 use kronik_core::env::BoxFuture;
+use kronik_core::error::ErrorCode;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
 use wasmtime::component::{HasData, Resource, ResourceTable};
@@ -22,6 +23,8 @@ use wasmtime_wasi::p2::bindings::clocks::{monotonic_clock, wall_clock};
 use wasmtime_wasi::p2::bindings::random::{insecure, insecure_seed, random};
 use wasmtime_wasi::p2::{DynPollable, OutputStream, Pollable, StreamResult};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+
+use crate::turn::RunError;
 
 pub mod bindings {
     wasmtime::component::bindgen!({
@@ -114,6 +117,8 @@ pub enum FetchOutcome {
     Timeout,
     TooLarge,
     OutcomeUnknown,
+    /// The gate durably recorded status HOST_REDACTION_FAILURE. Never an SDK network error.
+    HostRedactionFailure,
 }
 
 /// `messaging.call` results (`call-error` in the WIT).
@@ -146,11 +151,22 @@ pub enum CryptoOutcome {
 pub enum GateError {
     /// A host failure: the turn is abandoned without a record.
     Host(String),
+    /// A durable current FX11, or a valid-fingerprint durable legacy receipt
+    /// proven unsafe for disclosure and projected safely in the NEW terminal
+    /// turn. The original receipt is never rewritten. Uses the common trap.
+    HostRedactionFailure,
+    /// An immutable recorded prerequisite is gone; never give the guest another result.
+    Prerequisite(ErrorCode),
     /// A re-run's request differs from the recorded one: the turn traps
     /// with `REPLAY_DIVERGED`.
     Diverged(String),
 }
 
+
+/// A typed trap cause; guest strings cannot forge this downcast.
+#[derive(Debug, thiserror::Error)]
+#[error("HOST_REDACTION_FAILURE")]
+pub(crate) struct HostRedactionFailure;
 /// The effect boundary of one turn (docs/design/m2-effects.md §3): the
 /// scheduler implements capability checks, `TurnBegin`, recording, replay of
 /// recorded results and execution. `ordinal` is the turn's operation ordinal.
@@ -306,7 +322,7 @@ pub struct TurnHost {
     next_ordinal: u32,
     http: wasi_http::State,
     /// A host failure (not guest-visible); the turn is abandoned.
-    pub(crate) fatal: Option<String>,
+    pub(crate) fatal: Option<RunError>,
 }
 
 fn stream(seed: [u8; 32], id: u64) -> ChaCha20Rng {
@@ -388,7 +404,7 @@ impl TurnHost {
     /// Records a host failure and traps the guest.
     fn host_failure(&mut self, msg: String) -> wasmtime::Error {
         let e = wasmtime::format_err!("host failure: {msg}");
-        self.fatal = Some(msg);
+        self.fatal = Some(RunError::Host(msg));
         e
     }
 
@@ -440,6 +456,11 @@ impl TurnHost {
     fn gate_failure(&mut self, e: GateError) -> wasmtime::Error {
         match e {
             GateError::Host(msg) => self.host_failure(msg),
+            GateError::HostRedactionFailure => wasmtime::Error::new(HostRedactionFailure),
+            GateError::Prerequisite(code) => {
+                self.fatal = Some(RunError::Prerequisite(code));
+                wasmtime::format_err!("{code}")
+            }
             GateError::Diverged(msg) => wasmtime::format_err!("REPLAY_DIVERGED: {msg}"),
         }
     }
@@ -587,7 +608,30 @@ pub(crate) fn message_to_pb(m: types::Message, subject: Option<String>) -> pb::M
                 size: b.size,
             })
             .collect(),
+        retained_compensation_source: None,
     }
+}
+
+/// The gate must resolve the actual source and protected key before returning
+/// success. Missing, sealed, or opaque erased payloads are never empty replies.
+fn guest_call_reply(message: pb::Message) -> Result<types::Message, GateError> {
+    let body = match message.body.and_then(|value| value.value) {
+        Some(pb::sealable::Value::Plain(bytes)) => bytes,
+        _ => return Err(GateError::Prerequisite(ErrorCode::Unavailable)),
+    };
+    Ok(types::Message {
+        name: message.name,
+        content_type: message.content_type,
+        body,
+        blobs: message
+            .blobs
+            .into_iter()
+            .map(|blob| types::BlobRef {
+                hash: blob.hash,
+                size: blob.size,
+            })
+            .collect(),
+    })
 }
 
 impl messaging::Host for TurnHost {
@@ -631,15 +675,10 @@ impl messaging::Host for TurnHost {
         let res = gate.call(ordinal, to, msg, compensate).await;
         let out = res.map_err(|e| self.gate_failure(e))?;
         Ok(match out {
-            CallOutcome::Ok(reply) => Ok(reply.map(|m| types::Message {
-                name: m.name,
-                content_type: m.content_type,
-                body: match m.body.and_then(|b| b.value) {
-                    Some(pb::sealable::Value::Plain(b)) => b,
-                    _ => Vec::new(),
-                },
-                blobs: Vec::new(),
-            })),
+            CallOutcome::Ok(reply) => Ok(reply
+                .map(guest_call_reply)
+                .transpose()
+                .map_err(|error| self.gate_failure(error))?),
             CallOutcome::NotFound => Err(messaging::CallError::NotFound),
             CallOutcome::Rejected(m) => Err(messaging::CallError::Rejected(m)),
             CallOutcome::Failed(m) => Err(messaging::CallError::Failed(m)),
@@ -747,6 +786,7 @@ impl http_client::Host for TurnHost {
             FetchOutcome::Timeout => Err(http_client::FetchError::Timeout),
             FetchOutcome::TooLarge => Err(http_client::FetchError::TooLarge),
             FetchOutcome::OutcomeUnknown => Err(http_client::FetchError::OutcomeUnknown),
+            FetchOutcome::HostRedactionFailure => return Err(self.gate_failure(GateError::HostRedactionFailure)),
         })
     }
 }

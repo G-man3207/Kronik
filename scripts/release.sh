@@ -8,6 +8,8 @@
 #   install.sh                            version and base URL substituted
 #   SHA256SUMS                            SHA-256 of all of the above
 # The manual tag workflow compares two real builds before OIDC attestation.
+# KRONIK_RELEASE_KEYHELPER=yes adds the separate optional x86_64 GNU PKCS#11
+# helper archive; it never enables cryptoki in the daemon.
 #
 # The binaries are cross-compiled with cargo-zigbuild, which links with zig
 # and compiles the C code (SQLite, ring) with zig's clang for musl. Paths of
@@ -16,7 +18,7 @@
 # $CARGO_TARGET_DIR/release-tools). Only tool inputs may be shared between
 # independent builds, never compiled Kronik output.
 #
-# Usage: [KRONIK_BASE_URL=url] scripts/release.sh
+# Usage: [KRONIK_BASE_URL=url] [KRONIK_RELEASE_KEYHELPER=yes] scripts/release.sh
 # KRONIK_BASE_URL is where the release's files will be published; install.sh
 # downloads from there. Without it, install.sh needs KRONIK_BASE_URL when it
 # runs.
@@ -35,6 +37,12 @@ zig_sha256_aarch64=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234
 zigbuild_version=0.24.0
 cyclonedx_version=0.5.9
 targets=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl)
+with_keyhelper="${KRONIK_RELEASE_KEYHELPER:-no}"
+case "$with_keyhelper" in
+    yes) targets+=(x86_64-unknown-linux-gnu) ;;
+    no) ;;
+    *) echo "KRONIK_RELEASE_KEYHELPER must be yes or no" >&2; exit 1 ;;
+esac
 
 root="$(pwd)"
 target_dir="$(mkdir -p "${CARGO_TARGET_DIR:-target}" && cd "${CARGO_TARGET_DIR:-target}" && pwd)"
@@ -48,6 +56,10 @@ export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git show -s --format=%ct HEAD)}
 
 # zig, checked against its pinned SHA-256.
 host="$(uname -m)"
+if [ "$with_keyhelper" = yes ] && [ "$host" != x86_64 ]; then
+    echo "the optional GNU helper must be built on the supported x86_64 GNU host" >&2
+    exit 1
+fi
 zig_sha256_var="zig_sha256_$host"
 zig_dir="$tools/zig-$host-linux-$zig_version"
 if [ ! -x "$zig_dir/zig" ]; then
@@ -65,7 +77,7 @@ export PATH="$zig_dir:$tools/bin:$PATH"
 if [ "$(cargo-zigbuild --version 2>/dev/null)" != "cargo-zigbuild $zigbuild_version" ]; then
     cargo install --locked --root "$tools" --version "$zigbuild_version" cargo-zigbuild
 fi
-if [ "$(cargo-cyclonedx --version 2>/dev/null)" != "cargo-cyclonedx $cyclonedx_version" ]; then
+if [ "$(cargo cyclonedx --version 2>/dev/null)" != "cargo-cyclonedx-cyclonedx $cyclonedx_version" ]; then
     cargo install --locked --root "$tools" --version "$cyclonedx_version" cargo-cyclonedx
 fi
 rustup target add "${targets[@]}"
@@ -78,24 +90,34 @@ mkdir -p "$out"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 for target in "${targets[@]}"; do
-    cargo zigbuild --locked --release -p kronik --target "$target" \
-        --config 'profile.release.strip = "symbols"'
-    # Keep each target's SBOM inside its own archive. cargo-cyclonedx writes
-    # beside workspace manifests; remove only this invocation's generated name.
-    cargo cyclonedx --manifest-path crates/kronik/Cargo.toml --format json \
-        --spec-version 1.5 --target "$target" --override-filename kronik.cdx
-    mv crates/kronik/kronik.cdx.json "$work/kronik.cdx.json"
-    python3 - "$work/kronik.cdx.json" <<'PY'
+    package=kronik
+    features=()
+    metadata_features=()
+    if [ "$target" = x86_64-unknown-linux-gnu ]; then
+        package=kronik-keyhelper
+        features=(--features pkcs11)
+        metadata_features=(--features kronik-keyhelper/pkcs11)
+        cargo build --locked --release -p "$package" --target "$target" "${features[@]}" \
+            --config 'profile.release.strip = "symbols"'
+    else
+        cargo zigbuild --locked --release -p kronik --target "$target" \
+            --config 'profile.release.strip = "symbols"'
+    fi
+    # Each archive carries only its own target-specific SBOM.
+    cargo cyclonedx --manifest-path "crates/$package/Cargo.toml" --format json \
+        --spec-version 1.5 --target "$target" "${features[@]}" --override-filename "$package.cdx"
+    mv "crates/$package/$package.cdx.json" "$work/$package.cdx.json"
+    python3 - "$work/$package.cdx.json" <<'PY'
 from pathlib import Path
 import runpy
 import sys
 path = Path(sys.argv[1])
 path.write_bytes(runpy.run_path("scripts/package-release.py")["reproducible_sbom"](path, Path.cwd()))
 PY
-    rm -f crates/*/kronik.cdx.json
-    cargo metadata --locked --format-version 1 --filter-platform "$target" >"$work/metadata.json"
-    python3 scripts/package-release.py "$target" "$target_dir/$target/release/kronik" \
-        "$work/kronik.cdx.json" "$work/metadata.json" "$zig_dir" "$out"
+    rm -f crates/*/"$package.cdx.json"
+    cargo metadata --locked --format-version 1 --filter-platform "$target" "${metadata_features[@]}" >"$work/metadata.json"
+    python3 scripts/package-release.py "$target" "$target_dir/$target/release/$package" \
+        "$work/$package.cdx.json" "$work/metadata.json" "$zig_dir" "$out"
 done
 
 base_url="${KRONIK_BASE_URL:-@BASE_URL@}"

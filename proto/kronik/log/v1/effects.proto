@@ -13,9 +13,12 @@ message SecretRef {
   string name = 1;
   // Header template such as "Bearer {}"; empty for crypto and reveal.
   string template = 2;
+  // Legacy identity: unchanged uint32 field and four-byte hash input.
   uint32 version = 3;
-  // 16 bytes of blake3_keyed(version key, name \0 version \0 value).
+  // 16 bytes; legacy v1 hash through u32::MAX, explicit v2 hash for wide_version.
   bytes version_hash = 4;
+  // Exactly one version field is set. Wide values are >u32::MAX and <=2^53-1.
+  uint64 wide_version = 5;
 }
 
 message HttpEffectHeader {
@@ -32,6 +35,9 @@ message HttpEffectRequest {
   string url = 2;
   repeated HttpEffectHeader headers = 3;
   bytes body = 4;
+  // 0: exact legacy v1 normalization; 2: strict typed-component redaction.
+  // New requests use 2. Other versions are invalid.
+  uint32 fingerprint_version = 5;
 }
 
 message HeaderPair {
@@ -53,6 +59,8 @@ message CallEffectRequest {
   // Unset when the call has no compensation.
   Message compensate = 3;
   string message_id = 4;
+  // 0 verifies the exact historical fingerprint; new host requests use 2.
+  uint32 fingerprint_version = 5;
 }
 
 // actor.call response: the callee's reply, unset for output::none.

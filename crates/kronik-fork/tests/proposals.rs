@@ -340,6 +340,7 @@ fn messages_into_a_fork_reach_the_network_only_as_allowlisted_gets() {
             content_type: "text/plain".into(),
             body: plain(&body),
             blobs: vec![],
+            retained_compensation_source: None,
         };
         let actor = kronik_core::ids::ActorRef::parse("counter/x").unwrap();
         p.rt.block_on(props.fork_send("probe", actor, m)).unwrap()
@@ -457,6 +458,7 @@ fn inputs_inside_the_promote_gap_stay_unverified() {
                 content_type: "text/plain".into(),
                 body: plain(""),
                 blobs: vec![],
+                retained_compensation_source: None,
             };
             while !stop.load(Ordering::Relaxed) {
                 let _ = node.send(actor.clone(), m.clone(), audit(), false).await;
@@ -630,6 +632,7 @@ fn a_running_proposal_refuses_send_approve_request_approval_and_diff() {
         content_type: "text/plain".into(),
         body: plain(""),
         blobs: vec![],
+        retained_compensation_source: None,
     };
     let actor = || kronik_core::ids::ActorRef::parse("counter/a").unwrap();
     let running = ErrorCode::ProposalRunning;

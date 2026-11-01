@@ -48,6 +48,11 @@ pub const METRICS: &[Def] = &[
         kind: Type::Gauge,
     },
     Def {
+        name: "kronik_secret_recovery_stalled",
+        help: "Recorded secret reveals waiting for immutable backend availability.",
+        kind: Type::Gauge,
+    },
+    Def {
         name: "kronik_turns_total",
         help: "Turns recorded, by actor kind and outcome.",
         kind: Type::Counter,

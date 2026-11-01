@@ -264,15 +264,22 @@ fn first_keyword(sql: &str) -> &str {
 }
 
 fn authorize(s: &mut Shared, ctx: &AuthContext<'_>) -> Authorization {
-    if s.host {
-        return Authorization::Allow;
-    }
     let deny = |s: &mut Shared, why: String| {
         if s.stmt.denied.is_none() {
             s.stmt.denied = Some(why);
         }
         Authorization::Deny
     };
+    if let AuthAction::Function {function_name}=&ctx.action {
+        for name in ["sqlite_filestat","sqlite_walstat"] {
+            if function_name.eq_ignore_ascii_case(name) {
+                return deny(s,format!("function {name}() is not allowed"));
+            }
+        }
+    }
+    if s.host {
+        return Authorization::Allow;
+    }
     let internal = |t: &str| t.starts_with("_kronik");
     match &ctx.action {
         AuthAction::Pragma {
@@ -804,7 +811,7 @@ impl SqlActor {
     /// columns of every user table with `[secret:<name>]`, inside the turn,
     /// so the turn's changeset never holds the value. Returns the number of
     /// changed cells.
-    pub fn scrub(&mut self, secrets: &[(String, Vec<u8>)]) -> Result<u64, String> {
+    pub fn scrub<N: AsRef<str>, V: AsRef<[u8]>>(&mut self, secrets: &[(N, V)]) -> Result<u64, String> {
         if self.session.is_none() || self.poisoned {
             return Ok(0);
         }
@@ -827,7 +834,8 @@ impl SqlActor {
                 .map_err(|e| e.to_string())?;
             for c in &cols {
                 for (name, value) in secrets {
-                    let Ok(v) = std::str::from_utf8(value) else {
+                    let name = name.as_ref();
+                    let Ok(v) = std::str::from_utf8(value.as_ref()) else {
                         continue;
                     };
                     if v.len() < 4 {

@@ -111,11 +111,10 @@ impl TestHost {
         // The group commit window is a clock sleep, which would wait for the
         // test to advance time.
         log.group_commit_window = Duration::ZERO;
-        let secrets_conn =
-            rusqlite::Connection::open_in_memory().map_err(|e| Error::new("secrets", e))?;
         let master = MasterKey::from_bytes([7; 32]).map_err(|e| Error::new("master key", e))?;
         let secrets =
-            SecretStore::open(secrets_conn, &master).map_err(|e| Error::new("secrets", e))?;
+            SecretStore::open_memory(&master, kronik_sched::secrets::SecretCacheData::new())
+                .map_err(|e| Error::new("secrets", e))?;
         let node = Node::start(NodeParts {
             env,
             config: NodeConfig {
@@ -265,5 +264,15 @@ impl ProcessRunner for NoProcesses {
             ),
         );
         Box::pin(std::future::ready(Err(e)))
+    }
+
+    fn exchange(
+        &self,
+        _request: kronik_core::env::SensitiveProcessRequest,
+    ) -> BoxFuture<'static, std::io::Result<zeroize::Zeroizing<Vec<u8>>>> {
+        Box::pin(std::future::ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the test host does not start sensitive helper processes",
+        ))))
     }
 }

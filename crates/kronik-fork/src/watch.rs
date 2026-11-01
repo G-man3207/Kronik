@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use kronik_core::authority::AuthLease;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{Lsn, random_id};
 use kronik_log::LogError;
@@ -533,7 +534,7 @@ impl Watches {
     /// kinds. With `wait` it returns when the watch is over; otherwise at
     /// once, `watching`. A dry run keeps nothing: it returns the current
     /// metrics and, in `triggered` (with LSN 0), the guards that would fire
-    /// now.
+    /// now. The original request authority fences the start's final log enqueue.
     pub async fn watch(
         self: &Arc<Self>,
         epoch: u64,
@@ -541,7 +542,9 @@ impl Watches {
         audit: pb::Audit,
         dry_run: bool,
         wait: bool,
+        authority: AuthLease,
     ) -> Result<Watch, ApiError> {
+        authority.check()?;
         if for_ms == 0 || for_ms > MAX_FOR_MS {
             return Err(ApiError::new(
                 ErrorCode::BadRequest,
@@ -638,7 +641,7 @@ impl Watches {
             ("for_ms".to_owned(), for_ms.to_string()),
         ];
         self.node
-            .record_audit_event("watch.start", &w.id, details.into(), audit)
+            .record_audit_event_authorized("watch.start", &w.id, details.into(), audit, authority.clone())
             .await?;
         self.save(&w)?;
         let id = w.id.clone();
@@ -653,9 +656,24 @@ impl Watches {
 
     /// `kronik watches stop <id>`: audits the intent, then ends the watch
     /// `stopped`; it triggers no more guards or rollbacks. A dry run checks
-    /// and changes nothing.
-    pub async fn stop(&self, id: &str, audit: pb::Audit, dry_run: bool) -> Result<Watch, ApiError> {
-        let _acting = self.acting.lock().await;
+    /// and changes nothing. The original authority survives the guard lock wait.
+    pub async fn stop(
+        &self,
+        id: &str,
+        audit: pb::Audit,
+        dry_run: bool,
+        authority: AuthLease,
+    ) -> Result<Watch, ApiError> {
+        authority.check()?;
+        let _acting = tokio::select! {
+            biased;
+            () = authority.cancelled() => {
+                authority.check()?;
+                return Err(ApiError::new(ErrorCode::Unauthenticated, "watch stop authority revoked"));
+            }
+            acting = self.acting.lock() => acting,
+        };
+        authority.check()?;
         let w = self.get(id)?;
         if w.status != WATCHING {
             return Err(ApiError::new(
@@ -668,7 +686,7 @@ impl Watches {
             return Ok(w);
         }
         self.node
-            .record_audit_event("watch.stop", id, Default::default(), audit.clone())
+            .record_audit_event_authorized("watch.stop", id, Default::default(), audit.clone(), authority.clone())
             .await?;
         let mut w = w;
         w.status = "stopped".into();
@@ -678,15 +696,19 @@ impl Watches {
             wall_time_ms: audit.wall_time_ms,
         });
         if let Err(e) = self.save(&w) {
-            crate::proposal::audit_failed(
+            if let Err(audit_error) = crate::proposal::audit_failed(
                 &self.node,
                 "watch.stop",
                 id,
                 Default::default(),
                 audit,
                 &e,
+                authority.clone(),
             )
-            .await;
+            .await
+            {
+                tracing::warn!(watch = %id, error = %audit_error, "could not audit failed watch stop");
+            }
             return Err(e);
         }
         lock(&self.watches).insert(id.to_owned(), w.clone());

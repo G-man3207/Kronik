@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Package one built musl binary with its locked sources' real license notices.
+"""Package one built daemon or optional GNU helper with its real license notices.
 
 Usage: package-release.py TARGET BINARY SBOM METADATA ZIG_DIR OUT_DIR
 METADATA is `cargo metadata --locked --filter-platform TARGET --format-version 1`.
+The Zig directory is used only for the static-musl daemon; GNU helper callers pass -.
 The metadata's workspace_root supplies the version's own LICENSE/NOTICE/lockfile.
 No build, download, license-text template or copyright guess occurs here.
 """
@@ -236,8 +237,15 @@ def notices(metadata, zig, target):
             "Rust standard-library notices include its own bundled dependencies.\n"
             "Node/ComponentizeJS/StarlingMonkey, CPython, TinyGo and WASI-Virt runtimes are\n"
             "external actor-build tools/outputs, not runtimes embedded in this host binary.\n")
-    text += dependency_notices(metadata, apache)
+    root_name = "kronik-keyhelper" if target == "x86_64-unknown-linux-gnu" else "kronik"
+    text += dependency_notices(metadata, apache, root_name=root_name)
     text += rust_notices(rust, subprocess.check_output(["rustc", "--version"], text=True).strip())
+    if root_name == "kronik-keyhelper":
+        text += section("GNU helper runtime prerequisites",
+                        "The system GNU loader, libc and libgcc_s are unbundled.\n"
+                        "The operator-selected PKCS#11 vendor module and its dependencies are unbundled.\n"
+                        "This artifact does not establish a supported glibc floor or vendor/HSM compatibility.\n")
+        return text.encode("utf-8")
     for relative in ("LICENSE", "lib/libc/musl/COPYRIGHT", "lib/libunwind/LICENSE.TXT"):
         text += section(f"Zig supplied runtime: {relative}", (zig / relative).read_text())
     for relative in ("lib/libc/musl", "lib/libunwind", "lib/compiler_rt", "lib/include"):
@@ -262,17 +270,35 @@ def notices(metadata, zig, target):
 def check_binary(path, target):
     with path.open("rb") as binary:
         header = binary.read(64)
-        machine = {"x86_64-unknown-linux-musl": 62, "aarch64-unknown-linux-musl": 183}[target]
+        machine = {"x86_64-unknown-linux-musl": 62, "aarch64-unknown-linux-musl": 183,
+                   "x86_64-unknown-linux-gnu": 62}[target]
         if len(header) != 64 or header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != machine:
             raise ValueError(f"not a 64-bit little-endian {target} ELF binary")
         offset = struct.unpack_from("<Q", header, 32)[0]
         size, count = struct.unpack_from("<HH", header, 54)
         if size < 4:
             raise ValueError("invalid ELF program header size")
+        kinds = set()
         for index in range(count):
             binary.seek(offset + index * size)
-            if struct.unpack("<I", binary.read(4))[0] == 3:
-                raise ValueError("release binary has a dynamic ELF interpreter")
+            kinds.add(struct.unpack("<I", binary.read(4))[0])
+    if target != "x86_64-unknown-linux-gnu":
+        if 3 in kinds:
+            raise ValueError("release binary has a dynamic ELF interpreter")
+        return
+    if not {2, 3}.issubset(kinds):
+        raise ValueError("GNU helper needs its dynamic segment and interpreter")
+    try:
+        output = subprocess.check_output(["readelf", "--wide", "--program-headers", "--dynamic", str(path)],
+                                         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, text=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("cannot inspect GNU helper ELF metadata") from error
+    interpreters = re.findall(r"^\s*\[Requesting program interpreter: ([^\]\n]+)\]$", output, re.MULTILINE)
+    if interpreters != ["/lib64/ld-linux-x86-64.so.2"]:
+        raise ValueError("GNU helper has an unexpected dynamic loader")
+    needed = set(re.findall(r"\(NEEDED\).*Shared library: \[([^]]+)\]", output))
+    if "libc.so.6" not in needed or not needed.issubset({"libc.so.6", "libgcc_s.so.1", "ld-linux-x86-64.so.2"}):
+        raise ValueError(f"GNU helper has unexpected shared-library dependencies: {sorted(needed)}")
 
 
 def reproducible_sbom(sbom, source):
@@ -327,16 +353,17 @@ def render_installer(source, version, base_url):
 
 def package(target, binary, sbom, metadata, zig, out):
     check_binary(binary, target)
-    root, _ = packages(metadata)
+    root_name = "kronik-keyhelper" if target == "x86_64-unknown-linux-gnu" else "kronik"
+    root, _ = packages(metadata, root_name=root_name)
     bom = json.loads(sbom.read_text())
-    if bom["bomFormat"] != "CycloneDX" or bom["metadata"]["component"]["name"] != "kronik" or bom["metadata"]["component"]["version"] != root["version"]:
-        raise ValueError("SBOM does not describe this Kronik version")
+    if bom["bomFormat"] != "CycloneDX" or bom["metadata"]["component"]["name"] != root_name or bom["metadata"]["component"]["version"] != root["version"]:
+        raise ValueError(f"SBOM does not describe this {root_name} version")
     source = Path(metadata["workspace_root"])
-    members = {"kronik": binary, "kronik.cdx.json": sbom,
+    members = {root_name: binary, f"{root_name}.cdx.json": sbom,
                "LICENSE": source / "LICENSE", "NOTICE": source / "NOTICE",
                "THIRD_PARTY_LICENSES.txt": notices(metadata, zig, target)}
     out.mkdir(parents=True, exist_ok=True)
-    archive = out / f"kronik-{target}.tar.gz"
+    archive = out / f"{root_name}-{target}.tar.gz"
     with tempfile.NamedTemporaryFile(dir=out, delete=False) as temporary:
         tmp = Path(temporary.name)
     try:
@@ -349,7 +376,7 @@ def package(target, binary, sbom, metadata, zig, out):
                         info.size = len(value) if isinstance(value, bytes) else value.stat().st_size
                         if not info.size:
                             raise ValueError(f"empty required release member: {name}")
-                        info.mode = 0o755 if name == "kronik" else 0o644
+                        info.mode = 0o755 if name == root_name else 0o644
                         tar.addfile(info, stream)
         tmp.replace(archive)
     finally:
@@ -365,7 +392,8 @@ def package(target, binary, sbom, metadata, zig, out):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("target", choices=["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"])
+    parser.add_argument("target", choices=["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl",
+                                         "x86_64-unknown-linux-gnu"])
     for name in ("binary", "sbom", "metadata", "zig", "out"):
         parser.add_argument(name, type=Path)
     args = parser.parse_args()
