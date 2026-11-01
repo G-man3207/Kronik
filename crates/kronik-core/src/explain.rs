@@ -27,7 +27,7 @@ pub enum TopicKind {
 /// `AGENT_GUIDE.md`, the single page an agent needs for the golden path.
 /// `kronik explain agent` and the MCP resource `kronik://agent-guide` both
 /// give this text.
-pub const AGENT_GUIDE: &str = include_str!("../../../AGENT_GUIDE.md");
+pub const AGENT_GUIDE: &str = include_str!("../../../docs/AGENT_GUIDE.md");
 
 /// The guide topics.
 const GUIDES: &[Topic] = &[Topic {

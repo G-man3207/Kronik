@@ -1,1 +1,1 @@
-{{#include ../../AGENT_GUIDE.md}}
+{{#include ../AGENT_GUIDE.md}}

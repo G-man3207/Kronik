@@ -186,7 +186,7 @@ layout and the decisions behind them.
 - [CLI reference](docs/reference/cli.md) and [error codes](docs/errors.md).
 - [Operating Kronik](docs/guides/operations.md) and the
   [security model](docs/guides/security.md).
-- [Kronik for agents](AGENT_GUIDE.md): the same text as `kronik explain agent`.
+- [Kronik for agents](docs/AGENT_GUIDE.md): the same text as `kronik explain agent`.
 - [Performance](docs/perf.md) and the [ADRs](docs/adr).
 
 The book is built from `docs/` with mdBook by `scripts/ci.sh book`.
