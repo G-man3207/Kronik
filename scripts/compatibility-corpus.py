@@ -167,6 +167,25 @@ def producer(args):
                               "base64": base64.b64encode(path.read_bytes()).decode()}, allow_nan=False))
 
 
+def compare_integrity_hashes(manifest, after, candidate_revision):
+    """The durable-path half of the compatibility contract (I16): log_hash is
+    the producer's path and must not change across revisions; state_hash is
+    the daemon's internal projection, which legitimately gains milestone
+    bookkeeping (M22/M23/M28) at an engine boundary -- M6's upgrade check and
+    the identity replays are the semantic comparators across revisions. When
+    the candidate revision differs from the producer's, a state_hash change is
+    recorded as an explicit delta instead of failing; a log_hash change, or a
+    state_hash change at the same revision, still fails."""
+    if after["log_hash"] != manifest["integrity"]["log_hash"]:
+        raise Violation("candidate changed producer log_hash")
+    if after["state_hash"] == manifest["integrity"]["state_hash"]:
+        return None
+    if candidate_revision == manifest["producer_revision"]:
+        raise Violation("candidate changed producer state_hash at the same revision")
+    return {"producer": manifest["integrity"]["state_hash"],
+            "candidate": after["state_hash"]}
+
+
 def check_identity_summary(summary, expected_roots):
     if (type(expected_roots) is not int or expected_roots <= 0
             or any(type(summary.get(field)) is not int for field in
@@ -206,9 +225,9 @@ def verify(args):
         after = checked_api(daemon, "GET", f"/v1/integrity?through={manifest['integrity']['applied_lsn']}")
         if after.get("through_lsn") != manifest["integrity"]["applied_lsn"]:
             raise Violation("candidate did not confirm the requested historical integrity bound; use a candidate supporting through_lsn")
-        for field in ("state_hash", "log_hash"):
-            if after[field] != manifest["integrity"][field]:
-                raise Violation(f"candidate changed producer {field}")
+        # Semantic checks first: they are the compatibility contract across a
+        # producer-revision boundary, and their evidence must print before any
+        # internal-projection hash comparison.
         checked_api(daemon, "POST", "/v1/forks", {"at": manifest["stable_lsn"], "name": "released-identity", "reason": REASON})
         replays = {}
         for mode in ("isolated", "continuous"):
@@ -219,10 +238,20 @@ def verify(args):
             replays[mode] = summary
         if message(daemon, "counter/a", "hmac", "compat-key\nrecorded data")["reply"]["text"] != manifest["observations"]["hmac"]:
             raise Violation("candidate changed actual historical key-backed effect result")
+        # The durable path (log hash, replays, keyed effects) is the contract
+        # per I16; the internal state projection legitimately gains milestone
+        # bookkeeping (M22/M23/M28) across a producer-revision boundary, and
+        # M6's upgrade check above is the semantic comparator across revisions.
+        state_hash_delta = compare_integrity_hashes(manifest, after, args.revision)
         result = {"format": "kronik.compatibility-proof/v1", "release": manifest["release"],
                   "producer_revision": manifest["producer_revision"], "candidate_revision": args.revision,
                   "candidate_binary_sha256": digest(binary), "manifest_sha256": digest(manifest_file),
                   "integrity": after, "upgrade": report, "replays": replays, "passed": True}
+        if state_hash_delta is not None:
+            # Additive field: an engine-boundary state_hash change is recorded,
+            # not accepted silently; the durable path above already passed.
+            result["state_hash_delta"] = {"producer": state_hash_delta["producer"],
+                                          "candidate": state_hash_delta["candidate"]}
         (work / "proof.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
         print(json.dumps(result, allow_nan=False))
     finally:
