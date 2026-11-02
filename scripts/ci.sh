@@ -217,8 +217,8 @@ step_examples() {
     cargo test --manifest-path examples/Cargo.toml --locked -p kronik-sdk
     scripts/build-examples.sh
     cargo run --quiet --locked -p kronik-runtime --example check_imports -- examples/dist/*.wasm
-}
     cargo test --locked --manifest-path tools/loadgen/Cargo.toml
+}
 
 # The TypeScript SDK (sdk/ts): its types (the guest code and the Node.js
 # testkit), its unit tests, and the types/ that `jco guest-types` generates
