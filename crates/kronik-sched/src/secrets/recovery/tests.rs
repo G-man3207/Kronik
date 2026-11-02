@@ -1,3 +1,6 @@
+// Recovery fixtures race admitted work directly: the spawned tasks are
+// the harness, not daemon paths.
+#![allow(clippy::disallowed_methods)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::super::Scope;

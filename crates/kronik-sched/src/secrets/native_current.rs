@@ -48,6 +48,12 @@ impl NativeCurrentState {
     pub(super) fn is_pending(&self) -> bool {
         self.applying.is_some() || self.awaiting_config.is_some()
     }
+    /// True while a native-current apply batch is in flight on the applier:
+    /// coverage published in this window would be retired by that apply.
+    pub(super) fn apply_in_flight(&self) -> bool {
+        self.applying.is_some()
+    }
+
     pub(super) fn capture_revision(&self) -> Option<u64> {
         let revision = self.revision.load(Ordering::Acquire);
         (!self.is_pending() && revision != u64::MAX).then_some(revision)

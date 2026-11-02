@@ -1,3 +1,6 @@
+// The deadline fixtures race real refresh timing: the direct tokio
+// timeout calls are the harness, not daemon paths.
+#![allow(clippy::disallowed_methods)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::time::Duration;

@@ -106,3 +106,4 @@
 - [ADR 0105: Fleet enrollment uses ordinary authority](adr/0105-fleet-ordinary-authority.md)
 - [ADR 0106: Operational events follow committed records](adr/0106-operational-events.md)
 - [ADR 0107: Original authority through final enqueue](adr/0107-original-authority-final-admission.md)
+- [ADR 0108: Durable secret-coverage watermark](adr/0108-durable-secret-coverage-watermark.md)

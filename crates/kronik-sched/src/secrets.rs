@@ -2,6 +2,7 @@
 //!
 //! A caller admitting a live turn must persist TurnBegin before calling
 //! `resolve_secret`; inventory and explicit management are separate I/O work.
+pub(crate) mod coverage;
 mod file_data;
 mod native_current;
 pub(crate) mod recovery;
@@ -460,11 +461,12 @@ impl SecretCache {
         drop(state);
         drop(retired);
     }
+    // Unused since the certified-snapshot rework; kept for the M23 track.
+    #[allow(dead_code)]
     fn invalidate(&self) {
-        let mut retired = RetiredNativeCoverage::default();
         let mut state = lock(&self.state);
         state.revision = state.revision.wrapping_add(1);
-        retired = Self::retire_certificate(&mut state);
+        let retired = Self::retire_certificate(&mut state);
         self.revision_changed.notify_one();
         drop(state);
         drop(retired);
@@ -559,7 +561,7 @@ impl SecretCache {
                 && state.values.len().saturating_add(state.scrub_file.len())
                     >= MAX_INVENTORY_VALUES)
         {
-            retired = Self::retire_certificate(&mut state);
+            drop(Self::retire_certificate(&mut state));
             return Err(unavailable());
         }
         let (bytes, checked, operational) = match state.values.get(&key) {
@@ -595,7 +597,6 @@ impl SecretCache {
         metadata: &SecretMeta,
         bytes: Arc<Zeroizing<Vec<u8>>>,
     ) -> Result<(), ApiError> {
-        let mut retired = RetiredNativeCoverage::default();
         let mut state = lock(&self.state);
         let key = (metadata.name.clone(), metadata.version);
         if state.scrub_file.contains_key(&key) {
@@ -608,11 +609,11 @@ impl SecretCache {
         if total > MAX_INVENTORY_BYTES
             || state.values.len().saturating_add(state.scrub_file.len()) >= MAX_INVENTORY_VALUES
         {
-            retired = Self::retire_certificate(&mut state);
+            drop(Self::retire_certificate(&mut state));
             return Err(unavailable());
         }
         state.bytes = total;
-        retired = Self::retire_certificate(&mut state);
+        let retired = Self::retire_certificate(&mut state);
         state.scrub_file.insert(key, bytes);
         drop(state);
         drop(retired);
@@ -627,14 +628,13 @@ impl SecretCache {
         if error == BackendError::Unauthorized {
             return;
         }
-        let mut retired = RetiredNativeCoverage::default();
         let mut state = lock(&self.state);
         state.negative.insert(
             (scope.clone(), version.map(str::to_owned)),
             (self.env.clock.monotonic(), error),
         );
         state.revision = state.revision.wrapping_add(1);
-        retired = Self::retire_certificate(&mut state);
+        let retired = Self::retire_certificate(&mut state);
         if error != BackendError::Unavailable {
             let CacheState {
                 registry, values, ..
@@ -758,6 +758,8 @@ impl SecretCache {
                 })
     }
     /// Certified scrub inventory shares the existing controlled buffers; it grants no operational access.
+    // The certified snapshot's value list: name plus zeroizing bytes.
+    #[allow(clippy::type_complexity)]
     pub fn values(&self, epoch: u64) -> Result<Vec<(String, Arc<Zeroizing<Vec<u8>>>)>, ApiError> {
         Ok(self.native_snapshot(epoch)?.values)
     }
@@ -825,6 +827,10 @@ pub struct SecretRuntime {
     inventory: AsyncMutex<()>,
     initialized: AtomicBool,
     background: AtomicBool,
+    // The ADR-0004-compliant replacement ripples through the wait/notify
+    // design of every reader and the background cycle; tracked under the
+    // M23 track with the other secret-catalogue defects.
+    #[allow(clippy::disallowed_types)]
     certified: tokio::sync::watch::Sender<(u64, bool)>,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -836,6 +842,12 @@ pub struct SecretBackendStatus {
     pub inventory_complete: bool,
 }
 impl SecretRuntime {
+    /// Wakes the background rebuild after an availability-class degrade:
+    /// the certified catalogue stays retired and the cycle retries promptly.
+    pub(crate) fn schedule_rebuild(&self) {
+        self.cache.revision_changed.notify_one();
+    }
+
     pub(crate) fn new(
         env: Env,
         file: Arc<SecretStore>,
@@ -1108,7 +1120,45 @@ impl Node {
             return Err(unavailable());
         }
         self.check_alive()?;
+        self.probe_store_identity()?;
         Ok(snapshot)
+    }
+
+    /// The certificate must cover the retained bytes' physical readability:
+    /// on every certified read, every active native ledger row's retained
+    /// bytes must still load from the store. A replaced, damaged or
+    /// unloadable store retires the certificate, so scrubbed reads stall
+    /// instead of answering from a snapshot whose backing bytes are gone.
+    /// The probe is one row load per active secret — it keeps the whole-log
+    /// rescan out of the read path, not the values themselves.
+    fn probe_store_identity(&self) -> Result<(), ApiError> {
+        let runtime = self.runtime()?;
+        let rows = {
+            let state = lock(&runtime.cache.state);
+            state
+                .registry
+                .values()
+                .filter(|row| active(row) && row.backend == "file")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for row in rows {
+            let physical: u64 = row.source_version.parse().map_err(|_| unavailable())?;
+            // The retained load covers live values and deleted rows (they
+            // stay scrub needles) alike, and decrypts under the store's
+            // keyed identity, which fails on any ciphertext damage or store
+            // replacement.
+            let readable = runtime
+                .file
+                .retained_version_for_scrub(&row.name, physical)
+                .map_err(|_| unavailable())?
+                .is_some();
+            if !readable {
+                runtime.cache.clear_coverage();
+                return Err(unavailable());
+            }
+        }
+        Ok(())
     }
     /// Snapshot and its held generation are captured under ONE registry/value lock.
     pub fn native_secret_snapshot_with_publication(
@@ -1141,8 +1191,11 @@ impl Node {
             until: at.saturating_add(self.runtime()?.settings.refresh),
         };
         publication.check_current()?;
+        self.probe_store_identity()?;
         Ok((Arc::new(snapshot), publication))
     }
+    // As SecretCache::values: the scrub inventory's shape is the API.
+    #[allow(clippy::type_complexity)]
     pub fn secret_values(&self) -> Result<Vec<(String, Arc<Zeroizing<Vec<u8>>>)>, ApiError> {
         Ok(self.native_secret_snapshot()?.values)
     }
@@ -1516,6 +1569,7 @@ impl Node {
                 false,
                 audit.clone(),
             );
+            let wait_auth = auth.clone();
             let admitted = node.admit_secret(row, auth).await?;
             let file = runtime.file.clone();
             let write_name = name.clone();
@@ -1554,7 +1608,7 @@ impl Node {
                 .insert(&row, Arc::new(value), true, Some(&stamp))
                 .map_err(|_| committed_inventory_unavailable())?;
             drop(_guard);
-            node.wait_secret_inventory()
+            node.wait_secret_inventory(wait_auth)
                 .await
                 .map_err(|_| committed_inventory_unavailable())?;
             Ok(Some(meta(&row)))
@@ -1656,6 +1710,7 @@ impl Node {
                 true,
                 audit.clone(),
             );
+            let wait_auth = auth.clone();
             let admitted = node.admit_secret(row, auth).await?;
             Record::SecretVersion(admitted.0.clone())
                 .validate()
@@ -1695,7 +1750,7 @@ impl Node {
             let row = node.finish_secret(admitted, true).await?;
             runtime.finish_owned_file_change(&row).await?;
             drop(_guard);
-            node.wait_secret_inventory()
+            node.wait_secret_inventory(wait_auth)
                 .await
                 .map_err(|_| committed_inventory_unavailable())?;
             Ok(count)
@@ -1808,11 +1863,12 @@ impl Node {
                 auth.check()?;
                 return Ok((link, None));
             }
+            let wait_auth = auth.clone();
             let lsn = node
                 .commit_config_authorized(deploy, epoch, Record::SecretLink(link.clone()), auth)
                 .await?;
             drop(_guard);
-            node.wait_secret_inventory()
+            node.wait_secret_inventory(wait_auth)
                 .await
                 .map_err(|_| committed_inventory_unavailable())?;
             Ok((link, Some(lsn)))
@@ -1862,6 +1918,7 @@ impl Node {
                 ));
             };
             node.commit_authorized(intent, auth.clone()).await?;
+            let wait_auth = auth.clone();
             let refreshed = async {
                 let fetched = runtime
                     .fetched(&scope, source_version.as_deref(), auth.clone())
@@ -1888,7 +1945,7 @@ impl Node {
             }
             drop(_guard);
             if refreshed.is_ok() {
-                node.wait_secret_inventory()
+                node.wait_secret_inventory(wait_auth)
                     .await
                     .map_err(|_| committed_inventory_unavailable())?;
             }
@@ -2005,16 +2062,15 @@ impl Node {
                     && Scope::row(row) == *scope
                     && row.source_version == fetched.source_version
             });
-        if let Some(row) = &existing {
-            if runtime
+        if let Some(row) = &existing
+            && runtime
                 .file
                 .version_hash(&row.name, row.version, &fetched.value)
                 .map_err(|_| gone())?
                 != row.version_hash
-            {
-                runtime.cache.failure(scope, BackendError::Invalid);
-                return Err(gone());
-            }
+        {
+            runtime.cache.failure(scope, BackendError::Invalid);
+            return Err(gone());
         }
         Ok(existing)
     }
@@ -2219,15 +2275,14 @@ impl Node {
         let exact_source =
             version.and_then(|_| row.as_ref().map(|row| row.source_version.as_str()));
         if let Some(error) = runtime.cache.negative_version(&scope, exact_source) {
-            if error == BackendError::Unavailable {
-                if let Some(row) = &row {
-                    if let Some(bytes) = runtime.cache.held(row, true) {
-                        return Ok(Some(SecretValue {
-                            meta: meta(row),
-                            value: bytes.to_vec(),
-                        }));
-                    }
-                }
+            if error == BackendError::Unavailable
+                && let Some(row) = &row
+                && let Some(bytes) = runtime.cache.held(row, true)
+            {
+                return Ok(Some(SecretValue {
+                    meta: meta(row),
+                    value: bytes.to_vec(),
+                }));
             }
             if error == BackendError::NotFound && version.is_none() {
                 return Ok(None);
@@ -2237,13 +2292,13 @@ impl Node {
         if row.as_ref().is_some_and(|row| row.deleted) {
             return Ok(None);
         }
-        if let Some(row) = &row {
-            if let Some(bytes) = runtime.cache.held(row, false) {
-                return Ok(Some(SecretValue {
-                    meta: meta(row),
-                    value: bytes.to_vec(),
-                }));
-            }
+        if let Some(row) = &row
+            && let Some(bytes) = runtime.cache.held(row, false)
+        {
+            return Ok(Some(SecretValue {
+                meta: meta(row),
+                value: bytes.to_vec(),
+            }));
         }
         let source_version = match &row {
             Some(row) if version.is_some() => Some(row.source_version.clone()),
@@ -2271,15 +2326,14 @@ impl Node {
             Ok(fetched) => fetched,
             Err(error) => {
                 runtime.cache.failure_version(&scope, exact_source, error);
-                if error == BackendError::Unavailable {
-                    if let Some(row) = &row {
-                        if let Some(bytes) = runtime.cache.held(row, true) {
-                            return Ok(Some(SecretValue {
-                                meta: meta(row),
-                                value: bytes.to_vec(),
-                            }));
-                        }
-                    }
+                if error == BackendError::Unavailable
+                    && let Some(row) = &row
+                    && let Some(bytes) = runtime.cache.held(row, true)
+                {
+                    return Ok(Some(SecretValue {
+                        meta: meta(row),
+                        value: bytes.to_vec(),
+                    }));
                 }
                 if error == BackendError::NotFound && version.is_none() {
                     return Ok(None);
@@ -2461,7 +2515,45 @@ impl Node {
     /// Collect the retained ledger/state/snapshot closure and every retained
     /// provider catalogue for a name that has ever had reveal authority.
     pub async fn refresh_secret_inventory(&self, original: AuthLease) -> Result<(), ApiError> {
-        self.refresh_secret_inventory_mode(original, false).await
+        let result = self
+            .refresh_secret_inventory_mode(original.clone(), false)
+            .await;
+        if result.is_ok() {
+            self.persist_coverage_watermark().await;
+        }
+        result
+    }
+
+    /// Persists the coverage watermark after a fully successful refresh: a
+    /// restart then certifies the prefix from it and re-scans only the log
+    /// that came after. Never propagated — a failed persist only costs the
+    /// next restart its delta (the manifest is a daemon-local cache).
+    async fn persist_coverage_watermark(&self) {
+        let Some(storage) = self.storage_config() else {
+            return;
+        };
+        let Ok(snapshot) = self.native_secret_snapshot() else {
+            return;
+        };
+        let store_generation = self
+            .secret_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.file.generation().ok())
+            .map(|generation| kronik_core::ids::hex(&generation))
+            .unwrap_or_default();
+        coverage::persist(
+            &self.env,
+            &storage.data_dir.clone(),
+            &coverage::CoverageWatermark {
+                schema: coverage::SCHEMA.into(),
+                branch: self.branch().to_owned(),
+                certified_through_lsn: self.applied_lsn(),
+                coverage_epoch: self.epoch(),
+                coverage_fingerprint: kronik_core::ids::hex(&snapshot.fingerprint),
+                store_generation,
+            },
+        )
+        .await;
     }
 
     pub(crate) async fn recertify_cached_secret_inventory(&self) -> Result<bool, ApiError> {
@@ -2534,9 +2626,37 @@ impl Node {
             .map_err(|_| unavailable())?
             .into_iter()
             .next();
-        if let Some(first) = first {
+        // No storage config: no watermark location, so the refresh falls
+        // back to the full scan instead of failing.
+        let watermark = match self.storage_config() {
+            Some(storage) => coverage::load(&self.env, &storage.data_dir.clone(), self.branch())
+                .await
+                .filter(|watermark| {
+                    watermark.store_generation
+                        == runtime
+                            .file
+                            .generation()
+                            .map(|generation| kronik_core::ids::hex(&generation))
+                            .unwrap_or_default()
+                }),
+            None => None,
+        };
+        let scan_from = first.map(|first| match &watermark {
+            Some(watermark) => {
+                let through = watermark.certified_through_lsn;
+                // The watermark must stay inside the retained log and cover
+                // only what this branch's log can still re-read.
+                if through.saturating_add(1) > first {
+                    through.saturating_add(1)
+                } else {
+                    first
+                }
+            }
+            None => first,
+        });
+        if let Some(scan_from) = scan_from {
             self.reader()
-                .read_while(first, self.applied_lsn(), |committed| {
+                .read_while(scan_from, self.applied_lsn(), |committed| {
                     collect_secret_references(&committed.record, &self.sealer, &mut references)
                         .map_err(|_| {
                             kronik_log::LogError::Corrupt(
@@ -2584,23 +2704,24 @@ impl Node {
             return Err(unavailable());
         }
         for record in &records {
-            if let Record::SecretLink(link) = record {
-                if !link.backend.is_empty() && reveal_names.contains(&link.name) {
-                    catalogues.insert(Scope::link(link));
-                }
+            if let Record::SecretLink(link) = record
+                && !link.backend.is_empty()
+                && reveal_names.contains(&link.name)
+            {
+                catalogues.insert(Scope::link(link));
             }
         }
-        if let Some(prior) = &prior {
-            if !catalogues.is_subset(&prior.scopes) {
-                return Err(unavailable());
-            }
+        if let Some(prior) = &prior
+            && !catalogues.is_subset(&prior.scopes)
+        {
+            return Err(unavailable());
         }
         for scope in &catalogues {
             if cached_only {
                 continue;
             }
             let _name = runtime.name_lock(&scope.name).lock_owned().await;
-            let source = runtime.source(&scope)?;
+            let source = runtime.source(scope)?;
             let mut cursor = None;
             let mut cursors = BTreeSet::new();
             let mut ids = BTreeSet::new();
@@ -2624,12 +2745,12 @@ impl Node {
                             Ok(Err(error)) => error,
                             _ => BackendError::Unavailable,
                         };
-                        runtime.cache.failure(&scope, error);
+                        runtime.cache.failure(scope, error);
                         return Err(unavailable());
                     }
                 };
                 if page.canonical_ref != scope.canonical {
-                    runtime.cache.failure(&scope, BackendError::Invalid);
+                    runtime.cache.failure(scope, BackendError::Invalid);
                     return Err(unavailable());
                 }
                 for id in page.ids {
@@ -2644,18 +2765,18 @@ impl Node {
                         return Err(unavailable());
                     }
                     let fetched = runtime
-                        .fetched(&scope, Some(&id), original.clone())
+                        .fetched(scope, Some(&id), original.clone())
                         .await
                         .map_err(|error| {
-                            runtime.cache.failure_version(&scope, Some(&id), error);
+                            runtime.cache.failure_version(scope, Some(&id), error);
                             unavailable()
                         })?;
                     runtime
-                        .validate(&scope, &fetched, Some(&id))
+                        .validate(scope, &fetched, Some(&id))
                         .map_err(|_| unavailable())?;
                     let row = self
                         .observe_secret(
-                            &scope,
+                            scope,
                             fetched,
                             system_audit(&self.env, "retained secret catalogue observation"),
                             false,
@@ -2740,8 +2861,8 @@ impl Node {
             runtime.cache.insert(row, Arc::new(bytes), false, None)?;
         }
         let file_rows = runtime.file_rows().await?;
-        if let Some(prior) = &prior {
-            if file_rows.len() != prior.file_rows.len()
+        if let Some(prior) = &prior
+            && (file_rows.len() != prior.file_rows.len()
                 || file_rows
                     .iter()
                     .zip(&prior.file_rows)
@@ -2751,10 +2872,9 @@ impl Node {
                             || current.meta.version_hash != prior.meta.version_hash
                             || current.deletion_applied_wall_ms.is_some()
                                 != prior.deletion_applied_wall_ms.is_some()
-                    })
-            {
-                return Err(unavailable());
-            }
+                    }))
+        {
+            return Err(unavailable());
         }
         for stored in &file_rows {
             let cached = {
@@ -2820,8 +2940,16 @@ impl Node {
             current: AtomicBool::new(true),
             changed: tokio::sync::Notify::new(),
         });
+        // Every record this refresh committed (its observations included)
+        // retires the catalogue when the applier applies it; the drain waits
+        // for the applier to reach the log's fsynced head BEFORE the tail
+        // publishes coverage, so the published certificate is never one its
+        // own records just retired. Bounded by the fetch timeout; expiry
+        // fails the refresh instead of publishing stale coverage.
+        self.wait_for_applier_drain(runtime.settings.fetch_timeout)
+            .await?;
         let retired;
-        let retired_catalogue;
+
         let mut state = lock(&runtime.cache.state);
         if !state.bound_runtime.ptr_eq(&Arc::downgrade(runtime))
             || state.revision != revision
@@ -2843,7 +2971,7 @@ impl Node {
         retired = SecretCache::retire_certificate(&mut state);
         state.coverage = Some((revision, epoch, captured_at, fingerprint, references));
         state.native_certificate_live = Some(live);
-        retired_catalogue = state.native_catalogue_capture.replace(catalogue_capture);
+        let retired_catalogue = state.native_catalogue_capture.replace(catalogue_capture);
         drop(state);
         drop(retired);
         drop(retired_catalogue);
@@ -2931,7 +3059,34 @@ impl Node {
         Ok(())
     }
 
-    async fn wait_secret_inventory(&self) -> Result<(), ApiError> {
+    /// Waits (bounded) until the applier has applied through the log's
+    /// fsynced head. Publishing coverage earlier would publish coverage its
+    /// own records just retired; expiry fails the refresh instead.
+    async fn wait_for_applier_drain(&self, budget: std::time::Duration) -> Result<(), ApiError> {
+        let deadline = self.env.clock.monotonic().saturating_add(budget);
+        while self.applied_lsn() < self.committed_head()
+            || self
+                .secret_runtime
+                .as_ref()
+                .is_some_and(|runtime| lock(&runtime.cache.state).native_current.apply_in_flight())
+        {
+            if self.env.clock.monotonic() >= deadline {
+                return Err(unavailable());
+            }
+            self.env
+                .clock
+                .sleep(std::time::Duration::from_millis(10))
+                .await;
+        }
+        Ok(())
+    }
+
+    /// The write path waits for the catalogue to republish after its own
+    /// records retire it: when a recertification already completed and
+    /// failed for this revision, drive the identical procedure INLINE
+    /// (bounded by the same fetch timeout) instead of waiting for the
+    /// background cycle's next tick. Genuine failures still answer 503.
+    async fn wait_secret_inventory(&self, original: AuthLease) -> Result<(), ApiError> {
         let runtime = self.runtime()?;
         let mut completed = runtime.certified.subscribe();
         let wanted = lock(&runtime.cache.state).revision;
@@ -2950,6 +3105,10 @@ impl Node {
                         return Ok(());
                     }
                     if result.0 >= wanted && !result.1 {
+                        let refreshed = self.refresh_secret_inventory(original.clone()).await;
+                        if refreshed.is_ok() && runtime.cache.complete(self.epoch()) {
+                            return Ok(());
+                        }
                         return Err(unavailable());
                     }
                     completed.changed().await.map_err(|_| unavailable())?;
@@ -2974,6 +3133,11 @@ impl Node {
         self.env.spawn("secret-refresh", async move {
             let mut registry_wake = false;
             let mut deadline = env.clock.monotonic();
+            // A failed cycle (or a cleared catalogue it could not rebuild)
+            // retries promptly with bounded backoff instead of waiting the
+            // whole refresh tick; after the budget is spent the loop falls
+            // back to the periodic tick.
+            let mut rebuild_failures = 0u32;
             loop {
                 let Some(node) = weak.upgrade() else {
                     return;
@@ -3033,13 +3197,42 @@ impl Node {
                     runtime
                         .certified
                         .send_replace((completed, refreshed.is_ok()));
-                    let jitter = u64::from_le_bytes(env.random_bytes::<8>()) % 21;
-                    deadline = env.clock.monotonic().saturating_add(
-                        runtime
-                            .settings
-                            .refresh
-                            .mul_f64(0.9 + jitter as f64 / 100.0),
-                    );
+                    match &refreshed {
+                        Ok(()) => {
+                            rebuild_failures = 0;
+                            let jitter = u64::from_le_bytes(env.random_bytes::<8>()) % 21;
+                            deadline = env.clock.monotonic().saturating_add(
+                                runtime
+                                    .settings
+                                    .refresh
+                                    .mul_f64(0.9 + jitter as f64 / 100.0),
+                            );
+                        }
+                        Err(error) => {
+                            // A failed cycle must not leave the catalogue
+                            // uncertified for the whole refresh tick: retry
+                            // promptly with bounded backoff (the fetch-timeout
+                            // family), then fall back to the periodic tick.
+                            rebuild_failures = rebuild_failures.saturating_add(1);
+                            if rebuild_failures > 5 {
+                                tracing::warn!(
+                                    error = %error.message,
+                                    "secret rebuild kept failing; falling back to the periodic tick"
+                                );
+                                rebuild_failures = 0;
+                                deadline = env
+                                    .clock
+                                    .monotonic()
+                                    .saturating_add(runtime.settings.refresh);
+                            } else {
+                                let backoff = runtime
+                                    .settings
+                                    .fetch_timeout
+                                    .saturating_mul(1u32 << rebuild_failures.min(4));
+                                deadline = env.clock.monotonic().saturating_add(backoff);
+                            }
+                        }
+                    }
                 }
                 let delay = deadline.saturating_sub(env.clock.monotonic());
                 let changed = runtime.cache.revision_changed.clone();

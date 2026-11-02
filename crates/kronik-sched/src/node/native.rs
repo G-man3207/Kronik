@@ -125,6 +125,10 @@ impl Drop for Node {
 
 #[cfg(test)]
 mod tests {
+    // The tests race real time and spawned tasks around admitted work: the
+    // direct calls are the harness, not daemon paths.
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
 
     use kronik_core::env::{BoxFuture, HttpRequest, HttpResponse, NetError};

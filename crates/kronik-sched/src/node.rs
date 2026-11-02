@@ -989,6 +989,12 @@ impl Node {
         self.store.applied.get()
     }
 
+    /// The log writer's fsynced head: every record up to this LSN is
+    /// durably committed (the applier may still be catching up).
+    pub fn committed_head(&self) -> Lsn {
+        self.log.committed_head()
+    }
+
     /// `[sql] max_size_per_actor` for this node (1 GiB unless `serve` set it).
     pub fn sql_bytes_per_actor(&self) -> u64 {
         self.cfg.sql_bytes_per_actor
@@ -1245,6 +1251,9 @@ impl Node {
     /// (a client disconnect) never leaves a switch committed but not
     /// installed. `hold`: park on `test_hold_switch` before the install. A rebase switch then reloads the queues and timers; when
     /// that fails after the commit the node goes fatal.
+    // A code switch's admission carries the held locks, gate and deployment
+    // state: one call site, no struct worth its own name.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn finish_switch<H: Send + 'static>(
         &self,
         held: H,
@@ -1343,6 +1352,9 @@ impl Node {
     /// Runs an input on its actor: a migrate turn first when the code's
     /// schema version is ahead of the actor's, then the input's own turn.
     /// A re-run repeats its recorded turn exactly.
+    // One admitted turn's inputs; grouping them would only move the same
+    // names into a struct the caller unpacks again.
+    #[allow(clippy::too_many_arguments)]
     async fn run_job(
         &self,
         actor: &ActorRef,
@@ -2298,6 +2310,9 @@ impl Node {
 
     /// Appends records in order (sealed) and resolves once the last is
     /// applied; its LSN, 0 for none.
+    // Unused since the single-record commit path settled; kept for the M23
+    // track's batched writes.
+    #[allow(dead_code)]
     pub(crate) async fn commit_all(&self, records: Vec<Record>) -> Result<Lsn, ApiError> {
         let mut sealed = Vec::with_capacity(records.len());
         for mut r in records {
@@ -3597,6 +3612,8 @@ impl Node {
 
     /// `kronik grant`: writes a `Grant` record. Returns (epoch, lsn); lsn is 0
     /// for a dry run.
+    // The public grant API mirrors the CLI and the wire record.
+    #[allow(clippy::too_many_arguments)]
     pub async fn grant(
         &self,
         kind: &str,
@@ -4159,7 +4176,26 @@ async fn applier(
                 .begin_native_current_apply(&batch, &store, &rebase.reader)
                 .await
             {
-                Ok(current) => current,
+                Ok(current) => Some(current),
+                // Availability-class publication failures are cache
+                // maintenance, not durability: the records still apply, the
+                // certified catalogue stays retired (reads stall fail-closed)
+                // and the background rebuild retries. Corruption-class
+                // failures stay fatal.
+                Err(error)
+                    if matches!(
+                        error.code,
+                        ErrorCode::SecretUnavailable | ErrorCode::Unavailable
+                    ) =>
+                {
+                    tracing::warn!(
+                        lsn = batch[0].lsn,
+                        error = %error.message,
+                        "native-current prepare unavailable; applying without the certified capture and retrying the rebuild"
+                    );
+                    runtime.schedule_rebuild();
+                    None
+                }
                 Err(error) => {
                     fatal.set(format!(
                         "preparing current secret data at lsn {}: {}",
@@ -4174,9 +4210,23 @@ async fn applier(
             fatal.set(format!("applying lsn {}: {e}", batch[0].lsn));
             return;
         }
-        if let (Some(runtime), Some(current)) = (&runtime, current)
+        if let (Some(runtime), Some(Some(current))) = (&runtime, current)
             && let Err(error) = runtime.finish_native_current_apply(current, &store)
         {
+            // Availability-class: as above — degrade to uncertified and let
+            // the background rebuild retry; corruption-class stays fatal.
+            if matches!(
+                error.code,
+                ErrorCode::SecretUnavailable | ErrorCode::Unavailable
+            ) {
+                tracing::warn!(
+                    lsn = batch[0].lsn,
+                    error = %error.message,
+                    "native-current publish unavailable; leaving coverage uncertified and retrying the rebuild"
+                );
+                runtime.schedule_rebuild();
+                continue;
+            }
             fatal.set(format!(
                 "publishing current secret data at lsn {}: {}",
                 batch[0].lsn, error.message

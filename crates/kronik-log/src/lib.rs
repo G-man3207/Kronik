@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -746,6 +747,9 @@ pub struct Log {
     tx: mpsc::UnboundedSender<Append>,
     authorized_slots: Arc<tokio::sync::Semaphore>,
     native_writer: Arc<NativeWriterState>,
+    /// The writer task's fsynced head, shared so readers can tell whether
+    /// the applier has drained every committed record.
+    committed_head: Arc<AtomicU64>,
 }
 
 struct Segment {
@@ -782,6 +786,12 @@ async fn create_segment(env: &Env, cfg: &LogConfig, start_lsn: Lsn) -> Result<Se
 }
 
 impl Log {
+    /// The writer task's fsynced head: every record up to this LSN is
+    /// durably committed. Zero only before the first record exists.
+    pub fn committed_head(&self) -> Lsn {
+        self.committed_head.load(Ordering::Acquire)
+    }
+
     /// Opens the log, truncates a torn tail durably and starts the writer.
     /// Every durable record is sent to `committed` in LSN order after its
     /// fsync; `fatal` fires if the writer stops on an I/O error (the daemon
@@ -874,15 +884,26 @@ impl Log {
         let (tx, rx) = mpsc::unbounded_channel();
         let native_writer = Arc::new(NativeWriterState::new());
         let rx = NativeInbox::new(rx, native_writer.clone());
+        let committed_head = Arc::new(AtomicU64::new(next_lsn.saturating_sub(1)));
         env.spawn(
             "log-writer",
-            writer(env.clone(), cfg, segment, rx, next_lsn, committed, fatal),
+            writer(
+                env.clone(),
+                cfg,
+                segment,
+                rx,
+                next_lsn,
+                Arc::clone(&committed_head),
+                committed,
+                fatal,
+            ),
         );
         Ok((
             Log {
                 tx,
                 authorized_slots: Arc::new(tokio::sync::Semaphore::new(AUTHORIZED_QUEUE_CAPACITY)),
                 native_writer,
+                committed_head,
             },
             Opened {
                 next_lsn,
@@ -996,12 +1017,17 @@ impl Log {
     }
 }
 
+// The writer loop's plumbing: env, segment state and the commit channels are
+// all genuinely distinct; bundling them would only obscure the send/receive
+// order at the call site.
+#[allow(clippy::too_many_arguments)]
 async fn writer(
     env: Env,
     cfg: LogConfig,
     mut seg: Segment,
     mut rx: NativeInbox<Append>,
     mut next_lsn: Lsn,
+    committed_head: Arc<AtomicU64>,
     committed: mpsc::UnboundedSender<Committed>,
     fatal: oneshot::Sender<String>,
 ) {
@@ -1014,6 +1040,7 @@ async fn writer(
             batch.push(a);
         }
         let result = write_batch(&env, &cfg, &mut seg, &mut next_lsn, batch, &committed).await;
+        committed_head.store(next_lsn.saturating_sub(1), Ordering::Release);
         if let Err((msg, batch)) = result {
             rx.close();
             // Never retry a failed write or fsync: fail every waiter and stop.
