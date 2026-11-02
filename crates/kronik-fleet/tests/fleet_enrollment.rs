@@ -1,3 +1,7 @@
+// The enrollment fixtures drive a real controller and TLS material;
+// a failed setup is the test's outcome.
+#![allow(clippy::unwrap_used, clippy::disallowed_methods)]
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

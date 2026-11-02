@@ -1018,36 +1018,38 @@ async fn committed_pages_restart_rewind_and_prepared_webhook_survive_durable_rel
     let entry = recovered_cursors.get("events-test:actor-native").unwrap();
     assert!(entry.lsn >= proposal_lsn);
     assert_eq!(entry.state["secret"]["version"], 8);
-    let requests = network.requests.lock().unwrap();
-    let request = requests
-        .iter()
-        .find(|request| {
-            serde_json::from_slice::<events::Event>(&request.body).is_ok_and(|event| {
-                event.source == native(proposal_lsn) && event.data.action == "proposal.create"
-            })
-        })
-        .unwrap();
-    let event: events::Event = serde_json::from_slice(&request.body).unwrap();
-    let header = |name: &str| {
-        request
-            .headers
+    let _event = {
+        let requests = network.requests.lock().unwrap();
+        let request = requests
             .iter()
-            .find(|(key, _)| key == name)
+            .find(|request| {
+                serde_json::from_slice::<events::Event>(&request.body).is_ok_and(|event| {
+                    event.source == native(proposal_lsn) && event.data.action == "proposal.create"
+                })
+            })
+            .unwrap();
+        let event: events::Event = serde_json::from_slice(&request.body).unwrap();
+        let header = |name: &str| {
+            request
+                .headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .unwrap()
+                .1
+                .as_str()
+        };
+        assert_eq!(
+            header("kronik-signature"),
+            webhook::signature(
+                b"dummy-next-key",
+                header("kronik-timestamp-ms").parse().unwrap(),
+                &event.id,
+                &request.body
+            )
             .unwrap()
-            .1
-            .as_str()
+        );
+        event
     };
-    assert_eq!(
-        header("kronik-signature"),
-        webhook::signature(
-            b"dummy-next-key",
-            header("kronik-timestamp-ms").parse().unwrap(),
-            &event.id,
-            &request.body
-        )
-        .unwrap()
-    );
-    drop(requests);
     let mut rebound = rotated;
     rebound.secret.version_hash = [9; 16];
     let rebound_stream =
@@ -1774,7 +1776,13 @@ async fn canonical_operational_identity_separates_visible_changes_not_sealable_v
 }
 
 #[tokio::test]
-#[ignore = "requires unlanded M16-M19 cluster record kinds 20-25; this checkout cannot decode them"]
+// Reduction (STATUS, "Repair session 2026-11-01"): the underlying feature is
+// not on main. The cluster track M16-M19 (and its record kinds 20-25:
+// shard_term, shard_membership, inbox, outbox_ack, epoch_barrier,
+// shard_origin) remains parked; the record enum and the native log cannot
+// decode those kinds yet, so the exact event variants cannot be exercised.
+// Restore this test when the cluster record kinds land.
+#[ignore = "unlanded feature: needs M16-M19 cluster record kinds 20-25, which the parked cluster track has not put on main (STATUS, Repair session 2026-11-01)"]
 async fn decoded_operational_wire_records_fsynced_in_native_log_publish_exact_variants() {
     let directory = tempfile::tempdir().unwrap();
     let env = Env::real(tokio::runtime::Handle::current());
@@ -2079,7 +2087,6 @@ fn control_record(operation: pb::audit_event::Operation) -> Record {
         operation: Some(operation),
         audit: Some(audit),
         details: BTreeMap::new(),
-        ..Default::default()
     })
 }
 
@@ -3566,7 +3573,6 @@ fn ordinary_metadata_audit_unit_records_publish_actions_without_identity_or_free
             details: [("operator".into(), "raw-details-PII-NEEDLE".into())].into(),
             audit: audit(),
             operation: None,
-            ..Default::default()
         });
         let decoded = Record::decode(record.kind(), &record.encode()).unwrap();
         // Exact record-shape projection only, not a claim of a durable metadata commit.

@@ -228,17 +228,14 @@ fn preview_persistence_failures_keep_intent_failure_and_caller_context() {
     assert_eq!(events[1].details["code"], e.code.as_str());
 }
 
-// The per-request retained-secret load this injection targeted is gone: the
-// current WIP preview scrub uses the node's in-memory certified inventory
-// (`Node::secret_values` -> certified snapshot), which keeps a committed
-// value after the `keys/secrets.db` ciphertext is edited. The injection
-// therefore reaches no failure path (the preview commits instead of answering
-// SECRET_UNAVAILABLE), and there is no test-visible seam to retire the
-// certificate without racing the background recertification. Reported as a
-// coverage loss; I8 is still covered by `a_preview_uses_no_production_key`
-// and `crates/kronik-sched` secret tests.
+// The preview scrub reads the node's certified inventory
+// (`Node::secret_values`). Warm certified bytes survive ciphertext damage,
+// so the injection must also destroy the retained row's physical identity
+// (version_hash) and force a recertification, which then fails closed and
+// makes the inventory — and with it the preview — answer
+// SECRET_UNAVAILABLE (the fleet unit test in crates/kronik-api/src/fleet.rs
+// uses the same recipe).
 #[test]
-#[ignore = "WIP certifies scrub secrets in memory: corrupting keys/secrets.db no longer fails retained secret loading, so the preview cannot be made to answer SECRET_UNAVAILABLE"]
 fn preview_output_is_unavailable_when_retained_secret_loading_fails() {
     let dir = tempdir();
     let p = Proc::start(dir.path());
@@ -255,8 +252,13 @@ fn preview_output_is_unavailable_when_retained_secret_loading_fails() {
     .unwrap();
     rusqlite::Connection::open(dir.path().join("keys/secrets.db"))
         .unwrap()
-        .execute("UPDATE secrets SET ciphertext = x'00'", [])
+        .execute(
+            "UPDATE secrets SET ciphertext = x'00', version_hash = x'00'",
+            [],
+        )
         .unwrap();
+    p.rt.block_on(p.node.refresh_secret_inventory(p.owner()))
+        .unwrap_err();
     let (actor, http) = request("get", "");
     let original = p.node.local_operator_authority().unwrap();
     let e =

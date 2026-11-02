@@ -64,6 +64,32 @@ fn start(rt: &Runtime, dir: &Path) -> Result<Arc<Node>, StartError> {
     })
 }
 
+/// A stopped node's background workers keep the data-directory lock's file
+/// descriptor until they wind down (admitted capabilities share the owner
+/// `File`, native_execution.rs), so an immediate restart can briefly answer
+/// `KeySource(DataInUse)`. Await exactly that window — the CLI retries the
+/// deployment-epoch recertification window the same way (STATUS, known
+/// gaps) — and treat any other start error, or a wait that runs out, as
+/// fatal: a genuinely owned directory still fails here.
+fn start_when_released(rt: &Runtime, dir: &Path) -> Arc<Node> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match start(rt, dir) {
+            Ok(node) => return node,
+            Err(error @ StartError::KeySource(_))
+                if error.to_string().contains("the data directory is owned by") =>
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the stopped node's data lock was not released: {error}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("start failed: {error}"),
+        }
+    }
+}
+
 fn tempdir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("upgrade-")
@@ -236,7 +262,7 @@ fn another_engine_needs_a_passing_report_and_records_the_upgrade() {
         checked_wall_ms: 0,
     };
     let path = report.write(dir.path()).unwrap();
-    let node = start(&rt, dir.path()).unwrap();
+    let node = start_when_released(&rt, dir.path());
     let mut upgrades = Vec::new();
     rt.block_on(node.reader().read(1, node.applied_lsn(), |c| {
         if let Record::EngineUpgrade(u) = c.record {
@@ -262,7 +288,7 @@ fn another_engine_needs_a_passing_report_and_records_the_upgrade() {
     );
     drop(node);
     // From now on the data is this engine's: no second record.
-    let node = start(&rt, dir.path()).unwrap();
+    let node = start_when_released(&rt, dir.path());
     assert_eq!(node.applied_lsn(), head + 1);
 }
 

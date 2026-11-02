@@ -156,6 +156,34 @@ def effect_worker(daemon, actor, spec, wait):
         pass
 
 
+# A deployment switch retires the certified secret catalogue and
+# recertifies it asynchronously, so a scrubbed read can briefly answer 503
+# SECRET_UNAVAILABLE in between; the CLI retries exactly that window within
+# 30 s at a 100 ms backoff (crates/kronik/src/cli/fork.rs) and the daemon's
+# own hint says to retry. Mirror that budget here: a persistent 503 past the
+# deadline is still a violation.
+HISTORY_RETRY_CODES = ("SECRET_UNAVAILABLE", "UNAVAILABLE")
+HISTORY_RETRY_BUDGET_S = 30.0
+HISTORY_RETRY_BACKOFF_S = 0.1
+
+
+def read_history(daemon, actor, query):
+    """One history page, retrying only the secret-coverage window."""
+    deadline = time.monotonic() + HISTORY_RETRY_BUDGET_S
+    while True:
+        status, body = daemon.api("GET", f"/v1/actors/{actor}/history{query}")
+        if status != 503:
+            return status, body
+        code = ""
+        try:
+            code = body.get("error", {}).get("code", "")
+        except AttributeError:
+            pass
+        if code not in HISTORY_RETRY_CODES or time.monotonic() >= deadline:
+            return status, body
+        time.sleep(HISTORY_RETRY_BACKOFF_S)
+
+
 class Turns:
     """The turns of the actors the run uses, fetched as they appear."""
 
@@ -169,7 +197,7 @@ class Turns:
         after, before, new = (known[-1]["lsn"] if known else 0), None, []
         while True:
             q = "?limit=200" + (f"&before={before}" if before else "")
-            status, body = self.daemon.api("GET", f"/v1/actors/{actor}/history{q}")
+            status, body = read_history(self.daemon, actor, q)
             if status == 404:
                 return []
             if status != 200:

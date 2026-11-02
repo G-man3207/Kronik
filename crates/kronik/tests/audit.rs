@@ -389,6 +389,30 @@ fn drive(
         let shown = (s.template != "/v1/privacy/erase").then(|| reason.clone());
         want.push((action.into(), shown.clone(), token.into()));
         match s.template {
+            // The secret ledger exports the reserved intent row before the
+            // change, so one secret write is two lines; the M28-era
+            // `secret.set`/`secret.delete` events were one line each.
+            "/v1/secrets/{name}" => {
+                let active = want.pop().unwrap();
+                want.push((
+                    "secret.version.reserved".into(),
+                    active.1.clone(),
+                    token.into(),
+                ));
+                want.push(active);
+            }
+            // A reseal pins the mode in a `PrivacyMode` record
+            // (`reseal_requested`, exported as `privacy.reseal.request`)
+            // before the route's own `privacy.reseal` event.
+            "/v1/privacy/reseal" => {
+                let event = want.pop().unwrap();
+                want.push((
+                    "privacy.reseal.request".into(),
+                    event.1.clone(),
+                    token.into(),
+                ));
+                want.push(event);
+            }
             "/v1/actors/{kind}/{key}/messages" if s.body["name"] == "fail" => {
                 dead_letter = v["turn_id"].as_str().unwrap().into();
             }
@@ -520,7 +544,15 @@ fn every_mutation_reaches_the_file_sink_and_verify_reports_it_complete() {
     let mut seen = Vec::new();
 
     let d = Daemon::start(dir.path(), &data, "");
-    // A first start with a sink records the settings.
+    // A first start with a sink exports the M23 secret format fence, the
+    // installation identity and the settings record; their system reasons
+    // are not asserted here.
+    want.push(("secret.range".into(), None, "system".into()));
+    want.push((
+        "installation.identity".into(),
+        None,
+        "system:installation".into(),
+    ));
     want.push(("audit.config".into(), None, "system".into()));
     drive(
         &d,
@@ -537,7 +569,10 @@ fn every_mutation_reaches_the_file_sink_and_verify_reports_it_complete() {
                 "/v1/secrets/{name}",
                 "/v1/secrets/db",
                 json!({"text": SECRET}),
-                Some("secret.set"),
+                // The M23 secret ledger audits a write in its rows; the
+                // active row exports as `secret.version`, the reserved row
+                // is inserted by `drive` below.
+                Some("secret.version"),
             ),
             step(
                 "POST",
@@ -814,7 +849,9 @@ fn every_mutation_reaches_the_file_sink_and_verify_reports_it_complete() {
                 "/v1/secrets/{name}",
                 "/v1/secrets/db",
                 json!({}),
-                Some("secret.delete"),
+                // As the PUT: the ledger row exports as `secret.version`,
+                // with `deleted` in its details.
+                Some("secret.version"),
             ),
             // shortcut: foreign add and remove fail here (port 0, no such actor) and must export nothing; crates/kronik/tests/foreign.rs covers their records, extend once this test can run a foreign actor.
             step(
@@ -838,6 +875,60 @@ fn every_mutation_reaches_the_file_sink_and_verify_reports_it_complete() {
                 "/v1/keys/rewrap",
                 "/v1/keys/rewrap",
                 json!({}),
+                None,
+            ),
+            // The remaining mutating routes are refused here before they
+            // write, and their success-path audit lines are asserted in
+            // their own domains: the external secret link, unlink and
+            // refresh need a configured provider backend (secret.link /
+            // secret.unlink export fixtures in
+            // crates/kronik-otel/tests/audit_export.rs, the
+            // secret.refresh intent in kronik-sched's secret tests), the
+            // fleet routes need an enrolled controller (fleet intent
+            // events in kronik-api's fleet tests) and the webhook replay a
+            // published event feed (events.webhook.replay in
+            // crates/kronik-otel/tests/audit_export.rs).
+            step(
+                "PUT",
+                "/v1/secrets/{name}/link",
+                "/v1/secrets/db/link",
+                json!({"backend": "external", "ref": "db"}),
+                None,
+            ),
+            step(
+                "DELETE",
+                "/v1/secrets/{name}/link",
+                "/v1/secrets/db/link",
+                json!({}),
+                None,
+            ),
+            step(
+                "POST",
+                "/v1/secrets/{name}/refresh",
+                "/v1/secrets/db/refresh",
+                json!({}),
+                None,
+            ),
+            step(
+                "POST",
+                "/v1/fleet/enroll",
+                "/v1/fleet/enroll",
+                json!({"url": "https://controller.test"}),
+                None,
+            ),
+            step(
+                "POST",
+                "/v1/fleet/revoke",
+                "/v1/fleet/revoke",
+                json!({}),
+                None,
+            ),
+            step(
+                "POST",
+                "/v1/events/webhooks/{name}/replay",
+                "/v1/events/webhooks/audit/replay",
+                json!({"cursor": {"schema": "kronik.events-cursor/v1",
+                    "identity": {"installation": "events", "branch": "main"}, "streams": {}}}),
                 None,
             ),
         ],

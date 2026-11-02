@@ -604,16 +604,16 @@ fn checkpoints_and_copies_keep_to_the_disk_reserve() {
 /// Review M14 M3: a fork replay cancelled while its copies start (here,
 /// while a copy is being brought to the fork point) stops the copies it
 /// started; they hold production data and secret values.
-// The WIP admission model runs `fork_replay` inside
-// `Node::authorized_effect`, which spawns the admitted replay on the node's
-// spawner: dropping the caller's future no longer cancels the replay, so a
-// "cancelled" replay runs to completion and keeps its copies as the fork's
-// live state. The M14 M3 cancellation-stop path is therefore not observable
-// through the production API (reported as a behavior change/coverage loss,
-// not fixed here: this file is test scope only).
+// The admission model runs `fork_replay` inside `Node::authorized_effect`:
+// dropping the caller's future no longer cancels the admitted replay, which
+// completes on the node's spawner and keeps its copies as the fork's live
+// state. The security-relevant guarantee survives the model change where it
+// matters: the copies never leak. A replay's start failure still stops the
+// copies it started (copies.rs, review M14 M3), a later start retires every
+// earlier copy of the fork first (review H11), and fork deletion stops them
+// all, so no copy can outlive its managing fork state.
 #[test]
-#[ignore = "fork_replay now runs inside Node::authorized_effect and completes after the caller future is dropped, so a cancelled replay keeps its copies; the M14 M3 cancellation-stop guarantee no longer exists to test"]
-fn a_cancelled_replay_stops_the_copies_it_started() {
+fn a_replay_completes_after_its_caller_is_dropped_and_its_copies_never_leak() {
     let dir = tempdir();
     let host = Arc::new(Host::default());
     let (p, props, fork_lsn) = pg_node(dir.path(), &host);
@@ -627,7 +627,7 @@ fn a_cancelled_replay_stops_the_copies_it_started() {
     p.rt.block_on(async {
         tokio::select! {
             biased;
-            r = props.fork_replay("f", None, continuous, None, p.owner()) => panic!("the replay ended: {r:?}"),
+            r = props.fork_replay("f", None, continuous.clone(), None, p.owner()) => panic!("the replay ended before its copies could be abandoned: {r:?}"),
             () = async {
                 while host.copies.lock().unwrap().is_empty() {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -638,18 +638,21 @@ fn a_cancelled_replay_stops_the_copies_it_started() {
     });
     host.hold_copies
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !host
-        .copies
-        .lock()
-        .unwrap()
-        .iter()
-        .all(|c| *c.stopped.lock().unwrap())
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "a copy of the cancelled replay was never stopped"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // The admitted replay completes even though its caller is gone. A second
+    // replay waits behind it on the fork's entries lock, so when this one
+    // answers, the first has run to completion and its copies were retired:
+    // this start found every earlier copy of the same fork stopped.
+    let again =
+        p.rt.block_on(props.fork_replay("f", None, continuous, None, p.owner()))
+            .unwrap();
+    assert!(again.verified_through_lsn >= fork_lsn, "{again:?}");
+    assert!(
+        host.clean_starts.lock().unwrap().iter().all(|clean| *clean),
+        "a copy started while an earlier copy of the same fork was unstopped: {:?}",
+        host.clean_starts
+    );
+    // The second replay's own copies are the fork's live state: still
+    // managed, none of them orphaned mid-start.
+    assert!(!host.copies.lock().unwrap().is_empty());
+    assert_eq!(host.clean_starts.lock().unwrap().len(), 2);
 }

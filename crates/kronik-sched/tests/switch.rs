@@ -81,7 +81,7 @@ fn promote(v: pb::KindVersion) -> CodeSwitch {
 async fn promote_now(node: &Node, hold: &SwitchHold, name: &str) -> u64 {
     let v = version(node, name).await;
     hold.release.add_permits(1);
-    node.switch_code(promote(v), audit(), false, owner(&node))
+    node.switch_code(promote(v), audit(), false, owner(node))
         .await
         .unwrap()
         .0
@@ -421,7 +421,7 @@ async fn send(node: &Node, key: &str) {
             },
             audit(),
             false,
-            owner(&node),
+            owner(node),
         )
         .await
         .unwrap()

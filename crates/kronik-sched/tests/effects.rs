@@ -1272,12 +1272,12 @@ fn a_subjects_failed_turn_after_a_call_keeps_the_node_running_with_privacy_on() 
 }
 
 /// Review H2 (v0.1): a revealed value passed in a call's compensation of a
-/// failed turn is scrubbed in the structured message, so the record still
-/// decodes, the node keeps running and restarts, and the value is nowhere
-/// on disk; the compensation the callee gets is scrubbed as well.
+/// failed turn never reaches the callee: the whole call is denied
+/// (`scrub::call_request`, UnsafeCompensation -> POLICY_DENIED), so no
+/// compensation copy — scrubbed or not — can arrive. The node keeps running
+/// and restarts, and the value is nowhere on disk.
 #[test]
-#[ignore = "superseded design: a fresh call whose compensation carries a revealed secret is denied (scrub::call_request UnsafeCompensation -> POLICY_DENIED) instead of delivering a scrubbed copy; no compensation can arrive"]
-fn a_revealed_value_in_a_compensation_is_scrubbed_and_the_node_restarts() {
+fn an_unsafe_compensation_denies_the_call_and_the_node_restarts() {
     const SECRET: &str = "VALUE-comp-5d1e9a";
     let dir = tempfile::tempdir().unwrap();
     let p = start(dir.path());
@@ -1304,7 +1304,29 @@ fn a_revealed_value_in_a_compensation_is_scrubbed_and_the_node_restarts() {
     .unwrap();
     let r = p.send("leaky/a", msg("reveal-comp", "k1 leaky/b"));
     assert!(!r.committed(), "{r:?}");
+    // The call with the unsafe compensation is denied outright; the guest's
+    // own failure still closes the turn.
+    let turn = turn_records(&p.records())
+        .into_iter()
+        .find(|t| {
+            t.input.as_ref().and_then(|i| i.kind.as_ref()).is_some_and(|k| {
+                matches!(k, pb::input::Kind::Message(m) if m.msg.as_ref().is_some_and(|m| m.name == "reveal-comp"))
+            })
+        })
+        .expect("the reveal-comp turn record");
+    assert_eq!(
+        turn.outcome.as_ref().unwrap().kind,
+        pb::OutcomeKind::Failed as i32
+    );
+    let denied = turn
+        .effects
+        .iter()
+        .find(|e| e.status == pb::EffectStatus::Denied as i32)
+        .expect("the denied call effect");
+    assert_eq!(denied.error, "POLICY_DENIED");
     takes_turns(&p);
+    // The callee never ran: neither its "keep" call nor any compensation
+    // ("undone") arrived, scrubbed or not.
     let kv = |p: &Proc, k: &str| {
         p.node
             .store()
@@ -1313,8 +1335,8 @@ fn a_revealed_value_in_a_compensation_is_scrubbed_and_the_node_restarts() {
             .unwrap()
             .map(|v| String::from_utf8(v).unwrap())
     };
-    p.wait_until("the compensation", |p| kv(p, "undone").is_some());
-    assert_eq!(kv(&p, "undone").as_deref(), Some("[secret:k1]"));
+    assert_eq!(kv(&p, "kept"), None);
+    assert_eq!(kv(&p, "undone"), None);
     drop(p);
     let p = start(dir.path());
     takes_turns(&p);

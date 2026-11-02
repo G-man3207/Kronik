@@ -653,11 +653,33 @@ fn the_model_never_sees_or_caches_secret_values() {
                     "the original model node ended",
                 )
             })?;
-            node.native_secret_snapshot_with_publication()
-                .map(|(snapshot, publication)| ModelSecretSnapshot::Live {
-                    snapshot,
-                    publication,
-                })
+            // The certified catalogue briefly uncertifies across a
+            // deployment-epoch publication (STATUS, known product gap): a
+            // scrubbed read answers SECRET_UNAVAILABLE while it
+            // recertifies, and clients must retry that window, as the CLI
+            // does. Await exactly that window here; any other error, or a
+            // wait that runs out, still fails the test.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match node.native_secret_snapshot_with_publication() {
+                    Ok((snapshot, publication)) => {
+                        return Ok(ModelSecretSnapshot::Live {
+                            snapshot,
+                            publication,
+                        });
+                    }
+                    Err(error)
+                        if error.code == kronik_core::error::ErrorCode::SecretUnavailable =>
+                    {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the secret catalogue never recertified: {error}"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }),
         offline: false,
     };
@@ -667,7 +689,6 @@ fn the_model_never_sees_or_caches_secret_values() {
         headers: vec![],
         body: body.as_bytes().to_vec(),
         fingerprint_version: 0,
-        ..Default::default()
     };
     // Preserve the existing known-literal legacy refusal/no-wire contract.
     let unprepared = req("key=sk-live-0123456789");

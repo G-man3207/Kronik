@@ -882,7 +882,10 @@ fn consequences_in_flight_at_the_pause_run_on_main_after_the_switch() {
                 let (p, go) = (&s.p, &go);
                 scope.spawn(move || {
                     let mut sent = 0;
-                    while go.load(Ordering::SeqCst) || sent < 5 {
+                    // The send phase must stay bounded even if the promote
+                    // ever stalls: 5 sends are the test's minimum, 500 the
+                    // most one worker floods the pause window with.
+                    while sent < 5 || (go.load(Ordering::SeqCst) && sent < 500) {
                         let res = keyed_op(p, "a", "forward", "f", &format!("f-{t}-{sent}"));
                         assert!(res.committed(), "{:?}", res.outcome);
                         sent += 1;
