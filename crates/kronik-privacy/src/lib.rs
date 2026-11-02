@@ -339,6 +339,9 @@ impl MasterKey {
     }
 
     /// Pure secret version identities using one protected derivation, without opening a store.
+    // The returned derivation closure is the API; naming its full type would
+    // only restate the impl-trait line above it.
+    #[allow(clippy::type_complexity)]
     pub fn secret_version_hasher(
         &self,
     ) -> Result<
@@ -590,6 +593,8 @@ CREATE TABLE IF NOT EXISTS secrets (
 CREATE TABLE IF NOT EXISTS secret_deletion_floors (
   name TEXT PRIMARY KEY NOT NULL, through_version INTEGER NOT NULL,
   deleted_wall_ms INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS store_identity (
+  id INTEGER PRIMARY KEY CHECK (id = 1), generation BLOB NOT NULL);
 ";
 
 // Keep metadata-only and value reads on exactly the same current-row selector.
@@ -1067,10 +1072,10 @@ impl SecretStore {
             stored_version(low)?;
         }
         let mut high = high.map(stored_version).transpose()?.unwrap_or(0);
-        if self.has_floor_table {
-            if let Some(floor) = deletion_floor(&tx, name)? {
-                high = high.max(floor.through_version);
-            }
+        if self.has_floor_table
+            && let Some(floor) = deletion_floor(&tx, name)?
+        {
+            high = high.max(floor.through_version);
         }
         tx.commit()?;
         Ok(high)
@@ -1630,6 +1635,24 @@ impl SecretStore {
         self.fresh_at_open
     }
 
+    /// The store's random generation, minted by the store itself at creation
+    /// (`randomblob(16)`) and preserved by copies of the file. A restored or
+    /// replaced store carries another generation, which voids a daemon's
+    /// durable coverage watermark; the generation is not secret material.
+    pub fn generation(&self) -> Result<Vec<u8>, PrivacyError> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO store_identity (id, generation) VALUES (1, randomblob(16))              ON CONFLICT(id) DO NOTHING",
+            [],
+        )?;
+        let generation: Vec<u8> = conn.query_row(
+            "SELECT generation FROM store_identity WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(generation)
+    }
+
     fn validate_legacy_key(conn: &Connection, master: &MasterKey) -> Result<bool, PrivacyError> {
         let row: Option<(String, i64, Vec<u8>, Vec<u8>)> = conn
             .query_row(
@@ -1697,6 +1720,9 @@ impl SecretStore {
     /// Prepares exact custody bytes for reservation preflight without accessing SQLite.
     /// This is not persistence or authorization; import still checks the committed floor.
     /// `nonce` must be fresh randomness for this physical version and value.
+    // The row layout is the on-disk format: name, version, value, nonce,
+    // wall clock, token and reason mirror the physical columns.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_encrypted_row(
         &self,
         name: &str,
@@ -1725,6 +1751,8 @@ impl SecretStore {
     }
 
     /// Stores an explicitly reserved immutable version. `nonce` must be fresh randomness.
+    // As prepare_encrypted_row: the physical row's field order.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_at(
         &self,
         name: &str,
