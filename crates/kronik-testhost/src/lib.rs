@@ -80,6 +80,9 @@ pub struct TestHost {
     api: Api,
     clock: Arc<ManualClock>,
     net: Arc<StubNet>,
+    // The private data directory backing the file-backed secret store;
+    // dropped (and removed) when the host is.
+    _temp: tempfile::TempDir,
 }
 
 impl TestHost {
@@ -111,10 +114,20 @@ impl TestHost {
         // The group commit window is a clock sleep, which would wait for the
         // test to advance time.
         log.group_commit_window = Duration::ZERO;
+        // The secret store is FILE-BACKED in a private 0700 temp directory
+        // (cleaned on exit), exactly as production runs: the write path then
+        // includes a genuine directory fsync, and the store's data state is
+        // owned by this host alone.
+        let temp = tempfile::TempDir::with_prefix("kronik-test-host")
+            .map_err(|e| Error::new("temp dir", e))?;
+        let ownership = kronik_privacy::key_source::lock_data(temp.path())
+            .map_err(|e| Error::new("data ownership", e))?;
         let master = MasterKey::from_bytes([7; 32]).map_err(|e| Error::new("master key", e))?;
-        let secrets =
-            SecretStore::open_memory(&master, kronik_sched::secrets::SecretCacheData::new())
-                .map_err(|e| Error::new("secrets", e))?;
+        let secrets_data = SecretStore::owned_data(&ownership)
+            .map_err(|e| Error::new("secret store data", e))?
+            .unwrap_or_else(|| kronik_sched::secrets::SecretCacheData::new());
+        let secrets = SecretStore::open_owned(&ownership, &master, secrets_data)
+            .map_err(|e| Error::new("secrets", e))?;
         let node = Node::start(NodeParts {
             env,
             config: NodeConfig {
@@ -124,10 +137,10 @@ impl TestHost {
             log,
             store,
             code,
-            secrets: Some(Arc::new(secrets)),
+            secrets: Some(secrets),
             sealer: None,
             key_source: None,
-            ownership: None,
+            ownership: Some(ownership),
         })
         .await
         .map_err(|e| Error::new("starting the node", e))?;
@@ -137,6 +150,7 @@ impl TestHost {
             node,
             clock,
             net,
+            _temp: temp,
         })
     }
 
@@ -153,7 +167,10 @@ impl TestHost {
                 path: path.to_string(),
                 query: query.to_string(),
                 body,
-                token_id: "test-host".to_string(),
+                // The test host stands in for the daemon's local unix-socket caller, whose
+                // captured id is the peer's `unix:uid=N` (crates/kronik-api/src/auth.rs
+                // `local_uid`); the local operator is uid 0.
+                token_id: "unix:uid=0".to_string(),
                 bearer: None,
             })
             .await
