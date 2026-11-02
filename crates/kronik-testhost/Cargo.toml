@@ -20,6 +20,7 @@ kronik-runtime = { workspace = true }
 kronik-sched = { workspace = true }
 kronik-store = { workspace = true }
 rusqlite = { workspace = true }
+tempfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
