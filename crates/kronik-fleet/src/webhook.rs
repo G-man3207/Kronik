@@ -184,6 +184,8 @@ pub struct Webhook {
     state: State,
 }
 
+// The two hosts' callback fields carry the webhook's wiring.
+#[allow(clippy::type_complexity)]
 enum Host {
     Native {
         node: Arc<Node>,
@@ -502,6 +504,9 @@ impl Webhook {
     /// Actor delivery uses the existing follower with Options.batch = 1.
     /// The caller supplies its original native/member execution lease once;
     /// delivery retains it rather than reacquiring authority on retries.
+    // The webhook stream's opening inputs; grouping them would only move
+    // the same names into a struct every caller unpacks again.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open(
         node: Arc<Node>,
         mapper: Arc<Mapper>,
@@ -532,6 +537,12 @@ impl Webhook {
     /// The real Member producer validates the exact registered source, branch,
     /// shard, cursors and stream before constructing these retained callbacks.
     /// Capture returns that producer's ONE actual reader Arc, never a Node fallback.
+    // The webhook stream's opening inputs; grouping them would only move
+    // the same names into a struct every caller unpacks again.
+    #[allow(clippy::too_many_arguments)]
+    // The webhook stream's opening inputs; grouping them would only move
+    // the same names into a struct every caller unpacks again.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub async fn open_registered(
         runtime: MetadataRuntime,
         capture: Arc<
@@ -585,6 +596,11 @@ impl Webhook {
         }
     }
 
+    // The webhook stream's opening inputs; grouping them would only move
+    // the same names into a struct every caller unpacks again.
+    #[allow(clippy::too_many_arguments)]
+    // As open_registered: the webhook stream's opening inputs.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     async fn open_at(
         host: Host,
         mapper: Arc<Mapper>,
@@ -1223,11 +1239,11 @@ impl MetadataStream {
             Err(error) => error.into_inner(),
         };
         errors.code = Some(code);
-        if let Some(gap) = gap {
-            if errors.last_gap.as_ref() != Some(&gap) {
-                errors.gaps = errors.gaps.saturating_add(1);
-                errors.last_gap = Some(gap);
-            }
+        if let Some(gap) = gap
+            && errors.last_gap.as_ref() != Some(&gap)
+        {
+            errors.gaps = errors.gaps.saturating_add(1);
+            errors.last_gap = Some(gap);
         }
     }
 
@@ -1240,6 +1256,9 @@ impl MetadataStream {
     }
 }
 
+// The webhook stream's opening inputs; grouping them would only move
+// the same names into a struct every caller unpacks again.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_metadata(
     runtime: MetadataRuntime,
     mapper: Arc<Mapper>,
@@ -1536,8 +1555,8 @@ async fn follow_metadata_live(mut sink: Webhook, shared: Arc<MetadataStream>) {
         if sink.state.pending.is_none() && image.records.is_empty() {
             if from > image.durable_through.saturating_add(1) {
                 shared.failure("webhook_source".into(), None);
-            } else if image.scanned_through > position {
-                if let Err(code) = metadata_checkpoint(
+            } else if image.scanned_through > position
+                && let Err(code) = metadata_checkpoint(
                     &mut sink,
                     &shared,
                     image.scanned_through,
@@ -1545,9 +1564,8 @@ async fn follow_metadata_live(mut sink: Webhook, shared: Arc<MetadataStream>) {
                     &shared.runtime.execution,
                 )
                 .await
-                {
-                    shared.failure(code, None);
-                }
+            {
+                shared.failure(code, None);
             }
             pause(
                 &env,

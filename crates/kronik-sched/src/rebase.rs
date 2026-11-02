@@ -454,6 +454,9 @@ impl Node {
     /// and reloads its timers and queued messages. Returns (epoch, lsn).
     /// Takes the pause: the switch's task holds it until the switch is
     /// done, also when the caller goes away.
+    // One rebase switch's admission: held drain, ids, windows and
+    // authority; a single call site.
+    #[allow(clippy::too_many_arguments)]
     pub async fn rebase_switch(
         &self,
         pause: crate::gate::Drain,

@@ -1,3 +1,8 @@
+// Provider fixtures drive real sockets and threads with wall-clock
+// deadlines: the direct std/tokio calls here are the harness, not daemon
+// paths (ADR 0004 governs the daemon, which reads time through Env).
+#![allow(clippy::disallowed_methods)]
+
 use super::*;
 use crate::secret_backend::{BackendError, SecretBackend};
 use kronik_core::authority::Authority;

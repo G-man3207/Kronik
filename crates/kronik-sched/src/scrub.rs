@@ -514,9 +514,7 @@ pub fn original_secret_prefix(
         // A resolved cleanup can add a scrub-only seed absent from its effects.
         return None;
     }
-    if input.kind.is_none() {
-        return None;
-    }
+    input.kind.as_ref()?;
     let mut prefix = Vec::new();
     for effect in effects.iter().filter(|effect| effect.ordinal <= ordinal) {
         prefix.try_reserve(1).ok()?;
@@ -1090,8 +1088,9 @@ pub fn legacy_verification_fingerprint<N: AsRef<str>, V: AsRef<[u8]>>(
         request.body = legacy_bytes(&original_body, secrets)?;
         for (index, header) in request.headers.iter_mut().enumerate() {
             if let Some(pb::http_effect_header::Value::Text(value)) = &mut header.value {
-                originals.push((index, std::mem::take(value)));
-                *value = text(&originals.last().expect("just pushed").1, secrets)?;
+                let original = (index, std::mem::take(value));
+                *value = text(&original.1, secrets)?;
+                originals.push(original);
             }
         }
         kronik_effects::http::fingerprint(request).map_err(|_| ScrubError::InvalidText)
@@ -1157,8 +1156,9 @@ pub fn legacy_call_verification_fingerprint<N: AsRef<str>, V: AsRef<[u8]>>(
                 ..
             }) = message
             {
-                originals[index] = Some(std::mem::take(bytes));
-                *bytes = legacy_bytes(originals[index].as_deref().expect("just moved"), secrets)?;
+                let original = std::mem::take(bytes);
+                originals[index] = Some(original.clone());
+                *bytes = legacy_bytes(&original, secrets)?;
             }
         }
         legacy_call_source_fingerprint(request)
@@ -1167,8 +1167,8 @@ pub fn legacy_call_verification_fingerprint<N: AsRef<str>, V: AsRef<[u8]>>(
         .into_iter()
         .zip(originals)
     {
-        if let Some(original) = original {
-            if let Some(pb::Message {
+        if let Some(original) = original
+            && let Some(pb::Message {
                 body:
                     Some(pb::Sealable {
                         value: Some(pb::sealable::Value::Plain(bytes)),
@@ -1176,10 +1176,9 @@ pub fn legacy_call_verification_fingerprint<N: AsRef<str>, V: AsRef<[u8]>>(
                     }),
                 ..
             }) = message
-            {
-                bytes.zeroize();
-                *bytes = original;
-            }
+        {
+            bytes.zeroize();
+            *bytes = original;
         }
     }
     request.fingerprint_version = original_version;

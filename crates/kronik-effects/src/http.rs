@@ -316,7 +316,8 @@ impl From<aho_corasick::Match> for ScrubMatch {
 
 enum CompiledMatcher {
     Literals(aho_corasick::AhoCorasick),
-    Output(credential_output::CredentialMatcher),
+    // Boxed: the credential matcher dwarfs the literal automaton.
+    Output(Box<credential_output::CredentialMatcher>),
 }
 
 /// One ordered matcher. Secret values are compiled once; only names remain borrowed.
@@ -386,11 +387,11 @@ impl<'a> CompiledScrubber<'a> {
         }
         let matcher = if credentials {
             max_len = max_len.max(50);
-            Some(CompiledMatcher::Output(
+            Some(CompiledMatcher::Output(Box::new(
                 credential_output::CredentialMatcher::build(
                     patterns.iter().map(|(value, _)| *value),
                 )?,
-            ))
+            )))
         } else if patterns.is_empty() {
             None
         } else {
@@ -826,8 +827,9 @@ mod tests {
         let matcher = std::sync::Arc::new(matcher);
         assert!(matcher.is_match(b"[secret:marker]"));
         assert!(!matcher.is_match(b"unchanged"));
-        let callback: Box<dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, ScrubError> + Send + Sync> =
-            Box::new(move |bytes| matcher.scrub_if_matched(bytes, 128));
+        type ScrubCallback =
+            Box<dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, ScrubError> + Send + Sync>;
+        let callback: ScrubCallback = Box::new(move |bytes| matcher.scrub_if_matched(bytes, 128));
         assert_eq!(callback(b"unchanged").unwrap(), None);
         assert_eq!(
             callback(b"[secret:marker]").unwrap(),

@@ -184,37 +184,6 @@ pub(crate) fn write_atomic_with(
     Ok(())
 }
 
-#[cfg(test)]
-mod atomic_write_tests {
-    use super::{write_atomic, write_atomic_with};
-    use std::io::{Error, ErrorKind, Write as _};
-
-    #[test]
-    fn streamed_replacement_preserves_previous_file_on_producer_failure() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("answers.json");
-        write_atomic(&path, b"previous answers").unwrap();
-
-        let error = write_atomic_with(&path, |file| {
-            file.write_all(b"incomplete replacement")?;
-            Err(Error::new(
-                ErrorKind::InvalidData,
-                "producer rejected the container",
-            ))
-        })
-        .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidData);
-        assert_eq!(std::fs::read(&path).unwrap(), b"previous answers");
-
-        write_atomic_with(&path, |file| {
-            file.write_all(b"new ")?;
-            file.write_all(b"answers")
-        })
-        .unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"new answers");
-    }
-}
-
 /// The configuration (grants, limits) after main's records up to `lsn`.
 /// Kinds with no `sql_bytes_per_actor` in a `Limits` record use 1 GiB.
 pub fn config_at(index: &ProductionIndex, lsn: Lsn) -> Config {
@@ -347,4 +316,35 @@ pub async fn run(
         hash,
         continuous,
     })
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::{write_atomic, write_atomic_with};
+    use std::io::{Error, ErrorKind, Write as _};
+
+    #[test]
+    fn streamed_replacement_preserves_previous_file_on_producer_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("answers.json");
+        write_atomic(&path, b"previous answers").unwrap();
+
+        let error = write_atomic_with(&path, |file| {
+            file.write_all(b"incomplete replacement")?;
+            Err(Error::new(
+                ErrorKind::InvalidData,
+                "producer rejected the container",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous answers");
+
+        write_atomic_with(&path, |file| {
+            file.write_all(b"new ")?;
+            file.write_all(b"answers")
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new answers");
+    }
 }

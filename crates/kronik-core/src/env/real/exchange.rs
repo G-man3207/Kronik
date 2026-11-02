@@ -424,10 +424,10 @@ mod tests {
     fn pid(dir: &Path) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            if let Ok(text) = std::fs::read_to_string(dir.join("pid")) {
-                if let Ok(pid) = text.parse() {
-                    return pid;
-                }
+            if let Ok(text) = std::fs::read_to_string(dir.join("pid"))
+                && let Ok(pid) = text.parse()
+            {
+                return pid;
             }
             assert!(Instant::now() < deadline, "helper did not publish its pid");
             std::thread::sleep(Duration::from_millis(2));
@@ -541,6 +541,9 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        // The helper returns the spawned task unawaited on purpose: the
+        // caller drops the runtime first and reaps the child afterwards.
+        #[allow(clippy::async_yields_async)]
         let task = runtime.block_on(async {
             let task = tokio::spawn(exchange(req));
             let deadline = Instant::now() + Duration::from_secs(3);

@@ -732,10 +732,10 @@ impl Authority for RetainedDisclosure {
                         hint: denial.hint.take(),
                     });
                 }
-                publication.with_current_publication(&mut denial, || effect())
+                publication.with_current_publication(&mut denial, &mut *effect)
             }
             Projection::Metadata(_snapshot, publication) => {
-                publication.with_current_publication(&mut denial, || effect())
+                publication.with_current_publication(&mut denial, &mut *effect)
             }
             Projection::MetadataRecords(stream, _snapshot, publication) => {
                 let published = publication.with_current_publication(&mut denial, || {
@@ -766,6 +766,10 @@ impl Authority for RetainedDisclosure {
 
 #[cfg(test)]
 mod retained_file_tests {
+    // The fixtures race real time and spawned tasks around admitted work:
+    // the direct calls are the harness, not daemon paths.
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use kronik_core::env::Env;
     use kronik_proto::log::v1 as pb;
@@ -1299,10 +1303,10 @@ mod retained_file_tests {
                 if line == "\r\n" {
                     break;
                 }
-                if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        length = value.trim().parse::<usize>().unwrap();
-                    }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse::<usize>().unwrap();
                 }
             }
             let mut body = vec![0; length];
@@ -1882,6 +1886,8 @@ pub async fn follow<S: Sink + 'static>(
 /// to the sink and, once the sink recorded it, counted. False after a
 /// failed record, once the backoff passed: the caller keeps its cursor
 /// before the gap and tries again, so a restart still sees the gap.
+// One sink-gap report's plumbing: env, sink, stream and cursors.
+#[allow(clippy::too_many_arguments)]
 async fn report_gap<S: Sink>(
     env: &Env,
     sink: &Arc<tokio::sync::Mutex<S>>,

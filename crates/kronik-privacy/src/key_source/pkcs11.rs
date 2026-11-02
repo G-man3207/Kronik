@@ -54,7 +54,7 @@ pub(crate) fn check(cfg: &Pkcs11, require_probe: bool) -> Result<(), String> {
         || !text(&cfg.key_version, 128)
         || cfg.key_id.is_empty()
         || cfg.key_id.len() > 128
-        || cfg.key_id.len() % 2 != 0
+        || !cfg.key_id.len().is_multiple_of(2)
         || !is_hex(&cfg.key_id, cfg.key_id.len() / 2)
         || (require_probe && cfg.probe.is_none())
         || cfg
@@ -273,7 +273,7 @@ fn decode_seed(value: &str) -> Result<Zeroizing<Vec<u8>>, String> {
         return Err(PROTOCOL.into());
     }
     let mut output = Zeroizing::new(vec![0u8; 32]);
-    for (out, pair) in output.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+    for (out, pair) in output.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
         let nibble = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
         *out = nibble(pair[0]) * 16 + nibble(pair[1]);
     }

@@ -171,7 +171,6 @@ pub fn prepare_inline_fetch_response(
                 status: u32::from(status),
                 headers: Vec::new(),
                 body: WITHHELD_EFFECT_BODY.to_vec(),
-                ..Default::default()
             }
             .encode_to_vec(),
         );
@@ -264,7 +263,7 @@ pub fn prepare_call_outcome(
                 matcher,
                 std::iter::once(error.as_bytes()),
             )
-            .and_then(|()| {
+            .and({
                 if error.len() <= output_bytes {
                     Ok(())
                 } else {
@@ -282,7 +281,7 @@ pub fn prepare_call_outcome(
                 matcher,
                 std::iter::once(error.as_bytes()),
             )
-            .and_then(|()| {
+            .and({
                 if error.len() <= output_bytes {
                     Ok(())
                 } else {
@@ -310,14 +309,14 @@ pub fn prepare_call_outcome(
         }
     };
     if let Err(error) = prepared {
-        if let Some(response) = &mut response {
-            if let Some(reply) = &mut response.reply {
-                crate::scrub::wipe_message(reply);
-                reply.name = "WITHHELD".into();
-                reply.content_type = "application/octet-stream".into();
-                if let Some(body) = &mut reply.body {
-                    body.value = Some(pb::sealable::Value::Plain(WITHHELD_EFFECT_BODY.to_vec()));
-                }
+        if let Some(response) = &mut response
+            && let Some(reply) = &mut response.reply
+        {
+            crate::scrub::wipe_message(reply);
+            reply.name = "WITHHELD".into();
+            reply.content_type = "application/octet-stream".into();
+            if let Some(body) = &mut reply.body {
+                body.value = Some(pb::sealable::Value::Plain(WITHHELD_EFFECT_BODY.to_vec()));
             }
         }
         if record.callee_source.is_none() {
@@ -337,9 +336,24 @@ pub fn prepare_call_outcome(
         return Err(GateError::HostRedactionFailure);
     }
     record.status = observed as i32;
-    match prepared.expect("handled the redaction failure") {
-        CallOutcome::Ok(_) => {
-            let mut response = response.expect("the successful call response");
+    let prepared = match prepared {
+        // The redaction plan already handled every failure class that could
+        // carry callee content; a bare Ok without a response is a host bug
+        // surfaced as an explicit gate error instead of a panic.
+        Ok(outcome) => outcome,
+        Err(_) => {
+            return Err(GateError::Host(
+                "the call outcome's redaction plan did not resolve to a known outcome".into(),
+            ));
+        }
+    };
+    match prepared {
+        CallOutcome::Ok(_outcome) => {
+            let mut response = response.ok_or_else(|| {
+                GateError::Host(
+                    "the call outcome reported success without a response to redact".into(),
+                )
+            })?;
             let subject = response
                 .reply
                 .as_ref()
@@ -493,13 +507,11 @@ pub fn legacy_http_disclosure(
         headers,
         body: WITHHELD_EFFECT_BODY.to_vec(),
         fingerprint_version: 0,
-        ..Default::default()
     };
     let response = status.map(|status| pb::HttpEffectResponse {
         status,
         headers: Vec::new(),
         body: WITHHELD_EFFECT_BODY.to_vec(),
-        ..Default::default()
     });
     for (payload, bytes) in [
         (&mut record.request, Some(request.encode_to_vec())),
@@ -633,10 +645,10 @@ pub fn legacy_call_disclosure(
                 message_id: std::mem::take(&mut source.message_id),
                 ..Default::default()
             };
-            if let Some(response) = &mut response {
-                if let Some(reply) = &mut response.reply {
-                    withhold(reply)?;
-                }
+            if let Some(response) = &mut response
+                && let Some(reply) = &mut response.reply
+            {
+                withhold(reply)?;
             }
             for (payload, bytes) in [
                 (&mut record.request, Some(request.encode_to_vec())),
@@ -668,10 +680,10 @@ pub fn legacy_call_disclosure(
     {
         crate::scrub::wipe_message(message);
     }
-    if let Some(response) = &mut response {
-        if let Some(reply) = &mut response.reply {
-            crate::scrub::wipe_message(reply);
-        }
+    if let Some(response) = &mut response
+        && let Some(reply) = &mut response.reply
+    {
+        crate::scrub::wipe_message(reply);
     }
     if result.is_err() {
         for payload in [&mut record.request, &mut record.response]
@@ -726,6 +738,8 @@ pub(crate) struct FxState {
 impl FxState {
     /// Seed privacy matching only. These cache-held bytes never become an
     /// operational credential, a provider fallback, or an actor grant.
+    // Unused since the certified-snapshot rework; kept for the M23 track.
+    #[allow(dead_code)]
     pub(crate) fn seed_scrub_snapshot(
         &mut self,
         snapshot: &crate::secrets::CertifiedSecretSnapshot,
@@ -1272,7 +1286,6 @@ impl TurnFx {
             headers,
             body: req.body.clone(),
             fingerprint_version: 2,
-            ..Default::default()
         };
         // Recorded and fingerprinted without the values of secrets revealed
         // so far (I8), so a fork's placeholder (`[secret:<name>]`) matches
@@ -1445,7 +1458,7 @@ impl TurnFx {
                             )
                         })?;
                         let rendered = if s.template.contains("{}") {
-                            s.template.replace("{}", &value)
+                            s.template.replace("{}", value)
                         } else {
                             value.to_owned()
                         };
@@ -1539,7 +1552,6 @@ impl TurnFx {
                         .map(|(name, value)| pb::HeaderPair { name, value })
                         .collect(),
                     body: Vec::from(response.body),
-                    ..Default::default()
                 },
                 &matcher,
                 self.spec
@@ -1680,7 +1692,9 @@ impl TurnFx {
             (matcher, legacy, state.secret_scope())
         };
         if let Some(candidate_plain) = legacy {
-            let source = source.expect("the legacy source");
+            let source = source.ok_or_else(|| {
+                GateError::Host("the legacy re-run's recorded source is missing".into())
+            })?;
             if source.to.as_ref() != Some(&to.to_pb())
                 || source.message_id != message_id
                 || source.msg.is_none()
@@ -1693,7 +1707,9 @@ impl TurnFx {
                 crate::scrub::legacy_call_source_fingerprint(&source).map_err(|_| {
                     GateError::Host("The legacy call source fingerprint is invalid".into())
                 })?;
-            let raw = self.recorded_raw(ordinal).expect("the legacy result");
+            let raw = self.recorded_raw(ordinal).ok_or_else(|| {
+                GateError::Host("the legacy re-run's recorded result is missing".into())
+            })?;
             let original_subject = raw
                 .request
                 .as_ref()

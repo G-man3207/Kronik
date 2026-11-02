@@ -1884,6 +1884,9 @@ pub fn watch(ctx: &Ctx, a: WatchArgs) -> Result<ExitCode, Error> {
 const WATCH_TRANSIENT_BUDGET: Duration = Duration::from_secs(30);
 const WATCH_TRANSIENT_BACKOFF: Duration = Duration::from_millis(100);
 
+// The watch follower runs on the operator's terminal, not the daemon: its
+// wall-clock retry budget is the client's own, not ADR 0004's Env.
+#[allow(clippy::disallowed_methods)]
 fn watch_status(ctx: &Ctx, id: &str) -> Result<Vec<u8>, Error> {
     let target = format!("/v1/watches/{id}");
     let mut deadline = None;
@@ -2284,6 +2287,11 @@ fn plural(n: u64, word: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    // The remote-mode fixtures drive real sockets, threads and wall-clock
+    // deadlines: the direct std/tokio calls are the harness, not daemon paths.
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use serde_json::json;
 

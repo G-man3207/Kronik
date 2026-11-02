@@ -102,6 +102,7 @@ pub(crate) fn file_identity(
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
+
     use super::*;
     use std::sync::Mutex;
 
@@ -123,12 +124,16 @@ mod tests {
 
     fn probe(path: &std::path::Path) {
         let test = concat!(module_path!(), "::sqlite_lock_probe");
-        let test = test.split_once("::").unwrap().1;
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let (_, test) = test
+            .split_once("::")
+            .unwrap_or_else(|| panic!("the probe name carries its module::test form"));
+        let exe = std::env::current_exe()
+            .unwrap_or_else(|error| panic!("this test runs from an executable: {error}"));
+        let status = std::process::Command::new(exe)
             .args(["--ignored", "--exact", test, "--test-threads=1"])
             .env("KRONIK_TEST_BORROWED_SQLITE_LOCK", path)
             .status()
-            .unwrap();
+            .unwrap_or_else(|error| panic!("the probe subprocess must start: {error}"));
         assert!(
             status.success(),
             "a second process must still observe the real SQLite write lock"

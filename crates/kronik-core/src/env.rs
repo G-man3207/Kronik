@@ -201,13 +201,12 @@ impl std::fmt::Debug for TlsConfig {
     /// Structural metadata only: certificate and key bytes never reach a log.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let ca = format!("[redacted] {} certificate(s)", self.ca.len());
-        let identity = match &self.identity {
-            None => None,
-            Some((chain, _key)) => Some(format!(
+        let identity = self.identity.as_ref().map(|(chain, _key)| {
+            format!(
                 "[redacted] {} certificate(s) and a private key",
                 chain.len()
-            )),
-        };
+            )
+        });
         f.debug_struct("TlsConfig")
             .field("ca", &ca)
             .field("identity", &identity)

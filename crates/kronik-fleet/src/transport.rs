@@ -342,6 +342,9 @@ fn control_hashes(
 /// One ordinary HTTP connection, including native streaming and upgrades.
 /// Opening uses its required original-bound producer; the opening slot is not
 /// retained by the channel. Later commands use ordinary per-operation admission.
+// One control connection's admission: client, enrollment, streams and
+// callbacks.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_control<S, D>(
     env: &Env,
     client: &ControllerClient,

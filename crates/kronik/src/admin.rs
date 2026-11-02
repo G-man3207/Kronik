@@ -248,7 +248,7 @@ async fn browser_request(
         let mut response = bytes_response(result.status, result.content_type, result.body);
         for (name, value) in result.headers.iter() {
             response.headers_mut().append(
-                hyper::header::HeaderName::from_static(*name),
+                hyper::header::HeaderName::from_static(name),
                 hyper::header::HeaderValue::from_str(value).map_err(|_| {
                     ApiError::new(
                         ErrorCode::Internal,

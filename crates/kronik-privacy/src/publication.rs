@@ -212,13 +212,13 @@ impl KeystoreMutation {
 
 impl Drop for KeystoreMutation {
     fn drop(&mut self) {
-        if !self.settled {
-            if let Ok(mut state) = self.publisher.state.lock() {
-                state.failed = true;
-                state.mutations -= 1;
-                if self.restoring {
-                    state.stage = None;
-                }
+        if !self.settled
+            && let Ok(mut state) = self.publisher.state.lock()
+        {
+            state.failed = true;
+            state.mutations -= 1;
+            if self.restoring {
+                state.stage = None;
             }
         }
     }

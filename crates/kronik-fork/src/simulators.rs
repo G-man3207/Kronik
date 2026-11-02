@@ -234,6 +234,8 @@ impl Simulators {
     /// the input, effects, writes, messages, timers, reply or SQL, and no
     /// SQL at all). State reads are not recorded, so this is not enough
     /// under privacy mode (see [`ModelAccess::privacy`]).
+    // The recorded-effect view a simulator replays: LSN, effect, secrets.
+    #[allow(clippy::type_complexity)]
     pub fn model_sources<'a>(
         index: &'a ProductionIndex,
         target: &str,
@@ -266,6 +268,8 @@ impl Simulators {
         out
     }
 
+    // The recorded-effect view a simulator replays: LSN, effect, secrets.
+    #[allow(clippy::type_complexity)]
     fn recorded_sources<'a>(
         index: &'a ProductionIndex,
         target: &str,
@@ -809,6 +813,9 @@ impl ModelCache {
         ModelCache::default()
     }
 
+    // The recorded-effect view a simulator replays: LSN, effect, secrets.
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity)]
     fn slot(&self, key: &str, source_fingerprint: [u8; 32]) -> Result<Arc<Slot>, ApiError> {
         let mut slots = lock(&self.slots);
         if let Some(slot) = slots.get(key) {
@@ -1075,6 +1082,8 @@ fn model_scope(
 
 /// Optional subject-free exchanges, using their original source identity
 /// prefix. Unknown/ambiguous examples are omitted, never marked complete.
+// The recorded-effect view a simulator replays: LSN, effect, secrets.
+#[allow(clippy::type_complexity)]
 pub fn model_examples(
     recorded: &[(Lsn, &pb::EffectRecord, Option<Arc<[pb::SecretRef]>>)],
     max: usize,
@@ -1388,13 +1397,13 @@ impl ModelAccess {
             }
             result = Some(saved.clone());
         }
-        if let ModelSecretSnapshot::Live { publication, .. } = &source {
-            if let Err(error) = publication.check_current() {
-                if let Some(result) = &mut result {
-                    wipe_model_result(result);
-                }
-                return Err(error);
+        if let ModelSecretSnapshot::Live { publication, .. } = &source
+            && let Err(error) = publication.check_current()
+        {
+            if let Some(result) = &mut result {
+                wipe_model_result(result);
             }
+            return Err(error);
         }
         result.map(model_result).transpose()
     }
@@ -1481,6 +1490,9 @@ impl ModelAccess {
 
     /// Saved facts match first. A new request needs BOTH the caller's original
     /// dispatch lease and the source's actual atomic live publication resource.
+    // The simulator answer's inputs: target, fingerprint, request, scopes
+    // and the caller's authority.
+    #[allow(clippy::too_many_arguments)]
     pub async fn answer(
         &self,
         target: &str,
@@ -1613,7 +1625,6 @@ impl ModelAccess {
                                     .map(|(name, value)| pb::HeaderPair { name, value })
                                     .collect(),
                                 body: answer.body.into_bytes(),
-                                ..Default::default()
                             };
                             match kronik_sched::scrub::http_response(
                                 &mut response,
@@ -1808,7 +1819,6 @@ mod tests {
                         },
                     ],
                     body: b"ok".to_vec(),
-                    ..Default::default()
                 }
                 .encode_to_vec(),
             ),
@@ -1886,7 +1896,6 @@ mod tests {
                 status: 200,
                 headers: vec![],
                 body,
-                ..Default::default()
             }
             .encode_to_vec(),
         );

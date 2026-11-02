@@ -34,7 +34,6 @@ impl Node {
                 wall_time_ms: self.env.clock.wall_ms(),
             }),
             operation: None,
-            ..Default::default()
         };
         kronik_proto::control::validate_metadata_gap_event(&event)
             .map_err(|error| ApiError::new(ErrorCode::BadRequest, error.to_string()))?;

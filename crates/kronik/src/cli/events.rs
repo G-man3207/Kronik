@@ -284,6 +284,9 @@ fn tail(
     let stop = cancelled.clone();
     let runtime = crate::restore::runtime()?;
     let result = runtime.block_on(async move {
+        // The watch follower's blocking worker runs client-side, outside the
+        // daemon's Env abstraction.
+        #[allow(clippy::disallowed_methods)]
         let mut worker = tokio::task::spawn_blocking(move || {
             let result = (|| {
                 let response = match http::stream(&endpoint, &target, token.as_deref(), encoded.as_deref(), stop.clone()) {
@@ -626,6 +629,11 @@ fn sse_line(input: &mut impl io::BufRead, skip_lf: &mut bool) -> io::Result<Opti
 
 #[cfg(test)]
 mod tests {
+
+    // The remote-mode fixtures drive real sockets, threads and wall-clock
+    // deadlines: the direct std/tokio calls are the harness, not daemon paths.
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use clap::Parser as _;
 
@@ -1621,7 +1629,6 @@ mod tests {
                 wall_time_ms: 123,
             }),
             operation: None,
-            ..Default::default()
         });
         let secrets = [("token", b"PRIVATE-CREDENTIAL".as_slice())];
         let event = match source {

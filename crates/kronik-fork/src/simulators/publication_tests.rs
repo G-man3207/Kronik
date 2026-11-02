@@ -1,5 +1,8 @@
+// Publication fixtures race spawned tasks and wall-clock deadlines: the
+// direct calls are the harness, not daemon paths.
+#![allow(clippy::disallowed_methods)]
+
 use super::*;
-use std::io::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot};

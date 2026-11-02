@@ -2,7 +2,6 @@ use super::*;
 use kronik_effects::http::{
     fingerprint, fingerprint_v2, parse_request_url, parse_url, prepared_target, target_of,
 };
-use prost::Message as _;
 
 fn body(value: &[u8]) -> Option<pb::Sealable> {
     Some(pb::Sealable {
@@ -315,7 +314,6 @@ fn free_header_names_cannot_bypass_redaction_or_turn_into_invalid_wire_names() {
             value: "ok".into(),
         }],
         body: b"ok".to_vec(),
-        ..Default::default()
     };
     assert_eq!(
         http_response(&mut response, &matcher, 4096),
@@ -353,7 +351,6 @@ fn body_and_header_expansion_share_the_response_budget() {
             value: "a".into(),
         }],
         body: b"a".to_vec(),
-        ..Default::default()
     };
     assert_eq!(
         http_response(&mut response, &plan(&secrets), 20),

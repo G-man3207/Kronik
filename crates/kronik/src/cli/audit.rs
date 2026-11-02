@@ -415,6 +415,11 @@ fn item_row(i: &Item) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    // The remote-mode fixtures drive real sockets, threads and wall-clock
+    // deadlines: the direct std/tokio calls are the harness, not daemon paths.
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
 
     #[test]

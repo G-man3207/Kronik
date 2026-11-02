@@ -8,12 +8,16 @@ use std::sync::Arc;
 /// Only canonical scheduler adapters construct fixed assignments from actual
 /// accepted key state. The sealer receives data, never a minting capability.
 pub struct SubjectKeyPlan {
+    // Unused while subject keys ride the M23 track; the plan keeps the
+    // parsed mapping for when it lands.
+    #[allow(dead_code)]
     versions: BTreeMap<String, u32>,
     authority: AuthLease,
     native: Option<(Arc<PreparedSubjectKey>, SessionLease)>,
 }
 
 impl SubjectKeyPlan {
+    #[allow(dead_code)]
     pub(crate) fn new(versions: BTreeMap<String, u32>, authority: AuthLease) -> Self {
         Self {
             versions,
@@ -22,6 +26,7 @@ impl SubjectKeyPlan {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn into_parts(self) -> Result<(BTreeMap<String, u32>, AuthLease), ApiError> {
         if self.native.is_some() {
             return Err(ApiError::new(

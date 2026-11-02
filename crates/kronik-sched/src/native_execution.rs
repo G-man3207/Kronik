@@ -77,6 +77,8 @@ impl Lifecycle {
             Err(stopped())
         }
     }
+    // Unused since the publication rework; kept for the M23 track.
+    #[allow(dead_code)]
     pub(crate) fn declare_member_under_publication(&self) {
         self.native_mode.store(false, Ordering::Release);
         self.changed.notify_waiters();
@@ -100,6 +102,8 @@ impl Lifecycle {
             changed.await;
         }
     }
+    // Unused since the lifecycle rework; kept for the M23 track.
+    #[allow(dead_code)]
     pub(crate) async fn stopped(&self) {
         loop {
             let changed = self.changed.notified();

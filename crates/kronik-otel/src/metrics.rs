@@ -144,6 +144,8 @@ pub fn request(
 
 /// Pushes the registry every `interval`, forever. `before` sets the
 /// scrape-time gauges first, as the admin endpoint does.
+// The exporter loop's configuration: node, endpoint and credentials.
+#[allow(clippy::too_many_arguments)]
 pub async fn push_loop(
     node: Arc<Node>,
     endpoint: String,

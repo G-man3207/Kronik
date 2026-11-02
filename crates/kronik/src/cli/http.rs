@@ -470,6 +470,10 @@ pub(super) struct StreamResponse {
 /// Resume cursors use the standard Last-Event-ID header, not the URI.
 /// CONNECT_TIMEOUT bounds TLS, request and response headers; only a successful
 /// SSE body may remain idle indefinitely, still polling cancellation.
+// The remote-mode client runs on the operator's terminal, not the daemon:
+// wall-clock deadlines and raw threads are the client's own transport
+// concerns (ADR 0004 governs the daemon's Env, which a client does not have).
+#[allow(clippy::disallowed_methods)]
 pub(super) fn stream(
     endpoint: &Endpoint,
     target: &str,
@@ -531,6 +535,9 @@ pub(super) fn stream(
 trait ReadWrite: Read + Write + Send {}
 impl<T: Read + Write + Send> ReadWrite for T {}
 
+// The SSE reader's wall-clock deadline is the client's own transport
+// concern, not ADR 0004's Env (this type never runs in the daemon).
+#[allow(clippy::disallowed_methods)]
 struct Cancellable<T> {
     inner: T,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
@@ -538,6 +545,8 @@ struct Cancellable<T> {
     opening_deadline: Instant,
 }
 
+// Wall-clock deadlines are the client's own transport concern.
+#[allow(clippy::disallowed_methods)]
 impl<T> Cancellable<T> {
     fn check(&self) -> io::Result<()> {
         if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -829,6 +838,11 @@ impl<R: std::io::BufRead> Read for StreamBody<R> {
 
 #[cfg(test)]
 mod tests {
+
+    // The remote-mode fixtures drive real sockets, threads and wall-clock
+    // deadlines: the direct std/tokio calls are the harness, not daemon paths.
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
 
     #[test]

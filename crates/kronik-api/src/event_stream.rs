@@ -368,6 +368,8 @@ async fn send(
         .is_ok()
 }
 
+// One event-stream pump's plumbing: env, feed, cursor and its first page.
+#[allow(clippy::too_many_arguments)]
 async fn pump(
     env: Env,
     feed: Arc<crate::events::Events>,
@@ -453,7 +455,7 @@ async fn pump(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 mod tests {
     use kronik_core::ids::SourcePos;
     use kronik_fleet::events::{Identity, Position};

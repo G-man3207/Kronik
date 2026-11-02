@@ -173,7 +173,6 @@ fn samples() -> Vec<Record> {
             generation: 1,
             epoch: 7,
             audit: audit.clone(),
-            ..Default::default()
         }),
     ]
 }

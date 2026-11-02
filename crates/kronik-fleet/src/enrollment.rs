@@ -141,7 +141,8 @@ impl EnrollmentPlan {
         }
         kronik_proto::control::validate_scopes(&self.scopes)
             .map_err(|_| FleetError::Invalid("allowed ordinary scope list"))?;
-        for hash in [&self.ca_sha256] {
+        {
+            let hash = &self.ca_sha256;
             if hash.len() != 64
                 || !hash
                     .bytes()
@@ -587,6 +588,8 @@ fn command_hash(
 /// The required dispatcher receives the reserved producer after Requested.
 /// Member callers must complete their sealed original-origin handoff before
 /// consuming it; a local receipt or these public hashes are not a Member grant.
+// One enrollment drive: env, client, record, CSR material and callbacks.
+#[allow(clippy::too_many_arguments)]
 pub async fn enroll<P, D>(
     env: &Env,
     client: &ControllerClient,

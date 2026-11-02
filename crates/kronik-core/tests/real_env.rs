@@ -1,5 +1,9 @@
 #![cfg(all(feature = "real", feature = "host-identity"))]
-#![allow(clippy::disallowed_methods)]
+#![allow(
+    clippy::disallowed_methods,
+    clippy::unwrap_used,
+    clippy::result_large_err
+)]
 
 use std::sync::Arc;
 use std::time::Duration;

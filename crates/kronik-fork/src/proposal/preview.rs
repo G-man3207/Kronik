@@ -401,8 +401,8 @@ impl Proposals {
             Ok((meta, false))
         }
         .await;
-        if let Err(e) = &result {
-            if let Err(audit_error) = super::audit_failed(
+        if let Err(e) = &result
+            && let Err(audit_error) = super::audit_failed(
                 &self.node,
                 "preview.create",
                 &id,
@@ -412,9 +412,8 @@ impl Proposals {
                 authority,
             )
             .await
-            {
-                tracing::warn!(preview = %id, code = %audit_error.code.as_str(), "preview failure audit denied or unavailable");
-            }
+        {
+            tracing::warn!(preview = %id, code = %audit_error.code.as_str(), "preview failure audit denied or unavailable");
         }
         result
     }

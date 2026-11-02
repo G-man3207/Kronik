@@ -954,6 +954,10 @@ pub async fn start(
 
 #[cfg(test)]
 mod tests {
+    // The fixtures race real time around admitted work: the direct calls
+    // are the harness, not daemon paths.
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
 
     #[test]

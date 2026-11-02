@@ -1,5 +1,5 @@
 #![cfg(feature = "real")]
-#![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_methods, clippy::unwrap_used)]
 
 use bytes::Bytes;
 use kronik_core::env::Env;

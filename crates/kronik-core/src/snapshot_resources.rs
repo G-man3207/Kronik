@@ -75,7 +75,7 @@ impl SnapshotRootRegistration {
             return None;
         }
         self.readers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |readers| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |readers| {
                 readers.checked_add(1)
             })
             .ok()?;
@@ -113,7 +113,7 @@ impl SnapshotRootRegistration {
         // permit physical deletion after an overflow or unmatched release.
         let _ = self
             .readers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |readers| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |readers| {
                 Some(if readers == usize::MAX {
                     usize::MAX
                 } else {
@@ -145,11 +145,12 @@ impl SnapshotRootPin {
 }
 impl Clone for SnapshotRootPin {
     fn clone(&self) -> Self {
-        let _ = self.registration.readers.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |readers| Some(readers.saturating_add(1)),
-        );
+        let _ =
+            self.registration
+                .readers
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |readers| {
+                    Some(readers.saturating_add(1))
+                });
         Self {
             registration: self.registration.clone(),
         }

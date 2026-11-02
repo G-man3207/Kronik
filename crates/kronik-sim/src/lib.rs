@@ -150,6 +150,9 @@ pub struct SimProcs {
 }
 
 struct SimProcess {
+    // The DST harness's kill signal: the watch is the harness's own
+    // mechanism, not daemon code (ADR-0004 governs the daemon).
+    #[allow(clippy::disallowed_types)]
     killed: tokio::sync::watch::Sender<bool>,
     reaped: Arc<AtomicBool>,
 }

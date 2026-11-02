@@ -285,7 +285,7 @@ fn deleted_corrupt_or_missing_original_store_denies_before_crypto_and_publicatio
         // the fault itself leaves behind. Moving the store directory strands its
         // WAL sidecars under the old names, so for the missing-path case that
         // baseline has to be taken before the move.
-        let missing_baseline = (fault == "missing_path").then(|| revision());
+        let missing_baseline = (fault == "missing_path").then(revision);
         match fault {
             "delete" => {
                 other

@@ -1252,6 +1252,8 @@ impl ReplayGate {
         self.matcher_with_scope().map(|(matcher, _)| matcher)
     }
 
+    // The replay's scrub plan: matcher plus the references it may mint.
+    #[allow(clippy::type_complexity)]
     fn matcher_with_scope(
         &self,
     ) -> Result<(CompiledScrubber<'static>, Option<Arc<[pb::SecretRef]>>), GateError> {
@@ -1908,6 +1910,8 @@ impl ReplayGate {
     }
 
     /// A live GET from a fork (`[fork] live_allowlist`), grounding `live`.
+    // One live fetch's admission: ordinal, capability, body and scrubber.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_live(
         &self,
         ordinal: u32,

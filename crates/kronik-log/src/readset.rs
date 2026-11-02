@@ -150,6 +150,9 @@ pub(super) struct SegmentProgress {
 }
 
 /// Shared with the live LogReader, not a second decoder or a pathname reopen.
+// One segment read's plumbing: the parameters are the reader's own state
+// and the caller's callback, not a public surface worth a struct.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn read_segment(
     file: &dyn File,
     file_len: u64,

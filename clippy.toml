@@ -14,7 +14,7 @@ disallowed-methods = [
     { path = "tokio::task::spawn_blocking", reason = "use Env::blocking (ADR 0004)", allow-invalid = true },
     { path = "tokio::time::sleep", reason = "use Env::clock (ADR 0004)", allow-invalid = true },
     { path = "tokio::time::timeout", reason = "use Env::timeout (ADR 0004)", allow-invalid = true },
-    { path = "getrandom::fill", reason = "use Env::entropy (ADR 0004)" },
+    { path = "getrandom::fill", reason = "use Env::entropy (ADR 0004)", allow-invalid = true },
 ]
 disallowed-types = [
     { path = "tokio::sync::watch::Sender", reason = "watch wakes in an order chosen by tokio's thread-local RNG (ADR 0004)", allow-invalid = true },

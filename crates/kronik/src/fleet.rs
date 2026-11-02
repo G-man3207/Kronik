@@ -134,17 +134,16 @@ pub fn start(
                                 },
                                 move |stream, _guard| {
                                     Box::pin(async move {
-                                        if let Some(api) = api.upgrade() {
-                                            if kronik_api::server::serve_fleet_connection(
+                                        if let Some(api) = api.upgrade()
+                                            && kronik_api::server::serve_fleet_connection(
                                                 stream, api, captured, mount,
                                             )
                                             .await
                                             .is_err()
-                                            {
-                                                tracing::warn!(
-                                                    "fleet HTTP connection authority unavailable"
-                                                );
-                                            }
+                                        {
+                                            tracing::warn!(
+                                                "fleet HTTP connection authority unavailable"
+                                            );
                                         }
                                     })
                                 },

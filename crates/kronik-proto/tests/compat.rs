@@ -689,7 +689,9 @@ fn native_origin_message_is_data_only_and_field10_is_not_an_old_reader_write_fen
     let text = "0a0d6f70657261746f722e6e6f7465221c0a0e746f6b656e3a6f726967696e616c12086f726967696e616c18075231122f0a0a756e69783a7569643d30121f6e617469766520617574686f7269747920696e697469616c697a6174696f6e1801";
     let wire: Vec<u8> = text
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect();
     let Record::AuditEvent(old) = Record::decode(kronik_proto::kind::AUDIT_EVENT, &wire).unwrap()
