@@ -1,3 +1,7 @@
+// The control-channel fixture returns the library's large response type
+// from its websocket handler; the shape is the harness's, not the API's.
+#![allow(clippy::result_large_err)]
+
 //! Real transport consumer: no Net or Authority substitute, and no Member proof claim.
 use super::*;
 use crate::auth::Scope;
