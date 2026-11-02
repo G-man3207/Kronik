@@ -37,15 +37,18 @@ const NOT_A_MUTATION: &[(&str, &str)] = &[("POST", "/v1/policy/test")];
 /// Requires a reason. No dry run: it writes only in its fork (and its
 /// `AuditEvent` in main's log).
 const NO_DRY_RUN: &[(&str, &str)] = &[("POST", "/v1/forks/{name}/replay")];
-const NO_DRY_RUN_WRITES: &str = "fork.replay";
+const NO_DRY_RUN_WRITES: &[&str] = &["fork.replay"];
 
 struct Case {
     method: &'static str,
     path: &'static str,
-    /// The audited record the call writes in main's log (M28 §4.2): a
-    /// configuration record's kind, an `AuditEvent`'s action, or `send` /
-    /// `resend` for an operator message's `TurnRecord`.
-    writes: &'static str,
+    /// The audited records the call writes in main's log (M28 §4.2): a
+    /// configuration record's kind, an `AuditEvent`'s action, a
+    /// `SecretVersion` row's export action per ledger row, or `send` /
+    /// `resend` for an operator message's `TurnRecord`. A secret write
+    /// reserves its ledger row before the change, so its list has two
+    /// entries in commit order.
+    writes: &'static [&'static str],
     /// Fields other than `reason` and `dry_run`, so the body deserializes
     /// and `reason()` runs before any other check.
     extra: Value,
@@ -57,254 +60,263 @@ fn cases() -> Vec<Case> {
         Case {
             method: "POST",
             path: "/v1/deployments",
-            writes: "Deployment",
+            writes: &["Deployment"],
             extra: json!({"wasm_base64": wasm.clone()}),
         },
         Case {
             method: "POST",
             path: "/v1/deployments/{epoch}/rollback",
-            writes: "Deployment",
+            writes: &["Deployment"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/deployments/{epoch}/rebase",
-            writes: "rebase.create",
+            writes: &["rebase.create"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/deployments/{epoch}/watch",
-            writes: "watch.start",
+            writes: &["watch.start"],
             extra: json!({"for_ms": 60_000}),
         },
         Case {
             method: "POST",
             path: "/v1/watches/{id}/stop",
-            writes: "watch.stop",
+            writes: &["watch.stop"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/actors/{kind}/{key}/messages",
-            writes: "send",
+            writes: &["send"],
             extra: json!({"name": "increment"}),
         },
         Case {
             method: "POST",
             path: "/v1/dead-letters/{id}/resend",
-            writes: "resend",
+            writes: &["resend"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/grants",
-            writes: "Grant",
+            writes: &["Grant"],
             extra: json!({"kind": "counter", "capability": "http:example.com"}),
         },
         Case {
             method: "POST",
             path: "/v1/grants/revoke",
-            writes: "Grant",
+            writes: &["Grant"],
             extra: json!({"kind": "counter", "capability": "http:example.com"}),
         },
         Case {
             method: "POST",
             path: "/v1/limits",
-            writes: "Limits",
+            writes: &["Limits"],
             extra: json!({"kind": "counter", "fuel": 1000}),
         },
         Case {
             method: "PUT",
             path: "/v1/secrets/{name}",
-            writes: "secret.set",
+            // The M23 secret ledger audits a write in its rows, not in a
+            // separate `secret.set` event: the reserved row is the intent
+            // (M28 review M3), the active row the change. The audit mapper
+            // exports the rows as `secret.version.reserved` /
+            // `secret.version`; the M28 API-level intent event shape is
+            // retired.
+            writes: &["secret.version.reserved", "secret.version"],
             extra: json!({"text": "value"}),
         },
         Case {
             method: "DELETE",
             path: "/v1/secrets/{name}",
-            writes: "secret.delete",
+            // As the PUT: ledger rows, with `deleted` in the row.
+            writes: &["secret.version.reserved", "secret.version"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/keys/rewrap",
-            writes: "keys.rewrap",
+            writes: &["keys.rewrap"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/tokens",
-            writes: "token.create",
+            writes: &["token.create"],
             extra: json!({"name": "agent-1"}),
         },
         Case {
             method: "POST",
             path: "/v1/tokens/{name}/revoke",
-            writes: "token.revoke",
+            writes: &["token.revoke"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/forks",
-            writes: "fork.create",
+            writes: &["fork.create"],
             extra: json!({"at": "now"}),
         },
         Case {
             method: "DELETE",
             path: "/v1/forks/{name}",
-            writes: "fork.delete",
+            writes: &["fork.delete"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/forks/{name}/deployments",
-            writes: "fork.deploy",
+            writes: &["fork.deploy"],
             extra: json!({"wasm_base64": wasm.clone()}),
         },
         Case {
             method: "POST",
             path: "/v1/forks/{name}/actors/{kind}/{key}/messages",
-            writes: "fork.send",
+            writes: &["fork.send"],
             extra: json!({"name": "increment"}),
         },
         Case {
             method: "POST",
             path: "/v1/previews",
-            writes: "preview.create",
+            writes: &["preview.create"],
             extra: json!({"proposal": "p-000000000000"}),
         },
         Case {
             method: "DELETE",
             path: "/v1/previews/{id}",
-            writes: "preview.delete",
+            writes: &["preview.delete"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/proposals",
-            writes: "proposal.create",
+            writes: &["proposal.create"],
             extra: json!({"wasm_base64": [wasm]}),
         },
         Case {
             method: "POST",
             path: "/v1/proposals/{id}/request-approval",
-            writes: "Approval",
+            writes: &["Approval"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/proposals/{id}/approve",
-            writes: "Approval",
+            writes: &["Approval"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/proposals/{id}/promote",
-            writes: "Deployment",
+            writes: &["Deployment"],
             extra: json!({}),
         },
         Case {
             method: "PUT",
             path: "/v1/policy",
-            writes: "Policy",
+            writes: &["Policy"],
             extra: json!({"rules_toml": "[[rule]]\nname = \"quiet\"\nwhen = \"false\"\naction = \"allow\"\n"}),
         },
         Case {
             method: "POST",
             path: "/v1/foreign",
-            writes: "ForeignActor",
+            writes: &["ForeignActor"],
             extra: json!({"name": "echo", "image": "not-an-image", "port": 8080}),
         },
         Case {
             method: "DELETE",
             path: "/v1/foreign/{name}",
-            writes: "ForeignActor",
+            writes: &["ForeignActor"],
             extra: json!({}),
         },
         Case {
             method: "PUT",
             path: "/v1/simulators/{target}",
-            writes: "SimulatorConfig",
+            writes: &["SimulatorConfig"],
             extra: json!({"neighbor": true}),
         },
         Case {
             method: "POST",
             path: "/v1/privacy/mode",
-            writes: "PrivacyMode",
+            writes: &["PrivacyMode"],
             extra: json!({"mode": "on"}),
         },
         Case {
             method: "POST",
             path: "/v1/privacy/erase",
-            writes: "Erasure",
+            writes: &["Erasure"],
             extra: json!({"subject": "user:1"}),
         },
         Case {
             method: "POST",
             path: "/v1/privacy/reseal",
-            writes: "privacy.reseal",
+            // The reseal pins the mode in a `PrivacyMode` record
+            // (`reseal_requested`, a new epoch) before its AuditEvent.
+            writes: &["PrivacyMode", "privacy.reseal"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/snapshots",
-            writes: "snapshot.create",
+            writes: &["snapshot.create"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/export/{stream}/rewind",
-            writes: "export.rewind",
+            writes: &["export.rewind"],
             extra: json!({"to": 0}),
         },
         Case {
             method: "PUT",
             path: "/v1/secrets/{name}/link",
-            writes: "secret.link",
+            writes: &["secret.link"],
             extra: json!({"backend": "external", "ref": "db"}),
         },
         Case {
             method: "DELETE",
             path: "/v1/secrets/{name}/link",
-            writes: "secret.unlink",
+            writes: &["secret.unlink"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/secrets/{name}/refresh",
-            writes: "secret.refresh",
+            writes: &["secret.refresh"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/fleet/enroll",
-            writes: "fleet.enroll",
+            writes: &["fleet.enroll"],
             extra: json!({"url": "https://controller.test"}),
         },
         Case {
             method: "POST",
             path: "/v1/fleet/revoke",
-            writes: "fleet.revoke",
+            writes: &["fleet.revoke"],
             extra: json!({}),
         },
         Case {
             method: "POST",
             path: "/v1/events/webhooks/{name}/replay",
-            writes: "events.webhook.replay",
+            writes: &["events.webhook.replay"],
             extra: json!({"cursor": {"schema": "kronik.events-cursor/v1",
                 "identity": {"installation": "events", "branch": "main"}, "streams": {}}}),
         },
         Case {
             method: "POST",
             path: "/v1/auth/logout",
-            writes: "auth.logout",
+            writes: &["auth.logout"],
             extra: json!({}),
         },
         Case {
             method: "PUT",
             path: "/v1/auth/config",
-            writes: "auth.config",
+            writes: &["auth.config"],
             extra: json!({"config": null}),
         },
     ]
@@ -775,6 +787,16 @@ fn audited(record: &Record) -> Option<String> {
             "StateRebase".into()
         }
         Record::AuditEvent(e) => e.action.clone(),
+        // The secret ledger's rows export as the mapper's `secret.version*`
+        // actions (crates/kronik-otel/src/audit.rs); each ledger row is one
+        // audited fact in commit order.
+        Record::SecretVersion(row) => match pb::secret_version::Phase::try_from(row.phase) {
+            Ok(pb::secret_version::Phase::Reserved) => "secret.version.reserved".into(),
+            Ok(pb::secret_version::Phase::Active) => "secret.version".into(),
+            Ok(pb::secret_version::Phase::Failed) => "secret.version.failed".into(),
+            Ok(pb::secret_version::Phase::Fence) => "secret.range".into(),
+            _ => return None,
+        },
         Record::TurnRecord(t) => match t.input.as_ref().and_then(|i| i.kind.as_ref()) {
             Some(pb::input::Kind::Message(m)) if m.source == pb::MessageSource::Operator as i32 => {
                 "send".into()
@@ -825,8 +847,8 @@ const UNDRIVEN: &[(&str, &str)] = &[
 ];
 
 /// Every mutating route, run once for real, writes exactly the audited
-/// record its `writes` column names in main's log (M28 §4.2), and the
-/// AuditEvent never holds a secret value or a token.
+/// records its `writes` column names in main's log (M28 §4.2), and neither
+/// the AuditEvents nor the secret ledger holds a secret value or a token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_mutation_writes_its_audited_record() {
     let dir = tempfile::tempdir().unwrap();
@@ -874,7 +896,7 @@ async fn every_mutation_writes_its_audited_record() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/guests/counter-step2.wasm"
     ));
-    let mut writes: std::collections::BTreeMap<(&str, &str), &str> = cases()
+    let mut writes: std::collections::BTreeMap<(&str, &str), &'static [&'static str]> = cases()
         .iter()
         .map(|c| ((c.method, c.path), c.writes))
         .collect();
@@ -1155,7 +1177,11 @@ async fn every_mutation_writes_its_audited_record() {
             continue;
         }
         assert_eq!(status, 200, "{method} {path}: {v}");
-        assert_eq!(got, [writes[&(method, template)]], "{method} {path}: {v}");
+        assert_eq!(
+            got,
+            writes[&(method, template)].to_vec(),
+            "{method} {path}: {v}"
+        );
         match template {
             "/v1/actors/{kind}/{key}/messages" => {
                 dead_letter = v["turn_id"].as_str().unwrap().into()
@@ -1170,10 +1196,16 @@ async fn every_mutation_writes_its_audited_record() {
 
     // What the AuditEvents hold: never the secret value or the token.
     let mut events = Vec::new();
+    // What the secret ledger holds: the same facts the retired M28
+    // `secret.set` intent event carried (name, version, caller, scrubbed
+    // reason, never the value), as `secret.version*` export lines.
+    let mut versions = Vec::new();
     node.reader()
         .read(1, node.applied_lsn(), |c| {
-            if let Record::AuditEvent(e) = &c.record {
-                events.push(e.clone());
+            match &c.record {
+                Record::AuditEvent(e) => events.push(e.clone()),
+                Record::SecretVersion(row) if !row.name.is_empty() => versions.push(row.clone()),
+                _ => {}
             }
             Ok(())
         })
@@ -1196,12 +1228,31 @@ async fn every_mutation_writes_its_audited_record() {
         } else {
             "audit"
         }));
+    let version_text = format!("{versions:?}");
+    assert!(
+        !version_text.contains("s3cr3t-value"),
+        "a secret value leaked into the ledger: {version_text}"
+    );
+    let set = versions
+        .iter()
+        .find(|row| row.name == "db" && !row.deleted)
+        .unwrap();
+    assert_eq!(set.version, 1);
+    let set_audit = set.audit.as_ref().unwrap();
+    assert_eq!(set_audit.reason, "audit");
+    assert_eq!(set_audit.token_id, "unix:uid=0");
+    let deleted = versions
+        .iter()
+        .find(|row| row.name == "db" && row.deleted)
+        .unwrap();
+    assert!(deleted.audit.as_ref().unwrap().reason == "audit");
 }
 
-/// Secrets and tokens write their `AuditEvent` before the change, and a
-/// change that fails after it adds `<action>.failed` with the error code
-/// (M28 review M3). The token store is opened read-only, so the
-/// validation passes and the insert fails.
+/// Tokens write their `AuditEvent` intent before the change, and a change
+/// that fails after it adds `<action>.failed` with the error code (M28
+/// review M3); a secret write reserves its ledger row first, the same
+/// intent in `SecretVersion` form. The token store is opened read-only, so
+/// the validation passes and the insert fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_token_create_writes_its_intent_and_failed() {
     let dir = tempfile::tempdir().unwrap();

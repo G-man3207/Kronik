@@ -811,10 +811,48 @@ mod tests {
         .await
         .unwrap();
         let operator = node.local_operator_authority().unwrap();
-        node.refresh_secret_inventory(operator.clone())
-            .await
-            .unwrap();
-        let fingerprint = node.native_secret_snapshot().unwrap().fingerprint;
+        // The startup background cycle races this first refresh for the
+        // inventory lock on a current-thread runtime; retry until stable
+        // (the documented fail-closed window, as the CLI does).
+        let mut refreshed = None;
+        for _ in 0..100 {
+            match node.refresh_secret_inventory(operator.clone()).await {
+                Ok(()) => {
+                    refreshed = Some(());
+                    break;
+                }
+                Err(error) if error.code == ErrorCode::SecretUnavailable => {
+                    node.env()
+                        .clock
+                        .sleep(std::time::Duration::from_millis(50))
+                        .await;
+                }
+                Err(error) => panic!("refresh failed: {error}"),
+            }
+        }
+        assert!(refreshed.is_some(), "the catalogue never certified");
+        // The certified snapshot may still be mid-rebuild (the background
+        // cycle's clear-then-rebuild window is fail-closed); retry the read
+        // within the documented window instead of racing it.
+        let fingerprint = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match node.native_secret_snapshot() {
+                    Ok(snapshot) => break snapshot.fingerprint,
+                    Err(error) if error.code == ErrorCode::SecretUnavailable => {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "the catalogue never recertified: {error}"
+                        );
+                        node.env()
+                            .clock
+                            .sleep(std::time::Duration::from_millis(100))
+                            .await;
+                    }
+                    Err(error) => panic!("snapshot failed: {error}"),
+                }
+            }
+        };
         let api = Api::new(node.clone());
         let request = crate::ApiRequest {
             method: "GET".into(),

@@ -492,7 +492,7 @@ impl Api {
             )
             .await?;
         if dry_run {
-            return self.ok_scrubbed(ProposeResponse {
+            return self.ok_scrubbed_committed(ProposeResponse {
                 dry_run,
                 proposal: proposal_info(&p, props),
             });
@@ -502,7 +502,7 @@ impl Api {
         } else {
             props.wait(&p.id).await?
         };
-        self.ok_scrubbed(ProposeResponse {
+        self.ok_scrubbed_committed(ProposeResponse {
             dry_run,
             proposal: proposal_info(&p, props),
         })
@@ -951,7 +951,7 @@ impl Api {
             self.audit_event(req, "rebase.create", &p.id, &details, r.reason)
                 .await?;
         }
-        self.ok_scrubbed(ProposeResponse {
+        self.ok_scrubbed_committed(ProposeResponse {
             dry_run,
             proposal: proposal_info(&p, props),
         })
@@ -1018,7 +1018,7 @@ impl Api {
                 req.authority.clone(),
             )
             .await?;
-        self.ok_scrubbed(WatchResponse {
+        self.ok_scrubbed_committed(WatchResponse {
             dry_run: r.dry_run,
             watch: watch_info(&w)?,
         })
@@ -1050,7 +1050,7 @@ impl Api {
                 req.authority.clone(),
             )
             .await?;
-        self.ok_scrubbed(WatchResponse {
+        self.ok_scrubbed_committed(WatchResponse {
             dry_run: r.dry_run,
             watch: watch_info(&w)?,
         })

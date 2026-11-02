@@ -2,6 +2,9 @@
 use super::*;
 
 impl TokenStore {
+    // The fleet token creation's admission: node, name, scopes, bearer and
+    // authority.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_authorized(
         self: &Arc<Self>,
         node: Arc<kronik_sched::Node>,

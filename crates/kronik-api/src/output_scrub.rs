@@ -24,6 +24,15 @@ pub(super) trait ScrubbedOutput: Serialize {
         self.scrub_fields(&mut context)?;
         context.finish()
     }
+
+    /// A committed mutation's answer under an uncertified inventory: reason
+    /// fields become the WITHHELD marker and any other free text errors, so
+    /// the mutation still answers without leaving uncertified bytes.
+    fn scrub_free_withheld(&mut self) -> Result<()> {
+        let mut context = Context::withholding(MAX_JSON_OUTPUT_BYTES);
+        self.scrub_fields(&mut context)?;
+        context.finish()
+    }
 }
 
 /// Only the JSON constructed by `turn_json`, not arbitrary JSON data.
@@ -49,9 +58,22 @@ pub(super) struct Context<'a> {
     matcher: Option<CompiledScrubber<'a>>,
     remaining: usize,
     error: Option<ScrubError>,
+    /// Withhold mode: a committed mutation's answer under an uncertified
+    /// inventory. Reason fields become the WITHHELD marker; any other free
+    /// text keeps its hard error.
+    withholding: bool,
 }
 
 impl<'a> Context<'a> {
+    pub(super) fn withholding(remaining: usize) -> Self {
+        Self {
+            matcher: None,
+            remaining,
+            error: None,
+            withholding: true,
+        }
+    }
+
     pub(super) fn new<N: AsRef<str>, V: AsRef<[u8]>>(
         inventory: &'a [(N, V)],
         remaining: usize,
@@ -61,11 +83,13 @@ impl<'a> Context<'a> {
                 matcher: Some(matcher),
                 remaining,
                 error: None,
+                withholding: false,
             },
             Err(error) => Self {
                 matcher: None,
                 remaining,
                 error: Some(error),
+                withholding: false,
             },
         }
     }
@@ -223,6 +247,12 @@ fn text(value: &mut String, context: &mut Context<'_>) {
     if context.error.is_some() {
         return;
     }
+    if context.withholding {
+        // Non-reason free text has no withhold marker: it keeps the hard
+        // stall instead of leaving uncertified bytes in the answer.
+        context.error = Some(ScrubError::MatcherUnavailable);
+        return;
+    }
     let result = context
         .matcher
         .as_ref()
@@ -251,6 +281,15 @@ fn persisted_reason(value: &mut String, context: &mut Context<'_>) {
     if context.error.is_some() {
         return;
     }
+    if context.withholding {
+        // The reason is the one field `audit()`'s own scrub path withholds:
+        // an uncertified inventory turns it into the marker, never free text.
+        *value = kronik_sched::scrub::WITHHELD.to_owned();
+        if encoded_len(value, context.remaining).is_err() {
+            context.error = Some(ScrubError::OutputLimit);
+        }
+        return;
+    }
     *value = kronik_sched::scrub::persisted_audit_reason(
         std::mem::take(value).into(),
         context.matcher.as_ref(),
@@ -263,6 +302,10 @@ fn persisted_reason(value: &mut String, context: &mut Context<'_>) {
 }
 
 fn optional_text(value: &mut Option<String>, secrets: &mut Context<'_>) {
+    if secrets.withholding && value.is_some() {
+        secrets.error = Some(ScrubError::MatcherUnavailable);
+        return;
+    }
     if let Some(value) = value {
         text(value, secrets);
     }
@@ -657,6 +700,178 @@ impl std::fmt::Display for TurnJson {
     }
 }
 
+impl ScrubbedOutput for DeploymentsResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for deployment in &mut self.deployments {
+            persisted_reason(&mut deployment.reason, secrets);
+        }
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for GrantsResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for grant in &mut self.grants {
+            persisted_reason(&mut grant.reason, secrets);
+        }
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for SecretHistoryResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for version in &mut self.versions {
+            persisted_reason(&mut version.reason, secrets);
+        }
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for TokenView {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        persisted_reason(&mut self.reason, secrets);
+        if let Some(reason) = &mut self.revoke_reason {
+            persisted_reason(reason, secrets);
+        }
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for TokensResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for token in &mut self.tokens {
+            token.scrub_fields(secrets)?;
+        }
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for ProposalInfo {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for request in &mut self.approval_requests {
+            persisted_reason(&mut request.reason, secrets);
+        }
+        for approval in &mut self.approvals {
+            persisted_reason(&mut approval.reason, secrets);
+        }
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for ProposalsResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for proposal in &mut self.proposals {
+            proposal.scrub_fields(secrets)?;
+        }
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for WatchInfo {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        persisted_reason(&mut self.reason, secrets);
+        if let Some(stopped) = &mut self.stopped {
+            persisted_reason(&mut stopped.reason, secrets);
+        }
+        for triggered in &mut self.triggered {
+            text(&mut triggered.reason, secrets);
+        }
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for WatchesResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for watch in &mut self.watches {
+            watch.scrub_fields(secrets)?;
+        }
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for crate::events::WebhookStatus {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        optional_text(&mut self.last_error, secrets);
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for crate::events::WebhooksResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for webhook in &mut self.webhooks {
+            webhook.scrub_fields(secrets)?;
+        }
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for crate::m7::ForeignListResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for foreign in &mut self.foreign {
+            persisted_reason(&mut foreign.reason, secrets);
+        }
+        optional_text(&mut self.unavailable, secrets);
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for crate::m7::ForeignShowResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        persisted_reason(&mut self.foreign.reason, secrets);
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for crate::m12::SimulatorsResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for target in &mut self.targets {
+            persisted_reason(&mut target.reason, secrets);
+        }
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for GrantResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        persisted_reason(&mut self.grant.reason, secrets);
+        Ok(())
+    }
+}
+
+impl ScrubbedOutput for TokenCreateResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        self.token.scrub_fields(secrets)
+    }
+}
+
+impl ScrubbedOutput for TokenRevokeResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        self.token.scrub_fields(secrets)
+    }
+}
+
+impl ScrubbedOutput for ProposeResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        self.proposal.scrub_fields(secrets)
+    }
+}
+
+impl ScrubbedOutput for WatchResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        self.watch.scrub_fields(secrets)
+    }
+}
+
+impl ScrubbedOutput for crate::m7::ForeignAddResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        persisted_reason(&mut self.foreign.reason, secrets);
+        for warning in &mut self.warnings {
+            text(warning, secrets);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1035,7 +1250,7 @@ mod tests {
 
     #[test]
     fn turn_projection_borrows_shared_zeroizing_inventory_values() {
-        let inventory = vec![(
+        let inventory = [(
             "retained".to_owned(),
             std::sync::Arc::new(zeroize::Zeroizing::new(b"x".to_vec())),
         )];
@@ -1129,177 +1344,5 @@ mod tests {
                 })
             );
         }
-    }
-}
-
-impl ScrubbedOutput for DeploymentsResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        for deployment in &mut self.deployments {
-            persisted_reason(&mut deployment.reason, secrets);
-        }
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for GrantsResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        for grant in &mut self.grants {
-            persisted_reason(&mut grant.reason, secrets);
-        }
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for SecretHistoryResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        for version in &mut self.versions {
-            persisted_reason(&mut version.reason, secrets);
-        }
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for TokenView {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        persisted_reason(&mut self.reason, secrets);
-        if let Some(reason) = &mut self.revoke_reason {
-            persisted_reason(reason, secrets);
-        }
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for TokensResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        for token in &mut self.tokens {
-            token.scrub_fields(secrets)?;
-        }
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for ProposalInfo {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        for request in &mut self.approval_requests {
-            persisted_reason(&mut request.reason, secrets);
-        }
-        for approval in &mut self.approvals {
-            persisted_reason(&mut approval.reason, secrets);
-        }
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for ProposalsResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        for proposal in &mut self.proposals {
-            proposal.scrub_fields(secrets)?;
-        }
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for WatchInfo {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        persisted_reason(&mut self.reason, secrets);
-        if let Some(stopped) = &mut self.stopped {
-            persisted_reason(&mut stopped.reason, secrets);
-        }
-        for triggered in &mut self.triggered {
-            text(&mut triggered.reason, secrets);
-        }
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for WatchesResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        for watch in &mut self.watches {
-            watch.scrub_fields(secrets)?;
-        }
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for crate::events::WebhookStatus {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        optional_text(&mut self.last_error, secrets);
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for crate::events::WebhooksResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        for webhook in &mut self.webhooks {
-            webhook.scrub_fields(secrets)?;
-        }
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for crate::m7::ForeignListResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        for foreign in &mut self.foreign {
-            persisted_reason(&mut foreign.reason, secrets);
-        }
-        optional_text(&mut self.unavailable, secrets);
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for crate::m7::ForeignShowResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        persisted_reason(&mut self.foreign.reason, secrets);
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for crate::m12::SimulatorsResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        for target in &mut self.targets {
-            persisted_reason(&mut target.reason, secrets);
-        }
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for GrantResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        persisted_reason(&mut self.grant.reason, secrets);
-        Ok(())
-    }
-}
-
-impl ScrubbedOutput for TokenCreateResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        self.token.scrub_fields(secrets)
-    }
-}
-
-impl ScrubbedOutput for TokenRevokeResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        self.token.scrub_fields(secrets)
-    }
-}
-
-impl ScrubbedOutput for ProposeResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        self.proposal.scrub_fields(secrets)
-    }
-}
-
-impl ScrubbedOutput for WatchResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        self.watch.scrub_fields(secrets)
-    }
-}
-
-impl ScrubbedOutput for crate::m7::ForeignAddResponse {
-    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
-        persisted_reason(&mut self.foreign.reason, secrets);
-        for warning in &mut self.warnings {
-            text(warning, secrets);
-        }
-        Ok(())
     }
 }

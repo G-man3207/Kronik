@@ -194,7 +194,7 @@ impl Api {
                 model: None,
             },
         };
-        self.ok_scrubbed(SimulatorsResponse {
+        self.ok_scrubbed_committed(SimulatorsResponse {
             simulators: simulator_infos(),
             targets,
             model,

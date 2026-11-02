@@ -834,7 +834,9 @@ async fn a_secret_deleted_before_the_export_is_not_in_the_audit_log() {
 
 /// Token secrets never reach the log (ADR 0082), and a scrub that cannot
 /// load the stored secrets withholds the reason instead of writing it
-/// unscrubbed: the reason of a `Grant`, and of an `AuditEvent`.
+/// unscrubbed: the reason of a `Grant`, and of a secret write's
+/// `SecretVersion` ledger intent (the retired M28 `secret.set` event's
+/// successor).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_secrets_are_scrubbed_and_an_unloadable_scrub_withholds_the_reason() {
     const SECRET: &str = "hunter2-db-password";
@@ -871,35 +873,56 @@ async fn token_secrets_are_scrubbed_and_an_unloadable_scrub_withholds_the_reason
     let text = log().await;
     assert!(!text.contains(&token), "{text}");
 
-    // One undecryptable row: the stored values cannot be loaded.
+    // One unloadable retained value. Warm certified bytes survive ciphertext
+    // damage (the scrub keeps serving the certified in-memory inventory), so
+    // the physical identity is destroyed too and the inventory is refreshed:
+    // the recertification then fails closed, and later disclosure gates
+    // answer 503 SECRET_UNAVAILABLE until the store is repaired. The same
+    // recipe as the fleet unit test in crates/kronik-api/src/fleet.rs
+    // ("Warm certified bytes survive ciphertext damage").
     rusqlite::Connection::open(dir.path().join("keys/secrets.db"))
         .unwrap()
-        .execute("UPDATE secrets SET ciphertext = x'00'", [])
+        .execute(
+            "UPDATE secrets SET ciphertext = x'00', version_hash = x'00'",
+            [],
+        )
         .unwrap();
-    for (method, path, body) in [
-        ("POST", "/v1/grants", grant(format!("key {SECRET}"))),
-        (
-            "PUT",
-            "/v1/secrets/other",
-            json!({"text": "v", "reason": format!("key {SECRET}")}),
-        ),
-    ] {
-        let (s, v) = call(&api, method, path, body).await;
-        assert_eq!(s, 200, "{method} {path}: {v}");
-    }
+    node.refresh_secret_inventory(node.local_operator_authority().unwrap())
+        .await
+        .unwrap_err();
+    // The grant is an unrelated mutation: it commits, answers 200, and its
+    // response reason is the WITHHELD marker (the same field audit()'s own
+    // scrub path withholds) instead of stalling the answer.
+    let (s, v) = call(&api, "POST", "/v1/grants", grant(format!("key {SECRET}"))).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["grant"]["reason"], kronik_sched::scrub::WITHHELD, "{v}");
+    // The secret write records its withheld intent in the ledger, but does
+    // not answer 200: without a certified catalogue the change is not
+    // reported as a published success.
+    let (s, v) = call(
+        &api,
+        "PUT",
+        "/v1/secrets/other",
+        json!({"text": "v", "reason": format!("key {SECRET}")}),
+    )
+    .await;
+    assert_eq!(s, 503, "{v}");
+    assert_eq!(v["error"]["code"], "SECRET_UNAVAILABLE", "{v}");
     let text = log().await;
     assert!(!text.contains(SECRET), "{text}");
-    let (mut grant_reason, mut set_reason) = (None, None);
+    let (mut grant_reason, mut set_reasons) = (None, Vec::new());
     node.reader()
         .read(1, node.applied_lsn(), |c| {
             match c.record {
                 kronik_proto::Record::Grant(grant) => {
                     grant_reason = grant.audit.map(|audit| audit.reason);
                 }
-                kronik_proto::Record::AuditEvent(event)
-                    if event.action == "secret.set" && event.target == "other" =>
-                {
-                    set_reason = event.audit.map(|audit| audit.reason);
+                // The M23 secret ledger carries a secret write's audit in its
+                // `SecretVersion` rows; the retired M28 API-level `secret.set`
+                // intent event no longer exists. The audit mapper exports the
+                // rows as the `secret.version*` lines.
+                kronik_proto::Record::SecretVersion(row) if row.name == "other" => {
+                    set_reasons.push(row.audit.map(|audit| audit.reason));
                 }
                 _ => {}
             }
@@ -908,7 +931,16 @@ async fn token_secrets_are_scrubbed_and_an_unloadable_scrub_withholds_the_reason
         .await
         .unwrap();
     assert_eq!(grant_reason.as_deref(), Some(kronik_sched::scrub::WITHHELD));
-    assert_eq!(set_reason.as_deref(), Some(kronik_sched::scrub::WITHHELD));
+    assert!(
+        set_reasons
+            .iter()
+            .all(|reason| reason.as_deref() == Some(kronik_sched::scrub::WITHHELD)),
+        "a secret intent kept its reason: {set_reasons:?}"
+    );
+    assert!(
+        !set_reasons.is_empty(),
+        "the secret write left no audited ledger row"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1040,7 +1072,7 @@ async fn incomplete_secret_inventory_blocks_disclosure_not_unrelated_turns() {
     )
     .await
     .unwrap();
-    let api = Api::new(node);
+    let api = Api::new(node.clone());
     for (path, body) in [
         (
             "/v1/deployments",
@@ -1062,9 +1094,18 @@ async fn incomplete_secret_inventory_blocks_disclosure_not_unrelated_turns() {
     )
     .await;
     assert_eq!(status, 200, "{response}");
+    // Warm certified bytes survive ciphertext damage, so the read path's
+    // store-identity probe is what catches a damaged store: every active
+    // ledger row's physical row must still carry the ledger's version hash,
+    // and a mismatch retires the certificate (fail closed) without any
+    // manual refresh (the fleet unit test in crates/kronik-api/src/fleet.rs
+    // uses the same corruption recipe).
     rusqlite::Connection::open(dir.path().join("keys/secrets.db"))
         .unwrap()
-        .execute("UPDATE secrets SET ciphertext = x'00'", [])
+        .execute(
+            "UPDATE secrets SET ciphertext = x'00', version_hash = x'00'",
+            [],
+        )
         .unwrap();
     for path in [
         "/v1/audit",

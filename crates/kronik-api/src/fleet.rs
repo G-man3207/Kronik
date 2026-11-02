@@ -124,7 +124,7 @@ fn token_name(record: &EnrollmentRecord) -> Result<String, ApiError> {
         return Err(internal("invalid fleet request identity"));
     }
     let mut request = [0; 32];
-    for (byte, pair) in request.iter_mut().zip(bytes.chunks_exact(2)) {
+    for (byte, pair) in request.iter_mut().zip(bytes.as_chunks::<2>().0) {
         let nibble = |value| match value {
             b'0'..=b'9' => Ok(value - b'0'),
             b'a'..=b'f' => Ok(value - b'a' + 10),
@@ -1294,6 +1294,10 @@ impl crate::Api {
 
 #[cfg(test)]
 mod tests {
+    // The fixtures race real time and spawned tasks around admitted work:
+    // the direct calls are the harness, not daemon paths.
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use crate::tokens::Change;
     use kronik_core::env::{
@@ -1616,12 +1620,13 @@ mod tests {
             .node
             .reader()
             .read(before + 1, fleet.node.applied_lsn(), |committed| {
-                if let kronik_proto::Record::AuditEvent(event) = committed.record {
-                    if event.action == "token.revoke" && event.target == "startup-orphan" {
-                        let audit = event.audit.unwrap();
-                        assert_eq!(audit.token_id, "system:fleet-recovery");
-                        durable_recovery = true;
-                    }
+                if let kronik_proto::Record::AuditEvent(event) = committed.record
+                    && event.action == "token.revoke"
+                    && event.target == "startup-orphan"
+                {
+                    let audit = event.audit.unwrap();
+                    assert_eq!(audit.token_id, "system:fleet-recovery");
+                    durable_recovery = true;
                 }
                 Ok(())
             })
@@ -2097,24 +2102,24 @@ mod tests {
                 .await
                 .is_err()
         );
-        let requests = network.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        let bodies = network.request_bodies.lock().unwrap();
-        assert_eq!(bodies[0], bodies[1]);
-        drop(bodies);
-        assert!(
-            requests[0]
-                .headers
-                .iter()
-                .any(|(key, _)| key == "authorization")
-        );
-        assert!(
-            !requests[1]
-                .headers
-                .iter()
-                .any(|(key, _)| key == "authorization")
-        );
-        drop(requests);
+        {
+            let requests = network.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let bodies = network.request_bodies.lock().unwrap();
+            assert_eq!(bodies[0], bodies[1]);
+            assert!(
+                requests[0]
+                    .headers
+                    .iter()
+                    .any(|(key, _)| key == "authorization")
+            );
+            assert!(
+                !requests[1]
+                    .headers
+                    .iter()
+                    .any(|(key, _)| key == "authorization")
+            );
+        }
         assert_eq!(reopened.record().unwrap().unwrap(), requested);
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(

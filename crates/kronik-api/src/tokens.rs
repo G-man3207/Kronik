@@ -1047,9 +1047,16 @@ impl Authenticator for TokenAuthenticator {
 
 #[cfg(test)]
 mod tests {
+    // The fixtures race real time and spawned tasks around admitted work:
+    // the direct calls are the harness, not daemon paths.
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
 
+    // Deliberate in the named-profile test: the audit write must commit
+    // while the token store's database lock is held by this test.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn named_capture_retains_actual_hash_and_original_revocation_at_real_wal() {
         let dir = tempfile::tempdir().unwrap();
         let node = kronik_sched::start_local(
@@ -1094,6 +1101,8 @@ mod tests {
             reason: "named operation".into(),
             wall_time_ms: node.env().clock.wall_ms(),
         };
+        // Deliberate: the audit write must commit while the token store's
+        // database lock is held by this test.
         let database = store.inner().unwrap();
         let accepted = node
             .record_audit_event_authorized(

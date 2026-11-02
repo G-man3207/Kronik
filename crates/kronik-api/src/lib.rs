@@ -994,6 +994,22 @@ impl Api {
     }
 
     /// Scrub producer-defined free fields against the complete retained inventory.
+    /// A committed mutation's answer: under an uncertified scrub inventory
+    /// the response's reason fields become the WITHHELD marker (the same
+    /// field `audit()` already withholds) and the mutation still answers;
+    /// any other free text keeps the hard stall. Reads answer 503 as before
+    /// ([`Self::ok_scrubbed`]).
+    fn ok_scrubbed_committed<T: ScrubbedOutput>(&self, mut value: T) -> Result<ApiResponse> {
+        match self.node.secret_values() {
+            Ok(values) => {
+                let patterns = kronik_sched::effects::secret_patterns(&values);
+                value.scrub_free(&patterns)?;
+            }
+            Err(_) => value.scrub_free_withheld()?,
+        }
+        ok(&value)
+    }
+
     fn ok_scrubbed<T: ScrubbedOutput>(&self, mut value: T) -> Result<ApiResponse> {
         let values = self.node.secret_values()?;
         let patterns = kronik_sched::effects::secret_patterns(&values);
@@ -1042,10 +1058,12 @@ impl Api {
         Ok(())
     }
 
-    /// For secrets and tokens the `AuditEvent` is the intent, written
-    /// before the change (M28 review M3); a failed change adds
-    /// `<action>.failed` with the error code. A crash in between leaves an
-    /// intent without a change: it over-reports, the safe direction.
+    /// For tokens the `AuditEvent` is the intent, written before the change
+    /// (M28 review M3); a failed change adds `<action>.failed` with the
+    /// error code. A secret write's intent is its reserved `SecretVersion`
+    /// ledger row instead (M23), audited through the `secret.version*`
+    /// export lines. A crash in between leaves an intent without a change:
+    /// it over-reports, the safe direction.
     async fn intent<T: Send + 'static>(
         &self,
         req: &AuthorizedRequest,
@@ -1311,7 +1329,7 @@ impl Api {
 
     fn deployments(&self) -> Result<ApiResponse> {
         let rows = self.node.store().db().deployments().map_err(internal)?;
-        self.ok_scrubbed(DeploymentsResponse {
+        self.ok_scrubbed_committed(DeploymentsResponse {
             deployments: rows
                 .into_iter()
                 .map(|(lsn, d)| DeploymentEntry {
@@ -1583,7 +1601,7 @@ impl Api {
             .await?;
         let capability = kronik_effects::Capability::parse(&r.capability)
             .map_or(r.capability.clone(), |c| c.render());
-        self.ok_scrubbed(GrantResponse {
+        self.ok_scrubbed_committed(GrantResponse {
             dry_run: r.dry_run,
             grant: GrantView {
                 kind: r.kind,
@@ -1981,7 +1999,7 @@ impl Api {
             )
             .await?
         };
-        self.ok_scrubbed(TokenCreateResponse {
+        self.ok_scrubbed_committed(TokenCreateResponse {
             dry_run: r.dry_run,
             token: Self::token_view(&meta),
             secret,
@@ -2030,7 +2048,7 @@ impl Api {
                 })
                 .await?;
         }
-        self.ok_scrubbed(TokenRevokeResponse {
+        self.ok_scrubbed_committed(TokenRevokeResponse {
             dry_run: r.dry_run,
             token: Self::token_view(&meta),
         })
