@@ -585,10 +585,13 @@ An owned fixture's configured PKCS#11 helper cannot complete: inspect its
 reported failure class, trusted module digest, private PIN credential and
 enrolled token/key identity through the approved operator procedure.
 Restore that exact prerequisite; never create a fallback master key or put
-the PIN in argv, logs or an example report.
+the PIN in argv, logs or an example report. `kronik keys enroll` re-verifies
+the configured helper, module and possession probe offline, without loading
+or changing the master seed; `kronik keys status` reports the loaded source.
 
 ```sh
-kronik keys status --config /owned/fixture/pkcs11.toml
+kronik keys enroll --config /owned/fixture/pkcs11.toml
+kronik keys status
 ```
 
 ## SECRET_BACKEND_UNKNOWN

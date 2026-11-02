@@ -263,7 +263,8 @@ def routed_api(text):
 def event_stream_api(server, handler):
     """Inventory the server's real pre-body stream dispatch and GET rejection."""
     code, layout = rust_views(server)
-    calls = {match.start() for match in re.finditer(r"\bcrate::event_stream::serve\s*\(", layout)}
+    calls = {match.start() for match in re.finditer(
+        r"\bcrate::event_stream::serve(?:_captured)?\s*\(", layout)}
     if not calls:
         return set()
     dispatch = re.compile(r'if\s+matches!\(\s*req\.path\.as_str\(\)\s*,\s*("(?:\\.|[^"\\])*"(?:\s*\|\s*"(?:\\.|[^"\\])*")*)\s*\)\s*\{')
@@ -292,6 +293,35 @@ def event_stream_api(server, handler):
     return {"GET " + path for path in paths}
 
 
+def ui_asset_api(root):
+    """Inventory the admin listener's embedded UI asset mapping.
+
+    The assets are served by a Mount closure on the admin listener
+    (crates/kronik/src/admin.rs), which maps paths through kronik-ui's
+    `asset()` literal arms. The mapping is the surface of record: every
+    literal path it serves is a real GET/HEAD route.
+    """
+    source = root / "crates/kronik-ui/src/lib.rs"
+    code, layout = rust_views(source.read_text())
+    function = re.search(r"\bpub\s+fn\s+asset\s*\(\s*path\s*:\s*&str\s*\)", layout)
+    if function is None:
+        raise InvalidSurface("kronik-ui has no asset mapping")
+    start = layout.find("{", function.end())
+    if start < 0:
+        raise InvalidSurface("UI asset mapping has no body")
+    body = code[start + 1:delimited_end(layout, start)]
+    paths = set()
+    for arm in re.finditer(r'((?:"(?:\\.|[^"\\])*"\s*\|\s*)*"(?:\\.|[^"\\])*")\s*=>', body):
+        paths.update(json.loads(value) for value in re.findall(r'"(?:\\.|[^"\\])*"', arm.group(1)))
+    if not paths:
+        raise InvalidSurface("UI asset mapping has no literal path arms")
+    operations = set()
+    for path in paths:
+        operations.add("GET " + path)
+        operations.add("HEAD " + path)
+    return operations
+
+
 def actual_api(root):
     source_root = root / "crates/kronik-api/src"
     operations = set()
@@ -304,6 +334,7 @@ def actual_api(root):
         elif source == source_root / "event_stream.rs":
             handler = text
     operations.update(event_stream_api(server, handler))
+    operations.update(ui_asset_api(root))
     return operations
 
 

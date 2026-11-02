@@ -1052,6 +1052,28 @@ operation without publishing it:
 kronik keys rewrap --reason "validate the provider key rotation" --dry-run
 ```
 
+## kronik keys enroll
+
+`kronik keys enroll [--config <PATH>] [--json]`
+
+Verifies a configured PKCS#11 key through the isolated helper and prints the
+non-secret possession probe. This is an offline operator command: it reads the
+`[keys]` configuration from `--config` (default `/etc/kronik/kronik.toml`),
+drives the configured module through the helper, and prints the probe to save
+under `[keys.pkcs11.probe]` in that same file. It does not load or change the
+master seed, and it never prints key bytes, the private PIN or other module
+credentials. Normal startup, wrap, rewrap and restore require the enrolled
+probe. A helper, module, token or credential failure is
+[`KEY_HELPER_FAILED`](../errors.md#key_helper_failed). After a verified
+enrollment, the probe's own output names the next step:
+`kronik keys wrap --source pkcs11`. See the installation guide's
+[PKCS#11 helper](../guides/install.md#optional-gnu-pkcs11-helper) section and
+the operations guide's master-key tables.
+
+```sh
+kronik keys enroll --config /etc/kronik/kronik.toml --json
+```
+
 ## kronik fork create
 
 `kronik fork create --at <LSN|now|TIME> [--name <NAME>] [--no-pii] --reason <REASON> [--dry-run]`
@@ -2356,6 +2378,10 @@ still selects a reachable local Unix API when the controller is unavailable.
 Human output renders the API response as indented JSON; `--json` prints the
 response unchanged, without inventing an installation identity.
 
+```sh
+kronik fleet status
+```
+
 ## kronik fleet revoke
 
 `kronik fleet revoke --reason <REASON> [--dry-run]`
@@ -2364,6 +2390,10 @@ Revokes enrollment using the ordinary `POST /v1/fleet/revoke` API. It remains
 available through the daemon's Unix socket and has no alternate privileged
 offline path. The daemon checks the API caller's authorization, records the
 reason and enforces dry-run semantics.
+
+```sh
+kronik fleet revoke --reason "revoke the owned fixture's enrollment" --dry-run
+```
 
 ## kronik events list
 
@@ -2387,6 +2417,10 @@ to read bounded JSON from stdin, including a file redirected by the shell:
 cursor schema, source domains and 525568-byte bound locally before any HTTP
 request. Invalid input errors never echo the input. There is no `@file` syntax,
 extra cursor-file option or automatic disk cache.
+
+```sh
+kronik events list --source actor-native --limit 100
+```
 
 ## kronik events tail
 
@@ -2453,6 +2487,10 @@ backpressure.
 Reads `GET /v1/events/schemas`, the daemon's published schema registry.
 See also [JSON output](json.md).
 
+```sh
+kronik events schemas
+```
+
 ## kronik events webhooks status
 
 `kronik events webhooks status`
@@ -2460,9 +2498,18 @@ See also [JSON output](json.md).
 Reads `GET /v1/events/webhooks`, showing delivery status for configured webhook
 names. It does not expose webhook signing secrets.
 
+```sh
+kronik events webhooks status
+```
+
 ## kronik events webhooks replay
 
 `kronik events webhooks replay <NAME> --cursor <CURSOR> --reason <REASON> [--dry-run]`
+
+```sh
+kronik events webhooks replay owned-native --cursor "$CHECKPOINT_CURSOR" \
+  --reason "replay the retained boundary" --dry-run
+```
 
 As with list and tail, `--cursor -` reads and validates the bounded cursor JSON
 from stdin; file input uses shell redirection.

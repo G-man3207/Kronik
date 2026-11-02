@@ -143,6 +143,60 @@ class DocumentationSurfaceTest(unittest.TestCase):
         '''
         self.assertEqual({"GET /v1/events/stream", "GET /v1/events/ws"}, SURFACE["event_stream_api"](server, handler))
 
+    def test_captured_stream_call_is_the_same_dispatch_shape(self):
+        server = '''
+        if matches!(req.path.as_str(), "/v1/events/stream" | "/v1/events/ws") {
+            let incoming = hyper::Request::from_parts(parts, body);
+            return Ok(crate::event_stream::serve_captured(api, req, captured, incoming).await);
+        }
+        '''
+        handler = '''
+        if request.method != "GET" || req.headers().contains_key(TRANSFER_ENCODING) {
+            return Err(ApiError::new(BadRequest, "GET without a body"));
+        }
+        '''
+        self.assertEqual({"GET /v1/events/stream", "GET /v1/events/ws"}, SURFACE["event_stream_api"](server, handler))
+
+    def test_captured_stream_call_outside_the_literal_guard_is_rejected(self):
+        server = '''
+        if req.path == "/v1/events/stream" {
+            return Ok(crate::event_stream::serve_captured(api, req, captured, incoming).await);
+        }
+        '''
+        with self.assertRaisesRegex(SURFACE["InvalidSurface"], "unsupported server event-stream dispatch"):
+            SURFACE["event_stream_api"](server, "")
+
+    def test_ui_asset_literal_arms_become_get_and_head_routes(self):
+        root = self.temporary_ui_mapping('''
+        pub fn asset(path: &str) -> Option<Asset> {
+            match path {
+                "/ui" | "/ui/" => (("text/html; charset=utf-8"), include_bytes!("../ui/index.html")),
+                "/ui/app.css" => (("text/css"), include_bytes!("../ui/app.css")),
+                _ => None,
+            }
+        }
+        ''')
+        self.assertEqual(
+            {"GET /ui", "HEAD /ui", "GET /ui/", "HEAD /ui/", "GET /ui/app.css", "HEAD /ui/app.css"},
+            SURFACE["ui_asset_api"](root),
+        )
+
+    def test_ui_asset_mapping_without_literal_arms_is_rejected(self):
+        root = self.temporary_ui_mapping('''
+        pub fn asset(path: &str) -> Option<Asset> {
+            builtins().get(path).copied()
+        }
+        ''')
+        with self.assertRaisesRegex(SURFACE["InvalidSurface"], "no literal path arms"):
+            SURFACE["ui_asset_api"](root)
+
+    def temporary_ui_mapping(self, source):
+        import tempfile
+        root = Path(tempfile.mkdtemp()) / "crates" / "kronik-ui" / "src"
+        root.mkdir(parents=True)
+        (root / "lib.rs").write_text(source)
+        return root.parents[2]
+
     def test_special_stream_method_must_be_proved_by_the_handler(self):
         server = '''
         if matches!(req.path.as_str(), "/v1/events/stream") {

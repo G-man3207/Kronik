@@ -336,3 +336,205 @@ Content-Type: application/json
 
 {"reason":"preview owned fixture unlink","dry_run":true}
 ```
+
+## Admin listener, embedded UI and cluster observations: current main surface
+
+These operations are declared by current main's generated OpenAPI and served
+by its binary. They are absent from the published v0.3.0 binary. The
+authentication operations are public OpenAPI operations on the admin listener
+only; product operations are never routed there. The browser flows are driven
+by a browser, not scripted: the examples document the request heads the daemon
+must receive, not an invitation to automate a login. Cookie mutations require
+the session's exact CSRF token and the configured Origin; a bearer supplied
+explicitly wins, and cookie credentials never gain the Unix socket's local
+identity. Never put a real bearer, session cookie, CSRF token or provider
+credential in argv, history or committed documentation.
+
+## GET /ui
+
+The admin listener's embedded administration page. Static assets are never
+mounted on application routes, and an ordinary `/v1` client never needs them.
+
+```http
+GET /ui HTTP/1.1
+Host: kronik
+```
+
+## HEAD /ui
+
+The same asset's headers without the body, for cache revalidation.
+
+```http
+HEAD /ui HTTP/1.1
+Host: kronik
+```
+
+## GET /ui/
+
+The trailing-slash alias of the embedded administration page.
+
+```http
+GET /ui/ HTTP/1.1
+Host: kronik
+```
+
+## HEAD /ui/
+
+The alias's headers without the body.
+
+```http
+HEAD /ui/ HTTP/1.1
+Host: kronik
+```
+
+## GET /ui/app.css
+
+The embedded administration page's stylesheet.
+
+```http
+GET /ui/app.css HTTP/1.1
+Host: kronik
+```
+
+## HEAD /ui/app.css
+
+The stylesheet's headers without the body.
+
+```http
+HEAD /ui/app.css HTTP/1.1
+Host: kronik
+```
+
+## GET /ui/app.js
+
+The embedded administration page's script.
+
+```http
+GET /ui/app.js HTTP/1.1
+Host: kronik
+```
+
+## HEAD /ui/app.js
+
+The script's headers without the body.
+
+```http
+HEAD /ui/app.js HTTP/1.1
+Host: kronik
+```
+
+## GET /ui/icon.svg
+
+The embedded administration page's icon.
+
+```http
+GET /ui/icon.svg HTTP/1.1
+Host: kronik
+```
+
+## HEAD /ui/icon.svg
+
+The icon's headers without the body.
+
+```http
+HEAD /ui/icon.svg HTTP/1.1
+Host: kronik
+```
+
+## GET /v1/auth/login
+
+Begin the browser's OIDC authorization-code flow with PKCE, state and nonce.
+The answer is a `303` redirect to the configured issuer's authorization
+endpoint; the browser transaction is bound server-side. This requires an
+admitted authentication profile on the admin listener.
+
+```http
+GET /v1/auth/login HTTP/1.1
+Host: kronik
+```
+
+## GET /v1/auth/callback
+
+The address the configured issuer redirects the browser back to. The daemon
+consumes the provider's single-use code together with the browser-bound state,
+and on success installs the opaque session cookie with the `303` answer. A
+caller that has not been redirected by the actual provider has no code or
+state a callback would accept.
+
+```http
+GET /v1/auth/callback HTTP/1.1
+Host: kronik
+```
+
+## GET /v1/auth/session
+
+The caller's current identity and live scopes. Without a credential it reports
+whether browser authentication is available and why not. With a valid session
+cookie or scoped bearer it reports the principal, the verified identity, the
+live scopes, the CSRF token and the expiry. An explicitly supplied bearer
+wins over cookies.
+
+```http
+GET /v1/auth/session HTTP/1.1
+Host: kronik
+```
+
+## POST /v1/auth/logout
+
+Revoke one browser session. The cookie answer requires the session's exact
+CSRF token and the configured Origin; the reason is required and recorded.
+The session stays valid until this committed answer, and a revoked cookie is
+never resurrected by a retry.
+
+```http
+POST /v1/auth/logout HTTP/1.1
+Host: kronik
+Content-Type: application/json
+Origin: https://admin.example.test
+X-Kronik-CSRF: <the session's exact csrf_token>
+
+{"reason":"close this browser session"}
+```
+
+## GET /v1/auth/config
+
+The durably admitted authentication profile's audit source, digest and
+activation status: whether a profile is enabled and whether the running
+admin listener's browser authentication is actually active, with the typed
+reason when it is not. This is configuration state, not a provider health
+check.
+
+```http
+GET /v1/auth/config HTTP/1.1
+Host: kronik
+```
+
+## PUT /v1/auth/config
+
+Admit a typed authentication profile, or `null` to disable browser
+authentication explicitly. The profile names the HTTPS issuer, the client id
+and a redirect URI ending in `/v1/auth/callback`, and maps verified subjects
+to existing token names. A dry run prepares and digests the profile without
+committing it; a committed change that the running listener cannot apply
+until a restart reports `restart_required` and stays inactive until then.
+
+```http
+PUT /v1/auth/config HTTP/1.1
+Host: kronik
+Content-Type: application/json
+
+{"config":{"issuer":"https://idp.example.test","client_id":"kronik-admin","redirect_uri":"https://admin.example.test/v1/auth/callback","bindings":[{"subject":"operator@example.test","token":"operator-ro"}]},"reason":"admit the owned fixture's OIDC profile","dry_run":true}
+```
+
+## GET /v1/cluster/status
+
+The installation's actual cluster observation. On a native installation the
+truthful answer is `{"member": false}`; only a real member runtime backed by
+its own MetaService returns member observations through its installed
+adapter, and that adapter's error is an error, never a fabricated non-member
+answer.
+
+```http
+GET /v1/cluster/status HTTP/1.1
+Host: kronik
+```
