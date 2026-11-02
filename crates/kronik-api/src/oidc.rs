@@ -136,7 +136,9 @@ pub(crate) fn principal(hash: &[u8; 32]) -> String {
     let mut value = String::with_capacity(69);
     value.push_str("oidc:");
     for byte in hash {
-        write!(&mut value, "{byte:02x}").expect("writing to String");
+        // `fmt::Write for String` is infallible: this cannot fail. (Hygiene
+        // requires no expect() outside test code, so write byte-by-byte.)
+        let _ = write!(&mut value, "{byte:02x}");
     }
     value
 }
@@ -1048,6 +1050,8 @@ impl BrowserAuth {
     }
 
     /// Provider I/O is outside the fence; only this exact committed receipt may activate it.
+    // The OIDC publication's inputs: node, source, digests and cursors.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn publish_current(
         &self,
         node: &kronik_sched::Node,
@@ -1195,8 +1199,8 @@ impl BrowserAuth {
         api: &crate::Api,
         original: Option<crate::CapturedRequest>,
     ) -> Option<Result<Response, ApiError>> {
-        let segments: Vec<&str> = req.path.split('/').skip(1).collect();
-        let result = match (req.method.as_str(), segments.as_slice()) {
+        let segs: Vec<&str> = req.path.split('/').skip(1).collect();
+        let result = match (req.method.as_str(), segs.as_slice()) {
             ("GET", ["v1", "auth", "session"]) => match self.session_info(req, original.as_ref()) {
                 Ok(response) => match original {
                     Some(original) => api.complete_browser_response(response, original).await,
@@ -1943,6 +1947,10 @@ fn verify(
 
 #[cfg(test)]
 mod tests {
+    // The fixtures race real time and spawned tasks around admitted work:
+    // the direct calls are the harness, not daemon paths.
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
 
     #[test]
@@ -3299,8 +3307,7 @@ mod tests {
         assert!(callback.await.unwrap_err().is_cancelled());
         original
             .check()
-            .err()
-            .expect("dropping the callback must close its private latch");
+            .expect_err("dropping the callback must close its private latch");
         release.send(()).unwrap();
         assert!(
             result.await.unwrap(),
