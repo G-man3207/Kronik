@@ -45,6 +45,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(runtime);
 
     #[cfg(target_os = "linux")]
-    assert_eq!(std::fs::read_dir("/proc/self/task")?.count(), 1);
+    {
+        // A helper thread may still be exiting when the runtime drops; the
+        // invariant is that no thread outlives the exchange. Give the exit a
+        // short, bounded grace instead of racing the scheduler.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if std::fs::read_dir("/proc/self/task")?.count() == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the process exchange leaked a thread"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     Ok(())
 }
