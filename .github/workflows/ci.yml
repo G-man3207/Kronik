@@ -68,7 +68,19 @@ jobs:
         run: scripts/ci.sh clippy
       - name: hygiene
         run: scripts/ci.sh hygiene
+
+      # The CLI audit and API mutation tests run the repository's owned
+      # TLS/code/PKCE/JWT provider through a pinned private Python runtime
+      # (CONTRIBUTING.md); the test step is its only consumer.
+      - name: Prepare the pinned OIDC test runtime
+        run: |
+          python3 -m venv target/oidc-test-python
+          target/oidc-test-python/bin/python3 -m pip install --only-binary=:all: \
+            -r scripts/requirements-oidc-tests.txt
+
       - name: test
+        env:
+          KRONIK_TEST_PYTHON: ${{ github.workspace }}/target/oidc-test-python/bin/python3
         run: scripts/ci.sh test
       - name: docs
         run: scripts/ci.sh docs
