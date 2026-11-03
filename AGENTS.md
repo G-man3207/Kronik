@@ -37,6 +37,44 @@ rule covers code, comments, documentation, tests, fixtures, scripts, workflow
 files and commit messages. If personal information does reach a commit, rewrite
 the history before publishing it.
 
+### Commit identity and history
+
+Every commit is authored and committed as the project, never as an individual:
+`Kronik Maintainers <maintainers@users.noreply.github.com>`. The repository sets
+this identity locally (`git config user.name` / `user.email`), so ordinary
+commits inherit it; never override it, even temporarily, because the author and
+committer fields are permanent parts of every commit object.
+
+If a personal identity or other personal information has already been committed,
+rewrite the history before it is published. A `.mailmap` only changes how an
+identity is displayed; it does not change the stored commit data or the commit
+SHA. Set both the author and committer identity on every commit, then force-push
+and re-point every release tag:
+
+```sh
+# Recommended: git filter-repo
+git filter-repo --force --commit-callback '
+    commit.author_name = b"Kronik Maintainers"
+    commit.author_email = b"maintainers@users.noreply.github.com"
+    commit.committer_name = b"Kronik Maintainers"
+    commit.committer_email = b"maintainers@users.noreply.github.com"
+'
+
+# Equivalent with git filter-branch
+git filter-branch --env-filter '
+    export GIT_AUTHOR_NAME="Kronik Maintainers"
+    export GIT_AUTHOR_EMAIL="maintainers@users.noreply.github.com"
+    export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+    export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+' --tag-name-filter cat -- --all
+```
+
+Rewriting gives every commit a new SHA: update commit references in docs,
+workflow pins and release notes, recreate annotated tags with the neutral
+tagger, force-push `main` and the tags, and tell collaborators to re-clone (or
+hard-reset) because their old objects are unchanged. Keep a backup bundle
+before rewriting.
+
 ## Conventions
 
 The full list is in `CONTRIBUTING.md`. In short:
