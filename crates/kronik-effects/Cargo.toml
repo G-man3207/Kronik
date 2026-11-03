@@ -24,3 +24,7 @@ zeroize = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+kronik-testhost = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }

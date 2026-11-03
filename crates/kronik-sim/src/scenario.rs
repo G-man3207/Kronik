@@ -299,8 +299,11 @@ struct World {
     code: Arc<CodeStore>,
     fatal_tx: mpsc::UnboundedSender<NodeId>,
     service: Option<Arc<SimService>>,
-    /// The secret store (on "disk": it survives crashes).
-    secrets: Option<Arc<kronik_privacy::SecretStore>>,
+    /// The real directory backing the file-backed secret stores; held for
+    /// the whole run. Each node start opens its own store under it with
+    /// production custody (lock_data + open_owned) and passes the ownership
+    /// into the node parts, exactly as `serve` and the test host do.
+    secrets_root: Option<tempfile::TempDir>,
     state: Mutex<State>,
 }
 
@@ -369,6 +372,33 @@ impl World {
     }
 
     /// Starts a new node process on the current disk.
+    /// Opens this node's file-backed secret store under the run's private
+    /// root. A fresh directory per node start models the worst case (the
+    /// crash lost the store); recovery reconciles from the ledger, which is
+    /// the durable truth. The returned guard holds the store and its
+    /// ownership alive for the node's lifetime.
+    fn open_secrets(
+        self: &Arc<Self>,
+        node_id: NodeId,
+        mut parts: NodeParts,
+    ) -> Result<(NodeParts, Option<Arc<kronik_privacy::SecretStore>>), String> {
+        let Some(root) = self.secrets_root.as_ref() else {
+            return Ok((parts, None));
+        };
+        let dir = root.path().join(format!("secrets-{node_id}"));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let ownership = kronik_privacy::key_source::lock_data(&dir).map_err(|e| e.to_string())?;
+        let master = kronik_privacy::MasterKey::from_bytes([7; 32]).map_err(|e| e.to_string())?;
+        let data = kronik_privacy::SecretStore::owned_data(&ownership)
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| kronik_sched::secrets::SecretCacheData::new());
+        let store = kronik_privacy::SecretStore::open_owned(&ownership, &master, data)
+            .map_err(|e| e.to_string())?;
+        parts.secrets = Some(store);
+        parts.ownership = Some(ownership);
+        Ok((parts, None))
+    }
+
     fn start_node(self: &Arc<Self>) {
         let store = {
             let mut st = self.st();
@@ -402,15 +432,25 @@ impl World {
                 apply_batch: 64,
                 bulk_replay_min: self.cfg.bulk_replay_min,
                 startup_apply_batch: self.cfg.startup_apply_batch,
+                // Production nodes always have a storage root; the simulated
+                // node's virtual /data backs the coverage watermark (and its
+                // cold-start scan frontier) the same way, across restarts.
+                storage: Some(kronik_sched::snapshots::StorageConfig::new(PathBuf::from(
+                    "/data",
+                ))),
                 ..NodeConfig::default()
             },
             log: self.log_config(),
             store,
             code: self.code.clone(),
-            secrets: self.secrets.clone(),
+            secrets: None,
             sealer: None,
             key_source: None,
             ownership: None,
+        };
+        let (parts, _store_guard) = match self.open_secrets(node_id, parts) {
+            Ok(opened) => opened,
+            Err(e) => return self.violation(format!("node {node_id} secret store: {e}")),
         };
         let node = match Node::start(parts).await {
             Ok(n) => n,
@@ -1019,10 +1059,16 @@ impl World {
                     .take_while(|u| u.at.saturating_sub(s.at) < rate.per)
                     .count();
                 if n > rate.count as usize {
+                    let times: Vec<String> = sent[i..]
+                        .iter()
+                        .take(n)
+                        .map(|u| format!("{:.3}", u.at.as_secs_f64()))
+                        .collect();
                     self.violation(format!(
-                        "{n} calls sent within {:?} (rate {})",
+                        "{n} calls sent within {:?} (rate {}) at monotonic {:?}",
                         rate.per,
-                        rate.render()
+                        rate.render(),
+                        times
                     ));
                     break;
                 }
@@ -1314,20 +1360,17 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
     let service = cfg
         .effects
         .map(|fx| SimService::new(clock.clone(), SimRng::new(seed, b"service"), fx.faults));
-    let secrets = match cfg.effects.filter(|fx| fx.webhook).map(|_| {
-        let master = kronik_privacy::MasterKey::from_bytes([7; 32]).map_err(|e| e.to_string())?;
-        kronik_privacy::SecretStore::open_memory(
-            &master,
-            kronik_sched::secrets::SecretCacheData::new(),
-        )
-        .map(Arc::new)
-        .map_err(|e| e.to_string())
-    }) {
-        Some(Ok(s)) => Some(s),
-        Some(Err(e)) => {
+    let secrets_root = match cfg
+        .effects
+        .filter(|fx| fx.webhook)
+        .map(|_| tempfile::tempdir().map_err(|e| e.to_string()))
+        .transpose()
+    {
+        Ok(root) => root,
+        Err(e) => {
             return Report {
                 seed,
-                violations: vec![format!("secret store: {e}")],
+                violations: vec![format!("secret store root: {e}")],
                 trace_hash: String::new(),
                 events: 0,
                 crashes: 0,
@@ -1341,10 +1384,10 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
                 notes: String::new(),
             };
         }
-        None => None,
     };
+
     let world = Arc::new(World {
-        secrets,
+        secrets_root,
         service,
         seed,
         exec: handle.clone(),

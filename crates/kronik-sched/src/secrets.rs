@@ -16,6 +16,31 @@ use std::time::Duration;
 
 use kronik_core::authority::AuthLease;
 use kronik_core::env::Env;
+
+// TEMPORARY DEBUG SCAFFOLD — remove before landing.
+pub(crate) static STATE_HOLDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) struct TrackedGuard<'a, T>(std::sync::MutexGuard<'a, T>);
+impl<'a, T> std::ops::Deref for TrackedGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+impl<'a, T> std::ops::DerefMut for TrackedGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+impl<'a, T> Drop for TrackedGuard<'a, T> {
+    fn drop(&mut self) {
+        STATE_HOLDER.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+pub(crate) fn track_lock<'a, T>(m: &'a std::sync::Mutex<T>, site: u32) -> TrackedGuard<'a, T> {
+    let guard = m.lock().unwrap_or_else(|poison| poison.into_inner());
+    STATE_HOLDER.store(u64::from(site), std::sync::atomic::Ordering::Release);
+    TrackedGuard(guard)
+}
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_effects::Config;
 use kronik_privacy::secret_backend::config::{Backends, Settings};
@@ -178,7 +203,19 @@ struct Held {
     checked: Duration,
     operational: bool,
 }
-type NativeCoverage = (u64, u64, Duration, [u8; 32], Option<Arc<[pb::SecretRef]>>);
+/// The certificate covers every retained secret's committed state through
+/// `base_lsn`: a PREFIX of the applied log, not a moment. Mutations after
+/// the base dirty only the names they touch; untouched names keep serving
+/// under this certificate while a rebuild builds the next one.
+#[derive(Clone)]
+struct NativeCoverage {
+    revision: u64,
+    epoch: u64,
+    captured_at: Duration,
+    fingerprint: [u8; 32],
+    references: Option<Arc<[pb::SecretRef]>>,
+    base_lsn: u64,
+}
 struct SnapshotLiveness {
     current: AtomicBool,
     changed: tokio::sync::Notify,
@@ -248,14 +285,14 @@ impl SecretSnapshotPublication {
         };
         if publication.native_current.is_pending()
             || !self.data_is_current_under_publication()
-            || publication
-                .coverage
-                .as_ref()
-                .is_none_or(|(revision, epoch, at, _, _)| {
-                    *revision != publication.revision
-                        || *epoch != self.epoch
-                        || at.saturating_add(self.cache.settings.refresh) != self.until
-                })
+            || publication.coverage.as_ref().is_none_or(|coverage| {
+                coverage.revision != publication.revision
+                    || coverage.epoch != self.epoch
+                    || coverage
+                        .captured_at
+                        .saturating_add(self.cache.settings.refresh)
+                        != self.until
+            })
             || publication
                 .native_certificate_live
                 .as_ref()
@@ -317,6 +354,12 @@ struct CacheState {
     names: BTreeMap<String, SecretName>,
     negative: BTreeMap<(Scope, Option<String>), (Duration, BackendError)>,
     revision: u64,
+    /// Per name: the applied LSN of the last record touching it. A name is
+    /// certified through a coverage whose base_lsn is at or after this.
+    dirty: BTreeMap<String, u64>,
+    /// The highest dirty LSN: the whole-inventory gate (all names certified
+    /// only when the coverage's base reaches it).
+    dirty_max: u64,
     coverage: Option<NativeCoverage>,
     native_certificate_live: Option<Arc<SnapshotLiveness>>,
     native_catalogue_capture: Option<Arc<NativeCatalogueCapture>>,
@@ -444,6 +487,12 @@ impl SecretCache {
             })
     }
     fn register(&self, row: pb::SecretVersion) {
+        if row.name == "token" {
+            eprintln!(
+                "REGISTER token v={} phase={} deleted={}",
+                row.version, row.phase, row.deleted
+            );
+        }
         let key = (row.name.clone(), row.version);
         let mut retired = RetiredNativeCoverage::default();
         let mut state = lock(&self.state);
@@ -453,10 +502,33 @@ impl SecretCache {
             return;
         }
         if state.registry.get(&key) != Some(&row) {
-            state.registry.insert(key, row);
+            state.registry.insert(key, row.clone());
             state.revision = state.revision.wrapping_add(1);
             retired = Self::retire_certificate(&mut state);
             self.revision_changed.notify_one();
+        }
+        // A linked row is selected for its link scope through the CURRENT
+        // map: the resolve path's unversioned lookup for a non-file scope
+        // reads it, mirroring the durable link scope. The newest active,
+        // undeleted version holds the pointer; a deleted or inactive row
+        // releases a pointer that names it.
+        if row.backend != "file" {
+            let scope = Scope::row(&row);
+            if active(&row) && !row.deleted {
+                let superseded = state
+                    .current
+                    .get(&scope)
+                    .is_some_and(|(name, version)| *name == row.name && *version >= row.version);
+                if !superseded {
+                    state.current.insert(scope, (row.name.clone(), row.version));
+                }
+            } else if state
+                .current
+                .get(&scope)
+                .is_some_and(|(name, version)| *name == row.name && *version == row.version)
+            {
+                state.current.remove(&scope);
+            }
         }
         drop(state);
         drop(retired);
@@ -496,7 +568,7 @@ impl SecretCache {
     }
     fn row(&self, scope: &Scope, version: Option<u64>) -> Option<pb::SecretVersion> {
         let state = lock(&self.state);
-        match version {
+        let result = match version {
             Some(version) => state
                 .registry
                 .get(&(scope.name.clone(), version))
@@ -514,7 +586,29 @@ impl SecretCache {
                 .map(|(_, row)| row)
                 .find(|row| active(row) && Scope::row(row) == *scope)
                 .cloned(),
+        };
+        if result.is_none() && std::env::var("KRONIK_ROW_DIAG").is_ok() {
+            for (key, row) in state
+                .registry
+                .range((scope.name.clone(), 0)..=(scope.name.clone(), MAX_SECRET_VERSION))
+            {
+                eprintln!(
+                    "ROW-DIAG key={key:?} active={} backend={} binding={} ref={} canonical={} gen={} deleted={}",
+                    active(row),
+                    row.backend,
+                    row.binding,
+                    row.r#ref,
+                    row.canonical_ref,
+                    row.link_generation,
+                    row.deleted
+                );
+            }
+            eprintln!(
+                "ROW-DIAG scope backend={} binding={} ref={} canonical={} gen={} version={version:?}",
+                scope.backend, scope.binding, scope.reference, scope.canonical, scope.generation
+            );
         }
+        result
     }
     fn held(&self, row: &pb::SecretVersion, allow_stale: bool) -> Option<Arc<Zeroizing<Vec<u8>>>> {
         let state = lock(&self.state);
@@ -703,6 +797,11 @@ impl SecretCache {
         if version.is_none() && Self::file_current_pending(&lock(&self.state), &row) {
             return Err(unavailable());
         }
+        let negative = if version.is_some() {
+            self.negative_version(&scope, Some(&row.source_version))
+        } else {
+            self.negative(&scope)
+        };
         let stale = match if version.is_some() {
             self.negative_version(&scope, Some(&row.source_version))
         } else {
@@ -748,14 +847,21 @@ impl SecretCache {
     fn complete(&self, epoch: u64) -> bool {
         let state = lock(&self.state);
         !state.native_current.is_pending()
-            && state
-                .coverage
-                .as_ref()
-                .is_some_and(|(revision, at_epoch, at, _, _)| {
-                    *revision == state.revision
-                        && epoch == *at_epoch
-                        && self.env.clock.monotonic().saturating_sub(*at) <= self.settings.refresh
-                })
+            && state.coverage.as_ref().is_some_and(|coverage| {
+                epoch == coverage.epoch && coverage.base_lsn >= state.dirty_max
+            })
+    }
+
+    /// A single name is certified when its last-touching record is inside
+    /// the certificate's covered prefix; untouched names keep serving while
+    /// a rebuild builds the next certificate.
+    fn certified_name(&self, epoch: u64, name: &str) -> bool {
+        let state = lock(&self.state);
+        !state.native_current.is_pending()
+            && state.coverage.as_ref().is_some_and(|coverage| {
+                epoch == coverage.epoch
+                    && coverage.base_lsn >= state.dirty.get(name).copied().unwrap_or(0)
+            })
     }
     /// Certified scrub inventory shares the existing controlled buffers; it grants no operational access.
     // The certified snapshot's value list: name plus zeroizing bytes.
@@ -772,15 +878,24 @@ impl SecretCache {
         state: &CacheState,
         epoch: u64,
     ) -> Result<CertifiedSecretSnapshot, ApiError> {
-        let (revision, at_epoch, at, fingerprint, references) =
-            state.coverage.clone().ok_or_else(unavailable)?;
-        if state.native_current.is_pending()
-            || revision != state.revision
-            || epoch != at_epoch
-            || self.env.clock.monotonic().saturating_sub(at) > self.settings.refresh
-        {
+        let NativeCoverage {
+            revision,
+            epoch: at_epoch,
+            captured_at: at,
+            fingerprint,
+            references,
+            base_lsn,
+        } = state.coverage.clone().ok_or_else(unavailable)?;
+        if state.native_current.is_pending() {
             return Err(unavailable());
         }
+        if state.dirty_max > base_lsn {
+            return Err(unavailable());
+        }
+        if epoch != at_epoch {
+            return Err(unavailable());
+        }
+        let _ = revision;
         let values = state
             .values
             .iter()
@@ -831,6 +946,10 @@ pub struct SecretRuntime {
     // design of every reader and the background cycle; tracked under the
     // M23 track with the other secret-catalogue defects.
     #[allow(clippy::disallowed_types)]
+    // The ADR-0004-compliant replacement ripples through the wait/notify
+    // design of every reader and the background cycle; tracked under the
+    // M23 track with the other secret-catalogue defects.
+    #[allow(clippy::disallowed_types)]
     certified: tokio::sync::watch::Sender<(u64, bool)>,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -842,6 +961,21 @@ pub struct SecretBackendStatus {
     pub inventory_complete: bool,
 }
 impl SecretRuntime {
+    /// Registers applied secret rows into the certification cache as the
+    /// applier applies them: the registry is the applied projection, fed by
+    /// the applier rather than by later store queries racing its lag.
+    pub(crate) fn register_applied(&self, row: pb::SecretVersion) {
+        self.cache.register(row);
+    }
+
+    /// Abandons an in-flight native-current apply's bookkeeping after an
+    /// availability-class publish failure (see NativeCurrentState::abandon).
+    pub(crate) fn abandon_in_flight_apply(&self) {
+        track_lock(&self.cache.state, line!())
+            .native_current
+            .abandon();
+    }
+
     /// Wakes the background rebuild after an availability-class degrade:
     /// the certified catalogue stays retired and the cycle retries promptly.
     pub(crate) fn schedule_rebuild(&self) {
@@ -887,7 +1021,7 @@ impl SecretRuntime {
         Ok(runtime)
     }
     fn name_lock(&self, name: &str) -> Arc<AsyncMutex<()>> {
-        let mut state = lock(&self.cache.state);
+        let mut state = track_lock(&self.cache.state, line!());
         if let Some(slot) = state.names.get(name) {
             return slot.lock.clone();
         }
@@ -964,7 +1098,7 @@ impl SecretRuntime {
             canonical_ref,
         } = result?;
         if !self.cache.read_matches(
-            &lock(&self.cache.state),
+            &track_lock(&self.cache.state, line!()),
             &scope.backend,
             &scope.canonical,
             &stamp,
@@ -1096,7 +1230,7 @@ impl Node {
             return;
         };
         let retired = {
-            let mut state = lock(&runtime.cache.state);
+            let mut state = track_lock(&runtime.cache.state, line!());
             state.revision = state.revision.wrapping_add(1);
             let retired = SecretCache::retire_certificate(&mut state);
             publish_epoch();
@@ -1134,7 +1268,7 @@ impl Node {
     fn probe_store_identity(&self) -> Result<(), ApiError> {
         let runtime = self.runtime()?;
         let rows = {
-            let state = lock(&runtime.cache.state);
+            let state = track_lock(&runtime.cache.state, line!());
             state
                 .registry
                 .values()
@@ -1171,13 +1305,16 @@ impl Node {
         let cache = self.runtime()?.cache.clone();
         let epoch = self.epoch();
         let (snapshot, live, at) = {
-            let state = lock(&cache.state);
+            let state = track_lock(&cache.state, line!());
             let snapshot = cache.native_snapshot_locked(&state, epoch)?;
             let live = state
                 .native_certificate_live
                 .clone()
                 .ok_or_else(unavailable)?;
-            let at = state.coverage.as_ref().ok_or_else(unavailable)?.2;
+            let at = state
+                .coverage
+                .as_ref()
+                .map_or(self.env.clock.monotonic(), |coverage| coverage.captured_at);
             (snapshot, live, at)
         };
         let publication = SecretSnapshotPublication {
@@ -1665,7 +1802,10 @@ impl Node {
                 .filter(|row| active(row) && row.backend == "file" && !row.version_hash.is_empty())
             {
                 key.1 = row.version;
-                if !lock(&runtime.cache.state).values.contains_key(&key) {
+                if !track_lock(&runtime.cache.state, line!())
+                    .values
+                    .contains_key(&key)
+                {
                     let physical = kronik_privacy::secret_backend::file::source_highwater(
                         &name,
                         std::slice::from_ref(row),
@@ -2094,7 +2234,7 @@ impl Node {
         );
         runtime.cache.insert(row, bytes, operational, Some(stamp))?;
         if operational {
-            lock(&runtime.cache.state)
+            track_lock(&runtime.cache.state, line!())
                 .current
                 .insert(scope.clone(), (row.name.clone(), row.version));
         }
@@ -2108,6 +2248,7 @@ impl Node {
         operational: bool,
         original: AuthLease,
     ) -> Result<pb::SecretVersion, ApiError> {
+        eprintln!("OBSERVE name={} backend={} operational={operational}", scope.name, scope.backend);
         let runtime = self.runtime()?;
         if let Some(row) = self.known_secret_observation(scope, &fetched).await? {
             let mut bytes = Some(Arc::new(fetched.value));
@@ -2302,13 +2443,16 @@ impl Node {
         }
         let source_version = match &row {
             Some(row) if version.is_some() => Some(row.source_version.clone()),
-            _ => match self.file_current_source(&scope).await {
-                Ok(source) => source,
-                Err(error) if error.code == ErrorCode::SecretNotFound && version.is_none() => {
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            },
+            _ => {
+                let source = match self.file_current_source(&scope).await {
+                    Ok(source) => source,
+                    Err(error) if error.code == ErrorCode::SecretNotFound && version.is_none() => {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
+                source
+            }
         };
         if remaining().is_zero() {
             return Err(unavailable());
@@ -2551,6 +2695,7 @@ impl Node {
                 coverage_epoch: self.epoch(),
                 coverage_fingerprint: kronik_core::ids::hex(&snapshot.fingerprint),
                 store_generation,
+                scan_frontier: None,
             },
         )
         .await;
@@ -2584,13 +2729,13 @@ impl Node {
             Some(runtime.inventory.lock().await)
         };
         let file_changes = runtime.cache.capture_file_changes()?;
-        let native_revision = lock(&runtime.cache.state)
+        let native_revision = track_lock(&runtime.cache.state, line!())
             .native_current
             .capture_revision()
             .ok_or_else(unavailable)?;
         let prior = if cached_only {
             Some(
-                lock(&runtime.cache.state)
+                track_lock(&runtime.cache.state, line!())
                     .native_catalogue_capture
                     .clone()
                     .ok_or_else(unavailable)?,
@@ -2716,6 +2861,10 @@ impl Node {
         {
             return Err(unavailable());
         }
+        eprintln!(
+            "CATALOGUE-LOOP catalogues={catalogues:?} reveal={reveal_names:?} records={}",
+            records.len()
+        );
         for scope in &catalogues {
             if cached_only {
                 continue;
@@ -2810,13 +2959,16 @@ impl Node {
             required.insert((row.name.clone(), row.version), row.clone());
             runtime.cache.register(row);
         }
-        let revision = lock(&runtime.cache.state).revision;
+        let revision = track_lock(&runtime.cache.state, line!()).revision;
         for row in required.values().filter(|row| active(row)) {
             if row.deleted && row.version_hash.is_empty() {
                 continue;
             }
             let key = (row.name.clone(), row.version);
-            if lock(&runtime.cache.state).values.contains_key(&key) {
+            if track_lock(&runtime.cache.state, line!())
+                .values
+                .contains_key(&key)
+            {
                 continue;
             }
             if cached_only {
@@ -2878,7 +3030,7 @@ impl Node {
         }
         for stored in &file_rows {
             let cached = {
-                let state = lock(&runtime.cache.state);
+                let state = track_lock(&runtime.cache.state, line!());
                 state
                     .scrub_file
                     .get(&(stored.meta.name.clone(), stored.meta.version))
@@ -2946,11 +3098,166 @@ impl Node {
         // publishes coverage, so the published certificate is never one its
         // own records just retired. Bounded by the fetch timeout; expiry
         // fails the refresh instead of publishing stale coverage.
+        // DELTA BUILD: a warm certificate scans only (base, head] and adds
+        // the delta's references to the certificate's own set — the corpus
+        // the old certificate covered keeps serving during the build.
+        let (mut references, delta_base) = {
+            let state = track_lock(&runtime.cache.state, line!());
+            match &state.coverage {
+                Some(coverage) if coverage.base_lsn > 0 => {
+                    (coverage.references.clone(), Some(coverage.base_lsn))
+                }
+                _ => (None, None),
+            }
+        };
+        let mut references_map = BTreeMap::new();
+        if let Some(existing) = &references {
+            for reference in existing.iter() {
+                references_map.insert(
+                    (reference.name.clone(), u64::from(reference.version)),
+                    reference.version_hash.clone(),
+                );
+            }
+        }
+        let mut touched_names = BTreeSet::new();
+        let mut scan_from = first.map(|first| {
+            let through = delta_base.unwrap_or(0);
+            if through.saturating_add(1) > first {
+                through.saturating_add(1)
+            } else {
+                first
+            }
+        });
+        // COLD-START BOOTSTRAP (ADR 0108): a full scan is crash-resilient via
+        // the scan-frontier checkpoint. A validated frontier resumes the
+        // scan from `through` instead of restarting it; the checkpoint is a
+        // HINT — any validation failure discards it and the scan restarts
+        // from zero. Resumes require the accumulated references to have been
+        // empty at the checkpoint (a non-empty set would need its own
+        // artifact). The frontier never publishes coverage by itself: the
+        // strict applied-LSN CAS after the drain is the only publication.
+        // Cold builds checkpoint; warm deltas are short and skip it.
+        let mut cold_frontier: Option<(u64, u64)> = if delta_base.is_none() {
+            Some((0, 0))
+        } else {
+            None
+        };
+        if scan_from.is_some() && delta_base.is_none() {
+            let generation = runtime
+                .file
+                .generation()
+                .map(|generation| kronik_core::ids::hex(&generation))
+                .unwrap_or_default();
+            if let Some(watermark) = &watermark
+                && let Some(frontier) = &watermark.scan_frontier
+                && frontier.store_generation == generation
+                && frontier.branch == self.branch()
+                && frontier.references_empty
+                && frontier.through >= frontier.base
+                && frontier.head >= frontier.through
+            {
+                let first = first.unwrap_or(1);
+                if frontier.base == first
+                    && frontier.through.saturating_add(1) >= first
+                    && frontier.head <= self.applied_lsn()
+                {
+                    scan_from = Some(frontier.through.saturating_add(1).min(frontier.head));
+                    cold_frontier = Some((frontier.through, frontier.head));
+                }
+            }
+        }
+        if let Some((through, head)) = cold_frontier {
+            scan_from = Some(through.saturating_add(1).min(head));
+        }
+        // The scan runs in segments so a cold build checkpoints its frontier
+        // periodically: a crash-restart resumes from the last checkpoint
+        // instead of restarting the whole scan.
+        const SCAN_SEGMENT_RECORDS: u64 = 2_048;
+        let mut seg_start = scan_from;
+        while let Some(from) = seg_start {
+            let end = self.applied_lsn();
+            if from > end {
+                break;
+            }
+            let seg_end = from
+                .saturating_add(SCAN_SEGMENT_RECORDS.saturating_sub(1))
+                .min(end);
+            self.reader()
+                .read_while(from, seg_end, |committed| {
+                    collect_secret_references(&committed.record, &self.sealer, &mut references_map)
+                        .map_err(|_| {
+                            kronik_log::LogError::Corrupt(
+                                "invalid retained secret reference".into(),
+                            )
+                        })?;
+                    match &committed.record {
+                        Record::SecretVersion(row) => {
+                            touched_names.insert(row.name.clone());
+                        }
+                        Record::SecretLink(link) => {
+                            touched_names.insert(link.name.clone());
+                        }
+                        _ => {}
+                    }
+                    Ok(true)
+                })
+                .await
+                .map_err(|_| unavailable())?;
+            if let Some((_, head)) = &cold_frontier
+                && let Some(storage) = self.storage_config()
+            {
+                let generation = runtime
+                    .file
+                    .generation()
+                    .map(|generation| kronik_core::ids::hex(&generation))
+                    .unwrap_or_default();
+                coverage::persist(
+                    &self.env,
+                    &storage.data_dir.clone(),
+                    &coverage::CoverageWatermark {
+                        schema: coverage::SCHEMA.into(),
+                        branch: self.branch().to_owned(),
+                        certified_through_lsn: 0,
+                        coverage_epoch: self.epoch(),
+                        coverage_fingerprint: String::new(),
+                        store_generation: generation.clone(),
+                        scan_frontier: Some(coverage::ScanFrontier {
+                            base: first.unwrap_or(1),
+                            through: seg_end,
+                            head: *head,
+                            store_generation: generation,
+                            branch: self.branch().to_owned(),
+                            references_empty: references_map.is_empty(),
+                        }),
+                    },
+                )
+                .await;
+            }
+            if seg_end >= end {
+                break;
+            }
+            seg_start = Some(seg_end.saturating_add(1));
+        }
+        // Every record this refresh committed (its observations included)
+        // retires the catalogue when the applier applies it; the drain waits
+        // for the applier to reach the log's fsynced head BEFORE the tail
+        // publishes coverage. Bounded by the fetch timeout; expiry fails the
+        // refresh instead of publishing stale coverage.
         self.wait_for_applier_drain(runtime.settings.fetch_timeout)
             .await?;
-        let retired;
+        // The CAS base: the applier's drained head this build built against.
+        let head = self.committed_head();
+        if self.applied_lsn() != head {
+            // The applier moved during the build: the strict CAS fails, the
+            // shadow is discarded, and the still-serving coverage stays; the
+            // cycle's next iteration rebuilds the delta from the new head.
+            return Err(unavailable());
+        }
 
-        let mut state = lock(&runtime.cache.state);
+        self.wait_for_applier_drain(runtime.settings.fetch_timeout)
+            .await?;
+
+        let mut state = track_lock(&runtime.cache.state, line!());
         if !state.bound_runtime.ptr_eq(&Arc::downgrade(runtime))
             || state.revision != revision
             || self.epoch() != epoch
@@ -2968,12 +3275,22 @@ impl Node {
             return Err(unavailable());
         }
         let references = pattern_references(&state).map(Arc::from);
-        retired = SecretCache::retire_certificate(&mut state);
-        state.coverage = Some((revision, epoch, captured_at, fingerprint, references));
+        state.coverage = Some(NativeCoverage {
+            revision,
+            epoch,
+            captured_at,
+            fingerprint,
+            references,
+            base_lsn: head,
+        });
         state.native_certificate_live = Some(live);
+        // The delta's names are certified through the new base.
+        for name in &touched_names {
+            state.dirty.insert(name.clone(), head);
+            state.dirty_max = state.dirty_max.max(head);
+        }
         let retired_catalogue = state.native_catalogue_capture.replace(catalogue_capture);
         drop(state);
-        drop(retired);
         drop(retired_catalogue);
         Ok(())
     }
@@ -3065,10 +3382,11 @@ impl Node {
     async fn wait_for_applier_drain(&self, budget: std::time::Duration) -> Result<(), ApiError> {
         let deadline = self.env.clock.monotonic().saturating_add(budget);
         while self.applied_lsn() < self.committed_head()
-            || self
-                .secret_runtime
-                .as_ref()
-                .is_some_and(|runtime| lock(&runtime.cache.state).native_current.apply_in_flight())
+            || self.secret_runtime.as_ref().is_some_and(|runtime| {
+                track_lock(&runtime.cache.state, line!())
+                    .native_current
+                    .apply_in_flight()
+            })
         {
             if self.env.clock.monotonic() >= deadline {
                 return Err(unavailable());
@@ -3089,7 +3407,7 @@ impl Node {
     async fn wait_secret_inventory(&self, original: AuthLease) -> Result<(), ApiError> {
         let runtime = self.runtime()?;
         let mut completed = runtime.certified.subscribe();
-        let wanted = lock(&runtime.cache.state).revision;
+        let wanted = track_lock(&runtime.cache.state, line!()).revision;
         if runtime.cache.complete(self.epoch()) {
             return Ok(());
         }
@@ -3138,18 +3456,21 @@ impl Node {
             // whole refresh tick; after the budget is spent the loop falls
             // back to the periodic tick.
             let mut rebuild_failures = 0u32;
+            eprintln!("CYCLE spawned");
             loop {
                 let Some(node) = weak.upgrade() else {
+                    eprintln!("CYCLE exit: upgrade");
                     return;
                 };
-                if original.check().is_err() {
+                if let Err(e) = original.check() {
+                    eprintln!("CYCLE exit: lease {}", e.code);
                     return;
                 }
                 let Some(runtime) = &node.secret_runtime else {
                     return;
                 };
                 if !registry_wake || !runtime.cache.complete(node.epoch()) {
-                    let attempt = lock(&runtime.cache.state).revision;
+                    let attempt = track_lock(&runtime.cache.state, line!()).revision;
                     let config = node.config_now();
                     let mut names: BTreeSet<_> = match node.secret_rows(None).await {
                         Ok(rows) => rows.into_iter().map(|row| row.name).collect(),
@@ -3190,7 +3511,7 @@ impl Node {
                     }
                     let refreshed = node.refresh_secret_inventory(original.clone()).await;
                     let completed = if refreshed.is_ok() {
-                        lock(&runtime.cache.state).revision
+                        track_lock(&runtime.cache.state, line!()).revision
                     } else {
                         attempt
                     };

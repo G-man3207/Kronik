@@ -40,6 +40,32 @@ pub struct CoverageWatermark {
     /// The secret store's random generation (hex): a restored or replaced
     /// store carries another generation and voids the watermark.
     pub store_generation: String,
+    /// A cold-start scan checkpoint: crash-resilient PROGRESS, never trust
+    /// (ADR 0108). A restarted node resumes the reference scan from
+    /// `through` instead of restarting it; any validation failure (store
+    /// generation, branch, retained-log bounds) discards it and the build
+    /// restarts from zero. Never publishes coverage by itself — coverage
+    /// publishes only through the complete-build strict CAS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_frontier: Option<ScanFrontier>,
+}
+
+/// A cold-start scan checkpoint. Valid only while the accumulated
+/// references were empty at the checkpoint (a non-empty set needs its own
+/// artifact); the checkpoint's resume rule re-validates the binding before
+/// resuming.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScanFrontier {
+    /// The scan's start: the log's first retained LSN when the build began.
+    pub base: u64,
+    /// The LSN the reference scan had reached when the checkpoint was written.
+    pub through: u64,
+    /// The build's intended head at checkpoint time.
+    pub head: u64,
+    pub store_generation: String,
+    pub branch: String,
+    /// The accumulated references were empty through `through`.
+    pub references_empty: bool,
 }
 
 /// Loads the watermark, if a valid one exists. Every problem — missing

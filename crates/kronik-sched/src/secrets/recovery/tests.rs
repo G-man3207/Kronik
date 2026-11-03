@@ -322,7 +322,8 @@ impl Net for Bao {
             if request.url.contains("/data/") {
                 assert!(
                     request.url.ends_with("?version=1"),
-                    "recorded recovery fetched current instead of immutable version"
+                    "recorded recovery fetched current instead of immutable version: {}",
+                    request.url
                 );
             }
         }
@@ -527,6 +528,10 @@ async fn definitive_gone_does_not_retry_and_cancellation_releases_the_owned_stal
         .code,
         ErrorCode::SecretVersionGone
     );
+    // The staging swap's delta republish observes the link's immutable
+    // version (replay-legal: ?version=1, never CURRENT) — exactly one extra
+    // provider GET, as before the swap. The definitive-gone verdict still
+    // comes from the recorded hash comparison.
     assert_eq!(bao.gets.load(Ordering::Acquire), before + 1);
     assert_eq!(*super::super::lock(&STALLED), 0);
     let runtime = node.runtime().unwrap();

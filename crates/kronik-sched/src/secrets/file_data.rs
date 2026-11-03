@@ -287,7 +287,7 @@ impl SecretRuntime {
         initial_epoch: u64,
     ) -> Result<(), PrivacyError> {
         {
-            let mut state = lock(&self.cache.state);
+            let mut state = track_lock(&self.cache.state, line!());
             if !self.owns_data_state(&state) {
                 return Err(PrivacyError::SecretStoreUnowned);
             }
@@ -296,7 +296,7 @@ impl SecretRuntime {
         self.verify_native_current_source(reader)
             .await
             .map_err(|_| PrivacyError::SecretStoreUnknown)?;
-        let mut state = lock(&self.cache.state);
+        let mut state = track_lock(&self.cache.state, line!());
         if !self.owns_data_state(&state)
             || state
                 .native_owner
@@ -318,14 +318,12 @@ impl SecretRuntime {
 
 impl SecretCache {
     pub(super) fn capture_file_changes(&self) -> Result<Vec<(String, u64)>, ApiError> {
+        // Unsettled mutations do not fail the capture: the strict
+        // applied-LSN CAS at publish is the concurrency authority, and
+        // finish_file_corpus reconciles only settled captured tickets (a
+        // superseding write owns its own reconciliation). Failing here would
+        // starve rebuilds under concurrent same-name writes.
         let state = lock(&self.state);
-        if state.names.values().any(|slot| {
-            slot.file_mutation
-                .as_ref()
-                .is_some_and(|pending| pending.running || !pending.sql_committed)
-        }) {
-            return Err(unavailable());
-        }
         Ok(state
             .names
             .iter()
@@ -338,29 +336,22 @@ impl SecretCache {
             .collect())
     }
     pub(super) fn finish_file_corpus(state: &mut CacheState, captured: &[(String, u64)]) -> bool {
-        if !state
-            .names
-            .iter()
-            .filter_map(|(name, slot)| {
-                slot.file_mutation
-                    .as_ref()
-                    .filter(|pending| pending.current_unknown || pending.corpus_unknown)
-                    .map(|pending| {
-                        (
-                            name.as_str(),
-                            pending.ticket,
-                            !pending.running && pending.sql_committed && !pending.current_unknown,
-                        )
-                    })
-            })
-            .eq(captured
-                .iter()
-                .map(|(name, ticket)| (name.as_str(), *ticket, true)))
-        {
-            return false;
-        }
-        for slot in state.names.values_mut() {
-            if let Some(pending) = &mut slot.file_mutation {
+        // Reconcile exactly the mutations captured at build start. A later
+        // write superseding a captured ticket owns its own reconciliation —
+        // it must not fail this publish (the staging swap builds under
+        // concurrent same-name writes; the strict applied-LSN CAS is the
+        // concurrency authority).
+        for (name, ticket) in captured {
+            let Some(slot) = state.names.get_mut(name) else {
+                return false;
+            };
+            let Some(pending) = slot.file_mutation.as_mut() else {
+                return false;
+            };
+            if pending.ticket == *ticket {
+                if pending.running || !pending.sql_committed || pending.current_unknown {
+                    return false;
+                }
                 pending.corpus_unknown = false;
             }
         }
@@ -379,7 +370,7 @@ impl SecretRuntime {
             .parse::<u64>()
             .map_err(|_| unavailable())?;
         let ticket = {
-            let state = lock(&self.cache.state);
+            let state = track_lock(&self.cache.state, line!());
             state
                 .names
                 .get(&row.canonical_ref)
@@ -412,7 +403,7 @@ impl SecretRuntime {
             return Err(unavailable());
         }
         {
-            let state = lock(&self.cache.state);
+            let state = track_lock(&self.cache.state, line!());
             if !self.owns_data_state(&state)
                 || !state
                     .names
@@ -463,7 +454,7 @@ impl SecretRuntime {
         if !matches {
             return Err(unavailable());
         }
-        let mut state = lock(&self.cache.state);
+        let mut state = track_lock(&self.cache.state, line!());
         if !self.owns_data_state(&state) {
             return Err(unavailable());
         }

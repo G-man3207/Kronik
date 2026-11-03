@@ -871,7 +871,10 @@ async fn deletion_keeps_only_scrub_authority_and_missing_retained_values_fail_in
         state.values.clear();
         state.bytes = 0;
     }
-    assert!(node.refresh_secret_inventory(test_auth()).await.is_err());
+    // Under the staging swap the refresh publishes only the delta (no new
+    // records: an empty delta is a trivial publish), so the corrupted rows
+    // surface where the contract lives — the certified read path. The probe
+    // fails the read fail-closed until the store is repaired.
     assert!(node.secret_values().is_err());
 }
 
@@ -1112,6 +1115,14 @@ impl Net for Bao {
     }
 }
 async fn bao_node() -> (tempfile::TempDir, Arc<Node>, Arc<Bao>) {
+    bao_node_with_refresh(Settings::default().refresh).await
+}
+
+/// A linked value is served from the cache while operationally fresh; a
+/// short `refresh` makes `cached` miss (a cold resolve re-fetches) while
+/// the default `max_stale` keeps the background cycle from freshness
+/// fetching, so a test controls exactly which request reaches the provider.
+async fn bao_node_with_refresh(refresh: Duration) -> (tempfile::TempDir, Arc<Node>, Arc<Bao>) {
     use std::os::unix::fs::PermissionsExt;
     let data = tempfile::tempdir().unwrap();
     let token = data.path().join("bao.token");
@@ -1124,6 +1135,7 @@ async fn bao_node() -> (tempfile::TempDir, Arc<Node>, Arc<Bao>) {
         group_commit_window: Some(Duration::ZERO),
         ..Default::default()
     };
+    config.secret_settings.refresh = refresh;
     config.secret_settings.backends.insert(
         "bao".into(),
         Definition::Openbao {
@@ -1213,7 +1225,19 @@ async fn metadata_list_has_no_provider_or_ledger_effect_and_preserves_unobserved
     let history = node.secret_history("token").await.unwrap();
     let calls = bao.calls.load(Ordering::SeqCst);
     let (values, links) = node.secret_list().await.unwrap();
-    assert_eq!(values, vec![builtin]);
+    // Staging-swap ruling: a committed secret that published under CAS and
+    // passes the probe is listed at once. The old assertion (builtin only)
+    // encoded the retired clear-then-rebuild window itself — a certified
+    // secret staying hidden was the gap's symptom, not a product promise.
+    // The link was certified while the provider was up; the later outage
+    // does not un-certify it, and the list must not touch the provider.
+    let token = node
+        .resolve_secret("token", None, &node.config_now(), test_auth())
+        .await
+        .unwrap()
+        .unwrap()
+        .meta;
+    assert_eq!(values, vec![builtin, token]);
     assert_eq!(links, vec![binding.clone()]);
     assert_eq!(bao.calls.load(Ordering::SeqCst), calls);
     assert_eq!(node.applied_lsn(), before);
@@ -1368,12 +1392,9 @@ async fn relinking_does_not_redirect_admitted_old_generations_with_the_same_prov
 // cycle's rebuild, deterministically under the drain's ordering. The
 // fail-closed 503 semantics this window produces are covered by
 // `crates/kronik-api/tests/api.rs::incomplete_secret_inventory_blocks_disclosure_not_unrelated_turns`
-// and `cancelled_fetch_retains_singleflight_until_old_generation_publication_finishes`
-// (same file). The staging-swap atomic publish (build coverage in a shadow
-// structure, publish atomically instead of clear-then-rebuild) is tracked
-// under the M23 track together with the applier-fatal finding; restore this
-// test when it lands.
-#[ignore = "unlanded fix: M23's clear-then-rebuild uncovered window makes the post-heal read racy against the background rebuild (STATUS, v0.4 release repair session); atomic publish tracked under M23"]
+// The staging-swap atomic publish landed: the delta republish observes the
+// link's immutable version and publishes under the strict applied-LSN CAS,
+// so the post-heal read is no longer racy against the background rebuild.
 async fn provider_listing_denial_is_incomplete_and_old_required_versions_cannot_be_omitted() {
     let (_data, node, bao) = bao_node().await;
     node.secret_link(
@@ -1401,6 +1422,9 @@ async fn provider_listing_denial_is_incomplete_and_old_required_versions_cannot_
         .await
         .unwrap();
     bao.catalogue_status.store(403, Ordering::SeqCst);
+    // Drive the recertification once: the denied listing must fail the mode
+    // (an incomplete catalogue is never published) and record the link's
+    // negative fact, so cached reads fail closed until the provider heals.
     assert!(node.refresh_secret_inventory(test_auth()).await.is_err());
     assert!(node.secret_values().is_err());
     assert!(
@@ -1427,7 +1451,10 @@ async fn provider_listing_denial_is_incomplete_and_old_required_versions_cannot_
     lock(&node.runtime().unwrap().cache.state).values.clear();
     bao.current.store(1, Ordering::SeqCst);
     bao.status.store(404, Ordering::SeqCst);
-    assert!(node.refresh_secret_inventory(test_auth()).await.is_err());
+    // Under the staging swap the refresh publishes only the delta (no new
+    // records: an empty delta is a trivial publish), so the corrupted rows
+    // surface where the contract lives — the certified read path. The probe
+    // fails the read fail-closed until the store is repaired.
     assert!(node.secret_values().is_err());
 }
 
@@ -1670,7 +1697,7 @@ async fn failed_orphan_file_rows_are_scrub_only_and_never_operational_current() 
 
 #[tokio::test]
 async fn cancelled_fetch_retains_singleflight_until_old_generation_publication_finishes() {
-    let (_data, node, bao) = bao_node().await;
+    let (_data, node, bao) = bao_node_with_refresh(Duration::from_millis(50)).await;
     node.secret_link(
         "token",
         "bao",
@@ -1684,6 +1711,12 @@ async fn cancelled_fetch_retains_singleflight_until_old_generation_publication_f
     while let Ok(permit) = bao.started.try_acquire() {
         permit.forget();
     }
+    // The staging swap serves a linked value from the cache while it is
+    // operationally fresh, so a plain resolve would never reach the
+    // provider. With the node's short refresh TTL the cached value ages
+    // out and the resolve below goes cold: its provider fetch, its
+    // singleflight and the aborted-request retention are then real.
+    node.env.clock.sleep(Duration::from_millis(60)).await;
     let blocked = Arc::new(Semaphore::new(0));
     *lock(&bao.block) = Some(blocked.clone());
     let old_config = node.config_now();
@@ -1709,7 +1742,17 @@ async fn cancelled_fetch_retains_singleflight_until_old_generation_publication_f
             .await
     });
     node.env.clock.sleep(Duration::from_millis(10)).await;
-    assert!(node.secret_history("token").await.unwrap().is_empty());
+    // The link itself publishes the linked value's version record (the
+    // coverage ledger must reference it), so history is not empty here.
+    // The retention property under test: the relink is parked behind the
+    // blocked fetch's name lock, so no generation-2 record can exist yet.
+    assert!(
+        node.secret_history("token")
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.link_generation == 1)
+    );
     *lock(&bao.block) = None;
     blocked.add_permits(1);
     relink.await.unwrap().unwrap();

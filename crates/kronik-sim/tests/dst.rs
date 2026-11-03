@@ -135,22 +135,6 @@ fn main() -> ExitCode {
             ScenarioConfig::for_seed(seed)
         }
     };
-    // The webhook scenario fails on seeds 0/2/3 deterministically under the
-    // accepted M23 clear-then-rebuild gap (STATUS); the release gate is the
-    // release-profile dst step. At debug speed each failing seed burns its
-    // full step budget, so the debug `cargo test` run skips the webhook
-    // scenario rather than grinding CI for hours.
-    if cfg!(debug_assertions)
-        && scenarios.contains(&"webhook")
-        && std::env::var("KRONIK_DST_WEBHOOK_DEBUG").is_err()
-    {
-        println!(
-            "skipping the webhook scenario at debug speed (seeds 0/2/3 hit the accepted \
-             M23 clear-then-rebuild gap); run it with --release, or set \
-             KRONIK_DST_WEBHOOK_DEBUG=1 to force the debug run"
-        );
-        scenarios.retain(|sc| *sc != "webhook");
-    }
     let runs: Vec<(u64, &str)> = seeds
         .clone()
         .flat_map(|s| scenarios.iter().map(move |sc| (s, *sc)))

@@ -45,8 +45,16 @@ impl NativeCurrentState {
     pub(super) fn bind_epoch(&mut self, epoch: u64) {
         self.config_epoch = epoch;
     }
+    /// Abandons an in-flight apply's bookkeeping after an availability-class
+    /// publish failure: the records are already applied, so leaving
+    /// `applying` set would wedge every later begin (and the whole
+    /// certification) on a state the next batch re-establishes anyway.
+    pub(super) fn abandon(&mut self) {
+        self.applying = None;
+    }
     pub(super) fn is_pending(&self) -> bool {
-        self.applying.is_some() || self.awaiting_config.is_some()
+        let pending = self.applying.is_some() || self.awaiting_config.is_some();
+        pending
     }
     /// True while a native-current apply batch is in flight on the applier:
     /// coverage published in this window would be retired by that apply.
@@ -125,7 +133,7 @@ impl SecretRuntime {
         reader: &kronik_log::LogReader,
     ) -> Result<(), ApiError> {
         let (source, pending) = {
-            let state = lock(&self.cache.state);
+            let state = track_lock(&self.cache.state, line!());
             if !self.owns_data_state(&state) {
                 return Err(unavailable());
             }
@@ -161,7 +169,7 @@ impl SecretRuntime {
             .filter(|committed| {
                 matches!(
                     &committed.record,
-                    Record::SecretVersion(_) | Record::SecretLink(_)
+                    Record::SecretVersion(_) | Record::SecretLink(_) | Record::Erasure(_)
                 )
             })
             .max_by_key(|committed| committed.lsn)
@@ -195,7 +203,7 @@ impl SecretRuntime {
         let denial = unavailable();
         let retired = {
             let _publication = lock(&self.cache.publication);
-            let mut state = lock(&self.cache.state);
+            let mut state = track_lock(&self.cache.state, line!());
             if !self.owns_data_state(&state) || state.native_current.applying.is_some() {
                 return Err(denial);
             }
@@ -219,10 +227,32 @@ impl SecretRuntime {
                 .revision
                 .store(u64::MAX, Ordering::Release);
             state.revision = revision;
+            let mut links = false;
             for committed in batch {
                 let name = match &committed.record {
-                    Record::SecretVersion(row) if active(row) => row.name.as_str(),
-                    Record::SecretLink(link) => link.name.as_str(),
+                    // The applied record dirties its name through its own
+                    // LSN: reads of OTHER names keep serving under the
+                    // still-valid certificate prefix (the staging swap).
+                    Record::SecretVersion(row) if active(row) => {
+                        state.dirty.insert(row.name.clone(), cut);
+                        state.dirty_max = state.dirty_max.max(cut);
+                        row.name.as_str()
+                    }
+                    Record::SecretLink(link) => {
+                        state.dirty.insert(link.name.clone(), cut);
+                        state.dirty_max = state.dirty_max.max(cut);
+                        links = true;
+                        link.name.as_str()
+                    }
+                    // An erasure invalidates key material for its subject:
+                    // the erased scope's rows drop out of the corpus at the
+                    // next delta republish. Fail-closed until then — the
+                    // conservative reading keeps every name stale through
+                    // the erasure's cut.
+                    Record::Erasure(_) => {
+                        state.dirty_max = state.dirty_max.max(cut);
+                        continue;
+                    }
                     _ => continue,
                 };
                 if let Some(current) = state.names.get(name).and_then(|name| name.current.as_ref())
@@ -230,9 +260,21 @@ impl SecretRuntime {
                     current.live.store(false, Ordering::Release);
                 }
             }
+            // A link batch changes the catalogue capture's inputs wholesale:
+            // that stays a global retire (the capture must rebuild); plain
+            // version batches keep the prefix serving.
+            let retired = if links {
+                SecretCache::retire_certificate(&mut state)
+            } else {
+                RetiredNativeCoverage::default()
+            };
             (
-                SecretCache::retire_certificate(&mut state),
-                state.native_catalogue_capture.take(),
+                retired,
+                if links {
+                    state.native_catalogue_capture.take()
+                } else {
+                    None
+                },
                 state.native_current.source.replace(source),
             )
         };
@@ -259,7 +301,7 @@ impl SecretRuntime {
         let denial = unavailable();
         {
             let _publication = lock(&self.cache.publication);
-            let mut state = lock(&self.cache.state);
+            let mut state = track_lock(&self.cache.state, line!());
             if !self.owns_data_state(&state) || state.native_current.applying != Some(ticket.cut) {
                 return Err(denial);
             }
@@ -272,6 +314,8 @@ impl SecretRuntime {
     }
     /// The actual config publisher already holds its original publication domain.
     pub(crate) fn publish_native_current_config_under_publication(&self, epoch: u64) {
-        lock(&self.cache.state).native_current.configured(epoch);
+        track_lock(&self.cache.state, line!())
+            .native_current
+            .configured(epoch);
     }
 }

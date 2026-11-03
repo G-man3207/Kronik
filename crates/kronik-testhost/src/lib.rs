@@ -32,6 +32,7 @@ use kronik_store::Store;
 use kronik_store::sql::{Limits, MemOpener, SqlPool};
 
 pub use clock::ManualClock;
+pub use fs::MemFs;
 pub use net::{Recorded, Stub, StubFailure, StubNet};
 pub use protocol::Body;
 
@@ -269,7 +270,7 @@ impl EntropySource for SeededEntropy {
 }
 
 /// A test host starts no processes.
-struct NoProcesses;
+pub struct NoProcesses;
 
 impl ProcessRunner for NoProcesses {
     fn spawn(&self, spec: ProcessSpec) -> BoxFuture<'static, std::io::Result<Arc<dyn Process>>> {

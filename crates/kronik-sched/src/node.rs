@@ -4210,6 +4210,16 @@ async fn applier(
             fatal.set(format!("applying lsn {}: {e}", batch[0].lsn));
             return;
         }
+        // The cache is the applied projection: applied secret rows register
+        // into it as they apply (the certification's registry is fed by the
+        // applier, not by later store queries racing the applier's lag).
+        if let Some(runtime) = &runtime {
+            for committed in &batch {
+                if let Record::SecretVersion(row) = &committed.record {
+                    runtime.register_applied(row.clone());
+                }
+            }
+        }
         if let (Some(runtime), Some(Some(current))) = (&runtime, current)
             && let Err(error) = runtime.finish_native_current_apply(current, &store)
         {
@@ -4222,8 +4232,9 @@ async fn applier(
                 tracing::warn!(
                     lsn = batch[0].lsn,
                     error = %error.message,
-                    "native-current publish unavailable; leaving coverage uncertified and retrying the rebuild"
+                    "native-current publish unavailable; abandoning the in-flight apply bookkeeping and retrying the rebuild"
                 );
+                runtime.abandon_in_flight_apply();
                 runtime.schedule_rebuild();
                 continue;
             }

@@ -2010,6 +2010,7 @@ dependencies = [
  "kronik-core",
  "kronik-privacy",
  "kronik-proto",
+ "kronik-testhost",
  "prost",
  "serde",
  "serde_json",
@@ -2350,6 +2351,7 @@ dependencies = [
  "kronik-store",
  "rusqlite",
  "serde_json",
+ "tempfile",
  "tokio",
  "zeroize",
 ]
