@@ -114,11 +114,26 @@ impl Daemon {
     }
 
     fn api_as(&self, method: &str, path: &str, body: Value, token: Option<&str>) -> Value {
-        let (s, v) = self
-            .try_api(method, path, body, token)
-            .unwrap_or_else(|| panic!("API {method} {path} failed: {}", self.serve_log()));
-        assert_eq!(s, 200, "{method} {path}: {v}");
-        v
+        // A request can land in the documented fail-closed secret-coverage
+        // window (ADR 0108): the daemon answers 503 SECRET_UNAVAILABLE while
+        // its certificate is retired, and the hint says to retry after
+        // complete coverage is restored. The window closes in milliseconds;
+        // await it here (bounded, as the CLI does) instead of racing it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (s, v) = self
+                .try_api(method, path, body.clone(), token)
+                .unwrap_or_else(|| panic!("API {method} {path} failed: {}", self.serve_log()));
+            if s == 200 {
+                return v;
+            }
+            let retriable = v["error"]["code"] == "SECRET_UNAVAILABLE";
+            assert!(
+                retriable && std::time::Instant::now() < deadline,
+                "{method} {path}: {v}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     fn api(&self, method: &str, path: &str, body: Value) -> Value {
