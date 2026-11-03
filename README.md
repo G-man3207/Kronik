@@ -26,20 +26,25 @@ change between releases.
 | --- | --- |
 | [`v0.1.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.1.0) | Durable turns, effects and capabilities, fork, replay and behavior diff with policy and approvals, proposals that span several actors, the TypeScript and Rust SDKs, the JSON API and MCP server, operations on a VPS, foreign actors in gVisor, privacy mode |
 | [`v0.3.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.3.0) | Python and Go SDKs, the CLI against a remote API, watch and preview forks, effect simulators, rollback via replay, foreign actors copied into forks |
+| [`v0.4.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.4.0) | Standard `fetch` through `wasi:http`, OpenTelemetry traces with a complete verifiable audit export, KMS-wrapped master key (OpenBao/AWS/GCP/Azure), Wasmtime 50.0.1, and crash-path hardening: atomic secret-catalogue publication, paced rate windows, restart-safe custody |
 
-`v0.3.0` is the latest **historical unsigned** release: static musl binaries
-for x86_64 and aarch64, with `install.sh`, checksums and a CycloneDX SBOM.
-The new checkout installer/Action require exact-tag GitHub OIDC attestations;
-no public Kronik signing event has yet been run for that cutover. Since the tag, `main`
-has added OpenTelemetry traces and a verifiable audit export, standard
-`fetch` through `wasi:http`, and KMS master-key custody; these are unreleased.
-M23 B1 custody (OpenBao/AWS/GCP/Azure) is complete but is not M23 closure;
-its emulator and static-musl acceptance is recorded in `STATUS.md`. The
-remaining M23 work (B2–B6: external secret-value backends, cache/outage
-handling, PKCS#11) has work in progress source on `main` but is not part of that B1 custody
-change and is not accepted.
+`v0.4.0` is the latest release and the first with GitHub OIDC/Sigstore
+attested archives: static musl binaries for x86_64 and aarch64 with
+`install.sh`, checksums, CycloneDX SBOMs and two-build byte-equality evidence
+(`reproducibility.json`); `install.sh` verifies each archive's attestation and
+refuses unsigned ones. It adds standard `fetch` through `wasi:http`,
+OpenTelemetry traces with a verifiable audit export, and KMS master-key
+custody (OpenBao/AWS/GCP/Azure). The crash-path hardening on top of that
+content replaces the secret catalogue's clear-and-rebuild with atomic
+certificate publication under crash injection, paces effect rate windows, and
+keeps secret custody available across restarts; it is described in the
+release notes. M23 B1 custody is complete but is not M23 closure; its emulator
+and static-musl acceptance is recorded in `STATUS.md`. The remaining M23 work
+(B2–B6: external secret-value backends, cache/outage handling, PKCS#11) has
+work in progress source on `main` but is not part of that B1 custody change and is not
+accepted. `v0.3.0` and `v0.1.0` are the historical unsigned releases.
 
-`main` is an unreleased `0.4.0-dev` work in progress. Major areas remain
+`main` is an unreleased `0.4.1-dev` work in progress. Major areas remain
 absent or partial: the cluster (M16–M19), microVMs (M20), the rootless daemon
 (M21), the WASI 0.3 remainder (M22), long-lived connections (M24), blobs
 (M25–M26), and the UI, OpenTelemetry, fleet and hardening tracks (M27–M34).
@@ -94,10 +99,18 @@ questions and the known gaps.
 ## Getting started
 
 The [installation guide](docs/guides/install.md) describes the signed-release
-contract and standalone curl-pipe installer. Historical `v0.3.0` and its unchanged
-installer remain unsigned; current consumers intentionally refuse its archives.
-Until an actually signed release is available, build current code only from a
-trusted checkout, with the prerequisites in [CONTRIBUTING.md](CONTRIBUTING.md):
+contract and standalone curl-pipe installer. `v0.4.0` is attested: the
+installer verifies each archive's Sigstore attestation, and historical `v0.3.0`
+and `v0.1.0` remain unsigned, so current consumers intentionally refuse their
+archives. To run the latest release:
+
+```sh
+curl -fsSL https://github.com/G-man3207/Kronik/releases/download/v0.4.0/install.sh | sh
+kronik doctor
+```
+
+To build current `main` instead, from a trusted checkout with the
+prerequisites in [CONTRIBUTING.md](CONTRIBUTING.md):
 
 ```sh
 cargo build --locked --release -p kronik
