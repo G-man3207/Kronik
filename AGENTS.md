@@ -22,7 +22,7 @@ proceeding.
 
 ## Public repository
 
-Kronik's repository is public (since 2026-11-03). Everything that is committed
+Kronik's repository is public. Everything that is committed
 stays in the project history and is visible to everyone, so the project never
 commits personal or environment-specific information: no names, email
 addresses, usernames, hostnames, private network addresses, home-directory or

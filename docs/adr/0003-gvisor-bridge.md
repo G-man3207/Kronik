@@ -180,11 +180,11 @@ quota the numbers are similar except for the tails.
   for the gofer. Each `--stream` helper uses about 15 MiB while it lives.
   Disabling the systrap fast path made no measurable difference.
 - **Egress:** TCP to 1.1.1.1:443, 8.8.8.8:53,
-  [2606:4700:4700::1111]:443 and to the host's own public, Docker and
-  private management-network addresses, UDP DNS to 8.8.8.8, 1.1.1.1 and
-  100.100.100.100, and busybox `nslookup` and `wget` all fail with `Network
-  unreachable`; name resolution fails; inside there is only `lo`; the sandbox
-  host processes sit in a namespace with only `lo`.
+  [2606:4700:4700::1111]:443 and to the host's own public, container and
+  private-network addresses, UDP DNS to 8.8.8.8 and 1.1.1.1, and busybox
+  `nslookup` and `wget` all fail with `Network unreachable`; name resolution
+  fails; inside there is only `lo`; the sandbox host processes sit in a
+  namespace with only `lo`.
 - **Limits:** two busy threads get 1.00 CPU with
   `cpu.max 100000 100000` and 1.97 CPU with the quota lifted. 300 MiB fits
   (`memory.peak` 323 MiB); touching 700 MiB gets `gvisor_sentry` killed by the
