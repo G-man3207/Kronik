@@ -89,8 +89,6 @@ impl Executor {
     /// Polls tasks until quiescence, `max_polls`, or `stop()` returns true
     /// (checked between polls).
     pub fn run(&self, max_polls: u64, mut stop: impl FnMut() -> bool) -> RunEnd {
-        let mut poll_counts: std::collections::BTreeMap<String, u64> = Default::default();
-        let mut next_dump: u64 = 1_000_000;
         loop {
             if stop() {
                 return RunEnd::Stopped;
@@ -115,23 +113,8 @@ impl Executor {
                     continue;
                 };
                 slot.queued = false;
-                let name = slot.name;
                 let Some(fut) = slot.fut.take() else { continue };
                 g.polls += 1;
-                let (polls, alive) = {
-                    *poll_counts.entry(name.to_string()).or_default() += 1;
-                    let alive: Vec<&'static str> = g.tasks.values().map(|slot| slot.name).collect();
-                    (g.polls, alive)
-                };
-                if polls >= next_dump {
-                    next_dump = polls + 1_000_000;
-                    let top: Vec<String> = poll_counts
-                        .iter()
-                        .filter(|(_, count)| **count > 10_000)
-                        .map(|(name, count)| format!("{name}={count}"))
-                        .collect();
-                    eprintln!("EXEC polls={polls} alive={alive:?} hot={top:?}");
-                }
                 (id, fut)
             };
             let waker = Waker::from(Arc::new(TaskWaker {
@@ -144,9 +127,6 @@ impl Executor {
                 .is_ready();
             let mut g = self.handle.lock();
             if done {
-                if let Some(slot) = g.tasks.get(&id) {
-                    eprintln!("TASK-EXIT {} polls={}", slot.name, g.polls);
-                }
                 g.tasks.remove(&id);
             } else if let Some(slot) = g.tasks.get_mut(&id) {
                 slot.fut = Some(fut);

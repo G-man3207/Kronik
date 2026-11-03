@@ -287,7 +287,7 @@ impl SecretRuntime {
         initial_epoch: u64,
     ) -> Result<(), PrivacyError> {
         {
-            let mut state = track_lock(&self.cache.state, line!());
+            let mut state = lock(&self.cache.state);
             if !self.owns_data_state(&state) {
                 return Err(PrivacyError::SecretStoreUnowned);
             }
@@ -296,7 +296,7 @@ impl SecretRuntime {
         self.verify_native_current_source(reader)
             .await
             .map_err(|_| PrivacyError::SecretStoreUnknown)?;
-        let mut state = track_lock(&self.cache.state, line!());
+        let mut state = lock(&self.cache.state);
         if !self.owns_data_state(&state)
             || state
                 .native_owner
@@ -370,7 +370,7 @@ impl SecretRuntime {
             .parse::<u64>()
             .map_err(|_| unavailable())?;
         let ticket = {
-            let state = track_lock(&self.cache.state, line!());
+            let state = lock(&self.cache.state);
             state
                 .names
                 .get(&row.canonical_ref)
@@ -403,7 +403,7 @@ impl SecretRuntime {
             return Err(unavailable());
         }
         {
-            let state = track_lock(&self.cache.state, line!());
+            let state = lock(&self.cache.state);
             if !self.owns_data_state(&state)
                 || !state
                     .names
@@ -454,7 +454,7 @@ impl SecretRuntime {
         if !matches {
             return Err(unavailable());
         }
-        let mut state = track_lock(&self.cache.state, line!());
+        let mut state = lock(&self.cache.state);
         if !self.owns_data_state(&state) {
             return Err(unavailable());
         }

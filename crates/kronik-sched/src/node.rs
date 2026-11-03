@@ -3258,12 +3258,23 @@ impl Node {
             .map(|values| crate::effects::secret_patterns(values));
         audit.reason = crate::scrub::for_log(&audit.reason, patterns.as_deref());
         let target = crate::scrub::for_target(target, patterns.as_deref());
+        // Detail keys whose value is operator free text: they carry the same
+        // withholding contract as the reason. Every other detail field is
+        // operator metadata (codes, names, identifiers, positions) and is
+        // scrubbed against the inventory when it is available, left plain
+        // when it is not — withholding a failure code would erase the very
+        // fact the audit record exists to keep.
+        const FREE_TEXT_DETAIL_KEYS: &[&str] = &["note"];
         for (field, value) in &mut details {
             if positions
                 .and_then(|positions| positions.value(field))
                 .is_none()
             {
-                *value = crate::scrub::for_log(value, patterns.as_deref());
+                *value = if FREE_TEXT_DETAIL_KEYS.contains(&field.as_str()) {
+                    crate::scrub::for_log(value, patterns.as_deref())
+                } else {
+                    crate::scrub::for_target(value, patterns.as_deref())
+                };
             }
         }
         let event = pb::AuditEvent {

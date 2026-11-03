@@ -53,8 +53,7 @@ impl NativeCurrentState {
         self.applying = None;
     }
     pub(super) fn is_pending(&self) -> bool {
-        let pending = self.applying.is_some() || self.awaiting_config.is_some();
-        pending
+        self.applying.is_some() || self.awaiting_config.is_some()
     }
     /// True while a native-current apply batch is in flight on the applier:
     /// coverage published in this window would be retired by that apply.
@@ -133,7 +132,7 @@ impl SecretRuntime {
         reader: &kronik_log::LogReader,
     ) -> Result<(), ApiError> {
         let (source, pending) = {
-            let state = track_lock(&self.cache.state, line!());
+            let state = lock(&self.cache.state);
             if !self.owns_data_state(&state) {
                 return Err(unavailable());
             }
@@ -203,7 +202,7 @@ impl SecretRuntime {
         let denial = unavailable();
         let retired = {
             let _publication = lock(&self.cache.publication);
-            let mut state = track_lock(&self.cache.state, line!());
+            let mut state = lock(&self.cache.state);
             if !self.owns_data_state(&state) || state.native_current.applying.is_some() {
                 return Err(denial);
             }
@@ -233,7 +232,9 @@ impl SecretRuntime {
                     // The applied record dirties its name through its own
                     // LSN: reads of OTHER names keep serving under the
                     // still-valid certificate prefix (the staging swap).
-                    Record::SecretVersion(row) if active(row) => {
+                    Record::SecretVersion(row)
+                        if active(row) && !row.name.is_empty() && row.version != 0 =>
+                    {
                         state.dirty.insert(row.name.clone(), cut);
                         state.dirty_max = state.dirty_max.max(cut);
                         row.name.as_str()
@@ -301,7 +302,7 @@ impl SecretRuntime {
         let denial = unavailable();
         {
             let _publication = lock(&self.cache.publication);
-            let mut state = track_lock(&self.cache.state, line!());
+            let mut state = lock(&self.cache.state);
             if !self.owns_data_state(&state) || state.native_current.applying != Some(ticket.cut) {
                 return Err(denial);
             }
@@ -314,8 +315,6 @@ impl SecretRuntime {
     }
     /// The actual config publisher already holds its original publication domain.
     pub(crate) fn publish_native_current_config_under_publication(&self, epoch: u64) {
-        track_lock(&self.cache.state, line!())
-            .native_current
-            .configured(epoch);
+        lock(&self.cache.state).native_current.configured(epoch);
     }
 }

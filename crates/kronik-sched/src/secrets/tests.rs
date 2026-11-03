@@ -1220,6 +1220,15 @@ async fn metadata_list_has_no_provider_or_ledger_effect_and_preserves_unobserved
         )
         .await
         .unwrap();
+    // Observe the linked value while the provider is reachable: the first
+    // cold resolve publishes the durable ledger row (the link itself has no
+    // provider or ledger effect) and the refresh certifies it. The outage
+    // below must not change what was certified here.
+    node.resolve_secret("token", None, &node.config_now(), test_auth())
+        .await
+        .unwrap()
+        .unwrap();
+    refresh_until_complete(&node).await;
     bao.status.store(503, Ordering::SeqCst);
     let before = node.applied_lsn();
     let history = node.secret_history("token").await.unwrap();
@@ -1436,7 +1445,11 @@ async fn provider_listing_denial_is_incomplete_and_old_required_versions_cannot_
     bao.catalogue_status.store(200, Ordering::SeqCst);
     bao.current.store(2, Ordering::SeqCst);
     refresh_until_complete(&node).await;
-    let values = node.secret_values().unwrap();
+    // The background cycle keeps observing while the provider heals, and an
+    // observation's applied row is deliberately not covered until the next
+    // publish (the documented fail-closed window). A whole-catalogue read
+    // therefore waits out the window, bounded, like the API fixtures do.
+    let values = values_until_complete(&node).await;
     assert!(
         values
             .iter()
@@ -1697,7 +1710,7 @@ async fn failed_orphan_file_rows_are_scrub_only_and_never_operational_current() 
 
 #[tokio::test]
 async fn cancelled_fetch_retains_singleflight_until_old_generation_publication_finishes() {
-    let (_data, node, bao) = bao_node_with_refresh(Duration::from_millis(50)).await;
+    let (_data, node, bao) = bao_node_with_refresh(Duration::from_millis(500)).await;
     node.secret_link(
         "token",
         "bao",
@@ -1716,7 +1729,7 @@ async fn cancelled_fetch_retains_singleflight_until_old_generation_publication_f
     // provider. With the node's short refresh TTL the cached value ages
     // out and the resolve below goes cold: its provider fetch, its
     // singleflight and the aborted-request retention are then real.
-    node.env.clock.sleep(Duration::from_millis(60)).await;
+    node.env.clock.sleep(Duration::from_millis(600)).await;
     let blocked = Arc::new(Semaphore::new(0));
     *lock(&bao.block) = Some(blocked.clone());
     let old_config = node.config_now();
@@ -2038,6 +2051,20 @@ async fn settle_failing_catalogue_attempt(node: &Arc<Node>) {
 /// The background refresh can retire coverage between an explicit refresh's
 /// capture and its final check. Retry the explicit call until it certifies a
 /// complete inventory; the caller still proves the resulting contents.
+async fn values_until_complete(node: &Arc<Node>) -> Vec<(String, Arc<Zeroizing<Vec<u8>>>)> {
+    node.env
+        .timeout(Duration::from_secs(5), async {
+            loop {
+                match node.secret_values() {
+                    Ok(values) => return values,
+                    Err(_) => node.env.clock.sleep(Duration::from_millis(1)).await,
+                }
+            }
+        })
+        .await
+        .unwrap()
+}
+
 async fn refresh_until_complete(node: &Arc<Node>) {
     node.env
         .timeout(Duration::from_secs(5), async {

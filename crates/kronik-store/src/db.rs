@@ -2483,19 +2483,6 @@ fn check_secret_link(conn: &Connection, m: &pb::SecretVersion) -> Result<(), Sto
         })
     };
     if !matches {
-        eprintln!(
-            "LINK-BARRIER-REJECT name={} version={} gen={} backend={} binding={} ref={} canonical={} link_in_history={:?} link_backend={:?} link_gen={:?}",
-            m.name,
-            m.version,
-            m.link_generation,
-            m.backend,
-            m.binding,
-            m.r#ref,
-            m.canonical_ref,
-            link.as_ref().map(|l| l.generation),
-            link.as_ref().map(|l| &l.backend),
-            link.as_ref().map(|l| l.generation)
-        );
         return Err(corrupt(
             "secret version does not match its historical link barrier",
         ));

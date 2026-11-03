@@ -17,30 +17,6 @@ use std::time::Duration;
 use kronik_core::authority::AuthLease;
 use kronik_core::env::Env;
 
-// TEMPORARY DEBUG SCAFFOLD — remove before landing.
-pub(crate) static STATE_HOLDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) struct TrackedGuard<'a, T>(std::sync::MutexGuard<'a, T>);
-impl<'a, T> std::ops::Deref for TrackedGuard<'a, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.0
-    }
-}
-impl<'a, T> std::ops::DerefMut for TrackedGuard<'a, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.0
-    }
-}
-impl<'a, T> Drop for TrackedGuard<'a, T> {
-    fn drop(&mut self) {
-        STATE_HOLDER.store(0, std::sync::atomic::Ordering::Release);
-    }
-}
-pub(crate) fn track_lock<'a, T>(m: &'a std::sync::Mutex<T>, site: u32) -> TrackedGuard<'a, T> {
-    let guard = m.lock().unwrap_or_else(|poison| poison.into_inner());
-    STATE_HOLDER.store(u64::from(site), std::sync::atomic::Ordering::Release);
-    TrackedGuard(guard)
-}
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_effects::Config;
 use kronik_privacy::secret_backend::config::{Backends, Settings};
@@ -487,12 +463,6 @@ impl SecretCache {
             })
     }
     fn register(&self, row: pb::SecretVersion) {
-        if row.name == "token" {
-            eprintln!(
-                "REGISTER token v={} phase={} deleted={}",
-                row.version, row.phase, row.deleted
-            );
-        }
         let key = (row.name.clone(), row.version);
         let mut retired = RetiredNativeCoverage::default();
         let mut state = lock(&self.state);
@@ -506,29 +476,6 @@ impl SecretCache {
             state.revision = state.revision.wrapping_add(1);
             retired = Self::retire_certificate(&mut state);
             self.revision_changed.notify_one();
-        }
-        // A linked row is selected for its link scope through the CURRENT
-        // map: the resolve path's unversioned lookup for a non-file scope
-        // reads it, mirroring the durable link scope. The newest active,
-        // undeleted version holds the pointer; a deleted or inactive row
-        // releases a pointer that names it.
-        if row.backend != "file" {
-            let scope = Scope::row(&row);
-            if active(&row) && !row.deleted {
-                let superseded = state
-                    .current
-                    .get(&scope)
-                    .is_some_and(|(name, version)| *name == row.name && *version >= row.version);
-                if !superseded {
-                    state.current.insert(scope, (row.name.clone(), row.version));
-                }
-            } else if state
-                .current
-                .get(&scope)
-                .is_some_and(|(name, version)| *name == row.name && *version == row.version)
-            {
-                state.current.remove(&scope);
-            }
         }
         drop(state);
         drop(retired);
@@ -568,7 +515,7 @@ impl SecretCache {
     }
     fn row(&self, scope: &Scope, version: Option<u64>) -> Option<pb::SecretVersion> {
         let state = lock(&self.state);
-        let result = match version {
+        match version {
             Some(version) => state
                 .registry
                 .get(&(scope.name.clone(), version))
@@ -586,29 +533,7 @@ impl SecretCache {
                 .map(|(_, row)| row)
                 .find(|row| active(row) && Scope::row(row) == *scope)
                 .cloned(),
-        };
-        if result.is_none() && std::env::var("KRONIK_ROW_DIAG").is_ok() {
-            for (key, row) in state
-                .registry
-                .range((scope.name.clone(), 0)..=(scope.name.clone(), MAX_SECRET_VERSION))
-            {
-                eprintln!(
-                    "ROW-DIAG key={key:?} active={} backend={} binding={} ref={} canonical={} gen={} deleted={}",
-                    active(row),
-                    row.backend,
-                    row.binding,
-                    row.r#ref,
-                    row.canonical_ref,
-                    row.link_generation,
-                    row.deleted
-                );
-            }
-            eprintln!(
-                "ROW-DIAG scope backend={} binding={} ref={} canonical={} gen={} version={version:?}",
-                scope.backend, scope.binding, scope.reference, scope.canonical, scope.generation
-            );
         }
-        result
     }
     fn held(&self, row: &pb::SecretVersion, allow_stale: bool) -> Option<Arc<Zeroizing<Vec<u8>>>> {
         let state = lock(&self.state);
@@ -682,6 +607,29 @@ impl SecretCache {
                 operational,
             },
         );
+        // A linked row is selected for its link scope through the CURRENT
+        // map: the unversioned resolve of a non-file scope reads it. Only an
+        // OPERATIONAL value chooses the pointer (a catalogue observation is
+        // not the current value), and the newest version wins; a deleted row
+        // releases a pointer that names it.
+        if row.backend != "file" {
+            let scope = Scope::row(row);
+            if operational && !row.deleted && active(row) {
+                let superseded = state
+                    .current
+                    .get(&scope)
+                    .is_some_and(|(name, version)| *name == row.name && *version >= row.version);
+                if !superseded {
+                    state.current.insert(scope, (row.name.clone(), row.version));
+                }
+            } else if state
+                .current
+                .get(&scope)
+                .is_some_and(|(name, version)| *name == row.name && *version == row.version)
+            {
+                state.current.remove(&scope);
+            }
+        }
         drop(state);
         drop(retired);
         Ok(())
@@ -797,11 +745,6 @@ impl SecretCache {
         if version.is_none() && Self::file_current_pending(&lock(&self.state), &row) {
             return Err(unavailable());
         }
-        let negative = if version.is_some() {
-            self.negative_version(&scope, Some(&row.source_version))
-        } else {
-            self.negative(&scope)
-        };
         let stale = match if version.is_some() {
             self.negative_version(&scope, Some(&row.source_version))
         } else {
@@ -852,17 +795,7 @@ impl SecretCache {
             })
     }
 
-    /// A single name is certified when its last-touching record is inside
-    /// the certificate's covered prefix; untouched names keep serving while
-    /// a rebuild builds the next certificate.
-    fn certified_name(&self, epoch: u64, name: &str) -> bool {
-        let state = lock(&self.state);
-        !state.native_current.is_pending()
-            && state.coverage.as_ref().is_some_and(|coverage| {
-                epoch == coverage.epoch
-                    && coverage.base_lsn >= state.dirty.get(name).copied().unwrap_or(0)
-            })
-    }
+
     /// Certified scrub inventory shares the existing controlled buffers; it grants no operational access.
     // The certified snapshot's value list: name plus zeroizing bytes.
     #[allow(clippy::type_complexity)]
@@ -881,7 +814,7 @@ impl SecretCache {
         let NativeCoverage {
             revision,
             epoch: at_epoch,
-            captured_at: at,
+            captured_at: _,
             fingerprint,
             references,
             base_lsn,
@@ -965,15 +898,20 @@ impl SecretRuntime {
     /// applier applies them: the registry is the applied projection, fed by
     /// the applier rather than by later store queries racing its lag.
     pub(crate) fn register_applied(&self, row: pb::SecretVersion) {
+        // The durable format fence is a `SecretVersion` record with no name
+        // and version zero; it initializes the store's format floor, it is
+        // not a secret, and it must not enter the certificate's registry or
+        // dirty tracking.
+        if row.name.is_empty() || row.version == 0 {
+            return;
+        }
         self.cache.register(row);
     }
 
     /// Abandons an in-flight native-current apply's bookkeeping after an
     /// availability-class publish failure (see NativeCurrentState::abandon).
     pub(crate) fn abandon_in_flight_apply(&self) {
-        track_lock(&self.cache.state, line!())
-            .native_current
-            .abandon();
+        lock(&self.cache.state).native_current.abandon();
     }
 
     /// Wakes the background rebuild after an availability-class degrade:
@@ -1021,7 +959,7 @@ impl SecretRuntime {
         Ok(runtime)
     }
     fn name_lock(&self, name: &str) -> Arc<AsyncMutex<()>> {
-        let mut state = track_lock(&self.cache.state, line!());
+        let mut state = lock(&self.cache.state);
         if let Some(slot) = state.names.get(name) {
             return slot.lock.clone();
         }
@@ -1098,7 +1036,7 @@ impl SecretRuntime {
             canonical_ref,
         } = result?;
         if !self.cache.read_matches(
-            &track_lock(&self.cache.state, line!()),
+            &lock(&self.cache.state),
             &scope.backend,
             &scope.canonical,
             &stamp,
@@ -1230,7 +1168,7 @@ impl Node {
             return;
         };
         let retired = {
-            let mut state = track_lock(&runtime.cache.state, line!());
+            let mut state = lock(&runtime.cache.state);
             state.revision = state.revision.wrapping_add(1);
             let retired = SecretCache::retire_certificate(&mut state);
             publish_epoch();
@@ -1268,7 +1206,7 @@ impl Node {
     fn probe_store_identity(&self) -> Result<(), ApiError> {
         let runtime = self.runtime()?;
         let rows = {
-            let state = track_lock(&runtime.cache.state, line!());
+            let state = lock(&runtime.cache.state);
             state
                 .registry
                 .values()
@@ -1305,7 +1243,7 @@ impl Node {
         let cache = self.runtime()?.cache.clone();
         let epoch = self.epoch();
         let (snapshot, live, at) = {
-            let state = track_lock(&cache.state, line!());
+            let state = lock(&cache.state);
             let snapshot = cache.native_snapshot_locked(&state, epoch)?;
             let live = state
                 .native_certificate_live
@@ -1802,10 +1740,7 @@ impl Node {
                 .filter(|row| active(row) && row.backend == "file" && !row.version_hash.is_empty())
             {
                 key.1 = row.version;
-                if !track_lock(&runtime.cache.state, line!())
-                    .values
-                    .contains_key(&key)
-                {
+                if !lock(&runtime.cache.state).values.contains_key(&key) {
                     let physical = kronik_privacy::secret_backend::file::source_highwater(
                         &name,
                         std::slice::from_ref(row),
@@ -2234,7 +2169,7 @@ impl Node {
         );
         runtime.cache.insert(row, bytes, operational, Some(stamp))?;
         if operational {
-            track_lock(&runtime.cache.state, line!())
+            lock(&runtime.cache.state)
                 .current
                 .insert(scope.clone(), (row.name.clone(), row.version));
         }
@@ -2248,7 +2183,6 @@ impl Node {
         operational: bool,
         original: AuthLease,
     ) -> Result<pb::SecretVersion, ApiError> {
-        eprintln!("OBSERVE name={} backend={} operational={operational}", scope.name, scope.backend);
         let runtime = self.runtime()?;
         if let Some(row) = self.known_secret_observation(scope, &fetched).await? {
             let mut bytes = Some(Arc::new(fetched.value));
@@ -2444,14 +2378,15 @@ impl Node {
         let source_version = match &row {
             Some(row) if version.is_some() => Some(row.source_version.clone()),
             _ => {
-                let source = match self.file_current_source(&scope).await {
+                match self.file_current_source(&scope).await {
                     Ok(source) => source,
                     Err(error) if error.code == ErrorCode::SecretNotFound && version.is_none() => {
                         return Ok(None);
                     }
-                    Err(error) => return Err(error),
-                };
-                source
+                    Err(error) => {
+                        return Err(error);
+                    }
+                }
             }
         };
         if remaining().is_zero() {
@@ -2729,13 +2664,13 @@ impl Node {
             Some(runtime.inventory.lock().await)
         };
         let file_changes = runtime.cache.capture_file_changes()?;
-        let native_revision = track_lock(&runtime.cache.state, line!())
+        let native_revision = lock(&runtime.cache.state)
             .native_current
             .capture_revision()
             .ok_or_else(unavailable)?;
         let prior = if cached_only {
             Some(
-                track_lock(&runtime.cache.state, line!())
+                lock(&runtime.cache.state)
                     .native_catalogue_capture
                     .clone()
                     .ok_or_else(unavailable)?,
@@ -2861,10 +2796,6 @@ impl Node {
         {
             return Err(unavailable());
         }
-        eprintln!(
-            "CATALOGUE-LOOP catalogues={catalogues:?} reveal={reveal_names:?} records={}",
-            records.len()
-        );
         for scope in &catalogues {
             if cached_only {
                 continue;
@@ -2959,16 +2890,13 @@ impl Node {
             required.insert((row.name.clone(), row.version), row.clone());
             runtime.cache.register(row);
         }
-        let revision = track_lock(&runtime.cache.state, line!()).revision;
+        let revision = lock(&runtime.cache.state).revision;
         for row in required.values().filter(|row| active(row)) {
             if row.deleted && row.version_hash.is_empty() {
                 continue;
             }
             let key = (row.name.clone(), row.version);
-            if track_lock(&runtime.cache.state, line!())
-                .values
-                .contains_key(&key)
-            {
+            if lock(&runtime.cache.state).values.contains_key(&key) {
                 continue;
             }
             if cached_only {
@@ -3030,7 +2958,7 @@ impl Node {
         }
         for stored in &file_rows {
             let cached = {
-                let state = track_lock(&runtime.cache.state, line!());
+                let state = lock(&runtime.cache.state);
                 state
                     .scrub_file
                     .get(&(stored.meta.name.clone(), stored.meta.version))
@@ -3101,8 +3029,8 @@ impl Node {
         // DELTA BUILD: a warm certificate scans only (base, head] and adds
         // the delta's references to the certificate's own set — the corpus
         // the old certificate covered keeps serving during the build.
-        let (mut references, delta_base) = {
-            let state = track_lock(&runtime.cache.state, line!());
+        let (references, delta_base) = {
+            let state = lock(&runtime.cache.state);
             match &state.coverage {
                 Some(coverage) if coverage.base_lsn > 0 => {
                     (coverage.references.clone(), Some(coverage.base_lsn))
@@ -3257,7 +3185,7 @@ impl Node {
         self.wait_for_applier_drain(runtime.settings.fetch_timeout)
             .await?;
 
-        let mut state = track_lock(&runtime.cache.state, line!());
+        let mut state = lock(&runtime.cache.state);
         if !state.bound_runtime.ptr_eq(&Arc::downgrade(runtime))
             || state.revision != revision
             || self.epoch() != epoch
@@ -3382,11 +3310,10 @@ impl Node {
     async fn wait_for_applier_drain(&self, budget: std::time::Duration) -> Result<(), ApiError> {
         let deadline = self.env.clock.monotonic().saturating_add(budget);
         while self.applied_lsn() < self.committed_head()
-            || self.secret_runtime.as_ref().is_some_and(|runtime| {
-                track_lock(&runtime.cache.state, line!())
-                    .native_current
-                    .apply_in_flight()
-            })
+            || self
+                .secret_runtime
+                .as_ref()
+                .is_some_and(|runtime| lock(&runtime.cache.state).native_current.apply_in_flight())
         {
             if self.env.clock.monotonic() >= deadline {
                 return Err(unavailable());
@@ -3407,7 +3334,7 @@ impl Node {
     async fn wait_secret_inventory(&self, original: AuthLease) -> Result<(), ApiError> {
         let runtime = self.runtime()?;
         let mut completed = runtime.certified.subscribe();
-        let wanted = track_lock(&runtime.cache.state, line!()).revision;
+        let wanted = lock(&runtime.cache.state).revision;
         if runtime.cache.complete(self.epoch()) {
             return Ok(());
         }
@@ -3456,21 +3383,18 @@ impl Node {
             // whole refresh tick; after the budget is spent the loop falls
             // back to the periodic tick.
             let mut rebuild_failures = 0u32;
-            eprintln!("CYCLE spawned");
             loop {
                 let Some(node) = weak.upgrade() else {
-                    eprintln!("CYCLE exit: upgrade");
                     return;
                 };
-                if let Err(e) = original.check() {
-                    eprintln!("CYCLE exit: lease {}", e.code);
+                if original.check().is_err() {
                     return;
                 }
                 let Some(runtime) = &node.secret_runtime else {
                     return;
                 };
                 if !registry_wake || !runtime.cache.complete(node.epoch()) {
-                    let attempt = track_lock(&runtime.cache.state, line!()).revision;
+                    let attempt = lock(&runtime.cache.state).revision;
                     let config = node.config_now();
                     let mut names: BTreeSet<_> = match node.secret_rows(None).await {
                         Ok(rows) => rows.into_iter().map(|row| row.name).collect(),
@@ -3511,7 +3435,7 @@ impl Node {
                     }
                     let refreshed = node.refresh_secret_inventory(original.clone()).await;
                     let completed = if refreshed.is_ok() {
-                        track_lock(&runtime.cache.state, line!()).revision
+                        lock(&runtime.cache.state).revision
                     } else {
                         attempt
                     };

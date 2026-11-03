@@ -379,13 +379,19 @@ impl World {
     /// ownership alive for the node's lifetime.
     fn open_secrets(
         self: &Arc<Self>,
-        node_id: NodeId,
+        _node_id: NodeId,
         mut parts: NodeParts,
     ) -> Result<(NodeParts, Option<Arc<kronik_privacy::SecretStore>>), String> {
         let Some(root) = self.secrets_root.as_ref() else {
             return Ok((parts, None));
         };
-        let dir = root.path().join(format!("secrets-{node_id}"));
+        // The secret store is the run's durable custody: it survives node
+        // restarts exactly like production's data directory (the crash model
+        // covers the simulated log/state disk, not this separate store; a
+        // lost store would break the scenario's once-only setup contract,
+        // which is not what this scenario varies). Each process start
+        // re-acquires custody of the same directory, as `serve` does.
+        let dir = root.path().join("secrets");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let ownership = kronik_privacy::key_source::lock_data(&dir).map_err(|e| e.to_string())?;
         let master = kronik_privacy::MasterKey::from_bytes([7; 32]).map_err(|e| e.to_string())?;

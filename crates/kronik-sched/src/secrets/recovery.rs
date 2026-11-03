@@ -178,7 +178,9 @@ impl Node {
                         }
                         break;
                     }
-                    Ok(None) => return Err(gone()),
+                    Ok(None) => {
+                        return Err(gone());
+                    }
                     Err(error) if error.code == ErrorCode::SecretUnavailable => {
                         wait_for_availability(&self.env, &mut stalled, &mut delay).await;
                     }
