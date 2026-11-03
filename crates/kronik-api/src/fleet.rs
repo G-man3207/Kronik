@@ -1584,6 +1584,25 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
+        // The detached secret-refresh cycle takes its first jitter from the
+        // env's entropy source once its certificate lands. Wait for a stable
+        // entropy count so tests that assert "no entropy consumed" observe a
+        // baseline that the background cycle cannot advance underneath them.
+        let mut stable = 0u32;
+        let mut last = count.load(Ordering::SeqCst);
+        for _ in 0..400 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let now = count.load(Ordering::SeqCst);
+            if now == last {
+                stable += 1;
+                if stable >= 20 {
+                    break;
+                }
+            } else {
+                stable = 0;
+                last = now;
+            }
+        }
         (dir, fleet, network, count)
     }
 
