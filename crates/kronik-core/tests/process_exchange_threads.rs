@@ -48,18 +48,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         // A helper thread may still be exiting when the runtime drops; the
         // invariant is that no thread outlives the exchange. Give the exit a
-        // short, bounded grace instead of racing the scheduler.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
+        // short, bounded grace instead of racing the scheduler (a fixed
+        // attempt count, so the test module reads no clock of its own).
+        let mut settled = false;
+        for _ in 0..200 {
             if std::fs::read_dir("/proc/self/task")?.count() == 1 {
+                settled = true;
                 break;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the process exchange leaked a thread"
-            );
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(settled, "the process exchange leaked a thread");
     }
     Ok(())
 }
