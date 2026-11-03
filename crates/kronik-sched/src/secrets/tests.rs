@@ -1393,7 +1393,7 @@ async fn relinking_does_not_redirect_admitted_old_generations_with_the_same_prov
 }
 
 #[tokio::test]
-// Reduction (STATUS, "v0.4 release repair session"): M23's clear-then-rebuild
+// M23's clear-then-rebuild
 // uncovered window — a background cycle that starts while the catalogue
 // catalogue is retired clears coverage again and its failure (here: the
 // injected provider 403) leaves it retired until the next periodic tick —
@@ -2142,12 +2142,12 @@ async fn actual_aws_unending_catalogue_stops_at_the_page_budget_without_claiming
 }
 
 #[tokio::test]
-// Reduction (STATUS, "Repair session 2026-11-01"): the underlying feature is
-// not on main. Linking a secret to the built-in "file" backend answers
+// The underlying feature is not implemented. Linking a secret to the
+// built-in "file" backend answers
 // SECRET_BACKEND_UNKNOWN; only file->external links are representable, so a
 // successful file->file link, its mutation refusals and its unlink cannot be
-// exercised yet. Restore this test when the M23 track lands file->file links.
-#[ignore = "unlanded feature: FILE-to-FILE secret links answer SECRET_BACKEND_UNKNOWN; only file->external links are representable on main"]
+// exercised yet. Restore this test when file->file links are implemented.
+#[ignore = "not implemented: FILE-to-FILE secret links answer SECRET_BACKEND_UNKNOWN; only file->external links are representable"]
 async fn file_links_refuse_mutation_without_touching_either_physical_name() {
     let (_data, node) = node().await;
     let original = node.local_operator_authority().unwrap();

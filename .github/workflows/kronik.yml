@@ -1,5 +1,5 @@
 # A synthetic same-repository M10 proof using the existing official Action.
-# No fixture manifest exists until the director's actual PR; bootstrap does not run this flow.
+# No fixture manifest exists until the actual PR; bootstrap does not run this flow.
 name: Kronik
 
 on:
@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: G-man3207/Kronik/action@eb7de5f74d9ba73ff56a014de14364c52cea1145
+      - uses: G-man3207/Kronik/action@090c49ec8f8e663c44bbace1bedc7f0f67b5aa3b
         with:
           command: install
           base-url: ${{ env.KRONIK_BUNDLE }}
@@ -40,7 +40,7 @@ jobs:
         id: fixture
         run: python3 scripts/e2e-github-flow.py start
       - name: Propose the pull request's selected component
-        uses: G-man3207/Kronik/action@eb7de5f74d9ba73ff56a014de14364c52cea1145
+        uses: G-man3207/Kronik/action@090c49ec8f8e663c44bbace1bedc7f0f67b5aa3b
         with:
           command: propose
           components: ${{ steps.fixture.outputs.component }}
@@ -51,7 +51,7 @@ jobs:
         run: python3 scripts/e2e-github-flow.py cleanup
 
   verify:
-    # A distinct real App bot must initiate the main push; no author self-review or dispatch substitute.
+    # A distinct real App bot must initiate the main push; no self-approval or dispatch substitute.
     if: github.event_name == 'push' && endsWith(github.actor, '[bot]')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -65,7 +65,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: G-man3207/Kronik/action@eb7de5f74d9ba73ff56a014de14364c52cea1145
+      - uses: G-man3207/Kronik/action@090c49ec8f8e663c44bbace1bedc7f0f67b5aa3b
         with:
           command: install
           base-url: ${{ env.KRONIK_BUNDLE }}
@@ -74,7 +74,7 @@ jobs:
         run: python3 scripts/e2e-github-flow.py start
       - name: Propose main's component
         id: propose
-        uses: G-man3207/Kronik/action@eb7de5f74d9ba73ff56a014de14364c52cea1145
+        uses: G-man3207/Kronik/action@090c49ec8f8e663c44bbace1bedc7f0f67b5aa3b
         with:
           command: propose
           components: ${{ steps.fixture.outputs.component }}
@@ -114,7 +114,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 2
-      - uses: G-man3207/Kronik/action@eb7de5f74d9ba73ff56a014de14364c52cea1145
+      - uses: G-man3207/Kronik/action@090c49ec8f8e663c44bbace1bedc7f0f67b5aa3b
         with:
           command: install
           base-url: ${{ env.KRONIK_BUNDLE }}
@@ -140,7 +140,7 @@ jobs:
           previous=$(git rev-parse HEAD^)
           python3 scripts/e2e-github-flow.py reject-stale --proposal "$PROPOSAL" --previous-sha "$previous"
       - name: Promote the exact proposal after the actual human environment approval
-        uses: G-man3207/Kronik/action@eb7de5f74d9ba73ff56a014de14364c52cea1145
+        uses: G-man3207/Kronik/action@090c49ec8f8e663c44bbace1bedc7f0f67b5aa3b
         with:
           command: promote
           proposal: ${{ needs.verify.outputs.proposal-id }}

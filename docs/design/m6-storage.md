@@ -4,8 +4,8 @@ Status: design for M6's storage half (the brief's "Snapshots, shipping to
 S3-compatible storage, `restore`, retention and compaction", the startup
 target, `demo/vps-restore.sh` and `kronik upgrade check`). The operations
 half (config file, `serve --init`, systemd, TLS/ACME, doctor, metrics,
-logs, install) is fast-policy's. Builds on ADR 0005 (per-actor SQL files),
-m1-core (log, store, startup) and m3-fork (replay).
+logs, install) is covered by the operations guide. Builds on ADR 0005
+(per-actor SQL files), m1-core (log, store, startup) and m3-fork (replay).
 
 ## 1. Crates
 
@@ -17,7 +17,7 @@ m1-core (log, store, startup) and m3-fork (replay).
 | `kronik-ship` (new) | `object_store` (S3) + zstd: the shipper and `restore` |
 | `kronik-fork` | production cursors from the nearest snapshot; the retention bound; `upgrade check` |
 | `kronik-api` | `/v1/snapshots`, `/v1/integrity` |
-| `kronik` | `snapshot create/list`, `restore`, `upgrade check` (CLI by fast-docs) |
+| `kronik` | `snapshot create/list`, `restore`, `upgrade check` |
 
 ## 2. Snapshots
 

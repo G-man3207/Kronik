@@ -1,12 +1,9 @@
 # M8 privacy mode: design
 
-Status: groundwork. The seams in §12 are agreed with good-core (log, store,
-sched, fork), which also reviewed §6 and §8. This document covers the build brief
-"Privacy mode (the GDPR switch)", I8/I9, the M8 acceptance list, and ADR 0005
-§6. The table in §14 says who builds what: **now** is fast-policy's
-groundwork; **later** is the deep integration, by good-foreign (sealing,
-redaction, erasure, forks, measurement) and good-core (reseal compaction and
-shipping, on its M6 storage); **CLI** is fast-docs.
+Status: design. The seams in §12 are agreed with the log, store, sched and
+fork crates, which also reviewed §6 and §8. This document covers the build
+brief's "Privacy mode (the GDPR switch)", I8/I9, the M8 acceptance list, and
+ADR 0005 §6.
 
 ## 1. What the format already has
 
@@ -24,7 +21,7 @@ A subject is 1 to 256 bytes of printable ASCII without spaces, such as
 `user:123` (`kronik_privacy::keystore::valid_subject`). A value has at most
 one subject.
 
-## 2. Keystore (now: done in 895ff28)
+## 2. Keystore
 
 `<data_dir>/keys/keystore.db`, `kronik_privacy::keystore::Keystore`:
 
@@ -91,8 +88,9 @@ one subject.
   Only a separately proved, subject-bound global floor can advance local state;
   physical shared-key deletion requires the actual GLOBAL epoch/all-required-
   replica barrier and LOCAL hosted-shard cuts, not one shard's erasure/intent.
-  The method's floor tuple is an expectation/projection, not that proof. An
-  unproved packet floor cannot authorize deletion, and absence is not floor zero.
+  The method's floor tuple is an expectation/projection, not that proof. A
+  floor that has not been proved cannot authorize deletion, and absence is not
+  floor zero.
   The already-admitted receiving host supplies its actual clock only to stamp
   a newly applied local floor; unchanged/lower floors preserve their old time,
   and the capsule's erasure time is diagnostic, not authority. Floor advancement
@@ -116,7 +114,7 @@ one subject.
   shipped. Operators back it up separately (docs/operations must say so):
   without it, the keystore and its backups are useless.
 
-## 3. Modes and the `PrivacyMode` record (now)
+## 3. Modes and the `PrivacyMode` record
 
 `kronik privacy mode on|off --reason R [--dry-run]` → `POST /v1/privacy/mode`
 → `Node::set_privacy_mode`, which commits a `PrivacyMode` record with the
@@ -136,7 +134,7 @@ points read. Asking for the current mode commits nothing and answers
   record, keystore counts (`subjects`, `keys`, `erased`; `null` without a
   keystore), and (later) pending erasures and reseal progress.
 
-## 4. Sealing points (later: good-foreign)
+## 4. Sealing points
 
 The rule: **every `Sealable` with a subject is sealed when its record is
 assembled while the mode is `on`.** Values without a subject stay `plain`.
@@ -161,7 +159,7 @@ Concretely:
   Kronik's log. Docs must tell guest authors not to log personal data; the
   `execution_id`/`causal_id` fields identify the turn without it.
 
-## 5. Unsealing and redaction (later: good-foreign; CLI rendering: fast-docs)
+## 5. Unsealing and redaction
 
 - **Inside turns:** the host unseals before the guest sees a value (state
   reads, delivered message bodies, recorded effect responses on re-run). An
@@ -170,7 +168,7 @@ Concretely:
   as a dead letter: the turn can't run on data that no longer exists.
 - **API output** (`actors inspect`, `history`, diffs, MCP): with `pii:read`,
   sealed values are unsealed. Without it they show as `[sealed]` (as built:
-  no subject id either, see §15), and erased ones as `[erased]` for every
+  no subject id either, see §14), and erased ones as `[erased]` for every
   caller. An API call that reads an
   erased value directly (`GET` of one state key, an effect body) gets
   `SUBJECT_ERASED` (410). Plain values written in `off` mode are shown as
@@ -179,7 +177,7 @@ Concretely:
   `render_sealable(&Sealable, &Caller) -> Rendered`, in kronik-api, so the
   JSON API, MCP and diffs agree.
 
-## 6. Erasure (later: good-foreign; snapshots: good-core; the open question in §7)
+## 6. Erasure
 
 `kronik privacy erase user:123 --reason R [--dry-run]` →
 `POST /v1/privacy/erase {subject, reason, dry_run}` → `Node::erase_subject`:
@@ -219,14 +217,14 @@ Concretely:
 Erasing a subject that has no key still records the erasure and runs the SQL
 deletion, and it works in `off` mode too (there are no keys, version 0).
 
-## 7. The open open question: rows in tables without `_subject`
+## 7. The open question: rows in tables without `_subject`
 
 ADR 0005 §6: a turn with a default subject can write to a table that has no
 `_subject` column. Its changeset is sealed under the turn's default subject,
 but the row can never be found by `DELETE … WHERE _subject = ?`. After that
 subject's erasure, the rebuild also diverges (`subjects/gap-without-column`).
-The maintainers has been asked. Both options are designed here, and neither is
-implemented until the answer comes.
+This question is open. Both options are designed here, and neither is
+implemented until a decision is made.
 
 **Option A, the brief as written: such rows belong to the turn's default
 subject.**
@@ -264,7 +262,7 @@ only write tables that have `_subject`.**
 Recommendation: B, for the same reasons as ADR 0005: it is correct by
 construction and costs nothing in `off` mode.
 
-## 8. Reseal via compaction (later: good-core)
+## 8. Reseal via compaction
 
 `kronik privacy reseal --reason R [--dry-run]` → `POST /v1/privacy/reseal`
 starts a background compaction that requires the mode to be `on`:
@@ -290,7 +288,7 @@ starts a background compaction that requires the mode to be `on`:
   `privacy status`. Docs recommend running reseal right after turning the
   mode on, before the first erasure.
 
-## 9. Forks without PII (later: good-foreign)
+## 9. Forks without PII
 
 `kronik fork create --no-pii`; tokens without `pii:read` always get it
 (`no_pii = request.no_pii || !caller.has(PiiRead)`):
@@ -308,7 +306,7 @@ starts a background compaction that requires the mode to be `on`:
   instead of `diverged`.
 - Diffs of a `--no-pii` fork show the pseudonyms, never real values.
 
-## 10. Keystore backup (now: export/import; later: shipping by good-core)
+## 10. Keystore backup
 
 `Keystore::export_backup(nonce)` produces one blob: `KRKSTOR1`, a 24-byte
 nonce, and XChaCha20-Poly1305 under `derive_key("kronik keystore backup v1",
@@ -332,7 +330,7 @@ before it writes. The shipper's change stamp covers the keystore's WAL, so
 a new key ships within a minute rather than after the next checkpoint. This
 retention is what makes erasure complete (§6.7).
 
-## 11. Gateway subject (now)
+## 11. Gateway subject
 
 `privacy.subject_from = "header:<name>"` or `"jwt:<claim>"` (normally
 `jwt:sub`), in `kronik_gateway::subject::SubjectFrom`:
@@ -346,28 +344,28 @@ retention is what makes erasure complete (§6.7).
 - **Kronik v0.1 does not verify the JWT, it only reads the claim.** Whoever
   can reach the gateway can choose the subject. The subject tags data; it
   does not authenticate. Put an authenticating proxy in front, or derive the
-  subject in the actor. Docs must say this (the build brief).
+  subject in the actor. The documentation must say this.
 
 ## 12. API and CLI
 
-| Endpoint | Scope | Request | Response | Who |
+| Endpoint | Scope | Request | Response | Phase |
 |---|---|---|---|---|
-| `GET /v1/privacy` | `read` | — | `{mode, epoch, keystore: {subjects, keys, erased} \| null}` | now |
-| `POST /v1/privacy/mode` | `operate` | `{mode: "on"\|"off", reason, dry_run}` | `{dry_run, changed, mode, previous, epoch, lsn}` | now |
-| `POST /v1/privacy/erase` | `operate` | `{subject, reason, dry_run}` | `{dry_run, subject, key_version, lsn, plain_values, complete_after_ms}` | later |
-| `POST /v1/privacy/reseal` | `operate` | `{reason, dry_run}` | `{dry_run, started, segments}` | later |
+| `GET /v1/privacy` | `read` | — | `{mode, epoch, keystore: {subjects, keys, erased} \| null}` | M8 |
+| `POST /v1/privacy/mode` | `operate` | `{mode: "on"\|"off", reason, dry_run}` | `{dry_run, changed, mode, previous, epoch, lsn}` | M8 |
+| `POST /v1/privacy/erase` | `operate` | `{subject, reason, dry_run}` | `{dry_run, subject, key_version, lsn, plain_values, complete_after_ms}` | planned |
+| `POST /v1/privacy/reseal` | `operate` | `{reason, dry_run}` | `{dry_run, started, segments}` | planned |
 
 `mode` is `"off"` or `"on"`. `epoch` is `null` before the first `PrivacyMode`
 record. `lsn` is `null` for a dry run or when nothing changed. Errors:
 `BAD_REQUEST` (a bad mode or subject), `REASON_REQUIRED`, `SUBJECT_ERASED`,
 and the usual auth errors.
 
-CLI (fast-docs, in `cli/privacy.rs`): `kronik privacy mode on|off --reason R
-[--dry-run]`, `kronik privacy status`, and later `kronik privacy erase
+CLI (in `cli/privacy.rs`): `kronik privacy mode on|off --reason R
+[--dry-run]`, `kronik privacy status`, and the planned `kronik privacy erase
 <subject> --reason R` and `kronik privacy reseal --reason R`, all with
 `--json`.
 
-Seams in good-core's crates, agreed:
+Seams in the core crates, agreed:
 
 1. kronik-store: apply `PrivacyMode` via `config_insert`, so that it is in
    `config_records`, from which the node rebuilds `kronik_effects::Config`
@@ -383,8 +381,8 @@ Seams in good-core's crates, agreed:
 Acceptance: "`off` has no measurable overhead compared to M6. Measure and
 document."
 
-- **Builds:** the last commit before any sealing code (baseline) against M8
-  in `off` mode, same machine, release builds, nothing else running.
+- **Builds:** the pre-M8 baseline against M8 in `off` mode, same machine,
+  release builds, nothing else running.
 - **Workloads:**
   - (a) the gateway with `subject_from = "header:x-user-id"`: 20,000 `POST
     /counter/<key>/increment` over 64 keys from 16 concurrent clients, half
@@ -399,35 +397,12 @@ document."
   deviation. "No measurable overhead" means the difference in throughput and
   p99 is within run-to-run noise: under 2 standard deviations and under 3%.
 - The same workloads in `on` mode give the documented cost of sealing.
-- `scripts/bench-privacy.sh` (later, with the sealing code) prints a
-  results table for `docs/operations/privacy.md`.
+- `scripts/bench-privacy.sh` prints a results table for
+  `docs/guides/privacy.md`.
 
-## 14. Who builds what
+## 14. Implementation notes
 
-| Part | Owner | When |
-|---|---|---|
-| Keystore, seal/unseal, pseudonyms, backup export/import | fast-policy | now (895ff28) |
-| Gateway `subject_from` (header, unverified JWT) | fast-policy | now |
-| `PrivacyMode` record path: store seam, `Node::set_privacy_mode`, `/v1/privacy` | fast-policy | now, after good-core's M6 commit |
-| CLI `privacy mode`, `privacy status` | fast-docs | now, after the API |
-| Opening the keystore in `start_local` | fast-policy | now, after good-core's M6 commit |
-| Sealing points, key cache, unsealing in turns | good-foreign | later |
-| Redaction helper and its use in API, MCP, diffs | good-foreign, with fast-docs for the CLI | later |
-| Erasure operation and `/v1/privacy/erase` | good-foreign | later |
-| Snapshot handling after erasure (§6.6) | good-core | later |
-| Reseal compaction, `/v1/privacy/reseal` | good-core | later |
-| `--no-pii` forks and `pii-masked` | good-foreign | later |
-| Keystore backup shipping and retention | good-core (M6 shipper) | later |
-| Option A or B for tables without `_subject` | owner decides; then good-foreign | after the answer |
-| Overhead measurement (`docs/perf.md`) | good-foreign | done on dev |
-
-## 15. As built (good-foreign: §4, §5, §6.1-6.4, §9)
-
-Commits `da0ad03` (the `Sealer`), `c99061f` (sealing, unsealing, erasure,
-`--no-pii` forks), `ed47360` (the erase route in the OpenAPI document),
-`c90a633` (erasure recovery), `eaf56b8` (no copy in `off` mode) and
-`22a8bca` (`history` marks erased writes). Where the code differs from the
-sections above:
+Where the code differs from the sections above:
 
 - **One seal point.** `Node::commit` and `Node::append` seal the record in
   place (`kronik-sched/src/sealing.rs`); the walk over a record's
@@ -438,7 +413,7 @@ sections above:
   see come from in-memory copies or are unsealed on the way in. Fetch
   effects carry the guest's subject (`FetchRequest.subject`), call effects
   the message's.
-- **The request line (v0.1 fix, review H10).** A gateway request with a
+- **The request line (v0.1).** A gateway request with a
   subject puts its path, query and route parameter values into
   `HttpInput.sealed_path`, `sealed_query` and `Param.sealed_value` (an
   additive change to the v1 format; the plain `path`, `query` and
@@ -451,10 +426,10 @@ sections above:
   stay plain everywhere. Turn details hide a sealed request's path, query,
   parameters and `Idempotency-Key` from callers without `pii:read`, and
   history, dead-letter and trace summaries show such a caller the route
-  pattern instead of the path (re-review R4: others see the path). A
+  pattern instead of the path (others see the path). A
   `--no-pii` fork pseudonymizes the request line like every tagged value
-  (re-review R2, redone: revealing it handed real paths and queries to
-  code an agent can write). A turn that read a pseudonym
+  (revealing it would hand real paths and queries to code an agent can
+  write). A turn that read a pseudonym
   (`ForkTurn::pseudonyms`) and differs from production, failing included,
   is `pii-masked` (`diff::Acc::turn_errors` and the causal grouping skip
   it): no introduced error, origin or consequence, so `no-new-errors` does
@@ -468,8 +443,8 @@ sections above:
   ADR 0031); a `pii:read` reviewer re-runs on real data to see such a
   turn's real behaviour before approving. Validation (`kronik_proto` `input()`) requires a value in
   each present sealable field.
-- **Idempotent replays stay with their requester (v0.1 fix, H8, M6, M7,
-  re-review R3).** `HttpInput.request_hash` is a version byte
+- **Idempotent replays stay with their requester (v0.1).**
+  `HttpInput.request_hash` is a version byte
   (`INGRESS_HASH_VERSION` = 3) and a hash of the method, path, query, body
   and the requester: the subject when there is one, else the value of
   `Authorization` (never `Cookie`), keyed with `Sealer::keyed_hash` (a
@@ -588,14 +563,14 @@ sections above:
   `kronik history` prints `set s [erased]`. No route reads a single state value or effect body,
   so nothing answers `SUBJECT_ERASED` (410) yet. Diffs never show a
   subject's values, in any fork: state values and bodies appear as
-  `{redacted, subject, hash}` (as before M8), and since `c99061f` so do the
+  `{redacted, subject, hash}` (as before M8), and so do the
   values of a subject's SQL rows. Since the v0.1 fix, so do the url,
   header and body fields of an effect request recorded under a subject,
   response header values with a subject, and the final-state rows with a
   `_subject` in continuous replay; the Markdown diff shows such a value as
   `[sealed:<subject> <hash>]`. Fork turns (`GET /v1/turns/<fork>:…`) and
   `trace` are redacted per caller like production turns.
-- **Who sees subjects (v0.1 review M3, H7, H12).** A caller without
+- **Who sees subjects (v0.1).** A caller without
   `pii:read` sees `[sealed]` (`kronik_proto::http::SEALED`) and no subject
   id: `redact::redact` drops the subject of every value for it, `inspect`
   and `history` null theirs. A diff is built once and served to every
@@ -631,7 +606,7 @@ sections above:
   log and `isolated.jsonl`) with the node's sealer, so no plain value of a
   subject reaches a fork's files in `on` mode. Forks written before that
   fix keep their plain files until deleted.
-- **The open open question (§7)** is one seam,
+- **The open question (§7)** is one seam,
   `kronik_store::sql::actor::rows_without_subject_column`: a no-op that
   returns 0, documented with both options. Option B's turn-time refusal is
   not built.
@@ -652,5 +627,5 @@ sections above:
 - **Overhead (§13):** `scripts/bench-privacy.sh` with the three workloads
   (the gateway with half the requests carrying a subject, the API's send
   with a subject, an SQL actor with `_subject`); results in
-  `docs/perf.md`: `off` is within run-to-run noise of the commit before
-  sealing, `on` adds 32 % to 57 % log bytes per record.
+  `docs/perf.md`: `off` is within run-to-run noise of the pre-M8 baseline,
+  `on` adds 32 % to 57 % log bytes per record.

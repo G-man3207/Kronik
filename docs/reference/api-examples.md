@@ -95,13 +95,13 @@ documented CLI consumer or explicit HTTP example; a WIT usage example rather
 than its declaration; and each error's typical cause/remediation example.
 Empty/malformed inventories and missing coverage fail. The existing generated
 document/schema checks remain required: this checker does not replace them or
-exercise every endpoint's runtime behavior. Final feature-owner API/WIT
-integration must rerun it against the actual integrated binary and source.
+exercise every endpoint's runtime behavior. Final API/WIT integration must
+rerun it against the actual integrated binary and source.
 
-## Feature-owner API additions: source contract, not checkpoint availability
+## API additions: source contract, not current availability
 
-The following examples match the fleet maintainers' actual request types and
-dispatch sources. They are **not available in the committed `0b84ab0f`
+The following examples match the fleet implementation's actual request types and
+dispatch sources. They are **not available in the committed `d9b946f2`
 baseline or the published v0.3.0 binary**. They apply only after that feature
 is integrated, its actual binary passes runtime proof, and its generated
 OpenAPI agrees. These examples do not claim M29/M30 acceptance or independently
@@ -206,7 +206,7 @@ Content-Length: 0
 Read the actual published registry before decoding operational event or cursor
 frames. The current source identifiers are `kronik.event/v1` and
 `kronik.events-cursor/v1`; a future incompatible format needs its own version.
-The maintainers' `docs/reference/events.schema.json` is a separate publication
+The `docs/reference/events.schema.json` file is a separate publication
 artifact, not a reason to regenerate historical event bytes.
 
 ```http
@@ -250,8 +250,8 @@ real durable rewind. Do not change event identity to hide duplicate delivery.
 
 ## M23 external-secret additions: source contract, not old-binary proof
 
-These five examples follow the current M23 maintainers' actual API handlers and
-request types. They are **not supported by the `0b84ab0f` proof binary or
+These five examples follow the current M23 implementation's actual API
+handlers and request types. They are **not supported by the `d9b946f2` proof binary or
 published v0.3.0**. The integrated binary, regenerated OpenAPI and runtime
 provider/recovery proofs must agree before these become an available contract.
 Documentation parsing below is not evidence that an external provider works.
@@ -337,9 +337,9 @@ Content-Type: application/json
 {"reason":"preview owned fixture unlink","dry_run":true}
 ```
 
-## Admin listener, embedded UI and cluster observations: current main surface
+## Admin listener, embedded UI and cluster observations: current surface
 
-These operations are declared by current main's generated OpenAPI and served
+These operations are declared by the current generated OpenAPI and served
 by its binary. They are absent from the published v0.3.0 binary. The
 authentication operations are public OpenAPI operations on the admin listener
 only; product operations are never routed there. The browser flows are driven

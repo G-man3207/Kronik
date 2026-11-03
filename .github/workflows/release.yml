@@ -2,7 +2,7 @@ name: Release
 
 # Manual exact-tag releases only. Two independent compiled builds must match
 # before GitHub OIDC/Sigstore attests the licensed archives and release metadata.
-# Draft publication remains an explicit owner decision; no push/tag trigger.
+# Draft publication remains an explicit maintainer decision; no push/tag trigger.
 
 on:
   workflow_dispatch:

@@ -1,7 +1,7 @@
 # 0006. Logical time: +1 ms only across restarts
 
-- **Status:** Accepted (deviates from the brief's formula; the maintainers may
-  overrule)
+- **Status:** Accepted (deviates from the brief's formula; the maintainers
+  may overrule)
 - **Date:** 2026-10-25
 
 ## Context
@@ -105,5 +105,5 @@ message).
   load, so timers (M2) can be due against it directly.
 - Equal `now-ms` values in different turns are normal; guests must not use
   `now-ms` as a unique key (docs for the SDK should say so).
-- Revisit if the maintainers prefers the literal formula, or if a cluster design
+- Revisit if the maintainers prefer the literal formula, or if a cluster design
   (v0.4) needs strictly increasing time per shard.

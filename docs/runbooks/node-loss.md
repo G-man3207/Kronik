@@ -10,9 +10,9 @@ This procedure requires the real public member startup/join/router/lifecycle
 integration. At the committed single-node baseline those cluster consumers are
 not available. A private RawNode fixture, three processes on one machine, or
 a single-node restart does **not** exercise the M32 replacement target or close
-this runbook's three-node test VPS criterion. Do not invent a `cluster` CLI
+this runbook's three-node test environment criterion. Do not invent a `cluster` CLI
 command to conceal that prerequisite. Reconcile the final public member
-commands and authority/status surface with the cluster maintainers' implementation
+commands and authority/status surface with the cluster implementation
 before executing a cluster drill.
 
 ## Operational procedure

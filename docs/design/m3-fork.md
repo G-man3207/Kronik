@@ -10,7 +10,7 @@ is self-contained for the `kronik-policy` implementer.
 | Crate | M3 adds |
 | --- | --- |
 | `kronik-fork` | `Fork` (branch metadata and state at the fork point), `ProductionIndex` (root inputs, production turns by causal key, effects by causal key and ordinal), `Replayer` (isolated and continuous replay, the deterministic scheduler, the replay effect gate), `Diff` (builder, `kronik.diff/v1` JSON, Markdown), `Sampler`. Pure except for reading logs and opening in-memory stores. |
-| `kronik-policy` | Rules in TOML, CEL evaluation against the diff JSON, default rules (§7). Implemented by a second worker against §7. |
+| `kronik-policy` | Rules in TOML, CEL evaluation against the diff JSON, default rules (§7). Implemented against §7. |
 | `kronik-store` | Overlays (`Store::overlay_begin/rollback`: savepoints on `state.db` and on every actor database touched), `StateDb::apply` inside a savepoint so it nests in an overlay, in-memory stores for production cursors. |
 | `kronik-sched` | Branch-aware code lookup for replay, `propose`, `approve`, `promote` with catch-up, `rollback`, policy records; `Deployment` with `PROMOTE`/`ROLLBACK`. |
 | `kronik-api` | The endpoints in §9. |

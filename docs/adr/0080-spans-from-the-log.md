@@ -47,7 +47,7 @@ and I4). DST requires determinism in everything the scheduler does.
     caller is open). It also keeps a committed callee's trace while its
     messages, timers or compensation are still to come, so that their
     links name the span that exists, and a caller's trace while a callee
-    whose call timed out has not run (M28 code review M7). A rewind
+    whose call timed out has not run. A rewind
     rebuilds this set at the rewind point from the retained log (M8).
   - Turn span id: 8 bytes of `blake3_keyed(id key, "kronik span v1" ‖
     encode(causal_key))`; a migrate turn also hashes
@@ -58,8 +58,8 @@ and I4). DST requires determinism in everything the scheduler does.
   - The id key is `Sealer::keyed_hash("kronik otel ids v1", [])`, or the same
     construction with the node-local `otel.key` on a node without a master
     key (ADR 0082). The causal key holds every step's actor key in plain,
-    so unkeyed ids would let a backend confirm a guessed actor key (M28 perf
-    review P1). Only the root's trace id, which is random, is not keyed.
+    so unkeyed ids would let a backend confirm a guessed actor key. Only the
+    root's trace id, which is random, is not keyed.
 - **Parent and link.** Every non-root turn within a trace gets both, so the
   trace is connected and the causal relation is still explicit:
   - a call: parent = the caller's `actor.call` effect span, link `call`;
@@ -96,7 +96,7 @@ and I4). DST requires determinism in everything the scheduler does.
   three actors to be one connected trace. Messages, which are asynchronous,
   do become links: in a new trace, not an orphan inside the old one.
 - **Messages inside the sender's trace** (the first draft). Unbounded
-  traces for actors that message each other (design review M1).
+  traces for actors that message each other.
 - **Trace context carried in the call input.** It would let a callee know
   its trace without the exporter's open-turn set, but adds a recorded field
   on every call for what the log already implies.

@@ -1,16 +1,16 @@
 # M23: Key and secret backends (design)
 
 Status: B1 KMS lifecycle is implemented for OpenBao, AWS, GCP and Azure.
-B2–B6 are approved and in active implementation; the current native product
-checkpoint and its remaining acceptance gaps are recorded in STATUS.md.
-Sections 1–13 preserve the revised parked `m23-design` proposal from main
-6c04dea, including its historical loader inventory and future acceptance
-plan. The resumed B1 gate below supersedes stale B1 details. Observed
-implementation evidence is recorded in STATUS.md; a plan is not a pass.
+B2–B6 are approved and under active implementation. Sections 1–13 contain
+the revised design proposal, including its historical loader inventory and
+the acceptance plan; the B1 design gate below records the design that was
+implemented. Implementation evidence is tracked with the code; a plan is not
+a pass.
 
 ## The brief
 
-English translation from the build brief (the authoritative Swedish brief is unchanged):
+English translation of the build brief (the authoritative Swedish original is
+unchanged):
 
 > **M23 Key and secret backends.** The master key and the secrets can live outside the server. Touches `kronik-privacy`.
 >
@@ -50,7 +50,7 @@ Invariants that bind it:
     configured file and `KRONIK_MASTER_KEY`.
 - A start with no key file and no env material **created a new key**, even
   when encrypted stores already existed.
-- Both are fixed by `fix-v01-master-key`: one loader (`MasterKey::open`),
+- Both are fixed: one loader (`MasterKey::open`),
   `MASTER_KEY_MISSING`, and a `key_check` row per store
   (`MASTER_KEY_MISMATCH`).
 - There is no master-key versioning and no rotation.
@@ -139,7 +139,7 @@ stays the 32-byte seed, and the KMS or HSM key **wraps** it:
 
   The process is already non-dumpable (`serve.rs:224`). Everything
   downstream is unchanged.
-- **Memory, not swap** (review, Low): the seed and the six derived keys
+- **Memory, not swap**: the seed and the six derived keys
   are `mlock`ed and marked `MADV_DONTDUMP`, and the derived keys are
   zeroized on drop too. Offline commands that load the seed (`restore`,
   `keys wrap`, `keys rewrap`) also set `PR_SET_DUMPABLE 0`.
@@ -155,10 +155,10 @@ stays the 32-byte seed, and the KMS or HSM key **wraps** it:
 - `aad` binds the blob to its purpose: AWS `EncryptionContext`, GCP
   `additionalAuthenticatedData`, PKCS#11 AES-GCM AAD, and OpenBao transit
   with a **derived** key (`derived=true`) and `context` = base64 of the AAD;
-  the guide says to create a dedicated derived transit key (review, Low).
+  the guide says to create a dedicated derived transit key.
   Azure RSA-OAEP has no AAD; the blob names its purpose in its own
   `schema` field only.
-- **`master.wrapped` is shipped** (review H1): it is ciphertext, so it goes
+- **`master.wrapped` is shipped**: it is ciphertext, so it goes
   to the bucket with each keystore backup (`keystore/<wall>.wrapped`) and
   again after `rewrap`. `kronik restore` installs the newest one at or
   before the restore point when the node's `[keys] source` is a KMS, so a
@@ -189,7 +189,7 @@ has to live somewhere. The clean answers are instance identity (AWS role,
 GCP metadata, Azure managed identity), a TLS client certificate, or an HSM
 PIN in a credential. The operations guide says so plainly.
 
-**What the envelope protects** (review M3): a copy of the data directory or
+**What the envelope protects**: a copy of the data directory or
 of the bucket without the bootstrap credential reveals no seed. A copy that
 includes it (an AppRole `secret_id`, a TLS client key, a PIN file or AWS
 keys on the same disk or in the same backup) can unwrap through a reachable
@@ -198,7 +198,7 @@ identity, and `kronik doctor` warns when a credential file lies under the
 data directory.
 
 **Credential sources Kronik does not support** are refused at config check
-with their name (review): AWS web identity, SSO and profiles; Azure
+with their name: AWS web identity, SSO and profiles; Azure
 certificate credentials; GCP workload identity federation. Tokens have a
 redacting `Debug`, and the shared `Env::net` client never logs headers.
 
@@ -209,16 +209,15 @@ redacting `Debug`, and the shared `Env::net` client never logs headers.
   the provider with backoff (Env clock) for `[keys] start_timeout` (default
   60 s). It then stops with `KEY_SOURCE_UNAVAILABLE`, and systemd restarts
   it.
-- **Never a silent new key, never another key:** on main since
-  `fix-v01-master-key`. A missing key over existing stores is
+- **Never a silent new key, never another key:** a missing key over existing stores is
   `MASTER_KEY_MISSING`; a wrong one is `MASTER_KEY_MISMATCH`, from the
   `key_check` row each store holds, written only after the key has
   decrypted one of the store's values (so a mis-copied key is never
-  blessed; review M5). A missing `master.wrapped` over existing stores is
+  blessed). A missing `master.wrapped` over existing stores is
   `MASTER_KEY_MISSING` too.
-- **One loader.** `MasterKey::open` (main) becomes `KeySource::load(config)`
+- **One loader.** `MasterKey::open` becomes `KeySource::load(config)`
   with the KMS sources added; start, shipping, restore and init all use it.
-- **A KMS outage during a restart is a full outage** (review, Low): it is
+- **A KMS outage during a restart is a full outage**: it is
   inherent to keeping the key elsewhere, and only at start. Doctor and the
   `kronik_key_source_up` gauge make it visible; the guide recommends an
   alert. Keeping the seed in the kernel keyring across daemon restarts is
@@ -241,17 +240,17 @@ redacting `Debug`, and the shared `Env::net` client never logs headers.
   OpenBao `min_decryption_version`. AWS rotates transparently.
 - **Doctor** shows the source, the key reference and version, and whether
   the stores' key checks match.
-- **Key-source changes are audited** (review M6): `rewrap` writes an
+- **Key-source changes are audited**: `rewrap` writes an
   `AuditEvent` `keys.rewrap` with its reason; `keys wrap` runs offline and
   leaves a marker that the next start turns into a system `AuditEvent`
   `keys.source` (M28's restore-marker pattern). Both need M28's kind 40, so
-  M23 Phase B merges after M28.
+  M23 Phase B follows M28.
 
 ### 3.4 Optional PKCS#11 helper (B6, accepted ADR 0093)
 
 PKCS#11 is a C ABI: the vendor's module (`libsofthsm2.so`, a YubiHSM or
 Luna library) must be `dlopen`ed. **The release `kronik` is a static musl
-binary, which cannot `dlopen` at all** (review B1, probed: "Dynamic loading
+binary, which cannot `dlopen` at all** (probed: "Dynamic loading
 not supported"), and the vendor modules are glibc-linked. So the daemon
 never loads one:
 
@@ -281,13 +280,13 @@ never loads one:
 - This is ADR 0093's accepted narrow process exception, not a promise about a
   vendor's C implementation or full B6 acceptance.
 - Proof must name the actual extracted artifact, source, profile and platform.
-  An owned GNU helper/software-token exercise with a matching GNU debug CLI is
+  A GNU helper/software-token exercise with a matching GNU debug CLI is
   local evidence, not the final musl-daemon/helper release lifecycle, supported
   glibc floor, Ubuntu/ARM execution or physical-HSM acceptance.
 - M21's unit has `PrivateDevices=yes`, which hides USB HSMs: the guide
-  ships a `DeviceAllow=` drop-in for them (review, Low).
+  ships a `DeviceAllow=` drop-in for them.
 
-## 4. Planned B2–B4: `SecretBackend` and links (parked ADR 0090)
+## 4. Planned B2–B4: `SecretBackend` and links (ADR 0090)
 
 ### 4.1 The trait
 
@@ -360,7 +359,7 @@ message SecretLink {
   fetches the current value once, so a bad ref fails now with the backend's
   error rather than at the first turn. The dry run fetches but appends
   nothing and does not fill the cache.
-- **Scope `admin`, and an allowlist** (review M2): the backend sees only
+- **Scope `admin`, and an allowlist**: the backend sees only
   the node's identity, so its own policy cannot tell which Kronik caller
   asked. Without a limit, `link` (with `secret-reveal` and an `http.fetch`
   grant) could read and send out anything that identity can read. So
@@ -382,7 +381,7 @@ message SecretLink {
 - `SecretLink` is applied to a `secret_links` table in `state.db`, so it is
   rebuilt from the log.
 
-## 5. Planned B2: versions and hashes in the log (parked ADR 0090)
+## 5. Planned B2: versions and hashes in the log (ADR 0090)
 
 ### 5.1 `SecretVersion`, kind 45
 
@@ -407,7 +406,7 @@ message SecretVersion {
   as the built-in store's: in `SecretRef.version_hash` on every effect, in
   `secret list`, and in `SecretVersion`. That is the second criterion,
   literally.
-- **Kronik's version number has one allocator per name** (review H4). A
+- **Kronik's version number has one allocator per name**. A
   new `source_version` can be seen by the refresher (§6), by `secret
   refresh <name>`, or by an effect whose fetch found a version not yet
   recorded, in parallel. All of them go through
@@ -422,14 +421,14 @@ message SecretVersion {
   So one `source_version` gets exactly one number, numbers are dense, and a
   `SecretRef` always names a committed version. An effect records the
   version *before* the value is used (an HTTP header leaving the node, a
-  MAC, a reveal), as `TurnBegin` is committed before the turn runs (review,
-  Low), so the log says which version actually left.
+  MAC, a reveal), as `TurnBegin` is committed before the turn runs, so the
+  log says which version actually left.
 - **On an M16 cluster** the metadata leader is the allocator: `record`
   forwards to it, and the record lives in the metadata log. M16's design
   names a metadata entry `SecretVersion` too; they are to be the same
   record, with M23's fields, reconciled when M16's metadata log is built
   (M16 §9/§12).
-- **The built-in store writes it too, as the intent** (review M7, with
+- **The built-in store writes it too, as the intent** (with
   M28): `secret set` allocates the number, appends `SecretVersion` with the
   caller's audit, then writes `secrets.db`; a failed write appends M28's
   `secret.set.failed` `AuditEvent`. `secret delete` appends one with
@@ -437,7 +436,7 @@ message SecretVersion {
   `secret.set`/`secret.delete` intent events for these two routes, so each
   change has one record, and M28's classifier exports kinds 45 and 46 (both
   carry `Audit`; its proto-walking test enforces it).
-- **Versions from before M23** have no record (review, Low): the first M23
+- **Versions from before M23** have no record: the first M23
   start appends one system `SecretVersion` per existing built-in version,
   in version order, so `secret history` is complete.
 - **Applied** into `secret_versions(name, version, version_hash, backend,
@@ -482,7 +481,7 @@ The third criterion: "Rotation of a secret shows up as a new version in
   2. `SecretBackend::version` fetches that version.
   3. The hash is checked against the recorded `version_hash`; a mismatch is
      `VersionGone`.
-- **A recorded outcome is never changed** (review H2, I1). A reveal (or a
+- **A recorded outcome is never changed** (I1). A reveal (or a
   re-send) whose `EffectResult` was recorded `Ok` must give the guest that
   value again:
   - **`Unavailable`:** the rerun retries with backoff (Env clock) and holds
@@ -498,7 +497,7 @@ The third criterion: "Rotation of a secret shows up as a new version in
   secret value for recorded effects, so it gives the same outcomes before
   and after a rotation.
 
-## 6. Planned B2–B5: caching, outages and timeouts (parked ADR 0091)
+## 6. Planned B2–B5: caching, outages and timeouts (ADR 0091)
 
 The rule (I10): a backend that is down affects only effects that need its
 secrets, and only once Kronik has no usable value.
@@ -540,7 +539,7 @@ secrets, and only once Kronik has no usable value.
     supervisor's existing retry applies.
   - A rotation does not restart a running foreign actor. `kronik foreign
     restart` or the next start picks the new version.
-- **Scrubbing survives restarts** (review H3, I8). `ok_scrubbed` keeps
+- **Scrubbing survives restarts** (I8). `ok_scrubbed` keeps
   revealed values that a guest stored or logged out of `history`, `actors
   inspect` and MCP. It must cover every value that may sit in retained data:
   - at start the refresher fetches, by `source_version`, every version a
@@ -552,12 +551,12 @@ secrets, and only once Kronik has no usable value.
   - a decrypt or fetch error in `secret_values()` also fails closed (today
     it returns an empty list, which fails open);
   - foreign logs keep their documented limit.
-- **Revocation beats staleness** (review M1): `NotFound`, `Denied`,
+- **Revocation beats staleness**: `NotFound`, `Denied`,
   `VersionGone` from a refresh, and `unlink`, drop the cached value at
   once; only `Unavailable` (timeouts, 5xx) uses `max_stale`. A rotation
   reaches new effects within `refresh` (5 min) or at once with `secret
   refresh`.
-- **Forks never fetch** (review M4, I7): an unmatched effect in a fork that
+- **Forks never fetch** (I7): an unmatched effect in a fork that
   needs an external secret uses a value this process already holds for the
   fork point's link and version; otherwise it is denied in the fork and the
   diff marks it unverifiable. No provider audit log or bill sees a fork.
@@ -584,7 +583,6 @@ caller's original final admission. Its callback only moves one prepared MAC.
 An exporter retains its actual inventory publication separately through that
 same original admission; the data publication is not a new authority. Avoiding
 cache publication here prevents re-entering the exporter's held cache fence.
-The focused native cold-FILE/cache consumer is authored but not yet executed.
 
 ### 6.2 Private native execution versus public readiness
 
@@ -617,13 +615,13 @@ and destruction stay outside that fence. Even a declaration with no secret
 bindings must check/watch the actual committed configuration and use the same
 configuration-DATA callback at final start or call enqueue. An old retained
 configuration Arc or an ACTIVE execution alone cannot authorize a removed run.
-The common manager/ForeignHost/Node courier adoption is held: its mandatory
-actual Cluster dependency eagerly includes the stopped native-import producer,
-not just an independently readable origin codec. Root keeps its existing Host
+The common manager/ForeignHost/Node courier adoption is not final: its mandatory
+actual Cluster dependency eagerly includes the native-import producer, not just
+an independently readable origin codec. Root keeps its existing Host
 ABI and callers; it does not add that producer, a Member facade, optional
 authority, a feature gate or an unused replacement courier. Native operational
-Foreign hot-rebind acceptance, as well as Member historical closure, remains
-unproved. The private startup guard and ordinary storage DATA work are separate.
+Foreign hot-rebind acceptance, as well as Member historical closure, is not
+established. The private startup guard and ordinary storage DATA work are separate.
 
 The shared `CurrentSecretSelection` primitive retains the actual active logical
 row, zeroizing value, original expiry and original publisher notification. A
@@ -650,7 +648,6 @@ the existing physical-name grammar. LINK and retained UNLINK remain distinct.
 version/hash/creation metadata, never nonce or ciphertext. It can detect that a
 retained immutable version is no longer physical CURRENT without decrypting it;
 it is not a custody, complete-history, no-deletion or logical-permission proof.
-Its new real SQLite/retention/reopen/corrupt-cipher regression remains unrun.
 The candidate-value regression inspects both actual Reserved/Active WAL audit
 facts and encrypted-row operator facts, then reopens the real store and checks
 the redacted history and unchanged encrypted row. It does not pin marker wording.
@@ -692,7 +689,7 @@ the same Connection/owner. Never duplicate, separately open or close a database
 descriptor for this check: that can release process-wide POSIX locks.
 The paired FILESTAT/WALSTAT build flags do not expose either diagnostic SQL
 function to guests. The observed bounded C-only ABI/locking proof is separate
-from the still-unrun Rust FFI, owned-store and daemon integration regressions.
+from the Rust FFI, owned-store and daemon integration regressions.
 
 A live secret reader stages the existing Connection's completed encrypted
 SQLite backup and consumes that private stage into `open_readonly`; it does
@@ -706,25 +703,13 @@ copies main/WAL files. Its path-only offline-sealer/M19, audit-verifier,
 doctor-fallback and existing-key init-rerun callers are not thereby frozen
 or qualified; the latter three are separate ordinary source-contract gaps.
 Source DB/WAL preservation and absent source SHM remain required. These
-callers retain their old behavior pending a genuine compatible source boundary;
-neither a blind live SQLite reopen nor the held H/replay producer was added.
+callers retain their old behavior pending a genuine compatible source boundary.
 
 Compliant file writers must retain the original exclusive owner. This is not a
 process-local claim to fence arbitrary external raw SQL; existing identity,
 master, floor and corruption checks remain necessary. The Root source cutover
-and authored regressions are unbuilt/unrun, and do not establish the held
-Foreign, historical-source or complete M23 acceptance criteria.
-The later Native FILE current/alias/observation/regression source task also
-stopped at `cyber_policy`. Its pre-stop packets and applied Root source are
-preserved, not completed through another owner or label. Known unclosed
-interfaces and the no-execution cleanup receipt are retained in
-`<internal-evidence>`.
-
-Local source checkpoint `10b60d52c53ccdb10ba869eede8b65f7a0f4e467` preserves
-these already-landed changes without verification or completion of those seams.
-It does not close public Path-only live candidate validation, operational
-Foreign hot-rebind or complete M23. Main publication is blocked by the existing
-broad CI event; the stopped work is not rerun through a push.
+and its regressions are not implemented, and do not establish the Foreign,
+historical-source or complete M23 acceptance criteria.
 
 ## 7. Providers without SDKs (ADR 0094)
 
@@ -752,7 +737,7 @@ Rejected:
 
 B1 adds no provider SDK or PKCS#11 dependency. The proposed B6 helper would
 need a separate cargo-deny review of its `cryptoki` dependency tree; this
-design does not claim that unlanded tree or any SoftHSM check passed.
+design does not claim that the proposed tree or any SoftHSM check passed.
 
 ## 8. Proposed configuration, CLI and API (B2–B6 not implemented)
 
@@ -814,12 +799,11 @@ fetch_timeout = "2s"
 - `KEY_HELPER_FAILED` (503): `kronik-keyhelper` missing, crashed, timed out
   or answered an error.
 
-`MASTER_KEY_MISSING` and `MASTER_KEY_MISMATCH` exist already
-(`fix-v01-master-key`).
+`MASTER_KEY_MISSING` and `MASTER_KEY_MISMATCH` exist already.
 
 Milestone "M23".
 
-## 9. Acceptance plan (B1 evidence in STATUS.md; B2–B6 planned)
+## 9. Acceptance plan (B1 evidence recorded; B2–B6 planned)
 
 The original full-M23 plan uses the following free services. Only the B1
 KMS lifecycle is implemented; external-secret and PKCS#11 runs remain planned.
@@ -829,9 +813,9 @@ KMS lifecycle is implemented; external-secret and PKCS#11 runs remain planned.
 | Vault-compatible backend and the KMS path | `openbao/openbao` (KV v2 + transit), dev mode | MPL-2.0 (a separately run server, not linked) |
 | AWS Secrets Manager + KMS | `motoserver/moto` | Apache-2.0 |
 | GCP Secret Manager (planned B4) | Blackwell Systems REST emulator | Apache-2.0, third party |
-| Azure Key Vault RSA wrap/unwrap (secrets planned B4) | rokeller emulator, pinned B1 version/digest in STATUS.md | Apache-2.0, third party |
+| Azure Key Vault RSA wrap/unwrap (secrets planned B4) | rokeller emulator, pinned B1 version/digest | Apache-2.0, third party |
 | PKCS#11 (maintainer-gated B6 proposal) | proposed SoftHSM2 run, not exercised by B1 | BSD-2-Clause |
-| GCP Cloud KMS | Blackwell Systems dual REST KMS emulator, pinned B1 digest in STATUS.md | Apache-2.0, third party |
+| GCP Cloud KMS | Blackwell Systems dual REST KMS emulator, pinned B1 digest | Apache-2.0, third party |
 
 Not used:
 - **LocalStack:** since March 2026 its image needs an account token under
@@ -839,10 +823,11 @@ Not used:
 - **HashiCorp Vault:** BUSL-1.1. OpenBao proves the same API.
 
 B1's actual pinned service images, proper TLS leaf fixtures and observed
-outcomes are recorded in STATUS.md; this table is not a proof of unrun work.
+outcomes are recorded in the project status page; this table is not a proof of
+unrun work.
 
 **B1 criterion 1: "Kronik starts with the master key in a KMS without the key
-being written to disk"** (`scripts/e2e-keys.sh`; observed runs in STATUS.md):
+being written to disk"** (`scripts/e2e-keys.sh`; observed runs are in the project status page):
 1. Start OpenBao. Enable transit and create key `kronik`.
 2. `kronik serve --init`-style start with `[keys] source = "openbao"`.
 3. Set a secret, send a turn, stop, and start again: the secret still
@@ -855,7 +840,7 @@ being written to disk"** (`scripts/e2e-keys.sh`; observed runs in STATUS.md):
 5. With OpenBao stopped, `kronik serve` stops with `KEY_SOURCE_UNAVAILABLE`
    after `start_timeout` and writes no key. With the wrapped file deleted
    but stores present, it stops with `MASTER_KEY_MISSING`.
-6. **Restore onto an empty directory** (review H1): ship, then `kronik
+6. **Restore onto an empty directory**: ship, then `kronik
    restore` into a new directory whose only key source is the KMS
    configuration. The restored node installs the shipped `master.wrapped`,
    unwraps through OpenBao, and its secrets and sealed values decrypt.
@@ -865,7 +850,7 @@ The same flow runs for `aws` (moto KMS), `azure` (emulator wrapkey) and
 with `pkcs11-tool --keygen` as non-extractable). For `pkcs11` the needle
 search also covers SoftHSM's token directory, which holds its own encrypted
 key store. All of these run the **release artifacts** (`kronik-*-musl` and
-`kronik-keyhelper`), never a dev build (review B1).
+`kronik-keyhelper`), never a development build.
 
 **Planned B2–B4 criterion 2: "Secrets from an external backend get a version
 hash in the log, just as with the built-in store"**
@@ -894,12 +879,12 @@ in `history`, and replay of old turns is not affected":**
    1), not v2's.
 6. After destroying KV version 1, the same recovery fails the turn with
    `SECRET_VERSION_GONE`, never v2's value and never a different effect
-   outcome (review H2). With OpenBao stopped instead, the rerun waits and
+   outcome. With OpenBao stopped instead, the rerun waits and
    the guest never sees `SECRET_UNAVAILABLE` for a recorded reveal.
-7. **Scrubbing after a restart** (review H3): reveal v1 and store it in
+7. **Scrubbing after a restart**: reveal v1 and store it in
    state, rotate, restart; `actors inspect` and `history` never show v1,
    and while v1 is not yet fetched again they answer `SECRET_UNAVAILABLE`.
-8. **One allocator** (review H4): a DST scenario with two concurrent first
+8. **One allocator**: a DST scenario with two concurrent first
    uses and the refresher on a rotated backend gives exactly one record per
    `source_version`, with dense numbers.
 
@@ -912,7 +897,7 @@ in `history`, and replay of old turns is not affected":**
 
 **Cloud providers for real:** `scripts/e2e-cloud-secrets.sh` runs against
 real AWS, GCP and Azure only with the operator's own credentials. It is
-not in CI or the batch: about $1 a month per KMS key, plus API calls.
+not in CI: about $1 a month per KMS key, plus API calls.
 Running it once before release is the maintainers' call (§12).
 
 ## 10. Determinism and invariants
@@ -949,12 +934,12 @@ Running it once before release is the maintainers' call (§12).
 
 ## 11. Numbering
 
-- **ADR reservations/status:**
-  - 0090: parked proposal for `SecretBackend`, links and versions;
-  - 0091: parked proposal for caching, outages and timeouts;
-  - 0092: restored and accepted for B1 KMS only;
-  - 0093: unlanded helper proposal, requiring maintainer approval;
-  - 0094: restored and accepted for B1 KMS clients only.
+- **ADRs:**
+  - 0090: `SecretBackend`, links and versions in the log;
+  - 0091: caching, outages and complete retained-value coverage;
+  - 0092: the master key wrapped by a KMS or HSM (B1);
+  - 0093: PKCS#11 through an optional helper process;
+  - 0094: secret and key providers without SDKs (B1 KMS clients).
 - **Record kinds:** 45 `SecretVersion`, 46 `SecretLink`. 47–49 are not used.
 - **Proto fields 90–99:** none needed. `SecretRef` already carries
   `version` and `version_hash`, and the new messages are new kinds.
@@ -964,7 +949,7 @@ Running it once before release is the maintainers' call (§12).
 ## 12. Phase B plan
 
 Each slice carries its tests, which fail without the change, and its docs.
-Gates run through `kronik-slot`.
+Gates run through the CI harness.
 
 0. **Spike** (a day):
    - a glibc `kronik-keyhelper` with `cryptoki` against SoftHSM2, called
@@ -974,7 +959,7 @@ Gates run through `kronik-slot`.
    - SigV4 against the AWS test vectors;
    - check `cryptoki`'s dependency tree with `cargo deny`.
 1. **B1 key sources:**
-   - `KeySource::load`, growing main's `MasterKey::open`;
+   - `KeySource::load`, growing `MasterKey::open`;
    - `master.wrapped`, shipped with keystore backups and installed by
      restore;
    - mlock / `MADV_DONTDUMP` / zeroize of the seed and derived keys;
@@ -1012,7 +997,7 @@ Gates run through `kronik-slot`.
    - `azure` (client credentials and IMDS).
 5. **B5 proof and docs:**
    - `crates/kronik/tests/secret_backends.rs` (criteria 2 and 3);
-   - the e2e and batch rows with OpenBao, moto, the emulators and SoftHSM2;
+   - the e2e suite with OpenBao, moto, the emulators and SoftHSM2;
    - the operations guide (backends, the master key in a KMS, bootstrap
      credentials, migration, rewrap, losing the KMS key);
    - the security guide's at-rest map;
@@ -1024,11 +1009,11 @@ Gates run through `kronik-slot`.
    enrollment/probe with owned SoftHSM; retain exact scope separately from the
    complete matching musl release lifecycle and device/vendor acceptance.
 
-B1 and B2 are independent. B3 and B4 need B2's trait. M23 merges after M28
+B1 and B2 are independent. B3 and B4 need B2's trait. M23 follows M28
 (kind 40 for the key-source audit events, and M28's classifier for kinds 45
 and 46).
 
-## 13. Open questions for the maintainers
+## 13. Open questions
 
 - **ADR 0093:** the release `kronik` is static musl and cannot load a
   PKCS#11 module at all. Proposed: a separate glibc `kronik-keyhelper`
@@ -1041,12 +1026,13 @@ and 46).
   KMS.
 
 
-## B1 resumed design gate (2026-10-30)
+## B1 design gate (2026-10-30)
 
-Only B1 is resumed. B2–B5 remain pending; B6 and ADR 0093 remain maintainer-gated.
-The revised B1 design was re-reviewed before implementation. The earlier
-loader inventory is historical: current main already fixes missing/wrong keys,
-shipping and restore; offline upgrade and audit verify are additional callers.
+B1 is the implemented scope. B2–B5 remain pending; B6 and ADR 0093 remain
+maintainer-gated. The revised B1 design was reviewed before implementation.
+The earlier loader inventory is historical: the current code already fixes
+missing/wrong keys, shipping and restore; offline upgrade and audit verify are
+additional callers.
 
 - All source readers use one provider-aware loader, including init, upgrade
   check and offline audit verify. Runtime shipping uses the loaded key, never

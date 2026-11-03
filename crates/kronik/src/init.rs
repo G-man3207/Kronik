@@ -1,4 +1,4 @@
-//! `kronik serve --init`: sets a host up to run Kronik under systemd (SPEC.md,
+//! `kronik serve --init`: sets a host up to run Kronik under systemd (the build brief,
 //! "The finished product", step 2): the configuration file, the data
 //! directory, the master key, the `kronik` group (which may use the API
 //! socket) and the systemd unit, which it enables and starts. Every step

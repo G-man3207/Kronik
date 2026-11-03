@@ -1,6 +1,6 @@
 # 0070. Standard `fetch` through `wasi:http/outgoing-handler` as an `http.fetch` effect
 
-- **Status:** Accepted (spike `spikes/spike-m22-wasi-http` proved §2 and §3's secret mapping for TypeScript `fetch`; §5 blocked on Wasmtime)
+- **Status:** Accepted (the M22 spike proved §2 and §3's secret mapping for TypeScript `fetch`; §5 blocked on Wasmtime)
 - **Date:** 2026-10-27
 
 ## Context
@@ -211,7 +211,7 @@ re-run ADR 0001's determinism suite with the async scheduler, and route the
 0.3 `wasi:http/client.send` import (`src/p3/wit/deps/http.wit:454`) through
 the same `send_request` hook, queue and gate.
 
-### 6. Spike results (`spikes/spike-m22-wasi-http`, 2026-10-27)
+### 6. Spike results (2026-10-27)
 
 A standalone harness (Kronik's engine from `kronik_runtime::build_engine`,
 the real `EffectGate`/`FetchRequest`/`FetchHeader` types, a stand-in gate
@@ -220,7 +220,7 @@ real latency per effect) runs a guest built with the pinned jco 1.39.0 /
 componentize-js 0.23.0 with only `fetch-event stdio` disabled. Its imports
 are exactly `wasi:http/{types,outgoing-handler}@0.2.10` beside the
 allowlisted `wasi:io`, `wasi:clocks`, `wasi:random` and `wasi:cli/stderr`.
-100 runs per mode (`results/run.txt`):
+100 runs per mode:
 
 | Mode | Transcripts (output, effects, every `poll` ready list, fuel) |
 | --- | --- |

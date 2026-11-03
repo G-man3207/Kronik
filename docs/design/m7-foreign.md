@@ -473,7 +473,7 @@ decimals (`0.5`). `--json` prints the response body unchanged.
   `payments.internal` end to end, including the approval the default policy
   requires for the EU VAT change.
 
-## 15. `kronik doctor` (fast-policy)
+## 15. `kronik doctor`
 
 ADR 0003's list, with what M7 fixes:
 

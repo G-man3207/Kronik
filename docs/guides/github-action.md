@@ -19,8 +19,8 @@ approval. Without such an approval it approves and promotes nothing.
 
 > **Not yet run on GitHub.** The action and the reference workflow are tested
 > against a fake `kronik` and a fake GitHub API (`scripts/ci.sh action`).
-> Running them in a real GitHub repository, against a real daemon, is an owner
-> action that has not been done yet.
+> Running them in a real GitHub repository, against a real daemon, is a
+> maintainer action that has not been done yet.
 
 ## What it does
 
@@ -177,7 +177,7 @@ Required reviewers are a GitHub plan feature: on Free, Pro and Team they work
 only in public repositories; on Enterprise in any repository. Environment
 secrets work without them, which is why the action checks for the approval
 itself. In the environment's protection rules, turn on **Prevent
-review** and turn off **Allow administrators to bypass configured
+self-review** and turn off **Allow administrators to bypass configured
 protection rules**.
 
 ## Inputs

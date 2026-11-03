@@ -19,7 +19,7 @@ use crate::node::Node;
 use crate::node::{internal, store_err};
 
 /// What staging the fork turn `record` of rebase `id` writes to main's log,
-/// at most (review N13-2, round 3): the turn wrapped in its StateRebase
+/// at most (review N13-2): the turn wrapped in its StateRebase
 /// record (the id, the fork LSN and two message headers), the log frame (17
 /// bytes), and a quarter more for sealing its values (a key id, a nonce and
 /// a tag each).
@@ -262,7 +262,7 @@ impl Node {
     /// 0017); without storage there is nothing to do. Also below `[log]
     /// disk_reserve`: until it exists compaction holds the log (it may have
     /// to rebuild across the switch), so refusing it would keep the node
-    /// below the reserve (review N13-2, round 3).
+    /// below the reserve (review N13-2).
     pub async fn snapshot_after_rebase(&self) {
         if self.storage_config().is_some()
             && let Err(e) = self.take_snapshot("rebase").await
@@ -325,7 +325,7 @@ impl Node {
         };
         // Every batch keeps to the reserve, not only the estimate before the
         // first: turns staged so far stay unused and are reused by a later
-        // promote (review N13-2, round 3).
+        // promote (review N13-2).
         let bytes: u64 = turns.iter().map(|(_, r)| rebase_turn_bytes(id, r)).sum();
         if self.disk_below_reserve().is_some()
             || self.disk_budget().is_some_and(|room| bytes > room)

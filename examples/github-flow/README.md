@@ -62,8 +62,8 @@ without requiring equality. Deployment, integrity and the changed HTTPS response
 are also checked. The synthetic fixture's public encryption seed is not a
 production key.
 
-The configured `kronik-production` environment has only reviewer `G-man3207`
-(user ID 113182292), prevents review, disallows administrator bypass and
+The configured `kronik-production` environment has a single required
+reviewer, prevents self-review, disallows administrator bypass and
 allows only branch `main`; these properties were read back from GitHub.
 The main event must be authored by a genuinely distinct installed App bot,
 then actually approved by that human. No dispatch/PAT approval substitutes
@@ -82,7 +82,7 @@ python3 scripts/e2e-github-flow.py smoke
 This performs real local product approval with an explicit **not GitHub approval**
 reason. It cannot satisfy the still-pending public PR/updated comment/check,
 App-authored merge, actual human environment approval and main promotion.
-Publishing branches or triggering those runs is separately director-batched.
+Publishing branches or triggering those runs is a separate, manual step.
 
 
 ## 1. A daemon GitHub can reach
@@ -143,7 +143,7 @@ In the repository's settings:
 | Variables → Actions | `KRONIK_BASE_URL` | Where one release's files are: `kronik-x86_64-unknown-linux-musl` and `SHA256SUMS` (a versioned URL, not a "latest" one) |
 | Secrets → Actions | `KRONIK_URL` | `https://kronik.example.com:7443` |
 | Secrets → Actions | `KRONIK_TOKEN` | The `ci-propose` token (`read`, `propose`) |
-| Environments | `kronik-production` | Required reviewers, "Prevent review" on, administrators may not bypass, deployment branches: `main` only |
+| Environments | `kronik-production` | Required reviewers, "Prevent self-review" on, administrators may not bypass, deployment branches: `main` only |
 | Environment `kronik-production` → secrets | `KRONIK_URL` | As above |
 | Environment `kronik-production` → secrets | `KRONIK_TOKEN` | The `ci-promote` token (`read`, `approve`, `promote`) |
 

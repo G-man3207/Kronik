@@ -5,7 +5,7 @@
 
 ## Context
 
-The brief (the build brief, "Agent interface: API, CLI and MCP") wants OpenAPI
+The build brief ("Agent interface: API, CLI and MCP") wants OpenAPI
 "generated, for example with `utoipa`, and published in the docs", and "all
 commands have `--json` with published schemas". The JSON API's router is one
 `match` on the method and the path segments (`kronik_api::Api::route`, plus

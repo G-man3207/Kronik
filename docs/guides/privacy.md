@@ -108,7 +108,7 @@ CREATE TABLE orders (
   changesets are sealed under the turn's default subject, but the rows
   themselves carry no subject. Give every table that holds personal data a
   `_subject` column. How such rows should be handled is an open question
-  for the project's owner (ADR 0005 §6).
+  for the maintainers (ADR 0005 §6).
 
 ## The modes
 

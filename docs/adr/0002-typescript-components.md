@@ -12,7 +12,7 @@ allowlist and the deterministic WASI host of ADR 0001 (I1, I2), and a fresh
 instance per turn (I3). M0 spike B asks for a TypeScript component built that
 way to run in that world with its imports listed. The brief also leaves an
 open question to an ADR: how fast is a fresh instance per turn for JavaScript
-components on the test VPS VPS, and what pre-initialization is needed? ADR
+components on the test VPS, and what pre-initialization is needed? ADR
 0001 left spike B to find out how much memory, fuel and how many table
 elements such components need.
 
@@ -24,22 +24,24 @@ from that snapshot. So the questions were what this engine imports, whether
 its clocks and randomness go through Kronik's host, what restoring the
 snapshot costs per turn, and what the build must do.
 
-Spike B (`spikes/spike-b-componentize-js/`, see its README) has:
+Spike B has:
 
-- `src/actor.ts`, a probe actor with modes for a no-op turn, the counter,
+- A probe actor with modes for a no-op turn, the counter,
   state/context/clock/randomness reporting, `Math.random()` counting, JSON
   work, an endless loop, allocation, a thrown `Error` and a thrown
-  `handler-error`; `src/counter.ts`, the brief's counter written against the
-  raw bindings; and `src/build-time-random.ts`, which must fail to build.
+  `handler-error`; a counter written against the raw bindings; and an actor
+  that reads a random value at build time, which must fail to build.
 - Scripts that build the components with the pinned toolchain the way
   `kronik build` would, list their imports, and run them in spike A's harness
   (unmodified) for determinism checks and benchmarks. Two experiments use a
   patched copy of the harness, because they do what Kronik must not: calling
   `handle` repeatedly on one instance, and changing the pooling allocator's
   slot reset.
-- Results from the development machine (AMD EPYC 9354P, 8 vCPU, shared with
-  other work, so its timings are noisy) and from the test VPS VPS (Debian 13,
-  2 vCPU Intel Xeon Skylake, no `/dev/kvm`, 3.7 GiB), in `results/`.
+- Results from the development machine (AMD EPYC 9354P, 8 vCPU) and from the
+  test VPS (Debian 13, 2 vCPU Intel Xeon Skylake, no `/dev/kvm`, 3.7 GiB).
+
+The M0 spike notes are in the project wiki:
+https://github.com/G-man3207/Kronik/wiki/Spikes.
 
 The spike used `wit/kronik-actor.wit` as of `5a8d400`. The amendments in
 `b8a3b39` (`state.set-for`, `privacy.current-subject`) add functions to
@@ -91,7 +93,7 @@ build time. ComponentizeJS always runs it.
 ### 3. Imports
 
 With `--disable http fetch-event stdio` a component imports 18 interfaces and
-passes the allowlist (`results/imports.txt`):
+passes the allowlist:
 
 - all 11 `kronik:actor/*@0.1.0` interfaces, in every build: ComponentizeJS
   imports every interface of the world, whether the code uses it or not (the
@@ -147,8 +149,8 @@ These are SDK obligations for M4, observed with the raw bindings:
 ### 5. Determinism
 
 Every check gave the same digests, fuel and outcomes on the AMD development
-machine and the Intel VPS (`results/determinism-*.txt` differ only in
-timestamps and timings):
+machine and the Intel VPS; only timestamps and timings differed between the
+runs:
 
 - **Fresh instances and processes.** Three fresh instances and two more
   processes give identical digests for the same input, seed and time.
@@ -185,9 +187,8 @@ timestamps and timings):
 
 ### 6. Fresh instance per turn: cost and pre-initialization
 
-This answers the brief's open question. Measured on the test VPS VPS with
-the pooling allocator, `InstancePre` and code loaded from the `.cwasm` cache
-(`results/bench-test-vps.txt`, `results/reuse-test-vps.txt`):
+This answers the brief's open question. Measured on the test VPS with the
+pooling allocator, `InstancePre` and code loaded from the `.cwasm` cache:
 
 | | `noop` | counter | JSON, 64 KB |
 | --- | --- | --- | --- |
@@ -215,12 +216,11 @@ Rust turn takes 45.6 µs on the same VPS.
   the call gets faster (at 16 MiB, `noop` takes 0.46 ms instead of 1.2 ms),
   but the time moves to freeing the slot, where the resident memory is reset:
   the whole `noop` turn takes 1.7, 1.9 and 2.4 ms instead of 1.3 ms, the
-  counter 2.0, 2.3 and 2.5 ms instead of 1.7 ms
-  (`results/keep-resident-test-vps.txt`). On the development machine
-  16 MiB does pay off (counter 0.82 ms instead of 1.3 ms), so the outcome
-  depends on the machine; Kronik keeps Wasmtime's default. The probe's
-  digests and fuel were the same at every size, so no state leaked between
-  turns.
+  counter 2.0, 2.3 and 2.5 ms instead of 1.7 ms.
+  On the development machine 16 MiB does pay off (counter 0.82 ms instead of
+  1.3 ms), so the outcome depends on the machine; Kronik keeps Wasmtime's
+  default. The probe's digests and fuel were the same at every size, so no
+  state leaked between turns.
 - **`--aot` (weval) does not help either.** The counter turn takes 1.8 ms
   instead of 1.7 ms, the JSON turn 6.7 ms instead of 7.1 ms with 10% less
   fuel, but the component grows from 12.8 to 19.0 MB, its compile time from
@@ -263,7 +263,7 @@ state the cost model and point to `kronik limits set <kind> --fuel`:
 - **Also disabling `random` and `clocks`** (`--disable all`). The component
   then imports only the 11 `kronik:actor` interfaces, and the `noop` and
   counter turns work, but the probe, which uses `crypto`, `Date` and
-  `Math.random()`, traps (`results/no-wasi.txt`). The SDK would have to
+  `Math.random()`, traps. The SDK would have to
   replace those APIs, while the host already makes them deterministic.
 - **`--aot` (weval).** Measured in section 6: no gain for small turns, 6%
   for JSON, at about 48% more size and 40% more compile time. It could become
@@ -272,8 +272,8 @@ state the cost model and point to `kronik limits set <kind> --fuel`:
   counter is 2.35 MB and builds in 1.4 s, but jco adds a
   `jco:node/console@0.1.0` import and writes it into the WIT file it is given,
   and the component imports `wasi:filesystem`. With `--backend-qjs-stub-wasi`
-  only `jco:node/console` is left, which the allowlist still rejects
-  (`results/quickjs.txt`). Not measured at runtime. The brief names
+  only `jco:node/console` is left, which the allowlist still rejects.
+  Not measured at runtime. The brief names
   ComponentizeJS; QuickJS is worth a second look if the size and per-turn
   cost of StarlingMonkey become a problem.
 - **The `componentize-js` command instead of jco.** Fails to read the WIT

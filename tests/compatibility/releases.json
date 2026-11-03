@@ -4,10 +4,10 @@
   "releases": [
     {
       "release": "v0.1.0",
-      "producer_revision": "4353863c275e1ddbe978c7701181cc7ac26f9db5",
+      "producer_revision": "f4d9d9e2cccf515cb5cc4952c0e8a3f643372e34",
       "producer_binary_sha256": "0cae31380774ef2b346d79ea234f6244e89b3f59d9c259a6d034b24e999b1db9",
       "manifest": "v0.1.0/manifest.json",
-      "manifest_sha256": "d46be2768467aa0f8e8c853df76c40b45e281a6468011168fa1aa1cec4d58df1",
+      "manifest_sha256": "b4db798bb9db962a96ad2bbb3c37b604f302f02c406be5f9263f83d12d986906",
       "root_inputs": 9,
       "contracts": {
         "api": {
@@ -60,10 +60,10 @@
     },
     {
       "release": "v0.3.0",
-      "producer_revision": "86d5a4bb92432d1acaf2cf8bec3188f9963dff76",
+      "producer_revision": "d9d460bc89f6ae30962ef16238b8fcaa6485a8de",
       "producer_binary_sha256": "1681833ad84da60622a6c196b8084bbe52a2deb8f6860a26c81dc9ea4f4a3947",
       "manifest": "v0.3.0/manifest.json",
-      "manifest_sha256": "07b81b5b73668f8d6757ba450ffa6f6e9e25475be7a5e9b554fa54462591e692",
+      "manifest_sha256": "604bf6c6ed56969a45f8abb1124b7dbde9ea7c5a866c471ee5aeeb923a611c57",
       "root_inputs": 9,
       "contracts": {
         "api": {

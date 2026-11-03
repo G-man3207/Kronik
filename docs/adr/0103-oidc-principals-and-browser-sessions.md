@@ -12,10 +12,8 @@ privileged UI dispatcher does not establish that identity. I5, I6, I8 and I12
 still apply. A browser session is authentication, not an additional permission.
 
 ## Decision
-This representation is the parent's engineering choice under the M27 task.
 Acceptance of this ADR is not evidence that a human reviewed the product or
 explicitly approved a representation or invariant change.
-
 
 Use the standard authorization-code flow with S256 PKCE. The operator fixes
 one HTTPS issuer, public client ID and exact HTTPS admin callback URI. Discovery

@@ -14,8 +14,6 @@ dist/
 *~
 .DS_Store
 
-# Coding-agent tool folders. The canonical skill copies live in .agents/;
-# these are symlinks to it.
-.zcode/
-.claude/
-.grok/
+# Python caches from repository tooling.
+__pycache__/
+*.pyc

@@ -10,8 +10,8 @@ everything that runs as Wasm actors, including their SQL state.
 
 Kronik is pre-alpha: it has two releases, `v0.1.0` and `v0.3.0`, and is not
 ready for production. This book describes what the code in the repository
-does. `STATUS.md` in the repository root shows how far the work has come,
-including what has not been run on a VPS. The
+does. The [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
+shows how far the work has come, including what has not been run on a VPS. The
 [quickstart](guides/quickstart.md) is the finished-product journey with the
 commands that exist today.
 
@@ -80,7 +80,7 @@ There is no web interface. The CLI, the JSON API and MCP are the surface.
 
 - Agents that write and change software at machine pace and need to prove
   that a change is safe.
-- Humans who review the contributors' work and do not have time to read all the
+- Humans who review the agents' work and do not have time to read all the
   code, but can read a behavior diff.
 - Small teams that want safe deploys on a VPS without Kubernetes.
 
@@ -128,8 +128,7 @@ on M3 and can be built in parallel, and release v0.1.0 needs all nine.
 
 After v0.1, the road to v1.0 (milestones M9 to M34) makes Kronik a cluster,
 with richer replay, CI integration, visibility, control from outside and a
-compatibility promise that holds until v2. The brief, `the build brief` in the
-repository root, describes it.
+compatibility promise that holds until v2. The build brief describes it.
 
 ## Reading this book
 

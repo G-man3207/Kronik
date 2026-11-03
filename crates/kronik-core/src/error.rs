@@ -51,7 +51,7 @@ macro_rules! codes {
             }
 
             /// The roadmap milestone that introduces the code, `M1` to `M8`
-            /// for v0.1 (SPEC.md, "Roadmap").
+            /// for v0.1 (the build brief, "Roadmap").
             pub const fn milestone(self) -> &'static str {
                 match self {
                     $(ErrorCode::$variant => $milestone,)*
@@ -462,7 +462,7 @@ mod tests {
 
     use super::*;
 
-    /// The codes that the brief requires in v0.1 (SPEC.md, "Agent
+    /// The codes that the brief requires in v0.1 (the build brief, "Agent
     /// interface: API, CLI and MCP").
     const BRIEF_CODES: [&str; 26] = [
         "IMPORT_NOT_ALLOWED",

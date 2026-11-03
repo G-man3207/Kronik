@@ -17,15 +17,15 @@ allocator, precompiled code per hash and engine version, and a deterministic
 WASI allowlist (`wasi:clocks`, `wasi:random`, `wasi:cli`, `wasi:io`), with
 everything else rejected at deploy with `IMPORT_NOT_ALLOWED`.
 
-Spike A tested this in `spikes/spike-a-wasmtime/`:
+Spike A tested this:
 
 - `wit/kronik-actor.wit`: the brief's WIT draft, `package kronik:actor@0.1.0`.
-- `spikes/spike-a-wasmtime/`: a host harness CLI (`imports`, `describe`,
+- A host harness CLI (`imports`, `describe`,
   `handle`, `demo`, `bench`) that can load any component targeting the
   `kronik:actor` world. It implements every import and prints the result plus
   an ordered trace of host calls, including WASI clock, random and stdio
   calls.
-- `spikes/spike-a-wasmtime/guest/`: a Rust guest built for `wasm32-wasip2` with
+- A Rust guest built for `wasm32-wasip2` with
   `wit-bindgen` 0.63. It uses Kronik state, `now-ms` and `random-bytes`, and it
   also uses std-level WASI: `SystemTime::now`, `Instant::now`, a `HashMap` with
   `RandomState`, `println!`/`eprintln!`, NaN arithmetic and a `static` counter.
@@ -124,10 +124,11 @@ same-kind code switch with distinct hashes (`kronik-fork/tests/upgrade.rs`).
   directory, never from user input or object storage.
 - Wasmtime embeds an engine and target fingerprint (including host CPU
   features) in the artifact and refuses mismatches. Observed: a `.cwasm` built
-  on the AMD EPYC development machine was refused on the Intel Skylake VPS ("failed to
-  load code"). Kronik treats a refused file as a cache miss, recompiles and
-  overwrites it. The cache is derived data (I4) and specific to one machine.
-  Snapshots and shipping never include `.cwasm` files, and `restore`
+  on the AMD EPYC development machine was refused on the Intel Skylake VPS
+  ("failed to load code"). Kronik treats a refused file as a cache miss,
+  recompiles and overwrites it. The cache is derived data (I4) and specific
+  to one machine. Snapshots and shipping never include `.cwasm` files, and
+  `restore`
   recompiles.
 
 ### 5. Fresh instance per turn
@@ -301,8 +302,8 @@ executor.
   and sleeps return immediately. The SDK docs must say this, and timers are the
   way to wait.
 - Precompiled code is per machine. A restore or a move to a different CPU
-  recompiles once per hash: 83 ms (dev) to 175 ms (VPS) for the 110 KB Rust
-  guest.
+  recompiles once per hash: 83 ms (development machine) to 175 ms (VPS) for
+  the 110 KB Rust guest.
 - The defaults for fuel and memory interact through the per-byte fuel cost of
   bulk memory operations (6).
 - Open for spike B: how much memory, fuel and how many table elements
@@ -320,14 +321,13 @@ generate bindings from it without changes.
 
 ### Measurements
 
-Dev machine: AMD EPYC 9354P (8 vCPUs visible, shared with other workloads,
-load average about 14 during the run, so the numbers are noisy). Test VPS VPS
-(`test-vps`): Intel Xeon Skylake (IBRS, no TSX), 2 vCPUs, 4 GB, KVM guest
+Development machine: AMD EPYC 9354P (8 vCPUs visible). Test VPS: Intel Xeon
+Skylake (IBRS, no TSX), 2 vCPUs, 4 GB, KVM guest
 without `/dev/kvm`, Debian 13, idle. The guest is the 110-116 KB Rust
 component. "Whole turn" includes creating the store and the per-turn WASI
 context, instantiating, calling `handle`, and reading fuel.
 
-| Measurement | Dev (EPYC 9354P) | VPS (Skylake, 2 vCPU) |
+| Measurement | Development machine (EPYC 9354P) | Test VPS (Skylake, 2 vCPU) |
 | --- | --- | --- |
 | Compile (Cranelift, parallel), p50 | 83 ms | 175 ms |
 | Deserialize `.cwasm` (cache hit), p50 | 155 µs | 333 µs |
@@ -344,11 +344,11 @@ will dominate.
 ### Verification
 
 ```sh
-spikes/spike-a-wasmtime/run.sh demo    # builds guest + harness, prints imports, runs 22 checks
-spikes/spike-a-wasmtime/run.sh bench   # the measurements above
 wasm-tools component wit wit/kronik-actor.wit
-cd spikes/spike-a-wasmtime && cargo test --release   # allowlist unit tests
 ```
+
+The M0 spike notes are in the project wiki:
+https://github.com/G-man3207/Kronik/wiki/Spikes.
 
 Observed on both machines: `0 check(s) failed`. The checks cover the
 allowlist, `IMPORT_NOT_ALLOWED` for synthetic and `std::fs` components, the

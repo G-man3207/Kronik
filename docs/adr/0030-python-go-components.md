@@ -10,10 +10,9 @@ Go with TinyGo and wit-bindgen-go, and both SDKs expose the same API as
 the Rust and TypeScript ones. Their components run in the same
 `kronik:actor` world under the same rules: the deploy allowlist, the
 deterministic WASI host of ADR 0001, a fresh instance per turn (I3). ADR
-0002 answered these questions for TypeScript. The M15 spike
-(`spikes/spike-m15-python-go/`, reproduced by its `run.sh`) asked them again: do the
-two toolchains produce components for `wit/kronik-actor.wit` whose imports
-stay inside the allowlist, what does a turn cost in fuel, do they run
+0002 answered these questions for TypeScript. The M15 spike asked them again:
+do the two toolchains produce components for `wit/kronik-actor.wit` whose
+imports stay inside the allowlist, what does a turn cost in fuel, do they run
 deterministically, and are the builds reproducible.
 
 Versions: componentize-py 0.25.1 (CPython 3.14 inside, wasi-sdk);
@@ -60,7 +59,7 @@ are reservations, not memory: unused slots cost address space only.
 | no-op message | 0.14 to 0.17 M | 0.77 M | 0.95 M |
 | counter increment | 0.37 to 0.42 M | 0.89 to 0.91 M | 1.59 M |
 | component size | 18.7 MB | 2.75 MB | 12.8 MB |
-| build | 10 s | 70 s (contended dev) | 3.7 s |
+| build | 10 s | 70 s | 3.7 s |
 
 componentize-py pre-initializes CPython at build time (as ComponentizeJS
 does with Wizer), so a turn starts from an initialized interpreter; most of

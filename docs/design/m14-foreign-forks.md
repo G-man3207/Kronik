@@ -37,7 +37,7 @@ independent: a row inserted in one is in neither the other nor production,
 and a row inserted in production afterwards is in no copy. From inside a
 copy, `wget http://1.1.1.1/` fails with "Network unreachable". Checkpoint
 and restore need no KVM: they work with systrap, so M14 holds on the
-test VPS VPS. I11 binds v0.1; the brief's test strategy runs every
+test VPS. I11 binds v0.1; the brief's test strategy runs every
 milestone's demo on a VPS without KVM, and M14 meets that too.
 
 Findings for the design: `/data` is not in the checkpoint (a host bind

@@ -93,9 +93,8 @@ make any skipped source range explicit.
 
 - **No hold, as `ship` does.** Simple, but an outage longer than the
   history window breaks completeness silently.
-- **An unbounded hold** (this ADR's first draft). Review H2: below the disk
-  reserve the node refuses new work, so an outside sink could stop
-  production.
+- **An unbounded hold** (this ADR's first draft). Below the disk reserve the
+  node refuses new work, so an outside sink could stop production.
 - **A hold capped by default (e.g. 30 days).** Bounds disk use, but turns a
   long outage into a gap that is recorded yet permanent. The default leans
   to completeness, and the cap is one setting (open question in m28-otel

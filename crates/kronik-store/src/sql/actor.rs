@@ -1011,7 +1011,7 @@ impl SqlActor {
     /// data itself).
     ///
     /// Tables without `_subject` are untouched here: see
-    /// [`rows_without_subject_column`] (the open owner question, ADR 0005 §6,
+    /// [`rows_without_subject_column`] (the open question, ADR 0005 §6,
     /// docs/design/m8-privacy.md §7).
     pub fn erase_subject(&mut self, subject: &str, lsn: u64) -> Result<u64, String> {
         lock(&self.shared).host = true;
@@ -1376,7 +1376,7 @@ pub fn canonical_hash_raw(conn: &Connection) -> rusqlite::Result<String> {
     Ok(format!("b3:{}", &h.finalize().to_hex()[..16]))
 }
 
-/// THE SEAM for the open owner question (docs/design/m8-privacy.md §7, ADR
+/// THE SEAM for the open question (docs/design/m8-privacy.md §7, ADR
 /// 0005 §6): rows that a turn with a default subject wrote to a table
 /// without a `_subject` column. Erasure deletes every row with `_subject =
 /// subject` (common to both options); what happens to these rows depends on

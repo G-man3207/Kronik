@@ -1,6 +1,6 @@
 # 0027. systemd unit hardening and runsc
 
-- **Status:** Accepted (owner confirmed 2026-10-29). Amended 2026-10-28 for
+- **Status:** Accepted (confirmed 2026-10-29). Amended 2026-10-28 for
   v0.1: `RestrictSUIDSGID` stayed while nothing ran `runsc restore`.
   Amended for v0.3: M14's sandbox copies run `runsc restore`, so the unit
   drops it (see "Without `RestrictSUIDSGID` (M14)").
@@ -11,8 +11,9 @@
 
 `kronik serve --init` installs `deploy/systemd/kronik.service`. In v0.1 the
 daemon runs as root, with the hardening that systemd allows (brief:
-"Säkerhetsmodell", SPEC: "Security model"). Every foreign-actor test runs
-the daemon outside systemd. When the unit was tested on test-vps it
+"Säkerhetsmodell", English build brief: "Security model"). Every
+foreign-actor test runs the daemon outside systemd. When the unit was
+tested on test-vps it
 failed in two ways.
 
 1. **No sandbox starts.** Under the unit shipped with 927c80a, every
@@ -127,11 +128,11 @@ the residual risk, which is wider than a compromised process:
 
 ## Evidence
 
-- **On test-vps, 2026-10-27, 20:09 UTC, under the VPS lock.**
+- **On test-vps, 2026-10-27, 20:09 UTC.**
   - Setup:
     - The 927c80a release, installed by `install.sh` and
       `kronik serve --init`.
-    - Then the installed unit replaced by this branch's
+    - Then the installed unit replaced by this change's
       `deploy/systemd/kronik.service` (only `@KRONIK@` substituted;
       `diff` against the file: identical), `daemon-reload`, restart.
   - With the new unit:
@@ -160,11 +161,11 @@ the residual risk, which is wider than a compromised process:
   - The same result came earlier as a non-root user in a user namespace
     (the M21 setting), toggling each setting alone: only
     `RestrictSUIDSGID` breaks restore.
-- **The v0.1 amendment, on test-vps, 2026-10-28, 09:32 UTC, under the
-  VPS lock.** Each binary was installed through `kronik serve --init` from
-  `/opt` (no `install.sh`). Each run deployed counter.wasm, added
-  foreign-echo as `echo`, granted it, sent `GET foreign://echo/healthz` from
-  `counter/c1`, listed the modes, and removed everything again.
+- **The v0.1 amendment, on test-vps, 2026-10-28, 09:32 UTC.** Each binary was
+  installed through `kronik serve --init` from `/opt` (no `install.sh`). Each
+  run deployed counter.wasm, added foreign-echo as `echo`, granted it, sent
+  `GET foreign://echo/healthz` from `counter/c1`, listed the modes, and
+  removed everything again.
   - **Before** (main's unit, without `RestrictSUIDSGID`): `CapPrm
     000001f3fdfeffff`, `NoNewPrivs 1`, reply `200 ok`. `/run/kronik` was
     `750 root:kronik`, and runsc's root `/run/kronik/runsc` was
@@ -179,10 +180,10 @@ the residual risk, which is wider than a compromised process:
   - Afterwards: no unit, configuration, data, group or runsc process left.
     `/run/kronik` holds only its `foreign.lock` again.
 - **The v0.3 unit with M14's copies, on test-vps, 2026-10-29, 01:20:36
-  to 01:20:41 UTC, under the VPS lock** (the batch's `M14/unit`). The
-  94d20ac release, installed by `install.sh` and `kronik serve --init`; the
-  installed unit is `deploy/systemd/kronik.service` with only `@KRONIK@`
-  substituted (`cmp`: identical).
+  to 01:20:41 UTC.** The f4d1143 release, installed by `install.sh` and
+  `kronik serve --init`; the installed unit is
+  `deploy/systemd/kronik.service` with only `@KRONIK@` substituted (`cmp`:
+  identical).
   - `systemctl show`: `User=` empty, `Group=kronik`,
     `NoNewPrivileges=yes`, `RestrictSUIDSGID=no`. The daemon has `CapInh 0`,
     `CapPrm 000001f3fdfeffff`, `NoNewPrivs 1`.
@@ -201,7 +202,7 @@ the residual risk, which is wider than a compromised process:
   - Afterwards: unit, group, data, configuration, binary and image copy
     removed; no runsc process left.
 
-To repeat the toggle test on a host with runsc (as root, under the lock;
+To repeat the toggle test on a host with runsc (as root;
 `$B` is a bundle whose `config.json` has `"terminal": false`):
 
 ```sh
@@ -248,8 +249,8 @@ exactly these):
 
 - Foreign actors work under the installed unit, which they never did in a
   release.
-- The batch should run the foreign suites under the installed unit, not
-  only outside systemd. Both problems stayed hidden because no test did.
+- The foreign suites should also run under the installed unit, not only
+  outside systemd. Both problems stayed hidden because no test did.
 - M21 replaces this unit with a non-root one (`User=kronik`, a user
   namespace for the sandboxes). The `User=` trap does not apply there: a
   non-root daemon gets its capabilities inside its own user namespace, not

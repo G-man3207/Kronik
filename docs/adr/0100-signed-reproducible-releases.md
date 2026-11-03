@@ -90,9 +90,10 @@ fabricated unsigned release to install gVisor.
 
 ## Alternatives
 
-An project-held Ed25519 key and OpenSSL would make the consumer smaller, but adds
-unavailable long-lived key custody and rotation. It was not selected. Requiring
-a modern system `gh` is not a fresh-Ubuntu contract: Noble supplies an older CLI.
+A maintainer-held Ed25519 key and OpenSSL would make the consumer smaller, but
+adds unavailable long-lived key custody and rotation. It was not selected.
+Requiring a modern system `gh` is not a fresh-Ubuntu contract: Noble supplies
+an older CLI.
 Downloading a verifier and trusting its adjacent checksum, handwritten Sigstore
 PKI, executing Kronik to verify its own download, and unsigned fallbacks are not
 acceptable alternatives.

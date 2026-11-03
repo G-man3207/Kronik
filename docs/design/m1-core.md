@@ -1,16 +1,15 @@
 # M1 core design
 
-Status: binding for M1 work. Owner of the daemon core: the core worker. This
-document fixes the interfaces other workers build against: the crates' main
-types, the v1 log format, the id formulas, the JSON API, and the guest SDK
-contract. The ADRs it relies on: 0001 (Wasmtime), 0004 (Env and DST),
-0005 (SQL state).
+Status: binding for M1 work. This document fixes the interfaces the other
+crates build against: the crates' main types, the v1 log format, the id
+formulas, the JSON API, and the guest SDK contract. The ADRs it relies on:
+0001 (Wasmtime), 0004 (Env and DST), 0005 (SQL state).
 
 ## 1. Crates and their main types
 
 | Crate | Exposes |
 | --- | --- |
-| `kronik-core` | `env` (`Clock`, `Spawner`, `EntropySource`, `Fs`/`File`, `Net`, `ProcessRunner`, `Env`, `JoinHandle`, `Env::{spawn, blocking, timeout, random_bytes}`); `env::real` behind feature `real` (tokio/std implementations, ADR 0004); `ids` (`ActorRef`, `Lsn`, `TurnId`, `ExecutionId`, `CodeHash`, `RootId`); `causal` (`CausalKey`, `causal_id()`, `message_id()`, `idempotency_key()`); `time` (`LogicalClock`, I15); `error` (`ErrorCode`, `ApiError`; content owned by the docs/CLI worker). |
+| `kronik-core` | `env` (`Clock`, `Spawner`, `EntropySource`, `Fs`/`File`, `Net`, `ProcessRunner`, `Env`, `JoinHandle`, `Env::{spawn, blocking, timeout, random_bytes}`); `env::real` behind feature `real` (tokio/std implementations, ADR 0004); `ids` (`ActorRef`, `Lsn`, `TurnId`, `ExecutionId`, `CodeHash`, `RootId`); `causal` (`CausalKey`, `causal_id()`, `message_id()`, `idempotency_key()`); `time` (`LogicalClock`, I15); `error` (`ErrorCode`, `ApiError`; content defined by the error catalog). |
 | `kronik-proto` | Generated prost types `kronik_proto::log::v1::*` from `proto/kronik/log/v1/*.proto` (built with `prost-build` + `protox`, no `protoc` needed); `Record` (enum over all record types) with `kind()`, `encode()`, `decode(kind, bytes)`; `validate()` that turns enum 0, unknown enum values and missing required oneofs into `Corrupt`. |
 | `kronik-log` | Segment format and envelope; `Log` (group-commit writer: `append(Record) -> Lsn` resolves after fsync; committed records are streamed in LSN order to the applier); `scan_dir()`/`LogReader` (read from an LSN); recovery (torn-tail truncation of the active segment, `STORAGE_CORRUPT` otherwise); segment rolling at 64 MiB or 60 s. |
 | `kronik-store` | `StateDb` (`state.db`, SQLite WAL) and the `Applier` (`apply(lsn, &Record)`, single writer, LSN order, `applied_lsn` + logical-time high-water mark in the same transaction); read queries for the API (actors, kv, history, dead letters, deployments, ingress keys); `sql::SqlActor` + `SqliteOpener` (`FileOpener`, `MemOpener`) + an LRU pool (ADR 0005). |

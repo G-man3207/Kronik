@@ -672,7 +672,7 @@ fn the_model_never_sees_or_caches_secret_values() {
                 )
             })?;
             // The certified catalogue briefly uncertifies across a
-            // deployment-epoch publication (STATUS, known product gap): a
+            // deployment-epoch publication (known product gap): a
             // scrubbed read answers SECRET_UNAVAILABLE while it
             // recertifies, and clients must retry that window, as the CLI
             // does. Await exactly that window here; any other error, or a

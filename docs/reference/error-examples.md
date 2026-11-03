@@ -2,7 +2,7 @@
 
 The [generated catalog](../errors.md) defines each stable code, HTTP status,
 meaning and detailed remediation. These are **illustrative fixture scenarios**,
-not claims that every failure was induced in this change. Commands assume an
+not claims that every failure was induced. Commands assume an
 owned installation, the stated precondition and the appropriate scoped token;
 replace example ids with real fixture ids. Do not induce faults in production,
 change shared host settings, or pass actual credentials in argv to reproduce an
@@ -572,8 +572,8 @@ kronik watches list
 
 ## M23 source-contract additions
 
-These six codes follow the current maintainers' authoritative error catalog. They
-are not claims that the `0b84ab0f` proof binary or published v0.3.0 implements
+These six codes follow the current authoritative error catalog. They
+are not claims that the `d9b946f2` proof binary or published v0.3.0 implements
 the new source, nor that these failures were induced here. The M23 CLI
 commands and backend setup require the integrated artifact described in the
 [CLI](cli.md) and [API examples](api-examples.md). Final error-catalog

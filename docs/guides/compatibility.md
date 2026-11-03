@@ -1,10 +1,10 @@
 # Compatibility, versions and deprecation
 
 Kronik has **not reached the v0.9 compatibility freeze**. The actor package is
-currently `kronik:actor@0.1.0` in the committed baseline; the IO workstream is
-changing the actual ABI before that freeze. This page defines the required
+currently `kronik:actor@0.1.0` in the committed baseline; the IO 0.2 interface
+changes the actual ABI before that freeze. This page defines the required
 compatibility policy, not a claim that unfinished interfaces are frozen or that
-v0.9/v1.0 is ready. `STATUS.md` identifies accepted implementation and proof.
+v0.9/v1.0 is ready.
 
 ## What must remain compatible
 
@@ -101,8 +101,7 @@ it as compatible or fabricating a twelve-month history.
 
 The current fixture tests, example identity replay and engine-upgrade checks
 remain useful evidence for their measured revisions. They do not by themselves
-establish the complete M33 release corpus or all future interfaces. Consult
-`STATUS.md` before relying on an acceptance claim.
+establish the complete M33 release corpus or all future interfaces.
 
 ## Replaying the actual released corpus
 
@@ -171,11 +170,11 @@ Promotion verifies bounded payloads, exact inventory and digest/provenance
 agreement, and refuses existing destinations. Only the public dummy master key
 `44` repeated 32 times and owned test data occur in these fixtures.
 
-The retained checkpoint proof reports under `docs/benchmarks/compatibility-*`
-show nine original roots and ten turns per actual producer, successful engine
+The retained [compatibility proof](https://github.com/G-man3207/Kronik/wiki/Performance-evidence)
+shows nine original roots and ten turns per actual producer, successful engine
 upgrade from Wasmtime 50.0.0 to 50.0.1, and complete unchanged replay in both
-modes. Their candidate is the assurance branch's `0b84ab0f`-based development
-binary, **not the subsequently integrated M23–M30 product**. The later IO
+modes. Those measurements were made on the `d9b946f2`-based binary, **before
+the subsequently integrated M23–M30 product**. The later IO
 0.1-to-0.2 adapter, new wire formats, public API/CLI additions and their schemas
 must pass again against that actual integrated binary before any M33 or v0.9
 claim. The source revision label alone is not proof of a clean release build.
@@ -183,7 +182,7 @@ claim. The source revision label alone is not proof of a clean release build.
 
 ### Exercised tagged-component and public-contract consumer
 
-The complete index consumer subsequently passed against that same owned
+The complete index consumer subsequently passed against that same
 checkpoint binary, SHA-256
 `149fe62fe088267992a1eec40853947c89daab9c38b58acb44cf0bf6a1fc5408`.
 For **both** actual releases it read the frozen producer log, upgraded and
@@ -197,10 +196,10 @@ The real public `kronik.diff/v1` API agreed with the CLI replay's semantic
 summary. Public policy evaluation kept `deny` stricter than later `allow`,
 and a missing-field evaluation error required approval rather than allowing
 promotion. The exact
-[released-component and contract proof](../benchmarks/released-components-and-contracts-2026-10-31.json)
+[released-component and contract proof](https://github.com/G-man3207/Kronik/wiki/Performance-evidence)
 is retained; this was not a source-copy, default-value or decoder-only test.
 
-The released v0.1.0/v0.3.0 WIT definitions and the committed `0b84ab0f`
+The released v0.1.0/v0.3.0 WIT definitions and the committed `d9b946f2`
 definition also resolve to the same actual Git blob,
 `86c3f0e739057aa08c460bda06f1a42c9679d87e`. That confirms the legacy definition's
 lineage without substituting today's component binary for the older binaries.
@@ -247,7 +246,7 @@ python3 scripts/compatibility-contracts.py \
 The historical directories are **lineage and comparison inputs**, not a claim
 that all pre-v0.9 API/error-enum changes were forbidden. This command can reject
 a deliberately documented pre-freeze change. It is not newly wired into
-today's CI as a global freeze gate. The Swedish brief starts the interface
+today's CI as a global freeze gate. The build brief starts the interface
 promise after v0.9; the separate old-log requirement already covers every
 published `0.x`. No empty, future or invented v0.9 baseline is checked in.
 Once a coherent product actually meets the acceptance criteria, retain its
@@ -262,30 +261,27 @@ components, and exact tagged contract source bytes with Git-blob and SHA-256
 identities. Do not delete a published release to make the matrix green, rewrite
 old bytes for a new engine, or replace a tagged component with a new build.
 The currently retained v0.1.0/v0.3.0 snapshots were read directly from source
-commits `4353863c275e1ddbe978c7701181cc7ac26f9db5` and
-`86d5a4bb92432d1acaf2cf8bec3188f9963dff76`.
+commits `f4d9d9e2cccf515cb5cc4952c0e8a3f643372e34` and
+`d9d460bc89f6ae30962ef16238b8fcaa6485a8de`.
 
 Ordinary Python behavior tests and explicit source-CLI comparisons do not run
 the Kronik product, upgrade/replay an old log, or prove a production WIT
-migration rejection. The historical checkpoint receipts above remain
+migration rejection. The historical checkpoint evidence above remains
 historical. These source guards do **not** declare WIT 1.0, current coherent
 product acceptance, the v0.9 freeze or a v1/v2 support window already in force.
 
-### Narrow source-verification receipt
+### Source-verification evidence
 
-`<internal-evidence>` retains the exact lightweight observation,
-raw outputs and read-only inputs. The tested source identities are:
+The source identities tested by the lightweight source verification are:
 
 | Source | SHA-256 |
 | --- | --- |
 | `scripts/compatibility-contracts.py` | `ddddce87b3b24d48ebc4179936b23f73a4d7bae7b686ab29839183b6cd8dc984` |
 | `scripts/tests/test_compatibility_contracts.py` | `1f7d2b92b72d686747d5bcbbcaf6ecacde245d85cbf29eb43087e1864a9fdb3b` |
-| `scripts/tests/test_compatibility.py` after the private-copy fix | `e73f41e1fef0b37b0210b638b8137f7e8a6cc6f2d2d5ff0ff59fb43fded40e00` |
+| `scripts/tests/test_compatibility.py` | `e73f41e1fef0b37b0210b638b8137f7e8a6cc6f2d2d5ff0ff59fb43fded40e00` |
 
-There were 58 initial successful cases and three initial private-copy
-permission errors; only those three were corrected and resumed successfully,
-with zero skips and no fresh whole-suite rerun. The two real source-CLI
-pass/fail pairs and total 2.140556-second outer observation are separate from
-any production acceptance. The owned driver/control scaffolding was removed;
-the raw failure/success outputs and exact read-only source evidence remain.
-Mutable candidates existed only in the two finite `--rm` containers' tmpfs.
+The suite reported 58 successful cases and zero skips. The two real source-CLI
+pass/fail pairs and the 2.140556-second outer observation are separate from
+any production acceptance. The raw failure/success outputs and exact
+read-only source evidence are retained. Mutable candidates existed only in the
+two finite `--rm` containers' tmpfs.

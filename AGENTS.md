@@ -1,20 +1,24 @@
 # Agents
 
-Kronik is built by a parallel development. Before you change anything, read:
+Kronik accepts contributions from people and from automated agents. Before you
+change anything, read:
 
-1. `the build brief`: the English translation of the build brief.
-2. `Kronik — Build Brief.md`: the original brief, in Swedish. It is the
-   source of truth and is authoritative if it and `the build brief` disagree. Never
-   edit, move or rename it.
-3. `STATUS.md`: the current milestone, what is done, next steps, open
-   questions and known gaps. Update it at the end of every work period.
+1. [The build brief](https://github.com/G-man3207/Kronik/wiki/Build-Brief): the
+   English translation of the project's build brief, and the source of truth
+   for scope, invariants and milestones.
+2. The original build brief, in Swedish:
+   [Build-Brief-Original-Swedish](https://github.com/G-man3207/Kronik/wiki/Build-Brief-Original-Swedish).
+   It is authoritative if the two disagree, and the two pages are kept in sync.
+3. [The project status](https://github.com/G-man3207/Kronik/wiki/Project-status):
+   the current state of each milestone, the open questions and the known gaps.
 4. `docs/adr/`: the decisions so far. Record new non-trivial decisions as ADRs
    based on `docs/adr/0000-template.md`.
 
-The brief also says how to work: follow the milestone order, verify
-everything yourself, never change an invariant on your own, and when you are
-stuck after three serious attempts, write the problem under open questions in
-`STATUS.md` and continue with the next independent task.
+The build brief also sets out the project's conventions: follow the milestone
+order, verify changes against the tests and the demo scripts, and never change
+an invariant without a maintainer decision. If a change would alter an
+invariant or the scope of v0.1, open an issue for a maintainer decision before
+proceeding.
 
 ## Conventions
 

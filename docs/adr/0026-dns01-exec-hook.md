@@ -54,8 +54,8 @@ these APIs built in and no way to test against them in CI.
   hook can call `nsupdate` for the zones that do.
 - **acme-dns** (a CNAME from `_acme-challenge` to a small dedicated DNS
   server): limits what a leaked credential can do, but needs a separate
-  server. A hook can call acme-dns's HTTP API, so the maintainers can still choose
-  it.
+  server. A hook can call acme-dns's HTTP API, so the operator can still
+  choose it.
 - **No wildcard; a certificate per preview fork**: one order per preview,
   slow and against Let's Encrypt's rate limits. The path prefix
   `/__preview/<id>` on the main name, without `preview_domain`, is the
@@ -63,7 +63,7 @@ these APIs built in and no way to test against them in CI.
 
 ## Consequences
 
-- The maintainers writes or picks the hook, and keeps the DNS API credentials
+- The operator writes or picks the hook, and keeps the DNS API credentials
   where the hook reads them, not in `kronik.toml`. Kronik never sees them.
 - There is no built-in DNS provider: without a hook there is no wildcard
   certificate, so `mode = "acme"` with `preview_domain` and no hook is

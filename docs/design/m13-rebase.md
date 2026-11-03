@@ -253,7 +253,7 @@ round, at most `promote.max_gap` of traffic, are added after the approval).
 
 Creating a rebase needs the `propose` scope (it writes only a fork) and
 `pii:read`: it replays on full data, so it cannot be the `--no-pii` fork a
-token without `pii:read` gets (review N13-5, ADR 0018). The switch is a
+token without `pii:read` gets (ADR 0018). The switch is a
 promote (`promote` scope) and needs an approval (`approve`).
 `kronik rollback <epoch> --by-replay [--mode continuous|both] [--threads
 N] --reason "..." [--dry-run] [--json]` prints the proposal, its summary
@@ -296,7 +296,7 @@ No new error codes: refusals are `BAD_REQUEST`, `PROPOSAL_STALE`,
 | A rollback via replay after a migration gives the old code's state and a list of irreversible effects | `kronik-fork` `rollback_by_replay_after_a_migration_restores_the_old_state` (counter → a schema-1 build that migrates and makes an extra GET; the diff's state, `irreversible`, approval required, the switch: old code, old schema, no migrated key, state as the old code computes it, history kept). |
 | Recovery from the log after a `StateRebase` gives the same state as before the restart | `kronik-fork` `the_rebased_state_is_rebuilt_from_the_log` (state hash after the switch = after a restart = after a rebuild from a snapshot before the switch, which crosses the switch and builds the shadow from the log). |
 | No root input is lost or duplicated during the switch | `kronik-fork` `no_root_input_is_lost_or_duplicated_during_the_switch` (requests with idempotency keys sent from threads during promote: each key in exactly one root turn of main's effective history, the counter equals the number of answered requests), and `a_switch_that_cannot_pause_in_time_writes_nothing` (a turn hanging on an effect: `PROPOSAL_STALE`, no switch record, held requests answered). |
-| Review hardening (v0.3 review) | `kronik-fork` `tests/rebase.rs`: `a_deployment_after_the_rebase_makes_its_promote_stale`, `a_proposal_from_before_a_rebase_switch_is_stale` (§1, §6); `a_timer_fired_during_catch_up_is_replayed_in_its_place`, `a_resume_that_cannot_prove_its_staged_turns_is_refused` (§4 step 2); `consequences_in_flight_at_the_pause_run_on_main_after_the_switch` (§4); `the_pause_holds_requests_at_most_max_pause` (step 6); `a_rebase_scrubs_revealed_secrets_like_production`, `a_rebase_uses_recordings_only_and_its_dry_run_writes_nothing` (§8, I8, I12); `a_message_pending_at_the_fork_point_is_replayed`, `a_resend_of_a_message_the_old_code_ran_is_skipped` (§4); `a_rebase_replaces_and_clears_sql_actor_databases` (§3, SQL actors). |
+| Hardening | `kronik-fork` `tests/rebase.rs`: `a_deployment_after_the_rebase_makes_its_promote_stale`, `a_proposal_from_before_a_rebase_switch_is_stale` (§1, §6); `a_timer_fired_during_catch_up_is_replayed_in_its_place`, `a_resume_that_cannot_prove_its_staged_turns_is_refused` (§4 step 2); `consequences_in_flight_at_the_pause_run_on_main_after_the_switch` (§4); `the_pause_holds_requests_at_most_max_pause` (step 6); `a_rebase_scrubs_revealed_secrets_like_production`, `a_rebase_uses_recordings_only_and_its_dry_run_writes_nothing` (§8, I8, I12); `a_message_pending_at_the_fork_point_is_replayed`, `a_resend_of_a_message_the_old_code_ran_is_skipped` (§4); `a_rebase_replaces_and_clears_sql_actor_databases` (§3, SQL actors). |
 
 Plus `kronik-proto` compatibility fixtures for both parts of
 `StateRebase`, `kronik-api` `rebase_endpoints`, and the schema checks of a

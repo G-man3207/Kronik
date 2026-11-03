@@ -33,7 +33,7 @@ is a log record.
      create/delete/deploy/replay/send, proposal create, privacy reseal,
      snapshot create. Five routes of v0.2 join them: watch start and stop,
      preview create and delete, and a rollback via replay's proposal
-     (`rebase.create`, perf review P2).
+     (`rebase.create`).
    - Secret/token changes, preview create/delete, watch stop and proposal
      submission record intent before the effect; failures record
      `<action>.failed`. Intent is not proof of success. Watch start also
@@ -68,7 +68,7 @@ is a log record.
      withheld/token-scrubbed, so a reseal does not change it.
      An erasure's subject is replaced by its keyed label, and the key in a
      `fork.send` event's `details.actor` by its keyed label (`kind/` plus
-     the label, perf review R1), so the hash cannot confirm a guessed
+     the label), so the hash cannot confirm a guessed
      subject or actor key.
 
    A unit test fails when a record message with an `Audit` field is not
@@ -120,7 +120,7 @@ is a log record.
      contract; arbitrary deletion plus a stale listing is not safe.
      Unsupported conditional create stalls as `s3_unsupported`.
    - After a restore reuses LSNs, no sink loses or deduplicates away the
-     lines it got before (code review H-B).
+     lines it got before.
    - Delivery is at least once and in order. Consumers dedup by (`lsn`, `effect`, `record_hash`).
 
 ## Alternatives
@@ -147,7 +147,8 @@ is a log record.
   fixture (I16). Binaries from before M28 cannot open a log that has one,
   as with any new kind.
 - The log becomes the complete audit trail (I5). `kronik history
-  --operations`, which SPEC promises, can later read the same records.
+  --operations`, which the build brief promises, can later read the same
+  records.
 - Re-sent batches duplicate lines, so consumers must dedup by (`lsn`,
   `effect`, `record_hash`). This is documented with the sink formats.
 - The file sink truncates its newest file to the last newline at start, so

@@ -52,8 +52,8 @@ design and are not in the log; the log had no wall latency of a turn.
 
 ## Amendment (2026-10-27): a watch never undoes a later deployment
 
-The M11 review found that a guard's rollback could revert a newer
-deployment, and that the statistics could roll back healthy code.
+A guard's rollback could revert a newer deployment, and the statistics
+could roll back healthy code.
 
 - **Only the latest deployment of its kinds is watched**, and the window
   after it ends at the first later `Deployment` that touches one of them.

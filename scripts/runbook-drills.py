@@ -70,7 +70,7 @@ def main():
     recovery = None
     results = {"format": "kronik.runbook-proof/v1", "revision": args.revision,
                "binary_sha256": corpus.digest(binary), "storage": "same-host file fixture; not off-host backup",
-               "cluster_node_loss": "not exercised; requires actual public member lifecycle and three-node test VPS"}
+               "cluster_node_loss": "not exercised; requires actual public member lifecycle and three-node test environment"}
     try:
         source.start(env)
         for guest in (args.counter, args.notes):

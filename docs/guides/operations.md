@@ -158,7 +158,7 @@ a recovered provider. There is no repair endpoint, anonymous fallback or
 automatic file-based replacement. Pending callbacks and sessions retain their
 original source/epoch and cannot upgrade to a new one. Corrupt durable
 authority, missing required master keys and invalid global configuration remain
-fatal as appropriate. Actual integrated acceptance is recorded in `STATUS.md`.
+fatal as appropriate.
 
 Discovery must return the exact configured issuer and HTTPS authorization,
 token and JWKS URLs on its authority. Redirects and token-directed key URLs
@@ -471,14 +471,14 @@ has expired and warns 30 days before.
 Preview forks answer at `<id>.<preview_domain>`. One certificate,
 `*.<preview_domain>`, covers them all, and ACME issues wildcards only by
 DNS-01: the CA looks up a TXT record at `_acme-challenge.<preview_domain>`.
-Kronik has no DNS provider built in. The maintainers provides a hook, a program
+Kronik has no DNS provider built in. The operator provides a hook, a program
 that writes and deletes that TXT record through the DNS host's API (see
 [ADR 0026](../adr/0026-dns01-exec-hook.md)). Without a hook there is no
 wildcard certificate, so `mode = "acme"` with `preview_domain` and no hook
 is refused at start; leave `preview_domain` unset and preview forks use the
 path prefix `/__preview/<id>` on the main name.
 
-The maintainers provides:
+The operator provides:
 
 - a DNS zone they can write to through an API, with a wildcard record
   `*.preview.example.com` (`A`, and `AAAA` with IPv6) pointing at this
@@ -1143,8 +1143,8 @@ KRONIK_BIN=target/x86_64-unknown-linux-musl/release/kronik \
   flock -w 20 /var/tmp/kronik-vps.lock scripts/e2e-keys.sh
 ```
 
-The VPS lock is the existing shared test VPS convention: do not run another
-suite concurrently. Each run creates a fresh private directory beneath
+The VPS lock is the existing convention on the shared test VPS: do not run
+another suite concurrently. Each run creates a fresh private directory beneath
 `/var/tmp`, prints its `results.json` path and retains logs/test data there.
 On exit the driver removes only its owned containers, reports removal
 failures and records a filtered post-cleanup observation. Existing services

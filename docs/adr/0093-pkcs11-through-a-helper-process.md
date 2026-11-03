@@ -1,7 +1,7 @@
 # 0093. PKCS#11 through an optional helper process
 
 - **Status:** Accepted narrow exception for M23 B6; integrated helper/release acceptance is not yet claimed.
-- **Supersedes:** the parked owner gate, label/slot identity assumptions and unpatched cryptoki 0.10 recommendation.
+- **Supersedes:** the parked approval gate, label/slot identity assumptions and unpatched cryptoki 0.10 recommendation.
 
 ## Context
 
@@ -57,7 +57,7 @@ floor, ARM/Ubuntu execution, a physical HSM or a public signed release.
 
 An owned, network-disabled, read-only-container spike exercised authenticated Debian SoftHSM2 2.6.1-3: AES256 sensitive/nonextractable/nonmodifiable keys, real AES-GCM encrypt/decrypt, wrong-key/AAD/tag rejection, finalize/reinitialize and exact serial/ID recovery. Duplicate labels returned two objects; slots changed; `CKA_UNIQUE_ID` was unsupported. The mechanism reported ENCRYPT/DECRYPT only. No host module/package/service installation or physical HSM was used.
 
-This proves the exercised software module capability, not an integrated helper, release ABI floor, daemon lifecycle, IAM, vendor hardware or complete no-plaintext/no-orphan claim. Exact command/package/module digests and source-review caveats are retained in the implementation evidence; STATUS.md must name only actually exercised integrated checks.
+This proves the exercised software module capability, not an integrated helper, release ABI floor, daemon lifecycle, IAM, vendor hardware or complete no-plaintext/no-orphan claim. Exact command/package/module digests and source-review caveats are retained on [the project status page](https://github.com/G-man3207/Kronik/wiki/Project-status); only actually exercised integrated checks may be claimed.
 
 ## Acceptance evidence required
 

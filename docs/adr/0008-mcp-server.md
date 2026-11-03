@@ -5,7 +5,7 @@
 
 ## Context
 
-The brief (the build brief, "Agent interface: API, CLI and MCP") asks for `kronik
+The build brief ("Agent interface: API, CLI and MCP") asks for `kronik
 mcp` on stdio and Streamable HTTP on the API listener, built with the
 official Rust MCP SDK "if it is sufficient", with the tools of its table and
 resources for concepts, the WIT, the error catalog, the configuration and

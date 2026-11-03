@@ -179,7 +179,7 @@ kronik approve p-7h3k2a9c1d0e --reason '...'
 kronik promote p-7h3k2a9c1d0e --reason '...'
 ```
 
-Give both commands to the reviewer, with the proposal id and a summary of the
+Give both commands to the human, with the proposal id and a summary of the
 diff. Promote first replays the traffic that arrived since your proposal
 (catch-up) and evaluates the policy again; an approval applies to the diff
 it was given for.

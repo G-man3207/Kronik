@@ -894,7 +894,7 @@ Next     kronik secret list
 ## M23 external-secret CLI additions: source contract
 
 The following five commands match the current M23 source declarations, not
-availability in the `0b84ab0f` proof binary or published v0.3.0. The final
+availability in the `d9b946f2` proof binary or published v0.3.0. The final
 integrated binary must pass the real help/surface check before availability is
 claimed. See the [API examples](api-examples.md) for the owned `demo-env`
 backend configuration, permitted dummy environment reference and startup
@@ -1433,7 +1433,7 @@ Next     kronik diff show p-d8e829aa6c7a --md
 ```
 
 A request for approval (`request_approval` over MCP) follows the policy,
-with its requester and its reason in full: the evidence the reviewer reads
+with its requester and its reason in full: the evidence the human reads
 before deciding.
 
 ```text

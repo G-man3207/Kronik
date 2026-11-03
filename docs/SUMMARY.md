@@ -54,11 +54,10 @@
 - [M13 rollback via replay design](design/m13-rebase.md)
 - [M14 foreign actors in forks design](design/m14-foreign-forks.md)
 - [M15 Python and Go SDKs design](design/m15-sdks.md)
-- [M23 key backends: B1 and parked remaining design](design/m23-secret-backends.md)
+- [M23 key backends: B1 and remaining design](design/m23-secret-backends.md)
 - [M28 OpenTelemetry and audit export design](design/m28-otel.md)
 - [Threat model and integration limits](design/threat-model.md)
 - [Performance](perf.md)
-- [Brief compliance audit](audit/brief-compliance.md)
 
 # Decisions
 

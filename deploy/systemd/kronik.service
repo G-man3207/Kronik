@@ -1,4 +1,4 @@
-# Installed and enabled by `kronik serve --init` (SPEC.md, "Security model":
+# Installed and enabled by `kronik serve --init` (the build brief, "Security model":
 # the daemon runs as root in v0.1, with the hardening systemd allows; ADR 0027
 # says why each setting is in or out).
 [Unit]

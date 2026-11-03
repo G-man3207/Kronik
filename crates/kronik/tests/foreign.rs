@@ -1241,7 +1241,7 @@ fn a_dropped_snapshot_request_leaves_no_sandbox_paused() {
     .unwrap();
     let body = json!({"reason": "m14 test"}).to_string();
     // The newest checkpoint's LSN: retention keeps a fixed number of them,
-    // so their count stops growing (review M14 round 4).
+    // so their count stops growing (review M14).
     let checkpoints = |d: &Daemon| newest_checkpoint(d, "echo");
     for attempt in 1..=5 {
         let before = checkpoints(&d);
@@ -1285,7 +1285,7 @@ fn newest_checkpoint(d: &Daemon, name: &str) -> u64 {
     })
 }
 
-/// Review M14 P1 (round 4): a checkpoint still running for a snapshot whose
+/// Review M14 P1: a checkpoint still running for a snapshot whose
 /// client left holds the actor's call gate. A second snapshot right after it
 /// does not keep main drained while it waits for that gate: it skips the
 /// actor, and main serves while the first checkpoint still runs.

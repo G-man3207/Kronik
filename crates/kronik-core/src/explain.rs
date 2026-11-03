@@ -53,7 +53,7 @@ pub struct Topic {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
     /// The roadmap milestone that introduces the topic, `M1` to `M8` for
-    /// v0.1 (SPEC.md, "Roadmap"). A text marks later parts with their own
+    /// v0.1 (the build brief, "Roadmap"). A text marks later parts with their own
     /// milestone.
     pub milestone: &'static str,
     /// The explanation, in Markdown.

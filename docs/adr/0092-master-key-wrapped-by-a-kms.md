@@ -1,13 +1,14 @@
 # 0092. The master key is a seed wrapped by a KMS or HSM
 
 - **Status:** Accepted for B1 KMS lifecycle and the reviewed optional PKCS#11 helper design in ADR 0093; helper implementation evidence is recorded separately.
-- **Date:** 2026-10-28; B1 re-reviewed 2026-10-30
+- **Date:** 2026-10-28, amended 2026-10-30
 
 ## Context
 
 M23 requires the master key to live in a KMS or an HSM through PKCS#11
 without writing its plaintext to disk. The acceptance criterion is startup
-with a KMS-held key and no plaintext key file (English translation in the build brief).
+with a KMS-held key and no plaintext key file (English translation in the build
+brief).
 
 Before B1 the master key was a 32-byte seed in a hex file or in
 `KRONIK_MASTER_KEY`. Six local keys are derived from it with keyed BLAKE3:
@@ -116,9 +117,10 @@ readers and must use the provider-aware source too.
   permissions. The seed is verified before any envelope is persisted.
 - `start_timeout` bounds the whole key-loading operation, including fresh
   encrypt and verification decrypt. No retry begins after that deadline.
-- Proof commands and observed outcomes are recorded in STATUS.md. SoftHSM2,
-  PKCS#11 and external secret version/history criteria are not part of B1
-  and are not claimed as verified here.
+- Proof commands and observed outcomes are tracked on
+  [the project status page](https://github.com/G-man3207/Kronik/wiki/Project-status).
+  SoftHSM2, PKCS#11 and external secret version/history criteria are not part
+  of B1 and are not claimed as verified here.
 - The durable envelope schema is `kronik.wrapped-key/v1`. Its repository
   compatibility fixture is
   `crates/kronik-privacy/tests/fixtures/wrapped-key-v1.json`; the privacy
@@ -142,7 +144,8 @@ readers and must use the provider-aware source too.
 - `scoped_provider_tls_does_not_change_guest_trust_or_identity` exercises
   actual TLS/mTLS, including non-inheritance by the guest client. The
   provider matrix independently verifies a real RS256 service-account JWT.
-- Exact commands, binary hashes, pinned emulator images and reports are in
-  STATUS.md. These are emulator and Linux-host results, not real-cloud IAM,
-  macOS runtime, SoftHSM or PKCS#11 verification.
+- Exact commands, binary hashes, pinned emulator images and reports are
+  recorded on [the project status page](https://github.com/G-man3207/Kronik/wiki/Project-status).
+  These are emulator and Linux-host results, not real-cloud IAM, macOS
+  runtime, SoftHSM or PKCS#11 verification.
 

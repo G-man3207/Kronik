@@ -1776,13 +1776,13 @@ async fn canonical_operational_identity_separates_visible_changes_not_sealable_v
 }
 
 #[tokio::test]
-// Reduction (STATUS, "Repair session 2026-11-01"): the underlying feature is
-// not on main. The cluster track M16-M19 (and its record kinds 20-25:
+// Not exercised yet: the underlying feature is not implemented. The cluster
+// milestones M16-M19 (and their record kinds 20-25:
 // shard_term, shard_membership, inbox, outbox_ack, epoch_barrier,
-// shard_origin) remains parked; the record enum and the native log cannot
-// decode those kinds yet, so the exact event variants cannot be exercised.
-// Restore this test when the cluster record kinds land.
-#[ignore = "unlanded feature: needs M16-M19 cluster record kinds 20-25, which the parked cluster track has not put on main (STATUS, Repair session 2026-11-01)"]
+// shard_origin) are not implemented; the record enum and the native log
+// cannot decode those kinds yet, so the exact event variants cannot be
+// exercised. Restore this test when the cluster record kinds are implemented.
+#[ignore = "not implemented: needs M16-M19 cluster record kinds 20-25"]
 async fn decoded_operational_wire_records_fsynced_in_native_log_publish_exact_variants() {
     let directory = tempfile::tempdir().unwrap();
     let env = Env::real(tokio::runtime::Handle::current());

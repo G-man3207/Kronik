@@ -8,9 +8,9 @@ fail without auto-install. Run only prebuilt KRONIK_BIN/guest files.
 
 Example (inside an integrator-owned isolated-loopback sandbox):
   python3 scripts/e2e-ui-oidc.py --sandboxed --binary /absolute/path/kronik \
-    --node $HOME/.nvm/versions/node/v26.10.0/bin/node \
-    --playwright /opt/fixtures/node_modules/@playwright/test \
-    --axe /opt/fixtures/node_modules/axe-core/axe.min.js \
+    --node /path/to/node \
+    --playwright /path/to/node_modules/@playwright/test \
+    --axe /path/to/node_modules/axe-core/axe.min.js \
     --chrome /usr/bin/google-chrome --timeout 600 --artifacts /private/new-directory
 
 --live-fixture accepts a PRIVATE JSON file describing an already-running,

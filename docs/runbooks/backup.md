@@ -49,5 +49,5 @@ or disaster-resilience proof**. Use known non-secret data, let the actual
 shipper publish the recorded snapshot, then run restore and integrity checks
 against another fixture directory. Record exact versions, commands, hashes,
 source/shipped/restored LSNs, missing-key inventory and cleanup. Physical S3
-availability/IAM and test VPS exercises are separate evidence, not inferred
+availability/IAM and test-VPS exercises are separate evidence, not inferred
 from this local flow.

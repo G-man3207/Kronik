@@ -1,8 +1,8 @@
 # 0014. Simulator configuration is a log record, applied as of the fork point
 
-- **Status:** Accepted (revised after the v0.3 review: the first version
-  applied the configuration at the window's end, which deviated from I5
-  without the maintainers' sign-off)
+- **Status:** Accepted (revised for v0.3: the first version applied the
+  configuration at the window's end, which deviated from I5 without
+  maintainer sign-off)
 - **Date:** 2026-10-26
 
 ## Context
@@ -11,10 +11,10 @@ M12 adds per-target simulator configuration (stub rules, an OpenAPI
 contract, `RecordedNeighbor`, the model simulator) set with `kronik stubs
 set`. I5 says configuration that affects behavior is history: a log record,
 seen by a fork as it was at its fork point. Invariants are not changed by
-agents (AGENTS.md). An operator usually sets simulator configuration after
+contributors (AGENTS.md). An operator usually sets simulator configuration after
 a proposal's diff shows `FailClosed` answers, at an LSN after the proposal's
 fork point. Formats need a versioned schema and a compatibility fixture
-(SPEC, "Format changes").
+(the build brief, "Format changes").
 
 ## Decision
 

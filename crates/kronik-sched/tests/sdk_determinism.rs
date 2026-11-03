@@ -1,5 +1,5 @@
 //! The determinism test for SDK components built elsewhere (M15: the
-//! Python and Go examples, `scripts/ci.sh sdks`; review M15 round 3). Every
+//! Python and Go examples, `scripts/ci.sh sdks`; review M15). Every
 //! component in `KRONIK_DETERMINISM_COMPONENTS` (absolute paths separated
 //! by `:`) runs a sequence of inputs twice, each time in a fresh world: its
 //! migration, a `configure` message, every route with real ids (POST and PUT

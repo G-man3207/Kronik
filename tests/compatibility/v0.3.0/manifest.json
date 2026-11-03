@@ -1,7 +1,7 @@
 {
   "format": "kronik.compatibility-corpus/v1",
   "release": "v0.3.0",
-  "producer_revision": "86d5a4bb92432d1acaf2cf8bec3188f9963dff76",
+  "producer_revision": "d9d460bc89f6ae30962ef16238b8fcaa6485a8de",
   "producer_binary_sha256": "1681833ad84da60622a6c196b8084bbe52a2deb8f6860a26c81dc9ea4f4a3947",
   "producer_version": "kronik 0.3.0\nwasmtime 50.0.0\nengine kronik-0.3.0+wasmtime-50.0.0\n",
   "engine": "kronik-0.3.0+wasmtime-50.0.0",

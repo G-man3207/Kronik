@@ -1,4 +1,4 @@
-//! The server's basic settings: `/etc/kronik/kronik.toml` (SPEC.md,
+//! The server's basic settings: `/etc/kronik/kronik.toml` (the build brief,
 //! "Operator configuration and policy"). Only what the server needs to start
 //! lives in the file; everything that affects behavior (grants, limits,
 //! policy, privacy mode, foreign actors) is history set through the API (I5).
@@ -1260,18 +1260,68 @@ mod tests {
         Config::parse(text, Path::new("kronik.toml"))
     }
 
-    /// The file in SPEC.md, "Operator configuration and policy".
-    fn brief_file() -> String {
-        let spec = include_str!("../../../SPEC.md");
-        let start = spec.find("`/etc/kronik/kronik.toml`:").unwrap();
-        let block = &spec[start..];
-        let block = &block[block.find("```toml\n").unwrap() + 8..];
-        block[..block.find("```").unwrap()].to_owned()
-    }
+    /// The operator configuration file documented in the build brief,
+    /// "Operator configuration and policy".
+    const DOCUMENTED_CONFIG: &str = r#"[server]
+data_dir = "/var/lib/kronik"
+api_socket = "/run/kronik/api.sock"
+http_listen = "0.0.0.0:443"
+admin_listen = "127.0.0.1:9464"      # /metrics and /healthz
+
+[tls]
+mode = "acme"                         # acme, files or off
+domains = ["app.example.com"]
+acme_email = "ops@example.com"
+
+[gateway]
+timeout = "30s"
+idempotency_header = "Idempotency-Key"
+idempotency_ttl = "24h"
+
+[log]
+group_commit_ms = 2
+segment_max_mb = 64
+segment_max_age_s = 60
+
+[retention]
+history = "7d"                        # also bounds kv_versions
+snapshot_interval = "60m"
+snapshots_kept = 48
+
+[sql]
+max_size_per_actor = "1GiB"
+
+[ship]
+enabled = false
+url = "s3://bucket/kronik"
+endpoint = "https://s3.example.com"
+
+[keys]
+master_key_file = "/etc/kronik/master.key"   # secret store and privacy keystore
+
+[privacy]
+keystore_backup_retention = "30d"
+subject_from = "header:x-user-id"
+
+[replay]
+default_mode = "both"                 # isolated, continuous or both
+sample = "100%"                       # isolated mode, stratified per route and actor type
+
+[fork]
+live_allowlist = []
+
+[promote]
+max_gap = "2s"
+catch_up_timeout = "5m"
+
+[foreign]
+runsc_path = "/usr/local/bin/runsc"
+platform = "auto"                     # auto, systrap or kvm
+"#;
 
     #[test]
-    fn the_brief_file_parses_to_its_values() {
-        let config = parse(&brief_file()).unwrap();
+    fn the_documented_config_parses_to_its_values() {
+        let config = parse(DOCUMENTED_CONFIG).unwrap();
         assert_eq!(config.server.data_dir, PathBuf::from("/var/lib/kronik"));
         assert_eq!(config.http_listen(), "0.0.0.0:443".parse().unwrap());
         assert_eq!(
@@ -1298,8 +1348,8 @@ mod tests {
     }
 
     #[test]
-    fn omitted_keys_take_the_brief_defaults() {
-        let brief = parse(&brief_file()).unwrap();
+    fn omitted_keys_take_the_documented_defaults() {
+        let brief = parse(DOCUMENTED_CONFIG).unwrap();
         let empty = parse("").unwrap();
         assert_eq!(empty, Config::default());
         assert_eq!(empty.gateway, brief.gateway);

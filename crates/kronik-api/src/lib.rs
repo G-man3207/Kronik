@@ -103,8 +103,8 @@ pub(crate) struct AuthorizedRequest {
     request: ApiRequest,
     pub(crate) caller: auth::Caller,
     pub(crate) authority: kronik_core::authority::AuthLease,
-    /// Forwarded-principal seam kept from the unbuilt WIP checkpoint; the
-    /// handler that reads it has not landed, so it is not wired to routing yet.
+    /// Forwarded-principal seam: the handler that reads it has not landed, so
+    /// it is not wired to routing yet.
     #[allow(dead_code)]
     pub(crate) principal: Option<tokens::ForwardedPrincipal>,
     pub(crate) verified_identity: Option<Arc<pb::Sealable>>,

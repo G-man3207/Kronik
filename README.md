@@ -34,34 +34,19 @@ attested archives: static musl binaries for x86_64 and aarch64 with
 (`reproducibility.json`); `install.sh` verifies each archive's attestation and
 refuses unsigned ones. It adds standard `fetch` through `wasi:http`,
 OpenTelemetry traces with a verifiable audit export, and KMS master-key
-custody (OpenBao/AWS/GCP/Azure). The crash-path hardening on top of that
-content replaces the secret catalogue's clear-and-rebuild with atomic
-certificate publication under crash injection, paces effect rate windows, and
-keeps secret custody available across restarts; it is described in the
-release notes. M23 B1 custody is complete but is not M23 closure; its emulator
-and static-musl acceptance is recorded in `STATUS.md`. The remaining M23 work
-(B2–B6: external secret-value backends, cache/outage handling, PKCS#11) has
-work in progress source on `main` but is not part of that B1 custody change and is not
-accepted. `v0.3.0` and `v0.1.0` are the historical unsigned releases.
+custody (OpenBao/AWS/GCP/Azure). The crash-path hardening replaces the secret
+catalogue's clear-and-rebuild with atomic certificate publication under crash
+injection, paces effect rate windows, and keeps secret custody available
+across restarts. `v0.3.0` and `v0.1.0` are the historical unsigned releases.
 
 `main` is an unreleased `0.4.1-dev` work in progress. Major areas remain
 absent or partial: the cluster (M16–M19), microVMs (M20), the rootless daemon
 (M21), the WASI 0.3 remainder (M22), long-lived connections (M24), blobs
 (M25–M26), and the UI, OpenTelemetry, fleet and hardening tracks (M27–M34).
-M10's criterion 4 (a real GitHub Actions run) and M22's criterion 3 (WASI 0.3)
-remain open. The cluster, the rootless daemon, microVMs and connections are
-not on `main`; external secret backends, the admin UI, the fleet API and the
-OpenTelemetry/audit export have unaccepted work in progress source on `main`, and presence
-of source is not acceptance. On this checkout the binary and all test targets
-compile after a 2026-11-01 repair work; the full workspace run is not green:
-1426 passed, 7 failed, 12 ignored (3 tests gated on a missing
-`KRONIK_TEST_PYTHON`, 2 known API fail-closed privacy expectations, and 2
-parallel-load flakes that pass serially; `kronik-sim` excluded). See
-[`docs/audit/brief-compliance.md`](docs/audit/brief-compliance.md), which maps
-the brief to the tree.
-
-[`STATUS.md`](STATUS.md) records the evidence for each milestone, the open
-questions and the known gaps.
+See the [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
+for the state of each milestone, the open questions and the known gaps, and the
+[compliance audit](https://github.com/G-man3207/Kronik/wiki/Compliance-audit)
+for how the brief maps to the tree.
 
 ## What works today
 
@@ -228,7 +213,7 @@ test of 1,000 `kill -9` cycles, deterministic simulation with 10,000 seeds
 over every workload and a million-step run, and the release build.
 
 [`CONTRIBUTING.md`](CONTRIBUTING.md) has the conventions, and
-[`AGENTS.md`](AGENTS.md) is the entry point for contributors.
+[`AGENTS.md`](AGENTS.md) is the guide for automated and human contributors.
 
 ## Security
 

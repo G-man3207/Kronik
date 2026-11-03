@@ -2,8 +2,8 @@
 
 Version 1.0
 
-This agreement sets out the rights that you grant to The Kronik Authors (the
-"Licensor") when you contribute to Kronik (the "Project"). You keep the
+This agreement sets out the rights that you grant to the Kronik maintainers
+(the "Licensor") when you contribute to Kronik (the "Project"). You keep the
 copyright in your contributions. This agreement grants licenses; it does not
 transfer ownership. Please read it before you sign it.
 

@@ -17,20 +17,6 @@ fn repo_path(relative: &str) -> PathBuf {
         .join(relative)
 }
 
-/// The Swedish brief's file name at the repo root (it holds an em dash and
-/// spaces), located by pattern rather than by a literal that encoding
-/// trouble could silently misspell.
-fn brief_path() -> PathBuf {
-    let root = repo_path(".");
-    let name = std::fs::read_dir(&root)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .find(|n| n.starts_with("Kronik") && n.ends_with("Build Brief.md"))
-        .expect("the brief (Kronik — Build Brief.md) is in the repo root");
-    root.join(name)
-}
-
 /// A fixture diff, and its `expected_policy` removed from it.
 fn fixture(path: &Path) -> (Value, Value) {
     let text = std::fs::read_to_string(path).unwrap();
@@ -112,14 +98,10 @@ fn every_fixture_gives_its_expected_policy_under_the_default_rules() {
 }
 
 #[test]
-fn the_default_rules_are_the_brief_rules_verbatim() {
-    // The Swedish brief is authoritative; its `Standardregler` block is
-    // the default rules, byte for byte. (SPEC.md carries a translation.)
-    let brief = std::fs::read_to_string(brief_path()).unwrap();
-    let start = brief.find("Standardregler som följer med:").unwrap();
-    let block = &brief[start..];
-    let block = &block[block.find("```toml\n").unwrap() + "```toml\n".len()..];
-    let block = &block[..block.find("```").unwrap()];
+fn the_default_rules_match_the_documented_fixture() {
+    // The documented default rules are kept as a fixture, byte for byte. The
+    // same block appears in the build brief's "Standardregler" section.
+    let block = include_str!("fixtures/default-rules.toml");
     assert_eq!(DEFAULT_RULES_TOML, block);
 
     let defaults = RuleSet::defaults();

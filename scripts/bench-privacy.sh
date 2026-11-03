@@ -3,13 +3,13 @@
 # two release builds, the last commit before the sealing code (BASE) and
 # one with it (NEW), measured alternately with the same workloads; NEW also
 # with the mode on. Prints mean ± standard deviation per build and workload:
-# throughput and latency, which a busy machine blurs, and the daemon's CPU
+# throughput and latency, which background load blurs, and the daemon's CPU
 # time per log record (user + system, from /proc), which it blurs much less.
 #
 # Usage: [NICE=-10] scripts/bench-privacy.sh BASE NEW [RUNS] [SECONDS]
 # Defaults: 5 runs of 10 s per workload. NICE runs the daemon and the load
-# generator at that niceness (negative needs root), which keeps other work
-# on a shared machine from blurring the numbers. Builds in /var/tmp (worktrees and
+# generator at that niceness (negative needs root), which keeps background
+# load from blurring the numbers. Builds in /var/tmp (worktrees and
 # target directories per commit), data on /var/tmp (a real disk).
 # Workloads (privacy.subject_from = "header:x-user-id"):
 #   counter: the gateway, POST /counter/k<key>/increment, 64 keys, 16

@@ -1,9 +1,11 @@
 # Contributing to Kronik
 
-Kronik is pre-alpha. Before you change anything, read `STATUS.md` for the
-current milestone and the decisions in `docs/adr/`. The product specification
-is the build brief, `Kronik — Build Brief.md` (in Swedish), with an
-English translation coming in `the build brief`.
+Kronik is pre-alpha. Before you change anything, read
+[the build brief](https://github.com/G-man3207/Kronik/wiki/Build-Brief), the
+English translation of the original
+[Swedish build brief](https://github.com/G-man3207/Kronik/wiki/Build-Brief-Original-Swedish).
+The [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
+has the current status, and `docs/adr/` records the decisions so far.
 
 ## Contributor License Agreement
 
@@ -19,9 +21,9 @@ You need [rustup](https://rustup.rs) and
 `rust-toolchain.toml`, and rustup installs it on first use.
 
 Default Cargo API mutation and real CLI audit tests also run the existing
-owned TLS/code/PKCE/JWT provider. Prepare Python 3.11+ with the pinned test-only
-dependencies before `cargo test` or the `test` step; no target test installs
-packages, skips missing dependencies, or substitutes a mock identity:
+in-repo TLS/code/PKCE/JWT provider. Prepare Python 3.11+ with the pinned
+test-only dependencies before `cargo test` or the `test` step; no target test
+installs packages, skips missing dependencies, or substitutes a mock identity:
 
 ```sh
 python3 -m venv target/oidc-test-python
@@ -61,14 +63,15 @@ corpus-promotion and performance-comparator boundary tests in `scripts/tests`.
 These are semantic checks of parsers, provenance, tampering and regression
 enforcement, not real benchmark results or between-release performance acceptance.
 The `examples` step tests the dependency-free standalone `tools/loadgen`.
-The `ts` step reuses its already-built real product for the CLI/API/WIT/error
+The `ts` step reuses its already-built binary for the CLI/API/WIT/error
 documentation-surface gate and the frozen v0.1.0/v0.3.0 log and genuine tagged
-component consumers. A newly routed operation or authoritative error requires
-the real product's regenerated reference and usage examples in the same change;
-old-checkpoint receipts are not evidence for the integrated product. Compatibility
-failures retain their fresh, printed fixture directory; success removes only that
-owned temporary parent. See [compatibility](docs/guides/compatibility.md) and
-[performance](docs/perf.md) for the historical results and remaining physical gates.
+component consumers. A newly routed operation or error code requires the
+regenerated reference and usage examples in the same change; results from an
+earlier revision are not evidence for the integrated build. Compatibility
+failures retain their fresh, printed fixture directory; success removes only
+that step's temporary parent directory. See
+[compatibility](docs/guides/compatibility.md) and [performance](docs/perf.md)
+for the historical results and remaining physical gates.
 `hygiene` checks every argument of literal workflow `ci.sh` calls against
 the default step inventory; missing, unknown, duplicate or reordered steps
 fail. Pull requests must keep it green.
@@ -111,7 +114,7 @@ remaining public acceptance requirements are in `examples/github-flow/README.md`
   milestone or release is `Kronik M28: OpenTelemetry and audit export`.
   The body, wrapped at 72 columns, says why when the diff does not. A
   message describes the change, not how it came about: no people, agents
-  or machines, and no reviews.
+  or machines, and no review rounds.
 - **Docs move with behavior.** Docs and the error catalog are updated in the
   same commit as the behavior they describe.
 - **No panics in the daemon.** No `unwrap` or `expect` in daemon code paths; a

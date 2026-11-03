@@ -1,6 +1,8 @@
 # 0091. Secret cache, outages and complete retained-value coverage
 
-- **Status:** Accepted design for M23 B2–B5 and the shared M28 confidentiality boundary; implementation and exercised evidence are tracked separately in STATUS.md.
+- **Status:** Accepted design for M23 B2–B5 and the shared M28 confidentiality
+  boundary; implementation and exercised evidence are tracked separately on
+  [the project status page](https://github.com/G-man3207/Kronik/wiki/Project-status).
 - **Supersedes:** the parked two-method backend trait and observed-current-only coverage assumptions.
 
 ## Context
@@ -73,4 +75,5 @@ Forks never fetch. Their configuration/link epoch remains the fork point plus ex
 
 ## Acceptance evidence required
 
-This design does not preclaim tests. Exercise cold/warm/stale/deadline boundaries, typed revocation, pagination/truncation and authority attacks, generation races, failed/reserved publication, cross-restart closure from log/state/snapshots, changed environment values, no-network replay, unrelated-actor progress, foreign starts, and no leaked needles from every affected API/export/marker. See [the M23 design](../design/m23-secret-backends.md) and STATUS.md for observed results.
+This design does not preclaim tests. Exercise cold/warm/stale/deadline boundaries, typed revocation, pagination/truncation and authority attacks, generation races, failed/reserved publication, cross-restart closure from log/state/snapshots, changed environment values, no-network replay, unrelated-actor progress, foreign starts, and no leaked needles from every affected API/export/marker. See [the M23 design](../design/m23-secret-backends.md); observed results are
+  tracked on [the project status page](https://github.com/G-man3207/Kronik/wiki/Project-status).

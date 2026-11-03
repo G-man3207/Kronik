@@ -68,7 +68,7 @@ fn start(rt: &Runtime, dir: &Path) -> Result<Arc<Node>, StartError> {
 /// descriptor until they wind down (admitted capabilities share the owner
 /// `File`, native_execution.rs), so an immediate restart can briefly answer
 /// `KeySource(DataInUse)`. Await exactly that window — the CLI retries the
-/// deployment-epoch recertification window the same way (STATUS, known
+/// deployment-epoch recertification window the same way (known
 /// gaps) — and treat any other start error, or a wait that runs out, as
 /// fatal: a genuinely owned directory still fails here.
 fn start_when_released(rt: &Runtime, dir: &Path) -> Arc<Node> {

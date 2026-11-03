@@ -2041,7 +2041,7 @@ fn set_free(p: &Proc, free: &std::sync::atomic::AtomicU64, bytes: u64) {
     }
 }
 
-/// Review N13-2 (round 3): rebase staging keeps to `[log] disk_reserve`.
+/// Review N13-2: rebase staging keeps to `[log] disk_reserve`.
 /// (1) The budget counts what staging writes (the StateRebase wrapper, the
 /// frame, sealing), not the bare turns. (2) Every staged batch is checked,
 /// not only the estimate before the first. (3) The snapshot after the

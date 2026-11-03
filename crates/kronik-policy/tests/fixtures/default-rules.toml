@@ -1,0 +1,29 @@
+[[rule]]
+name = "no-new-errors"
+when = "diff.errors.introduced > 0"
+action = "deny"
+
+[[rule]]
+name = "no-new-orphans"
+when = "diff.errors.new_orphans > 0"
+action = "require_approval"
+
+[[rule]]
+name = "low-grounding-needs-approval"
+when = "diff.summary.confidence < 0.9"
+action = "require_approval"
+
+[[rule]]
+name = "payments-must-be-exact"
+when = "diff.grounding.exists(t, t.host.endsWith('payments.internal') && t.approximate + t.synthetic > 0)"
+action = "require_approval"
+
+[[rule]]
+name = "payments-full-coverage"
+when = "diff.summary.sample < 1.0 && diff.grounding.exists(t, t.host.endsWith('payments.internal'))"
+action = "deny"
+
+[[rule]]
+name = "fuel-regression"
+when = "diff.resources.fuel_p99_change > 0.5"
+action = "deny"

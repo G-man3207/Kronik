@@ -39,7 +39,9 @@ Do not send real secrets or personal data from a production system.
 
 Kronik assumes that actor code, foreign images and agents can be faulty or
 hostile, and limits what each of them can do. Kronik is pre-alpha, so most of
-the design below is not implemented yet; `STATUS.md` shows what is.
+the design below is not implemented yet; the
+[project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
+shows what is.
 
 - **Actors** run in a Wasm sandbox with a fresh instance per turn, default-deny
   capabilities, and fuel and memory limits.

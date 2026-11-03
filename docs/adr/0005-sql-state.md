@@ -28,13 +28,13 @@ SQLite database, owned by the host.
   privacy-mode erasure must delete a subject's rows physically; the
   simulator opens SQLite in memory (ADR 0004, the `SqliteOpener` seam).
 
-Spike E (`spikes/spike-e-sql/`) is the prototype. It uses `rusqlite =0.41.0`
+Spike E is the prototype. It uses `rusqlite =0.41.0`
 with bundled SQLite 3.54.0 (`libsqlite3-sys =0.39.0`).
 
 - **`SqlActor`** wraps one actor database.
 - **`ffi.rs`** is the only module with `unsafe` code.
-- **`check`** runs 30 checks. All pass on the development machine (AMD EPYC 9354P)
-  and on the test VPS VPS (Intel Skylake, 2 vCPUs).
+- **`check`** runs 30 checks. All pass on the development machine (AMD EPYC
+  9354P) and on the test VPS (Intel Skylake, 2 vCPUs).
 - **`bench`** does the measurements, on real disk (`/var/tmp`, not tmpfs).
 
 ## Decision
@@ -200,8 +200,6 @@ remained `BUSY` before and after the diagnostics, then succeeded after the
 parent's rollback. Both diagnostic callbacks returned valid JSON. This was a
 bounded C-only immutable-read-only-input check (build/run exit 0, 4.990776 s),
 not a Rust FFI, Keystore, guest-authorizer or current-product test.
-Exact source, argv, output, limits and cleanup:
-`<internal-evidence>`.
 
 All checks go through the authorizer unless noted. Every denial returns
 `sql-error::denied(reason)`. The 31 denied statements (`deny/list`):
@@ -280,7 +278,7 @@ Limits:
   column. On rebuild, the erased subject's changesets are unreadable and
   skipped, and the erasure operation is replayed. The result equals the
   live database (`subjects/erasure`).
-- **A gap in the brief (needs an maintainer decision before M8).** "Saknas
+- **A gap in the brief (needs a maintainer decision before M8).** "Saknas
   kolumnen gäller turnens standardsubjekt" decides how such changesets are
   *sealed*, but those rows can never be *erased*: they carry no subject in
   the database. After erasure the rebuild also diverges. A row inserted
@@ -296,9 +294,10 @@ Limits:
   row-owner table (invisible to guests, but more machinery) or forced
   snapshots at erasure (rejected: the rows would still be readable).
 
-  Status after M1: open. The maintainers has been asked; M1 implements the brief
-  as written (tables without `_subject` use the turn's default subject) and
-  ships `kronik_subject()`. The question is tracked in `STATUS.md`.
+  Status after M1: open. The question was raised with the maintainers; M1
+  implements the brief as written (tables without `_subject` use the turn's
+  default subject) and ships `kronik_subject()`. The question is tracked on
+  [the project status page](https://github.com/G-man3207/Kronik/wiki/Project-status).
 
 ### 7. Storage: one SQLite file per actor
 
@@ -328,10 +327,9 @@ Limits:
   pages for forks, but it is a large build. Revisit if actor counts reach
   100k+ or snapshots of many changed actors dominate.
 
-Measured (warm page cache, real disk; the dev numbers are from a shared
-machine):
+Measured (warm page cache, real disk):
 
-| | Dev (EPYC 9354P) | VPS (Skylake, 2 vCPU) |
+| | Development machine (EPYC 9354P) | Test VPS (Skylake, 2 vCPU) |
 | --- | --- | --- |
 | Direct execution of a turn (BEGIN; INSERT, UPSERT, DELETE/5; COMMIT), file WAL, p50 | 19 µs | 24 µs |
 | Kronik turn, file WAL, p50 (p99) | 220 µs (430 µs) | 326 µs (4.6 ms) |
@@ -373,8 +371,8 @@ machine):
   plus the actor's changesets in (S, L]. The prototype's fork at 150 =
   snapshot@100 + 50 changesets, equal to production@150
   (`at-lsn/fork-roll-forward`). The cost is linear in the number of
-  changesets (110 µs each on the development machine, 241 µs on the VPS, for this
-  workload).
+  changesets (110 µs each on the development machine, 241 µs on the VPS, for
+  this workload).
 - **(b) Isolated replay:**
   - Per actor, keep a *production cursor*: a copy rolled forward
     monotonically through the window. Each production changeset is applied
@@ -390,8 +388,8 @@ machine):
   changesets (`sqlite3changeset_invert`; the changesets keep full old
   values) of (L, HEAD] in reverse. 50 inverted changesets from HEAD@200
   gave production@150 (`at-lsn/inverted-from-head`), at 76 µs each on the
-  development machine. Inversion cannot cross a `migrate` with DDL; such ranges use
-  the snapshot path.
+  development machine. Inversion cannot cross a `migrate` with DDL; such
+  ranges use the snapshot path.
 - **(c) Consistent snapshots without pausing the applier.**
   - Copy `state.db` and every SQL database changed since the previous
     snapshot with the backup API (205 µs for a 104 KiB database in memory).
@@ -469,15 +467,12 @@ from `[env]` in `.cargo/config.toml`, and sessions are called through
 - **M3:** needs the per-actor changeset index, production cursors and
   overlays as in 8.
 - **M6:** fuzzy snapshots and hard links for unchanged actors, as in 8.
-- **M8:** needs the maintainers' decision on the `_subject` gap (6).
+- **M8:** needs a maintainer decision on the `_subject` gap (6).
 - **SQLite upgrades** go through `kronik upgrade check`, plus re-running the
   spike's determinism checks: `localtime` test-control, column-name
   randomness, `OBJCONFIG_ROWID`, the authorizer action list.
 
 ### Verification
 
-```sh
-cd spikes/spike-e-sql
-./run.sh check     # 30 checks, "0 check(s) failed" (dev and VPS)
-./run.sh bench     # the measurements above (writes to /var/tmp)
-```
+The M0 spike notes are in the project wiki:
+https://github.com/G-man3207/Kronik/wiki/Spikes.

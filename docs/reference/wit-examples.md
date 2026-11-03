@@ -169,6 +169,6 @@ state::set("label", b"known fixture data");
 ```
 
 Future connection/blob functions must gain their **actual** examples when the
-IO owner completes those interfaces. `scripts/check-doc-surface.py` reads the
+IO interfaces are complete. `scripts/check-doc-surface.py` reads the
 current WIT and will reject undocumented new functions; a baseline example
 page is not evidence that a later ABI has been synchronized or exercised.

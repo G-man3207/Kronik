@@ -1,19 +1,18 @@
 # M28: OpenTelemetry and audit export (design)
 
-Status: accepted design and implemented hardening. Initial delivery was
-9d1f65b; the current 102-test exporter run and actual binary archive/
-restore proofs are described below. Complete retained external/deleted
-secret inventory across restart remains M23 work. Decisions are in
-ADRs 0080–0084.
+Status: accepted design and implemented hardening. The 102-test exporter
+suite and the actual binary archive/restore proofs are described below.
+Complete retained external/deleted secret inventory across restart remains
+M23 work. Decisions are in ADRs 0080–0084.
 
-B2 (trace and metrics export) is in, with these refinements:
+B2 (trace and metrics export) is implemented, with these refinements:
 - The open-turn set (§3.1) also decides links into other traces: a link
   names the cause's trace from the set while the cause is open or kept,
   else from its key (the root's, its open caller's, or the trace it
   started).
 - A first start of the trace export, without a cursor, starts at the
   applied LSN: history is not replayed into a new backend. That cursor is
-  saved before the first batch (code review Low), so a refused first batch
+  saved before the first batch, so a refused first batch
   is resent after a restart.
 - `[otel] batch_spans` caps the log records read per request (each turn
   record gives its turn span plus one per effect).
@@ -21,13 +20,13 @@ B2 (trace and metrics export) is in, with these refinements:
   serializing the open/kept sets into `export.json`. Legacy open-pairs and
   `{open,kept}` migrate once; selected modern state must validate (§4.6).
 
-Code review fixes, export follower and traces (M28 code review):
-- **M2:** a failed `audit.gap` record keeps the cursor before the gap: the
+Fixes to the export follower and traces:
+- A failed `audit.gap` record keeps the cursor before the gap: the
   follower counts it as an error (`last_error` is the sink's code), backs
   off and records the gap again; the gap is counted once it is recorded.
-- **M3:** a batch also stops at 4 MiB of encoded records (`BATCH_BYTES`,
+- A batch also stops at 4 MiB of encoded records (`BATCH_BYTES`,
   for both streams); a larger record goes alone.
-- **M7:** a committed callee that joined its caller's trace stays in the
+- A committed callee that joined its caller's trace stays in the
   open-turn set ("kept") until its messages and timers have arrived, and,
   while its caller has not committed or failed with a compensation for it,
   so links from them name its span in the caller's trace. Kept turns are
@@ -35,17 +34,17 @@ Code review fixes, export follower and traces (M28 code review):
   never arrives).
   This count limit does not establish a blanket heap bound; checkpoint
   payloads are separately byte-limited (§4.6).
-- **M8:** `kronik export rewind traces` rebuilds the open-turn set at the
+- `kronik export rewind traces` rebuilds the open-turn set at the
   rewind point by replaying the retained log's beginnings and commits from
   an empty set, so a re-export sends the same spans. Chosen over refusing a
   rewind past open turns, which would refuse almost every rewind of a busy
   node. Limit: a turn begun before the first retained record and still
   open or kept there is unknown.
-- **M9:** a malformed `headers_env` pair is reported by the variable and
+- A malformed `headers_env` pair is reported by the variable and
   its position, a rejected `[otel] endpoint` by scheme and host, and S3
   failures (audit sink log and status, `audit verify`) by a classified code
   (`s3_forbidden`, `s3_not_found`, …), never by their text.
-- **Lows:** a callee whose call timed out joins its caller's trace (the
+- A callee whose call timed out joins its caller's trace (the
   caller is kept until it arrives); a migrate turn's ids include its target
   schema version, and its link names the trace its input will join; the
   lag gauge is set on every failed delivery; an idle, caught-up follower
@@ -57,7 +56,7 @@ Code review fixes, export follower and traces (M28 code review):
   reports as a stall once older than `[retention] history`, until the
   daemon is restarted. Clamping stays per batch (§3.3, documented).
 
-B3 (audit export) is in, with these refinements:
+B3 (audit export) is implemented, with these refinements:
 - The audit cursor of a first start is the record before the first
   retained one (not 0). The hold never advances ahead of the durably saved
   cursor.
@@ -75,21 +74,21 @@ B3 (audit export) is in, with these refinements:
 - The completeness test drives foreign add and remove as failures (no
   sandbox in CI), which must export nothing, as `mutations.rs` does.
 
-Code review fixes (M28 code review):
-- H-A: startup durably clamps or initializes trace/audit cursors after
+Further fixes:
+- Startup durably clamps or initializes trace/audit cursors after
   restore, including absent/from-now entries, and discards lost-tail
   resume state before marker removal and parent sync (§4.2).
-- H-B: no sink overwrites earlier lines when LSNs repeat: new files never
+- No sink overwrites earlier lines when LSNs repeat: new files never
   reuse a name, object names are exclusively created numeric slots, and
   webhook retry keys bind the body and replay generation (§4.4). Current
   file/S3 names use confirmed numeric slots, independent of wall clocks.
-- M1: a rewind's retention floor holds until the follower resends from it;
+- A rewind's retention floor holds until the follower resends from it;
   a batch in flight does not raise it (§5).
-- M4: free disk is measured for `hold_release` with `[log] disk_reserve`
+- Free disk is measured for `hold_release` with `[log] disk_reserve`
   at 0 too (§5).
-- M5: reasons, `AuditEvent` targets and details and approval commands are
+- Reasons, `AuditEvent` targets and details and approval commands are
   scrubbed when they are written (§4.3).
-- M6: an erasure's `record_hash` covers its subject's keyed label, not the
+- An erasure's `record_hash` covers its subject's keyed label, not the
   subject (§4.3).
 
 ## The brief
@@ -109,7 +108,7 @@ Code review fixes (M28 code review):
 >   poster, och ett test jämför dem.
 
 M28 builds on v0.1 and needs no other v0.2+ milestone. It can use M11's
-`TurnRecord.duration_us` (field 23) if M11 is merged first (§3.3).
+`TurnRecord.duration_us` (field 23) if M11 is implemented first (§3.3).
 
 ## 1. What exists today (main 07bdeae)
 
@@ -128,7 +127,7 @@ M28 builds on v0.1 and needs no other v0.2+ milestone. It can use M11's
   names the scheduling turn.
 - **Time.** `logical_time_ms` is set when a turn starts: `max(wall, high
   water mark, parent)`, so it is close to the wall clock. There is no
-  turn-level duration on main (M11 adds field 23). `EffectRecord.duration_us`
+  turn-level duration yet (M11 adds field 23). `EffectRecord.duration_us`
   is set only for live `http.fetch` and `foreign.http`, and no effect
   records a start time.
 - **Metrics.** `kronik-metrics` has no dependencies. It keeps 12 metrics
@@ -188,7 +187,7 @@ runtime features of its own: it gets the clock, spawning and network from
 - **Trace id:** `causal_key.root`, decoded from 32 hex characters. A root
   that is not 32 hex characters (only tests make those) maps to the first 16
   bytes of `blake3("kronik trace v1" ‖ root)`.
-  - An incoming W3C `traceparent` never sets the trace id (review H1): a
+  - An incoming W3C `traceparent` never sets the trace id: a
     callee computes its trace id from its own record, and a CALL input
     carries no trace context, so an adopted trace id would split the trace.
     Instead the root span gets a **link** to the incoming span
@@ -199,7 +198,7 @@ runtime features of its own: it gets the clock, spawning and network from
     erased, the link is left out, which is the only way a re-export can
     differ.
   - **A trace is one root and its synchronous calls.** Timers and sends
-    start a new trace (review M1), linked to their cause: a timer's or a
+    start a new trace, linked to their cause: a timer's or a
     message's causal key is a child of the turn that caused it, so a
     self-rescheduling timer, or two actors messaging each other, would
     otherwise make one trace for their whole life, and backends cap trace
@@ -208,13 +207,13 @@ runtime features of its own: it gets the clock, spawning and network from
     v1" ‖ encode(key))` of the turn's own key.
   - **A callee's trace** is its caller's. The causal key does not say
     whether an ancestor started a trace (a timer's key looks like a send's),
-    so the exporter keeps the trace id of every begun, pending turn,
+    so the exporter keeps the trace id of every begun, uncommitted turn,
     read from `TurnBegin`. A call is synchronous, so its caller is always
     open when the callee's record arrives: the set is bounded by the turns
     in flight, and is saved with the cursor. A committed callee that
     joined its caller's trace is kept while its messages, timers or
     compensation are still to come, and a caller while the callee of a
-    timed-out call has not run (code review M7). A turn whose parent is
+    timed-out call has not run. A turn whose parent is
     neither open nor kept for it (a compensation, which never joins a
     committed callee) starts its own trace, linked.
 - **Turn span id:** the first 8 bytes of `blake3_keyed(id key, "kronik span
@@ -224,7 +223,7 @@ runtime features of its own: it gets the clock, spawning and network from
   first migration.
 - **Effect span id:** the first 8 bytes of `blake3_keyed(id key, "kronik
   effect span v1" ‖ encode(key) ‖ ordinal)`.
-- **The id key** (perf review P1): `causal::encode` holds every step's actor
+- **The id key**: `causal::encode` holds every step's actor
   kind and key in plain, so an unkeyed id would let a backend confirm a
   guessed actor key (an e-mail, say) against an exported id, whatever
   `actor_keys` says. Every id but a root's trace id (16 random bytes) is
@@ -278,7 +277,7 @@ that says how it was caused:
 - **Effect span end:** start + `duration_us`.
 - **Phase B work:** set `duration_us` for `actor.call`, crypto and reveal
   effects too; today only fetch sets it.
-- **Children inside parents** (review M9): `logical_time_ms` has
+- **Children inside parents**: `logical_time_ms` has
   millisecond resolution and can run ahead of the wall clock, so an effect
   span is clamped into its turn span, and a callee's turn span into its
   caller's `actor.call` span when the exporter has the caller's record in
@@ -341,7 +340,7 @@ node. So:
 - `[otel] actor_keys = "hashed"` is the default. It exports
   `kronik.actor.key = "kh:" + 12 hex` of `Sealer::keyed_hash("kronik otel
   key v1", [kind, key])`: stable for correlation, and not reversible without
-  the master key. A node without a master key (review M5) hashes with a
+  the master key. A node without a master key hashes with a
   node-local key, 32 random bytes in `<data>/otel.key` (0600), created at
   first use: still stable on that node and not reversible.
 - `"plain"` exports the key as it is.
@@ -362,7 +361,7 @@ under their own purpose (§3.1).
   prost-build, as `kronik-proto` is. The exporter sends through `Env::net()`.
 - **No OpenTelemetry crate and no gRPC** (ADR 0081 explains why).
 - **Batching and retries:** up to `[otel] batch_spans` spans (default 512),
-  4 MiB of encoded log records (code review M3; a larger record goes
+  4 MiB of encoded log records (a larger record goes
   alone) or `[otel] interval` (default 5 s). A failed POST is retried with
   backoff (1 s doubling to 60 s, from `env.clock`).
 - **HTTP answers:**
@@ -376,7 +375,7 @@ under their own purpose (§3.1).
     stay out of the config file.
   - `https://` endpoints use the native roots.
   - `http://` to a host that is not loopback is refused at config check when
-    `headers_env` is set (review L4): the headers usually carry credentials.
+    `headers_env` is set: the headers usually carry credentials.
 
 ### 3.7 Metrics over OTLP
 
@@ -405,14 +404,14 @@ record** of main's log, in LSN order. An audited record is:
   new `AuditEvent`, §4.2);
 - a `TurnRecord` whose input is a message with source `OPERATOR` or
   `DEAD_LETTER_RESEND`, which carries `MessageInput.audit`;
-- each `secret.reveal` effect of any `TurnRecord` (review H3: the brief says
+- each `secret.reveal` effect of any `TurnRecord` (the brief says
   a reveal "syns i audit"). One line per reveal effect, keyed by the turn's
   LSN and the effect's ordinal, naming the actor (per §3.5) and the secret,
   never the value.
 
 The classifier is one function in `kronik-otel`. A unit test walks every
 record message of `kronik-proto` and fails when one with an `Audit` field
-is not classified (review M4), so a new audited kind cannot be missed.
+is not classified, so a new audited kind cannot be missed.
 
 The same Mapper accepts validated ActorSource values from each held native
 frame. Its actor-specific line, operational and verification entrypoints borrow
@@ -505,7 +504,7 @@ It is written by:
 | DELETE `/v1/previews/{id}` | `preview.delete` | preview id | |
 
 Rules for `AuditEvent`:
-- **Ordering, security-relevant routes** (review M3): secret set, secret
+- **Ordering, security-relevant routes**: secret set, secret
   delete, token create and token revoke append their `AuditEvent` *before*
   the change, as the intent. If the change then fails, a second event with
   the action plus `.failed` and the error code follows. A crash in between
@@ -516,7 +515,7 @@ Rules for `AuditEvent`:
   commit returns loses the event while the fork directory, proposal,
   rebase or snapshot remains; the window is the event's append (one
   group commit) after the change's own writes. The two routes that wait
-  for a job write their event before waiting (perf review P3): `watch.start`
+  for a job write their event before waiting: `watch.start`
   is appended before the watch is saved and starts, so it precedes any
   guard record or rollback the watch writes, and a crash in between
   over-reports; `proposal.create` is appended once the job is started
@@ -527,11 +526,11 @@ Rules for `AuditEvent`:
   recorded.
 - **Dry runs write none.** Other failed actions write none.
 - **System events** (`token_id = "system"`), written by the node itself:
-  - `restore`, on the first start after `kronik restore` (review H4), with
+  - `restore`, on the first start after `kronik restore`, with
     `through_lsn`: `restore` leaves a marker file, written durably as part
     of the staged install before its commit step, with the last LSN of the
     staged log (the snapshot's when no segment follows it), so restored
-    state never comes without it (perf review R4). The start records the
+    state never comes without it. The start records the
     event unless the log after `through_lsn` holds it already. Startup
     then durably clamps or initializes both export cursors, even if absent
     or configured from `"now"`; drops lost-tail resume state; resets the
@@ -541,7 +540,7 @@ Rules for `AuditEvent`:
     or off. `restore --force` may keep an old `export.json`.
   - `audit.gap`, for a range retention deleted before export (§5);
   - `audit.config`, at a start where `[audit]` or `[otel]` differ from the
-    last recorded one (review L2), with the settings' hash and the sink's
+    last recorded one, with the settings' hash and the sink's
     scheme and host.
 - **Tests:** the existing `crates/kronik-api/tests/mutations.rs` lists
   every mutating route. It gains a column: the record each route writes,
@@ -560,7 +559,7 @@ One object per line, UTF-8, `\n`-terminated, keys in this order:
  "record_hash":"b3:<64 hex>"}
 ```
 
-- **The dedup key is (`lsn`, `effect`, `record_hash`)** (review H4).
+- **The dedup key is (`lsn`, `effect`, `record_hash`)**.
   Delivery is at least once. `effect` is the ordinal on reveal lines and
   absent otherwise. The LSN alone is not unique: after `kronik restore` from
   an older ship point, new records reuse the LSNs of the lost tail. The
@@ -637,7 +636,7 @@ One object per line, UTF-8, `\n`-terminated, keys in this order:
     mark; do not renumber archive files or assume removed history is checked.
     The sink starts a new file when the newest one is gone, replaced (another
     inode, as logrotate's `create` leaves it) or shorter than written (its
-    `copytruncate`), never writing at a stale offset (perf review R5).
+    `copytruncate`), never writing at a stale offset.
     The systemd unit gets `LogsDirectory=kronik`, so the default path is
     writable under `ProtectSystem=strict`.
   - Removed directories are recreated; recoverable open/write failures
@@ -701,7 +700,7 @@ the export cursor equals the applied LSN.
   conditional create, legacy/current readback and forged-line rejection,
   rewind/restart without overwrite, and `s3_unsupported` with durable
   cursor zero while the counter still runs. Its seven archive objects
-  and daemon logs exclude the needle; human tables and cleanup are recorded.
+  and daemon logs exclude the needle.
 - The earlier 2.66 s daemon/API/OTLP smoke exercises recoverable I/O,
   whole-batch rotation, removed-directory recovery, and restart with
   corrupt secret ciphertext: three API 503s, both export cursors frozen
@@ -788,7 +787,7 @@ the export cursor equals the applied LSN.
 Retention deletes closed segments once a snapshot covers them and they are
 older than `[retention] history`. A slow sink would otherwise lose records.
 
-- **Audit holds retention, but never production** (review H2). `Node::compact`
+- **Audit holds retention, but never production**. `Node::compact`
   takes a floor: it keeps every segment with records past the audit cursor.
   The floor is exposed as a `RetentionHold` that the exporter updates.
   - **Released before the disk reserve:** when free disk falls below
@@ -799,13 +798,12 @@ older than `[retention] history`. A slow sink would otherwise lose records.
     core must not depend on an outside service (I10).
     Free disk is measured whenever retention runs, also with
     `disk_reserve = 0`, which would otherwise leave only `max_hold` to
-    protect the disk (code review M4). Once the hold has given way, the
+    protect the disk. Once the hold has given way, the
     once-a-second disk check runs retention itself, at most once a minute,
-    so the release does not wait for the next snapshot pass (perf review
-    R2). A configuration whose `hold_release` is at or below
-    `disk_reserve` (`"0B"` with `"2x"`, or `"1x"`) and has no `max_hold`
-    is refused, after the flags too: that hold could never give way
-    before the reserve refuses work (perf review R3).
+    so the release does not wait for the next snapshot pass. A configuration
+    whose `hold_release` is at or below `disk_reserve` (`"0B"` with `"2x"`,
+    or `"1x"`) and has no `max_hold` is refused, after the flags too: that
+    hold could never give way before the reserve refuses work.
   - `[audit] max_hold` (default 0 = no time cap) can also cap the hold.
   - **Durable floor:** the hold is restored before exporter spawn, then
     updated only after durable checkpoints. A replay request's earliest
@@ -879,9 +877,9 @@ Every command has `--json`.
 
 | CLI | API | Scope | What |
 |---|---|---|---|
-| `kronik export status` | GET `/v1/export` | read | per stream: enabled, the sink's or endpoint's scheme and host only (review M6: webhook URLs often carry credentials in the path), cursor, applied LSN, lag, last success, last error code (not its text, which can contain the URL), gaps |
+| `kronik export status` | GET `/v1/export` | read | per stream: enabled, the sink's or endpoint's scheme and host only (webhook URLs often carry credentials in the path), cursor, applied LSN, lag, last success, last error code (not its text, which can contain the URL), gaps |
 | `kronik audit show [--from LSN] [--limit N]` | GET `/v1/audit?from=&limit=` | admin | the audit lines, as the sink receives them, from the log (also when the export is off) |
-| `kronik audit verify [--sink URL] [--from LSN] [--to LSN]` | (local; no API) | — | compares a sink's lines with the log, by §4.5's definition. `--sink` is a `file://` or `s3://` URL (default: `[audit] sink`; a webhook cannot be read back, review L1). Prints the missing, extra and conflicting lines, and exits 1 if there are any. The completeness test runs it. |
+| `kronik audit verify [--sink URL] [--from LSN] [--to LSN]` | (local; no API) | — | compares a sink's lines with the log, by §4.5's definition. `--sink` is a `file://` or `s3://` URL (default: `[audit] sink`; a webhook cannot be read back). Prints the missing, extra and conflicting lines, and exits 1 if there are any. The completeness test runs it. |
 | `kronik export rewind <stream> --to LSN --reason R [--dry-run]` | POST `/v1/export/{stream}/rewind` | operate | moves a cursor back to re-send (after a sink lost data). A mutation, so it has a reason and a dry run, and writes an `AuditEvent` `export.rewind`. |
 
 `kronik audit show` uses scope `admin` because the lines name tokens and
@@ -945,10 +943,10 @@ OpenTelemetry-backend":**
 - **The backend.** Jaeger v2 (`jaegertracing/jaeger`, pinned by digest) is
   an ordinary OpenTelemetry backend. It receives OTLP/HTTP on 4318 and
   serves its query API on 16686.
-- **Where it runs:** in docker on `test-vps`, under the VPS lock
+- **Where it runs:** in docker on the test VPS, under the VPS lock
   (`flock /var/tmp/kronik-vps.lock`), as the install suites already use
-  docker there. The batch row is `suite otel 'with_garage scripts/jaeger.sh
-  demo/vps-otel.sh' 5` in a row `M28`.
+  docker there. The test entry is `suite otel 'with_garage scripts/jaeger.sh
+  demo/vps-otel.sh' 5` under M28.
 - **`demo/vps-otel.sh`**, in the shape of `demo/vps-restore.sh`:
   1. Start Jaeger with `--rm` on free loopback ports (`scripts/jaeger.sh`,
      Jaeger 2.22.0 pinned by digest).
@@ -979,11 +977,11 @@ OpenTelemetry-backend":**
   in-process OTLP receiver (a small hyper server that decodes
   `ExportTraceServiceRequest` with the vendored types). It makes the same
   three-actor call and the same connectivity checks, plus: the same call
-  with a `traceparent` header keeps one trace and links it (review H1),
-  and every child lies within its parent (review M9). The Jaeger run then
+  with a `traceparent` header keeps one trace and links it, and every
+  child lies within its parent. The Jaeger run then
   proves that a real backend accepts and joins the spans.
-- **Independent decode** (the review's caveat: the receiver test decodes
-  with our own types): a golden `ExportTraceServiceRequest` produced by a
+- **Independent decode** (the receiver test decodes with our own types): a
+  golden `ExportTraceServiceRequest` produced by a
   reference implementation (the Collector's `telemetrygen`, captured once on
   the test VPS) is checked in, and a CI test decodes it with the vendored
   types. Until it is captured, a hand-encoded request built from the
@@ -1018,15 +1016,15 @@ the `with_garage` S3 sink in `demo/vps-otel.sh`'s second half
   retention.
 - **Record kinds:** 40 `AuditEvent`. 41–44 are not used.
 - **Proto fields:** `EffectRecord.offset_us = 80`. 81–89 are not used.
-  `TurnRecord.duration_us` is M11's field 23. If M28 lands first, it takes
-  that commit rather than adding a second field.
+  `TurnRecord.duration_us` is M11's field 23. If M28 is implemented first, it
+  takes that field rather than adding a second one.
 - **Error codes:** `EXPORT_NOT_CONFIGURED`, `AUDIT_RANGE_GONE` (milestone
   "M28").
 
 ## 11. Phase B plan
 
 Each slice comes with its tests (failing before the change) and its docs.
-Each runs the gates through `kronik-slot`.
+Each runs the gates through the CI harness.
 
 1. **B1 `kronik-otel` core**
    - vendored OTLP protos and their build;
@@ -1057,24 +1055,24 @@ Each runs the gates through `kronik-slot`.
      - `audit show`, `audit verify`, `export rewind`, the error codes;
      - `crates/kronik/tests/audit.rs`.
 4. **B4 proof and docs**
-   - `demo/vps-otel.sh`, `scripts/jaeger.sh` and the batch row;
+   - `demo/vps-otel.sh`, `scripts/jaeger.sh` and the CI harness entry;
    - an operations guide section (OTLP to a collector, Jaeger, Grafana
      Tempo; the audit sinks), privacy guide lines (§3.4, §4.3), `cli.md`,
      `json.md`, `openapi.json`, `errors.md`;
-   - STATUS.
+   - the project status page.
 
-Before B2, a spike via `kronik-slot`:
+Before B2, a spike in the CI harness:
 - check that the vendored protos compile with protox 0.10 and prost 0.14;
 - check that a recorded batch is accepted by Jaeger and by the OpenTelemetry
   Collector `otlphttp` receiver. That needs the docker images, and network
   once for the image pull.
 
-## 12. Open questions for the maintainers
+## 12. Open questions
 
 - The default for actor keys: `hashed` (proposed) or `plain`, which matches
   Kronik's "keys are identities" model.
-- The audit hold's release point: below 2 × `disk_reserve` (proposed, after
-  review H2), with no time cap by default.
+- The audit hold's release point: below 2 × `disk_reserve` (proposed), with
+  no time cap by default.
 - Whether outgoing `http.fetch` requests should carry a `traceparent`, so
   that services Kronik calls join the trace. This is not in the brief and
   is not proposed. It would add a header on the wire only (not in the

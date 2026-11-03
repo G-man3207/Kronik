@@ -103,8 +103,7 @@ impl<'a> Context<'a> {
 
     /// Validate only this original outcome's scalar phase, without replacing
     /// prepared markers. Opaque bodies and effects need their own source guards.
-    /// Kept from the unbuilt WIP checkpoint: the endpoint that calls it has not
-    /// landed yet.
+    /// The endpoint that calls it has not landed yet.
     #[allow(dead_code)]
     pub(super) fn prepared_outcome(
         &mut self,

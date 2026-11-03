@@ -75,7 +75,7 @@ pub trait Dns01: Send + Sync + std::fmt::Debug {
 }
 
 /// A [`Dns01`] provider that runs an executable, as `<program> present|cleanup
-/// <fqdn> <value>`, which talks to the owner's DNS API. A non-zero exit, or
+/// <fqdn> <value>`, which talks to the DNS provider's API. A non-zero exit, or
 /// no exit within `timeout`, is a failure; its output goes to the log. The
 /// hook inherits the daemon's environment, where its DNS credentials live,
 /// minus [`HOOK_ENV_REMOVED`].

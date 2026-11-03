@@ -11,7 +11,7 @@ and replace every section. Keep it short: what was decided and why.
 ## Context
 
 The problem, the forces and constraints at play, and the invariants that are
-affected. Link to spikes, measurements and sections of the brief.
+affected. Link to measurements and sections of the build brief.
 
 ## Decision
 

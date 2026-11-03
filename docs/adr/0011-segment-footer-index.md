@@ -5,8 +5,8 @@
 
 ## Context
 
-the build brief requires a closed segment to be immutable and to carry a footer
-index from actor to offset. `kronik-log` already reserved kind 255 and
+The build brief requires a closed segment to be immutable and to carry a
+footer index from actor to offset. `kronik-log` already reserved kind 255 and
 readers already skip that kind without consuming an LSN. Nothing wrote it.
 A format version bump would make every segment written so far unreadable.
 The index must not be a `Record` and must not live in `state.db`: retention

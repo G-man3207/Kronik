@@ -1,7 +1,7 @@
 # 0094. Secret and key providers without SDKs
 
 - **Status:** Accepted for B1 KMS clients; external secret clients remain planned.
-- **Date:** 2026-10-28; B1 re-reviewed 2026-10-30
+- **Date:** 2026-10-28, amended 2026-10-30
 
 ## Context
 
@@ -48,9 +48,11 @@ external secret retrieval remain B4 work, not implemented by this slice.
   - `keys/K/{version}/wrapkey` and `unwrapkey`.
 
 No new third-party dependency enters the graph: B1 reuses locked dependencies.
-PKCS#11 dependencies and the separate helper artifact remain maintainer-gated.
+PKCS#11 dependencies and the separate helper artifact remain
+maintainer-gated.
 
-**No-paid-cloud acceptance targets** (observed outcomes belong in STATUS.md):
+**No-paid-cloud acceptance targets** (observed outcomes are tracked on
+[the project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)):
 
 | Provider | Run against |
 |---|---|
@@ -60,7 +62,7 @@ PKCS#11 dependencies and the separate helper artifact remain maintainer-gated.
 | Azure Key Vault | rokeller emulator (Apache-2.0) |
 
 The acceptance services run in isolated containers. Real-cloud/IAM checks
-remain opt-in owner work; emulator evidence does not claim those checks.
+remain opt-in maintainer work; emulator evidence does not claim those checks.
 
 ## Alternatives
 
@@ -89,7 +91,8 @@ remain opt-in owner work; emulator evidence does not claim those checks.
 
   B1 requires published signing vectors and real emulator acceptance;
   permanent tests focus on uncertain integrity/security boundaries, not
-  mock-echo round trips. STATUS.md records actual commands and outcomes.
+  mock-echo round trips. Actual commands and outcomes are recorded on
+  [the project status page](https://github.com/G-man3207/Kronik/wiki/Project-status).
 - Emulators prove protocol and cryptographic operation, not real IAM. Paid
   cloud checks remain the maintainers' choice. The original no-GCP-KMS-emulator
   assumption is historical; the B1 verification work evaluates the available

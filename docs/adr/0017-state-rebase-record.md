@@ -13,8 +13,8 @@ derived and can be rebuilt from the log. Main's log holds the new code's
 turns since the deployment; the state after the switch is built from the
 old code's turns, which until now existed only in the fork (in memory and
 in `branches/<fork>/log`, which a user can delete). A new record needs a
-versioned Protobuf schema and a compatibility fixture (I5, I16, SPEC
-"Format changes"); M12 took envelope kind 15.
+versioned Protobuf schema and a compatibility fixture (I5, I16, the build
+brief "Format changes"); M12 took envelope kind 15.
 
 ## Decision
 

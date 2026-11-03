@@ -1,6 +1,8 @@
 # 0090. Secret backends and versions in the log
 
-- **Status:** Accepted design for M23 B2–B5; implementation and exercised evidence are tracked separately in STATUS.md.
+- **Status:** Accepted design for M23 B2–B5; implementation and exercised
+  evidence are tracked separately on
+  [the project status page](https://github.com/G-man3207/Kronik/wiki/Project-status).
 - **Supersedes:** the parked proposal's source-version-only identity and independent store `max+1` allocation.
 
 ## Context
@@ -50,4 +52,5 @@ Complete retained-value coverage is a separate requirement in ADR 0091, not sati
 
 ## Acceptance evidence required
 
-No test is preclaimed by this accepted design. Required exercised evidence includes failed/concurrent set reservations, crash publication boundaries, legacy import, same-version IDs across refs/generations, provider binding and pagination attacks, hash equivalence, old-version rotation/history, no-network replay, historical upgrade configuration/code/link semantics and actual supported secret-service lifecycles. See [the M23 design](../design/m23-secret-backends.md) and STATUS.md for observed results.
+No test is preclaimed by this accepted design. Required exercised evidence includes failed/concurrent set reservations, crash publication boundaries, legacy import, same-version IDs across refs/generations, provider binding and pagination attacks, hash equivalence, old-version rotation/history, no-network replay, historical upgrade configuration/code/link semantics and actual supported secret-service lifecycles. See [the M23 design](../design/m23-secret-backends.md); observed results are
+  tracked on [the project status page](https://github.com/G-man3207/Kronik/wiki/Project-status).

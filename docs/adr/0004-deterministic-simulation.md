@@ -18,8 +18,8 @@ and a simulated implementation. The question was `madsim` or our own
 executor. ADR 0001 already decided that host functions are async, so a turn
 is a future that a simulator can drive.
 
-Spike D (`spikes/spike-d-dst/`) built a mini daemon that contains the hard
-parts and ran it on both executors:
+Spike D built a mini daemon that contains the hard parts and ran it on both
+executors:
 
 - **Log:** segment header, envelopes of `[u32 len][u32 crc32c][u64 lsn][u8
   kind][payload]`, a group-commit writer (2 ms window), `fdatasync` through
@@ -113,7 +113,7 @@ the spike runs the same scenario on madsim with a 170-line backend (`madsim_back
 
 ### 2. The trait set: `kronik-core::env`
 
-Lift `spikes/spike-d-dst/src/env.rs` verbatim into `kronik-core::env`. It
+The spike's `Env` implementation moves verbatim into `kronik-core::env`. It
 depends only on `bytes` and `tokio` with the `sync` and `macros` features
 (for `oneshot` and a biased `select!`).
 
@@ -181,9 +181,8 @@ impl Env {
 
 - **Where the implementations live.** The real implementations go in
   `kronik-core::env::real` behind a cargo feature `real`, enabled only by the
-  `kronik` binary and integration tests (source:
-  `spikes/spike-d-dst/src/env_real.rs`). The simulated ones go in
-  `kronik-sim` (source: `spikes/spike-d-dst/src/sim/`).
+  `kronik` binary and integration tests. The simulated ones go in
+  `kronik-sim`.
 - **Inbound HTTP is not part of `Net`** (see 5). A real `Net` (a hyper
   client) comes in M2; the spike's real mode used an in-process loopback.
 
@@ -306,7 +305,7 @@ SQLite is not behind `Fs`.
   and the exact reproduce command. `DST_TRACE=1` streams every event.
 - **Determinism check.** Each event (with its virtual time) is hashed with
   BLAKE3. CI runs a slice of seeds twice and requires identical hashes. The
-  spike's seed 12345 gave hash `0842addb3798aa9d` on both the AMD dev
+  spike's seed 12345 gave hash `0842addb3798aa9d` on both the AMD development
   machine and the Intel VPS.
 - **Mutation tests.** The harness's checks must keep catching seeded bugs.
   The `mutants` command runs each deliberate bug against a seed range and
@@ -394,22 +393,22 @@ SQLite is not behind `Fs`.
 
 ### Measurements
 
-Dev machine: AMD EPYC 9354P, 8 vCPUs, shared, load average about 3. VPS:
-Intel Skylake, 2 vCPUs, Debian 13, idle. Release builds. A "poll" is one
+Development machine: AMD EPYC 9354P, 8 vCPUs. Test VPS: Intel Skylake,
+2 vCPUs, Debian 13, idle. Release builds. A "poll" is one
 executor poll of one task (the brief's "step"). Every DST seed runs 4 clients
 × 12 requests against 3 actors with crashes about every 150 ms, followed by
 the full end-of-run checks including identity replay.
 
 | Measurement | Result |
 | --- | --- |
-| Executor overhead only (100 tasks × 10k random sleeps + `tokio::sync::Mutex`) | own: 2.6–2.9M polls/s (dev), 1.44M polls/s (VPS); madsim: 5.0M polls/s (dev) |
+| Executor overhead only (100 tasks × 10k random sleeps + `tokio::sync::Mutex`) | own: 2.6–2.9M polls/s (development machine), 1.44M polls/s (VPS); madsim: 5.0M polls/s (development machine) |
 | DST seeds, single thread | own: 30.2 seeds/s; madsim: 29.9 seeds/s (dev, 100 seeds); own: 18.4 seeds/s (VPS) |
 | DST seeds, parallel | 1,000 seeds in 28.1 s with 8 threads (dev, 0 failures); 200 seeds in 6.8 s with 2 threads (VPS) |
 | Determinism, same seed twice | 50/50 identical, 50/50 distinct across seeds (own); identical under madsim; seed 12345 identical on AMD and Intel |
 | ≥1M-step run (8 clients × 5,000 requests, 16 actors) | 1,199,684 polls, 39,912 turns, 911 crashes, 138 fsync-error restarts, 106 torn tails, 26 valid-records-after-tear, 0 violations, 224 s wall, 613 s simulated |
 | Same, crashes off and replay off | 1,118,378 polls in 81 s |
-| Real mode (tokio, 4 workers, real files, WAL `state.db`) | 400 turns, 297 turns/s (dev), 314 turns/s (VPS); recovered state identical; identity replay 0 mismatches |
-| Faults over 200 seeds (dev) | 1,095 crashes, 51 torn tails, 45 fsync-error restarts, 1,596 recovery re-runs, 577 stale-`state.db` restarts, 453 clock jumps |
+| Real mode (tokio, 4 workers, real files, WAL `state.db`) | 400 turns, 297 turns/s (development machine), 314 turns/s (VPS); recovered state identical; identity replay 0 mismatches |
+| Faults over 200 seeds (development machine) | 1,095 crashes, 51 torn tails, 45 fsync-error restarts, 1,596 recovery re-runs, 577 stale-`state.db` restarts, 453 clock jumps |
 
 Mutation suite: every seeded bug is caught (`mutants 0..100`).
 
@@ -425,18 +424,5 @@ Mutation suite: every seeded bug is caught (`mutants 0..100`).
 
 ### Verification
 
-```sh
-cd spikes/spike-d-dst
-(cd guest && cargo build --release --target wasm32-wasip2)
-cargo build --release
-target/release/spike-d-dst determinism 0..50
-target/release/spike-d-dst seeds 0..1000 -j 8
-target/release/spike-d-dst mutants 0..100 -j 8
-target/release/spike-d-dst long --requests 5000
-target/release/spike-d-dst real
-target/release/spike-d-dst exec-bench
-cargo test --release --test dst -- --seed 12345
-RUSTFLAGS="--cfg madsim" cargo build --release --target-dir target/madsim
-target/madsim/release/spike-d-dst madsim-seeds 0..100
-target/madsim/release/spike-d-dst exec-bench
-```
+The M0 spike notes are in the project wiki:
+https://github.com/G-man3207/Kronik/wiki/Spikes.

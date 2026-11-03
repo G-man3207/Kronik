@@ -10,12 +10,11 @@ gVisor; only the boundary to it is recorded (brief: "Främmande aktörer med
 gVisor", M7). Actors reach it with `http.fetch` on `foreign://<name>/...`,
 recorded as `foreign.http`. The sandbox gets no external network, and egress
 is disabled in v0.1. `runsc` must use the `systrap` platform, which works on
-the test VPS VPS without `/dev/kvm` (I11). The brief leaves the bridge from
+the test VPS without `/dev/kvm` (I11). The brief leaves the bridge from
 Kronik into the sandbox to this spike: a bind-mounted Unix socket with
 gVisor's `--host-uds`, or `runsc port-forward`.
 
-Spike C (`spikes/spike-c-gvisor/`) built what Kronik will need and measured
-both bridges on the test VPS:
+Spike C built what Kronik will need and measured both bridges on the test VPS:
 
 - `oci-tool bundle` turns an image in a local OCI layout into a runsc bundle:
   it verifies the digests of index, manifest, config and every layer (each
@@ -25,7 +24,9 @@ both bridges on the test VPS:
   image config plus operator overrides.
 - A static echo server is the foreign actor; `netprobe`, `bridge-bench` and a
   Unix-socket-to-TCP shim do the rest.
-- The scripts and their raw output are in `scripts/` and `results/`.
+
+The M0 spike notes are in the project wiki:
+https://github.com/G-man3207/Kronik/wiki/Spikes.
 
 **Test VPS.** Debian 13 (trixie), kernel 6.12.111+deb13-cloud-amd64, 2 vCPU
 Intel Xeon (Skylake) under KVM without nested virtualization (no `vmx` or
@@ -71,8 +72,8 @@ NIC and nothing else: no route out. Kronik deletes the namespace after
 
 `--network=none` is not an option: `runsc port-forward` rejects it
 (`unsupported network type "none"`). A namespace that runsc creates itself has
-`lo` down, and then port-forward fails with `network is unreachable`. Both are
-in `13-alternatives.txt`.
+`lo` down, and then port-forward fails with `network is unreachable`. Both
+are in the spike notes.
 
 ### 3. Bridge: one `runsc port-forward --stream` per connection
 
@@ -124,7 +125,7 @@ sandbox processes in it, and removes it on `runsc delete`.
 
 - The child's exit status is the container's exit status: 3 when the app
   exits with 3, 137 after `runsc kill KILL` and 137 when the sandbox process
-  is killed on the host (30 of 30 in `12-wait-race.txt`). `runsc wait` on a
+  is killed on the host (30 of 30). `runsc wait` on a
   detached sandbox is not reliable. It reported the app's own exit when it
   was waiting in time (10 of 10), but it got the status in only 1 of 10 runs
   after `runsc kill` and in 0 of 10 after `kill -9`; it then fails with
@@ -144,17 +145,15 @@ sandbox processes in it, and removes it on `runsc delete`.
 
 `install.sh` installs a pinned gVisor release tarball into `/usr/local/bin`
 (`runsc` plus `gvisor-bin/`) after checking its SHA-512, or uses gVisor's
-signed apt repository on Debian and Ubuntu. `scripts/install-runsc.sh` in the
-spike does the former.
+signed apt repository on Debian and Ubuntu. `scripts/install-runsc.sh` does
+the former.
 
 ## Measurements
 
-Test VPS as above; all numbers in `spikes/spike-c-gvisor/results/`. Requests
-are sequential `POST /echo` with a 64-byte body, 3 rounds of 1000 after 100
-warmup requests; the table shows the median of the three rounds. The sandbox
-runs at `--cpu 1 --memory 512Mi` (`04-bridges-cpu-on.txt`); without the CPU
-quota the numbers are similar except for the tails
-(`04-bridges-cpu-off.txt`).
+Test VPS as above. Requests are sequential `POST /echo` with a 64-byte body, 3
+rounds of 1000 after 100 warmup requests; the table shows the median of the
+three rounds. The sandbox runs at `--cpu 1 --memory 512Mi`; without the CPU
+quota the numbers are similar except for the tails.
 
 | Bridge | Kept-alive p50 / p99 / p99.9 | New connection p50 / p99 |
 | --- | --- | --- |
@@ -167,58 +166,57 @@ quota the numbers are similar except for the tails
 
 - **CPU.** Over the same 6600 requests without the quota, the sandbox cgroup
   used 25 s of CPU with `--stream`, 18 s with local port-forward and 34 s with
-  the shim (`04-bridges-cpu-off.txt`). Under the 1-CPU quota the shim run was
-  throttled in 364 of 381 periods, the `--stream` run in 14 of 470
-  (`04-bridges-cpu-on.txt`). With `--stream`, a kept-alive request costs
+  the shim. Under the 1-CPU quota the shim run was
+  throttled in 364 of 381 periods, the `--stream` run in 14 of 470.
+  With `--stream`, a kept-alive request costs
   about 0.6 ms of sandbox CPU and a new connection about 7 ms, plus the
-  short-lived runsc helper on the host (`09-systrap.txt`).
-- **Cold start** (10 starts, `05-coldstart.txt`): `runsc run --detach`
+  short-lived runsc helper on the host.
+- **Cold start** (10 starts): `runsc run --detach`
   including the namespace takes 104 ms (median); the first answered request
   through `--stream` comes 123 ms after the start (108–150 ms). Teardown with
   `runsc delete --force` takes 17 ms.
-- **Idle cost** (`09-systrap.txt`, `11-overhead.txt`): 3 ms of CPU per 5 s;
+- **Idle cost:** 3 ms of CPU per 5 s;
   18 MiB `memory.current` in the cgroup; RSS 34 MiB for the sentry and 16 MiB
   for the gofer. Each `--stream` helper uses about 15 MiB while it lives.
   Disabling the systrap fast path made no measurable difference.
-- **Egress** (`06-egress-pf.txt`): TCP to 1.1.1.1:443, 8.8.8.8:53,
+- **Egress:** TCP to 1.1.1.1:443, 8.8.8.8:53,
   [2606:4700:4700::1111]:443 and to the host's own public, Docker and
-  private network addresses, UDP DNS to 8.8.8.8, 1.1.1.1 and 192.0.2.53, and
-  busybox `nslookup` and `wget` all fail with `Network unreachable`; name
-  resolution fails; inside there is only `lo`; the sandbox host processes sit
-  in a namespace with only `lo`.
-- **Limits** (`07-limits.txt`): two busy threads get 1.00 CPU with
+  private management-network addresses, UDP DNS to 8.8.8.8, 1.1.1.1 and
+  100.100.100.100, and busybox `nslookup` and `wget` all fail with `Network
+  unreachable`; name resolution fails; inside there is only `lo`; the sandbox
+  host processes sit in a namespace with only `lo`.
+- **Limits:** two busy threads get 1.00 CPU with
   `cpu.max 100000 100000` and 1.97 CPU with the quota lifted. 300 MiB fits
   (`memory.peak` 323 MiB); touching 700 MiB gets `gvisor_sentry` killed by the
   cgroup OOM killer (`oom_kill 1`) and the sandbox stops. The app sees 2 CPUs
   (runsc's `--cpu-num-from-quota` rounds the quota up but never below 2) and
   `MemTotal` 524288 kB.
-- **Bundles** (`02-bundle.txt`): a 1.7 MB gzip layer plus a 6.9 MB tar layer
+- **Bundles:** a 1.7 MB gzip layer plus a 6.9 MB tar layer
   verify and unpack in 0.22 s; a layer blob with one appended byte is
-  rejected. BuildKit layers with real whiteouts unpack correctly
-  (`10-buildkit-check.txt`).
+  rejected. BuildKit layers with real whiteouts unpack correctly.
 
 ## Alternatives
 
 - **`--host-uds=create` with a shim in the sandbox** (`--network=none`). It
   works and was measured in full. The sandbox needs `create` (with `none` or
   `open` the socket exists only inside the sandbox), and the shim needs root
-  inside the sandbox to bind in Kronik's 0700 directory (`13-alternatives.txt`).
+  inside the sandbox to bind in Kronik's 0700 directory.
   With `create`, the sandbox still cannot connect to host sockets in its
-  mounts (`06-egress-uds.txt`). Its advantages are `--network=none`, so no
+  mounts. Its advantages are `--network=none`, so no
   namespace to manage, and new connections without a process spawn (6.5 ms
   instead of 13 ms). Apps that can listen on a Unix socket themselves answer
   in 0.18 ms. It was not chosen because:
   - Kronik code would run inside every sandbox: a static shim per
     architecture, bind-mounted, started with `runsc exec` and supervised.
   - When the shim dies, its socket stays connectable but nobody answers, so
-    clients hang until their timeout (10 s in `08-supervise.txt`), until
+    clients hang until their timeout (10 s), until
     Kronik removes the file and starts the shim again.
   - `runsc checkpoint` fails with `Cannot save endpoint with bound host
     socket`, and the failed checkpoint leaves the container stopped. That
     conflicts with M14, which checkpoints foreign actors. A sandbox that has
-    served port-forward connections checkpoints fine (`13-alternatives.txt`).
+    served port-forward connections checkpoints fine.
   - It burns more CPU: 34 s instead of 25 s for the same requests, and heavy
-    throttling under `--cpu 1` (`04-bridges-cpu-*.txt`).
+    throttling under `--cpu 1`.
   - It needs an extra sandbox permission, `--host-uds=create`.
 - **`runsc port-forward` in local mode** (`runsc port-forward <id>
   <host-port>:<port>`). It listens on all host interfaces (`*:18080`), and
@@ -226,8 +224,8 @@ quota the numbers are similar except for the tails
   reachable from the internet unless a firewall blocks the port. It is also
   one more long-lived process per actor. Rejected.
 - **Passing a listening host socket into the sandbox** (`runsc exec
-  --pass-fd`). `accept` on the passed socket fails with `EINVAL` inside gVisor
-  (`13-alternatives.txt`). Rejected.
+  --pass-fd`). `accept` on the passed socket fails with `EINVAL` inside
+  gVisor. Rejected.
 - **A veth pair between Kronik and the sandbox** (`--network=sandbox` with real
   addressing). It would need IP configuration and firewall rules to keep
   egress closed, which is more host state and more ways to get it wrong.
@@ -267,8 +265,8 @@ quota the numbers are similar except for the tails
     brief expects this, and the spike did not measure it. The rootfs is an
     overlay (runsc's default `--overlay2=root:self`, with its filestore in the
     rootfs directory): writes there never reach the bundle and do not survive
-    the sandbox. Only bind mounts such as `foreign/<name>/data` persist
-    (`13-alternatives.txt`), and they cannot be replayed.
+    the sandbox. Only bind mounts such as `foreign/<name>/data` persist, and
+    they cannot be replayed.
   - Thread creation and new connections are slow in the sandbox: a new
     connection costs about 7 ms of sandbox CPU on the test VPS, so clients
     should keep connections alive.

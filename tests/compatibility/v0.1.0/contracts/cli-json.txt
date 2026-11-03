@@ -5,7 +5,7 @@
 Edit those, not this file; the test fails when it is out of date. -->
 
 With `--json`, every command prints one JSON object on stdout, so a script
-never parses the reviewer output. A client command prints the JSON API's
+never parses the human output. A client command prints the JSON API's
 response body unchanged, so its schema is that of the operation it calls,
 as in [openapi.json](openapi.json), the OpenAPI 3.1 description that
 `GET /v1/openapi.json` serves. `explain`, `doctor`, `init`, `build`,

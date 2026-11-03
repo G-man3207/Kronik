@@ -1,4 +1,4 @@
-//! `kronik doctor`: what this host can run (SPEC.md, "The finished product",
+//! `kronik doctor`: what this host can run (the build brief, "The finished product",
 //! step 1; ADR 0003 for gVisor). Needs no daemon: it reads the configuration
 //! and looks at the host. Each check passes, warns or fails, with a hint.
 //! Foreign actors are optional (I10), so the checks of what only they need
