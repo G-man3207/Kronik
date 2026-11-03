@@ -909,8 +909,8 @@ impl SecretRuntime {
 
     /// Abandons an in-flight native-current apply's bookkeeping after an
     /// availability-class publish failure (see NativeCurrentState::abandon).
-    pub(crate) fn abandon_in_flight_apply(&self) {
-        lock(&self.cache.state).native_current.abandon();
+    pub(crate) fn abandon_in_flight_apply(&self, cut: u64) {
+        lock(&self.cache.state).native_current.abandon(cut);
     }
 
     /// Wakes the background rebuild after an availability-class degrade:
@@ -1186,12 +1186,26 @@ impl Node {
     pub fn native_secret_snapshot(&self) -> Result<CertifiedSecretSnapshot, ApiError> {
         self.check_alive()?;
         let epoch = self.epoch();
-        let snapshot = self.runtime()?.cache.native_snapshot(epoch)?;
+        let snapshot = match self.runtime()?.cache.native_snapshot(epoch) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                // A reader that finds the catalogue uncertified wakes the
+                // rebuild. The exporter and the CLI retry the documented
+                // window, and a cycle parked on its periodic tick must not
+                // make a read-only workload wait the whole tick for a
+                // certificate its own demand needs.
+                self.runtime()?.cache.revision_changed.notify_one();
+                return Err(error);
+            }
+        };
         if self.epoch() != epoch {
             return Err(unavailable());
         }
         self.check_alive()?;
-        self.probe_store_identity()?;
+        if let Err(error) = self.probe_store_identity() {
+            self.runtime()?.cache.revision_changed.notify_one();
+            return Err(error);
+        }
         Ok(snapshot)
     }
 
@@ -1235,6 +1249,15 @@ impl Node {
     pub fn native_secret_snapshot_with_publication(
         &self,
     ) -> Result<(Arc<CertifiedSecretSnapshot>, SecretSnapshotPublication), ApiError> {
+        // Demand wakes the rebuild: the exporter polls this gate, and a
+        // cycle parked on its periodic tick must not make a read-only
+        // workload wait the whole tick for a certificate its own demand
+        // needs.
+        if let Some(runtime) = &self.secret_runtime
+            && !runtime.cache.complete(self.epoch())
+        {
+            runtime.cache.revision_changed.notify_one();
+        }
         self.check_alive()?;
         let node = Arc::downgrade(&self.me().ok_or_else(unavailable)?);
         let execution = self.native_snapshot_execution();
@@ -1243,11 +1266,20 @@ impl Node {
         let epoch = self.epoch();
         let (snapshot, live, at) = {
             let state = lock(&cache.state);
-            let snapshot = cache.native_snapshot_locked(&state, epoch)?;
-            let live = state
-                .native_certificate_live
-                .clone()
-                .ok_or_else(unavailable)?;
+            let snapshot = match cache.native_snapshot_locked(&state, epoch) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(step = "snapshot", code = %error.code, "publication snapshot failed");
+                    return Err(error);
+                }
+            };
+            let live = match state.native_certificate_live.clone() {
+                Some(live) => live,
+                None => {
+                    tracing::warn!(step = "live", "publication live token missing");
+                    return Err(unavailable());
+                }
+            };
             let at = state
                 .coverage
                 .as_ref()
@@ -1264,8 +1296,19 @@ impl Node {
             epoch,
             until: at.saturating_add(self.runtime()?.settings.refresh),
         };
-        publication.check_current()?;
-        self.probe_store_identity()?;
+        if let Err(error) = publication.check_current() {
+            tracing::warn!(
+                step = "current",
+                code = %error.code,
+                message = %error.message,
+                "publication check_current failed"
+            );
+            return Err(error);
+        }
+        if let Err(error) = self.probe_store_identity() {
+            tracing::warn!(step = "probe", code = %error.code, "publication probe failed");
+            return Err(error);
+        }
         Ok((Arc::new(snapshot), publication))
     }
     // As SecretCache::values: the scrub inventory's shape is the API.
@@ -1552,7 +1595,27 @@ impl Node {
         }
         drop(_guard);
         if runtime.backends.ids().next().is_none() {
-            let _ = self.refresh_secret_inventory(original).await;
+            // The startup records that follow (the installation identity, the
+            // audit configuration, early grants) are scrubbed against the
+            // certified inventory when they are written. A transient applier
+            // lag at startup must not leave their reasons permanently
+            // withheld, so certify before returning: the mode exits fast
+            // while the applier is still pending, and a few bounded retries
+            // outlast that window.
+            for attempt in 0..50 {
+                match self.refresh_secret_inventory(original.clone()).await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        tracing::warn!(
+                            attempt,
+                            code = %error.code,
+                            message = %error.message,
+                            "startup secret inventory certification retry"
+                        );
+                        self.env.clock.sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1983,6 +2046,7 @@ impl Node {
                 auth.check()?;
                 return Ok(None);
             }
+            node.await_secret_inventory().await;
             let intent =
                 node.audit_event_record("secret.refresh", &name, Default::default(), audit)?;
             let Record::AuditEvent(mut failed) = intent.clone() else {
@@ -2598,6 +2662,46 @@ impl Node {
             self.persist_coverage_watermark().await;
         }
         result
+    }
+
+    /// Wakes the background rebuild from a reader's demand.
+    pub(crate) fn wake_rebuild(&self) {
+        if let Some(runtime) = &self.secret_runtime {
+            runtime.cache.revision_changed.notify_one();
+        }
+    }
+
+    /// The fetch budget for transient secret-coverage windows.
+    pub(crate) fn fetch_timeout_for_coverage(&self) -> Duration {
+        self.secret_runtime
+            .as_ref()
+            .map_or(Duration::from_secs(2), |runtime| {
+                runtime.settings.fetch_timeout
+            })
+    }
+
+    /// Best-effort bounded wait for a certified secret inventory before an
+    /// audit reason is scrubbed. A transient rebuild window must not
+    /// permanently lose an operator's reason, and a read-only demand wakes
+    /// the rebuild; when the budget expires the caller proceeds with the
+    /// fail-closed withholding, never with a plaintext reason.
+    pub(crate) async fn await_secret_inventory(&self) {
+        let Some(runtime) = &self.secret_runtime else {
+            return;
+        };
+        let deadline = self
+            .env
+            .clock
+            .monotonic()
+            .saturating_add(runtime.settings.fetch_timeout);
+        // No extra wake here: the retire itself notifies the rebuild, and a
+        // per-poll notify would churn the cycle while a whole scan runs.
+        while !runtime.cache.complete(self.epoch()) {
+            if self.env.clock.monotonic() >= deadline {
+                return;
+            }
+            self.env.clock.sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Persists the coverage watermark after a fully successful refresh: a
@@ -3455,8 +3559,14 @@ impl Node {
                             // uncertified for the whole refresh tick: retry
                             // promptly with bounded backoff (the fetch-timeout
                             // family), then fall back to the periodic tick.
+                            tracing::warn!(
+                                code = %error.code,
+                                message = %error.message,
+                                failures = rebuild_failures,
+                                "secret rebuild failed"
+                            );
                             rebuild_failures = rebuild_failures.saturating_add(1);
-                            if rebuild_failures > 5 {
+                            if rebuild_failures > 20 {
                                 tracing::warn!(
                                     error = %error.message,
                                     "secret rebuild kept failing; falling back to the periodic tick"
@@ -3467,10 +3577,15 @@ impl Node {
                                     .monotonic()
                                     .saturating_add(runtime.settings.refresh);
                             } else {
+                                // Recovery windows (restore replay, applier
+                                // catch-up) close in seconds; a retry must
+                                // not back off for longer than one fetch
+                                // window squared, or the whole stream waits
+                                // on an otherwise transient state.
                                 let backoff = runtime
                                     .settings
                                     .fetch_timeout
-                                    .saturating_mul(1u32 << rebuild_failures.min(4));
+                                    .saturating_mul(1u32 << rebuild_failures.min(2));
                                 deadline = env.clock.monotonic().saturating_add(backoff);
                             }
                         }
@@ -3483,7 +3598,10 @@ impl Node {
                     biased;
                     () = changed.notified() => true,
                     () = env.clock.sleep(delay) => false,
-                    () = original.cancelled() => return,
+                    () = original.cancelled() => {
+                        tracing::warn!("secret refresh cycle cancelled");
+                        return;
+                    }
                 };
             }
         });

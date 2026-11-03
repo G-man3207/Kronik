@@ -1373,6 +1373,11 @@ pub struct Options {
 
 pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Preparation retries (secret inventory, reader, projection) stay fast: the
+/// documented fail-closed windows close in milliseconds, and a stream whose
+/// interval is 100 ms must not back off a whole minute for them. Only gap and
+/// checkpoint work uses [`MAX_BACKOFF`].
+pub const MAX_PREPARE_BACKOFF: Duration = Duration::from_secs(1);
 /// A `Retry-After` longer than this is cut to it.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 /// At most this many encoded record bytes per batch (review M3): a
@@ -1525,7 +1530,7 @@ pub async fn follow<S: Sink + 'static>(
                     failure(&stream, code);
                     drop(_control);
                     pause(&env, &stream, prepare_backoff).await;
-                    prepare_backoff = (prepare_backoff * 2).min(MAX_BACKOFF);
+                    prepare_backoff = (prepare_backoff * 2).min(MAX_PREPARE_BACKOFF);
                     continue;
                 }
                 let candidate = Entry {
@@ -1543,7 +1548,7 @@ pub async fn follow<S: Sink + 'static>(
                         failure(&stream, code);
                         drop(_control);
                         pause(&env, &stream, prepare_backoff).await;
-                        prepare_backoff = (prepare_backoff * 2).min(MAX_BACKOFF);
+                        prepare_backoff = (prepare_backoff * 2).min(MAX_PREPARE_BACKOFF);
                         continue;
                     }
                 }
@@ -1618,9 +1623,14 @@ pub async fn follow<S: Sink + 'static>(
         let (snapshot, publication) = match node.native_secret_snapshot_with_publication() {
             Ok(pair) => pair,
             Err(error) => {
+                tracing::warn!(
+                    code = %error.code,
+                    message = %error.message,
+                    "export secret inventory unavailable"
+                );
                 failure(&stream, error.code.as_str().to_owned());
                 pause(&env, &stream, prepare_backoff).await;
-                prepare_backoff = (prepare_backoff * 2).min(MAX_BACKOFF);
+                prepare_backoff = (prepare_backoff * 2).min(MAX_PREPARE_BACKOFF);
                 continue;
             }
         };
@@ -1713,7 +1723,7 @@ pub async fn follow<S: Sink + 'static>(
                 failure(&stream, code);
                 lag(cursor);
                 pause(&env, &stream, prepare_backoff).await;
-                prepare_backoff = (prepare_backoff * 2).min(MAX_BACKOFF);
+                prepare_backoff = (prepare_backoff * 2).min(MAX_PREPARE_BACKOFF);
                 continue;
             }
         };
@@ -1873,7 +1883,7 @@ pub async fn follow<S: Sink + 'static>(
                 Err(code) => {
                     failure(&stream, code);
                     pause(&env, &stream, prepare_backoff).await;
-                    prepare_backoff = (prepare_backoff * 2).min(MAX_BACKOFF);
+                    prepare_backoff = (prepare_backoff * 2).min(MAX_PREPARE_BACKOFF);
                 }
             }
         }

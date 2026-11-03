@@ -3232,16 +3232,87 @@ impl Node {
         authority: AuthLease,
     ) -> Result<Lsn, ApiError> {
         authority.check()?;
-        let record = self.audit_event_record(action, target, details, audit)?;
+        let record = self
+            .audit_event_record_waiting(action, target, details, audit)
+            .await?;
         self.commit_authorized(record, authority).await
+    }
+
+    /// Builds an audit event after a bounded wait for a certified scrub
+    /// inventory, scrubbing against the exact inventory it observed. The
+    /// documented fail-closed windows close in milliseconds; on expiry the
+    /// reason is withheld (never plaintext), which is the safe direction.
+    pub(crate) async fn audit_event_record_waiting(
+        &self,
+        action: &str,
+        target: &str,
+        details: std::collections::BTreeMap<String, String>,
+        audit: pb::Audit,
+    ) -> Result<Record, ApiError> {
+        let Some(runtime) = &self.secret_runtime else {
+            return self.audit_event_record(action, target, details, audit);
+        };
+        // One wake for the rebuild: a cycle parked in its failure backoff
+        // must retry now rather than after the backoff, and a single notify
+        // is enough (it retries as soon as it is scheduled). The budget is
+        // one fetch window plus a margin for a retry that was already in
+        // flight; the documented windows close in milliseconds.
+        self.wake_rebuild();
+        let budget = self
+            .fetch_timeout_for_coverage()
+            .saturating_add(std::time::Duration::from_secs(3));
+        let deadline = self.env.clock.monotonic().saturating_add(budget);
+        loop {
+            match self.secret_values() {
+                Ok(values) => {
+                    let patterns = crate::effects::secret_patterns(&values);
+                    return self.audit_event_record_scrubbed(
+                        action,
+                        target,
+                        details,
+                        audit,
+                        Some(&patterns),
+                    );
+                }
+                Err(_) => {
+                    if self.env.clock.monotonic() >= deadline {
+                        return self.audit_event_record(action, target, details, audit);
+                    }
+                    self.env
+                        .clock
+                        .sleep(std::time::Duration::from_millis(10))
+                        .await;
+                }
+            }
+        }
     }
 
     pub(crate) fn audit_event_record(
         &self,
         action: &str,
         target: &str,
+        details: std::collections::BTreeMap<String, String>,
+        audit: pb::Audit,
+    ) -> Result<Record, ApiError> {
+        let secrets = self.secret_values().ok();
+        let patterns = secrets
+            .as_ref()
+            .map(|values| crate::effects::secret_patterns(values));
+        self.audit_event_record_scrubbed(action, target, details, audit, patterns.as_deref())
+    }
+
+    /// Builds an audit event against a proven scrub inventory. Callers that
+    /// await the inventory first use this so the reason is scrubbed against
+    /// the exact inventory they observed: checking certification and then
+    /// re-fetching it would race a retirement in between and withhold a
+    /// reason that the inventory was available for.
+    pub(crate) fn audit_event_record_scrubbed(
+        &self,
+        action: &str,
+        target: &str,
         mut details: std::collections::BTreeMap<String, String>,
         mut audit: pb::Audit,
+        patterns: Option<&crate::scrub::Secrets<'_>>,
     ) -> Result<Record, ApiError> {
         self.check_alive()?;
         if action == "audit.gap" && details.contains_key("namespace") {
@@ -3252,12 +3323,8 @@ impl Node {
         }
         let positions = crate::scrub::AuditPositions::parse(action, &details)
             .map_err(|message| ApiError::new(ErrorCode::BadRequest, message))?;
-        let secrets = self.secret_values().ok();
-        let patterns = secrets
-            .as_ref()
-            .map(|values| crate::effects::secret_patterns(values));
-        audit.reason = crate::scrub::for_log(&audit.reason, patterns.as_deref());
-        let target = crate::scrub::for_target(target, patterns.as_deref());
+        audit.reason = crate::scrub::for_log(&audit.reason, patterns);
+        let target = crate::scrub::for_target(target, patterns);
         // Detail keys whose value is operator free text: they carry the same
         // withholding contract as the reason. Every other detail field is
         // operator metadata (codes, names, identifiers, positions) and is
@@ -3271,9 +3338,9 @@ impl Node {
                 .is_none()
             {
                 *value = if FREE_TEXT_DETAIL_KEYS.contains(&field.as_str()) {
-                    crate::scrub::for_log(value, patterns.as_deref())
+                    crate::scrub::for_log(value, patterns)
                 } else {
-                    crate::scrub::for_target(value, patterns.as_deref())
+                    crate::scrub::for_target(value, patterns)
                 };
             }
         }
@@ -4231,6 +4298,10 @@ async fn applier(
                 }
             }
         }
+        let current_cut = current
+            .as_ref()
+            .and_then(|current| current.as_ref())
+            .map_or(0, |current| current.cut());
         if let (Some(runtime), Some(Some(current))) = (&runtime, current)
             && let Err(error) = runtime.finish_native_current_apply(current, &store)
         {
@@ -4245,7 +4316,7 @@ async fn applier(
                     error = %error.message,
                     "native-current publish unavailable; abandoning the in-flight apply bookkeeping and retrying the rebuild"
                 );
-                runtime.abandon_in_flight_apply();
+                runtime.abandon_in_flight_apply(current_cut);
                 runtime.schedule_rebuild();
                 continue;
             }

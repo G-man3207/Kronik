@@ -1203,7 +1203,13 @@ fn a_torn_line_is_truncated_at_start() {
         .into_iter()
         .map(|l| l.reason)
         .collect();
-    assert!(reasons.contains(&"two".to_owned()), "{text}");
+    assert!(
+        reasons.contains(&"two".to_owned()),
+        "{text}
+--- daemon log ---
+{}",
+        d.log()
+    );
     let (code, report) = verify(&d, &data);
     assert_eq!(code, 0, "{report}");
 }

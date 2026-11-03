@@ -48,9 +48,15 @@ impl NativeCurrentState {
     /// Abandons an in-flight apply's bookkeeping after an availability-class
     /// publish failure: the records are already applied, so leaving
     /// `applying` set would wedge every later begin (and the whole
-    /// certification) on a state the next batch re-establishes anyway.
-    pub(super) fn abandon(&mut self) {
+    /// certification) on a state the next batch re-establishes anyway. The
+    /// revision sentinel set by `begin` is restored to the abandoned cut:
+    /// leaving it at `u64::MAX` would make `capture_revision` answer `None`
+    /// forever, silently disabling every certification attempt.
+    pub(super) fn abandon(&mut self, cut: u64) {
         self.applying = None;
+        if self.revision.load(Ordering::Acquire) == u64::MAX {
+            self.revision.store(cut, Ordering::Release);
+        }
     }
     pub(super) fn is_pending(&self) -> bool {
         self.applying.is_some() || self.awaiting_config.is_some()
@@ -97,6 +103,12 @@ pub(crate) struct NativeCurrentApply {
     store: Weak<Store>,
     cut: u64,
     config_epoch: u64,
+}
+
+impl NativeCurrentApply {
+    pub(crate) fn cut(&self) -> u64 {
+        self.cut
+    }
 }
 fn same_current_source(left: &Committed, right: &Committed) -> bool {
     left.lsn == right.lsn
