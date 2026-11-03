@@ -97,8 +97,26 @@ fn replay(p: &Proc, props: &Arc<Proposals>, name: &str) -> Vec<u8> {
 
 fn replay_with(p: &Proc, props: &Arc<Proposals>, name: &str, options: DiffOptions) -> Vec<u8> {
     p.settle();
-    p.rt.block_on(props.fork_replay(name, None, options, Some(2), p.owner()))
-        .unwrap();
+    // A replay verifies the recorded operation against the certified source;
+    // the daemon answers the documented fail-closed 503 SECRET_UNAVAILABLE
+    // while its certificate is retired (ADR 0108), so await that window
+    // (bounded) instead of racing it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match p
+            .rt
+            .block_on(props.fork_replay(name, None, options.clone(), Some(2), p.owner()))
+        {
+            Ok(_) => break,
+            Err(error)
+                if error.code == ErrorCode::SecretUnavailable
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => panic!("fork replay of {name}: {error}"),
+        }
+    }
     p.rt.block_on(props.diff(name, false, false)).unwrap()
 }
 
