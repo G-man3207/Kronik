@@ -795,7 +795,6 @@ impl SecretCache {
             })
     }
 
-
     /// Certified scrub inventory shares the existing controlled buffers; it grants no operational access.
     // The certified snapshot's value list: name plus zeroizing bytes.
     #[allow(clippy::type_complexity)]
@@ -2377,17 +2376,15 @@ impl Node {
         }
         let source_version = match &row {
             Some(row) if version.is_some() => Some(row.source_version.clone()),
-            _ => {
-                match self.file_current_source(&scope).await {
-                    Ok(source) => source,
-                    Err(error) if error.code == ErrorCode::SecretNotFound && version.is_none() => {
-                        return Ok(None);
-                    }
-                    Err(error) => {
-                        return Err(error);
-                    }
+            _ => match self.file_current_source(&scope).await {
+                Ok(source) => source,
+                Err(error) if error.code == ErrorCode::SecretNotFound && version.is_none() => {
+                    return Ok(None);
                 }
-            }
+                Err(error) => {
+                    return Err(error);
+                }
+            },
         };
         if remaining().is_zero() {
             return Err(unavailable());
