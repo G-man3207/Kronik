@@ -3249,9 +3249,9 @@ impl Node {
         details: std::collections::BTreeMap<String, String>,
         audit: pb::Audit,
     ) -> Result<Record, ApiError> {
-        let Some(runtime) = &self.secret_runtime else {
+        if self.secret_runtime.is_none() {
             return self.audit_event_record(action, target, details, audit);
-        };
+        }
         // One wake for the rebuild: a cycle parked in its failure backoff
         // must retry now rather than after the backoff, and a single notify
         // is enough (it retries as soon as it is scheduled). The budget is
