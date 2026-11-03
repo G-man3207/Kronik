@@ -3260,8 +3260,9 @@ impl Node {
         self.wake_rebuild();
         let budget = self
             .fetch_timeout_for_coverage()
-            .saturating_add(std::time::Duration::from_secs(3));
+            .saturating_add(std::time::Duration::from_secs(5));
         let deadline = self.env.clock.monotonic().saturating_add(budget);
+        let mut polls = 0u32;
         loop {
             match self.secret_values() {
                 Ok(values) => {
@@ -3277,6 +3278,14 @@ impl Node {
                 Err(_) => {
                     if self.env.clock.monotonic() >= deadline {
                         return self.audit_event_record(action, target, details, audit);
+                    }
+                    // Keep the demand visible: a cycle parked in its failure
+                    // backoff retries promptly while a writer still needs the
+                    // inventory, instead of waiting out the backoff. One wake
+                    // per 200 ms only while uncertified keeps the churn bound.
+                    polls = polls.wrapping_add(1);
+                    if polls.is_multiple_of(20) {
+                        self.wake_rebuild();
                     }
                     self.env
                         .clock
