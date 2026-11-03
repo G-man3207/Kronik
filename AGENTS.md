@@ -20,6 +20,23 @@ an invariant without a maintainer decision. If a change would alter an
 invariant or the scope of v0.1, open an issue for a maintainer decision before
 proceeding.
 
+## Public repository
+
+Kronik's repository is public (since 2026-11-03). Everything that is committed
+stays in the project history and is visible to everyone, so the project never
+commits personal or environment-specific information: no names, email
+addresses, usernames, hostnames, private network addresses, home-directory or
+absolute local paths, private repository or branch references, internal
+receipts, credentials, or other details about a development environment.
+
+Use the project identity (`Kronik Maintainers
+<maintainers@users.noreply.github.com>`) for commits, keep project-management
+documents on the [wiki](https://github.com/G-man3207/Kronik/wiki), and report
+anything sensitive to the maintainers privately instead of committing it. The
+rule covers code, comments, documentation, tests, fixtures, scripts, workflow
+files and commit messages. If personal information does reach a commit, rewrite
+the history before publishing it.
+
 ## Conventions
 
 The full list is in `CONTRIBUTING.md`. In short:

@@ -107,9 +107,20 @@ remaining public acceptance requirements are in `examples/github-flow/README.md`
 
 - **English only.** Code, comments, docs, commit messages, error messages and
   all user-facing text are in English.
+- **Public information only.** The repository is public and everything that is
+  committed is permanent. Do not commit personal or environment-specific
+  information: names, email addresses, usernames, hostnames, private network
+  addresses, home-directory or absolute local paths, private repository or
+  branch references, internal receipts, credentials, or other details about a
+  development environment. This covers code, comments, docs, tests, fixtures,
+  scripts, workflow files and commit messages. Use the project identity for
+  commits and keep project-management documents on the wiki. If personal
+  information does reach a commit, rewrite the history before publishing it.
 - **Small commits** with descriptive messages.
-- **Commit messages.** The subject is `area: summary` in the imperative, at
-  most 72 characters and with no final period, for example
+- **Commit messages.** Commit as the project identity (`Kronik Maintainers
+  <maintainers@users.noreply.github.com>`), never as an individual. The subject
+  is `area: summary` in the imperative, at most 72 characters and with no
+  final period, for example
   `CI: run the foreign step as root with gVisor installed`. A squashed
   milestone or release is `Kronik M28: OpenTelemetry and audit export`.
   The body, wrapped at 72 columns, says why when the diff does not. A
