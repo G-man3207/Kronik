@@ -1571,6 +1571,19 @@ mod tests {
         )
         .await
         .unwrap();
+        // The startup records (the format fence, the installation identity and
+        // the fleet recovery) are applied asynchronously to the writer's
+        // durable head. Wait for the node to be quiescent so tests that
+        // capture the applied LSN observe a stable baseline, not one that a
+        // late startup apply can advance underneath them.
+        let quiescent = std::time::Instant::now();
+        while fleet.node.applied_lsn() != fleet.node.committed_head() {
+            assert!(
+                quiescent.elapsed() < std::time::Duration::from_secs(5),
+                "the node did not settle its startup records"
+            );
+            tokio::task::yield_now().await;
+        }
         (dir, fleet, network, count)
     }
 
@@ -2044,7 +2057,35 @@ mod tests {
             .unwrap();
         assert!(preview.dry_run);
         assert!(preview.state.is_none());
-        assert_eq!(fleet.node.applied_lsn(), lsn);
+        // The applied head may advance with the fleet's own startup recovery
+        // (a late token.revoke under load), which is not the dry run's doing.
+        // Fail on any other record: a dry run writes no history of its own.
+        let mut unexpected = Vec::new();
+        fleet
+            .node
+            .reader()
+            .read(lsn + 1, fleet.node.applied_lsn(), |committed| {
+                let startup_recovery = match &committed.record {
+                    kronik_proto::Record::AuditEvent(event) => {
+                        event.action == "token.revoke"
+                            && event
+                                .audit
+                                .as_ref()
+                                .is_some_and(|audit| audit.token_id == "system:fleet-recovery")
+                    }
+                    _ => false,
+                };
+                if !startup_recovery {
+                    unexpected.push(format!("{:?}", committed.record));
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            unexpected.is_empty(),
+            "dry run wrote history: {unexpected:?}"
+        );
         assert_eq!(entropy.load(Ordering::SeqCst), random);
         assert!(network.requests.lock().unwrap().is_empty());
         assert!(fleet.tokens.list().unwrap().is_empty());
