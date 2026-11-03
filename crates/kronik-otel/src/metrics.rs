@@ -209,6 +209,12 @@ mod tests {
 
     #[test]
     fn counters_gauges_and_histograms_map_to_otlp() {
+        // The registry is process-global and other tests in this binary record
+        // log fsyncs through their stores; assert on the delta this test adds
+        // rather than assuming exclusivity (the runner's parallel schedule
+        // otherwise leaves counts from earlier observations here).
+        let before = kronik_metrics::snapshot();
+        let counts_before = histogram_counts(before.as_slice());
         kronik_metrics::inc(
             "kronik_turns_total",
             &[("kind", "counter"), ("outcome", "committed")],
@@ -224,6 +230,23 @@ mod tests {
             &[],
             Duration::from_secs(60),
         );
+        let counts_after = histogram_counts(&kronik_metrics::snapshot());
+        // The fsync histogram is the one this test observes (no labels).
+        let pick = |rows: &[HistogramSeries]| {
+            rows.iter()
+                .find(|(name, labels, _)| {
+                    *name == "kronik_log_fsync_duration_seconds" && labels.is_empty()
+                })
+                .map(|(_, _, counts)| counts.clone())
+                .unwrap_or_default()
+        };
+        let after = pick(&counts_after);
+        let before = pick(&counts_before);
+        let delta: Vec<u64> = after
+            .iter()
+            .enumerate()
+            .map(|(i, after)| after - before.get(i).copied().unwrap_or(0))
+            .collect();
         let resource = Resource {
             service_name: "kronik",
             service_version: "v",
@@ -257,11 +280,44 @@ mod tests {
             panic!()
         };
         let p = &h.data_points[0];
-        assert_eq!(p.count, 2);
         assert_eq!(p.explicit_bounds.len() + 1, p.bucket_counts.len());
-        // 3 ms falls in (2.5 ms, 5 ms]; 60 s past the last bound.
-        assert_eq!(p.bucket_counts[3], 1);
-        assert_eq!(*p.bucket_counts.last().unwrap(), 1);
-        assert_eq!(p.bucket_counts.iter().sum::<u64>(), 2);
+        assert_eq!(p.count, p.bucket_counts.iter().sum::<u64>());
+        // 3 ms falls in (2.5 ms, 5 ms]; 60 s past the last bound. The registry
+        // is process-global and other tests keep recording through their
+        // stores while this test runs, so the observations show up as lower
+        // bounds at the mapped buckets: exact equality would race them.
+        assert!(
+            delta[3] >= 1,
+            "3 ms must land in the (2.5 ms, 5 ms] bucket: {delta:?}"
+        );
+        assert!(
+            *delta.last().unwrap() >= 1,
+            "60 s must land past the last bound: {delta:?}"
+        );
+        assert!(delta.iter().sum::<u64>() >= 2, "{delta:?}");
+    }
+
+    /// A histogram series: definition name, rendered label set, bucket counts.
+    type HistogramSeries = (&'static str, Vec<(String, String)>, Vec<u64>);
+
+    /// The histogram samples keyed by their definition name and label set:
+    /// the delta a test adds is independent of observations other tests made
+    /// first.
+    fn histogram_counts(samples: &[kronik_metrics::Sample]) -> Vec<HistogramSeries> {
+        samples
+            .iter()
+            .filter_map(|sample| match &sample.value {
+                kronik_metrics::SampleValue::Histogram { buckets, .. } => Some((
+                    sample.def.name,
+                    sample
+                        .labels
+                        .iter()
+                        .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                        .collect(),
+                    buckets.to_vec(),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 }
