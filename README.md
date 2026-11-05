@@ -3,6 +3,10 @@
 > Don't deploy code you hope works. See what it would have done with
 > yesterday's traffic.
 
+https://github.com/user-attachments/assets/5c42b6b8-a40e-42d4-a994-31848284a324
+
+<sub>The video shows the v1.0 target; see <a href="#status">Status</a> for what works today.</sub>
+
 Kronik is a source-available runtime in which a system is a deterministic
 function of its history. Every input, every effect result and every state
 change is recorded in an append-only log, and a turn is applied, delivered and
