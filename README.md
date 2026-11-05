@@ -3,6 +3,16 @@
 > Don't deploy code you hope works. See what it would have done with
 > yesterday's traffic.
 
+<p align="center">
+  <a href="docs/media/kronik-in-45-seconds.mp4">
+    <img src="docs/media/kronik-in-45-seconds.png" width="720"
+         alt="Kronik in 45 seconds: what it is, why it exists, how it works and how it differs from Kubernetes">
+  </a>
+  <br>
+  <sub><a href="docs/media/kronik-in-45-seconds.mp4">Watch Kronik in 45 seconds</a>.
+  The video shows the v1.0 target; see <a href="#status">Status</a> for what works today.</sub>
+</p>
+
 Kronik is a source-available runtime in which a system is a deterministic
 function of its history. Every input, every effect result and every state
 change is recorded in an append-only log, and a turn is applied, delivered and
