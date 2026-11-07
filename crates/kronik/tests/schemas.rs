@@ -4,7 +4,8 @@
 //! checked against what a real `kronik serve` answers: every turn of main's
 //! log, fork turns of both replay modes, and the diffs of an identity replay,
 //! counter +2, approximate payments, a sample, stub rules, a new error and a
-//! fork without personal data.
+//! fork without personal data. The turns of effects that used a secret, before
+//! and after its rotation, name the version each used (M23).
 
 // Test harness code: unwraps are fine here.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -198,6 +199,43 @@ impl Daemon {
             "/v1/deployments",
             json!({"wasm_base64": wasm(guest), "reason": "schemas"}),
         );
+    }
+
+    /// Waits out the fail-closed window after a secret change (ADR 0108):
+    /// until the secret certificate is back, scrubbed outputs answer 503
+    /// SECRET_UNAVAILABLE.
+    fn await_secret_coverage(&self) {
+        for _ in 0..1200 {
+            match self.try_api("GET", "/v1/actors/counter/a/history", Value::Null) {
+                Some((200, _)) => return,
+                Some((503, v)) if v["error"]["code"] == "SECRET_UNAVAILABLE" => {}
+                other => panic!("history after a secret change: {other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("secret coverage did not return: {}", self.log());
+    }
+
+    /// Sets the secret `signing` (a new version if it exists) and waits
+    /// until outputs are served again.
+    fn set_signing_key(&self, text: &str) -> Value {
+        let v = self.api(
+            "PUT",
+            "/v1/secrets/signing",
+            json!({"text": text, "reason": "schemas"}),
+        );
+        self.await_secret_coverage();
+        v["secret"].clone()
+    }
+
+    /// A message to `counter/h` whose turn must commit.
+    fn commit(&self, name: &str, text: &str) {
+        let v = self.api(
+            "POST",
+            "/v1/actors/counter/h/messages",
+            json!({"name": name, "text": text, "reason": "schemas"}),
+        );
+        assert_eq!(v["outcome"]["kind"], "committed", "{name}: {v}");
     }
 
     fn applied_lsn(&self) -> u64 {
@@ -570,4 +608,66 @@ fn real_diffs_and_turns_match_their_schemas() {
     let diff = d.api("GET", &format!("/v1/proposals/{id}/diff"), Value::Null);
     s.check(s.diff, "a rollback via replay's diff", &diff);
     assert!(diff["irreversible"]["count"].is_u64(), "{diff}");
+
+    // Effects that use a secret, before and after its rotation (M23): an
+    // HMAC, a reveal and a fetch with a secret header. The turn JSON names
+    // the version each used, and the closed schema accepts it.
+    for capability in ["secret:signing", "secret-reveal:signing"] {
+        d.api(
+            "POST",
+            "/v1/grants",
+            json!({"kind": "counter", "capability": capability, "reason": "schemas"}),
+        );
+    }
+    let first = d.set_signing_key("schemas-signing-key-one");
+    let sign = format!("POST http://{target}/v1/sign\nS x-signature signing {{}}\n\nbody");
+    d.commit("hmac", "signing\ndata");
+    d.commit("reveal", "signing");
+    d.commit("fetch-ok", &sign);
+    let second = d.set_signing_key("schemas-signing-key-two");
+    d.commit("hmac", "signing\ndata");
+    d.commit("fetch-ok", &sign);
+    assert_eq!(
+        (&first["version"], &second["version"]),
+        (&json!(1), &json!(2))
+    );
+
+    let mut used = BTreeSet::new();
+    for t in d.main_turns() {
+        s.check(s.turn, &format!("turn {}", t["turn_id"]), &t);
+        for e in t["effects"].as_array().unwrap() {
+            for secret in e["secrets"].as_array().into_iter().flatten() {
+                assert_eq!(secret["name"], "signing", "{e}");
+                used.insert((
+                    e["kind"].as_str().unwrap().to_owned(),
+                    secret["version"].as_u64().unwrap(),
+                    secret["version_hash"].as_str().unwrap().to_owned(),
+                ));
+            }
+        }
+    }
+    let hash8 = |secret: &Value| secret["version_hash"].as_str().unwrap()[..8].to_owned();
+    let (one, two) = (hash8(&first), hash8(&second));
+    let expected: BTreeSet<(String, u64, String)> = [
+        ("crypto.hmac-sha256", 1, &one),
+        ("secret.reveal", 1, &one),
+        ("http.fetch", 1, &one),
+        ("crypto.hmac-sha256", 2, &two),
+        ("http.fetch", 2, &two),
+    ]
+    .into_iter()
+    .map(|(kind, version, hash)| (kind.to_owned(), version, hash.clone()))
+    .collect();
+    assert_eq!(used, expected);
+    // The same in the actor's history, which has no hand-written schema: the
+    // newest turn used version 2, the oldest of them version 1.
+    let history = d.api("GET", "/v1/actors/counter/h/history", Value::Null);
+    let versions: Vec<u64> = history["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["effects"][0]["secrets"][0]["version"].as_u64())
+        .collect();
+    assert_eq!(versions, [2, 2, 1, 1, 1], "{history}");
+    assert!(!history.to_string().contains("schemas-signing-key"));
 }
