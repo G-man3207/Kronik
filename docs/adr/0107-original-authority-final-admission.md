@@ -26,6 +26,18 @@ only perform bounded synchronous final enqueue. It must not wait, do I/O or
 acquire another authentication fence. Capacity/ReadIndex/body/secret waits occur
 outside that fence and retain sticky cancellation.
 
+The publication fence of the secret snapshot is the secret cache's mutex.
+`SecretSnapshotPublication::with_current_publication` takes it with a small
+constant number of attempts (about a millisecond) before it denies the
+publication for contention. That is not a wait in the sense above: it does
+not wait for a certificate, for I/O or for another authority. Every holder of
+the mutex runs a short synchronous section that takes no authentication fence,
+does no I/O and keeps the guard across no await, so it lets go without waiting
+for the publication. A single attempt denied the publication whenever another
+thread happened to hold the mutex, and a fork replay with a model configured
+answered a spurious 503 `SECRET_UNAVAILABLE` under load. A certificate that is
+no longer current is still denied at once.
+
 TokenStore binds its publication domain and original physical execution before
 any issuer starts; binding is not an optional production default. Lock order is
 publication, bounded live/session/fleet projection data, final enqueue. Native

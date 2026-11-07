@@ -2745,3 +2745,133 @@ async fn a_secret_mutation_does_not_wait_for_a_rebuild_that_is_failing() {
         );
     }
 }
+
+/// The node's publication of its current certificate, once the cycle has
+/// settled.
+async fn settled_publication(node: &Node) -> SecretSnapshotPublication {
+    node.env
+        .timeout(Duration::from_secs(60), node.secret_cycle_settled())
+        .await
+        .unwrap();
+    node.native_secret_snapshot_with_publication().unwrap().1
+}
+
+/// Runs `scenario` on a thread of its own and fails when it does not finish:
+/// a retry without bound, or a lock that blocks, would hang the suite.
+fn finishes_within<T: Send + 'static>(
+    seconds: u64,
+    scenario: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (done, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(scenario());
+    });
+    result
+        .recv_timeout(Duration::from_secs(seconds))
+        .expect("the scenario did not finish: it waits on the cache mutex without bound")
+}
+
+#[tokio::test]
+async fn a_publication_waits_out_a_holder_of_the_cache_mutex_that_lets_go_in_time() {
+    let (_data, node) = node().await;
+    let publication = settled_publication(&node).await;
+    let (attempts, took) = finishes_within(30, move || {
+        // This thread holds the mutex and lets go while the fifth attempt
+        // fails: well inside the bound.
+        let mut held = Some(lock(&publication.cache.state));
+        let mut attempts = 0;
+        let took = publication
+            .lock_cache(|attempt| {
+                attempts += 1;
+                if attempt == 4 {
+                    drop(held.take());
+                }
+            })
+            .is_some();
+        (attempts, took)
+    });
+    assert!(
+        took,
+        "the publication gave up on a holder that let go in time"
+    );
+    assert_eq!(attempts, 5);
+}
+
+#[tokio::test]
+async fn a_publication_gives_up_on_a_holder_of_the_cache_mutex_that_does_not_let_go() {
+    let (_data, node) = node().await;
+    let publication = settled_publication(&node).await;
+    let (attempts, took) = finishes_within(30, move || {
+        let _held = lock(&publication.cache.state);
+        let mut attempts = 0;
+        let took = publication
+            .lock_cache(|attempt| {
+                assert!(
+                    attempt < PUBLICATION_LOCK_ATTEMPTS,
+                    "retried past the bound"
+                );
+                attempts += 1;
+            })
+            .is_some();
+        (attempts, took)
+    });
+    assert!(!took, "the publication took a mutex that was held");
+    assert_eq!(attempts, PUBLICATION_LOCK_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn a_publication_is_denied_in_bounded_time_while_another_thread_holds_the_cache_mutex() {
+    let (_data, node) = node().await;
+    let publication = settled_publication(&node).await;
+    let held = lock(&publication.cache.state);
+    let other = publication.clone();
+    let outcome = finishes_within(30, move || {
+        let mut denied = ApiError::new(ErrorCode::SecretUnavailable, "denied");
+        let mut published = false;
+        let result = other.with_current_publication(&mut denied, || {
+            published = true;
+            Ok(())
+        });
+        (result.map_err(|error| error.code), published)
+    });
+    assert_eq!(outcome, (Err(ErrorCode::SecretUnavailable), false));
+    drop(held);
+    // The mutex is free again: the same publication goes through.
+    let mut denied = ApiError::new(ErrorCode::SecretUnavailable, "denied");
+    let published = publication.with_current_publication(&mut denied, || Ok(7));
+    assert_eq!(published.unwrap(), 7);
+}
+
+#[tokio::test]
+async fn a_publication_of_a_retired_certificate_is_denied_and_publishes_nothing() {
+    let (_data, node) = node().await;
+    let publication = settled_publication(&node).await;
+    node.runtime().unwrap().cache.clear_coverage();
+    let mut denied = ApiError::new(ErrorCode::SecretUnavailable, "denied");
+    let mut published = false;
+    let result = publication.with_current_publication(&mut denied, || {
+        published = true;
+        Ok(())
+    });
+    assert_eq!(result.unwrap_err().code, ErrorCode::SecretUnavailable);
+    assert!(!published);
+}
+
+#[tokio::test]
+async fn a_poisoned_cache_mutex_is_taken_without_a_retry() {
+    let (_data, node) = node().await;
+    let publication = settled_publication(&node).await;
+    let cache = publication.cache.clone();
+    let poisoned = std::thread::spawn(move || {
+        let _guard = cache.state.lock().unwrap();
+        panic!("poison the cache mutex");
+    })
+    .join();
+    assert!(poisoned.is_err());
+    assert!(publication.cache.state.is_poisoned());
+    assert!(
+        publication
+            .lock_cache(|_| panic!("a poisoned mutex was retried"))
+            .is_some()
+    );
+}

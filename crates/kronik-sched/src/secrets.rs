@@ -238,6 +238,16 @@ impl Drop for RetiredNativeCoverage {
     }
 }
 
+/// Attempts that a publication makes to take the cache mutex before it is
+/// denied for contention: about a millisecond on an idle machine. The holders
+/// keep the mutex for microseconds, and for longer only when they are
+/// preempted. See [`SecretSnapshotPublication::lock_cache`].
+const PUBLICATION_LOCK_ATTEMPTS: u32 = 1_000;
+/// The first attempts only spin (a holder that runs on another processor lets
+/// go within microseconds); the rest yield the processor, which a holder that
+/// was preempted needs in order to let go.
+const PUBLICATION_LOCK_SPINS: u32 = 32;
+
 /// Data only; the existing cache mutex is its concrete publication fence.
 #[derive(Clone)]
 pub struct SecretSnapshotPublication {
@@ -270,23 +280,61 @@ impl SecretSnapshotPublication {
         }
         Ok(())
     }
+    /// Takes the cache mutex, the publication fence, for one publication. A
+    /// holder in the middle of its critical section is given a small
+    /// constant number of attempts ([`PUBLICATION_LOCK_ATTEMPTS`]) to let go;
+    /// `None` when it did not. `contended` sees the index of every failed
+    /// attempt.
+    ///
+    /// ADR 0107 lets nothing inside the original authority's fence wait for
+    /// a certificate, for I/O or for another authority. This is none of
+    /// them: every holder of the mutex runs a short synchronous section that
+    /// takes no authentication fence, does no I/O and keeps the guard across
+    /// no await, so it lets go without waiting for this publication. The
+    /// caller does not hold the mutex itself: the guard exists only inside
+    /// [`Self::with_current_publication`], whose `publish` callback must not
+    /// publish again. A single `try_lock` would deny the publication
+    /// whenever another thread happens to hold the mutex at that instant (a
+    /// replay with a model configured answered a spurious 503
+    /// `SECRET_UNAVAILABLE` under load).
+    fn lock_cache(
+        &self,
+        mut contended: impl FnMut(u32),
+    ) -> Option<std::sync::MutexGuard<'_, CacheState>> {
+        for attempt in 0..PUBLICATION_LOCK_ATTEMPTS {
+            match self.cache.state.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    return Some(poisoned.into_inner());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    contended(attempt);
+                    if attempt < PUBLICATION_LOCK_SPINS {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+        None
+    }
     /// Only a concrete final enqueue/cache swap, inside the SAME original admission.
     /// Lock order: original admission -> cache; never call a getter, authority or I/O here.
+    /// A contended cache mutex is retried a bounded number of times
+    /// ([`Self::lock_cache`]); a certificate that is no longer current is
+    /// denied at once.
     pub fn with_current_publication<T>(
         &self,
         denied: &mut ApiError,
         publish: impl FnOnce() -> Result<T, ApiError>,
     ) -> Result<T, ApiError> {
-        let publication = match self.cache.state.try_lock() {
-            Ok(publication) => publication,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return Err(ApiError {
-                    code: denied.code,
-                    message: std::mem::take(&mut denied.message),
-                    hint: denied.hint.take(),
-                });
-            }
+        let Some(publication) = self.lock_cache(|_| ()) else {
+            return Err(ApiError {
+                code: denied.code,
+                message: std::mem::take(&mut denied.message),
+                hint: denied.hint.take(),
+            });
         };
         if publication.native_current.is_pending()
             || !self.data_is_current_under_publication()
@@ -1406,27 +1454,39 @@ impl Node {
         let recovery = self.native_recovery_authority()?;
         let cache = self.runtime()?.cache.clone();
         let epoch = self.epoch();
-        let (snapshot, live, at) = {
+        // The events of a failed capture are logged after the cache mutex is
+        // released: it is the publication fence, and nothing under it does I/O
+        // ([`SecretSnapshotPublication::lock_cache`]).
+        enum Missed {
+            Snapshot(ApiError),
+            LiveToken,
+        }
+        let captured = {
             let state = lock(&cache.state);
-            let snapshot = match cache.native_snapshot_locked(&state, epoch) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    tracing::warn!(step = "snapshot", code = %error.code, "publication snapshot failed");
-                    return Err(error);
-                }
-            };
-            let live = match state.native_certificate_live.clone() {
-                Some(live) => live,
-                None => {
-                    tracing::warn!(step = "live", "publication live token missing");
-                    return Err(unavailable());
-                }
-            };
-            let at = state
-                .coverage
-                .as_ref()
-                .map_or(self.env.clock.monotonic(), |coverage| coverage.captured_at);
-            (snapshot, live, at)
+            match cache.native_snapshot_locked(&state, epoch) {
+                Err(error) => Err(Missed::Snapshot(error)),
+                Ok(snapshot) => match state.native_certificate_live.clone() {
+                    None => Err(Missed::LiveToken),
+                    Some(live) => {
+                        let at = state
+                            .coverage
+                            .as_ref()
+                            .map_or(self.env.clock.monotonic(), |coverage| coverage.captured_at);
+                        Ok((snapshot, live, at))
+                    }
+                },
+            }
+        };
+        let (snapshot, live, at) = match captured {
+            Ok(captured) => captured,
+            Err(Missed::Snapshot(error)) => {
+                tracing::warn!(step = "snapshot", code = %error.code, "publication snapshot failed");
+                return Err(error);
+            }
+            Err(Missed::LiveToken) => {
+                tracing::warn!(step = "live", "publication live token missing");
+                return Err(unavailable());
+            }
         };
         let publication = SecretSnapshotPublication {
             node,
