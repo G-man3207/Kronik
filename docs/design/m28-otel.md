@@ -607,8 +607,11 @@ One object per line, UTF-8, `\n`-terminated, keys in this order:
   - `reason` is capped at 4 KiB (`"reason_truncated":true` marks an export
     cut); the API rejects longer reasons with `BAD_REQUEST`.
   - Unavailable inventory gives privacy-sensitive API projections HTTP
-    503 `SECRET_UNAVAILABLE`; mutating audit text is safely withheld and
-    exporter preparation stalls without cursor advance.
+    503 `SECRET_UNAVAILABLE` and exporter preparation stalls without
+    cursor advance. A mutation waits for a rebuild in flight (at most
+    `[secrets] fetch_timeout` plus 5 s) and records its reason; only a
+    wait that runs out records the safely withheld text, and it does not
+    wait while the rebuilds fail.
   - Current LocalSecretStore inventory does not close complete retained
     external/deleted-version coverage across restart; that remains M23
     work. Do not put personal data in reasons.

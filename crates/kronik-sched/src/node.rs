@@ -3305,47 +3305,12 @@ impl Node {
         if self.secret_runtime.is_none() {
             return self.audit_event_record(action, target, details, audit);
         }
-        // One wake for the rebuild: a cycle parked in its failure backoff
-        // must retry now rather than after the backoff, and a single notify
-        // is enough (it retries as soon as it is scheduled). The budget is
-        // one fetch window plus a margin for a retry that was already in
-        // flight; the documented windows close in milliseconds.
-        self.wake_rebuild();
-        let budget = self
-            .fetch_timeout_for_coverage()
-            .saturating_add(std::time::Duration::from_secs(5));
-        let deadline = self.env.clock.monotonic().saturating_add(budget);
-        let mut polls = 0u32;
-        loop {
-            match self.secret_values() {
-                Ok(values) => {
-                    let patterns = crate::effects::secret_patterns(&values);
-                    return self.audit_event_record_scrubbed(
-                        action,
-                        target,
-                        details,
-                        audit,
-                        Some(&patterns),
-                    );
-                }
-                Err(_) => {
-                    if self.env.clock.monotonic() >= deadline {
-                        return self.audit_event_record(action, target, details, audit);
-                    }
-                    // Keep the demand visible: a cycle parked in its failure
-                    // backoff retries promptly while a writer still needs the
-                    // inventory, instead of waiting out the backoff. One wake
-                    // per 200 ms only while uncertified keeps the churn bound.
-                    polls = polls.wrapping_add(1);
-                    if polls.is_multiple_of(20) {
-                        self.wake_rebuild();
-                    }
-                    self.env
-                        .clock
-                        .sleep(std::time::Duration::from_millis(10))
-                        .await;
-                }
+        match self.wait_for_secret_values(false).await {
+            Some(values) => {
+                let patterns = crate::effects::secret_patterns(&values);
+                self.audit_event_record_scrubbed(action, target, details, audit, Some(&patterns))
             }
+            None => self.audit_event_record(action, target, details, audit),
         }
     }
 
@@ -3467,6 +3432,9 @@ impl Node {
                 "installation identity has a fixed startup producer",
             ));
         }
+        // The reason is scrubbed under the deploy lock below. A rebuild that
+        // has retired the certificate is waited out first, with no lock held.
+        self.wait_out_rebuild_window().await;
         let held = self.lock_deploy_authorized(&authority).await?;
         let node = self
             .arc()
@@ -3503,6 +3471,7 @@ impl Node {
         let authority: AuthLease = session;
         authority.check()?;
         self.check_alive()?;
+        self.wait_out_rebuild_window().await;
         if !matches!(
             revoked.config_source,
             Some(pb::auth_session_revoked::ConfigSource::NativeLsn(_))

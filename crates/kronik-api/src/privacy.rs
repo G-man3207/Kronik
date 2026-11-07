@@ -188,7 +188,7 @@ impl Api {
     async fn privacy_erase(&self, req: &AuthorizedRequest) -> Result<ApiResponse> {
         let r: ErasureRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let audit = self.audit(req, r.reason.clone());
+        let audit = self.audit(req, r.reason.clone()).await;
         let done = self
             .node
             .erase_subject(&r.subject, audit, r.dry_run, req.authority.clone())
@@ -217,7 +217,7 @@ impl Api {
         let done = self
             .node
             .reseal(
-                self.audit(req, r.reason.clone()),
+                self.audit(req, r.reason.clone()).await,
                 r.dry_run,
                 req.authority.clone(),
             )
@@ -241,7 +241,7 @@ impl Api {
     async fn privacy_mode(&self, req: &AuthorizedRequest) -> Result<ApiResponse> {
         let r: PrivacyModeRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let audit = self.audit(req, r.reason.clone());
+        let audit = self.audit(req, r.reason.clone()).await;
         let change = self
             .node
             .set_privacy_mode(r.mode.into(), audit, r.dry_run, req.authority.clone())

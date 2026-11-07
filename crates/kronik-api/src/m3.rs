@@ -320,7 +320,7 @@ impl Api {
                 r.name.clone(),
                 lsn,
                 no_pii(r.no_pii, caller),
-                self.audit(req, r.reason.clone()),
+                self.audit(req, r.reason.clone()).await,
                 r.dry_run,
                 req.authority.clone(),
             )
@@ -484,7 +484,7 @@ impl Api {
                     at: r.at,
                     options,
                     workers: r.options.threads,
-                    audit: self.audit(req, r.reason.clone()),
+                    audit: self.audit(req, r.reason.clone()).await,
                     dry_run: r.dry_run,
                 },
                 false,
@@ -567,7 +567,7 @@ impl Api {
             .proposals()?
             .request_approval(
                 id,
-                self.audit(req, r.reason.clone()),
+                self.audit(req, r.reason.clone()).await,
                 r.dry_run,
                 req.authority.clone(),
             )
@@ -861,7 +861,7 @@ impl Api {
             .proposals()?
             .approve(
                 id,
-                self.audit(req, r.reason.clone()),
+                self.audit(req, r.reason.clone()).await,
                 r.dry_run,
                 req.verified_identity.as_deref().cloned(),
                 req.authority.clone(),
@@ -885,7 +885,7 @@ impl Api {
             .proposals()?
             .promote(
                 id,
-                self.audit(req, r.reason.clone()),
+                self.audit(req, r.reason.clone()).await,
                 r.dry_run,
                 req.authority.clone(),
             )
@@ -937,7 +937,7 @@ impl Api {
                     epoch,
                     options,
                     workers: r.threads,
-                    audit: self.audit(req, r.reason.clone()),
+                    audit: self.audit(req, r.reason.clone()).await,
                     dry_run: r.dry_run,
                 },
                 req.authority.clone(),
@@ -967,7 +967,7 @@ impl Api {
             .proposals()?
             .rollback(
                 epoch,
-                self.audit(req, r.reason.clone()),
+                self.audit(req, r.reason.clone()).await,
                 r.dry_run,
                 req.authority.clone(),
             )
@@ -1012,7 +1012,7 @@ impl Api {
             .watch(
                 epoch,
                 r.for_ms,
-                self.audit(req, r.reason),
+                self.audit(req, r.reason).await,
                 r.dry_run,
                 !r.run_async,
                 req.authority.clone(),
@@ -1045,7 +1045,7 @@ impl Api {
             .watches()?
             .stop(
                 id,
-                self.audit(req, r.reason.clone()),
+                self.audit(req, r.reason.clone()).await,
                 r.dry_run,
                 req.authority.clone(),
             )
@@ -1094,7 +1094,7 @@ impl Api {
             .node
             .set_policy(
                 &r.rules_toml,
-                self.audit(req, r.reason.clone()),
+                self.audit(req, r.reason.clone()).await,
                 r.dry_run,
                 req.authority.clone(),
             )

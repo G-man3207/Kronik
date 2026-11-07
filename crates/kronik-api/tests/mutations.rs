@@ -1253,6 +1253,73 @@ async fn every_mutation_writes_its_audited_record() {
 /// review M3); a secret write reserves its ledger row first, the same
 /// intent in `SecretVersion` form. The token store is opened read-only, so
 /// the validation passes and the insert fails.
+/// A mutation that begins while the secret inventory is being rebuilt waits
+/// for it (as an audit event does) and records the operator's reason, not
+/// the placeholder. A read in the same window still answers 503 at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mutation_in_a_rebuild_window_waits_and_records_the_operators_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start_local(
+        Env::real(tokio::runtime::Handle::current()),
+        dir.path(),
+        NodeConfig::default(),
+    )
+    .await
+    .unwrap();
+    let api = Arc::new(Api::new(node.clone()));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        node.secret_cycle_settled(),
+    )
+    .await
+    .unwrap();
+    let window = node.hold_secret_rebuild_window().await.unwrap();
+    let (status, body) = call(&api, "GET", "/v1/audit", Value::Null).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (503, Some("SECRET_UNAVAILABLE")),
+        "{body}"
+    );
+    let mut mutation = {
+        let api = api.clone();
+        tokio::spawn(async move {
+            call(
+                &api,
+                "POST",
+                "/v1/grants",
+                with_reason(
+                    &json!({"kind": "counter", "capability": "http:example.com"}),
+                    "operator reason",
+                    false,
+                ),
+            )
+            .await
+        })
+    };
+    // It waits for the inventory; one that did not would be done long before
+    // this, with the placeholder as the reason of its record.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut mutation)
+            .await
+            .is_err(),
+        "the mutation did not wait for the inventory"
+    );
+    drop(window);
+    let (status, body) = mutation.await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    let mut reasons = Vec::new();
+    node.reader()
+        .read(1, node.applied_lsn(), |c| {
+            if let Record::Grant(grant) = &c.record {
+                reasons.push(grant.audit.as_ref().unwrap().reason.clone());
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(reasons, ["operator reason"]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_token_create_writes_its_intent_and_failed() {
     let dir = tempfile::tempdir().unwrap();

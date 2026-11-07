@@ -213,7 +213,7 @@ impl Api {
         }
         .record()
         .map_err(|m| ApiError::new(ErrorCode::BadRequest, m))?;
-        let audit = self.audit(req, r.reason.clone());
+        let audit = self.audit(req, r.reason.clone()).await;
         let (epoch, lsn) = self
             .node
             .set_simulators(record, audit, r.dry_run, req.authority.clone())

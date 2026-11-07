@@ -72,7 +72,7 @@ submit another mutation. Once inventory is available, inspect history before
 an explicit new operation. A successful certificate is scoped to its real
 revision and does not promise availability after a later concurrent change.
 
-Writes use canonical whole-text withholding for unavailable free-text coverage, so an unrelated mutation need not stop. Canonical identifiers retain the existing target policy; that is not permission to publish arbitrary unsanitized text. Metadata-only health, keys and doctor remain available. No master-seed/KMS reload happens on these paths.
+Writes use canonical whole-text withholding for unavailable free-text coverage, so an unrelated mutation need not stop. A write first waits, before it takes any lock, for a rebuild that has retired the certificate: one fetch window and a margin for a rebuild in flight, the bound an audit event already has. The operator's reason is then recorded scrubbed against the certified inventory, and only a wait that runs out records the placeholder. A write does not wait for a rebuild that is failing, as every pass does while a backend is down: once the cycle's last pass has failed it records the placeholder at once, so that an outage does not delay work that needs no secret (I10). Reads do not wait. Canonical identifiers retain the existing target policy; that is not permission to publish arbitrary unsanitized text. Metadata-only health, keys and doctor remain available. No master-seed/KMS reload happens on these paths.
 
 ### Replay and authorization
 

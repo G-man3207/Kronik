@@ -687,7 +687,7 @@ impl Api {
                     "registered webhook replay requires its actual metadata-owned member receiver")
                     .with_hint("Use the registered source's ordinary member API; a native node cannot supply its metadata receipt.")),
                 WebhookTarget::Metadata { stream, record_replay } => {
-                    let audit = self.audit(req, request.reason);
+                    let audit = self.audit(req, request.reason).await;
                     let receipt = record_replay(kronik_log::MetadataWebhookReplay {
                         stream: format!("events-{name}"), from_index: events::coordinate(position.source),
                     }, audit, req.authority.clone()).await?;

@@ -63,7 +63,7 @@ impl Api {
                 &r.proposal,
                 r.ttl_ms.map(Duration::from_millis),
                 no_pii,
-                self.audit(req, r.reason.clone()),
+                self.audit(req, r.reason.clone()).await,
                 r.dry_run,
                 req.authority.clone(),
             )
@@ -91,7 +91,7 @@ impl Api {
         self.proposals()?
             .delete_preview(
                 id,
-                self.audit(req, r.reason),
+                self.audit(req, r.reason).await,
                 r.dry_run,
                 req.authority.clone(),
             )

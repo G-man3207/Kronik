@@ -237,7 +237,7 @@ impl crate::Api {
                 })?)
             },
         });
-        let audit = self.audit(req, change.reason);
+        let audit = self.audit(req, change.reason).await;
         let node = self.node.clone();
         let worker_browser = browser.clone();
         let dry_run = change.dry_run;

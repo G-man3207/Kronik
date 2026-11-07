@@ -255,7 +255,7 @@ and [0104](../adr/0104-admin-ui-as-a-public-api-client.md).
 |---|---|---|
 | `refresh` | `"5m"` | About how often the node reads every secret's current version from its source and rebuilds the inventory of secret values that the views remove from what they show; a value read from a backend is also used for this long without another request. **Keep `refresh` well above the `elapsed_ms` of the `secret inventory certified` log line:** a rebuild that takes longer than `refresh` never installs its certificate, and the reads that remove secret values answer 503 `SECRET_UNAVAILABLE` for as long as that holds. The daemon logs a warning, `the catalogue the secret inventory was built from is older than [secrets] refresh`, when that is the cause |
 | `max_stale` | `"24h"` | How long a value that was authorized stays in use while its backend is unavailable (a timeout or a 5xx answer). A definitive refusal, a missing version or a binding that no longer matches ends its use at once |
-| `fetch_timeout` | `"2s"` | The longest a request to a backend, or a secret change waiting for the inventory to be published again, takes; at most `"60s"`. When the wait for the inventory runs out, `kronik secret set`, `delete`, `link`, `unlink` and `refresh` answer 503 `SECRET_UNAVAILABLE` saying that the change is already committed: it is made, so do not repeat it |
+| `fetch_timeout` | `"2s"` | The longest a request to a backend, or a secret change waiting for the inventory to be published again, takes; at most `"60s"`. When the wait for the inventory runs out, `kronik secret set`, `delete`, `link`, `unlink` and `refresh` answer 503 `SECRET_UNAVAILABLE` saying that the change is already committed: it is made, so do not repeat it. A mutation that begins while the inventory is being rebuilt waits for it for this long plus 5 s before its reason is recorded |
 
 External backends are defined in `[secrets.backends.<id>]` tables; see the
 [M23 design](../design/m23-secret-backends.md).
@@ -828,9 +828,13 @@ Free text, names and spans are scrubbed for secret values and token
 spellings; canonical audit hashing withholds free text. Subject masking
 handles case, percent encoding and identifier boundaries. Never put
 personal data in `--reason`. If secret inventory is unavailable,
-privacy-sensitive API projections return 503 `SECRET_UNAVAILABLE`,
-mutating audit text is withheld and both exporters stall preparation
-without cursor advance. Unrelated node work remains usable. Complete
+privacy-sensitive API projections return 503 `SECRET_UNAVAILABLE` and
+both exporters stall preparation without cursor advance. A mutation that
+begins while the inventory is being rebuilt waits for it, for `[secrets]
+fetch_timeout` plus 5 s at most, and records its reason; only a wait that
+runs out records `[withheld: secrets could not be loaded]` in its place.
+While a backend is down and the rebuilds fail, a mutation does not wait:
+it records the placeholder at once. Unrelated node work remains usable. Complete
 retained external/deleted-version coverage across restart remains M23
 work, not a guarantee of the current local inventory.
 

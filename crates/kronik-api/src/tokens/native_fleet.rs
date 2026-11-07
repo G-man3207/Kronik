@@ -20,7 +20,7 @@ impl TokenStore {
             return Err(metadata_unavailable());
         }
         audit.reason = {
-            let values = node.secret_values().ok();
+            let values = node.certified_secret_values().await;
             let patterns = values
                 .as_ref()
                 .map(|values| kronik_sched::effects::secret_patterns(values));
@@ -79,7 +79,7 @@ impl TokenStore {
             return Err(metadata_unavailable());
         }
         audit.reason = {
-            let values = node.secret_values().ok();
+            let values = node.certified_secret_values().await;
             let patterns = values
                 .as_ref()
                 .map(|values| kronik_sched::effects::secret_patterns(values));

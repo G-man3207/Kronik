@@ -257,8 +257,11 @@ that a turn generated from `random-bytes`.
   hashing withholds free text. Subject masking handles case, percent
   encoding and identifier boundaries.
   If the inventory cannot be loaded, privacy-sensitive API projections
-  return 503 `SECRET_UNAVAILABLE`, mutating audit text is withheld, and
-  both exporters stall preparation without cursor advance. Unrelated
+  return 503 `SECRET_UNAVAILABLE` and both exporters stall preparation
+  without cursor advance. A mutation waits for a rebuild in flight (at
+  most `[secrets] fetch_timeout` plus 5 s) and records its reason; only a
+  wait that runs out withholds the audit text, and a mutation does not
+  wait while the rebuilds fail. Unrelated
   node work remains usable. Complete retained external/deleted-version
   coverage across restart remains M23 work; current local inventory is
   not evidence that this is closed.

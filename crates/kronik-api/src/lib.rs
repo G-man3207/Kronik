@@ -1022,9 +1022,14 @@ impl Api {
     /// The caller's `Audit`, its reason scrubbed of every stored secret
     /// value and token now (review M5): a secret deleted before the export
     /// reads the record would otherwise leave its value in the log for
-    /// good. Withheld when the secrets cannot be loaded.
-    fn audit(&self, req: &ApiRequest, reason: String) -> pb::Audit {
-        let secrets = self.node.secret_values().ok();
+    /// good. While a rebuild has retired the certificate this waits for it,
+    /// as an audit event does (`Node::certified_secret_values`), so that the
+    /// operator's reason is recorded and not the placeholder; the reason is
+    /// withheld only when the secrets cannot be loaded within that wait.
+    /// Reads do not wait. Called at the start of a request, with no lock
+    /// held.
+    async fn audit(&self, req: &ApiRequest, reason: String) -> pb::Audit {
+        let secrets = self.node.certified_secret_values().await;
         let patterns = secrets
             .as_ref()
             .map(|values| kronik_sched::effects::secret_patterns(values));
@@ -1300,7 +1305,7 @@ impl Api {
             .node
             .deploy(
                 &wasm,
-                self.audit(req, r.reason),
+                self.audit(req, r.reason).await,
                 r.dry_run,
                 req.authority.clone(),
             )
@@ -1392,7 +1397,7 @@ impl Api {
             .send(
                 actor,
                 msg,
-                self.audit(req, r.reason),
+                self.audit(req, r.reason).await,
                 r.dry_run,
                 req.authority.clone(),
             )
@@ -1596,7 +1601,7 @@ impl Api {
                 &r.capability,
                 delivery,
                 rate,
-                self.audit(req, r.reason.clone()),
+                self.audit(req, r.reason.clone()).await,
                 r.dry_run,
                 req.authority.clone(),
             )
@@ -1625,7 +1630,7 @@ impl Api {
             .revoke(
                 &r.kind,
                 &r.capability,
-                self.audit(req, r.reason),
+                self.audit(req, r.reason).await,
                 r.dry_run,
                 req.authority.clone(),
             )
@@ -1698,7 +1703,7 @@ impl Api {
             .node
             .set_limits(
                 limits,
-                self.audit(req, r.reason),
+                self.audit(req, r.reason).await,
                 r.dry_run,
                 req.authority.clone(),
             )
@@ -1956,7 +1961,7 @@ impl Api {
             Some(list) => tokens::parse_scopes(list)?,
             None => tokens::DEFAULT_SCOPES.into_iter().collect(),
         };
-        let safe_reason = self.audit(req, r.reason.clone()).reason;
+        let safe_reason = self.audit(req, r.reason.clone()).await.reason;
         let change = tokens::Change {
             wall_ms: self.node.env().clock.wall_ms(),
             by: &req.token_id,
@@ -2022,7 +2027,7 @@ impl Api {
     async fn token_revoke(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: TokenRevokeRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let safe_reason = self.audit(req, r.reason.clone()).reason;
+        let safe_reason = self.audit(req, r.reason.clone()).await.reason;
         let change = tokens::Change {
             wall_ms: self.node.env().clock.wall_ms(),
             by: &req.token_id,
@@ -2239,7 +2244,7 @@ impl Api {
             .node
             .resend(
                 lsn,
-                self.audit(req, r.reason),
+                self.audit(req, r.reason).await,
                 r.dry_run,
                 req.authority.clone(),
             )

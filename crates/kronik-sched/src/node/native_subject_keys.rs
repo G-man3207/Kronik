@@ -211,6 +211,9 @@ impl Node {
         let execution = self.local_operator_authority()?;
         let authority: AuthLease =
             kronik_core::authority::guard_session(original.clone(), execution.clone());
+        // The reason is scrubbed under the deploy lock below. A rebuild that
+        // has retired the certificate is waited out first, with no lock held.
+        self.wait_out_rebuild_window().await;
         let held = self.lock_deploy_authorized(&authority).await?;
         let node = self.arc().ok_or_else(unavailable_identity_key)?;
         let (done, result) = oneshot::channel();

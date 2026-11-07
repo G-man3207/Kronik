@@ -267,7 +267,7 @@ impl Api {
                 &|name| self.node.config_now().secret_is_linked(name),
             )
             .await?;
-        let audit = self.audit(req, r.reason.clone());
+        let audit = self.audit(req, r.reason.clone()).await;
         let mut record = plan.record.clone();
         record.audit = Some(audit.clone());
         let added = self
@@ -334,7 +334,7 @@ impl Api {
     async fn foreign_remove(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: ForeignRemoveRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let audit = self.audit(req, r.reason.clone());
+        let audit = self.audit(req, r.reason.clone()).await;
         let (epoch, lsn) = self
             .node
             .foreign_remove(name, audit, r.dry_run, req.authority.clone())

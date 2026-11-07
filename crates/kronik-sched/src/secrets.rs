@@ -941,6 +941,12 @@ pub struct SecretRuntime {
     #[allow(clippy::disallowed_types)]
     certified: tokio::sync::watch::Sender<(u64, bool)>,
 }
+/// A rebuild window held open by a test ([`Node::hold_secret_rebuild_window`]).
+#[doc(hidden)]
+pub struct SecretRebuildWindow<'a> {
+    _rebuilds: tokio::sync::MutexGuard<'a, ()>,
+}
+
 /// The passes of the background cycle, in one word: the passes that have
 /// finished in the high half, those in progress in the low half. A single
 /// load is then a consistent picture of the cycle. Relaxed is enough: nothing
@@ -957,6 +963,11 @@ impl CycleState {
     /// One pass fewer in progress, one more finished.
     fn end(&self) {
         self.0.fetch_add(Self::ONE_FINISHED - 1, Ordering::Relaxed);
+    }
+
+    /// At least one pass has finished.
+    fn has_finished(&self) -> bool {
+        self.0.load(Ordering::Relaxed) >= Self::ONE_FINISHED
     }
 
     /// At least one pass has finished and none is in progress.
@@ -986,6 +997,14 @@ pub struct SecretBackendStatus {
     pub inventory_complete: bool,
 }
 impl SecretRuntime {
+    /// Whether waiting for the certificate can end well: the cycle runs, and
+    /// its last pass did not fail. While the backend is down every pass
+    /// fails, and a wait would only add its bound to every request.
+    fn rebuild_may_certify(&self) -> bool {
+        self.background.load(Ordering::Acquire)
+            && (!self.cycle.has_finished() || self.certified.borrow().1)
+    }
+
     /// Registers applied secret rows into the certification cache as the
     /// applier applies them: the registry is the applied projection, fed by
     /// the applier rather than by later store queries racing its lag.
@@ -1439,6 +1458,94 @@ impl Node {
     pub fn secret_values(&self) -> Result<Vec<(String, Arc<Zeroizing<Vec<u8>>>)>, ApiError> {
         Ok(self.native_secret_snapshot()?.values)
     }
+
+    /// The scrub inventory for text that is about to be written to the log,
+    /// such as the reason of a mutation. While a rebuild has retired the
+    /// certificate this waits for it: one fetch window and a margin for a
+    /// rebuild that was already in flight, which is long enough for the
+    /// windows of a healthy node (milliseconds, or the length of a rebuild).
+    /// `None` when the node is stopping or the wait runs out; the caller
+    /// then proceeds with the fail-closed withholding, never with a
+    /// plaintext reason. A read does not wait: it answers 503 while the
+    /// inventory is not certified.
+    ///
+    /// It does not wait for a rebuild that is failing: once the cycle's last
+    /// pass has failed, as every pass does while a backend is down, the
+    /// answer is `None` at once. An outage must not stop work that does not
+    /// need the secret (I10), and a wait would add its whole bound to every
+    /// mutation for as long as the outage lasts.
+    ///
+    /// Call it before taking a lock. The cycle's pass and the rebuild take
+    /// the per-name locks of the names they visit, and a caller that holds
+    /// one while it waits waits for itself until the bound runs out.
+    #[allow(clippy::type_complexity)]
+    pub async fn certified_secret_values(&self) -> Option<Vec<(String, Arc<Zeroizing<Vec<u8>>>)>> {
+        self.wait_for_secret_values(true).await
+    }
+
+    /// The loop behind [`Node::certified_secret_values`]. An audit event
+    /// waits out its whole bound (`give_up_when_failing` false), also while
+    /// the rebuild fails.
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn wait_for_secret_values(
+        &self,
+        give_up_when_failing: bool,
+    ) -> Option<Vec<(String, Arc<Zeroizing<Vec<u8>>>)>> {
+        let runtime = self.secret_runtime.as_ref()?;
+        let mut polls = 0u32;
+        let mut deadline = None;
+        loop {
+            if let Ok(values) = self.secret_values() {
+                return Some(values);
+            }
+            if self.check_alive().is_err()
+                || (give_up_when_failing && !runtime.rebuild_may_certify())
+            {
+                return None;
+            }
+            let deadline = *deadline.get_or_insert_with(|| {
+                self.env.clock.monotonic().saturating_add(
+                    self.fetch_timeout_for_coverage()
+                        .saturating_add(Duration::from_secs(5)),
+                )
+            });
+            if self.env.clock.monotonic() >= deadline {
+                return None;
+            }
+            // A failed read has woken the rebuild once. Keep the demand
+            // visible: a cycle parked in its failure backoff retries now
+            // rather than after the backoff, and one wake per 200 ms keeps
+            // the churn bounded while a whole scan runs.
+            if polls.is_multiple_of(20) {
+                self.wake_rebuild();
+            }
+            polls = polls.wrapping_add(1);
+            self.env.clock.sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Waits out a rebuild window before the reason of a mutation is
+    /// scrubbed under its locks. See [`Node::certified_secret_values`]: call
+    /// this before taking any of them. What the mutation scrubs against is
+    /// read again under the locks, and is withheld if the inventory was
+    /// retired once more in between.
+    pub(crate) async fn wait_out_rebuild_window(&self) {
+        let _ = self.certified_secret_values().await;
+    }
+
+    /// Test seam: retires the certificate and keeps the secret cycle's full
+    /// rebuilds from running while the returned guard lives, so that a test
+    /// holds a rebuild window open for as long as it needs. Dropping the
+    /// guard lets the cycle rebuild, woken by whoever waits for it.
+    #[doc(hidden)]
+    pub async fn hold_secret_rebuild_window(&self) -> Option<SecretRebuildWindow<'_>> {
+        let runtime = self.secret_runtime.as_ref()?;
+        let rebuilds = runtime.inventory.lock().await;
+        runtime.cache.clear_coverage();
+        Some(SecretRebuildWindow {
+            _rebuilds: rebuilds,
+        })
+    }
     fn secret_audit(&self, audit: &pb::Audit) -> Result<pb::Audit, ApiError> {
         if audit.reason.trim().is_empty() {
             return Err(ApiError::new(
@@ -1763,6 +1870,9 @@ impl Node {
             ));
         }
         let name = name.to_owned();
+        // The reason is scrubbed under the name lock below. A rebuild that
+        // has retired the certificate is waited out first, with no lock held.
+        self.wait_out_rebuild_window().await;
         owned(self, move |node| async move {
             let runtime = node.runtime()?;
             let _guard = runtime.name_lock(&name).lock_owned().await;
@@ -1888,6 +1998,7 @@ impl Node {
         self.runtime()?.ready()?;
         let audit = audit.clone();
         let name = name.to_owned();
+        self.wait_out_rebuild_window().await;
         owned(self, move |node| async move {
             let runtime = node.runtime()?;
             let _guard = runtime.name_lock(&name).lock_owned().await;
@@ -2055,6 +2166,7 @@ impl Node {
         let name = name.to_owned();
         let destination =
             destination.map(|(backend, reference)| (backend.to_owned(), reference.to_owned()));
+        self.wait_out_rebuild_window().await;
         owned(self, move |node| async move {
             let runtime = node.runtime()?;
             // Configuration first in the lock order, as for other epoch changes.
@@ -2148,6 +2260,7 @@ impl Node {
         self.runtime()?.ready()?;
         let audit = audit.clone();
         let name = name.to_owned();
+        self.wait_out_rebuild_window().await;
         owned(self, move |node| async move {
             let runtime = node.runtime()?;
             let _guard = runtime.name_lock(&name).lock_owned().await;

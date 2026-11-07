@@ -2594,3 +2594,154 @@ async fn file_links_refuse_mutation_without_touching_either_physical_name() {
     assert_eq!(still_b.value, b.value);
     assert_eq!(still_b.meta.version, b.meta.version);
 }
+
+#[tokio::test]
+async fn a_secret_mutation_that_begins_in_a_rebuild_window_waits_and_records_the_reason() {
+    let (_data, node) = node().await;
+    let runtime = node.runtime().unwrap();
+    node.env
+        .timeout(Duration::from_secs(60), node.secret_cycle_settled())
+        .await
+        .unwrap();
+    let window = node.hold_secret_rebuild_window().await.unwrap();
+    let mut set = {
+        let node = node.clone();
+        tokio::spawn(async move {
+            node.secret_set(
+                "token",
+                b"first-credential".to_vec(),
+                &audit(),
+                false,
+                test_auth(),
+            )
+            .await
+        })
+    };
+    // It waits for the inventory before it writes anything. One that did not
+    // would have written its rows by now, with the placeholder as their
+    // reason, and be waiting for them to be published.
+    assert!(
+        node.env
+            .timeout(Duration::from_millis(300), &mut set)
+            .await
+            .is_err()
+    );
+    assert!(
+        node.secret_history("token").await.unwrap().is_empty(),
+        "the mutation wrote before the inventory was back"
+    );
+    // A read is not given the wait. The waiting mutation holds no lock: the
+    // rebuild it waits for takes the per-name locks.
+    assert!(node.secret_values().is_err());
+    drop(
+        runtime
+            .name_lock("token")
+            .try_lock_owned()
+            .expect("the waiting mutation holds the name lock"),
+    );
+    drop(window);
+    set.await.unwrap().unwrap();
+    let rows = node.secret_history("token").await.unwrap();
+    assert!(!rows.is_empty());
+    for row in &rows {
+        assert_eq!(
+            row.audit.as_ref().unwrap().reason,
+            audit().reason,
+            "{row:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_secret_mutation_whose_wait_for_the_inventory_runs_out_records_the_placeholder() {
+    let data = tempfile::tempdir().unwrap();
+    let mut config = crate::NodeConfig {
+        group_commit_window: Some(Duration::ZERO),
+        ..Default::default()
+    };
+    config.secret_settings.fetch_timeout = Duration::from_millis(100);
+    let node = crate::start_local(env(), data.path(), config)
+        .await
+        .unwrap();
+    node.env
+        .timeout(Duration::from_secs(60), node.secret_cycle_settled())
+        .await
+        .unwrap();
+    // The window does not close. The mutation waits for one fetch window and
+    // the margin of a rebuild in flight, as an audit event does, and then
+    // records the placeholder, never the reason in the clear. The wait for
+    // the inventory to be published after it fails as well: the mutation is
+    // committed, and says so.
+    let window = node.hold_secret_rebuild_window().await.unwrap();
+    let started = node.env.clock.monotonic();
+    let outcome = node
+        .secret_set(
+            "token",
+            b"first-credential".to_vec(),
+            &audit(),
+            false,
+            test_auth(),
+        )
+        .await;
+    let waited = node.env.clock.monotonic().saturating_sub(started);
+    assert!(waited >= Duration::from_millis(5100), "{waited:?}");
+    assert_eq!(outcome.unwrap_err().code, ErrorCode::SecretUnavailable);
+    drop(window);
+    let rows = node.secret_history("token").await.unwrap();
+    assert!(!rows.is_empty());
+    for row in &rows {
+        assert_eq!(
+            row.audit.as_ref().unwrap().reason,
+            crate::scrub::WITHHELD,
+            "{row:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_secret_mutation_does_not_wait_for_a_rebuild_that_is_failing() {
+    let data = tempfile::tempdir().unwrap();
+    let mut config = crate::NodeConfig {
+        group_commit_window: Some(Duration::ZERO),
+        ..Default::default()
+    };
+    config.secret_settings.fetch_timeout = Duration::from_millis(100);
+    let node = crate::start_local(env(), data.path(), config)
+        .await
+        .unwrap();
+    let runtime = node.runtime().unwrap();
+    node.env
+        .timeout(Duration::from_secs(60), node.secret_cycle_settled())
+        .await
+        .unwrap();
+    // The cycle's last pass failed, as every pass does while a backend is
+    // down (I10): the inventory will not come back by waiting, and a wait
+    // would add its bound to every mutation for as long as the outage lasts.
+    let window = node.hold_secret_rebuild_window().await.unwrap();
+    runtime.certified.send_replace((u64::MAX, false));
+    let started = node.env.clock.monotonic();
+    let outcome = node
+        .secret_set(
+            "token",
+            b"first-credential".to_vec(),
+            &audit(),
+            false,
+            test_auth(),
+        )
+        .await;
+    let waited = node.env.clock.monotonic().saturating_sub(started);
+    // The mutation was recorded with the placeholder at once. Its wait for
+    // the publication of the inventory ended at its fetch timeout.
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
+    assert_eq!(outcome.unwrap_err().code, ErrorCode::SecretUnavailable);
+    drop(window);
+    let rows = node.secret_history("token").await.unwrap();
+    assert!(!rows.is_empty());
+    for row in &rows {
+        assert_eq!(
+            row.audit.as_ref().unwrap().reason,
+            crate::scrub::WITHHELD,
+            "{row:?}"
+        );
+    }
+}

@@ -102,6 +102,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_control_operation_that_begins_in_a_rebuild_window_waits_and_records_the_reason() {
+        let data = tempfile::tempdir().unwrap();
+        let node = crate::start_local(
+            Env::real(tokio::runtime::Handle::current()),
+            data.path(),
+            NodeConfig::default(),
+        )
+        .await
+        .unwrap();
+        let original = node.local_operator_authority().unwrap();
+        node.record_installation_identity(pb::InstallationIdentity {
+            installation: "test".into(),
+        })
+        .await
+        .unwrap();
+        node.env()
+            .timeout(Duration::from_secs(60), node.secret_cycle_settled())
+            .await
+            .unwrap();
+        let window = node.hold_secret_rebuild_window().await.unwrap();
+        let mut change = {
+            let node = node.clone();
+            let operation = pb::audit_event::Operation::FleetState(pending());
+            node.env()
+                .clone()
+                .spawn("control-operation-test", async move {
+                    let audit = audit(&node);
+                    node.record_control_operation(operation, audit, false, original)
+                        .await
+                })
+        };
+        // It waits for the inventory; one that did not would be done long
+        // before this, with the placeholder as the reason of its record.
+        assert!(
+            node.env()
+                .timeout(Duration::from_millis(300), &mut change)
+                .await
+                .is_err(),
+            "the control operation did not wait for the inventory"
+        );
+        drop(window);
+        let SourcePos::Actor { lsn, .. } = change.await.unwrap().unwrap().unwrap() else {
+            panic!("a native record has an actor position")
+        };
+        let mut reasons = Vec::new();
+        node.reader()
+            .read(lsn, lsn, |c| {
+                if let Record::AuditEvent(event) = c.record {
+                    reasons.push(event.audit.unwrap().reason);
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(reasons, [audit(&node).reason]);
+    }
+
+    #[tokio::test]
     async fn exact_native_control_sources_survive_unrelated_records_and_reject_stale_transitions() {
         let data = tempfile::tempdir().unwrap();
         let node = crate::start_local(
