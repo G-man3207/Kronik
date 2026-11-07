@@ -83,8 +83,12 @@ struct Serve {
 
 impl Serve {
     fn start(dir: &Path) -> Serve {
-        let socket = dir.join("api.sock");
-        let data = dir.join("data");
+        Serve::start_at(&dir.join("data"), &dir.join("api.sock"))
+    }
+
+    /// Serves the data directory `data` on `socket`.
+    fn start_at(data: &Path, socket: &Path) -> Serve {
+        let (data, socket) = (data.to_path_buf(), socket.to_path_buf());
         let child = command()
             .arg("serve")
             .arg("--data-dir")
@@ -459,6 +463,150 @@ fn upgrade_check_asks_the_question_the_start_asks() {
         message.starts_with("state is at lsn 4, but the log starts at ")
             && message.contains("no snapshot reaches it"),
         "{message}"
+    );
+}
+
+/// Ships the data directory `data` to the bucket `url` once, the way a node
+/// does every few seconds (`kronik_ship::ship_once`), without a running node.
+fn ship_now(data: &Path, url: &str) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let remote = kronik_ship::Remote::open(url, None).unwrap();
+        let mut state = kronik_ship::ShipState::load(data).unwrap();
+        kronik_ship::ship_once(&remote, data, "main", &mut state)
+            .await
+            .unwrap();
+    });
+}
+
+/// The applied LSN of every actor database under `root`.
+fn actor_markers(root: &Path) -> Vec<i64> {
+    let mut out = Vec::new();
+    let Ok(dirs) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for d in dirs.flatten() {
+        if d.file_type().unwrap().is_dir() {
+            out.extend(actor_markers(&d.path()));
+        } else if d.path().extension().is_some_and(|e| e == "db") {
+            let conn = rusqlite::Connection::open(d.path()).unwrap();
+            out.push(
+                conn.query_row(
+                    "SELECT v FROM _kronik_meta WHERE k = 'applied_lsn'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+            );
+        }
+    }
+    out
+}
+
+/// A node whose retention compacted the log past the only SQL change of an
+/// idle actor starts shipping only afterwards, so the bucket's log starts
+/// mid-way and holds the snapshot taken before the compaction (whose copy of
+/// the idle actor's database still says where its change was). `kronik
+/// restore` into a fresh directory, `kronik upgrade check` on it and the first
+/// `kronik serve` must work, with the actor's row and a new write.
+#[test]
+fn restore_onto_a_compacted_log_with_an_idle_sql_actor_then_check_and_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    compacted_past_an_idle_actor(dir.path());
+    let bucket = tempfile::tempdir().unwrap();
+    let url = format!("file://{}", bucket.path().display());
+    ship_now(dir.path(), &url);
+    let first = std::fs::read_dir(bucket.path().join("main/segments"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .strip_suffix(".seg.zst")?
+                .parse::<i64>()
+                .ok()
+        })
+        .min()
+        .unwrap();
+    assert!(
+        first > 3,
+        "the bucket's log starts at {first}: nothing was compacted"
+    );
+
+    // The master key is never in the bucket: it goes into place first.
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dest.path().join("keys")).unwrap();
+    std::fs::copy(
+        dir.path().join("keys/master.key"),
+        dest.path().join("keys/master.key"),
+    )
+    .unwrap();
+    let restored = kronik(&[
+        "--json",
+        "restore",
+        "--from",
+        &url,
+        "--data-dir",
+        dest.path().to_str().unwrap(),
+    ]);
+    assert_eq!(restored.code, 0, "{restored:?}");
+    let snapshot_lsn = restored.json()["snapshot_lsn"].as_i64().unwrap();
+    assert!(snapshot_lsn + 1 >= first, "{restored:?}");
+
+    // The scenario is the one it claims to be: the restored actor database
+    // says where its change was, below the log the bucket kept.
+    let sql = dest.path().join("branches/main/sql");
+    let before = actor_markers(&sql);
+    assert_eq!(before.len(), 1, "{before:?}");
+    assert!(
+        before[0] + 1 < first,
+        "marker {}, log starts at {first}",
+        before[0]
+    );
+
+    // The step before the first start passes, and says what the start does.
+    let check = kronik(&[
+        "--json",
+        "upgrade",
+        "check",
+        "--data-dir",
+        dest.path().to_str().unwrap(),
+    ]);
+    assert_eq!(check.code, 0, "{check:?}");
+    assert_eq!(check.json()["passed"], true, "{check:?}");
+    assert!(
+        check
+            .stderr
+            .contains("the first start installs the snapshot at lsn"),
+        "{check:?}"
+    );
+
+    let serve = Serve::start_at(dest.path(), &dest.path().join("api.sock"));
+    let send = |args: &[&str]| {
+        let mut all = vec!["send", "notes/n"];
+        all.extend_from_slice(args);
+        all.extend_from_slice(&["--reason", "test"]);
+        let out = serve.run(&all);
+        assert_eq!(out.code, 0, "{out:?}");
+        out.stdout
+    };
+    let list = send(&["list"]);
+    assert_eq!(list.matches("hello").count(), 1, "{list}");
+    send(&["add", "--text", "after the restore"]);
+    let list = send(&["list"]);
+    assert_eq!(list.matches("hello").count(), 1, "{list}");
+    assert_eq!(list.matches("after the restore").count(), 1, "{list}");
+    drop(serve);
+    // The start installed the snapshot and stamped the database with its cut.
+    let after = actor_markers(&sql);
+    assert!(
+        after[0] + 1 >= first,
+        "marker {}, log starts at {first}",
+        after[0]
     );
 }
 

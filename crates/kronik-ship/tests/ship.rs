@@ -362,3 +362,173 @@ fn retention_deletes_remote_segments_and_snapshots() {
         .collect();
     assert_eq!(remote_snapshots.len(), p.node.snapshots().unwrap().len());
 }
+
+// -------------------------------------------------------------------------
+// Restore onto a log that retention compacted past an idle SQL actor. An
+// actor database's applied LSN is where its last change was; a snapshot
+// takes the actor databases as they are when it is taken, before the
+// retention pass that follows it raises them (and before it deletes the log
+// below the snapshot). So the newest snapshot in a bucket, whose log starts
+// where retention left it, can hold an actor database that says "6" while the
+// log starts at "30". The restore copies the snapshot as it is; the first
+// start must still work.
+//
+// With a `history` longer than the time between snapshots, a node that has
+// the raise in its retention pass carries the raised value from the pass
+// before into its newest snapshot, and nothing is left to repair. These tests
+// stand for the cases that remain: a bucket written by a release without the
+// raise (every idle SQL actor on a compacted log), and a short `history`,
+// which they take to the limit (zero).
+
+/// Builds a node whose retention compacted the log past the only SQL change
+/// of `notes/n`, which is idle since. With `ship_early` the node ships before
+/// the compaction too (the remote then drops what retention drops); otherwise
+/// shipping starts only after it, and the bucket's log starts mid-way. Returns
+/// the LSN of the note, the log's first LSN, the node's applied LSN and state
+/// hash at the end, and the master key (which never goes to the bucket). The
+/// node is stopped.
+fn compacted_node_shipped(
+    src: &Path,
+    remote: &Remote,
+    ship_early: bool,
+) -> (u64, u64, u64, String, Vec<u8>) {
+    let p = start(src, Some(Duration::ZERO));
+    for g in ["counter", "notes"] {
+        p.rt.block_on(p.node.deploy(
+            &guest(g),
+            audit(),
+            false,
+            p.node.local_operator_authority().unwrap(),
+        ))
+        .unwrap();
+    }
+    p.send("notes/n", "add", "hello");
+    let note = p
+        .node
+        .store()
+        .db()
+        .actor("notes", "n")
+        .unwrap()
+        .unwrap()
+        .last_lsn;
+    for i in 0..80 {
+        p.send(&format!("counter/k{}", i % 5), "increment", "");
+        if i % 20 == 19 {
+            // Logical time moves, so that retention finds segments older
+            // than a history of zero.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if ship_early && i == 40 {
+            p.ship(remote, src);
+        }
+    }
+    if ship_early {
+        // A node ships every few seconds: what was the active segment has
+        // long been uploaded as a closed one when retention gets to it.
+        p.ship(remote, src);
+    }
+    // The snapshot's retention pass compacts the log.
+    p.rt.block_on(
+        p.node
+            .snapshot("manual", p.node.local_operator_authority().unwrap()),
+    )
+    .unwrap();
+    let storage = p.node.storage_config().unwrap().clone();
+    let first = p.node.log_first(&storage).unwrap();
+    assert!(first > note + 1, "first {first}, the note's lsn {note}");
+    p.ship(remote, src);
+    let applied = p.node.applied_lsn();
+    let hash = p.node.store().state_hash().unwrap();
+    let key = std::fs::read(src.join("keys/master.key")).unwrap();
+    drop(p);
+    (note, first, applied, hash, key)
+}
+
+/// The first LSN of the bucket's log.
+fn bucket_first(bucket: &Path) -> u64 {
+    std::fs::read_dir(bucket.join("main/segments"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .strip_suffix(".seg.zst")?
+                .parse::<u64>()
+                .ok()
+        })
+        .min()
+        .unwrap()
+}
+
+fn restore_compacted_log_with_an_idle_sql_actor(ship_early: bool) {
+    let bucket = tempdir("ship-idle-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let src = tempdir("ship-idle-src-");
+    let (note, first, applied, hash, key) = compacted_node_shipped(src.path(), &remote, ship_early);
+    drop(src);
+    // The bucket's log starts mid-way, after the actor's last change.
+    assert_eq!(bucket_first(bucket.path()), first);
+
+    let dst = tempdir("ship-idle-dst-");
+    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
+    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
+    let rt = rt();
+    let report = rt
+        .block_on(restore(
+            &remote,
+            dst.path(),
+            "main",
+            false,
+            &Env::real(rt.handle().clone()),
+            &Default::default(),
+            KeystoreMode::Require,
+        ))
+        .unwrap();
+    drop(rt);
+    assert!(report.snapshot_lsn + 1 >= first, "{report:?}");
+
+    // The scenario is the one it claims to be: the restored actor database
+    // still says where its change was, below the log the bucket kept.
+    let branch = dst.path().join("branches/main");
+    let markers = kronik_store::snapshot::read_markers(&branch, false, Some(first))
+        .unwrap()
+        .unwrap();
+    assert_eq!(markers.lowest, note, "{markers:?}");
+    assert!(markers.lowest + 1 < first, "{markers:?}, first {first}");
+    // `kronik upgrade check` asks the start's question before the start does.
+    let plan = kronik_sched::snapshots::plan_state(dst.path(), "main", true).unwrap();
+    assert_eq!(
+        plan.install.as_ref().map(|(_, m)| m.lsn),
+        Some(report.snapshot_lsn)
+    );
+
+    // The first start repairs it from the snapshot the restore registered.
+    let q = start(dst.path(), None);
+    assert_eq!(q.node.applied_lsn(), applied);
+    assert_eq!(q.node.store().state_hash().unwrap(), hash);
+    let list = q.send("notes/n", "list", "");
+    assert_eq!(list.matches("hello").count(), 1, "{list}");
+    q.send("notes/n", "add", "after the restore");
+    let list = q.send("notes/n", "list", "");
+    assert_eq!(list.matches("hello").count(), 1, "{list}");
+    assert_eq!(list.matches("after the restore").count(), 1, "{list}");
+    assert!(q.node.store().replay_from().unwrap() + 1 >= first);
+    drop(q);
+    // And it stays repaired: a second start has nothing to do.
+    assert!(
+        kronik_sched::snapshots::plan_state(dst.path(), "main", false)
+            .unwrap()
+            .install
+            .is_none()
+    );
+}
+
+#[test]
+fn restore_onto_a_log_compacted_before_shipping_started_keeps_an_idle_sql_actor() {
+    restore_compacted_log_with_an_idle_sql_actor(false);
+}
+
+#[test]
+fn restore_onto_a_log_the_remote_compacted_along_keeps_an_idle_sql_actor() {
+    restore_compacted_log_with_an_idle_sql_actor(true);
+}
