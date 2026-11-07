@@ -2884,6 +2884,7 @@
                   "REASON_REQUIRED",
                   "REPLAY_DIVERGED",
                   "ROLLBACK_SCHEMA_CHANGED",
+                  "ROOTLESS_UNAVAILABLE",
                   "ROUTE_CONFLICT",
                   "ROUTE_NOT_FOUND",
                   "RUNC_MISSING",

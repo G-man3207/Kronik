@@ -22,6 +22,7 @@ mod simulators;
 mod snapshot;
 mod token;
 pub(crate) mod units;
+pub(crate) mod userns;
 
 use std::io::{self, BufRead as _, IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -185,6 +186,9 @@ pub enum Command {
     /// with foreign://<name>/... (add, list, logs, remove).
     #[command(subcommand)]
     Foreign(foreign::ForeignCommand),
+    /// Set up or inspect the stable daemon's pinned user namespace.
+    #[command(subcommand)]
+    Userns(userns::UsernsCommand),
     /// Set a target's effect simulators: stub rules, a contract, neighbor,
     /// model (how forks answer effects without a recording).
     #[command(subcommand)]
@@ -505,12 +509,15 @@ pub enum SecretCommand {
 /// Runs a client command and returns the process exit code: 0 on success,
 /// 1 on an error or a failed turn.
 pub fn run(command: Command, global: &Global) -> ExitCode {
-    let offline_keys = match &command {
+    // Host setup and key custody are local operations: a remote API cannot
+    // pin a namespace or wrap a key on the machine that runs the CLI.
+    let offline = match &command {
+        Command::Userns(_) => Some("userns"),
         Command::Keys(keys::KeysCommand::Wrap(_)) => Some("keys wrap"),
         Command::Keys(keys::KeysCommand::Enroll { .. }) => Some("keys enroll"),
         _ => None,
     };
-    if let Some(name) = offline_keys
+    if let Some(name) = offline
         && let Some(exit) = global.refuse_remote(name)
     {
         return exit;
@@ -591,6 +598,7 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
         Command::Privacy(c) => privacy::privacy(&ctx, c),
         Command::Token(c) => token::token(&ctx, c),
         Command::Foreign(c) => foreign::foreign(&ctx, c),
+        Command::Userns(c) => userns::userns(&ctx, c),
         Command::Stubs(c) => simulators::stubs(&ctx, c),
         Command::Simulators(c) => simulators::simulators(&ctx, c),
         Command::Snapshot(c) => snapshot::snapshot(&ctx, c),

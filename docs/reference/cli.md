@@ -1957,6 +1957,53 @@ deleted. Needs `operate`.
 kronik foreign remove echo --reason "retire the owned echo fixture" --dry-run
 ```
 
+## kronik userns pin
+
+`kronik userns pin [--user <NAME>] [--dry-run] [--json]`
+
+Host setup for the nonroot daemon (M21, ADR 0060). As root, creates the Kronik
+user namespace, owned by the `kronik` user, with id 0 mapped to that user and
+ids 1-65535 to its range in `/etc/subuid` and `/etc/subgid`, and pins it at
+`/run/kronik-userns/user`. A namespace already pinned there with the same owner
+and maps, and a matching root-only creation record, is kept; any other
+namespace or file at that path is refused, never replaced or adopted.
+`kronik-userns.service` runs it before `kronik.service`. The identity files
+must be root-owned and not writable by others, and the user must not be
+root. Without user namespaces, the user or a safe range:
+`ROOTLESS_UNAVAILABLE`. A local command: `--url` and `--token` are refused.
+`--dry-run` shows the plan and changes nothing.
+
+```sh
+kronik userns pin --dry-run
+```
+
+## kronik userns unpin
+
+`kronik userns unpin [--user <NAME>] [--dry-run] [--json]`
+
+As root, removes the pinned namespace, but only one whose root-only creation
+record and unchanged identity still match: a replacement or an unrelated file
+at that path is left alone. The service unit stopping does not unpin it, so a
+restart of the pin unit never strands a running daemon in another namespace.
+Change the `kronik` user's identity only with the daemon and its consumers
+stopped. `--dry-run` validates the record and changes nothing.
+
+```sh
+kronik userns unpin --dry-run
+```
+
+## kronik userns status
+
+`kronik userns status [--user <NAME>] [--json]`
+
+Whether a namespace is pinned, its owner and maps, the `kronik` user's ranges,
+and whether they match, so that the daemon can enter it. Any user may run it;
+only the owner and root can read the maps.
+
+```sh
+kronik userns status --json
+```
+
 ## kronik stubs set
 
 `kronik stubs set <TARGET> <RULES.toml> --reason <REASON> [--dry-run]`

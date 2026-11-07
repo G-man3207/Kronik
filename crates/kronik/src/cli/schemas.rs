@@ -33,6 +33,9 @@ enum Output {
 const COMMANDS: &[(&str, Output)] = &[
     ("serve", Output::None("the daemon; it refuses --json")),
     ("doctor", Output::Local(crate::doctor::json_schema)),
+    ("userns pin", Output::Local(super::userns::schema)),
+    ("userns unpin", Output::Local(super::userns::schema)),
+    ("userns status", Output::Local(super::userns::schema)),
     ("restore", Output::Local(crate::restore::json_schema)),
     ("upgrade check", Output::Local(crate::upgrade::json_schema)),
     ("init", Output::Local(crate::project::init_schema)),

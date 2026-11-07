@@ -28,6 +28,9 @@ against both.
 | --- | --- |
 | `kronik serve` | no JSON: the daemon; it refuses --json |
 | `kronik doctor` | [`Report`](#report), from the CLI itself |
+| `kronik userns pin` | [`UsernsReport`](#usernsreport), from the CLI itself |
+| `kronik userns unpin` | [`UsernsReport`](#usernsreport), from the CLI itself |
+| `kronik userns status` | [`UsernsReport`](#usernsreport), from the CLI itself |
 | `kronik restore` | [`RestoreOutput`](#restoreoutput), from the CLI itself |
 | `kronik upgrade check` | [`UpgradeCheckOutput`](#upgradecheckoutput), from the CLI itself |
 | `kronik init` | [`Created`](#created), from the CLI itself |
@@ -150,6 +153,36 @@ against both.
     },
     {
       "$ref": "#/components/schemas/TopicList"
+    }
+  ]
+}
+```
+
+### Action
+
+```json
+{
+  "description": "What a command did, or with `--dry-run` would do.",
+  "oneOf": [
+    {
+      "const": "created",
+      "description": "A namespace was pinned where there was none.",
+      "type": "string"
+    },
+    {
+      "const": "kept",
+      "description": "The pinned namespace had the right owner and maps.",
+      "type": "string"
+    },
+    {
+      "const": "removed",
+      "description": "The pinned namespace was removed.",
+      "type": "string"
+    },
+    {
+      "const": "absent",
+      "description": "Nothing was pinned.",
+      "type": "string"
     }
   ]
 }
@@ -2925,6 +2958,7 @@ against both.
             "REASON_REQUIRED",
             "REPLAY_DIVERGED",
             "ROLLBACK_SCHEMA_CHANGED",
+            "ROOTLESS_UNAVAILABLE",
             "ROUTE_CONFLICT",
             "ROUTE_NOT_FOUND",
             "RUNC_MISSING",
@@ -4320,6 +4354,59 @@ against both.
     "subjects",
     "keys",
     "erased"
+  ],
+  "type": "object"
+}
+```
+
+### KronikUser
+
+```json
+{
+  "description": "The `kronik` user and its subordinate ranges.",
+  "properties": {
+    "gid": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "name": {
+      "type": "string"
+    },
+    "subgid": {
+      "description": "`[start, count]` of its /etc/subgid range.",
+      "items": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "maxItems": 2,
+      "minItems": 2,
+      "type": "array"
+    },
+    "subuid": {
+      "description": "`[start, count]` of its /etc/subuid range.",
+      "items": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "maxItems": 2,
+      "minItems": 2,
+      "type": "array"
+    },
+    "uid": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "name",
+    "uid",
+    "gid",
+    "subuid",
+    "subgid"
   ],
   "type": "object"
 }
@@ -7578,6 +7665,118 @@ against both.
     "passed",
     "checked_wall_ms",
     "dry_run"
+  ],
+  "type": "object"
+}
+```
+
+### UsernsReport
+
+```json
+{
+  "description": "What `kronik userns pin|unpin|status --json` prints.",
+  "properties": {
+    "action": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/Action"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What `pin` or `unpin` did (with `--dry-run`: would do); absent for\n`status`."
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "gid_map": {
+      "items": {
+        "items": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maxItems": 3,
+        "minItems": 3,
+        "type": "array"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "maps_error": {
+      "description": "Why the maps could not be read: only the owner and root may.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "matches": {
+      "description": "Whether the owner and maps are what `user` gives (absent when either\nis unknown).",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "owner": {
+      "description": "The uid that owns the pinned namespace.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "path": {
+      "description": "Where the namespace is pinned: /run/kronik-userns/user.",
+      "type": "string"
+    },
+    "pinned": {
+      "description": "Whether a user namespace is pinned there now (with `--dry-run`:\nbefore the command).",
+      "type": "boolean"
+    },
+    "uid_map": {
+      "description": "Its maps as `[inside, outside, count]` lines.",
+      "items": {
+        "items": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maxItems": 3,
+        "minItems": 3,
+        "type": "array"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "user": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/KronikUser"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The `kronik` user and its ranges, when they are set up."
+    },
+    "user_error": {
+      "description": "Why the `kronik` user or its ranges are missing.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "path",
+    "dry_run",
+    "pinned"
   ],
   "type": "object"
 }

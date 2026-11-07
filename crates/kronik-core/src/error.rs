@@ -230,6 +230,9 @@ codes! {
     RollbackSchemaChanged = "ROLLBACK_SCHEMA_CHANGED", 409, "M3",
         "The schema version changed since that deployment",
         "Fix forward: propose a corrected version that keeps the current schema version.";
+    RootlessUnavailable = "ROOTLESS_UNAVAILABLE", 503, "M21",
+        "The rootless service boundary is unavailable",
+        "Run `kronik doctor --rootless` under the service identity; repair its owned namespace pin and delegated cgroup, then retry.";
     RouteConflict = "ROUTE_CONFLICT", 409, "M1",
         "Another actor type already serves this route",
         "Change the method or pattern in the kind's describe, rebuild and deploy again.";
@@ -553,8 +556,8 @@ mod tests {
 
     #[test]
     fn every_code_has_a_status_milestone_title_hint_and_explanation() {
-        const MILESTONES: [&str; 13] = [
-            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M23", "M28",
+        const MILESTONES: [&str; 14] = [
+            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M21", "M23", "M28",
         ];
         for &code in ErrorCode::ALL {
             assert!((400..600).contains(&code.http_status()), "{code}");
