@@ -1218,6 +1218,42 @@ fn model_error(error: kronik_core::error::ApiError) -> GateError {
     }
 }
 
+/// Whether a recorded effect with this status may hold a secret reference
+/// that never got a version. Production records one only for an effect that
+/// did not get its secret: the secret does not exist (`Denied`), the backend
+/// could not be had (`Network`), or a re-run ended an effect of an `unsafe`
+/// grant as `OutcomeUnknown` without asking. Production's own re-run refuses
+/// such a reference on a successful record, and a fork must not replay as
+/// exact what production would not.
+fn may_lack_its_secret(status: i32) -> bool {
+    matches!(
+        pb::EffectStatus::try_from(status),
+        Ok(pb::EffectStatus::Denied | pb::EffectStatus::Network | pb::EffectStatus::OutcomeUnknown)
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn only_an_effect_that_did_not_get_its_secret_may_lack_a_secret_version() {
+    use pb::EffectStatus::{Denied, Network, OutcomeUnknown};
+    let mut seen = 0;
+    for status in 0..32 {
+        let Ok(known) = pb::EffectStatus::try_from(status) else {
+            // A status this build does not know is not one production recorded
+            // for an effect without its secret.
+            assert!(!may_lack_its_secret(status), "{status}");
+            continue;
+        };
+        seen += 1;
+        assert_eq!(
+            may_lack_its_secret(status),
+            matches!(known, Denied | Network | OutcomeUnknown),
+            "{known:?}"
+        );
+    }
+    assert!(seen >= 12, "{seen} statuses");
+}
+
 #[cfg(test)]
 #[test]
 fn model_failures_keep_host_vs_prerequisite_semantics() {
@@ -1502,10 +1538,12 @@ impl ReplayGate {
                     // An unresolved reference is how production records an effect
                     // that never got its secret (not found, or unavailable): the
                     // recorded error is replayed below, with the fingerprint of
-                    // that very request. A reference that claims a version and
-                    // does not name one is a damaged record.
+                    // that very request. Any other record with one is damaged,
+                    // as is a reference that claims a version and does not name
+                    // one.
+                    let never_got_it = prod.as_ref().is_some_and(|p| may_lack_its_secret(p.status));
                     if let Some(reference) = &recorded
-                        && !reference.is_unresolved()
+                        && !(reference.is_unresolved() && never_got_it)
                         && let Err(error) = reference.resolved_version()
                     {
                         let error = error.to_string();

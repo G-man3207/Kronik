@@ -10,8 +10,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use common::*;
+use kronik_core::error::ErrorCode;
 use kronik_fork::diff::{DiffOptions, Mode};
 use kronik_fork::proposal::Proposals;
+use kronik_proto::Record;
+use kronik_proto::log::v1 as pb;
+use kronik_sched::NodeConfig;
+use prost::Message as _;
 
 const SECRET: &str = "VALUE-fork-8e31d0";
 
@@ -189,4 +194,154 @@ fn a_fork_replays_an_hmac_whose_secret_does_not_exist() {
 #[test]
 fn a_fork_replays_a_reveal_whose_secret_does_not_exist_as_the_failure_it_was() {
     replay_of_an_effect_without_its_secret("reveal", "nokey", false);
+}
+
+/// Damages every `http.fetch` record in the log of a node that is stopped: the
+/// effect becomes a timeout (no response, an error text) and its secret
+/// reference loses its version and hash, the name and the template staying.
+/// Returns how many records changed.
+fn damage_the_fetch_records(data: &std::path::Path) -> usize {
+    let log = data.join("branches/main/log");
+    let mut damaged = 0;
+    for start in kronik_log::segment_starts(&log).unwrap() {
+        let path = log.join(kronik_log::segment_name(start));
+        kronik_log::rewrite_segment(&path, |_lsn, record| {
+            let effects: Vec<&mut pb::EffectRecord> = match record {
+                Record::EffectResult(result) => result.effect.iter_mut().collect(),
+                Record::TurnRecord(turn) => turn.effects.iter_mut().collect(),
+                _ => return Ok(false),
+            };
+            let mut changed = false;
+            for effect in effects.into_iter().filter(|e| e.kind == "http.fetch") {
+                let Some(pb::sealable::Value::Plain(bytes)) = effect
+                    .request
+                    .as_mut()
+                    .and_then(|request| request.value.as_mut())
+                else {
+                    continue;
+                };
+                let mut request =
+                    pb::HttpEffectRequest::decode(bytes.as_slice()).map_err(|e| e.to_string())?;
+                for header in &mut request.headers {
+                    if let Some(pb::http_effect_header::Value::Secret(reference)) =
+                        &mut header.value
+                    {
+                        reference.version = 0;
+                        reference.wide_version = 0;
+                        reference.version_hash.clear();
+                        changed = true;
+                    }
+                }
+                *bytes = request.encode_to_vec();
+                effect.status = pb::EffectStatus::Timeout as i32;
+                effect.error = "no response within 2000 ms".into();
+                effect.response = None;
+            }
+            damaged += usize::from(changed);
+            Ok(changed)
+        })
+        .unwrap();
+    }
+    damaged
+}
+
+/// A fork at `lsn`, replayed in isolation: its diff, or why it could not be made.
+fn replay_probe(
+    p: &Proc,
+    dir: &std::path::Path,
+    name: &str,
+    lsn: u64,
+) -> Result<serde_json::Value, kronik_core::error::ApiError> {
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.to_path_buf()).unwrap());
+    p.rt.block_on(props.create_fork(Some(name.into()), lsn, false, audit(), false, p.owner()))
+        .unwrap();
+    p.rt.block_on(props.fork_replay(
+        name,
+        None,
+        DiffOptions {
+            mode: Mode::Isolated,
+            ..DiffOptions::default()
+        },
+        None,
+        p.owner(),
+    ))?;
+    Ok(serde_json::from_slice(&p.rt.block_on(props.diff(name, false, false)).unwrap()).unwrap())
+}
+
+/// Production records a secret header without a version only for an effect that
+/// did not get its secret: the secret does not exist, the backend could not be
+/// had, or an unsafe effect was ended as outcome unknown without asking. A
+/// fetch record that has one and another status is damaged, and a fork must
+/// refuse it, not replay it as if it matched.
+///
+/// A real turn with a real secret is replayed (it matches). Then its records
+/// are damaged on disk, while the node is stopped: a timeout, with the version
+/// of the secret gone. The node still certifies its inventory, because its scan
+/// takes an unresolved reference of an effect that did not succeed, so the
+/// replay of the same fork point is stopped by the fork's own check and by
+/// nothing else. (A *successful* record with one is stopped earlier: the scan
+/// refuses it, the inventory cannot be certified, and every read that scrubs,
+/// replays included, answers 503; the unit test of `may_lack_its_secret` has it.)
+#[test]
+fn a_fork_refuses_a_fetch_record_that_lacks_its_secret_version_without_a_reason() {
+    let (addr, hits) = server();
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    p.rt.block_on(
+        p.node
+            .secret_set("k1", SECRET.as_bytes().to_vec(), &audit(), false, p.owner()),
+    )
+    .unwrap();
+    for cap in ["secret:k1", "http:127.0.0.1"] {
+        p.grant(cap);
+    }
+    let fork_lsn = p.settle();
+    let turn = p.send(
+        "counter/a",
+        "fetch-ok",
+        &format!("POST http://{addr}/x\nS x-api-key k1 {{}}\n\nbody"),
+    );
+    assert!(turn.committed(), "{turn:?}");
+    p.settle();
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // The control: the undamaged records replay, every effect exact.
+    let d = replay_probe(&p, dir.path(), "control", fork_lsn).unwrap();
+    let s = &d["summary"];
+    assert_eq!(
+        (&s["changed"], &s["approximate"], &s["synthetic"]),
+        (&false.into(), &0.into(), &0.into()),
+        "{d}"
+    );
+    assert!(s["exact"].as_u64() >= Some(1), "{d}");
+    drop(p);
+
+    // The damage, on disk. The state is derived from the log, so it goes and is
+    // rebuilt at the next start.
+    assert!(damage_the_fetch_records(dir.path()) >= 2);
+    let branch = dir.path().join("branches/main");
+    for name in ["state.db", "state.db-wal", "state.db-shm"] {
+        let _ = std::fs::remove_file(branch.join(name));
+    }
+    let _ = std::fs::remove_dir_all(branch.join("sql"));
+    let _ = std::fs::remove_dir_all(dir.path().join("snapshots"));
+    let p = Proc::open(
+        dir.path(),
+        NodeConfig {
+            concurrency: 8,
+            ..NodeConfig::default()
+        },
+    );
+    // A 503 for a certificate that is not there yet is not the answer under test.
+    p.rt.block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            p.node.secret_cycle_settled(),
+        )
+        .await
+    })
+    .expect("the secret cycle never settled");
+    let error = replay_probe(&p, dir.path(), "damaged", fork_lsn).unwrap_err();
+    assert_eq!(error.code, ErrorCode::SecretUnavailable, "{error}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "a fork sent a request");
 }
