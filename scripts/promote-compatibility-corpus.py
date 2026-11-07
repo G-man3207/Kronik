@@ -13,6 +13,15 @@ MAX_FILE = 2 << 20
 MAX_TOTAL = 32 << 20
 MAX_LINE = 3 << 20
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# A release is named by its tag, v0.<minor>.<patch>, as in the release index.
+RELEASE_TAG = re.compile(r"v0\.[0-9]+\.[0-9]+")
+
+
+def release_tag(value):
+    """argparse type: the exact tag of an actual release."""
+    if not RELEASE_TAG.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a release tag such as v0.4.0")
+    return value
 
 
 def unique_object(pairs):
@@ -125,7 +134,7 @@ def promote(stream, destination, release, producer_sha256):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", type=Path, required=True, help="new owned directory only")
-    parser.add_argument("--release", choices=("v0.1.0", "v0.3.0"), required=True)
+    parser.add_argument("--release", type=release_tag, required=True)
     parser.add_argument("--producer-sha256", required=True)
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9a-f]{64}", args.producer_sha256):

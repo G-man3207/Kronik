@@ -1,4 +1,5 @@
 """Synthetic export records test promotion, not released logs or runtime compatibility."""
+import argparse
 import base64
 import hashlib
 import io
@@ -13,19 +14,19 @@ RELEASE = "v0.1.0"
 PRODUCER = "a" * 64
 
 
-def record(path, payload):
-    return {"format": "kronik.corpus-file/v1", "release": RELEASE, "path": path,
+def record(path, payload, release=RELEASE):
+    return {"format": "kronik.corpus-file/v1", "release": release, "path": path,
             "sha256": hashlib.sha256(payload).hexdigest(),
             "base64": base64.b64encode(payload).decode()}
 
 
-def records():
+def records(release=RELEASE):
     payload = b"known synthetic fixture bytes"
-    manifest = {"format": "kronik.compatibility-corpus/v1", "release": RELEASE,
+    manifest = {"format": "kronik.compatibility-corpus/v1", "release": release,
                 "producer_binary_sha256": PRODUCER, "dummy_master_key": "44" * 32,
                 "files": [{"path": "log/0001", "bytes": len(payload),
                            "sha256": hashlib.sha256(payload).hexdigest()}]}
-    return [record("manifest.json", json.dumps(manifest).encode()), record("data/log/0001", payload)]
+    return [record("manifest.json", json.dumps(manifest).encode(), release), record("data/log/0001", payload, release)]
 
 
 def stream(items):
@@ -109,6 +110,27 @@ class PromotionTest(unittest.TestCase):
     def test_oversized_stream_record_stops_at_its_bounded_read(self):
         with self.assertRaisesRegex(ValueError, "exceeds 3 MiB"):
             PROMOTE["promote"](io.BytesIO(b"x" * (PROMOTE["MAX_LINE"] + 1)), self.destination, RELEASE, PRODUCER)
+
+    def test_a_later_actual_release_is_promoted_like_the_earlier_ones(self):
+        result = PROMOTE["promote"](stream(records("v0.4.0")), self.destination, "v0.4.0", PRODUCER)
+        self.assertTrue(result["promoted"])
+        self.assertEqual("v0.4.0", json.loads((self.destination / "manifest.json").read_text())["release"])
+
+    def test_records_of_another_release_are_not_promoted(self):
+        with self.assertRaisesRegex(ValueError, "no producer manifest"):
+            PROMOTE["promote"](stream(records("v0.3.0")), self.destination, "v0.4.0", PRODUCER)
+
+
+class ReleaseTagTest(unittest.TestCase):
+    def test_every_actual_release_tag_is_accepted(self):
+        for tag in ("v0.1.0", "v0.3.0", "v0.4.0", "v0.10.12"):
+            with self.subTest(tag=tag):
+                self.assertEqual(tag, PROMOTE["release_tag"](tag))
+
+    def test_a_release_is_an_exact_tag(self):
+        for value in ("", "0.4.0", "v0.4", "v1.0.0", "v0.4.0-dev", "v0.4.0\n", " v0.4.0", "V0.4.0", "../v0.4.0"):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                PROMOTE["release_tag"](value)
 
 
 if __name__ == "__main__":

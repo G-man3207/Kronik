@@ -27,6 +27,24 @@ DUMMY_MASTER = "44" * 32
 REASON = "owned released-producer compatibility fixture"
 MAX_FILE = 2 << 20
 MAX_TOTAL = 32 << 20
+# A release is named by its tag, v0.<minor>.<patch>, as in the release index.
+RELEASE_TAG = re.compile(r"v0\.[0-9]+\.[0-9]+")
+# The first line of an actual release's `--version` is `kronik <version>`. The
+# one documented exception is the v0.1.0 artifact, which shipped its
+# development string; its real identity is retained, not rewritten.
+REPORTED_VERSION = {"v0.1.0": "kronik 0.1.0-dev"}
+
+
+def release_tag(value):
+    """argparse type: the exact tag of an actual release."""
+    if not RELEASE_TAG.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a release tag such as v0.4.0")
+    return value
+
+
+def expected_version(release):
+    """The first `--version` line that the release's own binary reports."""
+    return REPORTED_VERSION.get(release_tag(release), "kronik " + release[1:])
 
 
 def checked_api(daemon, method, path, body=None):
@@ -97,9 +115,7 @@ def producer(args):
     if digest(binary) != args.binary_sha256:
         raise Violation("producer binary does not match the explicitly pinned release SHA-256")
     version = subprocess.check_output([str(binary), "--version"], text=True, timeout=10)
-    # The actual v0.1.0 artifact shipped this documented development string.
-    expected_version = {"v0.1.0": "kronik 0.1.0-dev", "v0.3.0": "kronik 0.3.0"}[args.release]
-    if not version.splitlines() or version.splitlines()[0] != expected_version:
+    if not version.splitlines() or version.splitlines()[0] != expected_version(args.release):
         raise Violation(f"producer is not the declared actual release {args.release}")
     data, sock = work / "data", work / "api.sock"
     daemon = Daemon(str(binary), str(data), str(sock), args.port, str(work / "producer.log"), healthy_timeout=30)
@@ -262,8 +278,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="mode", required=True)
     produce = sub.add_parser("produce")
-    produce.add_argument("--release", choices=("v0.1.0", "v0.3.0"), required=True)
-    produce.add_argument("--binary-sha256", required=True)
+    produce.add_argument("--release", type=release_tag, required=True,
+                         help="tag of the actual release that built --binary, for example v0.4.0")
+    produce.add_argument("--binary-sha256", required=True,
+                         help="pinned SHA-256 of the release binary itself, taken from the verified release")
     produce.add_argument("--counter", type=Path, required=True)
     produce.add_argument("--notes", type=Path, required=True)
     produce.add_argument("--emit-files", action="store_true",

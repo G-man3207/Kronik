@@ -164,11 +164,15 @@ modern candidate, drop the integrity comparison, or rewrite the frozen log
 hash after an engine-upgrade record has been appended.
 
 `compatibility-corpus.py produce` is an explicit maintainer operation requiring
-the real release binary and its pinned SHA-256. Its `--emit-files` records may be
-promoted by `promote-compatibility-corpus.py` only into a new owned directory.
-Promotion verifies bounded payloads, exact inventory and digest/provenance
-agreement, and refuses existing destinations. Only the public dummy master key
-`44` repeated 32 times and owned test data occur in these fixtures.
+the real release binary and its pinned SHA-256. It accepts any published
+`v0.N.M` tag and refuses a binary whose `--version` first line is not that
+release's own: `kronik 0.N.M`, or `kronik 0.1.0-dev` for the v0.1.0 artifact.
+Its `--emit-files` records may be promoted by `promote-compatibility-corpus.py`
+only into a new owned directory. Promotion verifies bounded payloads, exact
+inventory and digest/provenance agreement, and refuses existing destinations.
+Only the public dummy master key `44` repeated 32 times and owned test data
+occur in these fixtures. The steps for a new release follow the catalog rule
+below.
 
 The retained [compatibility proof](https://github.com/G-man3207/Kronik/wiki/Performance-evidence)
 shows nine original roots and ten turns per actual producer, successful engine
@@ -263,6 +267,37 @@ old bytes for a new engine, or replace a tagged component with a new build.
 The currently retained v0.1.0/v0.3.0 snapshots were read directly from source
 commits `f4d9d9e2cccf515cb5cc4952c0e8a3f643372e34` and
 `d9d460bc89f6ae30962ef16238b8fcaa6485a8de`.
+
+The case is produced from the published binary, never from a build or from the
+candidate:
+
+1. Download the release's `kronik-x86_64-unknown-linux-musl.tar.gz`, its
+   `.sigstore.json` bundle, `SHA256SUMS` and `reproducibility.json`, and check
+   the checksums with `sha256sum -c`.
+2. Verify the attestation the way `scripts/install.sh` does: run the release's
+   own `install.sh` on the downloaded files in a scrubbed environment, with no
+   GitHub token or `gh` login and a private home directory (`env -i
+   PATH=/usr/bin:/bin HOME=... GH_CONFIG_DIR=... KRONIK_BASE_URL=file://...
+   KRONIK_INSTALL_DIR=... KRONIK_INSTALL_RUNSC=no sh install.sh`). It fetches
+   its source-pinned official verifier and refuses an archive that this
+   repository's release workflow did not attest for the tag. A matching
+   checksum alone is weaker evidence and does not qualify.
+3. Pin `sha256sum` of the installed `kronik`. It must equal the ELF digest in
+   the attested `reproducibility.json`, and it is the `--binary-sha256` and the
+   index's `producer_binary_sha256`.
+4. From a clean environment and a new work directory with a neutral name, run
+   `scripts/compatibility-corpus.py produce --release vX.Y.Z --emit-files` with
+   that binary, the maintained `tests/guests/counter.wasm` and `notes.wasm`, the
+   tag's commit from `git rev-parse vX.Y.Z^{commit}` as `--revision`, and a
+   free fixture port. Promote its output with
+   `scripts/promote-compatibility-corpus.py` into `tests/compatibility/vX.Y.Z`.
+5. Store the tag's four contract sources under `vX.Y.Z/contracts/` and its two
+   guest components under `components/` (`git show vX.Y.Z:<path>`), and add the
+   case to `releases.json` and the tag to `published_releases`. Take the root
+   count from the release binary's own `kronik upgrade check`.
+6. Run `scripts/verify-compatibility.py` as above, and scan every new file for
+   environment details (absolute paths, host names, account names, addresses and
+   e-mail) before committing.
 
 Ordinary Python behavior tests and explicit source-CLI comparisons do not run
 the Kronik product, upgrade/replay an old log, or prove a production WIT
