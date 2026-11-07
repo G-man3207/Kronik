@@ -56,12 +56,12 @@ pub struct ServeArgs {
     /// Run as the nonroot service (M21): bind every listener and take the
     /// data directory's lock, empty all capability sets, hand the API socket
     /// to a capability-free acceptor that reads the callers' true uids, and
-    /// enter the pinned Kronik user namespace. The unit that `serve --init`
-    /// writes sets it, and the daemon refuses to start where it cannot keep
-    /// its promises (as root, or in a rootless container or a nested user
-    /// namespace). Without it `serve` starts as it did before M21, as root or
-    /// as an ordinary user. With `--init`: install the nonroot service (the
-    /// default) rather than the root one.
+    /// enter the pinned Kronik user namespace. The unit that
+    /// `serve --init --rootless` writes sets it, and the daemon refuses to
+    /// start where it cannot keep its promises (as root, or in a rootless
+    /// container or a nested user namespace). Without it `serve` starts as it
+    /// did before M21, as root or as an ordinary user. With `--init`: install
+    /// the nonroot service rather than the root one (the default).
     #[arg(long)]
     rootless: bool,
     /// Below this much free space on the log's file system, new inputs and

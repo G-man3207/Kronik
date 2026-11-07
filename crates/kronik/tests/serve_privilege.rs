@@ -1,9 +1,9 @@
 //! `kronik serve` without `--rootless` starts as it did before M21, for root
 //! and for an ordinary user alike (developer and CI use): it makes no
 //! acceptor process and sets no `no_new_privs`. `--rootless` is the nonroot
-//! service, which the unit that `serve --init` writes asks for: it refuses to
-//! run as root, and as an ordinary user it empties every capability set and
-//! serves the API through an acceptor of its own.
+//! service, which the unit that `serve --init --rootless` writes asks for: it
+//! refuses to run as root, and as an ordinary user it empties every capability
+//! set and serves the API through an acceptor of its own.
 //!
 //! Whoever runs this test is who `serve` runs as, so each arm covers one
 //! kind of host: the plain daemon (root on a developer's machine, an ordinary

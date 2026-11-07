@@ -22,7 +22,7 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 # The sandboxes' cgroups live below the unit's own, in a private cgroup
 # namespace (ADR 0061). Not DelegateSubgroup=: with it the namespace is rooted
-# at the subgroup, which has no controllers. `serve --init` leaves
+# at the subgroup, which has no controllers. `serve --init --rootless` leaves
 # ProtectControlGroups=private out on systemd before 257, which does not have
 # it; the daemon then works without the namespace.
 Delegate=yes
@@ -35,10 +35,10 @@ LimitNOFILE=65536
 # subject data.
 LimitCORE=0
 # /run/kronik holds the API socket. The data directory (server.data_dir;
-# `serve --init` writes its path here) is created kronik:kronik 0700 by
-# `serve --init`. Not StateDirectory=: systemd chowns that whole tree to
-# User= when the top's owner differs, which would hand foreign actors' data,
-# owned by kronik's range, to kronik (ADR 0062).
+# `serve --init --rootless` writes its path here) is created kronik:kronik 0700
+# by `serve --init --rootless`. Not StateDirectory=: systemd chowns that whole
+# tree to User= when the top's owner differs, which would hand foreign actors'
+# data, owned by kronik's range, to kronik (ADR 0062).
 RuntimeDirectory=kronik
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=restart

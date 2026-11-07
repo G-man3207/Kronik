@@ -175,7 +175,6 @@ fn init_dry_run_prints_the_plan_and_changes_nothing() {
     let out = kronik(&[
         "serve",
         "--init",
-        "--root",
         "--domain",
         "app.example.com",
         "--acme-email",
@@ -198,7 +197,6 @@ fn init_dry_run_prints_the_plan_and_changes_nothing() {
     let out = kronik(&[
         "serve",
         "--init",
-        "--root",
         "--dry-run",
         "--config",
         config.to_str().unwrap(),
@@ -245,39 +243,78 @@ fn nonroot_host() -> bool {
             .is_some_and(|max| max != 0)
 }
 
-/// The default `serve --init` plans the nonroot service where the host can run
-/// it, and otherwise stops with an error that names the root service: missing
-/// prerequisites never install the root service by themselves.
+/// A plain `serve --init` plans the root service of v0.4.0 on any host, and
+/// the nonroot service is opt-in with `--rootless`: it is planned where the
+/// host can run it, and otherwise the command stops with an error that names
+/// the root service. Missing prerequisites never install the root service by
+/// themselves.
 #[test]
-fn the_default_init_plans_the_nonroot_service_or_names_the_root_one() {
+fn the_default_init_plans_the_root_service_and_rootless_is_opt_in() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let config = dir.path().join("kronik.toml");
-    std::fs::write(&config, format!("[server]\ndata_dir = {:?}\n", data)).unwrap();
-    let args = [
+    // The key is outside the data directory, as the nonroot service requires.
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\ndata_dir = {:?}\n[keys]\nmaster_key_file = {:?}\n",
+            data,
+            dir.path().join("master.key")
+        ),
+    )
+    .unwrap();
+    // The default: the root service, no user, pin or subordinate range.
+    let out = kronik(&[
         "serve",
         "--init",
         "--dry-run",
         "--json",
         "--config",
         config.to_str().unwrap(),
-    ];
-    // A host without systemd on its path cannot take the nonroot service,
-    // whatever this machine is.
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let plan: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(plan["mode"], "root");
+    assert_eq!(plan["dry_run"], true);
+    let steps = plan["steps"].to_string();
+    assert!(!steps.contains("kronik-userns.service"), "{steps}");
+    assert!(!steps.contains("system user kronik"), "{steps}");
+    assert!(!data.exists());
+    // `--rootless` on a host without systemd on its path: the error names the
+    // root service, whatever this machine is.
     let empty = dir.path().join("empty-path");
     std::fs::create_dir(&empty).unwrap();
-    let out = command().args(args).env("PATH", &empty).output().unwrap();
+    let out = command()
+        .args([
+            "serve",
+            "--init",
+            "--rootless",
+            "--dry-run",
+            "--json",
+            "--config",
+        ])
+        .arg(&config)
+        .env("PATH", &empty)
+        .output()
+        .unwrap();
     assert!(!out.status.success(), "{out:?}");
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("ROOTLESS_UNAVAILABLE"), "{text}");
     assert!(text.contains("kronik serve --init --root"), "{text}");
     assert!(!data.exists());
     if nonroot_host() {
-        let out = kronik(&args);
+        let out = kronik(&[
+            "serve",
+            "--init",
+            "--rootless",
+            "--dry-run",
+            "--json",
+            "--config",
+            config.to_str().unwrap(),
+        ]);
         assert!(out.status.success(), "{out:?}");
         let plan: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(plan["mode"], "rootless");
-        assert_eq!(plan["dry_run"], true);
         let steps = plan["steps"].to_string();
         assert!(steps.contains("kronik-userns.service"), "{steps}");
         assert!(!data.exists());
@@ -306,6 +343,47 @@ fn root_init_json_plan_does_not_create_a_minimal_keys_directory() {
     assert!(value["steps"].as_array().unwrap().len() >= 3);
     assert!(!data.exists());
     let selected = dir.path().join("selected.key");
+    // The root unit starts the daemon with the configuration alone, so a key
+    // file the configuration does not name would be used by the key step and
+    // not by the daemon: refused, with the way out.
+    let out = kronik(&[
+        "serve",
+        "--init",
+        "--root",
+        "--dry-run",
+        "--json",
+        "--master-key-file",
+        selected.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success(), "{out:?}");
+    let refusal: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(refusal["error"]["code"], "BAD_REQUEST", "{refusal}");
+    let message = refusal["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!(
+            "--master-key-file {} would not reach the root service: its unit starts the daemon with the configuration alone, and the configuration names ",
+            selected.display()
+        )),
+        "{message}"
+    );
+    assert!(
+        refusal["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("[keys] master_key_file"),
+        "{refusal}"
+    );
+    // The file the configuration names is accepted, and the plan names it.
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\ndata_dir = {:?}\n[keys]\nmaster_key_file = {:?}\n",
+            data, selected
+        ),
+    )
+    .unwrap();
     let out = kronik(&[
         "serve",
         "--init",

@@ -49,8 +49,8 @@ long-lived connections (M24), blobs (M25–M26), and the UI, OpenTelemetry,
 fleet and hardening tracks (M27–M34). The microVM level (M20) and the nonroot
 daemon (M21) are in the tree as proposals that have not been run on the hosts
 they need: `isolation = "microvm"` has never booted a VM on a KVM host, and
-`kronik serve --init` has never installed the nonroot service on a systemd
-host. Their decisions are ADRs 0060–0065, 0095 and 0096, which await the
+`kronik serve --init --rootless` has never installed the nonroot service on a
+systemd host (a plain `--init` installs the root service as before). Their decisions are ADRs 0060–0065, 0095 and 0096, which await the
 maintainers.
 See the [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
 for the state of each milestone, the open questions and the known gaps, and the

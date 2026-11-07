@@ -328,9 +328,10 @@ Prefer a preview domain wherever previews take traffic from browsers.
 
 ## Root
 
-The default `kronik serve --init` (M21) uses root only for setup and installs
-the nonroot `kronik` service. It is a proposal that has not been run on a host
-with systemd: the design is in
+`kronik serve --init` installs the root service of v0.1 to v0.4. Its opt-in
+alternative, `kronik serve --init --rootless` (M21), uses root only for setup
+and installs the nonroot `kronik` service. That service is a proposal that has
+not been run on a host with systemd: the design is in
 [ADR 0060](../adr/0060-non-root-daemon-user-namespace.md),
 [ADR 0061](../adr/0061-runsc-in-the-kronik-user-namespace.md),
 [ADR 0062](../adr/0062-non-root-systemd-units.md) and
@@ -359,8 +360,9 @@ from the brief's wording awaits the maintainers' ratification. A missing pin
 or delegation gives typed foreign unavailability (`FOREIGN_UNAVAILABLE` with
 the reason), never an automatic trusted runtime or a root fallback.
 
-`serve --init --root` selects the separate root service, which keeps the
-hardening decisions of [ADR 0027](../adr/0027-systemd-unit-hardening.md). Both
+`serve --init` (or `serve --init --root`) installs the separate root service,
+which keeps the hardening decisions of
+[ADR 0027](../adr/0027-systemd-unit-hardening.md). Both
 modes keep strict host file system protection, no-new-privileges and private
 runtime storage. `RestrictSUIDSGID` stays out because M14's `runsc restore`
 needs `openat2`.
@@ -381,7 +383,7 @@ root can read it, not every member of the API group.
 
 The nonroot service is `kronik serve --rootless` (M21,
 [ADR 0060](../adr/0060-non-root-daemon-user-namespace.md)); the unit that
-`serve --init` writes passes the flag. The daemon needs write access to the
+`serve --init --rootless` writes passes the flag. The daemon needs write access to the
 data directory and to the socket's directory (by default `/var/lib/kronik` and
 `/run/kronik`). While it still has one thread it takes the data directory's
 lock, binds its listeners and starts a small acceptor process that stays in

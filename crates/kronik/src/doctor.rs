@@ -562,7 +562,7 @@ fn rootless() -> Vec<Check> {
         ),
         Err(why) => check("subid", Status::Warn, why.clone())
             .code(code)
-            .hint("sudo kronik serve --init creates the kronik user and its ranges"),
+            .hint("sudo kronik serve --init --rootless creates the kronik user and its ranges"),
     });
     if !root && let Err(e) = sys::clear_capabilities() {
         checks.push(check(
@@ -835,7 +835,7 @@ fn caps(runsc: &Path, rootless: bool) -> Check {
         )
         .hint(
             "check the pinned namespace and delegated unit with `kronik doctor --rootless`; \
-             use `kronik serve --init --root` only for an explicit root fallback",
+             `kronik serve --init --root` installs the root service instead",
         ),
         None => check("caps", Status::Warn, format!("could not read {path}")),
     }

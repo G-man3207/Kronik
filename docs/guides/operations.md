@@ -23,13 +23,54 @@ kronik serve --init --domain api.example.com --acme-email ops@example.com
 kronik doctor
 ```
 
-`kronik serve --init` uses root for the setup and installs the nonroot
-service (M21; the design is proposed, see
+`kronik serve --init` installs the root service, the one of v0.1 to v0.4, and
+sets up a host in six steps:
+
+1. It writes `/etc/kronik/kronik.toml` (mode 0644). With `--domain` (which
+   can be repeated) the gateway listens on `0.0.0.0:443` with a certificate
+   from Let's Encrypt. Without it, the gateway listens on `0.0.0.0:80`
+   without TLS.
+2. It creates the data directory `/var/lib/kronik` (mode 0700).
+3. It creates or loads the master key through `[keys] source`. The default
+   is `/etc/kronik/master.key` (mode 0600); a KMS source stores only a
+   wrapped key. See [the master key](#the-master-key). The daemon runs as
+   root and reads the key file named by `[keys] master_key_file` itself; the
+   unit carries no key path or credential. For that reason `--master-key-file`
+   is accepted only for the file the configuration already names: another one
+   would be created or read by the key step while the daemon used the
+   configured file, two different keys, so it is refused with
+   `--master-key-file <file> would not reach the root service: its unit starts
+   the daemon with the configuration alone, and the configuration names
+   <configured file>`. Set `[keys] master_key_file` in `/etc/kronik/kronik.toml`
+   and run `--init` again, or use `--rootless`, whose unit hands the file to
+   the daemon as a credential.
+4. It creates the system group `kronik`.
+5. It installs `/etc/systemd/system/kronik.service`, whose `ExecStart`
+   points at the binary you ran and which is otherwise the unit of v0.4.0,
+   byte for byte: running `--init` again on a host that v0.4.0 set up changes
+   nothing.
+6. It runs `systemctl daemon-reload` and `systemctl enable --now
+   kronik.service`, waits for the service to answer, and runs `kronik doctor`
+   against it (see [what the install proves](#what-the-install-proves)).
+
+Every step checks before it acts, so running `--init` again changes nothing
+that is already in place, and it never overwrites an existing config file
+or key. Edit `/etc/kronik/kronik.toml` afterwards and run `systemctl restart
+kronik`. `--root` names this service explicitly. `--dry-run` shows the plan,
+as text or with `--json` (`{dry_run, mode, steps}`), and changes nothing.
+
+### The nonroot service
+
+`kronik serve --init --rootless` uses root for the setup and installs the
+nonroot service instead (M21; the design is proposed, see
 [ADR 0060](../adr/0060-non-root-daemon-user-namespace.md) and
-[ADR 0062](../adr/0062-non-root-systemd-units.md)). It needs systemd 255 or
-newer, cgroup v2 and user namespaces, and it has not been run on Ubuntu 24.04
-or checked against its AppArmor restriction on unprivileged user namespaces.
-Its steps:
+[ADR 0062](../adr/0062-non-root-systemd-units.md)). It is opt-in until the
+maintainers have ruled on it: it has not been run on a systemd host. It needs
+systemd 255 or newer, cgroup v2 and user namespaces, and it has not been run on
+Ubuntu 24.04 or checked against its AppArmor restriction on unprivileged user
+namespaces. Missing prerequisites never select the root service: the command
+stops and names `--init --root`. Its steps check before they act, like the
+root service's:
 
 1. It writes `/etc/kronik/kronik.toml` (mode 0644). With `--domain` (which
    can be repeated) the gateway listens on `0.0.0.0:443` with a certificate
@@ -40,14 +81,32 @@ Its steps:
    tools, which lock those files. The user is never root and never maps
    host root.
 3. It creates the data directory `/var/lib/kronik` (mode 0700, owned by
-   `kronik`).
+   `kronik`). Root changes the owner of what is in it, so no component of
+   its path may be a symbolic link and every directory above it must be owned
+   by root and closed to others: use a bind mount, not a link (a
+   `/var/lib/kronik -> /data/kronik` layout is refused), or set
+   `server.data_dir` to the real path. The directory is root's and private
+   while the next step writes into it, and is handed over to `kronik` only
+   after that step has succeeded; if the step fails (a KMS that cannot be
+   reached, say), the command stops with that error and the directory stays
+   root's, so that running the command again continues from there. Once it
+   belongs to `kronik`, running the command again reads nothing in it but the
+   KMS envelope and changes nothing in it.
 4. It creates or loads the master key through `[keys] source`. The default
    is `/etc/kronik/master.key` (mode 0600); a KMS source stores only a
    wrapped key. See [the master key](#the-master-key). A file key stays
    root-only on disk: the unit hands it to the daemon as a systemd
    credential (`LoadCredential=`) and starts the daemon with
-   `--master-key-file` pointing at that credential. An environment or KMS
-   source gets neither.
+   `--master-key-file` pointing at that credential. The file must be outside
+   the data directory, which `kronik` owns: the service manager reads it as
+   root, and `--init --rootless` refuses a key file under the data directory.
+   It refuses one under any other place that others can change as well: every
+   directory on the way to the key must belong to root with no write access for
+   the group or others, and none may be a symbolic link. A sticky directory such
+   as `/tmp` may be on the way, but not the directory that holds the key or in
+   which the installer creates the missing ones, so a key under `/tmp`,
+   `/var/tmp` or `/dev/shm` is refused. An environment or KMS source gets
+   neither.
 5. It installs `/etc/systemd/system/kronik.service`, whose `ExecStart`
    points at the binary you ran, and `kronik-userns.service`, a one-shot
    unit that runs `kronik userns pin` before the daemon starts. With
@@ -58,19 +117,11 @@ Its steps:
    kronik.service`, then checks the running service: its host uid and gid,
    that it keeps no capability in the host namespace, that it is in the
    owned pinned namespace with the expected maps, and `kronik doctor
-   --rootless`.
+   --rootless` (see [what the install proves](#what-the-install-proves)).
 
-Every step checks before it acts, so running `--init` again changes nothing
-that is already in place, and it never overwrites an existing config file
-or key. Edit `/etc/kronik/kronik.toml` afterwards and run `systemctl restart
-kronik`.
-
-`kronik serve --init --root` installs the root service of v0.1 to v0.4
-instead (its unit, now with the key credential and a delegated cgroup):
-there is no user, subordinate range, pin or KVM drop-in. Missing prerequisites
-of the nonroot service never select it; you choose it. `--rootless` names the
-default explicitly. `--dry-run` shows the plan, as text or with `--json`
-(`{dry_run, mode, steps}`), and changes nothing.
+The same rules apply: running it again changes nothing that is already in
+place, it never overwrites an existing config file or key, and `--dry-run`
+shows the plan.
 
 Clients (`kronik deploy`, `kronik actors`, `kronik mcp` and the rest) talk to
 the daemon over `/run/kronik/api.sock`. The socket's mode is 0660 for group
@@ -80,14 +131,34 @@ the daemon over `/run/kronik/api.sock`. The socket's mode is 0660 for group
 usermod -aG kronik alice        # takes effect at alice's next login
 ```
 
+### What the install proves
+
+`serve --init` ends by running `kronik doctor` (with `--rootless` for the
+nonroot service) against the running service. A check that fails fails the
+install. A warning does not: the service runs and answers, but something is not
+proven, such as the sandbox smoke under the service's identity or a delegated
+cgroup. `serve --init` prints those warnings at the end, with their hints
+(`warnings`, a list of `{check, message, hint}`, with `--json`). Nothing in the
+install proves that sandboxes work. The first foreign actor you add, in gVisor
+or in a microVM, is the real proof: add one that you can afford to remove, and
+read `kronik foreign list` and its logs.
+
 ### Moving between the two installations
 
 `--init` does not convert an installation in place, and it checks before it
-changes anything, in `--dry-run` as well (ADR 0063). A data directory that is
-empty (a first run that stopped early) is adopted. One owned by root is a root
-installation: `--init --root` reruns it, and plain `--init` is refused with
-`ROOTLESS_UNAVAILABLE`. One owned by the `kronik` user is a nonroot
-installation, with the same rule the other way round. Any other owner is
+changes anything, in `--dry-run` as well (ADR 0063). A data directory that does
+not exist, or that is root's and empty or holds only `keys` (a first run of
+`--rootless` that stopped early), is adopted by the nonroot service. One owned
+by root is a root installation: `--init` (or `--init --root`) reruns it, and
+`--init --rootless` is refused with `ROOTLESS_UNAVAILABLE`. One owned by the
+`kronik` user is a nonroot installation, even when it is empty, with the same
+rule the other way round: `--init --rootless` reruns it, and a plain `--init`
+or `--init --root` is refused. Beyond that the root service asks nothing, as in
+v0.4.0: a directory behind a symbolic link (a mounted volume) is followed, and
+a directory that another user owns is rerun, so that an installation can always
+be repaired. The nonroot service accepts only a directory that root owns (a
+first run) or the `kronik` user owns, reached without a symbolic link in its
+path, because root changes the owner of what is in it; any other owner is
 refused.
 
 To move an installation:
@@ -95,11 +166,18 @@ To move an installation:
 1. Ship the data, so that a snapshot, the log and the code are in the target
    (`[ship] url`: `s3://bucket/prefix`, or `file:///dir` on this machine).
 2. Stop and disable the old unit and keep the old data directory aside.
-3. Run `kronik serve --init` (or with `--root`) against an empty data
-   directory. For a nonroot installation that creates it owned by `kronik`.
+3. Run `kronik serve --init` (or `--init --rootless` for the nonroot
+   service) against an empty data directory. For a nonroot installation that
+   creates it owned by `kronik`.
 4. Run `kronik restore --from <URL>` into it. Run as root against a nonroot
    data directory it prepares as root, drops to the directory's owner and
-   installs as that owner, so nothing in it is owned by root.
+   installs as that owner, so nothing in it is owned by root. The commands
+   that run as root over another user's data directory (`keys wrap`, the root
+   phase of `restore`) open the path to it from `/` without following a
+   symbolic link and only through directories that root alone can change, and
+   refuse any other path, naming the directory (a data directory under an
+   operator's home is such a path: restore into one as that operator, or
+   put the directory under a path that root controls).
 5. Start the service.
 
 What is not shipped is not restored. Foreign actors' declarations are in the
@@ -108,6 +186,31 @@ checkpoints are local: copy a data directory over yourself (its numeric owners
 differ between the two kinds, and a nonroot installation's foreign files use
 the subordinate range) or accept that the actor starts empty. Keep the master
 key, or its KMS key, through the move.
+
+### Undoing a nonroot installation on a throwaway machine
+
+There is no uninstall command, and `--init` is not a journal: a run that stops
+half way leaves what it made, and the next run continues from there. On a
+machine you care about, `kronik serve --init --rootless --dry-run` is the only
+safe preview. On a throwaway machine, undo `--init --rootless` by hand, in this
+order (it follows what the installer creates, and has not been run on a systemd
+host):
+
+1. `systemctl disable --now kronik.service kronik-userns.service`
+2. `kronik userns unpin`, while the `kronik` user still exists: it removes the
+   pinned namespace, and only one that its creation record still describes.
+3. Remove the unit files and the drop-in directory the installer wrote:
+   `rm -f /etc/systemd/system/kronik.service /etc/systemd/system/kronik-userns.service`
+   and `rm -rf /etc/systemd/system/kronik.service.d` (the `/dev/kvm` drop-in is
+   in it), then `systemctl daemon-reload`.
+4. Remove the user's subordinate ranges before the user: `grep '^kronik:'
+   /etc/subuid /etc/subgid` shows them as `kronik:<first>:65536`, and
+   `usermod --del-subuids <first>-<last> --del-subgids <first>-<last> kronik`
+   removes them (`<last>` is `<first>` plus 65535). Then `userdel kronik`, and
+   `groupdel kronik` if the group is still there.
+5. Remove `/etc/kronik` (the configuration and the master key: ship the data
+   first if you may want it back), the data directory (`/var/lib/kronik` unless
+   `server.data_dir` says otherwise) and `/run/kronik`.
 
 ## kronik.toml
 
@@ -442,13 +545,21 @@ raise `--concurrency` only with the worst case above in mind.
 
 ## systemd
 
-`kronik serve --init` installs this unit (`deploy/systemd/kronik.service` in
-the source), with `kronik-userns.service` before it; `--root` installs
-`deploy/systemd/kronik-root.service` as `kronik.service` instead:
+`kronik serve --init` installs `deploy/systemd/kronik-root.service` in the
+source as `kronik.service`: the unit of v0.1 to v0.4, unchanged, with no
+delegated cgroup and no key credential, and `--config
+/etc/kronik/kronik.toml` written in as in v0.4.0. A microVM needs a delegated
+cgroup, which a drop-in adds (see [MicroVM actors on the root
+service](#microvm-actors-on-the-root-service)). `kronik serve --init
+--rootless` installs the nonroot
+unit (`deploy/systemd/kronik.service` in the source) instead, with
+`kronik-userns.service` before it. The list below describes the nonroot unit
+and says where the root unit differs:
 
 - `ExecStart=<binary> serve --rootless --config /etc/kronik/kronik.toml` (and,
   for a file key, `--master-key-file` pointing at the unit's credential; the
-  root unit has no `--rootless`), `Restart=on-failure` after 2 s, `LimitNOFILE=65536`, and `LimitCORE=0`:
+  root unit has neither `--rootless` nor a key argument), `Restart=on-failure`
+  after 2 s, `LimitNOFILE=65536`, and `LimitCORE=0`:
   no core dumps, since the process holds the master key, secrets and
   unsealed subject data. `kronik serve` also marks itself non-dumpable
   (`PR_SET_DUMPABLE` 0), which keeps it from dumping core and from being
@@ -463,8 +574,8 @@ the source), with `kronik-userns.service` before it; `--root` installs
   a cgroup subtree for the sandboxes, and `ProtectControlGroups=private`
   (systemd 257 or newer) a private view of it. Repair the namespace or the
   delegation rather than adding host capabilities or removing `User=` (ADR
-  0060 and 0061). The root installation (`serve --init --root`) keeps the
-  unit of v0.1, with no `User=`, for the reason in
+  0060 and 0061). The root installation (`serve --init`, or `--init --root`)
+  keeps the unit of v0.1, with no `User=`, for the reason in
   [ADR 0027](../adr/0027-systemd-unit-hardening.md). The nonroot daemon
   refuses to start, with `ROOTLESS_UNAVAILABLE`, where it cannot report its
   API callers' real uids: in a rootless container or a nested user namespace
@@ -479,8 +590,8 @@ the source), with `kronik-userns.service` before it; `--root` installs
   `config.json` (secret values) are removed even when the daemon was
   killed.
   The data directory (`/var/lib/kronik`, or `server.data_dir`, which
-  `serve --init` writes into `ReadWritePaths=`) is created by `serve --init`
-  with mode 0700, owned by `kronik`; the nonroot unit has no
+  `serve --init --rootless` writes into `ReadWritePaths=`) is created by
+  `serve --init --rootless` with mode 0700, owned by `kronik`; the nonroot unit has no
   `StateDirectory=`, because systemd would change the owner of the whole tree
   to `User=` and hand foreign actors' data, owned by the subordinate range,
   to `kronik`. The root unit keeps `StateDirectory=kronik`.
@@ -667,12 +778,13 @@ rather than fail, unless `kronik.toml` asks for what is missing
 | `runsc` | `runsc` is missing, not executable, lacks gVisor's `gvisor-bin`/`gvisor_sentry` next to it, or is older than the tested `release-20261019.0` (`RUNSC_MISSING`, warning) | Install or upgrade gVisor with `install.sh`; only foreign actors need it |
 | `kvm` | `/dev/kvm` is missing or can't be opened read-write (`KVM_UNAVAILABLE`): a warning, or a failure with `platform = "kvm"` | Most hosts are fine with systrap: set `platform = "auto"`. For `kvm` when it exists but is denied, give the daemon's user access (the `kvm` group) |
 | `cgroup` | cgroup v2 or its `cpu`, `memory` or `pids` controllers are missing (warning) | Foreign actors' resource limits need them |
+| `microvm` | Where a microVM tool bundle is installed and the root service runs: the daemon is not in a delegated cgroup leaf, so microVM actors cannot start (`FOREIGN_UNAVAILABLE`, warning). Passes when it is. Not shown without a tool bundle or with the nonroot service (`delegate` covers that) | Add the drop-in of [MicroVM actors on the root service](#microvm-actors-on-the-root-service); it needs systemd 254 or newer |
 | `userns` | User namespaces are off: `user.max_user_namespaces` is 0 or `kernel.unprivileged_userns_clone` is 0 (`ROOTLESS_UNAVAILABLE`, warning; `--rootless` only). Nothing else, such as a distribution's own restriction on unprivileged user namespaces, is checked | Allow them, or keep the root daemon with `sudo kronik serve --init --root` |
 | `uid_view` | The nonroot service would refuse to start here (`ROOTLESS_UNAVAILABLE`, failure; `--rootless` only): this process is in a user namespace whose uid map is not the host's identity map (a rootless container, a nested user namespace), or its real, effective and saved user ids differ. The kernel would translate every API caller's uid, so audit records and token attribution would name the wrong users. As root, the check is skipped: `sudo kronik doctor --rootless` becomes the `kronik` user and then runs it | The nonroot unit is not supported there: use the root service, `sudo kronik serve --init --root` |
-| `subid` | The `kronik` user (as root) or the current user has no safe subordinate id range in `/etc/subuid` and `/etc/subgid` (`ROOTLESS_UNAVAILABLE`, warning; `--rootless` only) | `sudo kronik serve --init` creates the user and its ranges |
+| `subid` | The `kronik` user (as root) or the current user has no safe subordinate id range in `/etc/subuid` and `/etc/subgid` (`ROOTLESS_UNAVAILABLE`, warning; `--rootless` only) | `sudo kronik serve --init --rootless` creates the user and its ranges |
 | `pin` | Nothing is pinned at `/run/kronik-userns/user`, or its maps are unreadable (warning); it has another owner or other maps than the user's ranges give, or this user cannot enter it (failure; `--rootless` only) | Start `kronik-userns.service`; for a mismatch, stop the consumers, unpin the owned namespace and pin the expected identity (`kronik userns`) |
 | `delegate` | The cgroup this user runs in is not delegated to it (warning); skipped as root (`--rootless` only) | The daemon gets one in `kronik.service` (`Delegate=yes`); outside it foreign actors are unavailable |
-| `service_identity` | With `--rootless` as root: the `kronik` user cannot be proven (warning) or not become (failure) | Run `sudo kronik serve --init`, then doctor again |
+| `service_identity` | With `--rootless` as root: the `kronik` user cannot be proven (warning) or not become (failure) | Run `sudo kronik serve --init --rootless`, then doctor again |
 | `root` | Not running as root (warning). With `--rootless` it names the identity the checks ran as instead: namespace-root authority, or an ordinary host user | The root daemon runs as root under systemd, so run doctor with `sudo` for the root-only checks. The nonroot service has no root of its own: use `doctor --rootless` for its boundary |
 | `runc` | `runc` is missing (`RUNC_MISSING`, warning) | Only foreign actors with `--isolation trusted` need it: `apt install runc` |
 | `netns` | A network namespace can't be created (`FOREIGN_UNAVAILABLE`, warning), or a new one has more than `lo` (failure); skipped without namespace-root authority, and not proven when the service identity is unavailable | Check the kernel and any container runtime around the host; only foreign actors need it |
@@ -1682,12 +1794,12 @@ microVM), and they record their calls like other effects
 ([M7 design](../design/m7-foreign.md), [ADR 0003](../adr/0003-gvisor-bridge.md),
 [ADR 0095](../adr/0095-pinned-firecracker-guest.md)). They need:
 
-- in the default installation (M21), the `kronik` service identity, the
-  pinned user namespace and a delegated cgroup, so that sandboxes run as
-  root inside the namespace and not on the host (systemd 255 or newer); in a
-  root installation, root. When the namespace or the delegation is missing
-  the daemon still serves Wasm actors and foreign actors report
-  `FOREIGN_UNAVAILABLE` with the reason;
+- in the nonroot installation (M21, `serve --init --rootless`), the `kronik`
+  service identity, the pinned user namespace and a delegated cgroup, so that
+  sandboxes run as root inside the namespace and not on the host (systemd 255
+  or newer); in the root installation, which is the default, root. When the
+  namespace or the delegation is missing the daemon still serves Wasm actors
+  and foreign actors report `FOREIGN_UNAVAILABLE` with the reason;
 - `runsc` at `[foreign] runsc_path`, from `install.sh` or gVisor's
   instructions; `kronik doctor`'s `runsc`, `kvm`, `cgroup`, `netns`,
   `run_dir` and `sandbox` checks tell whether the host can run them;
@@ -1699,6 +1811,38 @@ microVM), and they record their calls like other effects
   the daemon never downloads or builds it). Without KVM the add is refused
   with `KVM_UNAVAILABLE`, which suggests `gvisor`. The microVM level has not
   been run on a host with KVM.
+
+### MicroVM actors on the root service
+
+A microVM's cgroup, with its CPU, memory and process limits, goes next to the
+daemon's, so the daemon has to run in a delegated cgroup leaf. The nonroot
+service has one by design. The root service is the unit of v0.1 to v0.4,
+unchanged, and has none: delegating a cgroup would change where an existing
+installation's gVisor sandboxes get theirs. A host that runs microVM actors
+adds the delegation itself, with a drop-in; it needs systemd 254 or newer,
+because older versions ignore `DelegateSubgroup=` with a warning and leave the
+daemon in the unit's own cgroup:
+
+```ini
+# /etc/systemd/system/kronik.service.d/microvm.conf
+[Service]
+Delegate=yes
+DelegateSubgroup=daemon
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart kronik.service
+```
+
+Without it `kronik foreign add --isolation microvm` is refused with
+`FOREIGN_UNAVAILABLE` and the advice above, and `kronik doctor` warns that
+microVM actors need the leaf (the `microvm` check, shown only where a tool
+bundle is installed and the root service runs). With it, gVisor sandboxes
+also get their cgroups under the unit's cgroup, as they do in the nonroot
+service, and not under `/kronik/<hash>` as in v0.4.0, so stopping the service
+stops them too; their limits are enforced either way. Add it only if you use
+microVMs.
 
 They are managed with `kronik foreign add`, `list`, `logs` and `remove`
 (see the [CLI reference](../reference/cli.md)). Declaring and removing them

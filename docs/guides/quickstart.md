@@ -39,12 +39,14 @@ concern only foreign actors: the Wasm actors on this page run without them.
 
 ## 2. Start
 
-`kronik serve --init` writes `/etc`, creates the `kronik` system user and its
-systemd units (the daemon runs as that user, not as root; `--root` installs the
-root service of earlier versions instead), and, with `--domain`, asks Let's
-Encrypt for a certificate on port 443. Do not run it on a host you do not own.
-It needs systemd 255 or newer, which Ubuntu 24.04 has; on a host without it the
-command stops and names `--init --root`. See the plan first, and the
+`kronik serve --init` writes `/etc`, creates the `kronik` system group and a
+systemd unit (the daemon runs as root, as in earlier versions) and, with
+`--domain`, asks Let's Encrypt for a certificate on port 443. Do not run it on a
+host you do not own. `kronik serve --init --rootless` installs the nonroot
+service of M21 instead, with its own `kronik` user and units; that service is a
+proposal that has not been run on a systemd host. It needs systemd 255 or
+newer, which Ubuntu 24.04 has but where it is untested, and on a host without
+it the command stops and names `--init --root`. See the plan first, and the
 [operations guide](operations.md) for the real setup:
 
 ```sh

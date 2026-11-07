@@ -11,6 +11,6 @@ Run the diagnosis under the actual service identity and its owned unit:
 
 Repair the root-controlled stable-user/subordinate-ID setup and the unit's `Delegate=yes` configuration. A matching pin is kept. A mismatched pin is never replaced automatically: stop its consumers and use explicit, ownership-checked unpin/setup before changing identity. Never remove a replacement or preexisting pin belonging to another runner.
 
-`kronik serve --init` never converts an existing installation in place. Keep a root installation with `kronik serve --init --root`. To move it to the nonroot service, ship the data (or take a snapshot), run `kronik serve --init` against an empty data directory and `kronik restore` into it; the other direction works the same way. Foreign actors' data directories and checkpoints are local and are not part of a restore.
+`kronik serve --init` never converts an existing installation in place. Keep a root installation with `kronik serve --init --root` and a nonroot one with `kronik serve --init --rootless`. To move to the other kind, ship the data (or take a snapshot), run `kronik serve --init` with the other kind's flag against an empty data directory and `kronik restore` into it. Foreign actors' data directories and checkpoints are local and are not part of a restore.
 
 See also: `FOREIGN_UNAVAILABLE`, `isolation-level`.

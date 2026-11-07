@@ -1,7 +1,8 @@
-//! Idempotent systemd setup with a stable nonroot service identity by default.
-//! `--root` selects the root service instead. Both support a read-only dry-run
-//! plan and JSON output. An installation of the other kind is refused, never
-//! converted in place: the numeric owner of the data decides (ADR 0062).
+//! Idempotent systemd setup. The root service of v0.1 to v0.4 is the default
+//! (`DEFAULT_MODE`) and `--rootless` selects the stable nonroot service. Both
+//! support a read-only dry-run plan and JSON output. An installation of the
+//! other kind is refused, never converted in place: the numeric owner of the
+//! data decides (ADR 0063).
 #[path = "init/setup.rs"]
 mod setup;
 use setup::*;
@@ -24,16 +25,18 @@ const USERNS_UNIT: &str = include_str!("../../../deploy/systemd/kronik-userns.se
 const ROOT_UNIT: &str = include_str!("../../../deploy/systemd/kronik-root.service");
 
 /// The one place that decides which service `--init` installs when neither
-/// `--root` nor `--rootless` says. Set it to `Mode::Root` to keep the root
-/// service the default, with the nonroot one as the explicit `--rootless`
-/// choice, until the nonroot service has been run on the platforms that
-/// matter; nothing else in the code changes (the documentation does).
-const DEFAULT_MODE: Mode = Mode::Rootless;
+/// `--root` nor `--rootless` says. It is `Mode::Root`, the service of v0.1 to
+/// v0.4, until the nonroot service has been run on the platforms that matter
+/// (Ubuntu 24.04 with systemd 255). Set it to `Mode::Rootless` to make the
+/// nonroot service the default and the root one the explicit `--root` choice;
+/// nothing else in the code changes (the documentation does).
+const DEFAULT_MODE: Mode = Mode::Root;
 
 #[derive(Debug, Clone, Args)]
 pub struct InitArgs {
-    /// Install and start the stable nonroot systemd service. Run as root;
-    /// safe to run again.
+    /// Install and start the systemd service: the root service by default,
+    /// the stable nonroot one with `--rootless`. Run as root; safe to run
+    /// again.
     #[arg(long)]
     pub init: bool,
     /// With --init: the name to get a TLS certificate for with ACME
@@ -43,8 +46,9 @@ pub struct InitArgs {
     /// With --init and --domain: where the CA sends expiry notices.
     #[arg(long, requires = "domain", value_name = "EMAIL")]
     pub acme_email: Option<String>,
-    /// With --init: install the root service (the v0.1 unit) instead of the
-    /// nonroot one. Also how an existing root installation is rerun.
+    /// With --init: install the root service (the v0.1 unit). This is the
+    /// default; the flag names it explicitly. Also how an existing root
+    /// installation is rerun.
     #[arg(long, requires = "init", conflicts_with = "rootless")]
     pub root: bool,
     /// `serve --rootless`, which with --init asks for the nonroot service
@@ -365,6 +369,19 @@ pub(crate) struct InitOutput {
     dry_run: bool,
     mode: Mode,
     steps: Vec<StepOutput>,
+    /// What `kronik doctor` warned about once the service was running
+    /// (absent: nothing, or a dry run). A warning is not a failure: the install
+    /// succeeded, but nothing here proves that sandboxes work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<DoctorWarning>,
+}
+/// A warning of `kronik doctor`, as `serve --init` saw it.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct DoctorWarning {
+    /// The check: `delegate`, `sandbox`, `caps`, ...
+    check: String,
+    message: String,
+    hint: Option<String>,
 }
 #[derive(serde::Serialize, schemars::JsonSchema)]
 struct StepOutput {
@@ -666,6 +683,9 @@ fn plan(
         });
         config
     };
+    // What the configuration says, before a flag overrides it: the root unit
+    // starts the daemon with the configuration alone.
+    let configured_key = config.keys.key_path(&config.server.data_dir);
     let mut config = config.with(crate::config::Overrides {
         master_key_file: host.selected_key.clone(),
         ..Default::default()
@@ -674,6 +694,23 @@ fn plan(
         .keys
         .check_environment()
         .map_err(|error| error.api_error())?;
+    if args.mode() == Mode::Root
+        && let Some(selected) = &host.selected_key
+        && *selected != configured_key
+    {
+        // The unit of v0.4.0 passes the daemon no key file, so the key step
+        // would create or load one key and the daemon use another.
+        return Err(ApiError::new(
+            ErrorCode::BadRequest,
+            format!(
+                "--master-key-file {} would not reach the root service: its unit starts the daemon with the configuration alone, and the configuration names {}",
+                selected.display(),
+                configured_key.display()
+            ),
+        )
+        .with_hint("Set `[keys] master_key_file` in the configuration to that file and run `serve --init --root` again, or use `--rootless`, whose unit hands the file to the daemon as a credential.")
+        .into());
+    }
     if config.keys.source == kronik_privacy::key_source::Source::File
         && std::env::var_os(kronik_privacy::MASTER_KEY_ENV).is_some()
     {
@@ -697,6 +734,7 @@ fn plan(
     let rootless = args.mode() == Mode::Rootless;
     if rootless && config.keys.source == kronik_privacy::key_source::Source::File {
         reject_key_in_data_directory(&config)?;
+        reject_key_in_writable_place(&config)?;
     }
     let systemd = if rootless { rootless_checks()? } else { 0 };
     steps.push(Step::Group);
@@ -816,6 +854,7 @@ pub fn run(
                     println!(
                         "Kronik runs as kronik.service. Next:\n  kronik doctor\n  journalctl -u kronik -f"
                     );
+                    print_warnings(&out.warnings);
                     if !args.domain.is_empty() {
                         println!(
                             "  point {} at this host: the gateway gets its certificate when it starts",
@@ -831,12 +870,31 @@ pub fn run(
                 match error.downcast::<kronik_privacy::key_source::KeySourceError>() {
                     Ok(error) => error.api_error(),
                     Err(error) => ApiError::new(ErrorCode::RootlessUnavailable, format!("{error:#}"))
-                        .with_hint("Fix the cause and rerun `kronik serve --init`: every step checks before it acts. `--dry-run --json` shows the plan."),
+                        .with_hint("Fix the cause and rerun the same `kronik serve --init` command: every step checks before it acts. `--dry-run --json` shows the plan."),
                 }
             });
             crate::cli::report_error(json, &api)
         }
     }
+}
+
+/// What `serve --init` says at the end about the warnings of `kronik doctor`:
+/// the install succeeded and the service answers, but a warning means that
+/// something is not proven, and the first foreign actor is the real proof.
+fn print_warnings(warnings: &[DoctorWarning]) {
+    if warnings.is_empty() {
+        return;
+    }
+    println!("`kronik doctor` warns about:");
+    for warning in warnings {
+        println!("  {:<8} {}", warning.check, warning.message);
+        if let Some(hint) = &warning.hint {
+            println!("  {:<8} hint: {hint}", "");
+        }
+    }
+    println!(
+        "A warning is not a failure, and the install succeeded; but nothing here proves that\nsandboxes work. The first foreign actor you add, in gVisor or in a microVM, is the real proof."
+    );
 }
 
 /// The refusal that names both ways forward: keep the root installation, or
@@ -853,10 +911,15 @@ const NONROOT_INSTALLATION: &str =
 /// volume say, is followed (`create_dir_all` and the permission change did),
 /// and whoever owns a directory that holds a root installation is not asked
 /// about. The one refusal is the series' own: a directory that belongs to the
-/// nonroot service's user is another installation and is not converted in
-/// place (ADR 0063). The nonroot service never follows a link into the tree it
+/// nonroot service's user is another installation, empty or not, and is not
+/// converted in place (ADR 0063): the root service would write into it as
+/// root, by path, in a tree that user controls. The nonroot service never follows a link into the tree it
 /// hands over, and wants the directory to be root's or the service user's.
-fn check_existing_data_directory(data: &Path, mode: Mode) -> anyhow::Result<()> {
+fn check_existing_data_directory(
+    data: &Path,
+    mode: Mode,
+    service: &dyn Fn() -> anyhow::Result<Option<u32>>,
+) -> anyhow::Result<()> {
     let found = match mode {
         Mode::Root => std::fs::metadata(data),
         Mode::Rootless => std::fs::symlink_metadata(data),
@@ -879,7 +942,7 @@ fn check_existing_data_directory(data: &Path, mode: Mode) -> anyhow::Result<()> 
         mode,
         owner,
         data_directory_is_unused(data, mode)?,
-        user_ids()?.map(|ids| ids.0),
+        service()?,
     )
 }
 
@@ -891,6 +954,12 @@ fn admit_data_directory(
     empty: bool,
     service: Option<u32>,
 ) -> anyhow::Result<()> {
+    // A directory that belongs to the nonroot service's user is its
+    // installation whether or not it holds anything yet: the root service
+    // would write into it as root, by path, in a tree that user controls.
+    if mode == Mode::Root && owner != 0 && service == Some(owner) {
+        return Err(refused_conversion(NONROOT_INSTALLATION));
+    }
     // A directory without content is not an installation: a first run that
     // stopped early leaves one, and the next run adopts it.
     if empty {
@@ -905,12 +974,17 @@ fn admit_data_directory(
         Mode::Root => None,
         Mode::Rootless => bail!("data directory belongs to an unexpected user {owner}"),
     };
-    let Some(reason) = reversal else {
-        return Ok(());
-    };
-    Err(ApiError::new(ErrorCode::RootlessUnavailable, format!("{reason}: the data's numeric owners would change under a running history"))
-        .with_hint("Keep the installation (`kronik serve --init --root` reruns a root one, `kronik serve --init` a nonroot one), or re-initialize: ship the data (or take a snapshot), run `kronik serve --init` or `--init --root` against an empty data directory, then `kronik restore` into it. See the operations guide.")
-        .into())
+    match reversal {
+        None => Ok(()),
+        Some(reason) => Err(refused_conversion(reason)),
+    }
+}
+
+/// The refusal of an installation of the other kind (ADR 0063).
+fn refused_conversion(reason: &str) -> anyhow::Error {
+    ApiError::new(ErrorCode::RootlessUnavailable, format!("{reason}: the data's numeric owners would change under a running history"))
+        .with_hint("Keep the installation (`kronik serve --init --root` reruns a root one, `kronik serve --init --rootless` a nonroot one), or re-initialize: ship the data (or take a snapshot), run `kronik serve --init --root` or `--init --rootless` against an empty data directory, then `kronik restore` into it. See the operations guide.")
+        .into()
 }
 
 /// Who is who when `--init --rootless` works on the data directory.
@@ -1107,6 +1181,62 @@ fn reject_key_in_data_directory(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The key file is not to be reached through a place that others can change
+/// either, not only through the data directory. The service manager reads it as
+/// root, before it drops to the service user, so no directory on the way to it
+/// may be one that anyone but root (or the installer) can change: a link or a
+/// swapped directory there would be read with root's authority. Every directory
+/// from `/` to the one that holds the key must belong to root with no write
+/// access for the group or others, and none may be a symbolic link. A sticky
+/// directory such as `/tmp` is acceptable on the way, where only the owner of
+/// an entry can swap it, but not as the last one: the part of the path that
+/// does not exist yet is made by this installer, as root, in the nearest
+/// directory that does, and the key goes there, so that directory must be
+/// closed to the group and others whether or not it is sticky.
+fn reject_key_in_writable_place(config: &Config) -> anyhow::Result<()> {
+    use kronik_privacy::owned_tree::Dir;
+    let key = std::path::absolute(config.keys.key_path(&config.server.data_dir))
+        .context("resolving the master key path")?;
+    let mut nearest = key.parent().unwrap_or(Path::new("/")).to_owned();
+    while std::fs::symlink_metadata(&nearest).is_err() {
+        match nearest.parent() {
+            Some(parent) => nearest = parent.to_owned(),
+            None => break,
+        }
+    }
+    let installer = rustix::process::geteuid().as_raw();
+    let refused = |why: String| {
+        anyhow::Error::from(
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "the master key file {} is reached through a place that is not root's alone: {why}",
+                    key.display()
+                ),
+            )
+            .with_hint("systemd reads the key file as root before it drops to the service user, so every directory on the way to it must belong to root with no write access for anyone else, and none may be a symbolic link. Keep the key under a directory such as /etc/kronik, or install the root service with `--root`."),
+        )
+    };
+    let directory =
+        Dir::open_controlled(&nearest, installer, None).map_err(|e| refused(e.to_string()))?;
+    // The walk judges the directories above the last one, and a sticky one is fine
+    // among them (the next component is checked in its own turn, and only the owner
+    // of an entry can swap it). The last is the directory in which the installer, as
+    // root, creates the missing part of the path and then the key: no one else may be
+    // able to write in it, sticky or not (in /tmp another user can make the entry first
+    // and swap it for a link after).
+    let meta = directory.stat().map_err(|e| refused(e.to_string()))?;
+    if (meta.uid != 0 && meta.uid != installer) || meta.mode & 0o022 != 0 {
+        return Err(refused(format!(
+            "{} is owned by uid {} with mode {:04o}",
+            nearest.display(),
+            meta.uid,
+            meta.mode & 0o7777
+        )));
+    }
+    Ok(())
+}
+
 /// What a step reports once it has run, as in v0.4.0: `created`, `updated`,
 /// `deleted`, `checked`, or `kept` when nothing was needed.
 fn done(needed: Option<&str>) -> &'static str {
@@ -1136,11 +1266,12 @@ pub(crate) fn execute_on(
     let (config, steps) = plan(args, config_path, host)?;
     let mode = args.mode();
     let data = &config.server.data_dir;
-    check_existing_data_directory(data, mode)?;
+    check_existing_data_directory(data, mode, &|| Ok(user_ids()?.map(|ids| ids.0)))?;
     let mut out = InitOutput {
         dry_run: args.dry_run,
         mode,
         steps: Vec::new(),
+        warnings: Vec::new(),
     };
     // The nonroot installation's data directory, as the Dir step found it.
     let mut found = None;
@@ -1210,7 +1341,7 @@ pub(crate) fn execute_on(
     } else {
         host.control(&["enable", "--now", &host.unit_name])
     }?;
-    verify(mode, host, config_path)?;
+    out.warnings = verify(mode, host, config_path)?;
     Ok(out)
 }
 
@@ -1238,12 +1369,22 @@ mod tests {
     fn an_installation_of_the_other_kind_is_refused_with_both_ways_forward() {
         use super::*;
         const SERVICE: Option<u32> = Some(998);
-        // Fresh and interrupted first runs are not installations.
+        // Fresh and interrupted first runs are not installations: an empty
+        // directory is adopted, whoever owns it, except that the root service
+        // does not take over one that belongs to the nonroot service's user.
         for mode in [Mode::Root, Mode::Rootless] {
-            for owner in [0, 998, 1234] {
+            for owner in [0, 1234] {
                 admit_data_directory(mode, owner, true, SERVICE).unwrap();
             }
         }
+        admit_data_directory(Mode::Rootless, 998, true, SERVICE).unwrap();
+        let error = admit_data_directory(Mode::Root, 998, true, SERVICE).unwrap_err();
+        let error = error.downcast::<ApiError>().unwrap();
+        assert!(
+            error.message.starts_with(NONROOT_INSTALLATION),
+            "{}",
+            error.message
+        );
         // Reruns of the same kind are kept.
         admit_data_directory(Mode::Root, 0, false, SERVICE).unwrap();
         admit_data_directory(Mode::Rootless, 998, false, SERVICE).unwrap();
@@ -1258,6 +1399,7 @@ mod tests {
             assert!(error.message.starts_with(reason), "{}", error.message);
             let hint = error.hint.as_deref().unwrap_or_default();
             assert!(hint.contains("--init --root"), "{hint}");
+            assert!(hint.contains("--init --rootless"), "{hint}");
             assert!(hint.contains("kronik restore"), "{hint}");
         }
         // For the nonroot service an owner that is neither root nor the
@@ -1298,6 +1440,151 @@ mod tests {
         );
     }
 
+    /// `git show v0.4.0:deploy/systemd/kronik.service | sha256sum`
+    const V040_UNIT_SHA256: &str =
+        "4e846315f2850cee90a68e10ebd0a3bbf96f5d8158f2bfa02074261284af8c6c";
+
+    fn host(units: &std::path::Path, selected_key: Option<std::path::PathBuf>) -> super::InitHost {
+        super::InitHost {
+            exe: std::env::current_exe().unwrap(),
+            unit_name: "kronik.service".into(),
+            pin_unit_name: "kronik-userns.service".into(),
+            unit_dir: units.to_owned(),
+            fixture_etc: None,
+            fixture_helper: None,
+            selected_key,
+        }
+    }
+
+    fn root_args() -> super::InitArgs {
+        super::InitArgs {
+            init: true,
+            domain: Vec::new(),
+            acme_email: None,
+            root: true,
+            rootless: false,
+            dry_run: true,
+        }
+    }
+
+    /// The root service's unit is the one of v0.4.0 and nothing else: no
+    /// delegated cgroup (it would move where an existing installation's
+    /// sandboxes get theirs), no key credential, no placeholder but the
+    /// binary's path.
+    #[test]
+    fn the_root_template_is_the_v040_unit_byte_for_byte() {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(super::ROOT_UNIT.as_bytes());
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, V040_UNIT_SHA256);
+        for absent in ["Delegate", "LoadCredential", "@CONFIG@", "@KEY_"] {
+            assert!(!super::ROOT_UNIT.contains(absent), "{absent}");
+        }
+        assert_eq!(super::ROOT_UNIT.matches("@KRONIK@").count(), 2);
+        assert_eq!(
+            super::ROOT_UNIT.matches('@').count(),
+            4,
+            "no placeholder but the binary's path"
+        );
+    }
+
+    #[test]
+    fn init_root_changes_nothing_on_a_host_that_v040_set_up() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir(&units).unwrap();
+        let config = dir.path().join("kronik.toml");
+        std::fs::write(
+            &config,
+            format!("[server]\ndata_dir = {:?}\n", dir.path().join("data")),
+        )
+        .unwrap();
+        let host = host(&units, None);
+        // What v0.4.0's `serve --init` wrote: its template with the binary's path.
+        let written = ROOT_UNIT.replace("@KRONIK@", &host.exe.to_string_lossy());
+        std::fs::write(host.unit(), &written).unwrap();
+        let (_, steps) = plan(&root_args(), &config, &host).unwrap();
+        let unit = steps
+            .iter()
+            .find(|step| matches!(step, Step::Install { path, .. } if *path == host.unit()))
+            .expect("the plan installs the unit");
+        assert_eq!(unit.needed().unwrap(), None, "the unit is kept as it is");
+        // And it is a comparison, not a constant: any other byte is an update.
+        std::fs::write(
+            host.unit(),
+            written.replace("Restart=on-failure", "Restart=always"),
+        )
+        .unwrap();
+        let (_, steps) = plan(&root_args(), &config, &host).unwrap();
+        let unit = steps
+            .iter()
+            .find(|step| matches!(step, Step::Install { path, .. } if *path == host.unit()))
+            .unwrap();
+        assert_eq!(unit.needed().unwrap(), Some("update"));
+        // A rootless unit is never planned for the root service.
+        assert!(
+            !steps
+                .iter()
+                .any(|step| matches!(step, Step::Install { path, .. } if *path == host.pin_unit()))
+        );
+    }
+
+    #[test]
+    fn the_operations_guide_shows_the_microvm_drop_in_verbatim() {
+        let guide = include_str!("../../../docs/guides/operations.md");
+        assert!(
+            guide.contains(kronik_foreign::microvm::ROOT_LEAF_DROPIN),
+            "the guide must show the drop-in verbatim"
+        );
+        assert!(guide.contains(kronik_foreign::microvm::ROOT_LEAF_DROPIN_PATH));
+        assert!(guide.contains("MicroVM actors on the root service"));
+    }
+
+    #[test]
+    fn a_key_file_the_root_unit_could_not_pass_on_is_refused() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir(&units).unwrap();
+        let config = dir.path().join("kronik.toml");
+        let configured = dir.path().join("etc-master.key");
+        std::fs::write(
+            &config,
+            format!(
+                "[server]\ndata_dir = {:?}\n[keys]\nmaster_key_file = {:?}\n",
+                dir.path().join("data"),
+                configured
+            ),
+        )
+        .unwrap();
+        // The file the configuration already names: fine.
+        plan(
+            &root_args(),
+            &config,
+            &host(&units, Some(configured.clone())),
+        )
+        .unwrap();
+        plan(&root_args(), &config, &host(&units, None)).unwrap();
+        // Another one: the key step and the daemon would use two keys.
+        let other = dir.path().join("other.key");
+        let error = plan(&root_args(), &config, &host(&units, Some(other)))
+            .err()
+            .unwrap();
+        let api = error.downcast::<ApiError>().unwrap();
+        assert_eq!(api.code, ErrorCode::BadRequest);
+        assert!(
+            api.message.contains("would not reach the root service"),
+            "{}",
+            api.message
+        );
+        let hint = api.hint.unwrap_or_default();
+        assert!(
+            hint.contains("[keys] master_key_file") && hint.contains("--rootless"),
+            "{hint}"
+        );
+    }
+
     #[test]
     fn steps_report_what_was_done_in_the_past_tense() {
         use super::done;
@@ -1319,7 +1606,11 @@ mod tests {
     }
 
     /// Which service `--init` installs by default is `DEFAULT_MODE` and
-    /// nothing else; the flags override it either way.
+    /// nothing else; the flags override it either way. Until the nonroot
+    /// service has been run on Ubuntu 24.04 the default is the root service
+    /// of v0.4.0: flipping the constant also means editing the sentences that
+    /// name the default (the operations, security, CLI and quickstart guides
+    /// and ADRs 0062 and 0063) and the test of the default plan in ops.rs.
     #[test]
     fn the_default_service_is_one_switch_and_the_flags_override_it() {
         use super::*;
@@ -1332,6 +1623,7 @@ mod tests {
             dry_run: true,
         };
         assert_eq!(args(false, false).mode(), DEFAULT_MODE);
+        assert_eq!(DEFAULT_MODE, Mode::Root, "see the comment above");
         assert_eq!(args(true, false).mode(), Mode::Root);
         assert_eq!(args(false, true).mode(), Mode::Rootless);
     }
@@ -1498,6 +1790,54 @@ mod data_directory_tests {
         assert!(!data_directory_is_unused(&data, Mode::Root).unwrap());
     }
 
+    /// A directory that belongs to the nonroot service's user is its
+    /// installation even when it is empty: the root service would write into
+    /// it as root, by path, in a tree that user controls. Anything else is
+    /// as in v0.4.0.
+    #[test]
+    fn the_root_service_does_not_take_over_an_empty_directory_of_the_service_user() {
+        let base = tempfile::tempdir().unwrap();
+        let data = base.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        if rustix::process::geteuid().is_root() {
+            std::os::unix::fs::chown(&data, Some(65_534), Some(65_534)).unwrap();
+        }
+        use std::os::unix::fs::MetadataExt as _;
+        let owner = std::fs::metadata(&data).unwrap().uid();
+        let service = move || Ok(Some(owner));
+        let someone_else = move || Ok(Some(owner.wrapping_add(1)));
+        let none = || Ok(None);
+        let refused = |mode, who: &dyn Fn() -> anyhow::Result<Option<u32>>| {
+            check_existing_data_directory(&data, mode, who)
+        };
+        // Empty and service-owned: refused for the root service, adopted by
+        // the nonroot one.
+        let error = refused(Mode::Root, &service).unwrap_err();
+        let api = error.downcast::<ApiError>().unwrap();
+        assert!(
+            api.message.starts_with(NONROOT_INSTALLATION),
+            "{}",
+            api.message
+        );
+        refused(Mode::Rootless, &service).unwrap();
+        // The same, with content.
+        std::fs::create_dir(data.join("branches")).unwrap();
+        assert!(refused(Mode::Root, &service).is_err());
+        // Owned by somebody else than the service (an operator, as in v0.4.0)
+        // or by no service user at all: accepted by the root service, empty or not.
+        refused(Mode::Root, &someone_else).unwrap();
+        refused(Mode::Root, &none).unwrap();
+        std::fs::remove_dir(data.join("branches")).unwrap();
+        refused(Mode::Root, &someone_else).unwrap();
+        refused(Mode::Root, &none).unwrap();
+        // And the service user is not looked up for a directory root owns.
+        let base2 = tempfile::tempdir().unwrap();
+        if rustix::process::geteuid().is_root() {
+            let lookup = || -> anyhow::Result<Option<u32>> { panic!("looked up the service user") };
+            check_existing_data_directory(base2.path(), Mode::Root, &lookup).unwrap();
+        }
+    }
+
     #[test]
     fn the_root_service_follows_a_link_to_its_data_directory_as_v040_did() {
         let base = tempfile::tempdir().unwrap();
@@ -1508,9 +1848,9 @@ mod data_directory_tests {
         let link = base.path().join("var-lib-kronik");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         // A mounted volume behind a link is a root installation like another.
-        check_existing_data_directory(&link, Mode::Root).unwrap();
+        check_existing_data_directory(&link, Mode::Root, &|| Ok(None)).unwrap();
         // The nonroot service says what to do instead.
-        let error = check_existing_data_directory(&link, Mode::Rootless).unwrap_err();
+        let error = check_existing_data_directory(&link, Mode::Rootless, &|| Ok(None)).unwrap_err();
         let text = error.to_string();
         assert!(
             text.contains("symbolic link") && text.contains("bind mount"),
@@ -1520,12 +1860,17 @@ mod data_directory_tests {
         // directory is simply to be made.
         let dangling = base.path().join("dangling");
         std::os::unix::fs::symlink(base.path().join("nowhere"), &dangling).unwrap();
-        check_existing_data_directory(&dangling, Mode::Root).unwrap();
-        check_existing_data_directory(&base.path().join("absent"), Mode::Root).unwrap();
-        check_existing_data_directory(&base.path().join("absent"), Mode::Rootless).unwrap();
+        check_existing_data_directory(&dangling, Mode::Root, &|| Ok(None)).unwrap();
+        check_existing_data_directory(&base.path().join("absent"), Mode::Root, &|| Ok(None))
+            .unwrap();
+        check_existing_data_directory(&base.path().join("absent"), Mode::Rootless, &|| Ok(None))
+            .unwrap();
         // A file is not a data directory.
         std::fs::write(base.path().join("file"), b"x").unwrap();
-        assert!(check_existing_data_directory(&base.path().join("file"), Mode::Root).is_err());
+        assert!(
+            check_existing_data_directory(&base.path().join("file"), Mode::Root, &|| Ok(None))
+                .is_err()
+        );
     }
 
     /// A repair run: `serve --init --root` over an existing root installation
@@ -1542,9 +1887,9 @@ mod data_directory_tests {
         let data = base.path().join("data");
         std::fs::create_dir_all(data.join("branches")).unwrap();
         std::os::unix::fs::chown(&data, Some(65_534), Some(65_534)).unwrap();
-        check_existing_data_directory(&data, Mode::Root).unwrap();
+        check_existing_data_directory(&data, Mode::Root, &|| Ok(None)).unwrap();
         // The nonroot service wants root's or its own user's.
-        let error = check_existing_data_directory(&data, Mode::Rootless);
+        let error = check_existing_data_directory(&data, Mode::Rootless, &|| Ok(None));
         assert!(error.is_err());
     }
 
@@ -1820,6 +2165,74 @@ mod data_directory_tests {
             reject_key_in_data_directory(&config("[server]\ndata_dir = \"/var/lib/kronik\"\n"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_master_key_under_a_directory_that_others_can_change_is_refused_for_the_nonroot_service() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tempfile::tempdir().unwrap();
+        let make = |name: &str, mode: u32| {
+            let dir = base.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            dir
+        };
+        let check = |key: &Path| {
+            reject_key_in_writable_place(&config(&format!(
+                "[server]\ndata_dir = \"/var/lib/kronik\"\n[keys]\nmaster_key_file = {key:?}\n"
+            )))
+        };
+        // The base directory is the installer's own (or root's) and closed.
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let closed = make("etc", 0o755);
+        check(&closed.join("master.key")).unwrap();
+        // The part of the path that does not exist yet is made by the installer.
+        check(&closed.join("kronik/new/master.key")).unwrap();
+        // Writable by the group or others: refused, with the directory named.
+        for (name, mode) in [("shared", 0o777), ("group", 0o775), ("other", 0o757)] {
+            let dir = make(name, mode);
+            for key in [dir.join("master.key"), dir.join("kronik/master.key")] {
+                let error = check(&key).unwrap_err();
+                let api = error.downcast::<ApiError>().unwrap();
+                assert_eq!(api.code, ErrorCode::BadRequest);
+                assert!(api.message.contains("not root's alone"), "{}", api.message);
+                assert!(api.message.contains(name), "{}", api.message);
+                assert!(
+                    api.hint
+                        .as_deref()
+                        .is_some_and(|h| h.contains("/etc/kronik")),
+                    "{:?}",
+                    api.hint
+                );
+            }
+        }
+        // A sticky directory is no better where the installer creates the key and the
+        // missing directories: another user can make the entry first (/tmp, /var/tmp,
+        // /dev/shm), so it is refused as the last directory ...
+        let sticky = make("sticky", 0o1777);
+        assert!(check(&sticky.join("master.key")).is_err());
+        assert!(check(&sticky.join("kronik/master.key")).is_err());
+        // ... and fine as an ancestor of a closed directory, as /tmp is on the way to /tmp/x.
+        let below = sticky.join("closed");
+        std::fs::create_dir(&below).unwrap();
+        std::fs::set_permissions(&below, std::fs::Permissions::from_mode(0o755)).unwrap();
+        check(&below.join("master.key")).unwrap();
+        check(&below.join("new/master.key")).unwrap();
+        // A directory of another user than root or the installer: refused (root only).
+        if rustix::process::geteuid().is_root() {
+            let theirs = make("theirs", 0o755);
+            std::os::unix::fs::chown(&theirs, Some(65_534), Some(65_534)).unwrap();
+            assert!(check(&theirs.join("master.key")).is_err());
+        }
+        // A closed directory below one that others can write is no better.
+        let inner = base.path().join("shared/inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(check(&inner.join("master.key")).is_err());
+        // A symbolic link on the way is refused, even to a closed directory.
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&closed, &link).unwrap();
+        assert!(check(&link.join("master.key")).is_err());
     }
 
     #[test]

@@ -508,7 +508,7 @@ against both.
       "type": "string"
     },
     "name": {
-      "description": "Stable check names, including userns/uid_view/subid/pin/delegate with\n`--rootless` and service_identity when a root invocation requests it.",
+      "description": "Stable check names, including userns/uid_view/subid/pin/delegate with\n`--rootless`, service_identity when a root invocation requests it, and\nmicrovm where a microVM tool bundle is installed and the root service\nruns.",
       "type": "string"
     },
     "status": {
@@ -2629,6 +2629,34 @@ against both.
 }
 ```
 
+### DoctorWarning
+
+```json
+{
+  "description": "A warning of `kronik doctor`, as `serve --init` saw it.",
+  "properties": {
+    "check": {
+      "description": "The check: `delegate`, `sandbox`, `caps`, ...",
+      "type": "string"
+    },
+    "hint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "message": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "check",
+    "message"
+  ],
+  "type": "object"
+}
+```
+
 ### EffectSecret
 
 ```json
@@ -4111,6 +4139,13 @@ against both.
         "$ref": "#/components/schemas/StepOutput"
       },
       "type": "array"
+    },
+    "warnings": {
+      "description": "What `kronik doctor` warned about once the service was running\n(absent: nothing, or a dry run). A warning is not a failure: the install\nsucceeded, but nothing here proves that sandboxes work.",
+      "items": {
+        "$ref": "#/components/schemas/DoctorWarning"
+      },
+      "type": "array"
     }
   },
   "required": [
@@ -4734,7 +4769,7 @@ against both.
 
 ```json
 {
-  "description": "Which service `--init` installs: the nonroot default or the explicit root\nfallback.",
+  "description": "Which service `--init` installs: the root service of v0.1 to v0.4 or the\nnonroot one. `DEFAULT_MODE` says which is meant without a flag.",
   "enum": [
     "rootless",
     "root"

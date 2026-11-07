@@ -1,8 +1,8 @@
 //! Host setup operations of `kronik serve --init`.
 use super::*;
 
-/// Which service `--init` installs: the nonroot default or the explicit root
-/// fallback.
+/// Which service `--init` installs: the root service of v0.1 to v0.4 or the
+/// nonroot one. `DEFAULT_MODE` says which is meant without a flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Mode {
@@ -230,7 +230,11 @@ fn start_time(pid: u32) -> anyhow::Result<u64> {
         .parse()
         .context("invalid service start time")
 }
-pub(super) fn verify(mode: Mode, host: &InitHost, config: &Path) -> anyhow::Result<()> {
+pub(super) fn verify(
+    mode: Mode,
+    host: &InitHost,
+    config: &Path,
+) -> anyhow::Result<Vec<DoctorWarning>> {
     use kronik_core::env::{Clock, real::RealClock};
     use std::time::Duration;
     let pid = main_pid(host)?;
@@ -361,25 +365,206 @@ pub(super) fn verify(mode: Mode, host: &InitHost, config: &Path) -> anyhow::Resu
             );
         }
     }
-    if mode == Mode::Rootless {
-        sh(&[
-            &host.exe.to_string_lossy(),
-            "doctor",
-            "--rootless",
-            "--config",
-            &config.to_string_lossy(),
-        ])?;
-    } else {
-        sh(&[
-            &host.exe.to_string_lossy(),
-            "doctor",
-            "--config",
-            &config.to_string_lossy(),
-        ])?;
-    }
+    let doctor = doctor_report(host, config, mode == Mode::Rootless)?;
     anyhow::ensure!(
         main_pid(host)? == pid && start_time(pid)? == started,
         "service identity changed during verification"
     );
-    Ok(())
+    Ok(doctor)
+}
+
+/// Runs `kronik doctor` against the running service and returns what it warned
+/// about. The report is read as data (`--json`); a failed check, or a report
+/// that cannot be read, fails the installation, as the exit status always did.
+fn doctor_report(
+    host: &InitHost,
+    config: &Path,
+    rootless: bool,
+) -> anyhow::Result<Vec<DoctorWarning>> {
+    let mut command = Command::new(&host.exe);
+    command.arg("doctor");
+    if rootless {
+        command.arg("--rootless");
+    }
+    let output = command
+        .arg("--json")
+        .arg("--config")
+        .arg(config)
+        .output()
+        .context("running kronik doctor")?;
+    let (warnings, failed) = parse_doctor(&output.stdout).map_err(|cause| {
+        unreadable_report(
+            &cause,
+            &output.status.to_string(),
+            &output.stdout,
+            &output.stderr,
+        )
+    })?;
+    anyhow::ensure!(
+        output.status.success() && failed.is_empty(),
+        "kronik doctor failed: {}",
+        if failed.is_empty() {
+            format!("{}", output.status)
+        } else {
+            failed.join("; ")
+        }
+    );
+    Ok(warnings)
+}
+
+/// The error for a doctor whose output is not a report: the doctor failed
+/// before it could print one, and what it wrote says why. A bounded, printable
+/// excerpt of its standard error and output goes into the message.
+fn unreadable_report(
+    cause: &anyhow::Error,
+    status: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> anyhow::Error {
+    let excerpt = |bytes: &[u8]| -> String {
+        String::from_utf8_lossy(bytes)
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(400)
+            .collect::<String>()
+            .trim()
+            .to_owned()
+    };
+    let mut text = format!("{cause:#} (kronik doctor: {status}");
+    for (what, bytes) in [("standard error", stderr), ("standard output", stdout)] {
+        let shown = excerpt(bytes);
+        if !shown.is_empty() {
+            text.push_str(&format!("; {what}: {shown}"));
+        }
+    }
+    text.push(')');
+    anyhow::anyhow!(text)
+}
+
+/// The warnings and the failures (as `name: message`) in the JSON of
+/// `kronik doctor --json` (docs/reference/json.md).
+fn parse_doctor(report: &[u8]) -> anyhow::Result<(Vec<DoctorWarning>, Vec<String>)> {
+    let report: serde_json::Value =
+        serde_json::from_slice(report).context("kronik doctor did not print a JSON report")?;
+    let checks = report["checks"]
+        .as_array()
+        .context("the doctor's report has no checks")?;
+    let mut warnings = Vec::new();
+    let mut failed = Vec::new();
+    for check in checks {
+        let field = |name: &str| check[name].as_str().map(str::to_owned);
+        let (Some(name), Some(status), Some(message)) =
+            (field("name"), field("status"), field("message"))
+        else {
+            bail!("a check of the doctor's report is malformed");
+        };
+        match status.as_str() {
+            "warn" => warnings.push(DoctorWarning {
+                check: name,
+                message,
+                hint: field("hint"),
+            }),
+            "fail" => failed.push(format!("{name}: {message}")),
+            _ => {}
+        }
+    }
+    Ok((warnings, failed))
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    // `use super::*` sits in each test: the explicit fixture driver compiles this
+    // module with `cfg(test)` but without the test harness, which drops the tests.
+
+    const REPORT: &str = r#"{"checks":[
+        {"name":"config","status":"pass","code":null,"message":"/etc/kronik/kronik.toml is valid","hint":null},
+        {"name":"delegate","status":"warn","code":"ROOTLESS_UNAVAILABLE","message":"cgroup /x is not delegated to this user","hint":"the daemon gets one in kronik.service"},
+        {"name":"sandbox","status":"warn","code":null,"message":"not proven: daemon identity unavailable","hint":null},
+        {"name":"disk","status":"pass","code":null,"message":"7.9 GiB free","hint":null}],
+        "pass":2,"warn":2,"fail":0}"#;
+
+    #[test]
+    fn the_warnings_of_the_doctor_are_read_with_their_hints_and_nothing_else() {
+        use super::*;
+        let (warnings, failed) = parse_doctor(REPORT.as_bytes()).unwrap();
+        assert!(failed.is_empty());
+        assert_eq!(
+            warnings,
+            [
+                DoctorWarning {
+                    check: "delegate".into(),
+                    message: "cgroup /x is not delegated to this user".into(),
+                    hint: Some("the daemon gets one in kronik.service".into()),
+                },
+                DoctorWarning {
+                    check: "sandbox".into(),
+                    message: "not proven: daemon identity unavailable".into(),
+                    hint: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_doctor_that_printed_no_report_is_reported_with_what_it_wrote() {
+        use super::*;
+        let cause = parse_doctor(b"").unwrap_err();
+        let text = unreadable_report(
+            &cause,
+            "exit status: 1",
+            b"",
+            b"error: cannot read /etc/kronik/kronik.toml: Permission denied\n",
+        )
+        .to_string();
+        for needle in [
+            "did not print a JSON report",
+            "exit status: 1",
+            "standard error: error: cannot read /etc/kronik/kronik.toml: Permission denied",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(!text.contains("standard output"), "{text}");
+        // Long, multi-line and non-UTF-8 output is bounded and printable.
+        let noise = [b"line one\nline two\x1b[31m\xff".as_slice(), &[b'x'; 5000]].concat();
+        let text = unreadable_report(&cause, "signal: 9", &noise, b"").to_string();
+        assert!(
+            text.contains("standard output: line one line two"),
+            "{text}"
+        );
+        assert!(
+            text.len() < 700 && !text.contains('\n') && !text.contains('\u{1b}'),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_failed_check_and_an_unreadable_report_fail_the_installation() {
+        use super::*;
+        let report = REPORT.replace(
+            r#""name":"disk","status":"pass""#,
+            r#""name":"disk","status":"fail""#,
+        );
+        let (_, failed) = parse_doctor(report.as_bytes()).unwrap();
+        assert_eq!(failed, ["disk: 7.9 GiB free"]);
+        for bad in [
+            "",
+            "not json",
+            "{}",
+            r#"{"checks":[{"name":"x"}]}"#,
+            r#"{"checks":"x"}"#,
+        ] {
+            assert!(parse_doctor(bad.as_bytes()).is_err(), "{bad:?}");
+        }
+        // No checks at all is a report with nothing in it, not a failure.
+        assert_eq!(parse_doctor(br#"{"checks":[]}"#).unwrap(), (vec![], vec![]));
+    }
+
+    #[test]
+    fn the_end_of_the_install_says_what_is_not_proven_only_when_something_is_not() {
+        use super::*;
+        // Printing is a side effect; the shape of the input is what matters here.
+        print_warnings(&[]);
+        let (warnings, _) = parse_doctor(REPORT.as_bytes()).unwrap();
+        print_warnings(&warnings);
+    }
 }

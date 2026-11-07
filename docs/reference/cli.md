@@ -137,7 +137,7 @@ without a file the defaults below apply.
 | `--disk-reserve <SIZE>` | `log.disk_reserve` | `512MiB`; `$KRONIK_DISK_RESERVE`. Below this much free space new inputs and changes are refused; `0B` turns it off |
 | `--otel-endpoint <URL>` | `otel.endpoint` | off; `$KRONIK_OTEL_ENDPOINT` (an OTLP/HTTP collector for spans and metrics, M28) |
 | `--concurrency <N>` | | `64` |
-| `--rootless` | | off. Run as the nonroot service (M21, [ADR 0060](../adr/0060-non-root-daemon-user-namespace.md)): bind the listeners and take the data directory's lock, empty every capability set, serve the API through a capability-free acceptor that reads the callers' true uids, and enter the pinned Kronik user namespace. The unit that `serve --init` writes passes it. It stops with `ROOTLESS_UNAVAILABLE` as root, with differing real, effective and saved user ids, and in a user namespace whose uid map is not the host's (a rootless container, a nested user namespace). Without it, `serve` starts as before M21, as root or as an ordinary user. With `--init`: install the nonroot service explicitly |
+| `--rootless` | | off. Run as the nonroot service (M21, [ADR 0060](../adr/0060-non-root-daemon-user-namespace.md)): bind the listeners and take the data directory's lock, empty every capability set, serve the API through a capability-free acceptor that reads the callers' true uids, and enter the pinned Kronik user namespace. The unit that `serve --init --rootless` writes passes it. It stops with `ROOTLESS_UNAVAILABLE` as root, with differing real, effective and saved user ids, and in a user namespace whose uid map is not the host's (a rootless container, a nested user namespace). Without it, `serve` starts as before M21, as root or as an ordinary user. With `--init`: install the nonroot service instead of the default root one |
 | `--log-format text\|json` | | `text`; `$KRONIK_LOG_FORMAT` (`json`: one JSON object per line) |
 
 `kronik serve --help` lists every option.
@@ -193,26 +193,39 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_export_gaps_total` | counter | Log ranges retention deleted before an export stream read them, by stream. |
 
 `kronik serve --init [--root | --rootless] [--domain <NAME>]... [--acme-email <EMAIL>] [--master-key-file <PATH>] [--dry-run] [--json]`
-sets a host up, as root (M6, M21). By default it installs the nonroot service
-(ADR 0062): it writes the configuration file, creates the `kronik` group and
-user with their subordinate id ranges, the data directory (mode 0700, owned
-by `kronik`) and the master key (mode 0600, root-only; the unit passes it to
-the daemon as a systemd credential), installs and starts `kronik.service`
-and the one-shot `kronik-userns.service` that pins the daemon's user
-namespace, and then checks the running service's identity, capabilities and
-namespace. The unit starts the daemon as `kronik serve --rootless`. The API
-socket is open to the group `kronik`, and the audit trail records true host
-caller uids. `--root` installs the root service of v0.1 instead, and
-`--rootless` names the default explicitly; a host that lacks what the nonroot
-service needs never gets the root service by itself. An existing installation of the other
-kind is refused with `ROOTLESS_UNAVAILABLE`, before anything changes, and
-the operations guide says how to move one. With `--domain` the file asks for a
-TLS certificate by ACME for those names (`--acme-email` receives the CA's
-notices); without it the gateway serves plain HTTP on port 80.
-`--master-key-file` selects the key file for both the key step and the unit's
-credential. Each step checks the host first, so running it again changes
-nothing, and `--dry-run` prints the plan, as `{dry_run, mode, steps}` with
-`--json`. It needs systemd 255 or newer.
+sets a host up, as root (M6, M21). By default it installs the root service of
+v0.1 to v0.4: it writes the configuration file, creates the `kronik` group, the
+data directory (mode 0700) and the master key (mode 0600), and installs and
+starts `kronik.service`, the unit of v0.4.0 unchanged (a host that v0.4.0 set
+up is left as it is). `--root` names this service explicitly. `--rootless` installs the
+nonroot service instead (M21, [ADR 0062](../adr/0062-non-root-systemd-units.md)):
+it writes the configuration file, creates the `kronik` group and user with their
+subordinate id ranges, the data directory (mode 0700, owned by `kronik`) and the
+master key (mode 0600, root-only; the unit passes it to the daemon as a systemd
+credential), installs and starts `kronik.service` and the one-shot
+`kronik-userns.service` that pins the daemon's user namespace, and then checks
+the running service's identity, capabilities and namespace. The unit starts the
+daemon as `kronik serve --rootless`. The API socket is open to the group
+`kronik`, and the audit trail records true host caller uids. A host that lacks
+what the nonroot service needs (systemd 255 or newer, cgroup v2, user
+namespaces) stops `--rootless` with an error that names `--root`; it never gets
+the root service by itself. An existing installation of the other kind is
+refused with `ROOTLESS_UNAVAILABLE`, before anything changes, and the operations
+guide says how to move one. With `--domain` the file asks for a TLS certificate
+by ACME for those names (`--acme-email` receives the CA's notices); without it
+the gateway serves plain HTTP on port 80. `--master-key-file` selects the key
+file for both the key step and the nonroot unit's credential; the root service
+reads `[keys] master_key_file` from the configuration, so with `--root` the
+flag must name the file the configuration already names (otherwise the key
+step and the daemon would use two different keys, and `--init` refuses it).
+Each step checks the host
+first, so running it again changes nothing, and `--dry-run` prints the plan, as
+`{dry_run, mode, steps}` with `--json`. A run that installs ends by running
+`kronik doctor` against the running service: a failed check fails the install,
+and the warnings it printed are repeated at the end of the output, with their
+hints (`warnings`, a list of `{check, message, hint}`, in the JSON). A warning is
+not a failure, and nothing in the install proves that sandboxes work: the first
+foreign actor you add is the real proof.
 
 ## kronik doctor
 
@@ -226,6 +239,9 @@ certificate and shipping. Each check passes, warns or fails, with a hint.
 The checks of what only foreign actors need warn rather than fail, unless
 the configuration asks for what is missing (`platform = "kvm"`); the
 [operations guide](../guides/operations.md#kronik-doctor) lists them all.
+Where a microVM tool bundle is installed and the root service runs, `microvm`
+warns when the daemon has no delegated cgroup leaf and prints the drop-in
+that adds it.
 With `--rootless` (M21) it also checks what the nonroot service needs
 (`userns`, `uid_view`, `subid`, `pin` and `delegate`) and runs the network
 namespace and sandbox checks under the service's identity: as root it first

@@ -129,7 +129,7 @@ fn rootless(msg: String, hint: &str) -> ApiError {
     ApiError::new(ErrorCode::RootlessUnavailable, msg).with_hint(hint)
 }
 
-const SETUP_HINT: &str = "`sudo kronik serve --init` creates the kronik user and its ranges; \
+const SETUP_HINT: &str = "`sudo kronik serve --init --rootless` creates the kronik user and its ranges; \
      `sudo kronik serve --init --root` keeps the root daemon instead.";
 
 /// One `/etc/passwd` entry that `pick` accepts: name, uid, gid.
