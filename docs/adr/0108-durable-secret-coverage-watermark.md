@@ -73,3 +73,63 @@ validation is generation- and branch-pinned, its failure mode is fallback,
 and erasure/reseal semantics must keep re-verified against the delta rule
 (per-record, monotone union) as the suite grows. Revisit if a restore path
 ever ships or preserves the manifest.
+
+## Amendment (2026-11-07): what a refresh may read and write
+
+The consequences above promise a cost, and v0.4.0 did not keep it: in
+the crash test the time from `kill -9` to a healthy daemon grew from
+0.04 s at the first cycle to 24 s at the 326th, and scrubbed reads
+answered 503 for as long again after every restart. The causes were in
+the implementation, so the decision stands, and these rules bind it:
+
+1. A refresh reads the records after the watermark, once, up to the
+   applied LSN it started at; what is applied while it runs is for the
+   next refresh or restart to read. It reads from the first retained
+   record only when no valid watermark exists. (v0.4.0 ran a second scan
+   from the log start after the one that resumes at the watermark.)
+2. Only a finished certification writes the manifest, and always with
+   its certified LSN: the last record its scan read, not the applied LSN
+   of the moment it writes, so that a restart never skips a record that
+   no scan read. The manifest never records the progress of a scan under
+   way. (v0.4.0 stored a checkpoint after every 2,048 records with
+   certified LSN 0, which `load()` refuses, so every start that was
+   killed left no watermark.) A manifest that still has the old
+   `scan_frontier` field is read as before.
+3. A watermark ahead of the applied log covers nothing this log holds
+   and is ignored.
+4. The log is read in whole segment images decoded on the blocking
+   pool, not with `LogReader::read_while`. Its first read in a segment
+   validates every record before the requested one with two blocking-pool
+   round trips per record, so one scan that starts late in a segment is
+   linear in the segment, and a scan made of short windows is quadratic.
+5. A node that certified the inventory when it started keeps that
+   certificate: the first pass of the secret cycle still observes the
+   current versions, but does not rebuild a certificate that is moments
+   old, because a rebuild clears the certificate for as long as it runs.
+6. The coverage fingerprint identifies the inventory (ledger rows, links
+   and file rows), not the part of the log that a build read, so the
+   references a scan meets are not hashed. The manifest schema is v2 for
+   that reason.
+7. A v1 manifest (v0.4.0) is not trusted. v0.4.0 stored the applied LSN
+   of the moment it wrote the file, which can lie ahead of the last
+   record its scan read by every record applied while that refresh ran
+   (the refresh took seconds on a grown log). Skipping up to it could
+   skip records that no scan read, so a v1 manifest is
+   treated like a missing one: one info line, a scan from the first
+   retained record, and a v2 manifest written by that certification. The
+   first start after an upgrade from v0.4.0 therefore reads the whole
+   retained log once.
+
+Every build logs `secret inventory certified` with the LSN range it
+read, the number of records and the time it took, which is where to look
+when a start is slow.
+
+The crash test enforces the cost: it fails a restart that takes more
+than `--max-recovery`, a run whose last 50 restarts have a median
+`--max-recovery-growth` above the first 50, and a history read that
+answers 503 after a restart (`scripts/chaos.py`).
+
+Not changed, and still open: a rebuild clears the certificate when it
+starts, so a forced or periodic rebuild is a window of 503 for reads
+that scrub their output, as long as the rebuild; and a start waits for
+its first certification however long that takes.
