@@ -457,7 +457,22 @@ The third criterion: "Rotation of a secret shows up as a new version in
   first 8 hex of its hash. These come from the `SecretRef`s that are
   already recorded; `EffectSummary` gains a `secrets: [{name, version,
   version_hash}]` field, additive in JSON. A turn before a rotation shows
-  `@v3`, a turn after it `@v4`.
+  `@v3`, a turn after it `@v4`. As built:
+  - `version` is the legacy `uint32` or the wide version (at most 2^53 - 1,
+    exact in a JSON number); `version_hash` is the first 8 hex characters
+    of the recorded 16 bytes. Never a value.
+  - Every effect kind that records a `SecretRef` has it: the secret headers
+    of `http.fetch` and `foreign.http`, `crypto.*` and `secret.reveal`. A
+    secret version is listed once per effect, in the order of first use. A
+    reference that never resolved, as in a denied effect, is not a use.
+  - The field is omitted when it is empty and, like `request`, when the
+    request is sealed for a data subject or erased with it: it is read from
+    a plain request only, and a caller who may open a sealed request (the
+    turn JSON and the trace unseal it for `pii:read`) sees it.
+  - It is on the effects of `GET …/history`, of the turn JSON (`GET
+    /v1/turns/{id}`, `turn.schema.json`), of a trace and of a message into a
+    fork. The CLI adds a `SECRETS` column to the effects table of `history`
+    and of `send --fork` when an effect used a secret.
 - **`kronik secret history <name>`** (`GET /v1/secrets/{name}/history`,
   scope `read`) lists the `SecretVersion`s: version, hash, backend,
   `source_version`, when, who and reason. A deletion is a row.

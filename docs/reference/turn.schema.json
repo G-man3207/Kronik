@@ -688,7 +688,7 @@
       }
     },
     "TurnEffect": {
-      "description": "An effect: what it called and how it ended. Requests and responses are not shown.",
+      "description": "An effect: what it called and how it ended. Requests and responses are not shown, except the secret versions a request names.",
       "type": "object",
       "required": [
         "ordinal",
@@ -747,6 +747,14 @@
             "null"
           ]
         },
+        "secrets": {
+          "description": "The secret versions the effect used (M23), each once, in the order of first use: a rotation shows as a higher version in a later turn, and earlier turns keep theirs. Never a value. Absent when the effect used no secret (a denied one resolved none) and when its request is sealed for a data subject, or erased with it, and the caller cannot read it.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/TurnEffectSecret"
+          }
+        },
         "grounding": {
           "description": "Fork turns only: how the effect was answered (M12). Absent for production turns and for live effects of a fork.",
           "enum": [
@@ -766,6 +774,33 @@
             "fail-closed",
             "placeholder"
           ]
+        }
+      }
+    },
+    "TurnEffectSecret": {
+      "description": "A secret version an effect used: its name, its version and the first 8 hex characters of the keyed version hash. A secret is a handle; the value never appears (I8).",
+      "type": "object",
+      "required": [
+        "name",
+        "version",
+        "version_hash"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "description": "1, 2, ... per name. At most 2^53 - 1, so exact in a JSON number.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "version_hash": {
+          "description": "The first 8 hex characters of the version hash that `kronik secret list` shows in full.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}$"
         }
       }
     },

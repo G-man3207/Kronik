@@ -2595,6 +2595,36 @@ against both.
 }
 ```
 
+### EffectSecret
+
+```json
+{
+  "description": "A secret version an effect used (M23): what the effect's recorded request\nholds of the secret. A secret is a handle: the log and this view know its\nname, its version and a keyed hash of the version, never the value (I8).",
+  "properties": {
+    "name": {
+      "description": "The secret's name, such as `stripe-key`.",
+      "type": "string"
+    },
+    "version": {
+      "description": "The version the name resolved to when the effect ran: 1, 2, ... per\nname. At most 2^53 - 1, so exact in a JSON number.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "version_hash": {
+      "description": "The first 8 hex characters of the version's keyed hash (`kronik\nsecret list` shows all 32): enough to tell versions apart and to find\nthe row in `kronik secret history`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "version",
+    "version_hash"
+  ],
+  "type": "object"
+}
+```
+
 ### EffectSummary
 
 ```json
@@ -2640,6 +2670,13 @@ against both.
         "string",
         "null"
       ]
+    },
+    "secrets": {
+      "description": "The secret versions the effect used, each once, in the order of first\nuse: the secrets in an HTTP effect's headers, or the one secret of a\n`crypto.*` effect or a `secret.reveal`. A rotation shows as a higher\nversion in a later turn, while earlier turns keep theirs. Never a\nvalue. Omitted when the effect used no secret (a denied one resolved\nnone) and, like `request`, when the request is sealed for a data\nsubject, also after the subject is erased.",
+      "items": {
+        "$ref": "#/components/schemas/EffectSecret"
+      },
+      "type": "array"
     },
     "simulator": {
       "description": "Synthetic fork effects only: the simulator that answered (`stub`,\n`contract`, `neighbor`, `model`, `fail-closed`, `placeholder`; M12). Absent for a\nfork turn recorded before M12.",

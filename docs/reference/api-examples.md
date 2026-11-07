@@ -44,7 +44,12 @@ Host: kronik
 
 Read the actual turn identified by branch and LSN. The response follows
 [turn.schema.json](turn.schema.json), including its input/outcome/effect
-projection and the caller's data visibility; it is not a mutation.
+projection and the caller's data visibility; it is not a mutation. An effect
+that used a secret lists it in `secrets`: the secret's name, its version and
+the first 8 hex characters of the version hash, never a value. A rotation
+therefore shows as a higher version in the turns after it, while earlier turns
+keep the version they used. `GET /v1/actors/{kind}/{key}/history` and the
+trace of a turn carry the same field on their effects.
 
 ```http
 GET /v1/turns/main%3A42 HTTP/1.1
@@ -316,7 +321,10 @@ Content-Type: application/json
 Read recorded version identities, source identities, phase and deletion
 markers. Neither a `reserved` nor a `failed` row proves an activated value.
 Historical replay must retain the recorded identity rather than silently
-substitute the backend's current version.
+substitute the backend's current version. To see which version an actor's
+effects used, read the actor's history: each effect lists the `name`,
+`version` and first 8 hex characters of the `version_hash` in `secrets`, to be
+matched with the rows here.
 
 ```http
 GET /v1/secrets/demo-api-key/history HTTP/1.1

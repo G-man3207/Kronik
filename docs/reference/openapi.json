@@ -2567,6 +2567,31 @@
       "DiffValue": {
         "description": "A value on one side: a state value, a header, a body or part of one, an SQL row; null when that side has none. A value with a subject is never shown, nor is the subject id: a state value, body or header value is `{\"redacted\": true, \"subject\": \"s:<12 hex>\", \"hash\": \"k:<16 hex>\"}`, a value in an SQL row `\"[redacted:s:<12 hex>:k:<16 hex>]\"`. `s:` is a keyed hash of the subject id (equal subjects give equal ones), `k:` a keyed hash of the subject and the value; both are `-` when the diff was built without the master key (`kronik upgrade check`). In a `--no-pii` fork, what a turn that used SQL produced is redacted under the subject `[sql]`, shown as is."
       },
+      "EffectSecret": {
+        "description": "A secret version an effect used (M23): what the effect's recorded request\nholds of the secret. A secret is a handle: the log and this view know its\nname, its version and a keyed hash of the version, never the value (I8).",
+        "properties": {
+          "name": {
+            "description": "The secret's name, such as `stripe-key`.",
+            "type": "string"
+          },
+          "version": {
+            "description": "The version the name resolved to when the effect ran: 1, 2, ... per\nname. At most 2^53 - 1, so exact in a JSON number.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version_hash": {
+            "description": "The first 8 hex characters of the version's keyed hash (`kronik\nsecret list` shows all 32): enough to tell versions apart and to find\nthe row in `kronik secret history`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "version_hash"
+        ],
+        "type": "object"
+      },
       "EffectSummary": {
         "properties": {
           "delivery": {
@@ -2609,6 +2634,13 @@
               "string",
               "null"
             ]
+          },
+          "secrets": {
+            "description": "The secret versions the effect used, each once, in the order of first\nuse: the secrets in an HTTP effect's headers, or the one secret of a\n`crypto.*` effect or a `secret.reveal`. A rotation shows as a higher\nversion in a later turn, while earlier turns keep theirs. Never a\nvalue. Omitted when the effect used no secret (a denied one resolved\nnone) and, like `request`, when the request is sealed for a data\nsubject, also after the subject is erased.",
+            "items": {
+              "$ref": "#/components/schemas/EffectSecret"
+            },
+            "type": "array"
           },
           "simulator": {
             "description": "Synthetic fork effects only: the simulator that answered (`stub`,\n`contract`, `neighbor`, `model`, `fail-closed`, `placeholder`; M12). Absent for a\nfork turn recorded before M12.",
@@ -7807,7 +7839,7 @@
       },
       "TurnEffect": {
         "additionalProperties": false,
-        "description": "An effect: what it called and how it ended. Requests and responses are not shown.",
+        "description": "An effect: what it called and how it ended. Requests and responses are not shown, except the secret versions a request names.",
         "properties": {
           "delivery": {
             "description": "`replay-safe`, `idempotency-keyed` or `unsafe`; null for internal kinds.",
@@ -7844,6 +7876,14 @@
           },
           "ordinal": {
             "$ref": "#/components/schemas/TurnCount"
+          },
+          "secrets": {
+            "description": "The secret versions the effect used (M23), each once, in the order of first use: a rotation shows as a higher version in a later turn, and earlier turns keep theirs. Never a value. Absent when the effect used no secret (a denied one resolved none) and when its request is sealed for a data subject, or erased with it, and the caller cannot read it.",
+            "items": {
+              "$ref": "#/components/schemas/TurnEffectSecret"
+            },
+            "minItems": 1,
+            "type": "array"
           },
           "simulator": {
             "description": "Synthetic fork effects only: the simulator that answered (M12). Absent for a fork turn recorded before M12.",
@@ -7884,6 +7924,33 @@
           "delivery",
           "error",
           "hint"
+        ],
+        "type": "object"
+      },
+      "TurnEffectSecret": {
+        "additionalProperties": false,
+        "description": "A secret version an effect used: its name, its version and the first 8 hex characters of the keyed version hash. A secret is a handle; the value never appears (I8).",
+        "properties": {
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "version": {
+            "description": "1, 2, ... per name. At most 2^53 - 1, so exact in a JSON number.",
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "version_hash": {
+            "description": "The first 8 hex characters of the version hash that `kronik secret list` shows in full.",
+            "pattern": "^[0-9a-f]{8}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "version_hash"
         ],
         "type": "object"
       },

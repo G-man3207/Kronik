@@ -397,6 +397,7 @@ fn effects(values: &mut [EffectSummary], secrets: &mut Context<'_>) {
         error,
         hint,
         request,
+        secrets: used,
         grounding: _,
         simulator: _,
     } in values
@@ -405,6 +406,16 @@ fn effects(values: &mut [EffectSummary], secrets: &mut Context<'_>) {
         optional_text(error, secrets);
         optional_text(hint, secrets);
         optional_text(request, secrets);
+        // The version and its hash prefix are producer-owned numbers and
+        // hex; a secret's name is display text like the target that names it.
+        for EffectSecret {
+            name,
+            version: _,
+            version_hash: _,
+        } in used
+        {
+            text(name, secrets);
+        }
     }
 }
 
@@ -682,6 +693,12 @@ impl ScrubbedOutput for TurnJson {
         if let Some(values) = turn.get_mut("effects").and_then(Value::as_array_mut) {
             for value in values {
                 text_fields(value, &["target", "error", "hint", "request"], secrets);
+                // Version and hash prefix are producer-owned; the name is text.
+                if let Some(used) = value.get_mut("secrets").and_then(Value::as_array_mut) {
+                    for secret in used {
+                        text_fields(secret, &["name"], secrets);
+                    }
+                }
             }
         }
         if let Some(values) = turn.get_mut("timers").and_then(Value::as_array_mut) {
@@ -1091,6 +1108,7 @@ mod tests {
                 error: Some("failed".into()),
                 hint: Some("7".into()),
                 request: Some("7".into()),
+                secrets: Vec::new(),
                 grounding: Some("exact".into()),
                 simulator: None,
             }],
@@ -1131,6 +1149,119 @@ mod tests {
         assert_eq!(value.input.kind, "message");
         assert_eq!(value.input.summary, "[secret:digit]");
         assert_eq!(value.message, "[secret:phase]");
+    }
+
+    /// A secret whose value occurs in another secret's name: the name is
+    /// display text and is scrubbed like the target that names it, while the
+    /// version and the hash prefix are producer-owned and stay exact.
+    #[test]
+    fn effect_secrets_keep_version_and_hash_prefix_but_scrub_the_name() {
+        let inventory: Vec<(String, Vec<u8>)> = vec![("pin".into(), b"ring".to_vec())];
+        let used = |name: &str, version| EffectSecret {
+            name: name.into(),
+            version,
+            version_hash: "0a1b2c3d".into(),
+        };
+        let effect = EffectSummary {
+            ordinal: 0,
+            kind: "crypto.hmac-sha256".into(),
+            target: "secret:keyring".into(),
+            status: "ok".into(),
+            delivery: None,
+            error: None,
+            hint: None,
+            request: None,
+            secrets: vec![used("keyring", 2), used("signing", 9_007_199_254_740_991)],
+            grounding: None,
+            simulator: None,
+        };
+        let mut history = HistoryResponse {
+            turns: vec![TurnSummary {
+                turn_id: "main:7".into(),
+                lsn: 7,
+                logical_time_ms: 0,
+                code_hash: "b3:0123456789ab".into(),
+                input: InputSummary {
+                    kind: "message".into(),
+                    summary: "sign".into(),
+                },
+                outcome: Outcome {
+                    kind: "committed".into(),
+                    error_code: None,
+                    message: None,
+                },
+                writes: Vec::new(),
+                messages: Vec::new(),
+                sql_changes: 0,
+                fuel_used: 1,
+                effects: vec![effect.clone()],
+            }],
+            next: None,
+        };
+        history.scrub_free(&inventory).unwrap();
+        let shown = &history.turns[0].effects[0];
+        assert_eq!(shown.target, "secret:key[secret:pin]");
+        assert_eq!(
+            shown.secrets,
+            vec![
+                used("key[secret:pin]", 2),
+                used("signing", 9_007_199_254_740_991)
+            ]
+        );
+
+        // The fork turn's answer is scrubbed the same way.
+        let mut fork = ForkTurnResponse {
+            fork: "try".into(),
+            turn_id: "try:7".into(),
+            outcome: Outcome {
+                kind: "committed".into(),
+                error_code: None,
+                message: None,
+            },
+            reply: None,
+            effects: vec![effect],
+        };
+        fork.scrub_free(&inventory).unwrap();
+        assert_eq!(fork.effects[0].secrets[0], used("key[secret:pin]", 2));
+    }
+
+    #[test]
+    fn turn_json_scrubs_the_secret_names_of_its_effects() {
+        use prost::Message as _;
+        let inventory: Vec<(String, Vec<u8>)> = vec![("pin".into(), b"ring".to_vec())];
+        let record = pb::TurnRecord {
+            effects: vec![pb::EffectRecord {
+                kind: "crypto.hmac-sha256".into(),
+                target: "secret:keyring".into(),
+                request: plain(
+                    &pb::CryptoEffectRequest {
+                        algorithm: "hmac-sha256".into(),
+                        secret: Some(pb::SecretRef {
+                            name: "keyring".into(),
+                            version: 2,
+                            version_hash: (0x0a..0x1a).collect(),
+                            ..Default::default()
+                        }),
+                        data_hash: vec![0; 32],
+                    }
+                    .encode_to_vec(),
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut view = crate::turn_json("main", 7, &record);
+        view.scrub_free(&inventory).unwrap();
+        let effect = &view["effects"][0];
+        assert_eq!(effect["target"], "secret:key[secret:pin]");
+        assert_eq!(
+            effect["secrets"],
+            serde_json::json!([{
+                "name": "key[secret:pin]",
+                "version": 2,
+                "version_hash": "0a0b0c0d"
+            }])
+        );
     }
 
     #[test]

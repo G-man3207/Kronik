@@ -7,6 +7,7 @@ mod audit;
 pub mod auth;
 pub mod auth_config;
 mod cluster_status;
+mod effect_secrets;
 #[cfg(feature = "server")]
 pub mod event_stream;
 pub mod events;
@@ -540,6 +541,7 @@ fn effect_summaries(t: &pb::TurnRecord) -> Vec<EffectSummary> {
                 error: opt(&e.error),
                 hint,
                 request: None,
+                secrets: effect_secrets::of(e),
                 grounding: grounding_label(e),
                 // Empty for a record written before M12: unknown, not fail-closed.
                 simulator: (e.grounding == pb::Grounding::Synthetic as i32)

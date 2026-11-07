@@ -719,6 +719,22 @@ pub struct TimersResponse {
     pub timers: Vec<Timer>,
 }
 
+/// A secret version an effect used (M23): what the effect's recorded request
+/// holds of the secret. A secret is a handle: the log and this view know its
+/// name, its version and a keyed hash of the version, never the value (I8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EffectSecret {
+    /// The secret's name, such as `stripe-key`.
+    pub name: String,
+    /// The version the name resolved to when the effect ran: 1, 2, ... per
+    /// name. At most 2^53 - 1, so exact in a JSON number.
+    pub version: u64,
+    /// The first 8 hex characters of the version's keyed hash (`kronik
+    /// secret list` shows all 32): enough to tell versions apart and to find
+    /// the row in `kronik secret history`.
+    pub version_hash: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct EffectSummary {
     pub ordinal: u32,
@@ -736,6 +752,15 @@ pub struct EffectSummary {
     /// request is sealed for a data subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<String>,
+    /// The secret versions the effect used, each once, in the order of first
+    /// use: the secrets in an HTTP effect's headers, or the one secret of a
+    /// `crypto.*` effect or a `secret.reveal`. A rotation shows as a higher
+    /// version in a later turn, while earlier turns keep theirs. Never a
+    /// value. Omitted when the effect used no secret (a denied one resolved
+    /// none) and, like `request`, when the request is sealed for a data
+    /// subject, also after the subject is erased.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<EffectSecret>,
     /// Fork turns only: how the effect was answered, `exact`,
     /// `approximate`, `synthetic` or `forked` (a copy of a foreign actor,
     /// M14). Absent for production and live effects.

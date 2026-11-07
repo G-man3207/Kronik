@@ -1406,6 +1406,7 @@ mod tests {
             error: Some("CAPABILITY_NOT_GRANTED: http:api.example.com".into()),
             hint: Some("kronik grant billing http:api.example.com --reason '...'".into()),
             request: None,
+            secrets: Vec::new(),
             grounding: None,
             simulator: None,
         };
