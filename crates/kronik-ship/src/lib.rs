@@ -23,6 +23,8 @@ use object_store::path::Path as Key;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload};
 use serde::{Deserialize, Serialize};
 
+mod names;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ShipError {
     #[error("ship: {0}")]
@@ -466,9 +468,16 @@ pub async fn ship_once(
         if state.snapshots.contains(&m.lsn) {
             continue;
         }
+        let Ok(paths) = names::snapshot_destinations(dir, &m.files) else {
+            tracing::warn!(
+                lsn = m.lsn,
+                "snapshot manifest names unusable files; not shipped"
+            );
+            continue;
+        };
         let base = format!("{branch}/snapshots/{:020}", m.lsn);
-        for f in &m.files {
-            let bytes = std::fs::read(dir.join(&f.path))?;
+        for (f, path) in m.files.iter().zip(&paths) {
+            let bytes = std::fs::read(path)?;
             let z = compress(&bytes)?;
             report.bytes += z.len() as u64;
             report.objects += 1;
@@ -1314,6 +1323,17 @@ fn stage_keystore(
     })
 }
 
+/// Writes a file that does not exist yet: an existing file, or a link
+/// at the path, is an error and is never followed.
+fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)
+}
+
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     if !from.exists() {
         return Ok(());
@@ -1471,8 +1491,10 @@ async fn download_snapshot(
     branch: &str,
     m: &Manifest,
 ) -> Result<(), ShipError> {
+    // Nothing is fetched or written for a manifest whose paths are unsound.
+    let destinations = names::snapshot_destinations(snap_dir, &m.files)?;
     let base = format!("{branch}/snapshots/{:020}", m.lsn);
-    for f in &m.files {
+    for (f, dest) in m.files.iter().zip(&destinations) {
         let bytes = decompress(&remote.get(&format!("{base}/{}.zst", f.path)).await?)?;
         let hash = blake3::hash(&bytes).to_hex().to_string();
         if bytes.len() as u64 != f.size || hash != f.blake3 {
@@ -1481,11 +1503,10 @@ async fn download_snapshot(
                 f.path
             )));
         }
-        let dest = snap_dir.join(&f.path);
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p)?;
         }
-        std::fs::write(dest, bytes)?;
+        write_new(dest, &bytes)?;
     }
     std::fs::write(
         snap_dir.join("manifest.json"),
