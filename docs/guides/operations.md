@@ -1534,8 +1534,10 @@ long as it was watched (minutes):
 - `kronik secret refresh` and `kronik secret unlink` commit and then answer
   503 "already committed": do not repeat them;
 - `kronik secret backends` shows `false` in the INVENTORY COMPLETE column;
-- the daemon log repeats `secret rebuild failed code=SECRET_UNAVAILABLE`.
-  Neither it nor the error names the missing version.
+- the daemon log repeats `secret rebuild failed code=SECRET_UNAVAILABLE`; its
+  `failed_version` names the first retained version that the rebuild could not
+  get, as `NAME@vN on BACKEND: reason` (others may follow once it is served
+  again). The error that clients get does not name it.
 
 A running node is not affected until it restarts: it still holds the value in
 memory, so the loss can go unnoticed until the next start.
@@ -1616,6 +1618,16 @@ which.
   resend the dead letters.
 - Turns that need no external secret, or whose secret the node holds, run as
   usual during the outage. After a crash, a turn that had not yet got its
-  secret waits for an outage to end and then runs; one that had recorded the
-  error ends with it. A refusal does not pass while a turn waits, so a turn
-  that met one after a crash records it like a live turn does.
+  secret waits for an outage to end and then runs, except an effect of an
+  `unsafe` grant, which a re-run ends as outcome unknown whatever the secret
+  does; one that had recorded the error ends with it. A refusal does not pass
+  while a turn waits, so a turn that met one after a crash records it like a
+  live turn does.
+- A failure is remembered for 5 s, so that a burst of turns does not queue on
+  a dead backend. Right after the backend is back, effects can still fail for
+  up to 5 s. A dead letter that is resent in that window can fail again and
+  then makes one more dead letter; nothing is lost, resend that one.
+- A failed timer's turn is a failed turn like any other: what it buffered is
+  discarded, the next timer it set included. A timer that sets its next timer
+  stops after such a failure until the dead letter is resent; a handler that
+  handles the error and commits keeps the chain going.

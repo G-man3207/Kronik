@@ -554,8 +554,11 @@ secrets, and only once Kronik has no usable value.
       decides: a handler that fails with the error ends the turn as failed
       (`TURN_FAILED`; a message or timer becomes a dead letter), one that
       handles it commits. The caller is not answered with a 503, and no
-      `TurnBegin` is left open for the next start to run: a `TurnBegin`
-      without a record exists only after a crash.
+      `TurnBegin` is left open for the next start to run for want of a
+      secret: a `TurnBegin` without a record that a secret caused exists only
+      after a crash. (Other aborts after a `TurnBegin`, such as a call whose
+      callee's outcome cannot be handed to the caller, are not about secrets
+      and are not covered here.)
     - Only a failure is cached: for 5 s, so a burst of turns does not
       queue on a dead backend.
 - **Turns that use no linked secret never touch the cache or a backend.**
@@ -976,12 +979,14 @@ Running it once before release is the maintainers' call (§12).
   - Scrubbing covers every retained external version, fetched again after
     a restart, and fails closed until it does (§6).
 - **I1:** a rerun never gives a recorded effect another outcome (§5.3).
-- **I4 / I14 (open turns):** a `TurnBegin` without a `TurnRecord` exists only
-  after a crash, and the next start runs it. A turn that cannot get a secret
+- **I4 / I14 (open turns):** a `TurnBegin` without a `TurnRecord` is what a
+  crash leaves, and the next start runs it. A turn that cannot get a secret
   records an error result for the effect instead of abandoning its `TurnBegin`
-  (§6). Two checks guard this: the scenarios of `secret_backends.rs` end by
-  checking that no `TurnBegin` is open once the daemon is quiet, and DST checks
-  the same after every drain.
+  (§6). Two checks guard the invariant in general: every daemon scenario of
+  `secret_backends.rs` ends by checking that no `TurnBegin` is open once the
+  daemon is quiet, and DST checks the same after every drain. No DST scenario
+  makes a secret unavailable, so the secret case itself is guarded by
+  `secret_backends.rs`.
 - **I10:** both features are opt-in. `file` stays the default for both,
   with no behaviour change for existing nodes apart from the new
   `SecretVersion` records.
