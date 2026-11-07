@@ -169,6 +169,24 @@ fn shipped() -> Shipped {
     // The legitimate paths include a nested one: `sql/<dir>/<file>.db`.
     let nested = |f: &SnapshotFile| f.path.starts_with("sql/") && f.path.matches('/').count() == 2;
     assert!(manifest.files.iter().any(nested), "{:?}", manifest.files);
+    // A snapshot lists database files only: no SQLite sidecar, in the manifest
+    // or in the bucket.
+    let sidecar = |name: &str| {
+        let name = name.strip_suffix(".zst").unwrap_or(name);
+        ["-wal", "-shm", "-journal"]
+            .iter()
+            .any(|s| name.ends_with(s))
+    };
+    assert!(
+        manifest.files.iter().all(|f| !sidecar(&f.path)),
+        "{:?}",
+        manifest.files
+    );
+    let in_bucket = tree(bucket.path());
+    assert!(
+        in_bucket.keys().all(|p| !sidecar(&p.to_string_lossy())),
+        "{in_bucket:?}"
+    );
     Shipped {
         bucket,
         key,
@@ -314,8 +332,8 @@ fn refusal(result: Result<RestoreReport, ShipError>, what: &str) -> String {
 /// The path a manifest names in each case. The snapshot directory is
 /// `<data>/.restore/snapshot`, three levels below the area that holds the
 /// data directory, so a path that leaves it lands inside the area, where
-/// the comparison of the trees sees it.
-const UNSOUND: [&str; 13] = [
+/// the comparison of the trees sees it. The last four are SQLite sidecars.
+const UNSOUND: [&str; 17] = [
     "absolute",
     "parent directory",
     "parent directory below a name",
@@ -329,6 +347,10 @@ const UNSOUND: [&str; 13] = [
     "a file and a directory",
     "the manifest",
     "a path twice",
+    "a write-ahead log",
+    "a rollback journal",
+    "a shared-memory file",
+    "the log of an actor database",
 ];
 
 fn unsound_path(what: &str, area: &Path) -> String {
@@ -346,6 +368,10 @@ fn unsound_path(what: &str, area: &Path) -> String {
         "a file and a directory" => "sql".into(),
         "the manifest" => "manifest.json".into(),
         "a path twice" => "state.db".into(),
+        "a write-ahead log" => "state.db-wal".into(),
+        "a rollback journal" => "state.db-journal".into(),
+        "a shared-memory file" => "state.db-shm".into(),
+        "the log of an actor database" => "sql/ab/extra-0123abcd.db-wal".into(),
         other => panic!("{other}"),
     }
 }
@@ -423,10 +449,28 @@ fn the_files_a_node_writes_are_restored() {
             installed.display()
         );
     }
+    // A snapshot without sidecars restores without any: no database of the
+    // restored branch has a write-ahead log, an index or a journal. (The
+    // snapshot directory may hold the ones SQLite makes when the restore
+    // opens `secrets.db` to check it.)
+    let sidecars: Vec<PathBuf> = tree(&data.join("branches"))
+        .into_keys()
+        .filter(|p| {
+            let name = p.to_string_lossy();
+            ["-wal", "-shm", "-journal"]
+                .iter()
+                .any(|s| name.ends_with(s))
+        })
+        .collect();
+    assert!(sidecars.is_empty(), "{sidecars:?}");
 }
 
-#[test]
-fn shipping_does_not_read_files_a_manifest_names_outside_its_directory() {
+/// A node with one local snapshot whose manifest also names the file that
+/// `entry(data_dir, snapshot_dir)` makes, shipped once to a bucket: the
+/// snapshot's manifest, whether it was shipped, and the bucket's file names.
+fn ship_a_manifest_with(
+    entry: impl FnOnce(&Path, &Path) -> SnapshotFile,
+) -> (Manifest, bool, Vec<String>) {
     let src = tempdir("names-ship-src-");
     let bucket = tempdir("names-ship-bucket-");
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
@@ -434,20 +478,11 @@ fn shipping_does_not_read_files_a_manifest_names_outside_its_directory() {
     p.deploy("counter");
     p.send("counter/a", "increment", "");
     p.snapshot();
-    // A local manifest that names a file next to the snapshots.
     let (dir, manifest) = kronik_sched::snapshots::list(src.path(), "main")
         .pop()
         .unwrap();
-    let neighbour = src.path().join("neighbour.txt");
-    std::fs::write(&neighbour, b"not part of the snapshot").unwrap();
     let mut edited = manifest.clone();
-    edited.files.push(SnapshotFile {
-        path: neighbour.display().to_string(),
-        size: 24,
-        blake3: blake3::hash(b"not part of the snapshot")
-            .to_hex()
-            .to_string(),
-    });
+    edited.files.push(entry(src.path(), &dir));
     std::fs::write(
         dir.join("manifest.json"),
         serde_json::to_vec_pretty(&edited).unwrap(),
@@ -455,19 +490,53 @@ fn shipping_does_not_read_files_a_manifest_names_outside_its_directory() {
     .unwrap();
 
     p.ship(&remote, src.path());
-    // That snapshot was not shipped, and nothing of the neighbour was.
     let state = ShipState::load(src.path()).unwrap();
-    assert!(!state.snapshots.contains(&manifest.lsn), "{state:?}");
-    let shipped_files = walk_names(bucket.path());
+    let shipped = state.snapshots.contains(&manifest.lsn);
+    (manifest, shipped, walk_names(bucket.path()))
+}
+
+/// The entry of a file with these bytes.
+fn entry_of(path: String, bytes: &[u8]) -> SnapshotFile {
+    SnapshotFile {
+        path,
+        size: bytes.len() as u64,
+        blake3: blake3::hash(bytes).to_hex().to_string(),
+    }
+}
+
+#[test]
+fn shipping_does_not_read_files_a_manifest_names_outside_its_directory() {
+    let (manifest, shipped, files) = ship_a_manifest_with(|data, _| {
+        // A file next to the snapshots.
+        let neighbour = data.join("neighbour.txt");
+        std::fs::write(&neighbour, b"not part of the snapshot").unwrap();
+        entry_of(neighbour.display().to_string(), b"not part of the snapshot")
+    });
+    // That snapshot was not shipped, and nothing of the neighbour was.
+    assert!(!shipped);
+    assert!(files.iter().all(|n| !n.contains("neighbour")), "{files:?}");
+    let manifest_object = format!("{:020}/manifest.json", manifest.lsn);
     assert!(
-        shipped_files.iter().all(|n| !n.contains("neighbour")),
-        "{shipped_files:?}"
+        files.iter().all(|n| !n.ends_with(&manifest_object)),
+        "{files:?}"
     );
+}
+
+#[test]
+fn shipping_does_not_ship_a_snapshot_whose_manifest_names_a_sidecar() {
+    let (manifest, shipped, files) = ship_a_manifest_with(|_, dir| {
+        std::fs::write(dir.join("state.db-wal"), b"not part of the snapshot").unwrap();
+        entry_of("state.db-wal".into(), b"not part of the snapshot")
+    });
+    assert!(!shipped);
     assert!(
-        shipped_files
-            .iter()
-            .all(|n| !n.ends_with(&format!("{:020}/manifest.json", manifest.lsn))),
-        "{shipped_files:?}"
+        files.iter().all(|n| !n.contains("state.db-wal")),
+        "{files:?}"
+    );
+    let manifest_object = format!("{:020}/manifest.json", manifest.lsn);
+    assert!(
+        files.iter().all(|n| !n.ends_with(&manifest_object)),
+        "{files:?}"
     );
 }
 
