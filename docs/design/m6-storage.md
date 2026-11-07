@@ -213,8 +213,12 @@ the old one (the old daemon keeps running; the check only reads):
    from_engine_version, to_engine_version, effective_lsn: 0,
    check_report_hash (BLAKE3 of the report file), checked_through_lsn,
    audit}` after the log is replayed and before open turns re-run or
-   anything is served. Without one it refuses to start with
-   `ENGINE_VERSION_MISMATCH` and the exact `upgrade check` command.
+   anything is served. The record's audit reason names the report relative
+   to the data directory (`engine upgrade checked by the upgrade report
+   upgrade/<to-engine>.json`), never by its path on this machine: the log
+   is append-only and every audit export carries the reason. Without a
+   report it refuses to start with `ENGINE_VERSION_MISMATCH` and the exact
+   `upgrade check` command.
    (`kronik_fork::upgrade::check` and `kronik_sched::upgrade` hold the two
    halves; the report's fuel threshold is a finite 10^12, since JSON has no
    infinity.)

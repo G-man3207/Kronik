@@ -282,6 +282,24 @@ fn another_engine_needs_a_passing_report_and_records_the_upgrade() {
             .as_bytes()
             .to_vec()
     );
+    // The record stays in the append-only log and in every audit export: its
+    // reason names the report relative to the data directory, never by the
+    // path of this machine.
+    let reason = &u.audit.as_ref().unwrap().reason;
+    assert_eq!(
+        reason,
+        &format!("engine upgrade checked by the upgrade report upgrade/{ENGINE_VERSION}.json")
+    );
+    assert!(
+        !reason.contains(dir.path().to_str().unwrap()),
+        "the reason holds the data directory: {reason}"
+    );
+    assert!(
+        !reason
+            .split_whitespace()
+            .any(|word| Path::new(word).is_absolute()),
+        "the reason holds an absolute path: {reason}"
+    );
     assert_eq!(
         node.store().db().engine_version().unwrap().as_deref(),
         Some(ENGINE_VERSION)

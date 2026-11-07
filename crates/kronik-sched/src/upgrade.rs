@@ -34,6 +34,14 @@ impl UpgradeReport {
         data.join("upgrade").join(format!("{to_engine}.json"))
     }
 
+    /// `upgrade/<to_engine>.json`: where [`UpgradeReport::path`] puts the
+    /// report, relative to the data directory. This is the form the log may
+    /// name it in: the log is append-only and exported, so it never carries
+    /// the path of the machine it was written on.
+    pub fn relative_path(to_engine: &str) -> String {
+        format!("upgrade/{to_engine}.json")
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut v = serde_json::to_vec_pretty(self).unwrap_or_default();
         v.push(b'\n');
@@ -115,7 +123,14 @@ pub(crate) fn gate(
         checked_through_lsn: report.checked_through_lsn,
         audit: Some(pb::Audit {
             token_id: "system".into(),
-            reason: format!("engine upgrade checked by {}", path.display()),
+            // Named relative to the data directory, not by `path`: that is
+            // an absolute path of this machine, and this text is kept in
+            // the log and in every audit export. The record's own
+            // `check_report_hash` identifies the report's content.
+            reason: format!(
+                "engine upgrade checked by the upgrade report {}",
+                UpgradeReport::relative_path(running)
+            ),
             wall_time_ms: wall_ms,
         }),
     })
@@ -172,6 +187,39 @@ mod tests {
             blake3::hash(&std::fs::read(path).unwrap())
                 .as_bytes()
                 .to_vec()
+        );
+    }
+
+    #[test]
+    fn the_upgrade_record_names_the_report_relative_to_the_data_directory() {
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dir = tempfile::Builder::new().tempdir_in(tmp).unwrap();
+        let d = dir.path();
+        let path = report("old", "kronik-9.9.9+wasmtime-1.0.0", true)
+            .write(d)
+            .unwrap();
+        let Gate::Upgrade(u) = gate(d, Some("old"), "kronik-9.9.9+wasmtime-1.0.0", 3, 0) else {
+            panic!()
+        };
+        let reason = u.audit.unwrap().reason;
+        // The log keeps this text for good and exports it: no local path.
+        assert_eq!(
+            reason,
+            "engine upgrade checked by the upgrade report \
+             upgrade/kronik-9.9.9+wasmtime-1.0.0.json"
+        );
+        assert!(!reason.contains(d.to_str().unwrap()), "{reason}");
+        assert!(
+            !reason
+                .split_whitespace()
+                .any(|word| Path::new(word).is_absolute()),
+            "{reason}"
+        );
+        // The name is the report's place under the data directory.
+        assert_eq!(
+            path.strip_prefix(d).unwrap(),
+            Path::new(&UpgradeReport::relative_path("kronik-9.9.9+wasmtime-1.0.0"))
         );
     }
 }
