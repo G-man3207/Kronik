@@ -59,6 +59,11 @@ fn apply(buf: &mut Vec<u8>, op: &Op, keep: Option<usize>) {
     }
 }
 
+/// The text of the error `sync_data` returns when the fault injector fails
+/// an fsync. A start whose error carries it was failed by the simulated disk,
+/// and the scenarios restart that node.
+pub const INJECTED_FSYNC_EIO: &str = "injected fsync EIO";
+
 /// Fault and latency knobs for one disk.
 #[derive(Debug, Clone, Copy)]
 pub struct DiskFaults {
@@ -590,7 +595,7 @@ impl File for SimFile {
                 // case by forgetting them, like ext4 after a writeback error.
                 i.current = i.durable.clone();
                 i.pending.clear();
-                return Err(io::Error::other("injected fsync EIO"));
+                return Err(io::Error::other(INJECTED_FSYNC_EIO));
             }
             i.durable = i.current.clone();
             i.pending.clear();

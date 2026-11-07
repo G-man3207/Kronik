@@ -15,6 +15,11 @@
 //! time never decreases per actor and a receiver never runs before its
 //! message; the materialized state equals a rebuild from the log; the run is
 //! a deterministic function of the seed.
+//!
+//! A start that fails because the simulated disk failed an fsync (the log
+//! open, or a record the start itself writes) is a daemon that exits: the
+//! supervisor starts it again and recovery has to cope with what the failed
+//! start left behind. Any other failure to start is a violation.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -36,7 +41,7 @@ use kronik_store::sql::{Limits, MemOpener, SqlPool};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::exec::{Executor, Handle, NodeId, RunEnd, SUPERVISOR};
-use crate::fs::{CrashModel, Disk, DiskFaults, SimFs};
+use crate::fs::{CrashModel, Disk, DiskFaults, INJECTED_FSYNC_EIO, SimFs};
 use crate::service::{ServiceFaults, SimService};
 use crate::{SimClock, SimEntropy, SimNoNet, SimProcs, SimRng, SimSpawner, Trace};
 use kronik_effects::{Delivery, Rate};
@@ -227,6 +232,9 @@ pub struct Report {
     pub recent: Vec<String>,
     /// Workload-specific summary (the effects workload's service counts).
     pub notes: String,
+    /// The error of each start that failed on an injected fsync error; the
+    /// node was restarted after each.
+    pub start_failures: Vec<String>,
 }
 
 impl Report {
@@ -235,6 +243,11 @@ impl Report {
     }
 
     pub fn line(&self) -> String {
+        let start_failures = if self.start_failures.is_empty() {
+            String::new()
+        } else {
+            format!(" start-failures={}", self.start_failures.len())
+        };
         format!(
             "seed {:>5} {} trace={} requests={} turns={} crashes={} events={} polls={} \
              virtual={:.1}s wall={:.0}ms",
@@ -248,7 +261,8 @@ impl Report {
             self.polls,
             self.virtual_time.as_secs_f64(),
             self.wall.as_secs_f64() * 1000.0
-        ) + &self.notes
+        ) + &start_failures
+            + &self.notes
     }
 }
 
@@ -277,6 +291,7 @@ struct State {
     store: Option<Arc<Store>>,
     conn: Option<Conn>,
     crashes: u32,
+    start_failures: Vec<String>,
     clients_done: usize,
     responses: BTreeMap<String, Vec<u8>>,
     expected: BTreeMap<String, u64>,
@@ -305,6 +320,22 @@ struct World {
     /// into the node parts, exactly as `serve` and the test host do.
     secrets_root: Option<tempfile::TempDir>,
     state: Mutex<State>,
+}
+
+/// The cause of a start error when the simulated disk failed an fsync under
+/// the start, `None` for any other failure to start. The injected error can
+/// surface anywhere the start writes: the log open (`StartError::Log`) or a
+/// record the start appends itself, which `Node::start` reports under the
+/// error of the step that wrote it (the secret format fence as
+/// `StartError::Secret`, for one). The error's text is what they share, so
+/// the classifier asks for the injected error itself rather than for a
+/// variant; corruption, a mismatch or a bad configuration never carries it.
+fn injected_start_failure(error: &StartError) -> Option<String> {
+    let cause = match error {
+        StartError::Log(LogError::Io(e)) => e.to_string(),
+        other => other.to_string(),
+    };
+    cause.contains(INJECTED_FSYNC_EIO).then_some(cause)
 }
 
 fn log_dir() -> PathBuf {
@@ -430,6 +461,23 @@ impl World {
         );
     }
 
+    /// A start that fails is a daemon that exits: the supervisor starts it
+    /// again (the `fatal` channel), and the next start recovers from whatever
+    /// the failed one left on the disk. That is the right model only when the
+    /// simulated disk caused the failure ([`injected_start_failure`]); any
+    /// other failure to start is a violation, so a start that breaks without
+    /// a fault is not excused.
+    fn start_failed(&self, node_id: NodeId, error: &StartError) {
+        match injected_start_failure(error) {
+            Some(cause) => {
+                self.event(format!("node {node_id} start I/O error: {cause}"));
+                self.st().start_failures.push(cause);
+                let _ = self.fatal_tx.send(node_id);
+            }
+            None => self.violation(format!("node {node_id} failed to start: {error}")),
+        }
+    }
+
     async fn node_main(self: Arc<Self>, env: Env, node_id: NodeId, store: Arc<Store>) {
         let parts = NodeParts {
             env: env.clone(),
@@ -460,13 +508,7 @@ impl World {
         };
         let node = match Node::start(parts).await {
             Ok(n) => n,
-            Err(StartError::Log(LogError::Io(e))) => {
-                // An injected fsync failure during recovery: restart.
-                self.event(format!("node {node_id} start I/O error: {e}"));
-                let _ = self.fatal_tx.send(node_id);
-                return;
-            }
-            Err(e) => return self.violation(format!("node {node_id} failed to start: {e}")),
+            Err(e) => return self.start_failed(node_id, &e),
         };
         self.event(format!(
             "node {node_id} recovered at lsn {}",
@@ -1359,6 +1401,7 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
                 wall: started.elapsed(),
                 recent: vec![],
                 notes: String::new(),
+                start_failures: Vec::new(),
             };
         }
     };
@@ -1388,6 +1431,7 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
                 wall: started.elapsed(),
                 recent: vec![],
                 notes: String::new(),
+                start_failures: Vec::new(),
             };
         }
     };
@@ -1449,9 +1493,52 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
         wall: started.elapsed(),
         recent: st.trace.recent(),
         notes: st.notes.clone(),
+        start_failures: st.start_failures.clone(),
     }
 }
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kronik_core::error::{ApiError, ErrorCode};
+
+    #[test]
+    fn a_start_failed_by_the_injected_fsync_is_excused_whichever_error_carries_it() {
+        let writer = format!("log write/fsync failed: {INJECTED_FSYNC_EIO}");
+        for error in [
+            StartError::Log(LogError::Io(std::io::Error::other(INJECTED_FSYNC_EIO))),
+            StartError::Log(LogError::Stopped(writer.clone())),
+            StartError::Secret(ApiError::new(
+                ErrorCode::Unavailable,
+                format!("log writer stopped: {writer}"),
+            )),
+            StartError::Erasure(format!("log writer stopped: {writer}")),
+            StartError::Corrupt(format!(
+                "recording the engine upgrade: log writer stopped: {writer}"
+            )),
+        ] {
+            assert!(injected_start_failure(&error).is_some(), "{error}");
+        }
+    }
+
+    #[test]
+    fn any_other_failure_to_start_is_a_violation() {
+        for error in [
+            StartError::Log(LogError::Io(std::io::Error::other("no such segment"))),
+            StartError::Log(LogError::Stopped("writer task ended".into())),
+            StartError::Log(LogError::Corrupt("segment 7 header mismatch".into())),
+            StartError::Corrupt("state.db has applied lsn 9, but the log ends at 7".into()),
+            StartError::EngineMismatch("the data was last written by another engine".into()),
+            StartError::Secret(ApiError::new(
+                ErrorCode::Unavailable,
+                "the secret store is unavailable",
+            )),
+        ] {
+            assert!(injected_start_failure(&error).is_none(), "{error}");
+        }
+    }
 }

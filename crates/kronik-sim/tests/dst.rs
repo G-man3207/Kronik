@@ -20,6 +20,9 @@
 //! `--twice` runs every seed twice and fails if the traces differ
 //! (determinism check). `--mutation ack-before-fsync` seeds a deliberate
 //! log bug; the run is then expected to report violations for some seeds.
+//! A run line shows `start-failures=N` after its wall time when a node's
+//! start failed on an injected fsync error and the node was restarted; the
+//! lines under it say what failed.
 //! libtest rejects unknown flags such as `--seed`, hence the custom harness.
 
 // The harness reports on stdout like libtest does.
@@ -142,6 +145,9 @@ fn main() -> ExitCode {
     for (seed, scenario) in runs {
         let r = run(seed, config(seed, scenario));
         println!("{scenario:<8} {}", r.line());
+        for cause in &r.start_failures {
+            println!("  start failed on an injected fsync, node restarted: {cause}");
+        }
         let mut ok = r.ok();
         if let Some(steps) = long
             && r.polls < steps
