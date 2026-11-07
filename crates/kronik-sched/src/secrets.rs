@@ -877,6 +877,8 @@ pub struct SecretRuntime {
     watermark_io: AsyncMutex<()>,
     /// What certification has cost since the node started.
     stats: CertificationStats,
+    /// What the background cycle is doing.
+    cycle: CycleState,
     initialized: AtomicBool,
     background: AtomicBool,
     // The ADR-0004-compliant replacement ripples through the wait/notify
@@ -889,6 +891,31 @@ pub struct SecretRuntime {
     #[allow(clippy::disallowed_types)]
     certified: tokio::sync::watch::Sender<(u64, bool)>,
 }
+/// The passes of the background cycle, in one word: the passes that have
+/// finished in the high half, those in progress in the low half. A single
+/// load is then a consistent picture of the cycle. Relaxed is enough: nothing
+/// is published through the word, and tests are its only readers.
+#[derive(Default)]
+struct CycleState(std::sync::atomic::AtomicU64);
+impl CycleState {
+    const ONE_FINISHED: u64 = 1 << 32;
+
+    fn begin(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One pass fewer in progress, one more finished.
+    fn end(&self) {
+        self.0.fetch_add(Self::ONE_FINISHED - 1, Ordering::Relaxed);
+    }
+
+    /// At least one pass has finished and none is in progress.
+    fn settled(&self) -> bool {
+        let word = self.0.load(Ordering::Relaxed);
+        word >= Self::ONE_FINISHED && word & (Self::ONE_FINISHED - 1) == 0
+    }
+}
+
 /// What certifying the inventory has cost since the node started: the
 /// builds it ran, the log records they read and the effect requests of
 /// erased subjects they met. The numbers are in the "secret inventory
@@ -968,6 +995,7 @@ impl SecretRuntime {
             inventory: AsyncMutex::new(()),
             watermark_io: AsyncMutex::new(()),
             stats: CertificationStats::default(),
+            cycle: CycleState::default(),
             initialized: AtomicBool::new(false),
             background: AtomicBool::new(false),
             certified: tokio::sync::watch::channel((0, false)).0,
@@ -3409,6 +3437,26 @@ impl Node {
             .map_err(|_| unavailable())?
     }
 
+    /// Test support: resolves when the inventory is certified and the
+    /// background cycle has made a pass and is not in the middle of another.
+    /// A fixture that takes a publication needs this: a pass that began while
+    /// the fixture refreshed the inventory itself rebuilds once more when it
+    /// ends, and retires the certificate the fixture built. A quiet period
+    /// cannot tell that rebuild from none; the count of passes can. A node
+    /// whose cycle is not running never settles: callers bound the wait.
+    #[doc(hidden)]
+    pub async fn secret_cycle_settled(&self) {
+        let Some(runtime) = &self.secret_runtime else {
+            return;
+        };
+        loop {
+            if runtime.cycle.settled() && runtime.cache.complete(self.epoch()) {
+                return;
+            }
+            self.env.clock.sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     pub fn start_secret_refresh(&self, original: AuthLease) {
         let Some(runtime) = &self.secret_runtime else {
             return;
@@ -3451,6 +3499,7 @@ impl Node {
                     return;
                 };
                 if !registry_wake || !runtime.cache.complete(node.epoch()) {
+                    runtime.cycle.begin();
                     let attempt = lock(&runtime.cache.state).revision;
                     let config = node.config_now();
                     let mut names: BTreeSet<_> = match node.secret_rows(None).await {
@@ -3554,6 +3603,7 @@ impl Node {
                             }
                         }
                     }
+                    runtime.cycle.end();
                 }
                 let delay = deadline.saturating_sub(env.clock.monotonic());
                 let changed = runtime.cache.revision_changed.clone();

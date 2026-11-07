@@ -806,6 +806,26 @@ async fn complete_inventory_is_revision_and_epoch_bound_and_resource_failure_is_
 }
 
 #[tokio::test]
+async fn the_cycle_is_settled_between_passes_with_a_certified_inventory_and_not_otherwise() {
+    let (_data, node) = node().await;
+    let runtime = node.runtime().unwrap();
+    let within = |bound| node.env.timeout(bound, node.secret_cycle_settled());
+    // The first pass ends, and the inventory is certified: settled.
+    within(Duration::from_secs(60)).await.unwrap();
+    // A pass in the middle of its work: not settled until it ends.
+    runtime.cycle.begin();
+    assert!(within(Duration::from_millis(100)).await.is_err());
+    runtime.cycle.end();
+    within(Duration::from_secs(60)).await.unwrap();
+    // Between passes, but with the certificate retired: not settled until a
+    // rebuild installs one.
+    runtime.cache.clear_coverage();
+    assert!(within(Duration::from_millis(100)).await.is_err());
+    node.refresh_secret_inventory(test_auth()).await.unwrap();
+    within(Duration::from_secs(60)).await.unwrap();
+}
+
+#[tokio::test]
 async fn a_certificate_displaced_at_the_same_epoch_retires_the_publications_taken_from_it() {
     let (_data, node) = node().await;
     let original = node.local_operator_authority().unwrap();
