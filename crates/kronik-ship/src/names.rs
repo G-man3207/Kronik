@@ -1,7 +1,7 @@
 //! What a restore accepts as a name. A bucket does not decide where a file
 //! goes: a snapshot manifest lists plain relative paths below the snapshot
-//! directory, each once, and a component is stored under the hash of its
-//! content.
+//! directory, each once and none an SQLite sidecar, and a component is
+//! stored under the hash of its content.
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -20,6 +20,19 @@ fn shown(name: &str) -> String {
     let head: String = name.chars().take(SHOWN).collect();
     let cut = if head.len() < name.len() { "..." } else { "" };
     format!("{head:?}{cut}")
+}
+
+/// What SQLite appends to the name of a database file for the files it keeps
+/// beside it and reads when it opens the database: the write-ahead log, its
+/// index, and a rollback journal.
+const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// Whether a part of `path` ends like an SQLite sidecar file. No file or
+/// directory a node writes into a snapshot ends this way: the databases end
+/// in `.db`, and the directories are `sql` and two hex digits.
+fn is_sqlite_sidecar(path: &str) -> bool {
+    path.split('/')
+        .any(|part| SQLITE_SIDECARS.iter().any(|suffix| part.ends_with(suffix)))
 }
 
 /// Why `path` is not a plain relative path, or `None` when it is one: not
@@ -56,9 +69,10 @@ fn path_fault(path: &str) -> Option<&'static str> {
 /// Where the files of a manifest go below `dir`, in the manifest's order.
 ///
 /// Refuses the whole manifest unless every path is a plain relative path,
-/// each is listed once, none is also a directory of another, and none is
-/// `manifest.json`, which the restore writes itself. A path that passes is
-/// its own normal form, so comparing the strings compares the files.
+/// each is listed once, none is also a directory of another, none is
+/// `manifest.json`, which the restore writes itself, and none is an SQLite
+/// sidecar file. A path that passes is its own normal form, so comparing the
+/// strings compares the files.
 pub(crate) fn snapshot_destinations(
     dir: &Path,
     files: &[SnapshotFile],
@@ -71,6 +85,13 @@ pub(crate) fn snapshot_destinations(
         if let Some(fault) = fault {
             return Err(ShipError::Restore(format!(
                 "the snapshot manifest names a file {} that is not a plain relative path ({fault})",
+                shown(path)
+            )));
+        }
+        if is_sqlite_sidecar(path) {
+            return Err(ShipError::Restore(format!(
+                "the snapshot manifest names {}, which ends like an SQLite sidecar file; a \
+                 snapshot lists database files only",
                 shown(path)
             )));
         }
@@ -214,6 +235,55 @@ mod tests {
         // One bad path refuses the whole manifest, wherever it is.
         refused(&["state.db", "../x", "secrets.db"]);
         refused(&["../x", "state.db"]);
+    }
+
+    #[test]
+    fn an_sqlite_sidecar_file_is_refused() {
+        for bad in [
+            "state.db-wal",
+            "state.db-shm",
+            "state.db-journal",
+            "secrets.db-journal",
+            "sql/ab/notes-0123abcd.db-wal",
+            "sql/ab/notes-0123abcd.db-shm",
+            "sql/ab/notes-0123abcd.db-journal",
+            "a/b/c.db-wal",
+            "x-wal",
+            "sql/ab-wal/notes-0123abcd.db",
+            "state.db-journal/x.db",
+        ] {
+            let message = refused(&[bad]);
+            assert!(
+                message.contains("an SQLite sidecar file"),
+                "{bad:?}: {message}"
+            );
+        }
+        // Wherever it is in the manifest, next to its database or not.
+        refused(&["state.db", "state.db-wal"]);
+        refused(&["state.db-wal", "state.db"]);
+        refused(&[
+            "state.db",
+            "sql/ab/notes-0123abcd.db",
+            "sql/ab/notes-0123abcd.db-shm",
+        ]);
+        // The files a node writes, and names that only look like one.
+        let dir = Path::new("/stage/snapshot");
+        let fine = [
+            "state.db",
+            "secrets.db",
+            "sql/ab/notes-0123abcd.db",
+            "sql/ab/wal-0123abcd.db",
+            "sql/ab/journal-0123abcd.db",
+            "sql/ab/a-shm-0123abcd.db",
+            "sql/ab/a~wal-0123abcd.db",
+            "sql/walnut/x.db",
+            "walnut.db",
+            "wal",
+            "journal",
+            "shm.db",
+            "x.wal",
+        ];
+        snapshot_destinations(dir, &files(&fine)).unwrap();
     }
 
     #[test]
