@@ -86,11 +86,16 @@ struct Done {
     text: String,
     value: UpgradeCheckOutput,
     error: Option<ApiError>,
+    /// For stderr, whatever the output format: what the first start will do.
+    note: Option<String>,
 }
 
 pub fn check(args: CheckArgs, json: bool) -> ExitCode {
     match execute(args) {
         Ok(done) => {
+            if let Some(note) = &done.note {
+                eprintln!("{note}");
+            }
             if json {
                 match serde_json::to_string(&done.value) {
                     Ok(body) => println!("{body}"),
@@ -128,6 +133,13 @@ fn execute(args: CheckArgs) -> Result<Done, ApiError> {
         .data_dir
         .clone()
         .unwrap_or(configuration.server.data_dir);
+    // The start refuses a data directory whose databases the log no longer
+    // reaches, unless a snapshot repairs it: ask the question the start asks
+    // (read-only, the old daemon may still run), so that the operator learns
+    // before the restart and not at it.
+    let plan = kronik_sched::snapshots::plan_state(&data, "main", true)
+        .map_err(|text| ApiError::new(ErrorCode::StorageCorrupt, text))?;
+    let note = state_note(&plan);
     let workers = args
         .workers
         .map(usize::from)
@@ -209,7 +221,37 @@ fn execute(args: CheckArgs) -> Result<Done, ApiError> {
     };
     let error = (!checked.report.passed).then(|| diverge_error(&value, &args.window));
     let text = render(&value, &args, &data, selected_config.as_deref());
-    Ok(Done { text, value, error })
+    Ok(Done {
+        text,
+        value,
+        error,
+        note,
+    })
+}
+
+/// What the first start does with the databases, when it is not nothing.
+fn state_note(plan: &kronik_sched::snapshots::StatePlan) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some((_, manifest)) = &plan.install {
+        let at = plan
+            .state
+            .map(|(state, lowest)| {
+                format!(" (state at lsn {state}, an actor database at {lowest})")
+            })
+            .unwrap_or_default();
+        parts.push(format!(
+            "note: the first start installs the snapshot at lsn {} because the databases are \
+             older than the log retention kept{at}; kronik explain STORAGE_CORRUPT",
+            manifest.lsn
+        ));
+    }
+    if plan.unread > 0 {
+        parts.push(format!(
+            "note: {} actor database(s) are held by a running daemon and were not read",
+            plan.unread
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
 fn diverge_error(v: &UpgradeCheckOutput, window: &str) -> ApiError {

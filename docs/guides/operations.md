@@ -1357,6 +1357,14 @@ to it (`<engine>.diff.json`) and exits 1 with `ENGINE_UPGRADE_DIVERGED`:
 keep the current binary. `--dry-run` prints the result and writes neither
 file. A bad window or a directory with no log is `BAD_REQUEST`.
 
+The check also asks the question the start asks of the data directory: the
+databases (`state.db` and the actor databases) must be reached by the log
+that retention kept. It prints a note when the start will repair that by
+installing a snapshot, and stops with `STORAGE_CORRUPT` and the start's own
+message when it cannot ([A start that stops at the log's
+start](#a-start-that-stops-at-the-logs-start)). Run it before every restart
+after an upgrade.
+
 After the restart the data is the new engine's. Going back to the old
 binary is the same procedure the other way: its own `kronik upgrade check`
 first. That works between builds that write the same kinds of record; v0.3.0

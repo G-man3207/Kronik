@@ -321,6 +321,16 @@ result, and writes neither file. A bad window or a data directory with no
 log is `BAD_REQUEST`. `--json` prints the report, and the diff path when
 one was written, even when the command exits 1.
 
+The check also asks the question `kronik serve` asks of the data directory
+before it opens anything: whether the log that retention kept reaches
+`state.db` and every actor database (an actor database says where that
+actor's last change was, so an idle SQL actor can be behind a log that was
+compacted past it). When a snapshot repairs that, the check passes and prints
+a note on stderr, also with `--json`, that the first start installs that
+snapshot. When none does, it exits 1 with `STORAGE_CORRUPT` and the message
+`kronik serve` would stop with. Actor databases that a running daemon holds
+are not read; the note says how many.
+
 A Wasmtime patch also changes the recorded engine identity: 50.0.0 to
 50.0.1 still requires this check, with an empty behavior diff in both
 replay modes. The new daemon refuses the old directory until the exact

@@ -315,6 +315,153 @@ fn upgrade_check_writes_a_report_and_rejects_a_bad_window() {
     assert_eq!(file["to_engine"], v["to_engine"]);
 }
 
+const NOTES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/notes.wasm");
+
+/// A data directory whose log retention has compacted past the only SQL
+/// change of `notes/n`, which is idle since: a node with no history,
+/// small segments, one note, traffic of another actor, a snapshot.
+fn compacted_past_an_idle_actor(dir: &Path) {
+    use kronik_proto::log::v1 as pb;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+        let mut storage = kronik_sched::snapshots::StorageConfig::new(dir.to_path_buf());
+        storage.history = Duration::ZERO;
+        let node = kronik_sched::start_local(
+            env,
+            dir,
+            kronik_sched::NodeConfig {
+                concurrency: 8,
+                storage: Some(storage),
+                segment_max_bytes: Some(4096),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let audit = || pb::Audit {
+            token_id: "test".into(),
+            reason: "test".into(),
+            wall_time_ms: 0,
+        };
+        let message = |name: &str, text: &str| pb::Message {
+            name: name.into(),
+            content_type: "text/plain".into(),
+            body: Some(pb::Sealable {
+                subject: None,
+                value: Some(pb::sealable::Value::Plain(text.as_bytes().to_vec())),
+            }),
+            blobs: Vec::new(),
+            retained_compensation_source: None,
+        };
+        let owner = || node.local_operator_authority().unwrap();
+        for guest in [COUNTER, NOTES] {
+            node.deploy(&std::fs::read(guest).unwrap(), audit(), false, owner())
+                .await
+                .unwrap();
+        }
+        let send = |actor: &str, name: &str, text: &str| {
+            node.send(
+                kronik_core::ids::ActorRef::parse(actor).unwrap(),
+                message(name, text),
+                audit(),
+                false,
+                owner(),
+            )
+        };
+        send("notes/n", "add", "hello").await.unwrap();
+        for i in 0..80 {
+            send(&format!("counter/k{}", i % 5), "increment", "")
+                .await
+                .unwrap();
+            if i % 20 == 19 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        node.snapshot("manual", owner()).await.unwrap();
+        let storage = node.storage_config().unwrap().clone();
+        assert!(
+            node.log_first(&storage).unwrap() > 3,
+            "nothing was compacted"
+        );
+    });
+    drop(rt);
+}
+
+/// Sets the applied LSN of every actor database under `root` to `lsn`, as the
+/// compaction of an older binary left them.
+fn lower_actor_markers(root: &Path, lsn: i64) {
+    let Ok(dirs) = std::fs::read_dir(root) else {
+        return;
+    };
+    for d in dirs.flatten() {
+        if d.file_type().unwrap().is_dir() {
+            lower_actor_markers(&d.path(), lsn);
+        } else if d.path().extension().is_some_and(|e| e == "db") {
+            rusqlite::Connection::open(d.path())
+                .unwrap()
+                .execute(
+                    "UPDATE _kronik_meta SET v = ?1 WHERE k = 'applied_lsn'",
+                    [lsn],
+                )
+                .unwrap();
+        }
+    }
+}
+
+/// The start refuses a directory whose actor databases the log no
+/// longer reaches unless a snapshot repairs it, and `kronik upgrade check` is
+/// the step before the restart: it says so then, with the start's words, and
+/// notes the repair when there is one.
+#[test]
+fn upgrade_check_asks_the_question_the_start_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    compacted_past_an_idle_actor(dir.path());
+    lower_actor_markers(&dir.path().join("branches/main/sql"), 4);
+    for snapshot in std::fs::read_dir(dir.path().join("snapshots/main")).unwrap() {
+        lower_actor_markers(&snapshot.unwrap().path().join("sql"), 4);
+    }
+    let data = dir.path().to_str().unwrap();
+
+    // A snapshot reaches the log: it passes, and says what the start will do.
+    let repairable = kronik(&[
+        "--json",
+        "upgrade",
+        "check",
+        "--data-dir",
+        data,
+        "--dry-run",
+    ]);
+    assert_eq!(repairable.code, 0, "{repairable:?}");
+    assert_eq!(repairable.json()["passed"], true);
+    assert!(
+        repairable
+            .stderr
+            .contains("the first start installs the snapshot at lsn"),
+        "{repairable:?}"
+    );
+
+    // None does: it refuses, with the words of the start.
+    std::fs::remove_dir_all(dir.path().join("snapshots")).unwrap();
+    let refused = kronik(&[
+        "--json",
+        "upgrade",
+        "check",
+        "--data-dir",
+        data,
+        "--dry-run",
+    ]);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    let error = refused.json();
+    assert_eq!(error["error"]["code"], "STORAGE_CORRUPT", "{refused:?}");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("state is at lsn 4, but the log starts at ")
+            && message.contains("no snapshot reaches it"),
+        "{message}"
+    );
+}
+
 /// The one precompiled code artifact in `dir` (`code/<hash>.<engine>.cwasm`).
 fn one_cwasm(dir: &Path) -> std::path::PathBuf {
     let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join("code"))
