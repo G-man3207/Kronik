@@ -1268,3 +1268,31 @@ fn a_re_run_waits_for_a_secret_for_ever_and_for_other_unavailability_a_few_times
         assert!(!rerun_waits(code, 0, false), "{code}");
     }
 }
+
+#[tokio::test]
+async fn a_failed_certification_names_the_version_it_could_not_get() {
+    let _serial = TESTS.lock().await;
+    let (_data, node, _bao, _metadata) = provider(404).await;
+    let runtime = node.runtime().unwrap();
+    let original = node.local_operator_authority().unwrap();
+    // The node's own cycle retries the same rebuild and takes what it noted
+    // for its warning, so try until this call's note is the one read.
+    let mut named = String::new();
+    for _ in 0..100 {
+        assert!(
+            node.refresh_secret_inventory(original.clone())
+                .await
+                .is_err()
+        );
+        named = runtime.take_failed_row();
+        if !named.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        named,
+        "token@v1 on bao: the immutable secret version is no longer available"
+    );
+    // A value is never in it.
+    assert!(!named.contains("immutable-provider-value"));
+}

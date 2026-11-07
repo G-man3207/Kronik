@@ -875,6 +875,10 @@ pub struct SecretRuntime {
     inventory: AsyncMutex<()>,
     /// Serializes the writers of the coverage watermark file.
     watermark_io: AsyncMutex<()>,
+    /// The retained version the last failed certification could not get, for
+    /// the warning of the cycle that retries it: a name, a version, a backend
+    /// and a category, never a value.
+    failed_row: Mutex<Option<String>>,
     /// What certification has cost since the node started.
     stats: CertificationStats,
     /// What the background cycle is doing.
@@ -996,6 +1000,7 @@ impl SecretRuntime {
             watermark_io: AsyncMutex::new(()),
             stats: CertificationStats::default(),
             cycle: CycleState::default(),
+            failed_row: Mutex::new(None),
             initialized: AtomicBool::new(false),
             background: AtomicBool::new(false),
             certified: tokio::sync::watch::channel((0, false)).0,
@@ -1019,6 +1024,22 @@ impl SecretRuntime {
         } else {
             Err(unavailable())
         }
+    }
+    /// Remembers which retained version a certification failed on and why.
+    fn note_failed_row(&self, row: &pb::SecretVersion, reason: impl std::fmt::Display) {
+        let backend = if row.backend.is_empty() {
+            "file"
+        } else {
+            row.backend.as_str()
+        };
+        *lock(&self.failed_row) = Some(format!(
+            "{}@v{} on {backend}: {reason}",
+            row.name, row.version
+        ));
+    }
+    /// What [`Self::note_failed_row`] last remembered, once.
+    fn take_failed_row(&self) -> String {
+        lock(&self.failed_row).take().unwrap_or_default()
     }
     fn source(
         &self,
@@ -2819,7 +2840,11 @@ impl Node {
         let _guard = if cached_only {
             None
         } else {
-            Some(runtime.inventory.lock().await)
+            let guard = runtime.inventory.lock().await;
+            // A build says which version it could not get; another build's
+            // answer is not its own.
+            runtime.take_failed_row();
+            Some(guard)
         };
         let started = self.env.clock.monotonic();
         runtime
@@ -3084,12 +3109,19 @@ impl Node {
                 if physical.to_string() != row.source_version {
                     return Err(unavailable());
                 }
-                runtime.retained_file_bytes(&row.name, physical).await?
+                match runtime.retained_file_bytes(&row.name, physical).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        runtime.note_failed_row(row, "the retained file value cannot be read");
+                        return Err(error);
+                    }
+                }
             } else {
                 let fetched = runtime
                     .fetched(&scope, Some(&row.source_version), original.clone())
                     .await
                     .map_err(|error| {
+                        runtime.note_failed_row(row, error);
                         runtime
                             .cache
                             .failure_version(&scope, Some(&row.source_version), error);
@@ -3097,7 +3129,10 @@ impl Node {
                     })?;
                 runtime
                     .validate(&scope, &fetched, Some(&row.source_version))
-                    .map_err(|_| unavailable())?;
+                    .map_err(|_| {
+                        runtime.note_failed_row(row, "the fetched value failed its checks");
+                        unavailable()
+                    })?;
                 fetched.value
             };
             if runtime
@@ -3106,6 +3141,7 @@ impl Node {
                 .map_err(|_| unavailable())?
                 != row.version_hash
             {
+                runtime.note_failed_row(row, "the value does not match the recorded version hash");
                 return Err(unavailable());
             }
             runtime.cache.insert(row, Arc::new(bytes), false, None)?;
@@ -3586,6 +3622,7 @@ impl Node {
                                 code = %error.code,
                                 message = %error.message,
                                 failures = rebuild_failures,
+                                failed_version = %runtime.take_failed_row(),
                                 "secret rebuild failed"
                             );
                             rebuild_failures = rebuild_failures.saturating_add(1);
