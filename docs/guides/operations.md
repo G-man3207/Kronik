@@ -482,6 +482,7 @@ stays the same when it is replayed again.
 | `run_dir` | `"/run/kronik"` | Runtime state of the sandboxes: runsc's root, network namespaces and bridge sockets. Best on a tmpfs; nothing in it survives a reboot. One daemon per directory: a second daemon runs without foreign actors |
 | `layout_dirs` | `[]` | Absolute directories whose `oci-layout:` images an `operate` token may add; any other directory needs `admin` |
 | `pull_timeout` | `"10m"` | How long an image pull or layout import may take |
+| `start_timeout` | `"30s"` | How long a started sandbox or microVM may take to answer on its port before the start counts as failed and is retried with a backoff (1s to 1h). It only lengthens the wait for readiness and changes nothing that is recorded. A database's first start, or a microVM on a host without hardware virtualization of its own (nested), can need more |
 | `checkpoints_kept` | `3` | Checkpoints kept per `fork_mode = "sandbox"` actor ([M14](../design/m14-foreign-forks.md)); one is taken with every snapshot, and a fork's copy starts from the newest at or before its fork point |
 
 ### [otel]

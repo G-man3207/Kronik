@@ -443,6 +443,10 @@ pub struct Foreign {
     pub layout_dirs: Vec<PathBuf>,
     /// The longest one image pull from a registry may take.
     pub pull_timeout: Dur,
+    /// How long a sandbox or microVM may take to answer on its port after it
+    /// starts (default 30 seconds). A database's first start, a microVM on a
+    /// host without hardware virtualization of its own, can need more.
+    pub start_timeout: Dur,
     /// Checkpoints kept per `fork_mode = "sandbox"` actor (M14).
     pub checkpoints_kept: usize,
 }
@@ -456,6 +460,7 @@ impl Default for Foreign {
             run_dir: "/run/kronik".into(),
             layout_dirs: Vec::new(),
             pull_timeout: Dur::secs(600),
+            start_timeout: Dur::secs(30),
             checkpoints_kept: 3,
         }
     }
@@ -1039,6 +1044,13 @@ impl Config {
         if !self.foreign.microvm_dir.is_absolute() {
             return Err("[foreign] microvm_dir must be an absolute directory".into());
         }
+        if !(Duration::from_secs(1)..=Duration::from_secs(3600))
+            .contains(&self.foreign.start_timeout.0)
+        {
+            return Err(
+                "[foreign] start_timeout must be between 1s and 1h, such as \"30s\"".into(),
+            );
+        }
         if self.fork.preview_ttl.0.is_zero() {
             return Err("[fork] preview_ttl must be more than zero, such as \"24h\"".into());
         }
@@ -1266,6 +1278,26 @@ mod tests {
         Config::parse(text, Path::new("kronik.toml"))
     }
 
+    #[test]
+    fn a_foreign_actor_has_thirty_seconds_to_answer_unless_the_file_says_otherwise() {
+        assert_eq!(
+            parse("").unwrap().foreign.start_timeout.0,
+            Duration::from_secs(30)
+        );
+        let long = parse("[foreign]\nstart_timeout = \"5m\"\n").unwrap();
+        assert_eq!(long.foreign.start_timeout.0, Duration::from_secs(300));
+        for bad in ["0s", "500ms", "2h"] {
+            let error = parse(&format!("[foreign]\nstart_timeout = \"{bad}\"\n"))
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(error.contains("start_timeout"), "{bad}: {error}");
+        }
+        // Not a duration at all: the duration parser's own message.
+        let error = parse("[foreign]\nstart_timeout = \"-1s\"\n").err().unwrap();
+        assert!(error.to_string().contains("invalid duration"), "{error}");
+    }
+
     /// The operator configuration file documented in the build brief,
     /// "Operator configuration and policy".
     const DOCUMENTED_CONFIG: &str = r#"[server]
@@ -1323,6 +1355,7 @@ catch_up_timeout = "5m"
 [foreign]
 runsc_path = "/usr/local/bin/runsc"
 platform = "auto"                     # auto, systrap or kvm
+start_timeout = "30s"                 # how long a started sandbox may take to answer
 "#;
 
     #[test]
@@ -1351,6 +1384,8 @@ platform = "auto"                     # auto, systrap or kvm
         assert_eq!(config.replay.sample, Percent(100.0));
         assert_eq!(config.promote.catch_up_timeout, Dur::secs(300));
         assert_eq!(config.foreign.platform, Platform::Auto);
+        // The documented file carries the default, so the round trip holds.
+        assert_eq!(config.foreign.start_timeout.0, Duration::from_secs(30));
     }
 
     #[test]

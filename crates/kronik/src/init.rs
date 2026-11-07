@@ -359,6 +359,7 @@ platform = "auto"                     # auto, systrap or kvm
 run_dir = "/run/kronik"               # runsc state, namespaces, bridge sockets
 layout_dirs = []                      # oci-layout: images an operate token may add
 pull_timeout = "10m"
+start_timeout = "30s"                 # a started sandbox or microVM must answer on its port within this
 checkpoints_kept = 3                  # per fork_mode = "sandbox" actor, one per snapshot
 "#
     )

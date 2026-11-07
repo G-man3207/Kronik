@@ -437,6 +437,7 @@ pub(crate) fn foreign_config(
         insecure_registries,
         layout_dirs: config.foreign.layout_dirs.clone(),
         pull_timeout: config.foreign.pull_timeout.0,
+        start_timeout: config.foreign.start_timeout.0,
         checkpoints_kept: config.foreign.checkpoints_kept,
         privilege: kronik_foreign::Privilege::Root,
         microvm_dir: config.foreign.microvm_dir.clone(),

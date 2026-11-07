@@ -134,3 +134,7 @@ For the separate KVM/mapped-directory oracle, create a fresh fixture with the fi
 ## Evidence boundary
 
 Parser/socket/filesystem regressions and static review support implementation but cannot close these runtime criteria. The installed program proof (real malicious-actor controls, the demos, Postgres checkpoint and fork, the UID audit, source-unavailable loaded-key ship/restore), the pinned tool build and the KVM boot, call, resource calibration, ENOSPC, full snapshot, fork and stop checks have not been run on this revision. They remain unexercised criteria, never optional skips. No independent security audit, Ubuntu 24.04 result or cross-version snapshot compatibility is claimed.
+
+### The fixture's start timeout
+
+A started sandbox has thirty seconds to answer on its port, and a microVM's first start can take longer on a host that is itself virtual (Postgres running `initdb` in 512 MiB), so the fixture's configuration sets `[foreign] start_timeout = "5m"` for its own daemon when it holds microVM tools. The product's default is unchanged, and a result under this allowance does not say that thirty seconds is enough.

@@ -120,6 +120,9 @@ pub struct ForeignConfig {
     pub layout_dirs: Vec<PathBuf>,
     /// `[foreign] pull_timeout`: the longest one image fetch may take.
     pub pull_timeout: Duration,
+    /// `[foreign] start_timeout`: how long a started sandbox may take to answer
+    /// on its port.
+    pub start_timeout: Duration,
     /// `[foreign] checkpoints_kept`: checkpoints per actor (M14).
     pub checkpoints_kept: usize,
 }
@@ -358,7 +361,10 @@ impl Foreign {
             microvm_dir: cfg.microvm_dir.clone(),
             disk_reserve: cfg.disk_reserve,
             pull_timeout: cfg.pull_timeout,
-            timings: Timings::default(),
+            timings: Timings {
+                start_timeout: cfg.start_timeout,
+                ..Timings::default()
+            },
             cgroup_parent: match &cfg.privilege {
                 Privilege::Userns { cgroup } => cgroup.trim_end_matches('/').to_owned(),
                 _ => crate::sys::own_cgroup()
@@ -1470,6 +1476,7 @@ mod tests {
             privilege: Privilege::Root,
             layout_dirs: Vec::new(),
             pull_timeout: Duration::from_secs(5),
+            start_timeout: Duration::from_secs(30),
             checkpoints_kept: 3,
         }
     }

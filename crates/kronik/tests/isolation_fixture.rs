@@ -944,9 +944,19 @@ fn create(args: &[String]) -> Result<()> {
         }
     }
     // The service has its own mount view; no globally fixed data/run path is written.
+    // A microVM's first start (initdb in 512 MiB, on a host that is itself virtual)
+    // can take longer than the product's thirty seconds; the proof says so for
+    // its own daemon and leaves the product's default alone.
+    let start_timeout = if args.len() > 9 && !directory_only {
+        "start_timeout='5m'\n"
+    } else {
+        ""
+    };
     fs::write(
         root.join("etc/kronik/kronik.toml"),
-        "[server]\ndata_dir='/var/lib/kronik'\napi_socket='/run/kronik/api.sock'\nhttp_listen='127.0.0.1:0'\nadmin_listen='127.0.0.1:0'\n[foreign]\nrun_dir='/run/kronik'\nplatform='systrap'\nlayout_dirs=['/var/lib/kronik/layouts']\n[keys]\nsource='file'\nmaster_key_file='/etc/kronik/master.key'\n[ship]\nenabled=true\nurl='file:///var/lib/kronik-ship/main'\n[log]\ndisk_reserve='64MiB'\nsegment_max_age_s=1\n[gateway]\ntimeout='120s'\n",
+        format!(
+            "[server]\ndata_dir='/var/lib/kronik'\napi_socket='/run/kronik/api.sock'\nhttp_listen='127.0.0.1:0'\nadmin_listen='127.0.0.1:0'\n[foreign]\nrun_dir='/run/kronik'\nplatform='systrap'\nlayout_dirs=['/var/lib/kronik/layouts']\n{start_timeout}[keys]\nsource='file'\nmaster_key_file='/etc/kronik/master.key'\n[ship]\nenabled=true\nurl='file:///var/lib/kronik-ship/main'\n[log]\ndisk_reserve='64MiB'\nsegment_max_age_s=1\n[gateway]\ntimeout='120s'\n"
+        ),
     )?;
     for name in [
         "passwd",
