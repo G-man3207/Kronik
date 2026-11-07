@@ -56,7 +56,12 @@ revision for these read surfaces. SET, DELETE, LINK, UNLINK and explicit
 REFRESH release their per-name mutation lock, wake the existing independently
 authorized collector, and await its semantic-revision completion within the
 existing fetch deadline. A wake alone is not completion. Both actual
-configuration-epoch publishers invalidate coverage; a skipped stale wake does
+configuration-epoch publishers invalidate coverage and, before they return,
+recertify it from the catalogue that the last full rebuild captured. They wake
+the collector only when that recertification could not restore the
+certificate: a change that restored its own certificate is not followed by a
+full rebuild, which would retire the certificate at its first step and leave
+the next request without an inventory until it ends. A skipped stale wake does
 not reset the periodic refresh deadline. Metadata reads never fetch a provider
 or fill the cache to hide incomplete coverage.
 

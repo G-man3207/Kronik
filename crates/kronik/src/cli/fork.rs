@@ -1875,12 +1875,14 @@ pub fn watch(ctx: &Ctx, a: WatchArgs) -> Result<ExitCode, Error> {
 }
 
 /// A deployment switch publishes its new epoch by retiring the certified
-/// secret cache and recertifying it asynchronously
-/// (crates/kronik-sched/src/secrets.rs `publish_secret_config_epoch`), so a
-/// scrubbed read can briefly answer 503 `SECRET_UNAVAILABLE` or `UNAVAILABLE`
-/// in between. A watch status poll holds no secret and is read-only, and the
-/// daemon's own hint says to retry that window; retry exactly those two codes
-/// within a bounded budget, and return every other error unchanged.
+/// secret cache (crates/kronik-sched/src/secrets.rs
+/// `publish_secret_config_epoch`) and recertifying it: from the cached
+/// catalogue as the switch finishes or, when that cannot be reused, by the
+/// background rebuild. A scrubbed read can briefly answer 503
+/// `SECRET_UNAVAILABLE` or `UNAVAILABLE` in between. A watch status poll
+/// holds no secret and is read-only, and the daemon's own hint says to retry
+/// that window; retry exactly those two codes within a bounded budget, and
+/// return every other error unchanged.
 const WATCH_TRANSIENT_BUDGET: Duration = Duration::from_secs(30);
 const WATCH_TRANSIENT_BACKOFF: Duration = Duration::from_millis(100);
 

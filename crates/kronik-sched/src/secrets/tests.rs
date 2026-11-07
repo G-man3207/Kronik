@@ -890,6 +890,97 @@ async fn the_cycle_is_settled_between_passes_with_a_certified_inventory_and_not_
     within(Duration::from_secs(60)).await.unwrap();
 }
 
+/// Puts the cycle inside a pass and keeps it there: the certificate is
+/// retired and the cycle woken, and its full rebuild waits for the inventory
+/// lock that the guard holds. A wake is then a stored permit that nothing
+/// consumes, which [`wake_is_stored`] reads. Drops the permits stored so far.
+async fn park_the_cycle_in_a_pass<'a>(
+    node: &Node,
+    runtime: &'a SecretRuntime,
+) -> tokio::sync::MutexGuard<'a, ()> {
+    node.env
+        .timeout(Duration::from_secs(60), node.secret_cycle_settled())
+        .await
+        .unwrap();
+    let held = runtime.inventory.lock().await;
+    runtime.cache.clear_coverage();
+    node.wake_rebuild();
+    node.env
+        .timeout(Duration::from_secs(60), async {
+            while runtime.cycle.0.load(Ordering::Relaxed) & (CycleState::ONE_FINISHED - 1) == 0 {
+                node.env.clock.sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+    while wake_is_stored(node, runtime).await {}
+    held
+}
+
+/// Whether a wake of the cycle is stored (and takes it).
+async fn wake_is_stored(node: &Node, runtime: &SecretRuntime) -> bool {
+    node.env
+        .timeout(Duration::ZERO, runtime.cache.revision_changed.notified())
+        .await
+        .is_ok()
+}
+
+#[tokio::test]
+async fn a_configuration_change_that_restores_the_certificate_does_not_wake_the_cycle() {
+    let (_data, node) = node().await;
+    let runtime = node.runtime().unwrap();
+    let held = park_the_cycle_in_a_pass(&node, runtime).await;
+    // The change recertifies from the cached catalogue and succeeds. The
+    // cycle's full rebuild would only clear that certificate again, at its
+    // first step, and the request after the change would find no inventory.
+    node.grant(
+        "test",
+        "http:example.com",
+        None,
+        None,
+        audit(),
+        false,
+        test_auth(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        runtime.cache.complete(node.epoch()),
+        "the change did not restore the certificate"
+    );
+    assert!(
+        !wake_is_stored(&node, runtime).await,
+        "the change woke the cycle although it had restored the certificate"
+    );
+    drop(held);
+}
+
+#[tokio::test]
+async fn a_configuration_change_that_cannot_restore_the_certificate_wakes_the_cycle() {
+    let (_data, node) = node().await;
+    let runtime = node.runtime().unwrap();
+    let held = park_the_cycle_in_a_pass(&node, runtime).await;
+    // No catalogue to reuse: the cycle's full rebuild is the way back.
+    lock(&runtime.cache.state).native_catalogue_capture = None;
+    node.grant(
+        "test",
+        "http:example.com",
+        None,
+        None,
+        audit(),
+        false,
+        test_auth(),
+    )
+    .await
+    .unwrap();
+    assert!(!runtime.cache.complete(node.epoch()));
+    assert!(
+        wake_is_stored(&node, runtime).await,
+        "the change left the certificate retired and did not wake the cycle"
+    );
+    drop(held);
+}
+
 #[tokio::test]
 async fn a_certificate_displaced_at_the_same_epoch_retires_the_publications_taken_from_it() {
     let (_data, node) = node().await;

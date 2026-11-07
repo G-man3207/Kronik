@@ -1274,6 +1274,17 @@ impl Node {
     fn runtime(&self) -> Result<&Arc<SecretRuntime>, ApiError> {
         self.secret_runtime.as_ref().ok_or_else(unavailable)
     }
+    /// Publishes a configuration epoch and retires the certificate, which
+    /// was built for the epoch before.
+    ///
+    /// This does not wake the secret cycle. Both publishers recertify from
+    /// the cached catalogue right afterwards
+    /// ([`Node::recertify_cached_secret_inventory`]), and that wakes the cycle
+    /// only if it could not restore the certificate. A wake here ran the
+    /// cycle's full rebuild after every epoch change, and the rebuild begins
+    /// by clearing the certificate: the one the change had just restored.
+    /// The next request found no inventory until the rebuild ended, and
+    /// recorded the placeholder for the reason of its mutation.
     pub(crate) fn publish_secret_config_epoch(&self, publish_epoch: impl FnOnce()) {
         let Some(runtime) = &self.secret_runtime else {
             publish_epoch();
@@ -1288,7 +1299,6 @@ impl Node {
             retired
         };
         drop(retired);
-        runtime.cache.revision_changed.notify_one();
     }
     pub fn secret_cache(&self) -> Option<Arc<SecretCache>> {
         self.secret_runtime
@@ -2859,15 +2869,32 @@ impl Node {
         .await;
     }
 
+    /// Restores the certificate that a configuration epoch change retired,
+    /// from the catalogue the last full rebuild captured. `Ok(true)`: it is
+    /// back. Otherwise the secret cycle is woken, because its full rebuild is
+    /// then what restores it ([`Node::publish_secret_config_epoch`] does not
+    /// wake it): `Ok(false)` when the catalogue could not be reused (no
+    /// capture, a capture older than `[secrets] refresh`, a registry that
+    /// moved meanwhile), the error otherwise.
     pub(crate) async fn recertify_cached_secret_inventory(&self) -> Result<bool, ApiError> {
         if self.secret_runtime.is_none() {
             return Ok(false);
         }
-        let original = self.native_recovery_authority()?;
-        match self.refresh_secret_inventory_mode(original, true).await {
+        let outcome = async {
+            let original = self.native_recovery_authority()?;
+            self.refresh_secret_inventory_mode(original, true).await
+        }
+        .await;
+        match outcome {
             Ok(_) => Ok(true),
-            Err(error) if error.code == ErrorCode::SecretUnavailable => Ok(false),
-            Err(error) => Err(error),
+            Err(error) => {
+                self.wake_rebuild();
+                if error.code == ErrorCode::SecretUnavailable {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
         }
     }
 
