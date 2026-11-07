@@ -1,0 +1,31 @@
+{
+  "format": 1,
+  "id": "main-00000000000000000020",
+  "branch": "main",
+  "lsn": 20,
+  "engine_version": "kronik-0.4.0+wasmtime-50.0.1",
+  "created_wall_ms": 1794012419647,
+  "logical_time_ms": 1794012419599,
+  "segments": [
+    "00000000000000000001.seg"
+  ],
+  "files": [
+    {
+      "path": "state.db",
+      "size": 139264,
+      "blake3": "9d9b379630e9f66d1384a36e285575b34ae693bfb5c3abbc5cd8d0004a5e5997"
+    },
+    {
+      "path": "sql/df/notes~a-df924404.db",
+      "size": 16384,
+      "blake3": "c0bdf79c47f6004cac021f8a30f9ef6e022125e535997039a467bf471cb09043"
+    },
+    {
+      "path": "secrets.db",
+      "size": 20480,
+      "blake3": "71ac3886b3341d5c7902acbc2379704d4eb9239e696631f9b20d58fba43f68e5"
+    }
+  ],
+  "state_hash": "b3:011e1d9a0af2fe4245fde094ab3902771e59381dcb228567dc4ef30b76450e5e",
+  "reason": "manual"
+}
