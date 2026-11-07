@@ -559,6 +559,11 @@ fn failed_watch_stop_keeps_the_watch_live_and_audits_the_failure() {
     let w =
         p.rt.block_on(watches.watch(epoch, 60_000, audit(), false, false, p.owner()))
             .unwrap();
+    // A watch evaluates once as soon as it starts and saves what it saw, and
+    // a failed save fails the watch for good. Let that evaluation finish
+    // (the interval is an hour, so there is no other) before the directory is
+    // made unusable below; only the stop is to meet the failure.
+    wait_for(&watches, &w.id, |w| w.metrics.is_some());
     let path = dir.path().join("watches");
     std::fs::rename(&path, dir.path().join("held-watches")).unwrap();
     std::fs::write(&path, b"not a directory").unwrap();
