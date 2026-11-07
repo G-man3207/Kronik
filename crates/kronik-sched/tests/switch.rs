@@ -300,18 +300,36 @@ async fn a_held_resend_of_a_dead_letter_gone_by_the_switch_is_dropped() {
         .rebase_pause(Duration::from_secs(5), owner(&node))
         .await
         .unwrap();
-    let resend = {
-        let node = node.clone();
-        tokio::spawn(async move { node.resend(dead, audit(), false, owner(&node)).await })
-    };
+    let started = hold.arrived.load(Ordering::SeqCst);
+    // The resend is polled once, here: it checks its dead letter and queues
+    // behind the pause before the poll returns, so the switch finds it held
+    // whatever the scheduler does. A spawned task, even after a sleep, can
+    // be started late enough to check the dead letter before the switch and
+    // queue after it, when the pause is over and the state is the rebased one.
+    let mut resend = Box::pin(node.resend(dead, audit(), false, owner(&node)));
+    let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(resend.as_mut().poll(cx))).await;
+    assert!(polled.is_pending(), "held by the pause: {polled:?}");
+    // Only a failure to hold it is waited for: a worker that wrongly starts
+    // the turn has the time to do it.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(!resend.is_finished(), "held by the pause");
+    assert_eq!(hold.arrived.load(Ordering::SeqCst), started, "a turn ran");
     hold.release.add_permits(1);
     node.rebase_switch(pause, "r-dead", sw, kinds, not_after, audit(), owner(&node))
         .await
         .unwrap();
-    let r: Result<_, ApiError> = resend.await.unwrap();
+    assert!(
+        node.store().db().dead_letter(dead).unwrap().is_none(),
+        "the rebased state has no such dead letter"
+    );
+    let r: Result<_, ApiError> = resend.await;
     assert_eq!(r.unwrap_err().code, ErrorCode::DeadLetterNotFound);
+    // Dropped, not run: no turn started, and none failed into a dead letter.
+    assert_eq!(
+        hold.arrived.load(Ordering::SeqCst),
+        started,
+        "the resend ran"
+    );
+    assert!(node.store().db().dead_letters(0, 100).unwrap().is_empty());
 }
 
 /// Re-review #3 (v0.1): a configuration change whose caller goes away while
