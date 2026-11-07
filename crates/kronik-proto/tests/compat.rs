@@ -231,6 +231,37 @@ fn foreign_actor_fork_mode_v1() {
     );
 }
 
+/// `ForeignActor` with `isolation = MICROVM` (M20, ADR 0095). The value has
+/// been in the schema since M7, but until M20 the daemon refused to declare
+/// such an actor, so no log held one. No field and no format version change;
+/// the fixture pins the bytes of the first records that carry the level, its
+/// `firecracker` platform and `fork_mode = sandbox`.
+#[test]
+fn foreign_actor_microvm_v1() {
+    assert_eq!(pb::Isolation::Microvm as i32, 3);
+    let record = Record::ForeignActor(pb::ForeignActor {
+        epoch: 4,
+        op: pb::ForeignOp::Add as i32,
+        name: "vm".into(),
+        image: "oci-layout:/srv/foreign-echo.oci@sha256:".to_owned() + &"cd".repeat(32),
+        port: 8080,
+        cpu_millis: 2000,
+        memory_bytes: 268_435_456,
+        isolation: pb::Isolation::Microvm as i32,
+        platform: "firecracker".into(),
+        fork_mode: "sandbox".into(),
+        ..Default::default()
+    });
+    let bytes = fixture("foreign-actor-microvm-v1", &record);
+    let decoded = Record::decode(kronik_proto::kind::FOREIGN_ACTOR, &bytes).unwrap();
+    assert_eq!(decoded, record);
+    let Record::ForeignActor(actor) = decoded else {
+        panic!("not a ForeignActor record");
+    };
+    assert_eq!(actor.isolation, 3);
+    assert_eq!(actor.platform, "firecracker");
+}
+
 /// `GROUNDING_FORKED` (5, M14, ADR 0020) on an effect of a fork turn.
 #[test]
 fn effect_record_forked_v1() {
