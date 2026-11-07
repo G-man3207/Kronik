@@ -823,6 +823,54 @@ async fn complete_inventory_is_revision_and_epoch_bound_and_resource_failure_is_
 }
 
 #[tokio::test]
+async fn a_failed_inline_refresh_does_not_end_the_wait_for_the_inventory() {
+    let (_data, node) = patient_node().await;
+    let runtime = node.runtime().unwrap();
+    node.env
+        .timeout(Duration::from_secs(60), node.secret_cycle_settled())
+        .await
+        .unwrap();
+    // A mutation has retired the certificate, and nothing can rebuild it
+    // until the test says so: a full refresh, the cycle's or the waiter's
+    // own, fails at once while the runtime is not initialized.
+    runtime.initialized.store(false, Ordering::Release);
+    runtime.cache.clear_coverage();
+    assert!(!runtime.cache.complete(node.epoch()));
+    // The waiter is stepped by hand, so that what it does between two events
+    // is the only thing that decides what a step finds.
+    let mut waiter = Box::pin(node.wait_secret_inventory(test_auth()));
+    let step = std::future::poll_fn(|cx| std::task::Poll::Ready(waiter.as_mut().poll(cx))).await;
+    assert!(step.is_pending(), "{step:?}");
+    // The cycle, woken by the waiter, makes a pass for its revision and
+    // fails: it publishes the failed outcome.
+    node.env
+        .timeout(Duration::from_secs(60), async {
+            while runtime.certified.borrow().1 {
+                node.env.clock.sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+    // The waiter finds that outcome, runs its one inline attempt, and that
+    // fails as well. It has a long time left and must go on waiting: it
+    // answered 503 here, for a mutation that is committed.
+    let step = std::future::poll_fn(|cx| std::task::Poll::Ready(waiter.as_mut().poll(cx))).await;
+    assert!(
+        step.is_pending(),
+        "the wait ended with {step:?} with its time left"
+    );
+    // The next pass succeeds, and the waiter is satisfied by it.
+    runtime.initialized.store(true, Ordering::Release);
+    node.wake_rebuild();
+    node.env
+        .timeout(Duration::from_secs(60), &mut waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(runtime.cache.complete(node.epoch()));
+}
+
+#[tokio::test]
 async fn the_cycle_is_settled_between_passes_with_a_certified_inventory_and_not_otherwise() {
     let (_data, node) = node().await;
     let runtime = node.runtime().unwrap();

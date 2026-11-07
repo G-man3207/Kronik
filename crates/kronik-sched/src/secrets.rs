@@ -3404,7 +3404,16 @@ impl Node {
     /// records retire it: when a recertification already completed and
     /// failed for this revision, drive the identical procedure INLINE
     /// (bounded by the same fetch timeout) instead of waiting for the
-    /// background cycle's next tick. Genuine failures still answer 503.
+    /// background cycle's next tick. Genuine failures still answer 503, when
+    /// the fetch timeout is spent.
+    ///
+    /// A failed inline attempt is not a verdict. Other mutations may be
+    /// moving the registry under it (a rebuild installs only against the
+    /// revision it began at), and the cycle publishes again when they have
+    /// settled. The mutation is committed; answering 503 while time remains
+    /// makes a client retry it, and a retried `secret set` is another
+    /// version. So the wait goes on, with one inline attempt for each
+    /// failed outcome the cycle publishes.
     async fn wait_secret_inventory(&self, original: AuthLease) -> Result<(), ApiError> {
         let runtime = self.runtime()?;
         let mut completed = runtime.certified.subscribe();
@@ -3428,8 +3437,9 @@ impl Node {
                         if refreshed.is_ok() && runtime.cache.complete(self.epoch()) {
                             return Ok(());
                         }
-                        return Err(unavailable());
                     }
+                    // One attempt for each outcome the cycle publishes: the
+                    // next one comes when the next outcome does.
                     completed.changed().await.map_err(|_| unavailable())?;
                 }
             })
