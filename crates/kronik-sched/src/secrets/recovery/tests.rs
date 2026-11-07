@@ -287,6 +287,8 @@ async fn recorded_hash_or_captured_epoch_mismatch_is_definitive_before_guest_exe
 struct Bao {
     status: AtomicUsize,
     gets: AtomicUsize,
+    /// Every URL the node asked this, the only network it has.
+    urls: Mutex<Vec<String>>,
     require_begin: AtomicBool,
     node: Mutex<Option<std::sync::Weak<Node>>>,
 }
@@ -304,6 +306,7 @@ impl Net for Bao {
         self.http(request)
     }
     fn http(&self, request: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
+        self.urls.lock().unwrap().push(request.url.clone());
         if self.require_begin.load(Ordering::Acquire) {
             let node = self
                 .node
@@ -355,18 +358,23 @@ impl Net for Bao {
         })
     }
 }
-async fn provider(recovery_status: usize) -> (tempfile::TempDir, Arc<Node>, Arc<Bao>, SecretMeta) {
-    use std::os::unix::fs::PermissionsExt;
-    let data = tempfile::tempdir().unwrap();
-    let token = data.path().join("provider.token");
-    std::fs::write(&token, "fixture-bao-token").unwrap();
-    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let bao = Arc::new(Bao {
-        status: AtomicUsize::new(200),
+fn new_bao(status: usize) -> Arc<Bao> {
+    Arc::new(Bao {
+        status: AtomicUsize::new(status),
         gets: AtomicUsize::new(0),
+        urls: Mutex::new(Vec::new()),
         require_begin: AtomicBool::new(false),
         node: Mutex::new(None),
-    });
+    })
+}
+/// A node over `data` whose only network is the fake provider `bao`.
+async fn provider_node(data: &std::path::Path, bao: &Arc<Bao>) -> Arc<Node> {
+    use std::os::unix::fs::PermissionsExt;
+    let token = data.join("provider.token");
+    if !token.exists() {
+        std::fs::write(&token, "fixture-bao-token").unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let mut environment = env();
     environment.net = bao.clone();
     let mut config = config();
@@ -386,10 +394,20 @@ async fn provider(recovery_status: usize) -> (tempfile::TempDir, Arc<Node>, Arc<
             role: None,
         },
     );
-    let node = crate::start_local(environment, data.path(), config)
-        .await
-        .unwrap();
+    let node = crate::start_local(environment, data, config).await.unwrap();
     *bao.node.lock().unwrap() = Some(Arc::downgrade(&node));
+    node
+}
+async fn provider(recovery_status: usize) -> (tempfile::TempDir, Arc<Node>, Arc<Bao>, SecretMeta) {
+    let data = tempfile::tempdir().unwrap();
+    let bao = new_bao(200);
+    let node = provider_node(data.path(), &bao).await;
+    let metadata = link_token(&node, &bao, recovery_status).await;
+    (data, node, bao, metadata)
+}
+/// Links `token` to the provider, observes its first version, then makes the
+/// provider answer `recovery_status` and forgets the cached value.
+async fn link_token(node: &Arc<Node>, bao: &Arc<Bao>, recovery_status: usize) -> SecretMeta {
     let runtime = node.runtime().unwrap();
     // Settle the startup inventory before the fixture takes over the name: the
     // background refresh must not race this link's single observation. The
@@ -430,7 +448,7 @@ async fn provider(recovery_status: usize) -> (tempfile::TempDir, Arc<Node>, Arc<
     }
     drop(_name);
     drop(_inventory);
-    (data, node, bao, metadata)
+    metadata
 }
 
 #[tokio::test]
@@ -887,4 +905,337 @@ async fn unavailable_recorded_reference_itself_waits_and_cancellation_drops_its_
     assert!(pending.await.unwrap_err().is_cancelled());
     assert_eq!(*super::super::lock(&STALLED), 0);
     assert_eq!(node.probe.turns_run.load(Ordering::Relaxed), 0);
+}
+
+// --------------------------------------------------- a live turn without its secret
+
+fn text_message(name: &str, text: &str) -> pb::Message {
+    pb::Message {
+        name: name.into(),
+        content_type: "text/plain".into(),
+        body: plain(text.as_bytes().to_vec()),
+        blobs: Vec::new(),
+        retained_compensation_source: None,
+    }
+}
+async fn counter_with_grants(node: &Node) {
+    let authority = node.local_operator_authority().unwrap();
+    node.deploy(
+        &std::fs::read(COUNTER).unwrap(),
+        audit(),
+        false,
+        authority.clone(),
+    )
+    .await
+    .unwrap();
+    for capability in ["secret:token", "secret-reveal:token", "http:127.0.0.1"] {
+        node.grant(
+            "counter",
+            capability,
+            None,
+            None,
+            audit(),
+            false,
+            authority.clone(),
+        )
+        .await
+        .unwrap();
+    }
+}
+/// The turn ends the wait; the bound only turns a hang into a failure, and is
+/// far above what a loaded machine needs.
+async fn send_text(node: &Node, actor: &str, name: &str, text: &str) -> crate::TurnResult {
+    node.env
+        .timeout(
+            Duration::from_secs(60),
+            node.send(
+                ActorRef::parse(actor).unwrap(),
+                text_message(name, text),
+                audit(),
+                false,
+                node.local_operator_authority().unwrap(),
+            ),
+        )
+        .await
+        .expect("the turn did not finish: it is waiting for the backend")
+        .unwrap()
+        .expect("a turn")
+}
+async fn turn_of(node: &Node, result: &crate::TurnResult) -> pb::TurnRecord {
+    match record(node, result.turn_id.lsn).await {
+        Record::TurnRecord(turn) => turn,
+        other => panic!("not a turn record: {other:?}"),
+    }
+}
+/// The effects of the cases below: the message, its text, the kind of the
+/// effect it makes, the recorded status and error, and whether the guest
+/// handles the error (`fetch-ok` replies with it) or fails with it.
+const UNAVAILABLE_CASES: [(&str, &str, &str, pb::EffectStatus, &str, bool); 3] = [
+    (
+        "hmac",
+        "token\npayload",
+        "crypto.hmac-sha256",
+        pb::EffectStatus::Denied,
+        "SECRET_UNAVAILABLE: token",
+        false,
+    ),
+    (
+        "reveal",
+        "token",
+        "secret.reveal",
+        pb::EffectStatus::Denied,
+        "SECRET_UNAVAILABLE: token",
+        false,
+    ),
+    (
+        "fetch-ok",
+        "POST http://127.0.0.1:9/hook\nS x-api-key token {}\n\nbody",
+        "http.fetch",
+        pb::EffectStatus::Network,
+        "SECRET_UNAVAILABLE",
+        true,
+    ),
+];
+
+#[tokio::test]
+async fn a_live_effect_whose_secret_is_unavailable_is_recorded_as_an_error_and_the_turn_completes()
+{
+    let _serial = TESTS.lock().await;
+    let (_data, node, bao, _metadata) = provider(503).await;
+    counter_with_grants(&node).await;
+    for (index, (name, text, kind, status, error, handled)) in UNAVAILABLE_CASES.iter().enumerate()
+    {
+        let result = send_text(&node, &format!("counter/u{index}"), name, text).await;
+        let turn = turn_of(&node, &result).await;
+        assert_eq!(turn.effects.len(), 1, "{name}: {turn:?}");
+        let effect = &turn.effects[0];
+        assert_eq!(effect.kind, *kind, "{name}");
+        assert_eq!(effect.status, *status as i32, "{name}: {effect:?}");
+        assert_eq!(effect.error, *error, "{name}");
+        // The guest got the error: it handled it (and the turn committed with
+        // its answer) or it failed with it (and the turn is recorded as failed,
+        // with the error in its message).
+        assert_eq!(result.committed(), *handled, "{name}: {:?}", result.outcome);
+        let outcome = turn.outcome.as_ref().expect("an outcome");
+        if *handled {
+            assert!(outcome.output.is_some(), "{name}: {outcome:?}");
+        } else {
+            assert!(
+                outcome.message.contains("SECRET_UNAVAILABLE"),
+                "{name}: {outcome:?}"
+            );
+        }
+        // A turn that was begun is finished: no TurnBegin waits for a restart.
+        assert!(
+            node.store().db().open_turns().unwrap().is_empty(),
+            "{name}: a TurnBegin is still open"
+        );
+    }
+    // The provider was asked for the secret, and the request that needed it
+    // was never sent.
+    let urls = bao.urls.lock().unwrap().clone();
+    assert!(
+        urls.iter().any(|url| url.contains("/data/token")),
+        "{urls:?}"
+    );
+    assert!(urls.iter().all(|url| !url.contains("/hook")), "{urls:?}");
+}
+
+fn run<T>(future: impl std::future::Future<Output = T>) -> T {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let output = runtime.block_on(future);
+    drop(runtime);
+    output
+}
+
+/// What the node's life leaves of the turn of `case`: its record, and the
+/// position of the first record that the kill takes away.
+struct FirstLife {
+    turn: pb::TurnRecord,
+    effect_result_at: kronik_log::Position,
+    turn_record_at: kronik_log::Position,
+}
+
+/// A node over `data` whose provider is down when the turn of `case` asks for
+/// its secret; the node is then gone (the runtime is dropped with it).
+fn first_life(
+    data: &std::path::Path,
+    bao: &Arc<Bao>,
+    case: &(&str, &str, &str, pb::EffectStatus, &str, bool),
+) -> FirstLife {
+    let (name, text, ..) = *case;
+    run(async {
+        let node = provider_node(data, bao).await;
+        link_token(&node, bao, 503).await;
+        counter_with_grants(&node).await;
+        let result = send_text(&node, "counter/h", name, text).await;
+        let turn = turn_of(&node, &result).await;
+        let (mut effect_result_at, mut turn_record_at) = (None, None);
+        node.reader()
+            .read_while(1, result.turn_id.lsn, |committed| {
+                match &committed.record {
+                    Record::EffectResult(r) if r.execution_id == turn.execution_id => {
+                        effect_result_at.get_or_insert(committed.pos);
+                    }
+                    Record::TurnRecord(t) if t.execution_id == turn.execution_id => {
+                        turn_record_at = Some(committed.pos);
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        FirstLife {
+            turn,
+            effect_result_at: effect_result_at.expect("an effect result"),
+            turn_record_at: turn_record_at.expect("a turn record"),
+        }
+    })
+}
+
+/// The kill: the log ends at `at` (the records from there on never reached the
+/// disk), and the state is rebuilt from the log at the next start.
+fn kill_at(data: &std::path::Path, at: &kronik_log::Position) {
+    let branch = data.join("branches/main");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(
+            branch
+                .join("log")
+                .join(kronik_log::segment_name(at.segment)),
+        )
+        .unwrap()
+        .set_len(at.offset)
+        .unwrap();
+    for name in ["state.db", "state.db-wal", "state.db-shm"] {
+        let _ = std::fs::remove_file(branch.join(name));
+    }
+    let _ = std::fs::remove_dir_all(branch.join("sql"));
+    let _ = std::fs::remove_dir_all(data.join("snapshots"));
+}
+
+/// The last turn record of `counter/h`.
+async fn last_turn_of_h(node: &Node) -> pb::TurnRecord {
+    let last = node
+        .store()
+        .db()
+        .actor("counter", "h")
+        .unwrap()
+        .expect("the actor")
+        .last_lsn;
+    let Record::TurnRecord(turn) = record(node, last).await else {
+        panic!("the last record of the actor is not a turn");
+    };
+    turn
+}
+
+fn shape(turn: &pb::TurnRecord) -> (Vec<(String, i32, String)>, Option<pb::Outcome>) {
+    (
+        turn.effects
+            .iter()
+            .map(|e| (e.kind.clone(), e.status, e.error.clone()))
+            .collect(),
+        turn.outcome.clone(),
+    )
+}
+
+/// A node that dies after the error result of an effect and before the turn
+/// record leaves an open turn that holds the recorded error. The start runs it
+/// again while the provider is still down: the guest gets the very error it
+/// got the first time, whatever kind of effect it was, and the turn ends the
+/// way the first life's guest ended it, without waiting for the provider.
+#[test]
+fn a_crash_after_the_recorded_error_replays_it_while_the_backend_is_still_down() {
+    let _serial = TESTS.blocking_lock();
+    for case in &UNAVAILABLE_CASES {
+        let data = tempfile::tempdir().unwrap();
+        let bao = new_bao(200);
+        let first = first_life(data.path(), &bao, case);
+        kill_at(data.path(), &first.turn_record_at);
+
+        // The second life, with the provider still down.
+        let second = run(async {
+            let node = provider_node(data.path(), &bao).await;
+            node.env
+                .timeout(Duration::from_secs(60), async {
+                    while !node.store().db().open_turns().unwrap().is_empty() {
+                        node.env.clock.sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{}: the open turn waits for the provider", case.0));
+            last_turn_of_h(&node).await
+        });
+        assert_eq!(second.execution_id, first.turn.execution_id, "{}", case.0);
+        assert_eq!(shape(&second), shape(&first.turn), "{}", case.0);
+    }
+}
+
+/// The other order: the node dies after the `TurnBegin` and before any result
+/// of the effect. The guest never saw anything, and the re-run has no recorded
+/// result: the effect is still to be made, and the secret it needs is
+/// unavailable. The re-run waits for the provider, records nothing and holds
+/// only its own actor; when the provider answers, the effect is made for real.
+#[test]
+fn a_crash_before_the_error_result_makes_the_re_run_wait_and_then_run_the_effect() {
+    let _serial = TESTS.blocking_lock();
+    // The effects that do not go to the network: the fake provider is the only
+    // network of these nodes.
+    for case in UNAVAILABLE_CASES
+        .iter()
+        .filter(|case| case.2 != "http.fetch")
+    {
+        let data = tempfile::tempdir().unwrap();
+        let bao = new_bao(200);
+        let first = first_life(data.path(), &bao, case);
+        kill_at(data.path(), &first.effect_result_at);
+
+        let second = run(async {
+            let node = provider_node(data.path(), &bao).await;
+            // The provider is down: the turn stays open, and its re-run is the
+            // one thing that waits.
+            node.env.clock.sleep(Duration::from_secs(2)).await;
+            let open = node.store().db().open_turns().unwrap();
+            assert_eq!(open.len(), 1, "{}: the re-run is waiting: {open:?}", case.0);
+            assert!(
+                node.store()
+                    .db()
+                    .open_effects(&open[0].execution_id)
+                    .unwrap()
+                    .is_empty(),
+                "{}: the waiting re-run recorded an effect",
+                case.0
+            );
+            // Other actors are not held by it.
+            let free = send_text(&node, "counter/free", "increment", "").await;
+            assert!(free.committed(), "{}: {:?}", case.0, free.outcome);
+            // The provider returns: the effect is made, and the turn ends.
+            bao.status.store(200, Ordering::Release);
+            node.env
+                .timeout(Duration::from_secs(60), async {
+                    while !node.store().db().open_turns().unwrap().is_empty() {
+                        node.env.clock.sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{}: the re-run never finished", case.0));
+            last_turn_of_h(&node).await
+        });
+        assert_eq!(second.execution_id, first.turn.execution_id, "{}", case.0);
+        assert_eq!(second.effects.len(), 1, "{}", case.0);
+        assert_eq!(
+            second.effects[0].status,
+            pb::EffectStatus::Ok as i32,
+            "{}: {:?}",
+            case.0,
+            second.effects[0]
+        );
+        assert_eq!(
+            second.outcome.as_ref().map(|outcome| outcome.kind),
+            Some(pb::OutcomeKind::Committed as i32),
+            "{}",
+            case.0
+        );
+    }
 }

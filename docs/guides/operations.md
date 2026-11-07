@@ -1498,7 +1498,7 @@ operator meets:
 | `ENGINE_VERSION_MISMATCH` | A new binary started against data written by another engine, without a passing check | Run `kronik upgrade check --window 6h`, or start the recorded engine version |
 | `UNAUTHENTICATED`, `SCOPE_MISSING`, `TOKEN_NOT_FOUND` | A bearer token is missing, lacks the scope, or was revoked | `kronik token list`, `kronik token create --name <name> --scopes <scope>,... --reason ...`, on the socket as root or a member of `kronik` |
 | `SECRET_NOT_FOUND` | An effect uses a secret that isn't set, or was deleted | `kronik secret set <name> --reason ...` |
-| `SECRET_UNAVAILABLE` | A read answered 503 while the secret inventory was needed | After a restart, every read that needs scrubbing: the provider no longer serves a version that Kronik recorded, [a known defect](#secrets-that-an-external-backend-no-longer-serves). Or the rebuild of the inventory takes longer than `[secrets] refresh` and the daemon logs that it did not install its certificate: raise `refresh` above the `elapsed_ms` of the `secret inventory certified` line ([`[secrets]`](#secrets)) |
+| `SECRET_UNAVAILABLE` | A read answered 503 while the secret inventory was needed, or an effect failed inside a turn because its secret could not be fetched | For a read after a restart: the provider no longer serves a version that Kronik recorded, [a known defect](#secrets-that-an-external-backend-no-longer-serves). Or the rebuild of the inventory takes longer than `[secrets] refresh` and the daemon logs that it did not install its certificate: raise `refresh` above the `elapsed_ms` of the `secret inventory certified` line ([`[secrets]`](#secrets)). For an effect: the backend did not answer in time, see [A turn whose effect cannot get its secret](#a-turn-whose-effect-cannot-get-its-secret) |
 | `SECRET_VERSION_GONE` | A turn needed a secret version that its provider no longer serves, for example the re-run of a `secret.reveal` after the version was destroyed | The turn is recorded as failed before the guest runs, and no other version's value is used. See [the same section](#secrets-that-an-external-backend-no-longer-serves) for what else the lost version does |
 | `RUNSC_MISSING`, `KVM_UNAVAILABLE`, `RUNC_MISSING`, `FOREIGN_UNAVAILABLE` | Foreign actors can't run | `kronik doctor` names the cause; see [Foreign actors](#foreign-actors) |
 | `IMAGE_INVALID` | `kronik foreign add` got an image it can't verify or unpack | Check the reference; private images need a local layout |
@@ -1581,3 +1581,28 @@ No other repair is known.
   daemon, then link the name to the new variable with `kronik secret link NAME
   --backend ID --ref NEW_VARIABLE --reason "..."`. The old variable has to stay
   defined with its old value: unsetting it brings the 503 back (checked).
+
+### A turn whose effect cannot get its secret
+
+This is intended behavior. An effect that needs a secret from an external
+backend fails with `SECRET_UNAVAILABLE` inside its turn when the node holds no
+value for it and the backend does not answer within `[secrets] fetch_timeout`
+(default 2 s).
+
+- The error is recorded in the turn before the guest sees it, as for a network
+  error: the turn is in `kronik history ACTOR`, and its effect carries the
+  status (`network` for `http.fetch`, `denied` for `crypto.*` and
+  `secrets.reveal`) and the error. Nothing was sent to the target.
+- The guest decides. A handler that fails ends the turn as failed: an HTTP
+  client gets 500 `TURN_FAILED`, `kronik send` reports the failed outcome, and
+  a failed message or timer is a dead letter. A handler that handles the error
+  commits and answers as it chooses. The request is not answered 503, and the
+  secret no longer leaves a turn open to run again at the next start.
+- A client that repeats the request with the same `Idempotency-Key` gets the
+  recorded answer until `[gateway] idempotency_ttl` has passed, and nothing is
+  sent. To try again, use a new key. For a dead letter, wait until the backend
+  answers, then `kronik dead-letters resend ID --reason "..."`.
+- Turns that need no external secret, or whose secret the node holds, run as
+  usual during the outage. After a crash, a turn that had not yet got its
+  secret waits for the backend and then runs; one that had recorded the error
+  ends with it.

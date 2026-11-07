@@ -876,6 +876,13 @@ pub fn combined_secret_scope(
     Ok(Some(Arc::from(merged)))
 }
 
+/// What the node can say of the current version of a secret for a new effect.
+enum NewSecret {
+    Found(kronik_privacy::SecretValue),
+    Missing,
+    Unavailable,
+}
+
 pub(crate) struct TurnFx {
     node: Arc<Node>,
     spec: TurnSpec,
@@ -1076,6 +1083,29 @@ impl TurnFx {
             .map_err(|error| GateError::Prerequisite(error.code))
     }
 
+    /// The current version of a secret, for an effect that has no recorded
+    /// result yet.
+    ///
+    /// A secret the node cannot reach (`SecretUnavailable`: the backend is
+    /// down or too slow, and nothing is cached) is no reason to abandon a live
+    /// turn after its `TurnBegin`. An open `TurnBegin` means that the daemon
+    /// died, and the next start would run the turn again, whatever the caller
+    /// has been told. So the caller records an error result for the effect, as
+    /// for a missing secret, and the guest decides what to do with it (design
+    /// m23 section 6, ADR 0091). A re-run does not: it is the same turn, and it
+    /// waits for the backend in the worker, as it does for the recorded
+    /// effects whose value it needs again.
+    async fn new_secret_value(&self, name: &str) -> Result<NewSecret, GateError> {
+        match self.secret_value(name, None).await {
+            Ok(Some(value)) => Ok(NewSecret::Found(value)),
+            Ok(None) => Ok(NewSecret::Missing),
+            Err(GateError::Prerequisite(ErrorCode::SecretUnavailable)) if !self.rerun() => {
+                Ok(NewSecret::Unavailable)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn fetch(&self, ordinal: u32, req: FetchRequest) -> Result<FetchOutcome, GateError> {
         if let Some(record) = self.recorded_raw(ordinal)
             && matches!(record.kind.as_str(), "http.fetch" | "foreign.http")
@@ -1252,23 +1282,26 @@ impl TurnFx {
                         {
                             reference = header_reference(previous, template);
                         } else {
-                            match self.secret_value(secret, None).await {
-                                Ok(Some(value)) => {
+                            match self.new_secret_value(secret).await? {
+                                NewSecret::Found(value) => {
                                     reference = secret_ref(value.meta, template.clone())?;
                                     let bytes = Arc::new(Zeroizing::new(value.value));
                                     self.remember_secret(&reference, bytes.clone());
                                     wire_secrets.push((secret.clone(), bytes));
                                 }
-                                Ok(None) => {
+                                NewSecret::Missing => {
                                     failure = Some((
                                         pb::EffectStatus::Denied,
                                         ErrorCode::SecretNotFound.as_str().to_owned(),
                                     ))
                                 }
-                                Err(GateError::Prerequisite(code)) => {
-                                    return Err(GateError::Prerequisite(code));
+                                // Recorded like a network error: nothing was sent.
+                                NewSecret::Unavailable => {
+                                    failure = Some((
+                                        pb::EffectStatus::Network,
+                                        ErrorCode::SecretUnavailable.as_str().to_owned(),
+                                    ))
                                 }
-                                Err(error) => return Err(error),
                             }
                         }
                     }
@@ -2032,13 +2065,18 @@ impl TurnFx {
         }
         self.begin().await?;
         let mut rec = self.base(ordinal, kind, cap, fp);
-        let outcome = match self.secret_value(&secret, None).await {
-            Ok(None) => {
+        let outcome = match self.new_secret_value(&secret).await? {
+            NewSecret::Missing => {
                 rec.status = pb::EffectStatus::Denied as i32;
                 rec.error = format!("SECRET_NOT_FOUND: {secret}");
                 CryptoOutcome::Denied(rec.error.clone())
             }
-            Ok(Some(v)) => {
+            NewSecret::Unavailable => {
+                rec.status = pb::EffectStatus::Denied as i32;
+                rec.error = format!("{}: {secret}", ErrorCode::SecretUnavailable.as_str());
+                CryptoOutcome::Denied(rec.error.clone())
+            }
+            NewSecret::Found(v) => {
                 let reference = secret_ref(v.meta, String::new())?;
                 rec.request = plain(
                     pb::CryptoEffectRequest {
@@ -2070,8 +2108,6 @@ impl TurnFx {
                     }
                 }
             }
-            Err(GateError::Prerequisite(code)) => return Err(GateError::Prerequisite(code)),
-            Err(error) => return Err(error),
         };
         self.record(rec).await?;
         Ok(outcome)
@@ -2132,13 +2168,18 @@ impl TurnFx {
         }
         self.begin().await?;
         let mut rec = self.base(ordinal, kind, cap, fp);
-        let out = match self.secret_value(&name, None).await {
-            Ok(None) => {
+        let out = match self.new_secret_value(&name).await? {
+            NewSecret::Missing => {
                 rec.status = pb::EffectStatus::Denied as i32;
                 rec.error = format!("SECRET_NOT_FOUND: {name}");
                 Err(rec.error.clone())
             }
-            Ok(Some(v)) => {
+            NewSecret::Unavailable => {
+                rec.status = pb::EffectStatus::Denied as i32;
+                rec.error = format!("{}: {name}", ErrorCode::SecretUnavailable.as_str());
+                Err(rec.error.clone())
+            }
+            NewSecret::Found(v) => {
                 let reference = secret_ref(v.meta, String::new())?;
                 rec.request = plain(
                     pb::RevealEffectRequest {
@@ -2160,8 +2201,6 @@ impl TurnFx {
                     }
                 }
             }
-            Err(GateError::Prerequisite(code)) => return Err(GateError::Prerequisite(code)),
-            Err(error) => return Err(error),
         };
         self.record(rec).await?;
         Ok(out)

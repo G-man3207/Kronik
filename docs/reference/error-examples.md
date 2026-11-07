@@ -482,7 +482,9 @@ Restore that actual prerequisite; do not interpret an unavailable catalogue as
 empty or substitute current values for historical references. After a
 restart this includes a recorded version that the provider no longer serves,
 until it serves the version again; that is a known defect (see the operations
-guide).
+guide). An effect that cannot get its secret fails with this code inside its
+turn, and the guest decides what the turn does; the request is not answered
+503.
 
 ```sh
 kronik audit show --from 1

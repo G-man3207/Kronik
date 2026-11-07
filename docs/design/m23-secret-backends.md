@@ -506,8 +506,10 @@ The third criterion: "Rotation of a secret shows up as a new version in
     fails with `SECRET_VERSION_GONE` before the guest sees anything, and
     goes to dead letters with that code. The guest never takes a path the
     log does not record.
-  - An effect *without* a recorded result is a new effect and may get an
-    error result as in §6.
+  - An effect *without* a recorded result is a new effect. In a live turn it
+    gets an error result as in §6. In a re-run it waits like the recorded
+    ones (the worker retries with backoff), so that a re-run sees what the
+    first run would have seen as soon as the backend answers.
 - **Identity replay** (`kronik fork replay`, the identity check) needs no
   secret value for recorded effects, so it gives the same outcomes before
   and after a rotation.
@@ -535,9 +537,18 @@ secrets, and only once Kronik has no usable value.
   - **no cache:** fetches with `[secrets] fetch_timeout` (default 2 s, Env
     timer).
     - On failure, the effect gets an error result, `SECRET_UNAVAILABLE`.
-      This is like a network error: status `error`, and the guest sees an
-      error it can handle.
-    - The turn is not failed by Kronik, and nothing else waits.
+      This is like a network error, and the guest sees an error it can
+      handle. The result is recorded before the guest sees it, like every
+      effect result: status `network` for `http.fetch`, `denied` for
+      `crypto.*` and `secret.reveal`, with the error in `error`. Nothing is
+      sent. Replay and forks return the recorded error, and a crash re-run of
+      the turn does not ask the backend again.
+    - The turn is not failed by Kronik, and nothing else waits. The guest
+      decides: a handler that fails with the error ends the turn as failed
+      (`TURN_FAILED`; a message or timer becomes a dead letter), one that
+      handles it commits. The caller is not answered with a 503, and no
+      `TurnBegin` is left open for the next start to run: a `TurnBegin`
+      without a record exists only after a crash.
     - Only a failure is cached: for 5 s, so a burst of turns does not
       queue on a dead backend.
 - **Turns that use no linked secret never touch the cache or a backend.**

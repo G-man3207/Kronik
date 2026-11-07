@@ -84,6 +84,19 @@ Secrets arrive with M2.
   `kronik secret list` shows names, versions and version hashes but never
   values; `kronik secret delete` marks every version deleted. Every
   operation needs a reason.
+- **A secret that cannot be fetched.** A secret from an external backend
+  that is not cached and cannot be fetched within `[secrets] fetch_timeout`
+  fails the effect that asked for it with `SECRET_UNAVAILABLE`, as a network
+  error does: `http.fetch` answers `network` with that text, `crypto.*` and
+  `secrets.reveal` a denial with it. Nothing is sent. The error is recorded
+  in the turn before the guest sees it, and the guest decides: a handler
+  that fails ends the turn as failed (a message or timer becomes a dead
+  letter), one that handles the error commits. The caller is not answered
+  with a 503, and no turn is left open to run at the next start. A client
+  that repeats the request with the same `Idempotency-Key` gets the recorded
+  answer back until `[gateway] idempotency_ttl` has passed; use a new key to
+  try again. A fork replays the recorded error and never asks the backend. See
+  [A turn whose effect cannot get its secret](operations.md#a-turn-whose-effect-cannot-get-its-secret).
 - **Reveal.** `secrets.reveal` returns a raw value only with the capability
   `secret-reveal:<name>`. In a fork it returns the placeholder
   `[secret:<name>]`, never the value. `crypto.*` in a fork, when no
