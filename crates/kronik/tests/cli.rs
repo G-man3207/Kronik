@@ -1480,6 +1480,71 @@ fn m2_commands_against_a_daemon() {
             .contains("crypto.hmac-sha256  secret:api-key2  -         ok"),
         "{o:?}"
     );
+    // The last column names the version each effect used (M23): the secret,
+    // its version and the first 8 hex characters of its version hash.
+    let hash8 = |name: &str| {
+        let listed = d.run(&["--json", "secret", "list"]).json();
+        let secret = listed["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap_or_else(|| panic!("no secret {name}: {listed}"))
+            .clone();
+        secret["version_hash"].as_str().unwrap()[..8].to_owned()
+    };
+    let (first, other) = (hash8("api-key"), hash8("api-key2"));
+    assert!(
+        o.stdout.lines().any(|l| l.ends_with("ERROR  SECRETS"))
+            && o.stdout
+                .lines()
+                .any(|l| l.ends_with(&format!("secret:api-key2@v1 ({other})"))),
+        "{o:?}"
+    );
+    // A rotation shows up as a new version in the turns after it; the turns
+    // before it keep the version they used.
+    let o = d.run_with_input(
+        &[
+            "secret",
+            "set",
+            "api-key",
+            "--reason",
+            "rotate the hmac key",
+        ],
+        "k3y-value-456\n",
+    );
+    assert!(
+        o.stdout.starts_with("Stored secret api-key, version 2\n"),
+        "{o:?}"
+    );
+    let second = hash8("api-key");
+    assert_ne!(first, second);
+    assert_ne!(hmac("api-key"), h1, "the rotated key signs differently");
+    let o = d.run(&["history", "counter/h"]);
+    let rows: Vec<&str> = o
+        .stdout
+        .lines()
+        .filter(|l| l.contains("crypto.hmac-sha256"))
+        .collect();
+    let used = [
+        format!("secret:api-key@v2 ({second})"),
+        format!("secret:api-key2@v1 ({other})"),
+        format!("secret:api-key@v1 ({first})"),
+    ];
+    assert_eq!(rows.len(), 3, "{o:?}");
+    for (row, used) in rows.iter().zip(&used) {
+        assert!(row.ends_with(used.as_str()), "{used}: {o:?}");
+    }
+    let v = d.run(&["--json", "history", "counter/h"]).json();
+    assert_eq!(
+        v["turns"][0]["effects"][0]["secrets"],
+        json!([{"name": "api-key", "version": 2, "version_hash": second}])
+    );
+    assert_eq!(
+        v["turns"][2]["effects"][0]["secrets"],
+        json!([{"name": "api-key", "version": 1, "version_hash": first}])
+    );
+    assert!(!v.to_string().contains("k3y-value") && !o.stdout.contains("k3y-value"));
     assert_error(
         &d.run_with_input(&["secret", "set", "empty", "--reason", "x"], ""),
         "BAD_REQUEST",
