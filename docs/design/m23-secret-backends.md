@@ -77,8 +77,9 @@ Invariants that bind it:
 - The exceptions:
   - **production crash recovery of a reveal** reloads the recorded version;
   - an HTTP effect that must be re-sent loads its recorded version;
-  - **unmatched fork crypto** uses the *current* production value (a known
-    gap, unchanged here).
+  - **unmatched fork crypto** uses the *current* production value of a
+    built-in name (a known gap, unchanged here); a name linked to an external
+    backend at the fork point is refused (`SECRET_EXTERNAL`, see §6).
 
 **Scrubbing.** `Node::secret_values()` decrypts every non-deleted version of
 every secret for each scrubbed API response and for foreign logs.
@@ -601,6 +602,12 @@ secrets, and only once Kronik has no usable value.
   needs an external secret uses a value this process already holds for the
   fork point's link and version; otherwise it is denied in the fork and the
   diff marks it unverifiable. No provider audit log or bill sees a fork.
+  **Until the resolver serves forks, the stopgap denies every such effect:**
+  an unmatched `crypto.*` of a name that the fork point's configuration links
+  to a backend is denied with `SECRET_EXTERNAL` and graded synthetic, and the
+  built-in store is not asked. The fork point's configuration includes the
+  links of its window, so a fork from before the link, or after an unlink,
+  uses the built-in store as before.
 - **Metrics:**
   - `kronik_secret_fetch_total{backend,result}`;
   - `kronik_secret_fetch_seconds{backend}`;
@@ -999,8 +1006,10 @@ Running it once before release is the maintainers' call (§12).
   pre-M23 binary refuses a log with them, as for every new kind.
 - **Forks:**
   - A fork reads the links and versions of its fork point from the log.
-  - A fork never fetches from a backend (§6); with the built-in store,
-    unmatched fork crypto keeps today's behaviour (a known gap).
+  - A fork never fetches from a backend (§6); a name linked at the fork
+    point is refused for an unmatched `crypto.*` (the stopgap of §6), and with
+    the built-in store unmatched fork crypto keeps today's behaviour (a known
+    gap).
   - A fork never records new `SecretVersion`s in main's log.
 - **Cluster (M16):** each node fetches independently; the metadata leader
   allocates version numbers (§5.1).

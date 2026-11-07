@@ -622,7 +622,7 @@ kronik --socket /owned/fixture/api.sock secret refresh demo-api-key \
   --reason "preview separately approved provider change" --dry-run
 ```
 
-A foreign actor meets the same code when it needs a linked name: the
+A foreign actor or a fork meets the same code when it needs a linked name: the
 built-in store holds an older value of it or none, so `foreign add --secret`
 refuses it, and so does the next start of an actor declared before the link.
 Bind a name that Kronik stores itself.

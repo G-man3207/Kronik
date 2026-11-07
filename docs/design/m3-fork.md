@@ -141,7 +141,11 @@ the root id).
   Crypto matches exactly by fingerprint (name and data hash) or is
   recomputed on the host with the production key (the key never leaves the
   host, but the fork gets a real HMAC or signature over data its code
-  chose); it counts as exact either way. `secret.reveal` in a fork never
+  chose); it counts as exact either way. A name that is linked to an
+  external backend at the fork point is not recomputed: the built-in store
+  holds an older value of it or none, and a fork never fetches. The effect is
+  denied with `SECRET_EXTERNAL` and graded synthetic like any answer the fork
+  cannot give. `secret.reveal` in a fork never
   gets the value: it answers the placeholder `[secret:<name>]` (exact when
   production revealed at that point, else synthetic). Production records
   HTTP and call requests, and fingerprints them, with the same placeholder

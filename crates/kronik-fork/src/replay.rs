@@ -1211,6 +1211,55 @@ fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
 /// The guest-visible text of a replay without a recording (FailClosed).
 pub const NO_RECORDING: &str = "replay: no recording";
 
+/// The error of an unmatched effect of a fork that needs a secret which is
+/// linked to an external backend at the fork point (`SECRET_EXTERNAL`).
+fn linked_secret_denial(name: &str) -> String {
+    format!(
+        "SECRET_EXTERNAL: {name} is linked to an external secret manager, and a fork does \
+         not compute with it"
+    )
+}
+
+/// What an unmatched `crypto.*` of a fork computes with.
+enum UnmatchedKey {
+    /// The name is linked to an external backend in the configuration of the
+    /// fork point. The built-in store holds an older value of it, or none,
+    /// and a fork never fetches (I7): nothing is computed.
+    Linked,
+    /// The built-in store has no value of the name, or the fork has no store
+    /// (a preview: no production key computes for it).
+    Missing,
+    /// The built-in store's current value of a name that is not linked.
+    Value(kronik_privacy::SecretValue),
+}
+
+/// The built-in store, as an unmatched `crypto.*` of a fork reads it.
+trait KeyStore {
+    fn current_key(&self, name: &str) -> Option<kronik_privacy::SecretValue>;
+}
+
+impl KeyStore for SecretStore {
+    fn current_key(&self, name: &str) -> Option<kronik_privacy::SecretValue> {
+        self.current(name).ok().flatten()
+    }
+}
+
+/// The key for an unmatched `crypto.*` of `name` in a fork whose
+/// configuration is `config`. Without a store, nothing is computed, linked or
+/// not; with one, a link decides before the store is asked.
+fn unmatched_key(config: &Config, store: Option<&dyn KeyStore>, name: &str) -> UnmatchedKey {
+    let Some(store) = store else {
+        return UnmatchedKey::Missing;
+    };
+    if config.secret_is_linked(name) {
+        return UnmatchedKey::Linked;
+    }
+    match store.current_key(name) {
+        Some(value) => UnmatchedKey::Value(value),
+        None => UnmatchedKey::Missing,
+    }
+}
+
 fn model_error(error: kronik_core::error::ApiError) -> GateError {
     match error.code {
         ErrorCode::Internal | ErrorCode::StorageCorrupt => GateError::Host(error.message),
@@ -2221,15 +2270,22 @@ impl ReplayGate {
             return out;
         }
         // Unmatched: computed on the host, the value never leaves it.
-        let value = self
-            .runner
-            .setup
-            .secrets
-            .as_ref()
-            .and_then(|s| s.current(&secret).ok().flatten());
-        let Some(v) = value else {
-            self.push(self.synthetic(ordinal, kind, cap, fp, None));
-            return CryptoOutcome::Denied(NO_RECORDING.into());
+        let store = self.runner.setup.secrets.as_deref();
+        let v = match unmatched_key(self.config(), store.map(|s| s as &dyn KeyStore), &secret) {
+            UnmatchedKey::Value(v) => v,
+            UnmatchedKey::Missing => {
+                self.push(self.synthetic(ordinal, kind, cap, fp, None));
+                return CryptoOutcome::Denied(NO_RECORDING.into());
+            }
+            // Denied in the fork, and marked unverifiable like the other
+            // effects it cannot answer: with the cause as the guest's error.
+            UnmatchedKey::Linked => {
+                let mut record = self.synthetic(ordinal, kind, cap, fp, None);
+                record.error = linked_secret_denial(&secret);
+                let denied = CryptoOutcome::Denied(record.error.clone());
+                self.push(record);
+                return denied;
+            }
         };
         let result = match algorithm {
             CryptoAlgorithm::HmacSha256 => Ok(kronik_effects::crypto::hmac_sha256(&v.value, &data)),
@@ -2863,4 +2919,106 @@ pub async fn both(
         t.sort_by_key(|t| t.root_lsn);
     }
     Ok((trees, continuous))
+}
+
+#[cfg(test)]
+mod linked_key_tests {
+    use super::*;
+    use kronik_proto::Record;
+    use std::sync::Mutex;
+
+    fn link(name: &str, backend: &str, epoch: u64) -> Record {
+        Record::SecretLink(pb::SecretLink {
+            name: name.into(),
+            backend: backend.into(),
+            r#ref: if backend.is_empty() {
+                ""
+            } else {
+                "secret/a#key"
+            }
+            .into(),
+            epoch,
+            generation: epoch,
+            ..Default::default()
+        })
+    }
+
+    /// A built-in store with older values than any backend serves, which
+    /// remembers what it was asked.
+    struct Keys(Mutex<Vec<String>>);
+
+    impl KeyStore for Keys {
+        fn current_key(&self, name: &str) -> Option<kronik_privacy::SecretValue> {
+            self.0.lock().unwrap().push(name.to_owned());
+            matches!(name, "stripe" | "plain").then(|| kronik_privacy::SecretValue {
+                meta: kronik_privacy::SecretMeta {
+                    name: name.into(),
+                    version: 1,
+                    version_hash: vec![0; 16],
+                    created_wall_ms: 0,
+                },
+                value: b"older-built-in-value".to_vec(),
+            })
+        }
+    }
+
+    /// The link in force in the configuration of the fork decides, before the
+    /// built-in store is asked: a linked name is refused whatever the store
+    /// holds, any other name is the store's, and the record that an unlink
+    /// leaves makes the name the store's again.
+    #[test]
+    fn a_linked_name_is_refused_before_the_store_is_asked() {
+        let keys = Keys(Mutex::new(Vec::new()));
+        let store = Some(&keys as &dyn KeyStore);
+        let mut config = Config::default();
+        assert!(matches!(
+            unmatched_key(&config, store, "stripe"),
+            UnmatchedKey::Value(_)
+        ));
+        config.apply(&link("stripe", "bao", 1));
+        keys.0.lock().unwrap().clear();
+        assert!(matches!(
+            unmatched_key(&config, store, "stripe"),
+            UnmatchedKey::Linked
+        ));
+        assert!(keys.0.lock().unwrap().is_empty(), "the store was asked");
+        assert!(matches!(
+            unmatched_key(&config, store, "plain"),
+            UnmatchedKey::Value(_)
+        ));
+        assert!(matches!(
+            unmatched_key(&config, store, "missing"),
+            UnmatchedKey::Missing
+        ));
+        config.apply(&link("stripe", "", 2));
+        assert!(matches!(
+            unmatched_key(&config, store, "stripe"),
+            UnmatchedKey::Value(_)
+        ));
+    }
+
+    /// A fork without a store (a preview) computes nothing, as before: also
+    /// for a linked name, which it does not even say is linked.
+    #[test]
+    fn a_fork_without_a_store_computes_nothing_linked_or_not() {
+        let mut config = Config::default();
+        config.apply(&link("stripe", "bao", 1));
+        for name in ["stripe", "plain"] {
+            assert!(matches!(
+                unmatched_key(&config, None, name),
+                UnmatchedKey::Missing
+            ));
+        }
+    }
+
+    /// What the guest of the fork reads when it is refused: the code and the
+    /// name.
+    #[test]
+    fn the_refusal_names_the_code_and_the_secret() {
+        let text = linked_secret_denial("stripe");
+        assert!(
+            text.starts_with("SECRET_EXTERNAL: stripe is linked"),
+            "{text}"
+        );
+    }
 }

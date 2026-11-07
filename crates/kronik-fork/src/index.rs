@@ -57,7 +57,7 @@ pub struct Base {
     pub lsn: Lsn,
     pub dir: std::path::PathBuf,
     /// The snapshot's configuration records (deployments, grants, limits,
-    /// foreign actors), in LSN order.
+    /// foreign actors, secret links), in LSN order.
     pub config: Vec<(Lsn, Record)>,
 }
 
@@ -107,7 +107,10 @@ impl Base {
 }
 
 /// A configuration record as replay sees it: a rebase switch counts as its
-/// deployment (M13).
+/// deployment (M13). A secret link is one, as it is in the store's
+/// `config_records` that a base snapshot is read from: a fork sees the links
+/// in force at its fork point, whether they were made before its base
+/// snapshot or after it.
 fn config_view(r: &Record) -> Option<Record> {
     match r {
         Record::Deployment(_)
@@ -115,7 +118,8 @@ fn config_view(r: &Record) -> Option<Record> {
         | Record::Limits(_)
         | Record::ForeignActor(_)
         | Record::PrivacyMode(_)
-        | Record::SimulatorConfig(_) => Some(r.clone()),
+        | Record::SimulatorConfig(_)
+        | Record::SecretLink(_) => Some(r.clone()),
         _ => r
             .rebase_switch()
             .and_then(|(_, sw)| sw.deployment.clone())
@@ -389,8 +393,8 @@ impl ProductionIndex {
         })
     }
 
-    /// Configuration records (deployments, grants, limits, foreign actors)
-    /// up to `lsn`.
+    /// Configuration records (deployments, grants, limits, foreign actors,
+    /// secret links) up to `lsn`.
     pub fn config_records(&self, upto: Lsn) -> Vec<Record> {
         let base = self
             .base

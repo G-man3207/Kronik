@@ -105,7 +105,9 @@ Secrets arrive with M2.
   (brief): the key stays on the host, but code deployed into a fork (scope
   `fork`) can obtain HMACs and signatures under production keys over data it
   chooses, which is as good as the key for webhooks and tokens signed with
-  it. Grant `fork` only to callers you would trust with that. A preview
+  it. Grant `fork` only to callers you would trust with that. This holds for
+  built-in secrets: a name that is linked to an external backend at the fork
+  point is not computed in a fork (`SECRET_EXTERNAL`). A preview
   (M11) answers whoever has its URL, so it gets no production key at all:
   its `crypto.*` calls answer `no recording`.
 - **Scrubbing.** When a turn used or revealed a secret, exact occurrences of
