@@ -23,11 +23,18 @@ engine-compatibility exemption.
 
    Select a retained traffic window that covers the application's important
    behavior. Check the actual old/new engine pair, root and turn counts and
-   empty behavior diff. A zero-input check is not application evidence.
-3. If `ENGINE_UPGRADE_DIVERGED`, missing keys or another prerequisite is
-   reported, keep the current binary. Read the saved report/diff. Never edit
-   historical engine strings, suppress divergence, or copy a report from
-   another directory/pair. An unavailable prerequisite is not a passing check.
+   empty behavior diff. A zero-input check is not application evidence. The
+   check also asks the question the start asks of the data directory, whether
+   the log that retention kept reaches `state.db` and every actor database: it
+   prints a note on stderr, also with `--json`, when the start will repair that
+   by installing a snapshot, and exits 1 with `STORAGE_CORRUPT` and the start's
+   own message when it cannot ([A start that stops at the log's
+   start](../guides/operations.md#a-start-that-stops-at-the-logs-start)).
+3. If `ENGINE_UPGRADE_DIVERGED`, `STORAGE_CORRUPT`, missing keys or another
+   prerequisite is reported, keep the current binary. Read the saved
+   report/diff. Never edit historical engine strings, suppress divergence, or
+   copy a report from another directory/pair. An unavailable prerequisite is
+   not a passing check.
 4. Stop only the owned old process/service using its recorded lifecycle handle,
    replace its binary through the normal verified installation mechanism, and
    start the candidate with the same owned data/config/key source. In a local
