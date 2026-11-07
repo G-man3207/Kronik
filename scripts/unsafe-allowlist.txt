@@ -13,3 +13,4 @@ crates/kronik-privacy/src/keystore/ffi.rs public SQLite FILESTAT45/sqlite3_str e
 crates/kronik-core/src/env/real/exchange.rs owned Linux one-shot process groups, fixed fd3/CLOEXEC isolation, nonblocking pipes and kill-before-reap supervision
 crates/kronik-keyhelper/src/platform.rs optional Linux GNU PKCS11 helper protections and verified module/protocol descriptor ownership; no module loading in daemon
 sdk/rust/src/lib.rs                   the `bindings` module that wit-bindgen generates for the kronik:actor world, which the guest's export! needs
+crates/kronik-guest-init/src/sys.rs   Linux guest PID1 mount/device/capability/fork/exec/signal/reboot and bounded AF_VSOCK operations on live buffers and owned descriptors

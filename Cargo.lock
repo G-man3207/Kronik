@@ -2137,6 +2137,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kronik-guest-init"
+version = "0.4.1-dev"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kronik-keyhelper"
 version = "0.4.1-dev"
 dependencies = [
