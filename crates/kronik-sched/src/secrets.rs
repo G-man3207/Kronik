@@ -873,6 +873,8 @@ pub struct SecretRuntime {
     settings: Settings,
     cache: Arc<SecretCache>,
     inventory: AsyncMutex<()>,
+    /// Serializes the writers of the coverage watermark file.
+    watermark_io: AsyncMutex<()>,
     /// What certification has cost since the node started.
     stats: CertificationStats,
     initialized: AtomicBool,
@@ -963,6 +965,7 @@ impl SecretRuntime {
             settings,
             cache,
             inventory: AsyncMutex::new(()),
+            watermark_io: AsyncMutex::new(()),
             stats: CertificationStats::default(),
             initialized: AtomicBool::new(false),
             background: AtomicBool::new(false),
@@ -2731,13 +2734,18 @@ impl Node {
         if through == 0 {
             return;
         }
+        let Some(runtime) = &self.secret_runtime else {
+            return;
+        };
+        // One writer at a time: two refreshes finish apart from the
+        // inventory lock, and both write through the same temporary file.
+        let _writing = runtime.watermark_io.lock().await;
         let Ok(snapshot) = self.native_secret_snapshot() else {
             return;
         };
-        let store_generation = self
-            .secret_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.file.generation().ok())
+        let store_generation = runtime
+            .file
+            .generation()
             .map(|generation| kronik_core::ids::hex(&generation))
             .unwrap_or_default();
         coverage::persist(

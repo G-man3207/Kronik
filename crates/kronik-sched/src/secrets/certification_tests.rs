@@ -56,6 +56,22 @@ impl Recording {
             )
             .count()
     }
+
+    /// What was done to the watermark file, its temporary file and the data
+    /// directory that holds them, in order.
+    fn watermark_ops(&self, data: &Path) -> Vec<Op> {
+        lock(&self.ops)
+            .iter()
+            .filter(|op| match op {
+                Op::Read(path) | Op::Write(path) | Op::SyncData(path) => {
+                    path.file_name().is_some_and(|name| name == TEMPORARY)
+                }
+                Op::Rename { to, .. } => to.file_name().is_some_and(|name| name == MANIFEST),
+                Op::SyncDir(dir) => dir == data,
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 /// The real file system, recorded; reads of a log segment and writes to the
@@ -362,6 +378,117 @@ fn a_start_leaves_only_valid_watermarks_on_disk() {
         );
     }
     assert!(manifest(data.path()).certified_through_lsn >= before.certified_through_lsn);
+}
+
+#[test]
+fn watermark_writers_take_turns_and_write_synced_then_rename_then_sync_the_directory() {
+    let data = tempfile::tempdir().unwrap();
+    let ops = run(async {
+        let (environment, rec) = recording(Duration::ZERO, Duration::from_millis(40));
+        let node = start(data.path(), environment).await;
+        // The node's own cycle has written what it writes.
+        node.env.clock.sleep(Duration::from_millis(300)).await;
+        lock(&rec.ops).clear();
+        let through = node.applied_lsn();
+        tokio::join!(
+            node.persist_coverage_watermark(through),
+            node.persist_coverage_watermark(through)
+        );
+        rec.watermark_ops(data.path())
+    });
+    let one = |ops: &[Op]| {
+        matches!(
+            ops,
+            [Op::Write(a), Op::SyncData(b), Op::Rename { from, to, ok: true }, Op::SyncDir(_)]
+                if a == b && a == from && to.file_name().is_some_and(|name| name == MANIFEST)
+        )
+    };
+    assert!(
+        ops.len() == 8 && one(&ops[..4]) && one(&ops[4..]),
+        "two writers overlapped, or one skipped a step: {ops:#?}"
+    );
+    assert!(manifest(data.path()).certified_through_lsn > 0);
+}
+
+#[test]
+fn a_start_and_a_deployment_lose_no_watermark_rename() {
+    let data = tempfile::tempdir().unwrap();
+    let renames: Vec<bool> = run(async {
+        // Each write to the temporary file takes 20 ms, long enough for any
+        // two writers to overlap. A deployment retires the certificate, so
+        // the node's own cycle certifies again while the deployment
+        // recertifies the cached inventory: the first thing a crash test
+        // does after its first start.
+        let (environment, rec) = recording(Duration::ZERO, Duration::from_millis(20));
+        let node = start(data.path(), environment).await;
+        node.deploy(
+            &std::fs::read(COUNTER).unwrap(),
+            audit(),
+            false,
+            node.local_operator_authority().unwrap(),
+        )
+        .await
+        .unwrap();
+        node.env.clock.sleep(Duration::from_millis(500)).await;
+        let ops = lock(&rec.ops).clone();
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::Rename { to, ok, .. }
+                    if to.file_name().is_some_and(|name| name == MANIFEST) =>
+                {
+                    Some(*ok)
+                }
+                _ => None,
+            })
+            .collect()
+    });
+    assert!(!renames.is_empty(), "the start wrote no watermark");
+    assert!(
+        renames.iter().all(|ok| *ok),
+        "renames of the watermark: {renames:?}"
+    );
+}
+
+#[test]
+fn the_watermark_claims_only_the_records_the_scan_read() {
+    let data = tempfile::tempdir().unwrap();
+    grow(data.path(), 300, 0);
+    run(async {
+        let (environment, rec) = recording(Duration::ZERO, Duration::ZERO);
+        let node = start(data.path(), environment).await;
+        settle(&node).await;
+        quiesce(&node).await;
+        // Something for the scan to read: the start's watermark covers all else.
+        append_noise(&node, 5).await;
+        // From here a read of a log segment waits at the gate, so that records
+        // can be appended while the scan is under way.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *lock(&rec.gate) = Some(gate.clone());
+        let reads = rec.segment_reads();
+        let scanned = node.applied_lsn();
+        let refresh = tokio::spawn({
+            let node = node.clone();
+            async move { certify(&node).await }
+        });
+        // The scan is at the gate: it has taken its bound.
+        let waiting = tokio::time::Instant::now();
+        while rec.segment_reads() == reads {
+            assert!(
+                waiting.elapsed() < Duration::from_secs(30),
+                "the scan read no segment"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        append_noise(&node, 20).await;
+        gate.add_permits(1_000);
+        refresh.await.unwrap();
+        assert!(node.applied_lsn() >= scanned + 20);
+        assert_eq!(
+            manifest(data.path()).certified_through_lsn,
+            scanned,
+            "the watermark claims records that were appended while the scan read"
+        );
+    });
 }
 
 #[test]
