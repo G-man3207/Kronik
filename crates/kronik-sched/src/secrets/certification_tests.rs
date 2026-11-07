@@ -751,6 +751,29 @@ fn a_restart_certifies_only_the_records_after_its_watermark() {
     });
 }
 
+#[test]
+fn the_first_cycle_leaves_the_certificate_the_start_made_alone() {
+    let data = tempfile::tempdir().unwrap();
+    grow(data.path(), 300, 0);
+    run(async {
+        // Reading a log segment takes 3 ms: a rebuild that reads the log
+        // cannot pass unseen.
+        let (environment, _) = recording(Duration::from_millis(3), Duration::ZERO);
+        let node = start(data.path(), environment).await;
+        let stats = &node.runtime().unwrap().stats;
+        assert_eq!(stats.builds.load(Relaxed), 1);
+        let polling = tokio::time::Instant::now() + Duration::from_millis(600);
+        while tokio::time::Instant::now() < polling {
+            assert!(
+                node.secret_values().is_ok(),
+                "the certificate the start made was retired again"
+            );
+            node.env.clock.sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(stats.builds.load(Relaxed), 1);
+    });
+}
+
 // The fixtures below are those of `recovery/tests.rs`: a secret in the
 // ledger and a turn whose record cites it.
 

@@ -3381,6 +3381,17 @@ impl Node {
         self.env.spawn("secret-refresh", async move {
             let mut registry_wake = false;
             let mut deadline = env.clock.monotonic();
+            // A file-only inventory is certified before the node starts
+            // (`initialize_secret_versions`). The first cycle still
+            // observes every name's current version, but it does not
+            // rebuild that certificate moments after it was made: the
+            // rebuild retires the certificate, and every scrubbed read
+            // waits for a rebuild nothing asked for.
+            let mut certified_at_start = weak.upgrade().is_some_and(|node| {
+                node.secret_runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.cache.complete(node.epoch()))
+            });
             // A failed cycle (or a cleared catalogue it could not rebuild)
             // retries promptly with bounded backoff instead of waiting the
             // whole refresh tick; after the budget is spent the loop falls
@@ -3436,7 +3447,15 @@ impl Node {
                             Err(error) => runtime.cache.failure(&scope, error),
                         }
                     }
-                    let refreshed = node.refresh_secret_inventory(original.clone()).await;
+                    // Kept as it is only when no observation above retired it.
+                    let kept = std::mem::take(&mut certified_at_start)
+                        && runtime.cache.complete(node.epoch())
+                        && lock(&runtime.cache.state).revision == attempt;
+                    let refreshed = if kept {
+                        Ok(())
+                    } else {
+                        node.refresh_secret_inventory(original.clone()).await
+                    };
                     let completed = if refreshed.is_ok() {
                         lock(&runtime.cache.state).revision
                     } else {
