@@ -99,6 +99,8 @@
 - [ADR 0092: The master seed wrapped by a KMS](adr/0092-master-key-wrapped-by-a-kms.md)
 - [ADR 0093: PKCS#11 through an optional helper process](adr/0093-pkcs11-through-a-helper-process.md)
 - [ADR 0094: Key providers without SDKs](adr/0094-secret-providers-without-sdks.md)
+- [ADR 0095: Pinned Firecracker guest and finite persistent drive](adr/0095-pinned-firecracker-guest.md)
+- [ADR 0096: microVM snapshot ownership and fixed vsock protocols](adr/0096-microvm-snapshot-and-vsock-lifecycle.md)
 - [ADR 0100: Keyless signed and reproducible releases](adr/0100-signed-reproducible-releases.md)
 - [ADR 0103: OIDC principals and private browser sessions](adr/0103-oidc-principals-and-browser-sessions.md)
 - [ADR 0104: The admin UI is a public API client](adr/0104-admin-ui-as-a-public-api-client.md)
