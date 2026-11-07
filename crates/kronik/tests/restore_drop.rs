@@ -890,3 +890,182 @@ fn upgrade_check_as_root_opens_nothing_in_the_service_users_directory_before_the
         text(&control)
     );
 }
+
+/// Gives `path` and everything below it to the played service user.
+fn give_to_the_owner(path: &Path) {
+    let status = Command::new("chown")
+        .args(["-R", &format!("{OWNER}:{OWNER}")])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// A key file only root can read, with `key` in it.
+fn root_only_key(world: &World, key: &[u8]) -> String {
+    mkdir(world.key.parent().unwrap(), 0o700);
+    std::fs::write(&world.key, key).unwrap();
+    std::fs::set_permissions(&world.key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    world.key.display().to_string()
+}
+
+#[test]
+fn upgrade_check_as_root_opens_the_keystore_of_the_service_user_as_its_owner() {
+    let Some(world) = World::bare() else { return };
+    let (source, key) = bucket::node_directory();
+    let copied = Command::new("cp")
+        .args(["-a", &format!("{}/.", source.path().display())])
+        .arg(&world.data)
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    mkdir(&world.data, 0o700);
+    give_to_the_owner(&world.data);
+    let data = world.data.display().to_string();
+    let key_file = root_only_key(&world, &key);
+
+    // The right key: the replay opens the sealed value with the keystore, and the
+    // report is written by the owner.
+    let output = run(world.kronik(
+        &[
+            "upgrade",
+            "check",
+            "--data-dir",
+            &data,
+            "--master-key-file",
+            &key_file,
+        ],
+        &[],
+    ));
+    assert!(output.status.success(), "{}", text(&output));
+    let reports: Vec<_> = std::fs::read_dir(&world.data)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("upgrade"))
+        .collect();
+    assert!(!reports.is_empty(), "no report in the data directory");
+    for report in &reports {
+        let meta = std::fs::symlink_metadata(report.path()).unwrap();
+        assert_eq!(
+            (meta.uid(), meta.gid()),
+            (OWNER, OWNER),
+            "{:?}",
+            report.path()
+        );
+    }
+
+    // Another key: refused after the drop, by the check of the stores, and
+    // nothing is written.
+    let before = world.listing();
+    let wrong = root_only_key(&world, "7".repeat(64).as_bytes());
+    let output = run(world.kronik(
+        &[
+            "upgrade",
+            "check",
+            "--data-dir",
+            &data,
+            "--master-key-file",
+            &wrong,
+        ],
+        &[],
+    ));
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("MASTER_KEY_MISMATCH"),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(world.listing(), before);
+}
+
+#[test]
+fn upgrade_check_as_root_opens_no_store_of_the_service_user_before_the_drop() {
+    let Some(world) = World::bare() else { return };
+    // A file of root's, in a directory only root enters, behind a link where the
+    // keystore of the service user is.
+    let closed = world.dir.path().join("closed");
+    mkdir(&closed, 0o700);
+    let target = closed.join("keystore.db");
+    std::fs::write(&target, b"bytes of root's own, which are not a database").unwrap();
+    let keys = world.data.join("keys");
+    symlink(&target, keys.join("keystore.db")).unwrap();
+    std::os::unix::fs::lchown(keys.join("keystore.db"), Some(OWNER), Some(OWNER)).unwrap();
+    link_database_to(&world.data, &target, (OWNER, OWNER));
+    let key_file = root_only_key(&world, "5".repeat(64).as_bytes());
+    let watch = Watch::on(&target);
+    let data = world.data.display().to_string();
+    let output = run(world.kronik(
+        &[
+            "upgrade",
+            "check",
+            "--data-dir",
+            &data,
+            "--master-key-file",
+            &key_file,
+        ],
+        &[],
+    ));
+    let opened = watch.events();
+    assert_eq!(
+        opened,
+        0,
+        "the file was opened through the link: {}",
+        text(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("holds no log"),
+        "{}",
+        text(&output)
+    );
+
+    // The control: a root installation's directory with the same link. Root's own
+    // key source checks the stores, and so opens the file, so the watch works.
+    let own = world.dir.path().join("rootdata");
+    mkdir(&own.join("keys"), 0o700);
+    symlink(&target, own.join("keys/keystore.db")).unwrap();
+    link_database_to(&own, &target, (0, 0));
+    let own_arg = own.display().to_string();
+    let control = run(world.kronik(
+        &[
+            "upgrade",
+            "check",
+            "--data-dir",
+            &own_arg,
+            "--master-key-file",
+            &key_file,
+        ],
+        &[],
+    ));
+    assert!(
+        watch.events() > 0,
+        "the control did not open the file either, so the watch proves nothing: {}",
+        text(&control)
+    );
+}
+
+#[test]
+fn upgrade_check_needs_no_key_where_the_service_user_has_no_keystore() {
+    let Some(world) = World::bare() else { return };
+    // No keystore, and a key file that does not exist: nothing to open, so the
+    // key is not asked for, as for a root installation.
+    let missing = world.dir.path().join("no-such-key");
+    let data = world.data.display().to_string();
+    let output = run(world.kronik(
+        &[
+            "upgrade",
+            "check",
+            "--data-dir",
+            &data,
+            "--master-key-file",
+            &missing.display().to_string(),
+        ],
+        &[],
+    ));
+    let shown = text(&output);
+    assert!(!output.status.success(), "{shown}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("holds no log"),
+        "{shown}"
+    );
+    assert!(!shown.contains("MASTER_KEY"), "{shown}");
+}

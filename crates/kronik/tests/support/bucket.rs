@@ -124,3 +124,62 @@ pub fn ship_into(bucket: &Path) -> Vec<u8> {
     drop(runtime);
     key
 }
+
+/// A data directory that a node has served: a log, a snapshot, and a keystore
+/// that holds the key of a subject whose sealed value is in the log. Returns
+/// the directory and the node's master key (hex text, as the node keeps it).
+pub fn node_directory() -> (tempfile::TempDir, Vec<u8>) {
+    let source = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let env = Env::real(runtime.handle().clone());
+    let node = runtime.block_on(async {
+        start_local(
+            env.clone(),
+            source.path(),
+            NodeConfig {
+                storage: Some(StorageConfig::new(source.path().to_path_buf())),
+                segment_max_bytes: Some(4096),
+                ..NodeConfig::default()
+            },
+        )
+        .await
+        .unwrap()
+    });
+    runtime
+        .block_on(node.deploy(
+            &guest("counter"),
+            audit(),
+            false,
+            node.local_operator_authority().unwrap(),
+        ))
+        .unwrap();
+    runtime
+        .block_on(node.set_privacy_mode(
+            pb::PrivacyState::On,
+            audit(),
+            false,
+            node.local_operator_authority().unwrap(),
+        ))
+        .unwrap();
+    for name in ["increment", "subject", "increment"] {
+        let reply = runtime
+            .block_on(node.send(
+                ActorRef::parse("counter/on").unwrap(),
+                message(name, ""),
+                audit(),
+                false,
+                node.local_operator_authority().unwrap(),
+            ))
+            .unwrap()
+            .unwrap();
+        assert!(reply.committed(), "{reply:?}");
+    }
+    let key = std::fs::read(source.path().join("keys/master.key")).unwrap();
+    drop(node);
+    drop(runtime);
+    (source, key)
+}

@@ -361,8 +361,9 @@ Next     kronik serve --data-dir /var/lib/kronik
 Checks this binary against a data directory before it replaces the one
 that is running (M6). Offline and read-only apart from the report: the
 old daemon may keep running. Run as root against a nonroot installation,
-it loads the key source as root and then drops to the directory's owner,
-so the report is not owned by root. It replays the last `--window` of logical
+it reads the key as root and then drops to the directory's owner, who
+checks the directory's stores against the key and opens its keystore, so
+the report is not owned by root. It replays the last `--window` of logical
 time (default `6h`) with this binary's engine and the same code hashes.
 Fuel is not compared. Sealed values open with the directory's privacy
 keystore and the same `[keys]` configuration as `serve`. Select the matching

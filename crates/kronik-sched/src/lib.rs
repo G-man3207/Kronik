@@ -313,6 +313,17 @@ pub fn offline_sealer_loaded(
     source: &kronik_privacy::key_source::KeySource,
 ) -> Result<Option<Arc<kronik_privacy::sealer::Sealer>>, kronik_privacy::key_source::KeySourceError>
 {
+    offline_sealer_with(data, source.master())
+}
+
+/// [`offline_sealer_loaded`] from a master key alone, for a caller that has
+/// read the key as root and opens the keystore, as the directory's owner,
+/// after it has given up root.
+pub fn offline_sealer_with(
+    data: &Path,
+    master: &kronik_privacy::MasterKey,
+) -> Result<Option<Arc<kronik_privacy::sealer::Sealer>>, kronik_privacy::key_source::KeySourceError>
+{
     let file = data.join("keys/keystore.db");
     if !file.exists() {
         return Ok(None);
@@ -320,10 +331,10 @@ pub fn offline_sealer_loaded(
     let connection =
         rusqlite::Connection::open_with_flags(&file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(kronik_privacy::PrivacyError::from)?;
-    let keystore = kronik_privacy::keystore::Keystore::open_readonly(connection, source.master())?;
+    let keystore = kronik_privacy::keystore::Keystore::open_readonly(connection, master)?;
     Ok(Some(Arc::new(
         kronik_privacy::sealer::Sealer::new(Arc::new(keystore))
-            .with_pseudonyms(kronik_privacy::keystore::Pseudonyms::new(source.master())?),
+            .with_pseudonyms(kronik_privacy::keystore::Pseudonyms::new(master)?),
     )))
 }
 
