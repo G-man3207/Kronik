@@ -142,6 +142,7 @@ async fn native() -> (tempfile::TempDir, Arc<kronik_sched::Node>, AuthLease) {
     node.refresh_secret_inventory(original.clone())
         .await
         .unwrap();
+    settle_secret_inventory(&node).await;
     (data, node, original)
 }
 
@@ -1095,13 +1096,20 @@ fn malformed_versioned_cache_metadata_never_becomes_legacy_proof_or_rewrites_the
     }
 }
 
-/// The node's detached initial secret refresh retires the certificate a
-/// publication fences on. A test that dispatches a model request must wait
-/// until that refresh has settled, so a fresh publication stays current
-/// across an idle window; otherwise the request is denied mid-flight (as
-/// production intends when the source changes under it).
+/// The node's detached secret cycle makes a pass at start, and a pass that
+/// begins while a fixture refreshes the inventory itself rebuilds once more
+/// when it ends, retiring the certificate the fixture built. A publication
+/// taken before that rebuild is denied mid-flight (as production intends when
+/// the source changes under it). A test that dispatches a model request waits
+/// until the cycle has made its pass and is between passes with the inventory
+/// certified, and then until a fresh publication stays current across a short
+/// idle window. Both end on their conditions; the deadline only turns a node
+/// that never settles into a failure, and is far above a loaded machine's need.
 async fn settle_secret_inventory(node: &kronik_sched::Node) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    tokio::time::timeout_at(deadline, node.secret_cycle_settled())
+        .await
+        .expect("the secret cycle did not settle");
     loop {
         if let Ok((_, publication)) = node.native_secret_snapshot_with_publication() {
             tokio::time::sleep(Duration::from_millis(5)).await;
