@@ -111,8 +111,9 @@ kronik history billing/acme
 Each row is a turn, newest first: its input (`POST
 /billing/acme/increment`), its outcome, what it changed (`set n`), and in
 `CODE` the hash of the code that ran it. External effects, such as an
-`http.fetch` with its method, host and path, follow in a second table; this
-counter makes none.
+`http.fetch` with its method, host and path, follow in a second table, with
+the version of each secret they used (`secret:<name>@v<N>`); this counter
+makes none.
 
 The oldest turn is `migrate 0 -> 1`. The template declares
 `schemaVersion: 1`, so before an actor's first input Kronik runs its

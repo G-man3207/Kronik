@@ -500,8 +500,9 @@ Next     kronik dead-letters resend main:6 --reason "..."
 
 With `--fork`, the message goes to the actor in a fork instead (M3): it
 runs under the fork's code, on the fork's state from the fork point on,
-without live effects, and the output lists the turn's effects. A message
-into a fork has no dry run.
+without live effects, and the output lists the turn's effects, with the
+version of each secret they used in a `SECRETS` column when there is one
+(as in `kronik history`). A message into a fork has no dry run.
 
 ```text
 $ kronik send counter/a increment --fork try --reason "try it"
@@ -618,6 +619,29 @@ main:2  http.fetch  http:api.example.com  -         denied  CAPABILITY_NOT_GRANT
 Next     kronik grant counter http:api.example.com --reason '...'
 ```
 
+An effect that used a secret (M23) says which version in a last column,
+`SECRETS`, as `secret:<name>@v<N> (<hash>)`: the hash is the first 8 hex
+characters of the version hash that `kronik secret list` shows in full, and
+several secrets are separated by a comma. The column is there only when an
+effect on the page used a secret. When a secret is rotated, with
+`kronik secret set` and a new value, the turns after it show the new version
+while the turns before it keep the one they used. The value is never shown.
+`--json` gives the effect a `secrets` list of `name`, `version` and
+`version_hash`; it is absent when the effect used no secret, and, like
+`request`, when the request is sealed for a data subject.
+
+```text
+$ kronik history billing/acme
+TURN    TYPE     INPUT                 OUTCOME    CHANGES   CODE
+main:9  message  charge from operator  committed  1 effect  b3:d440473283f4
+main:5  message  charge from operator  committed  1 effect  b3:d440473283f4
+
+TURN    EFFECT      TARGET                           DELIVERY           STATUS  ERROR  SECRETS
+main:9  http.fetch  POST api.example.com/v1/charges  idempotency-keyed  ok      -      secret:stripe-key@v2 (3fa9c1d2)
+main:5  http.fetch  POST api.example.com/v1/charges  idempotency-keyed  ok      -      secret:stripe-key@v1 (8b705664)
+Next     kronik actors inspect billing/acme
+```
+
 ## kronik history --operations
 
 `kronik history --operations [--limit <N>]`
@@ -670,7 +694,8 @@ Next     kronik history counter/d
 Shows a turn's causal tree (M3): the root input, the turns from it down to
 this one, and everything this turn caused, as a tree of at most 1000
 turns. Turn ids are on main (`main:<lsn>`); fork turns follow once forks
-keep logs.
+keep logs. `--json` also has the traced turn's effects, with the secret
+versions each used (`secrets`).
 
 ```text
 $ kronik trace main:2

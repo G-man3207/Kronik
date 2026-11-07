@@ -4,12 +4,12 @@
 use std::fmt::Write as _;
 
 use kronik_api::types::{
-    ActorsResponse, DeadLettersResponse, DeployResponse, DeploymentsResponse, EffectSummary,
-    ForkTurnResponse, GrantResponse, GrantsResponse, HistoryResponse, InspectResponse,
-    LimitsListResponse, LimitsResponse, LimitsView, OrphansResponse, Outcome, Payload, Reply,
-    RevokeResponse, Route, SecretBackendsResponse, SecretDeleteResponse, SecretHistoryResponse,
-    SecretLinkResponse, SecretResponse, SecretVersionPhase, SecretsResponse, TimersResponse,
-    TraceNode, TraceResponse, TurnResponse, TurnSummary,
+    ActorsResponse, DeadLettersResponse, DeployResponse, DeploymentsResponse, EffectSecret,
+    EffectSummary, ForkTurnResponse, GrantResponse, GrantsResponse, HistoryResponse,
+    InspectResponse, LimitsListResponse, LimitsResponse, LimitsView, OrphansResponse, Outcome,
+    Payload, Reply, RevokeResponse, Route, SecretBackendsResponse, SecretDeleteResponse,
+    SecretHistoryResponse, SecretLinkResponse, SecretResponse, SecretVersionPhase, SecretsResponse,
+    TimersResponse, TraceNode, TraceResponse, TurnResponse, TurnSummary,
 };
 use kronik_core::error::ApiError;
 use kronik_core::explain::{Topic, TopicKind};
@@ -319,28 +319,40 @@ pub fn history(actor: &str, r: &HistoryResponse, limit: Option<u32>) -> String {
         rows,
     );
     // An HTTP effect's target is its request; a denied one has no request.
+    // The secret versions the effects used (M23) are one more column, there
+    // only when some effect used a secret.
+    let with_secrets = r
+        .turns
+        .iter()
+        .flat_map(|t| &t.effects)
+        .any(|e| !e.secrets.is_empty());
     let effects: Vec<Vec<String>> = r
         .turns
         .iter()
         .flat_map(|t| {
             t.effects.iter().map(move |e| {
-                vec![
+                let mut row = vec![
                     t.turn_id.clone(),
                     e.kind.clone(),
                     clip(e.request.as_ref().unwrap_or(&e.target), 60),
                     e.delivery.clone().unwrap_or_else(|| "-".to_owned()),
                     e.status.clone(),
                     clip(e.error.as_deref().unwrap_or("-"), 60),
-                ]
+                ];
+                if with_secrets {
+                    row.push(secrets_cell(&e.secrets));
+                }
+                row
             })
         })
         .collect();
     if !effects.is_empty() {
         out.push('\n');
-        out.push_str(&table(
-            &["TURN", "EFFECT", "TARGET", "DELIVERY", "STATUS", "ERROR"],
-            effects,
-        ));
+        let mut header = vec!["TURN", "EFFECT", "TARGET", "DELIVERY", "STATUS", "ERROR"];
+        if with_secrets {
+            header.push("SECRETS");
+        }
+        out.push_str(&table(&header, effects));
     }
     // A denied effect's hint is the exact command that grants it.
     let mut cmds: Vec<String> = Vec::new();
@@ -378,13 +390,38 @@ fn outcome(o: &Outcome) -> String {
     }
 }
 
+/// The secret versions an effect used, as `secret:<name>@v<N> (<hash>)`
+/// with the first 8 hex characters of the version hash, several separated
+/// by a comma; `-` for an effect that used none. Never clipped: the version
+/// is the point.
+fn secrets_cell(secrets: &[EffectSecret]) -> String {
+    if secrets.is_empty() {
+        return "-".to_owned();
+    }
+    secrets
+        .iter()
+        .map(|s| format!("secret:{}@v{} ({})", s.name, s.version, s.version_hash))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The header of [`effect_rows`]: the columns of a fork turn's effects.
+fn effect_header(with_secrets: bool) -> Vec<&'static str> {
+    let mut header = vec!["EFFECT", "TARGET", "DELIVERY", "STATUS", "ERROR"];
+    if with_secrets {
+        header.push("SECRETS");
+    }
+    header
+}
+
 /// The effects of a turn as table rows: effect, target, delivery class,
-/// status and the guest's error.
-fn effect_rows(effects: &[EffectSummary]) -> Vec<Vec<String>> {
+/// status and the guest's error, and the secret versions the effect used
+/// when `with_secrets` (M23).
+fn effect_rows(effects: &[EffectSummary], with_secrets: bool) -> Vec<Vec<String>> {
     effects
         .iter()
         .map(|e| {
-            vec![
+            let mut row = vec![
                 e.kind.clone(),
                 e.target.clone(),
                 e.delivery.clone().unwrap_or_else(|| "-".to_owned()),
@@ -395,7 +432,11 @@ fn effect_rows(effects: &[EffectSummary]) -> Vec<Vec<String>> {
                     _ => e.status.clone(),
                 },
                 clip(e.error.as_deref().unwrap_or("-"), 60),
-            ]
+            ];
+            if with_secrets {
+                row.push(secrets_cell(&e.secrets));
+            }
+            row
         })
         .collect()
 }
@@ -415,10 +456,11 @@ pub fn fork_turn(t: &ForkTurnResponse, actor: &str) -> String {
         field(&mut out, "Error", &[failure(&t.outcome)], "");
     }
     if !t.effects.is_empty() {
+        let with_secrets = t.effects.iter().any(|e| !e.secrets.is_empty());
         out.push('\n');
         out.push_str(&table(
-            &["EFFECT", "TARGET", "DELIVERY", "STATUS", "ERROR"],
-            effect_rows(&t.effects),
+            &effect_header(with_secrets),
+            effect_rows(&t.effects, with_secrets),
         ));
     }
     out.push_str(&next(&[
@@ -1444,6 +1486,173 @@ mod tests {
             shown.ends_with("Next     kronik grant billing http:api.example.com --reason '...'\n"),
             "the hint once: {shown}"
         );
+    }
+
+    fn used(name: &str, version: u64, hash: &str) -> EffectSecret {
+        EffectSecret {
+            name: name.into(),
+            version,
+            version_hash: hash.into(),
+        }
+    }
+
+    /// The lines of `shown` with their columns joined by single spaces.
+    fn words(shown: &str) -> Vec<String> {
+        shown
+            .lines()
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect()
+    }
+
+    #[test]
+    fn a_secret_is_shown_as_its_name_version_and_hash() {
+        assert_eq!(secrets_cell(&[]), "-");
+        assert_eq!(
+            secrets_cell(&[used("stripe-key", 2, "8b705664")]),
+            "secret:stripe-key@v2 (8b705664)"
+        );
+        assert_eq!(
+            secrets_cell(&[
+                used("stripe-key", 2, "8b705664"),
+                used("signing", 9_007_199_254_740_991, "00112233"),
+            ]),
+            "secret:stripe-key@v2 (8b705664), secret:signing@v9007199254740991 (00112233)"
+        );
+    }
+
+    #[test]
+    fn history_shows_a_rotation_as_a_new_secret_version() {
+        let turn = |id: &str, lsn, effects| TurnSummary {
+            turn_id: id.into(),
+            lsn,
+            logical_time_ms: 0,
+            code_hash: "b3:0123456789ab".into(),
+            input: kronik_api::types::InputSummary {
+                kind: "message".into(),
+                summary: "charge".into(),
+            },
+            outcome: Outcome {
+                kind: "committed".into(),
+                error_code: None,
+                message: None,
+            },
+            writes: Vec::new(),
+            messages: Vec::new(),
+            sql_changes: 0,
+            fuel_used: 1,
+            effects,
+        };
+        let effect = |kind: &str, request: Option<&str>, secrets| EffectSummary {
+            ordinal: 0,
+            kind: kind.into(),
+            target: "http:api.example.com".into(),
+            status: "ok".into(),
+            delivery: Some("idempotency-keyed".into()),
+            error: None,
+            hint: None,
+            request: request.map(str::to_owned),
+            secrets,
+            grounding: None,
+            simulator: None,
+        };
+        let post = Some("POST api.example.com/hooks/acme");
+        let r = HistoryResponse {
+            turns: vec![
+                // After the rotation of stripe-key; the signing key was not rotated.
+                turn(
+                    "main:9",
+                    9,
+                    vec![
+                        effect(
+                            "http.fetch",
+                            post,
+                            vec![
+                                used("stripe-key", 2, "3fa9c1d2"),
+                                used("signing", 1, "00112233"),
+                            ],
+                        ),
+                        effect("actor.call", None, Vec::new()),
+                    ],
+                ),
+                turn(
+                    "main:5",
+                    5,
+                    vec![effect(
+                        "http.fetch",
+                        post,
+                        vec![
+                            used("stripe-key", 1, "8b705664"),
+                            used("signing", 1, "00112233"),
+                        ],
+                    )],
+                ),
+            ],
+            next: None,
+        };
+        let lines = words(&history("billing/acme", &r, None));
+        for want in [
+            "TURN EFFECT TARGET DELIVERY STATUS ERROR SECRETS",
+            "main:9 http.fetch POST api.example.com/hooks/acme idempotency-keyed ok - \
+             secret:stripe-key@v2 (3fa9c1d2), secret:signing@v1 (00112233)",
+            "main:9 actor.call http:api.example.com idempotency-keyed ok - -",
+            "main:5 http.fetch POST api.example.com/hooks/acme idempotency-keyed ok - \
+             secret:stripe-key@v1 (8b705664), secret:signing@v1 (00112233)",
+        ] {
+            assert!(lines.iter().any(|l| l == want), "{want}: {lines:#?}");
+        }
+
+        // Without a secret in the page the table is what it was.
+        let plain = HistoryResponse {
+            turns: vec![turn(
+                "main:7",
+                7,
+                vec![effect("http.fetch", post, Vec::new())],
+            )],
+            next: None,
+        };
+        let lines = words(&history("billing/acme", &plain, None));
+        assert!(lines.contains(&"TURN EFFECT TARGET DELIVERY STATUS ERROR".to_owned()));
+        assert!(!lines.iter().any(|l| l.contains("SECRETS")), "{lines:#?}");
+    }
+
+    #[test]
+    fn a_turn_in_a_fork_shows_the_secret_versions_its_effects_used() {
+        let effect = |secrets| EffectSummary {
+            ordinal: 0,
+            kind: "crypto.hmac-sha256".into(),
+            target: "secret:signing".into(),
+            status: "ok".into(),
+            delivery: None,
+            error: None,
+            hint: None,
+            request: None,
+            secrets,
+            grounding: Some("exact".into()),
+            simulator: None,
+        };
+        let fork = |effects| ForkTurnResponse {
+            fork: "try".into(),
+            turn_id: "try:7".into(),
+            outcome: Outcome {
+                kind: "committed".into(),
+                error_code: None,
+                message: None,
+            },
+            reply: None,
+            effects,
+        };
+        let lines = words(&fork_turn(
+            &fork(vec![effect(vec![used("signing", 2, "00112233")])]),
+            "billing/acme",
+        ));
+        for want in [
+            "EFFECT TARGET DELIVERY STATUS ERROR SECRETS",
+            "crypto.hmac-sha256 secret:signing - ok (exact) - secret:signing@v2 (00112233)",
+        ] {
+            assert!(lines.iter().any(|l| l == want), "{want}: {lines:#?}");
+        }
+        let lines = words(&fork_turn(&fork(vec![effect(Vec::new())]), "billing/acme"));
+        assert!(lines.contains(&"EFFECT TARGET DELIVERY STATUS ERROR".to_owned()));
     }
 
     #[test]
