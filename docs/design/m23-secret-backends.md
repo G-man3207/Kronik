@@ -934,12 +934,16 @@ planned run against it must show.
 **Outages (I10):**
 - DST scenario `secret-outage`: a fake backend that hangs. Turns without
   secrets commit at their normal rate. Turns with a cached secret use it.
-  Turns with an uncached secret get `SECRET_UNAVAILABLE` within
-  `fetch_timeout`.
+  Turns with an uncached secret fail with, or handle, `SECRET_UNAVAILABLE`
+  within `fetch_timeout`, and leave no open `TurnBegin`.
 - `secret_backends.rs` makes the fake hang and checks the same in a real
   daemon: turns without secrets commit at once, and a turn with an uncached
-  secret answers `SECRET_UNAVAILABLE` (503) within `fetch_timeout`. A run that
-  stops a real OpenBao mid-run is still planned.
+  secret ends within `fetch_timeout` as a failed turn that names
+  `SECRET_UNAVAILABLE`, with nothing sent to the target, no open `TurnBegin`
+  (also for a timer's turn and after a restart) and no second request for one
+  `Idempotency-Key`. Every scenario of that file ends by checking that no
+  `TurnBegin` is open once the daemon is quiet. A run that stops a real
+  OpenBao mid-run is still planned.
 
 **Cloud providers for real:** `scripts/e2e-cloud-secrets.sh` runs against
 real AWS, GCP and Azure only with the operator's own credentials. It is
@@ -965,6 +969,12 @@ Running it once before release is the maintainers' call (§12).
   - Scrubbing covers every retained external version, fetched again after
     a restart, and fails closed until it does (§6).
 - **I1:** a rerun never gives a recorded effect another outcome (§5.3).
+- **I4 / I14 (open turns):** a `TurnBegin` without a `TurnRecord` exists only
+  after a crash, and the next start runs it. A turn that cannot get a secret
+  records an error result for the effect instead of abandoning its `TurnBegin`
+  (§6). Two checks guard this: the scenarios of `secret_backends.rs` end by
+  checking that no `TurnBegin` is open once the daemon is quiet, and DST checks
+  the same after every drain.
 - **I10:** both features are opt-in. `file` stays the default for both,
   with no behaviour change for existing nodes apart from the new
   `SecretVersion` records.

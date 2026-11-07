@@ -11,7 +11,10 @@
 //!   crash re-run of a recorded `secret.reveal` gets the value of the recorded
 //!   `source_version`, and `SECRET_VERSION_GONE` once the backend destroyed it,
 //!   never the value of a later version;
-//! - **I10**, a backend that hangs stops only the turns that need its secrets.
+//! - **I10**, a backend that hangs stops only the turns that need its secrets;
+//!   a turn that meets the outage ends with a recorded `SECRET_UNAVAILABLE`
+//!   and leaves no open `TurnBegin` for the next start to run, and a fork
+//!   replays the recorded error without asking the backend.
 //!
 //! The backend is a local HTTP server that speaks the KV v2 shape of the
 //! OpenBao client (`lookup-self`, `data/<path>?version=N`, `metadata/<path>`).
@@ -1100,6 +1103,7 @@ fn an_external_secret_gets_the_built_in_version_hash_and_its_value_stays_out_of_
     let answers = d.answers(&["counter/h"], &[turn_id]);
     assert_no_needle(dir.path(), &answers, &[VALUE_1]);
     assert_no_needle(file_dir.path(), &[], &[VALUE_1]);
+    assert_closed_when_quiet(&d, "an external secret");
 }
 
 /// Criterion 3, steps 1 to 4: a new KV version, `secret refresh`, the version
@@ -1235,6 +1239,7 @@ fn a_rotation_in_the_backend_shows_as_a_new_version_and_a_fork_before_it_replays
     // I8: neither value is anywhere.
     let answers = d.answers(&["counter/h"], &[first_id, second_id]);
     assert_no_needle(dir.path(), &answers, &[VALUE_1, VALUE_2]);
+    assert_closed_when_quiet(&d, "a rotation");
 }
 
 /// A linked node whose `leaky` guest may reveal `stripe` and POST to the
@@ -1368,6 +1373,8 @@ fn a_crash_re_run_of_a_reveal_gets_the_recorded_version_and_waits_while_the_back
     let turns = vec![rerun["turn_id"].as_str().unwrap().to_owned()];
     let answers = d.answers(&["leaky/a", "counter/a"], &turns);
     assert_no_needle(dir.path(), &answers, &[VALUE_1, VALUE_2]);
+    // The crash left the turn open; the re-run has closed it.
+    assert_closed_when_quiet(&d, "after the crash re-run of a reveal");
 }
 
 /// Criterion 3, step 6: when the backend destroyed the version a recorded
@@ -1446,6 +1453,8 @@ fn a_crash_re_run_of_a_reveal_fails_with_secret_version_gone_when_the_backend_de
     );
     // I8: neither value is in any file.
     assert_no_needle(dir.path(), &[], &[VALUE_1, VALUE_2]);
+    // The crash left the turn open; recovery has closed it as failed.
+    assert_closed_when_quiet(&d, "after the failed re-run of a reveal");
 }
 
 /// Criterion 3, step 7: the scrubbing of a revealed value survives a restart.
@@ -1500,6 +1509,7 @@ fn the_scrubbing_of_a_revealed_value_survives_a_restart() {
     assert!(sink.to_string().contains("[secret:stripe]"), "{sink}");
     let answers = d.answers(&["counter/a", "counter/sink"], &[turn_id]);
     assert_no_needle(dir.path(), &answers, &[VALUE_1, VALUE_2]);
+    assert_closed_when_quiet(&d, "the scrubbing after a restart");
 }
 
 /// I10: a backend that hangs delays only the turns that need an uncached
@@ -1530,7 +1540,10 @@ fn a_backend_that_hangs_stops_only_the_turns_that_need_its_secrets() {
         before + 5
     );
 
-    // A turn that needs the uncached secret answers within the fetch timeout.
+    // A turn that needs the uncached secret ends within the fetch timeout: the
+    // effect gets SECRET_UNAVAILABLE as its recorded result and the guest fails
+    // with it (this guest does not handle it), so the turn is a failed turn, not
+    // an open one (design m23 sections 6 and 9).
     let started = Instant::now();
     let (status, answer) = d.api(
         "POST",
@@ -1539,8 +1552,15 @@ fn a_backend_that_hangs_stops_only_the_turns_that_need_its_secrets() {
     );
     println!("hmac: {status} in {:?}: {answer}", started.elapsed());
     assert!(started.elapsed() < Duration::from_secs(10));
-    assert_eq!(status, 503, "{answer}");
-    assert_eq!(answer["error"]["code"], "SECRET_UNAVAILABLE", "{answer}");
+    let text = answer.to_string();
+    assert!(text.contains("SECRET_UNAVAILABLE"), "{answer}");
+    assert_ne!(answer["outcome"]["kind"], "committed", "{answer}");
+    assert_eq!(open_turns(dir.path()), 0, "the aborted turn was left open");
+    // The rebuild that cannot hold version 1 says which version it is.
+    d.wait_until("the rebuild warning to name the version", |d| {
+        d.serve_log()
+            .contains("failed_version=stripe@v1 on bao: the secret backend is unavailable")
+    });
 
     // Turns without a secret still commit.
     let (status, _) = d.api(
@@ -1561,4 +1581,366 @@ fn a_backend_that_hangs_stops_only_the_turns_that_need_its_secrets() {
         hmac_hex(VALUE_1.as_bytes(), b"payload"),
         "{again}"
     );
+    assert_closed_when_quiet(&d, "a backend that hangs");
+}
+
+// ------------------------------------------------ a turn without its secret
+
+/// One request to the gateway: the status and the body.
+fn gateway(addr: &str, path: &str, body: &str, key: Option<&str>) -> (u16, String) {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    let key = key.map_or(String::new(), |k| format!("idempotency-key: {k}\r\n"));
+    write!(
+        s,
+        "POST {path} HTTP/1.1\r\nhost: x\r\n{key}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    let status = out
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
+    let body = out.split_once("\r\n\r\n").map_or("", |(_, b)| b).to_owned();
+    (status, body)
+}
+
+/// `TurnBegin` records of the log that no `TurnRecord` follows. While the
+/// daemon runs there are none: an open turn is what a crash leaves.
+fn open_turns(dir: &Path) -> usize {
+    let records = log_records(dir);
+    let done: Vec<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::TurnRecord(t) => Some(t.execution_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    records
+        .iter()
+        .filter(|r| matches!(r, Record::TurnBegin(b) if !done.contains(&b.execution_id.as_str())))
+        .count()
+}
+
+/// The invariant that a recorded error keeps and that nothing else enforces:
+/// when the daemon is quiet, no `TurnBegin` is open. An open turn is what a
+/// crash leaves, and the next start runs it; a turn that stays open while the
+/// daemon runs is one that was abandoned after its `TurnBegin`, to be run by a
+/// start that nobody expects (S-7). Quiet means that the applied LSN has not
+/// moved for a second. After an injected crash, call it once the recovery is
+/// over: the re-runs have then closed what the crash left open.
+fn assert_closed_when_quiet(d: &Daemon, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last = d.applied_lsn();
+    let mut since = Instant::now();
+    while since.elapsed() < Duration::from_secs(1) {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the daemon never became quiet: {}",
+            d.serve_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let now = d.applied_lsn();
+        if now != last {
+            last = now;
+            since = Instant::now();
+        }
+    }
+    let open = open_turns(&d.dir);
+    assert_eq!(
+        open, 0,
+        "{what}: {open} TurnBegin records have no TurnRecord although the daemon is quiet"
+    );
+}
+
+/// A node that has restarted with the backend down, so that the secret is not
+/// cached and the cold fetch is what fails. The counter may call
+/// `http:127.0.0.1` with `delivery`.
+fn after_a_restart_with_the_backend_down(delivery: &str) -> (Linked, Target, String) {
+    let Linked { mut d, bao, dir } = linked();
+    let target = Target::start();
+    d.grant("counter", "http:127.0.0.1", Some(delivery));
+    d.kill9();
+    bao.set_mode(Mode::Unavailable);
+    d = Daemon::start(dir.path(), Some(&bao), "1s");
+    let gateway = d.get("/v1/health")["http_listen"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (Linked { d, bao, dir }, target, gateway)
+}
+
+fn fetch_spec(target: &Target) -> String {
+    format!(
+        "POST {}\nS x-api-key stripe {{}}\n\nbody",
+        target.url("/hook")
+    )
+}
+
+fn restart(linked: &mut Linked) -> String {
+    linked.d.kill9();
+    linked.d = Daemon::start(linked.dir.path(), Some(&linked.bao), "2s");
+    linked.d.get("/v1/health")["http_listen"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// A turn that needs a secret it cannot get does not abandon its `TurnBegin`:
+/// the effect gets `SECRET_UNAVAILABLE` as its recorded result and the guest
+/// decides, as for any other effect error. Nothing is left for the next start
+/// to run (design m23 section 6, ADR 0091).
+#[test]
+fn a_turn_that_cannot_get_its_secret_leaves_no_open_turn() {
+    let (l, target, gw) = after_a_restart_with_the_backend_down("idempotency-keyed");
+    // Through the gateway, and an operator's `send`.
+    let (status, body) = gateway(&gw, "/counter/h/fetch", &fetch_spec(&target), Some("K-1"));
+    println!(
+        "gateway: {status} {}",
+        body.chars().take(160).collect::<String>()
+    );
+    assert!(body.contains("SECRET_UNAVAILABLE"), "{status} {body}");
+    let (status, v) = l.d.api(
+        "POST",
+        "/v1/actors/counter/h/messages",
+        json!({"name": "hmac", "text": "stripe\npayload", "reason": "uncached"}),
+    );
+    println!("send: {status} {v}");
+    assert!(v.to_string().contains("SECRET_UNAVAILABLE"), "{v}");
+    assert_eq!(
+        open_turns(l.dir.path()),
+        0,
+        "TurnBegin records without a TurnRecord while the daemon runs"
+    );
+    // Nothing went to the target: the request never had its credential.
+    assert!(target.seen("/hook").is_empty());
+    assert_closed_when_quiet(&l.d, "a turn without its secret");
+}
+
+/// One client key is one request: the failed turn is the answer to the key,
+/// whatever happens to the backend, and a restart finds nothing to run.
+#[test]
+fn retrying_with_the_same_key_after_the_outage_sends_the_request_at_most_once() {
+    let (mut l, target, gw) = after_a_restart_with_the_backend_down("idempotency-keyed");
+    let mut answers = Vec::new();
+    for i in 0..3 {
+        let (status, body) = gateway(&gw, "/counter/h/fetch", &fetch_spec(&target), Some("K-3"));
+        println!("attempt {i}: {status}");
+        answers.push((status, body));
+    }
+    l.bao.set_mode(Mode::Up);
+    std::thread::sleep(Duration::from_secs(7));
+    let (status, body) = gateway(&gw, "/counter/h/fetch", &fetch_spec(&target), Some("K-3"));
+    println!("attempt 3, backend up: {status}");
+    answers.push((status, body));
+    assert!(
+        answers.windows(2).all(|pair| pair[0] == pair[1]),
+        "one key, different answers: {answers:?}"
+    );
+    restart(&mut l);
+    l.d.wait_until("no open turn", |d| open_turns(&d.dir) == 0);
+    std::thread::sleep(Duration::from_secs(3));
+    let seen = target.seen("/hook");
+    let keys: std::collections::BTreeSet<_> = seen
+        .iter()
+        .map(|r| {
+            r.headers
+                .get("idempotency-key")
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    assert!(
+        seen.len() <= 1,
+        "one client key, {} POSTs to the target with {} different Idempotency-Key headers",
+        seen.len(),
+        keys.len()
+    );
+    assert_closed_when_quiet(&l.d, "a repeated key after the outage");
+}
+
+#[test]
+fn a_timer_that_meets_the_outage_does_not_wait_for_a_restart() {
+    let Linked { d, bao, dir } = after_a_restart_with_the_backend_down("idempotency-keyed").0;
+    let (status, v) = d.api(
+        "POST",
+        "/v1/actors/counter/h/messages",
+        json!({"name": "schedule", "text": "300 hmac\nstripe\npayload", "reason": "timer"}),
+    );
+    println!("schedule: {status} {}", v["reply"]["text"]);
+    std::thread::sleep(Duration::from_secs(3));
+    bao.set_mode(Mode::Up);
+    std::thread::sleep(Duration::from_secs(8));
+    assert_eq!(
+        open_turns(dir.path()),
+        0,
+        "the timer's turn is still open 8 s after the backend returned"
+    );
+    // The timer did fire, met the outage, and ended as a failed turn (a dead
+    // letter) that names it, instead of waiting for the next start.
+    let timer_turns: Vec<pb::TurnRecord> = log_records(dir.path())
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::TurnRecord(t)
+                if matches!(
+                    t.input.as_ref().and_then(|i| i.kind.as_ref()),
+                    Some(pb::input::Kind::Timer(_))
+                ) =>
+            {
+                Some(t)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(timer_turns.len(), 1, "{timer_turns:?}");
+    let outcome = timer_turns[0].outcome.as_ref().unwrap();
+    assert_eq!(outcome.kind, pb::OutcomeKind::Failed as i32, "{outcome:?}");
+    assert!(
+        outcome.message.contains("SECRET_UNAVAILABLE"),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        timer_turns[0].effects.len(),
+        1,
+        "{:?}",
+        timer_turns[0].effects
+    );
+    assert_eq!(
+        timer_turns[0].effects[0].error,
+        "SECRET_UNAVAILABLE: stripe"
+    );
+    assert_closed_when_quiet(&d, "a timer that met the outage");
+}
+
+#[test]
+fn an_unsafe_target_is_not_made_unknown_by_a_turn_that_sent_nothing() {
+    let (mut l, target, gw) = after_a_restart_with_the_backend_down("unsafe");
+    let (status, _) = gateway(&gw, "/counter/h/fetch", &fetch_spec(&target), Some("K-2"));
+    println!("1st request, backend down: {status}");
+    l.bao.set_mode(Mode::Up);
+    std::thread::sleep(Duration::from_secs(7));
+    let (status, _) = gateway(&gw, "/counter/h/fetch", &fetch_spec(&target), Some("K-2"));
+    println!("2nd request, same key, backend up: {status}");
+    let gw = restart(&mut l);
+    l.d.wait_until("no open turn", |d| open_turns(&d.dir) == 0);
+    std::thread::sleep(Duration::from_secs(3));
+    let (status, body) = gateway(&gw, "/counter/h/fetch", &fetch_spec(&target), Some("K-2"));
+    println!(
+        "3rd request, same key, after the restart: {status} {}",
+        body.chars().take(100).collect::<String>()
+    );
+    assert!(
+        !body.contains("EFFECT_OUTCOME_UNKNOWN"),
+        "the key now answers EFFECT_OUTCOME_UNKNOWN for a request that was never sent"
+    );
+    assert!(target.seen("/hook").is_empty());
+    assert_closed_when_quiet(&l.d, "an unsafe grant that met the outage");
+}
+
+/// Each kind of effect that can ask for a secret records the outage as its
+/// result, and a fork replays the recorded errors exactly: every effect is
+/// matched, nothing changes, and the fork never asks the backend (a fork never
+/// fetches).
+#[test]
+fn a_fork_replays_the_secret_errors_that_production_recorded() {
+    let Linked { mut d, bao, dir } = linked();
+    let target = Target::start();
+    d.grant("counter", "http:127.0.0.1", Some("idempotency-keyed"));
+    d.grant("counter", "secret-reveal:stripe", None);
+    d.kill9();
+    bao.set_mode(Mode::Unavailable);
+    d = Daemon::start(dir.path(), Some(&bao), "1s");
+    let fork_point = d.applied_lsn();
+
+    // (message, text, kind of effect, recorded status, recorded error)
+    let cases = [
+        (
+            "hmac",
+            "stripe\npayload".to_owned(),
+            "crypto.hmac-sha256",
+            pb::EffectStatus::Denied,
+            "SECRET_UNAVAILABLE: stripe",
+        ),
+        (
+            "reveal",
+            "stripe".to_owned(),
+            "secret.reveal",
+            pb::EffectStatus::Denied,
+            "SECRET_UNAVAILABLE: stripe",
+        ),
+        (
+            "fetch-ok",
+            fetch_spec(&target),
+            "http.fetch",
+            pb::EffectStatus::Network,
+            "SECRET_UNAVAILABLE",
+        ),
+    ];
+    for (name, text, ..) in &cases {
+        let (status, answer) = d.api(
+            "POST",
+            "/v1/actors/counter/h/messages",
+            json!({"name": name, "text": text, "reason": "an outage"}),
+        );
+        println!("{name}: {status} {answer}");
+    }
+    assert_eq!(open_turns(dir.path()), 0, "a turn was left open");
+    for (name, _, kind, status, error) in &cases {
+        let turns = message_turns(dir.path(), "counter/h", name);
+        assert_eq!(turns.len(), 1, "{name}");
+        assert_eq!(turns[0].effects.len(), 1, "{name}: {:?}", turns[0].effects);
+        let effect = &turns[0].effects[0];
+        assert_eq!(
+            (effect.kind.as_str(), effect.status, effect.error.as_str()),
+            (*kind, *status as i32, *error),
+            "{name}"
+        );
+    }
+    assert!(
+        target.seen("/hook").is_empty(),
+        "the request had no credential"
+    );
+
+    // The backend returns; so does the coverage that the reads need.
+    bao.set_mode(Mode::Up);
+    std::thread::sleep(Duration::from_secs(7));
+    d.settle();
+    let requests = bao.requests();
+    let fork = d.mutate(
+        "POST",
+        "/v1/forks",
+        json!({"at": fork_point, "reason": "the outage, replayed"}),
+    )["fork"]["name"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    d.mutate(
+        "POST",
+        &format!("/v1/forks/{fork}/replay"),
+        json!({"reason": "the outage, replayed"}),
+    );
+    let diff = d.get(&format!("/v1/forks/{fork}/diff"));
+    let summary = &diff["summary"];
+    assert_eq!(summary["changed"], false, "{diff}");
+    assert_eq!(summary["divergent_turns"], 0, "{diff}");
+    assert_eq!(
+        (
+            &diff["effects"]["added"],
+            &diff["effects"]["removed"],
+            &diff["effects"]["changed"]
+        ),
+        (&json!(0), &json!(0), &json!(0)),
+        "{diff}"
+    );
+    assert!(summary["exact"].as_u64() >= Some(3), "{diff}");
+    for kind in ["approximate", "synthetic", "live"] {
+        assert_eq!(summary[kind], 0, "{kind}: {diff}");
+    }
+    assert_eq!(bao.requests(), requests, "the fork asked the backend");
+    assert!(target.seen("/hook").is_empty(), "the fork sent the request");
+    assert_closed_when_quiet(&d, "a fork replay of the outage");
 }
