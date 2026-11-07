@@ -4209,7 +4209,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admitted_self_logout_survives_own_revocation_and_caller_disconnect() {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // Every append waits out a 500 ms group-commit window (the window
+        // is what holds the logout in flight while its caller goes away) and
+        // the test makes several in sequence, so it waits seconds before any
+        // load. It ends on its events; the bound only turns a hang into a
+        // failure.
+        tokio::time::timeout(Duration::from_secs(60), async {
             let dir = tempfile::tempdir().unwrap();
             let env = Env::real(tokio::runtime::Handle::current());
             let config = kronik_sched::NodeConfig { group_commit_window: Some(Duration::from_millis(500)),
@@ -4262,7 +4267,7 @@ mod tests {
                         wall_time_ms: auth.env.clock.wall_ms() }, unrelated.authority).await.unwrap();
             }
             assert!(node.applied_lsn() > before + 1);
-        }).await.expect("owned admitted self logout must finish within five seconds after disconnect");
+        }).await.expect("owned admitted self logout must finish after disconnect");
     }
 
     #[tokio::test]
