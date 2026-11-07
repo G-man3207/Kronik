@@ -496,6 +496,20 @@ night with the commands below, once the repository is on GitHub.
     (it reads the whole log), and the recovered state must equal the state
     rebuilt from the log.
   - The details are in `scripts/chaos.py`.
+- **Crash test under retention:** `scripts/chaos-retention.py --bin PATH
+  --dir WORKDIR [--cycles 60]`. `chaos.py` keeps every actor busy and the log
+  whole, so it cannot meet an actor with an SQL database that has not changed
+  for longer than `[retention] history`. This script runs the daemon with a
+  history of 4 s, 1 s segments and a snapshot every second, writes a dozen
+  `notes` actors once and never again, and kills the daemon with `SIGKILL`
+  under counter load. After every restart the daemon must be healthy, every
+  idle actor must still have its one row, and the log's first LSN must not go
+  down; by the end retention must have compacted. A start that stops at the log's
+  start (`STORAGE_CORRUPT: state is at lsn N, but the log starts at M`) is a
+  violation. A read that answers 503 `SECRET_UNAVAILABLE` is one too, as in
+  `chaos.py`; `--read-retry-budget SECONDS` lets a run against an older
+  release retry it that long and counts the retries. About three minutes for
+  60 cycles.
 - **DST:** `scripts/dst.sh [SEEDS] [JOBS] [harness options]` runs
   kronik-sim's harness over a range of seeds, split across processes.
   - `--twice` runs every seed twice and compares the traces.
