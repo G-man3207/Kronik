@@ -1,10 +1,12 @@
 //! What a restore accepts as a name. A bucket does not decide where a file
 //! goes: a snapshot manifest lists plain relative paths below the snapshot
-//! directory, each once.
+//! directory, each once, and a component is stored under the hash of its
+//! content.
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
+use kronik_core::ids::CodeHash;
 use kronik_sched::snapshots::SnapshotFile;
 
 use crate::ShipError;
@@ -100,6 +102,34 @@ pub(crate) fn snapshot_destinations(
         }
     }
     Ok(destinations)
+}
+
+/// The hash in the name of a component object (without its `.zst`):
+/// `<64 lower-case hex digits>.wasm`, which is what `CodeStore` stores and
+/// `ship_once` uploads. Any other name is refused.
+pub(crate) fn component_hash(name: &str) -> Result<&str, ShipError> {
+    name.strip_suffix(".wasm")
+        .filter(|hash| {
+            hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+        .ok_or_else(|| {
+            ShipError::Restore(format!(
+                "the bucket's code/ holds {}, which is not a component named by the BLAKE3 \
+                 hash of its content (<64 hex digits>.wasm)",
+                shown(name)
+            ))
+        })
+}
+
+/// Checks that a downloaded component is the content its name says.
+pub(crate) fn component_content(hash: &str, bytes: &[u8]) -> Result<(), ShipError> {
+    if CodeHash::of(bytes).hex() == hash {
+        Ok(())
+    } else {
+        Err(ShipError::Restore(format!(
+            "component {hash} does not match its name"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -209,5 +239,42 @@ mod tests {
         let message = refused(&[&long]);
         assert!(message.len() < 300, "{message}");
         assert!(message.contains("..."), "{message}");
+    }
+
+    #[test]
+    fn a_component_is_named_by_the_hash_of_its_content() {
+        let bytes = b"\0asm component";
+        let hash = CodeHash::of(bytes).hex();
+        assert_eq!(hash.len(), 64);
+        assert_eq!(component_hash(&format!("{hash}.wasm")).unwrap(), hash);
+        component_content(&hash, bytes).unwrap();
+        // Another content under the name.
+        let other = CodeHash::of(b"other").hex();
+        assert!(
+            matches!(component_content(&other, bytes), Err(ShipError::Restore(m)) if m.contains("does not match"))
+        );
+        let bad: Vec<String> = vec![
+            String::new(),
+            ".wasm".into(),
+            "plain.wasm".into(),
+            hash.clone(),
+            format!("{hash}.cwasm"),
+            format!("{hash}.kronik-0.4.1+wasmtime-50.0.1.cwasm"),
+            format!("{hash}.wasm.wasm"),
+            format!("{hash}.wasm.zst"),
+            format!("{}.wasm", hash.to_uppercase()),
+            format!("{}.wasm", &hash[1..]),
+            format!("{hash}0.wasm"),
+            format!("../{hash}.wasm"),
+            format!("{hash}/x.wasm"),
+            format!("{} .wasm", &hash[1..]),
+            format!("{}g.wasm", &hash[1..]),
+        ];
+        for name in &bad {
+            assert!(
+                matches!(component_hash(name), Err(ShipError::Restore(_))),
+                "{name:?} was accepted"
+            );
+        }
     }
 }

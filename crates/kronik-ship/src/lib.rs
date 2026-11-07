@@ -1092,8 +1092,10 @@ async fn stage_restore(
         let Some(name) = c.strip_suffix(".zst") else {
             continue;
         };
+        let hash = names::component_hash(name)?;
         let bytes = decompress(&remote.get(&format!("code/{c}")).await?)?;
-        std::fs::write(code.join(name), bytes)?;
+        names::component_content(hash, &bytes)?;
+        write_new(&code.join(name), &bytes)?;
         components.push(name.to_owned());
     }
     // 5. The state and actor databases, copied now so that moving the
@@ -1128,6 +1130,25 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .create_new(true)
         .open(path)?;
     file.write_all(bytes)
+}
+
+/// Removes the precompiled artifacts (`*.cwasm`) of a code directory.
+fn remove_precompiled(code: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(code)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "cwasm")
+        {
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -1207,6 +1228,10 @@ fn install_staged(
     fault("code")?;
     let code = data.join("code");
     std::fs::create_dir_all(&code)?;
+    // A precompiled artifact is loaded as native code (ADR 0001): restore
+    // installs none and removes those the directory holds, so that every
+    // component is compiled again from the bytes that were checked.
+    remove_precompiled(&code)?;
     for c in &s.components {
         std::fs::rename(stage.join("code").join(c), code.join(c))?;
     }
