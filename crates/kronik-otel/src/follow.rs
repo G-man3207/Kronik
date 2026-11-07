@@ -798,6 +798,123 @@ mod retained_file_tests {
         }
     }
 
+    /// A sink that keeps what it prepared and delivered, and refuses its
+    /// first delivery the way a refused admission does.
+    #[derive(Default, Clone)]
+    struct Probe {
+        prepared: Arc<Mutex<Vec<(Lsn, Lsn)>>>,
+        delivered: Arc<Mutex<Vec<(Lsn, Lsn)>>>,
+        refuse_first: Arc<AtomicBool>,
+    }
+    impl Sink for Probe {
+        type Batch = (Lsn, Lsn);
+
+        async fn prepare(
+            &mut self,
+            records: &[(pb::ActorSource, Committed)],
+            _generation: Generation,
+            _reader: &ShardReader,
+            _snapshot: &CertifiedSecretSnapshot,
+            _original: AuthLease,
+        ) -> Result<(Lsn, Lsn), String> {
+            let batch = (
+                records.first().map_or(0, |(_, c)| c.lsn),
+                records.last().map_or(0, |(_, c)| c.lsn),
+            );
+            lock(&self.prepared).push(batch);
+            Ok(batch)
+        }
+
+        async fn deliver(&mut self, batch: &(Lsn, Lsn), _original: AuthLease) -> Delivery {
+            if self.refuse_first.swap(false, Ordering::SeqCst) {
+                return Delivery::Retry {
+                    code: ErrorCode::Unavailable.as_str().into(),
+                    after: Some(Duration::from_millis(5)),
+                };
+            }
+            lock(&self.delivered).push(*batch);
+            Delivery::Delivered
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_delivery_is_prepared_again_from_the_same_cursor() {
+        let data = tempfile::tempdir().unwrap();
+        let env = Env::real(tokio::runtime::Handle::current());
+        let node = kronik_sched::start_local(
+            env.clone(),
+            data.path(),
+            kronik_sched::NodeConfig::default(),
+        )
+        .await
+        .unwrap();
+        let original = node.local_operator_authority().unwrap();
+        let audit = pb::Audit {
+            token_id: "unix:uid=0".into(),
+            reason: "records to follow".into(),
+            wall_time_ms: env.clock.wall_ms(),
+        };
+        for name in ["first", "second"] {
+            node.secret_set(
+                name,
+                name.as_bytes().to_vec(),
+                &audit,
+                false,
+                original.clone(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        settled(&node).await;
+        let applied = node.applied_lsn();
+        let cursors = Arc::new(Cursors::load(env.clone(), data.path()).await.unwrap());
+        let stream = Stream::new("probe", true, String::new(), 0, cursors);
+        let probe = Probe::default();
+        probe.refuse_first.store(true, Ordering::SeqCst);
+        stream.own_task(env.spawn(
+            "probe-follow",
+            follow(
+                node.clone(),
+                stream.clone(),
+                Options {
+                    batch: 1,
+                    interval: Duration::from_millis(10),
+                },
+                probe.clone(),
+                original,
+            ),
+        ));
+        env.timeout(Duration::from_secs(20), async {
+            while stream.progress().cursor < applied {
+                env.clock.sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        stream.stop_and_join().await.unwrap();
+        // The refused batch was prepared again from the same cursor, and
+        // came out the same: the cursor is durable, so a batch is a function
+        // of it.
+        let prepared = lock(&probe.prepared).clone();
+        assert_eq!(
+            prepared.get(..2),
+            Some(&[(1, 1), (1, 1)][..]),
+            "{prepared:?}"
+        );
+        // Every record is delivered once and in order: no line lost, none
+        // twice, whatever the refused delivery did.
+        let delivered = lock(&probe.delivered).clone();
+        assert!(
+            delivered.len() as u64 >= applied
+                && delivered
+                    .iter()
+                    .zip(1..)
+                    .all(|(batch, lsn)| *batch == (lsn, lsn)),
+            "{delivered:?} after {applied} records"
+        );
+    }
+
     // Source fixture for the existing Root Node::secret_hmac(..., OriginalLAST)
     // immutable FILE port. No provider echo or general-resolver cache grants.
     #[tokio::test]
@@ -1730,6 +1847,10 @@ pub async fn follow<S: Sink + 'static>(
         drop(snapshot);
         let mut backoff = FIRST_BACKOFF;
         let mut disclosure_conflict = false;
+        // The last delivery was refused at admission, which is where the
+        // retained publication is judged for the last time: whatever the
+        // check says, it is not the publication to deliver with.
+        let mut refused = false;
         loop {
             if stream.is_stopping() {
                 return;
@@ -1745,7 +1866,7 @@ pub async fn follow<S: Sink + 'static>(
                     () = stream.rewound.notified() => continue,
                 }
             }
-            if retained.check().is_err() {
+            if refused || retained.check().is_err() {
                 if stream.is_stopping() || original.check().is_err() {
                     return;
                 }
@@ -1791,6 +1912,7 @@ pub async fn follow<S: Sink + 'static>(
                     break;
                 }
                 Delivery::Retry { code, after } => {
+                    refused = code == ErrorCode::Unavailable.as_str();
                     failure(&stream, code);
                     lag(cursor);
                     let wait = after.map_or(backoff, |a| a.min(MAX_RETRY_AFTER));
