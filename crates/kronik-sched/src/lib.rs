@@ -193,13 +193,38 @@ impl TurnResult {
 pub async fn start_local(
     env: Env,
     data: &Path,
-    mut config: NodeConfig,
+    config: NodeConfig,
 ) -> Result<Arc<Node>, StartError> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .create(data)
         .map_err(|e| StartError::Log(kronik_log::LogError::Io(e)))?;
     let ownership = kronik_privacy::key_source::lock_data(data).map_err(StartError::KeySource)?;
+    start_local_locked(env, data, config, ownership).await
+}
+
+/// Starts with the data directory already locked by [`lock_data`], before
+/// privileged listener setup. The lock is never released and reacquired; the
+/// directory the lock holds must still be the one `data` names.
+///
+/// [`lock_data`]: kronik_privacy::key_source::lock_data
+pub async fn start_local_locked(
+    env: Env,
+    data: &Path,
+    mut config: NodeConfig,
+    ownership: kronik_privacy::key_source::DataOwnership,
+) -> Result<Arc<Node>, StartError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let held = ownership
+        .directory_resource()
+        .metadata()
+        .map_err(|e| StartError::KeySource(e.into()))?;
+    let named = std::fs::metadata(data).map_err(|e| StartError::KeySource(e.into()))?;
+    if !held.is_dir() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+        return Err(StartError::KeySource(
+            std::io::Error::other("the data directory changed after bootstrap locked it").into(),
+        ));
+    }
     let branch_dir = data.join("branches").join(&config.branch);
     std::fs::create_dir_all(&branch_dir)
         .map_err(|e| StartError::Log(kronik_log::LogError::Io(e)))?;
@@ -277,6 +302,21 @@ pub async fn offline_sealer(
         return Ok(None);
     }
     let source = kronik_privacy::key_source::KeySource::load(env, config, data, false).await?;
+    offline_sealer_loaded(data, &source)
+}
+
+/// Opens the offline keystore read-only from a key source that is already
+/// loaded, so a caller that has dropped to the destination owner does not
+/// load its source twice.
+pub fn offline_sealer_loaded(
+    data: &Path,
+    source: &kronik_privacy::key_source::KeySource,
+) -> Result<Option<Arc<kronik_privacy::sealer::Sealer>>, kronik_privacy::key_source::KeySourceError>
+{
+    let file = data.join("keys/keystore.db");
+    if !file.exists() {
+        return Ok(None);
+    }
     let connection =
         rusqlite::Connection::open_with_flags(&file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(kronik_privacy::PrivacyError::from)?;
@@ -326,6 +366,48 @@ fn private_files(dir: &Path, databases: &[&str]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[tokio::test]
+    async fn prelocked_start_rejects_directory_replacement_before_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let held = kronik_privacy::key_source::lock_data(&data).unwrap();
+        std::fs::rename(&data, root.path().join("old")).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        let error = super::start_local_locked(
+            kronik_core::env::Env::real(tokio::runtime::Handle::current()),
+            &data,
+            super::NodeConfig::default(),
+            held,
+        )
+        .await
+        .err()
+        .expect("replaced directory must fail");
+        assert!(matches!(error, super::StartError::KeySource(_)));
+        assert!(!data.join("branches").exists());
+        assert!(!data.join("keys").exists());
+    }
+
+    #[tokio::test]
+    async fn prelocked_start_keeps_the_data_directory_exclusive() {
+        let data = tempfile::tempdir().unwrap();
+        let held = kronik_privacy::key_source::lock_data(data.path()).unwrap();
+        let error = super::start_local(
+            kronik_core::env::Env::real(tokio::runtime::Handle::current()),
+            data.path(),
+            super::NodeConfig::default(),
+        )
+        .await
+        .err()
+        .expect("a second start must not share the locked directory");
+        assert!(matches!(
+            error,
+            super::StartError::KeySource(kronik_privacy::key_source::KeySourceError::DataInUse)
+        ));
+        assert!(!data.path().join("branches").exists());
+        drop(held);
+    }
 
     #[test]
     fn key_stores_become_private_whatever_their_mode_was() {
