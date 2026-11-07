@@ -16,7 +16,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 
-const MANIFEST: &str = "secret-coverage.json";
+pub(super) const MANIFEST: &str = "secret-coverage.json";
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/guests/counter.wasm"
@@ -38,17 +38,17 @@ enum Op {
 }
 
 #[derive(Default)]
-struct Recording {
+pub(super) struct Recording {
     ops: Mutex<Vec<Op>>,
     /// The text of every watermark renamed into place.
     manifests: Mutex<Vec<String>>,
     /// While set, a read of a log segment waits here for a permit.
-    gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    pub(super) gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl Recording {
     /// Reads of log segments: one per segment image, or one per record.
-    fn segment_reads(&self) -> usize {
+    pub(super) fn segment_reads(&self) -> usize {
         lock(&self.ops)
             .iter()
             .filter(
@@ -199,11 +199,11 @@ impl File for RecordingFile {
     }
 }
 
-fn env() -> Env {
+pub(super) fn env() -> Env {
     Env::real(tokio::runtime::Handle::current())
 }
 
-fn recording(read_delay: Duration, write_delay: Duration) -> (Env, Arc<Recording>) {
+pub(super) fn recording(read_delay: Duration, write_delay: Duration) -> (Env, Arc<Recording>) {
     let rec = Arc::new(Recording::default());
     let mut environment = env();
     environment.fs = Arc::new(RecordingFs {
@@ -215,7 +215,7 @@ fn recording(read_delay: Duration, write_delay: Duration) -> (Env, Arc<Recording
     (environment, rec)
 }
 
-fn config() -> crate::NodeConfig {
+pub(super) fn config() -> crate::NodeConfig {
     crate::NodeConfig {
         concurrency: 1,
         group_commit_window: Some(Duration::ZERO),
@@ -223,20 +223,20 @@ fn config() -> crate::NodeConfig {
     }
 }
 
-fn audit() -> pb::Audit {
+pub(super) fn audit() -> pb::Audit {
     system_audit(&env(), "certification fixture")
 }
 
 /// Runs `future` on a runtime of its own, then drops the runtime with
 /// everything the node spawned on it: the node is gone as a `kill -9` leaves it.
-fn run<T>(future: impl Future<Output = T>) -> T {
+pub(super) fn run<T>(future: impl Future<Output = T>) -> T {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let output = runtime.block_on(future);
     drop(runtime);
     output
 }
 
-async fn start(data: &Path, environment: Env) -> Arc<Node> {
+pub(super) async fn start(data: &Path, environment: Env) -> Arc<Node> {
     crate::start_local(environment, data, config())
         .await
         .unwrap()
@@ -244,7 +244,7 @@ async fn start(data: &Path, environment: Env) -> Arc<Node> {
 
 /// Waits until the node's own cycle has made its first pass: the fixtures
 /// below write the ledger directly, which that pass would race.
-async fn settle(node: &Node) {
+pub(super) async fn settle(node: &Node) {
     let runtime = node.runtime().unwrap();
     for _ in 0..400 {
         if runtime.certified.borrow().1 {
@@ -257,7 +257,7 @@ async fn settle(node: &Node) {
 
 /// Waits until the node's own cycle has certified every change made so far
 /// and is idle again, so that it cannot rebuild between two steps of a test.
-async fn quiesce(node: &Node) {
+pub(super) async fn quiesce(node: &Node) {
     let runtime = node.runtime().unwrap();
     let (mut builds, mut idle) = (u64::MAX, 0);
     for _ in 0..600 {
@@ -278,7 +278,7 @@ async fn quiesce(node: &Node) {
 
 /// An explicit certification, repeated while a change of the inventory
 /// that races it makes it give way (the documented fail-closed window).
-async fn certify(node: &Node) {
+pub(super) async fn certify(node: &Node) {
     let original = node.local_operator_authority().unwrap();
     for _ in 0..200 {
         match node.refresh_secret_inventory(original.clone()).await {
@@ -294,7 +294,7 @@ async fn certify(node: &Node) {
 
 /// `count` records that mean nothing to the inventory, committed by sixteen
 /// writers so that the log writer groups their fsyncs.
-async fn append_noise(node: &Arc<Node>, count: usize) {
+pub(super) async fn append_noise(node: &Arc<Node>, count: usize) {
     let mut writers = Vec::new();
     for writer in 0..16 {
         let node = node.clone();
@@ -332,7 +332,7 @@ fn grow(data: &Path, covered: usize, after: usize) -> u64 {
     })
 }
 
-fn manifest(data: &Path) -> coverage::CoverageWatermark {
+pub(super) fn manifest(data: &Path) -> coverage::CoverageWatermark {
     serde_json::from_slice(&std::fs::read(data.join(MANIFEST)).unwrap()).unwrap()
 }
 
@@ -784,7 +784,7 @@ fn plain(bytes: Vec<u8>) -> Option<pb::Sealable> {
     })
 }
 
-fn begin(node: &Node) -> pb::TurnBegin {
+pub(super) fn begin(node: &Node) -> pb::TurnBegin {
     pb::TurnBegin {
         execution_id: "0123456789abcdef0123456789abcdef".into(),
         actor: Some(pb::ActorRef {
@@ -834,7 +834,7 @@ fn reveal(metadata: SecretMeta, ordinal: u32) -> pb::EffectRecord {
     }
 }
 
-async fn install_file(node: &Node, value: &[u8]) -> SecretMeta {
+pub(super) async fn install_file(node: &Node, value: &[u8]) -> SecretMeta {
     let runtime = node.runtime().unwrap();
     let version = node.next_secret_version("token").await.unwrap();
     let hash = runtime.file.version_hash("token", version, value).unwrap();

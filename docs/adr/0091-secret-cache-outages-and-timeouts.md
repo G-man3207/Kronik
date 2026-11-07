@@ -41,6 +41,8 @@ A successful inventory is complete for a specific observed-version registry revi
 1. required immutable versions derived from retained log references, current state and snapshots, including values whose first reveal is no longer in the retained log;
 2. every still-retained provider version of a reveal-capable name, obtained through complete paginated listing.
 
+Retained log references include those in sealed requests. The request of an erased subject (its key destroyed, or a tombstone left by a reseal) is gone for everyone and derives no required version, and the required set does not shrink because of it: the versions it named stay in the ledger. A request that cannot be opened and was not erased (no key store, a missing key version, a value that fails to unseal) keeps coverage incomplete, and the key store is the remediation (ADR 0108, amendment on erased requests).
+
 A grant revocation, relink, current-version change, omitted provider ID or restart does not silently remove a required historical value. A new registry observation invalidates/reconciles coverage before disclosure. Listing races are merged/rechecked; do not claim stronger snapshot semantics than the provider supplies. Durable log-before-use provenance closes the set of values Kronik could have exposed.
 
 Bound work and memory, but never call a capped or truncated catalogue complete. Failure or resource exhaustion preserves incomplete status and an operator-visible least-privilege/remediation hint. Required immutable versions are fetched by version and their recorded hashes checked, never replaced with current.

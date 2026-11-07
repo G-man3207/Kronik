@@ -235,6 +235,18 @@ The erasure itself:
 Other subjects are unaffected, also their values written in the same turn:
 each has its own key, its own changesets and its own rows.
 
+The scrubbing of secrets reads the log too: to see which secret versions a
+turn used, it opens the sealed requests of the effects that can carry a
+secret. The requests of an erased subject cannot be opened and are skipped as
+erased (the `secret inventory certified` log line counts them as
+`erased_requests`, once for each record that holds one), so `history`,
+`inspect` and the other reads that scrub secrets keep answering after an
+erasure, with or without a secret in the store. A request that cannot be
+opened although its subject was never erased (the keystore is missing, or
+another one) is a loss of coverage instead: those reads answer 503
+`SECRET_UNAVAILABLE` until the keystore that holds the key is back
+([ADR 0108](../adr/0108-durable-secret-coverage-watermark.md)).
+
 `plain_values` counts the subject's values written in `off` mode that are
 still in plain text in the log. Erasure does not rewrite those segments;
 `POST /v1/privacy/reseal` does (below). Until then the erasure is pending,

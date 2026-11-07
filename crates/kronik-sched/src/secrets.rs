@@ -890,13 +890,14 @@ pub struct SecretRuntime {
     certified: tokio::sync::watch::Sender<(u64, bool)>,
 }
 /// What certifying the inventory has cost since the node started: the
-/// builds it ran and the log records they read. The numbers are in the
-/// "secret inventory certified" log line, and what the tests of the watermark
-/// read.
+/// builds it ran, the log records they read and the effect requests of
+/// erased subjects they met. The numbers are in the "secret inventory
+/// certified" log line, and what the tests of the watermark read.
 #[derive(Default)]
 struct CertificationStats {
     builds: std::sync::atomic::AtomicU64,
     records: std::sync::atomic::AtomicU64,
+    erased: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2878,11 +2879,13 @@ impl Node {
         let mut references = BTreeMap::new();
         let mut touched_names = BTreeSet::new();
         let mut records_read = 0;
+        let mut erased_requests = 0;
         if let Some(scan_from) = scan_from {
             let scan = self.scan_secret_use(scan_from, scanned).await?;
             references = scan.references;
             touched_names = scan.touched;
             records_read = scan.records;
+            erased_requests = scan.erased;
         }
         for (key, hash) in &references {
             if !required
@@ -3223,11 +3226,16 @@ impl Node {
             .stats
             .records
             .fetch_add(records_read, std::sync::atomic::Ordering::Relaxed);
+        runtime
+            .stats
+            .erased
+            .fetch_add(erased_requests, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             target: "kronik::secrets",
             from = scan_from.unwrap_or(0),
             through = scanned,
             records = records_read,
+            erased_requests,
             elapsed_ms = u64::try_from(self.env.clock.monotonic().saturating_sub(started).as_millis())
                 .unwrap_or(u64::MAX),
             "secret inventory certified"
@@ -3591,16 +3599,35 @@ fn native_coverage_fingerprint(
     *hash.finalize().as_bytes()
 }
 
+/// Adds to `result` every secret version the effects of `record` cite, and
+/// returns how many of those effects it could not read because their request
+/// belongs to an erased subject.
+///
+/// A sealed request is opened to find out whether it cites a secret. What
+/// the sealer says of it decides the outcome:
+/// - a value: its references count;
+/// - erased: the subject's key was destroyed on purpose (or a reseal left a
+///   tombstone), so the request is gone for everyone, this node included. It
+///   cites nothing anyone can read, adds no reference and removes none: the
+///   versions it named stay retained through the ledger, the snapshots and
+///   the provider catalogues, which do not depend on references (ADR 0108);
+/// - unreadable: no key store, no such key version, or a value that fails to
+///   unseal. That is not an erasure, a restored key store may hold the key,
+///   and coverage cannot be claimed over a request the node cannot read.
+///   Fail closed (I8).
 fn collect_secret_references(
     record: &Record,
     sealer: &kronik_privacy::sealer::Sealer,
     result: &mut BTreeMap<(String, u64), Vec<u8>>,
-) -> Result<(), ApiError> {
+) -> Result<u64, ApiError> {
+    use kronik_privacy::sealer::Opened;
+
+    /// Whether the request of `effect` was one of an erased subject.
     fn effect(
         effect: &pb::EffectRecord,
         sealer: &kronik_privacy::sealer::Sealer,
         result: &mut BTreeMap<(String, u64), Vec<u8>>,
-    ) -> Result<(), ApiError> {
+    ) -> Result<bool, ApiError> {
         if !matches!(
             effect.kind.as_str(),
             "http.fetch"
@@ -3609,20 +3636,23 @@ fn collect_secret_references(
                 | "crypto.sign-ed25519"
                 | "secret.reveal"
         ) {
-            return Ok(());
+            return Ok(false);
         }
         let Some(request) = &effect.request else {
-            return Ok(());
+            return Ok(false);
         };
         let decrypted;
         let bytes: &[u8] = match &request.value {
             Some(pb::sealable::Value::Plain(bytes)) => bytes,
-            Some(pb::sealable::Value::Sealed(_)) => {
-                decrypted =
-                    Zeroizing::new(sealer.open(request).into_owned().ok_or_else(unavailable)?);
-                &decrypted
-            }
-            None => return Ok(()),
+            Some(pb::sealable::Value::Sealed(_)) => match sealer.open(request) {
+                Opened::Value(bytes) => {
+                    decrypted = Zeroizing::new(bytes.into_owned());
+                    &decrypted
+                }
+                Opened::Erased { .. } => return Ok(true),
+                Opened::Unreadable { .. } => return Err(unavailable()),
+            },
+            None => return Ok(false),
         };
         let references: Vec<pb::SecretRef> = match effect.kind.as_str() {
             "http.fetch" | "foreign.http" => pb::HttpEffectRequest::decode(bytes)
@@ -3667,22 +3697,23 @@ fn collect_secret_references(
                 return Err(unavailable());
             }
         }
-        Ok(())
+        Ok(false)
     }
+    let mut erased = 0;
     match record {
         Record::EffectResult(result_record) => {
             if let Some(record) = &result_record.effect {
-                effect(record, sealer, result)?;
+                erased += u64::from(effect(record, sealer, result)?);
             }
         }
         _ if record.turn().is_some() => {
             for record in &record.turn().ok_or_else(unavailable)?.effects {
-                effect(record, sealer, result)?;
+                erased += u64::from(effect(record, sealer, result)?);
             }
         }
         _ => {}
     }
-    Ok(())
+    Ok(erased)
 }
 
 #[cfg(test)]
@@ -3692,3 +3723,7 @@ mod tests;
 #[cfg(test)]
 #[path = "secrets/certification_tests.rs"]
 mod certification_tests;
+
+#[cfg(test)]
+#[path = "secrets/erasure_tests.rs"]
+mod erasure_tests;

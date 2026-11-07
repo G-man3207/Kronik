@@ -32,12 +32,17 @@ pub(super) struct LogScan {
     pub(super) touched: BTreeSet<String>,
     /// How many records the range held.
     pub(super) records: u64,
+    /// How many effect requests of erased subjects it met: they cite nothing
+    /// anyone can read, so they are not in `references`. The effect of a
+    /// finished turn is in the log twice, in its own record and in its
+    /// turn's, and counts twice.
+    pub(super) erased: u64,
 }
 
 impl LogScan {
     pub(super) fn visit(&mut self, record: &Record, sealer: &Sealer) -> Result<(), ApiError> {
         self.records += 1;
-        collect_secret_references(record, sealer, &mut self.references)?;
+        self.erased += collect_secret_references(record, sealer, &mut self.references)?;
         match record {
             Record::SecretVersion(row) => {
                 self.touched.insert(row.name.clone());
@@ -68,6 +73,7 @@ impl LogScan {
         }
         self.touched.extend(later.touched);
         self.records += later.records;
+        self.erased += later.erased;
         Ok(())
     }
 }

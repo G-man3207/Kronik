@@ -133,3 +133,47 @@ Not changed, and still open: a rebuild clears the certificate when it
 starts, so a forced or periodic rebuild is a window of 503 for reads
 that scrub their output, as long as the rebuild; and a start waits for
 its first certification however long that takes.
+
+## Amendment (2026-11-07): sealed requests of erased subjects
+
+The scan opens every sealed request of an effect that can carry a secret
+(`http.fetch`, `foreign.http`, `crypto.hmac-sha256`, `crypto.sign-ed25519`,
+`secret.reveal`), because only the plaintext tells whether it cites a
+version. v0.4.0 read a request it could not open as a loss of coverage.
+Erasing a subject (`kronik privacy erase`) destroys its key on purpose, so
+the sealed `http.fetch` of any of its turns could never be opened again:
+every output that scrubs answered 503 `SECRET_UNAVAILABLE`, with no secret
+in the store, for as long as a refresh had that request to read. The
+watermark of the first amendment hides it while the request lies before
+the watermark; any scan from the first record brings it back (a v1
+manifest, a restore, a lost manifest, retention cutting the log below the
+watermark). The sealer already tells the two ways a sealed value fails to
+open apart, and the scan now follows it:
+
+8. An erased request cites nothing. Its subject's key was destroyed on
+   purpose, or a reseal left a tombstone for it: the content is gone for
+   everyone, this node included. The scan counts it and goes on
+   (`erased_requests` in the `secret inventory certified` line counts the
+   effects it skipped; the effect of a finished turn is met twice, in its
+   own record and in its turn's).
+9. A request that is unreadable and not erased refuses coverage. A request
+   the sealer cannot open and has not erased (no key store, no such key
+   version, a value that fails to unseal) is not gone: a restored key store
+   may hold its key, and nothing says what it cites. The refresh fails with
+   `SECRET_UNAVAILABLE`, as before, until the key is back.
+10. Skipping loses no scrub value. A certificate scrubs against the ledger
+   rows, the retained snapshots and the provider catalogues; the references
+   a scan finds are checked against them and never added to them, so a
+   skipped request removes nothing from what is scrubbed. Nothing releases a
+   version because the requests that cited it were erased (there is no
+   collector of retained versions). What the skip gives up is the check that
+   such a request cited a version the ledger knows.
+11. An erasure does not void the watermark. The Decision lists an erasure
+   among the events that force a full scan; no code does that. An erasure is
+   a configuration epoch: it retires the certificate, and the next refresh
+   reads the records after the watermark, as after a deployment. A scan from
+   the first record reads the same sealed requests and now passes the erased
+   ones.
+
+A scan of a log with many erased subjects costs one key store lookup per
+erased request: the sealer caches the keys that exist, not the erasures.
