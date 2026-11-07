@@ -175,6 +175,7 @@ fn init_dry_run_prints_the_plan_and_changes_nothing() {
     let out = kronik(&[
         "serve",
         "--init",
+        "--root",
         "--domain",
         "app.example.com",
         "--acme-email",
@@ -197,6 +198,7 @@ fn init_dry_run_prints_the_plan_and_changes_nothing() {
     let out = kronik(&[
         "serve",
         "--init",
+        "--root",
         "--dry-run",
         "--config",
         config.to_str().unwrap(),
@@ -223,6 +225,162 @@ fn init_dry_run_prints_the_plan_and_changes_nothing() {
         .status
         .success()
     );
+}
+
+/// Whether this host can take the nonroot service: the prerequisites that
+/// `serve --init` checks before it plans anything (systemd 255 or newer,
+/// cgroup v2, user namespaces).
+fn nonroot_host() -> bool {
+    let systemd = Command::new("systemctl")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|text| text.split_whitespace().nth(1)?.parse::<u32>().ok());
+    systemd.is_some_and(|version| version >= 255)
+        && Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+        && std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .is_some_and(|max| max != 0)
+}
+
+/// The default `serve --init` plans the nonroot service where the host can run
+/// it, and otherwise stops with an error that names the root service: missing
+/// prerequisites never install the root service by themselves.
+#[test]
+fn the_default_init_plans_the_nonroot_service_or_names_the_root_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("kronik.toml");
+    std::fs::write(&config, format!("[server]\ndata_dir = {:?}\n", data)).unwrap();
+    let args = [
+        "serve",
+        "--init",
+        "--dry-run",
+        "--json",
+        "--config",
+        config.to_str().unwrap(),
+    ];
+    // A host without systemd on its path cannot take the nonroot service,
+    // whatever this machine is.
+    let empty = dir.path().join("empty-path");
+    std::fs::create_dir(&empty).unwrap();
+    let out = command().args(args).env("PATH", &empty).output().unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("ROOTLESS_UNAVAILABLE"), "{text}");
+    assert!(text.contains("kronik serve --init --root"), "{text}");
+    assert!(!data.exists());
+    if nonroot_host() {
+        let out = kronik(&args);
+        assert!(out.status.success(), "{out:?}");
+        let plan: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(plan["mode"], "rootless");
+        assert_eq!(plan["dry_run"], true);
+        let steps = plan["steps"].to_string();
+        assert!(steps.contains("kronik-userns.service"), "{steps}");
+        assert!(!data.exists());
+    }
+}
+
+#[test]
+fn root_init_json_plan_does_not_create_a_minimal_keys_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("kronik.toml");
+    std::fs::write(&config, format!("[server]\ndata_dir = {:?}\n", data)).unwrap();
+    let out = kronik(&[
+        "serve",
+        "--init",
+        "--root",
+        "--dry-run",
+        "--json",
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["mode"], "root");
+    assert_eq!(value["dry_run"], true);
+    assert!(value["steps"].as_array().unwrap().len() >= 3);
+    assert!(!data.exists());
+    let selected = dir.path().join("selected.key");
+    let out = kronik(&[
+        "serve",
+        "--init",
+        "--root",
+        "--dry-run",
+        "--json",
+        "--master-key-file",
+        selected.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        value["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["what"]
+                .as_str()
+                .unwrap()
+                .contains(selected.to_str().unwrap())),
+        "{value}"
+    );
+    assert!(!data.exists());
+    assert!(!selected.exists());
+}
+
+#[test]
+fn init_environment_dry_run_names_effective_source_without_persisting_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("kronik.toml");
+    let base = format!(
+        "[server]\ndata_dir = {:?}\n[foreign]\nmicrovm_dir = {:?}\n",
+        data,
+        dir.path().join("no-tools")
+    );
+    std::fs::write(&config, &base).unwrap();
+    let args = [
+        "serve",
+        "--init",
+        "--root",
+        "--dry-run",
+        "--json",
+        "--config",
+        config.to_str().unwrap(),
+    ];
+    let implicit = command()
+        .args(args)
+        .env("KRONIK_MASTER_KEY", "07".repeat(32))
+        .output()
+        .unwrap();
+    assert!(implicit.status.success(), "{implicit:?}");
+    let plan: serde_json::Value = serde_json::from_slice(&implicit.stdout).unwrap();
+    assert!(
+        plan["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["what"]
+                .as_str()
+                .unwrap()
+                .contains("env master key from KRONIK_MASTER_KEY (no key file)")),
+        "{plan}"
+    );
+    assert!(!data.exists());
+    std::fs::write(&config, format!("{base}\n[keys]\nsource = \"env\"\n")).unwrap();
+    let explicit = command()
+        .args(args)
+        .env("KRONIK_MASTER_KEY", "07".repeat(32))
+        .output()
+        .unwrap();
+    assert!(explicit.status.success(), "{explicit:?}");
+    assert!(!data.exists());
 }
 
 #[test]

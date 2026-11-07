@@ -33,6 +33,7 @@ enum Output {
 const COMMANDS: &[(&str, Output)] = &[
     ("serve", Output::None("the daemon; it refuses --json")),
     ("doctor", Output::Local(crate::doctor::json_schema)),
+    ("serve --init", Output::Local(crate::init::json_schema)),
     ("userns pin", Output::Local(super::userns::schema)),
     ("userns unpin", Output::Local(super::userns::schema)),
     ("userns status", Output::Local(super::userns::schema)),
@@ -526,6 +527,8 @@ mod tests {
     fn every_command_has_its_json_output_listed() {
         let mut commands = BTreeSet::new();
         leaves(&crate::Cli::command(), "", &mut commands);
+        // Host initialization is a flag mode with its own JSON result.
+        commands.insert("serve --init".into());
         let listed: BTreeSet<String> = COMMANDS.iter().map(|(c, _)| (*c).to_owned()).collect();
         assert_eq!(
             commands, listed,

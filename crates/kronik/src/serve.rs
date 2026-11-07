@@ -102,6 +102,22 @@ pub struct ServeArgs {
 }
 
 impl ServeArgs {
+    /// `--init` and what it needs, for main: host setup is a flag mode of
+    /// `serve` that binds nothing, so it runs before the daemon starts.
+    pub(crate) fn init_args(
+        &self,
+    ) -> Option<(crate::init::InitArgs, Option<&Path>, Option<&Path>)> {
+        self.init.init.then(|| {
+            let mut init = self.init.clone();
+            init.rootless = self.rootless;
+            (
+                init,
+                self.config.as_deref(),
+                self.master_key_file.as_deref(),
+            )
+        })
+    }
+
     /// The configuration file, if any, with the flags in place.
     fn config(&self) -> anyhow::Result<Config> {
         let (config, _file) = Config::find(self.config.as_deref())?;
@@ -205,12 +221,6 @@ impl ServeArgs {
 }
 
 pub fn run(args: ServeArgs) -> anyhow::Result<()> {
-    // Host setup binds nothing and enters no namespace: it runs first, as it
-    // always did, with the logger up.
-    if args.init.init {
-        init_tracing(args.log_format);
-        return crate::init::run_init(&args.init, args.config.as_deref());
-    }
     // `serve --rootless`, the nonroot service, binds its listeners, takes the
     // data directory's lock and gives up its host authority while it still
     // has one thread, before the logger and the runtime start. Plain `serve`,
@@ -1162,6 +1172,25 @@ mod tests {
     }
 
     #[test]
+    fn init_forwards_the_selected_file_key_without_reloading_it() {
+        let args = Serve::parse_from([
+            "kronik",
+            "--init",
+            "--config",
+            "/fixture/kronik.toml",
+            "--master-key-file",
+            "/fixture/selected-master.key",
+        ])
+        .args;
+        let (_, config, selected_key) = args.init_args().unwrap();
+        assert_eq!(config, Some(std::path::Path::new("/fixture/kronik.toml")));
+        assert_eq!(
+            selected_key,
+            Some(std::path::Path::new("/fixture/selected-master.key"))
+        );
+    }
+
+    #[test]
     fn test_flags_lists_the_set_test_hooks() {
         let flags = |argv: &[&str]| {
             Serve::parse_from([&["kronik"], argv].concat())
@@ -1198,6 +1227,19 @@ mod tests {
         for format in [super::LogFormat::Text, super::LogFormat::Json] {
             tracing::subscriber::with_default(super::log_subscriber(format, Some(spec)), &f);
         }
+    }
+
+    #[test]
+    fn rootless_is_a_flag_of_serve_and_conflicts_with_root_of_init() {
+        let parse = |argv: &[&str]| Serve::try_parse_from([&["kronik"], argv].concat());
+        assert!(!parse(&[]).unwrap().args.rootless);
+        assert!(parse(&["--rootless"]).unwrap().args.rootless);
+        let init = parse(&["--init", "--rootless"]).unwrap().args;
+        let (init_args, _, _) = init.init_args().unwrap();
+        assert!(init_args.rootless && !init_args.root);
+        assert!(parse(&["--init", "--root", "--rootless"]).is_err());
+        // --root without --init stays refused, as before.
+        assert!(parse(&["--root"]).is_err());
     }
 
     #[test]

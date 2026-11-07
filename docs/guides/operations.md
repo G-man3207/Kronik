@@ -23,26 +23,54 @@ kronik serve --init --domain api.example.com --acme-email ops@example.com
 kronik doctor
 ```
 
-`kronik serve --init` sets up a host in six steps:
+`kronik serve --init` uses root for the setup and installs the nonroot
+service (M21; the design is proposed, see
+[ADR 0060](../adr/0060-non-root-daemon-user-namespace.md) and
+[ADR 0062](../adr/0062-non-root-systemd-units.md)). It needs systemd 255 or
+newer, cgroup v2 and user namespaces, and it has not been run on Ubuntu 24.04
+or checked against its AppArmor restriction on unprivileged user namespaces.
+Its steps:
 
 1. It writes `/etc/kronik/kronik.toml` (mode 0644). With `--domain` (which
    can be repeated) the gateway listens on `0.0.0.0:443` with a certificate
    from Let's Encrypt. Without it, the gateway listens on `0.0.0.0:80`
    without TLS.
-2. It creates the data directory `/var/lib/kronik` (mode 0700).
-3. It creates or loads the master key through `[keys] source`. The default
+2. It creates the system group and user `kronik`, and a range of 65,536
+   subordinate ids for it in `/etc/subuid` and `/etc/subgid` with the shadow
+   tools, which lock those files. The user is never root and never maps
+   host root.
+3. It creates the data directory `/var/lib/kronik` (mode 0700, owned by
+   `kronik`).
+4. It creates or loads the master key through `[keys] source`. The default
    is `/etc/kronik/master.key` (mode 0600); a KMS source stores only a
-   wrapped key. See [the master key](#the-master-key).
-4. It creates the system group `kronik`.
+   wrapped key. See [the master key](#the-master-key). A file key stays
+   root-only on disk: the unit hands it to the daemon as a systemd
+   credential (`LoadCredential=`) and starts the daemon with
+   `--master-key-file` pointing at that credential. An environment or KMS
+   source gets neither.
 5. It installs `/etc/systemd/system/kronik.service`, whose `ExecStart`
-   points at the binary you ran.
+   points at the binary you ran, and `kronik-userns.service`, a one-shot
+   unit that runs `kronik userns pin` before the daemon starts. With
+   `[foreign] platform = "kvm"` or an installed microVM tool bundle it also
+   writes a drop-in that lets the service open `/dev/kvm` through that
+   device's own nonroot group.
 6. It runs `systemctl daemon-reload` and `systemctl enable --now
-   kronik.service`.
+   kronik.service`, then checks the running service: its host uid and gid,
+   that it keeps no capability in the host namespace, that it is in the
+   owned pinned namespace with the expected maps, and `kronik doctor
+   --rootless`.
 
 Every step checks before it acts, so running `--init` again changes nothing
 that is already in place, and it never overwrites an existing config file
 or key. Edit `/etc/kronik/kronik.toml` afterwards and run `systemctl restart
 kronik`.
+
+`kronik serve --init --root` installs the root service of v0.1 to v0.4
+instead (its unit, now with the key credential and a delegated cgroup):
+there is no user, subordinate range, pin or KVM drop-in. Missing prerequisites
+of the nonroot service never select it; you choose it. `--rootless` names the
+default explicitly. `--dry-run` shows the plan, as text or with `--json`
+(`{dry_run, mode, steps}`), and changes nothing.
 
 Clients (`kronik deploy`, `kronik actors`, `kronik mcp` and the rest) talk to
 the daemon over `/run/kronik/api.sock`. The socket's mode is 0660 for group
@@ -51,6 +79,35 @@ the daemon over `/run/kronik/api.sock`. The socket's mode is 0660 for group
 ```sh
 usermod -aG kronik alice        # takes effect at alice's next login
 ```
+
+### Moving between the two installations
+
+`--init` does not convert an installation in place, and it checks before it
+changes anything, in `--dry-run` as well (ADR 0063). A data directory that is
+empty (a first run that stopped early) is adopted. One owned by root is a root
+installation: `--init --root` reruns it, and plain `--init` is refused with
+`ROOTLESS_UNAVAILABLE`. One owned by the `kronik` user is a nonroot
+installation, with the same rule the other way round. Any other owner is
+refused.
+
+To move an installation:
+
+1. Ship the data, so that a snapshot, the log and the code are in the target
+   (`[ship] url`: `s3://bucket/prefix`, or `file:///dir` on this machine).
+2. Stop and disable the old unit and keep the old data directory aside.
+3. Run `kronik serve --init` (or with `--root`) against an empty data
+   directory. For a nonroot installation that creates it owned by `kronik`.
+4. Run `kronik restore --from <URL>` into it. Run as root against a nonroot
+   data directory it prepares as root, drops to the directory's owner and
+   installs as that owner, so nothing in it is owned by root.
+5. Start the service.
+
+What is not shipped is not restored. Foreign actors' declarations are in the
+log, so the actors are declared again, but their data directories and
+checkpoints are local: copy a data directory over yourself (its numeric owners
+differ between the two kinds, and a nonroot installation's foreign files use
+the subordinate range) or accept that the actor starts empty. Keep the master
+key, or its KMS key, through the move.
 
 ## kronik.toml
 
@@ -386,21 +443,34 @@ raise `--concurrency` only with the worst case above in mind.
 ## systemd
 
 `kronik serve --init` installs this unit (`deploy/systemd/kronik.service` in
-the source):
+the source), with `kronik-userns.service` before it; `--root` installs
+`deploy/systemd/kronik-root.service` as `kronik.service` instead:
 
-- `ExecStart=<binary> serve --config /etc/kronik/kronik.toml`,
-  `Restart=on-failure` after 2 s, `LimitNOFILE=65536`, and `LimitCORE=0`:
+- `ExecStart=<binary> serve --rootless --config /etc/kronik/kronik.toml` (and,
+  for a file key, `--master-key-file` pointing at the unit's credential; the
+  root unit has no `--rootless`), `Restart=on-failure` after 2 s, `LimitNOFILE=65536`, and `LimitCORE=0`:
   no core dumps, since the process holds the master key, secrets and
   unsealed subject data. `kronik serve` also marks itself non-dumpable
   (`PR_SET_DUMPABLE` 0), which keeps it from dumping core and from being
   traced by other users outside systemd too.
-- `Group=kronik`, `UMask=0007`, and no `User=`: v0.1 runs the daemon as
-  root, the default, because gVisor needs it for foreign actors (rootless
-  is a later milestone; see the security model). The group owns the API
-  socket. The unit leaves out an explicit `User=root` on purpose: together
-  with the seccomp-based settings below, systemd then drops `CAP_SETUID`
-  from the daemon, `NoNewPrivileges` keeps `runsc` from getting it back,
-  and no sandbox starts ([ADR 0027](../adr/0027-systemd-unit-hardening.md)).
+- `User=kronik`, `Group=kronik` and `UMask=0007`. The group owns the API
+  socket. The daemon holds `CAP_NET_BIND_SERVICE` (ambient, and the whole
+  bounding set) only until it has bound its ports and entered its user
+  namespace; it then empties all capability sets and sets `no_new_privs`.
+  The sandboxes' root is namespace-local: the root-owned one-shot
+  `kronik-userns.service` pins a user namespace owned by `kronik`, and the
+  daemon enters it (`kronik userns status` shows it). `Delegate=yes` gives it
+  a cgroup subtree for the sandboxes, and `ProtectControlGroups=private`
+  (systemd 257 or newer) a private view of it. Repair the namespace or the
+  delegation rather than adding host capabilities or removing `User=` (ADR
+  0060 and 0061). The root installation (`serve --init --root`) keeps the
+  unit of v0.1, with no `User=`, for the reason in
+  [ADR 0027](../adr/0027-systemd-unit-hardening.md). The nonroot daemon
+  refuses to start, with `ROOTLESS_UNAVAILABLE`, where it cannot report its
+  API callers' real uids: in a rootless container or a nested user namespace
+  (the uid map is not the host's), or when its real, effective and saved user
+  ids differ. Those hosts are not supported for the nonroot unit; use
+  `--root`. `kronik doctor --rootless` shows the same condition as `uid_view`.
 - `RuntimeDirectory=kronik` (`/run/kronik`, mode 0750 with group `kronik`,
   kept across restarts) holds the socket and the sandboxes' runtime state.
   The daemon keeps the runtimes' state directories in it (`runsc/`,
@@ -408,20 +478,29 @@ the source):
   `ExecStopPost=` runs `kronik foreign cleanup`, so sandboxes and their
   `config.json` (secret values) are removed even when the daemon was
   killed.
-  `StateDirectory=kronik` (`/var/lib/kronik`, mode 0700) is the data
-  directory. `LogsDirectory=kronik` (`/var/log/kronik`, mode 0750) makes
-  the default audit sink, `file:///var/log/kronik/audit/`, writable.
-- Hardening: `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
-  `NoNewPrivileges`, `ProtectClock`, `ProtectKernelModules`,
-  `ProtectKernelLogs`, `RestrictRealtime`, `LockPersonality`,
-  `SystemCallArchitectures=native`.
+  The data directory (`/var/lib/kronik`, or `server.data_dir`, which
+  `serve --init` writes into `ReadWritePaths=`) is created by `serve --init`
+  with mode 0700, owned by `kronik`; the nonroot unit has no
+  `StateDirectory=`, because systemd would change the owner of the whole tree
+  to `User=` and hand foreign actors' data, owned by the subordinate range,
+  to `kronik`. The root unit keeps `StateDirectory=kronik`.
+  `LogsDirectory=kronik` (`/var/log/kronik`, mode 0750) makes the default
+  audit sink, `file:///var/log/kronik/audit/`, writable.
+- Hardening of the nonroot unit: `ProtectSystem=strict`, `ProtectHome`,
+  `PrivateTmp`, `PrivateDevices`, `PrivateIPC`, `RemoveIPC`,
+  `ProtectHostname`, `ProtectClock`, `ProtectKernelTunables`,
+  `ProtectKernelModules`, `ProtectKernelLogs`, `RestrictRealtime`,
+  `LockPersonality`, `NoNewPrivileges`, `SystemCallArchitectures=native`,
+  `RestrictAddressFamilies` (Unix, IPv4, IPv6 and netlink) and a
+  `SystemCallFilter` that denies the clock, CPU-emulation, module,
+  obsolete, raw-I/O, reboot and swap groups.
 - Left out on purpose: `MemoryDenyWriteExecute`, because Wasmtime compiles
-  code at run time; `ProtectHostname`, `ProtectKernelTunables`,
-  `ProtectControlGroups` and a `CapabilityBoundingSet`, because `runsc`
-  creates namespaces and cgroups for foreign actors; and
-  `RestrictSUIDSGID`, because it also makes `openat2` fail, which
-  `runsc restore` needs for sandbox copies in forks
-  ([ADR 0027](../adr/0027-systemd-unit-hardening.md)).
+  code at run time, and `RestrictSUIDSGID`, because it also makes `openat2`
+  fail, which `runsc restore` needs for sandbox copies in forks
+  ([ADR 0027](../adr/0027-systemd-unit-hardening.md)). The root unit leaves
+  out `ProtectHostname`, `ProtectKernelTunables`, `ProtectControlGroups` and a
+  `CapabilityBoundingSet` as well, because `runsc` creates namespaces and
+  cgroups there with host root.
 
 `ProtectSystem=strict` makes the whole file system read-only for the daemon
 except its runtime and state directories. If `server.data_dir` is somewhere

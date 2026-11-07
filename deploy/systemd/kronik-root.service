@@ -1,0 +1,66 @@
+# Installed as /etc/systemd/system/kronik.service by `kronik serve --init
+# --root`, for hosts that cannot run the non-root daemon (kronik.service, ADR
+# 0062): the daemon runs as root, as in v0.1, with the hardening systemd
+# allows (ADR 0027 says why each setting is in or out).
+[Unit]
+Description=Kronik: every change verified against production traffic
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+@KEY_CREDENTIAL@
+Type=simple
+ExecStart=@KRONIK@ serve --config @CONFIG@@KEY_ARGUMENT@
+# Also after a crash or SIGKILL: foreign actors' sandboxes leave the
+# service's cgroup, so systemd would not stop them, and their config.json
+# holds secret values (docs/design/m7-foreign.md §5). "-": never blocks a
+# restart.
+ExecStopPost=-@KRONIK@ foreign cleanup --config @CONFIG@
+# Root is the default; no User=root on purpose. With an explicit User= and
+# any seccomp-based setting below, systemd drops CAP_SETUID from the daemon,
+# and NoNewPrivileges keeps runsc from getting it back: no sandbox starts
+# (ADR 0027).
+# The API socket is created with mode 0660 for the kronik group.
+Group=kronik
+Delegate=yes
+# The owned root unit supplies the leaf; a root shell must never infer
+# delegation merely because it can write an unrelated cgroup.
+DelegateSubgroup=daemon
+UMask=0007
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=65536
+# No core dumps: the process holds the master key, secrets and unsealed
+# subject data.
+LimitCORE=0
+# /run/kronik holds the API socket; /var/lib/kronik is the data directory
+# (server.data_dir; give another directory ReadWritePaths= here).
+RuntimeDirectory=kronik
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
+StateDirectory=kronik
+StateDirectoryMode=0700
+# /var/log/kronik is writable under ProtectSystem=strict for the default
+# audit sink, file:///var/log/kronik/audit/ (M28). Its lines name tokens and
+# callers; rotating them is the operator's.
+LogsDirectory=kronik
+LogsDirectoryMode=0750
+
+# Hardening. Left out on purpose: MemoryDenyWriteExecute (Wasmtime compiles
+# code at run time), ProtectHostname, ProtectKernelTunables,
+# ProtectControlGroups and a CapabilityBoundingSet (runsc creates namespaces
+# and cgroups for foreign actors), and RestrictSUIDSGID: it also makes
+# openat2 fail, which `runsc restore` needs for M14's sandbox copies (ADR 0027).
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectClock=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

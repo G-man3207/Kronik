@@ -192,15 +192,27 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_export_dropped_total` | counter | Records in batches the sink refused for good and the export skipped, by stream. |
 | `kronik_export_gaps_total` | counter | Log ranges retention deleted before an export stream read them, by stream. |
 
-`kronik serve --init [--domain <NAME>]... [--acme-email <EMAIL>] [--dry-run]`
-sets a host up, as root (M6): it writes the configuration file, creates the
-data directory, the master key (mode 0600) and the `kronik` group, and
-installs, enables and starts the systemd unit `deploy/systemd/kronik.service`,
-which runs the daemon with the group `kronik`, so the API socket is open to
-that group. With `--domain` the file asks for a TLS certificate by ACME for
-those names (`--acme-email` receives the CA's notices); without it the
-gateway serves plain HTTP on port 80. Each step checks the host first, so
-running it again changes nothing, and `--dry-run` prints the plan.
+`kronik serve --init [--root | --rootless] [--domain <NAME>]... [--acme-email <EMAIL>] [--master-key-file <PATH>] [--dry-run] [--json]`
+sets a host up, as root (M6, M21). By default it installs the nonroot service
+(ADR 0062): it writes the configuration file, creates the `kronik` group and
+user with their subordinate id ranges, the data directory (mode 0700, owned
+by `kronik`) and the master key (mode 0600, root-only; the unit passes it to
+the daemon as a systemd credential), installs and starts `kronik.service`
+and the one-shot `kronik-userns.service` that pins the daemon's user
+namespace, and then checks the running service's identity, capabilities and
+namespace. The unit starts the daemon as `kronik serve --rootless`. The API
+socket is open to the group `kronik`, and the audit trail records true host
+caller uids. `--root` installs the root service of v0.1 instead, and
+`--rootless` names the default explicitly; a host that lacks what the nonroot
+service needs never gets the root service by itself. An existing installation of the other
+kind is refused with `ROOTLESS_UNAVAILABLE`, before anything changes, and
+the operations guide says how to move one. With `--domain` the file asks for a
+TLS certificate by ACME for those names (`--acme-email` receives the CA's
+notices); without it the gateway serves plain HTTP on port 80.
+`--master-key-file` selects the key file for both the key step and the unit's
+credential. Each step checks the host first, so running it again changes
+nothing, and `--dry-run` prints the plan, as `{dry_run, mode, steps}` with
+`--json`. It needs systemd 255 or newer.
 
 ## kronik doctor
 

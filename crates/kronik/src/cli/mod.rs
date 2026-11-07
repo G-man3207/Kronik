@@ -67,7 +67,7 @@ pub struct Global {
     /// Print JSON: the API's response unchanged for a client command, the
     /// result of init, build, doctor, restore, upgrade check and explain,
     /// and the error JSON on failure (docs/reference/json.md has every
-    /// schema). Not for `serve`.
+    /// schema). Not for daemon `serve`; accepted by `serve --init`.
     #[arg(long, global = true)]
     pub json: bool,
 }

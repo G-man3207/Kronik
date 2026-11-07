@@ -28,6 +28,7 @@ against both.
 | --- | --- |
 | `kronik serve` | no JSON: the daemon; it refuses --json |
 | `kronik doctor` | [`Report`](#report), from the CLI itself |
+| `kronik serve --init` | [`InitOutput`](#initoutput), from the CLI itself |
 | `kronik userns pin` | [`UsernsReport`](#usernsreport), from the CLI itself |
 | `kronik userns unpin` | [`UsernsReport`](#usernsreport), from the CLI itself |
 | `kronik userns status` | [`UsernsReport`](#usernsreport), from the CLI itself |
@@ -4094,6 +4095,33 @@ against both.
 }
 ```
 
+### InitOutput
+
+```json
+{
+  "properties": {
+    "dry_run": {
+      "type": "boolean"
+    },
+    "mode": {
+      "$ref": "#/components/schemas/Mode"
+    },
+    "steps": {
+      "items": {
+        "$ref": "#/components/schemas/StepOutput"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "dry_run",
+    "mode",
+    "steps"
+  ],
+  "type": "object"
+}
+```
+
 ### InputSummary
 
 ```json
@@ -4699,6 +4727,19 @@ against both.
     "name"
   ],
   "type": "object"
+}
+```
+
+### Mode
+
+```json
+{
+  "description": "Which service `--init` installs: the nonroot default or the explicit root\nfallback.",
+  "enum": [
+    "rootless",
+    "root"
+  ],
+  "type": "string"
 }
 ```
 
@@ -6993,6 +7034,26 @@ against both.
     "fail"
   ],
   "type": "string"
+}
+```
+
+### StepOutput
+
+```json
+{
+  "properties": {
+    "action": {
+      "type": "string"
+    },
+    "what": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "action",
+    "what"
+  ],
+  "type": "object"
 }
 ```
 
