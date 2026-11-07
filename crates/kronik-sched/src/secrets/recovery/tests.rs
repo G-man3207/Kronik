@@ -189,9 +189,12 @@ async fn record(node: &Node, lsn: u64) -> Record {
         .unwrap();
     result.unwrap()
 }
+/// Waits for the recovery under test to register its stall. The condition is
+/// what ends the wait; the bound only turns a recovery that never stalls into
+/// a failure, and is far above what a loaded machine needs.
 async fn wait_stall(node: &Node) {
     node.env
-        .timeout(Duration::from_secs(3), async {
+        .timeout(Duration::from_secs(60), async {
             while *super::super::lock(&STALLED) == 0 {
                 node.env.clock.sleep(Duration::from_millis(1)).await;
             }
@@ -389,9 +392,10 @@ async fn provider(recovery_status: usize) -> (tempfile::TempDir, Arc<Node>, Arc<
     *bao.node.lock().unwrap() = Some(Arc::downgrade(&node));
     let runtime = node.runtime().unwrap();
     // Settle the startup inventory before the fixture takes over the name: the
-    // background refresh must not race this link's single observation.
+    // background refresh must not race this link's single observation. The
+    // condition ends the wait; the bound is far above a loaded machine's need.
     node.env
-        .timeout(Duration::from_secs(3), async {
+        .timeout(Duration::from_secs(60), async {
             while !runtime.cache.complete(node.epoch()) {
                 node.env.clock.sleep(Duration::from_millis(1)).await;
             }

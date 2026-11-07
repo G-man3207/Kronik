@@ -87,8 +87,11 @@ async fn promote_now(node: &Node, hold: &SwitchHold, name: &str) -> u64 {
         .0
 }
 
+/// Waits for `f`. The condition ends the wait; the attempts only bound a
+/// condition that never comes true, and are far more than a loaded machine
+/// needs (the commits behind these conditions take a group-commit window each).
 async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
-    for _ in 0..500 {
+    for _ in 0..6_000 {
         if f() {
             return;
         }
@@ -321,7 +324,7 @@ async fn a_cancelled_configuration_change_is_still_applied() {
     let env = Env::real(tokio::runtime::Handle::current());
     let config = NodeConfig {
         concurrency: 8,
-        group_commit_window: Some(Duration::from_millis(300)),
+        group_commit_window: Some(Duration::from_millis(1000)),
         ..NodeConfig::default()
     };
     let node = start_local(env, dir.path(), config).await.unwrap();
@@ -344,7 +347,7 @@ async fn a_cancelled_configuration_change_is_still_applied() {
             .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     task.abort();
     let _ = task.await;
     wait_until("the grant is applied", || node.applied_lsn() > before).await;
@@ -355,6 +358,14 @@ async fn a_cancelled_configuration_change_is_still_applied() {
     })
     .await;
     assert_eq!(node.epoch(), 2);
+    // The first change's task goes on after it has applied the change: it
+    // recertifies the secret inventory and gives the deploy lock back when
+    // that is done. A second change that begins before waits for the lock,
+    // and cancelling it there cancels a change that has not begun, which is
+    // never made. A dry run takes the lock and gives it back: wait for it.
+    node.set_privacy_mode(pb::PrivacyState::Off, audit(), true, owner(&node))
+        .await
+        .unwrap();
 
     let before = node.applied_lsn();
     let task = {
@@ -364,7 +375,7 @@ async fn a_cancelled_configuration_change_is_still_applied() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     task.abort();
     let _ = task.await;
     wait_until("the mode is applied", || node.applied_lsn() > before).await;

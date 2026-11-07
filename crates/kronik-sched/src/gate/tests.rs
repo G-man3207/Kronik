@@ -159,9 +159,11 @@ async fn a_turn_running_in_the_drain_is_not_quiet() {
         kronik_core::causal::root("spin".to_string()),
         0,
     );
-    // While the callee turn runs, the pause is not quiet.
+    // While the callee turn runs, the pause is not quiet. The turn running is
+    // what ends the wait; the attempts only bound a turn that never starts,
+    // and are far more than a loaded machine needs to schedule it.
     let mut seen = None;
-    for _ in 0..2500 {
+    for _ in 0..30_000 {
         if let Err(e) = drain.check_quiet() {
             seen = Some(e);
             break;
@@ -179,7 +181,7 @@ async fn a_turn_running_in_the_drain_is_not_quiet() {
         "{err}"
     );
     let _ = tokio::time::timeout(Duration::from_secs(30), reply).await;
-    for _ in 0..500 {
+    for _ in 0..12_000 {
         if drain.check_quiet().is_ok() {
             break;
         }
