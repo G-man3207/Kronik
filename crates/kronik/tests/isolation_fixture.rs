@@ -289,6 +289,11 @@ fn manager_process(root: &Path, cfg: &Value) -> Result<(u32, String)> {
     Ok((found[0], group))
 }
 
+/// The host id of the process of the private manager's PID namespace whose id
+/// in that namespace is `inside`. Only the processes of that namespace are
+/// translated: a process in a namespace of its own below it, such as a microVM's
+/// VMM (init of the namespace its launcher made), is not found by its last
+/// `NSpid` entry, which is its id in its own namespace. The VMM's launcher is.
 fn host_pid(root: &Path, cfg: &Value, inside: u32) -> Result<u32> {
     if inside == 0 {
         return Ok(0);

@@ -1466,6 +1466,23 @@ pub fn jail_microvm(jail: &MicrovmJail<'_>) -> io::Result<()> {
     fs::write(group.join("memory.swap.max"), "0")?;
     fs::write(group.join("pids.max"), "1024")?;
     fs::write(group.join("cgroup.procs"), std::process::id().to_string())?;
+    isolate(jail, Path::new("/dev/kvm"))
+}
+
+/// The rest of the jail, after the cgroup: new namespaces, a fork into the PID
+/// one, the mounts and the capabilities. It returns in the child only, which is
+/// init of the new PID namespace and goes on to exec the VMM. The process that
+/// called it, still in the VM's cgroup and so under its limits, gives up every
+/// capability, waits for that child and exits with its status.
+///
+/// The VMM has a PID namespace of its own because a process that escapes the
+/// guest must not be able to address any process of the host. Firecracker's
+/// seccomp filter lets `tkill` through for two signals but looks at no thread
+/// id, and "the daemon's uid" on a root installation is every root process of
+/// the host, PID 1 included: systemd's SIGABRT handler freezes the manager.
+/// In a namespace of its own, `kill(1, ...)` is the VMM itself and every host
+/// thread id is `ESRCH`.
+pub(crate) fn isolate(jail: &MicrovmJail<'_>, kvm: &Path) -> io::Result<()> {
     // SAFETY: only this launcher is affected; no shared runtime threads exist.
     check(
         unsafe {
@@ -1474,12 +1491,22 @@ pub fn jail_microvm(jail: &MicrovmJail<'_>) -> io::Result<()> {
                     | libc::CLONE_NEWNET
                     | libc::CLONE_NEWIPC
                     | libc::CLONE_NEWUTS
-                    | libc::CLONE_NEWCGROUP,
+                    | libc::CLONE_NEWCGROUP
+                    | libc::CLONE_NEWPID,
             )
         },
         "unsharing microVM namespaces",
     )?;
-    jail_mounts(jail, Path::new("/dev/kvm"))?;
+    match fork_into_pid_namespace()? {
+        Forked::Parent(child) => {
+            // Waiting needs no privilege, and this process shares the jail's
+            // mount namespace: nothing it holds may outlive the setup.
+            seal_capabilities()?;
+            std::process::exit(child.wait()?)
+        }
+        Forked::Child => {}
+    }
+    jail_mounts(jail, kvm)?;
     seal_capabilities()
 }
 
@@ -1523,6 +1550,129 @@ fn seal_capabilities() -> io::Result<()> {
 // The secure bits of linux/securebits.h that `seal_capabilities` sets.
 const SECBIT_NOROOT: libc::c_ulong = 1 << 0;
 const SECBIT_NOROOT_LOCKED: libc::c_ulong = 1 << 1;
+
+/// The two ways out of [`fork_into_pid_namespace`], one in each process.
+pub(crate) enum Forked {
+    /// In the child, which is init of the new PID namespace.
+    Child,
+    /// In the caller: the child to wait for.
+    Parent(Waiting),
+}
+
+/// The child of a fork into a new PID namespace, as its parent sees it.
+pub(crate) struct Waiting {
+    pid: libc::pid_t,
+    /// The write end of the pipe whose closing tells the child that its
+    /// parent is gone; it lives as long as the parent does.
+    _alive: OwnedFd,
+}
+
+impl Waiting {
+    /// The child's pid in the caller's PID namespace.
+    #[cfg(test)]
+    pub(crate) fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
+    /// Waits for the child and returns the code to exit with: its exit status,
+    /// or 128 plus the signal that ended it.
+    pub(crate) fn wait(self) -> io::Result<i32> {
+        let mut raw: libc::c_int = 0;
+        loop {
+            // SAFETY: `pid` is this process's own child, not yet reaped.
+            let reaped = unsafe { libc::waitpid(self.pid, &raw mut raw, 0) };
+            if reaped == self.pid {
+                return Ok(exit_code(raw));
+            }
+            let e = io::Error::last_os_error();
+            if reaped < 0 && e.kind() != io::ErrorKind::Interrupted {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("waiting for the VMM: {e}"),
+                ));
+            }
+        }
+    }
+}
+
+/// The exit code that stands for a `wait` status: the exit status, or 128 plus
+/// the number of the signal that ended the process (as a shell reports it).
+pub(crate) fn exit_code(raw: libc::c_int) -> i32 {
+    use std::os::unix::process::ExitStatusExt as _;
+    let status = std::process::ExitStatus::from_raw(raw);
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
+}
+
+/// Forks the first child into the PID namespace that the caller has just
+/// unshared (`unshare(CLONE_NEWPID)` puts only children into it, never the
+/// caller): the child is its init, pid 1.
+///
+/// Fork clears the parent-death signal, so the child arms it again, and then
+/// looks at a pipe whose write end only the parent holds: if the parent died
+/// before the signal was armed, the pipe is closed and the child ends rather
+/// than run without a parent (`getppid()` cannot tell: it is 0 for the init
+/// of a namespace whose parent is outside). The signal reaches a namespace's
+/// init because its sender is outside the namespace, and killing it kills
+/// everything in the namespace.
+///
+/// The caller must have one thread: only the forking thread survives in the
+/// child, and the signal fires when that thread ends.
+pub(crate) fn fork_into_pid_namespace() -> io::Result<Forked> {
+    let mut ends = [0 as libc::c_int; 2];
+    // SAFETY: pipe2 writes two descriptors.
+    check(
+        unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
+        "pipe2",
+    )?;
+    // SAFETY: both are fresh and owned here.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    // SAFETY: the caller has one thread, so the child cannot inherit a lock
+    // that another thread holds; it runs on in the same stack frames.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(
+            e.kind(),
+            format!("forking into the PID namespace: {e}"),
+        ));
+    }
+    if pid > 0 {
+        drop(read);
+        return Ok(Forked::Parent(Waiting { pid, _alive: write }));
+    }
+    drop(write);
+    // SAFETY: prctl with scalar arguments.
+    check(
+        unsafe {
+            libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0,
+                0,
+                0,
+            )
+        },
+        "PR_SET_PDEATHSIG",
+    )?;
+    let mut probe = libc::pollfd {
+        fd: read.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: poll reads and writes one pollfd; a zero timeout does not block.
+    if unsafe { libc::poll(&raw mut probe, 1, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if probe.revents & libc::POLLHUP != 0 {
+        return Err(io::Error::other(
+            "the microVM launcher died before its VMM started",
+        ));
+    }
+    Ok(Forked::Child)
+}
 
 // statvfs(3) `f_flag` bits of a mount.
 const ST_RDONLY: libc::c_ulong = 1;
@@ -1933,6 +2083,10 @@ mod tests {
 
     const REHEARSAL_DIR: &str = "KRONIK_JAIL_REHEARSAL_DIR";
     const REHEARSAL_CASE: &str = "KRONIK_JAIL_REHEARSAL_CASE";
+    /// Set: after its checks the VMM of the rehearsal writes `/out/ready` and
+    /// waits for `/out/go`, so that a test can look at the processes from outside
+    /// while the launcher waits for it.
+    const REHEARSAL_HOLD: &str = "KRONIK_JAIL_REHEARSAL_HOLD";
 
     // statvfs(3) `f_flag` bits that only the rehearsal looks at.
     const ST_NOATIME: libc::c_ulong = 1024;
@@ -2039,6 +2193,157 @@ mod tests {
                 "{case}: {text}"
             );
         }
+    }
+
+    /// The `Key:` lines of `/proc/<pid>/task/<tid>/status`, as (key, value).
+    fn status_of(pid: u32, tid: u32) -> Vec<(String, String)> {
+        fs::read_to_string(format!("/proc/{pid}/task/{tid}/status"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .map(|(key, value)| (key.to_owned(), value.trim().to_owned()))
+            .collect()
+    }
+
+    /// The threads of a process that wait: the only thread of the launcher in
+    /// production, and in this test binary the thread that runs the test (the
+    /// capabilities and `no_new_privs` are per thread, and the main thread of
+    /// the harness only waits for the test).
+    fn waiting_threads(pid: u32) -> Vec<u32> {
+        let all: Vec<u32> = fs::read_dir(format!("/proc/{pid}/task"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if all.len() <= 1 {
+            all
+        } else {
+            all.into_iter().filter(|tid| *tid != pid).collect()
+        }
+    }
+
+    /// Both processes of a running jail, seen from outside: the launcher, which
+    /// waits for its VMM in the VM's cgroup and in the jail's mount namespace,
+    /// and the VMM, init of a PID namespace of its own, hold no capability of
+    /// any kind and cannot gain one.
+    #[test]
+    fn while_the_launcher_waits_neither_it_nor_its_vmm_holds_a_capability() {
+        use std::process::{Command, Stdio};
+        if let Some(why) = rehearsal_unavailable() {
+            eprintln!("skipped: {why}");
+            return;
+        }
+        let dir = tempfile::Builder::new()
+            .prefix("kronik-jail-")
+            .tempdir()
+            .unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        let mut launcher = Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "sh", "-ec"])
+            .arg(
+                "exec unshare --user --map-root-user --mount \"$EXE\" \
+                     --exact sys::tests::jail_rehearsal_child --ignored --nocapture \
+                     --test-threads=1",
+            )
+            .env("EXE", std::env::current_exe().unwrap())
+            .env(REHEARSAL_DIR, dir.path())
+            .env(REHEARSAL_CASE, "hold")
+            .env(REHEARSAL_HOLD, "1")
+            .stdout(Stdio::from(File::create(dir.path().join("log")).unwrap()))
+            .stderr(Stdio::from(
+                File::create(dir.path().join("log-err")).unwrap(),
+            ))
+            .spawn()
+            .unwrap();
+        let ready = dir.path().join("src/out/ready");
+        let go = dir.path().join("src/out/go");
+        let mut looked_at = Ok(());
+        for _ in 0..1500 {
+            if ready.exists() || launcher.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if ready.exists() {
+            looked_at = (|| {
+                let parent = launcher.id();
+                // The VMM: a child of the launcher that is pid 1 in its namespace.
+                let vmm = fs::read_dir("/proc")
+                    .map_err(|e| e.to_string())?
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+                    .find(|pid| {
+                        let status = status_of(*pid, *pid);
+                        let get = |key: &str| {
+                            status
+                                .iter()
+                                .find(|(k, _)| k == key)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or_default()
+                        };
+                        get("PPid") == parent.to_string()
+                            && get("NSpid").split_whitespace().last() == Some("1")
+                    })
+                    .ok_or("the launcher has no child that is pid 1 of its namespace")?;
+                let mut seen = 0;
+                for (who, pid) in [("launcher", parent), ("VMM", vmm)] {
+                    for tid in waiting_threads(pid) {
+                        seen += 1;
+                        let status = status_of(pid, tid);
+                        let get = |key: &str| {
+                            status
+                                .iter()
+                                .find(|(k, _)| k == key)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or_default()
+                        };
+                        for key in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"] {
+                            if get(key) != "0000000000000000" {
+                                return Err(format!(
+                                    "the {who} (thread {tid}) holds {key} {}",
+                                    get(key)
+                                ));
+                            }
+                        }
+                        if get("NoNewPrivs") != "1" {
+                            return Err(format!(
+                                "the {who} (thread {tid}) can gain privilege: NoNewPrivs {}",
+                                get("NoNewPrivs")
+                            ));
+                        }
+                    }
+                }
+                if seen < 2 {
+                    return Err(format!("only {seen} thread(s) were looked at"));
+                }
+                Ok(())
+            })();
+        }
+        // Let the VMM finish and the launcher relay its status, whatever was found.
+        fs::write(&go, b"").unwrap();
+        let waited = (0..1500).find_map(|_| match launcher.try_wait().unwrap() {
+            Some(status) => Some(status),
+            None => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            }
+        });
+        let Some(status) = waited else {
+            launcher.kill().unwrap();
+            launcher.wait().unwrap();
+            panic!("the launcher did not end");
+        };
+        let log = fs::read_to_string(dir.path().join("log")).unwrap_or_default()
+            + &fs::read_to_string(dir.path().join("log-err")).unwrap_or_default();
+        assert!(ready.exists(), "the VMM never got ready: {log}");
+        assert_eq!(looked_at, Ok(()), "{log}");
+        assert!(
+            status.success() && log.contains("jail rehearsal ok"),
+            "{status}: {log}"
+        );
     }
 
     /// Sends one byte with `count` copies of `fd` in one control message.
@@ -2314,7 +2619,12 @@ mod tests {
         // A program to exec in the jail, to see what an exec gains: where the
         // source mount allows execution and a static C program can be made.
         let exec_stub = source_flags & ST_NOEXEC == 0 && make_stub(dir, &src.join("firecracker"))?;
-        jail_mounts(
+        let launcher = std::process::id() as libc::pid_t;
+        // The real sequence after the cgroup: namespaces (the PID one
+        // included), the fork into it, the mounts and the sealed capabilities.
+        // This returns in the child only; the process that called it waits for
+        // the child and exits with its status, which the test reads.
+        isolate(
             &MicrovmJail {
                 root: &root,
                 cgroup: "/unused",
@@ -2331,9 +2641,42 @@ mod tests {
             &src.join("kvm"),
         )?;
 
-        // From here on this process is inside the jail.
+        // From here on this process is inside the jail, and it is init of a
+        // PID namespace of its own.
         if is_open(inherited) {
             return fail("a descriptor inherited from before the jail survived it".into());
+        }
+        if std::process::id() != 1 {
+            return fail("the VMM is not init of its PID namespace".into());
+        }
+        // SAFETY: signal 0 only asks whether the target can be signalled.
+        if unsafe { libc::kill(1, 0) } != 0 {
+            return fail("pid 1 is not the VMM itself".into());
+        }
+        // The launcher is a real process of the host, and so is its thread.
+        // None of them exists here: a compromised VMM cannot signal them.
+        // SAFETY: signal 0 only asks; the thread calls take scalar arguments.
+        let reached = unsafe {
+            [
+                ("kill", libc::kill(launcher, 0)),
+                (
+                    "tkill",
+                    libc::syscall(libc::SYS_tkill, launcher, 0) as libc::c_int,
+                ),
+                (
+                    "tgkill",
+                    libc::syscall(libc::SYS_tgkill, launcher, launcher, 0) as libc::c_int,
+                ),
+            ]
+        };
+        for (call, result) in reached {
+            if result != -1 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return fail(format!("{call} of a host process did not fail with ESRCH"));
+            }
+        }
+        // SAFETY: getppid takes no argument.
+        if unsafe { libc::getppid() } != 0 {
+            return fail("the VMM has a parent in its own namespace".into());
         }
         let mut names: Vec<String> = fs::read_dir("/")?
             .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
@@ -2381,8 +2724,7 @@ mod tests {
         if fs::read_dir(".")?.count() != expected.len() {
             return fail("`..` of the jail root leads somewhere else".into());
         }
-        // The last step of the launcher's jail.
-        seal_capabilities()?;
+        // `isolate` has done the last step of the launcher's jail.
         // SAFETY: scalar prctl.
         if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 1 {
             return fail("no_new_privs is not set".into());
@@ -2431,6 +2773,16 @@ mod tests {
                     "a program executed in the jail found capabilities or a missing seal: {status}"
                 ));
             }
+        }
+        if std::env::var_os(REHEARSAL_HOLD).is_some() {
+            fs::write("/out/ready", b"")?;
+            for _ in 0..1500 {
+                if Path::new("/out/go").exists() {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            return fail("nobody looked at the launcher".into());
         }
         Ok(())
     }
@@ -2496,4 +2848,145 @@ int main(void) {
     return 0;
 }
 "#;
+
+    #[test]
+    fn exit_codes_stand_for_wait_statuses_as_a_shell_reports_them() {
+        assert_eq!(exit_code(0), 0);
+        assert_eq!(exit_code(37 << 8), 37);
+        assert_eq!(exit_code(libc::SIGKILL), 128 + libc::SIGKILL);
+        // A core dump flag does not change the signal.
+        assert_eq!(exit_code(libc::SIGSEGV | 0x80), 128 + libc::SIGSEGV);
+    }
+
+    const PIDNS_DIR: &str = "KRONIK_TEST_PIDNS_DIR";
+    const PIDNS_CASE: &str = "KRONIK_TEST_PIDNS_CASE";
+
+    /// The helper process of the PID namespace tests: a launcher that forks
+    /// its VMM into a PID namespace of its own and does what the case says.
+    #[test]
+    #[ignore = "a helper process of the PID namespace tests"]
+    fn pid_namespace_child() {
+        let (Some(dir), Ok(case)) = (std::env::var_os(PIDNS_DIR), std::env::var(PIDNS_CASE)) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        // SAFETY: unshare with one flag; this process has one thread.
+        check(unsafe { libc::unshare(libc::CLONE_NEWPID) }, "unshare").unwrap();
+        match fork_into_pid_namespace().unwrap() {
+            Forked::Parent(child) => {
+                fs::write(dir.join("child-pid"), child.pid().to_string()).unwrap();
+                std::process::exit(child.wait().unwrap());
+            }
+            Forked::Child => match case.as_str() {
+                "status" => std::process::exit(37),
+                "wait" => {
+                    fs::write(dir.join("ready"), b"").unwrap();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                    }
+                }
+                other => panic!("no PID namespace case {other}"),
+            },
+        }
+    }
+
+    /// Starts the helper in a user namespace made for the test (it is root in
+    /// there, and nowhere else) and returns it with its directory.
+    fn start_pid_namespace_helper(case: &str) -> (std::process::Child, tempfile::TempDir) {
+        use std::process::{Command, Stdio};
+        let dir = tempfile::Builder::new()
+            .prefix("kronik-pidns-")
+            .tempdir()
+            .unwrap();
+        let log = File::create(dir.path().join("log")).unwrap();
+        let child = Command::new("unshare")
+            .args(["--user", "--map-root-user"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sys::tests::pid_namespace_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PIDNS_DIR, dir.path())
+            .env(PIDNS_CASE, case)
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        (child, dir)
+    }
+
+    fn wait_for(path: &Path, what: &str) {
+        for _ in 0..200 {
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("{what}: {} did not appear", path.display());
+    }
+
+    /// Whether a process is gone or only a zombie waiting to be reaped.
+    fn is_dead(pid: libc::pid_t) -> bool {
+        match fs::read_to_string(format!("/proc/{pid}/status")) {
+            Ok(status) => status.lines().any(|l| l.starts_with("State:\tZ")),
+            Err(_) => true,
+        }
+    }
+
+    #[test]
+    fn the_launcher_exits_with_the_status_of_the_vmm_and_with_128_plus_its_signal() {
+        if let Some(why) = rehearsal_unavailable() {
+            eprintln!("skipped: {why}");
+            return;
+        }
+        // An exit status is relayed as it is.
+        let (mut helper, dir) = start_pid_namespace_helper("status");
+        let status = helper.wait().unwrap();
+        let log = fs::read_to_string(dir.path().join("log")).unwrap_or_default();
+        assert_eq!(status.code(), Some(37), "{log}");
+        assert!(dir.path().join("child-pid").exists(), "{log}");
+        // A VMM killed by a signal is 128 plus the signal, which is what the
+        // supervisor reads as "the sandbox exited": the signal comes from the
+        // host, the only place that can kill the init of a namespace.
+        let (mut helper, dir) = start_pid_namespace_helper("wait");
+        wait_for(&dir.path().join("ready"), "the VMM");
+        let pid: libc::pid_t = fs::read_to_string(dir.path().join("child-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: SIGKILL to a process of this test's own making.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        let status = helper.wait().unwrap();
+        assert_eq!(status.code(), Some(128 + libc::SIGKILL), "{status}");
+    }
+
+    #[test]
+    fn the_vmm_dies_with_its_launcher() {
+        if let Some(why) = rehearsal_unavailable() {
+            eprintln!("skipped: {why}");
+            return;
+        }
+        let (mut helper, dir) = start_pid_namespace_helper("wait");
+        wait_for(&dir.path().join("ready"), "the VMM");
+        let pid: libc::pid_t = fs::read_to_string(dir.path().join("child-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(!is_dead(pid), "the VMM runs while its launcher does");
+        // The daemon kills the launcher: nothing else tells the VMM.
+        helper.kill().unwrap();
+        helper.wait().unwrap();
+        for _ in 0..200 {
+            if is_dead(pid) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // SAFETY: do not leave the process behind when the assertion fails.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        panic!("the VMM outlived its launcher");
+    }
 }

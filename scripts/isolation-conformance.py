@@ -119,6 +119,11 @@ def status(pid):
     return dict(line.split(":", 1) for line in Path(f"/proc/{pid}/status").read_text().splitlines() if ":" in line)
 
 
+def process_args(pid):
+    """argv of a process, as /proc/PID/cmdline holds it."""
+    return Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+
+
 def fixture(root):
     root = Path(root).resolve(strict=True)
     md = root.stat()
@@ -697,6 +702,41 @@ def vm_roots(cfg):
         return set()
 
 
+def nspid(fields):
+    """The NSpid line of /proc/PID/status as integers: the id in each PID namespace, the reader's first."""
+    return [int(n) for n in fields["NSpid"].split()]
+
+
+def vm_processes(members, read_status, read_args):
+    """Tell the two processes of a VM's cgroup apart.
+
+    The VMM is init of a PID namespace of its own, so the cgroup holds two processes: the
+    launcher, an ordinary process of the private manager's PID namespace that waits for the
+    VMM, and the VMM, a child of the launcher whose NSpid ends in 1. Returns (launcher, vmm,
+    launcher_inside): the two host ids, and the launcher's id in the manager's namespace, which
+    is what the fixture helper translates. The last NSpid entry of the VMM is its id in its
+    own namespace (1) and says nothing about the manager's, and the helper only knows the
+    processes of the manager's namespace: the VMM is found through its launcher.
+    """
+    require(len(members) == 2 and len(set(members)) == 2,
+            f"owned VM cgroup must hold exactly the launcher and the VMM: {members}")
+    seen = {}
+    for pid in members:
+        ids = nspid(read_status(pid))
+        require(len(ids) >= 1 and ids[0] == pid, f"NSpid of {pid} does not start with its own id: {ids}")
+        seen[pid] = ids
+    # The VMM lives one PID namespace below the launcher and is init of it.
+    vmm = max(members, key=lambda pid: len(seen[pid]))
+    launcher = next(pid for pid in members if pid != vmm)
+    require(len(seen[vmm]) == len(seen[launcher]) + 1,
+            f"the VMM is not in a PID namespace of its own one level below the launcher's: {seen}")
+    require(seen[vmm][-1] == 1, f"the VMM is not init of its PID namespace: {seen}")
+    require(int(read_status(vmm)["PPid"]) == launcher, "the VMM is not a child of the launcher")
+    require(read_args(vmm)[:1] == [b"/firecracker"], f"the VMM is not /firecracker: {read_args(vmm)}")
+    require(b"launch-microvm" in read_args(launcher), "the launcher is not `kronik foreign launch-microvm`")
+    return launcher, vmm, seen[launcher][-1]
+
+
 def vm_calibration(root, cfg, name, cpu, memory, candidates):
     require(len(candidates) == 1, "actual VM runtime root was not uniquely created")
     directory = next(iter(candidates))
@@ -710,22 +750,28 @@ def vm_calibration(root, cfg, name, cpu, memory, candidates):
     matches = list(service_cg.rglob(child_name))
     require(len(matches) == 1, "VMM is not in the exact owned delegated cgroup")
     cg = matches[0]
-    pids = (cg/"cgroup.procs").read_text().split()
-    require(len(pids) == 1, "owned VM cgroup must hold the actual VMM process")
-    pid = int(pids[0])
+    members = [int(p) for p in (cg/"cgroup.procs").read_text().split()]
+    launcher, pid, launcher_inside = vm_processes(members, status, process_args)
+    # The launcher is a process of the private manager's namespace and the helper translates it;
+    # the VMM, init of a namespace of its own, is identified through it.
+    require(int(command([cfg["helper"],"host-pid",root,launcher_inside],10)) == launcher,
+            "VM launcher PID translation changed")
+    validate_fixture_pid(cfg,launcher)
     fields = status(pid)
-    inside = fields["NSpid"].split()[-1]
-    require(int(command([cfg["helper"],"host-pid",root,inside],10)) == pid,"VMM PID translation changed")
-    validate_fixture_pid(cfg,pid)
-    require(list(map(int,fields["Uid"].split())) == [cfg["uid"]]*4, "VMM has host root/wrong uid")
-    for cap in ["CapEff","CapPrm","CapInh","CapAmb"]:
-        require(int(fields[cap],16) == 0, f"VMM retained {cap}")
-    require(fields["NoNewPrivs"].strip() == "1" and fields["Seccomp"].strip() == "2",
-            "real VMM lacks no-new-privileges or seccomp")
     main, _ = service(cfg)
-    for ns in ["mnt","net","cgroup"]:
-        require(os.readlink(f"/proc/{pid}/ns/{ns}") != os.readlink(f"/proc/{main}/ns/{ns}"),
-                f"VMM did not enter its child-only {ns} namespace")
+    for who, process in [("VM launcher",launcher),("VMM",pid)]:
+        held = status(process)
+        require(list(map(int,held["Uid"].split())) == [cfg["uid"]]*4, f"{who} has host root/wrong uid")
+        for cap in ["CapEff","CapPrm","CapInh","CapAmb","CapBnd"]:
+            require(int(held[cap],16) == 0, f"{who} retained {cap}")
+        require(held["NoNewPrivs"].strip() == "1", f"{who} can gain privilege")
+        for ns in ["mnt","net","cgroup"]:
+            require(os.readlink(f"/proc/{process}/ns/{ns}") != os.readlink(f"/proc/{main}/ns/{ns}"),
+                    f"{who} did not enter its child-only {ns} namespace")
+    require(fields["Seccomp"].strip() == "2", "real VMM lacks seccomp")
+    require(os.readlink(f"/proc/{launcher}/ns/pid") == os.readlink(f"/proc/{main}/ns/pid") and
+            os.readlink(f"/proc/{pid}/ns/pid") != os.readlink(f"/proc/{launcher}/ns/pid"),
+            "the VMM did not enter a PID namespace of its own below the manager's")
     manifest = json.loads((root/"microvm/manifest.json").read_text())
     with open(f"/proc/{pid}/exe","rb") as executable:
         require(hashlib.file_digest(executable,"sha256").hexdigest() == manifest["firecracker_sha256"],
@@ -755,7 +801,7 @@ def vm_calibration(root, cfg, name, cpu, memory, candidates):
     if name.startswith("probe-") or name.startswith("pg-"):
         require(data.stat().st_size == 1<<30 and data.stat().st_blocks*512 >= 1<<30,
                 "actual persistent drive is not fixed/reserved 1GiB")
-    evidence = {"actor":name,"pid":pid,"runtime":str(directory),"cgroup":str(cg),
+    evidence = {"actor":name,"pid":pid,"launcher_pid":launcher,"runtime":str(directory),"cgroup":str(cg),
                 "machine_config":machine,"declared_cpu_millis":cpu,"declared_memory_bytes":memory,"limits":limits}
     (root/f"vm-calibration-{name}.json").write_text(json.dumps(evidence,indent=2))
     return directory, cg

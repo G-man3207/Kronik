@@ -21,6 +21,86 @@ proof = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(proof)
 
 
+class VmProcesses(unittest.TestCase):
+    """The two processes of a VM's cgroup, from a fake /proc with the lines the kernel prints.
+
+    NSpid is read by a process in the initial namespace: the id in each PID namespace down to the
+    process's own. The private manager is a PID namespace, and the VMM is init of one below it.
+    """
+
+    LAUNCHER, VMM = 4301, 4312
+
+    def tree(self):
+        status = {self.LAUNCHER: {"NSpid": "\t4301\t77", "PPid": "\t4290"},
+                  self.VMM: {"NSpid": "\t4312\t88\t1", "PPid": "\t4301"}}
+        args = {self.LAUNCHER: [b"/proc/self/exe", b"foreign", b"launch-microvm", b"/run/x/launch.json"],
+                self.VMM: [b"/firecracker", b"--api-sock", b"/api.sock"]}
+        return status, args
+
+    def processes(self, members, status, args):
+        return proof.vm_processes(members, status.__getitem__, args.__getitem__)
+
+    def test_the_launcher_is_what_the_manager_translates_and_the_vmm_is_found_through_it(self):
+        status, args = self.tree()
+        for members in ([self.LAUNCHER, self.VMM], [self.VMM, self.LAUNCHER]):
+            launcher, vmm, inside = self.processes(members, status, args)
+            self.assertEqual((launcher, vmm), (self.LAUNCHER, self.VMM))
+            # The id the helper must translate is the launcher's in the manager's namespace (77),
+            # not the last NSpid entry of the VMM, which is 1: init of its own namespace.
+            self.assertEqual(inside, 77)
+            self.assertEqual(proof.nspid(status[self.VMM])[-1], 1)
+
+    def test_one_process_or_three_is_not_a_vm_cgroup_any_more(self):
+        status, args = self.tree()
+        status[4400] = {"NSpid": "\t4400\t99", "PPid": "\t4301"}
+        args[4400] = [b"/bin/sh"]
+        for members in ([self.VMM], [self.LAUNCHER], [self.LAUNCHER, self.VMM, 4400], [], [self.VMM, self.VMM]):
+            with self.assertRaises(proof.Violation, msg=str(members)):
+                self.processes(members, status, args)
+
+    def test_the_vmm_must_be_init_of_a_pid_namespace_of_its_own(self):
+        status, args = self.tree()
+        # No PID namespace of its own (both in the manager's): the same depth, not a VMM below a launcher.
+        plain = {self.LAUNCHER: status[self.LAUNCHER], self.VMM: {"NSpid": "\t4312\t88", "PPid": "\t4301"}}
+        with self.assertRaises(proof.Violation):
+            self.processes([self.LAUNCHER, self.VMM], plain, args)
+        # One level below but not init of it.
+        not_init = {self.LAUNCHER: status[self.LAUNCHER], self.VMM: {"NSpid": "\t4312\t88\t5", "PPid": "\t4301"}}
+        with self.assertRaises(proof.Violation):
+            self.processes([self.LAUNCHER, self.VMM], not_init, args)
+
+    def test_the_vmm_is_a_child_of_the_launcher_one_namespace_below_it(self):
+        status, args = self.tree()
+        orphan = {self.LAUNCHER: status[self.LAUNCHER], self.VMM: {"NSpid": "\t4312\t88\t1", "PPid": "\t1"}}
+        with self.assertRaises(proof.Violation):
+            self.processes([self.LAUNCHER, self.VMM], orphan, args)
+        deeper = {self.LAUNCHER: status[self.LAUNCHER], self.VMM: {"NSpid": "\t4312\t88\t5\t1", "PPid": "\t4301"}}
+        with self.assertRaises(proof.Violation):
+            self.processes([self.LAUNCHER, self.VMM], deeper, args)
+
+    def test_a_status_that_does_not_start_with_its_own_id_is_refused(self):
+        status, args = self.tree()
+        status[self.VMM] = {"NSpid": "\t9999\t88\t1", "PPid": "\t4301"}
+        with self.assertRaises(proof.Violation):
+            self.processes([self.LAUNCHER, self.VMM], status, args)
+
+    def test_the_vmm_must_be_firecracker_and_the_launcher_the_launcher(self):
+        status, args = self.tree()
+        wrong_vmm = {**args, self.VMM: [b"/bin/sh", b"-c", b"/firecracker"]}
+        with self.assertRaises(proof.Violation):
+            self.processes([self.LAUNCHER, self.VMM], status, wrong_vmm)
+        wrong_launcher = {**args, self.LAUNCHER: [b"/usr/bin/python3"]}
+        with self.assertRaises(proof.Violation):
+            self.processes([self.LAUNCHER, self.VMM], status, wrong_launcher)
+
+    def test_the_readers_the_harness_hands_over_work_on_the_real_proc(self):
+        # NSpid of a process in this namespace starts with its own id; its arguments are bytes.
+        ids = proof.nspid(proof.status(os.getpid()))
+        self.assertEqual(ids[0], os.getpid())
+        args = proof.process_args(os.getpid())
+        self.assertTrue(args and all(isinstance(a, bytes) for a in args) and args[0])
+
+
 class RuntimeOracles(unittest.TestCase):
     def test_wrong_actual_pid_and_root_expectation_are_refused(self):
         with self.assertRaises(proof.Violation):
