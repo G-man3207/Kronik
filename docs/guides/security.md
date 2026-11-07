@@ -85,8 +85,9 @@ Secrets arrive with M2.
   values; `kronik secret delete` marks every version deleted. Every
   operation needs a reason.
 - **A secret that cannot be fetched.** A secret from an external backend
-  that is not cached and cannot be fetched within `[secrets] fetch_timeout`
-  fails the effect that asked for it with `SECRET_UNAVAILABLE`, as a network
+  that is not cached and cannot be fetched within `[secrets] fetch_timeout`,
+  or that the backend refuses, fails the effect that asked for it with
+  `SECRET_UNAVAILABLE`, as a network
   error does: `http.fetch` answers `network` with that text, `crypto.*` and
   `secrets.reveal` a denial with it. Nothing is sent. The error is recorded
   in the turn before the guest sees it, and the guest decides: a handler

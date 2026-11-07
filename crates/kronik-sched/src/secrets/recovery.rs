@@ -273,7 +273,7 @@ impl Node {
         let outcome = pb::Outcome {
             kind: pb::OutcomeKind::Failed as i32,
             error_code: code.as_str().into(),
-            message: "A recorded successful secret reveal is no longer recoverable".into(),
+            message: "A secret version that the turn recorded is no longer recoverable".into(),
             output: None,
         };
         let time = begin.logical_time_ms;

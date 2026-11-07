@@ -1498,7 +1498,7 @@ operator meets:
 | `ENGINE_VERSION_MISMATCH` | A new binary started against data written by another engine, without a passing check | Run `kronik upgrade check --window 6h`, or start the recorded engine version |
 | `UNAUTHENTICATED`, `SCOPE_MISSING`, `TOKEN_NOT_FOUND` | A bearer token is missing, lacks the scope, or was revoked | `kronik token list`, `kronik token create --name <name> --scopes <scope>,... --reason ...`, on the socket as root or a member of `kronik` |
 | `SECRET_NOT_FOUND` | An effect uses a secret that isn't set, or was deleted | `kronik secret set <name> --reason ...` |
-| `SECRET_UNAVAILABLE` | A read answered 503 while the secret inventory was needed, or an effect failed inside a turn because its secret could not be fetched | For a read after a restart: the provider no longer serves a version that Kronik recorded, [a known defect](#secrets-that-an-external-backend-no-longer-serves). Or the rebuild of the inventory takes longer than `[secrets] refresh` and the daemon logs that it did not install its certificate: raise `refresh` above the `elapsed_ms` of the `secret inventory certified` line ([`[secrets]`](#secrets)). For an effect: the backend did not answer in time, see [A turn whose effect cannot get its secret](#a-turn-whose-effect-cannot-get-its-secret) |
+| `SECRET_UNAVAILABLE` | A read answered 503 while the secret inventory was needed, or an effect failed inside a turn because its secret could not be fetched | For a read after a restart: the provider no longer serves a version that Kronik recorded, [a known defect](#secrets-that-an-external-backend-no-longer-serves). Or the rebuild of the inventory takes longer than `[secrets] refresh` and the daemon logs that it did not install its certificate: raise `refresh` above the `elapsed_ms` of the `secret inventory certified` line ([`[secrets]`](#secrets)). For an effect: the backend did not answer in time or refused, see [A turn whose effect cannot get its secret](#a-turn-whose-effect-cannot-get-its-secret) |
 | `SECRET_VERSION_GONE` | A turn needed a secret version that its provider no longer serves, for example the re-run of a `secret.reveal` after the version was destroyed | The turn is recorded as failed before the guest runs, and no other version's value is used. See [the same section](#secrets-that-an-external-backend-no-longer-serves) for what else the lost version does |
 | `RUNSC_MISSING`, `KVM_UNAVAILABLE`, `RUNC_MISSING`, `FOREIGN_UNAVAILABLE` | Foreign actors can't run | `kronik doctor` names the cause; see [Foreign actors](#foreign-actors) |
 | `IMAGE_INVALID` | `kronik foreign add` got an image it can't verify or unpack | Check the reference; private images need a local layout |
@@ -1586,8 +1586,10 @@ No other repair is known.
 
 This is intended behavior. An effect that needs a secret from an external
 backend fails with `SECRET_UNAVAILABLE` inside its turn when the node holds no
-value for it and the backend does not answer within `[secrets] fetch_timeout`
-(default 2 s).
+value for it and cannot get one: the backend does not answer within
+`[secrets] fetch_timeout` (default 2 s), or it refuses (bad credentials, an
+answer that Kronik cannot use), or the configuration no longer has the backend
+that the link names. The guest is told the same in every case.
 
 - The error is recorded in the turn before the guest sees it, as for a network
   error: the turn is in `kronik history ACTOR`, and its effect carries the
@@ -1604,5 +1606,6 @@ value for it and the backend does not answer within `[secrets] fetch_timeout`
   answers, then `kronik dead-letters resend ID --reason "..."`.
 - Turns that need no external secret, or whose secret the node holds, run as
   usual during the outage. After a crash, a turn that had not yet got its
-  secret waits for the backend and then runs; one that had recorded the error
-  ends with it.
+  secret waits for an outage to end and then runs; one that had recorded the
+  error ends with it. A refusal does not pass while a turn waits, so a turn
+  that met one after a crash records it like a live turn does.

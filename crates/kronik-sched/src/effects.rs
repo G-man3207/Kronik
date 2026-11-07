@@ -1086,20 +1086,31 @@ impl TurnFx {
     /// The current version of a secret, for an effect that has no recorded
     /// result yet.
     ///
-    /// A secret the node cannot reach (`SecretUnavailable`: the backend is
-    /// down or too slow, and nothing is cached) is no reason to abandon a live
-    /// turn after its `TurnBegin`. An open `TurnBegin` means that the daemon
-    /// died, and the next start would run the turn again, whatever the caller
-    /// has been told. So the caller records an error result for the effect, as
-    /// for a missing secret, and the guest decides what to do with it (design
-    /// m23 section 6, ADR 0091). A re-run does not: it is the same turn, and it
-    /// waits for the backend in the worker, as it does for the recorded
-    /// effects whose value it needs again.
+    /// A secret the node cannot get is no reason to abandon a live turn after
+    /// its `TurnBegin`. An open `TurnBegin` means that the daemon died, and the
+    /// next start would run the turn again, whatever the caller has been told.
+    /// So the caller records an error result for the effect, as for a missing
+    /// secret, and the guest decides what to do with it (design m23 section 6,
+    /// ADR 0091). Two cases:
+    ///
+    /// - The backend did not answer, or was too slow (`SecretUnavailable`). A
+    ///   re-run does not record the error: it is the same turn, the condition
+    ///   may be over, and it waits in the worker, as it does for the recorded
+    ///   effects whose value it needs again.
+    /// - The backend refused (bad credentials, an answer that cannot be used),
+    ///   or the node no longer trusts the backend binding of the link
+    ///   (`SecretVersionGone`, from the lookup of the *current* version: a
+    ///   recorded version keeps that code). Waiting changes nothing, and a wait
+    ///   for ever holds the actor, so a re-run records the error as well. The
+    ///   guest is told no more than for an outage; the log says why.
     async fn new_secret_value(&self, name: &str) -> Result<NewSecret, GateError> {
         match self.secret_value(name, None).await {
             Ok(Some(value)) => Ok(NewSecret::Found(value)),
             Ok(None) => Ok(NewSecret::Missing),
             Err(GateError::Prerequisite(ErrorCode::SecretUnavailable)) if !self.rerun() => {
+                Ok(NewSecret::Unavailable)
+            }
+            Err(GateError::Prerequisite(ErrorCode::SecretVersionGone)) => {
                 Ok(NewSecret::Unavailable)
             }
             Err(error) => Err(error),

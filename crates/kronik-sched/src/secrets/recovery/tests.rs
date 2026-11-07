@@ -289,6 +289,8 @@ struct Bao {
     gets: AtomicUsize,
     /// Every URL the node asked this, the only network it has.
     urls: Mutex<Vec<String>>,
+    /// Answer 200 to a read of the secret with a body that has no version.
+    invalid_body: AtomicBool,
     require_begin: AtomicBool,
     node: Mutex<Option<std::sync::Weak<Node>>>,
 }
@@ -347,7 +349,11 @@ impl Net for Bao {
                 request.url.ends_with("/data/token")
                     || request.url.ends_with("/data/token?version=1")
             );
-            serde_json::json!({"data":{"data":{"token":"immutable-provider-value"},"metadata":{"version":1,"destroyed":false,"deletion_time":""}}})
+            if self.invalid_body.load(Ordering::Acquire) {
+                serde_json::json!({"data":{"data":{"token":"immutable-provider-value"},"metadata":{"destroyed":false,"deletion_time":""}}})
+            } else {
+                serde_json::json!({"data":{"data":{"token":"immutable-provider-value"},"metadata":{"version":1,"destroyed":false,"deletion_time":""}}})
+            }
         };
         Box::pin(async move {
             Ok(HttpResponse {
@@ -363,6 +369,7 @@ fn new_bao(status: usize) -> Arc<Bao> {
         status: AtomicUsize::new(status),
         gets: AtomicUsize::new(0),
         urls: Mutex::new(Vec::new()),
+        invalid_body: AtomicBool::new(false),
         require_begin: AtomicBool::new(false),
         node: Mutex::new(None),
     })
@@ -997,16 +1004,15 @@ const UNAVAILABLE_CASES: [(&str, &str, &str, pb::EffectStatus, &str, bool); 3] =
     ),
 ];
 
-#[tokio::test]
-async fn a_live_effect_whose_secret_is_unavailable_is_recorded_as_an_error_and_the_turn_completes()
-{
-    let _serial = TESTS.lock().await;
-    let (_data, node, bao, _metadata) = provider(503).await;
-    counter_with_grants(&node).await;
+/// Each kind of effect, asked in a fresh actor of a live node whose secret it
+/// cannot get: one effect is recorded with the error, the guest decides, the
+/// turn ends, no `TurnBegin` is left open, and the request that needed the
+/// secret is never sent.
+async fn assert_live_effects_record_the_error(node: &Node, bao: &Bao, actors: &str) {
     for (index, (name, text, kind, status, error, handled)) in UNAVAILABLE_CASES.iter().enumerate()
     {
-        let result = send_text(&node, &format!("counter/u{index}"), name, text).await;
-        let turn = turn_of(&node, &result).await;
+        let result = send_text(node, &format!("counter/{actors}{index}"), name, text).await;
+        let turn = turn_of(node, &result).await;
         assert_eq!(turn.effects.len(), 1, "{name}: {turn:?}");
         let effect = &turn.effects[0];
         assert_eq!(effect.kind, *kind, "{name}");
@@ -1039,6 +1045,36 @@ async fn a_live_effect_whose_secret_is_unavailable_is_recorded_as_an_error_and_t
         "{urls:?}"
     );
     assert!(urls.iter().all(|url| !url.contains("/hook")), "{urls:?}");
+}
+
+#[tokio::test]
+async fn a_live_effect_whose_secret_is_unavailable_is_recorded_as_an_error_and_the_turn_completes()
+{
+    let _serial = TESTS.lock().await;
+    let (_data, node, bao, _metadata) = provider(503).await;
+    counter_with_grants(&node).await;
+    assert_live_effects_record_the_error(&node, &bao, "u").await;
+}
+
+/// A refusal ends the same way as an outage: the old mapping closed the turn
+/// as failed with `SECRET_VERSION_GONE` and no effect, before the guest could
+/// decide, under a text about a recorded reveal.
+#[tokio::test]
+async fn a_live_effect_whose_secret_is_refused_is_recorded_as_an_error_and_the_turn_completes() {
+    let _serial = TESTS.lock().await;
+    let (_data, node, bao, _metadata) = provider(403).await;
+    counter_with_grants(&node).await;
+    assert_live_effects_record_the_error(&node, &bao, "d").await;
+}
+
+/// The provider answers, but not with anything Kronik can use.
+#[tokio::test]
+async fn a_live_effect_whose_secret_comes_back_unusable_is_recorded_as_an_error_too() {
+    let _serial = TESTS.lock().await;
+    let (_data, node, bao, _metadata) = provider(200).await;
+    bao.invalid_body.store(true, Ordering::Release);
+    counter_with_grants(&node).await;
+    assert_live_effects_record_the_error(&node, &bao, "i").await;
 }
 
 fn run<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -1237,6 +1273,48 @@ fn a_crash_before_the_error_result_makes_the_re_run_wait_and_then_run_the_effect
             "{}",
             case.0
         );
+    }
+}
+
+/// A re-run whose effect has no recorded result, and whose secret the provider
+/// refuses, does not wait as it does for an outage: a refusal does not pass
+/// while a turn waits, and waiting for ever holds the actor. It records the
+/// error and ends the way the first life's guest ended.
+#[test]
+fn a_crash_before_the_error_result_makes_a_re_run_record_a_refusal_instead_of_waiting() {
+    let _serial = TESTS.blocking_lock();
+    // Not the fetch: its grant is `unsafe` (the default for POST), and a re-run
+    // never makes an unsafe effect again (I17), so it ends `outcome unknown`
+    // whatever the secret does.
+    for case in UNAVAILABLE_CASES
+        .iter()
+        .filter(|case| case.2 != "http.fetch")
+    {
+        let data = tempfile::tempdir().unwrap();
+        let bao = new_bao(200);
+        // The first life meets an outage and records the error; the kill takes
+        // the error away again.
+        let first = first_life(data.path(), &bao, case);
+        kill_at(data.path(), &first.effect_result_at);
+
+        // The second life meets a refusal.
+        bao.status.store(403, Ordering::Release);
+        let second = run(async {
+            let node = provider_node(data.path(), &bao).await;
+            node.env
+                .timeout(Duration::from_secs(60), async {
+                    while !node.store().db().open_turns().unwrap().is_empty() {
+                        node.env.clock.sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{}: the re-run waits for a provider that refuses", case.0)
+                });
+            last_turn_of_h(&node).await
+        });
+        assert_eq!(second.execution_id, first.turn.execution_id, "{}", case.0);
+        assert_eq!(shape(&second), shape(&first.turn), "{}", case.0);
     }
 }
 
