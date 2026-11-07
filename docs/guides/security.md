@@ -73,7 +73,12 @@ Secrets arrive with M2.
   {{secret:NAME}}`) or in a `crypto` call, and the host inserts the value at
   the effect boundary or computes with it. The value never enters guest memory,
   and the log records only the secret's name and a keyed hash of its
-  version, which reveals nothing even about short values.
+  version, which reveals nothing even about short values. `kronik history`
+  and the turn JSON show that identity for each effect that used a secret,
+  as `secret:<name>@v<N>` with the first 8 hex characters of the hash, so
+  a rotation shows up as a new version in the turns after it. A request
+  sealed for a data subject shows none of it to a caller who may not read
+  the request, nor once the subject is erased.
 - **Operations.** `kronik secret set` reads the value from stdin, never
   from the command line, and does not echo it on a terminal;
   `kronik secret list` shows names, versions and version hashes but never
