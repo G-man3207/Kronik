@@ -102,6 +102,10 @@ pub struct ForeignConfig {
     /// Registries (`host:port`) pulled over plain HTTP. Tests only; not in
     /// `kronik.toml`.
     pub insecure_registries: Vec<String>,
+    /// Directory of the verified, pinned microVM tool bundle.
+    pub microvm_dir: PathBuf,
+    /// Minimum free bytes retained on persistent storage.
+    pub disk_reserve: u64,
     /// `[foreign] layout_dirs`: directories whose `oci-layout:` images an
     /// `operate` token may add; any other directory needs `admin` (§4).
     pub layout_dirs: Vec<PathBuf>,
@@ -313,6 +317,8 @@ impl Foreign {
                 insecure_registries: cfg.insecure_registries.clone(),
                 max_new_bytes: None,
             },
+            microvm_dir: cfg.microvm_dir.clone(),
+            disk_reserve: cfg.disk_reserve,
             pull_timeout: cfg.pull_timeout,
             timings,
             cgroup_parent: format!("/kronik/{}", &instance.as_str()[..8]),
@@ -402,6 +408,11 @@ impl Foreign {
     fn runtime_for(&self, decl: &pb::ForeignActor) -> Runtime {
         match Isolation::from_pb(decl.isolation) {
             Some(Isolation::Trusted) => self.runc(),
+            Some(Isolation::Microvm) => Runtime {
+                engine: Engine::Firecracker,
+                program: self.cfg.microvm_dir.join("firecracker"),
+                root: self.ctx.paths.run.join("microvm"),
+            },
             _ => self.runsc(if decl.platform.is_empty() {
                 "systrap"
             } else {
@@ -456,11 +467,19 @@ impl Foreign {
         let mut warnings = Vec::new();
         let platform = match isolation {
             Isolation::Microvm => {
-                return Err(ApiError::new(
-                    ErrorCode::NotImplemented,
-                    "isolation microvm (Firecracker) is reserved and not implemented in v0.1; \
-                     use gvisor",
-                ));
+                crate::microvm::Resources::new(cpu_millis, memory_bytes).map_err(bad)?;
+                crate::microvm_sys::kvm().map_err(|e| {
+                    ApiError::new(
+                        ErrorCode::KvmUnavailable,
+                        format!("isolation microvm needs usable KVM: {e}"),
+                    )
+                    .with_hint("Use isolation gvisor on hosts without /dev/kvm.")
+                })?;
+                crate::microvm_assets::Assets::load(&self.cfg.microvm_dir)
+                    .and_then(|assets| assets.require_exec_mount()).map_err(|e|
+                    ApiError::new(ErrorCode::ForeignUnavailable, e)
+                        .with_hint("Install the pinned microVM tool bundle built by scripts/build-microvm-tools.sh."))?;
+                "firecracker".to_owned()
             }
             Isolation::Trusted => {
                 if find_runc().is_none() {
@@ -502,10 +521,10 @@ impl Foreign {
         };
         let fork_mode = match req.fork_mode.as_deref() {
             None | Some("recorded") => "recorded",
-            Some("sandbox") if isolation == Isolation::Gvisor => "sandbox",
+            Some("sandbox") if isolation != Isolation::Trusted => "sandbox",
             Some("sandbox") => {
                 return Err(bad(
-                    "fork_mode sandbox needs isolation gvisor: runc has no checkpoints",
+                    "fork_mode sandbox needs isolation gvisor or microvm: runc has no checkpoints",
                 ));
             }
             Some(other) => {
@@ -921,6 +940,23 @@ impl Foreign {
                 }
             }
         }
+        let microvm_safe = match crate::microvm::cleanup_stale(
+            env,
+            &self.ctx.paths.run.join("microvm"),
+            &self.ctx.cgroup_parent,
+        )
+        .await
+        {
+            Ok(count) => {
+                cleaned.sandboxes += count as u64;
+                true
+            }
+            Err(error) => {
+                tracing::error!(%error, "recovering leftover microVMs failed; backing files retained");
+                cleaned.failed += 1;
+                false
+            }
+        };
         let netns = self.ctx.paths.netns_dir();
         let sock = self.ctx.paths.sock_root();
         let actors = self.ctx.paths.actors();
@@ -954,6 +990,20 @@ impl Foreign {
                 let mut configs = 0;
                 if let Ok(entries) = std::fs::read_dir(&actors) {
                     for e in entries.flatten() {
+                        if e.file_type().is_ok_and(|kind| !kind.is_dir() && !kind.is_symlink()) {
+                            continue;
+                        }
+                        if microvm_safe {
+                            let output = e.path().join(".microvm");
+                            match std::fs::remove_dir_all(&output) {
+                                Ok(()) => configs += 1,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                                Err(error) => {
+                                    failed += 1;
+                                    tracing::warn!(path=%output.display(), %error, "removing interrupted microVM snapshot outputs failed");
+                                }
+                            }
+                        }
                         if std::fs::remove_file(e.path().join("bundle/config.json")).is_ok() {
                             configs += 1;
                         }
@@ -983,6 +1033,16 @@ impl Foreign {
                 for fork in dirs(&branches) {
                     for actor in dirs(&fork.join("foreign")) {
                         for copy in dirs(&actor) {
+                            if microvm_safe && copy.join("data.ext4").exists() {
+                                match std::fs::remove_dir_all(&copy) {
+                                    Ok(()) => configs += 1,
+                                    Err(error) => {
+                                        failed += 1;
+                                        tracing::warn!(path=%copy.display(), %error, "removing a stopped microVM copy failed");
+                                    }
+                                }
+                                continue;
+                            }
                             if std::fs::remove_file(copy.join("bundle/config.json")).is_ok() {
                                 configs += 1;
                             }
@@ -1095,7 +1155,9 @@ impl Foreign {
 
     /// The cgroup of `name` under the cgroup v2 root (tests and doctor).
     pub fn cgroup_path(&self, name: &str) -> String {
-        self.ctx.cgroup_path(name)
+        lock(&self.actors)
+            .get(name)
+            .map_or_else(|| self.ctx.cgroup_path(name), |actor| actor.cgroup.clone())
     }
 
     /// The network namespace file of `name` (tests).
@@ -1222,6 +1284,8 @@ mod tests {
             runsc_path: "/nonexistent/runsc".into(),
             platform: Platform::Auto,
             insecure_registries: Vec::new(),
+            microvm_dir: "/nonexistent/microvm".into(),
+            disk_reserve: 0,
             layout_dirs: Vec::new(),
             pull_timeout: Duration::from_secs(5),
             checkpoints_kept: 3,
@@ -1258,6 +1322,70 @@ mod tests {
         let error = f.logs("echo", 1, Vec::new()).await.unwrap_err();
         assert_eq!(error.code, ErrorCode::SecretUnavailable);
         assert!(error.message.contains("REDACTION_OUTPUT_LIMIT"));
+    }
+
+    #[tokio::test]
+    async fn actor_layout_marker_is_not_a_failed_microvm_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(tmp.path());
+        let actors = cfg.data_dir.join("foreign/actors");
+        let f = Foreign::new(Env::real(tokio::runtime::Handle::current()), cfg);
+        std::fs::create_dir_all(&actors).unwrap();
+        let marker = actors.join(".layout");
+        std::fs::write(&marker, b"retained layout marker").unwrap();
+        assert_eq!(f.cleanup_leftovers().await.failed, 0);
+        assert_eq!(std::fs::read(marker).unwrap(), b"retained layout marker");
+    }
+
+    /// `isolation = "microvm"` on a host without a usable `/dev/kvm` is
+    /// refused before any image is looked at, with the gVisor suggestion,
+    /// and nothing is created.
+    #[tokio::test]
+    async fn microvm_without_kvm_is_refused_with_the_gvisor_suggestion_and_writes_nothing() {
+        if std::path::Path::new("/dev/kvm").exists() {
+            eprintln!("skipped: this host has /dev/kvm");
+            return;
+        }
+        fn tree(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut all = Vec::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(dir) = pending.pop() {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        pending.push(path.clone());
+                    }
+                    all.push(path);
+                }
+            }
+            all.sort();
+            all
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let f = Foreign::new(
+            Env::real(tokio::runtime::Handle::current()),
+            config(tmp.path()),
+        );
+        let before = tree(tmp.path());
+        let request = AddRequest {
+            name: "vm".into(),
+            image: format!("oci-layout:/nonexistent@sha256:{}", "0".repeat(64)),
+            port: 8080,
+            isolation: Some("microvm".into()),
+            ..AddRequest::default()
+        };
+        let error = f.prepare_add(request, None, &|_| false).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::KvmUnavailable);
+        assert_eq!(error.code.http_status(), 503);
+        assert!(
+            error
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("gvisor")),
+            "{error:?}"
+        );
+        assert!(f.status("vm").is_none());
+        assert_eq!(tree(tmp.path()), before, "the refused add created files");
     }
 
     /// A runtime's state file holds the spec with resolved secret values,

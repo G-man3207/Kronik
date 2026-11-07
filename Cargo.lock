@@ -2063,6 +2063,7 @@ dependencies = [
  "hyper-util",
  "kronik-core",
  "kronik-effects",
+ "kronik-guest-init",
  "kronik-privacy",
  "kronik-proto",
  "libc",

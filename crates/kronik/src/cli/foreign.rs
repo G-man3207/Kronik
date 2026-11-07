@@ -105,6 +105,9 @@ pub enum ForeignCommand {
         #[arg(long, value_name = "PATH", env = "KRONIK_DATA_DIR")]
         data_dir: Option<PathBuf>,
     },
+    /// Child-only fixed Firecracker launcher.
+    #[command(hide = true)]
+    LaunchMicrovm { manifest: PathBuf },
 }
 
 pub(super) fn foreign(ctx: &Ctx, command: ForeignCommand) -> Result<ExitCode, Error> {
@@ -137,6 +140,11 @@ pub(super) fn foreign(ctx: &Ctx, command: ForeignCommand) -> Result<ExitCode, Er
         ForeignCommand::Logs { name, tail } => logs(ctx, &name, tail),
         ForeignCommand::Remove { name, mutation } => remove(ctx, &name, &mutation),
         ForeignCommand::Cleanup { config, data_dir } => cleanup(ctx, config, data_dir),
+        ForeignCommand::LaunchMicrovm { manifest } => {
+            kronik_foreign::microvm::launch(&manifest)
+                .map_err(|e| local(ErrorCode::Unavailable, e.to_string(), ""))?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

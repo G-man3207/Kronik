@@ -229,6 +229,8 @@ pub(crate) fn foreign_config(
         layout_dirs: config.foreign.layout_dirs.clone(),
         pull_timeout: config.foreign.pull_timeout.0,
         checkpoints_kept: config.foreign.checkpoints_kept,
+        microvm_dir: config.foreign.microvm_dir.clone(),
+        disk_reserve: config.log.disk_reserve.0,
     }
 }
 

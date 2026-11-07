@@ -343,6 +343,7 @@ Typical causes:
 - The image or its configuration is wrong, so the sandbox keeps failing to start.
 - `foreign add`: the registry (or the layout directory) did not answer within `[foreign] pull_timeout`. Check that it is reachable, or raise `pull_timeout`, and add the actor again.
 - Another daemon holds `[foreign] run_dir`, so this one runs no foreign actors.
+- An explicit microVM actor has missing or unverifiable pinned tools, a root image that cannot be formatted, insufficient disk reserve, or an existing data drive that is not a private, fully allocated 1 GiB regular file. Inspect the retained formatter/startup diagnostics; do not truncate or replace existing data to make admission pass.
 
 To fix it, check the foreign actor's state and its logs:
 
@@ -560,11 +561,13 @@ Default hint: Set `platform = "auto"` or `"systrap"` under `[foreign]`, or enabl
 
 The configuration or the operation needs KVM, but `/dev/kvm` is missing or not usable. Everything in v0.1 works without KVM (I11): foreign actors run in gVisor with the `systrap` platform by default.
 
-Typical cause: `platform = "kvm"` under `[foreign]` in `/etc/kronik/kronik.toml` on a VPS without KVM.
+This applies either to gVisor's explicit `platform = "kvm"` or to an actor declared with `isolation = "microvm"`.
 
-To fix it, set `platform = "auto"` or `platform = "systrap"` under `[foreign]`, or run on a host with `/dev/kvm`. `kronik doctor` shows whether the host has KVM:
+MicroVM admission checks the real KVM API and VM-creation operation; an existing pathname alone is not proof. Missing hardware is an error, not a successful boot test. Never reinterpret a microVM snapshot as a gVisor checkpoint.
 
-    kronik doctor
+For gVisor, select `platform = "auto"` or `"systrap"`. For a microVM, use a host with a usable existing `/dev/kvm`, or explicitly choose `isolation = "gvisor"` instead; changing the gVisor platform does not change a microVM declaration. Kronik does not create a device, load a module or silently weaken isolation. Check the selected service identity and its device access:
+
+    kronik doctor --rootless
 
 See also: [`isolation-level`](concepts/glossary.md#isolation-level).
 
@@ -640,9 +643,9 @@ HTTP status 501, milestone M1. Not available in this version.
 
 Default hint: Use what this version supports; `kronik --version` shows the version.
 
-The operation is part of Kronik's design but not available in this version, for example the `microvm` isolation level, which is reserved in v0.1, or an API endpoint that a later milestone adds.
+The requested operation is not implemented by this version. This is not the error for microVM admission: its missing-KVM and missing-tool failures use KVM_UNAVAILABLE and FOREIGN_UNAVAILABLE.
 
-To fix it, use what this version supports, for example the `gvisor` isolation level instead of `microvm`. `kronik --version` shows which version you run:
+Check the command's supported operations and `kronik --version`; an unavailable feature must not be replaced silently by a weaker isolation or different operation:
 
     kronik --version
 

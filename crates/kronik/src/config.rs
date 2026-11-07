@@ -430,6 +430,8 @@ pub enum Platform {
 #[serde(deny_unknown_fields, default)]
 pub struct Foreign {
     pub runsc_path: PathBuf,
+    /// Pinned Firecracker, source-built kernel, static init and tool manifest.
+    pub microvm_dir: PathBuf,
     pub platform: Platform,
     /// Runtime state of the sandboxes: runsc's root, network namespaces and
     /// bridge sockets (docs/design/m7-foreign.md §3). A tmpfs, so nothing
@@ -449,6 +451,7 @@ impl Default for Foreign {
     fn default() -> Self {
         Foreign {
             runsc_path: "/usr/local/bin/runsc".into(),
+            microvm_dir: "/usr/local/lib/kronik/microvm".into(),
             platform: Platform::Auto,
             run_dir: "/run/kronik".into(),
             layout_dirs: Vec::new(),
@@ -1032,6 +1035,9 @@ impl Config {
                 "[foreign] layout_dirs: {} is not an absolute directory",
                 d.display()
             ));
+        }
+        if !self.foreign.microvm_dir.is_absolute() {
+            return Err("[foreign] microvm_dir must be an absolute directory".into());
         }
         if self.fork.preview_ttl.0.is_zero() {
             return Err("[fork] preview_ttl must be more than zero, such as \"24h\"".into());

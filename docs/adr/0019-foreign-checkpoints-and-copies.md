@@ -22,7 +22,10 @@ to resume for a checkpoint and about 100 ms for a restore, with no KVM.
 
 - **`fork_mode` on the declaration** (`ForeignActor.fork_mode`, field 12,
   `recorded` default, `sandbox`): configuration is history (I5), and a fork
-  sees the mode as at its fork point. `sandbox` requires gVisor isolation.
+  sees the mode as at its fork point. M20 extends `sandbox` admission from
+  gVisor to `microvm`; the following runsc mechanics remain gVisor-specific.
+  [ADR 0096](0096-microvm-snapshot-and-vsock-lifecycle.md) defines the real
+  Firecracker memory/state/drive variant under the same main/per-actor gates.
 - **Checkpoints with every snapshot.** Main's turns are paused (the turn
   gate's drain, ADR 0018), so no foreign call is in flight and every call's
   `EffectResult` is at or before the applied LSN: the checkpoint's LSN is

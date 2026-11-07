@@ -12,7 +12,7 @@
 //! `..` are rejected. Setuid and setgid bits are cleared. Lifted from spike
 //! C's `oci-tool` and hardened.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as _;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -424,6 +424,7 @@ pub fn unpack(
     fs::set_permissions(rootfs, Permissions::from_mode(0o755))
         .map_err(|e| io_error(format!("chmod {}", rootfs.display()), e))?;
     let mut stats = UnpackStats::default();
+    let mut directories = HashMap::new();
     for (i, (layer, diff_id)) in image.layers.iter().zip(&image.diff_ids).enumerate() {
         let what = || format!("layer {i} ({})", layer.digest);
         let codec = layer_codec(&layer.media_type)?;
@@ -439,7 +440,8 @@ pub fn unpack(
             remaining: limits.max_bytes - stats.bytes.min(limits.max_bytes),
             exceeded: false,
         };
-        let mut result = apply_layer(rootfs, &mut reader, &mut stats, limits);
+        let mut result =
+            apply_layer_inner(rootfs, &mut reader, &mut stats, limits, &mut directories);
         if result.is_ok() {
             // Trailing padding after the end-of-archive marker is part of
             // the diff_id.
@@ -470,6 +472,7 @@ pub fn unpack(
         }
         stats.layers += 1;
     }
+    finish_directories(rootfs, &directories)?;
     Ok(stats)
 }
 
@@ -549,10 +552,24 @@ fn resolve(
                 )));
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
+                let parent = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                    .open(root.join(&resolved))
+                    .map_err(|e| io_error("open implicit directory parent", e))?;
+                let mtime = parent
+                    .metadata()
+                    .and_then(|md| md.modified())
+                    .map_err(|e| io_error("read implicit directory parent mtime", e))?;
                 fs::create_dir(&full)
                     .map_err(|e| io_error(format!("mkdir {}", full.display()), e))?;
+                parent
+                    .set_times(fs::FileTimes::new().set_modified(mtime))
+                    .map_err(|e| io_error("restore implicit directory parent mtime", e))?;
                 fs::set_permissions(&full, Permissions::from_mode(0o755))
                     .map_err(|e| io_error(format!("chmod {}", full.display()), e))?;
+                crate::microvm_sys::set_mtime(&full, 0)
+                    .map_err(|e| io_error("set implicit directory mtime", e))?;
                 created.insert(candidate.clone());
                 resolved = candidate;
             }
@@ -573,14 +590,20 @@ fn resolve(
 }
 
 /// Removes a file, symlink or directory tree without following symlinks.
-fn remove_any(path: &Path) -> Result<(), ImageError> {
-    let result = match fs::symlink_metadata(path) {
-        Ok(md) if md.is_dir() => fs::remove_dir_all(path),
-        Ok(_) => fs::remove_file(path),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+fn remove_any(path: &Path) -> Result<bool, ImageError> {
+    let directory = match fs::symlink_metadata(path) {
+        Ok(md) => md.is_dir(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(io_error(format!("stat {}", path.display()), e)),
     };
-    result.map_err(|e| io_error(format!("remove {}", path.display()), e))
+    let result = if directory {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result
+        .map(|()| directory)
+        .map_err(|e| io_error(format!("remove {}", path.display()), e))
 }
 
 /// Copies an entry's content into `file`, telling layer read errors
@@ -599,12 +622,72 @@ fn copy_entry(entry: &mut impl Read, file: &mut File, what: &str) -> Result<(), 
     }
 }
 
-/// Applies one uncompressed layer tarball to `root`.
+struct DirectoryMetadata {
+    inode: (u64, u64),
+    mode: u32,
+    owners: Option<(u32, u32)>,
+    mtime: u64,
+}
+
+fn finish_directories(
+    root: &Path,
+    metadata: &HashMap<PathBuf, DirectoryMetadata>,
+) -> Result<(), ImageError> {
+    fn visit(root: &Path, metadata: &HashMap<PathBuf, DirectoryMetadata>) -> io::Result<()> {
+        let mut pending = vec![(PathBuf::new(), false)];
+        while let Some((rel, finish)) = pending.pop() {
+            let path = root.join(&rel);
+            let handle = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(&path)?;
+            if !finish {
+                pending.push((rel.clone(), true));
+                for child in fs::read_dir(&path)? {
+                    let child = child?;
+                    if child.file_type()?.is_dir() {
+                        pending.push((rel.join(child.file_name()), false));
+                    }
+                }
+                continue;
+            }
+            let md = handle.metadata()?;
+            let record = metadata
+                .get(&rel)
+                .filter(|m| m.inode == (md.dev(), md.ino()));
+            if let Some(record) = record {
+                if let Some((uid, gid)) = record.owners {
+                    fchown(&handle, Some(uid), Some(gid))?;
+                }
+                handle.set_permissions(Permissions::from_mode(record.mode))?;
+            }
+            let time = record.map_or(0, |m| m.mtime);
+            crate::microvm_sys::set_mtime(&path, time)?;
+        }
+        Ok(())
+    }
+    visit(root, metadata).map_err(|e| io_error("restore image directory metadata", e))
+}
+
+#[cfg(test)]
 fn apply_layer(
     root: &Path,
     reader: impl Read,
     stats: &mut UnpackStats,
     limits: &UnpackLimits,
+) -> Result<(), ImageError> {
+    let mut directories = HashMap::new();
+    apply_layer_inner(root, reader, stats, limits, &mut directories)?;
+    finish_directories(root, &directories)
+}
+
+/// Applies one uncompressed layer tarball to `root`.
+fn apply_layer_inner(
+    root: &Path,
+    reader: impl Read,
+    stats: &mut UnpackStats,
+    limits: &UnpackLimits,
+    directories: &mut HashMap<PathBuf, DirectoryMetadata>,
 ) -> Result<(), ImageError> {
     let tar_err = |e: io::Error| invalid(format!("read tar: {}", chain(&e)));
     let mut archive = tar::Archive::new(reader);
@@ -628,7 +711,25 @@ fn apply_layer(
         let raw = entry.path().map_err(tar_err)?.into_owned();
         let rel = sanitize(&raw)?;
         let Some(name) = rel.file_name().map(|n| n.to_os_string()) else {
-            continue; // the root directory itself
+            if entry.header().entry_type() != tar::EntryType::Directory {
+                return Err(invalid("the image root entry must be a directory"));
+            }
+            let uid = u32::try_from(entry.header().uid().map_err(tar_err)?)
+                .map_err(|_| invalid("root uid out of range"))?;
+            let gid = u32::try_from(entry.header().gid().map_err(tar_err)?)
+                .map_err(|_| invalid("root gid out of range"))?;
+            let seconds = entry.header().mtime().map_err(tar_err)?;
+            let md = fs::symlink_metadata(root).map_err(|e| io_error("stat image root", e))?;
+            directories.insert(
+                PathBuf::new(),
+                DirectoryMetadata {
+                    inode: (md.dev(), md.ino()),
+                    mode: entry.header().mode().map_err(tar_err)? & 0o1777,
+                    owners: limits.preserve_owners.then_some((uid, gid)),
+                    mtime: seconds,
+                },
+            );
+            continue;
         };
         let parent_rel = rel.parent().unwrap_or(Path::new("")).to_path_buf();
         let name_str = name.to_string_lossy();
@@ -640,8 +741,8 @@ fn apply_layer(
                     for child in children {
                         let child = child.map_err(|e| io_error("read dir", e))?;
                         let child_rel = dir.join(child.file_name());
-                        if !created.contains(&child_rel) {
-                            remove_any(&root.join(&child_rel))?;
+                        if !created.contains(&child_rel) && remove_any(&root.join(&child_rel))? {
+                            directories.retain(|path, _| !path.starts_with(&child_rel));
                         }
                     }
                 }
@@ -665,8 +766,8 @@ fn apply_layer(
             }
             let dir = resolve(root, &parent_rel, false, &mut created)?;
             let target = dir.join(hidden);
-            if !created.contains(&target) {
-                remove_any(&root.join(&target))?;
+            if !created.contains(&target) && remove_any(&root.join(&target))? {
+                directories.retain(|path, _| !path.starts_with(&target));
             }
             stats.whiteouts += 1;
             continue;
@@ -682,6 +783,7 @@ fn apply_layer(
             .map_err(|_| invalid(format!("{}: uid out of range", raw.display())))?;
         let gid = u32::try_from(header.gid().map_err(tar_err)?)
             .map_err(|_| invalid(format!("{}: gid out of range", raw.display())))?;
+        let mtime = header.mtime().map_err(tar_err)?;
         match entry_type {
             tar::EntryType::Char | tar::EntryType::Block | tar::EntryType::Fifo => {
                 // The runtime provides /dev; device nodes and FIFOs are not
@@ -729,16 +831,22 @@ fn apply_layer(
                     .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
                     .open(&dest)
                     .map_err(io_ctx)?;
-                if let Some((uid, gid)) = owners {
-                    fchown(&handle, Some(uid), Some(gid)).map_err(io_ctx)?;
-                }
-                handle
-                    .set_permissions(Permissions::from_mode(mode))
-                    .map_err(io_ctx)?;
+                let md = handle.metadata().map_err(io_ctx)?;
+                directories.insert(
+                    dest_rel.clone(),
+                    DirectoryMetadata {
+                        inode: (md.dev(), md.ino()),
+                        mode,
+                        owners,
+                        mtime,
+                    },
+                );
                 stats.setid_cleared += setid;
             }
             tar::EntryType::Regular | tar::EntryType::Continuous | tar::EntryType::GNUSparse => {
-                remove_any(&dest)?;
+                if remove_any(&dest)? {
+                    directories.retain(|path, _| !path.starts_with(&dest_rel));
+                }
                 // create_new is O_CREAT|O_EXCL: it never follows a symlink.
                 let mut file = OpenOptions::new()
                     .write(true)
@@ -752,6 +860,7 @@ fn apply_layer(
                 }
                 file.set_permissions(Permissions::from_mode(mode))
                     .map_err(io_ctx)?;
+                crate::microvm_sys::set_mtime(&dest, mtime).map_err(io_ctx)?;
                 stats.setid_cleared += setid;
             }
             tar::EntryType::Symlink => {
@@ -760,11 +869,14 @@ fn apply_layer(
                     .map_err(tar_err)?
                     .ok_or_else(|| invalid(format!("{what}: symlink without target")))?
                     .into_owned();
-                remove_any(&dest)?;
+                if remove_any(&dest)? {
+                    directories.retain(|path, _| !path.starts_with(&dest_rel));
+                }
                 symlink(&target, &dest).map_err(io_ctx)?;
                 if let Some((uid, gid)) = owners {
                     lchown(&dest, Some(uid), Some(gid)).map_err(io_ctx)?;
                 }
+                crate::microvm_sys::set_mtime(&dest, mtime).map_err(io_ctx)?;
             }
             tar::EntryType::Link => {
                 let target_raw = entry
@@ -802,7 +914,9 @@ fn apply_layer(
                 if target == dest {
                     continue;
                 }
-                remove_any(&dest)?;
+                if remove_any(&dest)? {
+                    directories.retain(|path, _| !path.starts_with(&dest_rel));
+                }
                 // linkat(2) without AT_SYMLINK_FOLLOW: links the entry itself.
                 fs::hard_link(&target, &dest).map_err(io_ctx)?;
             }
@@ -1707,6 +1821,67 @@ mod tests {
         assert_eq!(stats.setid_cleared, 2);
     }
 
+    #[test]
+    fn tar_mtimes_survive_children_later_layers_and_symlinks() {
+        let tmp = temp_dir();
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, kind, seconds, mode) in [
+            (".", tar::EntryType::Directory, 44, 0o755),
+            ("dir", tar::EntryType::Directory, 111, 0o555),
+            ("dir/file", tar::EntryType::Regular, 222, 0o640),
+            ("dir/link", tar::EntryType::Symlink, 333, 0o777),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mode(mode);
+            header.set_mtime(seconds);
+            header.set_size(0);
+            if kind == tar::EntryType::Symlink {
+                tar.append_link(&mut header, name, "file").unwrap();
+            } else {
+                tar.append_data(&mut header, name, io::empty()).unwrap();
+            }
+        }
+        let bytes = tar.into_inner().unwrap();
+        let mut stats = UnpackStats::default();
+        let mut directories = HashMap::new();
+        apply_layer_inner(
+            tmp.path(),
+            bytes.as_slice(),
+            &mut stats,
+            &no_owners(),
+            &mut directories,
+        )
+        .unwrap();
+        let later = layer(&[E::File("dir/later", "later layer")]);
+        apply_layer_inner(
+            tmp.path(),
+            later.as_slice(),
+            &mut stats,
+            &no_owners(),
+            &mut directories,
+        )
+        .unwrap();
+        finish_directories(tmp.path(), &directories).unwrap();
+        for (name, seconds) in [("", 44), ("dir", 111), ("dir/file", 222), ("dir/link", 333)] {
+            assert_eq!(
+                fs::symlink_metadata(tmp.path().join(name)).unwrap().mtime(),
+                seconds
+            );
+        }
+        assert_eq!(
+            fs::metadata(tmp.path().join("dir")).unwrap().mode() & 0o777,
+            0o555
+        );
+        assert_eq!(
+            fs::read_link(tmp.path().join("dir/link")).unwrap(),
+            Path::new("file")
+        );
+        fs::set_permissions(tmp.path().join("dir"), Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// The image builder writes the modes unpacking would apply: setuid and
     /// setgid cleared, the sticky bit kept.
     #[test]
@@ -2040,6 +2215,42 @@ mod tests {
         fs::create_dir(tmp.path().join("bundle")).unwrap();
         unpack(&store, &image, &rootfs, &no_owners()).unwrap();
         (image, rootfs)
+    }
+
+    #[test]
+    fn missing_workdir_keeps_image_parent_mtimes_and_new_directories_are_epoch_zero() {
+        let tmp = temp_dir();
+        let (mut image, rootfs) = spec_image(&tmp);
+        image.config["config"]["WorkingDir"] = json!("/etc/missing/child");
+        crate::microvm_sys::set_mtime(&rootfs.join("etc"), 111).unwrap();
+        let root_time = fs::metadata(&rootfs).unwrap().modified().unwrap();
+        runtime_spec(&image, &rootfs, &Overrides::default()).unwrap();
+        assert_eq!(
+            fs::metadata(&rootfs).unwrap().modified().unwrap(),
+            root_time
+        );
+        assert_eq!(fs::metadata(rootfs.join("etc")).unwrap().mtime(), 111);
+        for name in ["etc/missing", "etc/missing/child"] {
+            let md = fs::metadata(rootfs.join(name)).unwrap();
+            assert_eq!(md.mtime(), 0);
+            assert_eq!(md.mode() & 0o777, 0o755);
+        }
+        runtime_spec(&image, &rootfs, &Overrides::default()).unwrap();
+        assert_eq!(fs::metadata(rootfs.join("etc")).unwrap().mtime(), 111);
+    }
+
+    #[test]
+    fn removing_ordinary_files_never_requests_directory_metadata_invalidation() {
+        let tmp = temp_dir();
+        fs::write(tmp.path().join("file"), b"file").unwrap();
+        fs::create_dir(tmp.path().join("directory")).unwrap();
+        fs::create_dir(tmp.path().join("canary")).unwrap();
+        symlink("canary", tmp.path().join("link")).unwrap();
+        assert!(!remove_any(&tmp.path().join("file")).unwrap());
+        assert!(!remove_any(&tmp.path().join("missing")).unwrap());
+        assert!(!remove_any(&tmp.path().join("link")).unwrap());
+        assert!(tmp.path().join("canary").is_dir());
+        assert!(remove_any(&tmp.path().join("directory")).unwrap());
     }
 
     #[test]

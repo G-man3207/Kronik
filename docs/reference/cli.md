@@ -1871,11 +1871,15 @@ is refused (`SECRET_EXTERNAL`), at the add and at the next start of an actor
 whose name was linked later: the built-in store holds an older value of it or
 none. `trusted` runs plain runc with a warning, a
 seccomp filter and no user namespace: it is not a security boundary;
-`microvm` is `NOT_IMPLEMENTED`. `--fork-mode` (M14) says how forks answer
-calls to it: `recorded` (the default) matches production's recordings;
-`sandbox` (gVisor only) checkpoints the actor with every snapshot, and each
-continuous fork gets a copy from the nearest checkpoint, with no network
-and its own disk, deleted with the fork; its answers are graded `forked`.
+`microvm` (M20) runs the image in a Firecracker VM with a pinned guest
+kernel and no network device; it needs a usable `/dev/kvm` and the pinned
+tool bundle in `[foreign] microvm_dir`, and without KVM the add is
+`KVM_UNAVAILABLE` (use `gvisor`) and nothing is written. `--fork-mode` (M14)
+says how forks answer calls to it: `recorded` (the default) matches
+production's recordings; `sandbox` (gVisor or microVM) checkpoints the actor
+with every snapshot, and each continuous fork gets a copy from the nearest
+checkpoint, with no network and its own disk, deleted with the fork; its
+answers are graded `forked`.
 To change the mode, remove and add the actor again. Errors:
 `FOREIGN_EXISTS`, `IMAGE_INVALID`, `RUNSC_MISSING`, `RUNC_MISSING`,
 `SECRET_NOT_FOUND`, `SECRET_EXTERNAL`, `SCOPE_MISSING`, `UNAVAILABLE` when the image's new

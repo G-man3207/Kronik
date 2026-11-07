@@ -15,6 +15,8 @@ pub(crate) enum Engine {
     Runsc { platform: String },
     /// Plain runc (`trusted`).
     Runc,
+    /// Firecracker has its own typed API; no OCI runtime commands are used.
+    Firecracker,
 }
 
 /// One runtime binary with its state directory (`--root`).
@@ -97,6 +99,7 @@ impl Runtime {
         let quiet = match self.engine {
             Engine::Runsc { .. } => "-quiet",
             Engine::Runc => "-q",
+            Engine::Firecracker => unreachable!("Firecracker state is not an OCI runtime root"),
         };
         let mut spec = self.spec(
             vec!["list".into(), quiet.into()],

@@ -337,17 +337,34 @@ fn foreign_actors_end_to_end() {
         json!({"text": SECRET, "reason": "foreign test"}),
     );
 
-    // microvm is reserved; an unpinned registry image is refused.
+    // microvm needs a usable /dev/kvm and the pinned tool bundle. Without KVM
+    // the add is refused up front with the gVisor suggestion; with KVM but no
+    // bundle (this test installs none) it is FOREIGN_UNAVAILABLE. Either way
+    // nothing is declared.
     let (s, v) = d.api(
         "POST",
         "/v1/foreign",
         json!({"name": "vm", "image": image, "port": 8080, "isolation": "microvm", "reason": "t"}),
     );
-    assert_eq!(
-        (s, v["error"]["code"].as_str()),
-        (501, Some("NOT_IMPLEMENTED")),
-        "{v}"
+    let code = v["error"]["code"].as_str();
+    if std::path::Path::new("/dev/kvm").exists() {
+        assert!(
+            matches!(code, Some("KVM_UNAVAILABLE" | "FOREIGN_UNAVAILABLE")),
+            "{v}"
+        );
+    } else {
+        assert_eq!((s, code), (503, Some("KVM_UNAVAILABLE")), "{v}");
+        assert!(
+            v["error"]["hint"].as_str().unwrap().contains("gvisor"),
+            "{v}"
+        );
+    }
+    let (_, v) = d.api("GET", "/v1/foreign", Value::Null);
+    assert!(
+        v["foreign"].as_array().unwrap().is_empty(),
+        "a refused microvm add declared an actor: {v}"
     );
+    // An unpinned registry image is refused.
     let (s, v) = d.api(
         "POST",
         "/v1/foreign",

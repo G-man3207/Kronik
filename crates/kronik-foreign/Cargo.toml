@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 kronik-core = { workspace = true }
 kronik-effects = { workspace = true }
+kronik-guest-init = { path = "../kronik-guest-init" }
 kronik-privacy = { workspace = true }
 kronik-proto = { workspace = true }
 blake3 = { workspace = true }

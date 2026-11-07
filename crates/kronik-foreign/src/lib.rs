@@ -20,6 +20,7 @@
 pub mod blobs;
 pub mod fetch;
 pub mod image;
+pub mod microvm;
 pub mod oci;
 pub mod sys;
 
@@ -28,6 +29,9 @@ mod checkpoint;
 mod layout;
 mod logs;
 mod manager;
+mod microvm_assets;
+mod microvm_checkpoint;
+mod microvm_sys;
 mod runtime;
 mod supervisor;
 

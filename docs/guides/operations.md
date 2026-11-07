@@ -317,6 +317,7 @@ stays the same when it is replayed again.
 | Key | Default | Meaning |
 |---|---|---|
 | `runsc_path` | `"/usr/local/bin/runsc"` | gVisor's `runsc` |
+| `microvm_dir` | `"/usr/local/lib/kronik/microvm"` | The protected, offline bundle for `isolation = "microvm"`: the pinned Firecracker, guest kernel, guest init and filesystem tools, with a digest manifest (ADR 0095). The daemon never downloads or builds it; `scripts/build-microvm-tools.sh` makes one. The files, the directory and every directory above it must be real directories (no symbolic link) owned by root or by the daemon's user, with no write access for group or others, because the files are checked and then executed; a bundle that someone else could replace is refused. Some distributions make `/usr/local` and `/usr/local/lib` group-writable (`root:staff`, mode 2775), and the default path is then refused with the directory it objects to named: put the bundle where only root writes, such as `/opt/kronik/microvm`, and set `microvm_dir` to it |
 | `platform` | `"auto"` | `"auto"`, `"systrap"` or `"kvm"`: gVisor's platform. `auto` is systrap; `kvm` needs a `/dev/kvm` the daemon can open |
 | `run_dir` | `"/run/kronik"` | Runtime state of the sandboxes: runsc's root, network namespaces and bridge sockets. Best on a tmpfs; nothing in it survives a reboot. One daemon per directory: a second daemon runs without foreign actors |
 | `layout_dirs` | `[]` | Absolute directories whose `oci-layout:` images an `operate` token may add; any other directory needs `admin` |

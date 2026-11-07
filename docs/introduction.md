@@ -66,8 +66,9 @@ What the code does today, on one node:
   `kronik upgrade check` exist. TLS from certificate files works. ACME is
   tested against Pebble, not a public Let's Encrypt host. `kronik doctor`
   and `/metrics` exist. There is no cluster.
-- **Foreign actors (M7).** Linux programs from OCI images run in gVisor.
-  `microvm` is reserved and not implemented.
+- **Foreign actors (M7, M20).** Linux programs from OCI images run in
+  gVisor. With `isolation = "microvm"` they run in a Firecracker VM on a host
+  with KVM; that level is implemented but has not been run on a KVM host.
 - **Privacy (M8).** Values with a subject can be sealed. `erase` deletes a
   subject's keys and SQL rows that have a `_subject` column; rows in tables
   without that column survive. `reseal` rewrites closed segments. A

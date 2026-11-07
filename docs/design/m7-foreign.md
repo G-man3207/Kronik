@@ -42,8 +42,8 @@ actors as at its fork point, and `kronik history` shows every change.
 | `image` | Always pinned by digest after resolution: `<registry>/<repo>@sha256:<hex>` or `oci-layout:<absolute dir>@sha256:<hex>`. A registry reference without a digest (only a tag) is `IMAGE_INVALID`. A local layout may be given without a digest when its `index.json` holds exactly one image (or as `oci-layout:<dir>:<ref name>`); the record stores the digest it resolved to. The CLI makes the directory absolute. |
 | `port` | The TCP port the program listens on inside the sandbox, 1 to 65535. Required. |
 | `cpu_millis` | `--cpu` in thousandths of a CPU (default 1000). `cpu.max` quota over a 100 ms period. |
-| `memory_bytes` | `--memory` (default 512Mi, at least 16Mi). `memory.max`, and no swap. |
-| `isolation` | `gvisor` (default), `trusted` (plain `runc`; the response carries a warning), `microvm` (`NOT_IMPLEMENTED`, nothing is written). |
+| `memory_bytes` | `--memory` (default 512Mi, at least 16Mi for the OCI backends). `memory.max`, and no swap. A microVM's guest RAM is at least 128Mi, floored to MiB; its host cgroup adds a fixed 128Mi allowance for the VMM (ADR 0095). |
+| `isolation` | `gvisor` (default), `trusted` (plain `runc`; the response carries a warning), `microvm` (Firecracker, M20; without a usable `/dev/kvm` it is `KVM_UNAVAILABLE`, and with KVM but without the tool bundle `FOREIGN_UNAVAILABLE`; nothing is written either way). |
 | `secrets` | `--secret <name>` or `--secret <ENV>=<name>`, stored as `ENV=name`. Without `ENV=`, the variable is the name in upper case with `-` and `.` replaced by `_` (`stripe-key` → `STRIPE_KEY`). Each secret must exist (`SECRET_NOT_FOUND`). §9. |
 | `platform` | `systrap` or `kvm`: `[foreign] platform` at add time (`auto` means `systrap`, as the brief says; `kvm` only when the operator chooses it). Empty for `trusted`. |
 
@@ -245,7 +245,7 @@ runtime was killed by a signal), `next_start_ms` and `error`.
 | --- | --- | --- |
 | `gvisor` | `runsc` with `--platform=systrap` (or `kvm`), `--network=sandbox` | yes, the default |
 | `trusted` | plain `runc` with the same bundle and a seccomp filter | yes; every add answers with the warning "isolation trusted runs the image with plain runc and the host kernel: only use it for images you trust" |
-| `microvm` | Firecracker | `NOT_IMPLEMENTED` |
+| `microvm` | Firecracker | M20: needs `/dev/kvm` and the pinned tool bundle; see ADR 0095 |
 
 **Network namespace with only `lo`** (ADR 0003 §2). Before each start,
 Kronik creates a namespace by `unshare(CLONE_NEWNET)` on a short-lived
@@ -418,8 +418,8 @@ Errors: `BAD_REQUEST` (name, port, cpu, memory), `IMAGE_INVALID` (400: not
 pinned, unreachable, not an image for this platform, digest or size
 mismatch, bad layer), `FOREIGN_EXISTS` (409), `FOREIGN_NOT_FOUND` (404),
 `SECRET_NOT_FOUND`, `RUNSC_MISSING` and `RUNC_MISSING` (503: the runtime
-binary is missing; nothing is written), `KVM_UNAVAILABLE`,
-`NOT_IMPLEMENTED` (`microvm`), `REASON_REQUIRED`.
+binary is missing; nothing is written), `KVM_UNAVAILABLE` (also for
+`microvm` without a usable `/dev/kvm`), `REASON_REQUIRED`.
 
 **Logs.** `output.log` holds what the program and runsc write, through a
 pipe the daemon reads: past 8 MiB the file moves to `output.log.1` and a
