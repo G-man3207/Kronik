@@ -264,6 +264,13 @@ def digest(data):
 def rebuild_check(daemon, data):
     """Recovered derived state == derived state rebuilt from the log alone."""
     daemon.stop()
+    # The stop took a shutdown snapshot and appended its marker without waiting
+    # for the applier: a process that exits first leaves state.db one record
+    # behind a log that holds the marker, and recovery applies it. The state
+    # to compare is the recovered one, so the daemon starts again and is killed
+    # once it serves, as the rebuilt one is below.
+    daemon.start()
+    daemon.kill9()
     live = digest(data)
     branch = os.path.join(data, "branches", "main")
     kept = os.path.join(os.path.dirname(data), "derived-as-recovered")
