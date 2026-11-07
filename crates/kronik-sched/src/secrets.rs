@@ -3193,6 +3193,14 @@ impl Node {
             return Err(unavailable());
         }
         let references = pattern_references(&state).map(Arc::from);
+        // The certificate this one displaces is retired like any other: its
+        // liveness goes, so a publication taken from it fails its check and
+        // its holder prepares again. Publishers can reach this point at the
+        // same epoch (the cached recertification after a config commit does
+        // not take the inventory lock), and a publication that passed its
+        // check but could never be admitted would be retried for as long as
+        // the displaced certificate's age allows.
+        let displaced = SecretCache::retire_certificate(&mut state);
         state.coverage = Some(NativeCoverage {
             revision,
             epoch,
@@ -3210,6 +3218,7 @@ impl Node {
         let retired_catalogue = state.native_catalogue_capture.replace(catalogue_capture);
         drop(state);
         drop(retired_catalogue);
+        drop(displaced);
         runtime
             .stats
             .records

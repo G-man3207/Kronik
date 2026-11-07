@@ -806,6 +806,54 @@ async fn complete_inventory_is_revision_and_epoch_bound_and_resource_failure_is_
 }
 
 #[tokio::test]
+async fn a_certificate_displaced_at_the_same_epoch_retires_the_publications_taken_from_it() {
+    let (_data, node) = node().await;
+    let original = node.local_operator_authority().unwrap();
+    // The cycle that starts with the node makes a first pass and publishes
+    // its outcome; wait for it, so that nothing else moves the certificate
+    // under the test.
+    let runtime = node.runtime().unwrap();
+    let mut certified = runtime.certified.subscribe();
+    node.env
+        .timeout(Duration::from_secs(5), async {
+            while !certified.borrow_and_update().1 {
+                certified.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    // A holder (an exporter preparing a batch) takes a publication from the
+    // current certificate.
+    let (_, held) = node.native_secret_snapshot_with_publication().unwrap();
+    held.check_current().unwrap();
+    // Another publisher reaches the install point at the same epoch, as the
+    // cached-only recertification after a config commit and the tail of a
+    // full refresh do when they overlap, and installs a new certificate.
+    assert!(node.recertify_cached_secret_inventory().await.unwrap());
+    // The publication cannot be admitted any more ...
+    let mut denied = unavailable();
+    assert!(
+        original
+            .admit(&mut || held.with_current_publication(&mut denied, || Ok(())))
+            .is_err()
+    );
+    // ... and it must say so before its holder tries to deliver with it:
+    // holders prepare again when the check fails, so a publication that
+    // passes its check and is refused at admission is never replaced.
+    assert!(
+        held.check_current().is_err(),
+        "a displaced certificate's publication still passes its check"
+    );
+    // Preparing again takes a publication from the installed certificate.
+    let (_, fresh) = node.native_secret_snapshot_with_publication().unwrap();
+    fresh.check_current().unwrap();
+    let mut denied = unavailable();
+    original
+        .admit(&mut || fresh.with_current_publication(&mut denied, || Ok(())))
+        .unwrap();
+}
+
+#[tokio::test]
 async fn deletion_keeps_only_scrub_authority_and_missing_retained_values_fail_inventory() {
     let (_data, node) = node().await;
     node.secret_set(
