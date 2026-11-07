@@ -22,6 +22,7 @@ pub mod fetch;
 pub mod image;
 pub mod microvm;
 pub mod oci;
+pub mod subid;
 pub mod sys;
 
 mod bridge;

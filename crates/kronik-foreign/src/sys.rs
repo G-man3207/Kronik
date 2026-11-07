@@ -17,12 +17,14 @@
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use crate::subid::{COUNT, Range};
 
 /// Whether the process runs with effective uid 0.
 pub fn is_root() -> bool {
@@ -133,8 +135,8 @@ pub fn delete_netns(path: &Path) -> io::Result<()> {
     let c = cstr(path)?;
     // A bound of layers, so a path that stays a mount point cannot loop.
     for _ in 0..64 {
-        // SAFETY: valid NUL-terminated path; MNT_DETACH needs no other state.
-        let rc = unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+        // SAFETY: a checked path; never follow a replacement symbolic link.
+        let rc = unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH | libc::UMOUNT_NOFOLLOW) };
         if rc == 0 {
             continue;
         }
@@ -191,8 +193,13 @@ pub fn netns_interfaces(netns: &Path) -> io::Result<Vec<String>> {
     })
 }
 
-/// capset(2): the version 3 header.
+/// `ioctl_ns(2)` requests: the namespace type, and a user namespace's owner.
+const NS_GET_NSTYPE: libc::c_ulong = 0xb703;
+const NS_GET_OWNER_UID: libc::c_ulong = 0xb704;
+
+/// capset(2): the version 3 header and the bit of `CAP_SYS_ADMIN`.
 const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const CAP_SYS_ADMIN: u32 = 1 << 21;
 
 #[repr(C)]
 struct CapHeader {
@@ -243,6 +250,888 @@ pub fn clear_capabilities() -> io::Result<()> {
     }
 }
 
+/// A `uid_map` or `gid_map`: lines of (inside, outside, count).
+pub type IdMap = Vec<[u32; 3]>;
+
+/// The map of the Kronik user namespace for the `kronik` user's `id` and
+/// its subordinate `range`: 0 is the user, 1–65535 come from the range
+/// (ADR 0060).
+pub fn kronik_map(id: u32, range: Range) -> IdMap {
+    vec![[0, id, 1], [1, range.start, COUNT - 1]]
+}
+
+/// A kernel id map. Malformed/extra fields invalidate the entire map.
+pub fn parse_map(text: &str) -> IdMap {
+    text.lines()
+        .map(|line| {
+            let mut f = line.split_whitespace();
+            let row = [
+                f.next()?.parse().ok()?,
+                f.next()?.parse().ok()?,
+                f.next()?.parse().ok()?,
+            ];
+            (f.next().is_none() && row[2] != 0).then_some(row)
+        })
+        .collect::<Option<IdMap>>()
+        .unwrap_or_default()
+}
+
+/// A pinned user namespace, as this process sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedUserns {
+    /// The uid that owns it (`NS_GET_OWNER_UID`).
+    pub owner: u32,
+    /// Its uid and gid maps, or why they could not be read: reading them
+    /// enters the namespace, which only its owner and root may.
+    pub maps: Result<(IdMap, IdMap), String>,
+}
+
+/// What [`pin_userns`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pin {
+    /// No namespace was pinned; one is now.
+    Created,
+    /// The pinned namespace had the right owner and maps.
+    Kept,
+}
+
+/// The steps a helper child reports as failed, by index (0 is success).
+const STEPS: [&str; 9] = [
+    "",
+    "PR_SET_KEEPCAPS",
+    "setgroups",
+    "setresgid",
+    "setresuid",
+    "capset(CAP_SYS_ADMIN)",
+    "unshare(CLONE_NEWUSER)",
+    "opening /proc/self/ns/user",
+    "setns(CLONE_NEWUSER)",
+];
+
+/// A forked child that did one privileged step and then waits, so that its
+/// `/proc/<pid>` files stay there, until this is dropped (which kills and
+/// reaps it). It may pass back one descriptor.
+struct Helper {
+    pid: libc::pid_t,
+    sock: Option<OwnedFd>,
+    fd: Option<OwnedFd>,
+}
+
+/// Buffer for one `SCM_RIGHTS` descriptor, aligned for `cmsghdr`.
+type CmsgBuf = [u64; 4];
+
+impl Helper {
+    /// Forks a child that runs `step`, which returns a descriptor to pass
+    /// back or the index of its failed step in [`STEPS`]. `step` runs after
+    /// fork in a process that may have other threads: it must make only
+    /// system calls, without allocating or taking a lock.
+    fn spawn(step: impl FnOnce() -> Result<Option<libc::c_int>, u8>) -> io::Result<Helper> {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: socketpair writes two descriptors into `fds`.
+        check(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            "socketpair",
+        )?;
+        // SAFETY: both descriptors are fresh and owned by nothing else.
+        let (mine, theirs) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        // SAFETY: the child runs only `step` and the system calls below,
+        // which neither allocate nor lock, and ends with _exit.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            let e = io::Error::last_os_error();
+            return Err(io::Error::new(e.kind(), format!("fork: {e}")));
+        }
+        if pid == 0 {
+            let sock = theirs.as_raw_fd();
+            let (status, errno, fd) = match step() {
+                Ok(fd) => (0, 0, fd),
+                Err(s) => (
+                    s,
+                    io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                    None,
+                ),
+            };
+            send_status(sock, status, errno, fd);
+            // Close every other descriptor, the parent's end of the socket
+            // included: else the EOF it waits for never comes.
+            close_descriptors(3, (sock as u32).saturating_sub(1));
+            close_descriptors(sock as u32 + 1, u32::MAX);
+            let mut byte = 0u8;
+            // SAFETY: reads at most one byte into `byte`; returns when the
+            // parent closes its end. Then the child ends without running
+            // destructors or atexit handlers.
+            unsafe {
+                libc::read(sock, (&raw mut byte).cast(), 1);
+                libc::_exit(0)
+            }
+        }
+        drop(theirs);
+        let mut helper = Helper {
+            pid,
+            sock: Some(mine),
+            fd: None,
+        };
+        let sock = helper.sock.as_ref().map_or(-1, AsRawFd::as_raw_fd);
+        let (status, errno, fd) = recv_status(sock)?;
+        if status != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            let step = STEPS.get(usize::from(status)).copied().unwrap_or("a step");
+            return Err(io::Error::new(e.kind(), format!("{step}: {e}")));
+        }
+        helper.fd = fd;
+        Ok(helper)
+    }
+}
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        // Closing the socket ends the child (it waits for EOF), so this
+        // needs no CAP_KILL for a child that switched users.
+        self.sock.take();
+        // SAFETY: `pid` is this process's own child, not yet reaped.
+        unsafe {
+            libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+        }
+    }
+}
+
+/// The child's answer: the status byte, errno, and the descriptor (if any)
+/// as `SCM_RIGHTS`. Called after fork: system calls only.
+fn send_status(sock: libc::c_int, status: u8, errno: i32, fd: Option<libc::c_int>) {
+    let mut msg = [0u8; 5];
+    msg[0] = status;
+    msg[1..].copy_from_slice(&errno.to_ne_bytes());
+    send_with_fd(sock, &msg, fd);
+}
+
+/// Sends `payload` as one message, with `fd` as `SCM_RIGHTS` when given.
+/// System calls only (safe after fork); returns sendmsg's result.
+fn send_with_fd(sock: libc::c_int, payload: &[u8], fd: Option<libc::c_int>) -> isize {
+    let mut iov = libc::iovec {
+        // sendmsg only reads the buffer.
+        iov_base: payload.as_ptr().cast_mut().cast(),
+        iov_len: payload.len(),
+    };
+    let mut control: CmsgBuf = [0; 4];
+    // SAFETY: msghdr is a plain C struct; all-zero is valid. The pointers
+    // set below point at locals that outlive sendmsg; CMSG_SPACE of one
+    // descriptor (24 bytes) fits `control` (32).
+    unsafe {
+        let mut hdr: libc::msghdr = std::mem::zeroed();
+        hdr.msg_iov = &raw mut iov;
+        hdr.msg_iovlen = 1;
+        if let Some(fd) = fd {
+            let len = std::mem::size_of::<libc::c_int>() as u32;
+            hdr.msg_control = control.as_mut_ptr().cast();
+            hdr.msg_controllen = libc::CMSG_SPACE(len) as _;
+            let c = libc::CMSG_FIRSTHDR(&raw const hdr);
+            (*c).cmsg_level = libc::SOL_SOCKET;
+            (*c).cmsg_type = libc::SCM_RIGHTS;
+            (*c).cmsg_len = libc::CMSG_LEN(len) as _;
+            std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<libc::c_int>(), fd);
+        }
+        libc::sendmsg(sock, &raw const hdr, libc::MSG_NOSIGNAL)
+    }
+}
+
+/// Receives one message into `buf`, with at most one descriptor. Returns
+/// its length (0: the other end closed) and the descriptor.
+fn recv_with_fd(sock: libc::c_int, buf: &mut [u8]) -> io::Result<(usize, Option<OwnedFd>)> {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut control: CmsgBuf = [0; 4];
+    // SAFETY: as in send_with_fd; recvmsg fills `buf` and `control`, which
+    // outlive the call, and sets msg_controllen to what it wrote.
+    unsafe {
+        let mut hdr: libc::msghdr = std::mem::zeroed();
+        hdr.msg_iov = &raw mut iov;
+        hdr.msg_iovlen = 1;
+        hdr.msg_control = control.as_mut_ptr().cast();
+        hdr.msg_controllen = std::mem::size_of::<CmsgBuf>() as _;
+        let n = libc::recvmsg(sock, &raw mut hdr, libc::MSG_CMSG_CLOEXEC);
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Every descriptor recvmsg installed is owned here, so that whichever
+        // way this returns none of them leaks: the message may carry more
+        // than one, in one control message or several.
+        let mut received = Vec::new();
+        let mut c = libc::CMSG_FIRSTHDR(&raw const hdr);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(c).cast::<libc::c_int>();
+                let count = ((*c).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize)
+                    / std::mem::size_of::<libc::c_int>();
+                for i in 0..count {
+                    // The descriptor was installed in this process by recvmsg.
+                    received.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))));
+                }
+            }
+            c = libc::CMSG_NXTHDR(&raw const hdr, c);
+        }
+        if hdr.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(io::Error::other(
+                "the peer sent more descriptors than one message may carry",
+            ));
+        }
+        if received.len() > 1 {
+            return Err(io::Error::other("the peer sent more than one descriptor"));
+        }
+        Ok((n as usize, received.pop()))
+    }
+}
+
+/// Reads a helper's answer (see [`send_status`]).
+fn recv_status(sock: libc::c_int) -> io::Result<(u8, i32, Option<OwnedFd>)> {
+    let mut msg = [0u8; 5];
+    let (n, fd) = recv_with_fd(sock, &mut msg)
+        .map_err(|e| io::Error::new(e.kind(), format!("reading the helper's answer: {e}")))?;
+    if n != msg.len() {
+        return Err(io::Error::other(
+            "the helper process ended without an answer",
+        ));
+    }
+    let errno = i32::from_ne_bytes([msg[1], msg[2], msg[3], msg[4]]);
+    Ok((msg[0], errno, fd))
+}
+
+/// Why the API acceptor cannot report true host uids in this process. The
+/// texts are the stable ones that `kronik serve --rootless` logs and
+/// `kronik doctor --rootless` reports, so each says what to do.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AcceptorRefusal {
+    /// The effective uid is 0.
+    #[error(
+        "the nonroot service runs as the unprivileged service user, not as root: start it with \
+         the unit's User=, or run `kronik serve` without --rootless"
+    )]
+    Root,
+    /// The real, effective and saved uids are not one and the same uid.
+    #[error(
+        "the real, effective and saved user ids are not one and the same (real {real}, \
+         effective {effective}, saved {saved}): the acceptor could regain another identity, so \
+         the nonroot service refuses to start; start it from a unit with User= and no \
+         set-user-id program in between"
+    )]
+    Uids {
+        real: u32,
+        effective: u32,
+        saved: u32,
+    },
+    /// The user namespace's uid map is not the identity map of the host.
+    #[error(
+        "this process is in a user namespace whose uid map is not the host's identity map: \
+         the kernel would translate every API caller's uid, so audit records and token \
+         attribution would name the wrong users. Rootless containers and nested user \
+         namespaces are not supported for the nonroot unit: run the root service \
+         (`kronik serve --init --root`), or `kronik serve` without --rootless for development"
+    )]
+    UserNamespace,
+    /// `/proc/self/uid_map` could not be read.
+    #[error("reading /proc/self/uid_map: {0}")]
+    Unreadable(String),
+}
+
+/// Whether an acceptor started by a process with the user ids `ids` (real,
+/// effective, saved) and the `uid_map` text could read true host uids from
+/// `SO_PEERCRED`: it must be one unprivileged uid, in the initial user
+/// namespace's identity map (`0 0 4294967295`).
+pub fn check_acceptor_view(uid_map: &str, ids: [u32; 3]) -> Result<(), AcceptorRefusal> {
+    let [real, effective, saved] = ids;
+    if effective == 0 {
+        return Err(AcceptorRefusal::Root);
+    }
+    if real != effective || saved != effective {
+        return Err(AcceptorRefusal::Uids {
+            real,
+            effective,
+            saved,
+        });
+    }
+    let map = parse_map(uid_map);
+    if map.len() != 1 || map[0] != [0, 0, u32::MAX] {
+        return Err(AcceptorRefusal::UserNamespace);
+    }
+    Ok(())
+}
+
+/// [`check_acceptor_view`] for this process.
+pub fn acceptor_view() -> Result<(), AcceptorRefusal> {
+    let (mut real, mut effective, mut saved) = (0, 0, 0);
+    // SAFETY: getresuid writes three uid_t values into valid locals.
+    if unsafe { libc::getresuid(&raw mut real, &raw mut effective, &raw mut saved) } < 0 {
+        return Err(AcceptorRefusal::Unreadable(
+            io::Error::last_os_error().to_string(),
+        ));
+    }
+    let map = fs::read_to_string("/proc/self/uid_map")
+        .map_err(|e| AcceptorRefusal::Unreadable(e.to_string()))?;
+    check_acceptor_view(&map, [real, effective, saved])
+}
+
+/// The API socket's acceptor of the non-root daemon: a child process that
+/// stays in the initial user namespace, as the daemon's user without any
+/// capability, accepts on the API's Unix listener and passes each
+/// connection on with its peer's uid. The daemon cannot read that uid
+/// itself once it is in Kronik's user namespace: the kernel translates
+/// `SO_PEERCRED` into the reader's namespace, where host root and every
+/// operator are the overflow uid 65534 and the `kronik` user is 0.
+pub struct Acceptor {
+    pid: libc::pid_t,
+    chan: OwnedFd,
+}
+
+impl Acceptor {
+    /// Forks the acceptor for `listener` (a bound, listening Unix socket),
+    /// which this process no longer accepts on. Call it while the process
+    /// has one thread, before it enters the user namespace. The child ends
+    /// with this process (`PR_SET_PDEATHSIG`) or when the channel closes.
+    pub fn spawn(listener: OwnedFd) -> io::Result<Acceptor> {
+        if threads()? != 1 {
+            return Err(io::Error::other(
+                "API acceptor requires one initial-namespace thread",
+            ));
+        }
+        acceptor_view().map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: socketpair writes two descriptors into `fds`.
+        check(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            "socketpair",
+        )?;
+        // SAFETY: both descriptors are fresh and owned by nothing else.
+        let (mine, theirs) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        // SAFETY: getpid has no preconditions.
+        let parent = unsafe { libc::getpid() };
+        // SAFETY: the child runs `accept_loop`, system calls only, and never
+        // returns.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            let e = io::Error::last_os_error();
+            return Err(io::Error::new(e.kind(), format!("fork: {e}")));
+        }
+        if pid == 0 {
+            accept_loop(parent, listener.as_raw_fd(), theirs.as_raw_fd());
+        }
+        drop(theirs);
+        let acceptor = Acceptor { pid, chan: mine };
+        let mut ready = [0u8; 1];
+        if !matches!(
+            recv_with_fd(acceptor.chan.as_raw_fd(), &mut ready)?,
+            (1, None)
+        ) || ready != [1]
+        {
+            return Err(io::Error::other(
+                "API acceptor failed to drop host authority",
+            ));
+        }
+        Ok(acceptor)
+    }
+
+    /// Owned helper identity for supervision and boundary diagnostics.
+    pub fn pid(&self) -> u32 {
+        self.pid as u32
+    }
+
+    /// Waits for the next connection: its descriptor and its peer's host
+    /// uid (`u32::MAX` when the acceptor could not read it). Blocking: run
+    /// it on a thread of its own.
+    pub fn recv(&self) -> io::Result<(OwnedFd, u32)> {
+        loop {
+            let mut msg = [0u8; 4];
+            match recv_with_fd(self.chan.as_raw_fd(), &mut msg) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+                Ok((0, _)) => return Err(io::Error::other("the API socket's acceptor ended")),
+                Ok((4, Some(fd))) => return Ok((fd, u32::from_ne_bytes(msg))),
+                Ok(_) => return Err(io::Error::other("invalid API acceptor message")),
+            }
+        }
+    }
+}
+
+impl Drop for Acceptor {
+    fn drop(&mut self) {
+        // SAFETY: `pid` is this process's own child, with the same host
+        // uid, not yet reaped.
+        unsafe {
+            libc::kill(self.pid, libc::SIGKILL);
+            libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+        }
+    }
+}
+
+/// The acceptor child (see [`Acceptor`]). It drops every capability,
+/// closes every descriptor but `listener` and `chan`, then accepts until
+/// the daemon is gone. System calls only.
+fn accept_loop(parent: libc::pid_t, listener: libc::c_int, chan: libc::c_int) -> ! {
+    let none = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    let header = CapHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let (lo, hi) = (
+        listener.min(chan) as libc::c_uint,
+        listener.max(chan) as libc::c_uint,
+    );
+    // SAFETY: plain system calls on values made before fork; capset reads
+    // `header` and both `none`; accept4 and getsockopt write into locals.
+    unsafe {
+        if libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        ) != 0
+            || libc::getppid() != parent
+            || libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+                0,
+                0,
+                0,
+            ) != 0
+            || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+            || libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0
+            || libc::syscall(libc::SYS_capset, &raw const header, none.as_ptr()) != 0
+        {
+            libc::_exit(1);
+        }
+        close_descriptors(3, lo.saturating_sub(1));
+        close_descriptors(lo + 1, hi.saturating_sub(1));
+        close_descriptors(hi + 1, u32::MAX);
+        if send_with_fd(chan, &[1], None) != 1 {
+            libc::_exit(1);
+        }
+        loop {
+            let conn = libc::accept4(
+                listener,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC,
+            );
+            if conn < 0 {
+                // EMFILE and the like: wait a little rather than spin.
+                let pause = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 50_000_000,
+                };
+                libc::nanosleep(&raw const pause, std::ptr::null_mut());
+                continue;
+            }
+            let mut cred: libc::ucred = std::mem::zeroed();
+            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            let uid = if libc::getsockopt(
+                conn,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &raw mut len,
+            ) == 0
+            {
+                cred.uid
+            } else {
+                u32::MAX
+            };
+            let sent = send_with_fd(chan, &uid.to_ne_bytes(), Some(conn));
+            libc::close(conn);
+            if sent < 0 {
+                // The daemon closed the channel: it is gone or stopping.
+                libc::_exit(0);
+            }
+        }
+    }
+}
+
+/// Reads `/proc/<pid>/uid_map` and `gid_map`.
+fn read_maps(pid: libc::pid_t) -> io::Result<(IdMap, IdMap)> {
+    let read = |which: &str| {
+        let path = format!("/proc/{pid}/{which}");
+        fs::read_to_string(&path)
+            .map(|t| parse_map(&t))
+            .map_err(|e| io::Error::new(e.kind(), format!("reading {path}: {e}")))
+    };
+    Ok((read("uid_map")?, read("gid_map")?))
+}
+
+/// The user namespace bound at `path`, or `None` when nothing is there or
+/// the file is not a user namespace.
+pub fn inspect_userns(path: &Path) -> io::Result<Option<PinnedUserns>> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let ns = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        r => r.map_err(|e| io::Error::new(e.kind(), format!("opening {}: {e}", path.display())))?,
+    };
+    inspect_userns_fd(&ns)
+}
+
+/// Inspects exactly this open namespace descriptor, without reopening a path.
+/// Trusted callers may open an owned PID's procfs namespace magic link and
+/// compare its FD metadata first. Map inspection forks a syscall-only helper:
+/// call before loading protected key material.
+pub fn inspect_userns_fd(ns: &File) -> io::Result<Option<PinnedUserns>> {
+    let fd = ns.as_raw_fd();
+    // SAFETY: NS_GET_NSTYPE takes no argument; on a file that is no
+    // namespace it fails with ENOTTY.
+    if unsafe { libc::ioctl(fd, NS_GET_NSTYPE as _) } != libc::CLONE_NEWUSER {
+        return Ok(None);
+    }
+    let mut owner: libc::uid_t = 0;
+    // SAFETY: NS_GET_OWNER_UID writes one uid_t into `owner`.
+    check(
+        unsafe { libc::ioctl(fd, NS_GET_OWNER_UID as _, &raw mut owner) },
+        "NS_GET_OWNER_UID",
+    )?;
+    let maps = Helper::spawn(|| {
+        // SAFETY: setns on the inherited descriptor, in the single-threaded
+        // child.
+        if unsafe { libc::setns(fd, libc::CLONE_NEWUSER) } != 0 {
+            return Err(8);
+        }
+        Ok(None)
+    })
+    .and_then(|helper| read_maps(helper.pid))
+    .map_err(|e| e.to_string());
+    Ok(Some(PinnedUserns { owner, maps }))
+}
+
+/// Pins the Kronik user namespace at `path` (ADR 0060): owned by `uid`,
+/// mapping 0 to `uid`/`gid` and 1–65535 to `uids`/`gids`. Needs root.
+///
+/// A child switches to `uid` and `gid` but keeps `CAP_SYS_ADMIN`, so that
+/// `uid` owns the namespace and its creation is privileged, creates it and
+/// passes its file back. This process writes both maps, each in one
+/// write(2) as the kernel requires, and bind-mounts the file at `path`
+/// (the parent directory is created with mode 0755). A namespace already
+/// pinned there with the same owner and maps is kept; mismatches are refused.
+pub fn pin_userns(uid: u32, gid: u32, uids: Range, gids: Range, path: &Path) -> io::Result<Pin> {
+    if uid == 0
+        || gid == 0
+        || uid == u32::MAX
+        || gid == u32::MAX
+        || [uids, gids]
+            .iter()
+            .any(|r| r.start < crate::subid::FLOOR || r.count < COUNT || r.end().is_none())
+        || (uids.start..uids.end().unwrap_or(0)).contains(&uid)
+        || (gids.start..gids.end().unwrap_or(0)).contains(&gid)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsafe namespace identity or subordinate range",
+        ));
+    }
+    root_dir(
+        path.parent()
+            .ok_or_else(|| io::Error::other("pin has no parent"))?,
+    )?;
+    let want = (kronik_map(uid, uids), kronik_map(gid, gids));
+    let outcome = match inspect_userns(path)? {
+        Some(p) if p.owner == uid && p.maps.as_ref().is_ok_and(|m| *m == want) => {
+            match validate_owned_userns(path) {
+                Ok(_) => {}
+                // A crash between the bind mount and the record leaves a
+                // namespace that is exactly the wanted one, in a directory
+                // only root writes, and no record: without it nothing could
+                // unpin it, and the next `pin` would refuse it for good.
+                // Only an absent record is repaired; one that disagrees is
+                // not (a replacement mounted over the pin keeps failing).
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    let ns = OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                        .open(path)?;
+                    let pinned = inspect_userns_fd(&ns)?
+                        .ok_or_else(|| io::Error::other("pin was replaced by a non-namespace"))?;
+                    if pinned.owner != uid || pinned.maps.as_ref().ok() != Some(&want) {
+                        return Err(e);
+                    }
+                    write_pin_record(path, uid, &ns)?;
+                }
+                Err(e) => return Err(e),
+            }
+            return Ok(Pin::Kept);
+        }
+        Some(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to replace a pinned namespace; stop its consumers and unpin its owned token first",
+            ));
+        }
+        None => Pin::Created,
+    };
+    match fs::symlink_metadata(path.with_extension("owner")) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "pin creation record already exists without its namespace",
+            ));
+        }
+    }
+    let helper = Helper::spawn(|| {
+        let caps = [
+            CapData {
+                effective: CAP_SYS_ADMIN,
+                permitted: CAP_SYS_ADMIN,
+                inheritable: 0,
+            },
+            CapData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            },
+        ];
+        let header = CapHeader {
+            version: CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        // SAFETY: plain system calls in the child on values made before
+        // fork; capset reads `header` and two `caps` (version 3).
+        unsafe {
+            if libc::prctl(libc::PR_SET_KEEPCAPS, 1 as libc::c_ulong, 0, 0, 0) != 0 {
+                return Err(1);
+            }
+            if libc::setgroups(0, std::ptr::null()) != 0 {
+                return Err(2);
+            }
+            if libc::setresgid(gid, gid, gid) != 0 {
+                return Err(3);
+            }
+            if libc::setresuid(uid, uid, uid) != 0 {
+                return Err(4);
+            }
+            if libc::syscall(libc::SYS_capset, &raw const header, caps.as_ptr()) != 0 {
+                return Err(5);
+            }
+            if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+                return Err(6);
+            }
+            let fd = libc::open(
+                c"/proc/self/ns/user".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            );
+            if fd < 0 {
+                return Err(7);
+            }
+            Ok(Some(fd))
+        }
+    })
+    .map_err(|e| io::Error::new(e.kind(), format!("creating the user namespace: {e}")))?;
+    let ns = helper
+        .fd
+        .as_ref()
+        .ok_or_else(|| io::Error::other("the helper passed no namespace"))?;
+    for (which, map) in [("uid_map", &want.0), ("gid_map", &want.1)] {
+        let file = format!("/proc/{}/{which}", helper.pid);
+        let text: String = map
+            .iter()
+            .map(|[a, b, c]| format!("{a} {b} {c}\n"))
+            .collect();
+        let written = OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .and_then(|mut f| f.write(text.as_bytes()))
+            .map_err(|e| io::Error::new(e.kind(), format!("writing {file}: {e}")))?;
+        if written != text.len() {
+            return Err(io::Error::other(format!("writing {file}: short write")));
+        }
+    }
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| io::Error::new(e.kind(), format!("creating {}: {e}", path.display())))?;
+    }
+    let source = CString::new(format!("/proc/self/fd/{}", ns.as_raw_fd()))
+        .map_err(|_| io::Error::other("descriptor path"))?;
+    let dest = cstr(path)?;
+    // SAFETY: both strings are valid NUL-terminated paths; a bind mount
+    // takes no filesystem type or data.
+    let mounted = check(
+        unsafe {
+            libc::mount(
+                source.as_ptr(),
+                dest.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        },
+        "bind-mounting the user namespace",
+    );
+    drop(helper);
+    if mounted.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    mounted?;
+    write_pin_record(path, uid, &File::open(path)?)?;
+    Ok(outcome)
+}
+
+/// The record that proves this process made the pin: the owner and the
+/// identity of the namespace `ns` is open on. `unpin` removes only a pin whose
+/// record matches.
+fn write_pin_record(path: &Path, uid: u32, ns: &File) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let meta = ns.metadata()?;
+    let mut token = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path.with_extension("owner"))?;
+    writeln!(token, "1 {} {} {}", uid, meta.dev(), meta.ino())?;
+    token.sync_all()
+}
+
+fn owned_userns_file(path: &Path) -> io::Result<Option<File>> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+        Ok(meta) if !meta.is_file() => return Err(io::Error::other("pin is not a namespace file")),
+        Ok(_) => {}
+    }
+    root_dir(
+        path.parent()
+            .ok_or_else(|| io::Error::other("pin has no parent"))?,
+    )?;
+    let ns = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        other => other?,
+    };
+    let record = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path.with_extension("owner"))?;
+    let meta = record.metadata()?;
+    if meta.uid() != 0 || meta.mode() & 0o077 != 0 || !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "untrusted pin creation record",
+        ));
+    }
+    use std::io::Read as _;
+    let mut text = String::new();
+    record.take(256).read_to_string(&mut text)?;
+    let pinned = inspect_userns_fd(&ns)?
+        .ok_or_else(|| io::Error::other("pin was replaced by a non-namespace"))?;
+    let meta = ns.metadata()?;
+    if text != format!("1 {} {} {}\n", pinned.owner, meta.dev(), meta.ino()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "pin creation token does not match",
+        ));
+    }
+    let current = fs::symlink_metadata(path)?;
+    if current.dev() != meta.dev() || current.ino() != meta.ino() {
+        return Err(io::Error::other("pin changed during cleanup"));
+    }
+    Ok(Some(ns))
+}
+
+/// Read-only admission for explicit unpin, including dry-run.
+pub fn validate_owned_userns(path: &Path) -> io::Result<bool> {
+    Ok(owned_userns_file(path)?.is_some())
+}
+
+/// Removes only a namespace matching its root-owned creation record.
+pub fn unpin_userns(path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(ns) = owned_userns_file(path)? else {
+        return Ok(false);
+    };
+    let held = ns.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+        return Err(io::Error::other("pin changed before unmount"));
+    }
+    let target = cstr(path)?;
+    // SAFETY: checked root-owned mount point; do not follow symbolic links.
+    check(
+        unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH | libc::UMOUNT_NOFOLLOW) },
+        "unpinning userns",
+    )?;
+    fs::remove_file(path)?;
+    fs::remove_file(path.with_extension("owner"))?;
+    Ok(true)
+}
+
+/// Creates `dir` (its parent must exist) with mode 0755, or checks that it
+/// is a directory owned by root and no symbolic link: the pin never
+/// follows a path that another user could have planted.
+fn root_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+    let shown = |e: io::Error| io::Error::new(e.kind(), format!("creating {}: {e}", dir.display()));
+    if !dir.is_absolute()
+        || dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "pin parent must be absolute without traversal",
+        ));
+    }
+    for ancestor in dir.ancestors().skip(1) {
+        let m = fs::symlink_metadata(ancestor)?;
+        if !m.is_dir() || m.uid() != 0 || (m.mode() & 0o022 != 0 && m.mode() & 0o1000 == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "untrusted pin ancestor",
+            ));
+        }
+    }
+    match fs::DirBuilder::new().mode(0o755).create(dir) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(shown(e)),
+        _ => {}
+    }
+    let m = fs::symlink_metadata(dir).map_err(shown)?;
+    if !m.is_dir() || m.uid() != 0 || m.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a directory owned by root", dir.display()),
+        ));
+    }
+    Ok(())
+}
+
 /// The number of threads of this process (`/proc/self/status`).
 fn threads() -> io::Result<u64> {
     let status = fs::read_to_string("/proc/self/status")?;
@@ -251,6 +1140,136 @@ fn threads() -> io::Result<u64> {
         .find_map(|l| l.strip_prefix("Threads:"))
         .and_then(|n| n.trim().parse().ok())
         .ok_or_else(|| io::Error::other("/proc/self/status has no Threads line"))
+}
+
+/// The number of threads of this process once it has settled to `at_most` or
+/// below. A thread that has been joined is still counted by the kernel for a
+/// moment, until it has left the thread group, so a process that has just
+/// dropped a runtime can show one more than it has: a count above `at_most` is
+/// read again, for up to two seconds, before it is believed.
+pub fn threads_settled(at_most: u64) -> io::Result<u64> {
+    let mut seen = threads()?;
+    for _ in 0..400 {
+        if seen <= at_most {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        seen = threads()?;
+    }
+    Ok(seen)
+}
+
+/// Moves this process into the user namespace pinned at `path`, then into
+/// a private mount namespace of its own whose `/` receives the host's
+/// mounts but does not send its own (the network namespaces' bind mounts).
+/// From then on the process is uid 0 inside: no capability in the initial
+/// namespace, all capabilities in Kronik's.
+///
+/// Refused unless the process has one thread (the kernel requires it; call
+/// this before any thread starts), the namespace is owned by this
+/// process's uid, and its uid and gid maps are `maps` exactly: never a
+/// namespace that maps host root, or ids that are not ours.
+pub fn enter_userns(path: &Path, maps: &(IdMap, IdMap)) -> io::Result<()> {
+    let n = threads()?;
+    if n != 1 {
+        return Err(io::Error::other(format!(
+            "entering the user namespace {} needs a process with one thread, not {n}",
+            path.display()
+        )));
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let safe = |map: &IdMap, owner: u32| {
+        map.len() == 2
+            && map[0] == [0, owner, 1]
+            && owner != 0
+            && map[1][0] == 1
+            && map[1][1] >= crate::subid::FLOOR
+            && map[1][2] == COUNT - 1
+            && map[1][1]
+                .checked_add(map[1][2])
+                .is_some_and(|end| !(map[1][1]..end).contains(&owner))
+    };
+    // SAFETY: getegid has no preconditions and cannot fail.
+    if !safe(&maps.0, me) || !safe(&maps.1, unsafe { libc::getegid() }) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe namespace map",
+        ));
+    }
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let ns = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    match inspect_userns_fd(&ns)? {
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} is no pinned user namespace", path.display()),
+            ));
+        }
+        Some(p) if p.owner != me => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "the user namespace {} is owned by uid {}, not by this process's uid {me}",
+                    path.display(),
+                    p.owner
+                ),
+            ));
+        }
+        Some(p) => match p.maps {
+            Ok(m) if m == *maps => {}
+            Ok(m) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "the user namespace {} maps uids {:?} and gids {:?}, not {:?} and {:?}",
+                        path.display(),
+                        m.0,
+                        m.1,
+                        maps.0,
+                        maps.1
+                    ),
+                ));
+            }
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "reading the maps of {}: {e}",
+                    path.display()
+                )));
+            }
+        },
+    }
+    // SAFETY: setns on an open namespace file; it changes this process's
+    // credentials and nothing in memory.
+    if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWUSER) } != 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(
+            e.kind(),
+            format!("entering the user namespace {}: {e}", path.display()),
+        ));
+    }
+    // SAFETY: unshare without shared state; allowed with CAP_SYS_ADMIN in
+    // the namespace just entered.
+    check(
+        unsafe { libc::unshare(libc::CLONE_NEWNS) },
+        "unshare(CLONE_NEWNS)",
+    )?;
+    // SAFETY: a propagation change takes no source, type or data.
+    check(
+        unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_SLAVE,
+                std::ptr::null(),
+            )
+        },
+        "making / a slave mount",
+    )
 }
 
 /// This process's cgroup v2 path (`0::<path>` in `/proc/self/cgroup`):
@@ -267,6 +1286,133 @@ pub fn own_cgroup() -> io::Result<String> {
 /// The directory of `cgroup` under `/sys/fs/cgroup`.
 pub fn cgroup_dir(cgroup: &str) -> PathBuf {
     Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/'))
+}
+
+/// Whether this process may move processes into `cgroup` and turn on its
+/// children's controllers: systemd delegated it (`Delegate=yes`).
+pub fn cgroup_delegated(cgroup: &str) -> bool {
+    let dir = cgroup_dir(cgroup);
+    ["cgroup.procs", "cgroup.subtree_control"]
+        .iter()
+        .all(|f| OpenOptions::new().write(true).open(dir.join(f)).is_ok())
+}
+
+/// When this process's cgroup C is delegated to it, moves the process into
+/// `C/daemon` and returns C, under which the sandboxes' cgroups then go
+/// (ADR 0061): a cgroup whose children get controllers may hold no process
+/// itself. `None` when C is not delegated.
+pub fn cgroup_leaf() -> io::Result<Option<String>> {
+    let own = own_cgroup()?;
+    if !cgroup_delegated(&own) {
+        return Ok(None);
+    }
+    let leaf = cgroup_dir(&own).join("daemon");
+    match fs::create_dir(&leaf) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("creating {}: {e}", leaf.display()),
+            ));
+        }
+        _ => {}
+    }
+    fs::write(leaf.join("cgroup.procs"), std::process::id().to_string())
+        .map_err(|e| io::Error::new(e.kind(), format!("moving into {}: {e}", leaf.display())))?;
+    Ok(Some(own))
+}
+
+/// Makes this process `uid` and `gid` for good, without supplementary
+/// groups: an offline command run as root that works on the non-root
+/// daemon's data directory. Call it while the process has one thread.
+pub fn become_user(uid: u32, gid: u32) -> io::Result<()> {
+    if uid == 0 || gid == 0 || uid == u32::MAX || gid == u32::MAX || threads_settled(1)? != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "becoming a service user requires valid nonroot IDs and one thread",
+        ));
+    }
+    // SAFETY: plain credential system calls; setgroups reads no memory
+    // with a count of 0.
+    unsafe {
+        check(libc::setgroups(0, std::ptr::null()), "setgroups")?;
+        check(libc::setresgid(gid, gid, gid), "setresgid")?;
+        check(libc::setresuid(uid, uid, uid), "setresuid")?;
+        // UID transitions reset dumpability; protect preloaded keys before
+        // any later capability/NNP operation can fail.
+        check(
+            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0),
+            "PR_SET_DUMPABLE",
+        )?;
+    }
+    clear_capabilities()
+}
+
+/// Trusted executable-fixture seam, not a daemon option: expose only owned
+/// identity/runtime directories in a private mount view. It does not isolate
+/// PID 1 or systemctl; installed-service tests need their own service manager.
+pub fn bootstrap_owned_rootless_fixture(etc: &Path, run: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    if !is_root() || threads()? != 1 {
+        return Err(io::Error::other(
+            "fixture bootstrap requires one root thread",
+        ));
+    }
+    let open = |path: &Path| -> io::Result<File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fixture view is not privately root-owned",
+            ));
+        }
+        Ok(file)
+    };
+    // SAFETY: one setup thread; mount propagation is cut before either bind.
+    check(
+        unsafe { libc::unshare(libc::CLONE_NEWNS) },
+        "unsharing fixture mounts",
+    )?;
+    check(
+        unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_PRIVATE | libc::MS_REC,
+                std::ptr::null(),
+            )
+        },
+        "privatizing fixture mounts",
+    )?;
+    // Ordinary directory FDs from the old mount namespace cannot be bind sources here.
+    let sources = [open(etc)?, open(run)?];
+    for (file, target) in sources.iter().zip([c"/etc", c"/run"]) {
+        let source = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .map_err(|_| io::Error::other("descriptor path"))?;
+        let context = if target == c"/etc" {
+            "binding owned /etc fixture view"
+        } else {
+            "binding owned /run fixture view"
+        };
+        // SAFETY: source descriptor is held and target is one fixed directory.
+        check(
+            unsafe {
+                libc::mount(
+                    source.as_ptr(),
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            },
+            context,
+        )?;
+    }
+    Ok(())
 }
 
 /// Fixed inputs for the child-only Firecracker jail; never an operator command template.
@@ -593,6 +1739,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_maps_never_validate_a_prefix() {
+        assert_eq!(
+            parse_map("0 1000 1\n1 200000 65535\n"),
+            [[0, 1000, 1], [1, 200000, 65535]]
+        );
+        for text in ["0 1000 1 extra\n", "0 1000 1\nbroken\n", "0 1000 0\n"] {
+            assert!(parse_map(text).is_empty());
+        }
+    }
+
+    #[test]
+    fn the_acceptor_needs_the_identity_uid_map_and_one_unprivileged_uid() {
+        const IDENTITY: &str = "         0          0 4294967295\n";
+        assert_eq!(check_acceptor_view(IDENTITY, [1000; 3]), Ok(()));
+        // The maps of a rootless container and of a nested user namespace, an
+        // identity map with another line, an empty and a malformed one.
+        for map in [
+            "         0       1000          1\n         1     100000      65536\n",
+            "      1000       1000          1\n",
+            "         0          0          1\n",
+            "         0          0 4294967295\n         5          5          1\n",
+            "",
+            "garbage\n",
+        ] {
+            assert_eq!(
+                check_acceptor_view(map, [1000; 3]),
+                Err(AcceptorRefusal::UserNamespace),
+                "{map:?}"
+            );
+        }
+        // A saved or real uid that differs, even when the effective uid is right.
+        for ids in [[1000, 1000, 0], [0, 1000, 1000], [1000, 1001, 1000]] {
+            assert!(
+                matches!(
+                    check_acceptor_view(IDENTITY, ids),
+                    Err(AcceptorRefusal::Uids { .. })
+                ),
+                "{ids:?}"
+            );
+        }
+        assert_eq!(
+            check_acceptor_view(IDENTITY, [0, 0, 0]),
+            Err(AcceptorRefusal::Root)
+        );
+        // The refusals say what to do.
+        let nested = check_acceptor_view("0 1000 1\n", [1000; 3])
+            .unwrap_err()
+            .to_string();
+        assert!(nested.contains("Rootless containers"), "{nested}");
+        assert!(nested.contains("nested user namespaces"), "{nested}");
+        assert!(nested.contains("--init --root"), "{nested}");
+        let uids = check_acceptor_view(IDENTITY, [1000, 1000, 0])
+            .unwrap_err()
+            .to_string();
+        assert!(uids.contains("saved 0"), "{uids}");
+    }
+
+    #[test]
+    fn credential_sentinels_are_rejected_before_any_identity_change() {
+        // SAFETY: credential reads have no preconditions.
+        let before = unsafe { (libc::geteuid(), libc::getegid()) };
+        let dir = tempfile::tempdir().unwrap();
+        let pin = dir.path().join("must-not-exist");
+        let range = Range {
+            start: 200000,
+            count: COUNT,
+        };
+        for (uid, gid) in [(0, 1001), (1001, 0), (u32::MAX, 1001), (1001, u32::MAX)] {
+            assert!(become_user(uid, gid).is_err());
+            assert!(pin_userns(uid, gid, range, range, &pin).is_err());
+        }
+        assert!(!pin.exists());
+        // SAFETY: as above.
+        assert_eq!(unsafe { (libc::geteuid(), libc::getegid()) }, before);
+    }
+
+    #[test]
     fn cgroups_cannot_escape_or_name_the_delegated_parent() {
         assert!(validate_child_cgroup("/unit", "/unit/vm-a").is_ok());
         assert!(validate_child_cgroup("", "/vm-a").is_ok());
@@ -606,6 +1829,20 @@ mod tests {
         ] {
             assert!(validate_child_cgroup("/unit", path).is_err(), "{path}");
         }
+    }
+
+    #[test]
+    fn namespace_inspection_rejects_symlink_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pin");
+        std::os::unix::fs::symlink("/proc/self/ns/user", &path).unwrap();
+        assert!(inspect_userns(&path).is_err());
+        let ns = File::open("/proc/self/ns/user").unwrap();
+        assert!(inspect_userns_fd(&ns).unwrap().is_some());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "replacement").unwrap();
+        assert!(inspect_userns(&path).unwrap().is_none());
+        assert!(inspect_userns_fd(&ns).unwrap().is_some());
     }
 
     #[test]
@@ -760,6 +1997,125 @@ mod tests {
                 "{case}: {text}"
             );
         }
+    }
+
+    /// Sends one byte with `count` copies of `fd` in one control message.
+    fn send_descriptors(sock: libc::c_int, fd: libc::c_int, count: usize) {
+        let mut byte = 1u8;
+        let mut iov = libc::iovec {
+            iov_base: (&raw mut byte).cast(),
+            iov_len: 1,
+        };
+        let fds = vec![fd; count];
+        let data = count * std::mem::size_of::<libc::c_int>();
+        // SAFETY: the buffer is sized by CMSG_SPACE and aligned as a cmsghdr.
+        let mut control = vec![0u64; unsafe { libc::CMSG_SPACE(data as u32) } as usize / 8 + 1];
+        // SAFETY: msghdr is a plain C struct; the pointers set below point at
+        // locals that outlive sendmsg.
+        unsafe {
+            let mut hdr: libc::msghdr = std::mem::zeroed();
+            hdr.msg_iov = &raw mut iov;
+            hdr.msg_iovlen = 1;
+            hdr.msg_control = control.as_mut_ptr().cast();
+            hdr.msg_controllen = libc::CMSG_SPACE(data as u32) as _;
+            let c = libc::CMSG_FIRSTHDR(&raw const hdr);
+            (*c).cmsg_level = libc::SOL_SOCKET;
+            (*c).cmsg_type = libc::SCM_RIGHTS;
+            (*c).cmsg_len = libc::CMSG_LEN(data as u32) as _;
+            std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(c).cast(), count);
+            assert_eq!(libc::sendmsg(sock, &raw const hdr, 0), 1);
+        }
+    }
+
+    /// How many descriptors of this process name `path`.
+    fn descriptors_on(path: &Path) -> usize {
+        fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter(|e| fs::read_link(e.path()).is_ok_and(|target| target == path))
+            .count()
+    }
+
+    #[test]
+    fn a_message_with_more_descriptors_than_one_is_refused_and_none_of_them_leak() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let held = File::create(&marker).unwrap();
+        let mut pair = [0; 2];
+        // SAFETY: socketpair writes two descriptors.
+        check(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    pair.as_mut_ptr(),
+                )
+            },
+            "socketpair",
+        )
+        .unwrap();
+        // SAFETY: both are fresh and owned here.
+        let (a, b) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+        let mut buf = [0u8; 4];
+        // One descriptor is the protocol: it arrives, close-on-exec.
+        send_descriptors(a.as_raw_fd(), held.as_raw_fd(), 1);
+        let (n, fd) = recv_with_fd(b.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(n, 1);
+        let fd = fd.expect("one descriptor");
+        assert_eq!(descriptors_on(&marker), 2);
+        // SAFETY: F_GETFD takes no pointer.
+        assert_ne!(
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        drop(fd);
+        assert_eq!(descriptors_on(&marker), 1);
+        // No descriptor at all is a message, not an error.
+        send_descriptors(a.as_raw_fd(), held.as_raw_fd(), 0);
+        assert!(matches!(
+            recv_with_fd(b.as_raw_fd(), &mut buf),
+            Ok((1, None))
+        ));
+        // Two in one control message are refused, and both are closed again.
+        send_descriptors(a.as_raw_fd(), held.as_raw_fd(), 2);
+        let error = recv_with_fd(b.as_raw_fd(), &mut buf).unwrap_err();
+        assert!(
+            error.to_string().contains("more than one descriptor"),
+            "{error}"
+        );
+        assert_eq!(descriptors_on(&marker), 1, "a received descriptor leaked");
+        // More than the control buffer holds: the kernel truncates the message,
+        // which is refused, and what it installed is closed too.
+        send_descriptors(a.as_raw_fd(), held.as_raw_fd(), 7);
+        let error = recv_with_fd(b.as_raw_fd(), &mut buf).unwrap_err();
+        assert!(error.to_string().contains("more descriptors"), "{error}");
+        assert_eq!(descriptors_on(&marker), 1, "a received descriptor leaked");
+    }
+
+    #[test]
+    fn the_record_of_a_pin_names_its_owner_and_the_namespace_and_is_written_once() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let pin = dir.path().join("user");
+        let stand_in = File::create(&pin).unwrap();
+        let meta = stand_in.metadata().unwrap();
+        write_pin_record(&pin, 998, &stand_in).unwrap();
+        let record = pin.with_extension("owner");
+        assert_eq!(
+            fs::read_to_string(&record).unwrap(),
+            format!("1 998 {} {}\n", meta.dev(), meta.ino())
+        );
+        assert_eq!(
+            fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // An existing record is never overwritten, a link in its place is not followed.
+        assert!(write_pin_record(&pin, 999, &stand_in).is_err());
+        fs::remove_file(&record).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), &record).unwrap();
+        assert!(write_pin_record(&pin, 998, &stand_in).is_err());
+        assert!(!dir.path().join("elsewhere").exists());
     }
 
     const DESCRIPTOR_CHILD: &str = "KRONIK_TEST_CLOSE_DESCRIPTORS";
