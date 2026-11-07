@@ -295,6 +295,12 @@ overlap.
   pruning to `snapshots_kept`, the shutdown snapshot.
 - Startup without `state.db` from the newest snapshot plus the log; a
   compacted log without a usable snapshot is `STORAGE_CORRUPT`.
+- An actor database that has not changed since before the log start:
+  the restart after a compaction works; a directory an older binary
+  compacted is repaired by the start (install stamps), and `kronik upgrade
+  check` says so (or refuses with the start's words); the order of a pass is
+  pinned by hooks (a crash after the raise deletes nothing, a crash after a
+  delete leaves a log every database reaches).
 - Replay from a snapshot: identity and +2 diffs equal those from LSN 1.
 - Retention: old segments deleted only when covered by a kept snapshot;
   forks outside the window refused; history/trace end at the window.

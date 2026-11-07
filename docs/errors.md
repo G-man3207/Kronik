@@ -995,6 +995,8 @@ To fix it, stop the daemon and keep the data directory as it is; do not delete o
 
     kronik restore --from s3://bucket/kronik
 
+The message "state is at lsn N, but the log starts at M (compacted)" is a different case and does not mean corruption: an actor database that has not changed for longer than `[retention] history` is behind the log that retention kept. Releases up to v0.4.0 can stop at the start for this; the fix raises those databases before it deletes log, and repairs such a directory at the next start from the newest snapshot. `kronik upgrade check` reports it before the restart. See "A start that stops at the log's start" in the operations guide.
+
 See also: [`segment`](concepts/glossary.md#segment), [`snapshot`](concepts/glossary.md#snapshot).
 
 ## SUBJECT_ERASED

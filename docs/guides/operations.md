@@ -1709,7 +1709,7 @@ operator meets:
 | Code | When | What to do |
 |---|---|---|
 | `BAD_REQUEST` at start | `kronik.toml` has an unknown key or a bad value | Fix the line the message names (`kronik doctor` checks the file too) |
-| `STORAGE_CORRUPT` | The data directory is inconsistent: `state.db` is ahead of the log, or a log record can't be read | Keep a copy of the data directory and look at the message. `state.db` is materialized from the log and can be rebuilt by moving it away and starting again; the log itself must not be edited |
+| `STORAGE_CORRUPT` | The data directory is inconsistent: `state.db` is ahead of the log, or a log record can't be read. "state is at lsn N, but the log starts at M (compacted)": see [A start that stops at the log's start](#a-start-that-stops-at-the-logs-start) | Keep a copy of the data directory and look at the message. `state.db` is materialized from the log and can be rebuilt by moving it away and starting again; the log itself must not be edited |
 | `UNAVAILABLE` | The node stopped after a storage failure (also `/healthz` 503) | The daemon exits and systemd restarts it; check the disk (`kronik doctor`'s `disk` check) and the journal |
 | `GATEWAY_TIMEOUT` | A turn took longer than `[gateway] timeout` | The turn still completes; clients that retry with the same `Idempotency-Key` get its response |
 | `PAYLOAD_TOO_LARGE` | A request body over 1 MiB | v0.1's limit |
@@ -1727,6 +1727,37 @@ If the daemon won't start, `journalctl -u kronik` shows why: the config
 error with its line, a port already in use (another process on 443 or 80),
 or `STORAGE_CORRUPT`. If `/metrics` is missing, the admin port was taken
 (the log has a warning); set `admin_listen` to a free port.
+
+### A start that stops at the log's start
+
+`kronik serve` stops with `STORAGE_CORRUPT: state is at lsn N, but the log
+starts at M (compacted); install a snapshot that reaches it or restore one`.
+Nothing is lost: the data directory is as it was.
+
+**What it means.** The start replays the log from the lowest applied LSN of
+`state.db` and of every actor database, and an actor database's applied LSN
+is where that actor's last change was. Retention deletes log older than
+`[retention] history` (7 days by default). An actor with an SQL database that
+has not changed for longer than that, for example one actor instance per
+customer key that is idle for a week, is behind the log that is left, and the
+start refuses. Releases up to and including v0.4.0 do this; a release with the
+fix raises those databases before it deletes, and repairs a directory an older
+release compacted, at the next start, from the newest snapshot (it logs
+`installed a snapshot as the branch's state`).
+
+**What to do on a release without the fix.**
+- `kronik upgrade check` passes on such a directory; do not read it as a
+  promise that the start works.
+- A full restore from a backup or a shipped bucket that still has the
+  records ([Restore](../runbooks/restore.md)), or the release with the fix.
+- Before it happens: an actor with a single instance and an SQL database can
+  be kept current by a heartbeat, a turn that changes its SQL more often than
+  `history`. That does not scale to one instance per key.
+- `snapshots_kept` does not help: more snapshots do not change what the actor
+  databases say.
+- Do not edit the databases or the log by hand: a wrong edit discards
+  changes without a message. Keep a copy of the data directory and ask for
+  help.
 
 ### Secrets that an external backend no longer serves
 
