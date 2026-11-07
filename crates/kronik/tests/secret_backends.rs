@@ -158,6 +158,8 @@ enum Mode {
     Up,
     /// Answers 503 to everything.
     Unavailable,
+    /// Answers 403 to everything, as a backend does for credentials it refuses.
+    Forbidden,
     /// Holds every request until the mode changes.
     Hang,
 }
@@ -212,6 +214,9 @@ impl Bao {
         }
         if g.mode == Mode::Unavailable {
             return Resp::json(503, &json!({"errors": ["Vault is sealed"]}));
+        }
+        if g.mode == Mode::Forbidden {
+            return Resp::json(403, &json!({"errors": ["permission denied"]}));
         }
         if request.headers.get("x-vault-token").map(String::as_str) != Some(BAO_TOKEN) {
             return Resp::json(403, &json!({"errors": ["permission denied"]}));
@@ -1943,4 +1948,167 @@ fn a_fork_replays_the_secret_errors_that_production_recorded() {
     assert_eq!(bao.requests(), requests, "the fork asked the backend");
     assert!(target.seen("/hook").is_empty(), "the fork sent the request");
     assert_closed_when_quiet(&d, "a fork replay of the outage");
+}
+
+/// The turn records of `actor` that came from an HTTP request.
+fn http_turns(dir: &Path, actor: &str) -> Vec<pb::TurnRecord> {
+    log_records(dir)
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::TurnRecord(t) => Some(t),
+            _ => None,
+        })
+        .filter(|t| {
+            t.actor
+                .as_ref()
+                .is_some_and(|a| format!("{}/{}", a.kind, a.key) == actor)
+                && matches!(
+                    t.input.as_ref().and_then(|i| i.kind.as_ref()),
+                    Some(pb::input::Kind::Http(_))
+                )
+        })
+        .collect()
+}
+
+/// The lines of the daemon's log about secrets that could not be fetched.
+fn fetch_failures(d: &Daemon) -> Vec<String> {
+    d.serve_log()
+        .lines()
+        .filter(|line| line.contains("secret fetch failed"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A secret that cannot be had ends its effect with `SECRET_UNAVAILABLE`
+/// whatever the reason: an outage, a refusal, a configuration that no longer
+/// has the backend. The guest is told no more; the log says which. A refusal
+/// used to close the turn before the guest could decide, as failed with
+/// `SECRET_VERSION_GONE` and a text about a recorded reveal.
+fn assert_the_effects_failed_as_unavailable(dir: &Path, target: &Target) {
+    let sent = message_turns(dir, "counter/h", "hmac");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let effect = &sent[0].effects;
+    assert_eq!(effect.len(), 1, "{effect:?}");
+    assert_eq!(
+        (
+            effect[0].kind.as_str(),
+            effect[0].status,
+            effect[0].error.as_str()
+        ),
+        (
+            "crypto.hmac-sha256",
+            pb::EffectStatus::Denied as i32,
+            "SECRET_UNAVAILABLE: stripe"
+        ),
+        "{effect:?}"
+    );
+    let outcome = sent[0].outcome.as_ref().unwrap();
+    assert_eq!(outcome.kind, pb::OutcomeKind::Failed as i32, "{outcome:?}");
+    assert!(
+        outcome.message.contains("SECRET_UNAVAILABLE"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.message.contains("recoverable"), "{outcome:?}");
+    assert_ne!(outcome.error_code, "SECRET_VERSION_GONE", "{outcome:?}");
+
+    let requests = http_turns(dir, "counter/h");
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let effect = &requests[0].effects;
+    assert_eq!(effect.len(), 1, "{effect:?}");
+    assert_eq!(
+        (
+            effect[0].kind.as_str(),
+            effect[0].status,
+            effect[0].error.as_str()
+        ),
+        (
+            "http.fetch",
+            pb::EffectStatus::Network as i32,
+            "SECRET_UNAVAILABLE"
+        ),
+        "{effect:?}"
+    );
+    assert!(
+        target.seen("/hook").is_empty(),
+        "the request had no credential"
+    );
+    assert_eq!(open_turns(dir), 0, "a turn was left open");
+}
+
+/// Both requests of the two tests below: one through the gateway whose handler
+/// fails on the error, one `send` of an HMAC.
+fn ask_for_the_secret_twice(d: &Daemon, target: &Target) {
+    let gw = d.get("/v1/health")["http_listen"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, body) = gateway(&gw, "/counter/h/fetch", &fetch_spec(target), Some("K-R"));
+    assert_eq!(status, 500, "{body}");
+    assert!(body.contains("TURN_FAILED"), "{body}");
+    let (status, answer) = d.api(
+        "POST",
+        "/v1/actors/counter/h/messages",
+        json!({"name": "hmac", "text": "stripe\npayload", "reason": "a refusal"}),
+    );
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["outcome"]["kind"], "failed", "{answer}");
+}
+
+#[test]
+fn a_backend_that_refuses_ends_the_effect_like_an_outage_and_the_log_says_why() {
+    let Linked { mut d, bao, dir } = linked();
+    let target = Target::start();
+    d.grant("counter", "http:127.0.0.1", Some("idempotency-keyed"));
+    d.kill9();
+    bao.set_mode(Mode::Forbidden);
+    d = Daemon::start(dir.path(), Some(&bao), "1s");
+    ask_for_the_secret_twice(&d, &target);
+    assert_the_effects_failed_as_unavailable(dir.path(), &target);
+
+    // The operator finds the reason in the log: a line when the refusal is
+    // first remembered (the background cycle asks too, so it may come before
+    // the first turn, and again for each window in which it lasts). It names
+    // the secret, the backend and the version asked for, and has neither the
+    // credential nor the words of the provider.
+    let lines = fetch_failures(&d);
+    assert!(!lines.is_empty(), "no line in the log");
+    for line in &lines {
+        for part in ["name=stripe", "backend=bao", "reason=denied"] {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+    }
+    // The start-up inventory asked for the recorded version by its id, the
+    // turns and the cycle for the current one.
+    assert!(
+        lines.iter().any(|line| line.contains("version=current")),
+        "{lines:?}"
+    );
+    let log = d.serve_log();
+    assert!(!log.contains(BAO_TOKEN), "the credential is in the log");
+    assert!(
+        !log.contains("permission denied"),
+        "the provider's words are in the log"
+    );
+    assert_closed_when_quiet(&d, "a backend that refuses");
+}
+
+/// The configuration no longer has the backend that the link names: the node
+/// cannot trust the binding, asks nobody, and says so.
+#[test]
+fn a_name_whose_backend_is_no_longer_configured_ends_the_effect_and_the_log_says_so() {
+    let Linked { mut d, dir, .. } = linked();
+    let target = Target::start();
+    d.grant("counter", "http:127.0.0.1", Some("idempotency-keyed"));
+    d.kill9();
+    d = Daemon::start(dir.path(), None, "1s");
+    ask_for_the_secret_twice(&d, &target);
+    assert_the_effects_failed_as_unavailable(dir.path(), &target);
+    let lines = fetch_failures(&d);
+    assert!(!lines.is_empty(), "no line in the log");
+    for line in &lines {
+        for part in ["name=stripe", "backend=bao", "reason=binding"] {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+    }
+    assert_closed_when_quiet(&d, "a backend that is no longer configured");
 }

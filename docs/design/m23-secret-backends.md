@@ -543,11 +543,13 @@ secrets, and only once Kronik has no usable value.
       backend binding that the node does not trust; a name that does not exist
       is `SECRET_NOT_FOUND`. This is like a network error, and the guest sees
       an error it can handle, the same one in each case: a guest should not
-      learn the state of the node's credentials. The result is recorded before
-      the guest sees it, like every effect result: status `network` for
-      `http.fetch`, `denied` for `crypto.*` and `secret.reveal`, with the
-      error in `error`. Nothing is sent. Replay and forks return the recorded
-      error, and a crash re-run of the turn does not ask the backend again.
+      learn the state of the node's credentials. The log has the reason
+      (`secret fetch failed`, with the secret, the backend and a category).
+      The result is recorded before the guest sees it, like every effect
+      result: status `network` for `http.fetch`, `denied` for `crypto.*` and
+      `secret.reveal`, with the error in `error`. Nothing is sent. Replay and
+      forks return the recorded error, and a crash re-run of the turn does not
+      ask the backend again.
     - The turn is not failed by Kronik, and nothing else waits. The guest
       decides: a handler that fails with the error ends the turn as failed
       (`TURN_FAILED`; a message or timer becomes a dead letter), one that

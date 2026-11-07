@@ -1589,7 +1589,8 @@ backend fails with `SECRET_UNAVAILABLE` inside its turn when the node holds no
 value for it and cannot get one: the backend does not answer within
 `[secrets] fetch_timeout` (default 2 s), or it refuses (bad credentials, an
 answer that Kronik cannot use), or the configuration no longer has the backend
-that the link names. The guest is told the same in every case.
+that the link names. The guest is told the same in every case; the log says
+which.
 
 - The error is recorded in the turn before the guest sees it, as for a network
   error: the turn is in `kronik history ACTOR`, and its effect carries the
@@ -1604,6 +1605,15 @@ that the link names. The guest is told the same in every case.
   recorded answer until `[gateway] idempotency_ttl` has passed, and nothing is
   sent. To try again, use a new key. For a dead letter, wait until the backend
   answers, then `kronik dead-letters resend ID --reason "..."`.
+- The log has one warning, `secret fetch failed`, with the name of the secret,
+  the id of the backend, the version asked for (`current`, or the provider's
+  own id of a recorded one) and a reason: `unavailable` (no answer in time),
+  `denied` (the backend refused: check the credentials and the policy),
+  `invalid` (an answer that Kronik cannot use) or `binding` (the configuration
+  no longer has the backend, or not the same). It comes once for each 5 s in
+  which the failure is remembered, whoever asked, a turn or the background
+  refresh, and never has a body, a credential or a value. Fix the cause, then
+  resend the dead letters.
 - Turns that need no external secret, or whose secret the node holds, run as
   usual during the outage. After a crash, a turn that had not yet got its
   secret waits for an outage to end and then runs; one that had recorded the

@@ -80,6 +80,34 @@ fn backend_error(error: BackendError) -> ApiError {
         BackendError::VersionGone | BackendError::Denied | BackendError::Invalid => gone(),
     }
 }
+
+/// The word for the log when a provider call failed: `None` for the answers
+/// that are not a failure of the backend (a name that does not exist, a caller
+/// whose lease ended).
+fn failure_reason(error: BackendError) -> Option<&'static str> {
+    match error {
+        BackendError::Unavailable => Some("unavailable"),
+        BackendError::Denied => Some("denied"),
+        BackendError::Invalid => Some("invalid"),
+        BackendError::VersionGone => Some("version-gone"),
+        BackendError::NotFound | BackendError::Unauthorized => None,
+    }
+}
+/// The line for an operator when a secret cannot be had from its backend: the
+/// name, the id of the backend in the configuration, the provider's own id of
+/// the version (`current` when the current one was asked for) and a category.
+/// The guest is told no more than "unavailable"; this is where the cause is.
+/// Never a body, a credential or a value.
+fn warn_fetch_failed(scope: &Scope, version: Option<&str>, reason: &str) {
+    tracing::warn!(
+        target: "kronik::secrets",
+        name = %scope.name,
+        backend = %scope.backend,
+        version = %version.unwrap_or("current"),
+        reason = %reason,
+        "secret fetch failed"
+    );
+}
 fn system_audit(env: &Env, reason: &str) -> pb::Audit {
     pb::Audit {
         token_id: "system".into(),
@@ -665,17 +693,32 @@ impl SecretCache {
     fn failure(&self, scope: &Scope, error: BackendError) {
         self.failure_version(scope, None, error);
     }
+    /// Remembers that the provider failed for `scope`, and for `version` when
+    /// it is that one version, and says so in the log. The line comes when no
+    /// failure for the same key is remembered yet, whoever asked (a turn or the
+    /// background cycle): one line for each `NEGATIVE_TTL` of a lasting failure.
     fn failure_version(&self, scope: &Scope, version: Option<&str>, error: BackendError) {
         // A caller's lease ending says nothing about the backend or the version:
         // never cache it as a negative observation.
         if error == BackendError::Unauthorized {
             return;
         }
+        // `fetched` reports a backend that the node does not trust (not
+        // configured, another binding, a reference it does not allow) as
+        // `Invalid`; the operator should read what is wrong.
+        let reason = if error == BackendError::Invalid && !self.trusted(scope) {
+            Some("binding")
+        } else {
+            failure_reason(error)
+        };
         let mut state = lock(&self.state);
-        state.negative.insert(
-            (scope.clone(), version.map(str::to_owned)),
-            (self.env.clock.monotonic(), error),
-        );
+        let key = (scope.clone(), version.map(str::to_owned));
+        let now = self.env.clock.monotonic();
+        let first = state
+            .negative
+            .get(&key)
+            .is_none_or(|(at, _)| now.saturating_sub(*at) >= NEGATIVE_TTL);
+        state.negative.insert(key, (now, error));
         state.revision = state.revision.wrapping_add(1);
         let retired = Self::retire_certificate(&mut state);
         if error != BackendError::Unavailable {
@@ -695,6 +738,9 @@ impl SecretCache {
         }
         drop(state);
         drop(retired);
+        if first && let Some(reason) = reason {
+            warn_fetch_failed(scope, version, reason);
+        }
     }
     fn negative(&self, scope: &Scope) -> Option<BackendError> {
         self.negative_version(scope, None)
