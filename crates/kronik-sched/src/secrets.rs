@@ -2816,6 +2816,9 @@ impl Node {
         let captured_at = prior
             .as_ref()
             .map_or_else(|| self.env.clock.monotonic(), |capture| capture.at);
+        // The cached path reuses the catalogue captured by the last full
+        // rebuild, and only while that capture is younger than `refresh`
+        // (see the install below); an older one needs a full rebuild.
         if self.env.clock.monotonic().saturating_sub(captured_at) > runtime.settings.refresh {
             return Err(unavailable());
         }
@@ -3179,17 +3182,40 @@ impl Node {
             .await?;
 
         let mut state = lock(&runtime.cache.state);
+        // A certificate is as old as the capture it was built from, and a
+        // capture older than `[secrets] refresh` is not installed: it would
+        // be due for the next rebuild already. The trap is that a rebuild
+        // which takes longer than `refresh` therefore never installs one,
+        // and every read that scrubs against the inventory answers
+        // SECRET_UNAVAILABLE for as long as that holds (a `refresh` set
+        // below what the scan needs, or a machine too slow for it). Keep
+        // `refresh` well above the `elapsed_ms` of "secret inventory
+        // certified"; when the age is what failed the install, the log
+        // says so.
+        let age = self.env.clock.monotonic().saturating_sub(captured_at);
+        let too_old = age > runtime.settings.refresh;
         if !state.bound_runtime.ptr_eq(&Arc::downgrade(runtime))
             || state.revision != revision
             || self.epoch() != epoch
             || state.native_current.capture_revision() != Some(native_revision)
-            || self.env.clock.monotonic().saturating_sub(captured_at) > runtime.settings.refresh
+            || too_old
             || state.registry.iter().any(|(key, row)| {
                 active(row)
                     && (!row.deleted || !row.version_hash.is_empty())
                     && !state.values.contains_key(key)
             })
         {
+            drop(state);
+            if too_old {
+                tracing::warn!(
+                    target: "kronik::secrets",
+                    age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+                    refresh_ms =
+                        u64::try_from(runtime.settings.refresh.as_millis()).unwrap_or(u64::MAX),
+                    "the catalogue the secret inventory was built from is older than \
+                     [secrets] refresh; its certificate was not installed"
+                );
+            }
             return Err(unavailable());
         }
         if !SecretCache::finish_file_corpus(&mut state, &file_changes) {
