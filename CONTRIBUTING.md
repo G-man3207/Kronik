@@ -61,9 +61,11 @@ needs root and `runsc` and is skipped with a message otherwise; without
 libfaketime, `identity` skips `todo-ts` the same way. Run as root, the
 `foreign` step also runs, under `KRONIK_FOREIGN_TESTS=require`, the
 rehearsals of the microVM launcher (`sys::tests` of `kronik-foreign`), the
-installer's hand-over of a data directory to another user and the key
-source's work in a tree that another user owns, so that a host that cannot
-run them fails the step instead of leaving them out. The `action` step
+installer's hand-over of a data directory to another user, the key
+source's work in a tree that another user owns and `kronik restore` as root
+into the nonroot service's directory (`--test restore_drop`, which really
+gives up root), so that a host that cannot run them fails the step instead
+of leaving them out. The `action` step
 installs checksum-verified actionlint 1.7.12 into `target/tools/` and lints
 the actual workflows and composite action; a download or lint failure
 fails the step. Its additional YAML structure checks need PyYAML.

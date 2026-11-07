@@ -213,6 +213,20 @@ is refused unless `--force`):
 `kronik restore` needs the master key file in place (or `--master-key-file`)
 only for the secrets to be usable; restore itself does not decrypt.
 
+Run as root against the data directory of the nonroot installation (a
+directory that another user owns), `restore` is split at a change of identity.
+As root it does only what needs root: it reads the master key and, for an
+`s3://` remote, the credentials (held in memory), and decrypts the keystore
+backup to check it against the key. Nothing is written, and the only things
+read in the directory are the key file and the envelope of a KMS source, by
+name. Then it gives up root for good, and the owner of the
+directory does the rest: the downloads into `DIR/.restore` (removed when the
+restore ends, and by the next restore if it was killed), the check of the
+directory's own stores against the key, and the install. A `file://` remote is
+read by the owner, so it must be readable by that user. The credentials of an
+`s3://` remote cannot be refreshed after the change, so temporary ones must
+last as long as the restore takes. The operations guide has the steps.
+
 ## 7. Upgrades (`kronik upgrade check`)
 
 The new binary checks itself against the data directory before it replaces

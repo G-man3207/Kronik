@@ -2007,6 +2007,34 @@ mod data_directory_tests {
     }
 
     #[test]
+    fn a_stage_that_a_killed_restore_left_in_the_service_users_directory_is_left_alone() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = victim(base.path());
+        let data = base.path().join("data");
+        std::fs::create_dir_all(data.join("keys")).unwrap();
+        // What a restore that was killed leaves in the directory it works in:
+        // a stage, here with a link in it that points outside.
+        std::fs::create_dir_all(data.join(".restore/snapshot")).unwrap();
+        std::os::unix::fs::symlink(&outside, data.join(".restore/branch")).unwrap();
+        let (data_before, outside_before, file_before) = (
+            ctime(&data),
+            ctime(&outside),
+            ctime(&outside.join("a.conf")),
+        );
+        tick();
+        // The directory is the service user's whatever is in it, and the
+        // installer reads nothing of it.
+        assert_eq!(
+            prepare_data_directory(&data, 0o700, service_is_me()).unwrap(),
+            DataDirectory::Owned
+        );
+        assert_eq!(ctime(&data), data_before);
+        assert_eq!(ctime(&outside), outside_before);
+        assert_eq!(ctime(&outside.join("a.conf")), file_before);
+        assert!(data.join(".restore/snapshot").is_dir());
+    }
+
+    #[test]
     fn a_missing_key_is_reported_without_looking_into_the_service_tree() {
         let base = tempfile::tempdir().unwrap();
         let data = base.path().join("data");

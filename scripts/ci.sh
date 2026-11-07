@@ -337,11 +337,17 @@ step_foreign() {
     # (all of `sys::tests` of kronik-foreign: what the launcher does in
     # namespaces of its own), the nonroot installer's hand-over of a data
     # directory to another user, and root's work in a tree that another user
-    # owns (the key source). With require, a host that cannot run them fails
-    # here instead of leaving them absent from every run.
+    # owns (the key source), and a restore as root that gives up root before it
+    # writes. With require, a host that cannot run them fails here instead of
+    # leaving them absent from every run.
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik-foreign --lib sys::tests
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --bin kronik data_directory_tests
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik-privacy --lib key_source::tests
+    # `kronik restore` as root into the nonroot service's directory, with the
+    # real drop of privileges: it needs root, a second uid and a private
+    # mount namespace in which /etc is a copy with that user.
+    KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --bin kronik restore::tests
+    KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --test restore_drop
 }
 
 # Identity replay of every example app (the Definition of done: "Identity

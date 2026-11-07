@@ -297,12 +297,26 @@ that fails leaves the directory as it was:
   backup at all): `KEYSTORE_INCOMPLETE`.
 
 Run as root against a nonroot installation (a data directory owned by the
-`kronik` user, M21), restore prepares everything as root, since only root
-may read a root-only key source, and writes nothing to the directory until it
-has dropped, for good, to the directory's owner: the key material stays in
-memory across the drop, and no file in the directory is owned by root. Against
-a root-owned directory, or as the owning user, it works as before. It refuses a
-directory owned by anyone else, and a missing directory when a Kronik user
+`kronik` user, M21), restore first does what only root can do, since only
+root may read a root-only key source: it reads the master key, the credentials
+of an S3 remote and the keystore backup. Then it gives up root, for good, and
+finishes as the directory's owner: the downloads, the checks of the
+directory's own stores and the install. The key material stays in protected
+memory across the drop; as root it writes nothing and reads in the directory
+only the key file and the envelope of a KMS source, by name, and no file in
+the directory is owned by root. The remote is read by the owner after that, so a
+`file://` target must be readable by the `kronik` user; the credentials of an
+S3 remote are read once, by root and before the drop (a token file may be
+root-only), and cannot be refreshed, so temporary credentials must last as
+long as the restore takes (a restore that
+outlives them stops with the provider's answer and installs nothing). The
+owner checks the directory's stores on copies in `$TMPDIR`, so a `TMPDIR`
+that only root can write fails the restore after the root phase, with nothing
+installed. `--dry-run` as root asks the remote as root, so it cannot tell
+whether the owner can read a `file://` target; the real run says so before it
+writes anything. Against a root-owned directory, or as the owning user, it
+works as before. It refuses
+a directory owned by anyone else, and a missing directory when a Kronik user
 namespace is pinned.
 
 Then the result is moved into place with renames: the old `state.db` is

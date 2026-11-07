@@ -481,12 +481,26 @@ pub(crate) fn as_data_dir_owner(data_dir: &Path) -> Result<(), ApiError> {
     let Some((uid, gid)) = data_dir_owner(data_dir)? else {
         return Ok(());
     };
+    become_owner(uid, gid)
+}
+
+/// Gives up root for good: the user and group of the data directory's owner,
+/// no supplementary group, no capability, no core dump, and nothing to go back
+/// to. It needs the process to have one thread, and says so if it has more.
+pub(crate) fn become_owner(uid: u32, gid: u32) -> Result<(), ApiError> {
     sys::become_user(uid, gid).map_err(|e| {
         ApiError::new(
             ErrorCode::Internal,
             format!("becoming the stable data owner {uid}:{gid}: {e}"),
         )
-    })
+    })?;
+    if rustix::process::geteuid().as_raw() != uid || rustix::process::getegid().as_raw() != gid {
+        return Err(ApiError::new(
+            ErrorCode::RootlessUnavailable,
+            "the identity of the data directory's owner was not taken",
+        ));
+    }
+    Ok(())
 }
 
 /// For a non-root command that works on the foreign actors' files (`foreign

@@ -164,20 +164,46 @@ refused.
 To move an installation:
 
 1. Ship the data, so that a snapshot, the log and the code are in the target
-   (`[ship] url`: `s3://bucket/prefix`, or `file:///dir` on this machine).
+   (`[ship] url`: `s3://bucket/prefix`, or `file:///dir` on this machine; for
+   a restore into a nonroot installation the `kronik` user must be able to
+   read a `file://` target, see step 4).
 2. Stop and disable the old unit and keep the old data directory aside.
 3. Run `kronik serve --init` (or `--init --rootless` for the nonroot
    service) against an empty data directory. For a nonroot installation that
    creates it owned by `kronik`.
 4. Run `kronik restore --from <URL>` into it. Run as root against a nonroot
-   data directory it prepares as root, drops to the directory's owner and
-   installs as that owner, so nothing in it is owned by root. The commands
-   that run as root over another user's data directory (`keys wrap`, the root
-   phase of `restore`) open the path to it from `/` without following a
-   symbolic link and only through directories that root alone can change, and
-   refuse any other path, naming the directory (a data directory under an
-   operator's home is such a path: restore into one as that operator, or
-   put the directory under a path that root controls).
+   data directory it first does what needs root: it reads the master key (a
+   root-only file, or a KMS provider's) and the credentials of an `s3://`
+   remote, and decrypts the keystore backup. Then it gives up root for good
+   and finishes as the directory's owner: the downloads, the checks of the
+   directory's own stores and the install. As root it writes nothing, and the
+   only things it reads in the directory are the key file and the envelope of
+   a KMS source, if they are there, by name through descriptors; nothing in the
+   directory ends up owned by root. Two consequences:
+   a `file://` target is read by the owner after root has been given up, so
+   it must be readable by the `kronik` user (make the directory readable by
+   that user, or restore from an `s3://` remote); and the credentials of an
+   `s3://` remote are read once, by root and before that (a token file or an
+   instance's endpoint can be root-only; the service user does not need to
+   read it), and cannot be refreshed, so temporary ones (a web identity, a pod
+   or instance role) must last as long as the restore takes. A restore that
+   outlives them stops with the provider's answer and a hint, and installs
+   nothing. Two more things to know. The directory's own stores are checked
+   against the key on copies that the owner makes in `$TMPDIR`, so a `TMPDIR`
+   that only root can write fails the restore after the root phase, with
+   nothing installed: point it at a directory the `kronik` user can write.
+   And `--dry-run` as root asks the remote as root, so it cannot tell whether
+   the owner can read a `file://` target; the real run says so before it
+   writes anything. The work is staged in `<data-dir>/.restore`, which a
+   failed restore removes; one that is killed leaves it, nothing reads it,
+   and the next restore removes it first.
+   Where root reads the key file or the envelope in the data directory, and
+   in `keys wrap`, which cannot give up root because it needs the provider's
+   credentials to the end, the path to the data directory is opened from `/`
+   without following a symbolic link and only through directories that root
+   alone can change; any other path is refused, naming the directory (a data
+   directory under an operator's home is such a path: run the command as that
+   operator, or put the directory under a path that root controls).
 5. Start the service.
 
 What is not shipped is not restored. Foreign actors' declarations are in the
@@ -1470,7 +1496,9 @@ url = "s3://my-bucket/kronik/prod"
 ```
 
 `url` may also be `file:///dir`: the daemon then ships to a directory on
-the same machine, and `kronik restore --from file:///dir` reads it back.
+the same machine, and `kronik restore --from file:///dir` reads it back (into
+a nonroot installation's directory the `kronik` user reads it, so the
+directory must be readable by that user).
 That runs the whole flow without a bucket, as the
 [quickstart](quickstart.md)'s step 9 does, but it is not a backup: the
 copy does not leave the machine.

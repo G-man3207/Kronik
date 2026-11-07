@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use clap::Args;
 use kronik_core::error::{ApiError, ErrorCode};
-use kronik_ship::{Remote, ShipError};
+use kronik_ship::{Remote, RemoteCredentials, ShipError};
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -175,31 +175,27 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
     };
     let destination = crate::cli::userns::data_dir_owner(&data)?;
     let report = if let Some((uid, gid)) = destination.filter(|_| !dry_run) {
-        let ownership = kronik_privacy::key_source::lock_data(&data).map_err(|e| e.api_error())?;
-        let prepared = rt.block_on(async {
-            let remote = Remote::open(&from, endpoint.as_deref()).map_err(ship_error)?;
-            let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
-            kronik_ship::prepare_restore(&remote, &data, &branch, &env, &keys, mode, &ownership)
-                .await
-                .map_err(ship_error)
-        })?;
-        // No runtime threads may retain root credentials across the irreversible drop.
+        // The runtime that was made above is not used: the steps below make
+        // and drop their own, on either side of the drop of privileges.
         drop(rt);
-        prepared.handover(uid, gid).map_err(ship_error)?;
-        let dropped = crate::cli::userns::as_data_dir_owner(&data);
-        kronik_privacy::key_source::protect_process().map_err(|e| e.api_error())?;
-        dropped?;
-        if rustix::process::geteuid().as_raw() != uid || rustix::process::getegid().as_raw() != gid
-        {
-            return Err(ApiError::new(
-                ErrorCode::RootlessUnavailable,
-                "destination identity changed during restore preparation",
-            ));
-        }
-        Some(
-            kronik_ship::install_prepared(&data, &branch, force, prepared, &ownership)
-                .map_err(ship_error)?,
-        )
+        let job = Job {
+            from: &from,
+            endpoint: endpoint.as_deref(),
+            data: &data,
+            branch: &branch,
+            force,
+            mode,
+            keys: &keys,
+        };
+        let mut hooks = Hooks {
+            drop_to: &crate::cli::userns::become_owner,
+            seen: &mut |_| {},
+            credentials: &remotes_credentials,
+            threads: &process_threads,
+            single: 1,
+            thread_name: "kronik",
+        };
+        Some(restore_dropping(&job, (uid, gid), &mut hooks)?)
     } else {
         rt.block_on(async {
             let remote = Remote::open(&from, endpoint.as_deref()).map_err(ship_error)?;
@@ -236,6 +232,245 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
         render(&output, &args, &data, selected_config.as_deref()),
         output,
     ))
+}
+
+/// What a restore needs to know, apart from the process it runs in.
+struct Job<'a> {
+    from: &'a str,
+    endpoint: Option<&'a str>,
+    data: &'a Path,
+    branch: &'a str,
+    force: bool,
+    mode: kronik_ship::KeystoreMode,
+    keys: &'a kronik_privacy::key_source::Keys,
+}
+
+/// The steps of [`restore_dropping`], in the order they happen. The tests pin
+/// that order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// The data directory is locked, and its owner read from what is locked.
+    Locked,
+    /// The remote's credentials are read, once, while the process may.
+    CredentialsResolved,
+    /// The key (and the destination's envelope, for a KMS source) is loaded, the
+    /// keystore backup decrypted: everything that needs root. Nothing is written.
+    RootPhase,
+    /// The runtime, its threads and the remote of the root phase are gone.
+    RuntimeJoined,
+    /// Root is given up for good.
+    Dropped,
+    /// A new runtime, and the remote again, with the credentials of before.
+    Reopened,
+    /// The data directory's owner has downloaded, checked and installed.
+    Installed,
+}
+
+/// The parts of [`restore_dropping`] that a test replaces. The drop itself
+/// cannot be rehearsed in a test process, nor can a process with one thread;
+/// what is checked there is the order, and the real drop is the subject of
+/// `tests/restore_drop.rs`.
+struct Hooks<'a> {
+    /// Gives up root: `userns::become_owner`.
+    drop_to: &'a dyn Fn(u32, u32) -> Result<(), ApiError>,
+    /// A witness of the steps.
+    seen: &'a mut dyn FnMut(Step),
+    /// Reads the credentials of the remote while the process may.
+    credentials:
+        &'a dyn Fn(&tokio::runtime::Runtime, &Job<'_>) -> Result<RemoteCredentials, ApiError>,
+    /// How many threads the process has once the runtime is gone, and how many
+    /// it may have for the drop (one: the thread that drops).
+    threads: &'a dyn Fn() -> Result<u64, ApiError>,
+    single: u64,
+    /// What the threads of the runtimes are called: `kronik`. A test that
+    /// counts them gives its restore a name of its own, because a test process
+    /// runs other tests side by side.
+    thread_name: &'a str,
+}
+
+/// The names of the threads of this process, for the message that says there
+/// are too many.
+fn thread_names() -> Vec<String> {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return Vec::new();
+    };
+    tasks
+        .flatten()
+        .map(|task| {
+            std::fs::read_to_string(task.path().join("comm"))
+                .map(|name| name.trim().to_owned())
+                .unwrap_or_else(|_| "?".into())
+        })
+        .collect()
+}
+
+/// The credentials of the remote of the job, from its own provider: the
+/// environment, a token file, the metadata of an instance or a pod. An `s3://`
+/// remote needs them for every request, and the process cannot read most of
+/// their sources once it has given up root.
+fn remotes_credentials(
+    runtime: &tokio::runtime::Runtime,
+    job: &Job<'_>,
+) -> Result<RemoteCredentials, ApiError> {
+    runtime.block_on(async {
+        Remote::open(job.from, job.endpoint)
+            .map_err(ship_error)?
+            .resolve_credentials()
+            .await
+            .map_err(ship_error)
+    })
+}
+
+/// The number of threads of this process, once a runtime that was just dropped
+/// has left the kernel's count.
+fn process_threads() -> Result<u64, ApiError> {
+    kronik_foreign::sys::threads_settled(1).map_err(|e| {
+        ApiError::new(
+            ErrorCode::Internal,
+            format!("counting the threads of the process: {e}"),
+        )
+    })
+}
+
+/// A restore into a data directory that another user owns, as root.
+///
+/// The order is the whole point, and each step is a line below:
+///
+/// 1. lock the data directory, and take the owner from the locked
+///    descriptor, not from a path;
+/// 2. read the remote's credentials (a token file only root may read, an
+///    instance's or a pod's endpoint) into memory;
+/// 3. do everything that needs root: load the key, unwrap the envelopes of a
+///    KMS source (the bucket's and the destination's), decrypt the keystore
+///    backup. Nothing is written, and the data directory's stores are not read;
+/// 4. drop the runtime, and with it every thread that might hold root;
+/// 5. give up root for good (one thread, no supplementary group, no core
+///    dump, no capability);
+/// 6. open a new runtime and the remote again, signing with the credentials of
+///    step 2 and reading no file;
+/// 7. as the owner: check the stores against the key, download into
+///    `.restore` inside the data directory, import the keystore and move it
+///    all into place.
+///
+/// A failure at any step leaves the data directory as it was.
+fn restore_dropping(
+    job: &Job<'_>,
+    expected: (u32, u32),
+    hooks: &mut Hooks<'_>,
+) -> Result<kronik_ship::RestoreReport, ApiError> {
+    // Before any secret is read: no core dump, and nothing for another
+    // process of the same user to attach to. (Taking another identity resets
+    // this on some hosts, so the drop sets it again right after.)
+    kronik_privacy::key_source::protect_process().map_err(|e| e.api_error())?;
+    // 1.
+    let ownership = kronik_privacy::key_source::lock_data(job.data).map_err(|e| e.api_error())?;
+    let owner = locked_owner(&ownership)?;
+    if owner != expected {
+        return Err(ApiError::new(
+            ErrorCode::RootlessUnavailable,
+            format!(
+                "{} changed owner to {}:{} while it was being locked, and is no longer the data directory of the stable daemon identity {}:{}",
+                job.data.display(),
+                owner.0,
+                owner.1,
+                expected.0,
+                expected.1
+            ),
+        )
+        .with_hint("Nothing was written. Fix the stopped installation's ownership and run the command again."));
+    }
+    (hooks.seen)(Step::Locked);
+    // 2. and 3., in a runtime that step 4 drops.
+    let root_runtime = runtime_named(hooks.thread_name)?;
+    let credentials = (hooks.credentials)(&root_runtime, job)?;
+    (hooks.seen)(Step::CredentialsResolved);
+    let phase = root_runtime.block_on(async {
+        let remote = Remote::open_with(job.from, job.endpoint, &credentials).map_err(ship_error)?;
+        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+        kronik_ship::root_phase(&remote, job.data, &env, job.keys, job.mode)
+            .await
+            .map_err(ship_error)
+    })?;
+    (hooks.seen)(Step::RootPhase);
+    // 4. No runtime thread may retain root credentials across the irreversible
+    //    drop: dropping the runtime joins its threads, and the count says so
+    //    before anything is given up (the drop would refuse as well).
+    drop(root_runtime);
+    let threads = (hooks.threads)()?;
+    if threads != hooks.single {
+        return Err(ApiError::new(
+            ErrorCode::Internal,
+            format!(
+                "the process still has {threads} threads after the runtime was dropped ({}), where {} is needed to give up root; nothing was written",
+                thread_names().join(", "),
+                hooks.single
+            ),
+        ));
+    }
+    (hooks.seen)(Step::RuntimeJoined);
+    // 5.
+    (hooks.drop_to)(owner.0, owner.1)?;
+    (hooks.seen)(Step::Dropped);
+    // 6.
+    let owner_runtime = runtime_named(hooks.thread_name)?;
+    let local_bucket = job.from.strip_prefix("file://");
+    let remote =
+        Remote::open_with(job.from, job.endpoint, &credentials).map_err(
+            |e| match local_bucket {
+                Some(directory) => unreadable_bucket(directory, owner, &e),
+                None => ship_error(e),
+            },
+        )?;
+    if let Some(directory) = local_bucket {
+        // A bucket directory that only root can read is not readable now.
+        owner_runtime
+            .block_on(remote.check())
+            .map_err(|e| unreadable_bucket(directory, owner, &e))?;
+    }
+    (hooks.seen)(Step::Reopened);
+    // 7.
+    let env = kronik_core::env::Env::real(owner_runtime.handle().clone());
+    let report = owner_runtime
+        .block_on(kronik_ship::restore_as_owner(
+            &remote, job.data, job.branch, job.force, &env, phase, &ownership,
+        ))
+        .map_err(ship_error)?;
+    (hooks.seen)(Step::Installed);
+    Ok(report)
+}
+
+/// The owner of the directory that is locked, from the descriptor: a path
+/// that was replaced after the lock names another directory.
+fn locked_owner(
+    ownership: &kronik_privacy::key_source::DataOwnership,
+) -> Result<(u32, u32), ApiError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = ownership.directory_resource().metadata().map_err(|e| {
+        ApiError::new(
+            ErrorCode::Internal,
+            format!("reading the locked data directory: {e}"),
+        )
+    })?;
+    if !meta.is_dir() {
+        return Err(ApiError::new(
+            ErrorCode::Internal,
+            "the locked data directory is not a directory",
+        ));
+    }
+    Ok((meta.uid(), meta.gid()))
+}
+
+fn unreadable_bucket(directory: &str, owner: (u32, u32), why: &ShipError) -> ApiError {
+    ApiError::new(
+        ErrorCode::BadRequest,
+        format!(
+            "the bucket directory {directory} cannot be read by user {}, the owner of the data directory, who reads it once root has been given up: {why}",
+            owner.0
+        ),
+    )
+    .with_hint(
+        "Make the bucket directory readable by that user, or restore from an s3:// bucket, whose credentials are read before root is given up. Nothing was written.",
+    )
 }
 
 fn render(
@@ -387,9 +622,14 @@ fn rerun(args: &RestoreArgs, config_path: Option<&Path>, data: &Path, force: boo
 }
 
 pub(crate) fn runtime() -> Result<tokio::runtime::Runtime, ApiError> {
+    runtime_named("kronik")
+}
+
+/// A multi-thread runtime whose threads are called `name`.
+fn runtime_named(name: &str) -> Result<tokio::runtime::Runtime, ApiError> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_name("kronik")
+        .thread_name(name)
         .build()
         .map_err(|e| {
             ApiError::new(
@@ -481,3 +721,6 @@ fn ship_error(e: ShipError) -> ApiError {
             .with_hint("Check that the data directory is writable and the bucket is readable."),
     }
 }
+
+#[cfg(test)]
+mod tests;
