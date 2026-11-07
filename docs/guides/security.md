@@ -357,7 +357,32 @@ socket can list it. The runtime state of the sandboxes beneath it
 container's environment, resolved secret values included. Only root can
 read it.
 
-Rootless operation comes after v0.1, with M21. Started by hand,
-`kronik serve` runs as the user that starts it, and
-that user needs write access to the data directory and to the socket's
-directory (by default `/var/lib/kronik` and `/run/kronik`).
+The nonroot service is `kronik serve --rootless` (M21,
+[ADR 0060](../adr/0060-non-root-daemon-user-namespace.md)); the unit that
+`serve --init` writes passes the flag. The daemon needs write access to the
+data directory and to the socket's directory (by default `/var/lib/kronik` and
+`/run/kronik`). While it still has one thread it takes the data directory's
+lock, binds its listeners and starts a small acceptor process that stays in
+the initial user namespace without any capability and hands each API
+connection over together with its caller's host uid, so the audit trail and
+token attribution keep real uids. It then empties all its capability sets,
+sets `no_new_privs`, and enters the pinned Kronik user namespace if one exists
+and its cgroup is delegated to it. Without them it still serves Wasm actors,
+and foreign actors answer `FOREIGN_UNAVAILABLE` with the reason; it never
+falls back to a weaker backend or to unbounded resources. `kronik userns
+status` shows the namespace.
+
+`--rootless` fails closed. It stops with `ROOTLESS_UNAVAILABLE`, before it
+creates or binds anything, where it cannot keep the promise above: as root;
+when the real, effective and saved user ids are not one and the same; and in a
+user namespace whose uid map is not the host's identity map, such as a
+rootless container or a nested user namespace. There the kernel would
+translate every API caller's uid, and the audit trail and token attribution
+would name the wrong users. Rootless containers and nested user namespaces are
+not supported for the nonroot unit: use the root service (`serve --init
+--root`). `kronik doctor --rootless` reports the same condition as `uid_view`
+before the service is started.
+
+Plain `kronik serve`, without `--rootless`, starts as it did before M21, as
+root or as an ordinary user: it takes no early lock, forks no acceptor, empties
+no capability set, does not set `no_new_privs` and does not enter a namespace.

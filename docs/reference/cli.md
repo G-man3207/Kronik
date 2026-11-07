@@ -137,6 +137,7 @@ without a file the defaults below apply.
 | `--disk-reserve <SIZE>` | `log.disk_reserve` | `512MiB`; `$KRONIK_DISK_RESERVE`. Below this much free space new inputs and changes are refused; `0B` turns it off |
 | `--otel-endpoint <URL>` | `otel.endpoint` | off; `$KRONIK_OTEL_ENDPOINT` (an OTLP/HTTP collector for spans and metrics, M28) |
 | `--concurrency <N>` | | `64` |
+| `--rootless` | | off. Run as the nonroot service (M21, [ADR 0060](../adr/0060-non-root-daemon-user-namespace.md)): bind the listeners and take the data directory's lock, empty every capability set, serve the API through a capability-free acceptor that reads the callers' true uids, and enter the pinned Kronik user namespace. The unit that `serve --init` writes passes it. It stops with `ROOTLESS_UNAVAILABLE` as root, with differing real, effective and saved user ids, and in a user namespace whose uid map is not the host's (a rootless container, a nested user namespace). Without it, `serve` starts as before M21, as root or as an ordinary user. With `--init`: install the nonroot service explicitly |
 | `--log-format text\|json` | | `text`; `$KRONIK_LOG_FORMAT` (`json`: one JSON object per line) |
 
 `kronik serve --help` lists every option.
