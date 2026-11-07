@@ -128,7 +128,8 @@ for entry in pathlib.Path("scripts/unsafe-allowlist.txt").read_text().splitlines
         if not why.strip():
             bad.append(f"scripts/unsafe-allowlist.txt: {path} has no reason")
         allowed[path] = why.strip()
-files = [f for root in ("crates", "sdk/rust/src", "vendor/raft/src", "vendor/raft-proto/src")
+files = [f for root in ("crates", "sdk/rust/src", "vendor/raft/src", "vendor/raft-proto/src",
+                        "examples/foreign-probe/src")
          for f in pathlib.Path(root).rglob("*.rs") if "target" not in f.parts]
 for f in sorted(files):
     src = code(f.read_text())
@@ -331,6 +332,16 @@ step_foreign() {
     fi
     scripts/build-foreign-examples.sh
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --test foreign -- --test-threads=1
+    # The isolation work's tests that need root or user and mount namespaces,
+    # which an unprivileged run skips: the rehearsals of the microVM launcher
+    # (all of `sys::tests` of kronik-foreign: what the launcher does in
+    # namespaces of its own), the nonroot installer's hand-over of a data
+    # directory to another user, and root's work in a tree that another user
+    # owns (the key source). With require, a host that cannot run them fails
+    # here instead of leaving them absent from every run.
+    KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik-foreign --lib sys::tests
+    KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --bin kronik data_directory_tests
+    KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik-privacy --lib key_source::tests
 }
 
 # Identity replay of every example app (the Definition of done: "Identity
