@@ -3887,7 +3887,21 @@ impl Node {
             return;
         };
         let declared: Vec<pb::ForeignActor> = self.config_now().foreign_actors().cloned().collect();
-        host.reconcile(declared, self.secrets.clone()).await;
+        host.reconcile(declared, self.secrets.clone(), self.foreign_secret_links())
+            .await;
+    }
+
+    /// What a foreign actor's start asks before it takes a secret from the
+    /// built-in store: is the name linked to an external backend in the
+    /// configuration of *now*? The answer follows later links and unlinks.
+    /// A node that is going away answers yes for every name: nothing is
+    /// injected from the built-in store when the link cannot be looked up.
+    pub(crate) fn foreign_secret_links(&self) -> kronik_effects::foreign::SecretLinks {
+        let me = self.me.clone();
+        Arc::new(move |name| {
+            me.upgrade()
+                .is_none_or(|node| node.config_now().secret_is_linked(name))
+        })
     }
 
     /// `kronik foreign add`: writes a `ForeignActor` add record (the caller

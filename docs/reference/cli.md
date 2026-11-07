@@ -1856,7 +1856,10 @@ A layout outside `[foreign] layout_dirs` needs `admin` (the daemon reads it
 as root); symbolic links inside a layout are refused. Pulls stop after
 `[foreign] pull_timeout` (default 10 minutes) and above 8 GiB.
 `--secret` passes a secret as an environment variable at every start (the
-program sees the value). `trusted` runs plain runc with a warning, a
+program sees the value). A name that is linked to an external secret manager
+is refused (`SECRET_EXTERNAL`), at the add and at the next start of an actor
+whose name was linked later: the built-in store holds an older value of it or
+none. `trusted` runs plain runc with a warning, a
 seccomp filter and no user namespace: it is not a security boundary;
 `microvm` is `NOT_IMPLEMENTED`. `--fork-mode` (M14) says how forks answer
 calls to it: `recorded` (the default) matches production's recordings;
@@ -1865,7 +1868,7 @@ continuous fork gets a copy from the nearest checkpoint, with no network
 and its own disk, deleted with the fork; its answers are graded `forked`.
 To change the mode, remove and add the actor again. Errors:
 `FOREIGN_EXISTS`, `IMAGE_INVALID`, `RUNSC_MISSING`, `RUNC_MISSING`,
-`SECRET_NOT_FOUND`, `SCOPE_MISSING`, `UNAVAILABLE` when the image's new
+`SECRET_NOT_FOUND`, `SECRET_EXTERNAL`, `SCOPE_MISSING`, `UNAVAILABLE` when the image's new
 layers do not fit above `[log] disk_reserve`, and `FOREIGN_UNAVAILABLE`
 when another daemon holds `[foreign] run_dir` or the registry (or layout
 directory) did not answer within `[foreign] pull_timeout`. See

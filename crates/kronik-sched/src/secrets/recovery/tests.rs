@@ -388,6 +388,14 @@ fn new_bao(status: usize) -> Arc<Bao> {
 }
 /// A node over `data` whose only network is the fake provider `bao`.
 async fn provider_node(data: &std::path::Path, bao: &Arc<Bao>) -> Arc<Node> {
+    provider_node_with(data, bao, kronik_effects::foreign::ForeignSlot::default()).await
+}
+/// [`provider_node`] with the foreign host `foreign`.
+async fn provider_node_with(
+    data: &std::path::Path,
+    bao: &Arc<Bao>,
+    foreign: kronik_effects::foreign::ForeignSlot,
+) -> Arc<Node> {
     use std::os::unix::fs::PermissionsExt;
     let token = data.join("provider.token");
     if !token.exists() {
@@ -397,6 +405,7 @@ async fn provider_node(data: &std::path::Path, bao: &Arc<Bao>) -> Arc<Node> {
     let mut environment = env();
     environment.net = bao.clone();
     let mut config = config();
+    config.foreign = foreign;
     config.secret_settings.backends.insert(
         "bao".into(),
         Definition::Openbao {
@@ -1470,4 +1479,78 @@ async fn a_failed_certification_names_the_version_it_could_not_get() {
     );
     // A value is never in it.
     assert!(!named.contains("immutable-provider-value"));
+}
+
+// ---------------------------------------- the links a foreign host is given
+
+/// A foreign host that keeps the link view the node gives it.
+#[derive(Default)]
+struct ViewHost {
+    view: Mutex<Option<kronik_effects::foreign::SecretLinks>>,
+}
+impl kronik_effects::foreign::ForeignHost for ViewHost {
+    fn reconcile(
+        &self,
+        _declared: Vec<pb::ForeignActor>,
+        _secrets: Option<Arc<kronik_privacy::SecretStore>>,
+        links: kronik_effects::foreign::SecretLinks,
+    ) -> BoxFuture<'static, ()> {
+        *self.view.lock().unwrap() = Some(links);
+        Box::pin(async {})
+    }
+    fn http(
+        &self,
+        name: &str,
+        _req: HttpRequest,
+    ) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
+        let error = kronik_effects::foreign::unavailable(name, "a test host");
+        Box::pin(async move { Err(error) })
+    }
+}
+
+/// What the node gives its foreign host to ask, at every start of an actor,
+/// whether a name is linked: an answer from the configuration of the
+/// moment, not of the reconcile. A link made later counts, an unlink counts,
+/// and a name that was never linked does not.
+#[tokio::test]
+async fn the_link_view_of_the_foreign_host_follows_the_nodes_configuration() {
+    let _serial = TESTS.lock().await;
+    let host = Arc::new(ViewHost::default());
+    let data = tempfile::tempdir().unwrap();
+    let bao = new_bao(200);
+    let node = provider_node_with(
+        data.path(),
+        &bao,
+        kronik_effects::foreign::ForeignSlot(Some(host.clone())),
+    )
+    .await;
+    // The node reconciled once at its start and handed the view over then.
+    let view = host.view.lock().unwrap().clone().expect("no reconcile");
+    let runtime = node.runtime().unwrap();
+    node.env
+        .timeout(Duration::from_secs(60), async {
+            while !runtime.cache.complete(node.epoch()) {
+                node.env.clock.sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+    let original = node.local_operator_authority().unwrap();
+    assert!(!view("token"), "linked before any link");
+    node.secret_link(
+        "token",
+        "bao",
+        "secret/token#token",
+        &audit(),
+        false,
+        original.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(view("token"), "a link made after the hand-over");
+    assert!(!view("other"), "a name that was not linked");
+    node.secret_unlink("token", &audit(), false, original)
+        .await
+        .unwrap();
+    assert!(!view("token"), "an unlink");
 }

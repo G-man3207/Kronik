@@ -352,6 +352,17 @@ is written with mode 0600 in a 0700 directory. A secret deleted from the
 store makes the next start fail (status `backoff`, error
 `SECRET_NOT_FOUND: <name>`).
 
+Only the built-in store is read. A name linked to an external backend
+(`kronik secret link`, docs/design/m23-secret-backends.md) is refused with
+`SECRET_EXTERNAL`: by `foreign add --secret`, and by every start while the name
+is linked (status `backoff`, error `SECRET_EXTERNAL: <name> is linked ...`),
+because the built-in store holds an older value of it or none. The node tells
+the host which names are linked from its configuration of the moment, so a
+link made after the actor was declared is seen by its next start, and an
+unlink by the one after it; a running actor is not touched and keeps the
+value it started with, as after a rotation. Nothing is logged or recorded for
+the refusal beyond the start failure that every refused start already is.
+
 ## 10. The data directory
 
 `foreign/actors/<name>/data` is bind-mounted read-write at `/data` and survives

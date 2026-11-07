@@ -572,7 +572,12 @@ secrets, and only once Kronik has no usable value.
 - **Foreign actors:**
   - They get their values from the same cache at start. A backend that is
     down stops only a foreign start that has no cached value; the
-    supervisor's existing retry applies.
+    supervisor's existing retry applies. **Until the resolver serves foreign
+    actors, the stopgap refuses a linked name:** `foreign add --secret` and
+    every start answer `SECRET_EXTERNAL` for a name that the node's
+    configuration of that moment links to a backend (the built-in store holds
+    an older value of it or none), and a name that is not linked is read as
+    before.
   - A rotation does not restart a running foreign actor. `kronik foreign
     restart` or the next start picks the new version.
 - **Scrubbing survives restarts** (I8). `ok_scrubbed` keeps

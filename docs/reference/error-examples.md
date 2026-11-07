@@ -622,6 +622,15 @@ kronik --socket /owned/fixture/api.sock secret refresh demo-api-key \
   --reason "preview separately approved provider change" --dry-run
 ```
 
+A foreign actor meets the same code when it needs a linked name: the
+built-in store holds an older value of it or none, so `foreign add --secret`
+refuses it, and so does the next start of an actor declared before the link.
+Bind a name that Kronik stores itself.
+
+```sh
+kronik foreign add echo --image oci-layout:/owned/fixture/echo.oci --port 8080 --secret API_KEY=fixture-key --reason "bind a name that is stored in Kronik" --dry-run
+```
+
 ## SECRET_REF_NOT_ALLOWED
 
 A fixture link requests a reference outside the configured backend prefixes.

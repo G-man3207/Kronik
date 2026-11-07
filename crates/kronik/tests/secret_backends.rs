@@ -433,6 +433,11 @@ impl Daemon {
     /// next to its data directory: guest log events are in it, and the
     /// needle search covers it.
     fn start(dir: &Path, bao: Option<&Bao>, fetch_timeout: &str) -> Daemon {
+        Daemon::start_with(dir, bao, fetch_timeout, "")
+    }
+
+    /// [`Daemon::start`] with `extra` lines appended to the configuration.
+    fn start_with(dir: &Path, bao: Option<&Bao>, fetch_timeout: &str, extra: &str) -> Daemon {
         let token = dir.join("bao.token");
         std::fs::write(&token, BAO_TOKEN).unwrap();
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -443,6 +448,7 @@ impl Daemon {
         if let Some(bao) = bao {
             config.push_str(&bao.config(&token));
         }
+        config.push_str(extra);
         let config_file = dir.join("kronik.toml");
         std::fs::write(&config_file, config).unwrap();
         let log = std::fs::OpenOptions::new()
@@ -2113,4 +2119,82 @@ fn a_name_whose_backend_is_no_longer_configured_ends_the_effect_and_the_log_says
         }
     }
     assert_closed_when_quiet(&d, "a backend that is no longer configured");
+}
+
+/// A foreign actor reads the built-in store only, which holds an older value
+/// of a name that was linked later (or none): `foreign add --secret` refuses
+/// a linked name with `SECRET_EXTERNAL`, before the image is looked at, and
+/// any other name goes on to the image as it always did. An unlink makes the
+/// name the built-in store's again. (The start of an actor declared before the
+/// link needs a sandbox; the tests of `kronik-foreign` and of the node's link
+/// view cover it, and the foreign tests of this crate need root and runsc.)
+#[test]
+fn a_foreign_actor_cannot_be_given_a_name_that_is_linked() {
+    let bao = Bao::start();
+    assert_eq!(bao.put("payments", "stripe", VALUE_2), 1);
+    let dir = tempfile::tempdir().unwrap();
+    // Adds check that the runtime is an executable file, nothing more.
+    let runsc = dir.path().join("runsc");
+    std::fs::write(&runsc, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&runsc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let extra = format!(
+        "[foreign]\nrun_dir = {:?}\nrunsc_path = {:?}\n",
+        dir.path().join("foreign-run"),
+        runsc
+    );
+    let d = Daemon::start_with(dir.path(), Some(&bao), "2s", &extra);
+    for name in ["stripe", "plain"] {
+        d.mutate(
+            "PUT",
+            &format!("/v1/secrets/{name}"),
+            json!({"text": VALUE_1, "reason": "a built-in value"}),
+        );
+    }
+    d.link("stripe", "secret/payments#stripe");
+    let requests = bao.requests();
+    let add = |secret: &str| {
+        d.api(
+            "POST",
+            "/v1/foreign",
+            json!({"name": "echo", "image": "oci-layout:/nonexistent/image.oci", "port": 8080,
+                   "secrets": [format!("API_KEY={secret}")], "dry_run": true,
+                   "reason": "a linked name"}),
+        )
+    };
+
+    let (status, answer) = add("stripe");
+    println!("linked: {status} {answer}");
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(answer["error"]["code"], "SECRET_EXTERNAL", "{answer}");
+    assert!(answer.to_string().contains("stripe is linked"), "{answer}");
+    assert!(!answer.to_string().contains(VALUE_1), "{answer}");
+
+    // Not linked: past the secrets, to the image that does not exist.
+    let (status, answer) = add("plain");
+    println!("not linked: {status} {answer}");
+    let code = answer["error"]["code"].as_str().unwrap_or("");
+    assert!(
+        !status.to_string().starts_with('2') && !code.starts_with("SECRET_"),
+        "{status} {answer}"
+    );
+
+    // Unlinked again: the built-in store's name, as before.
+    d.mutate(
+        "DELETE",
+        "/v1/secrets/stripe/link",
+        json!({"reason": "back to the built-in store"}),
+    );
+    d.settle();
+    let (status, answer) = add("stripe");
+    println!("unlinked: {status} {answer}");
+    let code = answer["error"]["code"].as_str().unwrap_or("");
+    assert!(!code.starts_with("SECRET_"), "{status} {answer}");
+
+    // Nothing was fetched from the backend, and the daemon did not log it.
+    assert_eq!(bao.requests(), requests, "an add asked the backend");
+    assert!(
+        !d.serve_log().contains("SECRET_EXTERNAL"),
+        "{}",
+        d.serve_log()
+    );
 }

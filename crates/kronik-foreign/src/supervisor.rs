@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kronik_core::env::{Env, Process};
+use kronik_effects::foreign::SecretLinks;
 use kronik_privacy::SecretStore;
 use kronik_proto::log::v1 as pb;
 use tokio::sync::Notify;
@@ -296,6 +297,10 @@ pub(crate) struct Actor {
     finished: Notify,
     done: AtomicBool,
     pub secrets: Mutex<Option<Arc<SecretStore>>>,
+    /// Whether a secret name is linked to an external backend now. The node
+    /// replaces it at every reconcile; it answers from the node's current
+    /// configuration, so a link made after this actor was declared counts.
+    pub links: Mutex<SecretLinks>,
     /// Calls hold it shared; a checkpoint holds it exclusively, so main's
     /// calls wait in the daemon, not inside the paused sandbox (M14).
     pub calls: tokio::sync::RwLock<()>,
@@ -311,6 +316,7 @@ impl Actor {
         decl: pb::ForeignActor,
         runtime: Runtime,
         secrets: Option<Arc<SecretStore>>,
+        links: SecretLinks,
     ) -> Arc<Actor> {
         let name = decl.name.clone();
         let port = u16::try_from(decl.port).unwrap_or(0);
@@ -348,6 +354,7 @@ impl Actor {
             done: AtomicBool::new(false),
             spec: Mutex::new(Vec::new()),
             secrets: Mutex::new(secrets),
+            links: Mutex::new(links),
             calls: tokio::sync::RwLock::new(()),
         })
     }
@@ -635,6 +642,66 @@ pub(crate) fn secret_binding(entry: &str) -> Result<(String, String), String> {
     Ok((var, secret))
 }
 
+/// The built-in secret store, as a start reads it.
+pub(crate) trait BuiltinSecrets {
+    /// The current value of `name`, or `None` when it has none.
+    fn current_value(&self, name: &str) -> Result<Option<Vec<u8>>, String>;
+}
+
+impl BuiltinSecrets for SecretStore {
+    fn current_value(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
+        self.current(name)
+            .map(|found| found.map(|secret| secret.value))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Why a start or an add refuses a secret that is linked to an external
+/// backend: a foreign actor reads the built-in store, which holds an older
+/// value of such a name or none.
+pub(crate) fn linked_secret_message(secret: &str) -> String {
+    format!(
+        "{secret} is linked to an external secret manager, and a foreign actor reads the \
+         built-in store only"
+    )
+}
+
+/// The environment variables (name, text) and the injected values (secret,
+/// bytes) of an actor's secrets.
+type StartSecrets = (Vec<(String, String)>, Vec<(String, Vec<u8>)>);
+
+/// The environment variables and the injected values of the `--secret`
+/// entries of an actor, each at its current version (§9). A name that is
+/// linked to an external backend is refused first, before the built-in store
+/// is asked for it; the other names behave as they always did.
+pub(crate) fn injected_secrets(
+    entries: &[String],
+    linked: &dyn Fn(&str) -> bool,
+    store: Option<&dyn BuiltinSecrets>,
+) -> Result<StartSecrets, String> {
+    let mut env_vars = Vec::new();
+    let mut injected = Vec::new();
+    for entry in entries {
+        let (var, secret) = secret_binding(entry)?;
+        if linked(&secret) {
+            return Err(format!(
+                "SECRET_EXTERNAL: {}",
+                linked_secret_message(&secret)
+            ));
+        }
+        let value = store
+            .ok_or("SECRET_NOT_FOUND: the secret store is not configured")?
+            .current_value(&secret)
+            .map_err(|e| format!("reading secret {secret}: {e}"))?
+            .ok_or_else(|| format!("SECRET_NOT_FOUND: {secret}"))?;
+        let text = String::from_utf8(value.clone())
+            .map_err(|_| format!("secret {secret} is not UTF-8 text"))?;
+        env_vars.push((var, text));
+        injected.push((secret, value));
+    }
+    Ok((env_vars, injected))
+}
+
 /// Starts the sandbox and waits until a bridge connection succeeds.
 async fn start(ctx: &Arc<Ctx>, a: &Arc<Actor>) -> Result<Arc<dyn Process>, String> {
     let env = &ctx.env;
@@ -651,22 +718,12 @@ async fn start(ctx: &Arc<Ctx>, a: &Arc<Actor>) -> Result<Arc<dyn Process>, Strin
     let name = a.name().to_owned();
     // Secrets at their current version (§9).
     let store = lock(&a.secrets).clone();
-    let mut env_vars = Vec::new();
-    let mut injected = Vec::new();
-    for entry in &a.decl.secrets {
-        let (var, secret) = secret_binding(entry)?;
-        let value = store
-            .as_ref()
-            .ok_or("SECRET_NOT_FOUND: the secret store is not configured")?
-            .current(&secret)
-            .map_err(|e| format!("reading secret {secret}: {e}"))?
-            .ok_or_else(|| format!("SECRET_NOT_FOUND: {secret}"))?
-            .value;
-        let text = String::from_utf8(value.clone())
-            .map_err(|_| format!("secret {secret} is not UTF-8 text"))?;
-        env_vars.push((var, text));
-        injected.push((secret, value));
-    }
+    let links = lock(&a.links).clone();
+    let (env_vars, injected) = injected_secrets(
+        &a.decl.secrets,
+        &*links,
+        store.as_deref().map(|s| s as &dyn BuiltinSecrets),
+    )?;
     {
         // Every value an actor of this name got since the daemon started,
         // not only the current ones: its log can still hold a rotated or
@@ -1001,5 +1058,82 @@ mod tests {
         assert!(secret_binding("1X=stripe-key").is_err());
         assert!(secret_binding("A-B=stripe-key").is_err());
         assert!(secret_binding("X=Bad Name").is_err());
+    }
+
+    /// A built-in store that counts what a start asks of it. The values are
+    /// older than anything a backend serves for the same name.
+    struct Store {
+        values: Vec<(&'static str, &'static str)>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl BuiltinSecrets for Store {
+        fn current_value(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
+            lock(&self.asked).push(name.to_owned());
+            Ok(self
+                .values
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.as_bytes().to_vec()))
+        }
+    }
+
+    fn store() -> Store {
+        Store {
+            values: vec![("stripe", "stale-built-in-value"), ("plain", "plain-value")],
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn entries(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    /// A name linked to an external backend is refused with `SECRET_EXTERNAL`
+    /// before the built-in store is asked for it, whatever the store holds:
+    /// the value of the store (stale, here) is neither injected nor in the
+    /// error, and the entries before it inject nothing. A store that is not
+    /// configured does not change the answer.
+    #[test]
+    fn a_start_refuses_a_linked_name_before_it_reads_the_store() {
+        let s = store();
+        let linked = |name: &str| name == "stripe";
+        let e = injected_secrets(&entries(&["plain", "stripe"]), &linked, Some(&s)).unwrap_err();
+        assert!(e.starts_with("SECRET_EXTERNAL: stripe is linked"), "{e}");
+        assert!(!e.contains("stale-built-in-value"), "{e}");
+        assert_eq!(*lock(&s.asked), ["plain"], "the store was asked for stripe");
+        let e = injected_secrets(&entries(&["stripe"]), &linked, None).unwrap_err();
+        assert!(e.starts_with("SECRET_EXTERNAL: "), "{e}");
+    }
+
+    /// A name that is not linked is injected as it always was, with the same
+    /// errors for a missing name or no store.
+    #[test]
+    fn a_start_injects_names_that_are_not_linked_as_before() {
+        let s = store();
+        let (vars, values) =
+            injected_secrets(&entries(&["TOKEN=plain"]), &|_| false, Some(&s)).unwrap();
+        assert_eq!(vars, [("TOKEN".to_owned(), "plain-value".to_owned())]);
+        assert_eq!(values, [("plain".to_owned(), b"plain-value".to_vec())]);
+        let e = injected_secrets(&entries(&["missing"]), &|_| false, Some(&s)).unwrap_err();
+        assert_eq!(e, "SECRET_NOT_FOUND: missing");
+        let e = injected_secrets(&entries(&["plain"]), &|_| false, None).unwrap_err();
+        assert_eq!(e, "SECRET_NOT_FOUND: the secret store is not configured");
+    }
+
+    /// The question is asked at every start: a name linked after the actor
+    /// was declared (or after it last started) is refused by its next start,
+    /// and the start after an unlink gets the built-in value again.
+    #[test]
+    fn the_next_start_follows_a_link_made_and_removed_later() {
+        let s = store();
+        let linked = std::sync::atomic::AtomicBool::new(false);
+        let view = |name: &str| name == "stripe" && linked.load(Ordering::SeqCst);
+        let start = || injected_secrets(&entries(&["stripe"]), &view, Some(&s));
+        assert_eq!(start().unwrap().1[0].1, b"stale-built-in-value");
+        linked.store(true, Ordering::SeqCst);
+        assert!(start().unwrap_err().starts_with("SECRET_EXTERNAL: "));
+        linked.store(false, Ordering::SeqCst);
+        assert_eq!(start().unwrap().1[0].1, b"stale-built-in-value");
     }
 }

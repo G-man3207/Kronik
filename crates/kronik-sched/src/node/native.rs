@@ -145,6 +145,7 @@ mod tests {
             &self,
             _declared: Vec<pb::ForeignActor>,
             _secrets: Option<Arc<SecretStore>>,
+            _links: kronik_effects::foreign::SecretLinks,
         ) -> BoxFuture<'static, ()> {
             let release = self.release.lock().unwrap().take().unwrap();
             self.entered

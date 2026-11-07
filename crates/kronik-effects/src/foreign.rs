@@ -12,6 +12,16 @@ use kronik_core::env::{BoxFuture, HttpRequest, HttpResponse, NetError};
 use kronik_privacy::SecretStore;
 use kronik_proto::log::v1 as pb;
 
+/// Whether a secret name is linked to an external backend in the node's
+/// configuration *now* (`Config::secret_is_linked`). The node answers from
+/// its current epoch at every call, so a link made or removed after an actor
+/// was declared is seen by that actor's next start.
+///
+/// A foreign actor gets its secrets from the built-in store only. For a
+/// linked name that store holds an older value or none, so the host refuses
+/// such a name (`SECRET_EXTERNAL`) instead of injecting it.
+pub type SecretLinks = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 pub trait ForeignHost: Send + Sync + 'static {
     /// Starts every declared actor that is not running and stops every
     /// running actor that is no longer declared (I5: the declarations are
@@ -22,6 +32,7 @@ pub trait ForeignHost: Send + Sync + 'static {
         &self,
         declared: Vec<pb::ForeignActor>,
         secrets: Option<Arc<SecretStore>>,
+        links: SecretLinks,
     ) -> BoxFuture<'static, ()>;
 
     /// Sends one request to `req.url` (`foreign://<name>/...`). Errors follow

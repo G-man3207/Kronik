@@ -83,6 +83,7 @@ impl ForeignHost for Host {
         &self,
         _: Vec<pb::ForeignActor>,
         _: Option<Arc<kronik_privacy::SecretStore>>,
+        _: kronik_effects::foreign::SecretLinks,
     ) -> BoxFuture<'static, ()> {
         Box::pin(async {})
     }
