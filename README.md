@@ -216,6 +216,10 @@ The nightly workflow adds what is too slow for every pull request: a crash
 test of 1,000 `kill -9` cycles, deterministic simulation with 10,000 seeds
 over every workload and a million-step run, and the release build.
 
+An informational job, which never turns the nightly red, also reports whether
+the upstream conditions for WASI 0.3 are met yet
+(`scripts/check-wasi-p3-gate.py`, [ADR 0070](docs/adr/0070-wasi-http-outgoing-handler.md)).
+
 [`CONTRIBUTING.md`](CONTRIBUTING.md) has the conventions, and
 [`AGENTS.md`](AGENTS.md) is the guide for automated and human contributors.
 
