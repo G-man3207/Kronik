@@ -59,9 +59,11 @@ It needs HTTPS access for official fixed-hash verifier archives and maintained
 TUF roots, but no account or GitHub token. Fixture identities are private SOURCE
 copies, never production runtime trust overrides.
 It also runs the pure-Python documentation-surface, frozen released-corpus,
-corpus-promotion and performance-comparator boundary tests in `scripts/tests`.
-These are semantic checks of parsers, provenance, tampering and regression
-enforcement, not real benchmark results or between-release performance acceptance.
+corpus-promotion, performance-comparator and WASI 0.3 gate-watcher boundary
+tests in `scripts/tests`. These are semantic checks of parsers, provenance,
+tampering and regression enforcement, not real benchmark results or
+between-release performance acceptance. The gate-watcher tests use canned
+upstream inputs and make no request.
 The `examples` step tests the dependency-free standalone `tools/loadgen`.
 The `ts` step reuses its already-built binary for the CLI/API/WIT/error
 documentation-surface gate and the frozen v0.1.0/v0.3.0/v0.4.0 log and genuine
