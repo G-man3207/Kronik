@@ -629,6 +629,24 @@ struct DirectoryMetadata {
     mtime: u64,
 }
 
+/// Setting an owner that the user namespace does not map fails with `EINVAL`,
+/// and the rootless installation maps ids 0 to 65535 only. Say that and what
+/// to do, instead of a bare "Invalid argument" at actor start.
+fn unmapped_owner(e: io::Error, uid: u32, gid: u32) -> io::Error {
+    if e.raw_os_error() == Some(libc::EINVAL) {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "owner {uid}:{gid} is outside the ids this installation maps (a rootless \
+                 installation maps 0 to 65535 only): rebuild the image so that its files \
+                 and user use ids up to 65535 (operations guide, Foreign actors)"
+            ),
+        )
+    } else {
+        e
+    }
+}
+
 fn finish_directories(
     root: &Path,
     metadata: &HashMap<PathBuf, DirectoryMetadata>,
@@ -657,7 +675,8 @@ fn finish_directories(
                 .filter(|m| m.inode == (md.dev(), md.ino()));
             if let Some(record) = record {
                 if let Some((uid, gid)) = record.owners {
-                    fchown(&handle, Some(uid), Some(gid))?;
+                    fchown(&handle, Some(uid), Some(gid))
+                        .map_err(|e| unmapped_owner(e, uid, gid))?;
                 }
                 handle.set_permissions(Permissions::from_mode(record.mode))?;
             }
@@ -856,7 +875,8 @@ fn apply_layer_inner(
                     .map_err(io_ctx)?;
                 copy_entry(&mut entry, &mut file, &what)?;
                 if let Some((uid, gid)) = owners {
-                    fchown(&file, Some(uid), Some(gid)).map_err(io_ctx)?;
+                    fchown(&file, Some(uid), Some(gid))
+                        .map_err(|e| io_ctx(unmapped_owner(e, uid, gid)))?;
                 }
                 file.set_permissions(Permissions::from_mode(mode))
                     .map_err(io_ctx)?;
@@ -874,7 +894,8 @@ fn apply_layer_inner(
                 }
                 symlink(&target, &dest).map_err(io_ctx)?;
                 if let Some((uid, gid)) = owners {
-                    lchown(&dest, Some(uid), Some(gid)).map_err(io_ctx)?;
+                    lchown(&dest, Some(uid), Some(gid))
+                        .map_err(|e| io_ctx(unmapped_owner(e, uid, gid)))?;
                 }
                 crate::microvm_sys::set_mtime(&dest, mtime).map_err(io_ctx)?;
             }
@@ -1230,7 +1251,7 @@ pub fn runtime_spec(
     }
     let mut linux = json!({
         "namespaces": [
-            {"type": "pid"}, network, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"},
+            {"type": "pid"}, network, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}, {"type": "cgroup"},
         ],
         "resources": resources,
         // Docker's masks, with the RAPL energy counters (a side channel)
@@ -1775,6 +1796,20 @@ mod tests {
     }
 
     #[test]
+    fn an_owner_outside_the_mapped_ids_gets_an_actionable_error() {
+        let text =
+            unmapped_owner(io::Error::from_raw_os_error(libc::EINVAL), 70_000, 70_001).to_string();
+        assert!(
+            text.contains("owner 70000:70001 is outside the ids this installation maps"),
+            "{text}"
+        );
+        assert!(text.contains("up to 65535"), "{text}");
+        // Any other error is left as it was.
+        let other = unmapped_owner(io::Error::from_raw_os_error(libc::EPERM), 1, 1);
+        assert_eq!(other.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
     fn owners_come_from_the_headers_but_setid_bits_do_not() {
         if !is_root() {
             eprintln!("skipped: chown needs root");
@@ -2294,7 +2329,7 @@ mod tests {
         assert_eq!(
             j["linux"]["namespaces"],
             json!([{"type": "pid"}, {"type": "network", "path": "/run/kronik/netns/echo"},
-                   {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}])
+                   {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}, {"type": "cgroup"}])
         );
         let mounts = j["mounts"].as_array().unwrap();
         let dests: Vec<&str> = mounts

@@ -165,7 +165,7 @@ impl Ctx {
     }
 
     pub fn cgroup_path(&self, name: &str) -> String {
-        format!("{}/{name}", self.cgroup_parent)
+        format!("{}/{}", self.cgroup_parent, container_id(name))
     }
 
     /// [`crate::fetch::pull`], given up after `pull_timeout` (a registry

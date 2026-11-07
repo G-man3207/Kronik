@@ -201,11 +201,11 @@ fn cleanup(
         })?;
     let cleaned = rt.block_on(async {
         let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
-        let foreign = kronik_foreign::Foreign::new(
+        kronik_foreign::cleanup(
             env,
             crate::serve::foreign_config(&config, data_dir, Vec::new()),
-        );
-        foreign.cleanup().await
+        )
+        .await
     });
     let cleaned = cleaned.map_err(|why| {
         local(

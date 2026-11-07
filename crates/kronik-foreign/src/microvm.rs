@@ -96,6 +96,50 @@ impl Drop for Unspawned {
     }
 }
 
+/// The drop-in that gives the root service's daemon the cgroup leaf a microVM
+/// needs. The root unit is the one of v0.4.0 and delegates no cgroup (a
+/// delegation would move where an existing installation's gVisor sandboxes
+/// get their cgroups), so a host that runs microVMs adds this itself. The
+/// nonroot service has the same by design. `DelegateSubgroup=` is new in
+/// systemd 254; older versions ignore it with a warning and leave the daemon
+/// in the unit's own cgroup, which `kronik doctor` then reports. The
+/// operations guide shows the same text (a test keeps them equal).
+pub const ROOT_LEAF_DROPIN: &str = "[Service]\nDelegate=yes\nDelegateSubgroup=daemon\n";
+/// Where the guide puts the drop-in.
+pub const ROOT_LEAF_DROPIN_PATH: &str = "/etc/systemd/system/kronik.service.d/microvm.conf";
+/// The first sentence of the refusal and of the warning.
+pub const ROOT_LEAF_NEED: &str = "microVM actors need the daemon in a delegated cgroup leaf, which the root service's unit does not give it";
+
+/// What to do about [`ROOT_LEAF_NEED`].
+pub fn root_leaf_advice() -> String {
+    format!(
+        "Add `Delegate=yes` and `DelegateSubgroup=daemon` under [Service] in a drop-in such as \
+         {ROOT_LEAF_DROPIN_PATH} (systemd 254 or newer; the operations guide has the whole \
+         file), run `systemctl daemon-reload` and restart kronik.service. Or use isolation gvisor."
+    )
+}
+
+/// Whether the daemon is where a microVM's cgroup goes: the root service must
+/// run in the leaf of its delegated cgroup (a direct root `serve` never makes
+/// one: it could be an unrelated shell's cgroup), the nonroot service moved
+/// itself into one before it could start foreign actors.
+pub fn require_leaf(
+    privilege: &crate::manager::Privilege,
+    own_cgroup: io::Result<String>,
+) -> Result<(), String> {
+    use crate::manager::Privilege;
+    match privilege {
+        Privilege::Root => match own_cgroup {
+            Ok(cgroup) if cgroup.ends_with("/daemon") => Ok(()),
+            Ok(cgroup) => Err(format!("{ROOT_LEAF_NEED} (the daemon runs in {cgroup})")),
+            Err(e) => Err(format!(
+                "{ROOT_LEAF_NEED} (the daemon's cgroup is unreadable: {e})"
+            )),
+        },
+        Privilege::Userns { .. } | Privilege::Unavailable(_) => Ok(()),
+    }
+}
+
 /// How a process that was waited for ended, for a message.
 fn describe_exit(status: io::Result<Option<i32>>) -> String {
     match status {
@@ -880,6 +924,48 @@ fn cpio_entry(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_root_service_needs_the_drop_in_for_microvms_and_the_nonroot_one_has_its_leaf() {
+        use crate::manager::Privilege;
+        let ok = |cgroup: &str| Ok(cgroup.to_owned());
+        let root = Privilege::Root;
+        assert!(super::require_leaf(&root, ok("/system.slice/kronik.service/daemon")).is_ok());
+        // `/` in a private cgroup namespace is a leaf only when it says so.
+        assert!(super::require_leaf(&root, ok("/daemon")).is_ok());
+        for cgroup in [
+            "/system.slice/kronik.service",
+            "/",
+            "/user.slice/session-3.scope",
+        ] {
+            let why = super::require_leaf(&root, ok(cgroup)).unwrap_err();
+            assert!(why.starts_with("microVM actors need"), "{why}");
+            assert!(why.contains(cgroup), "{why}");
+        }
+        let unreadable = super::require_leaf(&root, Err(std::io::Error::other("no cgroup")));
+        assert!(unreadable.unwrap_err().contains("unreadable"));
+        // The nonroot daemon made its leaf before it got a privilege.
+        let userns = Privilege::Userns {
+            cgroup: "/system.slice/kronik.service".into(),
+        };
+        assert!(super::require_leaf(&userns, ok("/system.slice/kronik.service/daemon")).is_ok());
+        assert!(super::require_leaf(&Privilege::Unavailable("x".into()), ok("/")).is_ok());
+    }
+
+    #[test]
+    fn the_advice_names_the_file_and_the_two_directives() {
+        let advice = super::root_leaf_advice();
+        for needle in [
+            super::ROOT_LEAF_DROPIN_PATH,
+            "Delegate=yes",
+            "DelegateSubgroup=daemon",
+            "254",
+        ] {
+            assert!(advice.contains(needle), "{advice}");
+        }
+        assert!(super::ROOT_LEAF_DROPIN.starts_with("[Service]\n"));
+        assert!(super::ROOT_LEAF_DROPIN.ends_with('\n'));
+    }
+
     use super::*;
 
     /// Pins the command line to the exact text, so that an edit is noticed.
