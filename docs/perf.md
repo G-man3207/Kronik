@@ -214,6 +214,23 @@ for operators.
 The build brief: "start with 1 GB of log after the latest snapshot: under 30
 seconds" (docs/design/m6-storage.md §9).
 
+Since v0.4.0 a start also certifies the secret inventory before it serves
+([ADR 0108](adr/0108-durable-secret-coverage-watermark.md)); the results
+below were measured before that. The certification runs after the replay,
+not alongside it, and reads the log appended since the coverage watermark,
+or the whole retained log when there is none: on the first start after an
+upgrade from v0.4.0, after a restore, or when retention cut the log below
+the watermark. Measured on 135 996 records in 5 segments (68 MB in the
+first) without a watermark: 1.8 to 3.0 s, 1.05 to 1.93 s of CPU for the
+whole start, and a peak resident set of 91 MiB against 26 MiB with a
+watermark, at a load average of 41 to 44. That is about 10 us of CPU per
+record, the decode speed of the results below. It decodes up to 4 segments
+at a time, so its transient memory is at most 4 segments (256 MiB at the
+default 64 MiB). It has not been measured with 1 GiB of log, and
+`startup_speed` does not report it. At 3 million records and the same speed
+it is 24 to 43 s of CPU, or 6 to 11 s on four free cores, to be added to
+the replay times below on a cold start only.
+
 ### Method
 
 `cargo run --release -p kronik-sched --example startup_speed -- [--gib 1.0]
@@ -510,6 +527,96 @@ Crash test details:
 
 DST long run details: 68 147 requests, 109 582 turns, 273 crashes and
 188.8 s of virtual time.
+
+### Restart time in the crash test since v0.4.0
+
+The 0.22 s median above predates v0.4.0, whose start also certifies the
+secret inventory before the daemon serves
+([ADR 0108](adr/0108-durable-secret-coverage-watermark.md)). The nightly of
+2026-11-06 (hosted runner, v0.4.0, seed 1) shows what that cost when the
+certification read the log again at every start: the time from `kill -9` to a
+healthy daemon rose in steps of about 1 800 acknowledged requests (2 048
+records), and the run ended after cycle 326 on a history read that answered
+503 `SECRET_UNAVAILABLE` for longer than the harness retried.
+
+| Cycle | Acknowledged so far | Healthy again after |
+| --- | --- | --- |
+| 1 | 74 | 0.04 s |
+| 50 | 6 015 | 1.28 s |
+| 100 | 12 307 | 3.20 s |
+| 150 | 18 141 | 5.94 s |
+| 200 | 23 839 | 10.53 s |
+| 250 | 30 123 | 15.32 s |
+| 300 | 36 184 | 20.57 s |
+| 326 | 39 499 | 24.42 s |
+
+Three things made the step: a second scan from the first retained record at
+every certification, in windows of 2 048 records; a read of a segment that
+checks every record before the first one asked for, with two blocking-pool
+round trips per record, so each window cost time in proportion to the
+segment; and a checkpoint after each window that replaced the last valid
+watermark. The secret cycle that follows a start then did the same again with
+the certificate cleared, which is the 503. The fix reads only the records
+after the watermark, from whole segment images, and keeps the certificate the
+start made.
+
+The same run, 150 cycles with seed 1, with the v0.4.0 binary and the fixed
+binary side by side on one machine (8 vCPUs, load average 15 to 35). The
+cells are the median and, in brackets, the maximum of the seconds until
+healthy:
+
+| Cycles | v0.4.0 | Fixed |
+| --- | --- | --- |
+| 1 to 10 | 0.15 (0.47) | 0.07 (0.19) |
+| 11 to 25 | 0.52 (1.65) | 0.07 (0.24) |
+| 26 to 50 | 1.98 (5.05) | 0.15 (0.58) |
+| 51 to 75 | 5.44 (11.58) | 0.15 (0.40) |
+| 76 to 100 | 8.96 (14.10) | 0.16 (0.31) |
+| 101 to 125 | 10.93 (17.41) | 0.18 (0.34) |
+| 126 to 150 | 17.42 (21.08) | 0.23 (0.54) |
+
+The run took 2 319 s with v0.4.0 and 315 s with the fix. v0.4.0 repeated a
+history read 4 538 times after a 503; the fix never did.
+
+The fixed binary then ran all 1 000 cycles in 75.5 minutes, on a machine at a
+load average of 15 to 56: no violation, 20 rebuild comparisons equal, an empty
+identity replay of 126 145 root inputs, and no history read answered 503. The
+median restart rose from 0.13 s (cycles 1 to 100) to 1.12 s (cycles 801 to
+900, 108 000 acknowledged requests); the last 100 cycles ran while other work
+kept the load average at 35 to 56 (median 2.37 s, maximum 9.10 s).
+
+What is left grows with the active log segment, which rolled at 68 MB after
+132 643 records. A start does three things with it. `Log::open` reads it,
+checks every CRC and decodes every turn record to rebuild the footer index
+(`crates/kronik-log/src/lib.rs`); the replay reads the whole image to reach
+its unapplied tail; and the certification reads it to reach the records after
+the watermark. In a traced start of a segment of 40 321 records on the loaded
+machine, the first took about 0.8 s from the read to its next system call, the
+second about 0.5 s for 28 records, and a certification of all the records
+0.6 s; the index decode is most of the first. A certification of about 125
+new records took a median of 6 ms while the segment held fewer than 20 000
+records, 25 ms up to 60 000, 67 ms up to 100 000 and 123 ms beyond (load
+average 15 to 40).
+
+A start from a copy of the data directory of cycle 104 (14 056 records, with
+the invalid manifest v0.4.0 had left), measured on the same machine:
+
+| | v0.4.0 (two starts) | Fixed (four starts) |
+| --- | --- | --- |
+| Healthy after | 7.3 and 9.6 s | 0.13 to 0.27 s |
+| A scrubbed read answers 200 after | 12.0 and 19.2 s (88 and 178 retries) | 0.01 s after healthy (no retry) |
+| Read system calls (process) | 261 865 (one start) | 5 132 to 5 162 |
+| CPU time of the daemon | 6.6 and 7.0 s | 0.10 to 0.14 s |
+| Certification | 7.2 s (one logged start) | 71 and 167 ms (two logged starts) |
+| Restart with a valid watermark | | 0.15 to 0.26 s, no record read |
+
+The absolute times depend on the machine, the counts and the ratios much
+less. `scripts/chaos.py` now fails a restart that takes more than
+`--max-recovery` (10 s), a run whose last 50 restarts have a median
+`--max-recovery-growth` (5 s) above that of the first 50, and a history read
+that answers 503 after a restart. Every certification logs `secret inventory
+certified` with the LSN range, the number of records read and the time it
+took.
 
 ## M32 benchmark and regression contract
 
