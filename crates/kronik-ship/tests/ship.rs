@@ -444,9 +444,9 @@ fn compacted_node_shipped(
     (note, first, applied, hash, key)
 }
 
-/// The first LSN of the bucket's log.
-fn bucket_first(bucket: &Path) -> u64 {
-    std::fs::read_dir(bucket.join("main/segments"))
+/// The start LSNs of the segments in the bucket, in order.
+fn bucket_segments(bucket: &Path) -> Vec<u64> {
+    let mut starts: Vec<u64> = std::fs::read_dir(bucket.join("main/segments"))
         .unwrap()
         .flatten()
         .filter_map(|e| {
@@ -456,8 +456,14 @@ fn bucket_first(bucket: &Path) -> u64 {
                 .parse::<u64>()
                 .ok()
         })
-        .min()
-        .unwrap()
+        .collect();
+    starts.sort_unstable();
+    starts
+}
+
+/// The first LSN of the bucket's log.
+fn bucket_first(bucket: &Path) -> u64 {
+    bucket_segments(bucket)[0]
 }
 
 fn restore_compacted_log_with_an_idle_sql_actor(ship_early: bool) {
@@ -531,4 +537,115 @@ fn restore_onto_a_log_compacted_before_shipping_started_keeps_an_idle_sql_actor(
 #[test]
 fn restore_onto_a_log_the_remote_compacted_along_keeps_an_idle_sql_actor() {
     restore_compacted_log_with_an_idle_sql_actor(true);
+}
+
+// -------------------------------------------------------------------------
+// A round uploads the active segment while it grows and records it in
+// `ShipState.active`; only a segment uploaded as a closed one is in
+// `ShipState.segments`, which is what the remote retention step deletes from.
+// A node that could not ship for longer than `history` can have retention
+// delete the active segment of its last round before any later round
+// uploaded it as a closed one: its partial object must not stay in the bucket.
+
+/// Builds that node: one round while a segment is active, then no round until
+/// the snapshot's retention pass has deleted that segment locally. Returns the
+/// start of the stale segment and the log's first LSN. The node stays up.
+fn active_segment_deleted_before_it_was_closed(
+    p: &Proc,
+    src: &Path,
+    remote: &Remote,
+    bucket: &Path,
+) -> (u64, u64) {
+    p.rt.block_on(p.node.deploy(
+        &guest("counter"),
+        audit(),
+        false,
+        p.node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
+    for i in 0..80 {
+        p.send(&format!("counter/k{}", i % 5), "increment", "");
+        if i % 20 == 19 {
+            // Logical time moves, so that retention finds segments older
+            // than a history of zero.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if i == 40 {
+            p.ship(remote, src);
+        }
+    }
+    let (stale, _) = ShipState::load(src).unwrap().active.unwrap();
+    // The partial upload is in the bucket.
+    assert!(bucket_segments(bucket).contains(&stale));
+    // The bucket is out of reach for longer than `history`: the snapshot's
+    // retention pass deletes the segment locally.
+    p.rt.block_on(
+        p.node
+            .snapshot("manual", p.node.local_operator_authority().unwrap()),
+    )
+    .unwrap();
+    let first = p
+        .node
+        .log_first(&p.node.storage_config().unwrap().clone())
+        .unwrap();
+    assert!(stale < first, "stale {stale}, the log starts at {first}");
+    assert!(
+        !kronik_log::segment_starts(&src.join("branches/main/log"))
+            .unwrap()
+            .contains(&stale)
+    );
+    (stale, first)
+}
+
+#[test]
+fn an_active_segment_retention_deleted_before_it_was_closed_leaves_the_bucket() {
+    let bucket = tempdir("ship-stale-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let src = tempdir("ship-stale-src-");
+    let p = start(src.path(), Some(Duration::ZERO));
+    let (stale, first) =
+        active_segment_deleted_before_it_was_closed(&p, src.path(), &remote, bucket.path());
+
+    // The bucket is back: the next round.
+    let report = p.ship(&remote, src.path());
+    assert!(report.deleted > 0, "{report:?}");
+    // The bucket's log is the node's, without the partial object.
+    let local = kronik_log::segment_starts(&src.path().join("branches/main/log")).unwrap();
+    assert_eq!(bucket_segments(bucket.path()), local);
+    assert_eq!(bucket_first(bucket.path()), first);
+    let state = ShipState::load(src.path()).unwrap();
+    assert!(!state.segments.contains(&stale), "{state:?}");
+    assert!(state.active.is_some_and(|(s, _)| s >= first), "{state:?}");
+    // Nothing is left to do.
+    let again = p.ship(&remote, src.path());
+    assert_eq!((again.objects, again.deleted), (0, 0), "{again:?}");
+}
+
+/// The partial object may be gone already (a bucket lifecycle rule, a person):
+/// that is the state wanted, not a reason to stop shipping for good.
+#[test]
+fn a_stale_active_segment_that_is_gone_from_the_bucket_does_not_stop_shipping() {
+    let bucket = tempdir("ship-stale-gone-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let src = tempdir("ship-stale-gone-src-");
+    let p = start(src.path(), Some(Duration::ZERO));
+    let (stale, first) =
+        active_segment_deleted_before_it_was_closed(&p, src.path(), &remote, bucket.path());
+    std::fs::remove_file(bucket.path().join(format!(
+        "main/segments/{}.zst",
+        kronik_log::segment_name(stale)
+    )))
+    .unwrap();
+
+    p.ship(&remote, src.path());
+    let local = kronik_log::segment_starts(&src.path().join("branches/main/log")).unwrap();
+    assert_eq!(bucket_segments(bucket.path()), local);
+    let state = ShipState::load(src.path()).unwrap();
+    assert!(state.active.is_some_and(|(s, _)| s >= first), "{state:?}");
+    // The snapshot that retention made travelled in the same round.
+    assert_eq!(
+        state.snapshots.len(),
+        p.node.snapshots().unwrap().len(),
+        "{state:?}"
+    );
 }

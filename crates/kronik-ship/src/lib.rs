@@ -382,7 +382,9 @@ pub struct ShipReport {
 /// Uploads what is missing remotely: closed segments (once), the active
 /// segment when it grew (so an idle node's last records leave within one
 /// round), snapshots (files, then the manifest), components; deletes
-/// remote segments and snapshots that retention removed locally.
+/// remote segments and snapshots that retention removed locally, among them
+/// the partial upload of an active segment that retention removed before a
+/// round uploaded it as a closed one.
 pub async fn ship_once(
     remote: &Remote,
     data: &Path,
@@ -393,6 +395,25 @@ pub async fn ship_once(
     let log_dir = data.join("branches").join(branch).join("log");
     let starts = kronik_log::segment_starts(&log_dir)?;
     let seg_rel = |s: Lsn| format!("{branch}/segments/{}.zst", kronik_log::segment_name(s));
+    // The active segment of an earlier round, uploaded while it grew and in no
+    // other list until a round uploads it as a closed one, is gone locally
+    // when retention got to it first (the node could not ship for longer than
+    // `history`). Its partial object would stay in the bucket for good: the
+    // retention step below knows closed segments only, and the loop below
+    // replaces `active` by the new one. So it goes first, before anything can
+    // forget it; an object that is gone already is the state wanted.
+    let first = starts.first().copied().unwrap_or(1);
+    if let Some((stale, _)) = state.active
+        && stale < first
+    {
+        match remote.delete(&seg_rel(stale)).await {
+            Ok(()) | Err(ShipError::Store(object_store::Error::NotFound { .. })) => {}
+            Err(e) => return Err(e),
+        }
+        state.active = None;
+        report.deleted += 1;
+        state.save(data)?;
+    }
     for (i, &start) in starts.iter().enumerate() {
         let closed = i + 1 < starts.len();
         let path = log_dir.join(kronik_log::segment_name(start));
@@ -427,7 +448,6 @@ pub async fn ship_once(
         state.save(data)?;
     }
     // Retention: segments gone locally go remotely too.
-    let first = starts.first().copied().unwrap_or(1);
     let gone: Vec<Lsn> = state
         .segments
         .iter()
