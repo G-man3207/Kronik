@@ -83,6 +83,23 @@ async fn node() -> (tempfile::TempDir, Arc<Node>) {
     .unwrap();
     (data, node)
 }
+/// A node whose secret mutations wait for the inventory as long as a loaded
+/// machine needs. A mutation answers 503 "already committed" when the
+/// inventory is not published again within `fetch_timeout` (two seconds by
+/// default) of the mutation, which a run of many mutations on a loaded
+/// machine can exceed; a test of the ledger itself should not depend on it.
+async fn patient_node() -> (tempfile::TempDir, Arc<Node>) {
+    let data = tempfile::tempdir().unwrap();
+    let mut config = crate::NodeConfig {
+        group_commit_window: Some(Duration::ZERO),
+        ..Default::default()
+    };
+    config.secret_settings.fetch_timeout = Duration::from_secs(30);
+    let node = crate::start_local(env(), data.path(), config)
+        .await
+        .unwrap();
+    (data, node)
+}
 fn row(version: u64, generation: u64) -> pb::SecretVersion {
     pb::SecretVersion {
         name: "token".into(),
@@ -183,7 +200,7 @@ fn hold(cache: &SecretCache, row: &pb::SecretVersion, operational: bool) {
 
 #[tokio::test]
 async fn per_name_concurrent_sets_use_one_durable_allocator() {
-    let (_data, node) = node().await;
+    let (_data, node) = patient_node().await;
     let mut tasks = Vec::new();
     for index in 0..12 {
         let node = node.clone();
@@ -875,7 +892,7 @@ async fn a_certificate_displaced_at_the_same_epoch_retires_the_publications_take
 
 #[tokio::test]
 async fn deletion_keeps_only_scrub_authority_and_missing_retained_values_fail_inventory() {
-    let (_data, node) = node().await;
+    let (_data, node) = patient_node().await;
     node.secret_set(
         "token",
         b"retained-secret-before-delete".to_vec(),
