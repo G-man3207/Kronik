@@ -180,10 +180,45 @@ impl Wrapped {
 impl KeySource {
     pub async fn load(
         env: Env,
-        mut config: Keys,
+        config: Keys,
         data: &Path,
         create: bool,
     ) -> Result<Arc<Self>, KeySourceError> {
+        let (config, master, wrapped) = Self::read_key(&env, config, data, create, true).await?;
+        Ok(Arc::new(Self {
+            env,
+            config,
+            data: data.to_path_buf(),
+            master,
+            wrapped: RwLock::new(wrapped),
+            change: tokio::sync::Mutex::new(()),
+        }))
+    }
+
+    /// The master key of the configured source, and nothing else: the data
+    /// directory's stores are not copied or opened. A restore that runs as
+    /// root needs a key only root can read (a root-only file, a KMS provider's
+    /// credentials), and must not read the stores of a directory that
+    /// another user owns; it checks them with [`validate_staged_stores`]
+    /// afterwards, as the directory's owner.
+    pub async fn load_master(
+        env: &Env,
+        config: Keys,
+        data: &Path,
+    ) -> Result<MasterKey, KeySourceError> {
+        Self::read_key(env, config, data, false, false)
+            .await
+            .map(|(_, master, _)| master)
+    }
+
+    async fn read_key(
+        env: &Env,
+        mut config: Keys,
+        data: &Path,
+        create: bool,
+        check_stores: bool,
+    ) -> Result<(Keys, MasterKey, Option<Wrapped>), KeySourceError> {
+        let env = env.clone();
         protect_process()?;
         config.check_environment()?;
         let deadline = operation_deadline(&env, &config)?;
@@ -199,7 +234,7 @@ impl KeySource {
                     let master = unwrap_retry(&env, &config, &wrapped, deadline).await?;
                     if create {
                         master.validate_stores(&keys)?;
-                    } else {
+                    } else if check_stores {
                         validate_staged_stores(&master, &keys)?;
                     }
                     (master, Some(wrapped))
@@ -223,22 +258,25 @@ impl KeySource {
             }
         } else {
             let fresh = create.then(|| env.random_bytes::<32>());
-            let (master, _) = MasterKey::open(&config.key_path(data), &keys, fresh)?;
+            let (master, _) = if check_stores || create {
+                MasterKey::open(&config.key_path(data), &keys, fresh)?
+            } else {
+                // Only the key: a key file inside the tree of another user is
+                // read by name through descriptors, as `keys wrap` reads its
+                // old key (a link in its place is an error, not followed).
+                (
+                    read_old_key_as(data, &config.key_path(data), Caller::this_process())?,
+                    false,
+                )
+            };
             if create {
                 master.validate_stores(&keys)?;
-            } else {
+            } else if check_stores {
                 validate_staged_stores(&master, &keys)?;
             }
             (master, None)
         };
-        Ok(Arc::new(Self {
-            env,
-            config,
-            data: data.to_path_buf(),
-            master,
-            wrapped: RwLock::new(wrapped),
-            change: tokio::sync::Mutex::new(()),
-        }))
+        Ok((config, master, wrapped))
     }
 
     pub fn master(&self) -> &MasterKey {

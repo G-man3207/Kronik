@@ -11,10 +11,14 @@ use std::sync::Arc;
 
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
+use kronik_privacy::key_source::lock_data;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::snapshots::{Manifest, SnapshotFile, StorageConfig};
 use kronik_sched::{Node, NodeConfig, start_local};
-use kronik_ship::{KeystoreMode, Remote, RestoreReport, ShipError, ShipState, restore, ship_once};
+use kronik_ship::{
+    KeystoreMode, Remote, RestoreReport, ShipError, ShipState, restore, restore_as_owner,
+    root_phase, ship_once,
+};
 use tokio::runtime::Runtime;
 
 fn runtime() -> Runtime {
@@ -140,9 +144,20 @@ struct Shipped {
     base: String,
     manifest: Manifest,
     rt: Runtime,
+    flow: Flow,
 }
 
-fn shipped() -> Shipped {
+/// The two ways a restore runs, which have to refuse and accept the same
+/// things: in one process (`restore`), and as the root phase followed by the
+/// phase of the data directory's owner (`kronik restore` as root over a
+/// nonroot installation, with the drop of privileges in between).
+#[derive(Clone, Copy, Debug)]
+enum Flow {
+    Whole,
+    Split,
+}
+
+fn shipped(flow: Flow) -> Shipped {
     let src = tempdir("names-src-");
     let bucket = tempdir("names-bucket-");
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
@@ -193,6 +208,7 @@ fn shipped() -> Shipped {
         base,
         manifest,
         rt,
+        flow,
     }
 }
 
@@ -310,15 +326,30 @@ impl Shipped {
         data: &Path,
         force: bool,
     ) -> Result<RestoreReport, ShipError> {
-        self.rt.block_on(restore(
-            &bucket.remote,
-            data,
-            "main",
-            force,
-            &Env::real(self.rt.handle().clone()),
-            &Default::default(),
-            KeystoreMode::Require,
-        ))
+        let env = Env::real(self.rt.handle().clone());
+        match self.flow {
+            Flow::Whole => self.rt.block_on(restore(
+                &bucket.remote,
+                data,
+                "main",
+                force,
+                &env,
+                &Default::default(),
+                KeystoreMode::Require,
+            )),
+            Flow::Split => self.rt.block_on(async {
+                let ownership = lock_data(data)?;
+                let phase = root_phase(
+                    &bucket.remote,
+                    data,
+                    &env,
+                    &Default::default(),
+                    KeystoreMode::Require,
+                )
+                .await?;
+                restore_as_owner(&bucket.remote, data, "main", force, &env, phase, &ownership).await
+            }),
+        }
     }
 }
 
@@ -376,9 +407,8 @@ fn unsound_path(what: &str, area: &Path) -> String {
     }
 }
 
-#[test]
-fn a_manifest_with_unsound_paths_is_refused_and_nothing_is_written() {
-    let shipped = shipped();
+fn a_manifest_with_unsound_paths_is_refused_and_nothing_is_written(flow: Flow) {
+    let shipped = shipped(flow);
     for what in UNSOUND {
         let bucket = shipped.copy();
         let (area, data) = shipped.destination();
@@ -399,9 +429,8 @@ fn a_manifest_with_unsound_paths_is_refused_and_nothing_is_written() {
     }
 }
 
-#[test]
-fn a_refused_restore_leaves_existing_state_as_it_was() {
-    let shipped = shipped();
+fn a_refused_restore_leaves_existing_state_as_it_was(flow: Flow) {
+    let shipped = shipped(flow);
     let (area, data) = shipped.destination();
     // A restore that worked: the data directory now holds a node.
     let good = shipped.copy();
@@ -426,9 +455,8 @@ fn a_refused_restore_leaves_existing_state_as_it_was() {
     assert_eq!(tree(area.path()), before);
 }
 
-#[test]
-fn the_files_a_node_writes_are_restored() {
-    let shipped = shipped();
+fn the_files_a_node_writes_are_restored(flow: Flow) {
+    let shipped = shipped(flow);
     let (_area, data) = shipped.destination();
     let bucket = shipped.copy();
     let report = shipped.restore(&bucket, &data, false).unwrap();
@@ -557,9 +585,8 @@ fn precompiled_below(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-#[test]
-fn a_code_object_that_is_not_a_component_named_by_its_hash_is_refused() {
-    let shipped = shipped();
+fn a_code_object_that_is_not_a_component_named_by_its_hash_is_refused(flow: Flow) {
+    let shipped = shipped(flow);
     let engine = shipped.manifest.engine_version.clone();
     let real = shipped.components()[0]
         .strip_suffix(".wasm")
@@ -634,9 +661,8 @@ fn a_code_object_that_is_not_a_component_named_by_its_hash_is_refused() {
     }
 }
 
-#[test]
-fn a_restore_installs_the_components_and_no_precompiled_artifact() {
-    let shipped = shipped();
+fn a_restore_installs_the_components_and_no_precompiled_artifact(flow: Flow) {
+    let shipped = shipped(flow);
     let engine = shipped.manifest.engine_version.clone();
     let components = shipped.components();
     let (area, data) = shipped.destination();
@@ -667,3 +693,25 @@ fn a_restore_installs_the_components_and_no_precompiled_artifact() {
         assert_eq!(format!("{hash}.wasm"), *name);
     }
 }
+
+/// Every test that restores runs through both flows.
+macro_rules! in_both_flows {
+    ($($name:ident),* $(,)?) => {
+        mod one_process {
+            use super::*;
+            $(#[test] fn $name() { super::$name(Flow::Whole) })*
+        }
+        mod two_phases {
+            use super::*;
+            $(#[test] fn $name() { super::$name(Flow::Split) })*
+        }
+    };
+}
+
+in_both_flows!(
+    a_manifest_with_unsound_paths_is_refused_and_nothing_is_written,
+    a_refused_restore_leaves_existing_state_as_it_was,
+    the_files_a_node_writes_are_restored,
+    a_code_object_that_is_not_a_component_named_by_its_hash_is_refused,
+    a_restore_installs_the_components_and_no_precompiled_artifact,
+);

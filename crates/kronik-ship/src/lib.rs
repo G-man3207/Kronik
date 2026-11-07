@@ -19,11 +19,16 @@ use kronik_core::env::Env;
 use kronik_core::ids::Lsn;
 use kronik_privacy::key_source::{KeySource, KeySourceError, Keys, Wrapped};
 use kronik_sched::snapshots::{self, Manifest};
+use object_store::aws::{AmazonS3ConfigKey, AwsCredential, AwsCredentialProvider};
 use object_store::path::Path as Key;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, StaticCredentialProvider};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 mod names;
+
+#[cfg(test)]
+mod credential_tests;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShipError {
@@ -47,6 +52,12 @@ pub enum ShipError {
     /// bucket can provide.
     #[error("KEYSTORE_INCOMPLETE: {0}")]
     KeystoreIncomplete(String),
+    /// The remote refused credentials that were resolved before a restore
+    /// dropped its privileges: they cannot be refreshed any more.
+    #[error(
+        "object storage: {0}; the credentials were resolved before the restore dropped its privileges and cannot be refreshed, so run it again with credentials that last as long as the restore takes"
+    )]
+    CredentialsExpired(object_store::Error),
 }
 
 impl ShipError {
@@ -63,7 +74,7 @@ impl ShipError {
             ShipError::Keystore(_) => "keystore",
             ShipError::KeySource(_) => "key_source",
             ShipError::KeystoreIncomplete(_) => "keystore_incomplete",
-            ShipError::Store(e) => match e {
+            ShipError::Store(e) | ShipError::CredentialsExpired(e) => match e {
                 E::NotFound { .. } => "s3_not_found",
                 E::PermissionDenied { .. } => "s3_forbidden",
                 E::Unauthenticated { .. } => "s3_unauthenticated",
@@ -87,6 +98,83 @@ pub const SHIP_INTERVAL: Duration = Duration::from_secs(10);
 pub struct Remote {
     store: Arc<dyn ObjectStore>,
     prefix: String,
+    /// An S3 remote's provider of credentials, kept so that they can be
+    /// resolved ([`Remote::resolve_credentials`]); none for a remote that is
+    /// not signed.
+    credentials: Option<AwsCredentialProvider>,
+    /// Set when this remote signs with credentials that were resolved before
+    /// ([`Remote::open_with`]) and are temporary (they carry a session token):
+    /// a refusal because they ran out is then reported as that.
+    stale_hint: bool,
+}
+
+/// Whether the provider's answer says that temporary credentials ran out:
+/// S3's and STS's own codes, as they appear in the body of the error.
+fn credentials_ran_out(error: &object_store::Error) -> bool {
+    let text = error.to_string();
+    [
+        "ExpiredToken",
+        "ExpiredTokenException",
+        "RequestExpired",
+        "TokenRefreshRequired",
+        "InvalidToken",
+    ]
+    .iter()
+    .any(|code| text.contains(code))
+}
+
+/// What a remote needs in order to be reached after the process has given up
+/// the privileges it had when it read it: the credentials of an S3 remote,
+/// read once now (an environment's, a token file's, an instance's or a pod's)
+/// and held in memory, so that nothing is read from a file again. A `file://`
+/// remote has none.
+pub struct RemoteCredentials(Option<Resolved>);
+
+/// One set of credentials, as the provider gave it. The secret parts are
+/// zeroed when this is dropped; the copy that a [`Remote`] built from it keeps
+/// in its signer lives as long as the remote does.
+struct Resolved {
+    key_id: String,
+    secret_key: Zeroizing<String>,
+    token: Option<Zeroizing<String>>,
+}
+
+impl Resolved {
+    fn aws(&self) -> AwsCredential {
+        AwsCredential {
+            key_id: self.key_id.clone(),
+            secret_key: (*self.secret_key).clone(),
+            token: self.token.as_ref().map(|t| (**t).clone()),
+        }
+    }
+}
+
+impl std::fmt::Debug for RemoteCredentials {
+    /// Never the credentials themselves.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "RemoteCredentials(resolved)"
+        } else {
+            "RemoteCredentials(none)"
+        })
+    }
+}
+
+impl RemoteCredentials {
+    /// No credentials: a `file://` remote, or an S3 remote opened as it is.
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// Credentials the caller already has. A session token marks them as
+    /// temporary: a refusal that says they ran out is then reported as that.
+    pub fn new(key_id: String, secret_key: String, session_token: Option<String>) -> Self {
+        Self(Some(Resolved {
+            key_id,
+            secret_key: Zeroizing::new(secret_key),
+            token: session_token.map(Zeroizing::new),
+        }))
+    }
 }
 
 impl Remote {
@@ -94,6 +182,18 @@ impl Remote {
     /// `AWS_*` environment; `endpoint` for S3-compatible servers, where
     /// `http://` is allowed) or `file:///dir/prefix`.
     pub fn open(url: &str, endpoint: Option<&str>) -> Result<Remote, ShipError> {
+        Self::open_with(url, endpoint, &RemoteCredentials::none())
+    }
+
+    /// [`Remote::open`] with credentials that were resolved before
+    /// ([`Remote::resolve_credentials`]): an S3 remote signs with them and
+    /// reads no other source, so a process that no longer may read a token
+    /// file still reaches its bucket.
+    pub fn open_with(
+        url: &str,
+        endpoint: Option<&str>,
+        resolved: &RemoteCredentials,
+    ) -> Result<Remote, ShipError> {
         // reqwest's rustls has no bundled provider; ring is the process's
         // (an error means one is installed already).
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -111,9 +211,23 @@ impl Remote {
             if let Some(e) = endpoint {
                 b = b.with_endpoint(e).with_allow_http(e.starts_with("http://"));
             }
+            let mut stale_hint = false;
+            if let Some(credential) = &resolved.0 {
+                stale_hint = credential.token.is_some();
+                b = b.with_credentials(Arc::new(StaticCredentialProvider::new(credential.aws())));
+            }
+            // A remote that is read without signing (`AWS_SKIP_SIGNATURE`, a
+            // public bucket) has no credentials to resolve; asking the provider
+            // would only try the metadata of an instance.
+            let unsigned = b
+                .get_config_value(&AmazonS3ConfigKey::SkipSignature)
+                .is_some_and(|value| value == "true");
+            let s3 = b.build()?;
             return Ok(Remote {
-                store: Arc::new(b.build()?),
+                credentials: (!unsigned).then(|| s3.credentials().clone()),
+                store: Arc::new(s3),
                 prefix: prefix.trim_matches('/').to_owned(),
+                stale_hint,
             });
         }
         if let Some(path) = url.strip_prefix("file://") {
@@ -122,11 +236,44 @@ impl Remote {
             return Ok(Remote {
                 store: Arc::new(fs),
                 prefix: String::new(),
+                credentials: None,
+                stale_hint: false,
             });
         }
         Err(ShipError::Config(format!(
             "{url}: expected s3://bucket/prefix or file:///path"
         )))
+    }
+
+    /// Reads the credentials of an S3 remote now, whatever they come from
+    /// (the environment, a web identity or pod token file, the metadata of an
+    /// instance), for [`Remote::open_with`]. A process that is going to give
+    /// up the privilege to read such a source calls this first. The
+    /// credentials last as long as their source made them last; temporary
+    /// ones that run out end the operation with the provider's refusal and a
+    /// hint (see `ShipError::CredentialsExpired`).
+    pub async fn resolve_credentials(&self) -> Result<RemoteCredentials, ShipError> {
+        let Some(provider) = &self.credentials else {
+            return Ok(RemoteCredentials::none());
+        };
+        let credential = provider.get_credential().await?;
+        Ok(RemoteCredentials(Some(Resolved {
+            key_id: credential.key_id.clone(),
+            secret_key: Zeroizing::new(credential.secret_key.clone()),
+            token: credential.token.clone().map(Zeroizing::new),
+        })))
+    }
+
+    /// A store's error. When this remote signs with temporary credentials that
+    /// were resolved before, and the provider's answer says that they ran out,
+    /// it is reported as that, with the way out. A refusal for another reason
+    /// (a policy, a missing bucket) is not blamed on them.
+    fn store_error(&self, error: object_store::Error) -> ShipError {
+        if self.stale_hint && credentials_ran_out(&error) {
+            ShipError::CredentialsExpired(error)
+        } else {
+            ShipError::Store(error)
+        }
     }
 
     fn key(&self, rel: &str) -> Key {
@@ -141,7 +288,8 @@ impl Remote {
     pub async fn put(&self, rel: &str, bytes: Vec<u8>) -> Result<(), ShipError> {
         self.store
             .put(&self.key(rel), PutPayload::from(bytes))
-            .await?;
+            .await
+            .map_err(|e| self.store_error(e))?;
         Ok(())
     }
 
@@ -154,26 +302,38 @@ impl Remote {
         {
             Ok(_) => Ok(true),
             Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
-            Err(error) => Err(error.into()),
+            Err(error) => Err(self.store_error(error)),
         }
     }
 
     /// The object under `rel`.
     pub async fn get(&self, rel: &str) -> Result<Vec<u8>, ShipError> {
+        let response = self
+            .store
+            .get(&self.key(rel))
+            .await
+            .map_err(|e| self.store_error(e))?;
         Ok(Vec::from(
-            self.store.get(&self.key(rel)).await?.bytes().await?,
+            response.bytes().await.map_err(|e| self.store_error(e))?,
         ))
     }
 
     async fn delete(&self, rel: &str) -> Result<(), ShipError> {
-        self.store.delete(&self.key(rel)).await?;
+        self.store
+            .delete(&self.key(rel))
+            .await
+            .map_err(|e| self.store_error(e))?;
         Ok(())
     }
 
     /// Object names directly under `rel/` and sub-directory names.
     pub async fn list(&self, rel: &str) -> Result<(Vec<String>, Vec<String>), ShipError> {
         let prefix = self.key(rel);
-        let r = self.store.list_with_delimiter(Some(&prefix)).await?;
+        let r = self
+            .store
+            .list_with_delimiter(Some(&prefix))
+            .await
+            .map_err(|e| self.store_error(e))?;
         let name = |p: &Key| p.filename().unwrap_or_default().to_owned();
         Ok((
             r.objects.iter().map(|o| name(&o.location)).collect(),
@@ -195,7 +355,7 @@ impl Remote {
         };
         let mut objects = self.store.list(Some(&prefix));
         while let Some(object) = std::future::poll_fn(|cx| objects.as_mut().poll_next(cx)).await {
-            let object = object?;
+            let object = object.map_err(|e| self.store_error(e))?;
             let name = object
                 .location
                 .as_ref()
@@ -912,12 +1072,188 @@ pub async fn restore_with_fault(
         .collect();
     std::fs::create_dir_all(data)?;
     let ownership = kronik_privacy::key_source::lock_data(data)?;
+    if data.join("branches").join(branch).join("state.db").exists() && !force {
+        return Err(already_holds_state(data));
+    }
+    // One process, one authority: the root phase and the owner's phase run
+    // here in the order they would run across a privilege drop.
+    let phase = match root_phase(remote, data, env, keys, mode).await {
+        Ok(phase) => phase,
+        Err(e) => {
+            // Empty only: never anything else that appeared meanwhile.
+            for d in &created {
+                let _ = std::fs::remove_dir(d);
+            }
+            return Err(e);
+        }
+    };
+    restore_staged(
+        remote, data, branch, force, env, phase, &ownership, &created, fault,
+    )
+    .await
+}
+
+fn already_holds_state(data: &Path) -> ShipError {
+    ShipError::Restore(format!(
+        "{} already holds state; restore into an empty data directory or pass --force",
+        data.display()
+    ))
+}
+
+/// What a restore does with the authority of its caller, which on a nonroot
+/// installation is root: the master key (from a file or a KMS provider that
+/// only root may use) and the keystore backup, decrypted to check that it can
+/// be installed. Nothing is written, and nothing in the data directory is
+/// opened but the envelope of a KMS source, which is read by name. Of the
+/// bucket it handles the wrapped key of a KMS source (one JSON document), the
+/// newest keystore backup (an authenticated blob) and the names of the
+/// backups, parsed as numbers; manifests, segments, snapshots and components
+/// are left to [`restore_as_owner`]. The key stays in the protected memory of
+/// [`kronik_privacy::MasterKey`], so that it can be carried across a drop of
+/// privileges; everything else needs no authority at all.
+pub struct RootPhase {
+    /// The key, when the source gave one. A restore needs no key unless a
+    /// keystore backup or the snapshot's secret store does, so a source that
+    /// could not be read is kept as it is for the moment it is needed.
+    master: Option<Result<kronik_privacy::MasterKey, KeySourceError>>,
+    wrapped: Option<(PathBuf, Vec<u8>)>,
+    keystore: Result<KeystoreBackup, &'static str>,
+    mode: KeystoreMode,
+    /// The stores of the data directory are checked against the key before
+    /// anything is downloaded (a KMS source, or a backup to install), not once
+    /// the snapshot is known to hold a secret store.
+    check_stores_first: bool,
+}
+
+/// The part of a restore that needs the caller's authority (see [`RootPhase`]).
+pub async fn root_phase(
+    remote: &Remote,
+    data: &Path,
+    env: &Env,
+    keys: &Keys,
+    mode: KeystoreMode,
+) -> Result<RootPhase, ShipError> {
+    // The keystore backup is checked before anything is downloaded, so a
+    // missing or wrong key fails fast (m8-privacy §10).
+    let mut wrapped = None;
+    let mut check_stores_first = false;
+    let master = if keys.source.is_kms() {
+        let bytes = match remote.get("wrapped/current.wrapped").await {
+            Ok(bytes) => bytes,
+            Err(ShipError::Store(object_store::Error::NotFound { .. })) => {
+                let (backups, _) = remote.list("keystore").await?;
+                let wall = backups
+                    .iter()
+                    .filter_map(|n| n.strip_suffix(".bin")?.parse::<u64>().ok())
+                    .max()
+                    .ok_or_else(|| {
+                        ShipError::Restore("no wrapped master key in the bucket".into())
+                    })?;
+                remote.get(&format!("keystore/{wall}.wrapped")).await?
+            }
+            Err(e) => return Err(e),
+        };
+        Wrapped::parse(&bytes, keys)?;
+        let master = kronik_privacy::key_source::unwrap_envelope(env, keys, &bytes).await?;
+        // On a forced restore the target's envelope is never silently replaced
+        // with a different seed, even when both use the configured provider.
+        let target = keys.envelope_path(data)?;
+        if kronik_privacy::key_source::exists_in(data, &target)? {
+            let old = kronik_privacy::key_source::read_envelope_in(data, &target)?;
+            let old = kronik_privacy::key_source::unwrap_envelope(env, keys, &old).await?;
+            if !master.same_key(&old) {
+                return Err(ShipError::Key(kronik_privacy::PrivacyError::KeyMismatch(
+                    "the restored envelope differs from the destination's master key".into(),
+                )));
+            }
+        }
+        wrapped = Some((target, bytes));
+        check_stores_first = true;
+        Some(Ok(master))
+    } else if mode != KeystoreMode::Without {
+        let (backups, _) = remote.list("keystore").await?;
+        let has_backup = backups.iter().any(|n| {
+            n.strip_suffix(".bin")
+                .is_some_and(|n| n.parse::<u64>().is_ok())
+        });
+        match KeySource::load_master(env, keys.clone(), data).await {
+            Ok(master) => {
+                check_stores_first = has_backup;
+                Some(Ok(master))
+            }
+            // Needed now: the backup cannot be decrypted without it.
+            Err(e) if has_backup => return Err(e.into()),
+            // Needed only if the snapshot turns out to hold a secret store.
+            Err(e) => Some(Err(e)),
+        }
+    } else {
+        None
+    };
+    let keystore = check_keystore_backup(
+        remote,
+        master.as_ref().and_then(|m| m.as_ref().ok()),
+        mode == KeystoreMode::Without,
+    )
+    .await?;
+    Ok(RootPhase {
+        master,
+        wrapped,
+        keystore,
+        mode,
+        check_stores_first,
+    })
+}
+
+/// The rest of a restore, run by the data directory's owner under the lock
+/// that was taken before the drop: it downloads into `.restore` inside the
+/// data directory, checks the stores against the key, imports the keystore and
+/// moves everything into place. It needs no authority beyond the owner's, and
+/// it refuses a directory that is no longer the one that was locked.
+pub async fn restore_as_owner(
+    remote: &Remote,
+    data: &Path,
+    branch: &str,
+    force: bool,
+    env: &Env,
+    phase: RootPhase,
+    ownership: &kronik_privacy::key_source::DataOwnership,
+) -> Result<RestoreReport, ShipError> {
+    directory_identity(data, ownership)?;
+    // Only `keys` can be new: the directory itself was locked, so it was there.
+    let created: Vec<PathBuf> = std::iter::once(data.join("keys"))
+        .take_while(|d| !d.exists())
+        .collect();
+    let result = restore_staged(
+        remote,
+        data,
+        branch,
+        force,
+        env,
+        phase,
+        ownership,
+        &created,
+        &|_| Ok(()),
+    )
+    .await;
+    directory_identity(data, ownership)?;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restore_staged(
+    remote: &Remote,
+    data: &Path,
+    branch: &str,
+    force: bool,
+    env: &Env,
+    phase: RootPhase,
+    ownership: &kronik_privacy::key_source::DataOwnership,
+    created: &[PathBuf],
+    fault: &dyn Fn(&str) -> std::io::Result<()>,
+) -> Result<RestoreReport, ShipError> {
     let branch_dir = data.join("branches").join(branch);
     if branch_dir.join("state.db").exists() && !force {
-        return Err(ShipError::Restore(format!(
-            "{} already holds state; restore into an empty data directory or pass --force",
-            data.display()
-        )));
+        return Err(already_holds_state(data));
     }
     // Everything is downloaded, checked and written in a staging directory
     // first: a restore that fails there leaves the data directory as it was,
@@ -928,14 +1264,13 @@ pub async fn restore_with_fault(
     if stage.exists() {
         std::fs::remove_dir_all(&stage)?;
     }
-    let staged = stage_restore(
+    let staged = stage_after_keys(
         remote,
         data,
         &stage,
         branch,
         env,
-        keys,
-        mode,
+        phase,
         KeystorePhase::Now(&keystore_restore),
     )
     .await;
@@ -952,7 +1287,7 @@ pub async fn restore_with_fault(
         Err(e) => {
             let _ = std::fs::remove_dir_all(&stage);
             // Empty only: never anything else that appeared meanwhile.
-            for d in &created {
+            for d in created {
                 let _ = std::fs::remove_dir(d);
             }
             Err(e)
@@ -1012,6 +1347,8 @@ struct KeystoreStaged {
     master: Option<kronik_privacy::MasterKey>,
 }
 
+/// Stage a restore in one process, the way the prepared restore needs it
+/// (removed with it).
 #[allow(clippy::too_many_arguments)]
 async fn stage_restore(
     remote: &Remote,
@@ -1023,6 +1360,40 @@ async fn stage_restore(
     mode: KeystoreMode,
     keystore_phase: KeystorePhase<'_>,
 ) -> Result<(Staged, Option<KeystoreStep>), ShipError> {
+    let phase = root_phase(remote, data, env, keys, mode).await?;
+    stage_after_keys(remote, data, stage, branch, env, phase, keystore_phase).await
+}
+
+/// Everything after the key phase: the downloads into `stage`, the checks of
+/// the stores against the key, the keystore step and the copies that make the
+/// move into place only renames.
+async fn stage_after_keys(
+    remote: &Remote,
+    data: &Path,
+    stage: &Path,
+    branch: &str,
+    env: &Env,
+    phase: RootPhase,
+    keystore_phase: KeystorePhase<'_>,
+) -> Result<(Staged, Option<KeystoreStep>), ShipError> {
+    let RootPhase {
+        master,
+        wrapped,
+        keystore,
+        mode,
+        check_stores_first,
+    } = phase;
+    let (master, deferred) = match master {
+        Some(Ok(master)) => (Some(master), None),
+        Some(Err(why)) => (None, Some(why)),
+        None => (None, None),
+    };
+    // The stores of the data directory against the key: here, by the owner of
+    // the directory, and before anything is downloaded when the key was
+    // needed for the backup or the envelope.
+    if check_stores_first && let Some(master) = &master {
+        kronik_privacy::key_source::validate_staged_stores(master, &data.join("keys"))?;
+    }
     // 1. The newest complete remote snapshot.
     let (_, lsns) = remote.list(&format!("{branch}/snapshots")).await?;
     let mut newest: Option<Manifest> = None;
@@ -1043,71 +1414,17 @@ async fn stage_restore(
         all.push(m);
     }
     let m = newest.ok_or_else(|| ShipError::Restore("no snapshot in the bucket".into()))?;
-    // The keystore backup is checked before anything is downloaded, so a
-    // missing or wrong key fails fast (m8-privacy §10).
-    let mut wrapped = None;
-    let mut master = if keys.source.is_kms() {
-        let bytes = match remote.get("wrapped/current.wrapped").await {
-            Ok(bytes) => bytes,
-            Err(ShipError::Store(object_store::Error::NotFound { .. })) => {
-                let (backups, _) = remote.list("keystore").await?;
-                let wall = backups
-                    .iter()
-                    .filter_map(|n| n.strip_suffix(".bin")?.parse::<u64>().ok())
-                    .max()
-                    .ok_or_else(|| {
-                        ShipError::Restore("no wrapped master key in the bucket".into())
-                    })?;
-                remote.get(&format!("keystore/{wall}.wrapped")).await?
-            }
-            Err(e) => return Err(e),
-        };
-        Wrapped::parse(&bytes, keys)?;
-        let master = kronik_privacy::key_source::unwrap_envelope(env, keys, &bytes).await?;
-        kronik_privacy::key_source::validate_staged_stores(&master, &data.join("keys"))?;
-        // On a forced restore the target's envelope is never silently replaced
-        // with a different seed, even when both use the configured provider.
-        let target = keys.envelope_path(data)?;
-        if kronik_privacy::key_source::exists_in(data, &target)? {
-            let old = kronik_privacy::key_source::read_envelope_in(data, &target)?;
-            let old = kronik_privacy::key_source::unwrap_envelope(env, keys, &old).await?;
-            if !master.same_key(&old) {
-                return Err(ShipError::Key(kronik_privacy::PrivacyError::KeyMismatch(
-                    "the restored envelope differs from the destination's master key".into(),
-                )));
-            }
-        }
-        wrapped = Some((target, bytes));
-        Some(master)
-    } else if mode != KeystoreMode::Without {
-        let (backups, _) = remote.list("keystore").await?;
-        if backups.iter().any(|n| {
-            n.strip_suffix(".bin")
-                .is_some_and(|n| n.parse::<u64>().is_ok())
-        }) {
-            Some(
-                KeySource::load(env.clone(), keys.clone(), data, false)
-                    .await?
-                    .master()
-                    .clone(),
-            )
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let keystore =
-        check_keystore_backup(remote, master.as_ref(), mode == KeystoreMode::Without).await?;
     let snap = stage.join("snapshot");
     download_snapshot(remote, &snap, branch, &m).await?;
-    if master.is_none() && mode != KeystoreMode::Without && snap.join("secrets.db").exists() {
-        master = Some(
-            KeySource::load(env.clone(), keys.clone(), data, false)
-                .await?
-                .master()
-                .clone(),
-        );
+    if mode != KeystoreMode::Without && snap.join("secrets.db").exists() {
+        // The snapshot holds a secret store, so the key is needed after all.
+        match (&master, deferred) {
+            (Some(master), _) if !check_stores_first => {
+                kronik_privacy::key_source::validate_staged_stores(master, &data.join("keys"))?;
+            }
+            (None, Some(why)) => return Err(why.into()),
+            _ => {}
+        }
     }
     // Validate the snapshot's encrypted secret store before touching the target.
     if let Some(master) = &master {
