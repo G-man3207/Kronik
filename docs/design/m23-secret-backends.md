@@ -1,11 +1,22 @@
 # M23: Key and secret backends (design)
 
-Status: B1 KMS lifecycle is implemented for OpenBao, AWS, GCP and Azure.
-B2–B6 are approved and under active implementation. Sections 1–13 contain
-the revised design proposal, including its historical loader inventory and
-the acceptance plan; the B1 design gate below records the design that was
-implemented. Implementation evidence is tracked with the code; a plan is not
-a pass.
+Status: B1 KMS lifecycle is implemented for OpenBao, AWS, GCP and Azure. B2
+to B4 (the backend trait, links and versions in the log, the cache and the
+five secret providers) have been in the code since v0.4.0. None of B2–B6 is
+accepted as a milestone; the project status page on the wiki has the state. Sections 1–13 contain the design proposal, including its historical
+loader inventory and the acceptance plan: where a sentence there says
+"planned", the table below decides. The B1 design gate at the end records the
+design that was implemented first. Implementation evidence is tracked with the
+code; a plan is not a pass.
+
+| Slice | In the code | Has run | Not done |
+| --- | --- | --- | --- |
+| B1 master key in a KMS | OpenBao, AWS, GCP and Azure wrapping; `file` and `env` seeds; `keys wrap`, `rewrap`, `status` | `scripts/e2e-keys.sh` on pinned service images (the status page has the runs) | |
+| B2 trait, links, versions | `SecretBackend`; `SecretVersion` (kind 45) and `SecretLink` (kind 46); `secret link`, `unlink`, `refresh`, `history`, `backends`; effects resolve through links; re-runs fetch by `source_version`; `secrets` in the effects of `history` (added after v0.4.0) | `crates/kronik/tests/secret_backends.rs`: a real daemon against a stand-in for OpenBao's KV v2 (§9, criteria 2 and 3, steps 1 to 7) | the DST scenario "one allocator" |
+| B3 cache and outages | the cache and the refresher; `fetch_timeout`; `max_stale`; the failure cache of 5 s; an error result for an effect that cannot get its secret; scrubbing that fails closed; forks that never fetch | the same file: a hanging, a refusing and an unconfigured backend, restarts, crash re-runs (the stale-use bounds only by unit tests) | the resolver for foreign actors and forks (a stopgap refuses linked names, §6); the metrics and the doctor section of §6; the DST scenario `secret-outage` |
+| B4 providers | clients for `env`, `openbao` (KV v2, token, AppRole, certificate), `aws` (Secrets Manager), `gcp` and `azure` | unit tests for each (with a fake network for the four REST clients); OpenBao's KV v2 shape through the stand-in | any run against a real service, moto or an emulator |
+| B5 proof and docs | `secret_backends.rs`; the `[secrets]` table and two troubleshooting sections of the operations guide; the CLI, JSON, OpenAPI and error references | | the e2e suite with real services; `scripts/e2e-cloud-secrets.sh`, which has not been written |
+| B6 PKCS#11 | the `kronik-keyhelper` crate and its default-off release asset (ADR 0093) | | integrated acceptance with SoftHSM2 or a device |
 
 ## The brief
 
@@ -90,7 +101,7 @@ environment variables.
 **What is missing:** no trait, no remote backend, no KMS or HSM code. The
 dependency tree has no provider SDK and no PKCS#11 crate.
 
-## 2. Overall proposal shape (B1 scope and planned B2–B6)
+## 2. Overall shape
 
 ```text
                  kronik-privacy
@@ -287,7 +298,11 @@ never loads one:
 - M21's unit has `PrivateDevices=yes`, which hides USB HSMs: the guide
   ships a `DeviceAllow=` drop-in for them.
 
-## 4. Planned B2–B4: `SecretBackend` and links (ADR 0090)
+## 4. `SecretBackend` and links (B2–B4, ADR 0090)
+
+In the code since v0.4.0 (`crates/kronik-privacy/src/secret_backend.rs`,
+`crates/kronik-sched/src/secrets.rs`). The sketches in 4.1 and 4.3 are the
+first proposal; the notes under them say what the types carry as built.
 
 ### 4.1 The trait
 
@@ -305,6 +320,12 @@ pub trait SecretBackend: Send + Sync + 'static {
 pub struct Fetched { pub value: Zeroizing<Vec<u8>>, pub source_version: String }
 pub enum BackendError { Unavailable(String), NotFound, VersionGone, Denied(String), Invalid(String) }
 ```
+
+As built, the trait has a third method, `versions` (the retained catalogue of a
+path, one page at a time), every method takes the caller's original lease, and
+`Fetched` also returns the canonical reference of what it read. `BackendError`
+carries no message and has one more variant, `Unauthorized` (the original
+authority ended).
 
 The built-in store is the `file` backend. It keeps its own write path
 (`secret set`, `secret delete`), which no other backend has: Kronik never
@@ -354,6 +375,9 @@ message SecretLink {
 }
 ```
 
+As built, `SecretLink` also carries `binding`, `generation`, `epoch` and
+`canonical_ref` (`proto/kronik/log/v1/config.proto`); ADR 0090 says why.
+
 - `kronik secret link <name> --backend bao --ref secret/payments#stripe
   --reason R [--dry-run]` checks that the backend exists on this node and
   that `ref` lies under one of the backend's `allowed_refs` prefixes, then
@@ -382,7 +406,7 @@ message SecretLink {
 - `SecretLink` is applied to a `secret_links` table in `state.db`, so it is
   rebuilt from the log.
 
-## 5. Planned B2: versions and hashes in the log (ADR 0090)
+## 5. Versions and hashes in the log (B2, ADR 0090)
 
 ### 5.1 `SecretVersion`, kind 45
 
@@ -400,6 +424,10 @@ message SecretVersion {
   Audit audit = 7;             // the caller for set/delete; "system" when observed
 }
 ```
+
+As built, `version` is a `uint64`, and the record also carries `ref`,
+`binding`, `link_generation`, `canonical_ref`, a `phase` (reserved, active,
+failed, or the format fence) and `hash_revision`.
 
 - **The hash** is the built-in one: `version_hash = BLAKE3_keyed(k,
   name ‖ 0 ‖ version_le ‖ 0 ‖ value)[..16]`, with k derived from the master
@@ -501,8 +529,9 @@ The third criterion: "Rotation of a secret shows up as a new version in
   re-send) whose `EffectResult` was recorded `Ok` must give the guest that
   value again:
   - **`Unavailable`:** the rerun retries with backoff (Env clock) and holds
-    only that actor's turn; other actors run (I10). Doctor and
-    `kronik_secret_stalled_reruns` show it.
+    only that actor's turn; other actors run (I10). The gauge
+    `kronik_secret_recovery_stalled` and a warning that names the actor and
+    the turn show it; `kronik doctor` does not yet.
   - **`VersionGone`** (destroyed version, changed `env` value): the turn
     fails with `SECRET_VERSION_GONE` before the guest sees anything, and
     goes to dead letters with that code. The guest never takes a path the
@@ -517,7 +546,15 @@ The third criterion: "Rotation of a secret shows up as a new version in
   secret value for recorded effects, so it gives the same outcomes before
   and after a rotation.
 
-## 6. Planned B2–B5: caching, outages and timeouts (ADR 0091)
+## 6. Caching, outages and timeouts (B3, ADR 0091)
+
+Built: the cache and the refresher, `fetch_timeout`, `max_stale`, the failure
+cache, scrubbing that fails closed and the error result of an effect that
+cannot get its secret. `secret_backends.rs` exercises the outage, refusal and
+restart cases against the stand-in, and unit tests the stale-use bounds. Not
+built, and marked below where they occur: the metrics, the doctor section, the
+resolver for foreign actors and forks (a stopgap refuses linked names) and the
+DST scenario `secret-outage`.
 
 The rule (I10): a backend that is down affects only effects that need its
 secrets, and only once Kronik has no usable value.
@@ -536,7 +573,8 @@ secrets, and only once Kronik has no usable value.
 - **An effect that needs a secret:**
   - **fresh cache:** uses it, with no I/O;
   - **stale cache** (refresh failed): uses it until `[secrets] max_stale`
-    (default 24 h), with `kronik_secret_stale{name}` set and a warning;
+    (default 24 h). The gauge `kronik_secret_stale{name}` and a warning are
+    planned; a stale value is used without either;
   - **no cache:** fetches with `[secrets] fetch_timeout` (default 2 s, Env
     timer).
     - On failure, the effect gets an error result, `SECRET_UNAVAILABLE`.
@@ -563,10 +601,12 @@ secrets, and only once Kronik has no usable value.
     - Only a failure is cached: for 5 s, so a burst of turns does not
       queue on a dead backend.
 - **Turns that use no linked secret never touch the cache or a backend.**
-  The DST scenario `secret-outage` asserts this with a backend that hangs
-  forever: such turns commit at their normal rate.
-- **Retries:** the refresher backs off from 1 s up to `refresh`. A
-  `Denied` error (bad credentials) is logged once per change and counted.
+  The DST scenario `secret-outage` (not written yet) is to assert this with a
+  backend that hangs forever: such turns commit at their normal rate.
+  `secret_backends.rs` shows it in a daemon with a hanging stand-in.
+- **Retries:** the refresher backs off from 1 s up to `refresh`. A refused
+  fetch (bad credentials) is logged as `secret fetch failed`, once for each 5 s
+  that the failure is remembered; it is not counted yet.
 - **Token lifetimes:** OpenBao tokens are renewed with `renew-self` at half
   their TTL. AppRole logs in again when renewal fails. Cloud access tokens
   are refreshed before `expires_in`.
@@ -579,8 +619,9 @@ secrets, and only once Kronik has no usable value.
     configuration of that moment links to a backend (the built-in store holds
     an older value of it or none), and a name that is not linked is read as
     before.
-  - A rotation does not restart a running foreign actor. `kronik foreign
-    restart` or the next start picks the new version.
+  - A rotation does not restart a running foreign actor. Its next start
+    (after a crash or a daemon restart), or removing and adding it again,
+    picks the new version; no command restarts one actor.
 - **Scrubbing survives restarts** (I8). `ok_scrubbed` keeps
   revealed values that a guest stored or logged out of `history`, `actors
   inspect` and MCP. It must cover every value that may sit in retained data:
@@ -608,13 +649,14 @@ secrets, and only once Kronik has no usable value.
   built-in store is not asked. The fork point's configuration includes the
   links of its window, so a fork from before the link, or after an unlink,
   uses the built-in store as before.
-- **Metrics:**
+- **Metrics (planned; none of these four exists, and of the `kronik_secret_*`
+  family only `kronik_secret_recovery_stalled` does):**
   - `kronik_secret_fetch_total{backend,result}`;
   - `kronik_secret_fetch_seconds{backend}`;
   - `kronik_secret_stale{name}`;
   - `kronik_secret_versions_total{backend}`.
-- **Doctor:** each backend's last success and error, and linked names with
-  no cached value.
+- **Doctor (planned; `kronik doctor` has no such section):** each backend's
+  last success and error, and linked names with no cached value.
 
 ### 6.1 Configured immutable host MACs
 
@@ -766,8 +808,8 @@ with ring, the effects client), with JSON through `serde_json`:
 
 | Need | How | New crate? |
 |---|---|---|
-| OpenBao / Vault | B1 transit + token/AppRole/cert login; KV v2 and token renewal remain planned B4 | no |
-| AWS SigV4 | B1 KMS over ring HMAC/SHA256 and `env.clock`, with published signing vectors; Secrets Manager remains planned B4 | no |
+| OpenBao / Vault | B1 transit + token/AppRole/cert login; KV v2 reads and token renewal (B4, in the code since v0.4.0, tested with a fake network and the stand-in only) | no |
+| AWS SigV4 | B1 KMS over ring HMAC/SHA256 and `env.clock`, with published signing vectors; Secrets Manager (B4, in the code since v0.4.0, tested with a fake network only) | no |
 | GCP OAuth2 service-account JWT | RS256 with `ring::signature::RsaKeyPair::from_pkcs8` + `RSA_PKCS1_SHA256`; token from `oauth2.googleapis.com/token`; or the metadata server | no |
 | Azure AD client credentials | form POST to `login.microsoftonline.com/{tenant}/oauth2/v2.0/token`, or IMDS managed identity | no |
 | PKCS#11 (B6 proposed; maintainer-gated) | proposed `cryptoki` helper dependency tree, not added by B1 | maintainer decision; no B1 dependency |
@@ -787,11 +829,13 @@ B1 adds no provider SDK or PKCS#11 dependency. The proposed B6 helper would
 need a separate cargo-deny review of its `cryptoki` dependency tree; this
 design does not claim that the proposed tree or any SoftHSM check passed.
 
-## 8. Proposed configuration, CLI and API (B2–B6 not implemented)
+## 8. Configuration, CLI and API
 
-B1's shipped interfaces are documented in the current CLI, JSON and OpenAPI
-references. This original combined proposal also contains planned external
-secret and PKCS#11 interfaces; those are not available in B1.
+The CLI, JSON and OpenAPI references are the contract; this section keeps the
+original combined proposal. Differences that matter: `kronik secret backends`
+lists the id, kind, binding, whether the backend is configured and whether the
+inventory is complete, and shows no last success or error; PKCS#11 follows
+§3.4, not the sketch.
 
 ```toml
 [keys]
@@ -840,7 +884,7 @@ Kronik](../guides/operations.md#secrets)).
 | `kronik secret unlink <name>` | DELETE `/v1/secrets/{name}/link` | admin | reason, dry run |
 | `kronik secret refresh <name>` | POST `/v1/secrets/{name}/refresh` | operate | reason, dry run; records a new version if there is one |
 | `kronik secret history <name>` | GET `/v1/secrets/{name}/history` | read | the `SecretVersion`s |
-| `kronik secret backends` | GET `/v1/secrets/backends` | read | id, type, address host only, last success/error |
+| `kronik secret backends` | GET `/v1/secrets/backends` | read | id, kind, binding, configured, inventory complete; contacts no provider |
 | `kronik keys status` | GET `/v1/keys` | read | source, key ref and version, check ok; never key bytes |
 | `kronik keys wrap --source S` | (offline) | — | dry run; migration (§3.3) |
 | `kronik keys rewrap` | POST `/v1/keys/rewrap` | admin | reason, dry run |
@@ -852,6 +896,7 @@ Kronik](../guides/operations.md#secrets)).
 - `SECRET_BACKEND_UNKNOWN` (400): a link to a backend this node lacks;
 - `SECRET_REF_NOT_ALLOWED` (403): a ref outside the backend's
   `allowed_refs`;
+- `SECRET_VERSION_EXHAUSTED` (409): the next version would pass 2^53 - 1;
 - `KEY_SOURCE_UNAVAILABLE` (503): at start and in doctor;
 - `KEY_HELPER_FAILED` (503): `kronik-keyhelper` missing, crashed, timed out
   or answered an error.
@@ -860,17 +905,21 @@ Kronik](../guides/operations.md#secrets)).
 
 Milestone "M23".
 
-## 9. Acceptance plan (B1 evidence recorded; B2–B6 planned)
+## 9. Acceptance plan and what has run
 
-The original full-M23 plan uses the following free services. Only the B1
-KMS lifecycle is implemented; external-secret and PKCS#11 runs remain planned.
+The original full-M23 plan uses the following free services. The B1 KMS
+lifecycle has run against them. The external-secret criteria have run only
+against a stand-in for OpenBao's KV v2 shape (`secret_backends.rs`): the
+repository has no run of them against OpenBao itself, moto's Secrets Manager,
+the GCP and Azure emulators or the real clouds, and PKCS#11 runs remain
+planned.
 
 | What | With | Licence |
 |---|---|---|
 | Vault-compatible backend and the KMS path | `openbao/openbao` (KV v2 + transit), dev mode | MPL-2.0 (a separately run server, not linked) |
-| AWS Secrets Manager + KMS | `motoserver/moto` | Apache-2.0 |
-| GCP Secret Manager (planned B4) | Blackwell Systems REST emulator | Apache-2.0, third party |
-| Azure Key Vault RSA wrap/unwrap (secrets planned B4) | rokeller emulator, pinned B1 version/digest | Apache-2.0, third party |
+| AWS KMS, and Secrets Manager (secrets: run planned) | `motoserver/moto` | Apache-2.0 |
+| GCP Secret Manager (run planned) | Blackwell Systems REST emulator | Apache-2.0, third party |
+| Azure Key Vault RSA wrap/unwrap (secrets: run planned) | rokeller emulator, pinned B1 version/digest | Apache-2.0, third party |
 | PKCS#11 (maintainer-gated B6 proposal) | proposed SoftHSM2 run, not exercised by B1 | BSD-2-Clause |
 | GCP Cloud KMS | Blackwell Systems dual REST KMS emulator, pinned B1 digest | Apache-2.0, third party |
 
@@ -967,10 +1016,10 @@ planned run against it must show.
   `TurnBegin` is open once the daemon is quiet. A run that stops a real
   OpenBao mid-run is still planned.
 
-**Cloud providers for real:** `scripts/e2e-cloud-secrets.sh` runs against
-real AWS, GCP and Azure only with the operator's own credentials. It is
-not in CI: about $1 a month per KMS key, plus API calls.
-Running it once before release is the maintainers' call (§12).
+**Cloud providers for real** (planned): `scripts/e2e-cloud-secrets.sh` is to
+run against real AWS, GCP and Azure only with the operator's own credentials.
+It does not exist yet. It would not be in CI: about $1 a month per KMS key,
+plus API calls. Running it once before release is the maintainers' call (§13).
 
 ## 10. Determinism and invariants
 
@@ -1026,12 +1075,13 @@ Running it once before release is the maintainers' call (§12).
 - **Proto fields 90–99:** none needed. `SecretRef` already carries
   `version` and `version_hash`, and the new messages are new kinds.
   `EffectSummary.secrets` is API JSON, not proto.
-- **Error codes:** the seven in §8, milestone "M23".
+- **Error codes:** the eight in §8, milestone "M23".
 
 ## 12. Phase B plan
 
 Each slice carries its tests, which fail without the change, and its docs.
-Gates run through the CI harness.
+Gates run through the CI harness. The status of each slice is in the table at
+the top of this page.
 
 0. **Spike** (a day):
    - a glibc `kronik-keyhelper` with `cryptoki` against SoftHSM2, called
@@ -1110,8 +1160,10 @@ and 46).
 
 ## B1 design gate (2026-10-30)
 
-B1 is the implemented scope. B2–B5 remain pending; B6 and ADR 0093 remain
-maintainer-gated. The revised B1 design was reviewed before implementation.
+This section records the gate of 2026-10-30: B1 was the implemented scope,
+B2–B5 were pending, and B6 and ADR 0093 were maintainer-gated. B2 to B4 have
+been built since (the table at the top of this page). The revised B1 design
+was reviewed before implementation.
 The earlier loader inventory is historical: the current code already fixes
 missing/wrong keys, shipping and restore; offline upgrade and audit verify are
 additional callers.
