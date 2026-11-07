@@ -1499,7 +1499,13 @@ impl ReplayGate {
                             _ => None,
                         })
                     });
+                    // An unresolved reference is how production records an effect
+                    // that never got its secret (not found, or unavailable): the
+                    // recorded error is replayed below, with the fingerprint of
+                    // that very request. A reference that claims a version and
+                    // does not name one is a damaged record.
                     if let Some(reference) = &recorded
+                        && !reference.is_unresolved()
                         && let Err(error) = reference.resolved_version()
                     {
                         let error = error.to_string();
@@ -2227,6 +2233,17 @@ impl ReplayGate {
         let fp = blake3::hash(format!("reveal\0{name}").as_bytes())
             .as_bytes()
             .to_vec();
+        // An effect production recorded as failed (no such secret, or the
+        // backend could not be reached) fails the same way here.
+        if let Some(recorded) = self.prod_at(ordinal).filter(|p| {
+            p.kind == kind && p.fingerprint == fp && p.status != pb::EffectStatus::Ok as i32
+        }) {
+            let mut rec = recorded.clone();
+            rec.grounding = pb::Grounding::Exact as i32;
+            let error = rec.error.clone();
+            self.push(rec);
+            return Err(error);
+        }
         // A fork never gets a secret's value (brief, effect table): reveal
         // answers the placeholder that production's records hold in place
         // of the value, so requests built from it match the recordings.

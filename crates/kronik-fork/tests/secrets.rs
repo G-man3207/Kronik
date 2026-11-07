@@ -7,6 +7,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use common::*;
 use kronik_fork::diff::{DiffOptions, Mode};
@@ -101,4 +102,91 @@ fn a_fork_reveals_only_the_placeholder_and_writes_no_secret_value() {
     let mut hits = Vec::new();
     scan(dir.path(), &mut hits);
     assert!(hits.is_empty(), "the secret value is in {hits:?}");
+}
+
+/// A turn whose secret it did not get recorded an error for the effect that
+/// asked for it: a secret that does not exist, or, with a secret backend, one
+/// that cannot be reached (the same recording, with another error). A fork
+/// replays the recorded error exactly, whatever kind of effect asked.
+///
+/// `text` is sent as `name` to a counter whose secret `nokey` does not exist;
+/// the guest of `fetch-ok` answers with the error, the others fail with it
+/// (`committed` says which). Every effect of the replay must be answered from
+/// the recording, in both modes, and no request is sent by anyone.
+fn replay_of_an_effect_without_its_secret(name: &str, text: &str, committed: bool) {
+    let (addr, hits) = server();
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    for cap in ["secret:nokey", "secret-reveal:nokey", "http:127.0.0.1"] {
+        p.grant(cap);
+    }
+    let fork_lsn = p.settle();
+    let text = text.replace("ADDR", &addr);
+    let turn = p.send("counter/a", name, &text);
+    assert_eq!(turn.committed(), committed, "{name}: {turn:?}");
+    p.settle();
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "the request had no credential"
+    );
+
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    p.rt.block_on(props.create_fork(
+        Some("probe".into()),
+        fork_lsn,
+        false,
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    for mode in [Mode::Isolated, Mode::Continuous] {
+        p.rt.block_on(props.fork_replay(
+            "probe",
+            None,
+            DiffOptions {
+                mode,
+                ..DiffOptions::default()
+            },
+            None,
+            p.owner(),
+        ))
+        .unwrap();
+        let d: serde_json::Value =
+            serde_json::from_slice(&p.rt.block_on(props.diff("probe", false, false)).unwrap())
+                .unwrap();
+        let s = &d["summary"];
+        assert_eq!(
+            (
+                &s["changed"],
+                &s["divergent_turns"],
+                &s["approximate"],
+                &s["synthetic"]
+            ),
+            (&false.into(), &0.into(), &0.into(), &0.into()),
+            "{name} {mode:?}: {d}"
+        );
+        assert!(s["exact"].as_u64() >= Some(1), "{name} {mode:?}: {d}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "a fork sent a request");
+}
+
+#[test]
+fn a_fork_replays_a_fetch_whose_secret_header_got_no_secret() {
+    replay_of_an_effect_without_its_secret(
+        "fetch-ok",
+        "POST http://ADDR/x\nS x-api-key nokey {}\n\nbody",
+        true,
+    );
+}
+
+#[test]
+fn a_fork_replays_an_hmac_whose_secret_does_not_exist() {
+    replay_of_an_effect_without_its_secret("hmac", "nokey\ndata", false);
+}
+
+#[test]
+fn a_fork_replays_a_reveal_whose_secret_does_not_exist_as_the_failure_it_was() {
+    replay_of_an_effect_without_its_secret("reveal", "nokey", false);
 }
