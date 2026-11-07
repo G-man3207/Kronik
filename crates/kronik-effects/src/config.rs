@@ -314,6 +314,14 @@ impl Config {
         self.secret_links.get(name)
     }
 
+    /// Whether `name` is linked to an external backend in this
+    /// configuration. An unlink keeps its record, with no backend: the name
+    /// is the built-in store's again.
+    pub fn secret_is_linked(&self, name: &str) -> bool {
+        self.secret_link(name)
+            .is_some_and(|link| !link.backend.is_empty())
+    }
+
     pub fn secret_links(&self) -> impl Iterator<Item = &pb::SecretLink> {
         self.secret_links.values()
     }
@@ -637,5 +645,38 @@ mod secret_link_tests {
         assert!(unlinked.backend.is_empty());
         assert_eq!(unlinked.generation, 3);
         assert_eq!(history.at(1).secret_link("service-token"), Some(old));
+    }
+
+    /// A name is linked from its link to its unlink, at the epoch asked for;
+    /// the record an unlink leaves is not a link, and a name that was never
+    /// linked is not one either.
+    #[test]
+    fn a_name_is_linked_between_its_link_and_its_unlink() {
+        let mut history = ConfigHistory::default();
+        let link = |epoch, generation, backend: &str| {
+            Record::SecretLink(pb::SecretLink {
+                name: "service-token".into(),
+                backend: backend.into(),
+                r#ref: if backend.is_empty() {
+                    ""
+                } else {
+                    "secret/a#token"
+                }
+                .into(),
+                epoch,
+                generation,
+                ..Default::default()
+            })
+        };
+        history.push(link(2, 1, "bao"));
+        history.push(link(3, 2, ""));
+        history.push(link(4, 3, "bao"));
+        let mut linked = |epoch: u64, name: &str| history.at(epoch).secret_is_linked(name);
+        assert!(!linked(1, "service-token"), "before the link");
+        assert!(linked(2, "service-token"), "linked");
+        assert!(!linked(3, "service-token"), "unlinked again");
+        assert!(linked(4, "service-token"), "linked again");
+        assert!(!linked(4, "other-token"), "never linked");
+        assert!(history.at(3).secret_link("service-token").is_some());
     }
 }
