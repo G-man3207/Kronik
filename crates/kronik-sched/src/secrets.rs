@@ -6,6 +6,7 @@ pub(crate) mod coverage;
 mod file_data;
 mod native_current;
 pub(crate) mod recovery;
+mod scan;
 pub use file_data::SecretCacheData;
 use file_data::{ReadStamp, StampedFetched};
 
@@ -872,6 +873,8 @@ pub struct SecretRuntime {
     settings: Settings,
     cache: Arc<SecretCache>,
     inventory: AsyncMutex<()>,
+    /// What certification has cost since the node started.
+    stats: CertificationStats,
     initialized: AtomicBool,
     background: AtomicBool,
     // The ADR-0004-compliant replacement ripples through the wait/notify
@@ -884,6 +887,16 @@ pub struct SecretRuntime {
     #[allow(clippy::disallowed_types)]
     certified: tokio::sync::watch::Sender<(u64, bool)>,
 }
+/// What certifying the inventory has cost since the node started: the
+/// builds it ran and the log records they read. The numbers are in the
+/// "secret inventory certified" log line, and what the tests of the watermark
+/// read.
+#[derive(Default)]
+struct CertificationStats {
+    builds: std::sync::atomic::AtomicU64,
+    records: std::sync::atomic::AtomicU64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SecretBackendStatus {
     pub id: String,
@@ -950,6 +963,7 @@ impl SecretRuntime {
             settings,
             cache,
             inventory: AsyncMutex::new(()),
+            stats: CertificationStats::default(),
             initialized: AtomicBool::new(false),
             background: AtomicBool::new(false),
             certified: tokio::sync::watch::channel((0, false)).0,
@@ -2655,13 +2669,11 @@ impl Node {
     /// Collect the retained ledger/state/snapshot closure and every retained
     /// provider catalogue for a name that has ever had reveal authority.
     pub async fn refresh_secret_inventory(&self, original: AuthLease) -> Result<(), ApiError> {
-        let result = self
+        let through = self
             .refresh_secret_inventory_mode(original.clone(), false)
-            .await;
-        if result.is_ok() {
-            self.persist_coverage_watermark().await;
-        }
-        result
+            .await?;
+        self.persist_coverage_watermark(through).await;
+        Ok(())
     }
 
     /// Wakes the background rebuild from a reader's demand.
@@ -2706,12 +2718,19 @@ impl Node {
 
     /// Persists the coverage watermark after a fully successful refresh: a
     /// restart then certifies the prefix from it and re-scans only the log
-    /// that came after. Never propagated — a failed persist only costs the
-    /// next restart its delta (the manifest is a daemon-local cache).
-    async fn persist_coverage_watermark(&self) {
+    /// that came after. `through` is the last record the refresh's scan read
+    /// (or an earlier scan had), never the applied LSN of the moment: records
+    /// applied while the refresh ran are for the next one to read. Never
+    /// propagated — a failed persist only costs the next restart its delta
+    /// (the manifest is a daemon-local cache).
+    async fn persist_coverage_watermark(&self, through: u64) {
         let Some(storage) = self.storage_config() else {
             return;
         };
+        // An empty log has nothing to resume after.
+        if through == 0 {
+            return;
+        }
         let Ok(snapshot) = self.native_secret_snapshot() else {
             return;
         };
@@ -2727,11 +2746,10 @@ impl Node {
             &coverage::CoverageWatermark {
                 schema: coverage::SCHEMA.into(),
                 branch: self.branch().to_owned(),
-                certified_through_lsn: self.applied_lsn(),
+                certified_through_lsn: through,
                 coverage_epoch: self.epoch(),
                 coverage_fingerprint: kronik_core::ids::hex(&snapshot.fingerprint),
                 store_generation,
-                scan_frontier: None,
             },
         )
         .await;
@@ -2743,20 +2761,22 @@ impl Node {
         }
         let original = self.native_recovery_authority()?;
         match self.refresh_secret_inventory_mode(original, true).await {
-            Ok(()) => Ok(true),
+            Ok(_) => Ok(true),
             Err(error) if error.code == ErrorCode::SecretUnavailable => Ok(false),
             Err(error) => Err(error),
         }
     }
 
+    /// Certifies the inventory. Returns the last LSN the log has been read
+    /// through for it: the scan's bound, 0 when there is no inventory.
     async fn refresh_secret_inventory_mode(
         &self,
         original: AuthLease,
         cached_only: bool,
-    ) -> Result<(), ApiError> {
+    ) -> Result<u64, ApiError> {
         original.check()?;
         let Some(runtime) = &self.secret_runtime else {
-            return Ok(());
+            return Ok(0);
         };
         runtime.ready()?;
         let _guard = if cached_only {
@@ -2764,6 +2784,11 @@ impl Node {
         } else {
             Some(runtime.inventory.lock().await)
         };
+        let started = self.env.clock.monotonic();
+        runtime
+            .stats
+            .builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let file_changes = runtime.cache.capture_file_changes()?;
         let native_revision = lock(&runtime.cache.state)
             .native_current
@@ -2799,7 +2824,6 @@ impl Node {
             .await?;
         // Modern values cannot enter state or snapshots without this durable ledger.
         // Legacy effect references supply missing-row evidence before any disclosure.
-        let mut references = BTreeMap::new();
         let first = self
             .reader()
             .starts()
@@ -2807,18 +2831,22 @@ impl Node {
             .map_err(|_| unavailable())?
             .into_iter()
             .next();
-        // No storage config: no watermark location, so the refresh falls
-        // back to the full scan instead of failing.
+        // The log is read up to `scanned`. Without a storage config there
+        // is no watermark location and the refresh falls back to the full
+        // scan instead of failing; a watermark that is ahead of the applied
+        // log, or belongs to another store, covers nothing this log holds.
+        let scanned = self.applied_lsn();
         let watermark = match self.storage_config() {
             Some(storage) => coverage::load(&self.env, &storage.data_dir.clone(), self.branch())
                 .await
                 .filter(|watermark| {
-                    watermark.store_generation
-                        == runtime
-                            .file
-                            .generation()
-                            .map(|generation| kronik_core::ids::hex(&generation))
-                            .unwrap_or_default()
+                    watermark.certified_through_lsn <= scanned
+                        && watermark.store_generation
+                            == runtime
+                                .file
+                                .generation()
+                                .map(|generation| kronik_core::ids::hex(&generation))
+                                .unwrap_or_default()
                 }),
             None => None,
         };
@@ -2835,19 +2863,18 @@ impl Node {
             }
             None => first,
         });
+        // The records the watermark does not cover, once: their references
+        // must be ones the ledger knows (the references of the covered
+        // prefix were checked when it was certified), and their names are
+        // the ones the new certificate vouches for.
+        let mut references = BTreeMap::new();
+        let mut touched_names = BTreeSet::new();
+        let mut records_read = 0;
         if let Some(scan_from) = scan_from {
-            self.reader()
-                .read_while(scan_from, self.applied_lsn(), |committed| {
-                    collect_secret_references(&committed.record, &self.sealer, &mut references)
-                        .map_err(|_| {
-                            kronik_log::LogError::Corrupt(
-                                "invalid retained secret reference".into(),
-                            )
-                        })?;
-                    Ok(true)
-                })
-                .await
-                .map_err(|_| unavailable())?;
+            let scan = self.scan_secret_use(scan_from, scanned).await?;
+            references = scan.references;
+            touched_names = scan.touched;
+            records_read = scan.records;
         }
         for (key, hash) in &references {
             if !required
@@ -3109,7 +3136,7 @@ impl Node {
             .reconcile_native_file_changes(&file_changes, &required)
             .await?;
         let fingerprint =
-            native_coverage_fingerprint(epoch, floor, &required, &records, &references, &file_rows);
+            native_coverage_fingerprint(epoch, floor, &required, &records, &file_rows);
         let catalogue_capture = prior.unwrap_or_else(|| {
             Arc::new(NativeCatalogueCapture {
                 at: captured_at,
@@ -3121,152 +3148,6 @@ impl Node {
             current: AtomicBool::new(true),
             changed: tokio::sync::Notify::new(),
         });
-        // Every record this refresh committed (its observations included)
-        // retires the catalogue when the applier applies it; the drain waits
-        // for the applier to reach the log's fsynced head BEFORE the tail
-        // publishes coverage, so the published certificate is never one its
-        // own records just retired. Bounded by the fetch timeout; expiry
-        // fails the refresh instead of publishing stale coverage.
-        // DELTA BUILD: a warm certificate scans only (base, head] and adds
-        // the delta's references to the certificate's own set — the corpus
-        // the old certificate covered keeps serving during the build.
-        let (references, delta_base) = {
-            let state = lock(&runtime.cache.state);
-            match &state.coverage {
-                Some(coverage) if coverage.base_lsn > 0 => {
-                    (coverage.references.clone(), Some(coverage.base_lsn))
-                }
-                _ => (None, None),
-            }
-        };
-        let mut references_map = BTreeMap::new();
-        if let Some(existing) = &references {
-            for reference in existing.iter() {
-                references_map.insert(
-                    (reference.name.clone(), u64::from(reference.version)),
-                    reference.version_hash.clone(),
-                );
-            }
-        }
-        let mut touched_names = BTreeSet::new();
-        let mut scan_from = first.map(|first| {
-            let through = delta_base.unwrap_or(0);
-            if through.saturating_add(1) > first {
-                through.saturating_add(1)
-            } else {
-                first
-            }
-        });
-        // COLD-START BOOTSTRAP (ADR 0108): a full scan is crash-resilient via
-        // the scan-frontier checkpoint. A validated frontier resumes the
-        // scan from `through` instead of restarting it; the checkpoint is a
-        // HINT — any validation failure discards it and the scan restarts
-        // from zero. Resumes require the accumulated references to have been
-        // empty at the checkpoint (a non-empty set would need its own
-        // artifact). The frontier never publishes coverage by itself: the
-        // strict applied-LSN CAS after the drain is the only publication.
-        // Cold builds checkpoint; warm deltas are short and skip it.
-        let mut cold_frontier: Option<(u64, u64)> = if delta_base.is_none() {
-            Some((0, 0))
-        } else {
-            None
-        };
-        if scan_from.is_some() && delta_base.is_none() {
-            let generation = runtime
-                .file
-                .generation()
-                .map(|generation| kronik_core::ids::hex(&generation))
-                .unwrap_or_default();
-            if let Some(watermark) = &watermark
-                && let Some(frontier) = &watermark.scan_frontier
-                && frontier.store_generation == generation
-                && frontier.branch == self.branch()
-                && frontier.references_empty
-                && frontier.through >= frontier.base
-                && frontier.head >= frontier.through
-            {
-                let first = first.unwrap_or(1);
-                if frontier.base == first
-                    && frontier.through.saturating_add(1) >= first
-                    && frontier.head <= self.applied_lsn()
-                {
-                    scan_from = Some(frontier.through.saturating_add(1).min(frontier.head));
-                    cold_frontier = Some((frontier.through, frontier.head));
-                }
-            }
-        }
-        if let Some((through, head)) = cold_frontier {
-            scan_from = Some(through.saturating_add(1).min(head));
-        }
-        // The scan runs in segments so a cold build checkpoints its frontier
-        // periodically: a crash-restart resumes from the last checkpoint
-        // instead of restarting the whole scan.
-        const SCAN_SEGMENT_RECORDS: u64 = 2_048;
-        let mut seg_start = scan_from;
-        while let Some(from) = seg_start {
-            let end = self.applied_lsn();
-            if from > end {
-                break;
-            }
-            let seg_end = from
-                .saturating_add(SCAN_SEGMENT_RECORDS.saturating_sub(1))
-                .min(end);
-            self.reader()
-                .read_while(from, seg_end, |committed| {
-                    collect_secret_references(&committed.record, &self.sealer, &mut references_map)
-                        .map_err(|_| {
-                            kronik_log::LogError::Corrupt(
-                                "invalid retained secret reference".into(),
-                            )
-                        })?;
-                    match &committed.record {
-                        Record::SecretVersion(row) => {
-                            touched_names.insert(row.name.clone());
-                        }
-                        Record::SecretLink(link) => {
-                            touched_names.insert(link.name.clone());
-                        }
-                        _ => {}
-                    }
-                    Ok(true)
-                })
-                .await
-                .map_err(|_| unavailable())?;
-            if let Some((_, head)) = &cold_frontier
-                && let Some(storage) = self.storage_config()
-            {
-                let generation = runtime
-                    .file
-                    .generation()
-                    .map(|generation| kronik_core::ids::hex(&generation))
-                    .unwrap_or_default();
-                coverage::persist(
-                    &self.env,
-                    &storage.data_dir.clone(),
-                    &coverage::CoverageWatermark {
-                        schema: coverage::SCHEMA.into(),
-                        branch: self.branch().to_owned(),
-                        certified_through_lsn: 0,
-                        coverage_epoch: self.epoch(),
-                        coverage_fingerprint: String::new(),
-                        store_generation: generation.clone(),
-                        scan_frontier: Some(coverage::ScanFrontier {
-                            base: first.unwrap_or(1),
-                            through: seg_end,
-                            head: *head,
-                            store_generation: generation,
-                            branch: self.branch().to_owned(),
-                            references_empty: references_map.is_empty(),
-                        }),
-                    },
-                )
-                .await;
-            }
-            if seg_end >= end {
-                break;
-            }
-            seg_start = Some(seg_end.saturating_add(1));
-        }
         // Every record this refresh committed (its observations included)
         // retires the catalogue when the applier applies it; the drain waits
         // for the applier to reach the log's fsynced head BEFORE the tail
@@ -3321,7 +3202,20 @@ impl Node {
         let retired_catalogue = state.native_catalogue_capture.replace(catalogue_capture);
         drop(state);
         drop(retired_catalogue);
-        Ok(())
+        runtime
+            .stats
+            .records
+            .fetch_add(records_read, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            target: "kronik::secrets",
+            from = scan_from.unwrap_or(0),
+            through = scanned,
+            records = records_read,
+            elapsed_ms = u64::try_from(self.env.clock.monotonic().saturating_sub(started).as_millis())
+                .unwrap_or(u64::MAX),
+            "secret inventory certified"
+        );
+        Ok(scanned)
     }
 
     async fn retained_snapshot_secrets(
@@ -3609,12 +3503,15 @@ impl Node {
 }
 
 // Only typed coordinates and already-keyed immutable value hashes enter this cache stamp.
+// It identifies the inventory a certificate vouches for, not the part of the log a build
+// re-read: the references a scan met are not an input, because a build that starts at
+// the coverage watermark meets only the newest ones and would otherwise stamp the same
+// inventory differently from one build to the next.
 fn native_coverage_fingerprint(
     epoch: u64,
     floor: u64,
     required: &BTreeMap<(String, u64), pb::SecretVersion>,
     records: &[Record],
-    references: &BTreeMap<(String, u64), Vec<u8>>,
     file_rows: &[SecretRowMeta],
 ) -> [u8; 32] {
     fn bytes(hash: &mut blake3::Hasher, value: &[u8]) {
@@ -3622,7 +3519,7 @@ fn native_coverage_fingerprint(
         hash.update(value);
     }
     let mut hash = blake3::Hasher::new();
-    hash.update(b"kronik native secret coverage v1\0");
+    hash.update(b"kronik native secret coverage v2\0");
     hash.update(&epoch.to_le_bytes());
     hash.update(&floor.to_le_bytes());
     hash.update(&(required.len() as u64).to_le_bytes());
@@ -3648,11 +3545,6 @@ fn native_coverage_fingerprint(
         hash.update(&epoch.to_le_bytes());
         hash.update(&generation.to_le_bytes());
         hash.update(&[u8::from(unlinked)]);
-    }
-    hash.update(&(references.len() as u64).to_le_bytes());
-    for ((_, version), version_hash) in references {
-        hash.update(&version.to_le_bytes());
-        bytes(&mut hash, version_hash);
     }
     hash.update(&(file_rows.len() as u64).to_le_bytes());
     for row in file_rows {
@@ -3760,3 +3652,7 @@ fn collect_secret_references(
 #[cfg(test)]
 #[path = "secrets/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "secrets/certification_tests.rs"]
+mod certification_tests;

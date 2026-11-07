@@ -3,6 +3,9 @@
 //! (temp file + atomic rename, byte budget). It records how far the
 //! certified catalogue's reference scan had read, so a restart certifies
 //! the prefix from the watermark and re-scans only what came after it.
+//! It is written once per fully successful refresh and never with partial
+//! progress: a manifest of a scan still under way would replace the
+//! watermark the next restart needs.
 //!
 //! Error semantics are the opposite of the cursors' on purpose: a missing,
 //! corrupt, unparseable or failed-validation manifest is discarded with a
@@ -13,6 +16,7 @@
 //! voids any copy that could have survived anyway).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes as IoBytes;
 use serde::{Deserialize, Serialize};
@@ -22,14 +26,27 @@ use kronik_core::env::{Env, OpenMode};
 /// The manifest's byte budget: one small record, like an export cursor.
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024;
 
-pub const SCHEMA: &str = "kronik.secret-coverage/v1";
+/// The schema this build writes. `certified_through_lsn` is the last record
+/// the finished certification's scan read, so a restart may skip everything up
+/// to it. The fingerprint hashes the inventory only (ledger rows, links and
+/// file rows), and is information: nothing compares it.
+pub const SCHEMA: &str = "kronik.secret-coverage/v2";
+
+/// The schema v0.4.0 wrote, never trusted. v0.4.0 stored the applied LSN of
+/// the moment it wrote the file, which can lie ahead of the last record its
+/// scan read by every record applied while that refresh ran, so skipping up to
+/// it could skip records that no scan read. A v1 manifest is treated like a
+/// missing one: the node reads the whole retained log once and the next
+/// certification writes v2.
+const SCHEMA_V1: &str = "kronik.secret-coverage/v1";
 
 /// The persisted coverage watermark of one native branch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CoverageWatermark {
     pub schema: String,
     pub branch: String,
-    /// The applied LSN the certified reference scan had reached.
+    /// The last record the certified reference scan read: everything up to
+    /// it is covered.
     pub certified_through_lsn: u64,
     /// The epoch the certified catalogue was captured under (informational:
     /// a publication retires coverage and the next cycle writes a fresh
@@ -40,37 +57,13 @@ pub struct CoverageWatermark {
     /// The secret store's random generation (hex): a restored or replaced
     /// store carries another generation and voids the watermark.
     pub store_generation: String,
-    /// A cold-start scan checkpoint: crash-resilient PROGRESS, never trust
-    /// (ADR 0108). A restarted node resumes the reference scan from
-    /// `through` instead of restarting it; any validation failure (store
-    /// generation, branch, retained-log bounds) discards it and the build
-    /// restarts from zero. Never publishes coverage by itself — coverage
-    /// publishes only through the complete-build strict CAS.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scan_frontier: Option<ScanFrontier>,
-}
-
-/// A cold-start scan checkpoint. Valid only while the accumulated
-/// references were empty at the checkpoint (a non-empty set needs its own
-/// artifact); the checkpoint's resume rule re-validates the binding before
-/// resuming.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ScanFrontier {
-    /// The scan's start: the log's first retained LSN when the build began.
-    pub base: u64,
-    /// The LSN the reference scan had reached when the checkpoint was written.
-    pub through: u64,
-    /// The build's intended head at checkpoint time.
-    pub head: u64,
-    pub store_generation: String,
-    pub branch: String,
-    /// The accumulated references were empty through `through`.
-    pub references_empty: bool,
 }
 
 /// Loads the watermark, if a valid one exists. Every problem — missing
 /// file, oversize, parse failure, schema or field mismatch — is a warning
-/// and `None`: the caller falls back to the full scan.
+/// and `None`: the caller falls back to the full scan. A v0.4.0 (v1)
+/// manifest is not trusted either (see `SCHEMA_V1`); it is noted once at
+/// info level, not warned about, since the upgrade is not a fault.
 pub async fn load(env: &Env, data_dir: &Path, branch: &str) -> Option<CoverageWatermark> {
     let path = path(data_dir);
     if !env.fs.exists(path.clone()).await.unwrap_or(false) {
@@ -78,6 +71,10 @@ pub async fn load(env: &Env, data_dir: &Path, branch: &str) -> Option<CoverageWa
     }
     match read(env, &path).await {
         Ok(watermark) => {
+            if watermark.schema == SCHEMA_V1 {
+                note_v1(&path);
+                return None;
+            }
             let valid = watermark.schema == SCHEMA
                 && watermark.branch == branch
                 && watermark.certified_through_lsn > 0;
@@ -163,6 +160,19 @@ async fn read(env: &Env, path: &Path) -> Result<CoverageWatermark, String> {
         .await
         .map_err(|error| format!("read: {error}"))?;
     serde_json::from_slice(&bytes).map_err(|error| format!("parse: {error}"))
+}
+
+/// Says once per process that a v0.4.0 manifest is not trusted.
+fn note_v1(path: &Path) {
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    if !NOTED.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            target: "kronik::secrets",
+            file = %path.display(),
+            "a v0.4.0 secret-coverage watermark is not trusted; \
+             recertifying from the first retained record"
+        );
+    }
 }
 
 async fn warn(path: &Path, message: &str) {
