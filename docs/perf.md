@@ -489,6 +489,12 @@ night with the commands below, once the repository is on GitHub.
     SQL database) must equal the state rebuilt from the log alone.
   - At the end, an identity replay of everything since the setup must give
     an empty diff.
+  - After that, a privacy phase (`--privacy-cycles`, 2 by default): with the
+    privacy mode on, a subject's turns make sealed requests, every other
+    subject is erased and the daemon is killed. Every history must answer
+    after each restart and after a restart whose coverage watermark is gone
+    (it reads the whole log), and the recovered state must equal the state
+    rebuilt from the log.
   - The details are in `scripts/chaos.py`.
 - **DST:** `scripts/dst.sh [SEEDS] [JOBS] [harness options]` runs
   kronik-sim's harness over a range of seeds, split across processes.

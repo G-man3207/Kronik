@@ -35,10 +35,19 @@ moment, restarts it on the same data directory and checks:
 At the end, a fork right after the setup (the deploys and grants) replays
 all of main's root inputs with the same code, and the behavior diff must be
 empty (identity replay).
+
+After that, a short privacy phase (--privacy-cycles): with the privacy mode on,
+a subject's turns make sealed HTTP requests, the subject is erased and the
+daemon is killed. Erasing destroys the key of those requests on purpose, and
+that must not read as a loss of secret coverage: after each restart, and after
+a restart that has to read the whole log because its watermark is gone, every
+scrubbed read (an actor's history) answers, and the state recovered is the
+state rebuilt from the log.
 The first violation stops the run and keeps the data directory.
 """
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import http.client
@@ -341,6 +350,55 @@ def free_port():
     raise SystemExit(f"no free port in {start // 2}..{start}")
 
 
+def privacy_phase(daemon, data, target, cycles):
+    """Turns of subjects make sealed requests, the subjects are erased, the daemon is killed.
+
+    The key of an erased subject is destroyed on purpose, so its sealed requests
+    can never be opened again; the secret inventory is certified over them all
+    the same, from the last watermark and from the first record. A subject that
+    is not erased keeps its turns readable beside them.
+    """
+    status, body = daemon.api("POST", "/v1/privacy/mode", {"mode": "on", "reason": "chaos: the privacy phase"})
+    if status != 200:
+        raise Violation(f"privacy mode on: HTTP {status} {body}")
+    actors = []
+
+    def read_all(when):
+        for actor in actors:
+            status, body, _ = read_history(daemon, actor, "", 0)
+            if status != 200:
+                raise Violation(f"privacy phase: history of {actor} answered HTTP {status} {when}: {body}")
+
+    for cycle in range(1, cycles + 1):
+        actor, subject = f"counter/privacy{cycle}", f"user:privacy{cycle}"
+        actors.append(actor)
+        for i in range(2):
+            status, body = daemon.api(
+                "POST", f"/v1/actors/{actor}/messages",
+                {"name": "fetch-ok", "text": f"POST http://127.0.0.1:{target.port}/privacy/{cycle}/{i}\n\nbody",
+                 "subject": subject, "reason": "chaos"})
+            if status != 200:
+                raise Violation(f"privacy phase: a message of {subject}: HTTP {status} {body}")
+        # Every other subject is kept: its sealed requests stay readable.
+        if cycle % 2:
+            status, body = daemon.api("POST", "/v1/privacy/erase", {"subject": subject, "reason": "chaos"})
+            if status != 200:
+                raise Violation(f"privacy phase: erasing {subject}: HTTP {status} {body}")
+        daemon.kill9()
+        recovery, _ = daemon.start()
+        read_all(f"after the cycle {cycle} and a restart")
+        print(f"privacy cycle {cycle}: {subject} {'erased' if cycle % 2 else 'kept'}, healthy again in "
+              f"{recovery:.2f} s, {len(actors)} histories read: ok", flush=True)
+    # A start that has no watermark reads the whole log, the erased requests included.
+    daemon.stop()
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(os.path.join(data, "secret-coverage.json"))
+    daemon.start()
+    read_all("after a restart without a watermark")
+    rebuild_check(daemon, data)
+    read_all("after the state was rebuilt from the log")
+
+
 def main():
     p = argparse.ArgumentParser(description="Kronik's crash test: kill -9 in a loop under load")
     p.add_argument("--bin", required=True)
@@ -363,6 +421,9 @@ def main():
     p.add_argument("--clients", type=int, default=12)
     p.add_argument("--guests", default="tests/guests")
     p.add_argument("--skip-identity-replay", action="store_true")
+    p.add_argument("--privacy-cycles", type=int, default=2,
+                   help="cycles of the privacy phase after the identity replay: erase a subject whose turns "
+                        "made sealed requests, then kill (0: no such phase)")
     args = p.parse_args()
     if args.port is None:
         args.port = free_port()
@@ -556,6 +617,10 @@ def main():
                                          ("root_inputs", "replayed", "changed", "divergent_turns", "confidence")}
             if summary.get("changed") is not False or summary.get("divergent_turns"):
                 raise Violation(f"the identity replay is not empty: {json.dumps(replay)[:2000]}")
+
+        if args.privacy_cycles:
+            privacy_phase(daemon, data, target, args.privacy_cycles)
+            report["privacy_cycles"] = args.privacy_cycles
     except Violation as v:
         report["violation"] = str(v)
     finally:
