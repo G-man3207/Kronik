@@ -59,7 +59,11 @@ personal data unless your token has `pii:read`.
   newest first. Each turn has its input (HTTP request, message or timer),
   its outcome (`committed` or `failed`, with an error code), the state it
   wrote, the messages it sent, and its effects: kind, target, status and
-  delivery. Pass a result's `next` as `before` for older turns.
+  delivery. An effect that used a secret also lists it in `secrets`, with
+  the secret's name, its version and the first 8 hex characters of its
+  version hash, never a value: when an operator rotates a secret, the turns
+  after it show a higher version and the turns before it keep theirs. Pass a
+  result's `next` as `before` for older turns.
 - `trace_turn` with `{"turn_id": "main:42"}` gives the causal tree around a
   turn. You get the root input that started it, the turns from the root down
   to it, and every turn it caused. Use it to see why something happened.

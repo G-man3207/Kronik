@@ -82,7 +82,9 @@ const TOOLS: &[Spec] = &[
         scope: "read",
         description: "An actor's turns: turn id, LSN, logical time, code hash, input, outcome \
             with its error code, state writes, messages sent, SQL changes, effects and fuel. \
-            To page, pass the previous result's `next` as `before`.",
+            An effect that used a secret lists it in `secrets` (name, version and the first 8 \
+            hex characters of the version hash, never a value), so a rotation shows as a new \
+            version. To page, pass the previous result's `next` as `before`.",
         mutates: false,
         dry_run: false,
         destructive: false,
@@ -213,7 +215,7 @@ const TOOLS: &[Spec] = &[
                 "turn_id": {"type": "string"},
                 "outcome": {"type": "object", "description": "{kind: committed | failed, error_code, message}"},
                 "reply": {"type": ["object", "null"], "description": "{name, content_type, text/base64 or blob:{hash,size}, optional blobs:[{hash,size}]}; blob identities do not grant reads"},
-                "effects": {"type": "array", "items": {"type": "object", "description": "{kind, target, delivery, status, error_code}"}}
+                "effects": {"type": "array", "items": {"type": "object", "description": "{ordinal, kind, target, status, delivery, error, secrets, grounding}; secrets, when the effect used any: [{name, version, version_hash}], never a value"}}
             }))
         },
     },
