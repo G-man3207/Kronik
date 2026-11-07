@@ -399,6 +399,8 @@ pub(crate) struct InitHost {
     fixture_etc: Option<PathBuf>,
     fixture_helper: Option<PathBuf>,
     selected_key: Option<PathBuf>,
+    /// `RuntimeMaxSec` of the fixture's units: the proof's own limit.
+    fixture_runtime_max_sec: u32,
 }
 impl InitHost {
     fn production(selected_key: Option<&Path>) -> anyhow::Result<Self> {
@@ -410,6 +412,7 @@ impl InitHost {
             fixture_etc: None,
             fixture_helper: None,
             selected_key: selected_key.map(Path::to_owned),
+            fixture_runtime_max_sec: 0,
         })
     }
     fn unit(&self) -> PathBuf {
@@ -492,6 +495,7 @@ impl InitHost {
         root: &Path,
         unit_name: String,
         helper: PathBuf,
+        runtime_max_sec: u32,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             unit_name.starts_with("kronik-proof-")
@@ -536,6 +540,7 @@ impl InitHost {
             fixture_etc: Some(root.join("etc")),
             fixture_helper: Some(helper),
             selected_key: None,
+            fixture_runtime_max_sec: runtime_max_sec,
         })
     }
 }
@@ -620,7 +625,7 @@ fn unit(
             text = text.replace("ExecStart=/usr/local/bin/kronik ",
                 "ExecStart=/usr/bin/unshare --user --mount --propagation private --keep-caps --map-users=0:0:65536 --map-groups=0:0:65536 /usr/local/bin/kronik ");
         }
-        text = text.replace("[Service]\n", &format!("[Service]\nBindReadOnlyPaths=/usr/local/bin/kronik\nBindReadOnlyPaths={}/kronik/kronik.toml:/etc/kronik/kronik.toml\nBindReadOnlyPaths=-{}/run/kronik-userns/user:/run/kronik-userns/user\nBindPaths={}/data:{}\nBindPaths={}/run/kronik:{}\nBindPaths={}/ship:/var/lib/kronik-ship\nReadWritePaths=/var/lib/kronik-ship\nCPUQuota=200%\nMemoryMax=2G\nTasksMax=512\nRuntimeMaxSec=1800\nTimeoutStartSec=90\nTimeoutStopSec=30\nStandardOutput=append:{}/serve.log\nStandardError=append:{}/serve.log\n", etc.display(), root.display(), root.display(), config.server.data_dir.display(), root.display(), config.foreign.run_dir.display(), root.display(), root.display(), root.display()));
+        text = text.replace("[Service]\n", &format!("[Service]\nBindReadOnlyPaths=/usr/local/bin/kronik\nBindReadOnlyPaths={}/kronik/kronik.toml:/etc/kronik/kronik.toml\nBindReadOnlyPaths=-{}/run/kronik-userns/user:/run/kronik-userns/user\nBindPaths={}/data:{}\nBindPaths={}/run/kronik:{}\nBindPaths={}/ship:/var/lib/kronik-ship\nReadWritePaths=/var/lib/kronik-ship\nCPUQuota=200%\nMemoryMax=2G\nTasksMax=512\nRuntimeMaxSec={}\nTimeoutStartSec=90\nTimeoutStopSec=30\nStandardOutput=append:{}/serve.log\nStandardError=append:{}/serve.log\n", etc.display(), root.display(), root.display(), config.server.data_dir.display(), root.display(), config.foreign.run_dir.display(), root.display(), host.fixture_runtime_max_sec, root.display(), root.display()));
         text = text.replace(
             "[Service]\n",
             &format!(
@@ -1359,7 +1364,7 @@ mod tests {
         std::fs::write(&unit, b"retained unrelated unit").unwrap();
         let before = unit.metadata().unwrap();
         let exe = std::env::current_exe().unwrap();
-        assert!(InitHost::owned_fixture(exe.clone(), root.path(), name.into(), exe).is_err());
+        assert!(InitHost::owned_fixture(exe.clone(), root.path(), name.into(), exe, 3600).is_err());
         let host = InitHost::production(None).unwrap();
         assert!(host.stop(name).is_err());
         assert_eq!(std::fs::read(&unit).unwrap(), b"retained unrelated unit");
@@ -1454,6 +1459,7 @@ mod tests {
             fixture_etc: None,
             fixture_helper: None,
             selected_key,
+            fixture_runtime_max_sec: 0,
         }
     }
 

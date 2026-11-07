@@ -1,6 +1,14 @@
 //! Explicit non-shipped, one-thread installed product proof. No generic path/env bypass.
 //! create PARENT PRODUCT PROBE_LAYOUT PG_LAYOUT PAYMENTS_LAYOUT UID GID SUBID OPERATOR_UID
+//!        [MICROVM_DIR | --directory-tools TOOLS_DIR] [--max-runtime SECONDS]
 //! init ROOT [root|rootless|dry-run]; cleanup ROOT.
+//! `create` refuses to run unless the operator has said, on this machine, that it is
+//! disposable (`cat /etc/machine-id > /etc/kronik-proof-host`, as root): the proof
+//! starts a transient service of the host's manager that keeps most of root's
+//! capabilities in the host's user and network namespaces and opens listeners on the
+//! host's real addresses (docs/adr/0064). It also refuses ids that the name service
+//! or a running process already uses, and a PARENT without room for its copies.
+//! `--max-runtime` (default 3600 seconds) bounds the manager's life, and so the proof.
 //! Init contains the real unit-consuming PID1 manager in one exact transient parent.
 //! control ROOT accepts only owned unit operations; manager/host-pid are fixed fixture seams.
 #![allow(
@@ -16,6 +24,8 @@ pub(crate) mod cli_http;
 mod config;
 #[path = "../src/init.rs"]
 mod init;
+#[path = "support/proof_guard.rs"]
+mod proof_guard;
 mod cli {
     pub(crate) use crate::cli_http as http;
     pub fn report_error(_: bool, error: &kronik_core::error::ApiError) -> std::process::ExitCode {
@@ -140,6 +150,14 @@ fn number(cfg: &Value, field: &str) -> Result<u32> {
     u32::try_from(cfg[field].as_u64().context("numeric field")?)
         .context("numeric identity overflow")
 }
+/// The proof's own time limit in seconds, as `create` recorded it.
+fn max_runtime(cfg: &Value) -> u32 {
+    cfg["max_runtime_sec"]
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(proof_guard::DEFAULT_MAX_RUNTIME_SECS)
+}
+
 fn text<'a>(cfg: &'a Value, key: &str) -> Result<&'a str> {
     cfg[key].as_str().context("string field")
 }
@@ -457,6 +475,7 @@ fn ensure_manager(root: &Path, cfg: &Value) -> Result<()> {
     let scratch = "TMPDIR=/run/kronik";
     let helper = text(cfg, "helper")?;
     let owned = root.to_str().context("fixture path")?;
+    let runtime_max = format!("--property=RuntimeMaxSec={}", max_runtime(cfg));
     let mut argv = vec![
         "systemd-run",
         "--quiet",
@@ -470,7 +489,7 @@ fn ensure_manager(root: &Path, cfg: &Value) -> Result<()> {
         "--property=CPUQuota=200%",
         "--property=MemoryMax=2G",
         "--property=TasksMax=1024",
-        "--property=RuntimeMaxSec=1800",
+        &runtime_max,
         "--property=TimeoutStopSec=10s",
         "--property=KillMode=control-group",
         "--property=ProtectSystem=strict",
@@ -718,6 +737,13 @@ fn copy_tree(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn validate_ids(uid: u32, gid: u32, start: u32, operator: u32) -> Result<()> {
+    // The flat files are read below; the name service and the running
+    // processes know accounts that no file here lists (LDAP, SSSD, homed).
+    proof_guard::require_unused_ids(
+        &proof_guard::fixture_ids(uid, gid, operator, start, COUNT)?,
+        &proof_guard::getent_knows,
+        Path::new("/proc"),
+    )?;
     ensure!(
         uid > 0
             && gid > 0
@@ -778,18 +804,35 @@ fn validate_ids(uid: u32, gid: u32, start: u32, operator: u32) -> Result<()> {
 }
 
 fn create(args: &[String]) -> Result<()> {
+    let (args, max_runtime_sec) = proof_guard::take_max_runtime(args)?;
     let directory_only = args.len() == 11 && args[9] == "--directory-tools";
     ensure!(
         (9..=10).contains(&args.len()) || directory_only,
-        "create PARENT PRODUCT PROBE_LAYOUT PG_LAYOUT PAYMENTS_LAYOUT UID GID SUBID OPERATOR_UID [MICROVM_DIR | --directory-tools TOOLS_DIR]"
+        "create PARENT PRODUCT PROBE_LAYOUT PG_LAYOUT PAYMENTS_LAYOUT UID GID SUBID OPERATOR_UID [MICROVM_DIR | --directory-tools TOOLS_DIR] [--max-runtime SECONDS]"
     );
     ensure!(sys::is_root(), "setup requires root");
+    // The one door every other command depends on: nothing below happens on a
+    // machine whose operator has not said that it is disposable.
+    proof_guard::require_proof_host(
+        Path::new(proof_guard::MARKER),
+        Path::new(proof_guard::MACHINE_ID),
+        0,
+    )?;
     let uid = args[5].parse()?;
     let gid = args[6].parse()?;
     let start = args[7].parse()?;
     let operator = args[8].parse()?;
     validate_ids(uid, gid, start, operator)?;
     let parent = Path::new(&args[0]).canonicalize()?;
+    // The copies this run is about to make, and the reserve, must fit in PARENT.
+    let mut needed = 0u64;
+    for input in [&args[1], &args[2], &args[3], &args[4]] {
+        needed = needed.saturating_add(proof_guard::tree_size(&Path::new(input).canonicalize()?)?);
+    }
+    if let Some(tools) = args.get(9).filter(|_| !directory_only).or(args.get(10)) {
+        needed = needed.saturating_add(proof_guard::tree_size(&Path::new(tools).canonicalize()?)?);
+    }
+    proof_guard::require_space(&parent, needed, proof_guard::available_bytes(&parent)?)?;
     let root = tempfile::Builder::new()
         .prefix("kronik-proof-")
         .tempdir_in(parent)?
@@ -984,6 +1027,7 @@ fn create(args: &[String]) -> Result<()> {
     let cfg = json!({"version":"kronik.isolation-fixture/v1","root_identity":[md.dev(),md.ino()],
         "token":token,"unit":unit,"manager_unit":manager_unit,"uid":uid,"gid":gid,"subid":start,"operator_uid":operator,
         "host_namespaces":host_namespaces,
+        "max_runtime_sec":max_runtime_sec,
         "expected_mode":"rootless","binary":product,"helper":helper,"data":root.join("data"),
         "data_roots":[root.join("data")],"run":root.join("run/kronik"),"etc":root.join("etc"),
         "socket":root.join("run/kronik/api.sock"),"probe_layout":root.join("data/layouts/probe.oci"),
@@ -991,6 +1035,21 @@ fn create(args: &[String]) -> Result<()> {
         "pg_image":"oci-layout:/var/lib/kronik/layouts/pg.oci",
         "payments_image":"oci-layout:/var/lib/kronik/layouts/payments.oci"});
     save(&root.join("fixture.json"), &cfg)?;
+    // On stderr: the caller reads the retained directory from stdout.
+    let size = proof_guard::tree_size(&root)?;
+    eprintln!(
+        "retained proof tree: {} ({} MiB; it is never pruned, remove it with `rm -r` once its evidence is read)",
+        root.display(),
+        size >> 20
+    );
+    eprintln!(
+        "if this run is killed without its cleanup (SIGKILL skips the traps), recover with: {} cleanup {}",
+        helper.display(),
+        root.display()
+    );
+    eprintln!(
+        "the proof is limited to {max_runtime_sec} seconds (--max-runtime): systemd ends the transient manager then"
+    );
     println!("{}", root.display());
     Ok(())
 }
@@ -1261,6 +1320,7 @@ fn setup(root: &Path, cfg: &Value, mode: &str) -> Result<()> {
         root,
         unit,
         PathBuf::from(FIXTURE_HELPER),
+        max_runtime(cfg),
     )?;
     private_setup(root)?;
     let args = init::InitArgs {
@@ -1357,6 +1417,7 @@ fn cleanup(root: &Path, cfg: &Value) -> Result<()> {
             root,
             unit.into(),
             PathBuf::from(text(cfg, "helper")?),
+            max_runtime(cfg),
         )?;
         host.stop(unit)?;
         host.stop(&pin)?;
