@@ -867,9 +867,12 @@ search also covers SoftHSM's token directory, which holds its own encrypted
 key store. All of these run the **release artifacts** (`kronik-*-musl` and
 `kronik-keyhelper`), never a development build.
 
-**Planned B2–B4 criterion 2: "Secrets from an external backend get a version
+**B2–B4 criterion 2: "Secrets from an external backend get a version
 hash in the log, just as with the built-in store"**
-(`crates/kronik/tests/secret_backends.rs` is still planned):
+(`crates/kronik/tests/secret_backends.rs` runs steps 1 to 4 below, and the
+steps of criterion 3, against a real `kronik serve` and a local fake that
+speaks the KV v2 shape of the OpenBao client; a run against `openbao/openbao`
+itself is still planned):
 1. Link `stripe` to `secret/payments#key`. A turn uses it in an HMAC.
 2. The log has a `SecretVersion {stripe, 1, hash, backend "bao",
    source_version "1"}`. The effect's `SecretRef` has version 1 and the
@@ -881,7 +884,7 @@ hash in the log, just as with the built-in store"**
 4. Needle: the value appears in no file, no `history`, no MCP answer and no
    `GET` response.
 
-**Planned B2–B5 criterion 3: "Rotation of a secret shows up as a new version
+**B2–B5 criterion 3: "Rotation of a secret shows up as a new version
 in `history`, and replay of old turns is not affected":**
 1. Write a new KV version in OpenBao, then `kronik secret refresh stripe`.
 2. `SecretVersion` 2 appears, and `secret history stripe` shows v1 and v2.
@@ -903,12 +906,20 @@ in `history`, and replay of old turns is not affected":**
    uses and the refresher on a rotated backend gives exactly one record per
    `source_version`, with dense numbers.
 
+Steps 1 to 7 of criterion 3 run in `secret_backends.rs`; step 8 is a DST
+scenario and is still planned. The fake answers 404 for a version it has
+destroyed, as the client expects; what a real OpenBao answers is what the
+planned run against it must show.
+
 **Outages (I10):**
 - DST scenario `secret-outage`: a fake backend that hangs. Turns without
   secrets commit at their normal rate. Turns with a cached secret use it.
   Turns with an uncached secret get `SECRET_UNAVAILABLE` within
   `fetch_timeout`.
-- An e2e test stops OpenBao mid-run and checks the same in a real daemon.
+- `secret_backends.rs` makes the fake hang and checks the same in a real
+  daemon: turns without secrets commit at once, and a turn with an uncached
+  secret answers `SECRET_UNAVAILABLE` (503) within `fetch_timeout`. A run that
+  stops a real OpenBao mid-run is still planned.
 
 **Cloud providers for real:** `scripts/e2e-cloud-secrets.sh` runs against
 real AWS, GCP and Azure only with the operator's own credentials. It is
