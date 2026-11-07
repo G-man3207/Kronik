@@ -229,6 +229,27 @@ impl Shipped {
         Bucket { _dir: dir, remote }
     }
 
+    /// The names of the components in the bucket: `<hash>.wasm`.
+    fn components(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.bucket.path().join("code"))
+            .unwrap()
+            .map(|e| {
+                let name = e.unwrap().file_name().to_string_lossy().into_owned();
+                name.strip_suffix(".zst").unwrap().to_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The object `code/<object>` in `bucket`, with `content` compressed.
+    fn put_code(&self, bucket: &Bucket, object: &str, content: &[u8]) {
+        let packed = zstd::stream::encode_all(content, 3).unwrap();
+        self.rt
+            .block_on(bucket.remote.put(&format!("code/{object}"), packed))
+            .unwrap();
+    }
+
     /// An entry for `path` whose object is in the bucket with the right size
     /// and BLAKE3, so that only the path can refuse it.
     fn entry(&self, bucket: &Bucket, path: &str, content: &[u8]) -> SnapshotFile {
@@ -457,4 +478,123 @@ fn walk_names(root: &Path) -> Vec<String> {
         .filter(|(_, kind)| kind != "dir")
         .map(|(path, _)| path.display().to_string())
         .collect()
+}
+
+/// Every `*.cwasm` below `root`.
+fn precompiled_below(root: &Path) -> Vec<PathBuf> {
+    tree(root)
+        .into_keys()
+        .filter(|p| p.extension().is_some_and(|e| e == "cwasm"))
+        .collect()
+}
+
+#[test]
+fn a_code_object_that_is_not_a_component_named_by_its_hash_is_refused() {
+    let shipped = shipped();
+    let engine = shipped.manifest.engine_version.clone();
+    let real = shipped.components()[0]
+        .strip_suffix(".wasm")
+        .unwrap()
+        .to_owned();
+    let content = guest("counter");
+    let other = blake3::hash(b"another content").to_hex().to_string();
+    // (what, object under code/, content, what the message says)
+    let cases: Vec<(&str, String, Vec<u8>, &str)> = vec![
+        (
+            "a precompiled artifact of a component",
+            format!("{real}.{engine}.cwasm.zst"),
+            b"precompiled".to_vec(),
+            "code/",
+        ),
+        (
+            "a precompiled artifact of another component",
+            format!("{other}.{engine}.cwasm.zst"),
+            b"precompiled".to_vec(),
+            "code/",
+        ),
+        (
+            "a name that is no hash",
+            "plain.wasm.zst".into(),
+            content.clone(),
+            "code/",
+        ),
+        (
+            "an upper-case hash",
+            format!("{}.wasm.zst", real.to_uppercase()),
+            content.clone(),
+            "code/",
+        ),
+        (
+            "a short hash",
+            format!("{}.wasm.zst", &real[..63]),
+            content.clone(),
+            "code/",
+        ),
+        (
+            "no extension",
+            format!("{real}.zst"),
+            content.clone(),
+            "code/",
+        ),
+        (
+            "a hash of other content",
+            format!("{other}.wasm.zst"),
+            content.clone(),
+            "does not match its name",
+        ),
+        (
+            "the name of a component with other content",
+            format!("{real}.wasm.zst"),
+            b"other content".to_vec(),
+            "does not match its name",
+        ),
+    ];
+    for (what, object, content, says) in &cases {
+        let bucket = shipped.copy();
+        shipped.put_code(&bucket, object, content);
+        let (area, data) = shipped.destination();
+        // The destination holds an artifact of its own, which a refusal leaves.
+        let code = data.join("code");
+        std::fs::create_dir_all(&code).unwrap();
+        std::fs::write(code.join(format!("{real}.{engine}.cwasm")), b"held").unwrap();
+
+        let before = tree(area.path());
+        let error = refusal(shipped.restore(&bucket, &data, false), what);
+        assert!(error.contains(says), "{what}: {error}");
+        assert_eq!(tree(area.path()), before, "{what}: the area changed");
+    }
+}
+
+#[test]
+fn a_restore_installs_the_components_and_no_precompiled_artifact() {
+    let shipped = shipped();
+    let engine = shipped.manifest.engine_version.clone();
+    let components = shipped.components();
+    let (area, data) = shipped.destination();
+    // The destination holds artifacts of components, of an engine and of
+    // none, a directory named like one, and a file that is not one.
+    let code = data.join("code");
+    std::fs::create_dir_all(code.join("dir.cwasm")).unwrap();
+    std::fs::write(code.join("dir.cwasm/inside"), b"held").unwrap();
+    let held = [
+        format!("{}.{engine}.cwasm", components[0].trim_end_matches(".wasm")),
+        "0000.another-engine.cwasm".to_owned(),
+        "stray.cwasm".to_owned(),
+    ];
+    for name in &held {
+        std::fs::write(code.join(name), b"held").unwrap();
+    }
+    std::fs::write(code.join("notes.txt"), b"kept").unwrap();
+
+    let bucket = shipped.copy();
+    shipped.restore(&bucket, &data, false).unwrap();
+    assert!(precompiled_below(area.path()).is_empty());
+    assert_eq!(std::fs::read(code.join("notes.txt")).unwrap(), b"kept");
+    // Every component came back, as the bytes its name is the hash of.
+    assert!(components.len() >= 2, "{components:?}");
+    for name in &components {
+        let bytes = std::fs::read(code.join(name)).unwrap();
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        assert_eq!(format!("{hash}.wasm"), *name);
+    }
 }
