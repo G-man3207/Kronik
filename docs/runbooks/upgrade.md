@@ -40,6 +40,13 @@ engine-compatibility exemption.
    is an engine transition in the opposite direction and needs its own passing
    check; restoring the old binary over new data without a check is unsafe.
 
+For data written by v0.3.0 or older, two things differ from the procedure
+above: an older binary could not start on data that a newer one had served,
+so the backup of step 1 is the way back, and some reads answer 503
+`SECRET_UNAVAILABLE` after the upgrade until retention has deleted the old
+snapshots. What was checked, and how to end it, is in [Upgrading from v0.3.0
+or older](../guides/operations.md#upgrading-from-v030-or-older).
+
 ## Compatibility drill
 
 `scripts/compatibility-corpus.py` preserves actual released producer data and

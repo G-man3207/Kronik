@@ -1202,7 +1202,9 @@ still continues from. It deletes closed log segments older than
 `[retention] history` (7 days by default) whose records a kept snapshot
 already covers. A record without a logical time of its own, such as a
 deployment, counts as old as the next turn after it, so a segment is kept
-until a later turn has aged out of the window too.
+until a later turn has aged out of the window too. After an upgrade from v0.3.0
+or older, `snapshots_kept` also decides how long some reads answer 503: see
+[Upgrading from v0.3.0 or older](#upgrading-from-v030-or-older).
 
 When a proposal's `--window` reaches back before the oldest point still
 kept, the fork starts at the oldest usable snapshot and the proposal says
@@ -1323,8 +1325,10 @@ Each release has its own engine version, `kronik-<version>+wasmtime-<version>`
 (`kronik --version` prints it). Data written by another engine starts
 only after this binary has checked itself against it: a start without a
 passing check stops with `ENGINE_VERSION_MISMATCH` before it serves
-anything, and loses nothing. So an upgrade, for example from a 0.1.0-dev
-build to 0.3.0, is three steps:
+anything, and loses nothing (on data from v0.3.0 or older it has by then
+changed the tables of the databases, see [Upgrading from v0.3.0 or
+older](#upgrading-from-v030-or-older)). So an upgrade, for example from a
+0.1.0-dev build to 0.3.0, is three steps:
 
 1. Install the new binary (`install.sh` replaces `/usr/local/bin/kronik`;
    the running daemon keeps the old one).
@@ -1352,8 +1356,213 @@ file. A bad window or a directory with no log is `BAD_REQUEST`.
 
 After the restart the data is the new engine's. Going back to the old
 binary is the same procedure the other way: its own `kronik upgrade check`
-first. A restore from a bucket that an older binary shipped also needs the
-check before the restored directory's first start.
+first. That works between builds that write the same kinds of record; v0.3.0
+could not start on data that a newer build had served (see [Upgrading from
+v0.3.0 or older](#upgrading-from-v030-or-older)). A restore from a bucket that
+an older binary shipped also needs the check before the restored directory's
+first start.
+
+### Upgrading from v0.3.0 or older
+
+This is a known defect, not intended behavior. A code change for it is being
+considered, and it may change this section. It concerns data directories that
+v0.3.0 or older wrote. It was checked with the data directories of v0.3.0 and
+v0.1.0 under `tests/compatibility/` and, for a log that had been compacted, with
+a data directory that the published v0.3.0 binary wrote for the purpose, using a
+build of `kronik 0.4.1-dev` and the published v0.4.0 binary, which behaves the
+same. The data directory of v0.4.0 upgraded without it. Each point says what was
+checked.
+
+**Before you upgrade.** Make the backup that [the upgrade
+runbook](../runbooks/upgrade.md) asks for, and keep it for as long as you may
+want to go back:
+
+- Once a newer binary has served the data, the older one cannot start on it.
+  The published v0.3.0 binary stopped on a copy that a build of `kronik
+  0.4.1-dev` had served, with `STORAGE_CORRUPT: record at lsn 19: unknown record
+  kind 45`. Nothing was corrupt: the log holds records of kinds that v0.3.0 does
+  not know. Going back to v0.3.0 means restoring the backup.
+- Between binaries that write the same kinds of record, going back is the
+  procedure above. The published v0.4.0 binary refused data that a build of
+  `kronik 0.4.1-dev` had served with `ENGINE_VERSION_MISMATCH`, passed its own
+  `kronik upgrade check`, started, and recorded a second `engine upgrade`. Only
+  that pair was tried.
+
+**The check.** Run it with the new binary before its first start, as above, with
+`--config` or with `--data-dir` and `--master-key-file`. On the data of v0.3.0
+and v0.1.0 it exited 0 with an empty diff (9 root inputs and 10 turns in the
+compatibility data) and wrote `<data-dir>/upgrade/<engine>.json`, here
+`kronik-0.4.1-dev+wasmtime-50.0.1.json` for the engines
+`kronik-0.3.0+wasmtime-50.0.0` and `kronik-0.1.0-dev+wasmtime-50.0.0`. These
+errors exited 1, and none of them wrote a report:
+
+- `MASTER_KEY_MISSING`: no key where the node looks (`--master-key-file`,
+  `[keys] master_key_file`, else `<data-dir>/keys/master.key`) and no
+  `KRONIK_MASTER_KEY`, while `keys/` holds encrypted stores;
+- `MASTER_KEY_MISMATCH`: a key was found, but `keys/secrets.db` was encrypted
+  under another one;
+- `BAD_REQUEST`: `KRONIK_MASTER_KEY` is set and a key file is configured as well
+  (the message says that they conflict). A `--window` that is not a duration and
+  a directory with no log gave `BAD_REQUEST` too.
+
+The key, given in each of four ways (the environment variable, `[keys]
+master_key_file`, `--master-key-file`, the default path), gave the same report
+on v0.4.0 data; the first two were also tried on v0.3.0 and v0.1.0. The check
+changed no file that existed. It added SQLite `-shm` and `-wal` files, a
+compiled-code cache named for the new engine in `code/`, and the report.
+
+**A start without a passing check.** The new binary stopped with exit 1 and
+`ENGINE_VERSION_MISMATCH: the data was last written by engine … and this binary
+is …; check the upgrade first with this binary: kronik upgrade check …`, before
+it served anything and without creating `upgrade/`. On the data of v0.3.0 and
+v0.1.0 it had by then already changed the databases: it added tables to
+`keys/secrets.db`, `keys/keystore.db` and `branches/main/state.db`, rewrote
+`state.db` and created `foreign/actors/.layout`. (On v0.4.0 data only an SQLite
+`-shm` file changed.) The published v0.3.0 binary still started on one such copy
+and answered `history` and a send. That was tried once; it is not a promise that
+going back after a refused start is safe. Start the new binary only after the
+check has passed.
+
+**What happens.** After a passing check the start succeeds and records the
+upgrade. From then on, for as long as it was watched (two minutes at a time, and
+across one restart):
+
+- The start is slower. The node tries to certify the secret inventory 50 times,
+  about 13 ms apart, and logs each try as `startup secret inventory
+  certification retry … SECRET_UNAVAILABLE`. Health answered after 0.8 s instead
+  of 0.1 s in the debug build that was used.
+- `kronik history`, `actors inspect`, `grants list`, `dead-letters list`, `token
+  list`, `audit show`, `trace`, `proposals list`, `foreign list` and `secret
+  history` answer 503 `SECRET_UNAVAILABLE`. Those ten were run. Reading a turn
+  by id, which [the section on external
+  backends](#secrets-that-an-external-backend-no-longer-serves) also lists, was
+  not.
+- `kronik deployments list` answers, but every REASON reads `[withheld: secrets
+  could not be loaded]`.
+- Sending messages and running turns work, and so do `actors list`, `secret
+  list`, `secret backends`, `limits show`, `keys status`, `policy show`,
+  `snapshot list`, `integrity` and the health check. `kronik upgrade check` run
+  against the running node still passes.
+- `kronik secret backends` shows `false` in the INVENTORY COMPLETE column.
+- `kronik snapshot create`, `token create`, `fork create` and `replay` each took
+  about 7 s (7.0 to 7.1 s) and wrote between 560 and 660 `secret rebuild failed`
+  lines to the log. What makes them wait was not examined. Each of ten reads
+  that answered 503, one a second, wrote one such line, and a node that nobody
+  asked anything wrote one about every 8 s. The log never shows `secret
+  inventory certified`.
+- A restart changed nothing. Neither did the way the key was given (the
+  environment variable and a key file were both tried).
+
+The error is the generic one. Its hint, "Check `kronik doctor`, the secret
+backend and access to retained versions", does not point at this cause: no
+external backend is involved.
+
+**How it arises.** The views remove secret values from what they show, so the
+node certifies the inventory of the secret versions it retains before it answers
+a read that needs scrubbing. For that it reads every retained snapshot. A
+snapshot that v0.3.0 or older wrote has no `secret_versions` table, the version
+ledger (the snapshots in the v0.3.0 and v0.1.0 data lack it; those in the v0.4.0
+data and the ones the new binary wrote have it). The node cannot certify an
+inventory with such a snapshot in it, so it fails closed. `kronik --json
+snapshot list` shows which engine wrote each snapshot (`engine_version`).
+
+**What ends it.** The node certifies, and the reads answer 200 without a
+restart, as soon as retention has deleted the last snapshot that v0.3.0 or older
+wrote. Retention runs after each snapshot. It keeps the newest `snapshots_kept`
+(48 by default) and, when the log no longer starts at LSN 1, also the oldest
+snapshot that the log still continues from, because a replay of the log begins
+there; see [Snapshots and retention](#snapshots-and-retention). So the start of
+the log decides which of two cases a node is in. `kronik integrity` prints it as
+`Log first LSN` (`log_first_lsn` in `--json`), for example `Log first LSN 1` on
+the v0.3.0 and v0.1.0 data of the compatibility tests and `Log first LSN 57` on
+the compacted copy described below.
+
+*The log starts at LSN 1.* This is a young node, or one whose log is younger
+than `[retention] history`. Nothing is kept beyond the newest `snapshots_kept`,
+so the wait is 48 snapshots of activity, not 48 hours. A snapshot is taken only
+when something was applied since the last one: at most every `snapshot_interval`
+(60 minutes), at a shutdown, or on request. A node that changes every hour needs
+about 48 hours, one that changes once a day needs 48 days, and one that never
+changes does not get there.
+
+Two ways to end it earlier were run on copies of the v0.3.0 and v0.1.0 data.
+Both use only documented settings and commands. Neither is a recommendation, and
+both delete restore points.
+
+1. Keep one snapshot. Set, in `kronik.toml`,
+
+   ```toml
+   [retention]
+   snapshots_kept = 1
+   ```
+
+   restart the daemon, and run `kronik snapshot create --reason "..."` once.
+   After the restart the reads still answered 503. The create returned in 0.06 s
+   on the v0.3.0 data and in 0.4 s on the v0.1.0 data. Retention then deleted
+   every older snapshot, so that the copy held only the one just taken; the log
+   showed `secret inventory certified` (`from=1 through=24 records=24`,
+   `elapsed_ms=2` and `20`) 6 ms and 56 ms after the `snapshot taken` line, and
+   the first read after the command answered 200. Then put the setting back
+   (remove the two lines) and restart. While it is 1, every later snapshot, the
+   one at each shutdown included, deletes all but the newest. After that restart
+   the node certified at start and the reads answered 200.
+
+   Consequence: every older snapshot is gone, and with it every restore point
+   and every base for a fork, replay or proposal before the newest snapshot.
+   With `[ship]` on, snapshots that retention deletes locally are deleted from
+   the bucket too, as [the section on shipping](#shipping-to-object-storage)
+   says; that was not tried here. On the compatibility data, whose log starts at
+   LSN 1, `kronik fork create --at 22` still worked afterwards.
+
+2. Make 48 snapshots. A round was one `kronik send` to an actor (an `increment`
+   of the counter actor in the compatibility data, so that something had
+   changed) and one `kronik snapshot create --reason "..."`. 47 rounds were
+   followed by 503 on `history` and the 48th by 200. That snapshot made
+   retention delete the old one: the copy then held 48 snapshots, the oldest
+   from round 1, and the log showed `secret inventory certified from=1
+   through=165 records=165` (`elapsed_ms=39`). The 48 rounds took 352 s on the
+   v0.3.0 data with the build used for this section, and about 354 s on the
+   v0.3.0 and on the v0.1.0 data with the build before it, most of it the 7 s
+   that each `snapshot create` waited in this state.
+
+   Consequence: 48 more turns in the history of the actor you send to, 48
+   snapshots on disk (each a copy of the whole state, about 172 KiB here), and
+   whatever retention deletes beyond the newest 48, the old snapshot included.
+   Do not run it on data whose history must not change.
+
+*The log starts later.* This is a node whose log has been compacted, which with
+the default `[retention] history = "7d"` is any node that has served for longer
+than that. **Neither way above helps.** Both were run on a copy of a data
+directory that the published v0.3.0 binary had written and compacted itself,
+with small log segments and a very short history: `Log first LSN 57`, ten
+snapshots from v0.3.0. `kronik upgrade check` passed (23 root
+inputs, 23 turns) and the first start answered 503. With `snapshots_kept = 1`
+and one `snapshot create`, retention deleted every snapshot but two, the new one
+and the v0.3.0 snapshot at LSN 64, the oldest that the log continues from; the
+reads still answered 503, also after the restart that put the setting back.
+After 52 rounds of `kronik send` and `snapshot create` (48 are enough where the
+log starts at LSN 1) every read still answered 503: the copy held 49 snapshots,
+the newest 48 and the one at LSN 64, and the log still started at LSN 57. The 52
+rounds took 385 s and the log got 32,596 `secret rebuild failed` lines.
+
+What ends it there is the log itself: retention deletes the old snapshot when
+compaction has moved the start of the log past the newest snapshot that v0.3.0
+or older wrote, and 48 newer snapshots exist. Compaction deletes only closed
+segments that are older than `[retention] history` and covered by a newer
+snapshot, and the age is measured in logical time, so it needs new turns. On a
+node that keeps working that is about one retention window after the node
+stopped under v0.3.0 (7 days with the defaults); on a node that does nothing it
+does not happen. This follows from the retention rule above and from the code;
+no node was observed for a whole retention window. Waiting costs nothing beyond
+what retention deletes anyway.
+
+**What was not tried.** KMS key sources, sealed (privacy-mode) values, secrets
+linked to an external backend, `[ship]`, and a check that finds a behavior
+change (`ENGINE_UPGRADE_DIVERGED`). Waiting out a real retention window. A node
+that has run v0.3.0 for days with its default snapshots, and states larger than
+a few hundred KiB; every timing here comes from a debug build on small states.
+Other values of `snapshots_kept`, deleting snapshot directories by hand, v0.2.0
+(never published) and development builds.
 
 ## Foreign actors
 
@@ -1495,10 +1704,10 @@ operator meets:
 | `PAYLOAD_TOO_LARGE` | A request body over 1 MiB | v0.1's limit |
 | `REASON_REQUIRED` | A change without `--reason` | Every mutation is audited and needs a reason. `restore` and `upgrade check` write no log record, so they take no `--reason` |
 | `ENGINE_UPGRADE_DIVERGED` | `kronik upgrade check` found a behavior change | Keep the current binary. The diff is next to the report in `<data-dir>/upgrade/` |
-| `ENGINE_VERSION_MISMATCH` | A new binary started against data written by another engine, without a passing check | Run `kronik upgrade check --window 6h`, or start the recorded engine version |
+| `ENGINE_VERSION_MISMATCH` | A new binary started against data written by another engine, without a passing check | Run `kronik upgrade check --window 6h`, or start the recorded engine version. For data from v0.3.0 or older read [Upgrading from v0.3.0 or older](#upgrading-from-v030-or-older) first |
 | `UNAUTHENTICATED`, `SCOPE_MISSING`, `TOKEN_NOT_FOUND` | A bearer token is missing, lacks the scope, or was revoked | `kronik token list`, `kronik token create --name <name> --scopes <scope>,... --reason ...`, on the socket as root or a member of `kronik` |
 | `SECRET_NOT_FOUND` | An effect uses a secret that isn't set, or was deleted | `kronik secret set <name> --reason ...` |
-| `SECRET_UNAVAILABLE` | A read answered 503 while the secret inventory was needed, or an effect failed inside a turn because its secret could not be fetched | For a read after a restart: the provider no longer serves a version that Kronik recorded, [a known defect](#secrets-that-an-external-backend-no-longer-serves). Or the rebuild of the inventory takes longer than `[secrets] refresh` and the daemon logs that it did not install its certificate: raise `refresh` above the `elapsed_ms` of the `secret inventory certified` line ([`[secrets]`](#secrets)). For an effect: the backend did not answer in time or refused, see [A turn whose effect cannot get its secret](#a-turn-whose-effect-cannot-get-its-secret) |
+| `SECRET_UNAVAILABLE` | A read answered 503 while the secret inventory was needed, or an effect failed inside a turn because its secret could not be fetched | For a read after a restart: the provider no longer serves a version that Kronik recorded, [a known defect](#secrets-that-an-external-backend-no-longer-serves). For a read after an upgrade of data written by v0.3.0 or older: a snapshot from those versions is still retained, [a known defect](#upgrading-from-v030-or-older). Or the rebuild of the inventory takes longer than `[secrets] refresh` and the daemon logs that it did not install its certificate: raise `refresh` above the `elapsed_ms` of the `secret inventory certified` line ([`[secrets]`](#secrets)). For an effect: the backend did not answer in time or refused, see [A turn whose effect cannot get its secret](#a-turn-whose-effect-cannot-get-its-secret) |
 | `SECRET_VERSION_GONE` | A turn needed a secret version that its provider no longer serves, for example the re-run of a `secret.reveal` after the version was destroyed | The turn is recorded as failed before the guest runs, and no other version's value is used. See [the same section](#secrets-that-an-external-backend-no-longer-serves) for what else the lost version does |
 | `RUNSC_MISSING`, `KVM_UNAVAILABLE`, `RUNC_MISSING`, `FOREIGN_UNAVAILABLE` | Foreign actors can't run | `kronik doctor` names the cause; see [Foreign actors](#foreign-actors) |
 | `IMAGE_INVALID` | `kronik foreign add` got an image it can't verify or unpack | Check the reference; private images need a local layout |
