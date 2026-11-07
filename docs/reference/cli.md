@@ -2204,7 +2204,11 @@ behind the applied LSN, the last success, the last error's code (such as
 `http_503`, `connect` or `timeout`; never its text) and the gaps retention
 made since the start. With `--json`, `stalled_ms` is, while there is lag,
 the time since the last delivery (or since the start without one);
-`kronik doctor` warns on it.
+`kronik doctor` warns on it. A configuration change (a grant, a deployment, a
+policy) that lands while a stream is reading a batch makes that read fail once
+with `UNAVAILABLE`; the stream reads the batch again about a second later, so
+the last error can read `UNAVAILABLE` for that moment without a sink being
+down. Nothing is lost or sent twice.
 `storage_sync` means any sync failure or EIO latched the file writer:
 it makes no later filesystem attempts or cursor acknowledgements.
 The node remains usable. Repair/quarantine storage, create a new writer

@@ -154,6 +154,46 @@ impl Fixture {
         panic!("timed out waiting for {what}");
     }
 
+    /// `wait` with a limit in seconds.
+    fn wait_within(&self, seconds: u64, what: &str, done: impl Fn() -> bool) {
+        for _ in 0..seconds * 20 {
+            if done() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// A configuration commit (a grant, which moves the epoch) for a hook that
+    /// runs on the follower's own worker: the commit runs on a thread of its
+    /// own and the hook waits for it, while the other workers serve it.
+    fn grant_from_a_hook(&self) -> impl Fn(u32) + Send + Sync + 'static {
+        let (node, handle, original) = (
+            self.node.clone(),
+            self.rt.handle().clone(),
+            self.original.clone(),
+        );
+        move |n| {
+            let (node, handle, original) = (node.clone(), handle.clone(), original.clone());
+            std::thread::spawn(move || {
+                handle
+                    .block_on(node.grant(
+                        "counter",
+                        &format!("http:host-{n}.example.com"),
+                        None,
+                        None,
+                        audit(),
+                        false,
+                        original,
+                    ))
+                    .unwrap();
+            })
+            .join()
+            .unwrap();
+        }
+    }
+
     fn caught_up(&self, stream: &Stream) -> bool {
         stream.progress().cursor >= self.node.applied_lsn()
     }
@@ -207,7 +247,15 @@ struct Seen {
     gaps: Mutex<Vec<(Lsn, Lsn, Option<Lsn>)>>,
     /// Panic in this many prepares.
     panics: AtomicU32,
+    /// Readers the follower captured, and what to do right after each one,
+    /// given its number from 1.
+    captures: AtomicU32,
+    on_capture: Mutex<Option<CaptureHook>>,
 }
+
+/// What a test does right after the follower captured a reader, given the
+/// capture's number from 1.
+type CaptureHook = Box<dyn Fn(u32) + Send + Sync>;
 
 struct Fake {
     seen: Arc<Seen>,
@@ -262,6 +310,13 @@ impl Sink for Fake {
             }
         } else {
             Delivery::Delivered
+        }
+    }
+
+    fn reader_captured(&mut self) {
+        let n = self.seen.captures.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(hook) = self.seen.on_capture.lock().unwrap().as_ref() {
+            hook(n);
         }
     }
 
@@ -340,6 +395,69 @@ fn failed_preparation_keeps_cursor_and_sink_state_until_coverage_recovers() {
     );
     let prepared: usize = seen.batches.lock().unwrap().iter().map(|b| b.0).sum();
     assert_eq!(prepared as u64, f.node.applied_lsn());
+}
+
+/// A configuration commit that lands between the capture of a reader and the
+/// read of its page overtakes the reader: the read fails UNAVAILABLE. That
+/// says nothing about the log, so the follower captures again at the pace of
+/// its other preparation retries. It used to pause for a minute, as for a
+/// page read that failed on its own, and `kronik export status` showed
+/// UNAVAILABLE and a frozen cursor meanwhile.
+#[test]
+fn a_reader_overtaken_by_a_configuration_commit_is_captured_again_without_the_long_pause() {
+    let f = Fixture::new(false);
+    let seen = Arc::new(Seen::default());
+    let grant = f.grant_from_a_hook();
+    *seen.on_capture.lock().unwrap() = Some(Box::new(move |n| {
+        if n == 1 {
+            grant(n);
+        }
+    }));
+    let stream = f.follow("overtaken", 0, fake(&f, "overtaken", &seen));
+    f.wait_within(20, "the export after the overtaken capture", || {
+        f.caught_up(&stream)
+    });
+    assert!(
+        seen.captures.load(Ordering::SeqCst) >= 2,
+        "the reader was captured again"
+    );
+    assert_eq!(
+        stream.progress().last_error.as_deref(),
+        Some("UNAVAILABLE"),
+        "the first read was overtaken"
+    );
+    let prepared: usize = seen.batches.lock().unwrap().iter().map(|b| b.0).sum();
+    assert_eq!(prepared as u64, f.node.applied_lsn(), "every record once");
+}
+
+/// A reader that is overtaken every time is captured again at most once a
+/// second, not in a hot loop; and not once in a minute either.
+#[test]
+fn a_reader_that_is_overtaken_every_time_is_not_captured_in_a_hot_loop() {
+    let f = Fixture::new(false);
+    let seen = Arc::new(Seen::default());
+    let grant = f.grant_from_a_hook();
+    let overtaking = Arc::new(AtomicBool::new(true));
+    let overtake = overtaking.clone();
+    *seen.on_capture.lock().unwrap() = Some(Box::new(move |n| {
+        if overtake.load(Ordering::SeqCst) {
+            grant(n);
+        }
+    }));
+    let started = std::time::Instant::now();
+    let stream = f.follow("hot", 0, fake(&f, "hot", &seen));
+    std::thread::sleep(Duration::from_millis(3500));
+    let elapsed = started.elapsed().as_secs_f64();
+    let captures = seen.captures.load(Ordering::SeqCst);
+    // The k-th capture comes a second after the one before at the earliest.
+    assert!(
+        captures >= 2 && f64::from(captures) <= elapsed + 2.0,
+        "{captures} captures in {elapsed:.1} s"
+    );
+    overtaking.store(false, Ordering::SeqCst);
+    f.wait_within(20, "the export once the readers stay fresh", || {
+        f.caught_up(&stream)
+    });
 }
 
 #[test]

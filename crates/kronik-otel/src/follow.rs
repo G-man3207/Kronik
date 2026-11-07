@@ -105,6 +105,12 @@ pub trait Sink: Send {
     ) -> impl Future<Output = Result<(), String>> + Send {
         async { Ok(()) }
     }
+
+    /// Test seam: the follower has captured the reader of its next batch and
+    /// has not read the page from it yet. A test commits a configuration
+    /// change here to overtake the reader.
+    #[doc(hidden)]
+    fn reader_captured(&mut self) {}
 }
 
 /// A stream's progress, as `kronik export status` shows it.
@@ -1492,8 +1498,10 @@ pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Preparation retries (secret inventory, reader, projection) stay fast: the
 /// documented fail-closed windows close in milliseconds, and a stream whose
-/// interval is 100 ms must not back off a whole minute for them. Only gap and
-/// checkpoint work uses [`MAX_BACKOFF`].
+/// interval is 100 ms must not back off a whole minute for them. That includes
+/// a reader that a configuration commit overtook between its capture and its
+/// read. Only gap and checkpoint work, and a page read that failed on its own,
+/// use [`MAX_BACKOFF`].
 pub const MAX_PREPARE_BACKOFF: Duration = Duration::from_secs(1);
 /// A `Retry-After` longer than this is cut to it.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
@@ -1759,6 +1767,10 @@ pub async fn follow<S: Sink + 'static>(
                 continue;
             }
         };
+        // The seam never makes the follower wait for the sink.
+        if let Ok(mut sink) = sink.try_lock() {
+            sink.reader_captured();
+        }
         let page = match reader
             .local_export_page(
                 cursor,
@@ -1770,7 +1782,20 @@ pub async fn follow<S: Sink + 'static>(
             Ok(page) => page,
             Err(error) => {
                 failure(&stream, error.code.as_str().to_owned());
-                pause(&env, &stream, MAX_BACKOFF).await;
+                // A reader is good for the configuration and the execution it
+                // was captured under. When either moved since, as when a
+                // configuration commit lands between the capture and this
+                // read, the error says nothing about the log: capture again at
+                // the pace of the other preparation retries, which also keeps
+                // a reader that is stale every time from becoming a hot loop.
+                // A read that failed on its own keeps the long pause.
+                let stale = reader.check().is_err();
+                pause(
+                    &env,
+                    &stream,
+                    if stale { prepare_backoff } else { MAX_BACKOFF },
+                )
+                .await;
                 continue;
             }
         };
