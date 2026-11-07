@@ -15,6 +15,8 @@
 # override the two components (e.g. the TypeScript counter and its +2
 # build): any kind `counter` with POST /counter/{key}/increment answering
 # JSON {"n": N}. Needs curl and python3.
+# External owned mode: KRONIK_DEMO_{SOCKET,HTTP,DATA_DIR,RUN_DIR,OWNER_TOKEN,FIXTURE}.
+# It audits the exact nonroot fixture, retains evidence, and never stops/removes it.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -27,12 +29,12 @@ case "${GUESTS:-examples}" in
     examples)
         old=examples/dist/counter.wasm
         new=examples/dist/counter-step2.wasm
-        inc() { echo "/counter/$1/increment"; }
+        inc() { echo "/$kind/$1/increment"; }
         ;;
     test)
         old=tests/guests/counter.wasm
         new=tests/guests/counter-step2.wasm
-        inc() { echo "/counter/$1/increment"; }
+        inc() { echo "/$kind/$1/increment"; }
         ;;
     *)
         echo "GUESTS must be examples or test" >&2
@@ -44,11 +46,27 @@ new="${COUNTER_NEW:-$new}"
 for f in "$bin" "$old" "$new"; do
     [ -e "$f" ] || { echo "missing $f" >&2; exit 2; }
 done
+external=0
 sock="$dir/api.sock"
 gw="http://127.0.0.1:$port"
+if [ -n "${KRONIK_DEMO_SOCKET:-}" ]; then
+    : "${KRONIK_DEMO_HTTP:?external daemon needs its HTTP URL}"
+    : "${KRONIK_DEMO_DATA_DIR:?external daemon needs its owned data directory}"
+    : "${KRONIK_DEMO_RUN_DIR:?external daemon needs its owned runtime directory}"
+    : "${KRONIK_DEMO_OWNER_TOKEN:?external daemon needs its fixture ownership token}"
+    : "${KRONIK_DEMO_FIXTURE:?external daemon needs its trusted fixture manifest}"
+    bash scripts/check-rootless.sh --fixture "$KRONIK_DEMO_FIXTURE"
+    [ "$(cat "$KRONIK_DEMO_DATA_DIR/.kronik-proof-owner")" = "$KRONIK_DEMO_OWNER_TOKEN" ] ||
+        { echo "wrong external fixture owner" >&2; exit 2; }
+    [ ! -e "$dir" ] || { echo "evidence directory already exists: $dir" >&2; exit 2; }
+    external=1
+    sock=$KRONIK_DEMO_SOCKET
+    gw=$KRONIK_DEMO_HTTP
+fi
 pid=""
 
-rm -rf "$dir"
+if [ "$external" = 0 ]; then rm -rf "$dir"; fi
+umask 077
 mkdir -p "$dir"
 trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; true' EXIT
 
@@ -76,18 +94,28 @@ value() { # KEY -> n after one more increment
 }
 
 step "serve"
-setsid "$bin" serve --data-dir "$dir/data" --http-listen "127.0.0.1:$port" \
-    --api-socket "$sock" >>"$dir/serve.log" 2>&1 &
-pid=$!
-for _ in $(seq 1 100); do
-    curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null 2>&1 && break
-    sleep 0.1
-done
+if [ "$external" = 0 ]; then
+    setsid "$bin" serve --data-dir "$dir/data" --http-listen "127.0.0.1:$port" \
+        --api-socket "$sock" >>"$dir/serve.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 100); do
+        curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+fi
 curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null || fail "daemon not healthy"
 
 step "deploy counter"
+r=$(api POST /v1/deployments "{\"wasm_base64\":\"$(b64 "$old")\",\"dry_run\":true,\"reason\":\"demo manifest\"}")
+kind=$(field "$r" 'v["deployment"]["kind"]')
+[ -n "$kind" ] || fail "component has no actor kind"
+if [ "$external" = 1 ]; then
+    api GET /v1/deployments >"$dir/preexisting-deployments.json"
+    python3 -c 'import json,sys; kind=sys.argv[2]; assert not any(k["kind"]==kind for d in json.load(open(sys.argv[1]))["deployments"] for k in d["kinds"]), "refusing to overwrite an existing kind"' \
+        "$dir/preexisting-deployments.json" "$kind" || fail "external fixture already has kind $kind"
+fi
 r=$(api POST /v1/deployments "{\"wasm_base64\":\"$(b64 "$old")\",\"reason\":\"demo\"}")
-[ "$(field "$r" 'v["deployment"]["kind"]')" = counter ] || fail "deploy: $r"
+[ "$(field "$r" 'v["deployment"]["kind"]')" = "$kind" ] || fail "deploy: $r"
 fork_lsn=$(field "$(api GET /v1/health)" 'v["applied_lsn"]')
 
 step "record $requests requests"
