@@ -270,6 +270,63 @@ async fn nothing_is_staged_after_the_pause_bound() {
     assert_eq!(node.applied_lsn(), head, "nothing was written");
 }
 
+/// A resend that checked its dead letter before the rebase switch and is
+/// queued after it (stopped in between by the hold) does not run on the
+/// rebased state, which no longer has the dead letter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resend_queued_after_the_switch_for_a_dead_letter_it_removed_does_not_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, hold) = node(dir.path()).await;
+    let epoch = promote_now(&node, &hold, "counter-step2").await;
+    let failed = node
+        .send(
+            ActorRef::parse("counter/a").unwrap(),
+            pb::Message {
+                name: "fail".into(),
+                content_type: "text/plain".into(),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            owner(&node),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let dead = failed.turn_id.lsn;
+    let (sw, kinds, not_after) = prepare_rebase(&node, "r-late", epoch).await;
+    let pause = node
+        .rebase_pause(Duration::from_secs(5), owner(&node))
+        .await
+        .unwrap();
+    let started = hold.arrived.load(Ordering::SeqCst);
+    hold.park_resend.store(true, Ordering::SeqCst);
+    let resend = {
+        let node = node.clone();
+        tokio::spawn(async move { node.resend(dead, audit(), false, owner(&node)).await })
+    };
+    wait_until("the resend parks after its check", || {
+        hold.resend_parked.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // The whole switch happens while it is parked: when it goes on, the
+    // pause is over and the state has no such dead letter.
+    hold.release.add_permits(1);
+    node.rebase_switch(pause, "r-late", sw, kinds, not_after, audit(), owner(&node))
+        .await
+        .unwrap();
+    assert!(node.store().db().dead_letter(dead).unwrap().is_none());
+    hold.resend_release.add_permits(1);
+    let r: Result<_, ApiError> = resend.await.unwrap();
+    assert_eq!(r.unwrap_err().code, ErrorCode::DeadLetterNotFound);
+    assert_eq!(
+        hold.arrived.load(Ordering::SeqCst),
+        started,
+        "the resend ran"
+    );
+    assert!(node.store().db().dead_letters(0, 100).unwrap().is_empty());
+}
+
 /// A resend held by the pause whose dead letter the rebased state no
 /// longer has is dropped at the switch, not run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

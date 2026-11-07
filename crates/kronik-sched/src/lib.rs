@@ -145,13 +145,18 @@ impl Default for NodeConfig {
 
 /// Test hook for [`NodeConfig::test_hold_switch`]: counts the switches that
 /// parked and the turns that came to take their code, and lets each parked
-/// switch go on one permit of `release`.
+/// switch go on one permit of `release`. With `park_resend` set, a resend
+/// parks between the check of its dead letter and the queueing of its job,
+/// and goes on one permit of `resend_release`; `resend_parked` counts them.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct SwitchHold {
     pub parked: std::sync::atomic::AtomicUsize,
     pub arrived: std::sync::atomic::AtomicUsize,
     pub release: tokio::sync::Semaphore,
+    pub park_resend: std::sync::atomic::AtomicBool,
+    pub resend_parked: std::sync::atomic::AtomicUsize,
+    pub resend_release: tokio::sync::Semaphore,
 }
 
 impl Default for SwitchHold {
@@ -160,6 +165,9 @@ impl Default for SwitchHold {
             parked: Default::default(),
             arrived: Default::default(),
             release: tokio::sync::Semaphore::new(0),
+            park_resend: Default::default(),
+            resend_parked: Default::default(),
+            resend_release: tokio::sync::Semaphore::new(0),
         }
     }
 }

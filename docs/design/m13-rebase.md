@@ -116,9 +116,11 @@ gone, fork timers still pending fire when due. **Dead letters** are the
 old code's failures; main's dead letters from after the deployment stay in
 the history (the failed turns are in the log) but can no longer be resent
 (a resend held by the pause is answered `DEAD_LETTER_NOT_FOUND` at the
-switch), so a root input that the old code ran successfully is never
-applied twice. **Erased subjects** stay erased: every erasure after the
-base is applied again after the last staged turn.
+switch, and so is one that checked its dead letter just before the switch
+and was queued just after it, when its turn would start), so a root input
+that the old code ran successfully is never applied twice. **Erased
+subjects** stay erased: every erasure after the base is applied again
+after the last staged turn.
 **Orphans** are the old code's. **SQL state** is the old code's databases,
 in the old schema; the actors' `schema_version` is the old one, so the old
 code runs no migration. LSNs inside rebased records that refer to the

@@ -51,6 +51,16 @@ pub(crate) fn store_err(e: StoreError) -> ApiError {
     }
 }
 
+/// The answer to a resend whose dead letter the rebased state no longer has
+/// (m13-rebase §3), given when the switch drops the held resend and when a
+/// resend that was queued after that is about to run.
+fn dead_letter_gone(lsn: Lsn) -> ApiError {
+    ApiError::new(
+        ErrorCode::DeadLetterNotFound,
+        format!("dead letter {lsn} is gone: a rollback via replay switched main's state"),
+    )
+}
+
 /// Fixed host lifecycle producers, never deserialized operator authority.
 #[derive(Clone, Copy)]
 pub enum SystemAudit {
@@ -1231,12 +1241,7 @@ impl Node {
         for (lsn, job) in gone {
             lock(&self.resending).remove(&lsn);
             if let Some(reply) = job.reply {
-                let _ = reply.send(Err(ApiError::new(
-                    ErrorCode::DeadLetterNotFound,
-                    format!(
-                        "dead letter {lsn} is gone: a rollback via replay switched main's state"
-                    ),
-                )));
+                let _ = reply.send(Err(dead_letter_gone(lsn)));
             }
         }
         for row in mailbox {
@@ -1345,6 +1350,19 @@ impl Node {
         }
     }
 
+    /// The test hook `SwitchHold::park_resend`: parks a resend after the
+    /// check of its dead letter and before its job is queued.
+    async fn hold_resend(&self) {
+        if let Some(hold) = &self.cfg.test_hold_switch
+            && hold.park_resend.load(Ordering::SeqCst)
+        {
+            hold.resend_parked.fetch_add(1, Ordering::SeqCst);
+            if let Ok(permit) = hold.resend_release.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+
     fn kind(&self, name: &str) -> Option<Arc<Kind>> {
         lock(&self.kinds).get(name).cloned()
     }
@@ -1397,6 +1415,21 @@ impl Node {
                         m.message_id,
                         TurnId { branch, lsn }
                     )));
+                }
+                // The switch of a rollback via replay drops the held resends
+                // it finds in the queues, but a resend that checked its dead
+                // letter before the switch can be queued after it: it runs
+                // only if the state it runs on still has the dead letter.
+                if m.source == pb::MessageSource::DeadLetterResend as i32
+                    && let Some(of) = TurnId::parse(&m.resend_of)
+                    && self
+                        .store
+                        .db()
+                        .dead_letter(of.lsn)
+                        .map_err(store_err)?
+                        .is_none()
+                {
+                    return Err(dead_letter_gone(of.lsn));
                 }
             }
             Some(pb::input::Kind::Timer(t))
@@ -2718,6 +2751,7 @@ impl Node {
         if dry_run {
             return Ok(None);
         }
+        self.hold_resend().await;
         if !lock(&self.resending).insert(lsn) {
             return Err(ApiError::new(
                 ErrorCode::DeadLetterAlreadyResent,
