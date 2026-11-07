@@ -1559,7 +1559,7 @@ fn a_backend_that_hangs_stops_only_the_turns_that_need_its_secrets() {
     assert!(started.elapsed() < Duration::from_secs(10));
     let text = answer.to_string();
     assert!(text.contains("SECRET_UNAVAILABLE"), "{answer}");
-    assert_ne!(answer["outcome"]["kind"], "committed", "{answer}");
+    assert_eq!(answer["outcome"]["kind"], "failed", "{answer}");
     assert_eq!(open_turns(dir.path()), 0, "the aborted turn was left open");
     // The rebuild that cannot hold version 1 says which version it is.
     d.wait_until("the rebuild warning to name the version", |d| {
@@ -1759,8 +1759,10 @@ fn retrying_with_the_same_key_after_the_outage_sends_the_request_at_most_once() 
                 .unwrap_or_default()
         })
         .collect();
+    // The request never had its credential, so it is never sent: not by the
+    // retries, and not by a start that finds a turn to run.
     assert!(
-        seen.len() <= 1,
+        seen.is_empty(),
         "one client key, {} POSTs to the target with {} different Idempotency-Key headers",
         seen.len(),
         keys.len()

@@ -291,6 +291,8 @@ struct Bao {
     urls: Mutex<Vec<String>>,
     /// Answer 200 to a read of the secret with a body that has no version.
     invalid_body: AtomicBool,
+    /// The headers of every request of a guest (to `/hook`), as they went out.
+    hooks: Mutex<Vec<Vec<(String, String)>>>,
     require_begin: AtomicBool,
     node: Mutex<Option<std::sync::Weak<Node>>>,
 }
@@ -309,6 +311,15 @@ impl Net for Bao {
     }
     fn http(&self, request: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
         self.urls.lock().unwrap().push(request.url.clone());
+        if request.url.contains("/hook") {
+            // A guest's own request, not the node's business with the provider.
+            self.hooks.lock().unwrap().push(request.headers.clone());
+            return Box::pin(std::future::ready(Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: bytes::Bytes::from_static(b"ok"),
+            })));
+        }
         if self.require_begin.load(Ordering::Acquire) {
             let node = self
                 .node
@@ -370,6 +381,7 @@ fn new_bao(status: usize) -> Arc<Bao> {
         gets: AtomicUsize::new(0),
         urls: Mutex::new(Vec::new()),
         invalid_body: AtomicBool::new(false),
+        hooks: Mutex::new(Vec::new()),
         require_begin: AtomicBool::new(false),
         node: Mutex::new(None),
     })
@@ -926,6 +938,14 @@ fn text_message(name: &str, text: &str) -> pb::Message {
     }
 }
 async fn counter_with_grants(node: &Node) {
+    counter_with_http_delivery(node, None).await;
+}
+/// `counter_with_grants`, with the delivery class of the grant for HTTP:
+/// `None` is the method's default, which for a POST is `unsafe`.
+async fn counter_with_http_delivery(
+    node: &Node,
+    delivery: Option<kronik_effects::config::Delivery>,
+) {
     let authority = node.local_operator_authority().unwrap();
     node.deploy(
         &std::fs::read(COUNTER).unwrap(),
@@ -936,10 +956,15 @@ async fn counter_with_grants(node: &Node) {
     .await
     .unwrap();
     for capability in ["secret:token", "secret-reveal:token", "http:127.0.0.1"] {
+        let delivery = if capability.starts_with("http:") {
+            delivery
+        } else {
+            None
+        };
         node.grant(
             "counter",
             capability,
-            None,
+            delivery,
             None,
             audit(),
             false,
@@ -1084,6 +1109,16 @@ fn run<T>(future: impl std::future::Future<Output = T>) -> T {
     output
 }
 
+/// The delivery class of the grant for HTTP that a case needs so that a re-run
+/// makes its effect again: a fetch of an `unsafe` grant (the default for a POST)
+/// is never made again by a re-run (I17), so the tests that expect the effect
+/// to be made use a keyed grant for the fetch.
+fn delivery_for(
+    case: &(&str, &str, &str, pb::EffectStatus, &str, bool),
+) -> Option<kronik_effects::config::Delivery> {
+    (case.2 == "http.fetch").then_some(kronik_effects::config::Delivery::IdempotencyKeyed)
+}
+
 /// What the node's life leaves of the turn of `case`: its record, and the
 /// position of the first record that the kill takes away.
 struct FirstLife {
@@ -1098,12 +1133,13 @@ fn first_life(
     data: &std::path::Path,
     bao: &Arc<Bao>,
     case: &(&str, &str, &str, pb::EffectStatus, &str, bool),
+    delivery: Option<kronik_effects::config::Delivery>,
 ) -> FirstLife {
     let (name, text, ..) = *case;
     run(async {
         let node = provider_node(data, bao).await;
         link_token(&node, bao, 503).await;
-        counter_with_grants(&node).await;
+        counter_with_http_delivery(&node, delivery).await;
         let result = send_text(&node, "counter/h", name, text).await;
         let turn = turn_of(&node, &result).await;
         let (mut effect_result_at, mut turn_record_at) = (None, None);
@@ -1187,7 +1223,7 @@ fn a_crash_after_the_recorded_error_replays_it_while_the_backend_is_still_down()
     for case in &UNAVAILABLE_CASES {
         let data = tempfile::tempdir().unwrap();
         let bao = new_bao(200);
-        let first = first_life(data.path(), &bao, case);
+        let first = first_life(data.path(), &bao, case, None);
         kill_at(data.path(), &first.turn_record_at);
 
         // The second life, with the provider still down.
@@ -1216,16 +1252,12 @@ fn a_crash_after_the_recorded_error_replays_it_while_the_backend_is_still_down()
 #[test]
 fn a_crash_before_the_error_result_makes_the_re_run_wait_and_then_run_the_effect() {
     let _serial = TESTS.blocking_lock();
-    // The effects that do not go to the network: the fake provider is the only
-    // network of these nodes.
-    for case in UNAVAILABLE_CASES
-        .iter()
-        .filter(|case| case.2 != "http.fetch")
-    {
+    for case in &UNAVAILABLE_CASES {
         let data = tempfile::tempdir().unwrap();
         let bao = new_bao(200);
-        let first = first_life(data.path(), &bao, case);
+        let first = first_life(data.path(), &bao, case, delivery_for(case));
         kill_at(data.path(), &first.effect_result_at);
+        assert!(bao.hooks.lock().unwrap().is_empty(), "{}", case.0);
 
         let second = run(async {
             let node = provider_node(data.path(), &bao).await;
@@ -1273,6 +1305,22 @@ fn a_crash_before_the_error_result_makes_the_re_run_wait_and_then_run_the_effect
             "{}",
             case.0
         );
+        // The fetch went out once, now, with the provider's value in its header
+        // and the turn's idempotency key; the first life sent nothing.
+        let hooks = bao.hooks.lock().unwrap().clone();
+        if case.2 == "http.fetch" {
+            assert_eq!(hooks.len(), 1, "{}: {hooks:?}", case.0);
+            let header = |name: &str| {
+                hooks[0]
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.as_str())
+            };
+            assert_eq!(header("x-api-key"), Some("immutable-provider-value"));
+            assert!(header("idempotency-key").is_some(), "{hooks:?}");
+        } else {
+            assert!(hooks.is_empty(), "{}: {hooks:?}", case.0);
+        }
     }
 }
 
@@ -1283,18 +1331,12 @@ fn a_crash_before_the_error_result_makes_the_re_run_wait_and_then_run_the_effect
 #[test]
 fn a_crash_before_the_error_result_makes_a_re_run_record_a_refusal_instead_of_waiting() {
     let _serial = TESTS.blocking_lock();
-    // Not the fetch: its grant is `unsafe` (the default for POST), and a re-run
-    // never makes an unsafe effect again (I17), so it ends `outcome unknown`
-    // whatever the secret does.
-    for case in UNAVAILABLE_CASES
-        .iter()
-        .filter(|case| case.2 != "http.fetch")
-    {
+    for case in &UNAVAILABLE_CASES {
         let data = tempfile::tempdir().unwrap();
         let bao = new_bao(200);
         // The first life meets an outage and records the error; the kill takes
         // the error away again.
-        let first = first_life(data.path(), &bao, case);
+        let first = first_life(data.path(), &bao, case, delivery_for(case));
         kill_at(data.path(), &first.effect_result_at);
 
         // The second life meets a refusal.
@@ -1315,6 +1357,61 @@ fn a_crash_before_the_error_result_makes_a_re_run_record_a_refusal_instead_of_wa
         });
         assert_eq!(second.execution_id, first.turn.execution_id, "{}", case.0);
         assert_eq!(shape(&second), shape(&first.turn), "{}", case.0);
+        assert!(bao.hooks.lock().unwrap().is_empty(), "{}: sent", case.0);
+    }
+}
+
+/// An effect of an `unsafe` grant that has no recorded result is not made
+/// again by a re-run (I17): it ends as outcome unknown, at once, whatever the
+/// secret does. The wait of the crash-before test above is for the other
+/// delivery classes.
+#[test]
+fn a_crash_before_the_result_of_an_unsafe_fetch_ends_as_outcome_unknown_whatever_the_secret_does() {
+    let _serial = TESTS.blocking_lock();
+    let case = UNAVAILABLE_CASES
+        .iter()
+        .find(|case| case.2 == "http.fetch")
+        .unwrap();
+    // The provider is down, as it was for the first life, and it is back.
+    for provider in [503, 200] {
+        let data = tempfile::tempdir().unwrap();
+        let bao = new_bao(200);
+        let first = first_life(data.path(), &bao, case, None);
+        kill_at(data.path(), &first.effect_result_at);
+        bao.status.store(provider, Ordering::Release);
+
+        let second = run(async {
+            let node = provider_node(data.path(), &bao).await;
+            node.env
+                .timeout(Duration::from_secs(60), async {
+                    while !node.store().db().open_turns().unwrap().is_empty() {
+                        node.env.clock.sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{provider}: the re-run waits"));
+            last_turn_of_h(&node).await
+        });
+        assert_eq!(second.execution_id, first.turn.execution_id, "{provider}");
+        assert_eq!(second.effects.len(), 1, "{provider}");
+        assert_eq!(
+            second.effects[0].status,
+            pb::EffectStatus::OutcomeUnknown as i32,
+            "{provider}: {:?}",
+            second.effects[0]
+        );
+        assert!(
+            second.effects[0].error.starts_with("outcome unknown"),
+            "{provider}: {:?}",
+            second.effects[0]
+        );
+        // The guest handled it (`fetch-ok`), and nothing was sent.
+        assert_eq!(
+            second.outcome.as_ref().map(|outcome| outcome.kind),
+            Some(pb::OutcomeKind::Committed as i32),
+            "{provider}"
+        );
+        assert!(bao.hooks.lock().unwrap().is_empty(), "{provider}: sent");
     }
 }
 
