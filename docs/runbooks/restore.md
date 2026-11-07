@@ -40,6 +40,13 @@ existing encrypted store.
    kronik serve --config /owned/recovery/kronik.toml
    ```
 
+   The first start of a restored directory may install the newest snapshot
+   that the log continues (the restore registered it) and replay the log from
+   there, because an actor database that came with the snapshot can be older
+   than the log the bucket kept; the daemon logs `installed a snapshot as the
+   branch's state`, and `kronik upgrade check` on the restored directory notes
+   it before the start.
+
 5. Compare `kronik --json integrity --through <source-LSN>` against the recorded
    source state/log hashes. Check `keys_missing` is empty and read known
    fixture key-value and SQL values. Confirm the next audit records include
