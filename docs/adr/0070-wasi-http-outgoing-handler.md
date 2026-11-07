@@ -1,7 +1,7 @@
 # 0070. Standard `fetch` through `wasi:http/outgoing-handler` as an `http.fetch` effect
 
 - **Status:** Accepted (the M22 spike proved §2 and §3's secret mapping for TypeScript `fetch`; §5 blocked on Wasmtime)
-- **Date:** 2026-10-27
+- **Date:** 2026-10-27, amended 2026-11-07 (the gate of §5)
 
 ## Context
 
@@ -209,7 +209,10 @@ tier 1 (or tier 2) in `stability-tiers.md`, plus a componentize-js release
 that targets `wasi:http@0.3`. Then: compile `component-model-async`, add `p3`,
 re-run ADR 0001's determinism suite with the async scheduler, and route the
 0.3 `wasi:http/client.send` import (`src/p3/wit/deps/http.wit:454`) through
-the same `send_request` hook, queue and gate.
+the same `send_request` hook, queue and gate. The gate is restated, with how
+to check each part and what else stands in the way, in the
+[amendment of 2026-11-07](#amendment-2026-11-07-m22-what-reopens-the-wasi-03-gate)
+at the end of this ADR.
 
 ### 6. Spike results (2026-10-27)
 
@@ -278,3 +281,210 @@ a tokio runtime), forks and simulators. Those are M22's implementation.
   accepts the new imports and still rejects `incoming-handler` and `@0.3`.
 - Revisit if Wasmtime adds a hook that exposes the response pollable (drive
   could then drop the `handle` wrapper), or when the WASI 0.3 gate in §5 opens.
+
+## Amendment (2026-11-07, M22): what reopens the WASI 0.3 gate
+
+M22's third criterion, "Components for WASI 0.3 pass the determinism test
+and identity replay", is deferred. Wasmtime 50 does not meet it, the 51
+release branch does not either, and releases ship without it until the gate
+of §5 opens. §1 to §4 and the decision of §5 stand: no `p3`, no
+`component-model-async`, and the allowlist still rejects every `0.3.x`
+import. What changes is that the gate becomes something one can check, and
+that the blockers it did not name are written down.
+
+The three parts were read from the public sources on 2026-11-06 and again
+on 2026-11-07. A statement marked [not re-read] is from 2026-11-06 only. A
+statement marked [INFERENCE] is a conclusion, not an observation.
+
+### The gate, part by part
+
+(a) and (b) are read on a Wasmtime *release*, because Kronik pins exact
+releases and never `main` ([ADR 0001](0001-wasmtime-determinism.md#3-engine-version)).
+The release is the newest `release-N.0.0` branch whose final tag `vN.0.0`
+exists: a release branch exists before its release, and a release candidate
+is tagged `vN.0.0-rc.K`. A condition that holds only on `main` reaches a
+release with the next major version.
+
+- **(a) The `p3` modules lose the banner.**
+  - *State: not met.*
+    [`crates/wasi/src/p3/mod.rs`](https://github.com/bytecodealliance/wasmtime/blob/release-51.0.0/crates/wasi/src/p3/mod.rs)
+    and
+    [`crates/wasi-http/src/p3/mod.rs`](https://github.com/bytecodealliance/wasmtime/blob/release-51.0.0/crates/wasi-http/src/p3/mod.rs)
+    still open with "Experimental, unstable and incomplete implementation
+    of wasip3 …", "not compliant with semver and … not ready for production
+    use" and "Bug and security fixes limited to wasip3 will not be given
+    patch releases", on `release-50.0.0`, `release-51.0.0` and `main`.
+    Release 51 is a candidate (tag `v51.0.0-rc.1`) and due as final on
+    2026-11-20 [not re-read].
+  - *Check.* Read the leading `//!` block of both files on the newest
+    released branch, or in the published `wasmtime-wasi` and
+    `wasmtime-wasi-http` crates. Met when neither calls the module
+    experimental, unstable or incomplete, not compliant with semver or not
+    ready for production, and neither says that fixes limited to wasip3 get
+    no patch releases. Only that block counts: "unstable" occurs elsewhere in
+    the files.
+- **(b) Tier 1 or 2 in `stability-tiers.md`.**
+  - *State: not met.* `component-model-async` is a Tier 1 row on
+    `release-51.0.0` and `main` and is absent from `release-50.0.0`. No tier
+    lists WASIp3 on any of the three. The `wasi-http` row (Tier 1) is the 0.2
+    implementation [INFERENCE: the document does not say which WASI version a
+    row means]. See
+    [stability-tiers.md@release-51.0.0](https://github.com/bytecodealliance/wasmtime/blob/release-51.0.0/docs/stability-tiers.md).
+  - *Check.* Read the `Tier 1` and `Tier 2` tables of
+    `docs/stability-tiers.md` on the newest released branch: a row for
+    `component-model-async` and a row for WASIp3 (the WASI 0.3 interfaces,
+    under a name such as `wasip3` or "WASI 0.3"). The compiler-support
+    matrices further down name `component-model-async` too and are not tiers.
+  - *Reading.* §5 writes "WASIp3 / `component-model-async` is listed at tier
+    1 (or tier 2)", and the slash can mean "or", "and", or one thing under
+    two names. This amendment reads it as **both rows**. (1) The brief pairs
+    them: M22 asks for "components for WASI 0.3 and the asynchronous
+    component model" "when Wasmtime supports them stably". (2) Part (a) is
+    about the WASI 0.3 host modules; a tier for the engine feature underneath
+    says nothing about the module Kronik would link, and the one WASI row
+    there is, `wasi-http`, describes 0.2. (3) Read as "or", (b) would be met
+    by Wasmtime 51 alone and carry no information from then on, while opening
+    the work early costs far more than waiting for one more row (below). It
+    is a reading, not a decision: the maintainers can overrule it, and the
+    watcher shows the two rows apart (b1 and b2), so that either reading can
+    be read off its table.
+- **(c) A componentize-js release targets `wasi:http@0.3`.**
+  - *State: not met.* npm `latest` is 0.23.0 (published 2026-09-21), the
+    version that `sdk/ts/package-lock.json` pins. Its README names
+    `wasi:http/incoming-handler@0.2.0` and no 0.3 interface, and its features
+    are `stdio`, `random`, `clocks`, `http` and `fetch-event`. A p3 rewrite of
+    componentize-js is unreleased, and jco 1.41.0 and `preview3-shim` 0.13.0
+    are host-side [not re-read].
+  - *Check.* `npm view @bytecodealliance/componentize-js dist-tags version`
+    (the same document is at
+    [registry.npmjs.org](https://registry.npmjs.org/@bytecodealliance%2fcomponentize-js)),
+    then the README and the release notes of a new release, then the test
+    that decides: componentize a small module that calls `fetch` and list the
+    imports with `wasm-tools component wit`. Met when
+    `wasi:http/client@0.3.x` replaces `wasi:http/outgoing-handler@0.2.x`. The
+    jco release that uses it has to be pinned together with it.
+
+### Blockers the gate does not name
+
+None of these doubts the gate. Each has to be resolved before the criterion
+can pass, and the first is a decision for the project, not an upstream event.
+
+1. **`handle` is a synchronous export.** In `wit/kronik-actor.wit`,
+   `handler.handle` is a plain `func`. The component model says that a
+   sync-typed export that blocks traps, and Wasmtime raises
+   `CannotBlockSyncTask` unless the host future completes on its first poll
+   or another thread of the instance is ready [not re-read; see
+   [Concurrency.md](https://github.com/WebAssembly/component-model/blob/main/design/mvp/Concurrency.md),
+   "Blocking", and `concurrent.rs` in Wasmtime]. A WASI 0.3 guest that really
+   awaits `wasi:http/client.send` or a body stream would trap, unless the
+   export becomes an `async func` or Kronik supplies a non-concurrent `send`
+   binding. The first is an ABI decision that the long-lived connections
+   (M24) and streaming bodies (M25) milestones face as well, and it needs its
+   own ADR before p3 work starts. The second is what a spike would try.
+2. **The WASI version has moved.** WASI 0.3.1 (2026-08-11) and 0.3.2
+   (2026-10-13) exist, Wasmtime's `p3` WIT is still 0.3.0, and the `wasip3`
+   crate 0.10 targets 0.3.2 [not re-read]. A guest built for 0.3.2 may not
+   link against a 0.3.0 host [INFERENCE: an import of `0.2.10` resolves to a
+   `0.2.12` definition (Context, finding 3), not the other way round], so the
+   allowlist's `0.3.x` is not the only place that has to pin the version.
+3. **The Rust toolchain.** The rust-std for `wasm32-wasip3` is in Rust 1.100
+   (beta on 2026-11-06, stable due 2026-11-12) and not in the pinned 1.99.1
+   (`rust-toolchain.toml`). The standard library of that target may still
+   import 0.2 interfaces, so the allowlist would have to admit a mixed 0.2
+   and 0.3 import set [not re-read]. A p3 component also imports the 0.3
+   versions of `clocks`, `random` and `cli` [INFERENCE], so the allowlist and
+   the linker need a p3 subset of those, not only of `wasi:http`.
+4. **Security fixes.** The banner says that fixes limited to wasip3 get no
+   patch releases, and `deny.toml` keeps `ignore = []`, so every advisory has
+   to be fixed by upgrading. Once Kronik links `p3`, a p3-only advisory could
+   be fixed only by the next major Wasmtime: a new engine id and a `kronik
+   upgrade check` (ADR 0001 §3), with `cargo deny` failing until then
+   [INFERENCE]. This is why part (a) matters beyond maturity.
+
+### The vehicle for the criterion
+
+When the gate opens, the criterion is met with a **Rust guest**: Rust has a
+WASI 0.3 target (blocker 3) and the TypeScript toolchain has none (part (c)).
+The shape follows the existing test guests [INFERENCE: planned, not
+designed]: a feature of `tests/guests/test-actor`, as `wasi-http` is for 0.2,
+built for `wasm32-wasip3` by `scripts/build-test-guests.sh` and committed as
+a prebuilt component, so that `cargo test` still needs no wasm toolchain and
+only that script needs a newer Rust. The evidence is what the criterion
+names:
+
+- **The determinism test.** Identical turn records and fuel over many runs
+  under jittered latency, as `crates/kronik-runtime/tests/wasi_http.rs` does
+  for 0.2, now with Wasmtime's async scheduler (§5, ADR 0001).
+- **Identity replay.** A fork replayed in both modes with an empty diff, as
+  `scripts/identity-examples.sh` does for the examples.
+
+TypeScript and the other SDKs follow when their toolchains have a 0.3
+target. Part (c) is the TypeScript part of the gate, and the criterion's
+evidence does not depend on it. The three-part gate stays as decided in §5;
+to open the Rust-guest work on (a) and (b) alone would be a decision for the
+maintainers, and the watcher says so when only (c) is open.
+
+### What reopening costs
+
+Estimates in ideal engineer-days (one experienced engineer who knows the
+codebase), low / likely / high. They are judgement made on 2026-11-06 from
+reading the source, not measurements.
+
+| Package | Contents | IED |
+| --- | --- | --- |
+| Spike (optional) | A Rust p3 guest on today's synchronous `handle`: see `CannotBlockSyncTask`, try a non-concurrent `send` binding, probe the scheduler for determinism | 3 / 4 / 6 |
+| Minimal p3 | The `component-model-async` and `p3` features, the engine configuration, a p3 allowlist and linker subset (clocks, random, cli), the guest, the determinism test and identity replay, docs, the new engine id with its `upgrade check` | 14 / 20 / 30 |
+| Async handler | The ABI ADR and a turn runner on Wasmtime's `run_concurrent`, shared with M24 and M25 | 8 / 12 / 20 |
+| p3 `send` | `wasi:http/client.send` through the `send_request` hook, queue and gate with a deterministic completion order, DST, forks and simulators | 10 / 16 / 28 |
+
+A p3 guest that does not touch the network needs the first two rows
+(17 / 24 / 36). `wasi:http` over WASI 0.3 needs all four (35 / 52 / 84, or
+32 / 48 / 78 without the optional spike). Cheaper is not earlier: even the
+smallest subset links the `p3` modules, whose banner (part (a)) says that
+they get no patch releases, which is why the gate is not waived for it.
+
+What reopening changes [INFERENCE from ADR 0001 §3; to confirm in the
+implementation]:
+
+- **A new engine id.** Enabling `component-model-async` changes the engine
+  configuration, which ships as a new Kronik version and a new engine id.
+  Existing data is served only after a passing `kronik upgrade check`.
+  Precompiled `.cwasm` files are per engine id, so stale ones are a cache
+  miss.
+- **Old history.** p2 turns must replay identically under the new engine
+  (identity replay, the compatibility corpus). `fuel_used` is part of the
+  canonical outcome and may shift: that is tolerated across engines, not
+  within one.
+- **Rollback.** An older binary rejects a deployed p3 component
+  (`IMPORT_NOT_ALLOWED` or a link error), so rolling the binary back past a
+  p3 deployment needs a documented procedure.
+- **Records.** No new record kind: the effect stays `http.fetch`. p3 request
+  fingerprints differ from p2 ones (headers), so switching an actor between
+  p2 and p3 `fetch` breaks matching, as noted above for `ctx.http.fetch`. A
+  p3 component belongs among the compatibility corpus fixtures.
+- **Documentation.** The allowlist table in `docs/reference/wit.md`, ADR 0001
+  §8, §5 here, the `IMPORT_NOT_ALLOWED` text, and the tests in
+  `crates/kronik-runtime/src/allowlist.rs`.
+
+### Watching the gate
+
+`scripts/check-wasi-p3-gate.py` reads the sources above with plain HTTPS GETs
+(no token, Python standard library only) and prints a table with a row for
+each of a1, a2, b1, b2 and c, the state on `main` and on the newest released
+branch, and a status: "met" (it holds on the release), "main only", "not met"
+or "unknown". Exit status 0: the gate is still closed. 1: all three
+conditions hold. 2: a source could not be read or parsed; the table shows
+what could be. Part (c) is a heuristic: it searches the README, the
+descriptions and the dependency names of npm `latest` for `wasi:http@0.3`, and
+a hit is not proof. An exit status of 1 is therefore a prompt to run the
+checks above by hand.
+
+The nightly workflow runs the script as an informational job
+(`continue-on-error`, the table in the job summary), so it cannot turn the
+nightly red. Its unit tests use canned inputs and run in the `action` step of
+`scripts/ci.sh`. When the gate opens, record that in a further amendment,
+decide the async-handler ABI in its own ADR, and then follow §5.
+
+Revisit this amendment when Wasmtime 51.0.0 is released (row b1 should then
+read met), when the p3 banner or the tiers document changes, or when the
+maintainers settle the reading of part (b).
