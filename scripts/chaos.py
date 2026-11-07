@@ -6,7 +6,14 @@ restart. Run it with scripts/chaos.sh.
 Every cycle starts load on the daemon, kills it with SIGKILL at a random
 moment, restarts it on the same data directory and checks:
 
-- the daemon comes back healthy within --healthy-timeout seconds;
+- the daemon comes back healthy within --healthy-timeout seconds, and
+  within --max-recovery seconds; the median restart of the last 50 cycles
+  is at most --max-recovery-growth seconds above that of the first 50, so
+  start-up work that grows with the log fails the run long before the
+  timeout does;
+- a scrubbed read (an actor's history) answers right after the restart:
+  the secret inventory is certified before the daemon reports healthy, and
+  nothing retires it again, so a 503 there is a violation;
 - no acknowledged turn is lost and none is applied twice: every HTTP request
   carries its own Idempotency-Key and is retried with it until it is
   acknowledged, and then each counter's and each notes actor's answers are
@@ -50,6 +57,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.dont_write_bytecode = True  # no __pycache__ in scripts/
 from kronikd import Daemon, Violation  # noqa: E402
+
+
+def median(values):
+    """The middle value of `values` (0 for none)."""
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2] if ordered else 0.0
 
 
 class Target:
@@ -156,39 +169,45 @@ def effect_worker(daemon, actor, spec, wait):
         pass
 
 
-# A deployment switch retires the certified secret catalogue and
-# recertifies it asynchronously, so a scrubbed read can briefly answer 503
-# SECRET_UNAVAILABLE in between; the CLI retries exactly that window within
-# 30 s at a 100 ms backoff (crates/kronik/src/cli/fork.rs) and the daemon's
-# own hint says to retry. Mirror that budget here: a persistent 503 past the
-# deadline is still a violation.
+# A scrubbed read (an actor's history) needs the certified secret
+# inventory, and answers 503 SECRET_UNAVAILABLE while there is none. The
+# daemon certifies it before it reports healthy and nothing in this run
+# retires it again (no secret is written, no deployment or grant changes
+# after the setup), so a 503 after a restart is a violation. A budget above
+# 0 (--history-retry-budget) lets a read retry that long, as the CLI does
+# (crates/kronik/src/cli/fork.rs: 30 s at a 100 ms backoff); the retries
+# are counted in the report either way.
 HISTORY_RETRY_CODES = ("SECRET_UNAVAILABLE", "UNAVAILABLE")
-HISTORY_RETRY_BUDGET_S = 30.0
 HISTORY_RETRY_BACKOFF_S = 0.1
 
 
-def read_history(daemon, actor, query):
-    """One history page, retrying only the secret-coverage window."""
-    deadline = time.monotonic() + HISTORY_RETRY_BUDGET_S
+def read_history(daemon, actor, query, budget):
+    """One history page and the number of retries it took: only the
+    secret-coverage window is retried, and only within `budget` seconds."""
+    deadline = time.monotonic() + budget
+    retries = 0
     while True:
         status, body = daemon.api("GET", f"/v1/actors/{actor}/history{query}")
         if status != 503:
-            return status, body
+            return status, body, retries
         code = ""
         try:
             code = body.get("error", {}).get("code", "")
         except AttributeError:
             pass
         if code not in HISTORY_RETRY_CODES or time.monotonic() >= deadline:
-            return status, body
+            return status, body, retries
+        retries += 1
         time.sleep(HISTORY_RETRY_BACKOFF_S)
 
 
 class Turns:
     """The turns of the actors the run uses, fetched as they appear."""
 
-    def __init__(self, daemon):
+    def __init__(self, daemon, retry_budget):
         self.daemon = daemon
+        self.retry_budget = retry_budget
+        self.retries = 0  # history reads repeated after a 503
         self.by = {}  # actor -> its turns fetched so far, oldest first
 
     def fetch(self, actor):
@@ -197,7 +216,8 @@ class Turns:
         after, before, new = (known[-1]["lsn"] if known else 0), None, []
         while True:
             q = "?limit=200" + (f"&before={before}" if before else "")
-            status, body = read_history(self.daemon, actor, q)
+            status, body, retries = read_history(self.daemon, actor, q, self.retry_budget)
+            self.retries += retries
             if status == 404:
                 return []
             if status != 200:
@@ -324,6 +344,13 @@ def main():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--verify-every", type=int, default=50)
     p.add_argument("--healthy-timeout", type=float, default=60)
+    p.add_argument("--max-recovery", type=float, default=10,
+                   help="most seconds a restart may take to be healthy again; more is a violation (0: no limit)")
+    p.add_argument("--max-recovery-growth", type=float, default=5,
+                   help="most seconds the median restart of the last 50 cycles may exceed the median of the "
+                        "first 50, from 100 cycles on (0: no limit)")
+    p.add_argument("--history-retry-budget", type=float, default=0,
+                   help="seconds a history read may retry after a 503 SECRET_UNAVAILABLE (default: none)")
     p.add_argument("--min-kill", type=float, default=0.2, help="least seconds of load before the kill")
     p.add_argument("--max-kill", type=float, default=2.0, help="most seconds of load before the kill")
     p.add_argument("--clients", type=int, default=12)
@@ -342,7 +369,7 @@ def main():
     daemon = Daemon(args.bin, data, sock, args.port, os.path.join(args.dir, "serve.log"), args.healthy_timeout)
     target = Target(random.Random(args.seed + 1))
     clients = Clients(args.port)
-    turns = Turns(daemon)
+    turns = Turns(daemon, args.history_retry_budget)
     counters = [f"/counter/c{i}/increment" for i in range(4)]
     notes = [f"/notes/n{i}" for i in range(4)]
     actors = [f"counter/c{i}" for i in range(4)] + [f"notes/n{i}" for i in range(4)] + ["counter/probe"]
@@ -393,6 +420,15 @@ def main():
             daemon.kill9()
             recovery, boundary = daemon.start()
             recoveries.append(recovery)
+            if args.max_recovery and recovery > args.max_recovery:
+                raise Violation(f"cycle {cycle}: the daemon was healthy again after {recovery:.1f} s, "
+                                f"above --max-recovery {args.max_recovery:g} s")
+            if args.max_recovery_growth and len(recoveries) >= 100:
+                first, last = median(recoveries[:50]), median(recoveries[-50:])
+                if last - first > args.max_recovery_growth:
+                    raise Violation(f"cycle {cycle}: the median restart grew from {first:.2f} s (cycles 1-50) "
+                                    f"to {last:.2f} s (the last 50), above --max-recovery-growth "
+                                    f"{args.max_recovery_growth:g} s: start-up work that grows with the log")
 
             # Logical time: the first new turn is later than everything durable.
             for actor in actors + [f"counter/{a}" for a, _ in effects]:
@@ -523,7 +559,10 @@ def main():
     rec = sorted(recoveries) or [0.0]
     report["healthy_after_restart_s"] = {"p50": round(rec[len(rec) // 2], 3),
                                          "p99": round(rec[min(len(rec) - 1, len(rec) * 99 // 100)], 3),
-                                         "max": round(rec[-1], 3)}
+                                         "max": round(rec[-1], 3),
+                                         "first50_p50": round(median(recoveries[:50]), 3),
+                                         "last50_p50": round(median(recoveries[-50:]), 3)}
+    report["history_retries"] = turns.retries
     report["seconds"] = round(time.time() - started, 1)
     print(json.dumps(report))
     return 1 if "violation" in report else 0
