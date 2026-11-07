@@ -251,6 +251,40 @@ impl SqlActor {
             .map_err(sqlite)?;
         Ok(())
     }
+
+    /// Raises the applied LSN to `to` when it is below `floor`: this
+    /// database has no change since, so it is complete through `to`, which
+    /// the caller knows because it holds the apply lock ([`Store::raise_idle_sql`]).
+    /// Never lowers it. `None` when a turn has its savepoint open on this
+    /// connection between its statements: the stamp would be rolled back
+    /// with the turn, so the caller must try again.
+    pub fn raise_applied(&mut self, floor: u64, to: u64) -> Result<Option<bool>, StoreError> {
+        self.set_host();
+        let applied = self.applied_lsn().map_err(sqlite)?;
+        if applied >= floor || applied >= to {
+            return Ok(Some(false));
+        }
+        if !self.conn.is_autocommit() {
+            return Ok(None);
+        }
+        self.stamp_applied(to)?;
+        Ok(Some(true))
+    }
+
+    /// Makes what is committed durable: under `synchronous=NORMAL` a WAL is
+    /// synced only when it is checkpointed. `false` when a turn is open on
+    /// the connection and the checkpoint could not run.
+    pub fn checkpoint_durable(&self) -> Result<bool, StoreError> {
+        self.set_host();
+        if !self.conn.is_autocommit() {
+            return Ok(false);
+        }
+        let busy: i64 = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))
+            .map_err(sqlite)?;
+        Ok(busy == 0)
+    }
 }
 
 impl Store {
@@ -493,4 +527,172 @@ pub fn discard_interrupted_bulk_replay(branch_dir: &Path) -> Result<bool, StoreE
     std::fs::remove_file(&marker).map_err(bulk_io)?;
     sync_parent(&state)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The applied LSN of an actor database is where its last change was; an
+    //! idle actor is complete through any later LSN.
+
+    // A test measures a wait with the wall clock; this is not daemon code.
+    #![allow(clippy::disallowed_methods)]
+
+    use std::sync::Arc;
+
+    use rusqlite::Connection;
+
+    use super::*;
+    use crate::sql::{FileOpener, Limits, SqlPool, TurnOpts};
+
+    /// A store over files in `dir` (`state.db`, `sql/`), as the daemon opens
+    /// one, with `actors` registered as SQL actors whose databases have the
+    /// given applied LSNs, and the store itself applied through `applied`.
+    fn store_with(dir: &Path, applied: Lsn, actors: &[(&str, u64)]) -> Arc<Store> {
+        let store = Store::open(
+            Connection::open(dir.join("state.db")).unwrap(),
+            SqlPool::new(
+                Arc::new(FileOpener {
+                    root: dir.join("sql"),
+                }),
+                Limits::default(),
+                8,
+            ),
+        )
+        .unwrap();
+        for (name, marker) in actors {
+            let (kind, key) = name.split_once('/').unwrap();
+            store
+                .db()
+                .conn()
+                .execute(
+                    "INSERT INTO actors (kind, key, schema_version, first_lsn, last_lsn, turns, sql) \
+                     VALUES (?1, ?2, 0, 1, ?3, 1, 1)",
+                    rusqlite::params![kind, key, *marker as i64],
+                )
+                .unwrap();
+            let db = store.sql.get(name).unwrap();
+            db.lock().unwrap().stamp_applied(*marker).unwrap();
+        }
+        store
+            .db()
+            .conn()
+            .execute(
+                "UPDATE meta SET v = ?1 WHERE k = 'applied_lsn'",
+                [applied as i64],
+            )
+            .unwrap();
+        store.applied.set(applied);
+        store
+    }
+
+    fn marker_of(file: &Path) -> u64 {
+        Connection::open(file)
+            .unwrap()
+            .query_row(
+                "SELECT v FROM _kronik_meta WHERE k = 'applied_lsn'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap() as u64
+    }
+
+    fn opts() -> TurnOpts {
+        TurnOpts {
+            seed: [1; 32],
+            time_ms: 1,
+            default_subject: None,
+            migrate: true,
+            sql_budget: 1_000_000,
+            max_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn an_idle_actor_is_raised_and_nothing_else_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with(
+            dir.path(),
+            100,
+            &[("a/idle", 5), ("b/recent", 90), ("c/ahead", 150)],
+        );
+        let hash = store.state_hash().unwrap();
+        let out = store.raise_idle_sql(50, 2).unwrap();
+        assert_eq!((out.checked, out.raised), (3, 1), "{out:?}");
+        assert!(out.blocked.is_empty());
+        let applied = |name: &str| {
+            let db = store.sql.get(name).unwrap();
+            db.lock().unwrap().applied_lsn().unwrap()
+        };
+        assert_eq!(applied("a/idle"), 100);
+        // Above the floor already, so left as it was; never lowered.
+        assert_eq!(applied("b/recent"), 90);
+        assert_eq!(applied("c/ahead"), 150);
+        // What replay starts from is no longer the idle actor's old change.
+        assert_eq!(store.replay_from().unwrap(), 90);
+        // A second pass has nothing to do.
+        assert_eq!(store.raise_idle_sql(50, 2).unwrap().raised, 0);
+        // The applied LSN of a database is not state: the hash of the state
+        // (which skips `_kronik%`) does not move, so no format changes and a
+        // binary without this code reads the raised value as it always did.
+        assert_eq!(store.state_hash().unwrap(), hash);
+    }
+
+    /// The raise is a WAL frame under `synchronous=NORMAL`, synced only when
+    /// the WAL is checkpointed. Retention deletes the log after the raise
+    /// returns, so the raise must already be in the database file: a copy of
+    /// that file alone (no WAL, as after a power loss) must hold it.
+    #[test]
+    fn a_raise_is_in_the_database_file_when_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with(dir.path(), 100, &[("a/idle", 5)]);
+        store.raise_idle_sql(50, 64).unwrap();
+        let file = actor_file(&dir.path().join("sql"), "a/idle");
+        let copy = dir.path().join("only-the-file.db");
+        std::fs::copy(&file, &copy).unwrap();
+        assert_eq!(marker_of(&copy), 100);
+    }
+
+    #[test]
+    fn a_database_with_a_turn_open_is_waited_for_and_then_blocks_the_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with(dir.path(), 100, &[("a/idle", 5), ("b/idle", 6)]);
+        {
+            // A turn keeps its savepoint open between its statements.
+            let db = store.sql.get("a/idle").unwrap();
+            db.lock().unwrap().begin_turn(&opts()).unwrap();
+            let out = store.raise_idle_sql(50, 64).unwrap();
+            assert_eq!(out.blocked, ["a/idle"], "{out:?}");
+            assert_eq!(out.raised, 1, "the other database is raised: {out:?}");
+            // The stamp did not slip into the turn: it would be rolled back.
+            assert_eq!(db.lock().unwrap().applied_lsn().unwrap(), 5);
+            db.lock().unwrap().end_turn(false).unwrap();
+        }
+        let out = store.raise_idle_sql(50, 64).unwrap();
+        assert!(out.blocked.is_empty(), "{out:?}");
+        assert_eq!(out.raised, 1);
+    }
+
+    #[test]
+    fn a_missing_database_blocks_the_pass_and_is_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with(dir.path(), 100, &[("a/idle", 5)]);
+        // The pool's connection is dropped with the store; the file goes.
+        drop(store);
+        let file = actor_file(&dir.path().join("sql"), "a/idle");
+        std::fs::remove_file(&file).unwrap();
+        let store = Store::open(
+            Connection::open(dir.path().join("state.db")).unwrap(),
+            SqlPool::new(
+                Arc::new(FileOpener {
+                    root: dir.path().join("sql"),
+                }),
+                Limits::default(),
+                8,
+            ),
+        )
+        .unwrap();
+        let out = store.raise_idle_sql(50, 64).unwrap();
+        assert_eq!(out.blocked, ["a/idle"], "{out:?}");
+        assert!(!file.exists(), "stamping must not invent an empty database");
+    }
 }

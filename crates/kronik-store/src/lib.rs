@@ -37,6 +37,23 @@ pub enum StoreError {
     Corrupt(String),
 }
 
+/// What [`Store::raise_idle_sql`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct IdleRaise {
+    /// Actor databases looked at.
+    pub checked: usize,
+    /// Of those, raised and made durable.
+    pub raised: usize,
+    /// Databases that could not be raised or made durable (a turn open on
+    /// them, a missing file): the log must not be deleted yet.
+    pub blocked: Vec<String>,
+}
+
+/// Tries to raise a database a turn has open, and to make a raise durable,
+/// this many more times, [`BUSY_WAIT`] apart.
+const BUSY_RETRIES: usize = 50;
+const BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// The highest applied LSN, with a wake-up for waiters.
 #[derive(Default)]
 pub struct AppliedLsn {
@@ -333,6 +350,102 @@ impl Store {
             from = from.min(applied);
         }
         Ok(from)
+    }
+
+    /// Before the log below `floor` is deleted: raises the applied LSN of
+    /// every actor database that is below `floor` to the store's applied LSN,
+    /// and makes the raise durable.
+    ///
+    /// An actor database's applied LSN is where its last change was, and
+    /// [`Store::replay_from`] reads it as the point the log is needed from.
+    /// An actor that has not changed since a long time is complete through
+    /// any later LSN, but says otherwise, so retention would delete the log
+    /// that the next start asks for. Under the apply lock every database is
+    /// complete through what is applied (the SQL of a record is applied
+    /// before `state.db` takes it, under the one lock), which is what makes
+    /// the raise true. The lock is taken in batches of `batch` databases so
+    /// that turns are never held for a whole pass; the checkpoint that makes
+    /// a batch durable (a WAL is synced only when it is checkpointed under
+    /// `synchronous=NORMAL`) runs outside it. A durable raise implies every
+    /// earlier commit of that file is durable.
+    ///
+    /// Databases that cannot be raised now (a turn has its savepoint open on
+    /// them, or the file is missing) are returned in `blocked`: the caller
+    /// must not delete the log.
+    pub fn raise_idle_sql(&self, floor: Lsn, batch: usize) -> Result<IdleRaise, StoreError> {
+        let names = self.db().sql_actors()?;
+        let mut out = IdleRaise::default();
+        for chunk in names.chunks(batch.max(1)) {
+            // Opening a database is the slow part and needs no lock of ours.
+            let mut dbs = Vec::with_capacity(chunk.len());
+            for name in chunk {
+                out.checked += 1;
+                if self.sql.exists(name) {
+                    dbs.push((name.clone(), self.sql.get(name)?));
+                } else {
+                    out.blocked.push(name.clone());
+                }
+            }
+            let mut raised = Vec::new();
+            let mut busy = Vec::new();
+            {
+                let _apply = self.apply_lock();
+                let to = self.applied.get();
+                for (name, db) in dbs {
+                    let mut guard = db.lock().unwrap_or_else(|e| e.into_inner());
+                    match guard.raise_applied(floor, to)? {
+                        Some(true) => raised.push((name, db.clone())),
+                        Some(false) => {}
+                        None => busy.push((name, db.clone())),
+                    }
+                }
+            }
+            // A turn on an idle actor ends in milliseconds: try again a few
+            // times before giving up on the pass.
+            for _ in 0..BUSY_RETRIES {
+                if busy.is_empty() {
+                    break;
+                }
+                std::thread::sleep(BUSY_WAIT);
+                let _apply = self.apply_lock();
+                let to = self.applied.get();
+                let mut still = Vec::new();
+                for (name, db) in busy {
+                    let mut guard = db.lock().unwrap_or_else(|e| e.into_inner());
+                    match guard.raise_applied(floor, to)? {
+                        Some(true) => raised.push((name, db.clone())),
+                        Some(false) => {}
+                        None => still.push((name, db.clone())),
+                    }
+                }
+                busy = still;
+            }
+            out.blocked.extend(busy.into_iter().map(|(name, _)| name));
+            // Durable before the caller deletes anything.
+            let total = raised.len();
+            let mut pending = raised;
+            for _ in 0..=BUSY_RETRIES {
+                let mut still = Vec::new();
+                for (name, db) in pending {
+                    let durable = db
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .checkpoint_durable()?;
+                    if !durable {
+                        still.push((name, db));
+                    }
+                }
+                pending = still;
+                if pending.is_empty() {
+                    break;
+                }
+                std::thread::sleep(BUSY_WAIT);
+            }
+            out.raised += total - pending.len();
+            out.blocked
+                .extend(pending.into_iter().map(|(name, _)| name));
+        }
+        Ok(out)
     }
 
     fn apply_sql(&self, lsn: Lsn, t: &pb::TurnRecord) -> Result<(), StoreError> {
