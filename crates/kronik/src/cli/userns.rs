@@ -5,8 +5,10 @@
 //! setup, like `foreign cleanup`: no daemon, no reason, nothing in the
 //! history.
 //!
-//! Also the host facts that `serve` and `doctor` share: the `kronik` user,
-//! its subordinate ranges, and whether user namespaces are allowed.
+//! Also the host facts that `serve`, `doctor` and the offline commands
+//! share: the `kronik` user, its subordinate ranges, whether user
+//! namespaces are allowed, and dropping root for a data directory that
+//! belongs to the non-root daemon.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -420,6 +422,85 @@ fn unpin(path: &Path, dry_run: bool) -> Result<Action, Error> {
     } else {
         Action::Absent
     })
+}
+
+/// For a command that runs without the daemon and writes its data
+/// directory (`restore`, `upgrade check`, `foreign cleanup`): run as root
+/// against the non-root daemon's directory, it becomes that directory's
+/// owner first, so that it leaves no file owned by root there (M21). Root
+/// installs (a directory owned by root) are unchanged. Call it while the
+/// process has one thread.
+pub(crate) fn data_dir_owner(data_dir: &Path) -> Result<Option<(u32, u32)>, ApiError> {
+    use std::os::unix::fs::MetadataExt as _;
+    if !sys::is_root() {
+        return Ok(None);
+    }
+    let meta = match std::fs::metadata(data_dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if Path::new(USERNS_PIN).exists() {
+                return Err(rootless(
+                    format!(
+                        "{} does not exist, and this host runs the non-root daemon: as root this would create it owned by root",
+                        data_dir.display()
+                    ),
+                    &format!(
+                        "Create it for the kronik user first: `install -d -o {USER} -g {USER} -m 0700 {}`, then run the command again.",
+                        data_dir.display()
+                    ),
+                ));
+            }
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(ApiError::new(
+                ErrorCode::Internal,
+                format!("reading {}: {e}", data_dir.display()),
+            ));
+        }
+    };
+    if meta.uid() == 0 {
+        return Ok(None);
+    }
+    let user = kronik_user(USER, None).map_err(|why| rootless(why, SETUP_HINT))?;
+    if (meta.uid(), meta.gid()) != (user.uid, user.gid) || !meta.is_dir() {
+        return Err(rootless(
+            format!(
+                "{} is not owned by the configured stable daemon identity {}:{}",
+                data_dir.display(),
+                user.uid,
+                user.gid
+            ),
+            "Refusing a privileged data handover to an arbitrary owner; fix the stopped installation's ownership first.",
+        ));
+    }
+    Ok(Some((user.uid, user.gid)))
+}
+
+pub(crate) fn as_data_dir_owner(data_dir: &Path) -> Result<(), ApiError> {
+    let Some((uid, gid)) = data_dir_owner(data_dir)? else {
+        return Ok(());
+    };
+    sys::become_user(uid, gid).map_err(|e| {
+        ApiError::new(
+            ErrorCode::Internal,
+            format!("becoming the stable data owner {uid}:{gid}: {e}"),
+        )
+    })
+}
+
+/// For a non-root command that works on the foreign actors' files (`foreign
+/// cleanup`): enters the pinned Kronik namespace, as the daemon does, when
+/// one is pinned for this user. Returns this process's cgroup when it
+/// entered. Call it while the process has one thread.
+pub(crate) fn enter_if_pinned() -> Result<Option<String>, String> {
+    if sys::is_root() || !Path::new(USERNS_PIN).exists() {
+        return Ok(None);
+    }
+    let uid = rustix::process::geteuid().as_raw();
+    let user = kronik_user("", Some(uid))?;
+    sys::enter_userns(Path::new(USERNS_PIN), &user.maps()).map_err(|e| e.to_string())?;
+    sys::own_cgroup().map(Some).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

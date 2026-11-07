@@ -177,13 +177,36 @@ fn cleanup(
         )
     })?;
     let data_dir = data_dir.unwrap_or_else(|| config.server.data_dir.clone());
-    if !kronik_foreign::sys::is_root() {
-        return Err(local(
-            ErrorCode::Unavailable,
-            "kronik foreign cleanup needs root, like the daemon's sandboxes".into(),
-            "Run it as root (systemd's ExecStopPost= does).",
-        ));
-    }
+    // A running daemon holds the data directory's lock. A missing directory has
+    // none to take and nothing of the daemon's in it, and the runtime directory
+    // is cleaned as before.
+    let _ownership = match kronik_privacy::key_source::lock_data(&data_dir) {
+        Ok(ownership) => Some(ownership),
+        Err(kronik_privacy::key_source::KeySourceError::Io(e))
+            if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            None
+        }
+        Err(e) => return Err(Error::from(e.api_error())),
+    };
+    // A missing runtime needs no pin, but private secret files still need offline cleanup.
+    let runtime_exists = config
+        .foreign
+        .run_dir
+        .try_exists()
+        .map_err(|e| local(ErrorCode::Unavailable, e.to_string(), ""))?;
+    crate::cli::userns::as_data_dir_owner(&data_dir).map_err(Error::from)?;
+    let cgroup = if runtime_exists {
+        crate::cli::userns::enter_if_pinned().map_err(|e| {
+            local(
+                ErrorCode::RootlessUnavailable,
+                e,
+                "Restore the service's owned namespace pin before cleaning up an existing runtime.",
+            )
+        })?
+    } else {
+        None
+    };
     // What could not be removed is logged as a warning: show it.
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -201,11 +224,11 @@ fn cleanup(
         })?;
     let cleaned = rt.block_on(async {
         let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
-        kronik_foreign::cleanup(
-            env,
-            crate::serve::foreign_config(&config, data_dir, Vec::new()),
-        )
-        .await
+        let mut foreign_config = crate::serve::foreign_config(&config, data_dir, Vec::new());
+        if let Some(cgroup) = cgroup {
+            foreign_config.privilege = kronik_foreign::Privilege::Userns { cgroup };
+        }
+        kronik_foreign::cleanup(env, foreign_config).await
     });
     let cleaned = cleaned.map_err(|why| {
         local(

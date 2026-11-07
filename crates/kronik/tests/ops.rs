@@ -225,6 +225,63 @@ fn init_dry_run_prints_the_plan_and_changes_nothing() {
     );
 }
 
+#[test]
+fn stopped_cleanup_missing_runtime_is_idempotent_but_never_bypasses_data_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let run = dir.path().join("missing-run");
+    std::fs::create_dir(&data).unwrap();
+    let config = dir.path().join("kronik.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\ndata_dir = {:?}\n[foreign]\nrun_dir = {:?}\n",
+            data, run
+        ),
+    )
+    .unwrap();
+    let held = kronik_privacy::key_source::lock_data(&data).unwrap();
+    let args = [
+        "foreign",
+        "cleanup",
+        "--json",
+        "--config",
+        config.to_str().unwrap(),
+    ];
+    let refused = kronik(&args);
+    assert!(!refused.status.success(), "{refused:?}");
+    let error: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "UNAVAILABLE", "{error}");
+    assert!(!run.exists());
+    drop(held);
+    let private_config = data.join("foreign/actors/echo/bundle/config.json");
+    std::fs::create_dir_all(private_config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &private_config,
+        b"{\"env\":[\"SECRET=private-test-value\"]}",
+    )
+    .unwrap();
+    for iteration in 0..2 {
+        let out = kronik(&args);
+        assert!(out.status.success(), "{out:?}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["failed"], 0);
+        assert_eq!(value["sandboxes"], 0);
+        assert_eq!(value["configs"], if iteration == 0 { 1 } else { 0 });
+        assert!(
+            !private_config.exists(),
+            "a dead pin is not needed to remove owned secret config"
+        );
+        assert!(!run.exists(), "cleanup must not recreate runtime state");
+    }
+    // Without a data directory there is no lock to take and nothing of the
+    // daemon's to clean: that is still a success, as it was before the lock.
+    std::fs::remove_dir_all(&data).unwrap();
+    let out = kronik(&args);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!data.exists() && !run.exists());
+}
+
 /// `GET /` over TLS to `addr`, trusting only `root`.
 fn https_get(addr: &str, root: &rcgen::Certificate) -> String {
     use std::sync::Arc;

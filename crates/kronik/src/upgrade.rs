@@ -133,19 +133,45 @@ fn execute(args: CheckArgs) -> Result<Done, ApiError> {
         .data_dir
         .clone()
         .unwrap_or(configuration.server.data_dir);
-    // The start refuses a data directory whose databases the log no longer
-    // reaches, unless a snapshot repairs it: ask the question the start asks
-    // (read-only, the old daemon may still run), so that the operator learns
-    // before the restart and not at it.
-    let plan = kronik_sched::snapshots::plan_state(&data, "main", true)
-        .map_err(|text| ApiError::new(ErrorCode::StorageCorrupt, text))?;
-    let note = state_note(&plan);
+    // Root opens nothing in a data directory that another user owns: its
+    // databases are that user's, and the question about them is asked after
+    // the drop, by that user (below). A root installation asks first, as it
+    // always did.
+    let drops = crate::cli::userns::data_dir_owner(&data)?.is_some();
+    let early = if drops { None } else { Some(ask_state(&data)?) };
     let workers = args
         .workers
         .map(usize::from)
         .unwrap_or_else(default_workers);
-    // Sealed values in the window open as they do for the daemon.
-    let keys = configuration.keys;
+    // Source validation is read-only and may require a root-only credential.
+    let prepare_runtime = crate::restore::runtime()?;
+    let source = if data.join("keys/keystore.db").exists() {
+        Some(
+            prepare_runtime
+                .block_on(async {
+                    let env = Env::real(tokio::runtime::Handle::current());
+                    kronik_privacy::key_source::KeySource::load(
+                        env,
+                        configuration.keys,
+                        &data,
+                        false,
+                    )
+                    .await
+                })
+                .map_err(|e| e.api_error())?,
+        )
+    } else {
+        None
+    };
+    drop(prepare_runtime);
+    let dropped = crate::cli::userns::as_data_dir_owner(&data);
+    kronik_privacy::key_source::protect_process().map_err(|e| e.api_error())?;
+    dropped?;
+    let plan = match early {
+        Some(plan) => plan,
+        None => ask_state(&data)?,
+    };
+    let note = state_note(&plan);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("kronik")
@@ -158,9 +184,12 @@ fn execute(args: CheckArgs) -> Result<Done, ApiError> {
         })?;
     let checked = rt.block_on(async {
         let env = Env::real(tokio::runtime::Handle::current());
-        let sealer = kronik_sched::offline_sealer(env.clone(), &data, keys)
-            .await
-            .map_err(|e| e.api_error())?;
+        let sealer = source
+            .as_ref()
+            .map(|source| kronik_sched::offline_sealer_loaded(&data, source))
+            .transpose()
+            .map_err(|e| e.api_error())?
+            .flatten();
         kronik_fork::upgrade::check(
             &env,
             &data,
@@ -227,6 +256,15 @@ fn execute(args: CheckArgs) -> Result<Done, ApiError> {
         error,
         note,
     })
+}
+
+/// The start refuses a data directory whose databases the log no longer
+/// reaches, unless a snapshot repairs it: ask the question the start asks
+/// (read-only, the old daemon may still run), so that the operator learns
+/// before the restart and not at it.
+fn ask_state(data: &Path) -> Result<kronik_sched::snapshots::StatePlan, ApiError> {
+    kronik_sched::snapshots::plan_state(data, "main", true)
+        .map_err(|text| ApiError::new(ErrorCode::StorageCorrupt, text))
 }
 
 /// What the first start does with the databases, when it is not nothing.
@@ -359,5 +397,59 @@ fn check_error(msg: String) -> ApiError {
         ApiError::new(ErrorCode::StorageCorrupt, msg)
     } else {
         ApiError::new(ErrorCode::Internal, msg)
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    /// Run as root over the data directory of another user, the command opens
+    /// nothing in it before it has given up root: the owner is looked at first
+    /// (and refused if it is not one to hand over to), the databases are asked
+    /// about only after the drop, and only a root installation, where there is
+    /// no drop, asks first. This reads the order out of the source of
+    /// `execute`, because the drop cannot be rehearsed in a test process.
+    #[test]
+    fn the_databases_of_another_users_directory_are_opened_only_after_the_drop() {
+        let source = include_str!("upgrade.rs");
+        let body = source
+            .split("fn execute(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("the source of execute");
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is not in execute"))
+        };
+        let owner = at("data_dir_owner(&data)?");
+        let early = at("Some(ask_state(&data)?)");
+        let key_load = at("KeySource::load(");
+        let drop_call = at("as_data_dir_owner(&data)");
+        let drop_checked = at("dropped?;");
+        let late = at("None => ask_state(&data)?");
+        assert!(
+            owner < early,
+            "the owner is looked at before any question is asked"
+        );
+        assert!(
+            early < key_load,
+            "a root installation asks first, before the key"
+        );
+        assert!(key_load < drop_call, "the key is read while root");
+        assert!(
+            drop_call < drop_checked && drop_checked < late,
+            "another user's databases are asked about only once the drop is known to have worked"
+        );
+        // The first question is asked only when there is no drop.
+        assert!(
+            body.contains("let early = if drops { None } else { Some(ask_state(&data)?) };"),
+            "the question may be asked before the drop only when there is none"
+        );
+        assert!(
+            body.contains("let drops = crate::cli::userns::data_dir_owner(&data)?.is_some();"),
+            "whether there is a drop is decided by the owner of the directory"
+        );
+        // And nowhere else.
+        assert_eq!(body.matches("ask_state(&data)").count(), 2);
+        assert!(!body.contains("plan_state("));
     }
 }

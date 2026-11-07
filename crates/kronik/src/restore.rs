@@ -173,21 +173,47 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
     } else {
         kronik_ship::KeystoreMode::Require
     };
-    let report = rt.block_on(async {
-        let remote = Remote::open(&from, endpoint.as_deref()).map_err(ship_error)?;
-        if dry_run {
-            // Reachable credentials, and nothing written to the data directory.
-            // The library has no list API, so the plan cannot name the snapshot.
-            remote.check().await.map_err(ship_error)?;
-            return Ok(None);
+    let destination = crate::cli::userns::data_dir_owner(&data)?;
+    let report = if let Some((uid, gid)) = destination.filter(|_| !dry_run) {
+        let ownership = kronik_privacy::key_source::lock_data(&data).map_err(|e| e.api_error())?;
+        let prepared = rt.block_on(async {
+            let remote = Remote::open(&from, endpoint.as_deref()).map_err(ship_error)?;
+            let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+            kronik_ship::prepare_restore(&remote, &data, &branch, &env, &keys, mode, &ownership)
+                .await
+                .map_err(ship_error)
+        })?;
+        // No runtime threads may retain root credentials across the irreversible drop.
+        drop(rt);
+        prepared.handover(uid, gid).map_err(ship_error)?;
+        let dropped = crate::cli::userns::as_data_dir_owner(&data);
+        kronik_privacy::key_source::protect_process().map_err(|e| e.api_error())?;
+        dropped?;
+        if rustix::process::geteuid().as_raw() != uid || rustix::process::getegid().as_raw() != gid
+        {
+            return Err(ApiError::new(
+                ErrorCode::RootlessUnavailable,
+                "destination identity changed during restore preparation",
+            ));
         }
-        // The install writes the restore marker before its commit step.
-        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
-        let report = kronik_ship::restore(&remote, &data, &branch, force, &env, &keys, mode)
-            .await
-            .map_err(ship_error)?;
-        Ok::<_, ApiError>(Some(report))
-    })?;
+        Some(
+            kronik_ship::install_prepared(&data, &branch, force, prepared, &ownership)
+                .map_err(ship_error)?,
+        )
+    } else {
+        rt.block_on(async {
+            let remote = Remote::open(&from, endpoint.as_deref()).map_err(ship_error)?;
+            if dry_run {
+                remote.check().await.map_err(ship_error)?;
+                return Ok(None);
+            }
+            let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+            let report = kronik_ship::restore(&remote, &data, &branch, force, &env, &keys, mode)
+                .await
+                .map_err(ship_error)?;
+            Ok::<_, ApiError>(Some(report))
+        })?
+    };
     let output = RestoreOutput {
         dry_run,
         from: from.clone(),

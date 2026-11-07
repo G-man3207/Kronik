@@ -195,9 +195,12 @@ unmounts every namespace under `<run>/netns/` and runsc's own
 `config.json`: sandboxes never survive the daemon that started them. A
 daemon killed with SIGKILL cannot do that itself, so the systemd unit runs
 `kronik foreign cleanup` as `ExecStopPost=`; it does the same while no
-daemon holds `<run>`, needs root, takes the data directory from
+daemon holds `<run>` or the data directory's lock, runs as root or (M21)
+as the nonroot service user, takes the data directory from
 `--data-dir`, `KRONIK_DATA_DIR` or the configuration like `serve`, and
-prints what it could not remove. Without systemd, run it after a crash.
+prints what it could not remove. Against a nonroot installation it works as
+the data directory's owner, in the pinned user namespace when a runtime
+directory exists; a runtime directory that is gone is not recreated. Without systemd, run it after a crash.
 runsc's own state file (`<run>/runsc/<id>_sandbox:<id>.state`, mode 0640,
 which holds the spec) goes with `runsc delete`. A `config.json` also goes
 when the runtime cannot be spawned.

@@ -263,6 +263,15 @@ that fails leaves the directory as it was:
 - a sealed value whose key no backup provides (or sealed values and no
   backup at all): `KEYSTORE_INCOMPLETE`.
 
+Run as root against a nonroot installation (a data directory owned by the
+`kronik` user, M21), restore prepares everything as root, since only root
+may read a root-only key source, and writes nothing to the directory until it
+has dropped, for good, to the directory's owner: the key material stays in
+memory across the drop, and no file in the directory is owned by root. Against
+a root-owned directory, or as the owning user, it works as before. It refuses a
+directory owned by anyone else, and a missing directory when a Kronik user
+namespace is pinned.
+
 Then the result is moved into place with renames: the old `state.db` is
 removed first and the new one put in place last. A restore interrupted
 there (a crash, a full disk) leaves no `state.db`, never the old state with
@@ -304,7 +313,9 @@ Next     kronik serve --data-dir /var/lib/kronik
 
 Checks this binary against a data directory before it replaces the one
 that is running (M6). Offline and read-only apart from the report: the
-old daemon may keep running. It replays the last `--window` of logical
+old daemon may keep running. Run as root against a nonroot installation,
+it loads the key source as root and then drops to the directory's owner,
+so the report is not owned by root. It replays the last `--window` of logical
 time (default `6h`) with this binary's engine and the same code hashes.
 Fuel is not compared. Sealed values open with the directory's privacy
 keystore and the same `[keys]` configuration as `serve`. Select the matching
@@ -1923,7 +1934,13 @@ crashed or was killed left behind: runsc containers, network namespaces,
 bridge sockets, every `bundle/config.json` (they hold secret values),
 including those of fork copies (M14), partial checkpoints, and the cgroup
 parent, and unmounts runsc's `null-netns`. Refused with
-`UNAVAILABLE` while a daemon holds `[foreign] run_dir`, and without root.
+`UNAVAILABLE` while a daemon holds `[foreign] run_dir` or the data
+directory's lock. Run it as root or as the nonroot service user (the unit's
+`ExecStopPost=` does): as root against a nonroot installation (a data
+directory owned by the `kronik` user) it first becomes that owner, and as the
+service user it enters the pinned Kronik user namespace when a runtime
+directory exists, so it leaves no file owned by root and needs no host
+capability. A runtime directory that is gone is not recreated.
 The data directory comes from `--data-dir`, `KRONIK_DATA_DIR` or the
 configuration, as for `serve`. What it could not remove or list is printed
 as a warning on stderr, counted in `failed` (`--json`), and makes the exit
