@@ -378,3 +378,139 @@ fn shipping_state_format_is_strict_and_failures_are_not_fresh_defaults() {
         Err(ShipError::Io(_))
     ));
 }
+
+#[test]
+fn prepared_restore_never_reloads_the_source_and_keeps_the_directory_lock() {
+    let src = tempfile::tempdir().unwrap();
+    let bucket = tempfile::tempdir().unwrap();
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let runtime = rt();
+    let env = Env::real(runtime.handle().clone());
+    let node = runtime
+        .block_on(start_local(env.clone(), src.path(), NodeConfig::default()))
+        .unwrap();
+    node.sealer()
+        .keystore()
+        .unwrap()
+        .key_for_sealing("prepared:subject", [9; 32], [3; 24], 1)
+        .unwrap();
+    runtime
+        .block_on(node.snapshot("manual", node.local_operator_authority().unwrap()))
+        .unwrap();
+    let mut ship = ShipState::load(src.path()).unwrap();
+    runtime
+        .block_on(ship_once(&remote, src.path(), "main", &mut ship))
+        .unwrap();
+    runtime
+        .block_on(ship_keystore(
+            &env,
+            &remote,
+            src.path(),
+            &mut ship,
+            1_700_000_000_000,
+            Duration::from_secs(86400),
+            [7; 24],
+            node.key_source().unwrap(),
+            node.sealer().keystore().unwrap(),
+        ))
+        .unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let key = dst.path().join("source.key");
+    std::fs::copy(src.path().join("keys/master.key"), &key).unwrap();
+    let keys = kronik_privacy::key_source::Keys {
+        master_key_file: Some(key.clone()),
+        ..Default::default()
+    };
+    let held = kronik_privacy::key_source::lock_data(dst.path()).unwrap();
+    let bad = dst.path().join("wrong.key");
+    std::fs::write(&bad, [0x42; 32]).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let wrong = kronik_privacy::key_source::Keys {
+        master_key_file: Some(bad.clone()),
+        ..Default::default()
+    };
+    assert!(
+        runtime
+            .block_on(kronik_ship::prepare_restore(
+                &remote,
+                dst.path(),
+                "main",
+                &env,
+                &wrong,
+                KeystoreMode::Require,
+                &held
+            ))
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&bad).unwrap(), [0x42; 32]);
+    assert_eq!(
+        std::fs::read_dir(dst.path()).unwrap().count(),
+        2,
+        "wrong source cannot create destination files"
+    );
+    std::fs::remove_file(bad).unwrap();
+    let prepared = runtime
+        .block_on(kronik_ship::prepare_restore(
+            &remote,
+            dst.path(),
+            "main",
+            &env,
+            &keys,
+            KeystoreMode::Require,
+            &held,
+        ))
+        .unwrap();
+    assert!(
+        !dst.path().join(".restore").exists(),
+        "preparation must not write into the destination"
+    );
+    assert!(!dst.path().join("branches").exists());
+    assert!(matches!(
+        kronik_privacy::key_source::lock_data(dst.path()),
+        Err(kronik_privacy::key_source::KeySourceError::DataInUse)
+    ));
+    // The hand-over of the stage to the destination owner: here the owner is
+    // the current user, so the change is allowed and the walk is the real one.
+    // It also proves that the stage is private to the caller whatever the
+    // umask is (the hand-over refuses a directory that others can enter), which
+    // `tempdir()` alone does not give: it creates 0777 & !umask.
+    let (uid, gid) = (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    );
+    prepared.handover(uid, gid).unwrap();
+    // The source key is gone: installing uses the keystore backup that was
+    // decrypted while preparing, and never loads the source again.
+    std::fs::remove_file(&key).unwrap();
+    let report = kronik_ship::install_prepared(dst.path(), "main", false, prepared, &held).unwrap();
+    assert_eq!(report.keystore, "installed");
+    assert!(dst.path().join("branches/main/state.db").exists());
+    assert!(matches!(
+        kronik_privacy::key_source::lock_data(dst.path()),
+        Err(kronik_privacy::key_source::KeySourceError::DataInUse)
+    ));
+}
+
+#[test]
+fn failed_preparation_leaves_an_empty_destination_empty() {
+    let bucket = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let runtime = rt();
+    let held = kronik_privacy::key_source::lock_data(dst.path()).unwrap();
+    assert!(
+        runtime
+            .block_on(kronik_ship::prepare_restore(
+                &remote,
+                dst.path(),
+                "main",
+                &Env::real(runtime.handle().clone()),
+                &Default::default(),
+                KeystoreMode::Require,
+                &held
+            ))
+            .is_err()
+    );
+    assert_eq!(std::fs::read_dir(dst.path()).unwrap().count(), 0);
+}

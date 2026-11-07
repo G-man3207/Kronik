@@ -10,7 +10,7 @@
 //! ```
 
 use std::collections::BTreeSet;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -740,6 +740,137 @@ pub async fn restore(
     restore_with_fault(remote, data, branch, force, env, keys, mode, &|_| Ok(())).await
 }
 
+/// A fully authenticated restore, private until handed to the destination
+/// owner. Everything that needs the caller's privileges (the key source, the
+/// remote objects and their checks) is staged in a private directory of the
+/// caller's own; nothing is written to the destination. The keystore backup
+/// is decrypted but stays in memory: the owner imports it into the data
+/// directory's own restore phase (the same one an ordinary restore uses).
+pub struct PreparedRestore {
+    stage: tempfile::TempDir,
+    staged: Staged,
+    keystore: KeystoreStep,
+    identity: (u64, u64),
+}
+
+/// The directory that `held` locks must still be the one `data` names.
+fn directory_identity(
+    data: &Path,
+    held: &kronik_privacy::key_source::DataOwnership,
+) -> Result<(u64, u64), ShipError> {
+    let descriptor = held.directory_resource().metadata()?;
+    let named = std::fs::metadata(data)?;
+    let identity = (descriptor.dev(), descriptor.ino());
+    if !descriptor.is_dir() || identity != (named.dev(), named.ino()) {
+        return Err(ShipError::Restore(
+            "the locked destination directory was replaced".into(),
+        ));
+    }
+    Ok(identity)
+}
+
+/// Prepare under the caller's existing data-directory lock, without writing to the destination.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_restore(
+    remote: &Remote,
+    data: &Path,
+    branch: &str,
+    env: &Env,
+    keys: &Keys,
+    mode: KeystoreMode,
+    held: &kronik_privacy::key_source::DataOwnership,
+) -> Result<PreparedRestore, ShipError> {
+    let identity = directory_identity(data, held)?;
+    // Private to the caller: `tempdir` alone gives 0777 & !umask, so 0755
+    // under the usual umask, and the restored data would be readable by every
+    // local user while it is staged.
+    let stage = tempfile::Builder::new()
+        .prefix("kronik-restore-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()?;
+    let (staged, keystore) = stage_restore(
+        remote,
+        data,
+        stage.path(),
+        branch,
+        env,
+        keys,
+        mode,
+        KeystorePhase::Later,
+    )
+    .await?;
+    Ok(PreparedRestore {
+        stage,
+        staged,
+        keystore: keystore.ok_or_else(|| ShipError::Restore("missing keystore step".into()))?,
+        identity,
+    })
+}
+
+impl PreparedRestore {
+    /// Change only the authenticated private stage, never the destination tree.
+    /// The stage is a directory of the caller's own that no one else can enter;
+    /// it is handed over by descriptor, files before the directories that hold
+    /// them and the stage itself last, without following a link, and only if
+    /// it holds nothing but directories and regular files with one link
+    /// (`kronik_privacy::owned_tree`).
+    pub fn handover(&self, uid: u32, gid: u32) -> Result<(), ShipError> {
+        // Reached from `/` without following a link, through directories only
+        // root (or the caller) can change: `$TMPDIR` is the operator's, but a
+        // stage must not be reachable through a path another user controls.
+        let caller = rustix::process::geteuid().as_raw();
+        kronik_privacy::owned_tree::Dir::open_controlled(self.stage.path(), caller, None)?
+            .hand_over_tree(uid, gid)
+            .map_err(|e| ShipError::Restore(format!("handing over the restore stage: {e}")))
+    }
+}
+
+/// Install as the destination owner, retaining the exact directory descriptor locked by prepare.
+pub fn install_prepared(
+    data: &Path,
+    branch: &str,
+    force: bool,
+    prepared: PreparedRestore,
+    held: &kronik_privacy::key_source::DataOwnership,
+) -> Result<RestoreReport, ShipError> {
+    if held.directory_resource().metadata()?.uid() != rustix::process::geteuid().as_raw() {
+        return Err(ShipError::Restore(
+            "installation must run as the destination owner".into(),
+        ));
+    }
+    if directory_identity(data, held)? != prepared.identity {
+        return Err(ShipError::Restore("restore lock identity changed".into()));
+    }
+    let branch_dir = data.join("branches").join(branch);
+    if branch_dir.join("state.db").exists() && !force {
+        return Err(ShipError::Restore(format!(
+            "{} already holds state; pass --force",
+            data.display()
+        )));
+    }
+    let stage = data.join(".restore");
+    if stage.exists() {
+        std::fs::remove_dir_all(&stage)?;
+    }
+    std::fs::create_dir(&stage)?;
+    // The owner opens the same restore phase an ordinary restore holds, and
+    // imports the decrypted keystore backup into it.
+    let result = held
+        .begin_keystore_restore()
+        .map_err(ShipError::Key)
+        .and_then(|restore| {
+            copy_tree(prepared.stage.path(), &stage)?;
+            let mut staged = prepared.staged;
+            staged.keystore_step(stage_keystore(&restore, prepared.keystore)?);
+            install_staged(data, &stage, branch, &branch_dir, staged, restore, &|_| {
+                Ok(())
+            })
+        });
+    let _ = std::fs::remove_dir_all(&stage);
+    directory_identity(data, held)?;
+    result
+}
+
 /// The file a restore leaves in the branch directory, with the last LSN of
 /// the restored log (`through_lsn`): the next `kronik serve` records a
 /// system `AuditEvent` `restore` from it, then deletes it (M28 review H4:
@@ -796,11 +927,11 @@ pub async fn restore_with_fault(
         env,
         keys,
         mode,
-        &keystore_restore,
+        KeystorePhase::Now(&keystore_restore),
     )
     .await;
     let result = match staged {
-        Ok(s) => install_staged(
+        Ok((s, _)) => install_staged(
             data,
             &stage,
             branch,
@@ -838,6 +969,40 @@ struct Staged {
     wrapped_path: Option<PathBuf>,
 }
 
+impl Staged {
+    /// Records the outcome of the keystore step of a prepared restore.
+    fn keystore_step(&mut self, done: KeystoreStaged) {
+        self.keystore = done.status;
+        self.keystore_backup_ms = done.backup_ms;
+        self.keystore_master = done.master;
+        self.keys_missing = done.missing;
+    }
+}
+
+/// Whether [`stage_restore`] imports the keystore backup itself, into the
+/// restore phase of the data directory's owner, or leaves that step to the
+/// caller (a prepared restore, whose caller may not touch the destination).
+enum KeystorePhase<'a> {
+    Now(&'a kronik_privacy::keystore::KeystoreRestore),
+    Later,
+}
+
+/// What the keystore step needs from the staged log and snapshot.
+struct KeystoreStep {
+    backup: Result<KeystoreBackup, &'static str>,
+    needed: kronik_store::db::SubjectKeys,
+    erasures: Vec<(String, u32, u64)>,
+    allow: bool,
+}
+
+/// What the keystore step decided.
+struct KeystoreStaged {
+    status: &'static str,
+    backup_ms: Option<u64>,
+    missing: Vec<String>,
+    master: Option<kronik_privacy::MasterKey>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn stage_restore(
     remote: &Remote,
@@ -847,8 +1012,8 @@ async fn stage_restore(
     env: &Env,
     keys: &Keys,
     mode: KeystoreMode,
-    keystore_restore: &kronik_privacy::keystore::KeystoreRestore,
-) -> Result<Staged, ShipError> {
+    keystore_phase: KeystorePhase<'_>,
+) -> Result<(Staged, Option<KeystoreStep>), ShipError> {
     // 1. The newest complete remote snapshot.
     let (_, lsns) = remote.list(&format!("{branch}/snapshots")).await?;
     let mut newest: Option<Manifest> = None;
@@ -894,8 +1059,8 @@ async fn stage_restore(
         // On a forced restore the target's envelope is never silently replaced
         // with a different seed, even when both use the configured provider.
         let target = keys.envelope_path(data)?;
-        if target.exists() {
-            let old = kronik_privacy::key_source::read_envelope(&target)?;
+        if kronik_privacy::key_source::exists_in(data, &target)? {
+            let old = kronik_privacy::key_source::read_envelope_in(data, &target)?;
             let old = kronik_privacy::key_source::unwrap_envelope(env, keys, &old).await?;
             if !master.same_key(&old) {
                 return Err(ShipError::Key(kronik_privacy::PrivacyError::KeyMismatch(
@@ -999,66 +1164,21 @@ async fn stage_restore(
     }
     // 3. The keystore: the backup, with the log's erasures applied again,
     //    must hold every key a sealed value needs.
-    let allow = mode == KeystoreMode::AllowMissingKeys;
-    let subjects_of = |pairs: &[(String, u32)]| {
-        let mut s: Vec<String> = pairs.iter().map(|(s, _)| s.clone()).collect();
-        s.dedup();
-        s
+    let step = KeystoreStep {
+        backup: keystore,
+        needed,
+        erasures,
+        allow: mode == KeystoreMode::AllowMissingKeys,
     };
-    let keystore_master = keystore.as_ref().ok().map(|backup| backup.master.clone());
-    let (keystore, keystore_backup_ms, keys_missing) = match keystore {
-        Ok(k) => {
-            let ks = kronik_privacy::keystore::Keystore::restore_staged(
-                keystore_restore,
-                Path::new(".restore"),
-                &k.master,
-                &k.blob,
-            )
-            .map_err(ShipError::Key)?;
-            for (subject, version, wall) in &erasures {
-                ks.erase_through(subject, *version, *wall)
-                    .map_err(ShipError::Key)?;
-            }
-            let mut missing = Vec::new();
-            for ((subject, version), sample) in &needed {
-                if !ks
-                    .covers(subject, *version, sample)
-                    .map_err(ShipError::Key)?
-                {
-                    missing.push((subject.clone(), *version));
-                }
-            }
-            if !missing.is_empty() && !allow {
-                let shown: Vec<String> = missing
-                    .iter()
-                    .map(|(s, v)| format!("{s} (key {v})"))
-                    .collect();
-                return Err(ShipError::KeystoreIncomplete(format!(
-                    "the bucket's newest keystore backup ({}) lacks the keys of {}: their sealed \
-                     values would be unreadable",
-                    k.wall,
-                    list_some(&shown)
-                )));
-            }
-            keystore_restore.close_stage(ks).map_err(ShipError::Key)?;
-            ("installed", Some(k.wall), subjects_of(&missing))
+    // An ordinary restore imports the keystore here; a prepared one returns
+    // the step for the destination owner to run.
+    let (keystore, keystore_backup_ms, keystore_master, keys_missing, later) = match keystore_phase
+    {
+        KeystorePhase::Now(restore) => {
+            let done = stage_keystore(restore, step)?;
+            (done.status, done.backup_ms, done.master, done.missing, None)
         }
-        Err("none_in_bucket") if !needed.is_empty() => {
-            let pairs: Vec<(String, u32)> = needed.keys().cloned().collect();
-            if !allow {
-                let shown: Vec<String> = pairs
-                    .iter()
-                    .map(|(s, v)| format!("{s} (key {v})"))
-                    .collect();
-                return Err(ShipError::KeystoreIncomplete(format!(
-                    "the restored data holds sealed values of {}, and the bucket has no keystore \
-                     backup",
-                    list_some(&shown)
-                )));
-            }
-            ("none_in_bucket", None, subjects_of(&pairs))
-        }
-        Err(status) => (status, None, Vec::new()),
+        KeystorePhase::Later => ("none_in_bucket", None, None, Vec::new(), Some(step)),
     };
     // A rebase switch after the snapshot whose base is before it: the first
     // start rebuilds the shadow from a snapshot at or before that base
@@ -1096,17 +1216,101 @@ async fn stage_restore(
     if snap.join("secrets.db").exists() {
         std::fs::copy(snap.join("secrets.db"), stage.join("secrets.db"))?;
     }
-    Ok(Staged {
-        m,
-        segments,
-        components,
-        keystore,
-        keystore_backup_ms,
-        keystore_master,
-        keys_missing,
-        older,
-        through_lsn,
-        wrapped_path,
+    Ok((
+        Staged {
+            m,
+            segments,
+            components,
+            keystore,
+            keystore_backup_ms,
+            keystore_master,
+            keys_missing,
+            older,
+            through_lsn,
+            wrapped_path,
+        },
+        later,
+    ))
+}
+
+/// The keystore step of a restore: imports the decrypted backup into the
+/// restore phase's stage, applies the log's erasures again and checks that it
+/// holds every key the restored sealed values need.
+fn stage_keystore(
+    restore: &kronik_privacy::keystore::KeystoreRestore,
+    step: KeystoreStep,
+) -> Result<KeystoreStaged, ShipError> {
+    let KeystoreStep {
+        backup,
+        needed,
+        erasures,
+        allow,
+    } = step;
+    let subjects_of = |pairs: &[(String, u32)]| {
+        let mut s: Vec<String> = pairs.iter().map(|(s, _)| s.clone()).collect();
+        s.dedup();
+        s
+    };
+    let master = backup.as_ref().ok().map(|backup| backup.master.clone());
+    let (status, backup_ms, missing) = match backup {
+        Ok(k) => {
+            let ks = kronik_privacy::keystore::Keystore::restore_staged(
+                restore,
+                Path::new(".restore"),
+                &k.master,
+                &k.blob,
+            )
+            .map_err(ShipError::Key)?;
+            for (subject, version, wall) in &erasures {
+                ks.erase_through(subject, *version, *wall)
+                    .map_err(ShipError::Key)?;
+            }
+            let mut missing = Vec::new();
+            for ((subject, version), sample) in &needed {
+                if !ks
+                    .covers(subject, *version, sample)
+                    .map_err(ShipError::Key)?
+                {
+                    missing.push((subject.clone(), *version));
+                }
+            }
+            if !missing.is_empty() && !allow {
+                let shown: Vec<String> = missing
+                    .iter()
+                    .map(|(s, v)| format!("{s} (key {v})"))
+                    .collect();
+                return Err(ShipError::KeystoreIncomplete(format!(
+                    "the bucket's newest keystore backup ({}) lacks the keys of {}: their sealed \
+                     values would be unreadable",
+                    k.wall,
+                    list_some(&shown)
+                )));
+            }
+            restore.close_stage(ks).map_err(ShipError::Key)?;
+            ("installed", Some(k.wall), subjects_of(&missing))
+        }
+        Err("none_in_bucket") if !needed.is_empty() => {
+            let pairs: Vec<(String, u32)> = needed.keys().cloned().collect();
+            if !allow {
+                let shown: Vec<String> = pairs
+                    .iter()
+                    .map(|(s, v)| format!("{s} (key {v})"))
+                    .collect();
+                return Err(ShipError::KeystoreIncomplete(format!(
+                    "the restored data holds sealed values of {}, and the bucket has no keystore \
+                     backup",
+                    list_some(&shown)
+                )));
+            }
+            ("none_in_bucket", None, subjects_of(&pairs))
+        }
+        Err(status) => (status, None, Vec::new()),
+    };
+    Ok(KeystoreStaged {
+        status,
+        backup_ms,
+        missing,
+        master,
     })
 }
 

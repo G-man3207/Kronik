@@ -350,3 +350,486 @@ fn wrong_key_and_failed_rewrap_preserve_the_existing_envelope() {
     ));
     assert_eq!(std::fs::read(path).unwrap(), old);
 }
+
+/// Root working in the tree of the nonroot service. The tests play "another
+/// user's tree" by running as a user that is not the tree's owner (`euid`
+/// +1), which needs no privilege: what changes is how the files are reached.
+mod another_users_tree {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt as _, symlink};
+
+    struct Tree {
+        _dir: tempfile::TempDir,
+        data: std::path::PathBuf,
+        victim: std::path::PathBuf,
+        /// The caller who is not the tree's owner: root, in production.
+        stranger: Caller,
+        /// The tree's own owner.
+        owner: Caller,
+    }
+
+    /// A caller with this number. The directories of a test sit under the
+    /// test user's own temporary directory, so the rule for the way to the
+    /// data directory is "any" unless a test says otherwise.
+    fn caller(euid: u32) -> Caller {
+        Caller {
+            euid,
+            ancestors: Ancestors::Any,
+        }
+    }
+
+    fn tree() -> Tree {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(data.join("keys")).unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("secret.conf"), b"root-only").unwrap();
+        let owner = std::fs::metadata(&data).unwrap().uid();
+        Tree {
+            _dir: dir,
+            data,
+            victim,
+            stranger: caller(owner.wrapping_add(1)),
+            owner: caller(owner),
+        }
+    }
+
+    fn ctime(path: &Path) -> (i64, i64) {
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        (meta.ctime(), meta.ctime_nsec())
+    }
+
+    fn tick() {
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
+    #[test]
+    fn an_envelope_is_written_by_name_given_to_the_directorys_owner_and_replaced() {
+        let rt = runtime();
+        let (env, _, _) = setup(&rt, false, false);
+        let t = tree();
+        let path = t.data.join("keys/master.wrapped");
+        write_envelope_as(&env, &t.data, &path, b"one", false, t.stranger).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o600);
+        assert_eq!(meta.uid(), std::fs::metadata(&t.data).unwrap().uid());
+        assert_eq!(
+            read_envelope_as(&t.data, &path, t.stranger).unwrap(),
+            b"one"
+        );
+        // Creation never replaces what is there; replacement does.
+        assert!(write_envelope_as(&env, &t.data, &path, b"two", false, t.stranger).is_err());
+        write_envelope_as(&env, &t.data, &path, b"two", true, t.stranger).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert!(exists_as(&t.data, &path, t.stranger).unwrap());
+        // Nothing else is left in the directory.
+        let names: Vec<_> = std::fs::read_dir(t.data.join("keys"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["master.wrapped"]);
+    }
+
+    #[test]
+    fn a_link_planted_as_keys_is_not_followed_for_a_write_a_read_or_the_stores() {
+        let rt = runtime();
+        let (env, _, _) = setup(&rt, false, false);
+        let t = tree();
+        std::fs::remove_dir(t.data.join("keys")).unwrap();
+        symlink(&t.victim, t.data.join("keys")).unwrap();
+        let path = t.data.join("keys/master.wrapped");
+        // A file of the victim's own that the stores would be taken from.
+        std::fs::write(t.victim.join("secrets.db"), b"not the service's").unwrap();
+        let before = (ctime(&t.victim), ctime(&t.victim.join("secret.conf")));
+        tick();
+        let error = write_envelope_as(&env, &t.data, &path, b"x", false, t.stranger).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert!(read_envelope_as(&t.data, &path, t.stranger).is_err());
+        assert!(exists_as(&t.data, &path, t.stranger).is_err());
+        // The stores of a planted keys are refused too, and nothing is staged
+        // from the victim.
+        let error = stage_stores_as(&t.data.join("keys"), t.stranger).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert_eq!(
+            (ctime(&t.victim), ctime(&t.victim.join("secret.conf"))),
+            before,
+        );
+        assert_eq!(std::fs::read_dir(&t.victim).unwrap().count(), 2);
+        // In the process's own tree the path works as it always did.
+        assert_eq!(
+            read_envelope_as(&t.data, &t.data.join("keys/secrets.db"), t.owner).unwrap(),
+            b"not the service's"
+        );
+    }
+
+    #[test]
+    fn stores_that_are_links_or_special_files_are_not_staged_and_missing_ones_are_skipped() {
+        let t = tree();
+        let keys = t.data.join("keys");
+        // Nothing there: nothing staged, no error, as before.
+        let stage = stage_stores_as(&keys, t.stranger).unwrap();
+        assert_eq!(std::fs::read_dir(stage.path()).unwrap().count(), 0);
+        let missing = t.data.join("absent/keys");
+        assert_eq!(
+            std::fs::read_dir(stage_stores_as(&missing, t.stranger).unwrap().path())
+                .unwrap()
+                .count(),
+            0
+        );
+        // A real store is copied, a staging directory is private.
+        std::fs::write(keys.join("secrets.db"), b"db").unwrap();
+        let stage = stage_stores_as(&keys, t.stranger).unwrap();
+        assert_eq!(
+            std::fs::read(stage.path().join("secrets.db")).unwrap(),
+            b"db"
+        );
+        assert_eq!(std::fs::metadata(stage.path()).unwrap().mode() & 0o077, 0);
+        // A link in place of a store, a hard link and a FIFO are each refused.
+        std::fs::remove_file(keys.join("secrets.db")).unwrap();
+        symlink(t.victim.join("secret.conf"), keys.join("secrets.db")).unwrap();
+        assert!(stage_stores_as(&keys, t.stranger).is_err());
+        std::fs::remove_file(keys.join("secrets.db")).unwrap();
+        std::fs::hard_link(t.victim.join("secret.conf"), keys.join("secrets.db")).unwrap();
+        assert!(stage_stores_as(&keys, t.stranger).is_err());
+        std::fs::remove_file(keys.join("secrets.db")).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            keys.join("secrets.db"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        assert!(stage_stores_as(&keys, t.stranger).is_err());
+    }
+
+    #[test]
+    fn the_old_key_file_is_removed_by_name_and_a_link_in_its_place_is_only_unlinked() {
+        let t = tree();
+        let old = t.data.join("keys/master.key");
+        std::fs::write(&old, "ab".repeat(32)).unwrap();
+        remove_key_file(&t.data, &old, t.stranger).unwrap();
+        assert!(!old.exists());
+        // A link planted for it: the link goes, the victim stays.
+        symlink(t.victim.join("secret.conf"), &old).unwrap();
+        remove_key_file(&t.data, &old, t.stranger).unwrap();
+        assert!(old.symlink_metadata().is_err());
+        assert_eq!(
+            std::fs::read(t.victim.join("secret.conf")).unwrap(),
+            b"root-only"
+        );
+        // A key file outside the tree is the operator's: removed by path.
+        let outside = t.victim.join("elsewhere.key");
+        std::fs::write(&outside, "cd".repeat(32)).unwrap();
+        remove_key_file(&t.data, &outside, t.stranger).unwrap();
+        assert!(!outside.exists());
+    }
+
+    /// A test that needs root: where it cannot run it skips with a message, or
+    /// fails under `KRONIK_FOREIGN_TESTS=require`, which the foreign step of CI
+    /// sets and runs as root, so that a skip cannot go unnoticed there.
+    fn root_or_skip(what: &str) -> bool {
+        if rustix::process::geteuid().is_root() {
+            return true;
+        }
+        assert!(
+            std::env::var("KRONIK_FOREIGN_TESTS").as_deref() != Ok("require"),
+            "KRONIK_FOREIGN_TESTS=require, but {what} needs root"
+        );
+        eprintln!("skipped: {what} needs root");
+        false
+    }
+
+    /// A configuration whose envelope is directly under the data directory, so
+    /// that a swapped `keys` is met by the old key and not by the envelope.
+    fn wrap_config(base: &Keys) -> Keys {
+        Keys {
+            wrapped_file: "master.wrapped".into(),
+            ..base.clone()
+        }
+    }
+
+    #[test]
+    fn the_old_key_is_read_by_name_and_only_a_plain_file_is_a_key() {
+        let t = tree();
+        let old = t.data.join("keys/master.key");
+        let key = "ef".repeat(32);
+        std::fs::write(&old, &key).unwrap();
+        assert!(read_old_key_as(&t.data, &old, t.stranger).is_ok());
+        assert!(read_old_key_as(&t.data, &old, t.owner).is_ok());
+        // Not there: the usual message, not an I/O error from the descriptor code.
+        std::fs::remove_file(&old).unwrap();
+        for who in [t.stranger, t.owner] {
+            let error = read_old_key_as(&t.data, &old, who).err().unwrap();
+            assert!(error.to_string().contains("no master key"), "{error}");
+        }
+        // A link, a hard link and a FIFO planted in its place are refused in
+        // another user's tree, and the link is the only one the owner's own path read follows.
+        symlink(t.victim.join("secret.conf"), &old).unwrap();
+        let error = read_old_key_as(&t.data, &old, t.stranger).err().unwrap();
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        std::fs::remove_file(&old).unwrap();
+        std::fs::write(t.victim.join("linked.key"), &key).unwrap();
+        std::fs::hard_link(t.victim.join("linked.key"), &old).unwrap();
+        let error = read_old_key_as(&t.data, &old, t.stranger).err().unwrap();
+        assert!(error.to_string().contains("hard links"), "{error}");
+        // Bad key text names the file and not its contents.
+        std::fs::remove_file(&old).unwrap();
+        std::fs::remove_file(t.victim.join("linked.key")).unwrap();
+        std::fs::write(&old, "not a key at all").unwrap();
+        let error = read_old_key_as(&t.data, &old, t.stranger)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains(old.to_str().unwrap()) && !error.contains("not a key at all"),
+            "{error}"
+        );
+        // One outside the data directory is the operator's, read by path.
+        let outside = t.victim.join("operator.key");
+        std::fs::write(&outside, &key).unwrap();
+        assert!(read_old_key_as(&t.data, &outside, t.stranger).is_ok());
+    }
+
+    /// With `keys` swapped for a link to a directory that holds a
+    /// `master.key`, nothing is deleted, and nothing is read from it: a failure
+    /// to reach the old key by name is a failure, not a reason to go on by path.
+    #[test]
+    fn a_swapped_keys_never_makes_root_delete_or_read_the_key_it_points_at() {
+        let t = tree();
+        let real = "ab".repeat(32);
+        std::fs::write(t.victim.join("master.key"), &real).unwrap();
+        std::fs::remove_dir(t.data.join("keys")).unwrap();
+        symlink(&t.victim, t.data.join("keys")).unwrap();
+        let old = t.data.join("keys/master.key");
+        let before = (ctime(&t.victim), ctime(&t.victim.join("master.key")));
+        tick();
+        // The pieces: the key is not read, and it is not removed.
+        let error = read_old_key_as(&t.data, &old, t.stranger).err().unwrap();
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        let error = remove_key_file(&t.data, &old, t.stranger).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(t.victim.join("master.key")).unwrap(),
+            real
+        );
+        // The whole command, with `--remove-file`, an envelope that does not
+        // need `keys` and a provider that answers: refused, nothing written or removed.
+        let rt = runtime();
+        let (env, _, cfg) = setup(&rt, false, false);
+        let cfg = wrap_config(&cfg);
+        let result = rt.block_on(wrap_existing_as(
+            t.stranger,
+            &env,
+            &cfg,
+            &t.data,
+            &old,
+            true,
+            |_, _| "test".to_owned(),
+            false,
+        ));
+        assert!(result.is_err(), "the wrap went on through a swapped keys");
+        assert_eq!(
+            std::fs::read_to_string(t.victim.join("master.key")).unwrap(),
+            real
+        );
+        assert!(!t.data.join("master.wrapped").exists());
+        assert_eq!(
+            std::fs::read_dir(&t.victim).unwrap().count(),
+            2,
+            "the victim directory changed"
+        );
+        assert_eq!(
+            (ctime(&t.victim), ctime(&t.victim.join("master.key"))),
+            before,
+            "the victim directory or its key was touched"
+        );
+        // Control: the same command in an untouched tree wraps and removes.
+        let c = tree();
+        let old = c.data.join("keys/master.key");
+        let key_text = "cd".repeat(32);
+        std::fs::write(&old, &key_text).unwrap();
+        let wrapped = rt.block_on(wrap_existing_as(
+            c.stranger,
+            &env,
+            &cfg,
+            &c.data,
+            &old,
+            true,
+            |_, _| "test".to_owned(),
+            false,
+        ));
+        assert!(wrapped.is_ok(), "{wrapped:?}");
+        assert!(c.data.join("master.wrapped").exists());
+        assert!(!old.exists(), "the old key file is removed by name");
+    }
+
+    #[test]
+    fn a_wrap_that_is_done_says_so_when_the_old_key_cannot_be_removed() {
+        let why = std::io::Error::other("Operation not permitted");
+        let text = removal_failed(Path::new("/srv/data/keys/master.key"), &why).to_string();
+        for needle in [
+            "is wrapped",
+            "/srv/data/keys/master.key",
+            "Operation not permitted",
+            "remove the old file by hand",
+            "a wrapped key exists",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_path_is_outside_the_data_directory_by_its_spelling_and_a_dotdot_is_not_trusted() {
+        let t = tree();
+        std::fs::write(t.victim.join("op.key"), "ab".repeat(32)).unwrap();
+        // Outside: by path, in every tree.
+        assert!(matches!(
+            reach(&t.data, &t.victim.join("op.key"), t.stranger).unwrap(),
+            Reach::Path
+        ));
+        // Inside, in another user's tree: by name; in the owner's own: by path.
+        assert!(matches!(
+            reach(&t.data, &t.data.join("keys/x"), t.stranger).unwrap(),
+            Reach::Name(..)
+        ));
+        assert!(matches!(
+            reach(&t.data, &t.data.join("keys/x"), t.owner).unwrap(),
+            Reach::Path
+        ));
+        // A spelling that does not start with the data directory but has a
+        // `..` in it could still lead into it: refused in another user's tree,
+        // where that matters, and by path in the owner's own.
+        let tricky = t
+            .data
+            .parent()
+            .unwrap()
+            .join("other/../data/keys/master.key");
+        let error = reach(&t.data, &tricky, t.stranger).err().unwrap();
+        assert!(error.to_string().contains("`..`"), "{error}");
+        assert!(matches!(
+            reach(&t.data, &tricky, t.owner).unwrap(),
+            Reach::Path
+        ));
+        // One that starts with it and goes up again is refused by the walk.
+        let inside = t.data.join("../data/keys/master.key");
+        assert!(reach(&t.data, &inside, t.stranger).is_err());
+        // The data directory itself is not a file below it.
+        assert!(reach(&t.data, &t.data, t.stranger).is_err());
+    }
+
+    /// The way to the data directory: for another user's tree it is opened
+    /// again from `/`, with no link on the way and only directories that root
+    /// and the caller can change.
+    #[test]
+    fn the_way_to_another_users_data_directory_must_be_one_that_only_root_and_the_caller_change() {
+        let t = tree();
+        let strict = Caller {
+            euid: t.stranger.euid,
+            ancestors: Ancestors::ControlledBy(t.stranger.euid),
+        };
+        // The test's own temporary directory belongs to the tree's owner, who
+        // is neither root nor the caller here (as root, the test gives it away
+        // first, because root's directories always count): refused.
+        if rustix::process::geteuid().is_root() {
+            std::os::unix::fs::chown(t.data.parent().unwrap(), Some(65_534), None).unwrap();
+        }
+        let error = reach(&t.data, &t.data.join("keys/x"), strict)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("not controlled"), "{error}");
+        // The refusal says what to do instead.
+        assert!(
+            error
+                .to_string()
+                .contains("run the command as the user who owns it"),
+            "{error}"
+        );
+        // A link in the path of the data directory is refused as well.
+        let link = t.data.parent().unwrap().join("data-link");
+        symlink(&t.data, &link).unwrap();
+        let error = reach(&link, &link.join("keys/x"), caller(t.stranger.euid))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        // In the owner's own tree the path may be spelled any way.
+        assert!(matches!(
+            reach(&link, &link.join("keys/x"), t.owner).unwrap(),
+            Reach::Path
+        ));
+    }
+
+    /// The same again, as a real root over a tree that a real other user owns:
+    /// the numbers are the kernel's, not a played caller's. Where the test does
+    /// not run as root there is no way to give a tree to another user.
+    #[test]
+    fn a_swapped_keys_is_refused_for_the_real_root_over_a_tree_another_user_owns() {
+        use std::os::unix::fs::{chown, lchown};
+        if !root_or_skip("giving a tree to another user") {
+            return;
+        }
+        let service = 65_534;
+        let rt = runtime();
+        let (env, _, cfg) = setup(&rt, false, false);
+        let cfg = wrap_config(&cfg);
+        let who = Caller::this_process();
+        let wrap = |data: &Path, old: &Path| {
+            rt.block_on(wrap_existing_as(
+                who,
+                &env,
+                &cfg,
+                data,
+                old,
+                true,
+                |_, _| "test".to_owned(),
+                false,
+            ))
+        };
+        // The service's tree, with `keys` swapped for a link to a directory of
+        // root's own that holds a master.key.
+        let t = tree();
+        let real = "ab".repeat(32);
+        std::fs::write(t.victim.join("master.key"), &real).unwrap();
+        chown(&t.data, Some(service), Some(service)).unwrap();
+        std::fs::remove_dir(t.data.join("keys")).unwrap();
+        symlink(&t.victim, t.data.join("keys")).unwrap();
+        lchown(t.data.join("keys"), Some(service), Some(service)).unwrap();
+        let old = t.data.join("keys/master.key");
+        let before = (ctime(&t.victim), ctime(&t.victim.join("master.key")));
+        tick();
+        assert!(
+            wrap(&t.data, &old).is_err(),
+            "the wrap went on through a swapped keys"
+        );
+        // The pieces, each on its own: the key behind the link is neither read
+        // nor removed, whatever else would have stopped the command later.
+        let error = read_old_key_as(&t.data, &old, who).err().unwrap();
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        let error = remove_key_file(&t.data, &old, who).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(t.victim.join("master.key")).unwrap(),
+            real
+        );
+        assert!(!t.data.join("master.wrapped").exists());
+        assert_eq!(
+            (ctime(&t.victim), ctime(&t.victim.join("master.key"))),
+            before,
+            "the victim directory or its key was touched"
+        );
+        // Control: the service's untouched tree is wrapped, the envelope is
+        // given to the service user, and the old key is removed by name.
+        let c = tree();
+        chown(&c.data, Some(service), Some(service)).unwrap();
+        chown(c.data.join("keys"), Some(service), Some(service)).unwrap();
+        let old = c.data.join("keys/master.key");
+        std::fs::write(&old, "cd".repeat(32)).unwrap();
+        chown(&old, Some(service), Some(service)).unwrap();
+        let wrapped = wrap(&c.data, &old);
+        assert!(wrapped.is_ok(), "{wrapped:?}");
+        let envelope = std::fs::metadata(c.data.join("master.wrapped")).unwrap();
+        assert_eq!((envelope.uid(), envelope.gid()), (service, service));
+        assert!(!old.exists(), "the old key file is removed by name");
+    }
+}

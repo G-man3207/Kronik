@@ -10,6 +10,7 @@
 mod key_memory;
 pub mod key_source;
 pub mod keystore;
+pub mod owned_tree;
 mod publication;
 pub mod sealer;
 pub mod secret_backend;
