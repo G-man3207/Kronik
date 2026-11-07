@@ -1480,8 +1480,49 @@ pub fn jail_microvm(jail: &MicrovmJail<'_>) -> io::Result<()> {
         "unsharing microVM namespaces",
     )?;
     jail_mounts(jail, Path::new("/dev/kvm"))?;
+    seal_capabilities()
+}
+
+/// What no process of the jail may gain back through `exec`. The bounding set
+/// decides what an `exec` as uid 0 can gain (root's file capabilities count as
+/// all ones), so it is emptied: every capability the kernel has, which needs
+/// `CAP_SETPCAP`; `EINVAL` marks a number past the last one. Then the secure
+/// bits make uid 0 an ordinary uid for `exec` and cannot be undone, and the
+/// rest is cleared as [`clear_capabilities`] does. Without this only
+/// `no_new_privs` stands between a root VMM and the capabilities of root.
+fn seal_capabilities() -> io::Result<()> {
+    for cap in 0..64 {
+        // SAFETY: prctl with scalar arguments.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) } != 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINVAL) {
+                break;
+            }
+            return Err(io::Error::new(
+                e.kind(),
+                format!("dropping capability {cap} from the bounding set: {e}"),
+            ));
+        }
+    }
+    // SAFETY: prctl with scalar arguments.
+    check(
+        unsafe {
+            libc::prctl(
+                libc::PR_SET_SECUREBITS,
+                SECBIT_NOROOT | SECBIT_NOROOT_LOCKED,
+                0,
+                0,
+                0,
+            )
+        },
+        "PR_SET_SECUREBITS",
+    )?;
     clear_capabilities()
 }
+
+// The secure bits of linux/securebits.h that `seal_capabilities` sets.
+const SECBIT_NOROOT: libc::c_ulong = 1 << 0;
+const SECBIT_NOROOT_LOCKED: libc::c_ulong = 1 << 1;
 
 // statvfs(3) `f_flag` bits of a mount.
 const ST_RDONLY: libc::c_ulong = 1;
@@ -1978,7 +2019,8 @@ mod tests {
                     "if [ -n \"$OPTIONS\" ]; then \
                          mount -t tmpfs -o \"$OPTIONS,size=8m\" tmpfs \"$DIR/src\"; fi; \
                      exec unshare --user --map-root-user --mount \"$EXE\" \
-                         --exact sys::tests::jail_rehearsal_child --ignored --nocapture",
+                         --exact sys::tests::jail_rehearsal_child --ignored --nocapture \
+                         --test-threads=1",
                 )
                 .env("EXE", &exe)
                 .env("OPTIONS", options)
@@ -2269,6 +2311,9 @@ mod tests {
         if !is_open(inherited) {
             return fail("the control descriptor was not open to begin with".into());
         }
+        // A program to exec in the jail, to see what an exec gains: where the
+        // source mount allows execution and a static C program can be made.
+        let exec_stub = source_flags & ST_NOEXEC == 0 && make_stub(dir, &src.join("firecracker"))?;
         jail_mounts(
             &MicrovmJail {
                 root: &root,
@@ -2337,10 +2382,23 @@ mod tests {
             return fail("`..` of the jail root leads somewhere else".into());
         }
         // The last step of the launcher's jail.
-        clear_capabilities()?;
+        seal_capabilities()?;
         // SAFETY: scalar prctl.
         if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 1 {
             return fail("no_new_privs is not set".into());
+        }
+        // What an exec as uid 0 would gain is the bounding set, and the secure
+        // bits decide whether uid 0 counts: both are sealed, not only zeroed.
+        for cap in 0..64 {
+            // SAFETY: scalar prctl; a number past the last capability is -1.
+            if unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap as libc::c_ulong, 0, 0, 0) } == 1 {
+                return fail(format!("capability {cap} is still in the bounding set"));
+            }
+        }
+        // SAFETY: scalar prctl.
+        let bits = unsafe { libc::prctl(libc::PR_GET_SECUREBITS, 0, 0, 0, 0) } as libc::c_ulong;
+        if bits & (SECBIT_NOROOT | SECBIT_NOROOT_LOCKED) != SECBIT_NOROOT | SECBIT_NOROOT_LOCKED {
+            return fail(format!("the secure bits are {bits:#x}, not sealed"));
         }
         let mut header = CapHeader {
             version: CAPABILITY_VERSION_3,
@@ -2363,6 +2421,79 @@ mod tests {
         {
             return fail("capabilities remain after the jail".into());
         }
+        // And what an exec of a program of the jail gets: nothing. The program
+        // asks the kernel for its capability sets, bounding set, secure bits,
+        // no_new_privs and ambient set.
+        if exec_stub {
+            let status = std::process::Command::new("/firecracker").status()?;
+            if status.code() != Some(0) {
+                return fail(format!(
+                    "a program executed in the jail found capabilities or a missing seal: {status}"
+                ));
+            }
+        }
         Ok(())
     }
+
+    /// Writes the static program that `rehearse_jail` executes in the jail over
+    /// `target`. False where no static C program can be made (a host without a
+    /// C compiler and static libc), which fails under
+    /// `KRONIK_FOREIGN_TESTS=require`.
+    fn make_stub(dir: &Path, target: &Path) -> io::Result<bool> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let source = dir.join("stub.c");
+        let program = dir.join("stub");
+        fs::write(&source, STUB)?;
+        let built = std::process::Command::new("cc")
+            .args(["-static", "-O1", "-o"])
+            .arg(&program)
+            .arg(&source)
+            .output();
+        match built {
+            Ok(out) if out.status.success() => {
+                fs::copy(&program, target)?;
+                fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
+                Ok(true)
+            }
+            other => {
+                let why = format!("no static C program can be made here ({other:?})");
+                if std::env::var("KRONIK_FOREIGN_TESTS").as_deref() == Ok("require") {
+                    return Err(io::Error::other(why));
+                }
+                eprintln!("skipped the exec check: {why}");
+                Ok(false)
+            }
+        }
+    }
+
+    /// What the program executed in the jail looks at. Exit codes name the
+    /// first thing it finds wrong.
+    const STUB: &str = r#"
+#include <linux/capability.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#ifndef PR_CAPBSET_READ
+#define PR_CAPBSET_READ 23
+#endif
+#ifndef PR_GET_SECUREBITS
+#define PR_GET_SECUREBITS 27
+#endif
+
+int main(void) {
+    struct __user_cap_header_struct header = {_LINUX_CAPABILITY_VERSION_3, 0};
+    struct __user_cap_data_struct data[2];
+    if (syscall(SYS_capget, &header, data) != 0) return 90;
+    for (int i = 0; i < 2; i++)
+        if (data[i].effective || data[i].permitted || data[i].inheritable) return 91;
+    for (int cap = 0; cap < 64; cap++)
+        if (prctl(PR_CAPBSET_READ, cap, 0, 0, 0) == 1) return 92;
+    if ((prctl(PR_GET_SECUREBITS, 0, 0, 0, 0) & 3) != 3) return 93;
+    if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1) return 94;
+    for (int cap = 0; cap < 64; cap++)
+        if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap, 0, 0) == 1) return 95;
+    return 0;
+}
+"#;
 }

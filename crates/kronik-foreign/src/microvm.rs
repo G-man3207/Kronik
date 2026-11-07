@@ -210,6 +210,10 @@ pub(crate) const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off nomod
 /// A failed jail is fatal: there is no unjailed Firecracker fallback.
 #[allow(clippy::disallowed_methods)] // Only the already jailed, threadless child execs.
 pub fn launch(manifest: &Path) -> io::Result<()> {
+    // Whatever the daemon left open, a descriptor on a host path included, is
+    // not the launcher's: on a root installation a leaked descriptor is the
+    // authority of root. Only the standard three stay (the log is on 1 and 2).
+    crate::sys::close_descriptors(3, u32::MAX);
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -1274,5 +1278,70 @@ mod tests {
         );
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         assert!(write_initrd(&path, &init, &config).is_err());
+    }
+
+    const SWEEP_CHILD: &str = "KRONIK_TEST_LAUNCHER_SWEEP";
+
+    /// Whether this process has the descriptor open.
+    fn descriptor_is_open(fd: i32) -> bool {
+        fs::read_link(format!("/proc/self/fd/{fd}")).is_ok()
+    }
+
+    /// The helper process of the launcher sweep test: it holds descriptors of
+    /// the kind a daemon leaves open, starts the launcher with a manifest that
+    /// does not exist, and looks at what is left open. The sweep is the
+    /// launcher's first act, so the refusal to read the manifest comes after it.
+    #[test]
+    #[ignore = "a helper process of the launcher sweep test"]
+    fn launcher_sweep_child() {
+        use std::os::fd::AsRawFd as _;
+        if std::env::var_os(SWEEP_CHILD).is_none() {
+            return;
+        }
+        // Not close-on-exec, and with room between them.
+        let held: Vec<File> = (0..3).map(|_| File::open("/dev/null").unwrap()).collect();
+        let fds: Vec<i32> = held.iter().map(File::as_raw_fd).collect();
+        std::mem::forget(held);
+        assert!(
+            fds.iter().all(|fd| *fd >= 3 && descriptor_is_open(*fd)),
+            "{fds:?}"
+        );
+        let error = launch(Path::new("/nonexistent/microvm-launch.json")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        if let Some(fd) = fds.iter().find(|fd| descriptor_is_open(**fd)) {
+            println!("descriptor {fd} survived the start of the launcher");
+            std::process::exit(1);
+        }
+        // The standard three are the launcher's log and stay.
+        if !(0..3).all(descriptor_is_open) {
+            println!("a standard descriptor was closed");
+            std::process::exit(1);
+        }
+        println!("launcher sweep ok");
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn the_launcher_closes_every_descriptor_above_two_before_it_reads_anything() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "microvm::tests::launcher_sweep_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SWEEP_CHILD, "1")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success() && text.contains("launcher sweep ok"),
+            "{text}"
+        );
     }
 }
