@@ -29,6 +29,10 @@ from kronikd import Daemon, UnixConnection, Violation
 
 ROOT = Path(__file__).resolve().parent.parent
 LIMIT = 8 * 1024 * 1024
+# Every foreign call from an actor is cut off at its kind's effect timeout, ten
+# seconds by default, and the guest's fill of its 1 GiB data drive is one call:
+# on a slow disk or nested virtualization that alone can fail the oracle.
+EFFECT_TIMEOUT_MS = 300_000
 
 
 def require(condition, message):
@@ -642,7 +646,17 @@ def deploy_caller(daemon, root, cfg):
     result = ok(daemon, "POST", "/v1/deployments", {"wasm_base64":wasm,"reason":"owned isolation caller"})
     require(result["deployment"]["kind"] == kind, "caller manifest changed")
     cfg["caller_kind"] = kind
+    raise_effect_timeout(daemon, kind)
     return kind
+
+
+def raise_effect_timeout(daemon, kind):
+    """Sets the caller kind's effect timeout, recorded in the log like any limit."""
+    result = ok(daemon, "POST", "/v1/limits",
+                {"kind":kind,"effect_timeout_ms":EFFECT_TIMEOUT_MS,
+                 "reason":"owned isolation proof: the guest fills its 1GiB drive in one call"})
+    require(result["limits"]["effect_timeout_ms"] == EFFECT_TIMEOUT_MS,
+            f"the caller's effect timeout was not raised: {result}")
 
 
 def report_items(report, count=None, reached=False):
@@ -929,8 +943,11 @@ def conformance(root, cfg, isolation):
             before_used = allocated_bytes(root)
             require(os.statvfs(drive).f_bavail*os.statvfs(drive).f_frsize >= 64<<20,
                     "host reserve below 64MiB before guest-only ENOSPC proof")
+            fill_seconds = None
             try:
+                started = time.monotonic()
                 filled = fetch(own,query("/check/fill-data",[("token",secrets.token_hex(16))]))
+                fill_seconds = round(time.monotonic()-started,3)
                 require(filled["errno"] == errno.ENOSPC and filled["capacity_bytes"] == 1<<30 and
                         512<<20 <= filled["written_bytes"] <= (1<<30)+(1<<20) and
                         filled["marker_unchanged"] is True and filled["cleanup"] is True,
@@ -941,7 +958,8 @@ def conformance(root, cfg, isolation):
                 allocation = {"before_drive_bytes":before_drive.st_size,"after_drive_bytes":after_drive.st_size,
                               "before_drive_allocated":before_drive.st_blocks*512,
                               "after_drive_allocated":after_drive.st_blocks*512,
-                              "host_allocated_before":before_used,"host_allocated_after":after_used}
+                              "host_allocated_before":before_used,"host_allocated_after":after_used,
+                              "fill_seconds":fill_seconds,"effect_timeout_ms":EFFECT_TIMEOUT_MS}
                 (root/"guest-enospc-host.json").write_text(json.dumps(allocation,indent=2))
                 require((before_drive.st_dev,before_drive.st_ino) == (after_drive.st_dev,after_drive.st_ino) and
                         before_drive.st_size == after_drive.st_size == 1<<30 and

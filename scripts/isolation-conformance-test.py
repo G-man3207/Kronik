@@ -229,5 +229,37 @@ finally:
             proof.owner_tree([str(primary), str(separate)], cfg)
 
 
+class CallerLimits(unittest.TestCase):
+    """The caller's effect timeout: the guest's fill of its drive is one call."""
+
+    class Daemon:
+        def __init__(self, answer=None):
+            self.calls = []
+            self.answer = answer
+
+        def api(self, method, path, body=None, timeout=0):
+            self.calls.append((method, path, body))
+            if self.answer is not None:
+                return self.answer
+            return 200, {"dry_run": False, "limits": {"kind": body["kind"],
+                         "effect_timeout_ms": body["effect_timeout_ms"]}}
+
+    def test_the_effect_timeout_is_raised_for_the_caller_kind_with_a_reason(self):
+        daemon = self.Daemon()
+        proof.raise_effect_timeout(daemon, "caller-kind")
+        (method, path, body), = daemon.calls
+        self.assertEqual((method, path), ("POST", "/v1/limits"))
+        self.assertEqual(body["kind"], "caller-kind")
+        self.assertEqual(body["effect_timeout_ms"], 300_000)
+        self.assertGreater(proof.EFFECT_TIMEOUT_MS, 120_000, "more than the gateway's own timeout")
+        self.assertTrue(body["reason"].strip())
+
+    def test_an_answer_that_does_not_carry_the_new_limit_is_a_violation(self):
+        for answer in [(200, {"limits": {"effect_timeout_ms": 10_000}}),
+                       (409, {"error": {"code": "CONFLICT"}})]:
+            with self.assertRaises(proof.Violation):
+                proof.raise_effect_timeout(self.Daemon(answer), "caller-kind")
+
+
 if __name__ == "__main__":
     unittest.main()

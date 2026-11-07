@@ -131,6 +131,10 @@ This uses a separate fixed read-only tool bind, containing only manifest/provena
 For the separate KVM/mapped-directory oracle, create a fresh fixture with the final positional `"$TOOLS_DIR"` argument, then use `--isolation microvm --microvm-proof` instead. The tool directory must already contain the pinned manifest/provenance, Firecracker, kernel, static guest init, patched directory-populating mke2fs1.47.2, debugfs and e2fsck; no missing-tool skip is allowed. Root setup authority, active systemd255+, cgroupv2 delegation, mount/user namespaces, shadow tools, runsc, Python3, nsenter/unshare/setpriv, setcap/getcap, adequate owned disk space and all prebuilt example/test Wasm components are prerequisites. The Ubuntu wrapper adds mandatory Ubuntu kernel and AppArmor-policy checks that this invocation does not make.
 
 
+### Allowances for slow machines
+
+The microVM oracle runs on hosts that may themselves be virtual and have slow disks, so a limit that would fail it for the wait alone is raised for the proof's own daemon and not changed in the product. The guest fills its 1 GiB data drive in one call, and every foreign call is cut off at its caller kind's effect timeout (ten seconds by default, a recorded `Timeout`): the harness raises the caller's timeout to five minutes with `limits set` (an ordinary, recorded configuration change, in the evidence) and records how long the fill took (`fill_seconds` in `guest-enospc-host.json`). A real result under this allowance says how long the fill took; it does not say that the default is enough.
+
 ## Evidence boundary
 
 Parser/socket/filesystem regressions and static review support implementation but cannot close these runtime criteria. The installed program proof (real malicious-actor controls, the demos, Postgres checkpoint and fork, the UID audit, source-unavailable loaded-key ship/restore), the pinned tool build and the KVM boot, call, resource calibration, ENOSPC, full snapshot, fork and stop checks have not been run on this revision. They remain unexercised criteria, never optional skips. No independent security audit, Ubuntu 24.04 result or cross-version snapshot compatibility is claimed.
