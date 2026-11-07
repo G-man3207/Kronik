@@ -58,6 +58,8 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 boon = { workspace = true }
+# The explicit isolation drivers (tests/isolation_fixture.rs) call getuid and friends.
+libc = { workspace = true }
 # otel.rs decodes OTLP requests with the vendored types.
 prost = { workspace = true }
 rcgen = { workspace = true }
@@ -65,3 +67,18 @@ sha2 = { workspace = true }
 
 [lints]
 workspace = true
+
+# Explicit, never-default proof drivers (ADR 0064): they need root, real
+# namespaces and allocated numeric ids, so `cargo test` does not build or run
+# them. Build and run them by name (`--test rootless_boundary`).
+[[test]]
+name = "rootless_boundary"
+path = "tests/rootless_boundary.rs"
+harness = false
+test = false
+
+[[test]]
+name = "isolation_fixture"
+path = "tests/isolation_fixture.rs"
+harness = false
+test = false

@@ -1900,6 +1900,7 @@ dependencies = [
  "kronik-ship",
  "kronik-testhost",
  "kronik-ui",
+ "libc",
  "prost",
  "rcgen",
  "rmcp",
