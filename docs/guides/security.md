@@ -114,6 +114,19 @@ compensations are scrubbed in the sender's turn before delivery, so their
 receivers get the placeholder). Grant `secret-reveal` as rarely as
 possible.
 
+**Secrets linked to an external backend (known defect).** The views that
+remove secret values (`history`, `actors inspect`, turns, traces, dead letters
+and the audit log, among others) need the value of every secret version that
+the node recorded. For a name linked with `kronik secret link`, a node fetches
+each recorded version again from the provider after a restart. If the
+provider no longer serves one of them, the views answer 503
+`SECRET_UNAVAILABLE` instead of showing data they cannot scrub, until the
+provider serves it again; for a changed `env` variable no repair is known. The
+log and the state are intact and turns keep running. See [Secrets that an
+external backend no longer
+serves](operations.md#secrets-that-an-external-backend-no-longer-serves) for
+what happens, what was checked and how to avoid it.
+
 ### Master-key custody
 
 Keep file keys and KMS bootstrap credentials apart from the data directory

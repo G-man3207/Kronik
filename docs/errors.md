@@ -947,6 +947,8 @@ Check `kronik doctor`, the configured backend and access to the required retaine
 
 This is not `KEY_SOURCE_UNAVAILABLE`: that code concerns loading the master seed. Do not switch master-key sources or create a fallback key to work around missing secret coverage.
 
+After a restart, a recorded version of a linked secret that its provider no longer serves keeps every read that needs scrubbing at this code, until the provider serves the version again; reads then succeed without a restart. An `env` variable that was changed cannot serve its old value again. This is a known defect and no other repair is known; see Troubleshooting in the operations guide.
+
 ## SECRET_VERSION_EXHAUSTED
 
 HTTP status 409, milestone M23. The secret version domain is exhausted.
@@ -970,6 +972,8 @@ Default hint: Restore access to the matching source, immutable version and confi
 Kronik cannot recover the exact immutable secret identity recorded for this operation. The value may have been destroyed, an environment value may have changed across restart, access may have been revoked, or the trusted backend binding/reference may no longer match.
 
 Restore access to the matching backend configuration and exact retained version where possible. Never substitute the current value, another reference or a plaintext fallback: that would change an already recorded outcome. A recorded successful reveal or resend stops before exposing a different guest result. Missing values also keep scrub-dependent publication incomplete rather than allowing unsanitized output.
+
+The same loss leaves the reads that need scrubbing at 503 `SECRET_UNAVAILABLE` after the next restart, until the provider serves the version again; that is a known defect. To rotate an `env` secret, link the name to a new variable and keep every variable it has used at its recorded value.
 
 ## STORAGE_CORRUPT
 

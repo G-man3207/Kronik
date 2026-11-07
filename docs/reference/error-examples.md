@@ -479,7 +479,10 @@ printf '%s' 'fixture-only-value' | kronik secret set fixture-key --reason "provi
 
 An operation cannot obtain the complete required retained-value inventory.
 Restore that actual prerequisite; do not interpret an unavailable catalogue as
-empty or substitute current values for historical references.
+empty or substitute current values for historical references. After a
+restart this includes a recorded version that the provider no longer serves,
+until it serves the version again; that is a known defect (see the operations
+guide).
 
 ```sh
 kronik audit show --from 1
