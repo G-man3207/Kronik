@@ -108,12 +108,13 @@ establish the complete M33 release corpus or all future interfaces.
 `tests/compatibility/releases.json` is the versioned
 `kronik.compatibility-index/v2` inventory. Its separately declared
 `published_releases` set must exactly match its covered cases. It pins the actual
-published v0.1.0 and v0.3.0 producer binary digests, source commits, immutable
-exported manifest digests, original root counts, genuine counter/SQL component
-bytes, and original API, CLI JSON, diff and WIT source snapshots from those tags.
-There was no published v0.2.0 artifact in the inspected release set; do not
-invent one. The v0.1.0 artifact actually reports `kronik 0.1.0-dev` and records
-Wasmtime 50.0.0; its real identity is retained rather than rewritten.
+published v0.1.0, v0.3.0 and v0.4.0 producer binary digests, source commits,
+immutable exported manifest digests, original root counts, genuine counter/SQL
+component bytes, and original API, CLI JSON, diff and WIT source snapshots from
+those tags. There was no published v0.2.0 artifact in the inspected release set;
+do not invent one. The v0.1.0 artifact actually reports `kronik 0.1.0-dev` and
+records Wasmtime 50.0.0; its real identity is retained rather than rewritten.
+The v0.4.0 artifact reports `kronik 0.4.0` and records Wasmtime 50.0.1.
 
 The saved logs were produced by those binaries running the maintained test
 applications. Their embedded component bytes remain exactly as recorded.
@@ -121,6 +122,14 @@ Separately, the index's `components` entries preserve the genuine tagged old
 SDK/WIT component bytes, including older counters that differ from today's
 counter fixture. A newly compiled component with the same WIT package name
 is not a substitute for those bytes.
+
+The v0.4.0 case is the first produced from an attested release. The Sigstore
+attestation of its x86_64 musl archive was verified with the installer's pinned
+verifier, and the pinned binary digest is the ELF digest in the attested
+`reproducibility.json`. Its tagged counter and notes are the maintained fixtures
+of that tag, so its notes entry reuses the stored v0.3.0 notes bytes. Its data
+holds files that the earlier producers did not write: a second snapshot taken at
+shutdown, the secret-coverage watermark and the foreign-actor layout marker.
 
 Run the existing public-binary consumer from a clean candidate checkout:
 
@@ -203,7 +212,7 @@ promotion. The exact
 [released-component and contract proof](https://github.com/G-man3207/Kronik/wiki/Performance-evidence)
 is retained; this was not a source-copy, default-value or decoder-only test.
 
-The released v0.1.0/v0.3.0 WIT definitions and the committed `d9b946f2`
+The released v0.1.0/v0.3.0/v0.4.0 WIT definitions and the committed `d9b946f2`
 definition also resolve to the same actual Git blob,
 `86c3f0e739057aa08c460bda06f1a42c9679d87e`. That confirms the legacy definition's
 lineage without substituting today's component binary for the older binaries.
@@ -264,9 +273,10 @@ producer data/manifest, the observed original root count, genuine tagged
 components, and exact tagged contract source bytes with Git-blob and SHA-256
 identities. Do not delete a published release to make the matrix green, rewrite
 old bytes for a new engine, or replace a tagged component with a new build.
-The currently retained v0.1.0/v0.3.0 snapshots were read directly from source
-commits `f4d9d9e2cccf515cb5cc4952c0e8a3f643372e34` and
-`d9d460bc89f6ae30962ef16238b8fcaa6485a8de`.
+The currently retained v0.1.0/v0.3.0/v0.4.0 snapshots were read directly from
+source commits `f4d9d9e2cccf515cb5cc4952c0e8a3f643372e34`,
+`d9d460bc89f6ae30962ef16238b8fcaa6485a8de` and
+`90e0c92194514ad141a6273f26fc99f34145acff`.
 
 The case is produced from the published binary, never from a build or from the
 candidate:

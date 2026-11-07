@@ -1,6 +1,6 @@
 {
   "format": "kronik.compatibility-index/v2",
-  "published_releases": ["v0.1.0", "v0.3.0"],
+  "published_releases": ["v0.1.0", "v0.3.0", "v0.4.0"],
   "releases": [
     {
       "release": "v0.1.0",
@@ -102,6 +102,62 @@
           "source_path": "tests/guests/counter.wasm",
           "git_blob": "5e60c741cbeb65c5824c3d6c33c3ac2cce3a1694",
           "sha256": "1f989c2895d6374c5c4d46a94462487d307b100fe12c716fd55fc965b17383d1",
+          "bytes": 109079
+        },
+        {
+          "role": "notes",
+          "path": "components/250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423.wasm",
+          "source_path": "tests/guests/notes.wasm",
+          "git_blob": "c3147d12ffc2f3838809b3e20cf8dab8948f7216",
+          "sha256": "250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423",
+          "bytes": 76877
+        }
+      ]
+    },
+    {
+      "release": "v0.4.0",
+      "producer_revision": "90e0c92194514ad141a6273f26fc99f34145acff",
+      "producer_binary_sha256": "879c03b7fce8dd50bdbd24e8ccec70b3ebb2c40636f6368e3808f459d5557f7c",
+      "manifest": "v0.4.0/manifest.json",
+      "manifest_sha256": "55d337e3824f6e01630b6631a457cacf12761e149ab6bbbe1b07edf05eb3426a",
+      "root_inputs": 9,
+      "contracts": {
+        "api": {
+          "path": "v0.4.0/contracts/openapi.json",
+          "source_path": "docs/reference/openapi.json",
+          "git_blob": "57f1831b815788dea69b1683e6f26f755a515155",
+          "sha256": "7c295a3e9e8b82db97596cc504cff1d3ff296ad0f5ea019957ab7ccac78a64d4",
+          "bytes": 393905
+        },
+        "cli": {
+          "path": "v0.4.0/contracts/cli-json.txt",
+          "source_path": "docs/reference/json.md",
+          "git_blob": "150dcc4863ff4a26221d41623bdbec5369185d8c",
+          "sha256": "13422e9f6c3f11bc7017e07f775401e65dd4c6972c461472d96b941a4cecf4a4",
+          "bytes": 154313
+        },
+        "diff": {
+          "path": "v0.4.0/contracts/diff-v1.schema.json",
+          "source_path": "docs/reference/diff-v1.schema.json",
+          "git_blob": "8a9f7feb0f3f258ca6010170ace23e452ad9d3a4",
+          "sha256": "cc2087050a2f5502f06cae54bf9c90cb868d112819667d1cc4206b7788912ff1",
+          "bytes": 43870
+        },
+        "wit": {
+          "path": "v0.4.0/contracts/actor.wit",
+          "source_path": "wit/kronik-actor.wit",
+          "git_blob": "86c3f0e739057aa08c460bda06f1a42c9679d87e",
+          "sha256": "c2e7336a41b18405b5dfa26dad95600de79a21c133c61ec9ba516e0a63b32af6",
+          "bytes": 5832
+        }
+      },
+      "components": [
+        {
+          "role": "counter",
+          "path": "components/747c8630dfe34766b8b29f81787145b0c5061acef875be5c2c04c8da4ea70fb5.wasm",
+          "source_path": "tests/guests/counter.wasm",
+          "git_blob": "51bb8c5b672d056de9f651081bfc6c037793c2c7",
+          "sha256": "747c8630dfe34766b8b29f81787145b0c5061acef875be5c2c04c8da4ea70fb5",
           "bytes": 109079
         },
         {

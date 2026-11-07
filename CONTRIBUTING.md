@@ -64,8 +64,8 @@ These are semantic checks of parsers, provenance, tampering and regression
 enforcement, not real benchmark results or between-release performance acceptance.
 The `examples` step tests the dependency-free standalone `tools/loadgen`.
 The `ts` step reuses its already-built binary for the CLI/API/WIT/error
-documentation-surface gate and the frozen v0.1.0/v0.3.0 log and genuine tagged
-component consumers. A newly routed operation or error code requires the
+documentation-surface gate and the frozen v0.1.0/v0.3.0/v0.4.0 log and genuine
+tagged component consumers. A newly routed operation or error code requires the
 regenerated reference and usage examples in the same change; results from an
 earlier revision are not evidence for the integrated build. Compatibility
 failures retain their fresh, printed fixture directory; success removes only
