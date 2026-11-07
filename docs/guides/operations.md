@@ -249,6 +249,17 @@ and [0104](../adr/0104-admin-ui-as-a-public-api-client.md).
 | `wrapped_file` | `"keys/master.wrapped"` | KMS ciphertext, relative to `data_dir`; absolute paths, `.` and `..` are refused | |
 | `start_timeout` | `"60s"` | Total retry/timeout budget for one high-level KMS load, wrap or rewrap, including encrypt and verification decrypt; a positive duration in `ms`, `s` or `m` | |
 
+### [secrets]
+
+| Key | Default | Meaning |
+|---|---|---|
+| `refresh` | `"5m"` | About how often the node reads every secret's current version from its source and rebuilds the inventory of secret values that the views remove from what they show; a value read from a backend is also used for this long without another request. **Keep `refresh` well above the `elapsed_ms` of the `secret inventory certified` log line:** a rebuild that takes longer than `refresh` never installs its certificate, and the reads that remove secret values answer 503 `SECRET_UNAVAILABLE` for as long as that holds. The daemon logs a warning, `the catalogue the secret inventory was built from is older than [secrets] refresh`, when that is the cause |
+| `max_stale` | `"24h"` | How long a value that was authorized stays in use while its backend is unavailable (a timeout or a 5xx answer). A definitive refusal, a missing version or a binding that no longer matches ends its use at once |
+| `fetch_timeout` | `"2s"` | The longest a request to a backend, or a secret change waiting for the inventory to be published again, takes; at most `"60s"`. When the wait for the inventory runs out, `kronik secret set`, `delete`, `link`, `unlink` and `refresh` answer 503 `SECRET_UNAVAILABLE` saying that the change is already committed: it is made, so do not repeat it |
+
+External backends are defined in `[secrets.backends.<id>]` tables; see the
+[M23 design](../design/m23-secret-backends.md).
+
 ### [privacy]
 
 | Key | Default | Meaning |
@@ -1487,7 +1498,7 @@ operator meets:
 | `ENGINE_VERSION_MISMATCH` | A new binary started against data written by another engine, without a passing check | Run `kronik upgrade check --window 6h`, or start the recorded engine version |
 | `UNAUTHENTICATED`, `SCOPE_MISSING`, `TOKEN_NOT_FOUND` | A bearer token is missing, lacks the scope, or was revoked | `kronik token list`, `kronik token create --name <name> --scopes <scope>,... --reason ...`, on the socket as root or a member of `kronik` |
 | `SECRET_NOT_FOUND` | An effect uses a secret that isn't set, or was deleted | `kronik secret set <name> --reason ...` |
-| `SECRET_UNAVAILABLE` | A read answered 503 while the secret inventory was needed | After a restart, every read that needs scrubbing: the provider no longer serves a version that Kronik recorded, [a known defect](#secrets-that-an-external-backend-no-longer-serves) |
+| `SECRET_UNAVAILABLE` | A read answered 503 while the secret inventory was needed | After a restart, every read that needs scrubbing: the provider no longer serves a version that Kronik recorded, [a known defect](#secrets-that-an-external-backend-no-longer-serves). Or the rebuild of the inventory takes longer than `[secrets] refresh` and the daemon logs that it did not install its certificate: raise `refresh` above the `elapsed_ms` of the `secret inventory certified` line ([`[secrets]`](#secrets)) |
 | `SECRET_VERSION_GONE` | A turn needed a secret version that its provider no longer serves, for example the re-run of a `secret.reveal` after the version was destroyed | The turn is recorded as failed before the guest runs, and no other version's value is used. See [the same section](#secrets-that-an-external-backend-no-longer-serves) for what else the lost version does |
 | `RUNSC_MISSING`, `KVM_UNAVAILABLE`, `RUNC_MISSING`, `FOREIGN_UNAVAILABLE` | Foreign actors can't run | `kronik doctor` names the cause; see [Foreign actors](#foreign-actors) |
 | `IMAGE_INVALID` | `kronik foreign add` got an image it can't verify or unpack | Check the reference; private images need a local layout |

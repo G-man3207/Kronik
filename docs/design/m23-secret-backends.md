@@ -785,6 +785,15 @@ max_stale = "24h"
 fetch_timeout = "2s"
 ```
 
+`refresh` also limits how old the catalogue behind an inventory certificate
+may be: a rebuild installs its certificate only if the catalogue it was built
+from is younger than `refresh`. A rebuild that takes longer never installs
+one, and the reads that scrub answer 503 `SECRET_UNAVAILABLE` until one does,
+so `refresh` has to stay well above the `elapsed_ms` of the `secret
+inventory certified` log line. The daemon logs a warning when a certificate
+was not installed for that reason (see [`[secrets]` in Operating
+Kronik](../guides/operations.md#secrets)).
+
 `Config::check` refuses:
 - inline credentials (keys named `token`, `secret_id`, `client_secret` or
   `pin`); only `*_file` and env names are accepted;
