@@ -39,9 +39,9 @@ use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{AtFlags, FileType, Gid, Mode, OFlags, Stat, Uid};
 
-/// How deep and how large a tree this module will list and hand over. A
-/// restore stage holds one file per log segment, so the bound is generous: it
-/// is there so that a tree made to be endless cannot exhaust memory.
+/// How deep and how large a tree this module will list and hand over. A data
+/// directory holds one file per log segment, so the bound is generous: it is
+/// there so that a tree made to be endless cannot exhaust memory.
 const MAX_DEPTH: usize = 16;
 const MAX_ENTRIES: usize = 1 << 20;
 

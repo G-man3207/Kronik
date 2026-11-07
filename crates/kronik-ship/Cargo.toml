@@ -17,10 +17,8 @@ kronik-store = { workspace = true }
 object_store = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
-rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
@@ -28,6 +26,7 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 kronik-core = { workspace = true, features = ["real"] }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]

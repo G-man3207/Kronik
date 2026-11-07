@@ -380,7 +380,7 @@ fn shipping_state_format_is_strict_and_failures_are_not_fresh_defaults() {
 }
 
 #[test]
-fn prepared_restore_never_reloads_the_source_and_keeps_the_directory_lock() {
+fn a_restore_in_two_phases_never_reloads_the_source_and_keeps_the_directory_lock() {
     let src = tempfile::tempdir().unwrap();
     let bucket = tempfile::tempdir().unwrap();
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
@@ -432,14 +432,12 @@ fn prepared_restore_never_reloads_the_source_and_keeps_the_directory_lock() {
     };
     assert!(
         runtime
-            .block_on(kronik_ship::prepare_restore(
+            .block_on(kronik_ship::root_phase(
                 &remote,
                 dst.path(),
-                "main",
                 &env,
                 &wrong,
-                KeystoreMode::Require,
-                &held
+                KeystoreMode::Require
             ))
             .is_err()
     );
@@ -450,40 +448,38 @@ fn prepared_restore_never_reloads_the_source_and_keeps_the_directory_lock() {
         "wrong source cannot create destination files"
     );
     std::fs::remove_file(bad).unwrap();
-    let prepared = runtime
-        .block_on(kronik_ship::prepare_restore(
+    let phase = runtime
+        .block_on(kronik_ship::root_phase(
             &remote,
             dst.path(),
-            "main",
             &env,
             &keys,
             KeystoreMode::Require,
-            &held,
         ))
         .unwrap();
     assert!(
         !dst.path().join(".restore").exists(),
-        "preparation must not write into the destination"
+        "the root phase must not write into the destination"
     );
     assert!(!dst.path().join("branches").exists());
     assert!(matches!(
         kronik_privacy::key_source::lock_data(dst.path()),
         Err(kronik_privacy::key_source::KeySourceError::DataInUse)
     ));
-    // The hand-over of the stage to the destination owner: here the owner is
-    // the current user, so the change is allowed and the walk is the real one.
-    // It also proves that the stage is private to the caller whatever the
-    // umask is (the hand-over refuses a directory that others can enter), which
-    // `tempdir()` alone does not give: it creates 0777 & !umask.
-    let (uid, gid) = (
-        rustix::process::geteuid().as_raw(),
-        rustix::process::getegid().as_raw(),
-    );
-    prepared.handover(uid, gid).unwrap();
-    // The source key is gone: installing uses the keystore backup that was
-    // decrypted while preparing, and never loads the source again.
+    // The source key is gone: the owner's phase uses the key and the keystore
+    // backup of the root phase, and never loads the source again.
     std::fs::remove_file(&key).unwrap();
-    let report = kronik_ship::install_prepared(dst.path(), "main", false, prepared, &held).unwrap();
+    let report = runtime
+        .block_on(kronik_ship::restore_as_owner(
+            &remote,
+            dst.path(),
+            "main",
+            false,
+            &env,
+            phase,
+            &held,
+        ))
+        .unwrap();
     assert_eq!(report.keystore, "installed");
     assert!(dst.path().join("branches/main/state.db").exists());
     assert!(matches!(
@@ -493,24 +489,24 @@ fn prepared_restore_never_reloads_the_source_and_keeps_the_directory_lock() {
 }
 
 #[test]
-fn failed_preparation_leaves_an_empty_destination_empty() {
+fn a_failed_restore_in_two_phases_leaves_an_empty_destination_empty() {
     let bucket = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     let runtime = rt();
+    let env = Env::real(runtime.handle().clone());
     let held = kronik_privacy::key_source::lock_data(dst.path()).unwrap();
-    assert!(
-        runtime
-            .block_on(kronik_ship::prepare_restore(
-                &remote,
-                dst.path(),
-                "main",
-                &Env::real(runtime.handle().clone()),
-                &Default::default(),
-                KeystoreMode::Require,
-                &held
-            ))
-            .is_err()
-    );
+    let result = runtime.block_on(async {
+        let phase = kronik_ship::root_phase(
+            &remote,
+            dst.path(),
+            &env,
+            &Default::default(),
+            KeystoreMode::Require,
+        )
+        .await?;
+        kronik_ship::restore_as_owner(&remote, dst.path(), "main", false, &env, phase, &held).await
+    });
+    assert!(result.is_err());
     assert_eq!(std::fs::read_dir(dst.path()).unwrap().count(), 0);
 }

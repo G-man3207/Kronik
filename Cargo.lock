@@ -2334,7 +2334,6 @@ dependencies = [
  "kronik-store",
  "object_store",
  "reqwest",
- "rustix",
  "rustls",
  "serde",
  "serde_json",
