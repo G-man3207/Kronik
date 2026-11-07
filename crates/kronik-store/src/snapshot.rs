@@ -402,7 +402,159 @@ pub fn install(snapshot: &Path, branch_dir: &Path) -> Result<(), StoreError> {
     std::fs::create_dir_all(&sql).map_err(io)?;
     std::fs::copy(snapshot.join("state.db"), branch_dir.join("state.db")).map_err(io)?;
     copy_tree(&snapshot.join("sql"), &sql)?;
+    stamp_installed(snapshot, &sql)
+}
+
+/// A snapshot is a consistent cut: every actor database in it is complete
+/// through the snapshot's LSN, however long ago its last change was. An
+/// actor database's own applied LSN says only where its last change was
+/// (`SqlActor::apply`), and `Store::replay_from` reads it as the point the
+/// log is needed from, so the copies carry the cut: otherwise an idle actor
+/// would send the start back to a log the snapshot replaced. The snapshot
+/// itself is not touched (its manifest hashes the files).
+fn stamp_installed(snapshot: &Path, sql: &Path) -> Result<(), StoreError> {
+    let lsn = snapshot_lsn(snapshot)?;
+    for_each_db(sql, &mut |path| {
+        let conn = Connection::open(path).map_err(sqlite)?;
+        conn.execute(
+            "UPDATE _kronik_meta SET v = ?1 WHERE k = 'applied_lsn' AND v < ?1",
+            [lsn as i64],
+        )
+        .map_err(sqlite)?;
+        Ok(())
+    })
+}
+
+/// The applied LSN of a snapshot's `state.db`: the LSN of its cut.
+fn snapshot_lsn(snapshot: &Path) -> Result<Lsn, StoreError> {
+    let conn = Connection::open_with_flags(
+        snapshot.join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(sqlite)?;
+    let lsn: i64 = conn
+        .query_row("SELECT v FROM meta WHERE k = 'applied_lsn'", [], |r| {
+            r.get(0)
+        })
+        .map_err(sqlite)?;
+    Ok(lsn as Lsn)
+}
+
+/// `f` for every actor database file (`*.db`) under `dir` (`<xx>/<file>.db`).
+fn for_each_db(
+    dir: &Path,
+    f: &mut dyn FnMut(&Path) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for e in entries {
+        let e = e.map_err(io)?;
+        let path = e.path();
+        if e.file_type().map_err(io)?.is_dir() {
+            for_each_db(&path, f)?;
+        } else if path.extension().is_some_and(|x| x == "db") {
+            f(&path)?;
+        }
+    }
     Ok(())
+}
+
+/// What a branch directory's databases say about where the log must be
+/// replayed from: what [`Store::replay_from`] computes once the store is
+/// open, read before it opens (`prepare_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Markers {
+    /// `state.db`'s applied LSN.
+    pub state: Lsn,
+    /// The lowest applied LSN of `state.db` and of the actor databases it
+    /// lists. A listed database whose file is missing counts 0: the store
+    /// would create it empty and replay from the start.
+    pub lowest: Lsn,
+    /// Actor databases that could not be read. Only in read-only mode, where
+    /// a running daemon's exclusive lock refuses the read.
+    pub unread: usize,
+}
+
+/// The [`Markers`] of `branch_dir`, or `None` when it has no `state.db`.
+/// `log_first` is the first LSN the log holds: while it is 1 no database can
+/// be behind it, and when `state.db` itself is behind it the start installs
+/// a snapshot whatever the actor databases say, so in both cases they are not
+/// read (`lowest` is then `state`) and a start that has nothing to repair
+/// opens nothing extra. Read-only mode (`kronik upgrade check`, which may run
+/// beside a daemon) counts a database it cannot read instead of waiting for
+/// it or failing.
+pub fn read_markers(
+    branch_dir: &Path,
+    read_only: bool,
+    log_first: Option<Lsn>,
+) -> Result<Option<Markers>, StoreError> {
+    let state_db = branch_dir.join("state.db");
+    if !state_db.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(&state_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(sqlite)?;
+    let state = conn
+        .query_row("SELECT v FROM meta WHERE k = 'applied_lsn'", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map_or(0, |v| v as Lsn);
+    let first = log_first.unwrap_or(1);
+    if first <= 1 || state + 1 < first {
+        return Ok(Some(Markers {
+            state,
+            lowest: state,
+            unread: 0,
+        }));
+    }
+    let actors: Vec<String> =
+        match conn.prepare("SELECT kind, key FROM actors WHERE sql = 1 ORDER BY kind, key") {
+            Ok(mut st) => st
+                .query_map([], |r| {
+                    Ok(format!(
+                        "{}/{}",
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?
+                    ))
+                })
+                .and_then(|rows| rows.collect::<rusqlite::Result<_>>())
+                .map_err(sqlite)?,
+            // A state database from before the actors table has no SQL actors.
+            Err(_) => Vec::new(),
+        };
+    let mut out = Markers {
+        state,
+        lowest: state,
+        unread: 0,
+    };
+    let root = branch_dir.join("sql");
+    for name in actors {
+        let file = crate::sql::actor_file(&root, &name);
+        if !file.exists() {
+            out.lowest = 0;
+            continue;
+        }
+        let flags = if read_only {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        } else {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        };
+        let read = Connection::open_with_flags(&file, flags).and_then(|c| {
+            c.busy_timeout(std::time::Duration::ZERO)?;
+            c.query_row(
+                "SELECT v FROM _kronik_meta WHERE k = 'applied_lsn'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        });
+        match read {
+            Ok(v) => out.lowest = out.lowest.min(v as Lsn),
+            Err(_) if read_only => out.unread += 1,
+            Err(e) => return Err(sqlite(e)),
+        }
+    }
+    Ok(Some(out))
 }
 
 fn copy_tree(from: &Path, to: &Path) -> Result<(), StoreError> {
@@ -694,5 +846,63 @@ mod tests {
         let out = store.raise_idle_sql(50, 64).unwrap();
         assert_eq!(out.blocked, ["a/idle"], "{out:?}");
         assert!(!file.exists(), "stamping must not invent an empty database");
+    }
+
+    #[test]
+    fn install_carries_the_cut_to_every_database_and_leaves_the_snapshot_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with(dir.path(), 100, &[("a/idle", 5), ("b/recent", 90)]);
+        let snap = dir.path().join("snap");
+        store.snapshot_to(&snap).unwrap();
+        drop(store);
+        let branch = dir.path().join("restored");
+        std::fs::create_dir_all(&branch).unwrap();
+        install(&snap, &branch).unwrap();
+        let sql = branch.join("sql");
+        assert_eq!(marker_of(&actor_file(&sql, "a/idle")), 100);
+        assert_eq!(marker_of(&actor_file(&sql, "b/recent")), 100);
+        // The snapshot's own copies keep what they had (its manifest hashes them).
+        let theirs = snap.join("sql");
+        assert_eq!(marker_of(&actor_file(&theirs, "a/idle")), 5);
+        assert_eq!(marker_of(&actor_file(&theirs, "b/recent")), 90);
+        // And the installed directory starts from the cut.
+        let markers = read_markers(&branch, false, Some(50)).unwrap().unwrap();
+        assert_eq!(
+            (markers.state, markers.lowest, markers.unread),
+            (100, 100, 0)
+        );
+    }
+
+    #[test]
+    fn the_markers_read_before_the_store_opens_are_the_ones_replay_from_gives() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with(dir.path(), 100, &[("a/idle", 5), ("b/recent", 90)]);
+        let replay_from = store.replay_from().unwrap();
+        // A running daemon holds its databases exclusively: a read-only look
+        // counts them and does not wait.
+        let started = std::time::Instant::now();
+        let seen = read_markers(dir.path(), true, Some(50)).unwrap().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(seen.unread, 2, "{seen:?}");
+        drop(store);
+        let seen = read_markers(dir.path(), false, Some(50)).unwrap().unwrap();
+        assert_eq!(
+            (seen.state, seen.lowest, seen.unread),
+            (100, replay_from, 0)
+        );
+        assert_eq!(replay_from, 5);
+        // They are not read when they cannot matter: a log from LSN 1 (or no
+        // log yet), or a state.db that is behind the log by itself.
+        for first in [None, Some(1), Some(102)] {
+            let seen = read_markers(dir.path(), false, first).unwrap().unwrap();
+            assert_eq!((seen.state, seen.lowest), (100, 100), "{first:?}");
+        }
+        // No state.db: nothing to read.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            read_markers(empty.path(), false, Some(50))
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -80,6 +80,21 @@ restore, a lost disk) or the log no longer holds the records after
 then the log is applied from `L + 1`. Without one: `STORAGE_CORRUPT`
 naming the gap.
 
+*Which `applied_lsn`.* The start replays from the lowest applied LSN of
+`state.db` and of every actor database (`Store::replay_from`), because the
+files commit independently. An actor database's applied LSN is where its
+**last change** was (idempotence for `apply`, and the point the log is
+needed from), not "complete through n": an actor that has not changed for
+longer than `history` says an LSN that retention has long deleted. So the
+question above is asked of the lowest of them (`plan_state`, which
+`prepare_state`, the start, and `kronik upgrade check` all call), and an
+installed snapshot carries its cut to every database it installs: a
+snapshot is a consistent cut, complete through its LSN for each of them
+(`install` stamps the copies; the snapshot's own files are untouched, its
+manifest hashes them). Compaction does the same before it deletes (§5).
+No stored shape changes: the stamp is the row `stamp_applied` already
+writes for a rebase switch.
+
 **Replay cursors** (m3-fork §3.3) start from the nearest snapshot at or
 below the LSN they need instead of LSN 1: the snapshot's databases are
 loaded into memory (SQLite backup from file into an in-memory connection,

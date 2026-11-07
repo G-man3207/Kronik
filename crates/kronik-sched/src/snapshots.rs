@@ -287,10 +287,83 @@ pub fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Before the store opens: when `state.db` is missing, or behind the first
-/// LSN the log still holds, install the newest snapshot the log continues
-/// (m6-storage §3). A `state.db` an interrupted bulk replay left counts as
-/// missing. Returns the installed snapshot's LSN.
+/// What [`prepare_state`] decides, without doing it.
+#[derive(Debug)]
+pub struct StatePlan {
+    /// The snapshot to install, when the branch's databases are behind the
+    /// first LSN the log still holds (or there is no `state.db`).
+    pub install: Option<(PathBuf, Manifest)>,
+    /// `state.db`'s applied LSN and the lowest applied LSN of it and the
+    /// actor databases, when there is a `state.db`. The start refuses to
+    /// replay from the lowest one when the log no longer reaches it.
+    pub state: Option<(Lsn, Lsn)>,
+    /// Actor databases a read-only plan could not read (a running daemon
+    /// holds them). Always 0 for the plan the start makes.
+    pub unread: usize,
+}
+
+/// Whether the databases of `branch` are behind the log, and the snapshot
+/// that repairs it. The start refuses to replay from a point the log no
+/// longer holds (`Node::start`, from [`kronik_store::Store::replay_from`]:
+/// the lowest applied LSN of `state.db` and of every actor database), so
+/// this asks the same question before the store opens. `read_only` is for
+/// `kronik upgrade check`, which may run beside a daemon and so must neither
+/// wait for the databases it holds nor write.
+///
+/// An error is a start that cannot succeed: the log starts after what the
+/// databases hold, and no snapshot reaches the log.
+pub fn plan_state(data: &Path, branch: &str, read_only: bool) -> Result<StatePlan, String> {
+    let branch_dir = data.join("branches").join(branch);
+    let starts = kronik_log::segment_starts(&branch_dir.join("log")).map_err(|e| e.to_string())?;
+    let log_first = starts.first().copied();
+    let markers = kronik_store::snapshot::read_markers(&branch_dir, read_only, log_first)
+        .map_err(|e| e.to_string())?;
+    let behind = match markers {
+        Some(m) => log_first.is_some_and(|f| m.lowest + 1 < f),
+        // A fresh node (no log either) needs nothing.
+        None => log_first.is_some_and(|f| f > 1) || !list(data, branch).is_empty(),
+    };
+    let state = markers.map(|m| (m.state, m.lowest));
+    let unread = markers.map_or(0, |m| m.unread);
+    if !behind {
+        return Ok(StatePlan {
+            install: None,
+            state,
+            unread,
+        });
+    }
+    let usable = list(data, branch)
+        .into_iter()
+        .rev()
+        .find(|(_, m)| log_first.is_none_or(|f| m.lsn + 1 >= f));
+    let Some(found) = usable else {
+        let first = log_first.unwrap_or(1);
+        return Err(match state {
+            Some((_, lowest)) => format!(
+                "state is at lsn {lowest}, but the log starts at {first} (compacted) and no \
+                 snapshot reaches it; restore one (kronik restore --from ...)"
+            ),
+            None => format!(
+                "the log starts at LSN {first} and no snapshot reaches it; restore one \
+                 (kronik restore --from ...)"
+            ),
+        });
+    };
+    Ok(StatePlan {
+        install: Some(found),
+        state,
+        unread,
+    })
+}
+
+/// Before the store opens: when `state.db` is missing, or the databases are
+/// behind the first LSN the log still holds, install the newest snapshot the
+/// log continues (m6-storage §3). "The databases" are `state.db` and every
+/// actor database: an actor that has not changed for longer than `history`
+/// would otherwise keep the start from the log that retention deleted (the
+/// compaction raises their applied LSN before it deletes, but a directory an
+/// older binary compacted has them behind). A `state.db` an interrupted bulk
+/// replay left counts as missing. Returns the installed snapshot's LSN.
 pub fn prepare_state(data: &Path, branch: &str) -> Result<Option<Lsn>, String> {
     let branch_dir = data.join("branches").join(branch);
     // Copies a crash left mid-snapshot: before anything reads the list.
@@ -308,40 +381,20 @@ pub fn prepare_state(data: &Path, branch: &str) -> Result<Option<Lsn>, String> {
     if swept > 0 {
         tracing::info!(swept, "deleted copies an interrupted state hash left");
     }
-    let starts = kronik_log::segment_starts(&branch_dir.join("log")).map_err(|e| e.to_string())?;
-    let log_first = starts.first().copied();
-    let state = branch_dir.join("state.db");
-    let behind = if state.exists() {
-        let conn = rusqlite::Connection::open_with_flags(
-            &state,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|e| e.to_string())?;
-        let applied: Option<i64> = conn
-            .query_row("SELECT v FROM meta WHERE k = 'applied_lsn'", [], |r| {
-                r.get(0)
-            })
-            .ok();
-        let applied = applied.unwrap_or(0) as Lsn;
-        log_first.is_some_and(|f| applied + 1 < f)
-    } else {
-        // A fresh node (no log either) needs nothing.
-        log_first.is_some_and(|f| f > 1) || !list(data, branch).is_empty()
-    };
-    if !behind {
+    let plan = plan_state(data, branch, false)?;
+    let Some((dir, m)) = plan.install else {
         return Ok(None);
-    }
-    let usable = list(data, branch)
-        .into_iter()
-        .rev()
-        .find(|(_, m)| log_first.is_none_or(|f| m.lsn + 1 >= f));
-    let Some((dir, m)) = usable else {
-        return Err(format!(
-            "the log starts at LSN {} and no snapshot reaches it; restore one \
-             (kronik restore --from ...)",
-            log_first.unwrap_or(1)
-        ));
     };
+    if let Some((state, lowest)) = plan.state
+        && lowest < state
+    {
+        tracing::warn!(
+            state,
+            lowest,
+            "an actor database is older than the log retention kept: installing the newest \
+             snapshot, whose cut is complete for every database"
+        );
+    }
     kronik_store::snapshot::install(&dir, &branch_dir).map_err(|e| e.to_string())?;
     let secrets = dir.join("secrets.db");
     let keys = data.join("keys");
@@ -352,8 +405,6 @@ pub fn prepare_state(data: &Path, branch: &str) -> Result<Option<Lsn>, String> {
     tracing::warn!(lsn = m.lsn, snapshot = %m.id, "installed a snapshot as the branch's state");
     Ok(Some(m.lsn))
 }
-/// The earliest applied erasure's LSN, if `state.db` records one. A fork
-/// or restore must not go back past it (docs/design/m8-privacy.md §6.6).
 /// The newest StateRebase switch of `branch` as its state database has it:
 /// (its LSN, its base LSN). Read-only, also while the node runs.
 pub fn last_rebase_at(data: &Path, branch: &str) -> Option<(Lsn, Lsn)> {

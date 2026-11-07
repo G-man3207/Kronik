@@ -1363,6 +1363,38 @@ fn compacted_past_an_idle_actor(dir: &Path) -> (u64, u64) {
     (note, first)
 }
 
+/// Sets the applied LSN of every actor database under `root` (a branch's
+/// `sql/` or a snapshot's) to `lsn`, as the old compaction left them.
+fn lower_markers(root: &Path, lsn: u64) -> usize {
+    let mut n = 0;
+    if let Ok(dirs) = std::fs::read_dir(root) {
+        for d in dirs.flatten() {
+            if d.file_type().unwrap().is_dir() {
+                n += lower_markers(&d.path(), lsn);
+            } else if d.path().extension().is_some_and(|e| e == "db") {
+                rusqlite::Connection::open(d.path())
+                    .unwrap()
+                    .execute(
+                        "UPDATE _kronik_meta SET v = ?1 WHERE k = 'applied_lsn'",
+                        [lsn as i64],
+                    )
+                    .unwrap();
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// A directory as the old compaction left it: the live databases and those in
+/// every snapshot say the actor's last change, below the log.
+fn made_stuck(dir: &Path, note: u64) {
+    assert_eq!(lower_markers(&dir.join("branches/main/sql"), note), 1);
+    for s in std::fs::read_dir(dir.join("snapshots/main")).unwrap() {
+        lower_markers(&s.unwrap().path().join("sql"), note);
+    }
+}
+
 #[test]
 fn an_idle_sql_actor_does_not_stop_the_restart_after_a_compaction() {
     let dir = tempdir();
@@ -1379,6 +1411,78 @@ fn an_idle_sql_actor_does_not_stop_the_restart_after_a_compaction() {
     let list = reply(&p, "notes/n", "list");
     assert_eq!(list.matches("hello").count(), 1, "{list}");
     assert_eq!(list.matches("after the restart").count(), 1, "{list}");
+}
+
+#[test]
+fn a_directory_an_older_binary_compacted_is_repaired_by_the_next_start() {
+    let dir = tempdir();
+    let (note, first) = compacted_past_an_idle_actor(dir.path());
+    made_stuck(dir.path(), note);
+
+    // The question the start asks, asked before it, read-only: it will install
+    // the newest snapshot, which reaches the log.
+    let plan = kronik_sched::snapshots::plan_state(dir.path(), "main", true).unwrap();
+    let (_, lowest) = plan.state.unwrap();
+    assert_eq!(lowest, note);
+    let (_, snapshot) = plan.install.expect("a snapshot repairs it");
+    assert!(snapshot.lsn + 1 >= first);
+
+    let p = compacting(dir.path());
+    let list = reply(&p, "notes/n", "list");
+    assert_eq!(list.matches("hello").count(), 1, "{list}");
+    p.send("notes/n", "add", "after the repair");
+    let list = reply(&p, "notes/n", "list");
+    assert_eq!(list.matches("hello").count(), 1, "{list}");
+    assert_eq!(list.matches("after the repair").count(), 1, "{list}");
+    assert!(p.node.store().replay_from().unwrap() + 1 >= first);
+}
+
+#[test]
+fn a_stuck_directory_no_snapshot_reaches_says_so_before_and_at_the_start() {
+    let dir = tempdir();
+    let (note, first) = compacted_past_an_idle_actor(dir.path());
+    made_stuck(dir.path(), note);
+    std::fs::remove_dir_all(dir.path().join("snapshots")).unwrap();
+
+    let check = kronik_sched::snapshots::plan_state(dir.path(), "main", true).unwrap_err();
+    assert!(
+        check.contains(&format!(
+            "state is at lsn {note}, but the log starts at {first}"
+        )),
+        "{check}"
+    );
+    let start = kronik_sched::snapshots::prepare_state(dir.path(), "main").unwrap_err();
+    assert_eq!(start, check);
+    let (_rt, node) = try_start_with(dir.path(), 48, Some(Duration::ZERO), Some(4096), None);
+    assert!(
+        matches!(node, Err(kronik_sched::StartError::Corrupt(m)) if m == check),
+        "the start must refuse with the same words"
+    );
+}
+
+#[test]
+fn the_read_only_plan_does_not_wait_for_a_node_that_holds_its_databases() {
+    let dir = tempdir();
+    compacted_past_an_idle_actor(dir.path());
+    // The node that runs holds `notes/n` exclusively once it has written to
+    // it (the databases use exclusive locking). `kronik upgrade check` may run
+    // beside it: it counts what it cannot read and neither waits nor writes.
+    let p = compacting(dir.path());
+    p.send("notes/n", "add", "while the check runs");
+    let started = std::time::Instant::now();
+    let plan = kronik_sched::snapshots::plan_state(dir.path(), "main", true).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(plan.install.is_none());
+    assert_eq!(plan.unread, 1, "notes/n is held by the running node");
+    drop(p);
+    // A log that still starts at LSN 1 has nothing to ask of the actors.
+    let young = tempdir();
+    let p = compacting(young.path());
+    p.rt.block_on(p.node.deploy(&guest("notes"), audit(), false, p.owner()))
+        .unwrap();
+    p.send("notes/n", "add", "hello");
+    let plan = kronik_sched::snapshots::plan_state(young.path(), "main", true).unwrap();
+    assert_eq!((plan.unread, plan.install.is_none()), (0, true));
 }
 
 /// A pass that cannot make an actor database current does not delete: the
