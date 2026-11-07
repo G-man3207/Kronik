@@ -607,8 +607,10 @@ and says where the root unit differs:
   obsolete, raw-I/O, reboot and swap groups.
 - Left out on purpose: `MemoryDenyWriteExecute`, because Wasmtime compiles
   code at run time, and `RestrictSUIDSGID`, because it also makes `openat2`
-  fail, which `runsc restore` needs for sandbox copies in forks
-  ([ADR 0027](../adr/0027-systemd-unit-hardening.md)). The root unit leaves
+  fail, which `runsc restore` needs for sandbox copies in forks and which the
+  daemon needs to connect to a microVM's sockets
+  ([ADR 0027](../adr/0027-systemd-unit-hardening.md)); a drop-in that adds it
+  makes a microVM refuse to start with a message that names the setting. The root unit leaves
   out `ProtectHostname`, `ProtectKernelTunables`, `ProtectControlGroups` and a
   `CapabilityBoundingSet` as well, because `runsc` creates namespaces and
   cgroups there with host root.

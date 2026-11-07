@@ -439,6 +439,7 @@ impl Foreign {
         .await?;
         let dialer = Dialer::Vsock {
             socket: root.join("vsock.sock"),
+            cgroup: cgroup.clone(),
         };
         let copy = Arc::new(CopyInner {
             env: env.clone(),

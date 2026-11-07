@@ -140,6 +140,127 @@ pub fn require_leaf(
     }
 }
 
+/// The names of the VMM's sockets, `api.sock` and `vsock.sock`, are in a
+/// directory the VMM can write: a compromised VMM can replace either with a
+/// link to any socket the daemon can reach, and the daemon connects with its
+/// own authority. It only sends fixed bytes, so no use is known, but the
+/// peer must be the VMM and not what the VMM chose. So after every connect
+/// the peer, as the kernel recorded it when the socket was set to listen
+/// (`SO_PEERCRED`, in the daemon's PID namespace), must be a process of this
+/// VM's own cgroup, which holds the launcher and the VMM and nothing else.
+/// The check fails closed: a peer without a process id, a `/proc` entry that
+/// cannot be read (a process that ended and whose pid was reused between the
+/// connect and the read reads as another cgroup or as none) and a different
+/// cgroup are all refusals.
+async fn require_vm_peer(
+    env: &Env,
+    socket: &tokio::net::UnixStream,
+    cgroup: &str,
+) -> Result<(), String> {
+    let credentials = socket
+        .peer_cred()
+        .map_err(|e| format!("reading the peer of the VMM socket: {e}"))?;
+    // The VMM runs as this daemon's own identity.
+    if credentials.uid() != crate::sys::euid() {
+        return Err(format!(
+            "the peer of the VMM socket runs as user {}, not as this daemon's {}",
+            credentials.uid(),
+            crate::sys::euid()
+        ));
+    }
+    // No pid means a listener outside this PID namespace: not the VMM.
+    let pid = credentials
+        .pid()
+        .filter(|pid| *pid > 0)
+        .ok_or("the peer of the VMM socket has no process id in this PID namespace")?;
+    let theirs = env
+        .blocking("foreign-vm-peer", move || {
+            fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        })
+        .await
+        .ok_or("the peer check was dropped")?
+        .map_err(|e| format!("reading the cgroup of the VMM socket's peer {pid}: {e}"))?;
+    if peer_is_in(&theirs, cgroup) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the peer of the VMM socket (process {pid}) is not in the VM's cgroup"
+        ))
+    }
+}
+
+/// Why a connection to one of the VMM's sockets did not come about.
+pub(crate) enum Dial {
+    /// Nothing is listening yet (the VMM is still starting): try again.
+    Unavailable(String),
+    /// What is there is not the VMM's socket: a link, a file, another user's
+    /// socket, a listener that is not in the VM's cgroup. Never retried.
+    Refused(String),
+}
+
+impl Dial {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Dial::Unavailable(why) | Dial::Refused(why) => why,
+        }
+    }
+}
+
+/// Connects to the socket `socket` of the VMM, with every check that its name
+/// being the VMM's to choose calls for. The entry is opened without following a
+/// link and must be a socket of this daemon's user ([`crate::sys::open_socket_entry`]);
+/// the connection is made to the inode that was checked, through
+/// `/proc/self/fd`, so that a link planted in the meantime is never followed and
+/// no other socket sees a connection; and the listener must be in the VM's own
+/// cgroup ([`require_vm_peer`]), before a byte is sent.
+pub(crate) async fn connect_vmm_socket(
+    env: &Env,
+    socket: &Path,
+    cgroup: &str,
+) -> Result<tokio::net::UnixStream, Dial> {
+    let (Some(dir), Some(name)) = (socket.parent(), socket.file_name().and_then(|n| n.to_str()))
+    else {
+        return Err(Dial::Refused(format!(
+            "{} is not the path of a VMM socket",
+            socket.display()
+        )));
+    };
+    let (dir, name) = (dir.to_owned(), name.to_owned());
+    let entry = env
+        .blocking("foreign-vm-socket-entry", move || {
+            crate::sys::open_socket_entry(&dir, &name, crate::sys::euid())
+        })
+        .await
+        .ok_or_else(|| Dial::Refused("the socket check was dropped".into()))?;
+    let entry = entry.map_err(|e| {
+        let why = format!("the VMM socket {}: {e}", socket.display());
+        if e.kind() == io::ErrorKind::NotFound {
+            Dial::Unavailable(why)
+        } else {
+            Dial::Refused(why)
+        }
+    })?;
+    let stream = tokio::net::UnixStream::connect(crate::sys::fd_path(&entry))
+        .await
+        .map_err(|e| Dial::Unavailable(format!("connecting to {}: {e}", socket.display())))?;
+    require_vm_peer(env, &stream, cgroup)
+        .await
+        .map_err(Dial::Refused)?;
+    Ok(stream)
+}
+
+/// Whether the text of a `/proc/<pid>/cgroup` puts the process in `cgroup`
+/// (the same form as `Vm::cgroup`: the unified hierarchy's path, which is
+/// relative to the reader's cgroup namespace, as the daemon's own is).
+fn peer_is_in(proc_cgroup: &str, cgroup: &str) -> bool {
+    let ours = cgroup.trim_end_matches('/');
+    !ours.is_empty()
+        && proc_cgroup
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .is_some_and(|theirs| theirs.trim_end_matches('/') == ours)
+}
+
 /// How a process that was waited for ended, for a message.
 fn describe_exit(status: io::Result<Option<i32>>) -> String {
     match status {
@@ -475,9 +596,12 @@ impl Vm {
                                 describe_exit(status)
                             ));
                         }
-                        connected = tokio::net::UnixStream::connect(&vm.api) => {
-                            if connected.is_ok() {
-                                break;
+                        connected = connect_vmm_socket(env, &vm.api, &vm.cgroup) => {
+                            match connected {
+                                // The probe sends nothing; the checks were made.
+                                Ok(_) => break,
+                                Err(Dial::Unavailable(_)) => {}
+                                Err(Dial::Refused(why)) => return Err(why),
                             }
                         }
                     }
@@ -545,6 +669,7 @@ impl Vm {
     async fn request(
         env: &Env,
         api: &Path,
+        cgroup: &str,
         method: &str,
         path: &str,
         value: Value,
@@ -560,9 +685,9 @@ impl Vm {
             .body(Full::new(Bytes::from(body)))
             .map_err(|_| "invalid microVM control request")?;
         env.timeout(CONTROL_TIMEOUT, async {
-            let socket = tokio::net::UnixStream::connect(api)
+            let socket = connect_vmm_socket(env, api, cgroup)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(Dial::into_message)?;
             let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
                 .max_buf_size(8192)
                 .handshake(hyper_util::rt::TokioIo::new(socket))
@@ -602,13 +727,14 @@ impl Vm {
     }
 
     async fn put(&self, env: &Env, path: &str, value: Value) -> Result<(), String> {
-        Self::request(env, &self.api, "PUT", path, value).await
+        Self::request(env, &self.api, &self.cgroup, "PUT", path, value).await
     }
 
     pub async fn pause(&self, env: &Env, paused: bool) -> Result<(), String> {
         Self::request(
             env,
             &self.api,
+            &self.cgroup,
             "PATCH",
             "/vm",
             json!({"state":if paused {"Paused"} else {"Resumed"}}),
@@ -631,6 +757,7 @@ impl Vm {
             let mut socket = crate::bridge::vsock(
                 env,
                 &self.root.join("vsock.sock"),
+                &self.cgroup,
                 kronik_guest_init::CONTROL_PORT,
             )
             .await?;
@@ -1035,12 +1162,79 @@ mod tests {
         let result = env
             .timeout(
                 Duration::from_millis(500),
-                Vm::request(&env, &api, "PUT", "/machine-config", json!({})),
+                Vm::request(
+                    &env,
+                    &api,
+                    &own_cgroup(),
+                    "PUT",
+                    "/machine-config",
+                    json!({}),
+                ),
             )
             .await;
         let _ = release.send(());
         assert!(matches!(result, Ok(Ok(()))), "{result:?}");
         assert_eq!(server.await, Some(()));
+    }
+
+    /// The fake VMM of these tests is the test process: its cgroup.
+    fn own_cgroup() -> String {
+        crate::sys::own_cgroup()
+            .expect("these tests need a cgroup v2 host (a `0::` line in /proc/self/cgroup)")
+    }
+
+    #[test]
+    fn a_peer_must_be_in_the_vms_own_cgroup() {
+        let inside = "0::/system.slice/kronik.service/kronik-foreign-ab\n";
+        let vm = "/system.slice/kronik.service/kronik-foreign-ab";
+        assert!(peer_is_in(inside, vm));
+        // v1 lines and other controllers do not count; only the unified entry does.
+        assert!(peer_is_in(&format!("12:cpu:/x\n{inside}"), vm));
+        assert!(!peer_is_in(
+            "12:cpu:/system.slice/kronik.service/kronik-foreign-ab\n",
+            vm
+        ));
+        // The daemon's own cgroup, a sibling, a child and a prefix are not the VM's.
+        for other in [
+            "0::/system.slice/kronik.service/daemon\n",
+            "0::/system.slice/kronik.service\n",
+            "0::/system.slice/kronik.service/kronik-foreign-ac\n",
+            "0::/system.slice/kronik.service/kronik-foreign-ab/sub\n",
+            "0::/system.slice/kronik.service/kronik-foreign-a\n",
+            "0::/init.scope\n",
+            "0::/\n",
+            "",
+        ] {
+            assert!(!peer_is_in(other, vm), "{other:?}");
+        }
+        // A trailing slash is the same cgroup; an empty one is nothing.
+        assert!(peer_is_in("0::/a/b/\n", "/a/b"));
+        assert!(!peer_is_in("0::/\n", ""));
+        assert!(!peer_is_in("0::/\n", "/"));
+    }
+
+    #[tokio::test]
+    async fn a_peer_outside_the_vms_cgroup_is_refused_before_a_request_is_sent() {
+        use tokio::io::AsyncReadExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let api = directory.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&api).unwrap();
+        let env = Env::real(tokio::runtime::Handle::current());
+        let error = Vm::request(
+            &env,
+            &api,
+            "/some/other/vm",
+            "PUT",
+            "/machine-config",
+            json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("not in the VM's cgroup"), "{error}");
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut seen = Vec::new();
+        stream.read_to_end(&mut seen).await.unwrap();
+        assert!(seen.is_empty(), "{seen:?}");
     }
 
     #[test]
@@ -1103,9 +1297,16 @@ mod tests {
         )
         .into_bytes();
         let server = env.spawn("test-vm-control", serve_one(listener, reply));
-        let error = Vm::request(&env, &api, "PUT", "/drives/rootfs", json!({}))
-            .await
-            .unwrap_err();
+        let error = Vm::request(
+            &env,
+            &api,
+            &own_cgroup(),
+            "PUT",
+            "/drives/rootfs",
+            json!({}),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             error,
             "Firecracker PUT /drives/rootfs failed (status 400): Invalid request: the root drive is read-only"
@@ -1121,7 +1322,7 @@ mod tests {
         let env = Env::real(tokio::runtime::Handle::current());
         let reply = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_vec();
         let server = env.spawn("test-vm-control", serve_one(listener, reply));
-        let error = Vm::request(&env, &api, "PATCH", "/vm", json!({}))
+        let error = Vm::request(&env, &api, &own_cgroup(), "PATCH", "/vm", json!({}))
             .await
             .unwrap_err();
         assert_eq!(error, "Firecracker PATCH /vm failed (status 500)");
@@ -1140,6 +1341,116 @@ mod tests {
         fn kill(&self) -> kronik_core::env::BoxFuture<'static, io::Result<()>> {
             Box::pin(async { Ok(()) })
         }
+    }
+
+    /// A launcher that is still running and never says otherwise.
+    struct Running;
+    impl Process for Running {
+        fn id(&self) -> Option<u32> {
+            None
+        }
+        fn wait(&self) -> kronik_core::env::BoxFuture<'static, io::Result<Option<i32>>> {
+            Box::pin(std::future::pending())
+        }
+        fn kill(&self) -> kronik_core::env::BoxFuture<'static, io::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_link_planted_for_the_socket_is_never_connected_to() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let jail = directory.path().join("jail");
+        fs::create_dir(&jail).unwrap();
+        let env = Env::real(tokio::runtime::Handle::current());
+        let cgroup = own_cgroup();
+        // Nothing there yet: the VMM is still starting.
+        let api = jail.join("api.sock");
+        assert!(matches!(
+            connect_vmm_socket(&env, &api, &cgroup).await,
+            Err(Dial::Unavailable(_))
+        ));
+        // A socket of the right user, in the right cgroup, is connected to.
+        let listener = tokio::net::UnixListener::bind(&api).unwrap();
+        assert!(connect_vmm_socket(&env, &api, &cgroup).await.is_ok());
+        let (_stream, _) = listener.accept().await.unwrap();
+        // Another cgroup is refused, and never retried.
+        assert!(matches!(
+            connect_vmm_socket(&env, &api, "/some/other/vm").await,
+            Err(Dial::Refused(why)) if why.contains("not in the VM's cgroup")
+        ));
+        // The VMM replaces its socket by a link to a socket the daemon can
+        // reach: refused before any connection, and that socket sees none.
+        let other = directory.path().join("other.sock");
+        let victim = tokio::net::UnixListener::bind(&other).unwrap();
+        fs::remove_file(&api).unwrap();
+        symlink(&other, &api).unwrap();
+        assert!(matches!(
+            connect_vmm_socket(&env, &api, &cgroup).await,
+            Err(Dial::Refused(_))
+        ));
+        let accepted = env
+            .timeout(Duration::from_millis(100), victim.accept())
+            .await;
+        assert!(accepted.is_err(), "the planted link was followed");
+        // So is a regular file, and a directory.
+        fs::remove_file(&api).unwrap();
+        fs::write(&api, b"x").unwrap();
+        assert!(matches!(
+            connect_vmm_socket(&env, &api, &cgroup).await,
+            Err(Dial::Refused(_))
+        ));
+        fs::remove_file(&api).unwrap();
+        fs::create_dir(&api).unwrap();
+        assert!(matches!(
+            connect_vmm_socket(&env, &api, &cgroup).await,
+            Err(Dial::Refused(_))
+        ));
+        // The boot probe stops at a refusal instead of waiting out its timeout.
+        let vm = Vm {
+            child: Arc::new(Running),
+            root: jail.clone(),
+            output: directory.path().join("out"),
+            cgroup,
+            api: api.clone(),
+            resources: Resources::new(1000, 256 << 20).unwrap(),
+            restore: false,
+        };
+        let started = env.clock.monotonic();
+        let error = vm.boot(&env).await.unwrap_err();
+        assert!(
+            env.clock.monotonic() - started < Duration::from_secs(5),
+            "{error}"
+        );
+        assert!(error.contains("VMM socket"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_socket_of_another_cgroup_stops_the_boot_before_a_request_is_sent() {
+        use tokio::io::AsyncReadExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let jail = directory.path().join("jail");
+        fs::create_dir(&jail).unwrap();
+        let listener = tokio::net::UnixListener::bind(jail.join("api.sock")).unwrap();
+        let env = Env::real(tokio::runtime::Handle::current());
+        let vm = Vm {
+            child: Arc::new(Running),
+            root: jail.clone(),
+            output: directory.path().join("out"),
+            // Not the cgroup of this process, which plays the VMM.
+            cgroup: "/some/other/vm".into(),
+            api: jail.join("api.sock"),
+            resources: Resources::new(1000, 256 << 20).unwrap(),
+            restore: false,
+        };
+        let error = vm.boot(&env).await.unwrap_err();
+        assert!(error.contains("not in the VM's cgroup"), "{error}");
+        // The probe connected and sent nothing.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut seen = Vec::new();
+        stream.read_to_end(&mut seen).await.unwrap();
+        assert!(seen.is_empty(), "{seen:?}");
     }
 
     #[tokio::test]

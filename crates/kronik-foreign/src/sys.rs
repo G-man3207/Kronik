@@ -1776,6 +1776,99 @@ pub(crate) fn jail_mounts(jail: &MicrovmJail<'_>, kvm: &Path) -> io::Result<()> 
     Ok(())
 }
 
+/// The system call number of `openat2` (Linux 5.6): the same on every
+/// architecture that uses the generic table, x86-64 and aarch64 included.
+const SYS_OPENAT2: libc::c_long = 437;
+
+/// Opens the entry `name` of the directory `dir`, a socket that a process the
+/// daemon does not trust can rename or replace, without following a symbolic
+/// link, and returns a descriptor that stands for the entry itself (`O_PATH`)
+/// once it is known to be a socket that `owner` made.
+///
+/// `connect(2)` to a path follows links, so a link planted in place of the
+/// socket would be connected to with the caller's authority, and whatever a
+/// connection to that socket does would happen. The descriptor names the inode
+/// that was checked whatever the name becomes afterwards: connecting to
+/// `/proc/self/fd/<n>` (see [`fd_path`]) reaches that inode and no other.
+/// `name` is one plain component; no link on the way is followed
+/// (`RESOLVE_NO_SYMLINKS`), and none that the kernel makes up (`/proc` links).
+pub fn open_socket_entry(dir: &Path, name: &str, owner: u32) -> io::Result<OwnedFd> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name:?} is not the plain name of a socket"),
+        ));
+    }
+    // The directory is the daemon's own path to the jail: by path, as a path.
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(dir)?;
+    let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: open_how is a plain C struct; zero is a valid value for every field.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_BENEATH;
+    // SAFETY: `name` is a NUL-terminated string and `how` a live open_how of the
+    // size passed; the kernel only reads them.
+    let raw = unsafe {
+        libc::syscall(
+            SYS_OPENAT2,
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &raw const how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if raw < 0 {
+        return Err(explain_openat2(io::Error::last_os_error()));
+    }
+    // SAFETY: openat2 returned a new descriptor that nothing else owns.
+    let entry = unsafe { OwnedFd::from_raw_fd(raw as libc::c_int) };
+    // SAFETY: stat is a plain C struct that fstat fills in for a live descriptor.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    check(
+        unsafe { libc::fstat(entry.as_raw_fd(), &raw mut stat) },
+        "fstat",
+    )?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the entry is not a socket (a link, a file or a directory in its place)",
+        ));
+    }
+    if stat.st_uid != owner {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("the socket belongs to user {}, not {owner}", stat.st_uid),
+        ));
+    }
+    Ok(entry)
+}
+
+/// What a failed `openat2` means to the operator. `ENOSYS` is not a bug of the
+/// daemon: the kernel is older than Linux 5.6, or the service runs with
+/// `RestrictSUIDSGID=yes`, which makes systemd's seccomp filter answer `ENOSYS`
+/// to every `openat2` because the filter cannot read the flags in its argument
+/// (ADR 0027). An operator who adds that setting to a drop-in as hardening would
+/// otherwise get a microVM that never starts and "function not implemented".
+fn explain_openat2(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(libc::ENOSYS) {
+        return io::Error::new(
+            io::ErrorKind::Unsupported,
+            "openat2 is not available to the daemon: the kernel is older than Linux 5.6, or the service runs with RestrictSUIDSGID=yes, whose seccomp filter answers ENOSYS to openat2 (ADR 0027); remove that setting from the unit and its drop-ins",
+        );
+    }
+    error
+}
+
+/// The path through which `connect(2)` reaches exactly the inode that `fd`
+/// stands for, as long as `fd` is open.
+pub fn fd_path(fd: &OwnedFd) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+}
+
 /// The effective user id of this process.
 pub fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
@@ -2466,6 +2559,71 @@ mod tests {
     }
 
     const DESCRIPTOR_CHILD: &str = "KRONIK_TEST_CLOSE_DESCRIPTORS";
+
+    #[test]
+    fn a_socket_entry_is_opened_without_following_links_and_only_for_a_socket_of_the_owner() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let dir = tempfile::tempdir().unwrap();
+        let me = euid();
+        let real = dir.path().join("real.sock");
+        let listener = UnixListener::bind(&real).unwrap();
+        // The socket itself, reached through the descriptor.
+        let entry = open_socket_entry(dir.path(), "real.sock", me).unwrap();
+        drop(UnixStream::connect(fd_path(&entry)).unwrap());
+        listener.accept().unwrap();
+        // The name is replaced after the check: the connection still goes to the
+        // inode that was checked, and the newcomer sees none.
+        let moved = dir.path().join("moved.sock");
+        fs::rename(&real, &moved).unwrap();
+        let newcomer = UnixListener::bind(&real).unwrap();
+        newcomer.set_nonblocking(true).unwrap();
+        drop(UnixStream::connect(fd_path(&entry)).unwrap());
+        listener.accept().unwrap();
+        assert_eq!(
+            newcomer.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(entry);
+        // Links, files, directories and FIFOs in its place are not sockets.
+        symlink(&moved, dir.path().join("link.sock")).unwrap();
+        symlink(dir.path(), dir.path().join("dirlink.sock")).unwrap();
+        fs::write(dir.path().join("file.sock"), b"x").unwrap();
+        fs::create_dir(dir.path().join("dir.sock")).unwrap();
+        let fifo = std::process::Command::new("mkfifo")
+            .arg(dir.path().join("fifo.sock"))
+            .status();
+        let mut bad = vec!["link.sock", "dirlink.sock", "file.sock", "dir.sock"];
+        if matches!(fifo, Ok(status) if status.success()) {
+            bad.push("fifo.sock");
+        }
+        for name in bad {
+            let error = open_socket_entry(dir.path(), name, me).unwrap_err();
+            assert_ne!(error.kind(), io::ErrorKind::NotFound, "{name}: {error}");
+        }
+        // Another user's socket, a missing entry, and names that are not plain.
+        let error = open_socket_entry(dir.path(), "moved.sock", me + 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        let error = open_socket_entry(dir.path(), "absent.sock", me).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        for name in ["", ".", "..", "a/b", "/etc/passwd"] {
+            let error = open_socket_entry(dir.path(), name, me).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_openat2_is_explained_with_the_setting_that_causes_it() {
+        let explained = explain_openat2(io::Error::from_raw_os_error(libc::ENOSYS));
+        assert_eq!(explained.kind(), io::ErrorKind::Unsupported);
+        let text = explained.to_string();
+        for needle in ["openat2", "RestrictSUIDSGID=yes", "Linux 5.6", "ADR 0027"] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        // Every other failure is left as the system said it.
+        let other = explain_openat2(io::Error::from_raw_os_error(libc::ELOOP));
+        assert_eq!(other.raw_os_error(), Some(libc::ELOOP));
+    }
 
     fn open_plain() -> libc::c_int {
         // No O_CLOEXEC: the kind of descriptor that a child inherits.

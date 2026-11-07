@@ -42,6 +42,8 @@ pub(crate) enum Dialer {
     Vsock {
         /// Firecracker's hybrid-vsock UDS, in its fixed private jail.
         socket: PathBuf,
+        /// The VM's cgroup: the socket's peer must be a process of it.
+        cgroup: String,
     },
 }
 
@@ -127,11 +129,12 @@ pub(crate) async fn dial(env: &Env, pool: &Pool, d: &Dialer) -> Result<Sender, S
             let stream = tokio::net::TcpStream::from_std(std_stream).map_err(|e| e.to_string())?;
             handshake(env, stream).await
         }
-        Dialer::Vsock { socket } => {
+        Dialer::Vsock { socket, cgroup } => {
             let stream = env
                 .timeout(DIAL_TIMEOUT, async {
                     use tokio::io::AsyncReadExt as _;
-                    let mut stream = vsock(env, socket, kronik_guest_init::VSOCK_PORT).await?;
+                    let mut stream =
+                        vsock(env, socket, cgroup, kronik_guest_init::VSOCK_PORT).await?;
                     let mut ready = [0; kronik_guest_init::READY.len()];
                     stream
                         .read_exact(&mut ready)
@@ -154,13 +157,15 @@ pub(crate) async fn dial(env: &Env, pool: &Pool, d: &Dialer) -> Result<Sender, S
 pub(crate) async fn vsock(
     env: &Env,
     socket: &std::path::Path,
+    cgroup: &str,
     port: u32,
 ) -> Result<tokio::net::UnixStream, String> {
     env.timeout(DIAL_TIMEOUT, async {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let mut stream = tokio::net::UnixStream::connect(socket)
+        // Before any byte is sent: the socket's name is the VMM's to choose.
+        let mut stream = crate::microvm::connect_vmm_socket(env, socket, cgroup)
             .await
-            .map_err(|e| format!("connecting to microVM vsock: {e}"))?;
+            .map_err(|e| format!("connecting to microVM vsock: {}", e.into_message()))?;
         stream
             .write_all(format!("CONNECT {port}\n").as_bytes())
             .await
@@ -531,6 +536,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_vsock_peer_outside_the_vms_cgroup_is_refused_before_a_byte_is_sent() {
+        use tokio::io::AsyncReadExt as _;
+        let env = Env::real(tokio::runtime::Handle::current());
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("vsock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let error = crate::bridge::vsock(&env, &socket, "/some/other/vm", 10_000)
+            .await
+            .unwrap_err();
+        assert!(error.contains("not in the VM's cgroup"), "{error}");
+        // The server saw the connection and no byte of it.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut seen = Vec::new();
+        stream.read_to_end(&mut seen).await.unwrap();
+        assert!(seen.is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
     async fn vsock_requires_tcp_ready_and_never_retries_an_uncertain_http_send() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let env = Env::real(tokio::runtime::Handle::current());
@@ -566,7 +589,12 @@ mod tests {
                     send(
                         &env,
                         &Pool::default(),
-                        &Dialer::Vsock { socket },
+                        &Dialer::Vsock {
+                            socket,
+                            // The fake VMM is this process.
+                            cgroup: crate::sys::own_cgroup()
+                                .expect("these tests need a cgroup v2 host (a `0::` line in /proc/self/cgroup)"),
+                        },
                         "echo",
                         request("foreign://echo/x", b"", 1024),
                     ),

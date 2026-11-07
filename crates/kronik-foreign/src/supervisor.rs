@@ -349,6 +349,7 @@ impl Actor {
             },
             crate::runtime::Engine::Firecracker => Dialer::Vsock {
                 socket: runtime.root.join("jail/vsock.sock"),
+                cgroup: cgroup.clone(),
             },
         };
         Arc::new(Actor {
