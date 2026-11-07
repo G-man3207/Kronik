@@ -1676,17 +1676,29 @@ Other values of `snapshots_kept`, deleting snapshot directories by hand, v0.2.0
 ## Foreign actors
 
 Foreign actors are ordinary programs (OCI images) that run in gVisor
-sandboxes next to the daemon. Kronik reaches them only through its bridge,
-and they record their calls like other effects
-([M7 design](../design/m7-foreign.md), [ADR 0003](../adr/0003-gvisor-bridge.md)).
-They need:
+sandboxes next to the daemon, or, with `--isolation microvm` (M20), in a
+Firecracker microVM. Kronik reaches them only through its bridge (vsock for a
+microVM), and they record their calls like other effects
+([M7 design](../design/m7-foreign.md), [ADR 0003](../adr/0003-gvisor-bridge.md),
+[ADR 0095](../adr/0095-pinned-firecracker-guest.md)). They need:
 
-- root (the systemd unit runs the daemon as root);
+- in the default installation (M21), the `kronik` service identity, the
+  pinned user namespace and a delegated cgroup, so that sandboxes run as
+  root inside the namespace and not on the host (systemd 255 or newer); in a
+  root installation, root. When the namespace or the delegation is missing
+  the daemon still serves Wasm actors and foreign actors report
+  `FOREIGN_UNAVAILABLE` with the reason;
 - `runsc` at `[foreign] runsc_path`, from `install.sh` or gVisor's
   instructions; `kronik doctor`'s `runsc`, `kvm`, `cgroup`, `netns`,
   `run_dir` and `sandbox` checks tell whether the host can run them;
 - Linux 5.6 or newer with cgroup v2;
-- `runc`, only for `--isolation trusted`.
+- `runc`, only for `--isolation trusted`;
+- for `--isolation microvm`: a usable `/dev/kvm`, and the pinned tool bundle
+  in `[foreign] microvm_dir` (`scripts/build-microvm-tools.sh` builds one, and
+  takes `--command-timeout` and `--kernel-jobs` for a slow machine;
+  the daemon never downloads or builds it). Without KVM the add is refused
+  with `KVM_UNAVAILABLE`, which suggests `gvisor`. The microVM level has not
+  been run on a host with KVM.
 
 They are managed with `kronik foreign add`, `list`, `logs` and `remove`
 (see the [CLI reference](../reference/cli.md)). Declaring and removing them
@@ -1698,9 +1710,9 @@ Where things are:
 | Path | |
 |---|---|
 | `<data_dir>/foreign/blobs/` | Verified image layers, shared by all actors |
-| `<data_dir>/foreign/actors/<name>/data/` | The actor's persistent `/data`, never replayed |
-| `<data_dir>/foreign/actors/<name>/output.log` | The program's and runsc's stdout and stderr (`kronik foreign logs <name>`); the previous 8 MiB are in `output.log.1` |
-| `<data_dir>/foreign/actors/<name>/checkpoints/<lsn>/` | `fork_mode = "sandbox"`: the gVisor checkpoint and a copy of `/data` at a snapshot's LSN (0700; local, never shipped). It holds the secret values the actor was given (its memory and `config.json`); rotating a secret does not change kept checkpoints |
+| `<data_dir>/foreign/actors/<name>/data/` | The actor's persistent `/data` for gVisor and trusted actors, never replayed. A microVM uses a separate fixed, fully allocated 1 GiB ext4 drive instead |
+| `<data_dir>/foreign/actors/<name>/output.log` | The program's and the runtime's stdout and stderr (`kronik foreign logs <name>`); the previous 8 MiB are in `output.log.1` |
+| `<data_dir>/foreign/actors/<name>/checkpoints/<lsn>/` | `fork_mode = "sandbox"`: the gVisor checkpoint and a copy of `/data`, or a Firecracker full memory and state snapshot with its own copies of the drive and root backing, at a snapshot's LSN (0700; local, never shipped). It holds the secret values the actor was given (its memory and `config.json`); rotating a secret does not change kept checkpoints |
 | `<data_dir>/branches/<fork>/foreign/<name>/` | A fork's copy of the actor: its disk and runtime spec, deleted with the fork and at daemon start |
 | `<run_dir>/runsc/`, `<run_dir>/netns/`, `<run_dir>/sock/` | runsc's state, the network namespaces and the bridge sockets |
 
@@ -1716,21 +1728,33 @@ Limits to know: no outbound network at all, inbound only through Kronik's
 bridge; some syscalls and `/proc` files are missing in gVisor; file I/O is
 slower than native; registry pulls are anonymous, so private images must be
 copied into a local layout first (`skopeo copy` into `oci-layout:`). A
-program can fill the disk through `/data`, which has no quota: put
-`<data_dir>/foreign` on its own file system (or give it a quota) so the log
-keeps its room. `[log] disk_reserve` refuses new work before the log's disk
-is full, but sandboxes and running work keep writing, so on a shared file
-system it only narrows the risk; `kronik foreign remove` still works below
-it. `--isolation trusted` is not a security boundary. An image's setuid and
-setgid bits are cleared when it is unpacked (the sticky bit stays): a
-program that needs another user's rights through them won't get them.
-A program in a sandbox that runs as root can still set them on files in
-its `/data`, which lands them in `<data_dir>/foreign/actors/<name>/data`
-(owned by root, beneath mode 0700 directories). Checkpoints and fork
-copies clear them; the actor's own data keeps them, so don't copy that
-tree with modes kept (`cp -a`, `tar -p`) to where others can reach it
-([ADR 0027](../adr/0027-systemd-unit-hardening.md)). The
-[M7 design](../design/m7-foreign.md) lists the rest.
+gVisor or trusted program can fill the disk through `/data`, which has no
+quota: put `<data_dir>/foreign` on its own file system (or give it a quota)
+so the log keeps its room. `[log] disk_reserve` refuses new work before the
+log's disk is full, but sandboxes and running work keep writing, so on a
+shared file system it only narrows the risk; `kronik foreign remove` still
+works below it. A microVM instead has the fixed 1 GiB drive, whose ext4
+metadata takes some of it; its read-only root has a guest-memory overlay.
+Guest RAM is at least 128Mi and is floored to MiB, the host cgroup adds a
+fixed 128Mi for the VMM, the CPU quota is exact in thousandths of a CPU, and
+the vCPU topology is one or an even number (at most 32). These sizes are
+unmeasured on real KVM; [ADR 0096](../adr/0096-microvm-snapshot-and-vsock-lifecycle.md)
+says what has to be calibrated. In the rootless installation an image whose
+files or user lie outside the namespace's mapped ids (0 to 65535) cannot be
+unpacked: `foreign add` accepts it, and the actor then fails to start with
+"owner U:G is outside the ids this installation maps", which says to rebuild the
+image with ids up to 65535 (there is no admission check yet). `--isolation trusted` is not a security
+boundary. An image's setuid and setgid bits are cleared when it is unpacked
+(the sticky bit stays): a program that needs another user's rights through
+them won't get them. A program in a sandbox that runs as root can still set
+them on files in its persistent directory: in the nonroot installation they
+belong to the service user's mapped range, in a root installation to root,
+beneath mode 0700 directories. Checkpoints and fork copies of the
+directory-backed backends clear them; the actor's own data keeps them, so
+don't copy that tree with modes kept (`cp -a`, `tar -p`) to where others can
+reach it ([ADR 0027](../adr/0027-systemd-unit-hardening.md)). A microVM's
+guest file modes stay inside its drive and are not setid files on the host.
+The [M7 design](../design/m7-foreign.md) lists the rest.
 
 ## Previews
 

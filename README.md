@@ -44,9 +44,14 @@ injection, paces effect rate windows, and keeps secret custody available
 across restarts. `v0.3.0` and `v0.1.0` are the historical unsigned releases.
 
 `main` is an unreleased `0.4.1-dev` work in progress. Major areas remain
-absent or partial: the cluster (M16–M19), microVMs (M20), the rootless daemon
-(M21), the WASI 0.3 remainder (M22), long-lived connections (M24), blobs
-(M25–M26), and the UI, OpenTelemetry, fleet and hardening tracks (M27–M34).
+absent or partial: the cluster (M16–M19), the WASI 0.3 remainder (M22),
+long-lived connections (M24), blobs (M25–M26), and the UI, OpenTelemetry,
+fleet and hardening tracks (M27–M34). The microVM level (M20) and the nonroot
+daemon (M21) are in the tree as proposals that have not been run on the hosts
+they need: `isolation = "microvm"` has never booted a VM on a KVM host, and
+`kronik serve --init` has never installed the nonroot service on a systemd
+host. Their decisions are ADRs 0060–0065, 0095 and 0096, which await the
+maintainers.
 See the [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
 for the state of each milestone, the open questions and the known gaps, and the
 [compliance audit](https://github.com/G-man3207/Kronik/wiki/Compliance-audit)
