@@ -49,7 +49,7 @@ pub const METRICS: &[Def] = &[
     },
     Def {
         name: "kronik_secret_recovery_stalled",
-        help: "Recorded secret reveals waiting for immutable backend availability.",
+        help: "Re-runs of open turns waiting for a recorded secret value or for an unavailable prerequisite.",
         kind: Type::Gauge,
     },
     Def {

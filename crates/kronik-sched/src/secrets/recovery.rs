@@ -18,6 +18,31 @@ use crate::{Node, TurnResult};
 
 pub(crate) const RETRY_INITIAL: Duration = Duration::from_millis(100);
 pub(crate) const RETRY_MAX: Duration = Duration::from_secs(5);
+/// How many times a re-run that meets `Unavailable` (not a secret) is tried
+/// again by the worker: about 36 s at the backoff above.
+pub(crate) const RERUN_UNAVAILABLE_ATTEMPTS: u32 = 12;
+/// A waiting re-run says so on its first wait and then every this many.
+pub(crate) const RERUN_WARN_EVERY: u32 = 12;
+
+/// Whether the worker waits and tries a re-run again after it failed with
+/// `code`; `unavailable_waits` is how often it has waited for a plain
+/// `Unavailable` already.
+///
+/// A re-run must not end open while what it waits for can still come: a
+/// secret, without bound (the recorded value is needed again, design m23
+/// 5.3), and a prerequisite that is unavailable for a while, for a few
+/// attempts. The latter is the call machinery and the recorded call results,
+/// which can also be permanent (an erased subject, a record that cannot be
+/// projected): the actor must not be held for ever behind one of those, so
+/// after `RERUN_UNAVAILABLE_ATTEMPTS` the job ends, as before, and the next
+/// start runs the turn again. Nothing is retried on a node that has failed.
+pub(crate) fn rerun_waits(code: ErrorCode, unavailable_waits: u32, node_failed: bool) -> bool {
+    match code {
+        ErrorCode::SecretUnavailable => true,
+        ErrorCode::Unavailable => unavailable_waits < RERUN_UNAVAILABLE_ATTEMPTS && !node_failed,
+        _ => false,
+    }
+}
 const STALL_METRIC: &str = "kronik_secret_recovery_stalled";
 static STALLED: Mutex<u64> = Mutex::new(0);
 

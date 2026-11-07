@@ -1239,3 +1239,32 @@ fn a_crash_before_the_error_result_makes_the_re_run_wait_and_then_run_the_effect
         );
     }
 }
+
+#[test]
+fn a_re_run_waits_for_a_secret_for_ever_and_for_other_unavailability_a_few_times() {
+    use super::{RERUN_UNAVAILABLE_ATTEMPTS, rerun_waits};
+    for waited in [0, 1, 1_000, u32::MAX] {
+        assert!(rerun_waits(ErrorCode::SecretUnavailable, waited, false));
+    }
+    assert!(rerun_waits(ErrorCode::Unavailable, 0, false));
+    assert!(rerun_waits(
+        ErrorCode::Unavailable,
+        RERUN_UNAVAILABLE_ATTEMPTS - 1,
+        false
+    ));
+    assert!(!rerun_waits(
+        ErrorCode::Unavailable,
+        RERUN_UNAVAILABLE_ATTEMPTS,
+        false
+    ));
+    // A node that has failed is not waited for; nothing else is retried.
+    assert!(!rerun_waits(ErrorCode::Unavailable, 0, true));
+    for code in [
+        ErrorCode::SecretVersionGone,
+        ErrorCode::StorageCorrupt,
+        ErrorCode::Internal,
+        ErrorCode::SubjectErased,
+    ] {
+        assert!(!rerun_waits(code, 0, false), "{code}");
+    }
+}

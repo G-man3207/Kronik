@@ -1120,11 +1120,30 @@ impl Node {
             if let Some(begin) = retry_begin {
                 let mut delay = crate::secrets::recovery::RETRY_INITIAL;
                 let mut stalled = None;
-                while result
-                    .as_ref()
-                    .is_err_and(|error| error.code == ErrorCode::SecretUnavailable)
-                {
+                let mut waits = 0u32;
+                let mut transient = 0u32;
+                while let Err(error) = &result {
+                    if !crate::secrets::recovery::rerun_waits(
+                        error.code,
+                        transient,
+                        self.fatal().is_some(),
+                    ) {
+                        break;
+                    }
+                    if error.code == ErrorCode::Unavailable {
+                        transient += 1;
+                    }
                     stalled.get_or_insert_with(crate::secrets::recovery::Stalled::new);
+                    if waits.is_multiple_of(crate::secrets::recovery::RERUN_WARN_EVERY) {
+                        tracing::warn!(
+                            actor = %actor,
+                            execution_id = %begin.execution_id,
+                            code = %error.code,
+                            waits,
+                            "the re-run of an open turn is waiting for what it needs"
+                        );
+                    }
+                    waits = waits.saturating_add(1);
                     self.env.clock.sleep(delay).await;
                     delay = delay
                         .saturating_mul(2)
