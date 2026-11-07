@@ -1,0 +1,34 @@
+# 0063. An existing installation is not converted in place
+
+- **Status:** Proposed. Implemented as the behavior of `kronik serve --init`; awaits maintainer ratification. An in-place migration is the alternative; it is kept out of this decision as a separate, optional patch.
+- **Date:** 2026-11-07
+
+## Context
+
+Until M21 every installation is a root installation: the daemon, the data directory and the foreign actors' files are owned by host root. The default installation of ADR 0062 runs as the stable `kronik` user, and the foreign actors' files are owned by that user's subordinate id range (ADR 0061). Moving an existing installation from one kind to the other therefore changes the numeric owner, mode bits, capabilities and extended attributes of every file under the data directory, while the daemon is stopped, with foreign actors' trees that mix ids from the whole range.
+
+A conversion in place needs a journal that survives a crash and a restart fence that keeps systemd from starting the old unit on a half-converted tree. That is a substantial feature (the prototype's version is about 1,300 lines of unsafe-allowlisted code), and nothing in the brief asks for it.
+
+## Decision
+
+`kronik serve --init` looks at the owner of the data directory before it changes anything, in `--dry-run` as well:
+
+- A missing or empty directory is not an installation. A first run that stopped early is adopted: the directory goes to the service user and the run continues.
+- The same kind as the requested one (root-owned with `--root`, service-owned without it) is rerun as before; every step checks first and changes nothing that is already right.
+- The other kind is refused with `ROOTLESS_UNAVAILABLE` (503) before anything is written or stopped. The message names the kind that was found, and the hint names both ways forward: keep the installation by running `kronik serve --init` with `--root` (or without it, for a nonroot one), or re-initialize it.
+- Any other owner is refused.
+
+Re-initializing is documented in the operations guide: ship the data (or take a snapshot to a `file://` target), stop and remove the old unit, run `kronik serve --init` with an empty data directory, and `kronik restore` into it. Restore as root into the nonroot service's directory prepares everything as root, drops to the directory's owner and installs as that owner (ADR 0062), so no file is left owned by root. What is not shipped is not restored: foreign actors' data directories and checkpoints are local. Their records are in the log, so the actors are declared again; their persistent data has to be copied by the operator, with the ids of the other kind, or is lost.
+
+## Alternatives
+
+- **Convert in place.** Journal every inode's original owner, mode, capabilities and extended attributes before the first change, fence the old unit, change owners epoch by epoch and be able to reverse. It keeps foreign actors' data. It is the optional patch that accompanies this series; whether the project wants that much privileged, crash-sensitive code for a one-time move is the maintainer's call.
+- **`chown -R` in the documentation.** Unsafe: it follows no policy for the subordinate ranges, drops capabilities and misses extended attributes.
+- **Quietly keep the root installation.** Hides that the default changed.
+
+## Consequences
+
+- No privileged code walks the data directory; the unsafe-allowlisted surface is smaller by the migration module.
+- Moving an installation takes a restore, and foreign actors' persistent data does not move with it automatically.
+- Nothing here has been run on a host with systemd; the decision logic is a pure function with unit tests.
+- Revisit if operators need to keep foreign actors' data across the change: that is the case for the in-place migration.
