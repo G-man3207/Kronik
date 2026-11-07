@@ -984,12 +984,53 @@ impl World {
         self.sleep(Duration::from_millis(50)).await;
         self.check_counters(&node);
         self.check_log(&node).await;
+        self.check_no_open_turns(&node).await;
         self.check_effects(&node).await;
         let turns = node
             .probe
             .turns_run
             .load(std::sync::atomic::Ordering::Relaxed);
         self.st().turns += turns;
+    }
+
+    /// After the drain no `TurnBegin` is open. An open turn is what a crash
+    /// leaves, and every start runs what the crash left; one that a live job
+    /// abandoned after its `TurnBegin` would run at a start that nobody
+    /// expects (S-7). A re-run of the last start may still be on its way when
+    /// the mailbox is empty, so the log is read again for a bounded time (10 s
+    /// of virtual time).
+    async fn check_no_open_turns(&self, node: &Node) {
+        let mut open = Vec::new();
+        for _ in 0..100 {
+            open.clear();
+            let mut begun: BTreeMap<String, Lsn> = BTreeMap::new();
+            if let Err(e) = node
+                .reader()
+                .read(1, node.applied_lsn(), |c| {
+                    match &c.record {
+                        Record::TurnBegin(b) => {
+                            begun.insert(b.execution_id.clone(), c.lsn);
+                        }
+                        Record::TurnRecord(t) => {
+                            begun.remove(&t.execution_id);
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                })
+                .await
+            {
+                return self.violation(format!("reading the log for open turns: {e}"));
+            }
+            open.extend(begun.into_iter().map(|(id, lsn)| (lsn, id)));
+            if open.is_empty() {
+                return;
+            }
+            self.sleep(Duration::from_millis(100)).await;
+        }
+        self.violation(format!(
+            "TurnBegin without a TurnRecord after the drain: {open:?}"
+        ));
     }
 
     fn check_counters(&self, node: &Node) {
