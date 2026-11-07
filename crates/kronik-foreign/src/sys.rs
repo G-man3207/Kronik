@@ -1430,6 +1430,106 @@ pub struct MicrovmJail<'a> {
     pub parent_pid: u32,
 }
 
+// Classic BPF and seccomp, for `deny_io_uring`: the four instructions it uses
+// (BPF_LD|BPF_W|BPF_ABS, BPF_JMP|BPF_JEQ|BPF_K, BPF_JMP|BPF_JSET|BPF_K,
+// BPF_RET|BPF_K), the offsets of `struct seccomp_data` (nr at 0, arch at 4) and
+// the return values.
+const BPF_LD_W_ABS: u16 = 0x20;
+const BPF_JEQ_K: u16 = 0x15;
+const BPF_JSET_K: u16 = 0x45;
+const BPF_RET_K: u16 = 0x06;
+/// The x32 ABI keeps the architecture value of x86-64 and marks its system call
+/// numbers with this bit, so that its `io_uring_setup` is not the number a
+/// filter compares with.
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+const SECCOMP_DATA_NR: u32 = 0;
+const SECCOMP_DATA_ARCH: u32 = 4;
+const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xC000_003E;
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xC000_00B7;
+
+/// Makes `io_uring_setup`, `io_uring_enter` and `io_uring_register` fail with
+/// `EPERM` in this process and in everything it executes, forever (a seccomp
+/// filter cannot be removed, survives `exec` and stacks with the filters that
+/// the program installs for itself: the strictest answer of all of them wins).
+///
+/// Firecracker's own filter allows these calls in its VMM thread, for its
+/// asynchronous block engine, and io_uring can symlink, make directories,
+/// rename and unlink (`IORING_OP_SYMLINKAT`, `MKDIRAT`, `RENAMEAT`,
+/// `UNLINKAT`) without any of the plain system calls that the same filter
+/// denies: a VMM compromised by a guest escape could change its jail's
+/// directories despite the short list. Kronik uses the synchronous engine, so
+/// nothing needs them.
+///
+/// The program, eleven instructions: a process of another architecture than
+/// this one is killed (its numbers mean something else), and so is a call with
+/// the x32 bit set (see [`X32_SYSCALL_BIT`]); the three numbers answer `EPERM`;
+/// everything else is left to the other filters. Call it after the last step
+/// that needs privilege; it sets `no_new_privs` itself.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn deny_io_uring() -> io::Result<()> {
+    let mut program = io_uring_filter();
+    let filter = libc::sock_fprog {
+        len: program.len() as libc::c_ushort,
+        filter: program.as_mut_ptr(),
+    };
+    // SAFETY: prctl with scalar arguments.
+    check(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+        "PR_SET_NO_NEW_PRIVS",
+    )?;
+    // SAFETY: the kernel copies the program out of `filter` and `program`,
+    // which live until this returns.
+    check(
+        unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                &raw const filter,
+            )
+        },
+        "installing the io_uring filter",
+    )
+}
+
+/// The filter of [`deny_io_uring`]. Jumps are forward and relative to the next
+/// instruction.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn io_uring_filter() -> [libc::sock_filter; 11] {
+    let op = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
+    [
+        // 0-2: only this architecture's numbers are understood below.
+        op(BPF_LD_W_ABS, 0, 0, SECCOMP_DATA_ARCH),
+        op(BPF_JEQ_K, 1, 0, AUDIT_ARCH_NATIVE),
+        op(BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
+        // 3-5: nor the x32 flavour of them.
+        op(BPF_LD_W_ABS, 0, 0, SECCOMP_DATA_NR),
+        op(BPF_JSET_K, 0, 1, X32_SYSCALL_BIT),
+        op(BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
+        // 6-8: the three calls go to the last instruction.
+        op(BPF_JEQ_K, 3, 0, libc::SYS_io_uring_setup as u32),
+        op(BPF_JEQ_K, 2, 0, libc::SYS_io_uring_enter as u32),
+        op(BPF_JEQ_K, 1, 0, libc::SYS_io_uring_register as u32),
+        // 9: everything else is for the filters of the program itself.
+        op(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW),
+        // 10
+        op(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | libc::EPERM as u32),
+    ]
+}
+
+/// Other architectures than the two Kronik supports have no filter here.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn deny_io_uring() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no io_uring filter for this architecture",
+    ))
+}
+
 /// Installs the VMM's fixed jail in its single-threaded launcher process.
 /// Every resource write is mandatory: delegation errors never remove limits.
 pub fn jail_microvm(jail: &MicrovmJail<'_>) -> io::Result<()> {
@@ -2556,6 +2656,221 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("elsewhere"), &record).unwrap();
         assert!(write_pin_record(&pin, 998, &stand_in).is_err());
         assert!(!dir.path().join("elsewhere").exists());
+    }
+
+    /// What the kernel would answer for a call: the four instructions of the
+    /// filter, run by hand over (architecture, number).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn answer_of(program: &[libc::sock_filter], arch: u32, nr: u32) -> u32 {
+        let mut acc = 0u32;
+        let mut pc = 0usize;
+        for _ in 0..program.len() {
+            let ins = &program[pc];
+            pc += 1;
+            match ins.code {
+                BPF_LD_W_ABS => {
+                    acc = match ins.k {
+                        SECCOMP_DATA_NR => nr,
+                        SECCOMP_DATA_ARCH => arch,
+                        other => panic!("the filter reads offset {other}"),
+                    };
+                }
+                BPF_JEQ_K => pc += usize::from(if acc == ins.k { ins.jt } else { ins.jf }),
+                BPF_JSET_K => pc += usize::from(if acc & ins.k != 0 { ins.jt } else { ins.jf }),
+                BPF_RET_K => return ins.k,
+                other => panic!("an instruction the test does not know: {other:#x}"),
+            }
+        }
+        panic!("the filter ran off its end");
+    }
+
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn the_io_uring_filter_answers_for_every_architecture_and_number_it_can_be_asked() {
+        let program = io_uring_filter();
+        // Well formed: every jump lands inside, the last instruction returns.
+        for (at, ins) in program.iter().enumerate() {
+            if ins.code == BPF_JEQ_K || ins.code == BPF_JSET_K {
+                assert!(
+                    at + 1 + usize::from(ins.jt.max(ins.jf)) < program.len(),
+                    "{at}"
+                );
+            }
+        }
+        assert_eq!(program[program.len() - 1].code, BPF_RET_K);
+        let eperm = SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        let ask = |nr: u32| answer_of(&program, AUDIT_ARCH_NATIVE, nr);
+        for nr in [
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
+        ] {
+            assert_eq!(ask(nr as u32), eperm, "{nr}");
+        }
+        // Everything else, the neighbours of the three included, is left to the
+        // other filters.
+        for nr in [
+            libc::SYS_read,
+            libc::SYS_getpid,
+            libc::SYS_openat,
+            libc::SYS_symlinkat,
+            libc::SYS_io_uring_setup - 1,
+            libc::SYS_io_uring_register + 1,
+            0,
+            1000,
+        ] {
+            assert_eq!(ask(nr as u32), SECCOMP_RET_ALLOW, "{nr}");
+        }
+        // The x32 flavour of the three, and of anything, kills the process: its
+        // numbers carry a bit that the comparisons above would never match.
+        for nr in [
+            X32_SYSCALL_BIT | libc::SYS_io_uring_setup as u32,
+            X32_SYSCALL_BIT | libc::SYS_getpid as u32,
+            X32_SYSCALL_BIT,
+            u32::MAX,
+        ] {
+            assert_eq!(ask(nr), SECCOMP_RET_KILL_PROCESS, "{nr:#x}");
+        }
+        // Another architecture's numbers mean other calls: killed, whatever
+        // the number is.
+        for arch in [0x4000_0003, 0xC000_00B7, 0xC000_003E, 0x4000_003E, 0] {
+            if arch == AUDIT_ARCH_NATIVE {
+                continue;
+            }
+            for nr in [libc::SYS_io_uring_setup as u32, libc::SYS_getpid as u32, 0] {
+                assert_eq!(
+                    answer_of(&program, arch, nr),
+                    SECCOMP_RET_KILL_PROCESS,
+                    "{arch:#x} {nr}"
+                );
+            }
+        }
+    }
+
+    const URING_CHILD: &str = "KRONIK_TEST_IO_URING";
+    const URING_STUB: &str = "KRONIK_TEST_IO_URING_STUB";
+    /// The exit code of the helper for "this host does not let a test use
+    /// io_uring at all", where the positive control cannot be had.
+    const URING_UNAVAILABLE: i32 = 77;
+
+    /// What a program executed after the filter sees: the three calls answer
+    /// EPERM and an ordinary call works.
+    const URING_STUB_SOURCE: &str = r#"
+#include <errno.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+int main(void) {
+    char params[120] = {0};
+    for (int nr = 425; nr <= 427; nr++) {
+        long r = syscall(nr, 1, params, 0, 0, 0, 0);
+        if (r != -1 || errno != EPERM) return 10 + (nr - 425);
+    }
+    if (syscall(SYS_getpid) <= 0) return 20;
+    return 0;
+}
+"#;
+
+    fn io_uring(nr: libc::c_long) -> (libc::c_long, i32) {
+        let params = [0u8; 120];
+        // SAFETY: the three calls read at most `params`; with a descriptor
+        // that is not an io_uring they fail before they use it.
+        let r = unsafe { libc::syscall(nr, 1, params.as_ptr(), 0, 0, 0, 0) };
+        (r, io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    }
+
+    #[test]
+    #[ignore = "a helper process of the io_uring filter test"]
+    fn io_uring_filter_child() {
+        if std::env::var_os(URING_CHILD).is_none() {
+            return;
+        }
+        // The positive control: without the filter the host answers io_uring.
+        let (fd, errno) = io_uring(libc::SYS_io_uring_setup);
+        let usable = fd >= 0;
+        if usable {
+            // SAFETY: closing the descriptor just made.
+            unsafe { libc::close(fd as libc::c_int) };
+        }
+        // The filter is installed whether or not the host has io_uring: the
+        // kernel's own validation of the program is exercised either way.
+        deny_io_uring().unwrap();
+        if !usable {
+            println!("io_uring is not usable here (errno {errno}); the program was accepted");
+            std::process::exit(URING_UNAVAILABLE);
+        }
+        for (name, nr) in [
+            ("setup", libc::SYS_io_uring_setup),
+            ("enter", libc::SYS_io_uring_enter),
+            ("register", libc::SYS_io_uring_register),
+        ] {
+            let (r, errno) = io_uring(nr);
+            assert_eq!((r, errno), (-1, libc::EPERM), "io_uring_{name}");
+        }
+        // Ordinary calls are left to the other filters.
+        assert!(std::process::id() > 0);
+        File::open("/dev/null").unwrap();
+        // And the filter is still there after an exec.
+        if let Some(stub) = std::env::var_os(URING_STUB) {
+            let status = std::process::Command::new(stub).status().unwrap();
+            assert_eq!(status.code(), Some(0), "the executed program: {status}");
+        }
+        println!("io_uring filter ok");
+        std::process::exit(0);
+    }
+
+    /// The filter turns the three io_uring calls into EPERM, leaves the rest
+    /// alone and survives exec. It is irreversible, so it runs in a process of
+    /// its own, and it has a control: on a host where io_uring is off to begin
+    /// with (`kernel.io_uring_disabled`, the default seccomp profile of a
+    /// container) there is nothing to show beyond the kernel accepting the
+    /// program (which the helper checks first), and the test says so and
+    /// skips, even under `KRONIK_FOREIGN_TESTS=require`: that is the host's
+    /// choice and not a flaw of the test setup. The filter's instructions are tested by
+    /// hand in [`the_io_uring_filter_answers_for_every_architecture_and_number_it_can_be_asked`]
+    /// whatever the host does.
+    #[test]
+    fn the_io_uring_calls_answer_eperm_after_the_filter_and_in_what_is_executed() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("stub");
+        let source = dir.path().join("stub.c");
+        fs::write(&source, URING_STUB_SOURCE).unwrap();
+        let built = std::process::Command::new("cc")
+            .args(["-static", "-O1", "-o"])
+            .arg(&stub)
+            .arg(&source)
+            .output();
+        let have_stub = matches!(&built, Ok(out) if out.status.success());
+        if !have_stub && std::env::var("KRONIK_FOREIGN_TESTS").as_deref() == Ok("require") {
+            panic!("KRONIK_FOREIGN_TESTS=require, but no static C program can be made: {built:?}");
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "sys::tests::io_uring_filter_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(URING_CHILD, "1");
+        if have_stub {
+            command.env(URING_STUB, &stub);
+        }
+        let out = command.output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if out.status.code() == Some(URING_UNAVAILABLE) {
+            eprintln!("skipped: {text}");
+            return;
+        }
+        assert!(
+            out.status.success() && text.contains("io_uring filter ok"),
+            "{text}"
+        );
     }
 
     const DESCRIPTOR_CHILD: &str = "KRONIK_TEST_CLOSE_DESCRIPTORS";

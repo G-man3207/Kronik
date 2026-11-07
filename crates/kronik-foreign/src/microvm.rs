@@ -398,6 +398,8 @@ pub fn launch(manifest: &Path) -> io::Result<()> {
         output: &launch.output,
         parent_pid: launch.parent_pid,
     })?;
+    // The last step before the VMM: no io_uring (see `deny_io_uring`).
+    crate::sys::deny_io_uring()?;
     // Exec is intentionally confined to this already jailed, threadless child.
     Err(std::process::Command::new("/firecracker")
         .args(["--api-sock", "/api.sock"])
