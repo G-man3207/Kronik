@@ -507,7 +507,7 @@ against both.
       "type": "string"
     },
     "name": {
-      "description": "Stable: config, kernel, runsc, kvm, cgroup, root, disk, clock, tls,\ndns01_hook, ship, export.",
+      "description": "Stable check names, including userns/uid_view/subid/pin/delegate with\n`--rootless` and service_identity when a root invocation requests it.",
       "type": "string"
     },
     "status": {

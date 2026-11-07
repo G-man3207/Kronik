@@ -569,6 +569,14 @@ expiry like `tls` does for the main one.
 and reads the same `kronik.toml`. It exits 1 if any check fails, and `--json`
 gives `{checks: [{name, status, code, message, hint}], pass, warn, fail}`.
 Some checks need root (`sudo kronik doctor`) and are skipped otherwise.
+With `--rootless` (M21) it also checks the nonroot service's boundary
+(`userns`, `uid_view`, `subid`, `pin`, `delegate`), and the sandbox checks then
+run under the identity the daemon would have: an ordinary user enters the
+pinned Kronik user namespace, and `sudo kronik doctor --rootless` becomes the
+`kronik` user first (`service_identity`) instead of counting a root smoke as
+proof for the service. When that identity cannot be established the `netns` and
+`sandbox` checks warn that they are not proven. Without `--rootless` the checks
+are those of v0.4.0.
 Foreign actors are optional, so the checks of what only they need warn
 rather than fail, unless `kronik.toml` asks for what is missing
 (`platform = "kvm"`).
@@ -580,12 +588,18 @@ rather than fail, unless `kronik.toml` asks for what is missing
 | `runsc` | `runsc` is missing, not executable, lacks gVisor's `gvisor-bin`/`gvisor_sentry` next to it, or is older than the tested `release-20261019.0` (`RUNSC_MISSING`, warning) | Install or upgrade gVisor with `install.sh`; only foreign actors need it |
 | `kvm` | `/dev/kvm` is missing or can't be opened read-write (`KVM_UNAVAILABLE`): a warning, or a failure with `platform = "kvm"` | Most hosts are fine with systrap: set `platform = "auto"`. For `kvm` when it exists but is denied, give the daemon's user access (the `kvm` group) |
 | `cgroup` | cgroup v2 or its `cpu`, `memory` or `pids` controllers are missing (warning) | Foreign actors' resource limits need them |
-| `root` | Not running as root (warning) | The daemon runs as root under systemd; run doctor with `sudo` for the root-only checks |
+| `userns` | User namespaces are off: `user.max_user_namespaces` is 0 or `kernel.unprivileged_userns_clone` is 0 (`ROOTLESS_UNAVAILABLE`, warning; `--rootless` only). Nothing else, such as a distribution's own restriction on unprivileged user namespaces, is checked | Allow them, or keep the root daemon with `sudo kronik serve --init --root` |
+| `uid_view` | The nonroot service would refuse to start here (`ROOTLESS_UNAVAILABLE`, failure; `--rootless` only): this process is in a user namespace whose uid map is not the host's identity map (a rootless container, a nested user namespace), or its real, effective and saved user ids differ. The kernel would translate every API caller's uid, so audit records and token attribution would name the wrong users. As root, the check is skipped: `sudo kronik doctor --rootless` becomes the `kronik` user and then runs it | The nonroot unit is not supported there: use the root service, `sudo kronik serve --init --root` |
+| `subid` | The `kronik` user (as root) or the current user has no safe subordinate id range in `/etc/subuid` and `/etc/subgid` (`ROOTLESS_UNAVAILABLE`, warning; `--rootless` only) | `sudo kronik serve --init` creates the user and its ranges |
+| `pin` | Nothing is pinned at `/run/kronik-userns/user`, or its maps are unreadable (warning); it has another owner or other maps than the user's ranges give, or this user cannot enter it (failure; `--rootless` only) | Start `kronik-userns.service`; for a mismatch, stop the consumers, unpin the owned namespace and pin the expected identity (`kronik userns`) |
+| `delegate` | The cgroup this user runs in is not delegated to it (warning); skipped as root (`--rootless` only) | The daemon gets one in `kronik.service` (`Delegate=yes`); outside it foreign actors are unavailable |
+| `service_identity` | With `--rootless` as root: the `kronik` user cannot be proven (warning) or not become (failure) | Run `sudo kronik serve --init`, then doctor again |
+| `root` | Not running as root (warning). With `--rootless` it names the identity the checks ran as instead: namespace-root authority, or an ordinary host user | The root daemon runs as root under systemd, so run doctor with `sudo` for the root-only checks. The nonroot service has no root of its own: use `doctor --rootless` for its boundary |
 | `runc` | `runc` is missing (`RUNC_MISSING`, warning) | Only foreign actors with `--isolation trusted` need it: `apt install runc` |
-| `netns` | A network namespace can't be created (`FOREIGN_UNAVAILABLE`, warning), or a new one has more than `lo` (failure); skipped without root | Check the kernel and any container runtime around the host; only foreign actors need it |
+| `netns` | A network namespace can't be created (`FOREIGN_UNAVAILABLE`, warning), or a new one has more than `lo` (failure); skipped without namespace-root authority, and not proven when the service identity is unavailable | Check the kernel and any container runtime around the host; only foreign actors need it |
 | `run_dir` | `[foreign] run_dir` can't be created or written (warning) | Point it at a writable directory, ideally on a tmpfs |
-| `caps` | The running `kronik.service` (or, without one, `kronik doctor` itself) lacks `CAP_SETUID`, which `runsc` needs: no foreign actor can start (failure); skipped without runsc | Remove `User=` from the unit and its drop-ins ([ADR 0027](../adr/0027-systemd-unit-hardening.md)) |
-| `sandbox` | `runsc ... do /bin/true` fails (`FOREIGN_UNAVAILABLE`): a warning, or a failure with `platform = "kvm"`; skipped without runsc or root | See gVisor's compatibility notes and the host's seccomp/AppArmor setup |
+| `caps` | The running root `kronik.service` (or, without one, `kronik doctor` itself) lacks `CAP_SETUID`, which `runsc` needs: no foreign actor can start (failure); skipped without runsc. A nonroot `kronik.service` is not examined, because it holds no host capability by design: doctor then looks at itself, and with `--rootless` an ordinary user's missing namespace-local `CAP_SETUID` is a warning instead of a failure | For a root unit, remove `User=` from it and its drop-ins ([ADR 0027](../adr/0027-systemd-unit-hardening.md)). For the nonroot service, check the pinned namespace and the delegated unit with `doctor --rootless` |
+| `sandbox` | `runsc ... do /bin/true` fails (`FOREIGN_UNAVAILABLE`): a warning, or a failure with `platform = "kvm"`; skipped without runsc or namespace-root authority, and not proven when the service identity is unavailable | See gVisor's compatibility notes and the host's seccomp/AppArmor setup |
 | `disk` | Under 1 GiB free in the data directory (failure) or under 5 GiB (warning) | Free space or move `server.data_dir` |
 | `clock` | The clock is not synchronized by NTP (warning) | `timedatectl set-ntp true` |
 | `tls` | The certificate has expired or can't be read (failure), or expires within 30 days (warning). With `acme` and no certificate cached yet, it warns | Renew the files; for ACME see [TLS](#tls): the gateway orders a certificate when it starts |

@@ -424,28 +424,28 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
         .iter()
         .map(|c| c["name"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        names,
-        [
-            "config",
-            "kernel",
-            "runsc",
-            "kvm",
-            "cgroup",
-            "root",
-            "runc",
-            "netns",
-            "run_dir",
-            "caps",
-            "sandbox",
-            "disk",
-            "clock",
-            "tls",
-            "ship",
-            "export",
-            "key_source"
-        ]
-    );
+    // Plain doctor, as root or as an ordinary user, lists what it always did:
+    // the nonroot service's checks come with --rootless only.
+    let expected = [
+        "config",
+        "kernel",
+        "runsc",
+        "kvm",
+        "cgroup",
+        "root",
+        "runc",
+        "netns",
+        "run_dir",
+        "caps",
+        "sandbox",
+        "disk",
+        "clock",
+        "tls",
+        "ship",
+        "export",
+        "key_source",
+    ];
+    assert_eq!(names, expected);
     assert_eq!(status(&report, "config")["status"], "pass");
     assert_eq!(status(&report, "tls")["status"], "pass", "{report}");
     assert_ne!(status(&report, "kvm")["status"], "fail", "{report}");
@@ -491,6 +491,41 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
     assert!(!ok);
     assert_eq!(status(&report, "config")["status"], "fail");
     assert_eq!(report["checks"].as_array().unwrap().len(), 17);
+}
+
+#[test]
+fn explicit_rootless_doctor_never_counts_a_root_smoke_as_service_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("kronik.toml");
+    std::fs::write(
+        &config,
+        "[foreign]\nrunsc_path = \"/no-such-kronik-runsc\"\n",
+    )
+    .unwrap();
+    let out = kronik(&[
+        "--json",
+        "doctor",
+        "--rootless",
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    for name in ["userns", "uid_view", "subid", "pin", "delegate"] {
+        assert!(status(&report, name)["status"].is_string(), "{report}");
+    }
+    if kronik_foreign::sys::is_root() {
+        let identity = status(&report, "service_identity");
+        if identity["status"] != "pass" {
+            assert_ne!(status(&report, "netns")["status"], "pass", "{report}");
+            assert_ne!(status(&report, "sandbox")["status"], "pass", "{report}");
+        } else {
+            assert!(
+                identity["message"].as_str().unwrap().contains("host uid"),
+                "{report}"
+            );
+        }
+    }
 }
 
 #[test]

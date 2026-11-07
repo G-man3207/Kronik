@@ -6,7 +6,10 @@
 //! unless the configuration asks for what is missing: with `[foreign]
 //! platform = "kvm"`, `kvm` and `sandbox` fail. A new network namespace with
 //! more than `lo` fails too: foreign actors would run without their network
-//! isolation.
+//! isolation. Where a microVM tool bundle is installed and the root service runs
+//! (the nonroot one has its own delegation check), `microvm` says whether the
+//! daemon has the delegated cgroup leaf a microVM needs, and gives the drop-in
+//! that adds it when it has not.
 //
 // A client command, not daemon code: it compares certificate expiry with the
 // wall clock directly (ADR 0004 §3 concerns the daemon).
@@ -30,6 +33,10 @@ pub struct DoctorArgs {
     /// The configuration file [default: /etc/kronik/kronik.toml if it exists].
     #[arg(long, value_name = "PATH", env = "KRONIK_CONFIG")]
     config: Option<PathBuf>,
+    /// Also check what the nonroot service (M21) needs, and run the smoke under
+    /// its identity, also when invoked as root.
+    #[arg(long)]
+    rootless: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -42,8 +49,10 @@ enum Status {
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct Check {
-    /// Stable: config, kernel, runsc, kvm, cgroup, root, disk, clock, tls,
-    /// dns01_hook, ship, export.
+    /// Stable check names, including userns/uid_view/subid/pin/delegate with
+    /// `--rootless`, service_identity when a root invocation requests it, and
+    /// microvm where a microVM tool bundle is installed and the root service
+    /// runs.
     name: &'static str,
     status: Status,
     /// An error code from the catalog, when one applies.
@@ -120,6 +129,40 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
             Config::default()
         }
     };
+    // The nonroot service's checks are asked for, never added on their own: a
+    // plain `kronik doctor` reports what it always did.
+    let rootless_mode = args.rootless;
+    let mut service_identity = !kronik_foreign::sys::is_root();
+    if args.rootless && !service_identity {
+        match crate::cli::userns::kronik_user(crate::cli::userns::USER, None) {
+            Ok(user) => match kronik_foreign::sys::become_user(user.uid, user.gid) {
+                Ok(()) => {
+                    service_identity = true;
+                    checks.push(check(
+                        "service_identity",
+                        Status::Pass,
+                        format!("smoke runs as {} (host uid {})", user.name, user.uid),
+                    ));
+                }
+                Err(e) => {
+                    checks.push(check(
+                        "service_identity",
+                        Status::Fail,
+                        format!("cannot become daemon user: {e}"),
+                    ));
+                }
+            },
+            Err(e) => checks.push(check(
+                "service_identity",
+                Status::Warn,
+                format!("cannot prove daemon identity: {e}"),
+            )),
+        }
+    }
+    let original_identity = root(rootless_mode);
+    if rootless_mode {
+        checks.extend(rootless());
+    }
     checks.push(kernel());
     checks.push(runsc(&config.foreign.runsc_path));
     let dev_kvm = std::fs::OpenOptions::new()
@@ -128,12 +171,37 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
         .open("/dev/kvm");
     checks.push(kvm(config.foreign.platform, dev_kvm.map(drop)));
     checks.push(cgroup());
-    checks.push(root());
+    checks.extend(microvm_leaf(
+        config
+            .foreign
+            .microvm_dir
+            .join("manifest.json")
+            .try_exists()
+            .unwrap_or(false),
+        root_unit(),
+    ));
+    checks.push(original_identity);
     checks.push(runc());
-    checks.push(netns());
+    checks.push(if rootless_mode && !service_identity {
+        check(
+            "netns",
+            Status::Warn,
+            "not proven: daemon identity unavailable",
+        )
+    } else {
+        netns()
+    });
     checks.push(run_dir(&config.foreign.run_dir));
-    checks.push(caps(&config.foreign.runsc_path));
-    checks.push(sandbox(&config.foreign.runsc_path, config.foreign.platform));
+    checks.push(caps(&config.foreign.runsc_path, rootless_mode));
+    checks.push(if rootless_mode && !service_identity {
+        check(
+            "sandbox",
+            Status::Warn,
+            "not proven: daemon identity unavailable",
+        )
+    } else {
+        sandbox(&config.foreign.runsc_path, config.foreign.platform)
+    });
     checks.push(disk(&config.server.data_dir));
     checks.push(clock());
     checks.push(tls(&config));
@@ -310,21 +378,284 @@ fn cgroup() -> Check {
     }
 }
 
-fn root() -> Check {
+/// What the doctor can see of the root service's cgroup.
+#[derive(Debug, PartialEq, Eq)]
+enum RootUnit {
+    /// Running: its main process is in this cgroup of the unified hierarchy.
+    Running { pid: u32, cgroup: String },
+    /// Loaded, not running: whether it asks systemd for the daemon's leaf.
+    Stopped { leaf: bool },
+}
+
+/// The root service, from `systemctl show` of `kronik.service`: `None` when
+/// the unit is not loaded, runs as a user (the nonroot service, which
+/// `delegate` checks under `--rootless`), or systemd cannot be asked.
+fn root_unit() -> Option<RootUnit> {
+    let output = Command::new("systemctl")
+        .args([
+            "show",
+            "--property=LoadState,User,MainPID,DelegateSubgroup",
+            "kronik.service",
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let pid = main_pid(&text);
+    let cgroup = pid
+        .filter(|&pid| pid != 0)
+        .and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok())
+        .and_then(|text| {
+            text.lines()
+                .find_map(|l| l.strip_prefix("0::"))
+                .map(str::to_owned)
+        });
+    root_unit_from(&text, pid.zip(cgroup))
+}
+
+fn main_pid(show: &str) -> Option<u32> {
+    show.lines()
+        .find_map(|l| l.strip_prefix("MainPID="))?
+        .parse()
+        .ok()
+}
+
+/// `show` is the output of `systemctl show` for the properties above;
+/// `running` the main process and its cgroup, if there is one.
+fn root_unit_from(show: &str, running: Option<(u32, String)>) -> Option<RootUnit> {
+    let property = |name: &str| {
+        show.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix('='))
+    };
+    if property("LoadState") != Some("loaded") || property("User").is_none_or(|u| !u.is_empty()) {
+        return None;
+    }
+    Some(match running {
+        Some((pid, cgroup)) => RootUnit::Running { pid, cgroup },
+        None => RootUnit::Stopped {
+            leaf: property("DelegateSubgroup") == Some("daemon"),
+        },
+    })
+}
+
+/// A microVM needs the daemon in a delegated cgroup leaf. The root service's
+/// unit is v0.4.0's and has none; the drop-in in the operations guide gives it
+/// one. Silent where no tool bundle is installed or no root service is seen.
+fn microvm_leaf(bundle: bool, unit: Option<RootUnit>) -> Option<Check> {
+    use kronik_foreign::microvm::{ROOT_LEAF_NEED, root_leaf_advice};
+    if !bundle {
+        return None;
+    }
+    let (ok, where_) = match unit? {
+        RootUnit::Running { pid, cgroup } => (
+            cgroup.ends_with("/daemon"),
+            format!("kronik.service (pid {pid}) runs in {cgroup}"),
+        ),
+        RootUnit::Stopped { leaf } => (
+            leaf,
+            format!(
+                "kronik.service is not running and {} DelegateSubgroup=daemon",
+                if leaf { "sets" } else { "does not set" }
+            ),
+        ),
+    };
+    Some(if ok {
+        check(
+            "microvm",
+            Status::Pass,
+            format!("{where_}: the daemon has the delegated leaf microVM actors need"),
+        )
+    } else {
+        check(
+            "microvm",
+            Status::Warn,
+            format!("{ROOT_LEAF_NEED}: {where_}"),
+        )
+        .code("FOREIGN_UNAVAILABLE")
+        .hint(root_leaf_advice())
+    })
+}
+
+/// Whether the process runs as root. Without `--rootless` this says what it
+/// said before M21; with it, the identity the checks ran as.
+fn root(rootless: bool) -> Check {
     use std::os::unix::fs::MetadataExt as _;
-    match std::fs::metadata("/proc/self").map(|m| m.uid()) {
-        Ok(0) => check(
+    match (std::fs::metadata("/proc/self").map(|m| m.uid()), rootless) {
+        (Ok(0), false) => check(
             "root",
             Status::Pass,
             "running as root, as the daemon does in v0.1",
         ),
-        _ => check(
+        (_, false) => check(
             "root",
             Status::Warn,
             "not running as root: some checks see less than the daemon will",
         )
         .hint("sudo kronik doctor"),
+        (Ok(0), true) => check(
+            "root",
+            Status::Pass,
+            "running with namespace root authority (host-root only in explicit root mode)",
+        ),
+        (_, true) => check(
+            "root",
+            Status::Warn,
+            "running as a nonroot host user; namespace setup is reported separately",
+        ),
     }
+}
+
+/// Checks namespace setup before service-identity smoke probes.
+fn rootless() -> Vec<Check> {
+    use kronik_foreign::subid::USERNS_PIN;
+    use kronik_foreign::sys;
+    let code = "ROOTLESS_UNAVAILABLE";
+    let mut checks = Vec::new();
+    checks.push(match crate::cli::userns::userns_allowed() {
+        Ok(()) => check("userns", Status::Pass, "user namespaces are allowed"),
+        Err(why) => check("userns", Status::Warn, why).code(code).hint(
+            "set user.max_user_namespaces above 0 (and kernel.unprivileged_userns_clone = 1 on \
+             Debian), or keep the root daemon: sudo kronik serve --init --root",
+        ),
+    });
+    let root = sys::is_root();
+    // The check the service makes before it starts; it refuses to start
+    // where it fails (ADR 0065), so a failure here is a failure to start.
+    checks.push(if root {
+        check(
+            "uid_view",
+            Status::Warn,
+            "skipped as root: run doctor as the service user, or `sudo kronik doctor --rootless`, which becomes that user",
+        )
+    } else {
+        match sys::acceptor_view() {
+            Ok(()) => check(
+                "uid_view",
+                Status::Pass,
+                "the uid map is the host's identity map and the real, effective and saved \
+                 uids agree: API callers keep their host uids",
+            ),
+            Err(why) => check("uid_view", Status::Fail, why.to_string())
+                .code(code)
+                .hint(
+                    "the nonroot service refuses to start here; use the root service on this \
+                     host: sudo kronik serve --init --root",
+                ),
+        }
+    });
+    // As root, the `kronik` user; otherwise this user, as whom the daemon
+    // would run.
+    let uid = rustix::process::geteuid().as_raw();
+    let user = if root {
+        crate::cli::userns::kronik_user(crate::cli::userns::USER, None)
+    } else {
+        crate::cli::userns::kronik_user("", Some(uid))
+    };
+    checks.push(match &user {
+        Ok(u) => check(
+            "subid",
+            Status::Pass,
+            format!(
+                "user {} (uid {}) has the ranges {}+{} (uids) and {}+{} (gids)",
+                u.name, u.uid, u.subuid[0], u.subuid[1], u.subgid[0], u.subgid[1]
+            ),
+        ),
+        Err(why) => check("subid", Status::Warn, why.clone())
+            .code(code)
+            .hint("sudo kronik serve --init creates the kronik user and its ranges"),
+    });
+    if !root && let Err(e) = sys::clear_capabilities() {
+        checks.push(check(
+            "caps",
+            Status::Fail,
+            format!("cannot clear host capabilities: {e}"),
+        ));
+        return checks;
+    }
+    let pinned = sys::inspect_userns(std::path::Path::new(USERNS_PIN));
+    let pin = match (&pinned, &user) {
+        (Err(e), _) => check("pin", Status::Warn, format!("reading {USERNS_PIN}: {e}")).code(code),
+        (Ok(None), _) => check(
+            "pin",
+            Status::Warn,
+            format!("nothing is pinned at {USERNS_PIN}"),
+        )
+        .code(code)
+        .hint("sudo systemctl start kronik-userns (it runs `kronik userns pin`)"),
+        (Ok(Some(p)), _) if p.maps.is_err() => check(
+            "pin",
+            Status::Warn,
+            format!(
+                "{USERNS_PIN} is owned by uid {}; its maps are unreadable here: {}",
+                p.owner,
+                p.maps.as_ref().err().map_or("", String::as_str)
+            ),
+        )
+        .code(code)
+        .hint("run doctor as root or as the daemon's user"),
+        (Ok(Some(p)), Ok(u)) if p.owner == u.uid && p.maps.as_ref().ok() == Some(&u.maps()) => {
+            check(
+                "pin",
+                Status::Pass,
+                format!(
+                    "{USERNS_PIN} is owned by {} and maps 0 to it and 1-65535 to its ranges",
+                    u.name
+                ),
+            )
+        }
+        (Ok(Some(p)), _) => check(
+            "pin",
+            Status::Fail,
+            format!(
+                "{USERNS_PIN} is owned by uid {} with maps {:?}: not what the user's ranges give, \
+                 so the daemon refuses it",
+                p.owner, p.maps
+            ),
+        )
+        .code(code)
+        .hint("stop consumers, unpin the owned namespace, then pin the expected identity"),
+    };
+    let pin_ok = pin.status == Status::Pass;
+    let pin_index = checks.len();
+    checks.push(pin);
+    checks.push(if root {
+        check(
+            "delegate",
+            Status::Warn,
+            "skipped as root: only the daemon's unit has the delegated cgroup",
+        )
+        .hint("run `kronik doctor` as the daemon's user inside a unit like kronik.service to check it")
+    } else {
+        let cgroup = sys::own_cgroup().unwrap_or_default();
+        if sys::cgroup_delegated(&cgroup) {
+            check(
+                "delegate",
+                Status::Pass,
+                format!("cgroup {cgroup} is delegated to this user"),
+            )
+        } else {
+            check(
+                "delegate",
+                Status::Warn,
+                format!("cgroup {cgroup} is not delegated to this user"),
+            )
+            .code(code)
+            .hint("the daemon gets one in kronik.service (Delegate=yes); outside it foreign actors are unavailable")
+        }
+    });
+    if !root
+        && pin_ok
+        && let Ok(u) = &user
+        && let Err(e) = sys::enter_userns(std::path::Path::new(USERNS_PIN), &u.maps())
+    {
+        checks[pin_index] = check(
+            "pin",
+            Status::Fail,
+            format!("cannot enter {USERNS_PIN}: {e}"),
+        )
+        .code(code);
+    }
+    checks
 }
 
 /// runc, for `--isolation trusted` (docs/design/m7-foreign.md §15).
@@ -399,35 +730,96 @@ fn has_cap_setuid(status: &str) -> Option<bool> {
     Some(u64::from_str_radix(hex, 16).ok()? & (1 << 7) != 0)
 }
 
-/// runsc's gofer needs `CAP_SETUID`. systemd drops it from a unit with an
-/// explicit `User=` and a seccomp-based setting, and `NoNewPrivileges`
-/// keeps runsc from getting it back (ADR 0027). Looks at the running
-/// kronik.service's process if there is one, else at this process.
-fn caps(runsc: &Path) -> Check {
+/// What `caps` examines.
+#[derive(Debug, PartialEq, Eq)]
+enum CapsSubject {
+    /// The running root `kronik.service` (its pid): the trap of ADR 0027 is a
+    /// root unit that lost `CAP_SETUID`.
+    RootUnit(u32),
+    /// This process, the identity of the smoke.
+    Process,
+}
+
+/// The unit's main process is examined only while it runs as root. The
+/// nonroot unit holds no host capability by design (it empties them after
+/// binding its ports and works with namespace-local authority), so its
+/// status says nothing about whether `runsc` can start.
+fn caps_subject(unit: Option<(u32, &str)>) -> CapsSubject {
+    match unit {
+        Some((pid, status)) if effective_uid(status) == Some(0) => CapsSubject::RootUnit(pid),
+        _ => CapsSubject::Process,
+    }
+}
+
+/// Whether lacking `CAP_SETUID` is the trap of ADR 0027, a failure: it is for
+/// a root unit and, as in v0.4.0, for the doctor process itself. Only with
+/// `--rootless`, and only for a process that is not root (it entered the
+/// service's namespace, or could not), is it a warning about namespace-local
+/// authority.
+fn caps_is_trap(subject: &CapsSubject, root: bool, rootless: bool) -> bool {
+    match subject {
+        CapsSubject::RootUnit(_) => true,
+        CapsSubject::Process => root || !rootless,
+    }
+}
+
+/// The effective uid of a `/proc/<pid>/status` text.
+fn effective_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// runsc's gofer needs `CAP_SETUID`. systemd drops it from a root unit with
+/// an explicit `User=` and a seccomp-based setting, and `NoNewPrivileges`
+/// keeps runsc from getting it back (ADR 0027). Looks at the running root
+/// kronik.service's process if there is one, else at this process. A nonroot
+/// unit is not examined: it holds no host capability by design. With
+/// `--rootless`, a doctor process that is not root checks namespace-local
+/// authority, and lacking it is a warning: Wasm actors still run.
+fn caps(runsc: &Path, rootless: bool) -> Check {
     if !is_executable(runsc) {
         return check("caps", Status::Warn, "skipped: no runsc").code("RUNSC_MISSING");
     }
-    let pid = Command::new("systemctl")
+    let unit = Command::new("systemctl")
         .args(["show", "--property=MainPID", "--value", "kronik.service"])
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().parse::<u32>().ok())
-        .filter(|&pid| pid != 0);
-    let (who, path) = match pid {
-        Some(pid) => (
+        .filter(|&pid| pid != 0)
+        .and_then(|pid| {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+            Some((pid, status))
+        });
+    let subject = caps_subject(unit.as_ref().map(|(pid, s)| (*pid, s.as_str())));
+    let trap = caps_is_trap(&subject, kronik_foreign::sys::is_root(), rootless);
+    let (who, path) = match subject {
+        CapsSubject::RootUnit(pid) => (
             format!("kronik.service (pid {pid})"),
             format!("/proc/{pid}/status"),
         ),
-        None => ("this process".to_owned(), "/proc/self/status".to_owned()),
+        CapsSubject::Process if trap => ("this process".to_owned(), "/proc/self/status".to_owned()),
+        CapsSubject::Process => (
+            "this doctor process (the identity used by its smoke)".to_owned(),
+            "/proc/self/status".to_owned(),
+        ),
     };
-    match std::fs::read_to_string(&path).ok().as_deref().and_then(has_cap_setuid) {
+    match std::fs::read_to_string(&path)
+        .ok()
+        .as_deref()
+        .and_then(has_cap_setuid)
+    {
         Some(true) => check(
             "caps",
             Status::Pass,
             format!("{who} has CAP_SETUID, which runsc needs"),
         ),
-        Some(false) => check(
+        Some(false) if trap => check(
             "caps",
             Status::Fail,
             format!("{who} lacks CAP_SETUID: no foreign actor can start (runsc's gofer fails with EPERM)"),
@@ -435,6 +827,15 @@ fn caps(runsc: &Path) -> Check {
         .hint(
             "remove User= from kronik.service and its drop-ins; with it, systemd drops CAP_SETUID \
              under the unit's seccomp settings (docs/adr/0027-systemd-unit-hardening.md)",
+        ),
+        Some(false) => check(
+            "caps",
+            Status::Warn,
+            format!("{who} lacks namespace-local CAP_SETUID: foreign sandboxes are unavailable"),
+        )
+        .hint(
+            "check the pinned namespace and delegated unit with `kronik doctor --rootless`; \
+             use `kronik serve --init --root` only for an explicit root fallback",
         ),
         None => check("caps", Status::Warn, format!("could not read {path}")),
     }
@@ -496,6 +897,7 @@ fn sandbox(runsc: &Path, platform: Platform) -> Check {
         );
     };
     let out = Command::new("timeout")
+        .current_dir("/")
         .arg("30")
         .arg(runsc)
         .arg("--root")
@@ -986,6 +1388,74 @@ mod tests {
         assert_eq!(kvm(Platform::Kvm, Ok(())).status, Status::Pass);
     }
 
+    fn show(state: &str, user: &str, pid: u32, subgroup: &str) -> String {
+        format!("MainPID={pid}\nLoadState={state}\nUser={user}\nDelegateSubgroup={subgroup}\n")
+    }
+
+    #[test]
+    fn only_a_loaded_root_unit_is_looked_at() {
+        let running = Some((7, "/system.slice/kronik.service".to_owned()));
+        // The nonroot unit has User=; a unit that is not installed is not there.
+        assert_eq!(
+            root_unit_from(&show("loaded", "kronik", 7, ""), running.clone()),
+            None
+        );
+        assert_eq!(root_unit_from(&show("not-found", "", 0, ""), None), None);
+        assert_eq!(
+            root_unit_from(&show("loaded", "", 7, ""), running.clone()),
+            Some(RootUnit::Running {
+                pid: 7,
+                cgroup: "/system.slice/kronik.service".into()
+            })
+        );
+        // Not running: the property tells; systemd before 254 has none.
+        assert_eq!(
+            root_unit_from(&show("loaded", "", 0, "daemon"), None),
+            Some(RootUnit::Stopped { leaf: true })
+        );
+        assert_eq!(
+            root_unit_from(&show("loaded", "", 0, ""), None),
+            Some(RootUnit::Stopped { leaf: false })
+        );
+        assert_eq!(root_unit_from("LoadState=loaded\nMainPID=0\n", None), None);
+        assert_eq!(main_pid("MainPID=4242\nUser=\n"), Some(4242));
+    }
+
+    #[test]
+    fn microvm_actors_need_the_leaf_and_the_doctor_says_how_to_add_it() {
+        let running = |cgroup: &str| RootUnit::Running {
+            pid: 9,
+            cgroup: cgroup.into(),
+        };
+        // Nothing to say without a tool bundle or without a root service.
+        assert!(microvm_leaf(false, Some(running("/x"))).is_none());
+        assert!(microvm_leaf(true, None).is_none());
+        let c = microvm_leaf(true, Some(running("/system.slice/kronik.service/daemon"))).unwrap();
+        assert_eq!((c.name, c.status), ("microvm", Status::Pass));
+        for unit in [
+            running("/system.slice/kronik.service"),
+            RootUnit::Stopped { leaf: false },
+        ] {
+            let c = microvm_leaf(true, Some(unit)).unwrap();
+            assert_eq!(
+                (c.name, c.status, c.code),
+                ("microvm", Status::Warn, Some("FOREIGN_UNAVAILABLE"))
+            );
+            assert!(
+                c.message.starts_with("microVM actors need"),
+                "{}",
+                c.message
+            );
+            let hint = c.hint.unwrap();
+            assert!(
+                hint.contains("DelegateSubgroup=daemon") && hint.contains("254"),
+                "{hint}"
+            );
+        }
+        let c = microvm_leaf(true, Some(RootUnit::Stopped { leaf: true })).unwrap();
+        assert_eq!(c.status, Status::Pass);
+    }
+
     #[test]
     fn parses_what_the_host_reports() {
         assert_eq!(kernel_version("6.12.38+deb13-amd64"), Some((6, 12)));
@@ -1059,6 +1529,46 @@ mod tests {
         assert_eq!(has_cap_setuid(&status("000001f3fdfeff7f")), Some(false));
         assert_eq!(has_cap_setuid("Name:\tkronik\n"), None);
         assert_eq!(has_cap_setuid(&status("zz")), None);
+    }
+
+    /// The ADR 0027 trap is looked for in a root unit only: a nonroot unit
+    /// has no host capability by design, and no unit means this process.
+    #[test]
+    fn caps_looks_at_a_root_unit_and_ignores_a_nonroot_one() {
+        let status = |uid: u32, prm: &str| {
+            format!("Name:\tkronik\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nCapPrm:\t{prm}\n")
+        };
+        // The root unit that lost CAP_SETUID (User=root with a seccomp setting).
+        let lost = status(0, "000001f3fdfeff7f");
+        assert_eq!(caps_subject(Some((42, &lost))), CapsSubject::RootUnit(42));
+        assert_eq!(has_cap_setuid(&lost), Some(false));
+        let root = status(0, "000001f3fdfeffff");
+        assert_eq!(caps_subject(Some((7, &root))), CapsSubject::RootUnit(7));
+        // The nonroot unit holds no host capability, whatever its CapPrm says.
+        let nonroot = status(998, "0000000000000000");
+        assert_eq!(caps_subject(Some((9, &nonroot))), CapsSubject::Process);
+        assert_eq!(effective_uid(&nonroot), Some(998));
+        // Only the effective uid counts: a unit that is root in real uid only.
+        let mixed = "Uid:\t0\t998\t998\t998\n";
+        assert_eq!(effective_uid(mixed), Some(998));
+        assert_eq!(caps_subject(Some((9, mixed))), CapsSubject::Process);
+        // The doctor process itself is the trap too, as in v0.4.0, unless
+        // `--rootless` runs it as an ordinary user in the service's namespace.
+        for (root, rootless, trap) in [
+            (true, false, true),
+            (false, false, true),
+            (true, true, true),
+            (false, true, false),
+        ] {
+            assert_eq!(caps_is_trap(&CapsSubject::Process, root, rootless), trap);
+        }
+        assert!(caps_is_trap(&CapsSubject::RootUnit(1), false, true));
+        // No unit, or a status that cannot be read as one.
+        assert_eq!(caps_subject(None), CapsSubject::Process);
+        assert_eq!(
+            caps_subject(Some((1, "Name:\tkronik\n"))),
+            CapsSubject::Process
+        );
     }
 
     #[test]

@@ -204,7 +204,7 @@ running it again changes nothing, and `--dry-run` prints the plan.
 
 ## kronik doctor
 
-`kronik doctor [--config <PATH>]`
+`kronik doctor [--config <PATH>] [--rootless]`
 
 Checks what this host can run (M6): the configuration file, the kernel,
 gVisor's `runsc`, KVM, cgroups, whether it runs as root, and for foreign
@@ -214,6 +214,11 @@ certificate and shipping. Each check passes, warns or fails, with a hint.
 The checks of what only foreign actors need warn rather than fail, unless
 the configuration asks for what is missing (`platform = "kvm"`); the
 [operations guide](../guides/operations.md#kronik-doctor) lists them all.
+With `--rootless` (M21) it also checks what the nonroot service needs
+(`userns`, `uid_view`, `subid`, `pin` and `delegate`) and runs the network
+namespace and sandbox checks under the service's identity: as root it first
+becomes the `kronik` user, and when it cannot, those two checks say that they
+are not proven instead of counting a root smoke as proof for the service.
 The exit code is 1 when a check fails, so a provisioning script can stop on
 it; `--json` gives the report as data.
 
