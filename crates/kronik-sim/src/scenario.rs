@@ -79,6 +79,10 @@ pub struct ScenarioConfig {
     pub max_crashes: u32,
     pub crash_model: CrashModel,
     pub fsync_error: f64,
+    /// The `sync_data` calls on the disk (counted from 1, over every node, in
+    /// the order they run) that fail in addition to the random failures of
+    /// `fsync_error`: a write failed on purpose, whatever the seed's draws.
+    pub fail_fsyncs: Vec<u64>,
     /// Chance per fault tick that the wall clock jumps backwards.
     pub clock_jump_p: f64,
     /// Chance that `state.db` and the actor databases survive a crash.
@@ -130,6 +134,7 @@ impl ScenarioConfig {
                 CrashModel::Reorder
             },
             fsync_error: if r.chance(0.3) { 0.01 } else { 0.0 },
+            fail_fsyncs: Vec::new(),
             clock_jump_p: 0.2,
             keep_store_p: [0.0, 0.5, 1.0][r.below(3) as usize],
             segment_max_bytes: [2 << 10, 64 << 10, 64 << 20][r.below(3) as usize],
@@ -1436,6 +1441,8 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
         }
     };
 
+    let mut disk = Disk::default();
+    disk.fail_syncs(cfg.fail_fsyncs.iter().copied());
     let world = Arc::new(World {
         secrets_root,
         service,
@@ -1445,7 +1452,7 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
         faults: SimRng::new(seed, b"faults"),
         work: SimRng::new(seed, b"workload"),
         entropy: SimRng::new(seed, b"entropy"),
-        disk: Arc::new(Mutex::new(Disk::default())),
+        disk: Arc::new(Mutex::new(disk)),
         wall_offset,
         code,
         fatal_tx,

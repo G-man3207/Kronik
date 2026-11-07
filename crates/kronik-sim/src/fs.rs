@@ -83,6 +83,11 @@ pub struct Disk {
     pub fsyncs: u64,
     pub torn_writes: u64,
     pub lost_writes: u64,
+    /// `sync_data` calls so far, failed ones too, in the order they run.
+    sync_calls: u64,
+    /// The `sync_data` calls (counted from 1) that fail whatever the random
+    /// draws say; see [`Disk::fail_syncs`].
+    fail_sync_calls: BTreeSet<u64>,
 }
 
 fn parent(p: &Path) -> PathBuf {
@@ -110,6 +115,16 @@ fn insecure_file() -> io::Error {
 }
 
 impl Disk {
+    /// Fails the given `sync_data` calls, counted from 1 over the whole disk
+    /// in the order they run, in addition to the random failures of
+    /// [`DiskFaults::fsync_error`]. A call is a position in the run's I/O, not
+    /// in its random draws, so a test can fail one particular write (the
+    /// second fsync of a fresh disk is the first record a start appends)
+    /// whatever the seed.
+    pub fn fail_syncs(&mut self, calls: impl IntoIterator<Item = u64>) {
+        self.fail_sync_calls.extend(calls);
+    }
+
     /// The bytes of `path` that are guaranteed to survive a crash right now:
     /// durable contents of a durably named file.
     pub fn durable_contents(&self, path: &Path) -> Option<Vec<u8>> {
@@ -590,7 +605,8 @@ impl File for SimFile {
         let lat = self.fs.latency(200, 3000, 0.01, 20_000);
         let fail = self.fs.rng.chance(self.fs.faults.fsync_error);
         self.with(lat, move |i, d| {
-            if fail {
+            d.sync_calls += 1;
+            if fail || d.fail_sync_calls.contains(&d.sync_calls) {
                 // The kernel may have dropped the dirty pages: model the worst
                 // case by forgetting them, like ext4 after a writeback error.
                 i.current = i.durable.clone();
