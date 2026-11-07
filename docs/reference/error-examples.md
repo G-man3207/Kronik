@@ -482,9 +482,11 @@ Restore that actual prerequisite; do not interpret an unavailable catalogue as
 empty or substitute current values for historical references. After a
 restart this includes a recorded version that the provider no longer serves,
 until it serves the version again; that is a known defect (see the operations
-guide). An effect that cannot get its secret fails with this code inside its
-turn, and the guest decides what the turn does; the request is not answered
-503.
+guide). After an upgrade of data written by v0.3.0 or older it includes a
+snapshot from those versions that is still retained, until retention has
+deleted it; that is a known defect too (see the operations guide). An effect
+that cannot get its secret fails with this code inside its turn, and the guest
+decides what the turn does; the request is not answered 503.
 
 ```sh
 kronik audit show --from 1
