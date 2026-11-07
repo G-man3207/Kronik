@@ -1183,14 +1183,23 @@ impl Net for Bao {
     }
 }
 async fn bao_node() -> (tempfile::TempDir, Arc<Node>, Arc<Bao>) {
-    bao_node_with_refresh(Settings::default().refresh).await
+    bao_node_with_fetch_timeout(Settings::default().fetch_timeout).await
 }
 
-/// A linked value is served from the cache while operationally fresh; a
-/// short `refresh` makes `cached` miss (a cold resolve re-fetches) while
-/// the default `max_stale` keeps the background cycle from freshness
-/// fetching, so a test controls exactly which request reaches the provider.
-async fn bao_node_with_refresh(refresh: Duration) -> (tempfile::TempDir, Arc<Node>, Arc<Bao>) {
+/// A node with the OpenBao fake as its backend `bao`, settled: its cycle has
+/// made the pass that certifies the empty startup inventory.
+///
+/// Keep `refresh` at its default in a test that counts provider requests.
+/// The cycle fetches every linked name from the provider on each of its
+/// passes, whatever the age of the cached value: about every `refresh`, and
+/// after each change that retires the certificate. A short `refresh` puts
+/// requests of the node's own among the test's, at moments that depend on the
+/// clock, and a rebuild that takes longer than `refresh` is not installed.
+/// A test that blocks the provider needs a `fetch_timeout` that a loaded
+/// machine cannot exceed while the request waits.
+async fn bao_node_with_fetch_timeout(
+    fetch_timeout: Duration,
+) -> (tempfile::TempDir, Arc<Node>, Arc<Bao>) {
     use std::os::unix::fs::PermissionsExt;
     let data = tempfile::tempdir().unwrap();
     let token = data.path().join("bao.token");
@@ -1203,7 +1212,7 @@ async fn bao_node_with_refresh(refresh: Duration) -> (tempfile::TempDir, Arc<Nod
         group_commit_window: Some(Duration::ZERO),
         ..Default::default()
     };
-    config.secret_settings.refresh = refresh;
+    config.secret_settings.fetch_timeout = fetch_timeout;
     config.secret_settings.backends.insert(
         "bao".into(),
         Definition::Openbao {
@@ -1224,13 +1233,11 @@ async fn bao_node_with_refresh(refresh: Duration) -> (tempfile::TempDir, Arc<Nod
         .await
         .unwrap();
     *lock(&bao.node) = Some(Arc::downgrade(&node));
-    // Finish the independent empty startup inventory before observing management I/O.
+    // Finish the independent empty startup inventory before observing
+    // management I/O. The condition ends the wait; the bound only turns a
+    // cycle that never settles into a failure.
     node.env
-        .timeout(Duration::from_secs(3), async {
-            while !node.runtime().unwrap().cache.complete(node.epoch()) {
-                tokio::task::yield_now().await;
-            }
-        })
+        .timeout(Duration::from_secs(60), node.secret_cycle_settled())
         .await
         .unwrap();
     (data, node, bao)
@@ -1778,7 +1785,8 @@ async fn failed_orphan_file_rows_are_scrub_only_and_never_operational_current() 
 
 #[tokio::test]
 async fn cancelled_fetch_retains_singleflight_until_old_generation_publication_finishes() {
-    let (_data, node, bao) = bao_node_with_refresh(Duration::from_millis(500)).await;
+    // The blocked fetch must outlast everything the test does while it waits.
+    let (_data, node, bao) = bao_node_with_fetch_timeout(Duration::from_secs(30)).await;
     node.secret_link(
         "token",
         "bao",
@@ -1789,15 +1797,27 @@ async fn cancelled_fetch_retains_singleflight_until_old_generation_publication_f
     )
     .await
     .unwrap();
+    // Let the cycle finish the passes the link asked for, so that no request
+    // of the node's own reaches the provider from here on until the test
+    // changes something: the request below is the only one, and the permit
+    // the test takes is its.
+    node.env
+        .timeout(Duration::from_secs(60), node.secret_cycle_settled())
+        .await
+        .unwrap();
+    // A linked value is served from the cache while it is operationally
+    // fresh, and a resolve that finds nothing recorded for the name is cold
+    // anyway. Make the value, if the cycle already observed one, stale, so that
+    // the resolve below goes to the provider: its fetch, its singleflight and
+    // the aborted-request retention are then real.
+    for ((name, _), held) in lock(&node.runtime().unwrap().cache.state).values.iter_mut() {
+        if name == "token" {
+            held.operational = false;
+        }
+    }
     while let Ok(permit) = bao.started.try_acquire() {
         permit.forget();
     }
-    // The staging swap serves a linked value from the cache while it is
-    // operationally fresh, so a plain resolve would never reach the
-    // provider. With the node's short refresh TTL the cached value ages
-    // out and the resolve below goes cold: its provider fetch, its
-    // singleflight and the aborted-request retention are then real.
-    node.env.clock.sleep(Duration::from_millis(600)).await;
     let blocked = Arc::new(Semaphore::new(0));
     *lock(&bao.block) = Some(blocked.clone());
     let old_config = node.config_now();
@@ -1823,8 +1843,6 @@ async fn cancelled_fetch_retains_singleflight_until_old_generation_publication_f
             .await
     });
     node.env.clock.sleep(Duration::from_millis(10)).await;
-    // The link itself publishes the linked value's version record (the
-    // coverage ledger must reference it), so history is not empty here.
     // The retention property under test: the relink is parked behind the
     // blocked fetch's name lock, so no generation-2 record can exist yet.
     assert!(
@@ -1837,25 +1855,62 @@ async fn cancelled_fetch_retains_singleflight_until_old_generation_publication_f
     *lock(&bao.block) = None;
     blocked.add_permits(1);
     relink.await.unwrap().unwrap();
+    // The fetch the cancelled request left behind published under the
+    // generation it began in: one version of the first link, with the first
+    // reference. What the cycle observes of the second link, and when, is its
+    // own business, so rows of generation 2 may exist, and must be the
+    // second link's.
     let history = node.secret_history("token").await.unwrap();
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].link_generation, 1);
-    assert_eq!(history[0].r#ref, "secret/first#token");
-    let config = node.config_now();
+    let first: Vec<_> = history
+        .iter()
+        .filter(|row| row.link_generation == 1)
+        .collect();
+    assert_eq!(first.len(), 1, "{history:?}");
+    assert_eq!(first[0].r#ref, "secret/first#token");
     assert!(
-        node.secret_cache()
-            .unwrap()
-            .cached("token", None, &config)
-            .unwrap()
-            .is_none()
+        history
+            .iter()
+            .filter(|row| row.link_generation == 2)
+            .all(|row| row.r#ref == "secret/second#token"),
+        "{history:?}"
     );
+    // The relink waited for that publication: it is in the log before the
+    // relink's record.
+    let (mut published, mut relinked) = (None, None);
+    node.reader()
+        .read_while(1, node.applied_lsn(), |committed| {
+            match &committed.record {
+                Record::SecretVersion(row)
+                    if row.name == "token" && row.link_generation == 1 && active(row) =>
+                {
+                    published.get_or_insert(committed.lsn);
+                }
+                Record::SecretLink(link) if link.name == "token" && link.generation == 2 => {
+                    relinked.get_or_insert(committed.lsn);
+                }
+                _ => {}
+            }
+            Ok(true)
+        })
+        .await
+        .unwrap();
+    let (published, relinked) = (
+        published.expect("a version of the first link was published"),
+        relinked.expect("the relink was committed"),
+    );
+    assert!(published < relinked, "{published} {relinked}");
+    // The old generation's value is not served under the new configuration.
+    let config = node.config_now();
+    if let Ok(Some(value)) = node.secret_cache().unwrap().cached("token", None, &config) {
+        assert_eq!(value.value, b"second-credential-1");
+    }
     let current = node
         .resolve_secret("token", None, &config, test_auth())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(current.value, b"second-credential-1");
-    assert_ne!(current.meta.version, history[0].version);
+    assert_ne!(current.meta.version, first[0].version);
 }
 
 #[tokio::test]
