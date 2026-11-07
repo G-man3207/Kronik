@@ -1279,3 +1279,176 @@ fn partial_snapshots_are_swept() {
     assert_eq!(names().len(), 1, "{:?}", names());
     assert_eq!(p.node.snapshots().unwrap().len(), 1);
 }
+
+// -------------------------------------------------------------------------
+// Retention versus an actor database that has not changed for a long
+// time. An actor database's applied LSN is where its last change was, and the
+// start replays from the lowest of them; retention deleted the log below the
+// newest snapshot without asking, so the first restart after it refused
+// (`state is at lsn N, but the log starts at M (compacted)`) and the recovery
+// that installed a snapshot copied the same low number back.
+
+/// A node that compacts as soon as it can: no history, small segments.
+fn compacting(dir: &Path) -> Proc {
+    start_with(
+        dir,
+        48,
+        Some(Duration::ZERO),
+        Some(4096),
+        Some(Duration::from_secs(3600)),
+    )
+}
+
+/// The text of a reply to `name`.
+fn reply(p: &Proc, actor: &str, name: &str) -> String {
+    let r =
+        p.rt.block_on(p.node.send(
+            ActorRef::parse(actor).unwrap(),
+            msg(name, ""),
+            audit(),
+            false,
+            p.owner(),
+        ))
+        .unwrap()
+        .unwrap();
+    assert!(r.committed(), "{r:?}");
+    match r.outcome.output {
+        Some(pb::outcome::Output::Reply(m)) => match m.body.as_ref().and_then(|b| b.value.as_ref())
+        {
+            Some(pb::sealable::Value::Plain(bytes)) => String::from_utf8(bytes.clone()).unwrap(),
+            other => panic!("no plain reply: {other:?}"),
+        },
+        other => panic!("no reply: {other:?}"),
+    }
+}
+
+/// Builds a directory whose log was compacted past the only SQL change of
+/// `notes/n`, which is idle since: one note, then traffic of other actors
+/// until segments have rolled and time has moved, then a snapshot (whose
+/// retention pass compacts). Returns the LSN of the note and the log's first
+/// LSN afterwards. The node is stopped.
+fn compacted_past_an_idle_actor(dir: &Path) -> (u64, u64) {
+    let p = compacting(dir);
+    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false, p.owner()))
+        .unwrap();
+    p.rt.block_on(p.node.deploy(&guest("notes"), audit(), false, p.owner()))
+        .unwrap();
+    p.send("notes/n", "add", "hello");
+    for i in 0..80 {
+        p.send(&format!("counter/k{}", i % 5), "increment", "");
+        if i % 20 == 19 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
+    let storage = p.node.storage_config().unwrap().clone();
+    let first = p.node.log_first(&storage).unwrap();
+    let note = p
+        .node
+        .store()
+        .db()
+        .actor("notes", "n")
+        .unwrap()
+        .unwrap()
+        .last_lsn;
+    // The trigger: the log now starts after the actor's last change.
+    assert!(first > note + 1, "first {first}, the note's lsn {note}");
+    // Prevention: the node's own replay start is not below the log it kept.
+    assert!(
+        p.node.store().replay_from().unwrap() + 1 >= first,
+        "replay would start at {} but the log starts at {first}",
+        p.node.store().replay_from().unwrap()
+    );
+    drop(p);
+    (note, first)
+}
+
+#[test]
+fn an_idle_sql_actor_does_not_stop_the_restart_after_a_compaction() {
+    let dir = tempdir();
+    let (_note, _first) = compacted_past_an_idle_actor(dir.path());
+    // From the files: the next start has nothing to repair.
+    assert_eq!(
+        kronik_sched::snapshots::prepare_state(dir.path(), "main").unwrap(),
+        None
+    );
+    let p = compacting(dir.path());
+    // Once: the replay of the log tail skips what the raised database holds.
+    assert_eq!(reply(&p, "notes/n", "list").matches("hello").count(), 1);
+    p.send("notes/n", "add", "after the restart");
+    let list = reply(&p, "notes/n", "list");
+    assert_eq!(list.matches("hello").count(), 1, "{list}");
+    assert_eq!(list.matches("after the restart").count(), 1, "{list}");
+}
+
+/// A pass that cannot make an actor database current does not delete: the
+/// database is the idle actor's, and a turn of it is parked with its
+/// savepoint open (the test hook, as in the snapshot test above), so a stamp
+/// would be rolled back with the turn. The pass stops with an error and the
+/// log is whole; with nothing open it deletes.
+#[test]
+fn a_compaction_waits_for_an_actor_database_a_turn_has_open() {
+    let dir = tempdir();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let node = rt.block_on(async {
+        let env = Env::real(tokio::runtime::Handle::current());
+        let mut storage = StorageConfig::new(dir.path().to_path_buf());
+        storage.history = Duration::ZERO;
+        let config = NodeConfig {
+            concurrency: 8,
+            storage: Some(storage),
+            segment_max_bytes: Some(4096),
+            test_hold_after_call: true,
+            ..NodeConfig::default()
+        };
+        start_local(env, dir.path(), config).await.unwrap()
+    });
+    let p = Proc { rt, node };
+    for g in ["counter", "notes-sql-call"] {
+        p.rt.block_on(p.node.deploy(&guest(g), audit(), false, p.owner()))
+            .unwrap();
+    }
+    p.send("notes/n", "add", "applied");
+    let before = p.node.applied_lsn();
+    let node = p.node.clone();
+    let held = p.rt.spawn(async move {
+        let to = ActorRef::parse("notes/n").unwrap();
+        let original = node.local_operator_authority().unwrap();
+        node.send(to, msg("add-call", "in the turn"), audit(), false, original)
+            .await
+    });
+    for _ in 0..500 {
+        if p.node.applied_lsn() > before {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(p.node.applied_lsn() > before, "the call never answered");
+    // Traffic of another actor rolls segments and moves time.
+    for i in 0..80 {
+        p.send(&format!("counter/k{}", i % 5), "increment", "");
+        if i % 20 == 19 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    // A snapshot covers the segments; its own pass runs into the open turn.
+    p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
+    let storage = p.node.storage_config().unwrap().clone();
+    assert_eq!(
+        p.node.log_first(&storage).unwrap(),
+        1,
+        "nothing may be deleted yet"
+    );
+    let refused = p.node.compact(&storage).unwrap_err();
+    assert!(
+        refused.message.contains("compaction waits") && refused.message.contains("notes/n"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(p.node.log_first(&storage).unwrap(), 1);
+    held.abort();
+}

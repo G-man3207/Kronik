@@ -153,6 +153,19 @@ each object compressed with zstd (level 3):
   snapshot and the first later segment with a higher `last_time_ms` (the
   one holding the next turn) is older than the window too. Without a later
   turn the segment is kept. Compaction runs after each snapshot.
+- **Order of a pass.** Decide which segments go; raise the applied LSN of
+  every actor database below the horizon to the applied LSN, under the
+  apply lock (in batches of 64 databases, never the whole pass: turns wait
+  for a batch) and checkpoint it, so that the raise is in the database file
+  and not only in its WAL (`synchronous=NORMAL` syncs a WAL when it is
+  checkpointed); only then delete. An error stops the pass before any
+  delete. Under the apply lock every database is complete through what is
+  applied (a record's SQL is applied before `state.db` takes it), which is
+  what makes the raise true; only databases idle for longer than `history`
+  are written, one row each. A crash before the delete loses nothing; a crash
+  after a delete leaves a log that every database reaches. A database a turn
+  has open (its savepoint would roll the stamp back) is retried briefly and
+  then stops the pass, as does a missing file.
 - **A window cut short.** A proposal's `--window` can reach back before
   what the log and snapshots still hold. The fork then starts at the
   oldest usable snapshot and the proposal says so: `warnings` in its JSON,

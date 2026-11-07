@@ -187,6 +187,18 @@ impl Manifest {
     }
 }
 
+/// Actor databases raised under one hold of the apply lock by
+/// [`Node::compact`]: turns wait for a batch, never for a whole pass.
+const IDLE_RAISE_BATCH: usize = 64;
+
+// Test hooks for the order of a compaction pass: the pass ends with an error
+// as a crash would, after the raise before any delete, or after a delete.
+#[cfg(test)]
+thread_local! {
+    static CRASH_AFTER_RAISE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CRASH_AFTER_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn snapshots_dir(data: &Path, branch: &str) -> PathBuf {
     data.join("snapshots").join(branch)
 }
@@ -807,6 +819,52 @@ impl Node {
         }
     }
 
+    /// Before retention deletes the log up to `horizon`: every actor
+    /// database that has not changed since before it learns that it is
+    /// complete through what is applied now, durably. An actor database's
+    /// applied LSN says where its last change was, and the start replays
+    /// from the lowest one, so an actor idle for longer than `history` would
+    /// refuse every start after this pass. Stops the pass, with a
+    /// warning from [`Node::retain`], when a database cannot be raised.
+    fn raise_idle_markers(&self, horizon: Lsn) -> Result<(), ApiError> {
+        let started = self.env.clock.monotonic();
+        let raised = self
+            .store()
+            .raise_idle_sql(horizon, IDLE_RAISE_BATCH)
+            .map_err(|e| {
+                ApiError::new(
+                    ErrorCode::Internal,
+                    format!("raising the idle actor databases before compaction: {e}"),
+                )
+            })?;
+        if !raised.blocked.is_empty() {
+            return Err(ApiError::new(
+                ErrorCode::Internal,
+                format!(
+                    "compaction waits: {} actor database(s) could not be raised or made \
+                     durable (a turn is open on them, or the file is missing), first {}",
+                    raised.blocked.len(),
+                    raised.blocked[0]
+                ),
+            ));
+        }
+        if raised.raised > 0 {
+            tracing::info!(
+                horizon,
+                checked = raised.checked,
+                raised = raised.raised,
+                elapsed_ms = self
+                    .env
+                    .clock
+                    .monotonic()
+                    .saturating_sub(started)
+                    .as_millis() as u64,
+                "raised the applied LSN of idle actor databases before compaction"
+            );
+        }
+        Ok(())
+    }
+
     /// Retention (m6-storage §5): deletes closed segments older than
     /// `history` whose records a kept snapshot covers, then the index rows
     /// of what they held. Returns the log's first LSN afterwards.
@@ -854,6 +912,10 @@ impl Node {
         let hold = self.retention_hold();
         let released = hold.released(self.measured_disk_free(), self.env.clock.wall_ms());
         // Closed segments only: never the newest (active) one, oldest first.
+        // First decide which go, then make the databases not need them, then
+        // delete (m6-storage §5): a crash anywhere in between leaves the log
+        // whole or a prefix shorter, and every database ahead of it.
+        let mut doomed: Vec<(Lsn, Lsn, Option<Lsn>)> = Vec::new();
         for w in starts.windows(2).take_while(|_| !rebase_hold) {
             let (start, next) = (w[0], w[1]);
             let last_lsn = next - 1;
@@ -872,10 +934,28 @@ impl Node {
             if bound.is_none_or(|b| b >= cutoff) || !covered {
                 break;
             }
+            let mut released_floor = None;
             if let Some(floor) = hold.floor().filter(|f| last_lsn > *f) {
                 if !released {
                     break;
                 }
+                released_floor = Some(floor);
+            }
+            doomed.push((start, next, released_floor));
+        }
+        if let Some(&(_, next, _)) = doomed.last() {
+            self.raise_idle_markers(next - 1)?;
+            #[cfg(test)]
+            if CRASH_AFTER_RAISE.with(std::cell::Cell::get) {
+                return Err(ApiError::new(
+                    ErrorCode::Internal,
+                    "test crash after the raise",
+                ));
+            }
+        }
+        for (start, next, released_floor) in doomed {
+            let last_lsn = next - 1;
+            if let Some(floor) = released_floor {
                 tracing::warn!(
                     floor,
                     start,
@@ -892,6 +972,13 @@ impl Node {
             }
             tracing::info!(start, last_lsn, "deleted a segment past retention");
             first = next;
+            #[cfg(test)]
+            if CRASH_AFTER_DELETE.with(std::cell::Cell::get) {
+                return Err(ApiError::new(
+                    ErrorCode::Internal,
+                    "test crash after a delete",
+                ));
+            }
         }
         if !always_index && first == was_first {
             return Ok(first);
@@ -924,3 +1011,6 @@ pub(crate) async fn snapshot_loop(node: std::sync::Weak<Node>, interval: Duratio
         }
     }
 }
+
+#[cfg(test)]
+mod retention_tests;

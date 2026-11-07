@@ -1202,9 +1202,12 @@ still continues from. It deletes closed log segments older than
 `[retention] history` (7 days by default) whose records a kept snapshot
 already covers. A record without a logical time of its own, such as a
 deployment, counts as old as the next turn after it, so a segment is kept
-until a later turn has aged out of the window too. After an upgrade from v0.3.0
-or older, `snapshots_kept` also decides how long some reads answer 503: see
-[Upgrading from v0.3.0 or older](#upgrading-from-v030-or-older).
+until a later turn has aged out of the window too. Before it deletes, it
+records on every actor database that has not changed for longer than the
+window that the database is complete through the snapshot, so that the
+next start does not look for a log that has been deleted. After an upgrade
+from v0.3.0 or older, `snapshots_kept` also decides how long some reads
+answer 503: see [Upgrading from v0.3.0 or older](#upgrading-from-v030-or-older).
 
 When a proposal's `--window` reaches back before the oldest point still
 kept, the fork starts at the oldest usable snapshot and the proposal says
