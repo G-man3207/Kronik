@@ -1,6 +1,11 @@
 {
   "format": "kronik.compatibility-index/v2",
-  "published_releases": ["v0.1.0", "v0.3.0", "v0.4.0"],
+  "published_releases": [
+    "v0.1.0",
+    "v0.3.0",
+    "v0.4.0",
+    "v0.4.1"
+  ],
   "releases": [
     {
       "release": "v0.1.0",
@@ -145,6 +150,62 @@
         },
         "wit": {
           "path": "v0.4.0/contracts/actor.wit",
+          "source_path": "wit/kronik-actor.wit",
+          "git_blob": "86c3f0e739057aa08c460bda06f1a42c9679d87e",
+          "sha256": "c2e7336a41b18405b5dfa26dad95600de79a21c133c61ec9ba516e0a63b32af6",
+          "bytes": 5832
+        }
+      },
+      "components": [
+        {
+          "role": "counter",
+          "path": "components/747c8630dfe34766b8b29f81787145b0c5061acef875be5c2c04c8da4ea70fb5.wasm",
+          "source_path": "tests/guests/counter.wasm",
+          "git_blob": "51bb8c5b672d056de9f651081bfc6c037793c2c7",
+          "sha256": "747c8630dfe34766b8b29f81787145b0c5061acef875be5c2c04c8da4ea70fb5",
+          "bytes": 109079
+        },
+        {
+          "role": "notes",
+          "path": "components/250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423.wasm",
+          "source_path": "tests/guests/notes.wasm",
+          "git_blob": "c3147d12ffc2f3838809b3e20cf8dab8948f7216",
+          "sha256": "250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423",
+          "bytes": 76877
+        }
+      ]
+    },
+    {
+      "release": "v0.4.1",
+      "producer_revision": "34f0a8ce4251f10c44b243d337cbf0e9a203cdfc",
+      "producer_binary_sha256": "fdeb2a6c198d78417bf3dbdeb9193e33bca0d54d8e7d45d2d186058de6ef61a9",
+      "manifest": "v0.4.1/manifest.json",
+      "manifest_sha256": "c05b50276db18f97916e1bba47ba07bf826961d2ce9765236c6638dde86d9c8f",
+      "root_inputs": 9,
+      "contracts": {
+        "api": {
+          "path": "v0.4.1/contracts/openapi.json",
+          "source_path": "docs/reference/openapi.json",
+          "git_blob": "04e3498c6299d12121c3ec6dcad1c3b32bdf0afd",
+          "sha256": "3655cc6c5f030812759e839c886fce3e06518ee552b4190386aa4534e4ab5093",
+          "bytes": 397252
+        },
+        "cli": {
+          "path": "v0.4.1/contracts/cli-json.txt",
+          "source_path": "docs/reference/json.md",
+          "git_blob": "cb359b04a35291e5dbeb2dac77f9704fe549754b",
+          "sha256": "06237b52bd6dcfbd8936e5eca39773ac1d3bfc973c17538405c85659becafc6c",
+          "bytes": 155899
+        },
+        "diff": {
+          "path": "v0.4.1/contracts/diff-v1.schema.json",
+          "source_path": "docs/reference/diff-v1.schema.json",
+          "git_blob": "8a9f7feb0f3f258ca6010170ace23e452ad9d3a4",
+          "sha256": "cc2087050a2f5502f06cae54bf9c90cb868d112819667d1cc4206b7788912ff1",
+          "bytes": 43870
+        },
+        "wit": {
+          "path": "v0.4.1/contracts/actor.wit",
           "source_path": "wit/kronik-actor.wit",
           "git_blob": "86c3f0e739057aa08c460bda06f1a42c9679d87e",
           "sha256": "c2e7336a41b18405b5dfa26dad95600de79a21c133c61ec9ba516e0a63b32af6",

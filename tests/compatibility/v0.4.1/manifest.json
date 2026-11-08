@@ -1,0 +1,236 @@
+{
+  "format": "kronik.compatibility-corpus/v1",
+  "release": "v0.4.1",
+  "producer_revision": "34f0a8ce4251f10c44b243d337cbf0e9a203cdfc",
+  "producer_binary_sha256": "fdeb2a6c198d78417bf3dbdeb9193e33bca0d54d8e7d45d2d186058de6ef61a9",
+  "producer_version": "kronik 0.4.1\nwasmtime 50.0.1\nengine kronik-0.4.1+wasmtime-50.0.1\n",
+  "engine": "kronik-0.4.1+wasmtime-50.0.1",
+  "dummy_master_key": "4444444444444444444444444444444444444444444444444444444444444444",
+  "stable_lsn": 7,
+  "integrity": {
+    "applied_lsn": 22,
+    "state_hash": "b3:7afb4ea5d754fb18f5c14dc57308c493f0f03c3622ac0b39aedce880d09a0325",
+    "log_first_lsn": 1,
+    "log_hash": "b3:ff42402e7ea5dca18a486db5ddbb1ecc5aede85633cd1c698f6d83810bf2bb38",
+    "through_lsn": 22,
+    "retention_history_ms": 604800000,
+    "newest_logical_time_ms": 1794158418950,
+    "retention_cutoff_ms": 1793553618950,
+    "keys_missing": []
+  },
+  "observations": {
+    "counter": {
+      "actor": {
+        "kind": "counter",
+        "key": "a",
+        "schema_version": 0,
+        "turns": 7,
+        "last_turn_id": "main:19",
+        "sql": false
+      },
+      "state": [
+        {
+          "key": "n",
+          "text": "6",
+          "base64": "Ng==",
+          "subject": null,
+          "lsn": 19
+        }
+      ],
+      "sql": null
+    },
+    "notes": {
+      "actor": {
+        "kind": "notes",
+        "key": "a",
+        "schema_version": 1,
+        "turns": 3,
+        "last_turn_id": "main:15",
+        "sql": true
+      },
+      "state": [],
+      "sql": {
+        "tables": [
+          {
+            "name": "notes",
+            "rows": 2
+          }
+        ]
+      }
+    },
+    "sink": {
+      "actor": {
+        "kind": "counter",
+        "key": "sink",
+        "schema_version": 0,
+        "turns": 1,
+        "last_turn_id": "main:20",
+        "sql": false
+      },
+      "state": [
+        {
+          "key": "n",
+          "text": "1",
+          "base64": "MQ==",
+          "subject": null,
+          "lsn": 20
+        }
+      ],
+      "sql": null
+    },
+    "hmac": "0c5be0aaef6ecbed3227d381df9702c16ae4cd2aa7d205669db45fdfc7c3099b"
+  },
+  "components": [
+    {
+      "filename": "counter.wasm",
+      "sha256": "747c8630dfe34766b8b29f81787145b0c5061acef875be5c2c04c8da4ea70fb5",
+      "deployment": {
+        "dry_run": false,
+        "unchanged": false,
+        "deployment": {
+          "epoch": 1,
+          "lsn": 3,
+          "kind": "counter",
+          "code_hash": "b3:b310bc634637",
+          "schema_version": 0,
+          "routes": [
+            {
+              "method": "POST",
+              "pattern": "/counter/{key}/{op}"
+            },
+            {
+              "method": "GET",
+              "pattern": "/counter/{key}"
+            }
+          ],
+          "capabilities": []
+        },
+        "warnings": []
+      }
+    },
+    {
+      "filename": "notes.wasm",
+      "sha256": "250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423",
+      "deployment": {
+        "dry_run": false,
+        "unchanged": false,
+        "deployment": {
+          "epoch": 2,
+          "lsn": 4,
+          "kind": "notes",
+          "code_hash": "b3:c0c6b06edd01",
+          "schema_version": 1,
+          "routes": [
+            {
+              "method": "POST",
+              "pattern": "/notes/{key}"
+            },
+            {
+              "method": "GET",
+              "pattern": "/notes/{key}"
+            }
+          ],
+          "capabilities": []
+        },
+        "warnings": []
+      }
+    }
+  ],
+  "files": [
+    {
+      "path": "branches/main/log/00000000000000000001.seg",
+      "bytes": 7083,
+      "sha256": "855a272275eb9bfed501fce1afc462cbb3e2d131344276525d58622c97678dca"
+    },
+    {
+      "path": "branches/main/sql/df/notes~a-df924404.db",
+      "bytes": 4096,
+      "sha256": "2e96884c16791c7d4bde90a6db2c9da33c2a2aab3e52088adc148c368552a423"
+    },
+    {
+      "path": "branches/main/sql/df/notes~a-df924404.db-wal",
+      "bytes": 61832,
+      "sha256": "4f66510e8ad6eab0575f35113952ae9ac7901ff8082efa300541da0b7cd1a7c2"
+    },
+    {
+      "path": "branches/main/state.db",
+      "bytes": 139264,
+      "sha256": "a1535c90c1ee9f30095ed8a2e8c0bea80e53059197695fe7ba84cf677e9fa5d2"
+    },
+    {
+      "path": "code/b310bc634637383f31f8c82ab9adcbf27a8736c874e70bb5b47d4a461e8a4498.wasm",
+      "bytes": 109079,
+      "sha256": "747c8630dfe34766b8b29f81787145b0c5061acef875be5c2c04c8da4ea70fb5"
+    },
+    {
+      "path": "code/c0c6b06edd0178d0868b760e4a5a76c10f7c78598077cc127f0d9370043106f9.wasm",
+      "bytes": 76877,
+      "sha256": "250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423"
+    },
+    {
+      "path": "keys/keystore.db",
+      "bytes": 20480,
+      "sha256": "414d96ca77ec4a80f53d6effcac6a4dfc22611a7928421655f685b0bc19a0cea"
+    },
+    {
+      "path": "keys/secrets.db",
+      "bytes": 20480,
+      "sha256": "4bdd6e2da883d550a96e7a25078cd7681c768b500fedd3a1cd695d6458ab0816"
+    },
+    {
+      "path": "keys/tokens.db",
+      "bytes": 12288,
+      "sha256": "f5996a6cdc6f9b54cc90941af32c386fcfe87075ddf5ebe8737e31c9258be44e"
+    },
+    {
+      "path": "privacy/keystore_retention_ms",
+      "bytes": 10,
+      "sha256": "8961f1920779b1680abb30edb239ec4823c6694f6eb4db43e865c07936f2eeca"
+    },
+    {
+      "path": "secret-coverage.json",
+      "bytes": 243,
+      "sha256": "578e2b8cd20053b94e5b9a6c4509bcbe9df971b662534dc0a2cd16b63b2a25bd"
+    },
+    {
+      "path": "snapshots/main/00000000000000000020/manifest.json",
+      "bytes": 839,
+      "sha256": "95bc1367b1dbbfe48ba0f0ad2e6ffe231b4bd46cec631884a64571386e19d5fd"
+    },
+    {
+      "path": "snapshots/main/00000000000000000020/secrets.db",
+      "bytes": 20480,
+      "sha256": "a60680aeff39ce166fbcd59dec1704109791adbdc215bc59fcc56ee4c4aa7695"
+    },
+    {
+      "path": "snapshots/main/00000000000000000020/sql/df/notes~a-df924404.db",
+      "bytes": 16384,
+      "sha256": "76e8496145fd33b62f76d1c03bdb47a4d9a77bb316689442a569cdb46b98ec51"
+    },
+    {
+      "path": "snapshots/main/00000000000000000020/state.db",
+      "bytes": 139264,
+      "sha256": "d617c529e28c03284af1696d58445a91145667cf12c2c8ef138290cdfba0e652"
+    },
+    {
+      "path": "snapshots/main/00000000000000000022/manifest.json",
+      "bytes": 841,
+      "sha256": "6a963a081521c47cd22bad7fd1918549d73cbb9360d1f8c2fdb2446c4bd448ee"
+    },
+    {
+      "path": "snapshots/main/00000000000000000022/secrets.db",
+      "bytes": 20480,
+      "sha256": "a60680aeff39ce166fbcd59dec1704109791adbdc215bc59fcc56ee4c4aa7695"
+    },
+    {
+      "path": "snapshots/main/00000000000000000022/sql/df/notes~a-df924404.db",
+      "bytes": 16384,
+      "sha256": "76e8496145fd33b62f76d1c03bdb47a4d9a77bb316689442a569cdb46b98ec51"
+    },
+    {
+      "path": "snapshots/main/00000000000000000022/state.db",
+      "bytes": 139264,
+      "sha256": "e4a78f71be321af825615c1b88978c0ed6cedcbffd0126cf1dc83285031d46e7"
+    }
+  ]
+}
