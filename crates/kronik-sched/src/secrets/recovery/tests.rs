@@ -565,7 +565,21 @@ async fn definitive_gone_does_not_retry_and_cancellation_releases_the_owned_stal
     let effects = vec![reveal(metadata.clone(), 1)];
     persist(&node, &begin, &effects).await;
     bao.require_begin.store(true, Ordering::Release);
-    let before = bao.gets.load(Ordering::Acquire);
+    // The staging swap's delta republish observes the link's immutable
+    // version (replay-legal: ?version=1, never CURRENT). That is the I/O this
+    // test is about: count the pinned reads, not every request the provider
+    // sees, because an inventory pass may read CURRENT in the background and
+    // is not this call's doing.
+    let pinned = |bao: &Bao| {
+        bao.urls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|url| url.ends_with("/data/token?version=1"))
+            .count()
+    };
+    let before = pinned(&bao);
+    let asked = bao.gets.load(Ordering::Acquire);
     assert_eq!(
         node.prepare_recorded_secrets(
             &begin,
@@ -578,11 +592,20 @@ async fn definitive_gone_does_not_retry_and_cancellation_releases_the_owned_stal
         .code,
         ErrorCode::SecretVersionGone
     );
-    // The staging swap's delta republish observes the link's immutable
-    // version (replay-legal: ?version=1, never CURRENT) — exactly one extra
-    // provider GET, as before the swap. The definitive-gone verdict still
-    // comes from the recorded hash comparison.
-    assert_eq!(bao.gets.load(Ordering::Acquire), before + 1);
+    // One or two pinned reads: two deltas (the effect's and the staging swap's)
+    // can republish at once, and each probes before the negative-version cache
+    // is filled - the same reason `clear_negative_version` below is needed. The
+    // verdict itself still comes from the recorded hash comparison, and the
+    // pinned version, never CURRENT, is what the provider was asked for.
+    assert!(
+        bao.gets.load(Ordering::Acquire) > asked,
+        "the provider was not asked at all"
+    );
+    let reads = pinned(&bao) - before;
+    assert!(
+        (1..=2).contains(&reads),
+        "the recorded version was read {reads} times for one effect"
+    );
     assert_eq!(*super::super::lock(&STALLED), 0);
     let runtime = node.runtime().unwrap();
     runtime
