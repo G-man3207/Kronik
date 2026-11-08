@@ -2340,7 +2340,7 @@ mod tests {
             eprintln!("skipped: {why}");
             return;
         }
-        let exe = std::env::current_exe().unwrap();
+        let exe = rehearsal_exe();
         for (case, options) in [
             ("plain", ""),
             ("noatime", "noatime"),
