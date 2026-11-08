@@ -616,6 +616,12 @@ async fn definitive_gone_does_not_retry_and_cancellation_releases_the_owned_stal
         "a definitive gone was not remembered as negative"
     );
     assert_eq!(*super::super::lock(&STALLED), 0);
+    // Both entries: a pinned lookup falls back to the name-level one
+    // (`negative_version`), and the background inventory's CURRENT read can
+    // have cached `NotFound` there. Clearing only the version entry left the
+    // definitive verdict behind often enough that this test never observed
+    // the stall it is named for.
+    runtime.cache.clear_negative(&scope);
     runtime.cache.clear_negative_version(&scope, Some("1"));
     bao.status.store(503, Ordering::Release);
     let runner = node.clone();
