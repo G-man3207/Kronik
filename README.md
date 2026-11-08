@@ -31,19 +31,21 @@ change between releases.
 | [`v0.1.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.1.0) | Durable turns, effects and capabilities, fork, replay and behavior diff with policy and approvals, proposals that span several actors, the TypeScript and Rust SDKs, the JSON API and MCP server, operations on a VPS, foreign actors in gVisor, privacy mode |
 | [`v0.3.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.3.0) | Python and Go SDKs, the CLI against a remote API, watch and preview forks, effect simulators, rollback via replay, foreign actors copied into forks |
 | [`v0.4.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.4.0) | Standard `fetch` through `wasi:http`, OpenTelemetry traces with a complete verifiable audit export, KMS-wrapped master key (OpenBao/AWS/GCP/Azure), Wasmtime 50.0.1, and crash-path hardening: atomic secret-catalogue publication, paced rate windows, restart-safe custody |
+| [`v0.4.1`](https://github.com/G-man3207/Kronik/releases/tag/v0.4.1) | Patch release: `kronik restore` validates the manifest paths and the component names it takes from the snapshot bucket; restarts no longer grow with the log, nor stop on one whose retention compacted past an idle SQL actor; erasure no longer strands scrubbed reads at 503; the audit export and its followers recover at once from an overtaking configuration commit. Engine `kronik-0.4.1+wasmtime-50.0.1` |
 
-`v0.4.0` is the latest release and the first with GitHub OIDC/Sigstore
-attested archives: static musl binaries for x86_64 and aarch64 with
-`install.sh`, checksums, CycloneDX SBOMs and two-build byte-equality evidence
-(`reproducibility.json`); `install.sh` verifies each archive's attestation and
-refuses unsigned ones. It adds standard `fetch` through `wasi:http`,
-OpenTelemetry traces with a verifiable audit export, and KMS master-key
-custody (OpenBao/AWS/GCP/Azure). The crash-path hardening replaces the secret
-catalogue's clear-and-rebuild with atomic certificate publication under crash
-injection, paces effect rate windows, and keeps secret custody available
-across restarts. `v0.3.0` and `v0.1.0` are the historical unsigned releases.
+`v0.4.1` is the latest release: a patch on the attested line `v0.4.0` opened.
+The archives are static musl binaries for x86_64 and aarch64 with `install.sh`,
+checksums, CycloneDX SBOMs and two-build byte-equality evidence
+(`reproducibility.json`); `install.sh` verifies each archive's Sigstore
+attestation and refuses unsigned ones. `v0.4.1` fixes a security issue in
+`kronik restore` (the manifest paths and the component names it takes from the
+snapshot bucket are now validated, see the
+[advisory](https://github.com/G-man3207/Kronik/security/advisories/GHSA-f9xv-7cmm-95v6))
+and the defects found since `v0.4.0` in restart, retention, secret handling and
+the audit export; the engine is `kronik-0.4.1+wasmtime-50.0.1`. `v0.3.0` and
+`v0.1.0` are the historical unsigned releases.
 
-`main` is an unreleased `0.4.1-dev` work in progress. Major areas remain
+`main` is an unreleased `0.5.0-dev` work in progress. Major areas remain
 absent or partial: the cluster (M16–M19), microVMs (M20), the rootless daemon
 (M21), the WASI 0.3 remainder (M22), long-lived connections (M24), blobs
 (M25–M26), and the UI, OpenTelemetry, fleet and hardening tracks (M27–M34).
@@ -88,13 +90,13 @@ for how the brief maps to the tree.
 ## Getting started
 
 The [installation guide](docs/guides/install.md) describes the signed-release
-contract and standalone curl-pipe installer. `v0.4.0` is attested: the
-installer verifies each archive's Sigstore attestation, and historical `v0.3.0`
-and `v0.1.0` remain unsigned, so current consumers intentionally refuse their
-archives. To run the latest release:
+contract and standalone curl-pipe installer. `v0.4.1` and `v0.4.0` are
+attested: the installer verifies each archive's Sigstore attestation, and
+historical `v0.3.0` and `v0.1.0` remain unsigned, so current consumers
+intentionally refuse their archives. To run the latest release:
 
 ```sh
-curl -fsSL https://github.com/G-man3207/Kronik/releases/download/v0.4.0/install.sh | sh
+curl -fsSL https://github.com/G-man3207/Kronik/releases/download/v0.4.1/install.sh | sh
 kronik doctor
 ```
 

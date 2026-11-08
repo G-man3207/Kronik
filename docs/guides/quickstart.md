@@ -5,9 +5,9 @@ with the release binary. A reader without a public DNS name or a bucket can
 do every step; the steps that need one say what to do instead.
 
 Releases are on [GitHub](https://github.com/G-man3207/Kronik/releases).
-Current consumers require an actually signed exact tag; the latest published
-`v0.3.0` remains historical and unsigned. No public signing event has been run
-for this cutover. Follow the [installation trust contract](install.md), or build
+Current consumers require an actually signed exact tag: `v0.4.1` and `v0.4.0`
+are attested, while the historical `v0.3.0` and `v0.1.0` remain unsigned and are
+refused. Follow the [installation trust contract](install.md), or build
 unreleased code from a trusted checkout with `cargo build -p kronik` and put
 `target/debug` on `PATH`. The rest of this journey uses that trusted binary or
 an actually signed release, not an unsigned fallback.
