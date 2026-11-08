@@ -1330,6 +1330,7 @@ fn setup(root: &Path, cfg: &Value, mode: &str) -> Result<()> {
         root: mode == "root",
         rootless: mode != "root",
         dry_run: mode == "dry-run",
+        overrides: Default::default(),
     };
     let output = init::execute_on(&args, &root.join("etc/kronik/kronik.toml"), &host);
     if let Err(error) = &output {

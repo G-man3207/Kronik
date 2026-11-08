@@ -59,6 +59,12 @@ pub struct InitArgs {
     /// With --init: print what would be done, and change nothing.
     #[arg(long, requires = "init")]
     pub dry_run: bool,
+    /// The `serve` overrides of this run (`--data-dir`, `--http-listen`, ...)
+    /// as parsed: with --init they are written into a configuration the
+    /// installer generates, or checked against one it found. Copied in by
+    /// `ServeArgs::init_args`; not arguments of their own.
+    #[arg(skip)]
+    pub overrides: Box<crate::config::Overrides>,
 }
 
 impl InitArgs {
@@ -295,9 +301,41 @@ fn group_exists() -> anyhow::Result<bool> {
 }
 
 /// The configuration `--init` writes: the brief's file, with TLS by ACME for
-/// the given names, or plain HTTP on port 80 without them.
-fn config_file(domains: &[String], acme_email: Option<&str>) -> String {
+/// the given names, or plain HTTP on port 80 without them, and with every
+/// `serve` flag of this run written into it. The flags are the plan's: a
+/// generated file that named a different address than the command that
+/// installed the service would be found only by the users it surprises, so
+/// the two are rendered from the same [`crate::config::Overrides`].
+fn config_file(
+    domains: &[String],
+    acme_email: Option<&str>,
+    overrides: &crate::config::Overrides,
+) -> anyhow::Result<String> {
+    use std::net::SocketAddr;
     let quote = |s: &str| serde_json::Value::from(s).to_string();
+    let path = |value: &Path| -> anyhow::Result<String> {
+        let text = value
+            .to_str()
+            .with_context(|| format!("the path {} is not valid UTF-8", value.display()))?;
+        Ok(quote(text))
+    };
+    // A size and a duration as the configuration's own `FromStr` spells them.
+    let size = |value: crate::config::Size| -> String {
+        for (unit, shift) in [("TiB", 40), ("GiB", 30), ("MiB", 20), ("KiB", 10)] {
+            if value.0 >= 1 << shift && value.0.is_multiple_of(1 << shift) {
+                return format!("{}{unit}", value.0 >> shift);
+            }
+        }
+        format!("{}B", value.0)
+    };
+    let duration = |value: std::time::Duration| -> String {
+        let milliseconds = value.as_millis();
+        if milliseconds.is_multiple_of(1_000) {
+            format!("{}s", milliseconds / 1_000)
+        } else {
+            format!("{milliseconds}ms")
+        }
+    };
     let tls = if domains.is_empty() {
         "mode = \"off\"                          # acme, files or off\n".to_owned()
     } else {
@@ -311,27 +349,63 @@ fn config_file(domains: &[String], acme_email: Option<&str>) -> String {
             quote(acme_email.unwrap_or_default()),
         )
     };
-    let listen = if domains.is_empty() {
-        "0.0.0.0:80"
-    } else {
-        "0.0.0.0:443"
-    };
-    format!(
+    let data_dir = path(
+        overrides
+            .data_dir
+            .as_deref()
+            .unwrap_or(Path::new("/var/lib/kronik")),
+    )?;
+    let api_socket = path(
+        overrides
+            .api_socket
+            .as_deref()
+            .unwrap_or(Path::new("/run/kronik/api.sock")),
+    )?;
+    let master_key = path(
+        overrides
+            .master_key_file
+            .as_deref()
+            .unwrap_or(Path::new(MASTER_KEY)),
+    )?;
+    let http_listen = overrides.http_listen.unwrap_or_else(|| {
+        SocketAddr::from(([0, 0, 0, 0], if domains.is_empty() { 80 } else { 443 }))
+    });
+    let api_listen = overrides
+        .api_listen
+        .map(|address| format!("\napi_listen = {}", quote(&address.to_string())))
+        .unwrap_or_default();
+    let admin_listen = overrides
+        .admin_listen
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 9464)));
+    let gateway_timeout = overrides
+        .gateway_timeout
+        .map(duration)
+        .unwrap_or_else(|| "30s".to_owned());
+    let disk_reserve = overrides
+        .disk_reserve
+        .map(size)
+        .unwrap_or_else(|| "512MiB".to_owned());
+    let otel = overrides
+        .otel_endpoint
+        .as_deref()
+        .map(|endpoint| format!("\n[otel]\nendpoint = {}\n", quote(endpoint)))
+        .unwrap_or_default();
+    Ok(format!(
         r#"# Kronik's server settings, written by `kronik serve --init`. Only the
 # server's basics live here: grants, limits, policy, privacy mode and foreign
 # actors are history, set with the CLI or the API. `kronik serve` reads this
 # file at start; its flags override it.
 
 [server]
-data_dir = "/var/lib/kronik"
-api_socket = "/run/kronik/api.sock"
-http_listen = "{listen}"
-admin_listen = "127.0.0.1:9464"      # /metrics and /healthz
+data_dir = {data_dir}
+api_socket = {api_socket}
+http_listen = "{http_listen}"{api_listen}
+admin_listen = "{admin_listen}"      # /metrics and /healthz
 
 [tls]
 {tls}
 [gateway]
-timeout = "30s"
+timeout = "{gateway_timeout}"
 idempotency_header = "Idempotency-Key"
 idempotency_ttl = "24h"
 trusted_proxies = []                 # a reverse proxy here has no per-client connection cap
@@ -341,7 +415,7 @@ trusted_proxies = []                 # a reverse proxy here has no per-client co
 group_commit_ms = 2
 segment_max_mb = 64
 segment_max_age_s = 60
-disk_reserve = "512MiB"              # below this much free space, new inputs wait
+disk_reserve = "{disk_reserve}"              # below this much free space, new inputs wait
 
 [retention]
 history = "7d"                        # how far back the log reaches
@@ -357,7 +431,7 @@ enabled = false
 # endpoint = "https://s3.example.com"
 
 [keys]
-master_key_file = "{MASTER_KEY}"   # secret store and privacy keystore
+master_key_file = {master_key}   # secret store and privacy keystore
 
 [privacy]
 keystore_backup_retention = "30d"
@@ -395,8 +469,8 @@ layout_dirs = []                      # oci-layout: images an operate token may 
 pull_timeout = "10m"
 start_timeout = "30s"                 # a started sandbox or microVM must answer on its port within this
 checkpoints_kept = 3                  # per fork_mode = "sandbox" actor, one per snapshot
-"#
-    )
+{otel}"#
+    ))
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -717,6 +791,118 @@ fn config_dir(config_path: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
+/// Refuses a `serve` flag that disagrees with a configuration `--init` found:
+/// the installer does not rewrite the operator's file, so a flag it keeps
+/// quiet about would install a service that starts with the file's value
+/// (F-3: a plan that says one thing and a file that says another).
+///
+/// `key_elsewhere` leaves `--master-key-file` to the root service's own
+/// refusal, whose hint names the file to edit.
+fn reject_differing_overrides(
+    config_path: &Path,
+    config: &Config,
+    overrides: &crate::config::Overrides,
+    key_elsewhere: bool,
+) -> anyhow::Result<()> {
+    let file = config_path.display();
+    let mut differing = Vec::new();
+    if let Some(value) = &overrides.data_dir
+        && *value != config.server.data_dir
+    {
+        differing.push(format!(
+            "--data-dir {} (server.data_dir = {})",
+            value.display(),
+            config.server.data_dir.display()
+        ));
+    }
+    if let Some(value) = &overrides.api_socket
+        && *value != config.server.api_socket
+    {
+        differing.push(format!(
+            "--api-socket {} (server.api_socket = {})",
+            value.display(),
+            config.server.api_socket.display()
+        ));
+    }
+    if let Some(value) = overrides.http_listen
+        && value != config.http_listen()
+    {
+        differing.push(format!(
+            "--http-listen {value} (server.http_listen = {})",
+            config.http_listen()
+        ));
+    }
+    if let Some(value) = overrides.admin_listen
+        && value != config.server.admin_listen
+    {
+        differing.push(format!(
+            "--admin-listen {value} (server.admin_listen = {})",
+            config.server.admin_listen
+        ));
+    }
+    if let Some(value) = overrides.api_listen
+        && Some(value) != config.server.api_listen
+    {
+        differing.push(format!(
+            "--api-listen {value} (server.api_listen = {})",
+            config
+                .server
+                .api_listen
+                .map_or_else(|| "off".to_owned(), |address| address.to_string())
+        ));
+    }
+    if let Some(value) = overrides.gateway_timeout
+        && value != config.gateway.timeout.0
+    {
+        differing.push(format!(
+            "--gateway-timeout-ms {} (gateway.timeout = {})",
+            value.as_millis(),
+            config.gateway.timeout.0.as_millis()
+        ));
+    }
+    let configured_key = config.keys.key_path(&config.server.data_dir);
+    if let Some(value) = &overrides.master_key_file
+        && !key_elsewhere
+        && *value != configured_key
+    {
+        differing.push(format!(
+            "--master-key-file {} (keys.master_key_file = {})",
+            value.display(),
+            configured_key.display()
+        ));
+    }
+    if let Some(value) = overrides.disk_reserve
+        && value != config.log.disk_reserve
+    {
+        differing.push(format!(
+            "--disk-reserve {} bytes (log.disk_reserve = {} bytes)",
+            value.0, config.log.disk_reserve.0
+        ));
+    }
+    if let Some(value) = &overrides.otel_endpoint
+        && config.otel.endpoint.as_deref() != Some(value.as_str())
+    {
+        differing.push(format!(
+            "--otel-endpoint {value} (otel.endpoint = {})",
+            config.otel.endpoint.as_deref().unwrap_or("off")
+        ));
+    }
+    if differing.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        ErrorCode::BadRequest,
+        format!(
+            "`serve --init` does not rewrite {file}: it installs the configuration that is already there, and this command's flags disagree with it: {}",
+            differing.join("; ")
+        ),
+    )
+    .with_hint(format!(
+        "Edit {file} to the values the flags name, or rerun without those flags: the installed service starts from the file, so a flag the file contradicts would be forgotten at its next start."
+    ))
+    .into())
+}
+
 fn plan(
     args: &InitArgs,
     config_path: &Path,
@@ -731,7 +917,7 @@ fn plan(
     let config = if config_path.exists() {
         Config::load(config_path)?
     } else {
-        let text = config_file(&args.domain, args.acme_email.as_deref());
+        let text = config_file(&args.domain, args.acme_email.as_deref(), &args.overrides)?;
         let config = Config::parse(&text, config_path)?;
         steps.push(Step::Create {
             path: config_path.to_owned(),
@@ -743,6 +929,17 @@ fn plan(
     // What the configuration says, before a flag overrides it: the root unit
     // starts the daemon with the configuration alone.
     let configured_key = config.keys.key_path(&config.server.data_dir);
+    if config_path.exists() {
+        // A configuration that is already there is installed as it is. A
+        // flag it contradicts would be planned, then lost at the next start
+        // (the root service's key rule below has its own wording).
+        reject_differing_overrides(
+            config_path,
+            &config,
+            &args.overrides,
+            args.mode() == Mode::Root,
+        )?;
+    }
     let mut config = config.with(crate::config::Overrides {
         master_key_file: host.selected_key.clone(),
         ..Default::default()
@@ -1531,6 +1728,7 @@ mod tests {
             root: true,
             rootless: false,
             dry_run: true,
+            overrides: Default::default(),
         }
     }
 
@@ -1688,6 +1886,7 @@ mod tests {
             root,
             rootless,
             dry_run: true,
+            overrides: Default::default(),
         };
         assert_eq!(args(false, false).mode(), DEFAULT_MODE);
         assert_eq!(DEFAULT_MODE, Mode::Root, "see the comment above");
@@ -1700,7 +1899,12 @@ mod tests {
         use super::*;
         let path = Path::new("kronik.toml");
         let acme = Config::parse(
-            &config_file(&["app.example.com".into()], Some("ops@example.com")),
+            &config_file(
+                &["app.example.com".into()],
+                Some("ops@example.com"),
+                &Default::default(),
+            )
+            .unwrap(),
             path,
         )
         .unwrap();
@@ -1712,7 +1916,8 @@ mod tests {
             acme.keys.key_path(&acme.server.data_dir),
             PathBuf::from(MASTER_KEY)
         );
-        let plain = Config::parse(&config_file(&[], None), path).unwrap();
+        let plain =
+            Config::parse(&config_file(&[], None, &Default::default()).unwrap(), path).unwrap();
         assert_eq!(plain.tls.mode, crate::config::TlsMode::Off);
         assert_eq!(plain.http_listen(), "0.0.0.0:80".parse().unwrap());
         // Apart from TLS and the listen address, the file is the brief's.
@@ -1720,6 +1925,142 @@ mod tests {
         assert_eq!(plain.gateway, defaults.gateway);
         assert_eq!(plain.retention, defaults.retention);
         assert_eq!(plain.promote, defaults.promote);
+        assert_eq!(plain.log, defaults.log);
+    }
+
+    /// F-3: every flag `serve` takes for a configuration value is written
+    /// into that value of a generated file, so the installed service starts
+    /// on what the command said.
+    #[test]
+    fn every_serve_override_is_written_into_the_generated_configuration() {
+        use super::*;
+        let overrides = crate::config::Overrides {
+            data_dir: Some("/srv/kronik-data".into()),
+            api_socket: Some("/run/kronik/other.sock".into()),
+            http_listen: Some("127.0.0.1:8080".parse().unwrap()),
+            admin_listen: Some("127.0.0.1:9465".parse().unwrap()),
+            api_listen: Some("127.0.0.1:7070".parse().unwrap()),
+            gateway_timeout: Some(std::time::Duration::from_millis(1_500)),
+            master_key_file: Some("/srv/kronik-keys/master.key".into()),
+            disk_reserve: Some(crate::config::Size(64 << 20)),
+            otel_endpoint: Some("http://127.0.0.1:4318".into()),
+        };
+        let text = config_file(&[], None, &overrides).unwrap();
+        let config = Config::parse(&text, Path::new("kronik.toml")).unwrap();
+        assert_eq!(config.server.data_dir, PathBuf::from("/srv/kronik-data"));
+        assert_eq!(
+            config.server.api_socket,
+            PathBuf::from("/run/kronik/other.sock")
+        );
+        assert_eq!(config.http_listen(), "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(
+            config.server.admin_listen,
+            "127.0.0.1:9465".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            config.server.api_listen,
+            Some("127.0.0.1:7070".parse().unwrap())
+        );
+        assert_eq!(
+            config.gateway.timeout.0,
+            std::time::Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            config.keys.key_path(&config.server.data_dir),
+            PathBuf::from("/srv/kronik-keys/master.key")
+        );
+        assert_eq!(config.log.disk_reserve.0, 64 << 20);
+        assert_eq!(
+            config.otel.endpoint.as_deref(),
+            Some("http://127.0.0.1:4318")
+        );
+    }
+
+    /// F-3: the plan's steps and its effective configuration are the same
+    /// values; a driver that wrote the steps would write what the plan said.
+    #[test]
+    fn the_install_plan_writes_the_overrides_it_was_given() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir(&units).unwrap();
+        let config_path = dir.path().join("etc/kronik/kronik.toml");
+        let set = crate::config::Overrides {
+            data_dir: Some(dir.path().join("srv/data")),
+            http_listen: Some("127.0.0.1:8080".parse().unwrap()),
+            disk_reserve: Some(crate::config::Size(64 << 20)),
+            ..Default::default()
+        };
+        let args = InitArgs {
+            init: true,
+            domain: Vec::new(),
+            acme_email: None,
+            root: true,
+            rootless: false,
+            dry_run: true,
+            overrides: Box::new(set.clone()),
+        };
+        let (config, steps) = plan(&args, &config_path, &host(&units, None)).unwrap();
+        assert!(
+            matches!(
+                steps.first(),
+                Some(Step::ConfigDir { path }) if *path == config_path.parent().unwrap()
+            ),
+            "the configuration's directory is set up before the file"
+        );
+        let written = steps
+            .iter()
+            .find_map(|step| match step {
+                Step::Create { path, contents, .. } if *path == config_path => Some(contents),
+                _ => None,
+            })
+            .unwrap();
+        let written = Config::parse(written, &config_path).unwrap();
+        for value in [config, written] {
+            assert_eq!(value.server.data_dir, set.data_dir.clone().unwrap());
+            assert_eq!(value.http_listen(), set.http_listen.unwrap());
+            assert_eq!(value.log.disk_reserve, set.disk_reserve.unwrap());
+        }
+    }
+
+    /// F-3: an existing file is the installation's configuration, so a flag
+    /// that contradicts it is refused instead of being silently dropped.
+    #[test]
+    fn a_flag_that_contradicts_an_existing_configuration_is_refused() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir(&units).unwrap();
+        let config_path = dir.path().join("kronik.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\ndata_dir = {:?}\nhttp_listen = \"0.0.0.0:80\"\n",
+                dir.path().join("data")
+            ),
+        )
+        .unwrap();
+        let mut args = root_args();
+        args.overrides.http_listen = Some("127.0.0.1:8080".parse().unwrap());
+        let error = plan(&args, &config_path, &host(&units, None))
+            .err()
+            .expect("a differing flag must be refused");
+        let api = error.downcast::<ApiError>().unwrap();
+        assert_eq!(api.code, ErrorCode::BadRequest);
+        for needle in [
+            "--http-listen 127.0.0.1:8080",
+            "0.0.0.0:80",
+            config_path.to_str().unwrap(),
+        ] {
+            assert!(api.message.contains(needle), "{needle}: {}", api.message);
+        }
+        assert!(
+            api.hint.unwrap_or_default().contains("rerun without"),
+            "the hint names the way forward"
+        );
+        // What the file already says is installed as it is.
+        args.overrides.http_listen = Some("0.0.0.0:80".parse().unwrap());
+        plan(&args, &config_path, &host(&units, None)).unwrap();
     }
 
     fn mode_of(path: &std::path::Path) -> u32 {
@@ -1776,6 +2117,7 @@ mod tests {
             root: true,
             rootless: false,
             dry_run: true,
+            overrides: Default::default(),
         };
         std::fs::write(&file, "# Written by another owner\n[Service]\n").unwrap();
         let (_, steps) = plan(&args, &config, &host).unwrap();

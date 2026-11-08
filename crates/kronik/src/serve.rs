@@ -111,18 +111,33 @@ impl ServeArgs {
         self.init.init.then(|| {
             let mut init = self.init.clone();
             init.rootless = self.rootless;
+            init.overrides = Box::new(self.init_overrides());
             (
                 init,
                 self.config.as_deref(),
-                self.master_key_file.as_deref(),
+                Self::flag_given("--master-key-file")
+                    .then_some(self.master_key_file.as_deref())
+                    .flatten(),
             )
         })
     }
 
-    /// The configuration file, if any, with the flags in place.
-    fn config(&self) -> anyhow::Result<Config> {
-        let (config, _file) = Config::find(self.config.as_deref())?;
-        let config = config.with(Overrides {
+    /// Whether this process's command line spells `name` (`--name VALUE` or
+    /// `--name=VALUE`): what `--init` persists is what the operator wrote, not
+    /// what an `env =` attribute supplied.
+    fn flag_given(name: &str) -> bool {
+        std::env::args().skip(1).any(|argument| {
+            argument == name
+                || argument
+                    .strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
+    }
+
+    /// The flags that override the configuration file: the daemon's, and, for
+    /// `--init`, the ones a generated file is written from.
+    fn overrides(&self) -> Overrides {
+        Overrides {
             data_dir: self.data_dir.clone(),
             api_socket: self.api_socket.clone(),
             http_listen: self.http_listen,
@@ -132,7 +147,49 @@ impl ServeArgs {
             master_key_file: self.master_key_file.clone(),
             disk_reserve: self.disk_reserve,
             otel_endpoint: self.otel_endpoint.clone(),
-        });
+        }
+    }
+
+    /// [`Self::overrides`], but only the flags this command line spells: the
+    /// installed unit does not inherit the installer's environment, so a
+    /// value that came only from there is not the service's to keep.
+    fn init_overrides(&self) -> Overrides {
+        let all = self.overrides();
+        Overrides {
+            data_dir: Self::flag_given("--data-dir")
+                .then_some(all.data_dir)
+                .flatten(),
+            api_socket: Self::flag_given("--api-socket")
+                .then_some(all.api_socket)
+                .flatten(),
+            http_listen: Self::flag_given("--http-listen")
+                .then_some(all.http_listen)
+                .flatten(),
+            admin_listen: Self::flag_given("--admin-listen")
+                .then_some(all.admin_listen)
+                .flatten(),
+            api_listen: Self::flag_given("--api-listen")
+                .then_some(all.api_listen)
+                .flatten(),
+            gateway_timeout: Self::flag_given("--gateway-timeout-ms")
+                .then_some(all.gateway_timeout)
+                .flatten(),
+            master_key_file: Self::flag_given("--master-key-file")
+                .then_some(all.master_key_file)
+                .flatten(),
+            disk_reserve: Self::flag_given("--disk-reserve")
+                .then_some(all.disk_reserve)
+                .flatten(),
+            otel_endpoint: Self::flag_given("--otel-endpoint")
+                .then_some(all.otel_endpoint)
+                .flatten(),
+        }
+    }
+
+    /// The configuration file, if any, with the flags in place.
+    fn config(&self) -> anyhow::Result<Config> {
+        let (config, _file) = Config::find(self.config.as_deref())?;
+        let config = config.with(self.overrides());
         // The overrides are checked as the file's values are.
         config.otel.check().map_err(anyhow::Error::msg)?;
         config.check_audit_hold().map_err(anyhow::Error::msg)?;

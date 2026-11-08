@@ -64,7 +64,17 @@ The directory `/etc/kronik` is created with mode 0755 explicitly, whatever
 the caller's umask is, and an older one is brought to 0755: the nonroot
 service reads the file inside it as `kronik`, so a hardened `umask 077` must
 not leave a root-only directory behind. The same applies to the directory
-``--config`` names.
+`--config` names.
+
+The configuration flags of `serve` - `--data-dir`, `--api-socket`,
+`--http-listen`, `--admin-listen`, `--api-listen`, `--gateway-timeout-ms`,
+`--master-key-file`, `--disk-reserve` and `--otel-endpoint` - are written into
+a configuration that `--init` generates, so the service starts on what the
+command said. Their environment variables are not persisted: the installed
+unit does not inherit the installer's environment, so a value that came only
+from there would name something the service cannot keep. An existing
+configuration is installed as it is and never rewritten: a flag that
+contradicts it stops with the file's value rather than being silently lost.
 
 ### The nonroot service
 

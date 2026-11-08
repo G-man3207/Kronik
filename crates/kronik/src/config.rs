@@ -1199,7 +1199,7 @@ impl Config {
 
 /// `kronik serve` flags (and their environment variables), which override
 /// the file.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Overrides {
     pub data_dir: Option<PathBuf>,
     pub api_socket: Option<PathBuf>,
