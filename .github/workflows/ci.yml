@@ -7,6 +7,10 @@ on:
     paths-ignore: [examples/github-flow/proof/change.json]
   pull_request:
     paths-ignore: [examples/github-flow/proof/change.json]
+  # A push normally starts the run; this is the way to start one by hand when
+  # the push that should have carried it is already in history (a release tag,
+  # or a free runner after the fact). Same tree as the push, same steps.
+  workflow_dispatch:
 
 permissions:
   contents: read
