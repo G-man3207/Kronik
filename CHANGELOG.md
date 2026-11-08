@@ -47,6 +47,9 @@ Fixes to v0.4.0; no log-format, WIT or breaking API/CLI change.
 - `kronik restore` validates manifest paths and names before installing
   anything, installs only the components the manifest names, and refuses unsafe
   entries.
+- The daemon's log carries ANSI colours only when standard error is a terminal:
+  a redirected, piped or journaled log no longer holds escape sequences between
+  a field's name, its `=`, and its value (`NO_COLOR` is still honoured on one).
 - The `watch` test no longer races its first evaluation against the directory
   change (test-only).
 
