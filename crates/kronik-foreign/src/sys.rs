@@ -2441,7 +2441,7 @@ mod tests {
                      --exact sys::tests::jail_rehearsal_child --ignored --nocapture \
                      --test-threads=1",
             )
-            .env("EXE", std::env::current_exe().unwrap())
+            .env("EXE", rehearsal_exe())
             .env(REHEARSAL_DIR, dir.path())
             .env(REHEARSAL_CASE, "hold")
             .env(REHEARSAL_HOLD, "1")
@@ -2844,7 +2844,7 @@ int main(void) {
         if !have_stub && std::env::var("KRONIK_FOREIGN_TESTS").as_deref() == Ok("require") {
             panic!("KRONIK_FOREIGN_TESTS=require, but no static C program can be made: {built:?}");
         }
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        let mut command = std::process::Command::new(rehearsal_exe());
         command
             .args([
                 "--exact",
@@ -2992,7 +2992,7 @@ int main(void) {
     #[test]
     fn descriptors_above_the_standard_three_are_closed_with_and_without_close_range() {
         for mode in ["quick", "fallback"] {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
+            let out = std::process::Command::new(rehearsal_exe())
                 .args([
                     "--exact",
                     "sys::tests::close_descriptors_child",
@@ -3331,6 +3331,32 @@ int main(void) {
         assert_eq!(exit_code(libc::SIGSEGV | 0x80), 128 + libc::SIGSEGV);
     }
 
+    /// The test binary to re-exec from a rehearsal namespace.
+    ///
+    /// `unshare --user --map-root-user` runs the command as uid 0 of a *new*
+    /// user namespace. That uid is privileged only for inodes of its own
+    /// namespace; for this namespace's files it is an ordinary uid with no
+    /// `CAP_DAC_OVERRIDE`, so the file must be executable through its own mode
+    /// bits. A cargo test binary can be 0750 (a restrictive umask) and a CI
+    /// checkout can be owned by another uid; copy it once, 0755, under `/tmp`
+    /// (whose ancestors are world-searchable) and give every rehearsal the copy.
+    fn rehearsal_exe() -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        static COPY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        COPY.get_or_init(|| {
+            let exe = std::env::current_exe().unwrap();
+            let dir = std::path::Path::new("/tmp")
+                .join(format!("kronik-foreign-rehearsal-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let copy = dir.join("kronik-foreign");
+            std::fs::copy(&exe, &copy).unwrap();
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+            copy
+        })
+        .clone()
+    }
+
     const PIDNS_DIR: &str = "KRONIK_TEST_PIDNS_DIR";
     const PIDNS_CASE: &str = "KRONIK_TEST_PIDNS_CASE";
 
@@ -3381,7 +3407,7 @@ int main(void) {
         // the copy - the rehearsal is about the launcher, not about the mode
         // of the test binary.
         let helper = dir.path().join("kronik-foreign-jail-rehearsal");
-        std::fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+        std::fs::copy(rehearsal_exe(), &helper).unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let child = Command::new("unshare")
