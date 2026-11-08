@@ -3372,9 +3372,21 @@ int main(void) {
             .tempdir()
             .unwrap();
         let log = File::create(dir.path().join("log")).unwrap();
+        // `unshare --map-root-user` execs the command as uid 0 of a *new* user
+        // namespace. That uid is not privileged for inodes of the namespace it
+        // was made in, so the file must be executable through its own mode
+        // bits: a cargo test binary can be 0750 (or 0700) when the build ran
+        // with a restrictive umask, and a CI checkout owned by another uid is
+        // then not executable at all. Copy it beside the run as 0755 and exec
+        // the copy - the rehearsal is about the launcher, not about the mode
+        // of the test binary.
+        let helper = dir.path().join("kronik-foreign-jail-rehearsal");
+        std::fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let child = Command::new("unshare")
             .args(["--user", "--map-root-user"])
-            .arg(std::env::current_exe().unwrap())
+            .arg(&helper)
             .args([
                 "--exact",
                 "sys::tests::pid_namespace_child",
