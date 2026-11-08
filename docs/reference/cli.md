@@ -321,6 +321,15 @@ result, and writes neither file. A bad window or a data directory with no
 log is `BAD_REQUEST`. `--json` prints the report, and the diff path when
 one was written, even when the command exits 1.
 
+A turn whose recorded input was **erased** (`kronik privacy erase`, M8)
+is unverifiable, not divergent: the replay serves its effects from the
+recording, reports `N turns unverifiable: erased` (the report's
+`unverifiable` field, also in `--json`), and passes when nothing else
+differs. Any other difference still exits 1, so a check that fails after
+an erasure has found a real change or a recording that cannot be read.
+Reports written by older binaries lack the field; the report schema stays
+`kronik.upgrade-check/v1`.
+
 The check also asks the question `kronik serve` asks of the data directory
 before it opens anything: whether the log that retention kept reaches
 `state.db` and every actor database (an actor database says where that

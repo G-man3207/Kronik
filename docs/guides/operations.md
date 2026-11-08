@@ -1361,15 +1361,26 @@ to it (`<engine>.diff.json`) and exits 1 with `ENGINE_UPGRADE_DIVERGED`:
 keep the current binary. `--dry-run` prints the result and writes neither
 file. A bad window or a directory with no log is `BAD_REQUEST`.
 
-If a subject was **erased** while the previous binary ran, a check can diverge for a
-reason that is not a behaviour change: the erased turn's sealed request can no longer
-be opened, so a replay produces a failed turn where the recorded turn succeeded. The
-fork point is chosen from the **root inputs**, not from snapshots: `snapshot create`
-does not move it, and on an idle node no window value ages the erased turn out. Make
-one new turn after the erasure, then run the check with `--window` shorter than the
-time since that erasure (for example `--window 1m`), and let that report be the last
-one written - `serve` reads the last report, not the newest check. The erased turn is
-unverifiable rather than different; v0.5.0 records it as such.
+If a subject was **erased**, the turn that read it is **unverifiable**: the
+erased values cannot be opened again, so the replay cannot be compared with the
+recording the way other turns are. v0.5.0 and later say so instead of calling it a
+difference. The check serves such a turn's effects from their recording, counts the
+turn, and passes when nothing else differs; the report line reads `N turns
+unverifiable: erased` and the same count is in `--json` as `unverifiable`. A diverging
+report from v0.5.0 therefore means a real change (or an unreadable recording), and
+`serve` starts from it as from any other passing report. The count is also how many
+turns the upgrade did not verify: look at the diff when it is non-zero, and re-run the
+check with a window that starts after them if you want a fully verified tail.
+
+On **v0.4.1 and older** the same directory diverges for a reason that is not a
+behaviour change: the erased turn's sealed request can no longer be opened, so a
+replay produces a failed turn where the recorded turn succeeded. The fork point is
+chosen from the **root inputs**, not from snapshots: `snapshot create` does not move
+it, and on an idle node no window value ages the erased turn out. Make one new turn
+after the erasure, then run the check with `--window` shorter than the time since
+that erasure (for example `--window 1m`), and let that report be the last one written
+- `serve` reads the last report, not the newest check. v0.5.0 records the erased
+turn as unverifiable instead.
 
 The check also asks the question the start asks of the data directory: the
 databases (`state.db` and the actor databases) must be reached by the log

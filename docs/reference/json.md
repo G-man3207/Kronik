@@ -2459,7 +2459,7 @@ against both.
       "description": "Fork effects answered by a similar recording (same target, different request)."
     },
     "changed": {
-      "description": "Any difference anywhere in the diff.",
+      "description": "Any difference in the diff that a replay verified: not a difference of a turn that read a pseudonym or an erased value, which cannot be verified as a change (S-16, ADR 0109). The policy floor still reads `pii_masked + pii_unverified` (ADR 0031).",
       "type": "boolean"
     },
     "confidence": {
@@ -2528,6 +2528,10 @@ against both.
     "turns_prod": {
       "$ref": "#/components/schemas/DiffCount",
       "description": "Production turns of the replayed trees."
+    },
+    "unverifiable": {
+      "$ref": "#/components/schemas/DiffCount",
+      "description": "Turns whose recorded input was erased (S-16, ADR 0109): the replay served their effects from the recording, so their behaviour was not verified against the erased values and their differences are not changes. Any other difference of the same causal trees - including one in a turn that also met an erased value - still counts; a real divergence next to an unverifiable turn keeps `changed` true. Always written (0 when none); diffs and upgrade reports written before v0.5.0 lack it when 0."
     },
     "verified_through_lsn": {
       "$ref": "#/components/schemas/DiffCount",
@@ -7555,6 +7559,13 @@ against both.
       "type": "string"
     },
     "turns": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "unverifiable": {
+      "default": 0,
+      "description": "Turns the identity replay could not verify: their recorded input was\nerased (S-16, ADR 0109).",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
