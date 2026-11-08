@@ -60,6 +60,11 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// The daemon process's pid, for reading its cgroup.
+    fn pid(&self) -> u32 {
+        self.child.as_ref().expect("the daemon was started").id()
+    }
+
     fn start(dir: &Path) -> Daemon {
         Daemon::start_with(dir, &[])
     }
@@ -306,6 +311,25 @@ fn files_containing(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// The cgroup `kronik-foreign` gives a sandbox of this daemon: the daemon's
+/// own delegated cgroup if it has one (`Ctx::cgroup_parent`), else
+/// `/kronik/<first 8 hex of blake3(runsc root)>`, then `container_id(name)`.
+fn actor_cgroup(daemon: &Daemon, runsc_root: &Path, name: &str) -> std::path::PathBuf {
+    let instance = blake3::hash(runsc_root.as_os_str().as_encoded_bytes()).to_hex();
+    let own = std::fs::read_to_string(format!("/proc/{}/cgroup", daemon.pid()))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
+        });
+    let parent = own
+        .and_then(|cgroup| cgroup.strip_suffix("/daemon").map(str::to_owned))
+        .unwrap_or_else(|| format!("/kronik/{}", &instance.as_str()[..8]));
+    Path::new("/sys/fs/cgroup")
+        .join(parent.trim_start_matches('/'))
+        .join(kronik_foreign::container_id(name))
 }
 
 #[test]
@@ -561,15 +585,15 @@ fn foreign_actors_end_to_end() {
             .any(|l| l.as_str().unwrap().contains("listening")),
         "{logs}"
     );
-    // Only this daemon's cgroup: kronik-foreign puts it at
-    // /sys/fs/cgroup/kronik/<first 8 hex of the runsc root's blake3>/echo,
-    // and the other foreign tests run their own daemons (and their own
-    // `echo` cgroups) under /sys/fs/cgroup/kronik at the same time.
-    let instance = blake3::hash(runsc_root.as_os_str().as_encoded_bytes()).to_hex();
-    let cgroup = Path::new("/sys/fs/cgroup/kronik")
-        .join(&instance.as_str()[..8])
-        .join("echo");
-    assert!(cgroup.exists(), "no cgroup for echo");
+    // Only this daemon's sandbox: kronik-foreign names an actor's cgroup by
+    // `container_id(name)` under the daemon's cgroup parent and removes both
+    // when the actor goes. The parent is the daemon's own delegated cgroup when
+    // it has one, and `/kronik/<first 8 hex of blake3(runsc root)>` otherwise
+    // (ADR 0061); the other foreign tests run their own daemons under
+    // /sys/fs/cgroup/kronik at the same time, which is why the instance hash is
+    // part of the path.
+    let cgroup = actor_cgroup(&d, &runsc_root, "echo");
+    assert!(cgroup.exists(), "no cgroup for echo: {cgroup:?}");
     d.ok(
         "DELETE",
         "/v1/foreign/echo",

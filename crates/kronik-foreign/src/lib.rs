@@ -34,6 +34,8 @@ mod microvm_assets;
 mod microvm_checkpoint;
 mod microvm_sys;
 mod runtime;
+
+pub use runtime::container_id;
 mod supervisor;
 
 pub use checkpoint::Copy;

@@ -31,7 +31,7 @@ pub(crate) struct Runtime {
 /// digits of the name's BLAKE3 hash. runsc resolves ids by prefix, so ids
 /// must not be prefixes of each other, as `kronik-foreign-pay` was of
 /// `kronik-foreign-payments` (docs/design/m7-foreign.md §3).
-pub(crate) fn container_id(name: &str) -> String {
+pub fn container_id(name: &str) -> String {
     format!(
         "kronik-foreign-{}",
         &blake3::hash(name.as_bytes()).to_hex()[..16]
