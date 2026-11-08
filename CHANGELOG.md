@@ -38,6 +38,12 @@ Fixes to v0.4.0; no log-format, WIT or breaking API/CLI change.
   `DEAD_LETTER_NOT_FOUND` instead of running.
 - `kronik upgrade check` no longer writes the data directory's path into the
   `engine.upgrade` audit record, and neither does an upgrade.
+- An `upgrade check` that diverges because a subject was erased after the last
+  snapshot now names the reason and the way out: the check forks from the root
+  inputs, not from snapshots, so make one new turn and rerun it with a window
+  shorter than the time since the erasure. A snapshot alone does not move the
+  fork point. (v0.5.0 will report the erased turn as unverifiable rather than as
+  a change.)
 - `kronik restore` validates manifest paths and names before installing
   anything, installs only the components the manifest names, and refuses unsafe
   entries.

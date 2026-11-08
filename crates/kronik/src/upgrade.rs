@@ -268,7 +268,11 @@ fn diverge_error(v: &UpgradeCheckOutput, window: &str) -> ApiError {
         ),
     )
     .with_hint(format!(
-        "Keep the current binary.{where_} Report the diff with both engine versions."
+        "Keep the current binary.{where_} Report the diff with both engine versions. \
+         If a subject was erased after the last snapshot, make one new turn with the \
+         current binary and rerun with a window shorter than the time since the \
+         erasure (for example `--window 1m`): the erased request cannot be replayed \
+         from the log, and a snapshot does not move the check's fork point."
     ))
 }
 
