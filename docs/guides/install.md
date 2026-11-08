@@ -2,9 +2,10 @@
 
 Kronik is one static binary for Linux on x86_64 or aarch64. The target is a
 fresh Ubuntu 24.04 VPS. **This checkout's installer requires a signed release.**
-No public Kronik signing event has been performed for this cutover: the latest
-published `v0.3.0` is still historical and unsigned, with Wasmtime **50.0.0**,
-not the current source's 50.0.1 security/engine patch.
+The latest published release, `v0.4.1`, is attested (GitHub OIDC/Sigstore) and
+was built from this source line: static musl, Wasmtime **50.0.1**, engine
+`kronik-0.4.1+wasmtime-50.0.1`. `v0.4.0` is the first attested release on that
+line; the historical `v0.3.0` and `v0.1.0` remain unsigned and are refused.
 
 For an actually published signed version, obtain its standalone `install.sh`
 from the authenticated exact release tag, then use that release's curl-pipe
