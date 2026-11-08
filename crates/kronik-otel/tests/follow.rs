@@ -12,6 +12,7 @@
     clippy::panic
 )]
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -360,7 +361,25 @@ fn a_failed_gap_record_keeps_the_cursor_before_the_gap_and_is_retried() {
     // The first batch is pending; nothing holds retention.
     f.rt.block_on(f.node.snapshot("manual", f.original.clone()))
         .unwrap();
-    let first = f.node.log_first(f.node.storage_config().unwrap()).unwrap();
+    // The snapshot's deletion is applied in the background, and it can arrive
+    // in more than one step: the start of the log is a value that stops moving,
+    // not one that is already final when the snapshot returns. Let it stop
+    // before the sink is released, or a step that lands between the two gap
+    // attempts makes the retried range wider - correctly, but not what the
+    // identity below is meant to compare.
+    let first = Cell::new(f.node.log_first(f.node.storage_config().unwrap()).unwrap());
+    let settled = Cell::new(0u32);
+    f.wait("retention to settle", || {
+        let now = f.node.log_first(f.node.storage_config().unwrap()).unwrap();
+        if now == first.get() {
+            settled.set(settled.get() + 1);
+        } else {
+            first.set(now);
+            settled.set(0);
+        }
+        settled.get() == 3
+    });
+    let first = first.get();
     assert!(first > 5, "{first}");
     seen.down.store(false, Ordering::SeqCst);
     f.wait("the gap and the rest", || {
@@ -369,7 +388,13 @@ fn a_failed_gap_record_keeps_the_cursor_before_the_gap_and_is_retried() {
     let gaps = seen.gaps.lock().unwrap().clone();
     assert_eq!(gaps.len(), 2, "{gaps:?}");
     let (from, to, saved) = gaps[1];
-    assert_eq!((gaps[0].0, gaps[0].1), (from, to), "the same gap again");
+    // The retry starts where the first attempt did, and covers at least as
+    // much: retention may have deleted more, never less, in between.
+    assert_eq!(gaps[0].0, from, "the same gap again: {gaps:?}");
+    assert!(
+        to >= gaps[0].1,
+        "the retry lost less than the first try: {gaps:?}"
+    );
     assert_eq!(to, first - 1);
     assert!(saved.unwrap() < from, "{gaps:?}");
     assert_eq!(stream.progress().gaps, 1);
