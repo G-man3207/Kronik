@@ -115,9 +115,10 @@ impl ServeArgs {
             (
                 init,
                 self.config.as_deref(),
-                Self::flag_given("--master-key-file")
-                    .then_some(self.master_key_file.as_deref())
-                    .flatten(),
+                // The key the host is set up with, not the one the file
+                // records: a key given only by the environment still has to
+                // reach init, which reads it once instead of re-reading it.
+                self.master_key_file.as_deref(),
             )
         })
     }
