@@ -893,10 +893,30 @@ mod tests {
             .unwrap();
         assert_eq!(catalogues.load(Ordering::Relaxed), 1);
         node.refresh_secret_inventory(operator).await.unwrap();
-        assert_eq!(
-            fingerprint,
-            node.native_secret_snapshot().unwrap().fingerprint
-        );
+        // The refresh above clears the catalogue before its background rebuild
+        // certifies it again (fail-closed), just like the first one: read the
+        // recertified snapshot within the documented window instead of racing
+        // the clear. The fingerprint must survive the refresh unchanged.
+        let recertified = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match node.native_secret_snapshot() {
+                    Ok(snapshot) => break snapshot.fingerprint,
+                    Err(error) if error.code == ErrorCode::SecretUnavailable => {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "the catalogue never recertified after the refresh: {error}"
+                        );
+                        node.env()
+                            .clock
+                            .sleep(std::time::Duration::from_millis(100))
+                            .await;
+                    }
+                    Err(error) => panic!("snapshot failed: {error}"),
+                }
+            }
+        };
+        assert_eq!(fingerprint, recertified);
         assert!(captured.authority().check().is_ok());
         assert!(disclosure.check().is_err());
         assert!(prepared.read(&cursor, 1).await.is_err());
