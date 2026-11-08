@@ -232,6 +232,10 @@ pub struct ForkTurn {
     /// It read a pseudonym or an erased value: it did not run on real
     /// data, so failing where production committed is no introduced error.
     pub pseudonyms: bool,
+    /// It read a value whose subject was erased: the recording, not the
+    /// guest's input, is the only truth, so a difference from production is
+    /// `unverifiable` rather than divergent (S-16, ADR 0109).
+    pub erased: bool,
     /// `--no-pii` forks: it used SQL, called a turn that did, or was sent
     /// by one, so its values may hold real SQL rows (SQL is not
     /// pseudonymized). Implies `masked`; see [`crate::privacy::conceal_turn`].
@@ -698,6 +702,7 @@ impl Runner {
             masked: sql || pseudonyms,
             pseudonyms,
             sql,
+            erased: false,
             personal: p.personal || p.subject.is_some(),
         };
         lock(&self.turns).push(turn.clone());
@@ -794,6 +799,7 @@ impl Runner {
     ) -> Result<ForkTurn, ReplayError> {
         let prod = self.setup.index.turn(&p.key);
         let prod_lsn = prod.map(|(l, _)| l);
+        let erased_turn = prod_lsn.is_some_and(|lsn| self.setup.index.erased_turns.contains(&lsn));
         let (time, seed, prod_effects) = match prod {
             Some((_, t)) => (
                 t.logical_time_ms,
@@ -845,6 +851,10 @@ impl Runner {
             p.actor.clone(),
             self.setup.privacy.clone(),
         ));
+        let erased_effects = prod_lsn
+            .and_then(|lsn| self.setup.index.erased_effects.get(&lsn))
+            .cloned()
+            .unwrap_or_default();
         let gate = Arc::new(ReplayGate {
             dispatch,
             runner: self.clone(),
@@ -856,6 +866,7 @@ impl Runner {
             prod: prod_effects,
             call_chain,
             state: Mutex::new(GateState::default()),
+            erased_effects,
             input_tagged: p.subject.is_some()
                 || p.personal
                 || crate::privacy::tagged_input(Some(&p.input)),
@@ -1079,14 +1090,18 @@ impl Runner {
                     e.grounding != pb::Grounding::Live as i32
                         && e.response.as_ref().is_some_and(|r| r.subject.is_some())
                 }));
+        // A turn that met an erased recorded value (S-16, ADR 0109): mark it,
+        // whatever mode, so the diff reports it as unverifiable, not divergent.
+        let erased = erased_turn || state.erased();
         let turn = ForkTurn {
             id,
             record,
             lsn,
             prod_lsn,
-            masked: pseudonyms || (self.setup.privacy.no_pii && real_rows),
+            masked: pseudonyms || (self.setup.privacy.no_pii && real_rows) || erased,
             pseudonyms,
             sql: real_rows,
+            erased,
             personal,
         };
         lock(&self.turns).push(turn.clone());
@@ -1137,6 +1152,9 @@ struct ReplayGate {
     prod: Vec<pb::EffectRecord>,
     call_chain: Vec<ActorRef>,
     state: Mutex<GateState>,
+    /// The effect ordinals of this turn whose recorded request was erased
+    /// (S-16, ADR 0109): their outcome is served, not re-derived.
+    erased_effects: std::collections::BTreeSet<u32>,
     /// What the turn has seen of personal data, for the model simulator
     /// (ADR 0015): its root input's subject, state reads, SQL.
     input_tagged: bool,
@@ -1499,6 +1517,20 @@ impl ReplayGate {
         {
             self.push(record);
             return Err(GateError::HostRedactionFailure);
+        }
+        // The recorded request was erased: its plaintext is gone, so no
+        // request the guest can build is comparable with it. The recording is
+        // the only outcome there is - serve it, and mark the turn unverifiable
+        // (S-16, ADR 0109). Only a fetch-like recording is served this way; an
+        // effect of another kind at this ordinal is a real divergence.
+        if self.erased_effects.contains(&ordinal)
+            && let Some(mut record) = self.prod_at(ordinal).cloned()
+            && matches!(record.kind.as_str(), "http.fetch" | "foreign.http")
+        {
+            record.grounding = pb::Grounding::Exact as i32;
+            let out = outcome_of_fetch(&record)?;
+            self.push(record);
+            return Ok(out);
         }
         let (matcher, prepared_scope) = self.matcher_with_scope()?;
         let (t, raw_host) = match parse_request_url(&req.url) {

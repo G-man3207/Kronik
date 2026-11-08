@@ -93,6 +93,14 @@ impl ForkPrivacy {
         masked
     }
 
+    /// Whether `s` was erased: its subject's key is gone, so the recorded
+    /// value cannot be re-opened by anyone (ADR 0108, amendment on erased
+    /// requests). An identity replay cannot verify what the guest did with
+    /// it, only compare it with the recording (S-16, ADR 0109).
+    pub fn opens_erased(&self, s: &pb::Sealable) -> bool {
+        matches!(self.sealer.open(s), Opened::Erased { .. })
+    }
+
     /// [`ForkPrivacy::reveal`] over a turn record. SQL changesets are
     /// binary: they are unsealed (never pseudonymized), and an erased
     /// subject's stay sealed so the store skips them; the diff redacts the
@@ -141,6 +149,8 @@ pub struct ForkState {
     actor: ActorRef,
     privacy: ForkPrivacy,
     masked: AtomicBool,
+    /// The turn read a state value whose subject was erased (S-16).
+    erased: AtomicBool,
     /// The turn read a state value with a subject (M12: the model
     /// simulator then declines).
     saw_subject: AtomicBool,
@@ -153,6 +163,7 @@ impl ForkState {
             actor,
             privacy,
             masked: AtomicBool::new(false),
+            erased: AtomicBool::new(false),
             saw_subject: AtomicBool::new(false),
         }
     }
@@ -160,6 +171,11 @@ impl ForkState {
     /// Whether the turn read a pseudonym or an erased value.
     pub fn masked(&self) -> bool {
         self.masked.load(Ordering::Relaxed)
+    }
+
+    /// Whether the turn read an erased state value.
+    pub fn erased(&self) -> bool {
+        self.erased.load(Ordering::Relaxed)
     }
 
     /// Whether the turn read a state value with a subject.
@@ -183,6 +199,7 @@ impl StateView for ForkState {
         }
         if matches!(self.privacy.sealer.open(&value), Opened::Erased { .. }) {
             self.masked.store(true, Ordering::Relaxed);
+            self.erased.store(true, Ordering::Relaxed);
             return Ok(None);
         }
         if self.privacy.reveal(&mut value) {
