@@ -2,6 +2,7 @@
 //! serves the gateway on TCP and the API on the Unix socket. Settings come
 //! from `kronik.toml` ([`crate::config`]); the flags override it.
 
+use std::io::IsTerminal as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -175,6 +176,17 @@ fn rmcp_at_info(meta: &tracing::Metadata<'_>) -> bool {
     !(meta.target().starts_with("rmcp") && *meta.level() > tracing::Level::INFO)
 }
 
+/// Whether the log may carry ANSI colours: only when standard error is a
+/// terminal, and not when `NO_COLOR` says so (<https://no-color.org>).
+///
+/// The daemon's log is routinely kept rather than watched - systemd's journal,
+/// a redirected file, a test's pipe - and the escapes are then part of the
+/// text: they break a search for a field and they end up in a bug report.
+fn ansi_enabled() -> bool {
+    std::io::stderr().is_terminal()
+        && std::env::var("NO_COLOR").map_or(true, |value| value.is_empty())
+}
+
 /// The subscriber `kronik serve` logs through: KRONIK_LOG's filter (`spec`),
 /// then [`rmcp_at_info`] over it.
 fn log_subscriber(
@@ -184,6 +196,7 @@ fn log_subscriber(
     use tracing_subscriber::layer::SubscriberExt as _;
     let builder = tracing_subscriber::fmt()
         .with_env_filter(log_filter(spec))
+        .with_ansi(ansi_enabled())
         .with_writer(std::io::stderr);
     let cap = tracing_subscriber::filter::filter_fn(rmcp_at_info);
     match format {

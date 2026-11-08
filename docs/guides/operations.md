@@ -1598,6 +1598,16 @@ to it (`<engine>.diff.json`) and exits 1 with `ENGINE_UPGRADE_DIVERGED`:
 keep the current binary. `--dry-run` prints the result and writes neither
 file. A bad window or a directory with no log is `BAD_REQUEST`.
 
+If a subject was **erased** while the previous binary ran, a check can diverge for a
+reason that is not a behaviour change: the erased turn's sealed request can no longer
+be opened, so a replay produces a failed turn where the recorded turn succeeded. The
+fork point is chosen from the **root inputs**, not from snapshots: `snapshot create`
+does not move it, and on an idle node no window value ages the erased turn out. Make
+one new turn after the erasure, then run the check with `--window` shorter than the
+time since that erasure (for example `--window 1m`), and let that report be the last
+one written - `serve` reads the last report, not the newest check. The erased turn is
+unverifiable rather than different; v0.5.0 records it as such.
+
 The check also asks the question the start asks of the data directory: the
 databases (`state.db` and the actor databases) must be reached by the log
 that retention kept. It prints a note when the start will repair that by

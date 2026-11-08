@@ -1,6 +1,6 @@
 [package]
 name = "kronik-sdk"
-version = "0.4.1-dev"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.99.1"
 license = "Elastic-2.0"

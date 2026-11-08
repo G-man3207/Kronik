@@ -722,6 +722,38 @@ impl Daemon {
         panic!("timed out waiting for {what}: {}", self.serve_log());
     }
 
+    /// Waits until neither the log nor the backend has moved for 200 ms.
+    ///
+    /// A link, an unlink or a rotation starts a background rebuild of the
+    /// secret inventory, and that rebuild reads the backend. A request count
+    /// taken while one is still in flight measures the rebuild rather than the
+    /// operation under test, so a test that counts requests across a quiet
+    /// daemon drains here first. A test with a backend that is down must not
+    /// use this: there, the retries keep the count moving.
+    fn quiet(&self, bao: &Bao) {
+        let mut last = (self.applied_lsn(), bao.requests());
+        let mut still = 0;
+        for _ in 0..120 {
+            std::thread::sleep(Duration::from_millis(50));
+            let now = (self.applied_lsn(), bao.requests());
+            if now == last {
+                still += 1;
+                if still == 4 {
+                    return;
+                }
+            } else {
+                last = now;
+                still = 0;
+            }
+        }
+        panic!(
+            "the daemon never went quiet: at lsn {} the backend had seen {} requests: {}",
+            last.0,
+            last.1,
+            self.serve_log()
+        );
+    }
+
     /// The text of every answer a client can get about `actors` and the
     /// secrets, from the API, from the CLI and from MCP.
     fn answers(&self, actors: &[&str], turns: &[String]) -> Vec<String> {
@@ -1214,6 +1246,9 @@ fn a_rotation_in_the_backend_shows_as_a_new_version_and_a_fork_before_it_replays
     // 4. A fork before the rotation replays the turns on both sides of it
     // identically: same outcomes, every effect matched, and no request to the
     // backend (a fork never fetches).
+    // The rotation rebuilt the inventory in the background; let its fetch land
+    // before the count that the fork is measured against is taken.
+    d.quiet(&bao);
     let requests = bao.requests();
     let fork = d.mutate(
         "POST",
@@ -2166,6 +2201,9 @@ fn a_fork_refuses_the_built_in_value_of_a_name_that_is_linked_at_its_fork_point(
     );
     d.settle();
     let unlinked_at = d.applied_lsn();
+    // The unlink rebuilt the inventory in the background; let its fetch land
+    // before the count that the forks are measured against is taken.
+    d.quiet(&bao);
     let requests = bao.requests();
     let fork_at = |lsn: u64| {
         d.mutate(
@@ -2255,6 +2293,9 @@ fn a_foreign_actor_cannot_be_given_a_name_that_is_linked() {
         );
     }
     d.link("stripe", "secret/payments#stripe");
+    // The link rebuilt the inventory in the background; let its fetch land
+    // before the count that the adds are measured against is taken.
+    d.quiet(&bao);
     let requests = bao.requests();
     let add = |secret: &str| {
         d.api(
@@ -2272,6 +2313,7 @@ fn a_foreign_actor_cannot_be_given_a_name_that_is_linked() {
     assert_eq!(answer["error"]["code"], "SECRET_EXTERNAL", "{answer}");
     assert!(answer.to_string().contains("stripe is linked"), "{answer}");
     assert!(!answer.to_string().contains(VALUE_1), "{answer}");
+    assert_eq!(bao.requests(), requests, "the refusal asked the backend");
 
     // Not linked: past the secrets, to the image that does not exist.
     let (status, answer) = add("plain");
@@ -2281,6 +2323,11 @@ fn a_foreign_actor_cannot_be_given_a_name_that_is_linked() {
         !status.to_string().starts_with('2') && !code.starts_with("SECRET_"),
         "{status} {answer}"
     );
+    assert_eq!(
+        bao.requests(),
+        requests,
+        "the unresolvable name asked the backend"
+    );
 
     // Unlinked again: the built-in store's name, as before.
     d.mutate(
@@ -2289,6 +2336,11 @@ fn a_foreign_actor_cannot_be_given_a_name_that_is_linked() {
         json!({"reason": "back to the built-in store"}),
     );
     d.settle();
+    // The unlink starts the same background rebuild, and `settle` is not a
+    // barrier for it: the name is built-in again, so the history read it makes
+    // no longer waits for external coverage.
+    d.quiet(&bao);
+    let requests = bao.requests();
     let (status, answer) = add("stripe");
     println!("unlinked: {status} {answer}");
     let code = answer["error"]["code"].as_str().unwrap_or("");

@@ -109,7 +109,11 @@ pub(crate) fn gate(
     }
     if !report.passed {
         return Gate::Refuse(format!(
-            "{} records a diverging identity replay (diff {}); the upgrade is not safe",
+            "{} records a diverging identity replay (diff {}); the upgrade is not safe. \
+             If a subject was erased while the previous engine ran, make one new turn and \
+             run the check with a window shorter than the time since the erasure: the check \
+             forks from the root inputs, not from snapshots, so an erased request is \
+             replayed again unless newer input and a shorter window put it behind the fork",
             path.display(),
             report.diff_hash
         ));
