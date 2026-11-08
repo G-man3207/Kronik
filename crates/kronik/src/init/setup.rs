@@ -230,6 +230,87 @@ fn start_time(pid: u32) -> anyhow::Result<u64> {
         .parse()
         .context("invalid service start time")
 }
+
+/// The first part of `path` that `uid`/`gid` may not search (a directory) or
+/// read (the file itself), worded for the operator; `None` when the mode bits
+/// let the service in. This reads modes, not the service's credentials: it
+/// answers the one failure that leaves no process to ask, a daemon that
+/// exited before it could open its configuration.
+fn unreadable_configuration(path: &Path, uid: u32, gid: u32) -> anyhow::Result<Option<String>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let allows = |metadata: &std::fs::Metadata, bit: u32| {
+        let shift = if metadata.uid() == uid {
+            6
+        } else if metadata.gid() == gid {
+            3
+        } else {
+            0
+        };
+        (metadata.mode() >> shift) & bit != 0
+    };
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let mut ancestors: Vec<_> = absolute.ancestors().collect();
+    ancestors.reverse();
+    for component in ancestors {
+        let metadata = match std::fs::metadata(component) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Some(format!("{} does not exist", component.display())));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mode = metadata.mode() & 0o7777;
+        let (what, bit) = if component == absolute {
+            ("read", 0o4)
+        } else {
+            ("search", 0o1)
+        };
+        if !allows(&metadata, bit) {
+            return Ok(Some(format!(
+                "{} is mode {mode:04o}, owned by uid {} and gid {}; the kronik service (uid {uid}, gid {gid}) cannot {what} it",
+                component.display(),
+                metadata.uid(),
+                metadata.gid()
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// The readiness failure that the nonroot service's configuration already
+/// explains: the daemon exited because it could not read the file, so the
+/// service's PID is gone and `reading service PID N start time` would name
+/// the symptom, not the cause (F-2). `None` for the root service, and whenever
+/// the mode bits say the file is reachable: the caller then reports what it
+/// found, as before.
+pub(super) fn unreadable_configuration_error(
+    mode: Mode,
+    config: &Path,
+) -> anyhow::Result<Option<anyhow::Error>> {
+    if mode != Mode::Rootless {
+        return Ok(None);
+    }
+    let Some((uid, gid)) = user_ids()? else {
+        return Ok(None);
+    };
+    let Some(why) = unreadable_configuration(config, uid, gid)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        ApiError::new(
+            ErrorCode::RootlessUnavailable,
+            format!(
+                "the kronik service cannot read the configuration {}: {why}",
+                config.display()
+            ),
+        )
+        .with_hint(
+            "The nonroot service runs as kronik, so the configuration's directory must be mode 0755 and the file 0644, and every directory on the way to them must let it in. Rerunning `sudo kronik serve --init --rootless` restores both modes.",
+        )
+        .into(),
+    ))
+}
+
 pub(super) fn verify(
     mode: Mode,
     host: &InitHost,
@@ -237,8 +318,20 @@ pub(super) fn verify(
 ) -> anyhow::Result<Vec<DoctorWarning>> {
     use kronik_core::env::{Clock, real::RealClock};
     use std::time::Duration;
-    let pid = main_pid(host)?;
-    let started = start_time(pid)?;
+    // A diagnosis only: `verify` works unchanged when the mode bits are
+    // unreadable to this process. The daemon cannot have started without
+    // reading its configuration, so every way this process's absence shows
+    // (`systemctl` reporting none, `/proc` gone, a restart loop) prefers the
+    // configuration's path and mode to the symptom.
+    let unreadable = || unreadable_configuration_error(mode, config).ok().flatten();
+    let pid = match main_pid(host) {
+        Ok(pid) => pid,
+        Err(error) => return Err(unreadable().unwrap_or(error)),
+    };
+    let started = match start_time(pid) {
+        Ok(started) => started,
+        Err(error) => return Err(unreadable().unwrap_or(error)),
+    };
     let settings = Config::load(config)?;
     let endpoint = crate::cli::http::Endpoint::Unix(settings.server.api_socket);
     let clock = RealClock::default();
@@ -256,11 +349,12 @@ pub(super) fn verify(
         if ready.as_ref().is_ok_and(|response| response.status == 200) {
             break;
         }
-        anyhow::ensure!(
-            start_time(pid)? == started,
-            "service restarted during initialization"
-        );
+        let now = start_time(pid).map_err(|error| unreadable().unwrap_or(error))?;
+        anyhow::ensure!(now == started, "service restarted during initialization");
         if clock.monotonic() >= deadline {
+            if let Some(error) = unreadable() {
+                return Err(error);
+            }
             let why = match ready {
                 Ok(response) => format!("loaded-source status returned HTTP {}", response.status),
                 Err(error) => format!("{error:?}"),
@@ -366,8 +460,10 @@ pub(super) fn verify(
         }
     }
     let doctor = doctor_report(host, config, mode == Mode::Rootless)?;
+    let final_pid = main_pid(host).map_err(|error| unreadable().unwrap_or(error))?;
+    let final_started = start_time(pid).map_err(|error| unreadable().unwrap_or(error))?;
     anyhow::ensure!(
-        main_pid(host)? == pid && start_time(pid)? == started,
+        final_pid == pid && final_started == started,
         "service identity changed during verification"
     );
     Ok(doctor)
@@ -566,5 +662,79 @@ mod doctor_tests {
         print_warnings(&[]);
         let (warnings, _) = parse_doctor(REPORT.as_bytes()).unwrap();
         print_warnings(&warnings);
+    }
+
+    /// A directory this test's process owns, under `/tmp`: the service
+    /// identities below are neither owner nor group, so only the "other"
+    /// bits decide what they can reach.
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("kronik-init-")
+            .tempdir_in("/tmp")
+            .or_else(|_| tempfile::tempdir())
+            .unwrap()
+    }
+
+    fn mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// F-2: the install says which path the service cannot read, and its
+    /// mode, instead of `reading service PID N start time` (the PID is gone
+    /// precisely because the daemon could not read the configuration).
+    #[test]
+    fn the_configuration_the_service_cannot_reach_is_named() {
+        use super::*;
+        let root = temp_dir();
+        let etc = root.path().join("kronik");
+        std::fs::create_dir(&etc).unwrap();
+        let config = etc.join("kronik.toml");
+        std::fs::write(&config, "[server]\n").unwrap();
+        mode(root.path(), 0o755);
+        mode(&etc, 0o755);
+        mode(&config, 0o644);
+        // Service identities that own nothing here: the mode classes that
+        // decide are "other", as they are for the kronik user.
+        let uid = u32::MAX - 1;
+        let gid = u32::MAX - 2;
+        assert_eq!(unreadable_configuration(&config, uid, gid).unwrap(), None);
+        // The directory that took the operator's umask.
+        mode(&etc, 0o700);
+        let why = unreadable_configuration(&config, uid, gid)
+            .unwrap()
+            .unwrap();
+        assert!(why.contains(&etc.display().to_string()), "{why}");
+        assert!(why.contains("0700"), "{why}");
+        assert!(why.contains("cannot search"), "{why}");
+        assert!(why.contains(&format!("uid {uid}")), "{why}");
+        // A directory that is traversable but a file only root may read.
+        mode(&etc, 0o755);
+        mode(&config, 0o600);
+        let why = unreadable_configuration(&config, uid, gid)
+            .unwrap()
+            .unwrap();
+        assert!(why.contains(&config.display().to_string()), "{why}");
+        assert!(why.contains("0600"), "{why}");
+        assert!(why.contains("cannot read"), "{why}");
+        // And with the documented modes it says nothing.
+        mode(&config, 0o644);
+        assert_eq!(unreadable_configuration(&config, uid, gid).unwrap(), None);
+    }
+
+    /// Only the nonroot service is told about a configuration permission
+    /// problem: the root service reads it as root.
+    #[test]
+    fn the_root_service_never_blames_the_configuration_mode() {
+        use super::*;
+        let root = temp_dir();
+        let config = root.path().join("kronik.toml");
+        std::fs::write(&config, "[server]\n").unwrap();
+        mode(&config, 0o600);
+        assert!(
+            unreadable_configuration_error(Mode::Root, &config)
+                .unwrap()
+                .is_none()
+        );
     }
 }

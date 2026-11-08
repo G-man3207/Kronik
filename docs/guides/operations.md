@@ -26,7 +26,8 @@ kronik doctor
 `kronik serve --init` installs the root service, the one of v0.1 to v0.4, and
 sets up a host in six steps:
 
-1. It writes `/etc/kronik/kronik.toml` (mode 0644). With `--domain` (which
+1. It writes `/etc/kronik/kronik.toml` (mode 0644, in `/etc/kronik` mode
+   0755, under any umask). With `--domain` (which
    can be repeated) the gateway listens on `0.0.0.0:443` with a certificate
    from Let's Encrypt. Without it, the gateway listens on `0.0.0.0:80`
    without TLS.
@@ -59,6 +60,12 @@ or key. Edit `/etc/kronik/kronik.toml` afterwards and run `systemctl restart
 kronik`. `--root` names this service explicitly. `--dry-run` shows the plan,
 as text or with `--json` (`{dry_run, mode, steps}`), and changes nothing.
 
+The directory `/etc/kronik` is created with mode 0755 explicitly, whatever
+the caller's umask is, and an older one is brought to 0755: the nonroot
+service reads the file inside it as `kronik`, so a hardened `umask 077` must
+not leave a root-only directory behind. The same applies to the directory
+``--config`` names.
+
 ### The nonroot service
 
 `kronik serve --init --rootless` uses root for the setup and installs the
@@ -72,7 +79,8 @@ namespaces. Missing prerequisites never select the root service: the command
 stops and names `--init --root`. Its steps check before they act, like the
 root service's:
 
-1. It writes `/etc/kronik/kronik.toml` (mode 0644). With `--domain` (which
+1. It writes `/etc/kronik/kronik.toml` (mode 0644, in `/etc/kronik` mode
+   0755, under any umask). With `--domain` (which
    can be repeated) the gateway listens on `0.0.0.0:443` with a certificate
    from Let's Encrypt. Without it, the gateway listens on `0.0.0.0:80`
    without TLS.

@@ -82,6 +82,12 @@ enum Step {
         contents: String,
         mode: u32,
     },
+    /// The configuration's directory, at the documented mode: 0755 so the
+    /// nonroot service can traverse it, whatever the caller's umask is and
+    /// whoever made it before.
+    ConfigDir {
+        path: PathBuf,
+    },
     /// A file kept equal to `contents`.
     Install {
         path: PathBuf,
@@ -111,6 +117,7 @@ impl Step {
             | Step::Dir { path, mode } => {
                 format!("{} (mode {mode:04o})", path.display())
             }
+            Step::ConfigDir { path } => format!("{} (mode 0755)", path.display()),
             Step::MasterKey { keys, .. }
                 if keys.source == kronik_privacy::key_source::Source::Env
                     || (keys.source == kronik_privacy::key_source::Source::File
@@ -141,6 +148,14 @@ impl Step {
     fn needed(&self) -> anyhow::Result<Option<&'static str>> {
         Ok(match self {
             Step::Create { path, .. } => (!path.exists()).then_some("create"),
+            Step::ConfigDir { path } => match std::fs::metadata(path) {
+                Ok(metadata) => {
+                    anyhow::ensure!(metadata.is_dir(), "{} is not a directory", path.display());
+                    ((metadata.mode() & 0o7777) != 0o755).then_some("update")
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some("create"),
+                Err(error) => return Err(error.into()),
+            },
             Step::MasterKey { .. } => Some("check"),
             Step::Dir { path, .. } => (!path.is_dir()).then_some("create"),
             Step::Install { path, contents, .. } => match std::fs::read_to_string(path) {
@@ -174,6 +189,25 @@ impl Step {
                 std::fs::create_dir_all(path)
                     .with_context(|| format!("creating {}", path.display()))?;
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode))
+                    .with_context(|| format!("setting the mode of {}", path.display()))
+            }
+            Step::ConfigDir { path } => {
+                // Every missing part of the path is made with an explicit
+                // mode: mkdir alone would take whatever umask the operator
+                // installed under, and 0700 there hides the file as surely
+                // as 0700 on the last directory.
+                let missing: Vec<_> = path
+                    .ancestors()
+                    .take_while(|directory| !directory.exists())
+                    .collect();
+                for directory in missing.into_iter().rev() {
+                    std::fs::create_dir(directory)
+                        .with_context(|| format!("creating {}", directory.display()))?;
+                    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755))
+                        .with_context(|| format!("setting the mode of {}", directory.display()))?;
+                }
+                anyhow::ensure!(path.is_dir(), "{} is not a directory", path.display());
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
                     .with_context(|| format!("setting the mode of {}", path.display()))
             }
             Step::MasterKey { keys, data } => {
@@ -671,12 +705,29 @@ fn unit(
     })
 }
 
+/// The directory that holds `config_path`, as the plan's configuration step
+/// sees it.
+fn config_dir(config_path: &Path) -> anyhow::Result<PathBuf> {
+    match config_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => Ok(parent.to_owned()),
+        _ => bail!(
+            "the configuration path {} names no directory",
+            config_path.display()
+        ),
+    }
+}
+
 fn plan(
     args: &InitArgs,
     config_path: &Path,
     host: &InitHost,
 ) -> anyhow::Result<(Config, Vec<Step>)> {
     let mut steps = Vec::new();
+    // The nonroot service reads this file as kronik, so the directory must be
+    // traversable by it: 0755, whatever umask the install ran under.
+    steps.push(Step::ConfigDir {
+        path: config_dir(config_path)?,
+    });
     let config = if config_path.exists() {
         Config::load(config_path)?
     } else {
@@ -1342,11 +1393,20 @@ pub(crate) fn execute_on(
         return Ok(out);
     }
     host.control(&["daemon-reload"])?;
-    if host.fixture_etc.is_some() {
+    let start = if host.fixture_etc.is_some() {
         host.control(&["enable", "--runtime", "--now", &host.unit_name])
     } else {
         host.control(&["enable", "--now", &host.unit_name])
-    }?;
+    };
+    if let Err(error) = start {
+        // The start job fails too when the daemon cannot read its
+        // configuration; the service manager then says only that the
+        // process exited, and the file is still the cause (F-2).
+        return Err(unreadable_configuration_error(mode, config_path)
+            .ok()
+            .flatten()
+            .unwrap_or(error));
+    }
     out.warnings = verify(mode, host, config_path)?;
     Ok(out)
 }
@@ -1660,6 +1720,35 @@ mod tests {
         assert_eq!(plain.gateway, defaults.gateway);
         assert_eq!(plain.retention, defaults.retention);
         assert_eq!(plain.promote, defaults.promote);
+    }
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).unwrap().mode() & 0o7777
+    }
+
+    /// F-2: the configuration's directory is 0755 explicitly, never the
+    /// caller's umask (`umask 077` made it 0700, and the nonroot unit died
+    /// `cannot read the configuration: Permission denied`).
+    #[test]
+    fn the_configuration_directory_is_created_and_kept_at_0755() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("etc/kronik");
+        let step = Step::ConfigDir { path: path.clone() };
+        assert_eq!(step.needed().unwrap(), Some("create"));
+        step.apply(None).unwrap();
+        assert_eq!(mode_of(&path), 0o755);
+        assert_eq!(mode_of(&dir.path().join("etc")), 0o755);
+        assert_eq!(step.needed().unwrap(), None);
+        // A directory an earlier run left under a hard umask reaches the
+        // documented mode, and a rerun keeps it there.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(step.needed().unwrap(), Some("update"));
+        step.apply(None).unwrap();
+        assert_eq!(mode_of(&path), 0o755);
+        assert_eq!(step.needed().unwrap(), None);
+        assert_eq!(step.describe(), format!("{} (mode 0755)", path.display()));
     }
 
     #[test]
