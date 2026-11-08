@@ -122,8 +122,16 @@ fn status_field(pid: u32, field: &str) -> String {
 
 /// The processes whose parent is `pid` and that run the same program: a
 /// forked helper of the daemon, not `runsc` or another tool it starts.
+///
+/// The daemon that has loaded its master key is not dumpable (no core dump can
+/// carry the key, `protect_process` in kronik-privacy), and `/proc/<pid>/exe`
+/// and `cmdline` are EACCES to the same uid once that is so, unless it has
+/// CAP_SYS_PTRACE. That is why root can ask for the executable and an ordinary
+/// runner cannot: fall back to the command name, which `/proc/<pid>/comm`
+/// exposes to everyone and which a forked helper shares with its parent.
 fn forked_children(pid: u32) -> Vec<u32> {
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok();
     std::fs::read_dir("/proc")
         .unwrap()
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
@@ -137,8 +145,15 @@ fn forked_children(pid: u32) -> Vec<u32> {
                 .rsplit_once(')')
                 .and_then(|(_, rest)| rest.split_whitespace().nth(1))
                 .and_then(|p| p.parse::<u32>().ok());
-            ppid == Some(pid)
-                && std::fs::read_link(format!("/proc/{child}/exe")).ok() == Some(exe.clone())
+            if ppid != Some(pid) {
+                return false;
+            }
+            match &exe {
+                Some(exe) => {
+                    std::fs::read_link(format!("/proc/{child}/exe")).ok() == Some(exe.clone())
+                }
+                None => std::fs::read_to_string(format!("/proc/{child}/comm")).ok() == comm,
+            }
         })
         .collect()
 }

@@ -608,7 +608,11 @@ and says where the root unit differs:
   no core dumps, since the process holds the master key, secrets and
   unsealed subject data. `kronik serve` also marks itself non-dumpable
   (`PR_SET_DUMPABLE` 0), which keeps it from dumping core and from being
-  traced by other users outside systemd too.
+  traced by other users outside systemd too; the same flag makes its
+  `/proc/<pid>/exe` and `cmdline` unreadable to processes of its own uid that
+  lack `CAP_SYS_PTRACE` (a monitoring tool that wants the command line needs
+  the capability, or reads `/proc/<pid>/status` and `comm`, which stay
+  world-readable).
 - `User=kronik`, `Group=kronik` and `UMask=0007`. The group owns the API
   socket. The daemon holds `CAP_NET_BIND_SERVICE` (ambient, and the whole
   bounding set) only until it has bound its ports and entered its user
