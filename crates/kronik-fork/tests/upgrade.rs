@@ -258,6 +258,7 @@ fn another_engine_needs_a_passing_report_and_records_the_upgrade() {
         root_inputs: 40,
         turns: 40,
         diff_hash: "b3:00".into(),
+        unverifiable: 0,
         passed: true,
         checked_wall_ms: 0,
     };
@@ -512,4 +513,329 @@ fn upgrade_replays_recorded_code_across_a_same_kind_deployment() {
         assert_eq!(checked.report.root_inputs, 2);
         assert_eq!(checked.diff.summary.live, 0);
     });
+}
+
+// ---------------------------------------------------------------- S-16
+
+/// A message whose body is tagged with `subject`: the turn's default subject,
+/// so the effects it records are sealed for that subject.
+fn subject_msg(name: &str, body: &str, subject: &str) -> pb::Message {
+    let mut m = msg(name, body);
+    m.body.as_mut().unwrap().subject = Some(subject.into());
+    m
+}
+
+/// Privacy mode on; one turn whose `http.fetch` request is sealed for
+/// `user:1` (the target refuses the connection, so nothing listens), the
+/// subject erased, then one new turn with no subject. Returns the erasure
+/// snapshot's LSN.
+fn erased_workload(rt: &Runtime, dir: &Path) -> u64 {
+    let node = start(rt, dir).unwrap();
+    let erased = rt.block_on(async {
+        node.deploy(&guest("counter"), audit(), false, owner(&node))
+            .await
+            .unwrap();
+        node.grant(
+            "counter",
+            "http:127.0.0.1",
+            None,
+            None,
+            audit(),
+            false,
+            owner(&node),
+        )
+        .await
+        .unwrap();
+        node.set_privacy_mode(pb::PrivacyState::On, audit(), false, owner(&node))
+            .await
+            .unwrap();
+        let r = node
+            .send(
+                ActorRef::parse("counter/bob").unwrap(),
+                subject_msg("fetch-ok", "GET http://127.0.0.1:1/hook", "user:1"),
+                audit(),
+                false,
+                owner(&node),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r.committed(), "{r:?}");
+        let done = node
+            .erase_subject("user:1", audit(), false, owner(&node))
+            .await
+            .unwrap();
+        let erased = done.lsn.unwrap();
+        // The window is chosen against the gap between the erased turn and
+        // this one, so make it unambiguous.
+        std::thread::sleep(Duration::from_millis(50));
+        let r = node
+            .send(
+                ActorRef::parse("counter/k9").unwrap(),
+                msg("increment", ""),
+                audit(),
+                false,
+                owner(&node),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r.committed(), "{r:?}");
+        erased
+    });
+    drop(node);
+    erased
+}
+
+/// Evidence hook: `KRONIK_S16_KEEP=<directory>` keeps the S-16 fixture instead
+/// of deleting it with the temporary directory (drafts/16 §7 reproduction).
+fn keep(dir: &tempfile::TempDir, name: &str) {
+    let Ok(root) = std::env::var("KRONIK_S16_KEEP") else {
+        return;
+    };
+    let dest = Path::new(&root).join(name);
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::rename(dir.path(), &dest).unwrap();
+}
+
+fn check_dir(rt: &Runtime, dir: &Path, window: Duration) -> kronik_fork::upgrade::Checked {
+    rt.block_on(async {
+        let env = Env::real(tokio::runtime::Handle::current());
+        let sealer = kronik_sched::offline_sealer(env.clone(), dir, Default::default())
+            .await
+            .unwrap();
+        assert!(sealer.is_some(), "privacy mode left no keystore");
+        kronik_fork::upgrade::check(&env, dir, window, 2, sealer)
+            .await
+            .unwrap()
+    })
+}
+
+/// S-16 (1): a sealed request whose subject was erased is replayed from its
+/// recording and reported, not declared divergent. A window shorter than the
+/// gap to the erased turn skips it and reports nothing - that is the v0.4.1
+/// workaround, still passing.
+#[test]
+fn an_erased_request_is_unverifiable_not_divergence() {
+    let dir = tempdir();
+    let rt = rt();
+    let _erased = erased_workload(&rt, dir.path());
+
+    let long = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    assert!(
+        long.report.passed,
+        "{}",
+        String::from_utf8_lossy(&long.diff_bytes)
+    );
+    assert_eq!(long.report.root_inputs, 2);
+    assert_eq!(long.diff.summary.divergent_turns, 0);
+    assert_eq!(long.report.unverifiable, 1);
+    assert_eq!(long.diff.summary.unverifiable, 1);
+    assert_eq!(long.diff.effects.removed, 0);
+    assert_eq!(long.diff.effects.added, 0);
+
+    let short = check_dir(&rt, dir.path(), Duration::from_millis(10));
+    assert!(short.report.passed, "{:?}", short.report);
+    assert_eq!(short.report.root_inputs, 1);
+    assert_eq!(short.report.unverifiable, 0);
+    keep(&dir, "erased-only");
+}
+
+/// S-16 (5): the replay serves the recorded outcome of an erased request - an
+/// exact effect, not a synthetic denial the guest has to handle.
+#[test]
+fn replay_serves_the_recorded_outcome_of_an_erased_request() {
+    let dir = tempdir();
+    let rt = rt();
+    erased_workload(&rt, dir.path());
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let fetch = checked
+        .diff
+        .grounding
+        .iter()
+        .find(|g| g.kind == "http.fetch")
+        .expect("no http.fetch grounding row");
+    assert_eq!(fetch.exact, 1, "{fetch:?}");
+    assert_eq!((fetch.approximate, fetch.synthetic, fetch.live), (0, 0, 0));
+    assert_eq!(checked.diff.summary.synthetic, 0);
+    assert_eq!(checked.diff.summary.exact, 1);
+}
+
+/// S-16 (3): an erased request whose recorded outcome was a failure does not
+/// become a divergence: the failure is replayed, not recomputed.
+#[test]
+fn an_erased_request_with_a_recorded_failure_is_not_divergence() {
+    let dir = tempdir();
+    let rt = rt();
+    {
+        let node = start(&rt, dir.path()).unwrap();
+        rt.block_on(async {
+            node.deploy(&guest("counter"), audit(), false, owner(&node))
+                .await
+                .unwrap();
+            node.grant(
+                "counter",
+                "http:127.0.0.1",
+                None,
+                None,
+                audit(),
+                false,
+                owner(&node),
+            )
+            .await
+            .unwrap();
+            node.set_privacy_mode(pb::PrivacyState::On, audit(), false, owner(&node))
+                .await
+                .unwrap();
+            // `fetch` fails its turn on a fetch error; the target refuses, so
+            // the turn and the recorded outcome both fail.
+            let r = node
+                .send(
+                    ActorRef::parse("counter/bob").unwrap(),
+                    subject_msg("fetch", "GET http://127.0.0.1:1/hook", "user:1"),
+                    audit(),
+                    false,
+                    owner(&node),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!r.committed(), "{r:?}");
+            node.erase_subject("user:1", audit(), false, owner(&node))
+                .await
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            let r = node
+                .send(
+                    ActorRef::parse("counter/k9").unwrap(),
+                    msg("increment", ""),
+                    audit(),
+                    false,
+                    owner(&node),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(r.committed(), "{r:?}");
+        });
+    }
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    assert!(
+        checked.report.passed,
+        "{}",
+        String::from_utf8_lossy(&checked.diff_bytes)
+    );
+    assert_eq!(checked.report.root_inputs, 2);
+    assert_eq!(checked.report.unverifiable, 1);
+    assert_eq!(checked.diff.summary.divergent_turns, 0);
+}
+
+/// S-16 (2): the erased turn is unverifiable, but it is not amnesty: a second
+/// turn whose recording and replay genuinely differ still fails the check.
+#[test]
+fn a_real_divergence_still_fails_next_to_an_unverifiable_turn() {
+    let dir = tempdir();
+    let rt = rt();
+    erased_workload(&rt, dir.path());
+    let passed = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    assert!(passed.report.passed);
+    assert_eq!(passed.report.unverifiable, 1);
+    let head = passed.report.checked_through_lsn;
+
+    // A crafted recording of a turn the guest cannot reproduce: a root
+    // increment that claims to have failed, with no effects and no writes.
+    let node = start(&rt, dir.path()).unwrap();
+    let (hash, input, epoch) = rt.block_on(async {
+        let mut hash = Vec::new();
+        let mut input = None;
+        let mut epoch = 0;
+        node.reader()
+            .read(1, head, |c| {
+                match &c.record {
+                    Record::Deployment(d) => {
+                        for k in &d.kinds {
+                            if k.kind == "counter" {
+                                hash = k.code_hash.clone();
+                            }
+                        }
+                    }
+                    Record::TurnRecord(t) if input.is_none() => {
+                        let msg = match t.input.as_ref().and_then(|i| i.kind.as_ref()) {
+                            Some(pb::input::Kind::Message(m)) => m.msg.as_ref(),
+                            _ => None,
+                        };
+                        if msg.is_some_and(|m| m.name == "increment") {
+                            input = t.input.clone();
+                            epoch = t.config_epoch;
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        (hash, input.unwrap(), epoch)
+    });
+    drop(node);
+    let forged = pb::TurnRecord {
+        execution_id: String::new(),
+        actor: Some(pb::ActorRef {
+            kind: "counter".into(),
+            key: "forged".into(),
+        }),
+        code_hash: hash,
+        engine_version: ENGINE_VERSION.into(),
+        causal_key: Some(pb::CausalKey {
+            root: "forged-root".into(),
+            path: Vec::new(),
+        }),
+        logical_time_ms: 0,
+        random_seed: vec![0u8; 32],
+        input: Some(input),
+        effects: Vec::new(),
+        outcome: Some(pb::Outcome {
+            kind: pb::OutcomeKind::Failed as i32,
+            error_code: "TURN_FAILED".into(),
+            message: "forged: the recording says this failed".into(),
+            output: None,
+        }),
+        config_epoch: epoch,
+        ..Default::default()
+    };
+    rt.block_on(async {
+        let env = Env::real(tokio::runtime::Handle::current());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (fatal, _fatal_rx) = tokio::sync::oneshot::channel();
+        let (log, _) = kronik_log::Log::open(
+            &env,
+            kronik_log::LogConfig::new(
+                dir.path().join("branches").join("main").join("log"),
+                "main",
+            ),
+            tx,
+            fatal,
+        )
+        .await
+        .unwrap();
+        log.append(Record::TurnRecord(forged)).await.unwrap();
+        drop(log);
+        drop(rx);
+    });
+
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    assert!(!checked.report.passed, "{:?}", checked.report);
+    assert!(
+        checked.report.unverifiable >= 1,
+        "the erased turn is still unverifiable: {:?}",
+        checked.report
+    );
+    assert_eq!(checked.diff.summary.unverifiable, 1);
+    assert!(checked.diff.summary.changed);
+    assert!(
+        checked.diff.summary.divergent_turns >= 1,
+        "{}",
+        String::from_utf8_lossy(&checked.diff_bytes)
+    );
+    keep(&dir, "erased-and-real");
 }
