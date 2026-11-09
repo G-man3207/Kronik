@@ -474,8 +474,9 @@ certificate it has and retries after 1 minute, doubling up to 1 hour. Until
 the first certificate arrives, TLS handshakes fail; the daemon log says why
 the order failed.
 
-`kronik doctor` fails when the certificate (from the files or the cache)
-has expired and warns 30 days before.
+`kronik doctor` fails with `CERTIFICATE_INVALID` when the certificate
+(from the files or the cache) has expired or cannot be read, and warns 30
+days before.
 
 ### Preview forks: a wildcard certificate by DNS-01
 
@@ -558,9 +559,10 @@ esac
 The wildcard certificate is cached as `wildcard.<preview_domain>.pem` next
 to the main one and renewed the same way. The gateway serves it for every
 name exactly one label below `preview_domain`, and the main certificate for
-everything else. `kronik doctor`'s `dns01_hook` check fails when the hook is
-missing or not executable, and checks the cached wildcard certificate's
-expiry like `tls` does for the main one.
+everything else. `kronik doctor`'s `dns01_hook` check fails with
+`BAD_REQUEST` when the hook is missing or not executable, and checks the
+cached wildcard certificate's expiry like `tls` does for the main one
+(`CERTIFICATE_INVALID` when it has expired).
 
 ## kronik doctor
 
@@ -581,15 +583,15 @@ rather than fail, unless `kronik.toml` asks for what is missing
 | `cgroup` | cgroup v2 or its `cpu`, `memory` or `pids` controllers are missing (warning) | Foreign actors' resource limits need them |
 | `root` | Not running as root (warning) | The daemon runs as root under systemd; run doctor with `sudo` for the root-only checks |
 | `runc` | `runc` is missing (`RUNC_MISSING`, warning) | Only foreign actors with `--isolation trusted` need it: `apt install runc` |
-| `netns` | A network namespace can't be created (`FOREIGN_UNAVAILABLE`, warning), or a new one has more than `lo` (failure); skipped without root | Check the kernel and any container runtime around the host; only foreign actors need it |
+| `netns` | A network namespace can't be created (`FOREIGN_UNAVAILABLE`, warning), or a new one has more than `lo` (`FOREIGN_UNAVAILABLE`, failure); skipped without root | Check the kernel and any container runtime around the host; foreign actors would run without network isolation |
 | `run_dir` | `[foreign] run_dir` can't be created or written (warning) | Point it at a writable directory, ideally on a tmpfs |
-| `caps` | The running `kronik.service` (or, without one, `kronik doctor` itself) lacks `CAP_SETUID`, which `runsc` needs: no foreign actor can start (failure); skipped without runsc | Remove `User=` from the unit and its drop-ins ([ADR 0027](../adr/0027-systemd-unit-hardening.md)) |
+| `caps` | The running `kronik.service` (or, without one, `kronik doctor` itself) lacks `CAP_SETUID`, which `runsc` needs: no foreign actor can start (`FOREIGN_UNAVAILABLE`, failure); skipped without runsc | Remove `User=` from the unit and its drop-ins ([ADR 0027](../adr/0027-systemd-unit-hardening.md)) |
 | `sandbox` | `runsc ... do /bin/true` fails (`FOREIGN_UNAVAILABLE`): a warning, or a failure with `platform = "kvm"`; skipped without runsc or root | See gVisor's compatibility notes and the host's seccomp/AppArmor setup |
-| `disk` | Under 1 GiB free in the data directory (failure) or under 5 GiB (warning) | Free space or move `server.data_dir` |
+| `disk` | Under 1 GiB free in the data directory (`UNAVAILABLE`, failure) or under 5 GiB (warning) | Free space or move `server.data_dir` |
 | `clock` | The clock is not synchronized by NTP (warning) | `timedatectl set-ntp true` |
-| `tls` | The certificate has expired or can't be read (failure), or expires within 30 days (warning). With `acme` and no certificate cached yet, it warns | Renew the files; for ACME see [TLS](#tls): the gateway orders a certificate when it starts |
-| `dns01_hook` | `[tls] dns01_hook` is set and is not an executable file (failure); the cached `*.<preview_domain>` certificate has expired (failure), expires within 30 days or isn't cached yet (warning) | `chmod +x` the hook, or fix the path; for the certificate, read the hook's output in the daemon log; see [Preview forks](#preview-forks-a-wildcard-certificate-by-dns-01) |
-| `ship` | `[ship] endpoint` is not reachable over TCP (failure); passes when shipping is off | Check the address and the network |
+| `tls` | The certificate has expired or can't be read (`CERTIFICATE_INVALID`, failure), or expires within 30 days (warning). With `acme` and no certificate cached yet, it warns | Renew the files; for ACME see [TLS](#tls): the gateway orders a certificate when it starts |
+| `dns01_hook` | `[tls] dns01_hook` is set and is not an executable file (`BAD_REQUEST`, failure); the cached `*.<preview_domain>` certificate has expired (`CERTIFICATE_INVALID`, failure), expires within 30 days or isn't cached yet (warning) | `chmod +x` the hook, or fix the path; for the certificate, read the hook's output in the daemon log; see [Preview forks](#preview-forks-a-wildcard-certificate-by-dns-01) |
+| `ship` | `[ship] endpoint` is not an `http://` or `https://` URL (`BAD_REQUEST`, failure) or is not reachable over TCP (`UNAVAILABLE`, failure); passes when shipping is off | Set an `http://` or `https://` endpoint, and check DNS and the firewall |
 | `export` | With `[otel]` or `[audit]` on and the daemon answering on `server.api_socket`: a stream with lag has not delivered for 10 × its `interval`, or the audit export has held retention for longer than `[retention] history` (warnings); passes without a daemon | `kronik export status` shows the sink's last error code; fix the sink, or see [the audit log](#the-audit-log) |
 
 ## Metrics and logs
@@ -1734,6 +1736,7 @@ operator meets:
 | Code | When | What to do |
 |---|---|---|
 | `BAD_REQUEST` at start | `kronik.toml` has an unknown key or a bad value | Fix the line the message names (`kronik doctor` checks the file too) |
+| `CERTIFICATE_INVALID` | The TLS certificate has expired, cannot be parsed, or its files cannot be read (`kronik doctor`'s `tls` or `dns01_hook` check) | Renew it, or fix the path and permissions of the PEM files; see [TLS](#tls) |
 | `STORAGE_CORRUPT` | The data directory is inconsistent: `state.db` is ahead of the log, or a log record can't be read. "state is at lsn N, but the log starts at M (compacted)": see [A start that stops at the log's start](#a-start-that-stops-at-the-logs-start) | Keep a copy of the data directory and look at the message. `state.db` is materialized from the log and can be rebuilt by moving it away and starting again; the log itself must not be edited |
 | `UNAVAILABLE` | The node stopped after a storage failure (also `/healthz` 503) | The daemon exits and systemd restarts it; check the disk (`kronik doctor`'s `disk` check) and the journal |
 | `GATEWAY_TIMEOUT` | A turn took longer than `[gateway] timeout` | The turn still completes; clients that retry with the same `Idempotency-Key` get its response |

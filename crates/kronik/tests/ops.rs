@@ -409,10 +409,26 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
     assert!(!ok);
     let tls = status(&report, "tls");
     assert_eq!(tls["status"], "fail", "{report}");
+    assert_eq!(tls["code"], "CERTIFICATE_INVALID", "{report}");
+    assert!(
+        tls["hint"].as_str().is_some_and(|hint| !hint.is_empty()),
+        "{report}"
+    );
     assert!(
         tls["message"].as_str().unwrap().contains("expired"),
         "{report}"
     );
+    let human = command()
+        .env_remove("KRONIK_TOKEN")
+        .args(["doctor", "--config", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        text.contains("FAIL") && text.contains("(CERTIFICATE_INVALID)") && text.contains("hint:"),
+        "{text}"
+    );
+    assert!(!human.status.success(), "{text}");
     let kvm = status(&report, "kvm");
     // Usable, as doctor judges it: CI runners have a /dev/kvm only the kvm
     // group may open.
@@ -427,6 +443,36 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
         assert_eq!(kvm["status"], "fail", "{report}");
         assert_eq!(kvm["code"], "KVM_UNAVAILABLE", "{report}");
     }
+
+    // A ship endpoint without a scheme fails with a code and a hint.
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\ndata_dir = {:?}\n[ship]\nenabled = true\nurl = \"s3://bucket/kronik\"\nendpoint = \"s3.example.com\"\n",
+            dir.path().join("data"),
+        ),
+    )
+    .unwrap();
+    let (report, ok) = doctor(&config);
+    assert!(!ok);
+    let ship = status(&report, "ship");
+    assert_eq!(ship["status"], "fail", "{report}");
+    assert_eq!(ship["code"], "BAD_REQUEST", "{report}");
+    assert!(
+        ship["hint"].as_str().is_some_and(|hint| !hint.is_empty()),
+        "{report}"
+    );
+    let human = command()
+        .env_remove("KRONIK_TOKEN")
+        .args(["doctor", "--config", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        text.contains("(BAD_REQUEST)") && text.contains("hint:"),
+        "{text}"
+    );
+    assert!(!human.status.success(), "{text}");
 
     // A broken file is a failed check, and the rest still runs.
     std::fs::write(&config, "[tls]\nmode = \"ftp\"\n").unwrap();

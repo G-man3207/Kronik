@@ -113,6 +113,9 @@ codes! {
     CapabilityNotGranted = "CAPABILITY_NOT_GRANTED", 403, "M2",
         "The actor type lacks a capability for this effect",
         "Grant it with `kronik grant <kind> <capability> --reason '...'`.";
+    CertificateInvalid = "CERTIFICATE_INVALID", 400, "M6",
+        "The TLS certificate cannot be used",
+        "Renew the certificate, or fix the path and permissions of the PEM files.";
     DeadLetterAlreadyResent = "DEAD_LETTER_ALREADY_RESENT", 409, "M1",
         "The dead letter was already resent",
         "See its `resent_as` turn in `kronik dead-letters list`.";

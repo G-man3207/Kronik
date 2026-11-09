@@ -458,13 +458,14 @@ against both.
 {
   "properties": {
     "code": {
-      "description": "An error code from the catalog, when one applies.",
+      "description": "An error code from the catalog. Set on every failure, and on a\nwarning when one applies.",
       "type": [
         "string",
         "null"
       ]
     },
     "hint": {
+      "description": "What to do next. Set on every failure; a pass or a warning may omit it.",
       "type": [
         "string",
         "null"
@@ -2890,6 +2891,7 @@ against both.
             "AUDIT_RANGE_GONE",
             "BAD_REQUEST",
             "CAPABILITY_NOT_GRANTED",
+            "CERTIFICATE_INVALID",
             "DEAD_LETTER_ALREADY_RESENT",
             "DEAD_LETTER_NOT_FOUND",
             "DEPLOYMENT_NOT_FOUND",

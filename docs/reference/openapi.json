@@ -2849,6 +2849,7 @@
                   "AUDIT_RANGE_GONE",
                   "BAD_REQUEST",
                   "CAPABILITY_NOT_GRANTED",
+                  "CERTIFICATE_INVALID",
                   "DEAD_LETTER_ALREADY_RESENT",
                   "DEAD_LETTER_NOT_FOUND",
                   "DEPLOYMENT_NOT_FOUND",

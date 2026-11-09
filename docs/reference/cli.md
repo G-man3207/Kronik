@@ -209,7 +209,8 @@ Checks what this host can run (M6): the configuration file, the kernel,
 gVisor's `runsc`, KVM, cgroups, whether it runs as root, and for foreign
 actors `runc`, network namespaces, the run directory and a sandbox; then
 free disk for the data directory, clock synchronization, the TLS
-certificate and shipping. Each check passes, warns or fails, with a hint.
+certificate and shipping. Each check passes, warns or fails. A failure
+includes a catalog code and a hint; a pass or a warning may omit a hint.
 The checks of what only foreign actors need warn rather than fail, unless
 the configuration asks for what is missing (`platform = "kvm"`); the
 [operations guide](../guides/operations.md#kronik-doctor) lists them all.
