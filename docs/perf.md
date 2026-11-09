@@ -462,8 +462,8 @@ only the M8 commits on top (`c99061f`, the API fix `ed47360`, `c90a633`,
 
 The Definition of done asks for a crash test of 1 000 `kill -9` cycles and
 for DST over 10 000 seeds plus a long run of at least 1 000 000 steps,
-all without violations. `.github/workflows/nightly.yml` runs these every
-night with the commands below, once the repository is on GitHub.
+all without violations. `.github/workflows/nightly.yml` is started by hand
+and runs these with the commands below. It does not run on a schedule.
 
 ### Method
 

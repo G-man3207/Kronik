@@ -76,7 +76,7 @@ that step's temporary parent directory. See
 for the historical results and remaining physical gates.
 `hygiene` checks every argument of literal workflow `ci.sh` calls against
 the default step inventory; missing, unknown, duplicate or reordered steps
-fail. Pull requests must keep it green.
+fail. A change must keep it green; GitHub does not start CI on the pull request.
 
 The opt-in cluster server keeps its runtime/server dependencies behind the
 exact `server` feature; there is no whole-crate hygiene exemption. Vendored
@@ -100,10 +100,19 @@ the same strict standalone verification path. Source tests cover GNU loader/
 dependency rejection, independent helper ELF/payload comparison and real
 consumer signature/write-failure boundaries; tests are not release/HSM claims.
 
-Only `examples/github-flow/proof/change.json` is ignored by aggregate CI.
-Kronik's separate three-job synthetic M10 workflow handles that exact path;
-any other changed path still runs ordinary CI. Its real fixture smoke and
-remaining public acceptance requirements are in `examples/github-flow/README.md`.
+CI (`.github/workflows/ci.yml`) and the long checks
+(`.github/workflows/nightly.yml`) start only from `workflow_dispatch`. A push
+or pull request does not spend hosted-runner minutes. Run `scripts/ci.sh`
+locally, and start the GitHub workflow by hand when a hosted run is needed.
+The Release workflow was already manual. See
+[ADR 0110](docs/adr/0110-manual-github-workflows.md).
+
+The synthetic M10 workflow (`.github/workflows/kronik.yml`) is not a general
+build. It still starts only when `examples/github-flow/proof/change.json`
+changes, and only on a real pull request or push, because a manual dispatch
+cannot stand in for that proof. No such manifest is committed, so installing
+the workflow does not start a run. Its real fixture smoke and remaining
+public acceptance requirements are in `examples/github-flow/README.md`.
 
 ## Conventions
 

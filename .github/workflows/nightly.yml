@@ -1,16 +1,15 @@
 name: nightly
 
-# The Definition of done's long checks, too slow for every pull request
-# (ci.yml runs DST with 200 seeds): the crash test for 1,000 cycles
+# The Definition of done's long checks. They are too slow, and too expensive
+# in hosted-runner minutes, to start on a schedule or on every pull request
+# (a manual CI run uses DST with 200 seeds): the crash test for 1,000 cycles
 # (scripts/chaos.sh), DST with 10,000 seeds over every scenario, over the
 # rebuild workload and over the webhook workload with webhook-relay-ts
 # (scripts/dst.sh), and a DST run of 1,000,000 steps. Also the release
-# build (scripts/release.sh, static musl
-# binaries for x86_64 and aarch64), which no per-PR job compiles. Each also
-# runs locally with the same command.
+# build (scripts/release.sh, static musl binaries for x86_64 and aarch64),
+# which no ordinary CI job compiles. Each also runs locally with the same
+# command. Start this workflow by hand; one run starts every job below.
 on:
-  schedule:
-    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:

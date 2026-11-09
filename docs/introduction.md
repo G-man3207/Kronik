@@ -39,7 +39,7 @@ What the code does today, on one node:
   `random()` and `datetime('now')` come from the host and derive from values
   recorded with the turn, so running a turn again gives the same outcome. A
   deterministic simulation of the whole daemon, with injected crashes, runs
-  in CI ([ADR 0004](adr/0004-deterministic-simulation.md)).
+  in the CI checks ([ADR 0004](adr/0004-deterministic-simulation.md)).
 - **Interfaces (M1).** `kronik serve` runs the daemon: an HTTP gateway that
   routes requests to actors by the routes in their manifests, and a JSON API
   on a Unix socket. The CLI deploys components, sends messages, shows actors

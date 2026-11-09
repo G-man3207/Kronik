@@ -1,15 +1,10 @@
 name: CI
 
+# Manual only. A push or a pull request does not start this workflow, so a
+# hosted run spends minutes only when someone asks for it. Start it from the
+# Actions tab, or with `gh workflow run ci.yml`. The same steps run locally
+# with scripts/ci.sh.
 on:
-  push:
-    branches: [main]
-    # Only the synthetic M10 deployment manifest has its own real fixture flow.
-    paths-ignore: [examples/github-flow/proof/change.json]
-  pull_request:
-    paths-ignore: [examples/github-flow/proof/change.json]
-  # A push normally starts the run; this is the way to start one by hand when
-  # the push that should have carried it is already in history (a release tag,
-  # or a free runner after the fact). Same tree as the push, same steps.
   workflow_dispatch:
 
 permissions:

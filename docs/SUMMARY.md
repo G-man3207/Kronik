@@ -106,3 +106,4 @@
 - [ADR 0106: Operational events follow committed records](adr/0106-operational-events.md)
 - [ADR 0107: Original authority through final enqueue](adr/0107-original-authority-final-admission.md)
 - [ADR 0108: Durable secret-coverage watermark](adr/0108-durable-secret-coverage-watermark.md)
+- [ADR 0110: Hosted workflows start only by hand](adr/0110-manual-github-workflows.md)
