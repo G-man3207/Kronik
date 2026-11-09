@@ -1754,6 +1754,8 @@ pub(crate) fn report_error(json: bool, e: &kronik_core::error::ApiError) -> Exit
     ExitCode::FAILURE
 }
 
+#[cfg(test)]
+pub(crate) use render::error as render_error;
 pub(crate) use render::{field, next, shell_quote};
 pub(crate) use units::parse_duration_ms;
 

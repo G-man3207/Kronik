@@ -441,14 +441,15 @@ pub(super) fn check_imports(bytes: &[u8]) -> Result<(), Failure> {
     let denied = allowlist::disallowed_imports(bytes)
         .map_err(|e| Failure::new(format!("not a component: {e}")))?;
     if !denied.is_empty() {
+        // The message keeps the code prefix so `--json` stays as it was.
+        // The human printer strips that prefix rather than repeating it.
         return Err(Failure::new(format!(
             "{}: the component imports interfaces outside the allowlist: {}",
             ErrorCode::ImportNotAllowed.as_str(),
             denied.join(", ")
         ))
         .code(ErrorCode::ImportNotAllowed)
-        .hint("remove the code that uses them (std::fs, std::net, fetch, ...)")
-        .docs(ErrorCode::ImportNotAllowed.docs()));
+        .hint("remove the code that uses them (std::fs, std::net, fetch, ...)"));
     }
     eprintln!("  imports: {}, all within the allowlist", imports.len());
     Ok(())

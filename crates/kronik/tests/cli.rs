@@ -385,6 +385,87 @@ fn init_and_build_print_json() {
     );
 }
 
+/// I12: `kronik build` of a package.json with no name prints the stable
+/// code, a hint and the documentation command. `--json` stays the standard
+/// error object.
+#[test]
+fn build_names_a_missing_package_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("nameless");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("package.json"), "{}").unwrap();
+    let run = |args: &[&str]| {
+        Command::new(KRONIK)
+            .args(args)
+            .arg(&project)
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+
+    let human = run(&["build", "--dir"]);
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
+    let stderr = String::from_utf8(human.stderr).unwrap();
+    let stdout = String::from_utf8(human.stdout).unwrap();
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.starts_with("error: BAD_REQUEST: package.json has no name\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "hint:  Fix the field or value named in the message and send the request again.\n"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.ends_with("docs:  kronik explain BAD_REQUEST\n"),
+        "{stderr}"
+    );
+
+    let json = run(&["--json", "build", "--dir"]);
+    assert_eq!(json.status.code(), Some(1), "{json:?}");
+    assert!(json.stderr.is_empty(), "{json:?}");
+    let error: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "BAD_REQUEST", "{error}");
+    assert_eq!(
+        error["error"]["message"], "package.json has no name",
+        "{error}"
+    );
+    assert_eq!(
+        error["error"]["hint"],
+        "Fix the field or value named in the message and send the request again.",
+        "{error}"
+    );
+    assert_eq!(
+        error["error"]["docs"], "kronik explain BAD_REQUEST",
+        "{error}"
+    );
+}
+
+/// I12: a human `kronik init` error has the same shape: code, hint and docs.
+#[test]
+fn init_names_a_bad_project_name() {
+    let o = Command::new(KRONIK)
+        .args(["init", "Not-A-Name"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(o.stdout.is_empty(), "{o:?}");
+    let stderr = String::from_utf8(o.stderr).unwrap();
+    assert!(
+        stderr.starts_with("error: BAD_REQUEST: \"Not-A-Name\" is not a project name:"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("\nhint:  "), "{stderr}");
+    assert!(
+        stderr.ends_with("docs:  kronik explain BAD_REQUEST\n"),
+        "{stderr}"
+    );
+}
+
 /// `kronik build` of a TypeScript project checks Node.js before it runs the
 /// toolchain: a missing or old `node` is a clear error, not one from jco.
 #[test]
