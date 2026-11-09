@@ -450,3 +450,177 @@ fn a_preview_takes_a_bounded_number_of_requests() {
     props.forget_preview_states();
     assert_eq!(http_body(&send(&p, &props, &id, "increment", "")), "3");
 }
+
+/// ADR 0025: a preview fetch does not POST to `[simulators.model]`, even
+/// when the server configures one and the target has opted in. An ordinary
+/// fork replay of an unmatched fetch still may (ADR 0015).
+#[test]
+fn a_preview_does_not_post_to_the_model() {
+    let (charge_addr, _charge_hits) = server();
+    let (model_addr, seen) = recording_model();
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    p.grant("http:127.0.0.1");
+    p.rt.block_on(p.node.set_simulators(
+        pb::SimulatorConfig {
+            target: "http:127.0.0.1".into(),
+            model: true,
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    // The ordinary fork below replays from here, so the opt-in is at its
+    // fork point. The charge itself is after that point.
+    let fork_lsn = p.settle();
+    p.http(
+        "pay",
+        "fetch-ok",
+        &format!("POST http://{charge_addr}/v1/charges/0\n\namount=10"),
+    );
+    p.settle();
+
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_model(Some(model(&model_addr))),
+    );
+    let proposal = propose_step2(&p, &props);
+    let id = create(&p, &props, &proposal);
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "creating the preview posted to the model"
+    );
+
+    // Unmatched, not on the live allowlist: a model-enabled target would
+    // POST from an ordinary fork. A preview must deny it instead.
+    let body = http_body(&send(
+        &p,
+        &props,
+        &id,
+        "fetch-ok",
+        "GET http://127.0.0.1:9/never",
+    ));
+    assert!(
+        body.contains("no recording"),
+        "preview should deny the unmatched fetch, got {body}"
+    );
+    assert!(
+        !body.contains("model answer"),
+        "preview used a model answer: {body}"
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "preview POSTed to the model: {body}"
+    );
+
+    p.rt.block_on(props.create_fork(
+        Some("try".into()),
+        fork_lsn,
+        false,
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    let bytes = std::fs::read(guest("counter-fetch-extra")).unwrap();
+    p.rt.block_on(props.fork_deploy("try", &bytes, false, p.owner()))
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match p.rt.block_on(props.fork_replay(
+            "try",
+            None,
+            DiffOptions::default(),
+            Some(2),
+            p.owner(),
+        )) {
+            Ok(_) => break,
+            Err(error)
+                if error.code == ErrorCode::SecretUnavailable
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("fork replay: {error}"),
+        }
+    }
+    let calls = seen.lock().unwrap().clone();
+    assert!(
+        calls.iter().any(|line| line.starts_with("POST ")),
+        "ordinary fork replay did not POST to the model: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|line| line.contains("/extra")),
+        "ordinary fork replay did not ask the model about the unmatched fetch: {calls:?}"
+    );
+}
+
+/// A local fake of the model endpoint. Records `METHOD path` plus the body,
+/// and answers like [`model_server`], so a replay that may call it can finish.
+fn recording_model() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut w = stream.try_clone().unwrap();
+            let mut r = BufReader::new(stream);
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut len = 0usize;
+            loop {
+                let mut header = String::new();
+                if r.read_line(&mut header).unwrap_or(0) == 0 {
+                    break;
+                }
+                let header = header.trim_end().to_ascii_lowercase();
+                if header.is_empty() {
+                    break;
+                }
+                if let Some(value) = header.strip_prefix("content-length:") {
+                    len = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; len];
+            if r.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let request = line
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ");
+            recorded
+                .lock()
+                .unwrap()
+                .push(format!("{request} {}", String::from_utf8_lossy(&body)));
+            let n = recorded.lock().unwrap().len();
+            let content = serde_json::json!({
+                "status": 200,
+                "headers": {"content-type": "text/plain"},
+                "body": format!("model answer {n}")
+            })
+            .to_string();
+            let reply = serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": content}}]
+            })
+            .to_string();
+            let _ = w.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (addr, seen)
+}

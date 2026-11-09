@@ -96,6 +96,10 @@ pub struct ReplaySetup {
     /// answers from recordings only and leaves every consequence production
     /// has not run pending for main (m13-rebase §4, §8).
     pub rebase: bool,
+    /// A preview fork (M11, ADR 0025). An unmatched fetch is stubbed, denied,
+    /// or an allowlisted secret-less GET. The model simulator is a POST to a
+    /// configured endpoint, not that GET, so it is not used.
+    pub preview: bool,
     /// The fork's copies of `fork_mode = "sandbox"` foreign actors (M14,
     /// ADR 0019), used by continuous replay only.
     pub copies: Option<ForkCopies>,
@@ -183,6 +187,7 @@ impl ReplaySetup {
             prod_store: None,
             progress: None,
             rebase: false,
+            preview: false,
             dispatch,
         }
     }
@@ -1856,7 +1861,11 @@ impl ReplayGate {
                 self.push(rec);
                 return out;
             }
-            if s.model
+            // A preview reaches the outside world only through an allowlisted
+            // secret-less GET (ADR 0025). The model is a POST, so it is not
+            // asked even if a client was attached.
+            if !setup.preview
+                && s.model
                 && let Some(model) = &setup.model
             {
                 let cached = model.has_cached_answer(&cap, &fp).map_err(model_error)?;

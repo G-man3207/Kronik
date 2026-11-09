@@ -127,7 +127,11 @@ preview root never matches a production recording, so a fetch is answered
 by a stub rule, goes out live only if it is a `GET` without secret headers
 to a `[fork] live_allowlist` host, and is otherwise denied (`replay: no
 recording`). Allowlisted GETs are the one thing a preview does in the
-outside world. `secrets.reveal` answers the placeholder, as in every fork,
+outside world. The model simulator is not an exception: a preview does not
+POST to `[simulators.model]`, even when that server setting is present and
+the target's `SimulatorConfig.model` is set. An ordinary fork replay still
+may (ADR 0015). Letting a preview call the model would amend ADR 0025.
+`secrets.reveal` answers the placeholder, as in every fork,
 and a preview has no secret store at all (`ReplaySetup.secrets = None`):
 `crypto.*` answers `no recording` instead of computing an HMAC or a
 signature with a production key for whoever has the URL. Messages and
@@ -234,7 +238,9 @@ agent creates one through the API or the CLI, and its URL is for people.
   `previews_are_deleted_after_their_ttl_also_across_a_restart` (prefix).
 - `crates/kronik-fork/tests/preview.rs`: bounded turns and
   `PREVIEW_LIMIT`, a held request blocking no operator command, fork
-  commands refused, no production key, state dropped after an erasure.
+  commands refused, no production key, state dropped after an erasure,
+  and no POST to the model endpoint (`a_preview_does_not_post_to_the_model`,
+  which also checks that an ordinary fork replay still may).
 - `crates/kronik/tests/ops.rs`: create and requests refused below the disk
   reserve. `crates/kronik/tests/schemas.rs`: a preview's diff and turn
   match their schemas.

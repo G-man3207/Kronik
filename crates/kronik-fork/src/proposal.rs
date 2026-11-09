@@ -704,7 +704,8 @@ impl Proposals {
     /// from the saved cache only: it calls nothing and writes nothing (I12).
     /// A rebase's setup (`rebase`) answers from production's recordings
     /// only: no simulators, no model, no live GETs (m13-rebase §8), since
-    /// its turns become main's state.
+    /// its turns become main's state. A preview attaches no model: the one
+    /// live effect it may make is an allowlisted secret-less GET (ADR 0025).
     #[allow(clippy::too_many_arguments)]
     fn setup(
         &self,
@@ -721,7 +722,8 @@ impl Proposals {
         let config = crate::config_at_with(&index, index.fork_lsn, self.node.sql_bytes_per_actor());
         // A preview answers whoever has its URL: no production key computes
         // for it, so its HMACs and signatures are `no recording` (P-F10).
-        let secrets = if id.starts_with(preview::ID_PREFIX) {
+        let preview = id.starts_with(preview::ID_PREFIX);
+        let secrets = if preview {
             None
         } else {
             self.node.secrets().cloned()
@@ -731,6 +733,7 @@ impl Proposals {
         } else {
             ReplaySetup::new(id.to_owned(), index, kinds, config, secrets, authority)
         };
+        setup.preview = preview;
         setup.simulators = Arc::new(crate::simulators::Simulators::new(
             &setup.index,
             &options.simulator_overrides,
@@ -747,8 +750,10 @@ impl Proposals {
             env: self.node.env().clone(),
         });
         setup.progress = progress;
-        // Model answers are cached per proposal (ADR 0015).
-        if let Some(config) = self.model.clone() {
+        // Model answers are cached per proposal (ADR 0015). A preview does
+        // not get one: that client POSTs to the configured endpoint, which
+        // is not an allowlisted GET (ADR 0025, m11-preview §3).
+        if !preview && let Some(config) = self.model.clone() {
             // On now, at the fork point (the base snapshot's configuration
             // may predate the window), or switched in the window.
             let privacy = self.node.privacy_mode().0 == pb::PrivacyState::On
