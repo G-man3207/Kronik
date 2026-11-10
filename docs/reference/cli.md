@@ -317,8 +317,10 @@ configuration with `--config` (or `KRONIK_CONFIG`). File/env sources use
 `master.wrapped`, provider key and credentials. Missing/mismatched material
 is refused; KMS never falls back to an environment seed or raw key file.
 
-An empty diff writes `<data-dir>/upgrade/<engine>.json` and exits 0. A
-diff that is not empty writes that report and the diff next to it
+A diff with no verified difference writes `<data-dir>/upgrade/<engine>.json`
+and exits 0; differences of turns whose recorded input was erased do not
+count as changes. A diff with a verified difference writes that report and
+the diff next to it
 (`<data-dir>/upgrade/<engine>.diff.json`) and exits 1 with
 `ENGINE_UPGRADE_DIVERGED`. `--dry-run` runs the check and prints the
 result, and writes neither file. A bad window or a data directory with no
@@ -347,7 +349,7 @@ If it cannot be read, the check does not pass: it exits 1 with
 `STORAGE_CORRUPT` rather than treating the database as current.
 
 A Wasmtime patch also changes the recorded engine identity: 50.0.0 to
-50.0.1 still requires this check, with an empty behavior diff in both
+50.0.1 still requires this check, with no verified difference in both
 replay modes. The new daemon refuses the old directory until the exact
 pair has a passing report, then writes one `EngineUpgrade` before serving.
 Do not rewrite recorded engine metadata or relabel precompiled caches.

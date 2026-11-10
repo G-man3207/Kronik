@@ -643,6 +643,84 @@ fn an_erased_request_is_unverifiable_not_divergence() {
     keep(&dir, "erased-only");
 }
 
+/// Issue #16 (ADR 0109 points 3-5): an erased turn that committed a state or
+/// SQL write in production and does not reproduce it from `[erased]` is
+/// unverifiable, not a behavior change. The write is not counted in either
+/// state section, so the check passes and `serve` keeps accepting the
+/// directory.
+#[test]
+fn an_erased_turns_state_write_is_not_a_change() {
+    let dir = tempdir();
+    let rt = rt();
+    {
+        let node = start(&rt, dir.path()).unwrap();
+        rt.block_on(async {
+            node.deploy(&guest("counter"), audit(), false, owner(&node))
+                .await
+                .unwrap();
+            node.deploy(&guest("notes"), audit(), false, owner(&node))
+                .await
+                .unwrap();
+            node.set_privacy_mode(pb::PrivacyState::On, audit(), false, owner(&node))
+                .await
+                .unwrap();
+            // The note's body is sealed for user:1, so the turn's recorded
+            // input is erased with the subject; production commits the insert.
+            let r = node
+                .send(
+                    ActorRef::parse("notes/n1").unwrap(),
+                    subject_msg("add", "note text", "user:1"),
+                    audit(),
+                    false,
+                    owner(&node),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(r.committed(), "{r:?}");
+            node.erase_subject("user:1", audit(), false, owner(&node))
+                .await
+                .unwrap();
+            // Make the default window unambiguous about the gap.
+            std::thread::sleep(Duration::from_millis(50));
+            let r = node
+                .send(
+                    ActorRef::parse("counter/k9").unwrap(),
+                    msg("increment", ""),
+                    audit(),
+                    false,
+                    owner(&node),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(r.committed(), "{r:?}");
+        });
+    }
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    assert!(
+        checked.report.passed,
+        "{}",
+        String::from_utf8_lossy(&checked.diff_bytes)
+    );
+    assert_eq!(checked.report.root_inputs, 2);
+    assert_eq!(checked.report.unverifiable, 1);
+    assert_eq!(checked.diff.summary.unverifiable, 1);
+    assert_eq!(checked.diff.summary.divergent_turns, 0);
+    assert!(!checked.diff.summary.changed);
+    assert!(
+        checked.diff.state.isolated.is_empty(),
+        "{:?}",
+        checked.diff.state.isolated
+    );
+    assert!(
+        checked.diff.state.continuous.is_empty(),
+        "{:?}",
+        checked.diff.state.continuous
+    );
+    keep(&dir, "erased-state");
+}
+
 /// S-16 (5): the replay serves the recorded outcome of an erased request - an
 /// exact effect, not a synthetic denial the guest has to handle.
 #[test]
