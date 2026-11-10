@@ -1127,13 +1127,12 @@ fn projected_lines(
     }
     let hash = hash()?;
     for l in &mut out {
-        if !matches!(record, Record::AuditEvent(event) if event.operation.is_some())
-            && !matches!(record, Record::SecretVersion(_) | Record::SecretLink(_))
-            && !matches!(positions, Some(AuditPositions::MetadataGap { .. }))
-            && !matches!(record, Record::AuditEvent(event) if metadata_key_change(event) || metadata_replay(event))
-        {
-            scrub_details(&mut l.details, ctx.secrets, positions);
-        }
+        // ADR 0082/0083: every string detail is scrubbed, including secret
+        // versions, secret links, typed operations, and metadata signing-key,
+        // replay, and coverage-gap maps. Validated positions, epochs, and
+        // digest spellings stay intact. A scrub that cannot run withholds the
+        // string; export preparation stalls when the inventory cannot be loaded.
+        scrub_details(&mut l.details, ctx.secrets, positions);
         if l.reason.len() > REASON_MAX {
             let mut cut = REASON_MAX;
             while !l.reason.is_char_boundary(cut) {
@@ -1377,10 +1376,79 @@ fn scrub_details(
             if let Some(value) = positions.and_then(|positions| positions.value(&key)) {
                 return (key, value.into());
             }
+            // Digests, epochs, and other structured numbers are not free text.
+            // Substring replacement would corrupt them; a secret that only
+            // coincides with that spelling is not a disclosure of the field.
+            if leave_structured(&key, &value) {
+                return (key, value);
+            }
             scrub(&mut value, secrets);
             (kronik_sched::scrub::for_log(&key, Some(secrets)), value)
         })
         .collect();
+}
+
+/// Projection-emitted coordinates and digests. Operator strings that merely
+/// share a key name are still scrubbed: a number or digest spelling is required.
+fn leave_structured(key: &str, value: &Value) -> bool {
+    if value.is_number() && structured_number_key(key) {
+        return true;
+    }
+    if value.is_boolean() && matches!(key, "deleted" | "enabled" | "system_roots") {
+        return true;
+    }
+    match key {
+        "trust_roots_sha256" => match value {
+            Value::Array(items) => items.iter().all(digest_value),
+            other => digest_value(other),
+        },
+        "version_hash" | "ca_sha256" | "request_id" | "client_key_sha256" | "digest"
+        | "previous_digest" | "principal_hash" | "session_hash" | "config_digest" | "boot_id"
+        | "code_hash" | "rules_hash" | "diff_hash" | "controller_id" => digest_value(value),
+        _ => false,
+    }
+}
+
+fn structured_number_key(key: &str) -> bool {
+    matches!(
+        key,
+        "epoch"
+            | "version"
+            | "hash_revision"
+            | "link_generation"
+            | "generation"
+            | "from_version"
+            | "to_version"
+            | "position"
+            | "flow_ttl_ms"
+            | "session_ttl_ms"
+            | "expires_at_ms"
+            | "native_lsn"
+            | "metadata_index"
+            | "metadata_revision"
+            | "created_index"
+            | "token_revision"
+            | "fleet_revision"
+            | "member_id"
+            | "incarnation"
+            | "registration_index"
+    )
+}
+
+fn digest_value(value: &Value) -> bool {
+    match value {
+        Value::String(text) => is_digest(text),
+        _ => false,
+    }
+}
+
+/// `hex` or `b3:` plus hex. Free text that is not a digest spelling is scrubbed
+/// even when its key is one of the digest names.
+fn is_digest(text: &str) -> bool {
+    let hex = text.strip_prefix("b3:").unwrap_or(text);
+    !hex.is_empty()
+        && hex.len().is_multiple_of(2)
+        && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn obj(v: Value) -> Map<String, Value> {

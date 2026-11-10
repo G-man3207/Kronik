@@ -436,6 +436,11 @@ Verification checks this same-image view separately from the unchanged record
 hash, including the distinction between absent and known original provenance.
 The existing metadata coverage-gap, signing-key-change and replay schemas
 preserve only their strictly validated public coordinates and stream identity.
+String fields in those schemas, and in secret-version, secret-link, and typed
+operation details, are still scrubbed for stored secret values and token
+spellings. Numeric coordinates, epochs, and digest spellings are not rewritten
+by substring replacement. Export preparation stalls when the inventory cannot
+be loaded, rather than writing those strings unscrubbed.
 Persisted free audit reasons retain the shared whole-cell withholding policy;
 no protected approval identity, adoption token or adoption reason is published.
 

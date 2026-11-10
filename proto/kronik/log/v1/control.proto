@@ -2,7 +2,7 @@ syntax = "proto3";
 package kronik.log.v1;
 
 // Public authority metadata, never an enrollment credential or private key.
-// These fields have closed domain validation; they are not scrubbed free text.
+// Closed domain validation does not exempt string spellings from export scrubbing.
 message FleetState {
   string installation = 1;
   optional string node = 2;

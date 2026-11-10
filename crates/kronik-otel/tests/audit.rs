@@ -1288,6 +1288,227 @@ fn typed_positions_survive_secret_coincidence_and_versions_have_explicit_types()
     assert_eq!(line.details["message"], "[secret:digits]");
 }
 
+/// Secret-link, secret-version, auth-config, and metadata signing-key string
+/// fields are scrubbed. Digests, epochs, and other numbers are not rewritten
+/// because a secret coincides with their spelling (ADR 0082, ADR 0083).
+#[test]
+fn linked_and_typed_details_scrub_secrets_without_rewriting_digests_or_numbers() {
+    const NEEDLE: &str = "dummy-NEEDLE-secret";
+    let token = format!("kronik_{}", "A".repeat(43));
+    let hash_part = "deadbeef";
+    let version_hash = [0xde, 0xad, 0xbe, 0xef].repeat(4);
+    let mut config = pb::AuthConfig {
+        version: kronik_proto::control::AUTH_CONFIG_VERSION,
+        enabled: true,
+        issuer: "https://issuer.test".into(),
+        client_id: format!("client-{NEEDLE}-{token}"),
+        redirect_uri: "https://app.test/v1/auth/callback".into(),
+        system_roots: true,
+        flow_ttl_ms: kronik_proto::control::AUTH_FLOW_TTL_MS,
+        session_ttl_ms: kronik_proto::control::AUTH_SESSION_TTL_MS,
+        ..Default::default()
+    };
+    config.digest = kronik_proto::control::auth_config_digest(&config).to_vec();
+    let digest_hex = kronik_core::ids::hex(&config.digest);
+    let fragment = digest_hex[..8].to_owned();
+    let secrets: &[(&str, &[u8])] = &[
+        ("api-key", NEEDLE.as_bytes()),
+        ("hashpart", hash_part.as_bytes()),
+        ("digits", b"17"),
+        ("fragment", fragment.as_bytes()),
+    ];
+    let keys = ActorKeys::Omit;
+    let loaded = Ctx {
+        branch: "main",
+        keys: &keys,
+        subject: &subject,
+        sealer: sealer(),
+        secrets,
+    };
+    let unloaded = Ctx {
+        branch: "main",
+        keys: &keys,
+        subject: &subject,
+        sealer: sealer(),
+        secrets: &[],
+    };
+
+    let link = Record::SecretLink(pb::SecretLink {
+        name: "api-key".into(),
+        backend: "openbao-17".into(),
+        r#ref: format!("secret/{NEEDLE}"),
+        binding: token.clone(),
+        canonical_ref: format!("secret/{NEEDLE}#v1"),
+        generation: 17,
+        epoch: 17,
+        audit: audit("link"),
+    });
+    let linked = lines(1, &link, &loaded).unwrap().remove(0);
+    let linked_json = linked.to_json();
+    assert!(!linked_json.contains(NEEDLE), "{linked_json}");
+    assert!(!linked_json.contains(&token), "{linked_json}");
+    assert!(linked_json.contains("[secret:api-key]"));
+    assert!(linked_json.contains("[secret:token]"));
+    assert_eq!(linked.epoch, Some(17));
+    assert_eq!(linked.details["generation"], 17);
+    assert_eq!(linked.details["backend"], "openbao-[secret:digits]");
+    assert!(
+        verify(
+            &expected(1, &link, &loaded).unwrap(),
+            std::slice::from_ref(&linked),
+            0,
+            1
+        )
+        .complete
+    );
+    // `kronik audit verify` rebuilds with the protected key and an empty
+    // catalogue; identity still matches a line scrubbed at export.
+    assert!(verify(&expected(1, &link, &unloaded).unwrap(), &[linked], 0, 1).complete);
+
+    let version = Record::SecretVersion(pb::SecretVersion {
+        name: "api-key".into(),
+        version: 1,
+        version_hash: version_hash.clone(),
+        backend: "openbao".into(),
+        source_version: format!("rev-{hash_part}"),
+        r#ref: format!("secret/{NEEDLE}"),
+        binding: "vault".into(),
+        link_generation: 1,
+        canonical_ref: format!("secret/{NEEDLE}"),
+        phase: pb::secret_version::Phase::Active as i32,
+        hash_revision: 1,
+        audit: audit("secret version"),
+        ..Default::default()
+    });
+    let versioned = lines(2, &version, &loaded).unwrap().remove(0);
+    let versioned_json = versioned.to_json();
+    assert!(!versioned_json.contains(NEEDLE), "{versioned_json}");
+    assert_eq!(
+        versioned.details["version_hash"],
+        kronik_core::ids::hex(&version_hash)
+    );
+    assert!(
+        !versioned.details["version_hash"]
+            .as_str()
+            .unwrap()
+            .contains("[secret:")
+    );
+    assert_eq!(versioned.details["version"], 1);
+    assert_eq!(versioned.details["hash_revision"], 1);
+    assert_eq!(versioned.details["link_generation"], 1);
+    let source_version = versioned.details["source_version"].as_str().unwrap();
+    assert!(source_version.contains("[secret:"));
+    assert!(!source_version.contains(hash_part));
+    assert!(
+        verify(
+            &expected(2, &version, &loaded).unwrap(),
+            std::slice::from_ref(&versioned),
+            0,
+            2
+        )
+        .complete
+    );
+    assert!(
+        verify(
+            &expected(2, &version, &unloaded).unwrap(),
+            &[versioned],
+            0,
+            2
+        )
+        .complete
+    );
+
+    let auth = Record::AuditEvent(pb::AuditEvent {
+        action: "auth.config".into(),
+        target: "oidc".into(),
+        operation: Some(pb::audit_event::Operation::AuthConfig(config.clone())),
+        audit: audit("auth config"),
+        ..Default::default()
+    });
+    let configured = lines(3, &auth, &loaded).unwrap().remove(0);
+    let configured_json = configured.to_json();
+    assert!(!configured_json.contains(NEEDLE), "{configured_json}");
+    assert!(!configured_json.contains(&token), "{configured_json}");
+    assert!(
+        configured.details["client_id"]
+            .as_str()
+            .unwrap()
+            .contains("[secret:api-key]")
+    );
+    assert!(
+        configured.details["client_id"]
+            .as_str()
+            .unwrap()
+            .contains("[secret:token]")
+    );
+    assert_eq!(configured.details["digest"], digest_hex);
+    assert_eq!(
+        configured.details["version"],
+        kronik_proto::control::AUTH_CONFIG_VERSION
+    );
+    assert_eq!(
+        configured.details["flow_ttl_ms"],
+        kronik_proto::control::AUTH_FLOW_TTL_MS
+    );
+    assert_eq!(
+        configured.details["session_ttl_ms"],
+        kronik_proto::control::AUTH_SESSION_TTL_MS
+    );
+    assert!(
+        verify(
+            &expected(3, &auth, &loaded).unwrap(),
+            std::slice::from_ref(&configured),
+            0,
+            3
+        )
+        .complete
+    );
+    assert!(verify(&expected(3, &auth, &unloaded).unwrap(), &[configured], 0, 3).complete);
+
+    let signing_key = Record::AuditEvent(pb::AuditEvent {
+        action: "audit.config".into(),
+        target: format!("events-{NEEDLE}"),
+        details: BTreeMap::from([
+            ("change".into(), "webhook.signing_key".into()),
+            ("source".into(), "metadata".into()),
+            ("from_version".into(), "17".into()),
+            ("to_version".into(), "18".into()),
+        ]),
+        audit: audit("signing key"),
+        ..Default::default()
+    });
+    let rotated = lines(4, &signing_key, &loaded).unwrap().remove(0);
+    let rotated_json = rotated.to_json();
+    assert!(!rotated_json.contains(NEEDLE), "{rotated_json}");
+    assert_eq!(rotated.details["from_version"], 17);
+    assert_eq!(rotated.details["to_version"], 18);
+    assert_eq!(rotated.details["change"], "webhook.signing_key");
+    assert!(
+        rotated.details["target"]
+            .as_str()
+            .unwrap()
+            .contains("[secret:api-key]")
+    );
+    assert!(
+        verify(
+            &expected(4, &signing_key, &loaded).unwrap(),
+            std::slice::from_ref(&rotated),
+            0,
+            4
+        )
+        .complete
+    );
+    assert!(
+        verify(
+            &expected(4, &signing_key, &unloaded).unwrap(),
+            &[rotated],
+            0,
+            4
+        )
+        .complete
+    );
+}
+
 #[test]
 fn malformed_source_positions_are_corruption_not_empty_or_redacted_projections() {
     let ctx = Ctx {

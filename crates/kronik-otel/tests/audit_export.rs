@@ -1365,6 +1365,23 @@ fn metadata_view_rejects_malformed_or_unrepresentable_supplied_origin_instead_of
     }
 }
 
+/// The fixture secrets collide with closed stream markers. Longer matches win,
+/// the same way the export scrubber does.
+fn scrub_closed_secret_spellings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = text
+                .replace("events-control:metadata", "[secret:stream]")
+                .replace("metadata", "[secret:domain]");
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_closed_secret_spellings),
+        serde_json::Value::Object(map) => {
+            map.values_mut().for_each(scrub_closed_secret_spellings);
+        }
+        _ => {}
+    }
+}
+
 fn portable_metadata_control_fixtures() -> [(Record, serde_json::Value); 3] {
     let audit = Some(pb::Audit {
         token_id: "system:metadata".into(),
@@ -1460,7 +1477,12 @@ fn decoded_metadata_control_views_preserve_only_closed_facts_and_the_whole_persi
             unreachable!()
         };
         assert_eq!(lines[0].action, event.action);
-        assert_eq!(lines[0].details, details.as_object().unwrap().clone());
+        // Numeric coordinates stay exact. String spellings that match a loaded
+        // secret are scrubbed; they are not a generic exemption (ADR 0082).
+        let mut scrubbed = details.clone();
+        scrub_closed_secret_spellings(&mut scrubbed);
+        assert_eq!(lines[0].details, scrubbed.as_object().unwrap().clone());
+        assert!(!lines[0].to_json().contains("events-control:metadata"));
         assert!(!lines[0].reason.contains("private-NEEDLE"));
         assert!(!lines[0].reason.contains("exact-prefix"));
         assert!(!lines[0].reason.contains("exact-suffix"));
@@ -1638,7 +1660,12 @@ fn metadata_coverage_notice_in_native_log_keeps_its_actual_fsynced_actor_receipt
         (&*lines[0].kind, &*lines[0].action),
         ("audit_event", "audit.gap")
     );
-    assert_eq!(lines[0].details, details.as_object().unwrap().clone());
+    let mut scrubbed = details.clone();
+    scrub_closed_secret_spellings(&mut scrubbed);
+    assert_eq!(lines[0].details, scrubbed.as_object().unwrap().clone());
+    assert_eq!(lines[0].details["from_index"], 1);
+    assert_eq!(lines[0].details["through_index"], 17);
+    assert!(!lines[0].to_json().contains("events-control:metadata"));
     assert_eq!((lines[0].lsn, lines[0].source), (Some(lsn), None));
     assert_eq!(lines[0].branch, source.branch);
     let expected = mapper.expected_actor_at(source, &committed.record).unwrap();
