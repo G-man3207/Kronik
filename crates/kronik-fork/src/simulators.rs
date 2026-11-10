@@ -20,7 +20,7 @@ use kronik_core::ids::Lsn;
 use kronik_effects::contract::Contract;
 use kronik_effects::http::ScrubError;
 use kronik_effects::http::{CompiledScrubber, Target, parse_request_url, parse_url, route_pattern};
-use kronik_effects::simulator::{ContractFake, RecordedNeighbor};
+use kronik_effects::simulator::{ContractFake, NeighborSource, RecordedNeighbor};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::scrub::original_secret_prefix;
@@ -224,7 +224,8 @@ impl Simulators {
     }
 
     /// Production's recorded effects of `target` in the window, newest
-    /// first: `RecordedNeighbor`'s candidates.
+    /// first. Neighbor hits use [`Self::neighbor`], which also keeps each
+    /// effect's source secret-use prefix.
     pub fn recorded(index: &ProductionIndex, target: &str) -> Vec<(Lsn, pb::EffectRecord)> {
         Self::recorded_where(index, target, |_| true)
     }
@@ -302,7 +303,18 @@ impl Simulators {
     pub fn neighbor(&self, index: &ProductionIndex, target: &str) -> Arc<RecordedNeighbor> {
         let mut n = lock(&self.neighbors);
         n.entry(target.to_owned())
-            .or_insert_with(|| Arc::new(RecordedNeighbor::new(Self::recorded(index, target))))
+            .or_insert_with(|| {
+                // The prefix is the source turn's, through that ordinal.
+                // A missing prefix stays missing; inventory is not a substitute.
+                let sources = Self::recorded_sources(index, target, |_| true)
+                    .into_iter()
+                    .map(|(lsn, effect, prefix)| NeighborSource {
+                        lsn,
+                        effect: effect.clone(),
+                        prefix,
+                    });
+                Arc::new(RecordedNeighbor::from_sources(sources))
+            })
             .clone()
     }
 }
@@ -2113,6 +2125,267 @@ mod tests {
         assert!(original_secret_prefix(turn.input.as_ref().unwrap(), &turn.effects, 2).is_none());
         turn.effects = vec![exchange()];
         assert!(original_secret_prefix(turn.input.as_ref().unwrap(), &turn.effects, 0).is_none());
+    }
+
+    /// A neighbor hit stored for the fork log keeps the source effect's
+    /// fingerprint and fingerprint version. A prefix that cannot be taken
+    /// refuses the hit. A covering source prefix is what lets a matching
+    /// body through; unknown scope is not that prefix.
+    #[test]
+    fn neighbor_hit_keeps_source_identity_not_a_fresh_fingerprint() {
+        use kronik_effects::http::{CompiledScrubber, fingerprint_v2, prepared_target};
+        use kronik_effects::simulator::{NeighborSource, RecordedNeighbor};
+        use kronik_privacy::sealer::Sealer;
+
+        let secret_value = b"sekret-value";
+        let reference = |name: &str| pb::SecretRef {
+            name: name.into(),
+            version: 1,
+            version_hash: vec![9; 16],
+            ..Default::default()
+        };
+        let reveal = |ordinal, name: &str| pb::EffectRecord {
+            ordinal,
+            kind: "secret.reveal".into(),
+            status: pb::EffectStatus::Ok as i32,
+            request: plain(
+                pb::RevealEffectRequest {
+                    secret: Some(reference(name)),
+                }
+                .encode_to_vec(),
+            ),
+            ..Default::default()
+        };
+        let source_req = pb::HttpEffectRequest {
+            method: "POST".into(),
+            url: "https://pay.example/v1/charges/1".into(),
+            headers: vec![pb::HttpEffectHeader {
+                name: "authorization".into(),
+                value: Some(pb::http_effect_header::Value::Secret(pb::SecretRef {
+                    name: "api-key".into(),
+                    template: "Bearer {}".into(),
+                    version: 1,
+                    version_hash: vec![9; 16],
+                    ..Default::default()
+                })),
+            }],
+            body: br#"{"amount":5}"#.to_vec(),
+            fingerprint_version: 2,
+        };
+        let source_target = prepared_target(&source_req).unwrap();
+        let source_fp = fingerprint_v2(&source_req, &source_target).unwrap();
+        let source = pb::EffectRecord {
+            ordinal: 2,
+            kind: "http.fetch".into(),
+            target: "http:pay.example".into(),
+            fingerprint: source_fp.clone(),
+            status: pb::EffectStatus::Ok as i32,
+            request: plain(source_req.encode_to_vec()),
+            response: plain(
+                pb::HttpEffectResponse {
+                    status: 200,
+                    body: secret_value.to_vec(),
+                    headers: vec![pb::HeaderPair {
+                        name: "x-echo".into(),
+                        value: "sekret-value".into(),
+                    }],
+                }
+                .encode_to_vec(),
+            ),
+            ..Default::default()
+        };
+        let input = pb::Input {
+            kind: Some(pb::input::Kind::Migrate(pb::MigrateInput {
+                from_schema_version: 1,
+                to_schema_version: 2,
+            })),
+        };
+        let effects = vec![reveal(1, "before"), source.clone(), reveal(3, "future")];
+        let prefix = original_secret_prefix(&input, &effects, 2).unwrap();
+        assert_eq!(
+            prefix
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before", "api-key"]
+        );
+
+        let neighbor = RecordedNeighbor::from_sources([NeighborSource {
+            lsn: 7,
+            effect: source.clone(),
+            prefix: Some(prefix.clone()),
+        }]);
+        let fork_req = pb::HttpEffectRequest {
+            method: "POST".into(),
+            url: "https://pay.example/v1/charges/9".into(),
+            body: br#"{"amount":8}"#.to_vec(),
+            fingerprint_version: 2,
+            ..Default::default()
+        };
+        let fork_fp = fingerprint_v2(&fork_req, &prepared_target(&fork_req).unwrap()).unwrap();
+        assert_ne!(fork_fp, source_fp);
+        let hit = neighbor
+            .find(&fork_req)
+            .expect("the fork request is a neighbor");
+        assert_eq!(hit.source.fingerprint, source_fp);
+        assert_eq!(hit.prefix.map(|item| item.len()), Some(2));
+
+        let patterns = [
+            ("api-key", secret_value.as_slice()),
+            ("before", b"before-value".as_slice()),
+            ("future", b"later-value".as_slice()),
+        ];
+        let matcher = CompiledScrubber::new(&patterns, 1024).unwrap();
+        let sealer = Sealer::plain();
+        let disclosed = crate::replay::disclose_neighbor(
+            &hit,
+            4,
+            "http.fetch",
+            Some(prefix.as_ref()),
+            &matcher,
+            &sealer,
+        )
+        .unwrap();
+        let crate::replay::NeighborDisclosure::Recorded(recorded) = disclosed else {
+            panic!("a covered neighbor hit must be recorded");
+        };
+        let record = recorded.record;
+        let outcome = recorded.outcome;
+        assert_eq!(record.ordinal, 4);
+        assert_eq!(record.simulator, "neighbor");
+        assert_eq!(record.grounding, pb::Grounding::Synthetic as i32);
+        assert_eq!(record.fingerprint, source_fp);
+        assert_ne!(record.fingerprint, fork_fp);
+        let stored =
+            pb::HttpEffectRequest::decode(subject_free(record.request.as_ref()).unwrap()).unwrap();
+        assert_eq!(stored.fingerprint_version, source_req.fingerprint_version);
+        assert_eq!(stored.url, source_req.url);
+        assert_ne!(stored.url, fork_req.url);
+        let stored_secret = stored
+            .headers
+            .iter()
+            .find_map(|header| match &header.value {
+                Some(pb::http_effect_header::Value::Secret(secret)) => Some(secret),
+                _ => None,
+            });
+        let stored_secret = stored_secret.expect("the source secret reference");
+        assert_eq!(stored_secret.name, "api-key");
+        assert_eq!(stored_secret.version, 1);
+        assert_eq!(stored_secret.version_hash, vec![9; 16]);
+        match outcome {
+            kronik_runtime::FetchOutcome::Ok(response) => {
+                assert_eq!(response.body, secret_value);
+            }
+            other => panic!("covered source bytes must stay unchanged, got {other:?}"),
+        }
+
+        let refused = RecordedNeighbor::from_sources([NeighborSource {
+            lsn: 7,
+            effect: source,
+            prefix: None,
+        }]);
+        let refused_hit = refused.find(&fork_req).unwrap();
+        assert!(matches!(
+            crate::replay::disclose_neighbor(
+                &refused_hit,
+                4,
+                "http.fetch",
+                Some(prefix.as_ref()),
+                &matcher,
+                &sealer,
+            )
+            .unwrap(),
+            crate::replay::NeighborDisclosure::Decline
+        ));
+
+        let future = [reference("future")];
+        assert!(matches!(
+            crate::replay::disclose_neighbor(
+                &hit,
+                4,
+                "http.fetch",
+                Some(&future),
+                &matcher,
+                &sealer
+            ),
+            Err(kronik_runtime::GateError::Prerequisite(
+                kronik_core::error::ErrorCode::SecretUnavailable
+            ))
+        ));
+    }
+
+    /// A version-0 neighbor keeps the source fingerprint and is disclosed by
+    /// the legacy verifier, not by a manufactured version-2 prefix.
+    #[test]
+    fn legacy_neighbor_hit_keeps_the_source_fingerprint_version() {
+        use kronik_effects::http::{CompiledScrubber, fingerprint};
+        use kronik_effects::simulator::{NeighborSource, RecordedNeighbor};
+        use kronik_privacy::sealer::Sealer;
+
+        let source_req = pb::HttpEffectRequest {
+            method: "GET".into(),
+            url: "http://pay.example/v1/charges/1".into(),
+            ..Default::default()
+        };
+        let source_fp = fingerprint(&source_req).unwrap();
+        let source = pb::EffectRecord {
+            ordinal: 1,
+            kind: "http.fetch".into(),
+            target: "http:pay.example".into(),
+            fingerprint: source_fp.clone(),
+            status: pb::EffectStatus::Ok as i32,
+            request: plain(source_req.encode_to_vec()),
+            response: plain(
+                pb::HttpEffectResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"recorded-body".to_vec(),
+                }
+                .encode_to_vec(),
+            ),
+            ..Default::default()
+        };
+        let neighbor = RecordedNeighbor::from_sources([NeighborSource {
+            lsn: 3,
+            effect: source,
+            prefix: None,
+        }]);
+        let fork_req = pb::HttpEffectRequest {
+            method: "GET".into(),
+            url: "http://pay.example/v1/charges/9".into(),
+            ..Default::default()
+        };
+        let fork_fp = fingerprint(&fork_req).unwrap();
+        assert_ne!(fork_fp, source_fp);
+        let hit = neighbor.find(&fork_req).expect("legacy neighbor match");
+        let patterns = [("other", b"not-in-the-body".as_slice())];
+        let matcher = CompiledScrubber::new(&patterns, 1024).unwrap();
+        let disclosed = crate::replay::disclose_neighbor(
+            &hit,
+            5,
+            "http.fetch",
+            None,
+            &matcher,
+            &Sealer::plain(),
+        )
+        .unwrap();
+        let crate::replay::NeighborDisclosure::Recorded(recorded) = disclosed else {
+            panic!("a verified legacy neighbor hit must be recorded");
+        };
+        assert_eq!(recorded.record.fingerprint, source_fp);
+        assert_ne!(recorded.record.fingerprint, fork_fp);
+        assert_eq!(recorded.record.simulator, "neighbor");
+        let stored =
+            pb::HttpEffectRequest::decode(subject_free(recorded.record.request.as_ref()).unwrap())
+                .unwrap();
+        assert_eq!(stored.fingerprint_version, 0);
+        assert_eq!(stored.url, source_req.url);
+        match recorded.outcome {
+            kronik_runtime::FetchOutcome::Ok(response) => {
+                assert_eq!(response.body, b"recorded-body");
+            }
+            other => panic!("clean legacy bytes must stay unchanged, got {other:?}"),
+        }
     }
 
     #[test]

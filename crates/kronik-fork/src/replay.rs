@@ -13,7 +13,7 @@ use kronik_core::env::{BoxFuture, Env};
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
 use kronik_effects::http::{
-    CompiledScrubber, fingerprint, fingerprint_v2, parse_request_url, target_of,
+    CompiledScrubber, fingerprint, fingerprint_v2, parse_request_url, prepared_target, target_of,
 };
 use kronik_effects::{Config, ConfigHistory};
 use kronik_log::{Committed, Position};
@@ -1224,6 +1224,173 @@ pub(crate) fn prepared_outcome_safe(
         .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))
 }
 
+/// A neighbor hit after source-identity disclosure. Decline is not a
+/// disclosure: the next simulator may answer. A prerequisite is not a
+/// decline: the source answer must not reach the guest or a later external
+/// call. Contract fakes and stub rules are synthetic (ADR 0016) and must
+/// not be passed here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NeighborRecorded {
+    pub record: pb::EffectRecord,
+    pub outcome: FetchOutcome,
+}
+
+/// Decline carries no payload. The recorded arm is boxed so the enum stays
+/// small (the source effect is large).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NeighborDisclosure {
+    Decline,
+    Recorded(Box<NeighborRecorded>),
+}
+
+/// Store a neighbor hit as the source effect, or refuse it. The secret-use
+/// prefix is the one taken through the source ordinal. Unknown scope is not
+/// an empty scope, and a missing body is not an empty inline body.
+pub(crate) fn disclose_neighbor(
+    hit: &kronik_effects::simulator::NeighborHit<'_>,
+    ordinal: u32,
+    kind: &str,
+    current: Option<&[pb::SecretRef]>,
+    matcher: &CompiledScrubber<'_>,
+    sealer: &kronik_privacy::sealer::Sealer,
+) -> Result<NeighborDisclosure, GateError> {
+    if hit.source.kind != kind {
+        return Ok(NeighborDisclosure::Decline);
+    }
+    let request_bytes = match hit
+        .source
+        .request
+        .as_ref()
+        .and_then(|value| value.value.as_ref())
+    {
+        Some(pb::sealable::Value::Plain(bytes)) => bytes.as_slice(),
+        _ => return Err(GateError::Prerequisite(ErrorCode::Unavailable)),
+    };
+    let source_req = pb::HttpEffectRequest::decode(request_bytes)
+        .map_err(|_| GateError::Prerequisite(ErrorCode::Unavailable))?;
+    if hit.source.status == pb::EffectStatus::Ok as i32 {
+        match hit
+            .source
+            .response
+            .as_ref()
+            .and_then(|value| value.value.as_ref())
+        {
+            Some(pb::sealable::Value::Plain(_)) => {}
+            // A referenced or unreadable body is not an empty success.
+            _ => return Err(GateError::Prerequisite(ErrorCode::Unavailable)),
+        }
+    }
+    let subject = hit
+        .source
+        .request
+        .as_ref()
+        .and_then(|value| value.subject.as_deref());
+    let verified = match source_req.fingerprint_version {
+        0 => {
+            let plain_fp = fingerprint(&source_req).map_err(|_| {
+                GateError::Host("The legacy neighbor fingerprint is invalid".into())
+            })?;
+            sealer.fingerprint_matches(subject, &hit.source.fingerprint, &plain_fp)
+        }
+        2 => {
+            let Some(prefix) = hit.prefix else {
+                return Ok(NeighborDisclosure::Decline);
+            };
+            let target = prepared_target(&source_req)
+                .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?;
+            let plain_fp = fingerprint_v2(&source_req, &target)
+                .map_err(|_| GateError::Host("The neighbor fingerprint is invalid".into()))?;
+            if !sealer.fingerprint_matches(subject, &hit.source.fingerprint, &plain_fp) {
+                return Ok(NeighborDisclosure::Decline);
+            }
+            disclose_prepared_neighbor(&source_req, &target, hit.source, current, prefix, matcher)?;
+            true
+        }
+        _ => return Ok(NeighborDisclosure::Decline),
+    };
+    if !verified {
+        return Ok(NeighborDisclosure::Decline);
+    }
+    let mut record = hit.source.clone();
+    record.ordinal = ordinal;
+    record.grounding = pb::Grounding::Synthetic as i32;
+    record.simulator = kronik_effects::simulator::label::NEIGHBOR.into();
+    let record = if source_req.fingerprint_version == 0 {
+        kronik_sched::effects::legacy_http_disclosure(record, &source_req, matcher)?
+    } else {
+        record
+    };
+    let outcome = outcome_of_fetch(&record)?;
+    Ok(NeighborDisclosure::Recorded(Box::new(NeighborRecorded {
+        record,
+        outcome,
+    })))
+}
+
+/// Version-2 neighbor bytes stay unchanged only with a covering source
+/// prefix or a no-match proof. `current: None` is unknown, not empty.
+fn disclose_prepared_neighbor(
+    req: &pb::HttpEffectRequest,
+    target: &kronik_effects::http::Target,
+    source: &pb::EffectRecord,
+    current: Option<&[pb::SecretRef]>,
+    prefix: &[pb::SecretRef],
+    matcher: &CompiledScrubber<'_>,
+) -> Result<(), GateError> {
+    let response_bytes = match source
+        .response
+        .as_ref()
+        .and_then(|value| value.value.as_ref())
+    {
+        Some(pb::sealable::Value::Plain(bytes)) => bytes.as_slice(),
+        _ => return Err(GateError::Prerequisite(ErrorCode::Unavailable)),
+    };
+    let response = pb::HttpEffectResponse::decode(response_bytes)
+        .map_err(|_| GateError::Prerequisite(ErrorCode::Unavailable))?;
+    // Coverage first. A miss still scans the real fields; it does not treat
+    // unknown scope as a proved empty set, and it does not replace a
+    // referenced body with an empty inline substitute.
+    if kronik_sched::scrub::secret_scope_is_subset(current, Some(prefix))
+        .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?
+    {
+        return Ok(());
+    }
+    if kronik_sched::scrub::http_url_contains(target, &target.host, &|bytes| {
+        matcher.is_match(bytes)
+    })
+    .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?
+    {
+        return Err(GateError::Prerequisite(ErrorCode::SecretUnavailable));
+    }
+    let mut fields = Vec::new();
+    if !kronik_sched::scrub::protocol_method(&req.method) {
+        fields.push(req.method.as_bytes());
+    }
+    fields.push(req.body.as_slice());
+    for header in &req.headers {
+        fields.push(header.name.as_bytes());
+        match &header.value {
+            Some(pb::http_effect_header::Value::Text(value)) => fields.push(value.as_bytes()),
+            Some(pb::http_effect_header::Value::Secret(reference)) => {
+                if !reference.template.is_empty() {
+                    fields.push(reference.template.as_bytes());
+                }
+            }
+            // A missing header value is not an empty proved-clear field.
+            None => return Err(GateError::Prerequisite(ErrorCode::Unavailable)),
+        }
+    }
+    fields.push(response.body.as_slice());
+    for header in &response.headers {
+        fields.push(header.name.as_bytes());
+        fields.push(header.value.as_bytes());
+    }
+    // Original scope is the source prefix. Unknown current scope does not
+    // skip the scan, and is not passed as a proved empty set.
+    kronik_sched::scrub::prepared_fields_safe(current, Some(prefix), matcher, fields)
+        .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))
+}
+
 fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
     match s.and_then(|s| s.value.as_ref()) {
         Some(pb::sealable::Value::Plain(b)) => b.clone(),
@@ -1763,6 +1930,8 @@ impl ReplayGate {
             .or_else(|| sims.and_then(|s| crate::stubs::find(&s.stubs, &req.method, &req.url)));
         if let Some(rule) = rule {
             let mut rec = self.synthetic(ordinal, kind, cap, fp, encoded);
+            // ADR 0016: a stub answer is synthetic. It is not a neighbor hit
+            // and does not carry a source effect's secret-use prefix.
             rec.simulator = kronik_effects::simulator::label::STUB.into();
             rec.error = String::new();
             rec.status = match rule.error.as_deref() {
@@ -1832,34 +2001,36 @@ impl ReplayGate {
             let neighbor = s
                 .neighbor
                 .then(|| setup.simulators.neighbor(&setup.index, &cap));
-            let contract = s
+            // Contract fakes stay synthetic (ADR 0016). They are not neighbor
+            // hits and do not take a source secret-use prefix.
+            if let Some(answer) = s
                 .contract
                 .as_ref()
-                .and_then(|contract| contract.respond(&ereq, &ctx));
-            let raw_contract = contract.is_some();
-            let answer =
-                contract.or_else(|| neighbor.and_then(|neighbor| neighbor.respond(&ereq, &ctx)));
-            if let Some(a) = answer {
-                let mut rec = a.record;
+                .and_then(|contract| contract.respond(&ereq, &ctx))
+            {
+                let mut rec = answer.record;
                 rec.request = encoded;
-                let out = if raw_contract {
-                    self.prepare_http_record(&mut rec, &matcher)
-                } else {
-                    let outcome = outcome_of_fetch(&rec)?;
-                    if let FetchOutcome::Ok(response) = &outcome {
-                        let fields = std::iter::once(response.body.as_slice()).chain(
-                            response
-                                .headers
-                                .iter()
-                                .flat_map(|(name, value)| [name.as_bytes(), value.as_bytes()]),
-                        );
-                        kronik_sched::scrub::prepared_fields_safe(None, None, &matcher, fields)
-                            .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?;
-                    }
-                    Ok(outcome)
-                };
+                let out = self.prepare_http_record(&mut rec, &matcher);
                 self.push(rec);
                 return out;
+            }
+            if let Some(neighbor) = &neighbor
+                && let Some(hit) = neighbor.find(&request)
+            {
+                match disclose_neighbor(
+                    &hit,
+                    ordinal,
+                    kind,
+                    prepared_scope.as_deref(),
+                    &matcher,
+                    self.runner.setup.privacy.sealer.as_ref(),
+                )? {
+                    NeighborDisclosure::Decline => {}
+                    NeighborDisclosure::Recorded(recorded) => {
+                        self.push(recorded.record);
+                        return Ok(recorded.outcome);
+                    }
+                }
             }
             // A preview reaches the outside world only through an allowlisted
             // secret-less GET (ADR 0025). The model is a POST, so it is not
