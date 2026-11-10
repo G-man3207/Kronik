@@ -45,8 +45,11 @@ Fixes to v0.4.0; no log-format, WIT or breaking API/CLI change.
   fork point. (v0.5.0 will report the erased turn as unverifiable rather than as
   a change.)
 - `kronik restore` validates manifest paths and names before installing
-  anything, installs only the components the manifest names, and refuses unsafe
-  entries.
+  anything, installs a `code/` object only when it is named `<64 hex>.wasm`
+  and its bytes hash to that name, and refuses unsafe entries. (v0.4.1 still
+  installed every such object, named by a deployment or not; from v0.5.0 a
+  restore installs only the components the snapshot's and the segments'
+  deployments name, as the design says.)
 - The daemon's log carries ANSI colours only when standard error is a terminal:
   a redirected, piped or journaled log no longer holds escape sequences between
   a field's name, its `=`, and its value (`NO_COLOR` is still honoured on one).

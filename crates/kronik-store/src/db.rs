@@ -243,7 +243,10 @@ fn corrupt(msg: impl Into<String>) -> StoreError {
     StoreError::Corrupt(msg.into())
 }
 
-fn decode<M: prost::Message + Default>(bytes: &[u8], what: &str) -> Result<M, StoreError> {
+pub(crate) fn decode<M: prost::Message + Default>(
+    bytes: &[u8],
+    what: &str,
+) -> Result<M, StoreError> {
     M::decode(bytes).map_err(|e| corrupt(format!("{what} in state.db: {e}")))
 }
 

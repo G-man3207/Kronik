@@ -385,6 +385,38 @@ pub fn sealed_keys(snapshot: &Path) -> Result<crate::db::SubjectKeys, StoreError
     crate::db::sealed_keys(&conn)
 }
 
+/// The code hashes the snapshot's `deployments` table names, as `<64 hex>`
+/// strings (the name a `code/` object carries before `.wasm`), read without
+/// changing the snapshot. A restore downloads these and the ones the
+/// segments' deployment records name (m6-storage §6 step 3). The table
+/// holds every deployment ever applied, so an older snapshot's set is
+/// contained in a newer one's.
+pub fn deployment_code_hashes(
+    snapshot: &Path,
+) -> Result<std::collections::BTreeSet<String>, StoreError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        snapshot.join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let mut statement = conn.prepare("SELECT record FROM deployments")?;
+    let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut out = std::collections::BTreeSet::new();
+    for row in rows {
+        let deployment: kronik_proto::log::v1::Deployment = crate::db::decode(&row?, "deployment")?;
+        for kind in &deployment.kinds {
+            let hash =
+                kronik_core::ids::CodeHash::from_slice(&kind.code_hash).ok_or_else(|| {
+                    StoreError::Corrupt(format!(
+                        "a deployment of {} names a code hash that is not 32 bytes",
+                        kind.kind
+                    ))
+                })?;
+            out.insert(hash.hex());
+        }
+    }
+    Ok(out)
+}
+
 /// Installs a snapshot directory as a branch's state: `state.db` and the
 /// actor databases are copied into `branch_dir` (`state.db`, `sql/`),
 /// replacing what is there. The daemon must not run on it.

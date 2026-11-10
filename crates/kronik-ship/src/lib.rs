@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kronik_core::env::Env;
-use kronik_core::ids::Lsn;
+use kronik_core::ids::{CodeHash, Lsn};
 use kronik_privacy::key_source::{KeySource, KeySourceError, Keys, Wrapped};
 use kronik_sched::snapshots::{self, Manifest};
 use object_store::path::Path as Key;
@@ -962,6 +962,9 @@ async fn stage_restore(
     // 2. Every remote segment, and the subject keys its sealed values need.
     let mut needed = kronik_store::db::SubjectKeys::new();
     let mut erasures: Vec<(String, u32, u64)> = Vec::new();
+    // The components the segments' deployment records name (m6-storage §6
+    // step 3): a deployment after the snapshot is in the log only.
+    let mut deployed: BTreeSet<String> = BTreeSet::new();
     let log = stage.join("log");
     std::fs::create_dir_all(&log)?;
     let (names, _) = remote.list(&format!("{branch}/segments")).await?;
@@ -978,9 +981,20 @@ async fn stage_restore(
             .ok_or_else(|| ShipError::Restore(format!("{n} is not a segment name")))?;
         kronik_log::scan_segment_image(&bytes, branch, start, 0, Lsn::MAX, true, |mut c| {
             through_lsn = through_lsn.max(c.lsn);
-            if let kronik_proto::Record::Erasure(e) = &c.record {
-                let wall = e.audit.as_ref().map_or(0, |a| a.wall_time_ms);
-                erasures.push((e.subject.clone(), e.key_version, wall));
+            match &c.record {
+                kronik_proto::Record::Erasure(e) => {
+                    let wall = e.audit.as_ref().map_or(0, |a| a.wall_time_ms);
+                    erasures.push((e.subject.clone(), e.key_version, wall));
+                }
+                kronik_proto::Record::Deployment(d) => {
+                    note_deployment_hashes(d, &mut deployed)?;
+                }
+                _ => {}
+            }
+            if let Some((_, switch)) = c.record.rebase_switch()
+                && let Some(d) = &switch.deployment
+            {
+                note_deployment_hashes(d, &mut deployed)?;
             }
             kronik_proto::sealables::record_mut(
                 &mut c.record,
@@ -1083,20 +1097,35 @@ async fn stage_restore(
     if let Some(o) = &older {
         download_snapshot(remote, &stage.join("older-snapshot"), branch, o).await?;
     }
-    // 4. Components.
+    // 4. Components: the ones the snapshot's deployments and the segments'
+    //    deployments name, and no others (m6-storage §6 step 3). An object
+    //    under code/ that no deployment names is not installed; a
+    //    component a deployment names that the bucket does not hold fails
+    //    the restore here, before anything moves into place.
     let code = stage.join("code");
     std::fs::create_dir_all(&code)?;
     let (comps, _) = remote.list("code").await?;
-    let mut components = Vec::new();
+    let mut listed: BTreeSet<&str> = BTreeSet::new();
     for c in &comps {
         let Some(name) = c.strip_suffix(".zst") else {
             continue;
         };
-        let hash = names::component_hash(name)?;
-        let bytes = decompress(&remote.get(&format!("code/{c}")).await?)?;
+        listed.insert(names::component_hash(name)?);
+    }
+    let mut wanted = kronik_store::snapshot::deployment_code_hashes(&snap)
+        .map_err(|e| ShipError::Restore(format!("the snapshot's state.db: {e}")))?;
+    wanted.extend(deployed);
+    let mut components = Vec::new();
+    for hash in &wanted {
+        if !listed.contains(hash.as_str()) {
+            return Err(ShipError::Restore(format!(
+                "the bucket's code/ holds no {hash}.wasm, which a deployment names"
+            )));
+        }
+        let bytes = decompress(&remote.get(&format!("code/{hash}.wasm.zst")).await?)?;
         names::component_content(hash, &bytes)?;
-        write_new(&code.join(name), &bytes)?;
-        components.push(name.to_owned());
+        write_new(&code.join(format!("{hash}.wasm")), &bytes)?;
+        components.push(format!("{hash}.wasm"));
     }
     // 5. The state and actor databases, copied now so that moving the
     //    restore into place is only renames.
@@ -1130,6 +1159,25 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .create_new(true)
         .open(path)?;
     file.write_all(bytes)
+}
+
+/// The code hashes (`<64 hex>`, the name a `code/` object carries before
+/// `.wasm`) a deployment record names, added to `out` (m6-storage §6
+/// step 3).
+fn note_deployment_hashes(
+    d: &kronik_proto::log::v1::Deployment,
+    out: &mut BTreeSet<String>,
+) -> Result<(), kronik_log::LogError> {
+    for kind in &d.kinds {
+        let hash = CodeHash::from_slice(&kind.code_hash).ok_or_else(|| {
+            kronik_log::LogError::Corrupt(format!(
+                "a deployment of {} names a code hash that is not 32 bytes",
+                kind.kind
+            ))
+        })?;
+        out.insert(hash.hex());
+    }
+    Ok(())
 }
 
 /// Removes the precompiled artifacts (`*.cwasm`) of a code directory.

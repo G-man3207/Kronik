@@ -606,12 +606,6 @@ fn a_code_object_that_is_not_a_component_named_by_its_hash_is_refused() {
             "code/",
         ),
         (
-            "a hash of other content",
-            format!("{other}.wasm.zst"),
-            content.clone(),
-            "does not match its name",
-        ),
-        (
             "the name of a component with other content",
             format!("{real}.wasm.zst"),
             b"other content".to_vec(),
@@ -659,11 +653,150 @@ fn a_restore_installs_the_components_and_no_precompiled_artifact() {
     shipped.restore(&bucket, &data, false).unwrap();
     assert!(precompiled_below(area.path()).is_empty());
     assert_eq!(std::fs::read(code.join("notes.txt")).unwrap(), b"kept");
-    // Every component came back, as the bytes its name is the hash of.
+    // Every deployed component came back, as the bytes its name is the
+    // hash of, and nothing else: the code directory holds exactly them.
     assert!(components.len() >= 2, "{components:?}");
+    let mut installed: Vec<String> = std::fs::read_dir(&code)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".wasm"))
+        .collect();
+    installed.sort();
+    assert_eq!(installed, components, "{installed:?} vs {components:?}");
     for name in &components {
         let bytes = std::fs::read(code.join(name)).unwrap();
         let hash = blake3::hash(&bytes).to_hex().to_string();
         assert_eq!(format!("{hash}.wasm"), *name);
     }
+}
+
+/// A data directory in its own area, holding only the master key: the
+/// destination of a test that builds its own bucket.
+fn destination_of(key: &[u8]) -> (tempfile::TempDir, PathBuf) {
+    let area = tempdir("names-area-");
+    let data = area.path().join("data");
+    std::fs::create_dir_all(data.join("keys")).unwrap();
+    std::fs::write(data.join("keys/master.key"), key).unwrap();
+    (area, data)
+}
+
+#[test]
+fn a_component_no_deployment_names_is_not_installed() {
+    let shipped = shipped();
+    let bucket = shipped.copy();
+    // Well-named objects under code/ that no deployment names: one whose
+    // content is what its name says, and one whose is not. Neither is
+    // installed; the restore itself still succeeds.
+    let honest = blake3::hash(b"an unreferenced component")
+        .to_hex()
+        .to_string();
+    shipped.put_code(
+        &bucket,
+        &format!("{honest}.wasm.zst"),
+        b"an unreferenced component",
+    );
+    let wrong = blake3::hash(b"another content").to_hex().to_string();
+    shipped.put_code(&bucket, &format!("{wrong}.wasm.zst"), b"not that content");
+    let (_area, data) = shipped.destination();
+
+    let report = shipped.restore(&bucket, &data, false).unwrap();
+    let components = shipped.components();
+    let mut installed: Vec<String> = std::fs::read_dir(data.join("code"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    installed.sort();
+    assert_eq!(installed, components, "{report:?}");
+    assert_eq!(report.components, components.len(), "{report:?}");
+}
+
+#[test]
+fn a_deployment_component_the_bucket_lacks_is_refused() {
+    let shipped = shipped();
+    let components = shipped.components();
+    let bucket = shipped.copy();
+    // One of the components a deployment names is not in the bucket.
+    let missing = components[1].clone();
+    std::fs::remove_file(
+        bucket
+            ._dir
+            .path()
+            .join("code")
+            .join(format!("{missing}.zst")),
+    )
+    .unwrap();
+    let (area, data) = shipped.destination();
+
+    let before = tree(area.path());
+    let error = refusal(
+        shipped.restore(&bucket, &data, false),
+        "a named component is missing",
+    );
+    let hash = missing.strip_suffix(".wasm").unwrap();
+    assert!(error.contains("code/") && error.contains(hash), "{error}");
+    assert_eq!(tree(area.path()), before, "the area changed");
+}
+
+#[test]
+fn a_deployment_after_the_snapshot_names_its_component_from_the_segment() {
+    // A bucket whose newest snapshot predates the second deployment: the
+    // snapshot's state names only the first component, and the segment
+    // that carries the second deployment names the other one.
+    let src = tempdir("names-post-src-");
+    let bucket = tempdir("names-post-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let p = start(src.path());
+    p.deploy("counter");
+    p.send("counter/a", "increment", "");
+    p.snapshot();
+    p.ship(&remote, src.path());
+    p.deploy("notes");
+    p.send("notes/n0", "add", "note");
+    p.ship(&remote, src.path());
+    drop(p);
+    let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
+    let notes = format!("{}.wasm", blake3::hash(&guest("notes")).to_hex());
+
+    // The whole set: the snapshot names counter, the segments name notes.
+    let rt = runtime();
+    let (_area, data) = destination_of(&key);
+    let report = rt
+        .block_on(restore(
+            &remote,
+            &data,
+            "main",
+            false,
+            &Env::real(rt.handle().clone()),
+            &Default::default(),
+            KeystoreMode::Require,
+        ))
+        .unwrap();
+    assert_eq!(report.components, 2, "{report:?}");
+    assert!(
+        data.join("code").join(&notes).is_file(),
+        "{notes} was not installed"
+    );
+
+    // The second component's object gone: the restore refuses and writes
+    // nothing, although the snapshot's state does not name it.
+    std::fs::remove_file(bucket.path().join("code").join(format!("{notes}.zst"))).unwrap();
+    let (area, data) = destination_of(&key);
+    let before = tree(area.path());
+    let error = refusal(
+        rt.block_on(restore(
+            &remote,
+            &data,
+            "main",
+            false,
+            &Env::real(rt.handle().clone()),
+            &Default::default(),
+            KeystoreMode::Require,
+        )),
+        "the segment's component is missing",
+    );
+    assert!(
+        error.contains("code/") && error.contains(notes.trim_end_matches(".wasm")),
+        "{error}"
+    );
+    assert_eq!(tree(area.path()), before, "the area changed");
 }
