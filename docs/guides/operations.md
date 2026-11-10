@@ -1357,8 +1357,9 @@ The check replays the last `--window` of logical time with the new engine
 and the same code. It reads the data directory, its privacy keystore and
 the same key-source configuration as `kronik serve`. A KMS-backed check
 needs the provider and its credentials, even while the old daemon keeps
-running. An empty diff writes `<data-dir>/upgrade/<engine>.json`
-and exits 0. A diff that is not empty writes that report and the diff next
+running. A diff with no verified difference writes
+`<data-dir>/upgrade/<engine>.json` and exits 0. A diff with a verified
+difference writes that report and the diff next
 to it (`<engine>.diff.json`) and exits 1 with `ENGINE_UPGRADE_DIVERGED`:
 keep the current binary. `--dry-run` prints the result and writes neither
 file. A bad window or a directory with no log is `BAD_REQUEST`.
