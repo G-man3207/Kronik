@@ -273,7 +273,7 @@ HTTP status 409, milestone M6. The new engine version changes behavior.
 
 Default hint: Keep the current binary and report the diff from `kronik upgrade check`.
 
-`kronik upgrade check` ran an identity replay with the same code hashes under the new binary's engine version (Kronik plus Wasmtime), and the behavior diff is not empty. The diff must be empty before a new binary is swapped in; fuel is not compared between engine versions.
+`kronik upgrade check` ran an identity replay with the same code hashes under the new binary's engine version (Kronik plus Wasmtime), and the behavior diff has a verified difference. Differences of turns whose recorded input was erased are not a behavior change, and a check whose only differences are those turns passes. A verified difference must be gone before a new binary is swapped in; fuel is not compared between engine versions.
 
 Typical cause: a change in Kronik or Wasmtime that alters what guests observe, so existing code would behave differently under the new version.
 

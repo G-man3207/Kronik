@@ -464,7 +464,7 @@ pub(crate) fn page() -> String {
          `restore`, `upgrade check` and `audit verify` answer themselves. A\n\
          failure prints the [`Error`](#error) object instead, with exit code 1,\n\
          except `upgrade check`, which prints its report either way and exits 1\n\
-         when the replay is not empty (`code` is `ENGINE_UPGRADE_DIVERGED`), and\n\
+         when a verified difference remains (`code` is `ENGINE_UPGRADE_DIVERGED`), and\n\
          `audit verify`, which prints its report either way and exits 1 when it\n\
          is not `complete`. The\n\
          schemas are JSON Schema 2020-12; `$ref`s name the definitions below.\n\n\
