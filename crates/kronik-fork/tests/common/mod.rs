@@ -166,10 +166,16 @@ impl Proc {
 
     pub fn grant(&self, cap: &str) {
         self.rt
-            .block_on(
-                self.node
-                    .grant("counter", cap, None, None, audit(), false, self.owner()),
-            )
+            .block_on(self.node.grant(
+                "counter",
+                cap,
+                None,
+                None,
+                kronik_effects::InForks::Recorded,
+                audit(),
+                false,
+                self.owner(),
+            ))
             .unwrap();
     }
 

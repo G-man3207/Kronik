@@ -242,8 +242,10 @@ pub struct ForkTurn {
     /// `unverifiable` rather than divergent (S-16, ADR 0109).
     pub erased: bool,
     /// `--no-pii` forks: it used SQL, called a turn that did, or was sent
-    /// by one, so its values may hold real SQL rows (SQL is not
-    /// pseudonymized). Implies `masked`; see [`crate::privacy::conceal_turn`].
+    /// by one. Its reply and record are concealed even though subject-tagged
+    /// text and blob cells in the actor database are pseudonyms: a value
+    /// copied into a name, key or URL is not tracked. Implies `masked`; see
+    /// [`crate::privacy::conceal_turn`].
     pub sql: bool,
     /// Its values may hold personal data, in any fork: its input was tagged
     /// or came from such a turn, it read tagged state, used SQL, recorded a
@@ -278,6 +280,23 @@ pub fn cursor(index: &ProductionIndex) -> Result<Arc<Store>, ReplayError> {
     };
     // Production's sealed SQL changesets are opened as they are applied.
     store.set_sealer(index.sealer.clone());
+    if index.no_pii {
+        // A snapshot already holds the rows. Rewrite them the same way
+        // revealed changesets were, before any later UPDATE is applied.
+        let actors = store.db().sql_actors()?;
+        for name in actors {
+            let db = store
+                .sql
+                .get(&name)
+                .map_err(|e| ReplayError::Host(e.to_string()))?;
+            let mut actor = db.lock().unwrap_or_else(|e| e.into_inner());
+            actor
+                .pseudonymize_subject_cells(|subject, value| {
+                    crate::privacy::ForkPrivacy::sql_cell(&index.sealer, subject, value)
+                })
+                .map_err(ReplayError::Host)?;
+        }
+    }
     Ok(store)
 }
 
@@ -322,7 +341,7 @@ struct Pending {
     key: pb::CausalKey,
     time: u64,
     subject: Option<String>,
-    /// Sent by a turn whose values may hold real SQL rows ([`ForkTurn::sql`]).
+    /// Sent by a turn that used SQL ([`ForkTurn::sql`]).
     sql: bool,
     /// Sent by a turn whose values may hold personal data
     /// ([`ForkTurn::personal`]).
@@ -1139,7 +1158,7 @@ struct GateState {
     records: Vec<pb::EffectRecord>,
     compensations: Vec<pb::OutboundMessage>,
     secrets: Vec<(String, Vec<u8>)>,
-    /// A callee's values may hold real SQL rows ([`ForkTurn::sql`]).
+    /// A callee used SQL ([`ForkTurn::sql`]).
     sql: bool,
     /// A callee's values may hold personal data ([`ForkTurn::personal`]).
     personal: bool,
@@ -2451,11 +2470,13 @@ impl ReplayGate {
             CryptoAlgorithm::SignEd25519 => ("crypto.sign-ed25519", "sign-ed25519"),
         };
         let cap = format!("secret:{secret}");
-        if self.config().grant(&self.actor.kind, &cap).is_none() {
+        let Some(grant) = self.config().grant(&self.actor.kind, &cap) else {
             let e = format!("CAPABILITY_NOT_GRANTED: {cap}");
             self.push(self.denied(ordinal, kind, cap, e.clone()));
             return CryptoOutcome::Denied(e);
-        }
+        };
+        // Copy the mode: the grant reference does not outlive the match below.
+        let in_forks = grant.in_forks;
         let data_hash = blake3::hash(&data).as_bytes().to_vec();
         let mut h = blake3::Hasher::new();
         h.update(alg.as_bytes());
@@ -2481,7 +2502,8 @@ impl ReplayGate {
             self.push(rec);
             return out;
         }
-        // Unmatched: computed on the host, the value never leaves it.
+        // Unmatched. A linked name is denied. A recorded grant does not
+        // compute. Compute signs on the host; the key never leaves it.
         let store = self.runner.setup.secrets.as_deref();
         let v = match unmatched_key(self.config(), store.map(|s| s as &dyn KeyStore), &secret) {
             UnmatchedKey::Value(v) => v,
@@ -2499,6 +2521,23 @@ impl ReplayGate {
                 return denied;
             }
         };
+        // A recorded grant returns a matching recording or denies the call.
+        // It does not compute, so the production key is not used.
+        if in_forks == kronik_effects::InForks::Recorded {
+            drop(v);
+            self.push(self.synthetic(ordinal, kind, cap, fp, None));
+            return CryptoOutcome::Denied(NO_RECORDING.into());
+        }
+        tracing::info!(
+            algorithm = alg,
+            name = %secret,
+            kind = %self.actor.kind,
+            "fork computed a crypto effect; the key stayed on the host"
+        );
+        kronik_metrics::inc(
+            "kronik_fork_crypto_computations_total",
+            &[("algorithm", alg)],
+        );
         let result = match algorithm {
             CryptoAlgorithm::HmacSha256 => Ok(kronik_effects::crypto::hmac_sha256(&v.value, &data)),
             CryptoAlgorithm::SignEd25519 => kronik_effects::crypto::sign_ed25519(&v.value, &data),

@@ -2184,7 +2184,13 @@ fn a_fork_refuses_the_built_in_value_of_a_name_that_is_linked_at_its_fork_point(
     let d = Daemon::start(dir.path(), Some(&bao), "2s");
     d.deploy("counter.wasm");
     for name in ["stripe", "plain"] {
-        d.grant("counter", &format!("secret:{name}"), None);
+        // compute: this test is the link decision, not the recorded default.
+        d.mutate(
+            "POST",
+            "/v1/grants",
+            json!({"kind": "counter", "capability": format!("secret:{name}"),
+                   "in_forks": "compute", "reason": "secret backends"}),
+        );
         d.mutate(
             "PUT",
             &format!("/v1/secrets/{name}"),

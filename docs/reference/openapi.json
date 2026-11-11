@@ -3905,6 +3905,14 @@
             "default": false,
             "type": "boolean"
           },
+          "in_forks": {
+            "default": null,
+            "description": "`compute` or `recorded`. Absent on a new grant means `recorded`\n(ADR 0112). An older stored grant with the field absent is `compute`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "kind": {
             "type": "string"
           },
@@ -3959,6 +3967,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "in_forks": {
+            "description": "`compute` or `recorded`. What a fork does with an unmatched crypto\ncall of this secret (ADR 0112).",
+            "type": "string"
+          },
           "kind": {
             "type": "string"
           },
@@ -3984,7 +3996,8 @@
           "kind",
           "capability",
           "epoch",
-          "lsn"
+          "lsn",
+          "in_forks"
         ],
         "type": "object"
       },

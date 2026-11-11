@@ -289,6 +289,7 @@ fn grant(rt: &tokio::runtime::Runtime, node: &Node, host: &str, reason: &str) {
         &format!("http:{host}"),
         None,
         None,
+        kronik_effects::InForks::Recorded,
         audit,
         false,
         original,

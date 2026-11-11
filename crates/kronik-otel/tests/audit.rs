@@ -198,6 +198,7 @@ fn samples() -> Vec<Record> {
                 per_ms: 1000,
             }),
             audit: audit("needs the API"),
+            in_forks: String::new(),
         }),
         Record::Limits(pb::Limits {
             epoch: 9,

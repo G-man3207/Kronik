@@ -622,6 +622,7 @@ with OIDC, Host must match the configured admin origin:
 | `kronik_gateway_requests_total` | counter | `status` | Gateway requests by HTTP status |
 | `kronik_gateway_request_duration_seconds` | histogram | `status` | Gateway request duration |
 | `kronik_replay_runs_total` | counter | `mode` | Fork replays by mode |
+| `kronik_fork_crypto_computations_total` | counter | `algorithm` | Unmatched crypto effects a fork computed on the host. The key is not a label |
 | `kronik_guard_triggered_total` | counter | `action`, `outcome` | Guards of `kronik watch` that fired |
 | `kronik_export_records_total` | counter | `stream` | Log records an export stream (`traces`, `audit`) delivered or skipped |
 | `kronik_export_lag_records` | gauge | `stream` | Committed records the stream has not delivered yet |

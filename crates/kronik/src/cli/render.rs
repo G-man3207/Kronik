@@ -677,6 +677,9 @@ pub fn grant(r: &GrantResponse, rerun: &str) -> String {
             "",
         );
     }
+    if g.capability.starts_with("secret:") {
+        field(&mut out, "In forks", &[g.in_forks.clone()], "");
+    }
     let cmds = if r.dry_run {
         vec![rerun.to_owned()]
     } else {
@@ -747,13 +750,22 @@ pub fn grants(r: &GrantsResponse) -> String {
                     (None, false) => "-".to_owned(),
                 },
                 g.rate.clone().unwrap_or_else(|| "-".to_owned()),
+                g.in_forks.clone(),
                 g.epoch.to_string(),
                 clip(&g.reason, 40),
             ]
         })
         .collect();
     let mut out = table(
-        &["KIND", "CAPABILITY", "DELIVERY", "RATE", "EPOCH", "REASON"],
+        &[
+            "KIND",
+            "CAPABILITY",
+            "DELIVERY",
+            "RATE",
+            "IN-FORKS",
+            "EPOCH",
+            "REASON",
+        ],
         rows,
     );
     out.push_str(&next(&[format!(

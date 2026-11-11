@@ -249,6 +249,11 @@ impl Record {
                 if let Some(delivery) = m.delivery {
                     enum_value::<pb::Delivery>(delivery, "Grant.delivery")?;
                 }
+                // Empty is an older record (compute). A new grant writes
+                // "compute" or "recorded" (ADR 0112).
+                if !matches!(m.in_forks.as_str(), "" | "compute" | "recorded") {
+                    return Err(invalid("Grant.in_forks", "compute or recorded required"));
+                }
                 Ok(())
             }
             Record::Limits(_) | Record::Policy(_) => Ok(()),

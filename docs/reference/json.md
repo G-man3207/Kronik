@@ -3879,6 +3879,10 @@ against both.
       "minimum": 0,
       "type": "integer"
     },
+    "in_forks": {
+      "description": "`compute` or `recorded`. What a fork does with an unmatched crypto\ncall of this secret (ADR 0112).",
+      "type": "string"
+    },
     "kind": {
       "type": "string"
     },
@@ -3904,7 +3908,8 @@ against both.
     "kind",
     "capability",
     "epoch",
-    "lsn"
+    "lsn",
+    "in_forks"
   ],
   "type": "object"
 }

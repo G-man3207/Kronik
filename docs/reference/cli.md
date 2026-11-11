@@ -68,11 +68,13 @@ is refused before anything is sent. Prefer `$KRONIK_TOKEN` (or a CI secret
 in the environment) to `--token`.
 
 Every mutation (`deploy`, `send`, `dead-letters resend`, `grant`, `revoke`,
-`limits set`, `secret set`, `secret delete`, `fork create`, `fork deploy`,
-`fork delete`, `propose`, `approve`, `promote`, `rollback`, `policy set`,
-`foreign add`, `foreign remove`, `privacy mode`, `privacy erase`,
-`privacy reseal`, `keys wrap`, `keys rewrap`,
-`token create`, `token revoke`, `snapshot create`, `fleet enroll`, `fleet revoke`,
+`limits set`, `secret set`, `secret delete`, `secret link`, `secret unlink`,
+`secret refresh`, `fork create`, `fork deploy`, `fork delete`, `propose`,
+`approve`, `promote`, `rollback`, `watch`, `watches stop`, `policy set`,
+`preview create`, `preview delete`, `foreign add`, `foreign remove`,
+`stubs set`, `privacy mode`, `privacy erase`, `privacy reseal`, `keys wrap`,
+`keys rewrap`, `token create`, `token revoke`, `snapshot create`,
+`export rewind`, `fleet enroll`, `fleet revoke`,
 `events webhooks replay`) requires `--reason`,
 which the history records with the change, and supports `--dry-run`, which
 checks the request and writes nothing (I12). `replay` writes only in its
@@ -184,6 +186,7 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_gateway_requests_total` | counter | HTTP requests answered by the gateway, by status code. |
 | `kronik_gateway_request_duration_seconds` | histogram | Time to answer an HTTP request at the gateway, by status code. |
 | `kronik_replay_runs_total` | counter | Replays run for forks and proposals, by mode. |
+| `kronik_fork_crypto_computations_total` | counter | Unmatched crypto effects a fork computed on the host, by algorithm. The key is not a label. |
 | `kronik_guard_triggered_total` | counter | Guards of `kronik watch` that fired, by action and outcome. |
 | `kronik_export_records_total` | counter | Log records an export stream delivered (or skipped), by stream. |
 | `kronik_export_lag_records` | gauge | Committed records an export stream has not delivered yet, by stream. |
@@ -774,7 +777,7 @@ Next     kronik explain TURN_FAILED
 
 ## kronik grant
 
-`kronik grant <KIND> <CAPABILITY> [--delivery replay-safe|idempotency-keyed|unsafe] [--rate <N/s|N/m|N/h>] --reason <REASON> [--dry-run]`
+`kronik grant <KIND> <CAPABILITY> [--delivery replay-safe|idempotency-keyed|unsafe] [--rate <N/s|N/m|N/h>] [--in-forks compute|recorded] --reason <REASON> [--dry-run]`
 
 Grants an actor type a capability (M2). Every external effect is denied
 until it is granted (I6). Capabilities are `http:<host>`, `http:*.<domain>`
@@ -783,6 +786,16 @@ itself), `secret:<name>` (use the secret in a header template or in
 `crypto`) and `secret-reveal:<name>` (read its value). Grants apply per
 actor type, not per code hash, and take effect at a new configuration
 epoch.
+
+`--in-forks` chooses what a fork does with an unmatched
+`crypto.hmac-sha256` or `crypto.sign-ed25519` of a `secret:` grant
+([ADR 0112](../adr/0112-fork-crypto-grant-mode.md)). `recorded`, the
+default for a new grant, returns a matching recording or denies the call.
+`compute` signs on the host; the key does not enter the guest, the log, or
+the diff. A grant written before the field existed stays `compute` until it
+is granted again. Re-granting without `--in-forks compute` writes
+`recorded`. A name linked to an external backend is not computed in a fork
+either way.
 
 For `http:` capabilities, `--delivery` says how the target tolerates
 retries after a crash: `replay-safe` and `idempotency-keyed` requests are
@@ -804,6 +817,11 @@ Granted http:api.example.com to counter at lsn 3, epoch 2
   Rate          5/s
 Next     kronik grants list --kind counter
          kronik revoke counter http:api.example.com --reason "..."
+
+$ kronik grant counter secret:signing-key --in-forks compute --reason "forks may sign"
+Granted secret:signing-key to counter at lsn 5, epoch 4
+  In forks      compute
+Next     kronik grants list --kind counter
 ```
 
 ## kronik revoke
@@ -824,12 +842,12 @@ Next     kronik grants list --kind counter
 `kronik grants list [--kind <KIND>]`
 
 Lists the grants in force. `DELIVERY` is `by method` for an `http:` grant
-without a delivery class.
+without a delivery class. `IN-FORKS` is `compute` or `recorded`.
 
 ```text
 $ kronik grants list
-KIND     CAPABILITY            DELIVERY           RATE  EPOCH  REASON
-counter  http:api.example.com  idempotency-keyed  5/s   2      rates API
+KIND     CAPABILITY            DELIVERY           RATE  IN-FORKS  EPOCH  REASON
+counter  http:api.example.com  idempotency-keyed  5/s   recorded  2      rates API
 Next     kronik revoke counter http:api.example.com --reason "..."
 ```
 
@@ -964,9 +982,11 @@ kronik --socket /owned/fixture/api.sock secret backends
 
 `kronik secret link <NAME> --backend <ID> --ref <REFERENCE> --reason <REASON> [--dry-run]`
 
-Preview an admin binding to an explicitly configured backend and an allowed
-reference. This does not set the remote provider's value or establish a
-committed link. Use only the fixture's allowed dummy environment reference.
+Binds a name to an explicitly configured backend and an allowed reference.
+A run without `--dry-run` commits a `SecretLink` record. `--dry-run` only
+previews that binding and does not commit it. The command does not set the
+remote provider's value. Use only the fixture's allowed dummy environment
+reference.
 
 ```sh
 kronik --socket /owned/fixture/api.sock secret link demo-api-key \
@@ -1029,14 +1049,16 @@ kronik keys status
 
 ## kronik keys wrap
 
-`kronik keys wrap --source <openbao|aws|gcp|azure> [--config <PATH>] [--data-dir <DIR>] [--master-key-file <PATH>] --reason <REASON> [--dry-run] [--remove-file]`
+`kronik keys wrap --source <openbao|aws|gcp|azure|pkcs11> [--config <PATH>] [--data-dir <DIR>] [--master-key-file <PATH>] --reason <REASON> [--dry-run] [--remove-file]`
 
-Offline migration of an existing file or environment master seed into a KMS.
-Stop the daemon first. The target configuration must already select the
-same `source` as `--source` and contain that provider's settings; this
-command does not rewrite the configuration. See
+Offline migration of an existing file or environment master seed.
+`--source` is `openbao|aws|gcp|azure|pkcs11`. `openbao`, `aws`, `gcp` and
+`azure` are cloud KMS providers; `pkcs11` is the PKCS#11 helper, not a
+cloud KMS. Stop the daemon first. The target configuration must already
+select the same `source` as `--source` and contain that source's settings;
+this command does not rewrite the configuration. See
 [master-key configuration](../guides/operations.md#the-master-key) for the
-four provider tables and bootstrap credentials.
+four cloud provider tables and bootstrap credentials.
 
 `--data-dir` overrides `server.data_dir`. The old file comes from
 `--master-key-file`, else `KRONIK_MASTER_KEY_FILE`, else
@@ -1113,7 +1135,9 @@ credentials. Normal startup, wrap, rewrap and restore require the enrolled
 probe. A helper, module, token or credential failure is
 [`KEY_HELPER_FAILED`](../errors.md#key_helper_failed). After a verified
 enrollment, the probe's own output names the next step:
-`kronik keys wrap --source pkcs11`. See the installation guide's
+`kronik keys wrap --source pkcs11`. `--source` accepts
+`openbao|aws|gcp|azure|pkcs11`, the same set as the wrap synopsis.
+`pkcs11` is the PKCS#11 helper, not a cloud KMS. See the installation guide's
 [PKCS#11 helper](../guides/install.md#optional-gnu-pkcs11-helper) section and
 the operations guide's master-key tables.
 

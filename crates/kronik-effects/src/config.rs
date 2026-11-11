@@ -169,6 +169,51 @@ pub fn http_match(pattern: &str, host: &str) -> Option<usize> {
     }
 }
 
+/// What a fork does with an unmatched `crypto.hmac-sha256` or
+/// `crypto.sign-ed25519` of a granted secret (ADR 0112).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InForks {
+    /// Sign on the host. The wire field is absent on grants written before
+    /// the mode existed, and that absence means this.
+    #[default]
+    Compute,
+    /// Return a matching recording, or deny the call. Do not compute.
+    Recorded,
+}
+
+impl InForks {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InForks::Compute => "compute",
+            InForks::Recorded => "recorded",
+        }
+    }
+
+    /// A new grant's wire value. Never empty: empty is reserved for records
+    /// written before the field existed.
+    pub fn to_record(self) -> String {
+        self.as_str().to_owned()
+    }
+
+    /// `compute` or `recorded`. Anything else is not a mode.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "compute" => Some(InForks::Compute),
+            "recorded" => Some(InForks::Recorded),
+            _ => None,
+        }
+    }
+
+    /// The mode of a stored grant. An empty field is an older record and
+    /// stays compute.
+    pub fn from_record(text: &str) -> Option<Self> {
+        match text {
+            "" => Some(InForks::Compute),
+            other => Self::parse(other),
+        }
+    }
+}
+
 /// One active grant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
@@ -178,6 +223,8 @@ pub struct Grant {
     pub rate: Option<Rate>,
     pub epoch: u64,
     pub reason: String,
+    /// Unmatched fork crypto of this secret. Empty wire values are compute.
+    pub in_forks: InForks,
 }
 
 /// Per-kind limits; the defaults are the brief's.
@@ -271,6 +318,11 @@ impl Config {
                                 .as_ref()
                                 .map(|a| a.reason.clone())
                                 .unwrap_or_default(),
+                            // Empty is compute (an older record). An unknown value
+                            // cannot pass Record::validate; if one is applied
+                            // in memory, do not sign with it.
+                            in_forks: InForks::from_record(&g.in_forks)
+                                .unwrap_or(InForks::Recorded),
                         },
                     );
                 }
@@ -472,6 +524,7 @@ mod tests {
             delivery: delivery.map(|d| d as i32),
             rate: None,
             audit: None,
+            in_forks: String::new(),
         })
     }
 
@@ -678,5 +731,45 @@ mod secret_link_tests {
         assert!(linked(4, "service-token"), "linked again");
         assert!(!linked(4, "other-token"), "never linked");
         assert!(history.at(3).secret_link("service-token").is_some());
+    }
+
+    /// An older grant has no `in_forks` field. Applying it keeps compute.
+    /// A later grant that writes `recorded` replaces that mode.
+    #[test]
+    fn an_older_grant_without_in_forks_stays_compute() {
+        let mut config = Config::default();
+        config.apply(&Record::Grant(pb::Grant {
+            epoch: 1,
+            op: pb::GrantOp::Grant as i32,
+            kind: "counter".into(),
+            capability: "secret:signing-key".into(),
+            ..Default::default()
+        }));
+        assert_eq!(
+            config
+                .grant("counter", "secret:signing-key")
+                .unwrap()
+                .in_forks,
+            InForks::Compute
+        );
+        config.apply(&Record::Grant(pb::Grant {
+            epoch: 2,
+            op: pb::GrantOp::Grant as i32,
+            kind: "counter".into(),
+            capability: "secret:signing-key".into(),
+            in_forks: "recorded".into(),
+            ..Default::default()
+        }));
+        assert_eq!(
+            config
+                .grant("counter", "secret:signing-key")
+                .unwrap()
+                .in_forks,
+            InForks::Recorded
+        );
+        assert_eq!(InForks::parse("compute"), Some(InForks::Compute));
+        assert_eq!(InForks::parse("recorded"), Some(InForks::Recorded));
+        assert_eq!(InForks::parse("sandbox"), None);
+        assert_eq!(InForks::from_record(""), Some(InForks::Compute));
     }
 }

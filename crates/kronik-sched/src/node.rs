@@ -3729,6 +3729,7 @@ impl Node {
         capability: &str,
         delivery: Option<Delivery>,
         rate: Option<Rate>,
+        in_forks: kronik_effects::InForks,
         audit: pb::Audit,
         dry_run: bool,
         authority: AuthLease,
@@ -3771,6 +3772,8 @@ impl Node {
             delivery: delivery.map(Delivery::to_pb),
             rate: rate.map(|r| r.to_pb()),
             audit: Some(audit),
+            // Explicit: an empty field is an older record and means compute.
+            in_forks: in_forks.to_record(),
         });
         let lsn = self
             .commit_config_authorized(guard, epoch, record, authority)
@@ -3841,6 +3844,7 @@ impl Node {
             delivery: None,
             rate: None,
             audit: Some(audit),
+            in_forks: String::new(),
         });
         let lsn = self
             .commit_config_authorized(guard, epoch, record, authority)
