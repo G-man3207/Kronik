@@ -250,12 +250,9 @@ fn state_note(plan: &kronik_sched::snapshots::StatePlan) -> Option<String> {
             manifest.lsn
         ));
     }
-    if plan.unread > 0 {
-        parts.push(format!(
-            "note: {} actor database(s) are held by a running daemon and were not read",
-            plan.unread
-        ));
-    }
+    // A database that could not be read is an error from `plan_state`, not a
+    // note on a passing check: ignoring it would report a pass the start may
+    // refuse.
     (!parts.is_empty()).then(|| parts.join("\n"))
 }
 

@@ -30,6 +30,9 @@ engine-compatibility exemption.
    by installing a snapshot, and exits 1 with `STORAGE_CORRUPT` and the start's
    own message when it cannot ([A start that stops at the log's
    start](../guides/operations.md#a-start-that-stops-at-the-logs-start)).
+   An actor database the old daemon holds is read without taking that lock.
+   If it cannot be read, the check exits 1 with `STORAGE_CORRUPT` rather than
+   treating the database as current.
 3. If `ENGINE_UPGRADE_DIVERGED`, `STORAGE_CORRUPT`, missing keys or another
    prerequisite is reported, keep the current binary. Read the saved
    report/diff. Never edit historical engine strings, suppress divergence, or

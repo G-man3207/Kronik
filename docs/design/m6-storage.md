@@ -87,8 +87,13 @@ files commit independently. An actor database's applied LSN is where its
 needed from), not "complete through n": an actor that has not changed for
 longer than `history` says an LSN that retention has long deleted. So the
 question above is asked of the lowest of them (`plan_state`, which
-`prepare_state`, the start, and `kronik upgrade check` all call), and an
-installed snapshot carries its cut to every database it installs: a
+`prepare_state`, the start, and `kronik upgrade check` all call). The check
+may run beside the old daemon, which holds actor databases exclusively. It
+reads those applied LSNs from a private copy of the file and its WAL, without
+taking the lock, waiting, or writing the data directory. A database it still
+cannot read is not treated as current: the check fails rather than reporting
+a pass the start would refuse. An installed snapshot carries its cut
+to every database it installs: a
 snapshot is a consistent cut, complete through its LSN for each of them
 (`install` stamps the copies; the snapshot's own files are untouched, its
 manifest hashes them). Compaction does the same before it deletes (§5).
@@ -216,7 +221,10 @@ only for the secrets to be usable; restore itself does not decrypt.
 ## 7. Upgrades (`kronik upgrade check`)
 
 The new binary checks itself against the data directory before it replaces
-the old one (the old daemon keeps running; the check only reads):
+the old one (the old daemon keeps running; the check does not write the
+data directory). An actor database the daemon holds is read from a private
+copy of that file and its WAL, which is deleted after the applied LSN is
+read:
 
 1. `kronik upgrade check --window 6h [--data-dir DIR]` opens the log,
    snapshots and code read-only, picks the fork point 6 h of logical time

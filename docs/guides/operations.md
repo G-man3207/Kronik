@@ -1389,8 +1389,10 @@ databases (`state.db` and the actor databases) must be reached by the log
 that retention kept. It prints a note when the start will repair that by
 installing a snapshot, and stops with `STORAGE_CORRUPT` and the start's own
 message when it cannot ([A start that stops at the log's
-start](#a-start-that-stops-at-the-logs-start)). Run it before every restart
-after an upgrade.
+start](#a-start-that-stops-at-the-logs-start)). An actor database a running
+daemon holds is read from a private temporary copy of that file and its WAL,
+without taking the lock; the copy is deleted after the read. If it cannot be
+read, the check does not pass. Run it before every restart after an upgrade.
 
 After the restart the data is the new engine's. Going back to the old
 binary is the same procedure the other way: its own `kronik upgrade check`

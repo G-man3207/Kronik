@@ -338,8 +338,10 @@ actor's last change was, so an idle SQL actor can be behind a log that was
 compacted past it). When a snapshot repairs that, the check passes and prints
 a note on stderr, also with `--json`, that the first start installs that
 snapshot. When none does, it exits 1 with `STORAGE_CORRUPT` and the message
-`kronik serve` would stop with. Actor databases that a running daemon holds
-are not read; the note says how many.
+`kronik serve` would stop with. An actor database a running daemon holds is
+read without taking that lock or waiting for it, and counts in the same way.
+If it cannot be read, the check does not pass: it exits 1 with
+`STORAGE_CORRUPT` rather than treating the database as current.
 
 A Wasmtime patch also changes the recorded engine identity: 50.0.0 to
 50.0.1 still requires this check, with an empty behavior diff in both
