@@ -217,50 +217,23 @@ Concretely:
 Erasing a subject that has no key still records the erasure and runs the SQL
 deletion, and it works in `off` mode too (there are no keys, version 0).
 
-## 7. The open question: rows in tables without `_subject`
+## 7. Rows in tables without `_subject`
 
-ADR 0005 §6: a turn with a default subject can write to a table that has no
-`_subject` column. Its changeset is sealed under the turn's default subject,
-but the row can never be found by `DELETE … WHERE _subject = ?`. After that
-subject's erasure, the rebuild also diverges (`subjects/gap-without-column`).
-This question is open. Both options are designed here, and neither is
-implemented until a decision is made.
+Decided: option B (ADR 0005 §6). Option A, a host-side row-owner table, is
+not implemented. A turn that has a default subject may only write tables
+that have a `_subject` column. A write to a table without that column fails
+the turn with `subjects/table-without-subject` and names the table. Turns
+without a subject may still write anywhere, so configuration tables stay
+possible.
 
-**Option A, the brief as written: such rows belong to the turn's default
-subject.**
-
-- Sealing: as M1 does today, the changeset goes to the default subject.
-- Erasure can't delete the rows (they carry no subject), so they survive in
-  the live database while their changesets in the log become unreadable.
-- To keep rebuilds equal to the live database, the store would have to keep
-  a host-side row-owner table `_kronik_row_subjects (table, rowid/pk,
-  subject)`, maintained from the changesets at apply. Erasure would then
-  delete the rows it lists. This is invisible to guests, but it costs a
-  write per changed row in every turn with a subject, in `off` mode too,
-  which conflicts with "off costs nothing". The alternative, a forced
-  snapshot at erasure, was rejected in ADR 0005 (the rows would stay
-  readable).
-- Docs would say that rows in tables without `_subject` survive erasure.
-
-**Option B, ADR 0005's recommendation: a turn with a default subject may
-only write tables that have `_subject`.**
-
-- The SDK's migration helper declares `_subject TEXT DEFAULT
-  (kronik_subject())`, where the host function `kronik_subject()` (shipped
-  in M1) returns the turn's default subject, so rows carry their subject
-  explicitly.
-- A write to a table without `_subject` in a turn that has a default subject
-  fails the turn with `subjects/table-without-subject`, a clear error naming
-  the table. Turns without a subject (system work) may still write
-  anywhere, so configuration tables stay possible.
-- Erasure then finds every row, and rebuilds stay equal. There is no extra
-  cost at write time.
-- Migration: an existing table gets the column with `ALTER TABLE … ADD
-  COLUMN _subject TEXT DEFAULT (kronik_subject())`. Old rows have NULL, belong
-  to nobody, and docs explain this.
-
-Recommendation: B, for the same reasons as ADR 0005: it is correct by
-construction and costs nothing in `off` mode.
+`rows_without_subject_column` stays a no-op because new writes are refused.
+Erasure of rows that already have a `_subject` value is unchanged
+(`DELETE FROM t WHERE _subject = ?`). Existing rows written before this
+decision are not rewritten. Old rows in tables without `_subject`, or with
+a NULL `_subject`, belong to nobody and survive erasure. An existing table
+gets the column with `ALTER TABLE … ADD COLUMN _subject TEXT DEFAULT
+(kronik_subject())`; rows already in it stay NULL until rewritten by the
+application.
 
 ## 8. Reseal via compaction
 
@@ -301,6 +274,15 @@ starts a background compaction that requires the mode to be `on`:
   pseudonyms and equality checks in guest logic still hold. Without the key,
   a pseudonym can't be checked against a guessed value. Erased values become
   `[erased]`.
+- Subject-tagged SQL changesets are pseudonymized before they are applied
+  to the fork's actor database. Text and blob cell values become
+  `Pseudonyms::of(subject, bytes)`; old and new images are rewritten the
+  same way, so a later UPDATE still matches. Integer and real values,
+  including primary keys, stay so apply can find the row. The `_subject`
+  column stays the subject id, so erasure still finds the row. A snapshot
+  the fork continues is rewritten the same way before later changesets are
+  applied. Changesets with no subject are not rewritten. Erased subjects
+  stay skipped and unreadable.
 - The replay runner marks a turn that read at least one pseudonym. If such a
   turn's result differs from production, the diff calls it `pii-masked`
   instead of `diverged`.
@@ -433,8 +415,8 @@ Where the code differs from the sections above:
   (`ForkTurn::pseudonyms`) and differs from production, failing included,
   is `pii-masked` (`diff::Acc::turn_errors` and the causal grouping skip
   it): no introduced error, origin or consequence, so `no-new-errors` does
-  not deny on masking alone (an SQL turn ran on real rows: its errors
-  count). A production turn missing below such a turn is `pii-masked` too.
+  not deny on masking alone (an SQL turn's output is still concealed;
+  `turn_errors` still counts its errors). A production turn missing below such a turn is `pii-masked` too.
   Masked runs can't tell broken code from correct code, so while
   `summary.pii_masked + summary.pii_unverified > 0` (the latter: turns of
   changed code identical on pseudonyms, `Acc::pii_same`) the evaluation
@@ -585,8 +567,12 @@ Where the code differs from the sections above:
   `pii:read` (`SCOPE_MISSING`, `m3.rs` `require_fork_pii`).
 - **Forks.** The production index is revealed for the fork in place
   (`kronik-fork/src/privacy.rs`): plaintext, or pseudonyms for `--no-pii`.
-  SQL changesets are unsealed but never pseudonymized, so a `--no-pii`
-  fork's SQL state holds real rows (a v0.1 gap). So a `--no-pii` turn that
+  Subject-tagged SQL changesets are unsealed and, for `--no-pii`, have
+  their text and blob cells pseudonymized before the fork store applies
+  them (`sql::pseudonymize_changeset`); a snapshot the cursor loads is
+  rewritten the same way. Integer and real values and the `_subject`
+  column stay. Changesets with no subject are applied as recorded. So a
+  `--no-pii` turn that
   used SQL (`SqlTurn::end` returned something), called a turn that did, or
   was sent a message or timer by one is `ForkTurn::sql` (and masked): its
   record leaves the fork only through `privacy::conceal_turn` (every value
@@ -606,10 +592,11 @@ Where the code differs from the sections above:
   log and `isolated.jsonl`) with the node's sealer, so no plain value of a
   subject reaches a fork's files in `on` mode. Forks written before that
   fix keep their plain files until deleted.
-- **The open question (§7)** is one seam,
-  `kronik_store::sql::actor::rows_without_subject_column`: a no-op that
-  returns 0, documented with both options. Option B's turn-time refusal is
-  not built.
+- **Tables without `_subject` (§7)** are decided: option B. A turn with
+  a default subject that writes such a table fails with
+  `subjects/table-without-subject`. `rows_without_subject_column` stays
+  a no-op because those writes are refused. Old rows without a subject
+  still survive erasure.
 - **Tests:** `crates/kronik/tests/privacy_mode.rs` (a real `kronik serve`)
   covers tags per value from the gateway and the SDK including a mid-turn
   subject switch in `off` mode, sealing in `on` mode, `[sealed]`

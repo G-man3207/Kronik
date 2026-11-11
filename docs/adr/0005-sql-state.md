@@ -268,36 +268,26 @@ Limits:
   Otherwise the moved row's old values (one subject's data) would sit in
   the other subject's changeset.
 - **Verified** (`subjects/split`, `subjects/row-subject-wins`): one turn
-  with default subject `user:1` wrote rows for `user:2` and `user:3` plus a
-  table without `_subject`, giving three changesets, each applicable on its
-  own. An update of `user:2`'s row in a turn whose default subject is
-  `user:3` goes to `user:2`.
+  with default subject `user:1` wrote rows for `user:2` and `user:3`, each
+  in its own changeset, applicable on its own. An update of `user:2`'s row
+  in a turn whose default subject is `user:3` goes to `user:2`.
 - **Erasure** is a recorded erasure operation in the log, not a changeset,
   because a changeset's old values would be the erased data. The host runs
   `DELETE FROM t WHERE _subject = ?` on every table that has a `_subject`
   column. On rebuild, the erased subject's changesets are unreadable and
   skipped, and the erasure operation is replayed. The result equals the
-  live database (`subjects/erasure`).
-- **A gap in the brief (needs a maintainer decision before M8).** "Saknas
-  kolumnen gäller turnens standardsubjekt" decides how such changesets are
-  *sealed*, but those rows can never be *erased*: they carry no subject in
-  the database. After erasure the rebuild also diverges. A row inserted
-  under subject A and updated under subject B, with A erased, gives a
-  rebuild error `NOTFOUND on prefs Update`, while the live row survives
-  (`subjects/gap-without-column`).
-
-  Recommendation: a turn that has a default subject may only write to
-  tables that have a `_subject` column. The SDK's migration helper declares
-  `_subject TEXT DEFAULT (kronik_subject())`, where `kronik_subject()` is a
-  host function returning the turn's default subject, so rows carry the
-  default subject explicitly. Other alternatives would be a host-maintained
-  row-owner table (invisible to guests, but more machinery) or forced
-  snapshots at erasure (rejected: the rows would still be readable).
-
-  Status after M1: open. The question was raised with the maintainers; M1
-  implements the brief as written (tables without `_subject` use the turn's
-  default subject) and ships `kronik_subject()`. The question is tracked on
-  [the project status page](https://github.com/G-man3207/Kronik/wiki/Project-status).
+  live database (`subjects/erasure`). Rows that already have a `_subject`
+  value are erased that way; this decision does not change that.
+- **Tables without `_subject` (decided: option B).** A turn that has a
+  default subject may only write tables that have a `_subject` column. A
+  write to a table without that column fails the turn with
+  `subjects/table-without-subject` and names the table. Turns without a
+  subject may still write anywhere, so configuration tables stay possible.
+  `rows_without_subject_column` stays a no-op because new writes are
+  refused. Existing rows written before this decision are not rewritten.
+  Old rows in tables without `_subject`, or with a NULL `_subject`, belong
+  to nobody and survive erasure. Option A, a host-side row-owner table, is
+  not implemented.
 
 ### 7. Storage: one SQLite file per actor
 
@@ -467,7 +457,8 @@ from `[env]` in `.cargo/config.toml`, and sessions are called through
 - **M3:** needs the per-actor changeset index, production cursors and
   overlays as in 8.
 - **M6:** fuzzy snapshots and hard links for unchanged actors, as in 8.
-- **M8:** needs a maintainer decision on the `_subject` gap (6).
+- **M8:** the `_subject` gap is decided (6): option B. A turn with a
+  default subject cannot write a table that has no `_subject` column.
 - **SQLite upgrades** go through `kronik upgrade check`, plus re-running the
   spike's determinism checks: `localtime` test-control, column-name
   randomness, `OBJCONFIG_ROWID`, the authorizer action list.

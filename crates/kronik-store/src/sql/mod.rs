@@ -4,6 +4,7 @@
 
 mod actor;
 mod ffi;
+mod rewrite;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,6 +13,7 @@ pub use actor::{
     FileOpener, Limits, MemOpener, Rows, SqlActor, SqlError, SqlResult, SqliteOpener, TableRows,
     TurnOpts, TurnSql, actor_file, canonical_hash_raw,
 };
+pub use rewrite::pseudonymize_changeset;
 
 use rusqlite::types::Value;
 

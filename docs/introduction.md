@@ -69,10 +69,12 @@ What the code does today, on one node:
 - **Foreign actors (M7).** Linux programs from OCI images run in gVisor.
   `microvm` is reserved and not implemented.
 - **Privacy (M8).** Values with a subject can be sealed. `erase` deletes a
-  subject's keys and SQL rows that have a `_subject` column; rows in tables
-  without that column survive. `reseal` rewrites closed segments. A
-  `--no-pii` fork replays with pseudonyms, but its SQL rows are not
-  pseudonymized.
+  subject's keys and SQL rows that have a `_subject` value. A turn with a
+  subject cannot write a table without a `_subject` column. Old rows in
+  tables without that column, or with a NULL `_subject`, belong to nobody
+  and survive erasure. `reseal` rewrites closed segments. A
+  `--no-pii` fork replays with pseudonyms, including text and blob values
+  of subject-tagged SQL rows.
 
 There is no web interface. The CLI, the JSON API and MCP are the surface.
 

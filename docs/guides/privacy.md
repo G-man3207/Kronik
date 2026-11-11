@@ -104,11 +104,12 @@ CREATE TABLE orders (
   the row and insert it again), and a turn whose writes would move a row to
   another subject fails.
 - Erasure deletes the subject's rows from every table that has `_subject`.
-- **Rows in tables without `_subject` are not deleted by erasure.** Their
-  changesets are sealed under the turn's default subject, but the rows
-  themselves carry no subject. Give every table that holds personal data a
-  `_subject` column. How such rows should be handled is an open question
-  for the maintainers (ADR 0005 §6).
+- A turn that has a default subject may only write tables that have a
+  `_subject` column. A write to a table without that column fails the turn
+  with `subjects/table-without-subject` and names the table. A turn without
+  a subject may still write such a table. Old rows in tables without
+  `_subject`, or with a NULL `_subject`, belong to nobody and survive
+  erasure; they are not rewritten ([ADR 0005](../adr/0005-sql-state.md) §6).
 
 ## The modes
 
@@ -329,18 +330,26 @@ pseudonyms, but its diff shows these hashes. A fork's turns (`kronik trace
 <fork>:…`) are shown like production's: sealed without `pii:read`. In `on`
 mode a fork seals what it writes to disk, as the main log does.
 
-SQL rows are not pseudonymized: SQL changesets are applied to a fork's
-actor databases unsealed, so even a `--no-pii` fork's SQL state holds real
-rows (in memory, while the fork replays). A `--no-pii` fork therefore
-treats a turn that used SQL, called a turn that did, or was sent a message
-or timer by one as personal data: its values (reply, writes, messages,
-effects, outcome message) read `[sql]` in the reply to `send_to_fork`, in
-its turn and trace and in the fork's files, and its diff shows them
-redacted under the subject `[sql]`; its differences count as
-`pii-masked`. This covers what such a turn produces, not everything code
-can do with what it read: a value it writes to state and a later turn
-reads, or data it puts into names, keys or URLs, is not tracked. A
-`--no-pii` fork limits what reaches its callers; it is not a sandbox
+A `--no-pii` fork pseudonymizes text and blob cell values in subject-tagged
+SQL changesets before they are applied to the fork's actor database, using
+the same deterministic pseudonym as every other tagged value, so equal
+values stay equal. Old and new images are rewritten the same way, so a
+later UPDATE still matches the row. Integer and real values, including
+primary-key columns, are left unchanged so changeset apply can find the
+row. The `_subject` column stays the subject id, so erasure still finds
+the row. A snapshot the fork continues is rewritten the same way before
+later changesets are applied. Changesets with no subject are not
+rewritten. Erased subjects stay skipped and unreadable.
+
+A `--no-pii` fork still treats a turn that used SQL, called a turn that
+did, or was sent a message or timer by one as personal data: its values
+(reply, writes, messages, effects, outcome message) read `[sql]` in the
+reply to `send_to_fork`, in its turn and trace and in the fork's files,
+and its diff shows them redacted under the subject `[sql]`; its differences
+count as `pii-masked`. This covers what such a turn produces, not
+everything code can do with what it read: a value it writes to state and a
+later turn reads, or data it puts into names, keys or URLs, is not tracked.
+A `--no-pii` fork limits what reaches its callers; it is not a sandbox
 against code written to move rows out.
 
 ## Logs and other output
@@ -392,7 +401,9 @@ against code written to move rows out.
 - The gateway reads the JWT's claim without verifying the token (above).
 - The segment still being written is not resealed until it rolls. History
   in that segment stays plain until the next reseal.
-- Rows in SQL tables without `_subject` survive erasure.
+- Old rows in SQL tables without `_subject`, or with a NULL `_subject`,
+  belong to nobody and survive erasure. A turn with a subject can no longer
+  write a table without that column.
 - Requests recorded before path, query and route parameters became
   sealable fields hold them plain in the log; they are hidden from callers
   without `pii:read` but survive erasure and reseal. Actor keys are always

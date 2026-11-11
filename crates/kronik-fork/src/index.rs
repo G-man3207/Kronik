@@ -152,6 +152,9 @@ pub struct ProductionIndex {
     /// Opens production's sealed SQL changesets when a cursor applies them
     /// (M8); plain unless the index was revealed for a fork.
     pub sealer: std::sync::Arc<kronik_privacy::sealer::Sealer>,
+    /// Set by [`ProductionIndex::reveal`] for a `--no-pii` fork. The cursor
+    /// rewrites snapshot rows the same way revealed changesets were.
+    pub no_pii: bool,
 }
 
 impl ProductionIndex {
@@ -284,15 +287,18 @@ impl ProductionIndex {
             erased_turns: BTreeSet::new(),
             erased_effects: BTreeMap::new(),
             sealer: std::sync::Arc::new(kronik_privacy::sealer::Sealer::plain()),
+            no_pii: false,
         }
     }
 
     /// Shows the index's user data as the fork may see it (M8 §5, §9):
     /// root inputs, recorded effects and turn records are revealed in place
-    /// (plaintext, or pseudonyms for `--no-pii`); SQL changesets stay as
-    /// recorded and are opened by the cursor's store with `privacy.sealer`.
+    /// (plaintext, or pseudonyms for `--no-pii`). Subject-tagged SQL
+    /// changesets are unsealed and, for `--no-pii`, pseudonymized before
+    /// the cursor's store applies them.
     pub fn reveal(&mut self, privacy: &crate::privacy::ForkPrivacy) {
         self.sealer = privacy.sealer.clone();
+        self.no_pii = privacy.no_pii;
         for c in std::sync::Arc::make_mut(&mut self.records) {
             match &mut c.record {
                 Record::TurnRecord(t) => {
@@ -376,6 +382,7 @@ impl ProductionIndex {
             ProductionIndex::from_shared(std::sync::Arc::new(records), self.fork_lsn, to_lsn);
         index.base = self.base.clone();
         index.sealer = privacy.sealer.clone();
+        index.no_pii = privacy.no_pii;
         index.erased_turns = self.erased_turns.clone();
         index.erased_turns.extend(tail.erased_turns);
         index.erased_effects = self.erased_effects.clone();
