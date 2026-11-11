@@ -76,7 +76,7 @@ struct UpgradeCheckOutput {
     /// Set when a diverging diff was written.
     #[serde(skip_serializing_if = "Option::is_none")]
     diff_path: Option<String>,
-    /// `ENGINE_UPGRADE_DIVERGED` when the diff is not empty.
+    /// `ENGINE_UPGRADE_DIVERGED` when a verified difference remains.
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<String>,
 }

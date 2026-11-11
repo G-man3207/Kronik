@@ -1612,10 +1612,10 @@ impl Acc {
             .map(causal::encode)
             .unwrap_or_default();
         let f = &fork.record;
-        // A turn that read pseudonyms or erased data did not run on the real
-        // input: how it differs from production (failing included) is
-        // `pii-masked`/`unverifiable`, not an error of the code. SQL turns
-        // ran on real rows and count.
+        // A turn that read pseudonyms or erased data did not run on the
+        // recorded input: how it differs from production (failing included,
+        // and any SQL it wrote) is `pii-masked`/`unverifiable`, not an error
+        // of the code (issue #16, ADR 0109 points 3-4).
         match (prod, unverified_input(fork)) {
             (_, true) => {}
             (Some((lsn, p)), false) => {

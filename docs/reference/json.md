@@ -12,7 +12,7 @@ as in [openapi.json](openapi.json), the OpenAPI 3.1 description that
 `restore`, `upgrade check` and `audit verify` answer themselves. A
 failure prints the [`Error`](#error) object instead, with exit code 1,
 except `upgrade check`, which prints its report either way and exits 1
-when the replay is not empty (`code` is `ENGINE_UPGRADE_DIVERGED`), and
+when a verified difference remains (`code` is `ENGINE_UPGRADE_DIVERGED`), and
 `audit verify`, which prints its report either way and exits 1 when it
 is not `complete`. The
 schemas are JSON Schema 2020-12; `$ref`s name the definitions below.
@@ -7518,7 +7518,7 @@ against both.
       "type": "integer"
     },
     "code": {
-      "description": "`ENGINE_UPGRADE_DIVERGED` when the diff is not empty.",
+      "description": "`ENGINE_UPGRADE_DIVERGED` when a verified difference remains.",
       "type": [
         "string",
         "null"
