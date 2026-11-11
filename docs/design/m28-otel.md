@@ -963,8 +963,13 @@ OpenTelemetry-backend":**
   3. Deploy the test-actor counter. `POST /counter/a/call` with body
      `counter/b call`: counter/a calls counter/b, which calls counter/x.
      That is three actors in one root.
-  4. Read the root's trace id from `kronik --json turn <id>` (the causal
-     root).
+  4. Read the root's trace id (`causal_key.root`) by requesting
+     `GET /v1/turns/<id>` on the daemon's API Unix socket with
+     `curl -sf --unix-socket <socket> "http://kronik/v1/turns/<id>"`,
+     where `<id>` is that call's turn id (gateway response header
+     `kronik-turn-id`, `main:<lsn>`) and `<socket>` is that daemon's API
+     socket (`docs/reference/cli.md`: `--socket` / `kronik serve
+     --api-socket`, default `/run/kronik/api.sock`).
   5. Wait for `kronik export status` to show the trace cursor past the
      turn's LSN.
   6. Poll `GET <query>/api/traces/<trace id>` (the UI's model: references
