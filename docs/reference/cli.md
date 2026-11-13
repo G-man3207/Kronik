@@ -199,8 +199,9 @@ $ curl -s http://127.0.0.1:9464/healthz
 sets a host up, as root (M6, M21). By default it installs the root service of
 v0.1 to v0.4: it writes the configuration file, creates the `kronik` group, the
 data directory (mode 0700) and the master key (mode 0600), and installs and
-starts `kronik.service`, the unit of v0.4.0 unchanged (a host that v0.4.0 set
-up is left as it is). `--root` names this service explicitly. `--rootless` installs the
+starts `kronik.service`, the unit of v0.4.1 unchanged (a host that v0.4.1 set
+up is left as it is; v0.4.0's unit differs in one comment line, which a rerun
+rewrites). `--root` names this service explicitly. `--rootless` installs the
 nonroot service instead (M21, [ADR 0062](../adr/0062-non-root-systemd-units.md)):
 it writes the configuration file, creates the `kronik` group and user with their
 subordinate id ranges, the data directory (mode 0700, owned by `kronik`) and the

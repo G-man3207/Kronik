@@ -1703,8 +1703,9 @@ mod tests {
         );
     }
 
-    /// `git show v0.4.0:deploy/systemd/kronik.service | sha256sum`
-    const V040_UNIT_SHA256: &str =
+    /// `git show v0.4.1:deploy/systemd/kronik.service | sha256sum`. v0.4.0's
+    /// unit is the same but for one comment line.
+    const V041_UNIT_SHA256: &str =
         "4e846315f2850cee90a68e10ebd0a3bbf96f5d8158f2bfa02074261284af8c6c";
 
     fn host(units: &std::path::Path, selected_key: Option<std::path::PathBuf>) -> super::InitHost {
@@ -1732,16 +1733,16 @@ mod tests {
         }
     }
 
-    /// The root service's unit is the one of v0.4.0 and nothing else: no
+    /// The root service's unit is the one of v0.4.1 and nothing else: no
     /// delegated cgroup (it would move where an existing installation's
     /// sandboxes get theirs), no key credential, no placeholder but the
     /// binary's path.
     #[test]
-    fn the_root_template_is_the_v040_unit_byte_for_byte() {
+    fn the_root_template_is_the_v041_unit_byte_for_byte() {
         use sha2::Digest as _;
         let digest = sha2::Sha256::digest(super::ROOT_UNIT.as_bytes());
         let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(hex, V040_UNIT_SHA256);
+        assert_eq!(hex, V041_UNIT_SHA256);
         for absent in ["Delegate", "LoadCredential", "@CONFIG@", "@KEY_"] {
             assert!(!super::ROOT_UNIT.contains(absent), "{absent}");
         }
@@ -1754,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn init_root_changes_nothing_on_a_host_that_v040_set_up() {
+    fn init_root_changes_nothing_on_a_host_that_v041_set_up() {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
         let units = dir.path().join("units");
@@ -1766,7 +1767,7 @@ mod tests {
         )
         .unwrap();
         let host = host(&units, None);
-        // What v0.4.0's `serve --init` wrote: its template with the binary's path.
+        // What v0.4.1's `serve --init` wrote: its template with the binary's path.
         let written = ROOT_UNIT.replace("@KRONIK@", &host.exe.to_string_lossy());
         std::fs::write(host.unit(), &written).unwrap();
         let (_, steps) = plan(&root_args(), &config, &host).unwrap();

@@ -47,9 +47,9 @@ sets up a host in six steps:
    the daemon as a credential.
 4. It creates the system group `kronik`.
 5. It installs `/etc/systemd/system/kronik.service`, whose `ExecStart`
-   points at the binary you ran and which is otherwise the unit of v0.4.0,
-   byte for byte: running `--init` again on a host that v0.4.0 set up changes
-   nothing.
+   points at the binary you ran and which is otherwise the unit of v0.4.1,
+   byte for byte: running `--init` again on a host that v0.4.1 set up changes
+   nothing (v0.4.0's unit differs in one comment line, which it rewrites).
 6. It runs `systemctl daemon-reload` and `systemctl enable --now
    kronik.service`, waits for the service to answer, and runs `kronik doctor`
    against it (see [what the install proves](#what-the-install-proves)).
