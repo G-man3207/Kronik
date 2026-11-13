@@ -196,7 +196,9 @@ pub(super) async fn read_segment(
         ) else {
             break;
         };
-        if len > MAX_RECORD || ENVELOPE_LEN as u64 + len as u64 > file_len - off {
+        // Only what the file holds: a body over MAX_RECORD that is complete
+        // and passes its CRC reads (a release before 0.5 could write one).
+        if ENVELOPE_LEN as u64 + len as u64 > file_len - off {
             break;
         }
         let kind = envelope[16];

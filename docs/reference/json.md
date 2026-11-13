@@ -2948,6 +2948,7 @@ against both.
             "TOKEN_NOT_FOUND",
             "TURN_FAILED",
             "TURN_NOT_FOUND",
+            "TURN_TOO_LARGE",
             "UNAUTHENTICATED",
             "UNAVAILABLE",
             "VERIFY_REQUIRED",

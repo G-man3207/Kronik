@@ -734,6 +734,8 @@ impl Proposals {
             ReplaySetup::new(id.to_owned(), index, kinds, config, secrets, authority)
         };
         setup.preview = preview;
+        // Production's turn record budget, so the replay decides as it did.
+        setup.record_limit = self.node.turn_record_limit();
         setup.simulators = Arc::new(crate::simulators::Simulators::new(
             &setup.index,
             &options.simulator_overrides,

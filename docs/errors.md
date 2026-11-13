@@ -95,6 +95,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`TOKEN_NOT_FOUND`](#token_not_found) | 404 | M5 | No API token with that name |
 | [`TURN_FAILED`](#turn_failed) | 500 | M1 | The turn failed |
 | [`TURN_NOT_FOUND`](#turn_not_found) | 404 | M1 | No turn with that id |
+| [`TURN_TOO_LARGE`](#turn_too_large) | 500 | M1 | The turn's record would not fit in one log record |
 | [`UNAUTHENTICATED`](#unauthenticated) | 401 | M5 | No valid token |
 | [`UNAVAILABLE`](#unavailable) | 503 | M1 | The daemon is not accepting requests |
 | [`VERIFY_REQUIRED`](#verify_required) | 409 | M1 | The actor type has history; verify the change first |
@@ -1006,7 +1007,7 @@ HTTP status 500, milestone M1. The log or state on disk is corrupt.
 
 Default hint: Stop the daemon and keep the data directory; do not delete log segments.
 
-Kronik found data on disk that it cannot trust, such as a log record with a bad checksum in the middle of a segment, or a record with the enum value 0 or an unknown enum value. Kronik never applies such a record or reads it as a default value, and a corrupt record in the middle of a segment stops the startup. A torn last record after a crash is not corruption: it is truncated at startup.
+Kronik found data on disk that it cannot trust, such as a log record with a bad checksum in the middle of a segment, or a record with the enum value 0 or an unknown enum value. Kronik never applies such a record or reads it as a default value, and a corrupt record in the middle of a segment stops the startup. A torn last record after a crash is not corruption: it is truncated at startup. A record that `state.db` has already applied was written and acknowledged before, so it is never truncated: if it is damaged, the start stops with this code and changes nothing.
 
 Typical causes: disk or file system errors, or files in the data directory that something other than Kronik changed.
 
@@ -1016,7 +1017,9 @@ To fix it, stop the daemon and keep the data directory as it is; do not delete o
 
 The message "state is at lsn N, but the log starts at M (compacted)" is a different case and does not mean corruption: an actor database that has not changed for longer than `[retention] history` is behind the log that retention kept. Releases up to v0.4.0 can stop at the start for this; the fix raises those databases before it deletes log, and repairs such a directory at the next start from the newest snapshot. `kronik upgrade check` reports it before the restart, including for an actor database a running daemon holds: that applied LSN is read without taking the daemon's lock. If the database cannot be read, the check does not pass. See "A start that stops at the log's start" in the operations guide.
 
-See also: [`segment`](concepts/glossary.md#segment), [`snapshot`](concepts/glossary.md#snapshot).
+The message "state.db has applied lsn N, but the log ends at M" means the log lost records that were acknowledged. Releases up to v0.4.1 could cause it themselves: a turn could write a record over 128 MiB, which their start then cut off as if it were a torn write. Do not delete segments; restore from a shipped copy taken before the crash into a new data directory.
+
+See also: [`segment`](concepts/glossary.md#segment), [`snapshot`](concepts/glossary.md#snapshot), [`TURN_TOO_LARGE`](#turn_too_large).
 
 ## SUBJECT_ERASED
 
@@ -1077,6 +1080,24 @@ To fix it, take the turn id from the actor's history, from a dead letter or from
     kronik history billing/acme
 
 See also: [`turn-id`](concepts/glossary.md#turn-id), [`lsn`](concepts/glossary.md#lsn).
+
+## TURN_TOO_LARGE
+
+HTTP status 500, milestone M1. The turn's record would not fit in one log record.
+
+Default hint: Split the work over several turns, or fetch and write less in one turn; see `kronik history <kind/key>`.
+
+Everything a turn records must fit in one log record of at most 128 MiB: its input, the request and result of every external effect and `call`, its state writes, messages, timers, SQL changes and schema changes, compensations and its output. This turn would have needed more, so it failed instead of writing a record that later reads could not accept. Nothing it buffered was committed (state writes, SQL changes, messages, timers), compensation messages for successful calls are delivered, and external effects that already happened stand and are recorded. A failed message or timer is in dead letters. This code is the error code of the failed turn in `history` and in dead letters; an HTTP client gets `TURN_FAILED`, as for `FUEL_EXHAUSTED`. The limit is the same on every node, so the same input fails the same way again.
+
+The turn fails at the effect that no longer fits, before that effect happens, or when it ends and its state writes, messages, SQL changes and output do not fit. An HTTP response that is larger than what is left of the turn's record is cut off like one over the actor type's `effect_response_bytes`: the guest gets `too-large` and may go on.
+
+Typical causes: many large HTTP responses in one turn, a loop that writes many large state values or sends many large messages, or one SQL transaction that changes a great many rows.
+
+To fix it, split the work over several turns, for example one message per page of a large download, and keep large data out of a single turn:
+
+    kronik history billing/acme
+
+See also: [`turn`](concepts/glossary.md#turn), [`dead-letters`](concepts/glossary.md#dead-letters), [`FUEL_EXHAUSTED`](#fuel_exhausted), [`PAYLOAD_TOO_LARGE`](#payload_too_large).
 
 ## UNAUTHENTICATED
 

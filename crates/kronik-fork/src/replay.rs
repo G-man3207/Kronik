@@ -103,6 +103,9 @@ pub struct ReplaySetup {
     /// The fork's copies of `fork_mode = "sandbox"` foreign actors (M14,
     /// ADR 0019), used by continuous replay only.
     pub copies: Option<ForkCopies>,
+    /// The budget of one turn's record (`kronik_sched::record_budget`):
+    /// production's, so a replay makes the decisions production made.
+    pub record_limit: usize,
     dispatch: ReplayDispatch,
 }
 
@@ -188,6 +191,7 @@ impl ReplaySetup {
             progress: None,
             rebase: false,
             preview: false,
+            record_limit: kronik_sched::record_budget::turn_limit(kronik_log::MAX_RECORD as usize),
             dispatch,
         }
     }
@@ -879,6 +883,23 @@ impl Runner {
             .and_then(|lsn| self.setup.index.erased_effects.get(&lsn))
             .cloned()
             .unwrap_or_default();
+        // The same record budget as production, started from what the
+        // record holds before any effect, so a replay makes the same
+        // decisions (kronik_sched::record_budget).
+        let input_cost = kronik_sched::record_budget::input_cost(&mut p.input.clone());
+        let record_limit = self.setup.record_limit;
+        let budget = kronik_sched::record_budget::Budget::new(
+            record_limit,
+            kronik_sched::record_budget::base_cost(
+                &p.actor.to_pb(),
+                &kind.hash.0,
+                &p.key,
+                time,
+                &seed,
+                input_cost,
+                epoch,
+            ),
+        );
         let gate = Arc::new(ReplayGate {
             dispatch,
             runner: self.clone(),
@@ -889,7 +910,10 @@ impl Runner {
             order: order.clone(),
             prod: prod_effects,
             call_chain,
-            state: Mutex::new(GateState::default()),
+            state: Mutex::new(GateState {
+                budget,
+                ..GateState::default()
+            }),
             erased_effects,
             input_tagged: p.subject.is_some()
                 || p.personal
@@ -937,7 +961,16 @@ impl Runner {
                     return Err(ReplayError::Prerequisite(ErrorCode::SecretUnavailable));
                 }
             };
-        if kronik_sched::scrub::output(&mut out, &matcher).is_err() {
+        // Output larger than one log record holds fails the turn with
+        // TURN_TOO_LARGE, as in production.
+        let output = kronik_sched::scrub::output(&mut out, &matcher);
+        let output_too_large = matches!(output, Err(kronik_effects::http::ScrubError::OutputLimit));
+        if output_too_large {
+            out.writes.clear();
+            out.messages.clear();
+            out.timers.clear();
+            out.outcome = kronik_sched::record_budget::too_large_outcome(record_limit);
+        } else if output.is_err() {
             let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
             return Err(ReplayError::Prerequisite(ErrorCode::SecretUnavailable));
         }
@@ -984,6 +1017,7 @@ impl Runner {
         // As in production: a turn that did not commit after an effect whose
         // outcome is unknown fails with EFFECT_OUTCOME_UNKNOWN.
         if !committed
+            && !output_too_large
             && gs
                 .records
                 .iter()
@@ -992,13 +1026,8 @@ impl Runner {
             out.outcome.kind = pb::OutcomeKind::EffectOutcomeUnknown as i32;
             out.outcome.error_code = "EFFECT_OUTCOME_UNKNOWN".into();
         }
-        let leaf = self.isolated
-            && out.messages.is_empty()
-            && out.timers.is_empty()
-            && gs.compensations.is_empty()
-            && sql_changes.is_empty()
-            && sql_schema.is_empty();
-        let record = pb::TurnRecord {
+        let compensations = gs.compensations;
+        let mut record = pb::TurnRecord {
             execution_id: String::new(),
             actor: Some(p.actor.to_pb()),
             code_hash: kind.hash.0.to_vec(),
@@ -1017,7 +1046,7 @@ impl Runner {
             compensations: if committed {
                 Vec::new()
             } else {
-                gs.compensations
+                compensations.clone()
             },
             sql_schema,
             blob_refs: Vec::new(),
@@ -1027,6 +1056,27 @@ impl Runner {
             // A recomputed turn's wall time says nothing about production.
             duration_us: 0,
         };
+        // The record budget, decided as production decides it.
+        if output_too_large {
+            kronik_sched::record_budget::fail(
+                &mut record,
+                &compensations,
+                record_limit,
+                input_cost,
+            );
+        } else {
+            kronik_sched::record_budget::fit(&mut record, &compensations, record_limit, input_cost);
+        }
+        let committed = record
+            .outcome
+            .as_ref()
+            .is_some_and(|o| o.kind == pb::OutcomeKind::Committed as i32);
+        let leaf = self.isolated
+            && record.messages.is_empty()
+            && record.timers.is_empty()
+            && compensations.is_empty()
+            && record.sql_changes.is_empty()
+            && record.sql_schema.is_empty();
         // An isolated leaf's row is rolled back with the overlay, so it is
         // only buffered: if a later turn of the tree runs, it applies the
         // buffer first, because that turn may read what the leaf wrote (a
@@ -1207,6 +1257,9 @@ fn every_crypto_or_reveal_record_is_a_secret_use() {
 struct GateState {
     records: Vec<pb::EffectRecord>,
     compensations: Vec<pb::OutboundMessage>,
+    /// What the turn's record may still take, charged as in production
+    /// (`kronik_sched::record_budget`).
+    budget: kronik_sched::record_budget::Budget,
     /// The keys this turn computed with on the host, for scrubbing. Not
     /// every secret use: see [`used_a_secret`].
     secrets: Vec<(String, Vec<u8>)>,
@@ -1684,8 +1737,74 @@ impl ReplayGate {
         self.prod.iter().find(|e| e.ordinal == ordinal)
     }
 
-    fn push(&self, rec: pb::EffectRecord) {
-        lock(&self.state).records.push(rec);
+    /// Records an effect of the turn. As in production, a record that does
+    /// not fit in what is left of the turn's record traps the turn with
+    /// `TURN_TOO_LARGE` (`kronik_sched::record_budget`).
+    fn push(&self, mut rec: pb::EffectRecord) -> Result<(), GateError> {
+        let cost = kronik_sched::record_budget::effect_cost(&mut rec);
+        let mut state = lock(&self.state);
+        state.budget.take(cost, rec.ordinal, &rec.kind)?;
+        state.records.push(rec);
+        Ok(())
+    }
+
+    /// Production's response cap for a new fetch whose recorded request is
+    /// `encoded`: what is left of the turn's record after the request and a
+    /// result without a body, at most the kind's `effect_response_bytes`.
+    fn response_cap(&self, encoded: Option<&pb::Sealable>, effect_response_bytes: u64) -> u64 {
+        let len = match encoded.and_then(|s| s.value.as_ref()) {
+            Some(pb::sealable::Value::Plain(bytes)) => bytes.len(),
+            _ => 0,
+        };
+        let room = lock(&self.state).budget.clone();
+        kronik_sched::record_budget::response_room(
+            &room,
+            kronik_sched::record_budget::fetch_need(len),
+            effect_response_bytes,
+        )
+    }
+
+    /// The error of a response over `cap` ([`ReplayGate::response_cap`]),
+    /// worded as production words it.
+    fn too_large_error(cap: u64, effect_response_bytes: u64) -> String {
+        if cap < effect_response_bytes {
+            format!("the response exceeds {cap} bytes, what is left of the turn's record")
+        } else {
+            format!("the response exceeds {cap} bytes")
+        }
+    }
+
+    /// As in production: a fetch result that does not fit in what is left of
+    /// the turn's record is too large for this turn, and the guest never
+    /// sees it.
+    fn fit_fetch(
+        &self,
+        rec: &mut pb::EffectRecord,
+        out: Result<FetchOutcome, GateError>,
+    ) -> Result<FetchOutcome, GateError> {
+        if matches!(out, Ok(FetchOutcome::HostRedactionFailure) | Err(_)) {
+            return out;
+        }
+        let room = lock(&self.state).budget.clone();
+        if room.fits(kronik_sched::record_budget::effect_cost(rec)) {
+            return out;
+        }
+        rec.response = None;
+        rec.status = pb::EffectStatus::TooLarge as i32;
+        rec.error = "the response does not fit in what is left of the turn's record".into();
+        Ok(FetchOutcome::TooLarge)
+    }
+
+    /// Production's admission of a new effect: its `need` bytes must fit in
+    /// what is left of the turn's record, or the turn traps with
+    /// `TURN_TOO_LARGE` before the effect happens.
+    fn admit(&self, ordinal: u32, kind: &str, need: usize) -> Result<(), GateError> {
+        let state = lock(&self.state);
+        if state.budget.fits(need) {
+            Ok(())
+        } else {
+            Err(state.budget.refuse(ordinal, kind))
+        }
     }
 
     fn denied(&self, ordinal: u32, kind: &str, target: String, error: String) -> pb::EffectRecord {
@@ -1759,7 +1878,7 @@ impl ReplayGate {
             })
             .cloned()
         {
-            self.push(record);
+            self.push(record)?;
             return Err(GateError::HostRedactionFailure);
         }
         // The recorded request was erased: its plaintext is gone, so no
@@ -1773,7 +1892,7 @@ impl ReplayGate {
         {
             record.grounding = pb::Grounding::Exact as i32;
             let out = outcome_of_fetch(&record)?;
-            self.push(record);
+            self.push(record)?;
             return Ok(out);
         }
         let (matcher, prepared_scope) = self.matcher_with_scope()?;
@@ -1788,7 +1907,7 @@ impl ReplayGate {
                     "http.fetch",
                     "http:[withheld]".into(),
                     error.clone(),
-                ));
+                ))?;
                 return Ok(FetchOutcome::Denied(error));
             }
         };
@@ -1821,12 +1940,12 @@ impl ReplayGate {
             } else {
                 "http:[withheld]"
             };
-            self.push(self.denied(ordinal, kind, withheld.into(), e.clone()));
+            self.push(self.denied(ordinal, kind, withheld.into(), e.clone()))?;
             return Ok(FetchOutcome::Denied(e));
         }
         if foreign && self.config().foreign(&t.host).is_none() {
             let e = format!("FOREIGN_NOT_FOUND: no foreign actor {}", t.host);
-            self.push(self.denied(ordinal, kind, "foreign:[withheld]".into(), e.clone()));
+            self.push(self.denied(ordinal, kind, "foreign:[withheld]".into(), e.clone()))?;
             return Ok(FetchOutcome::Denied(e));
         }
         let prod = self.prod_at(ordinal).cloned();
@@ -1847,7 +1966,7 @@ impl ReplayGate {
                     let scap = format!("secret:{secret}");
                     if self.config().grant(&self.actor.kind, &scap).is_none() {
                         let e = format!("CAPABILITY_NOT_GRANTED: {scap}");
-                        self.push(self.denied(ordinal, kind, scap, e.clone()));
+                        self.push(self.denied(ordinal, kind, scap, e.clone()))?;
                         return Ok(FetchOutcome::Denied(e));
                     }
                     let recorded = prod_req.as_ref().and_then(|r| {
@@ -1872,7 +1991,7 @@ impl ReplayGate {
                         && let Err(error) = reference.resolved_version()
                     {
                         let error = error.to_string();
-                        self.push(self.denied(ordinal, kind, scap, error.clone()));
+                        self.push(self.denied(ordinal, kind, scap, error.clone()))?;
                         return Err(GateError::Prerequisite(ErrorCode::SecretUnavailable));
                     }
                     pb::http_effect_header::Value::Secret(recorded.unwrap_or(pb::SecretRef {
@@ -1929,7 +2048,7 @@ impl ReplayGate {
                         &matcher,
                     )?;
                     let outcome = outcome_of_fetch(&record);
-                    self.push(record);
+                    self.push(record)?;
                     return outcome;
                 }
                 2 => {}
@@ -1957,6 +2076,10 @@ impl ReplayGate {
             recorded_target.host
         );
         let encoded = tagged(&req.subject, request.encode_to_vec());
+        // Production admits a new fetch with room for its request and a
+        // result without a body; the same refusal keeps a replay identical.
+        let need = kronik_sched::record_budget::fetch_need(request.encoded_len());
+        self.admit(ordinal, kind, need)?;
         // A copy of the foreign actor answers in continuous replay (M14).
         if t.scheme == "foreign"
             && !self.runner.isolated
@@ -1982,7 +2105,7 @@ impl ReplayGate {
                 let mut rec = p;
                 rec.grounding = pb::Grounding::Exact as i32;
                 let out = outcome_of_fetch(&rec);
-                self.push(rec);
+                self.push(rec)?;
                 return out;
             }
             if target_of(&pr).is_some() && target_of(&pr) == target_of(&request) {
@@ -1991,7 +2114,7 @@ impl ReplayGate {
                 rec.fingerprint = fp;
                 rec.request = encoded;
                 let out = outcome_of_fetch(&rec);
-                self.push(rec);
+                self.push(rec)?;
                 return out;
             }
         }
@@ -2037,11 +2160,11 @@ impl ReplayGate {
                         .unwrap_or(usize::MAX)
                         .min(kronik_log::MAX_RECORD as usize),
                 );
-                self.push(rec);
+                self.push(rec)?;
                 return out;
             }
             let out = self.prepare_http_record(&mut rec, &matcher);
-            self.push(rec);
+            self.push(rec)?;
             return out;
         }
         // Live: an allowlisted host, a GET, no secret headers.
@@ -2083,7 +2206,7 @@ impl ReplayGate {
                 let mut rec = answer.record;
                 rec.request = encoded;
                 let out = self.prepare_http_record(&mut rec, &matcher);
-                self.push(rec);
+                self.push(rec)?;
                 return out;
             }
             if let Some(neighbor) = &neighbor
@@ -2099,7 +2222,7 @@ impl ReplayGate {
                 )? {
                     NeighborDisclosure::Decline => {}
                     NeighborDisclosure::Recorded(recorded) => {
-                        self.push(recorded.record);
+                        self.push(recorded.record)?;
                         return Ok(recorded.outcome);
                     }
                 }
@@ -2117,7 +2240,7 @@ impl ReplayGate {
                         .check()
                         .map_err(|error| GateError::Prerequisite(error.code))?;
                     if self.tainted(&req) {
-                        self.push(self.synthetic(ordinal, kind, cap, fp, encoded));
+                        self.push(self.synthetic(ordinal, kind, cap, fp, encoded))?;
                         return Ok(FetchOutcome::Denied(NO_RECORDING.into()));
                     }
                 }
@@ -2173,12 +2296,12 @@ impl ReplayGate {
                         ..Default::default()
                     };
                     let out = outcome_of_fetch(&rec);
-                    self.push(rec);
+                    self.push(rec)?;
                     return out;
                 }
             }
         }
-        self.push(self.synthetic(ordinal, kind, cap, fp, encoded));
+        self.push(self.synthetic(ordinal, kind, cap, fp, encoded))?;
         Ok(FetchOutcome::Denied(NO_RECORDING.into()))
     }
 
@@ -2203,6 +2326,7 @@ impl ReplayGate {
             .check()
             .map_err(|error| GateError::Prerequisite(error.code))?;
         let limits = self.config().limits(&self.actor.kind);
+        let cap_bytes = self.response_cap(encoded.as_ref(), limits.effect_response_bytes);
         let sealer = &self.runner.setup.privacy.sealer;
         let exact = prod.as_ref().is_some_and(|p| {
             sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &plain_fp)
@@ -2220,14 +2344,14 @@ impl ReplayGate {
             url: req.url,
             headers,
             body: req.body.into(),
-            max_response_bytes: limits.effect_response_bytes,
+            max_response_bytes: cap_bytes,
         });
         let answer = env.timeout(limits.effect_timeout, call).await;
         if let Some(p) = prod.filter(|_| exact) {
             let mut rec = p;
             rec.grounding = pb::Grounding::Exact as i32;
             let out = outcome_of_fetch(&rec);
-            self.push(rec);
+            self.push(rec)?;
             return out;
         }
         let mut rec = pb::EffectRecord {
@@ -2248,10 +2372,7 @@ impl ReplayGate {
                 pb::EffectStatus::Timeout
             }
             Ok(Err(kronik_core::env::NetError::TooLarge)) => {
-                rec.error = format!(
-                    "the response exceeds {} bytes",
-                    limits.effect_response_bytes
-                );
+                rec.error = Self::too_large_error(cap_bytes, limits.effect_response_bytes);
                 pb::EffectStatus::TooLarge
             }
             Ok(Err(kronik_core::env::NetError::Connect(e) | kronik_core::env::NetError::Io(e))) => {
@@ -2277,12 +2398,14 @@ impl ReplayGate {
                         .unwrap_or(usize::MAX)
                         .min(kronik_log::MAX_RECORD as usize),
                 );
-                self.push(rec);
+                let out = self.fit_fetch(&mut rec, out);
+                self.push(rec)?;
                 return out;
             }
         } as i32;
         let out = self.prepare_http_record(&mut rec, matcher);
-        self.push(rec);
+        let out = self.fit_fetch(&mut rec, out);
+        self.push(rec)?;
         out
     }
 
@@ -2300,6 +2423,7 @@ impl ReplayGate {
         matcher: &CompiledScrubber<'_>,
     ) -> Result<FetchOutcome, GateError> {
         let limits = self.config().limits(&self.actor.kind);
+        let cap_bytes = self.response_cap(encoded.as_ref(), limits.effect_response_bytes);
         let headers = req
             .headers
             .iter()
@@ -2324,7 +2448,7 @@ impl ReplayGate {
                 url: req.url,
                 headers,
                 body: req.body.into(),
-                max_response_bytes: limits.effect_response_bytes,
+                max_response_bytes: cap_bytes,
             },
             self.original()?.clone(),
         );
@@ -2337,10 +2461,7 @@ impl ReplayGate {
                 pb::EffectStatus::Timeout
             }
             Ok(Err(kronik_core::env::NetError::TooLarge)) => {
-                rec.error = format!(
-                    "the response exceeds {} bytes",
-                    limits.effect_response_bytes
-                );
+                rec.error = Self::too_large_error(cap_bytes, limits.effect_response_bytes);
                 pb::EffectStatus::TooLarge
             }
             Ok(Err(kronik_core::env::NetError::Connect(e) | kronik_core::env::NetError::Io(e))) => {
@@ -2366,12 +2487,14 @@ impl ReplayGate {
                         .unwrap_or(usize::MAX)
                         .min(kronik_log::MAX_RECORD as usize),
                 );
-                self.push(rec);
+                let out = self.fit_fetch(&mut rec, out);
+                self.push(rec)?;
                 return out;
             }
         } as i32;
         let out = self.prepare_http_record(&mut rec, matcher);
-        self.push(rec);
+        let out = self.fit_fetch(&mut rec, out);
+        self.push(rec)?;
         out
     }
 
@@ -2402,7 +2525,12 @@ impl ReplayGate {
                 | kronik_sched::scrub::CallRequestError::UnsafeCompensation,
             ) => {
                 let error = ErrorCode::PolicyDenied.as_str().to_owned();
-                self.push(self.denied(ordinal, "actor.call", format!("actor:{to}"), error.clone()));
+                self.push(self.denied(
+                    ordinal,
+                    "actor.call",
+                    format!("actor:{to}"),
+                    error.clone(),
+                ))?;
                 return Ok(CallOutcome::Failed(error));
             }
             Err(kronik_sched::scrub::CallRequestError::Redaction(_)) => {
@@ -2411,6 +2539,11 @@ impl ReplayGate {
         }
         let encoded = request.encode_to_vec();
         let compensate = request.compensate.take();
+        // Production admits a new call with room for its request, its
+        // compensation's copy and a result without a body.
+        let need =
+            kronik_sched::record_budget::call_need(encoded.len(), compensate.as_ref(), &to.to_pb());
+        self.admit(ordinal, "actor.call", need)?;
         let msg = request
             .msg
             .take()
@@ -2479,14 +2612,23 @@ impl ReplayGate {
             }
             (map_call_outcome(o)?, turn.id)
         };
+        // A reply larger than what is left of the turn's record is withheld,
+        // as in production.
+        let room = lock(&self.state).budget.clone();
+        let reply_bytes = kronik_sched::record_budget::response_room(
+            &room,
+            need,
+            self.config()
+                .limits(&self.actor.kind)
+                .effect_response_bytes
+                .min(u64::from(kronik_log::MAX_RECORD)),
+        );
         let out = kronik_sched::effects::prepare_call_outcome(
             &mut rec,
             outcome,
             turn_id,
             &matcher,
-            usize::try_from(self.config().limits(&self.actor.kind).effect_response_bytes)
-                .unwrap_or(usize::MAX)
-                .min(kronik_log::MAX_RECORD as usize),
+            usize::try_from(reply_bytes).unwrap_or(usize::MAX),
             None,
             None,
         );
@@ -2500,14 +2642,18 @@ impl ReplayGate {
             && let Some(c) = compensate
         {
             let key = causal::compensation(&self.key, &self.actor, ordinal, &to);
-            lock(&self.state).compensations.push(pb::OutboundMessage {
+            let mut compensation = pb::OutboundMessage {
                 to: Some(to.to_pb()),
                 msg: Some(c),
                 ordinal,
                 message_id: causal::causal_id(&key),
-            });
+            };
+            let cost = kronik_sched::record_budget::message_cost(&mut compensation);
+            let mut state = lock(&self.state);
+            state.budget.charge(cost);
+            state.compensations.push(compensation);
         }
-        self.push(rec);
+        self.push(rec)?;
         out
     }
 
@@ -2517,7 +2663,7 @@ impl ReplayGate {
         algorithm: CryptoAlgorithm,
         secret: String,
         data: Vec<u8>,
-    ) -> CryptoOutcome {
+    ) -> Result<CryptoOutcome, GateError> {
         let (kind, alg) = match algorithm {
             CryptoAlgorithm::HmacSha256 => ("crypto.hmac-sha256", "hmac-sha256"),
             CryptoAlgorithm::SignEd25519 => ("crypto.sign-ed25519", "sign-ed25519"),
@@ -2525,9 +2671,11 @@ impl ReplayGate {
         let cap = format!("secret:{secret}");
         let Some(grant) = self.config().grant(&self.actor.kind, &cap) else {
             let e = format!("CAPABILITY_NOT_GRANTED: {cap}");
-            self.push(self.denied(ordinal, kind, cap, e.clone()));
-            return CryptoOutcome::Denied(e);
+            self.push(self.denied(ordinal, kind, cap, e.clone()))?;
+            return Ok(CryptoOutcome::Denied(e));
         };
+        // Production admits a new crypto effect with room for its result.
+        self.admit(ordinal, kind, kronik_sched::record_budget::SMALL_NEED)?;
         // Copy the mode: the grant reference does not outlive the match below.
         let in_forks = grant.in_forks;
         let data_hash = blake3::hash(&data).as_bytes().to_vec();
@@ -2552,8 +2700,8 @@ impl ReplayGate {
             } else {
                 CryptoOutcome::Unsupported(rec.error.clone())
             };
-            self.push(rec);
-            return out;
+            self.push(rec)?;
+            return Ok(out);
         }
         // Unmatched. A linked name is denied. A recorded grant does not
         // compute. Compute signs on the host; the key never leaves it.
@@ -2561,8 +2709,8 @@ impl ReplayGate {
         let v = match unmatched_key(self.config(), store.map(|s| s as &dyn KeyStore), &secret) {
             UnmatchedKey::Value(v) => v,
             UnmatchedKey::Missing => {
-                self.push(self.synthetic(ordinal, kind, cap, fp, None));
-                return CryptoOutcome::Denied(NO_RECORDING.into());
+                self.push(self.synthetic(ordinal, kind, cap, fp, None))?;
+                return Ok(CryptoOutcome::Denied(NO_RECORDING.into()));
             }
             // Denied in the fork, and marked unverifiable like the other
             // effects it cannot answer: with the cause as the guest's error.
@@ -2570,16 +2718,16 @@ impl ReplayGate {
                 let mut record = self.synthetic(ordinal, kind, cap, fp, None);
                 record.error = linked_secret_denial(&secret);
                 let denied = CryptoOutcome::Denied(record.error.clone());
-                self.push(record);
-                return denied;
+                self.push(record)?;
+                return Ok(denied);
             }
         };
         // A recorded grant returns a matching recording or denies the call.
         // It does not compute, so the production key is not used.
         if in_forks == kronik_effects::InForks::Recorded {
             drop(v);
-            self.push(self.synthetic(ordinal, kind, cap, fp, None));
-            return CryptoOutcome::Denied(NO_RECORDING.into());
+            self.push(self.synthetic(ordinal, kind, cap, fp, None))?;
+            return Ok(CryptoOutcome::Denied(NO_RECORDING.into()));
         }
         tracing::info!(
             algorithm = alg,
@@ -2616,18 +2764,20 @@ impl ReplayGate {
                 CryptoOutcome::Unsupported(e)
             }
         };
-        self.push(rec);
-        out
+        self.push(rec)?;
+        Ok(out)
     }
 
-    fn reveal(&self, ordinal: u32, name: String) -> Result<String, String> {
+    fn reveal(&self, ordinal: u32, name: String) -> Result<Result<String, String>, GateError> {
         let kind = "secret.reveal";
         let cap = format!("secret-reveal:{name}");
         if self.config().grant(&self.actor.kind, &cap).is_none() {
             let e = format!("CAPABILITY_NOT_GRANTED: {cap}");
-            self.push(self.denied(ordinal, kind, cap, e.clone()));
-            return Err(e);
+            self.push(self.denied(ordinal, kind, cap, e.clone()))?;
+            return Ok(Err(e));
         }
+        // Production admits a new reveal with room for its result.
+        self.admit(ordinal, kind, kronik_sched::record_budget::SMALL_NEED)?;
         let fp = blake3::hash(format!("reveal\0{name}").as_bytes())
             .as_bytes()
             .to_vec();
@@ -2639,8 +2789,8 @@ impl ReplayGate {
             let mut rec = recorded.clone();
             rec.grounding = pb::Grounding::Exact as i32;
             let error = rec.error.clone();
-            self.push(rec);
-            return Err(error);
+            self.push(rec)?;
+            return Ok(Err(error));
         }
         // A fork never gets a secret's value (brief, effect table): reveal
         // answers the placeholder that production's records hold in place
@@ -2666,8 +2816,8 @@ impl ReplayGate {
                 kronik_effects::simulator::label::PLACEHOLDER.into()
             },
             ..Default::default()
-        });
-        Ok(format!("[secret:{name}]"))
+        })?;
+        Ok(Ok(format!("[secret:{name}]")))
     }
 }
 
@@ -2700,7 +2850,7 @@ impl EffectGate for GateHandle {
         data: Vec<u8>,
     ) -> BoxFuture<'static, Result<CryptoOutcome, GateError>> {
         let g = self.0.clone();
-        Box::pin(async move { Ok(g.crypto(ordinal, algorithm, secret, data)) })
+        Box::pin(async move { g.crypto(ordinal, algorithm, secret, data) })
     }
 
     fn reveal(
@@ -2709,7 +2859,7 @@ impl EffectGate for GateHandle {
         name: String,
     ) -> BoxFuture<'static, Result<Result<String, String>, GateError>> {
         let g = self.0.clone();
-        Box::pin(async move { Ok(g.reveal(ordinal, name)) })
+        Box::pin(async move { g.reveal(ordinal, name) })
     }
 }
 

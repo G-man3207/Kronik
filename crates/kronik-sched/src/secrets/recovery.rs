@@ -278,7 +278,14 @@ impl Node {
         };
         let time = begin.logical_time_ms;
         let key = begin.causal_key.ok_or_else(corrupt)?;
-        let record = pb::TurnRecord {
+        // The record that closes the open turn must fit in one log record
+        // (#26), or the turn would stay open for every later start.
+        let input_cost = begin
+            .input
+            .clone()
+            .as_mut()
+            .map_or(0, crate::record_budget::input_cost);
+        let mut record = pb::TurnRecord {
             execution_id: begin.execution_id,
             actor: begin.actor,
             code_hash: begin.code_hash,
@@ -293,6 +300,15 @@ impl Node {
             config_epoch: begin.config_epoch,
             ..Default::default()
         };
+        if crate::record_budget::fit_closing(&mut record, self.turn_record_limit(), input_cost)
+            != crate::record_budget::Fit::Fits
+        {
+            tracing::warn!(
+                execution_id = %record.execution_id,
+                "the record closing the turn left out its effects' payloads to fit in one log \
+                 record; the effect results in the log keep them"
+            );
+        }
         let lsn = self.commit(Record::TurnRecord(record)).await?;
         for message in compensations {
             let compensates = causal::message_id(&key, message.ordinal);

@@ -384,6 +384,30 @@ counter and 563 MiB with the TypeScript counter, which needs about 330 MiB
 for its compiled code alone. On a 4 GB machine the default leaves room;
 raise `--concurrency` only with the worst case above in mind.
 
+### Record size
+
+Everything one turn records goes into one log record of at most 128 MiB:
+its input, the request and result of every HTTP request and `call`, its
+state writes, messages, timers, SQL changes and output. This limit is fixed;
+it is not a setting, and `kronik limits set` does not raise it. A turn that
+would need more fails with `TURN_TOO_LARGE` instead (its writes and messages
+are discarded, its effects are recorded, a message input becomes a dead
+letter, and an HTTP client gets `TURN_FAILED`), and an HTTP response larger
+than what is left for the turn is `too-large` for the actor. So one turn
+writes at most about 256 MiB of log: its effect results as they happen and
+its record at the end. The per-kind limits (`effect_response_bytes`,
+`message_bytes`, `state_value_bytes`, `sql_bytes_per_actor`) apply within it.
+
+Releases up to v0.4.1 had no such check: a turn could commit a record over
+128 MiB, which their own `history` then refused (`STORAGE_CORRUPT: entry
+length ...`), and after a crash their start cut the record off as if it were
+a torn write and then stopped with "state.db has applied lsn N, but the log
+ends at M". v0.5 reads such a record again, and a start never cuts off an
+applied record. A data directory whose log a release before v0.5 already
+cut cannot get the record back from itself: restore it from a shipped copy
+(`kronik restore --from ...`) taken before the crash, or keep it as it is
+and ask for help.
+
 ## systemd
 
 `kronik serve --init` installs this unit (`deploy/systemd/kronik.service` in
@@ -1742,10 +1766,11 @@ operator meets:
 |---|---|---|
 | `BAD_REQUEST` at start | `kronik.toml` has an unknown key or a bad value | Fix the line the message names (`kronik doctor` checks the file too) |
 | `CERTIFICATE_INVALID` | The TLS certificate has expired, cannot be parsed, or its files cannot be read (`kronik doctor`'s `tls` or `dns01_hook` check) | Renew it, or fix the path and permissions of the PEM files; see [TLS](#tls) |
-| `STORAGE_CORRUPT` | The data directory is inconsistent: `state.db` is ahead of the log, or a log record can't be read. "state is at lsn N, but the log starts at M (compacted)": see [A start that stops at the log's start](#a-start-that-stops-at-the-logs-start) | Keep a copy of the data directory and look at the message. `state.db` is materialized from the log and can be rebuilt by moving it away and starting again; the log itself must not be edited |
+| `STORAGE_CORRUPT` | The data directory is inconsistent: `state.db` is ahead of the log, a log record can't be read, or an applied record in the active segment is damaged (nothing is truncated). "state is at lsn N, but the log starts at M (compacted)": see [A start that stops at the log's start](#a-start-that-stops-at-the-logs-start). "state.db has applied lsn N, but the log ends at M": see [record size](#record-size) | Keep a copy of the data directory and look at the message. `state.db` is materialized from the log and can be rebuilt by moving it away and starting again; the log itself must not be edited |
 | `UNAVAILABLE` | The node stopped after a storage failure (also `/healthz` 503) | The daemon exits and systemd restarts it; check the disk (`kronik doctor`'s `disk` check) and the journal |
 | `GATEWAY_TIMEOUT` | A turn took longer than `[gateway] timeout` | The turn still completes; clients that retry with the same `Idempotency-Key` get its response |
 | `PAYLOAD_TOO_LARGE` | A request body over 1 MiB | v0.1's limit |
+| `TURN_TOO_LARGE` | In `history` or a dead letter: a turn needed more than one log record (128 MiB) for its effects, writes, messages, SQL changes and output, so it failed instead of committing; an HTTP client got `TURN_FAILED` | Split the work over several turns; see [record size](#record-size). No limit setting raises it |
 | `REASON_REQUIRED` | A change without `--reason` | Every mutation is audited and needs a reason. `restore` and `upgrade check` write no log record, so they take no `--reason` |
 | `ENGINE_UPGRADE_DIVERGED` | `kronik upgrade check` found a behavior change | Keep the current binary. The diff is next to the report in `<data-dir>/upgrade/` |
 | `ENGINE_VERSION_MISMATCH` | A new binary started against data written by another engine, without a passing check | Run `kronik upgrade check --window 6h`, or start the recorded engine version. For data from v0.3.0 or older read [Upgrading from v0.3.0 or older](#upgrading-from-v030-or-older) first |

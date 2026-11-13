@@ -160,12 +160,22 @@ pub enum GateError {
     /// A re-run's request differs from the recorded one: the turn traps
     /// with `REPLAY_DIVERGED`.
     Diverged(String),
+    /// The turn's record has no room left for this effect (one log record
+    /// holds everything a turn records): the effect does not happen and the
+    /// turn traps with `TURN_TOO_LARGE`.
+    TurnTooLarge(String),
 }
 
 /// A typed trap cause; guest strings cannot forge this downcast.
 #[derive(Debug, thiserror::Error)]
 #[error("HOST_REDACTION_FAILURE")]
 pub(crate) struct HostRedactionFailure;
+
+/// A typed trap cause for [`GateError::TurnTooLarge`]; guest strings cannot
+/// forge this downcast.
+#[derive(Debug, thiserror::Error)]
+#[error("TURN_TOO_LARGE: {0}")]
+pub(crate) struct TurnTooLarge(pub(crate) String);
 /// The effect boundary of one turn (docs/design/m2-effects.md §3): the
 /// scheduler implements capability checks, `TurnBegin`, recording, replay of
 /// recorded results and execution. `ordinal` is the turn's operation ordinal.
@@ -461,6 +471,7 @@ impl TurnHost {
                 wasmtime::format_err!("{code}")
             }
             GateError::Diverged(msg) => wasmtime::format_err!("REPLAY_DIVERGED: {msg}"),
+            GateError::TurnTooLarge(msg) => wasmtime::Error::new(TurnTooLarge(msg)),
         }
     }
 

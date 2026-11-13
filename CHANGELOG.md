@@ -4,6 +4,23 @@ All notable changes to Kronik are recorded here. The project is pre-alpha; the
 formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
+## Unreleased
+
+- A turn could commit a log record over the 128 MiB record limit (for
+  example many large HTTP responses or state writes in one turn), which
+  `history` then refused with `STORAGE_CORRUPT: entry length ...`, and after
+  an unclean stop the start cut the acknowledged record off as a torn tail
+  and stopped with `state.db has applied lsn N, but the log ends at M`
+  (#26). Everything a turn records now counts against one budget: an effect
+  that no longer fits does not happen, a response is read only as far as
+  fits, and a turn whose record would not fit fails with the new code
+  `TURN_TOO_LARGE` (an HTTP client gets `TURN_FAILED`; a message becomes a
+  dead letter). The log refuses any record over the limit without writing
+  it. Readers accept a complete over-limit record that an earlier release
+  wrote, and a start never truncates a record `state.db` has applied: a
+  damaged one is `STORAGE_CORRUPT` with nothing cut off. No log-format
+  change.
+
 ## v0.4.1 — 2026-11-07
 
 Fixes to v0.4.0; no log-format, WIT or breaking API/CLI change.

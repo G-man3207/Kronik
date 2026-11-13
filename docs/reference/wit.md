@@ -456,6 +456,7 @@ host either records it or derives it from what it recorded (I1, I2):
 | SQL work per turn | the fuel limit, in SQLite VM steps | The turn fails with `FUEL_EXHAUSTED` |
 | Effect timeout (M2) | 10 s | `timeout` |
 | Effect response (M2) | 10 MiB | `too-large` |
+| Everything one turn records: its input, effects and their results, state writes, messages, timers, SQL changes and output | 128 MiB, one log record; not a setting | A new effect that no longer fits does not happen and the turn fails with `TURN_TOO_LARGE`; a response larger than what is left is `too-large`; a turn whose writes, messages, SQL changes or output do not fit fails with `TURN_TOO_LARGE` |
 | Table elements | 1,000,000 | `table.grow` returns -1 |
 
 Fuel, memory, message and state value size, SQL size per actor, effect

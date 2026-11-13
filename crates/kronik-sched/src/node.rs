@@ -51,6 +51,16 @@ pub(crate) fn store_err(e: StoreError) -> ApiError {
     }
 }
 
+/// A record the log refused for its size ([`LogError::is_refusal`]):
+/// nothing was written and the writer is healthy, so the node goes on.
+pub(crate) fn refused(e: &LogError) -> ApiError {
+    ApiError::new(
+        ErrorCode::PayloadTooLarge,
+        format!("{e}; nothing was written"),
+    )
+    .with_hint("One log record holds at most 128 MiB: send less data in one request.")
+}
+
 /// The answer to a resend whose dead letter the rebased state no longer has
 /// (m13-rebase §3), given when the switch drops the held resend and when a
 /// resend that was queued after that is about to run.
@@ -588,7 +598,7 @@ impl Node {
         let NodeParts {
             env,
             config,
-            log: log_cfg,
+            log: mut log_cfg,
             store,
             code,
             secrets,
@@ -642,6 +652,9 @@ impl Node {
         let space_dir = log_dir.clone();
         let group_commit_window = log_cfg.group_commit_window;
         let native_source_first_lsn = log_cfg.first_lsn;
+        // What state.db applied was fsynced and acknowledged: the log must
+        // never cut it off as a torn tail (#26).
+        log_cfg.acknowledged_through = store.applied.get();
         let (log, opened) = Log::open(&env, log_cfg, committed_tx, fatal_tx).await?;
         let writer = log.bind_native_execution(publication.clone(), lifecycle.ownership())?;
         let native_execution = crate::native_execution::NativeExecution::new(
@@ -664,7 +677,11 @@ impl Node {
         let last = opened.next_lsn - 1;
         if applied > last {
             return Err(StartError::Corrupt(format!(
-                "state.db has applied lsn {applied}, but the log ends at {last}"
+                "state.db has applied lsn {applied}, but the log ends at {last}: the log lost \
+                 records that were acknowledged (for example, a release before 0.5 cut a \
+                 record over 128 MiB off at its start as if it were a torn tail). Keep the \
+                 data directory and do not delete segments; a shipped copy of the log may \
+                 still hold them: kronik restore --from <url> into a new data directory"
             )));
         }
         let rebase = crate::rebase::RebaseCtx::new(
@@ -1754,6 +1771,32 @@ impl Node {
             }
             _ => Vec::new(),
         };
+        // One log record holds everything the turn records (#26): the
+        // budget starts with what the record holds before any effect.
+        let mut guest_input = self.guest_input(&input);
+        let input_cost = crate::record_budget::input_cost(&mut guest_input);
+        let record_limit = self.turn_record_limit();
+        let base = crate::record_budget::base_cost(
+            &actor.to_pb(),
+            &code_hash.0,
+            &key,
+            time,
+            &seed,
+            input_cost,
+            epoch,
+        );
+        if base > record_limit {
+            // Not even a failed record could hold this input. Nothing of the
+            // turn was written; a root input is refused like a body over
+            // the limit.
+            return Err(ApiError::new(
+                ErrorCode::PayloadTooLarge,
+                format!(
+                    "the input of {actor} needs {base} bytes of its turn's record, which holds \
+                     at most {record_limit}; the turn did not run"
+                ),
+            ));
+        }
         let fx = TurnFx::new(
             me,
             TurnSpec {
@@ -1765,6 +1808,7 @@ impl Node {
                 config,
                 limits: kind_limits,
                 call_chain,
+                budget: crate::record_budget::Budget::new(record_limit, base),
                 begin: recovery_begin.unwrap_or_else(|| pb::TurnBegin {
                     execution_id: execution_id.clone(),
                     actor: Some(actor.to_pb()),
@@ -1798,7 +1842,7 @@ impl Node {
             causal_key: key.clone(),
             logical_time_ms: time,
             seed,
-            input: self.guest_input(&input),
+            input: guest_input,
             limits,
             subject,
         };
@@ -1937,8 +1981,22 @@ impl Node {
             )
             .and_then(|matcher| crate::scrub::output(&mut out, &matcher))
         };
+        // Output larger than one log record can hold: the turn fails with
+        // TURN_TOO_LARGE below, and none of it (prepared or not) is kept.
+        let output_too_large = matches!(
+            disclosure,
+            Err(kronik_effects::http::ScrubError::OutputLimit)
+        );
+        if output_too_large {
+            out.writes.clear();
+            out.messages.clear();
+            out.timers.clear();
+            out.outcome = crate::record_budget::too_large_outcome(record_limit);
+        }
         let strict_preparation = disclosure.is_ok() && !closed_host_trap;
-        if let Err(error) = disclosure {
+        if let Err(error) = disclosure
+            && !output_too_large
+        {
             // end_turn captured SQL facts and rolled back its savepoint;
             // none of these local buffers has been appended or applied.
             // A NEW post-runtime failure is not a durable effect 11 or a
@@ -1955,22 +2013,11 @@ impl Node {
             None
         };
         let committed = out.committed();
-        if !committed && fxs.outcome_unknown {
+        if !committed && fxs.outcome_unknown && !output_too_large {
             out.outcome.kind = pb::OutcomeKind::EffectOutcomeUnknown as i32;
             out.outcome.error_code = ErrorCode::EffectOutcomeUnknown.as_str().into();
         }
-        let messages = if committed {
-            out.messages.clone()
-        } else {
-            Vec::new()
-        };
-        let timers = if committed {
-            out.timers.clone()
-        } else {
-            Vec::new()
-        };
-        let outcome = out.outcome.clone();
-        let record = pb::TurnRecord {
+        let mut record = pb::TurnRecord {
             execution_id,
             actor: Some(actor.to_pb()),
             code_hash: code_hash.0.to_vec(),
@@ -1979,7 +2026,7 @@ impl Node {
             logical_time_ms: time,
             random_seed: seed.to_vec(),
             input: Some(input),
-            effects: fxs.records,
+            effects: std::mem::take(&mut fxs.records),
             writes: out.writes,
             messages: out.messages,
             timers: out.timers,
@@ -2004,6 +2051,32 @@ impl Node {
                     .as_micros(),
             )
             .unwrap_or(u64::MAX),
+        };
+        // A record over the budget fails with TURN_TOO_LARGE and keeps its
+        // input, effects and compensations, which the gate kept within it.
+        let fitted = if output_too_large {
+            crate::record_budget::fail(&mut record, &fxs.compensations, record_limit, input_cost)
+        } else {
+            crate::record_budget::fit(&mut record, &fxs.compensations, record_limit, input_cost)
+        };
+        if fitted != crate::record_budget::Fit::Fits {
+            tracing::warn!(
+                actor = %actor,
+                stripped = fitted == crate::record_budget::Fit::Stripped,
+                "the turn's record did not fit in one log record: it fails with TURN_TOO_LARGE"
+            );
+        }
+        let outcome = record.outcome.clone().unwrap_or_default();
+        let committed = outcome.kind == pb::OutcomeKind::Committed as i32;
+        let messages = if committed {
+            record.messages.clone()
+        } else {
+            Vec::new()
+        };
+        let timers = if committed {
+            record.timers.clone()
+        } else {
+            Vec::new()
         };
         let authorized = !fxs.begun && matches!(&origin, OperationOrigin::Request(_));
         let completion = if fxs.begun {
@@ -2133,6 +2206,7 @@ impl Node {
         }
         let lsn = match self.log.append(record).await {
             Ok(lsn) => lsn,
+            Err(e) if e.is_refusal() => return Err(refused(&e)),
             Err(e) => {
                 self.fatal.set(e.to_string());
                 return Err(ApiError::new(ErrorCode::Unavailable, e.to_string()));
@@ -2145,6 +2219,18 @@ impl Node {
         }
     }
 
+    /// The largest record body this node's log appends: `MAX_RECORD`,
+    /// unless a test lowered it.
+    pub fn record_limit(&self) -> usize {
+        self.log.record_limit()
+    }
+
+    /// The budget of one turn's record ([`crate::record_budget`]): the same
+    /// for production turns and for their replays.
+    pub fn turn_record_limit(&self) -> usize {
+        crate::record_budget::turn_limit(self.log.record_limit())
+    }
+
     pub(crate) async fn commit_authorized(
         &self,
         record: Record,
@@ -2154,6 +2240,9 @@ impl Node {
         let lsn = match self.log.append_authorized(record, authority).await {
             Ok(lsn) => lsn,
             Err(kronik_log::AuthorizedAppendError::Authority(error)) => return Err(error),
+            Err(kronik_log::AuthorizedAppendError::Storage(error)) if error.is_refusal() => {
+                return Err(refused(&error));
+            }
             Err(kronik_log::AuthorizedAppendError::Storage(error)) => {
                 self.fatal.set(error.to_string());
                 return Err(ApiError::new(ErrorCode::Unavailable, error.to_string()));
@@ -2215,6 +2304,11 @@ impl Node {
                 match self.log.append_authorized(record, authority).await {
                     Ok(lsn) => Ok(lsn),
                     Err(kronik_log::AuthorizedAppendError::Authority(error)) => Err(error),
+                    Err(kronik_log::AuthorizedAppendError::Storage(error))
+                        if error.is_refusal() =>
+                    {
+                        Err(refused(&error))
+                    }
                     Err(kronik_log::AuthorizedAppendError::Storage(error)) => {
                         self.fatal.set(error.to_string());
                         Err(ApiError::new(ErrorCode::Unavailable, error.to_string()))
@@ -2373,6 +2467,7 @@ impl Node {
         }
         let last = match self.log.append_all(sealed).await {
             Ok(last) => last.unwrap_or(0),
+            Err(e) if e.is_refusal() => return Err(refused(&e)),
             Err(e) => {
                 self.fatal.set(e.to_string());
                 return Err(ApiError::new(ErrorCode::Unavailable, e.to_string()));
@@ -2393,6 +2488,9 @@ impl Node {
     pub(crate) async fn append(&self, mut record: Record) -> Result<Lsn, ApiError> {
         self.seal(&mut record)?;
         self.log.append(record).await.map_err(|e| {
+            if e.is_refusal() {
+                return refused(&e);
+            }
             self.fatal.set(e.to_string());
             ApiError::new(ErrorCode::Unavailable, e.to_string())
         })

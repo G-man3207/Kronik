@@ -330,6 +330,15 @@ fn classify_error(e: &wasmtime::Error, memory_limit_hit: bool) -> pb::Outcome {
             String::new(),
         );
     }
+    if let Some(too_large) = e.downcast_ref::<crate::host::TurnTooLarge>() {
+        // The gate refused an effect before it happened: the record has no
+        // room for it. Writes, messages and timers are discarded below.
+        return failed(
+            pb::OutcomeKind::Trap,
+            ErrorCode::TurnTooLarge.as_str(),
+            too_large.0.clone(),
+        );
+    }
     if let Some(trap) = e.downcast_ref::<Trap>() {
         if *trap == Trap::OutOfFuel {
             return failed(
