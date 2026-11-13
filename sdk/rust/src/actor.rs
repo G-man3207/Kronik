@@ -1,4 +1,7 @@
-use crate::{Ctx, HandlerError, HttpRequest, Incoming, Input, Manifest, Output, TimerFired};
+use crate::{
+    Closed, Ctx, HandlerError, HttpRequest, Incoming, IncomingFrame, Input, Manifest, OpenReply,
+    OpenRequest, Output, TimerFired,
+};
 
 /// An actor type: the code for one kind of actor.
 ///
@@ -55,11 +58,45 @@ pub trait Actor {
     fn migrate(_ctx: &mut Ctx, _from: u32) -> Result<(), HandlerError> {
         Ok(())
     }
+
+    /// A client asks to open a connection on one of the kind's `WEBSOCKET`
+    /// or `SSE` routes: accept it with [`OpenReply::accept`], or refuse it
+    /// with [`OpenReply::refuse`]. Frames sent here go out right after the
+    /// handshake. The default refuses with 404.
+    fn connection_open(ctx: &mut Ctx, _request: OpenRequest) -> Result<OpenReply, HandlerError> {
+        Ok(OpenReply::refuse(Output::text(
+            404,
+            unhandled_text(ctx, "connections", "connection_open", "connections"),
+        )))
+    }
+
+    /// A frame from the client of a connection this actor accepted
+    /// (WebSocket only). The default rejects it, which fails the turn and
+    /// puts the frame in the dead letters.
+    fn connection_frame(ctx: &mut Ctx, _frame: IncomingFrame) -> Result<(), HandlerError> {
+        Err(unhandled(
+            ctx,
+            "connection frames",
+            "connection_frame",
+            "connections",
+        ))
+    }
+
+    /// A connection this actor accepted ended: its last input, exactly
+    /// once, also after a restart (initiator host, reason `restart`). The
+    /// default does nothing.
+    fn connection_close(_ctx: &mut Ctx, _closed: Closed) -> Result<(), HandlerError> {
+        Ok(())
+    }
 }
 
 fn unhandled(ctx: &Ctx, what: &str, method: &str, topic: &str) -> HandlerError {
-    HandlerError::Rejected(format!(
+    HandlerError::Rejected(unhandled_text(ctx, what, method, topic))
+}
+
+fn unhandled_text(ctx: &Ctx, what: &str, method: &str, topic: &str) -> String {
+    format!(
         "actor type {} does not handle {what}: implement Actor::{method} (see `kronik explain {topic}`)",
         ctx.self_ref().kind,
-    ))
+    )
 }

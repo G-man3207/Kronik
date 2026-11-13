@@ -1,5 +1,6 @@
 use std::fmt;
 
+use crate::bindings::kronik::actor::connections::SendError;
 use crate::bindings::kronik::actor::crypto::CryptoError;
 use crate::bindings::kronik::actor::http_client::FetchError;
 use crate::{CallError, HandlerError, SqlError};
@@ -20,6 +21,9 @@ pub enum Error {
     Crypto(CryptoError),
     /// Revealing a secret failed or was denied.
     Reveal(String),
+    /// `send_now` was denied, or its outcome is unknown after a crash
+    /// ([`SendError::OutcomeUnknown`]: the frame is never sent twice).
+    SendNow(SendError),
     /// A value could not be converted to or from JSON.
     Json {
         /// What was being converted, such as `state value "n"`.
@@ -103,6 +107,18 @@ impl fmt::Display for Error {
                 m,
                 explain_topic(m, "secret-handle"),
             ),
+            Error::SendNow(e) => match e {
+                SendError::Denied(m) => {
+                    write_error(f, "sending now denied", m, explain_topic(m, "capability"))
+                }
+                SendError::OutcomeUnknown => write_error(
+                    f,
+                    "the frame may or may not have reached the client",
+                    "",
+                    "EFFECT_OUTCOME_UNKNOWN",
+                ),
+                SendError::Closed => write_error(f, "the connection is closed", "", "connections"),
+            },
             Error::Json {
                 what,
                 topic,
@@ -197,6 +213,10 @@ mod tests {
             Error::Crypto(CryptoError::Unsupported("ed25519".into())),
             Error::Reveal("CAPABILITY_NOT_GRANTED: secret-reveal:stripe".into()),
             Error::Value("column 2: expected an integer, got text".into()),
+            Error::SendNow(SendError::OutcomeUnknown),
+            Error::SendNow(SendError::Denied(
+                "CAPABILITY_NOT_GRANTED: connection:send-now".into(),
+            )),
         ];
         let messages: Vec<String> = errors.iter().map(ToString::to_string).collect();
         for m in &messages {
@@ -209,6 +229,14 @@ mod tests {
         assert_eq!(
             messages[2],
             "HTTP request denied: CAPABILITY_NOT_GRANTED: http:x.example (see `kronik explain CAPABILITY_NOT_GRANTED`)"
+        );
+        assert_eq!(
+            messages[9],
+            "the frame may or may not have reached the client (see `kronik explain EFFECT_OUTCOME_UNKNOWN`)"
+        );
+        assert_eq!(
+            messages[10],
+            "sending now denied: CAPABILITY_NOT_GRANTED: connection:send-now (see `kronik explain CAPABILITY_NOT_GRANTED`)"
         );
     }
 

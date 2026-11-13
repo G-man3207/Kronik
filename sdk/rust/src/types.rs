@@ -76,6 +76,18 @@ impl Route {
     pub fn delete(pattern: impl Into<String>) -> Self {
         Route::new("DELETE", pattern)
     }
+
+    /// A WebSocket route: an upgrade request opens a connection that the
+    /// actor accepts in [`Actor::connection_open`](crate::Actor::connection_open).
+    pub fn websocket(pattern: impl Into<String>) -> Self {
+        Route::new("WEBSOCKET", pattern)
+    }
+
+    /// A server-sent events route: a GET opens an event stream that the
+    /// actor accepts in [`Actor::connection_open`](crate::Actor::connection_open).
+    pub fn sse(pattern: impl Into<String>) -> Self {
+        Route::new("SSE", pattern)
+    }
 }
 
 impl Output {

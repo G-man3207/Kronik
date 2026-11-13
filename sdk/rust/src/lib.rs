@@ -1,4 +1,5 @@
-//! Kronik's Rust SDK: write actors for the `kronik:actor` world.
+//! Kronik's Rust SDK: write actors for the `kronik:actor` world (its
+//! `actor-connections` world, which adds WebSocket and SSE connections).
 //!
 //! An actor type implements [`Actor`] and is exported with [`export!`]. The
 //! crate is built as a `cdylib` for `wasm32-wasip2`, and the resulting
@@ -29,6 +30,9 @@
 //! runs first (the counter above counts it as an increment). Usually it is
 //! simpler to keep the default `handle` and implement [`Actor::http`],
 //! [`Actor::message`], [`Actor::timer`] and [`Actor::migrate`] as needed.
+//! A kind with `WEBSOCKET` or `SSE` routes implements
+//! [`Actor::connection_open`], [`Actor::connection_frame`] and
+//! [`Actor::connection_close`] (see the [`connections`] module).
 //!
 //! # The turn
 //!
@@ -55,6 +59,7 @@
 extern crate self as kronik_sdk;
 
 mod actor;
+pub mod connections;
 mod ctx;
 mod error;
 pub mod http;
@@ -75,7 +80,7 @@ pub mod testkit;
 pub mod bindings {
     //! The bindings that `wit-bindgen` generates from `wit/kronik-actor.wit`.
     wit_bindgen::generate!({
-        world: "actor",
+        world: "actor-connections",
         path: "wit/kronik-actor.wit",
         pub_export_macro: true,
         export_macro_name: "__export_kronik_actor",
@@ -91,6 +96,10 @@ pub use bindings::kronik::actor::types::{
     ActorRef, BlobRef, HandlerError, Header, HttpBody, HttpRequest, HttpResponse, Incoming, Input,
     Manifest, Message, Output, Route, TimerFired,
 };
+pub use connections::{
+    Accept, CloseInfo, CloseInitiator, Closed, Connections, Frame, IncomingFrame, OpenReply,
+    OpenRequest, Protocol, SendError, SseEvent,
+};
 pub use ctx::{Crypto, Ctx, Log, Random, Secrets, State, Timers};
 pub use error::Error;
 pub use http::{Http, Secret};
@@ -99,12 +108,14 @@ pub use sql::{FromSql, Row, Sql};
 /// The names most actors need: `use kronik_sdk::prelude::*;`.
 pub mod prelude {
     pub use crate::{
-        Actor, ActorRef, Ctx, Error, HandlerError, HttpRequest, HttpResponse, Incoming, Input,
-        Level, Manifest, Message, Output, Route, Row, Rows, Secret, SqlValue, TimerFired, params,
+        Accept, Actor, ActorRef, Closed, Ctx, Error, Frame, HandlerError, HttpRequest,
+        HttpResponse, Incoming, IncomingFrame, Input, Level, Manifest, Message, OpenReply,
+        OpenRequest, Output, Route, Row, Rows, Secret, SqlValue, TimerFired, params,
     };
 }
 
-/// Exports an [`Actor`] type as the component's `kronik:actor/handler`.
+/// Exports an [`Actor`] type as the component's `kronik:actor/handler` and
+/// `kronik:actor/connection-handler`.
 ///
 /// Use it once per component, at the crate root:
 ///
@@ -129,6 +140,24 @@ macro_rules! export {
                 }
             }
 
+            impl $crate::bindings::exports::kronik::actor::connection_handler::Guest for KronikExport {
+                fn open(
+                    request: $crate::OpenRequest,
+                ) -> ::core::result::Result<$crate::OpenReply, $crate::HandlerError> {
+                    $crate::__private::open::<$actor>(request)
+                }
+
+                fn frame(
+                    event: $crate::IncomingFrame,
+                ) -> ::core::result::Result<(), $crate::HandlerError> {
+                    $crate::__private::frame::<$actor>(event)
+                }
+
+                fn close(event: $crate::Closed) -> ::core::result::Result<(), $crate::HandlerError> {
+                    $crate::__private::close::<$actor>(event)
+                }
+            }
+
     $crate::bindings::__export_kronik_actor!(KronikExport with_types_in $crate::bindings);
         };
     };
@@ -148,10 +177,27 @@ macro_rules! params {
 
 #[doc(hidden)]
 pub mod __private {
-    use crate::{Actor, Ctx, HandlerError, Input, Output};
+    use crate::{
+        Actor, Closed, Ctx, HandlerError, IncomingFrame, Input, OpenReply, OpenRequest, Output,
+    };
 
     /// Runs one turn: the entry point that [`export!`](crate::export) wires up.
     pub fn handle<A: Actor>(input: Input) -> Result<Output, HandlerError> {
         A::handle(&mut Ctx::new(), input)
+    }
+
+    /// A connection's open, as a turn.
+    pub fn open<A: Actor>(request: OpenRequest) -> Result<OpenReply, HandlerError> {
+        A::connection_open(&mut Ctx::new(), request)
+    }
+
+    /// A connection's frame, as a turn.
+    pub fn frame<A: Actor>(event: IncomingFrame) -> Result<(), HandlerError> {
+        A::connection_frame(&mut Ctx::new(), event)
+    }
+
+    /// A connection's close, as a turn.
+    pub fn close<A: Actor>(event: Closed) -> Result<(), HandlerError> {
+        A::connection_close(&mut Ctx::new(), event)
     }
 }

@@ -50,6 +50,7 @@ pub const TS_SDK: &[File] = sdk_files!("../../../../sdk/ts/":
 pub const RUST_SDK: &[File] = sdk_files!("../../../../sdk/rust/":
     "Cargo.toml",
     "src/actor.rs",
+    "src/connections.rs",
     "src/ctx.rs",
     "src/error.rs",
     "src/http.rs",

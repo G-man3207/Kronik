@@ -7,7 +7,7 @@ use crate::bindings::kronik::actor::{
     context, crypto, log, messaging, privacy, secrets, state, timers,
 };
 use crate::types::{from_json, to_json};
-use crate::{ActorRef, Error, Http, Level, Message, Secret, Sql};
+use crate::{ActorRef, Connections, Error, Http, Level, Message, Secret, Sql};
 
 /// A turn's access to the host: state, SQL, messages, effects, time,
 /// randomness and logging.
@@ -32,6 +32,12 @@ impl Ctx {
     /// The actor's SQL database (see `kronik explain sql-state`).
     pub fn sql(&self) -> Sql {
         Sql::new()
+    }
+
+    /// The WebSocket and SSE connections this actor accepted (see `kronik
+    /// explain connections`).
+    pub fn connections(&self) -> Connections {
+        Connections::new()
     }
 
     /// Sends `message` to the actor `to`. The message is buffered and
