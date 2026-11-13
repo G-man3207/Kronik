@@ -216,6 +216,12 @@ until the v1.0 compatibility promise takes effect.
   M25 and M26 lands, the functions trap with `NOT_IMPLEMENTED`. The Go
   bindings and TypeScript types are regenerated; components built for
   `0.1.0` link and run as before.
+- Three new per-kind limits (M25, M26): `blob_threshold_bytes` (bodies above
+  it become blobs for code that imports `blobs`, 1 MiB, never above
+  `message_bytes`), `upload_bytes` (the largest upload for such code,
+  64 MiB) and `blob_bytes_per_actor` (1 GiB). `kronik limits set` takes
+  them as `--blob-threshold`, `--upload-size` and `--blob-size-per-actor`,
+  `POST /v1/limits` as fields, and `limits show` lists them.
 - The runtime can run a turn with blob storage (M25): a component that
   imports `blobs` reads the blobs its input carries in ranges, writes blobs
   and returns one as its HTTP response, and a fetch's request or response

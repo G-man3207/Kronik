@@ -245,6 +245,13 @@ pub struct KindLimits {
     pub sql_bytes_per_actor: u64,
     pub effect_timeout: Duration,
     pub effect_response_bytes: u64,
+    /// HTTP bodies and effect responses above it become blobs, for a kind
+    /// whose code reads blobs (M25); at most `message_bytes`.
+    pub blob_threshold_bytes: u64,
+    /// The largest HTTP request body of a kind whose code reads blobs (M25).
+    pub upload_bytes: u64,
+    /// The blob bytes one actor may hold (M26), and one turn may create.
+    pub blob_bytes_per_actor: u64,
 }
 
 impl Default for KindLimits {
@@ -257,11 +264,21 @@ impl Default for KindLimits {
             sql_bytes_per_actor: 1 << 30,
             effect_timeout: Duration::from_secs(10),
             effect_response_bytes: 10 << 20,
+            blob_threshold_bytes: 1 << 20,
+            upload_bytes: 64 << 20,
+            blob_bytes_per_actor: 1 << 30,
         }
     }
 }
 
 impl KindLimits {
+    /// The size above which a body becomes a blob: `blob_threshold_bytes`,
+    /// or the message size when that is smaller (a body at the threshold
+    /// stays inline, so it must fit a message).
+    pub fn blob_threshold(&self) -> u64 {
+        self.blob_threshold_bytes.min(self.message_bytes)
+    }
+
     fn apply(&mut self, l: &pb::Limits) {
         let set = |dst: &mut u64, v: Option<u64>| {
             if let Some(v) = v {
@@ -274,6 +291,9 @@ impl KindLimits {
         set(&mut self.state_value_bytes, l.state_value_bytes);
         set(&mut self.sql_bytes_per_actor, l.sql_bytes_per_actor);
         set(&mut self.effect_response_bytes, l.effect_response_bytes);
+        set(&mut self.blob_threshold_bytes, l.blob_threshold_bytes);
+        set(&mut self.upload_bytes, l.upload_bytes);
+        set(&mut self.blob_bytes_per_actor, l.blob_bytes_per_actor);
         if let Some(ms) = l.effect_timeout_ms {
             self.effect_timeout = Duration::from_millis(ms);
         }
@@ -656,6 +676,51 @@ mod tests {
         assert_eq!(
             h.at(3).limits("billing").effect_timeout,
             Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn blob_limits_follow_their_records_and_the_threshold_fits_a_message() {
+        let mut h = ConfigHistory::default();
+        h.push(Record::Limits(pb::Limits {
+            epoch: 1,
+            kind: "media".into(),
+            blob_threshold_bytes: Some(256 << 10),
+            upload_bytes: Some(512 << 20),
+            blob_bytes_per_actor: Some(4 << 30),
+            ..Default::default()
+        }));
+        h.push(Record::Limits(pb::Limits {
+            epoch: 2,
+            kind: "media".into(),
+            message_bytes: Some(64 << 10),
+            ..Default::default()
+        }));
+        let defaults = h.at(0).limits("media");
+        assert_eq!(
+            (
+                defaults.blob_threshold_bytes,
+                defaults.upload_bytes,
+                defaults.blob_bytes_per_actor,
+                defaults.blob_threshold()
+            ),
+            (1 << 20, 64 << 20, 1 << 30, 1 << 20)
+        );
+        let set = h.at(1).limits("media");
+        assert_eq!(
+            (
+                set.upload_bytes,
+                set.blob_bytes_per_actor,
+                set.blob_threshold()
+            ),
+            (512 << 20, 4 << 30, 256 << 10)
+        );
+        // A smaller message size lowers the effective threshold; the setting
+        // is kept for when the message size grows again.
+        let lowered = h.at(2).limits("media");
+        assert_eq!(
+            (lowered.blob_threshold_bytes, lowered.blob_threshold()),
+            (256 << 10, 64 << 10)
         );
     }
 

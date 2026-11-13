@@ -687,7 +687,7 @@ Limits per kind (history, `kronik limits set`, `POST /v1/limits`):
 
 | Field | Flag | Default | Meaning |
 | --- | --- | --- | --- |
-| `blob_threshold_bytes` | `--blob-threshold` | 1 MiB | Bodies above it become blobs; at most `message_bytes` (`BAD_REQUEST` otherwise) |
+| `blob_threshold_bytes` | `--blob-threshold` | 1 MiB | Bodies above it become blobs; setting it above `message_bytes` is `BAD_REQUEST`, and a `message_bytes` set below it lowers the effective threshold with it (`KindLimits::blob_threshold`), so lowering the message size never needs the threshold changed first |
 | `upload_bytes` | `--upload-size` | 64 MiB | The largest request body for a kind that reads blobs |
 | `blob_bytes_per_actor` | `--blob-size-per-actor` | 1 GiB | Held bytes per actor, and created bytes per turn (§5.2) |
 | `effect_response_bytes` | `--effect-response-size` | 10 MiB | Unchanged; now also bounds blob responses |

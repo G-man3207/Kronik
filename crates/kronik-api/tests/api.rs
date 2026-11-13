@@ -312,6 +312,64 @@ async fn m2_endpoints() {
     assert_eq!(v["limits"]["memory_bytes"], 64 << 20);
     let (_, v) = call(&api, "GET", "/v1/limits?kind=counter", Value::Null).await;
     assert_eq!(v["limits"][0]["fuel"], 1_000_000);
+    // The blob limits (M25): defaults, set, and a threshold above the
+    // message size refused, also when the message size moves below it.
+    assert_eq!(v["limits"][0]["blob_threshold_bytes"], 1 << 20);
+    assert_eq!(v["limits"][0]["upload_bytes"], 64 << 20);
+    assert_eq!(v["limits"][0]["blob_bytes_per_actor"], 1u64 << 30);
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/limits",
+        json!({"kind": "counter", "blob_threshold_bytes": 65536, "upload_bytes": 1u64 << 29,
+               "blob_bytes_per_actor": 1u64 << 31, "reason": "r"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (
+            &v["limits"]["blob_threshold_bytes"],
+            &v["limits"]["upload_bytes"],
+            &v["limits"]["blob_bytes_per_actor"],
+            &v["limits"]["fuel"]
+        ),
+        (
+            &json!(65536),
+            &json!(1u64 << 29),
+            &json!(1u64 << 31),
+            &json!(1_000_000)
+        )
+    );
+    for body in [
+        json!({"kind": "counter", "blob_threshold_bytes": (1 << 20) + 1, "reason": "r",
+               "dry_run": true}),
+        json!({"kind": "counter", "blob_threshold_bytes": 4096, "message_bytes": 1000,
+               "reason": "r", "dry_run": true}),
+    ] {
+        let (s, v) = call(&api, "POST", "/v1/limits", body).await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (400, Some("BAD_REQUEST")),
+            "{v}"
+        );
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("blob_threshold_bytes"),
+            "{v}"
+        );
+    }
+    // Lowering only the message size is accepted: the effective threshold
+    // follows it.
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/limits",
+        json!({"kind": "counter", "message_bytes": 1000, "reason": "r", "dry_run": true}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
     let (_, v) = call(
         &api,
         "POST",

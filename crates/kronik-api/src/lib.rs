@@ -1987,6 +1987,9 @@ impl Api {
             sql_bytes_per_actor: l.sql_bytes_per_actor,
             effect_timeout_ms: l.effect_timeout.as_millis() as u64,
             effect_response_bytes: l.effect_response_bytes,
+            blob_threshold_bytes: l.blob_threshold_bytes,
+            upload_bytes: l.upload_bytes,
+            blob_bytes_per_actor: l.blob_bytes_per_actor,
             epoch: None,
             lsn: None,
         }
@@ -2014,9 +2017,9 @@ impl Api {
                 .fingerprint_exclude_query
                 .clone()
                 .map(|names| pb::NameList { names }),
-            blob_bytes_per_actor: None,
-            blob_threshold_bytes: None,
-            upload_bytes: None,
+            blob_bytes_per_actor: r.blob_bytes_per_actor,
+            blob_threshold_bytes: r.blob_threshold_bytes,
+            upload_bytes: r.upload_bytes,
         };
         let (epoch, lsn, effective, rules) = self
             .node

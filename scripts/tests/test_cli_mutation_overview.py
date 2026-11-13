@@ -470,6 +470,9 @@ def is_mutation(type_name):
 
 def resolve(items, module, type_name):
     type_name = " ".join(type_name.split())
+    # A boxed payload, as clap accepts for a large variant: its contents.
+    if type_name.startswith("Box<") and type_name.endswith(">"):
+        type_name = type_name[len("Box<"):-1].strip()
     if is_mutation(type_name):
         return None
     if "::" in type_name:

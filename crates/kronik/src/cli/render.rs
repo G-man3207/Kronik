@@ -995,7 +995,7 @@ pub fn limits_set(r: &LimitsResponse, rerun: &str) -> String {
 }
 
 /// Every limit, labelled, in human units.
-fn limit_values(l: &LimitsView) -> [(&'static str, String); 8] {
+fn limit_values(l: &LimitsView) -> [(&'static str, String); 11] {
     [
         ("Fuel", l.fuel.to_string()),
         ("Memory", units::size(l.memory_bytes)),
@@ -1005,6 +1005,9 @@ fn limit_values(l: &LimitsView) -> [(&'static str, String); 8] {
         ("Effect timeout", units::duration(l.effect_timeout_ms)),
         ("Effect response", units::size(l.effect_response_bytes)),
         ("Not fingerprinted", not_fingerprinted(l)),
+        ("Blob threshold", units::size(l.blob_threshold_bytes)),
+        ("Upload size", units::size(l.upload_bytes)),
+        ("Blobs per actor", units::size(l.blob_bytes_per_actor)),
     ]
 }
 
@@ -1054,6 +1057,9 @@ pub fn limits(r: &LimitsListResponse) -> String {
             "EFFECT TIMEOUT",
             "EFFECT RESPONSE",
             "NOT FINGERPRINTED",
+            "BLOB THRESHOLD",
+            "UPLOAD",
+            "BLOBS PER ACTOR",
         ],
         rows,
     );
@@ -1805,6 +1811,40 @@ mod tests {
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("$HOME"), "'$HOME'");
+    }
+
+    /// The output of `kronik limits set` and `limits show` as the CLI
+    /// reference shows it (docs/reference/cli.md).
+    #[test]
+    fn limits_render_as_documented() {
+        let view = LimitsView {
+            kind: "counter".into(),
+            fuel: 100_000_000,
+            memory_bytes: 128 << 20,
+            message_bytes: 1 << 20,
+            state_value_bytes: 1 << 20,
+            sql_bytes_per_actor: 1 << 30,
+            effect_timeout_ms: 2000,
+            effect_response_bytes: 10 << 20,
+            blob_threshold_bytes: 1 << 20,
+            upload_bytes: 64 << 20,
+            blob_bytes_per_actor: 1 << 30,
+            fingerprint_exclude_headers: vec![],
+            fingerprint_exclude_query: vec![],
+            epoch: Some(4),
+            lsn: Some(5),
+        };
+        let reference = include_str!("../../../../docs/reference/cli.md");
+        let set = limits_set(
+            &LimitsResponse {
+                dry_run: false,
+                limits: view.clone(),
+            },
+            "",
+        );
+        assert!(reference.contains(&set), "{set}");
+        let show = limits(&LimitsListResponse { limits: vec![view] });
+        assert!(reference.contains(&show), "{show}");
     }
 
     #[test]

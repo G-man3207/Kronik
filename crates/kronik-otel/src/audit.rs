@@ -832,6 +832,9 @@ fn projected_lines(
                 ("sql_bytes_per_actor", l.sql_bytes_per_actor),
                 ("effect_timeout_ms", l.effect_timeout_ms),
                 ("effect_response_bytes", l.effect_response_bytes),
+                ("blob_threshold_bytes", l.blob_threshold_bytes),
+                ("upload_bytes", l.upload_bytes),
+                ("blob_bytes_per_actor", l.blob_bytes_per_actor),
             ] {
                 if let Some(v) = v {
                     details.insert(name.into(), v.into());

@@ -3709,6 +3709,7 @@ against both.
             "APPROVAL_REQUIRED",
             "AUDIT_RANGE_GONE",
             "BAD_REQUEST",
+            "BLOB_NOT_HELD",
             "CAPABILITY_NOT_GRANTED",
             "CERTIFICATE_INVALID",
             "CONNECTION_LIMIT",
@@ -5320,6 +5321,16 @@ against both.
 ```json
 {
   "properties": {
+    "blob_bytes_per_actor": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "blob_threshold_bytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
     "effect_response_bytes": {
       "format": "uint64",
       "minimum": 0,
@@ -5390,6 +5401,11 @@ against both.
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
+    },
+    "upload_bytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
     }
   },
   "required": [
@@ -5400,7 +5416,10 @@ against both.
     "state_value_bytes",
     "sql_bytes_per_actor",
     "effect_timeout_ms",
-    "effect_response_bytes"
+    "effect_response_bytes",
+    "blob_threshold_bytes",
+    "upload_bytes",
+    "blob_bytes_per_actor"
   ],
   "type": "object"
 }

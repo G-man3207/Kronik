@@ -577,6 +577,16 @@ pub struct LimitsRequest {
     /// writes them; as `fingerprint_exclude_headers`.
     #[serde(default)]
     pub fingerprint_exclude_query: Option<Vec<String>>,
+    /// Bodies above it become blobs for a kind whose code reads blobs
+    /// (M25); at most `message_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_threshold_bytes: Option<u64>,
+    /// The largest HTTP request body of a kind whose code reads blobs (M25).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_bytes: Option<u64>,
+    /// The blob bytes one actor may hold and one turn may create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_bytes_per_actor: Option<u64>,
     /// Required: missing or blank answers REASON_REQUIRED.
     #[serde(default)]
     pub reason: String,
@@ -601,6 +611,9 @@ pub struct LimitsView {
     /// Query-parameter names left out of them, sorted.
     #[serde(default)]
     pub fingerprint_exclude_query: Vec<String>,
+    pub blob_threshold_bytes: u64,
+    pub upload_bytes: u64,
+    pub blob_bytes_per_actor: u64,
     /// Set in responses to `POST /v1/limits` (lsn 0 for dry runs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<u64>,

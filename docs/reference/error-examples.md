@@ -51,6 +51,17 @@ Content-Length: 8
 {"text":
 ```
 
+## BLOB_NOT_HELD
+
+A fixture `media` actor stored a blob's hash in state and, in a later turn,
+built a `blob-ref` from it and returned it as its response. A hash is not a
+reference: find the failed turn, then change the code to use the reference
+its input carried, or to retain the blob (M26) in the turn that received it.
+
+```sh
+kronik history media/fixture --limit 5
+```
+
 ## CAPABILITY_NOT_GRANTED
 
 An actor calls an ungranted HTTP host or secret. Review the requested authority

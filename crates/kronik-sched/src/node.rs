@@ -5070,6 +5070,21 @@ impl Node {
         preview.apply(&record);
         let effective = preview.limits(&limits.kind);
         let rules = preview.fingerprint_rules(&limits.kind);
+        // A threshold set above the message size is refused; lowering the
+        // message size alone lowers the effective threshold with it
+        // (KindLimits::blob_threshold), so existing settings keep working.
+        if let Some(threshold) = limits.blob_threshold_bytes
+            && threshold > effective.message_bytes
+        {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "blob_threshold_bytes ({threshold}) must not be above message_bytes ({}): \
+                     a body at the threshold stays inline",
+                    effective.message_bytes
+                ),
+            ));
+        }
         if dry_run {
             return Ok((epoch, 0, effective, rules));
         }
@@ -5233,8 +5248,7 @@ fn turn_limits(l: &KindLimits) -> TurnLimits {
         memory_bytes: size(l.memory_bytes),
         message_bytes: size(l.message_bytes),
         state_value_bytes: size(l.state_value_bytes),
-        // The kind's blob limits come with M25 slice B6.
-        blob_bytes: TurnLimits::default().blob_bytes,
+        blob_bytes: l.blob_bytes_per_actor,
     }
 }
 

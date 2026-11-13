@@ -1151,8 +1151,7 @@ impl Runner {
             memory_bytes: size(kl.memory_bytes),
             message_bytes: size(kl.message_bytes),
             state_value_bytes: size(kl.state_value_bytes),
-            // The kind's blob limits come with M25 slice B6.
-            blob_bytes: TurnLimits::default().blob_bytes,
+            blob_bytes: kl.blob_bytes_per_actor,
         };
         let call_chain = match &p.input.kind {
             Some(pb::input::Kind::Message(m)) => {

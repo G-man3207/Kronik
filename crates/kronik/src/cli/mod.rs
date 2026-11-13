@@ -490,7 +490,7 @@ pub enum GrantsCommand {
 #[derive(Debug, Subcommand)]
 pub enum LimitsCommand {
     /// Change an actor type's limits; limits not named keep their value.
-    Set(LimitsSetArgs),
+    Set(Box<LimitsSetArgs>),
     /// Show the limits in force for every deployed actor type.
     Show {
         /// Only this actor type (deployed or not).
@@ -514,6 +514,9 @@ pub enum LimitsCommand {
             "effect_response_size",
             "fingerprint_exclude_header",
             "fingerprint_exclude_query",
+            "blob_threshold",
+            "upload_size",
+            "blob_size_per_actor",
         ])
 ))]
 pub struct LimitsSetArgs {
@@ -549,6 +552,16 @@ pub struct LimitsSetArgs {
     /// e.g. ts,nonce; replaces the type's list, and '' clears it.
     #[arg(long, value_name = "NAMES", value_delimiter = ',')]
     fingerprint_exclude_query: Option<Vec<String>>,
+    /// Bodies above this become blobs, for code that reads blobs, e.g. 1Mi;
+    /// at most the message size.
+    #[arg(long, value_name = "SIZE", value_parser = units::parse_size)]
+    blob_threshold: Option<u64>,
+    /// Largest HTTP request body for code that reads blobs, e.g. 512Mi.
+    #[arg(long, value_name = "SIZE", value_parser = units::parse_size)]
+    upload_size: Option<u64>,
+    /// Blob bytes one actor may hold and one turn may create, e.g. 2Gi.
+    #[arg(long, value_name = "SIZE", value_parser = units::parse_size)]
+    blob_size_per_actor: Option<u64>,
     #[command(flatten)]
     mutation: Mutation,
 }
@@ -669,7 +682,7 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
         Command::Grant(a) => grant(&ctx, a),
         Command::Revoke(a) => revoke(&ctx, a),
         Command::Grants(GrantsCommand::List { kind }) => grants(&ctx, kind),
-        Command::Limits(LimitsCommand::Set(a)) => limits_set(&ctx, a),
+        Command::Limits(LimitsCommand::Set(a)) => limits_set(&ctx, *a),
         Command::Limits(LimitsCommand::Show { kind }) => limits_show(&ctx, kind),
         Command::Secret(SecretCommand::Set { name, mutation }) => secret_set(&ctx, &name, mutation),
         Command::Secret(SecretCommand::List) => secrets(&ctx),
@@ -1636,6 +1649,9 @@ fn limits_set(ctx: &Ctx, a: LimitsSetArgs) -> Result<ExitCode, Error> {
             effect_response_bytes: a.effect_response_size,
             fingerprint_exclude_headers: exclude_headers.clone(),
             fingerprint_exclude_query: exclude_query.clone(),
+            blob_threshold_bytes: a.blob_threshold,
+            upload_bytes: a.upload_size,
+            blob_bytes_per_actor: a.blob_size_per_actor,
             reason: reason.to_owned(),
             dry_run: a.mutation.dry_run,
         },
@@ -1667,6 +1683,12 @@ fn limits_set(ctx: &Ctx, a: LimitsSetArgs) -> Result<ExitCode, Error> {
         (
             "--fingerprint-exclude-query",
             exclude_query.map(|names| shell_quote(&names.join(","))),
+        ),
+        ("--blob-threshold", a.blob_threshold.map(units::size_flag)),
+        ("--upload-size", a.upload_size.map(units::size_flag)),
+        (
+            "--blob-size-per-actor",
+            a.blob_size_per_actor.map(units::size_flag),
         ),
     ] {
         if let Some(v) = value {
