@@ -629,6 +629,13 @@ fn cause(turn: &Turn, key: &pb::CausalKey, me: SpanRef) -> (Option<[u8; 8]>, Lin
                 return (None, link.map(|l| (l, "resend")), SpanKind::Internal);
             }
         },
+        // M24: a connection's open, frame and close are root inputs from
+        // the gateway, like HTTP requests; a resent one links to the
+        // dead-lettered turn.
+        Some(Kind::Connection(c)) => {
+            let link = turn.resend_of.filter(|_| !c.resend_of.is_empty());
+            return (None, link.map(|l| (l, "resend")), SpanKind::Server);
+        }
         None => return (None, None, SpanKind::Internal),
     };
     let parent = link.filter(|_| joined).map(|p| p.span_id);
@@ -755,6 +762,22 @@ pub fn spans(turn: &Turn, keys: &ActorKeys) -> Vec<Span> {
         Some(Kind::Migrate(_)) => {
             a.push(s("kronik.input", "migrate"));
             "migrate".into()
+        }
+        // M24: the event, the protocol and the route pattern; never the
+        // connection id, a frame's data or a close reason.
+        Some(Kind::Connection(c)) => {
+            let event = match &c.event {
+                Some(pb::connection_input::Event::Open(_)) => "open",
+                Some(pb::connection_input::Event::Frame(_)) => "frame",
+                Some(pb::connection_input::Event::Close(_)) => "close",
+                None => "unspecified",
+            };
+            let method = kronik_proto::connection::protocol_method(c.protocol);
+            a.push(s("kronik.input", "connection"));
+            a.push(s("kronik.connection.event", event));
+            a.push(s("http.request.method", method));
+            a.push(s("http.route", &c.route));
+            format!("connection {event} {method} {}", c.route)
         }
         None => "turn".into(),
     };

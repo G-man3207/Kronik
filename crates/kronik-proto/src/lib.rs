@@ -7,6 +7,7 @@
 //! missing required field, is an error (the log treats it as
 //! `STORAGE_CORRUPT`), never a default operation.
 
+pub mod connection;
 pub mod control;
 pub mod http;
 pub mod sealables;
@@ -651,28 +652,104 @@ fn message(
     sealable(message.body.as_ref(), what)
 }
 
+fn http_input(h: &pb::HttpInput) -> Result<(), DecodeError> {
+    // The sealable request line is optional (records from before it,
+    // requests without a subject), but a present one has a value.
+    for (s, what) in [
+        (h.sealed_path.as_ref(), "HttpInput.sealed_path"),
+        (h.sealed_query.as_ref(), "HttpInput.sealed_query"),
+    ] {
+        if s.is_some() {
+            sealable(s, what)?;
+        }
+    }
+    for p in &h.params {
+        if p.sealed_value.is_some() {
+            sealable(p.sealed_value.as_ref(), "Param.sealed_value")?;
+        }
+    }
+    headers(&h.headers)?;
+    body(h.body.as_ref(), "HttpInput.body")
+}
+
+fn frame(f: Option<&pb::Frame>, what: &'static str) -> Result<(), DecodeError> {
+    let f = some(f, what)?;
+    enum_value::<pb::frame::Kind>(f.kind, "Frame.kind")?;
+    sealable(f.data.as_ref(), "Frame.data")
+}
+
+fn connection_id(id: &str, what: &'static str) -> Result<(), DecodeError> {
+    if !connection::valid_id(id) {
+        return Err(invalid(what, "c- and 32 lowercase hex characters required"));
+    }
+    Ok(())
+}
+
+/// A connection input (M24, docs/design/m24-connections.md §6.3).
+fn connection_input(c: &pb::ConnectionInput) -> Result<(), DecodeError> {
+    use pb::connection_input::Event;
+    connection_id(&c.connection, "ConnectionInput.connection")?;
+    enum_value::<pb::ConnectionProtocol>(c.protocol, "ConnectionInput.protocol")?;
+    match &c.event {
+        Some(Event::Open(o)) => http_input(some(o.request.as_ref(), "ConnectionOpen.request")?),
+        Some(Event::Frame(f)) => {
+            if c.protocol == pb::ConnectionProtocol::Sse as i32 {
+                return Err(invalid(
+                    "ConnectionInput.frame",
+                    "an SSE connection has no incoming frames",
+                ));
+            }
+            frame(f.frame.as_ref(), "ConnectionFrame.frame")
+        }
+        Some(Event::Close(close)) => {
+            enum_value::<pb::CloseCause>(close.cause, "ConnectionClose.cause")?;
+            if close.reason.is_some() {
+                sealable(close.reason.as_ref(), "ConnectionClose.reason")?;
+            }
+            Ok(())
+        }
+        None => Err(invalid(
+            "ConnectionInput.event",
+            "open, frame or close required",
+        )),
+    }
+}
+
+/// A turn's buffered connection operation (M24).
+fn connection_op(op: &pb::ConnectionOp) -> Result<(), DecodeError> {
+    for id in &op.connections {
+        connection_id(id, "ConnectionOp.connections")?;
+    }
+    match &op.op {
+        Some(pb::connection_op::Op::Send(f)) => {
+            if op.connections.is_empty() || op.seqs.len() != op.connections.len() {
+                return Err(invalid(
+                    "ConnectionOp",
+                    "a send needs connections and one seq per connection",
+                ));
+            }
+            frame(Some(f), "ConnectionOp.send")
+        }
+        Some(pb::connection_op::Op::Close(close)) => {
+            if op.connections.len() != 1 || !op.seqs.is_empty() {
+                return Err(invalid(
+                    "ConnectionOp",
+                    "a close needs exactly one connection and no seqs",
+                ));
+            }
+            if close.reason.is_some() {
+                sealable(close.reason.as_ref(), "ConnectionCloseRequest.reason")?;
+            }
+            Ok(())
+        }
+        None => Err(invalid("ConnectionOp.op", "send or close required")),
+    }
+}
+
 fn input(value: Option<&pb::Input>, what: &'static str) -> Result<(), DecodeError> {
     use pb::input::Kind;
     match &some(value, what)?.kind {
-        Some(Kind::Http(h)) => {
-            // The sealable request line is optional (records from before
-            // it, requests without a subject), but a present one has a value.
-            for (s, what) in [
-                (h.sealed_path.as_ref(), "HttpInput.sealed_path"),
-                (h.sealed_query.as_ref(), "HttpInput.sealed_query"),
-            ] {
-                if s.is_some() {
-                    sealable(s, what)?;
-                }
-            }
-            for p in &h.params {
-                if p.sealed_value.is_some() {
-                    sealable(p.sealed_value.as_ref(), "Param.sealed_value")?;
-                }
-            }
-            headers(&h.headers)?;
-            body(h.body.as_ref(), "HttpInput.body")
-        }
+        Some(Kind::Http(h)) => http_input(h),
         Some(Kind::Message(m)) => {
             enum_value::<pb::MessageSource>(m.source, "MessageInput.source")?;
             if m.source == pb::MessageSource::Actor as i32 {
@@ -686,6 +763,7 @@ fn input(value: Option<&pb::Input>, what: &'static str) -> Result<(), DecodeErro
         }
         Some(Kind::Timer(t)) => message(t.msg.as_ref(), "TimerInput.msg", false),
         Some(Kind::Migrate(_)) => Ok(()),
+        Some(Kind::Connection(c)) => connection_input(c),
         None => Err(invalid(what, "no input case set")),
     }
 }
@@ -755,6 +833,12 @@ fn effect(value: Option<&pb::EffectRecord>, what: &'static str) -> Result<(), De
             ));
         }
         None => {}
+    }
+    if e.kind == "connection.send-now" && !e.target.starts_with("connection:") {
+        return Err(invalid(
+            "EffectRecord.target",
+            "connection.send-now needs the target connection:<id>",
+        ));
     }
     match e.delivery.as_str() {
         "" | "replay-safe" | "idempotency-keyed" | "unsafe" => Ok(()),
@@ -844,7 +928,11 @@ fn turn_record(m: &pb::TurnRecord) -> Result<(), DecodeError> {
             headers(&h.headers)?;
             body(h.body.as_ref(), "Outcome.http.body")?;
         }
+        Some(pb::outcome::Output::Accept(a)) => headers(&a.headers)?,
         None => {}
+    }
+    for op in &m.connection_ops {
+        connection_op(op)?;
     }
     for c in &m.sql_changes {
         sealable(c.changeset.as_ref(), "SqlChangeset.changeset")?;
@@ -1179,5 +1267,321 @@ mod successful_call_consumer_tests {
         effect.kind = "http.fetch".into();
         assert!(!effect.successful_call());
         assert!(roundtrip(&effect).is_err());
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    const CONN: &str = "c-0123456789abcdef0123456789abcdef";
+
+    fn plain(bytes: &[u8]) -> Option<pb::Sealable> {
+        Some(pb::Sealable {
+            subject: None,
+            value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
+        })
+    }
+
+    fn text(t: &str) -> pb::Frame {
+        pb::Frame {
+            kind: pb::frame::Kind::Text as i32,
+            data: plain(t.as_bytes()),
+            ..Default::default()
+        }
+    }
+
+    fn turn(input: pb::ConnectionInput) -> pb::TurnRecord {
+        pb::TurnRecord {
+            actor: Some(pb::ActorRef {
+                kind: "room".into(),
+                key: "a".into(),
+            }),
+            causal_key: Some(pb::CausalKey {
+                root: "0123456789abcdef0123456789abcdef".into(),
+                path: vec![],
+            }),
+            input: Some(pb::Input {
+                kind: Some(pb::input::Kind::Connection(input)),
+            }),
+            outcome: Some(pb::Outcome {
+                kind: pb::OutcomeKind::Committed as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn frame_input(protocol: pb::ConnectionProtocol) -> pb::ConnectionInput {
+        pb::ConnectionInput {
+            connection: CONN.into(),
+            protocol: protocol as i32,
+            route: "/room/{key}/ws".into(),
+            event: Some(pb::connection_input::Event::Frame(pb::ConnectionFrame {
+                seq: 0,
+                frame: Some(text("say hi")),
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn check(t: pb::TurnRecord) -> Result<Record, DecodeError> {
+        Record::decode(kind::TURN_RECORD, &Record::TurnRecord(t).encode())
+    }
+
+    #[test]
+    fn a_valid_connection_turn_round_trips() {
+        let mut t = turn(frame_input(pb::ConnectionProtocol::Websocket));
+        t.connection_ops = vec![
+            pb::ConnectionOp {
+                connections: vec![CONN.into(), "c-ffffffffffffffffffffffffffffffff".into()],
+                seqs: vec![3, 0],
+                op: Some(pb::connection_op::Op::Send(text("msg"))),
+            },
+            pb::ConnectionOp {
+                connections: vec![CONN.into()],
+                seqs: vec![],
+                op: Some(pb::connection_op::Op::Close(pb::ConnectionCloseRequest {
+                    code: 1000,
+                    reason: plain(b"bye"),
+                })),
+            },
+        ];
+        let record = Record::TurnRecord(t);
+        assert_eq!(
+            Record::decode(kind::TURN_RECORD, &record.encode()).unwrap(),
+            record
+        );
+    }
+
+    /// M24 §6.3: an enum value 0 or an unknown one, a bad id, a missing
+    /// event and SSE frames are invalid.
+    #[test]
+    fn invalid_connection_inputs() {
+        let ok = frame_input(pb::ConnectionProtocol::Websocket);
+        assert!(check(turn(ok.clone())).is_ok());
+        let cases: Vec<(&str, pb::ConnectionInput)> = vec![
+            (
+                "bad id",
+                pb::ConnectionInput {
+                    connection: "c-xyz".into(),
+                    ..ok.clone()
+                },
+            ),
+            (
+                "protocol 0",
+                pb::ConnectionInput {
+                    protocol: 0,
+                    ..ok.clone()
+                },
+            ),
+            (
+                "unknown protocol",
+                pb::ConnectionInput {
+                    protocol: 9,
+                    ..ok.clone()
+                },
+            ),
+            (
+                "no event",
+                pb::ConnectionInput {
+                    event: None,
+                    ..ok.clone()
+                },
+            ),
+            ("sse frame", frame_input(pb::ConnectionProtocol::Sse)),
+            (
+                "frame kind 0",
+                pb::ConnectionInput {
+                    event: Some(pb::connection_input::Event::Frame(pb::ConnectionFrame {
+                        seq: 0,
+                        frame: Some(pb::Frame {
+                            kind: 0,
+                            ..text("x")
+                        }),
+                    })),
+                    ..ok.clone()
+                },
+            ),
+            (
+                "frame without data",
+                pb::ConnectionInput {
+                    event: Some(pb::connection_input::Event::Frame(pb::ConnectionFrame {
+                        seq: 0,
+                        frame: Some(pb::Frame {
+                            data: None,
+                            ..text("x")
+                        }),
+                    })),
+                    ..ok.clone()
+                },
+            ),
+            (
+                "frame missing",
+                pb::ConnectionInput {
+                    event: Some(pb::connection_input::Event::Frame(pb::ConnectionFrame {
+                        seq: 0,
+                        frame: None,
+                    })),
+                    ..ok.clone()
+                },
+            ),
+            (
+                "open without request",
+                pb::ConnectionInput {
+                    event: Some(pb::connection_input::Event::Open(
+                        pb::ConnectionOpen::default(),
+                    )),
+                    ..ok.clone()
+                },
+            ),
+            (
+                "close cause 0",
+                pb::ConnectionInput {
+                    event: Some(pb::connection_input::Event::Close(
+                        pb::ConnectionClose::default(),
+                    )),
+                    ..ok.clone()
+                },
+            ),
+            (
+                "unknown close cause",
+                pb::ConnectionInput {
+                    event: Some(pb::connection_input::Event::Close(pb::ConnectionClose {
+                        cause: 99,
+                        ..Default::default()
+                    })),
+                    ..ok.clone()
+                },
+            ),
+        ];
+        for (what, input) in cases {
+            assert!(
+                matches!(check(turn(input)), Err(DecodeError::Invalid { .. })),
+                "{what}"
+            );
+        }
+        // An SSE open and close are valid.
+        let open = pb::ConnectionInput {
+            protocol: pb::ConnectionProtocol::Sse as i32,
+            event: Some(pb::connection_input::Event::Open(pb::ConnectionOpen {
+                request: Some(pb::HttpInput {
+                    method: "GET".into(),
+                    body: Some(pb::Body {
+                        value: Some(pb::body::Value::Inline(plain(b"").unwrap())),
+                    }),
+                    ..Default::default()
+                }),
+                subprotocols: vec![],
+            })),
+            ..ok.clone()
+        };
+        assert!(check(turn(open)).is_ok());
+        let close = pb::ConnectionInput {
+            protocol: pb::ConnectionProtocol::Sse as i32,
+            event: Some(pb::connection_input::Event::Close(pb::ConnectionClose {
+                cause: pb::CloseCause::Restart as i32,
+                code: 1012,
+                restart_after_lsn: 7,
+                ..Default::default()
+            })),
+            ..ok
+        };
+        assert!(check(turn(close)).is_ok());
+    }
+
+    #[test]
+    fn invalid_connection_ops() {
+        let base = turn(frame_input(pb::ConnectionProtocol::Websocket));
+        let with = |op: pb::ConnectionOp| pb::TurnRecord {
+            connection_ops: vec![op],
+            ..base.clone()
+        };
+        let send = |connections: Vec<&str>, seqs: Vec<u64>| pb::ConnectionOp {
+            connections: connections.into_iter().map(String::from).collect(),
+            seqs,
+            op: Some(pb::connection_op::Op::Send(text("x"))),
+        };
+        let close = |connections: Vec<&str>, seqs: Vec<u64>| pb::ConnectionOp {
+            connections: connections.into_iter().map(String::from).collect(),
+            seqs,
+            op: Some(pb::connection_op::Op::Close(pb::ConnectionCloseRequest {
+                code: 1000,
+                reason: None,
+            })),
+        };
+        assert!(check(with(send(vec![CONN], vec![0]))).is_ok());
+        assert!(check(with(close(vec![CONN], vec![]))).is_ok());
+        for (what, op) in [
+            (
+                "no op",
+                pb::ConnectionOp {
+                    op: None,
+                    ..send(vec![CONN], vec![0])
+                },
+            ),
+            ("send without targets", send(vec![], vec![])),
+            ("send with a seq missing", send(vec![CONN, CONN], vec![0])),
+            ("send to a bad id", send(vec!["x"], vec![0])),
+            ("close with seqs", close(vec![CONN], vec![1])),
+            ("close of two", close(vec![CONN, CONN], vec![])),
+            (
+                "send kind 0",
+                pb::ConnectionOp {
+                    op: Some(pb::connection_op::Op::Send(pb::Frame {
+                        kind: 0,
+                        ..text("x")
+                    })),
+                    ..send(vec![CONN], vec![0])
+                },
+            ),
+        ] {
+            assert!(
+                matches!(check(with(op)), Err(DecodeError::Invalid { .. })),
+                "{what}"
+            );
+        }
+    }
+
+    /// An accept's header values are sealables; a send-now names its
+    /// connection target.
+    #[test]
+    fn accept_and_send_now() {
+        let mut t = turn(frame_input(pb::ConnectionProtocol::Websocket));
+        t.outcome = Some(pb::Outcome {
+            kind: pb::OutcomeKind::Committed as i32,
+            output: Some(pb::outcome::Output::Accept(pb::ConnectionAccept {
+                subprotocol: "room.v1".into(),
+                headers: vec![pb::Header {
+                    name: "x".into(),
+                    value: plain(b"1"),
+                }],
+                subject: Some("user:1".into()),
+            })),
+            ..Default::default()
+        });
+        assert!(check(t.clone()).is_ok());
+        let mut bad = t.clone();
+        if let Some(pb::outcome::Output::Accept(a)) =
+            bad.outcome.as_mut().and_then(|o| o.output.as_mut())
+        {
+            a.headers[0].value = None;
+        }
+        assert!(check(bad).is_err());
+        let effect = |target: &str| pb::EffectRecord {
+            ordinal: 0,
+            kind: "connection.send-now".into(),
+            status: pb::EffectStatus::Closed as i32,
+            grounding: pb::Grounding::Live as i32,
+            delivery: "unsafe".into(),
+            target: target.into(),
+            ..Default::default()
+        };
+        let mut good = t.clone();
+        good.effects = vec![effect(&format!("connection:{CONN}"))];
+        assert!(check(good).is_ok());
+        let mut wrong = t;
+        wrong.effects = vec![effect("http:example.com")];
+        assert!(check(wrong).is_err());
     }
 }

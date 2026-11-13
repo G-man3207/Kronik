@@ -525,6 +525,19 @@ pub fn turn_response(r: &TurnResult) -> HttpResponse {
                 body,
             }
         }
+        // Only an open turn accepts (M24), and the connection path answers
+        // it; an HTTP turn never does.
+        Some(pb::outcome::Output::Accept(_)) => {
+            let mut resp = error(&ApiError::new(
+                ErrorCode::TurnFailed,
+                format!(
+                    "turn {} answered with a connection accept, which is not an HTTP response",
+                    r.turn_id
+                ),
+            ));
+            resp.headers.push(id);
+            resp
+        }
         Some(pb::outcome::Output::Reply(m)) => HttpResponse {
             status: 200,
             headers: vec![

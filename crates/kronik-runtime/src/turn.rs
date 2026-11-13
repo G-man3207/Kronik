@@ -484,6 +484,12 @@ fn input_to_wit(input: &pb::Input) -> Result<types::Input, RunError> {
             msg: message_to_wit(t.msg.as_ref())?,
         }),
         Some(Kind::Migrate(m)) => types::Input::Migrate(m.from_schema_version),
+        // M24: `connection-handler` takes these, not `handle`.
+        Some(Kind::Connection(_)) => {
+            return Err(RunError::Input(
+                "a connection input is not an input of handle".into(),
+            ));
+        }
         None => return Err(RunError::Input("input has no case".into())),
     })
 }

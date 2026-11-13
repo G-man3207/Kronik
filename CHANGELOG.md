@@ -20,6 +20,20 @@ until the v1.0 compatibility promise takes effect.
   earlier release get their copy at the first start while the backend still
   serves them. **External secret values are now at rest, encrypted, in the
   data directory, its snapshots and the bucket.**
+- Log format v1 gains the records of long-lived connections (M24,
+  docs/design/m24-connections.md §6), all additive (I16): the input case
+  `Input.connection` (5) with `ConnectionInput` (an open with its request
+  and subprotocols, a frame with its incoming seq, or a close with its
+  cause, code and how many frames were written), the turn's buffered
+  `connection_ops` (`TurnRecord` field 30), an open turn's accept
+  (`Outcome.output` case 6), the effect status `CLOSED` (12) and the
+  request `ConnectionSendRequest` of the `connection.send-now` effect.
+  Logs of earlier versions read unchanged; a release before this one
+  cannot read a log with such records. The turn JSON (`GET
+  /v1/turns/{id}`, `turn.schema.json`) shows them: input type
+  `connection`, `connection_ops`, `output.accept` and effect status
+  `closed`; history summarizes a connection input as `open|frame|close
+  <id> ...`.
 - The actor WIT is now `kronik:actor@0.1.1` (M24, ADR 0113). It adds the
   `connections` interface (WebSocket and SSE frames: `send`, `broadcast`,
   `close`, `send-now`) and the world `actor-connections`, whose components

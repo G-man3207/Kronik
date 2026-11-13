@@ -153,6 +153,17 @@ impl<'a> Context<'a> {
                     free.chain(headers).chain(body),
                 )
             }
+            Some(pb::outcome::Output::Accept(accept)) => {
+                let headers = accept.headers.iter().flat_map(|header| {
+                    std::iter::once(header.name.as_bytes()).chain(plaintext(header.value.as_ref()))
+                });
+                kronik_sched::scrub::prepared_fields_safe(
+                    current,
+                    original,
+                    matcher,
+                    free.chain([accept.subprotocol.as_bytes()]).chain(headers),
+                )
+            }
             None => kronik_sched::scrub::prepared_fields_safe(current, original, matcher, free),
         }
         .map_err(scrub_error)

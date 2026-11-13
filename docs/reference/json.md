@@ -2768,7 +2768,7 @@ against both.
       ]
     },
     "status": {
-      "description": "ok, denied, network, timeout, too_large, outcome_unknown, not_found,\nrejected, failed, reentrant.",
+      "description": "ok, denied, network, timeout, too_large, outcome_unknown, not_found,\nrejected, failed, reentrant, closed (M24).",
       "type": "string"
     },
     "target": {
@@ -4193,7 +4193,7 @@ against both.
       "type": "string"
     },
     "type": {
-      "description": "http, message, timer or migrate.",
+      "description": "http, message, timer, migrate or connection (M24).",
       "type": "string"
     }
   },

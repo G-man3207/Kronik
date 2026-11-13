@@ -1300,6 +1300,7 @@ impl Runner {
             config_epoch: epoch,
             memory_peak_bytes: out.memory_peak_bytes,
             schema_version: if committed { schema_version } else { 0 },
+            connection_ops: Vec::new(),
             // A recomputed turn's wall time says nothing about production.
             duration_us: 0,
         };
@@ -1673,6 +1674,15 @@ pub(crate) fn prepared_outcome_safe(
                     return Err(GateError::Prerequisite(ErrorCode::Unavailable));
                 }
                 None => {}
+            }
+        }
+        Some(pb::outcome::Output::Accept(accept)) => {
+            fields.push(accept.subprotocol.as_bytes());
+            for header in &accept.headers {
+                fields.push(header.name.as_bytes());
+                if let Some(value) = &header.value {
+                    fields.push(prepared_plain(value)?);
+                }
             }
         }
         None => {}

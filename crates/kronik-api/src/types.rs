@@ -321,7 +321,7 @@ pub struct InspectResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct InputSummary {
-    /// http, message, timer or migrate.
+    /// http, message, timer, migrate or connection (M24).
     #[serde(rename = "type")]
     pub kind: String,
     pub summary: String,
@@ -815,7 +815,7 @@ pub struct EffectSummary {
     pub kind: String,
     pub target: String,
     /// ok, denied, network, timeout, too_large, outcome_unknown, not_found,
-    /// rejected, failed, reentrant.
+    /// rejected, failed, reentrant, closed (M24).
     pub status: String,
     pub delivery: Option<String>,
     pub error: Option<String>,

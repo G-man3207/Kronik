@@ -91,6 +91,9 @@
           "$ref": "#/$defs/TurnMigrateInput"
         },
         {
+          "$ref": "#/$defs/TurnConnectionInput"
+        },
+        {
           "type": "null"
         }
       ]
@@ -106,7 +109,7 @@
       ]
     },
     "output": {
-      "description": "The reply to a message or the HTTP response; null when there is none.",
+      "description": "The reply to a message, the HTTP response, or an open turn's accept; null when there is none.",
       "oneOf": [
         {
           "type": "object",
@@ -136,6 +139,18 @@
           "properties": {
             "http": {
               "$ref": "#/$defs/TurnHttpOutput"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "accept"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "accept": {
+              "$ref": "#/$defs/TurnAcceptOutput"
             }
           }
         },
@@ -242,6 +257,13 @@
             ]
           }
         }
+      }
+    },
+    "connection_ops": {
+      "description": "The turn's buffered connection operations (M24), in call order; empty when the turn failed or sent none.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TurnConnectionOp"
       }
     }
   },
@@ -705,7 +727,7 @@
           "$ref": "#/$defs/TurnCount"
         },
         "kind": {
-          "description": "`http.fetch`, `foreign.http`, `actor.call`, `crypto.hmac-sha256`, `crypto.sign-ed25519`, `secret.reveal`.",
+          "description": "`http.fetch`, `foreign.http`, `actor.call`, `crypto.hmac-sha256`, `crypto.sign-ed25519`, `secret.reveal`, `connection.send-now`.",
           "type": "string"
         },
         "target": {
@@ -724,6 +746,7 @@
             "rejected",
             "failed",
             "reentrant",
+            "closed",
             "unspecified"
           ]
         },
@@ -830,6 +853,386 @@
         },
         "name": {
           "description": "The message the timer delivers; null for a cancel.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TurnConnectionRequest": {
+      "description": "The upgrade request (WebSocket) or the GET (SSE) that opened the connection, with an empty body.",
+      "type": "object",
+      "required": [
+        "method",
+        "path",
+        "query",
+        "route",
+        "params",
+        "headers",
+        "body",
+        "idempotency_key"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "query": {
+          "description": "Without the `?`; empty when there is none.",
+          "type": "string"
+        },
+        "route": {
+          "description": "The route pattern that matched: `/counter/{key}/{op}`.",
+          "type": "string"
+        },
+        "params": {
+          "description": "The route's parameters, as `[name, value]` pairs.",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "minItems": 2,
+            "items": false
+          }
+        },
+        "headers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnHeader"
+          }
+        },
+        "body": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnSealable"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idempotency_key": {
+          "description": "The `Idempotency-Key` header; empty when there is none.",
+          "type": "string"
+        }
+      }
+    },
+    "TurnFrame": {
+      "description": "One frame of a long-lived connection (M24): a WebSocket text or binary message, or an SSE event.",
+      "type": "object",
+      "required": [
+        "kind",
+        "data",
+        "event",
+        "id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "text",
+            "binary",
+            "event"
+          ]
+        },
+        "data": {
+          "$ref": "#/$defs/TurnSealable"
+        },
+        "event": {
+          "description": "An SSE event's `event:` field; empty when there is none.",
+          "type": "string"
+        },
+        "id": {
+          "description": "An SSE event's `id:` field; empty when there is none.",
+          "type": "string"
+        }
+      }
+    },
+    "TurnConnectionInput": {
+      "description": "An event of a long-lived connection (M24): it opened, a frame arrived, or it closed.",
+      "type": "object",
+      "required": [
+        "type",
+        "event",
+        "connection",
+        "protocol",
+        "route",
+        "request",
+        "subprotocols",
+        "seq",
+        "frame",
+        "close",
+        "resend_of",
+        "reason",
+        "token_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "connection"
+        },
+        "event": {
+          "enum": [
+            "open",
+            "frame",
+            "close"
+          ]
+        },
+        "connection": {
+          "description": "The connection id: `c-` and 32 hex characters.",
+          "type": "string"
+        },
+        "protocol": {
+          "enum": [
+            "websocket",
+            "sse"
+          ]
+        },
+        "route": {
+          "description": "The route pattern that matched: `/chat/{key}/ws`.",
+          "type": "string"
+        },
+        "request": {
+          "description": "`open` only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnConnectionRequest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "subprotocols": {
+          "description": "`open` only: the WebSocket subprotocols the client offered, in order.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "seq": {
+          "description": "`frame` only: 0, 1, 2, ... per connection, in the order the client sent them.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnCount"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "frame": {
+          "description": "`frame` only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnFrame"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "close": {
+          "description": "`close` only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnConnectionClose"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resend_of": {
+          "description": "For a resent dead letter: the failed turn; else empty.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "The reason of the operator who resent or closed it, or null.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TurnConnectionClose": {
+      "description": "How a connection ended.",
+      "type": "object",
+      "required": [
+        "initiator",
+        "cause",
+        "code",
+        "reason",
+        "frames_written",
+        "frames_received",
+        "restart_after_lsn"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "initiator": {
+          "enum": [
+            "client",
+            "actor",
+            "host"
+          ]
+        },
+        "cause": {
+          "description": "`client`, `actor`, or the host's reason: `restart`, `ping-timeout`, `too-large`, `slow-consumer`, `protocol`, `operator`, `rebase`, `abandoned` or `unavailable`.",
+          "type": "string"
+        },
+        "code": {
+          "description": "The WebSocket close code received (client) or sent (actor, host).",
+          "$ref": "#/$defs/TurnCount"
+        },
+        "reason": {
+          "description": "The client's or the actor's reason; null for the host.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnSealable"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "frames_written": {
+          "description": "Outgoing frames with a lower seq were written, the rest dropped; null when unknown (after a restart).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnCount"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "frames_received": {
+          "description": "Incoming messages read, admitted or not.",
+          "$ref": "#/$defs/TurnCount"
+        },
+        "restart_after_lsn": {
+          "description": "After a restart: frames in records after this LSN were never written; else null.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnCount"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "TurnConnectionOp": {
+      "description": "A buffered connection operation of the turn (M24), in call order: `send` (and `broadcast`) or `close`.",
+      "type": "object",
+      "required": [
+        "op",
+        "connections",
+        "seqs",
+        "frame",
+        "code",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "op": {
+          "enum": [
+            "send",
+            "close"
+          ]
+        },
+        "connections": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "seqs": {
+          "description": "`send`: each connection's outgoing seq, at the same index; `close`: empty.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnCount"
+          }
+        },
+        "frame": {
+          "description": "`send` only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnFrame"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "code": {
+          "description": "`close` only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnCount"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "description": "`close` only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnSealable"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "TurnAcceptOutput": {
+      "description": "An open turn's accept (M24); a refusal is `http`.",
+      "type": "object",
+      "required": [
+        "subprotocol",
+        "headers",
+        "subject"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "subprotocol": {
+          "description": "The selected WebSocket subprotocol, or null.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "headers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnHeader"
+          }
+        },
+        "subject": {
+          "description": "The connection's subject from now on; null: the request's.",
           "type": [
             "string",
             "null"

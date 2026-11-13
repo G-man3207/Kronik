@@ -1666,6 +1666,12 @@ fn dead_letter(turn: &pb::TurnRecord) -> Option<(pb::OutcomeKind, &pb::Outcome, 
             }
         }
         pb::input::Kind::Timer(_) => "timer",
+        // M24: a failed frame or close turn is a dead letter, an open is not.
+        pb::input::Kind::Connection(c) => match c.event.as_ref()? {
+            pb::connection_input::Event::Frame(_) => "connection.frame",
+            pb::connection_input::Event::Close(_) => "connection.close",
+            pb::connection_input::Event::Open(_) => return None,
+        },
         pb::input::Kind::Http(_) | pb::input::Kind::Migrate(_) => return None,
     };
     Some((kind, outcome, input_class))

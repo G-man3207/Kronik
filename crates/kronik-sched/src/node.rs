@@ -2382,6 +2382,7 @@ impl Node {
             config_epoch: epoch,
             memory_peak_bytes: out.memory_peak_bytes,
             schema_version: if committed { schema_version } else { 0 },
+            connection_ops: Vec::new(),
             duration_us: u64::try_from(
                 self.env
                     .clock

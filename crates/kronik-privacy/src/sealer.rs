@@ -1001,6 +1001,74 @@ mod tests {
         assert_eq!(s.open(&other).bytes(), Some(&b"carol"[..]));
     }
 
+    /// M24: a connection turn's frame data, close reasons, open request
+    /// and accept headers are sealed with their subject and unseal again.
+    #[test]
+    fn connection_values_seal_and_unseal() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sealer(dir.path());
+        s.set_on(true);
+        let fill = counter_fill();
+        let conn = "c-0123456789abcdef0123456789abcdef".to_string();
+        let frame = |data: &[u8]| pb::Frame {
+            kind: pb::frame::Kind::Text as i32,
+            data: Some(val(Some("user:1"), data)),
+            ..Default::default()
+        };
+        let original = Record::TurnRecord(pb::TurnRecord {
+            input: Some(pb::Input {
+                kind: Some(pb::input::Kind::Connection(pb::ConnectionInput {
+                    connection: conn.clone(),
+                    protocol: pb::ConnectionProtocol::Websocket as i32,
+                    event: Some(pb::connection_input::Event::Frame(pb::ConnectionFrame {
+                        seq: 0,
+                        frame: Some(frame(b"incoming")),
+                    })),
+                    ..Default::default()
+                })),
+            }),
+            outcome: Some(pb::Outcome {
+                output: Some(pb::outcome::Output::Accept(pb::ConnectionAccept {
+                    headers: vec![pb::Header {
+                        name: "x".into(),
+                        value: Some(val(Some("user:1"), b"header")),
+                    }],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+            connection_ops: vec![
+                pb::ConnectionOp {
+                    connections: vec![conn.clone()],
+                    seqs: vec![0],
+                    op: Some(pb::connection_op::Op::Send(frame(b"outgoing"))),
+                },
+                pb::ConnectionOp {
+                    connections: vec![conn],
+                    seqs: vec![],
+                    op: Some(pb::connection_op::Op::Close(pb::ConnectionCloseRequest {
+                        code: 1000,
+                        reason: Some(val(Some("user:1"), b"bye")),
+                    })),
+                },
+            ],
+            ..Default::default()
+        });
+        let mut r = original.clone();
+        s.seal_record(&mut r, &fill, 1).unwrap();
+        let mut plain = 0;
+        kronik_proto::sealables::record_mut(&mut r, &mut |v| {
+            assert!(
+                matches!(v.value, Some(pb::sealable::Value::Sealed(_))),
+                "{v:?}"
+            );
+            plain += 1;
+        });
+        assert_eq!(plain, 4);
+        assert_eq!(s.unseal_record(&mut r), 0, "none fails to unseal");
+        assert_eq!(r, original);
+    }
+
     fn before_untagged(r: &Record) -> Option<pb::Sealable> {
         let Record::TurnRecord(t) = r else {
             return None;
