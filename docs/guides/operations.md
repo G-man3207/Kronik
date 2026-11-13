@@ -1899,6 +1899,29 @@ microVM), and they record their calls like other effects
   experimental: it has not been run on a host with KVM, and every add
   answers with a warning that says so. Use `gvisor` for actors you rely on.
 
+Know two things before you enable `--isolation microvm`
+([ADR 0095](../adr/0095-pinned-firecracker-guest.md),
+[ADR 0096](../adr/0096-microvm-snapshot-and-vsock-lifecycle.md)):
+
+- **The VMM runs as the daemon's own user, not as a user of its own.**
+  Firecracker's upstream jailer gives each VMM a distinct uid; it needs root,
+  and Kronik replaces it with a launcher of its own, which no one outside the
+  project has reviewed. The launcher empties every capability set and the
+  bounding set, locks the `NOROOT` secure bits, sets `no_new_privs`, denies
+  io_uring, and gives the VMM private mount, network, IPC, UTS, PID and cgroup
+  namespaces and a root that holds only its inputs. On the root service the
+  VMM's user is still host root, so a guest that escapes Firecracker acts as
+  root without capabilities; on the nonroot service it is the `kronik` user's
+  namespace root.
+- **Forks of a microVM actor repeat its memory.** With `fork_mode = sandbox`,
+  every fork resumes the same snapshot: random state and keys a program holds
+  in memory, a stored random seed and `/proc/sys/kernel/random/boot_id` are the
+  same in the original and in every fork, and the guest's clock lags the
+  host's by the age of the checkpoint. The guest kernel reseeds its own
+  random generator on resume; nothing tells the program that it was
+  restored. An actor whose forks must not repeat a value has to reseed
+  itself.
+
 ### MicroVM actors on the root service
 
 A microVM's cgroup, with its CPU, memory and process limits, goes next to the

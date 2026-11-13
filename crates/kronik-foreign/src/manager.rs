@@ -91,7 +91,7 @@ pub const TRUSTED_WARNING: &str = "isolation trusted runs the image with plain r
 
 /// The warning of every `isolation microvm` add (M20): the level ships as
 /// an experimental opt-in until a real KVM host has run its proofs (ADR 0095).
-pub const MICROVM_WARNING: &str = "isolation microvm is experimental: it has not yet booted on KVM hardware, so use gvisor for actors you rely on";
+pub const MICROVM_WARNING: &str = "isolation microvm is experimental: it has not yet booted on KVM hardware, its VMM runs as the daemon's own user, and its sandbox forks repeat the memory of one snapshot; use gvisor for actors you rely on";
 
 /// The foreign boundary established before the daemon starts any threads.
 #[derive(Debug, Clone)]

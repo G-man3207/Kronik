@@ -49,12 +49,15 @@ the audit export; the engine is `kronik-0.4.1+wasmtime-50.0.1`. `v0.3.0` and
 absent or partial: the cluster (M16–M19), the WASI 0.3 remainder (M22),
 long-lived connections (M24), blobs (M25–M26), and the UI, OpenTelemetry,
 fleet and hardening tracks (M27–M34). The microVM level (M20) and the nonroot
-daemon (M21) are in the tree as opt-in, experimental work that has not yet been
-run on every host it needs: `isolation = "microvm"` has not booted a VM on a
-KVM host, and `kronik serve --init --rootless` has passed on Debian 13 and is
-owed the Ubuntu 24.04/AppArmor proof (R1). The nonroot daemon's decisions,
-ADRs 0060–0065, were accepted on 2026-11-13; the microVM level's, ADRs 0095 and
-0096, await the maintainers.
+daemon (M21) are in the tree as opt-in work whose installed proofs have not
+been run on this revision: `isolation = "microvm"` is experimental and has not
+booted a VM on a KVM host, and the nonroot service of `kronik serve --init
+--rootless` has not passed its installed proofs (ADR 0064), on Ubuntu 24.04
+with AppArmor's restriction on user namespaces (R1) or elsewhere. The manual
+`isolation` workflow runs those proofs on disposable hosted runners and keeps
+their evidence. The nonroot daemon's decisions, ADRs 0060–0065, were accepted
+on 2026-11-13; the microVM level's, ADRs 0095 and 0096, await the
+maintainers.
 See the [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
 for the state of each milestone, the open questions and the known gaps, and the
 [compliance audit](https://github.com/G-man3207/Kronik/wiki/Compliance-audit)

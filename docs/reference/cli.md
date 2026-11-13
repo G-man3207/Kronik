@@ -1971,7 +1971,12 @@ whose name was linked later: the built-in store holds an older value of it or
 none. `trusted` runs plain runc with a warning, a
 seccomp filter and no user namespace: it is not a security boundary.
 `microvm` (M20) is **experimental**: it has not yet booted on KVM hardware,
-and every add answers with a warning that says so. It runs the image in a
+and every add answers with a warning that says so. Its VMM runs as the
+daemon's own user under a launcher of Kronik's (not Firecracker's jailer),
+and its sandbox forks all resume one snapshot, so values a program holds in
+memory repeat across forks (the
+[operations guide](../guides/operations.md#foreign-actors) says what that
+means). It runs the image in a
 Firecracker VM with a pinned guest kernel and no network device; it needs a
 usable `/dev/kvm` and the pinned tool bundle in `[foreign] microvm_dir`, and
 without KVM the add is `KVM_UNAVAILABLE` (use `gvisor`) and nothing is
