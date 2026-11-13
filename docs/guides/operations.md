@@ -245,7 +245,7 @@ and [0104](../adr/0104-admin-ui-as-a-public-api-client.md).
 | Key | Default | Meaning | Flag |
 |---|---|---|---|
 | `master_key_file` | `<data_dir>/keys/master.key` (`--init` writes `/etc/kronik/master.key`) | The file source's 64 hex characters. Conflicts with `KRONIK_MASTER_KEY` and with KMS sources | `--master-key-file`, `KRONIK_MASTER_KEY_FILE` |
-| `source` | `"file"` | `"file"`, `"env"`, `"openbao"`, `"aws"`, `"gcp"` or `"azure"`; see [the master key](#the-master-key) | |
+| `source` | `"file"` | `"file"`, `"env"`, `"openbao"`, `"aws"`, `"gcp"`, `"azure"` or `"pkcs11"`; see [the master key](#the-master-key) | |
 | `wrapped_file` | `"keys/master.wrapped"` | KMS ciphertext, relative to `data_dir`; absolute paths, `.` and `..` are refused | |
 | `start_timeout` | `"60s"` | Total retry/timeout budget for one high-level KMS load, wrap or rewrap, including encrypt and verification decrypt; a positive duration in `ms`, `s` or `m` | |
 
@@ -1100,8 +1100,40 @@ Azure `metadata_endpoint` may name a full loopback URL. These overrides
 are never read from the envelope, cannot target a non-loopback host and
 contain no inline credentials. Normal deployments leave them unset.
 
-PKCS#11 is not implemented by this slice. Neither an HSM module nor a
-keyhelper is loaded.
+**PKCS#11 (an HSM, or SoftHSM2 for tests):**
+
+```toml
+[keys]
+source = "pkcs11"
+
+[keys.pkcs11]
+helper_path = "/usr/local/libexec/kronik-keyhelper"
+module = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+module_sha256 = "<sha256 of the module file>"
+pin_file = "/etc/kronik/hsm.pin"
+manufacturer = "SoftHSM project"
+model = "SoftHSM v2"
+serial = "<the token's serial>"
+key_id = "<the key's CKA_ID in hex>"
+key_version = "1"
+```
+
+The daemon never loads the module: the optional `kronik-keyhelper` (ADR
+0093, a separate glibc build with `--features pkcs11`) does, once per
+operation, with an empty environment and the PIN on a private descriptor.
+The token is chosen by manufacturer, model and serial, the key by its
+`CKA_ID`; it must be an AES-256 secret key that is sensitive, not
+extractable and not modifiable, with AES-GCM allowed. Because the helper's
+environment is empty, SoftHSM2 reads its system configuration
+(`/etc/softhsm/softhsm2.conf`). `kronik keys enroll --config FILE` checks the
+key through the helper and prints a probe to add as `[keys.pkcs11.probe]`;
+a key with other attributes is refused (`KEY_HELPER_FAILED`). After that a
+start on an empty data directory makes the seed in memory and writes only
+its envelope, and later starts unwrap it through the helper. A wrong PIN, a
+missing helper or a token that does not answer stops the start with
+`KEY_HELPER_FAILED` and writes nothing. `scripts/e2e-pkcs11.sh` runs this
+flow against SoftHSM2 (the design's §9 has what it showed); no physical HSM
+has been tried.
 
 ### Migration and rewrap
 
