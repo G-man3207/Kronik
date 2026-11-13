@@ -1082,6 +1082,12 @@ async fn incomplete_secret_inventory_blocks_disclosure_not_unrelated_turns() {
             "/v1/actors/counter/a/messages",
             json!({"name": "increment", "reason": "before failure"}),
         ),
+        // A pending timer whose message name holds the value before it is
+        // a secret (#44).
+        (
+            "/v1/actors/counter/a/messages",
+            json!({"name": "schedule", "text": format!("3600000 run-{SECRET}"), "reason": "timer"}),
+        ),
     ] {
         let (status, response) = call(&api, "POST", path, body).await;
         assert_eq!(status, 200, "{response}");
@@ -1094,6 +1100,13 @@ async fn incomplete_secret_inventory_blocks_disclosure_not_unrelated_turns() {
     )
     .await;
     assert_eq!(status, 200, "{response}");
+    // The timers view scrubs the name, as a turn's `timers[].name` is.
+    let (status, response) = call(&api, "GET", "/v1/actors/counter/a/timers", Value::Null).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(
+        response["timers"][0]["name"], "run-[secret:api-key]",
+        "{response}"
+    );
     // Warm certified bytes survive ciphertext damage, so the read path's
     // store-identity probe is what catches a damaged store: every active
     // ledger row's physical row must still carry the ledger's version hash,
@@ -1111,6 +1124,7 @@ async fn incomplete_secret_inventory_blocks_disclosure_not_unrelated_turns() {
         "/v1/audit",
         "/v1/actors/counter/a",
         "/v1/actors/counter/a/history",
+        "/v1/actors/counter/a/timers",
     ] {
         let (status, response) = call(&api, "GET", path, Value::Null).await;
         assert_eq!(status, 503, "{path}: {response}");

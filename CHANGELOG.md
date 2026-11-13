@@ -155,6 +155,11 @@ M23, key and secret backends:
   failure to start is now the error JSON on stdout with `--json` and a full
   error (code, hint, `docs:`) otherwise, and a token the daemon refuses is
   `UNAUTHENTICATED` instead of `UNAVAILABLE` (#42).
+- `GET /v1/actors/{kind}/{key}/timers` returned pending timers' message names
+  unscrubbed, and answered 200 while the secret inventory was unavailable,
+  where every other view of a turn's data scrubs them or answers 503. It now
+  scrubs names like a turn's `timers[].name` and fails closed with
+  `SECRET_UNAVAILABLE` (#44).
 
 ## v0.4.1 — 2026-11-07
 

@@ -2166,7 +2166,9 @@ impl Api {
             .db()
             .timers(Some((&actor.kind, &actor.key)))
             .map_err(internal)?;
-        ok(&TimersResponse {
+        // A name is the guest's text: scrubbed like the turn views, and
+        // 503 rather than unscrubbed while the inventory is not held (#44).
+        self.ok_scrubbed(TimersResponse {
             timers: rows
                 .into_iter()
                 .map(|t| Timer {
