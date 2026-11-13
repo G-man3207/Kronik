@@ -1,5 +1,5 @@
-"""A real `kronik serve` for the scripts that drive one: scripts/chaos.py and
-scripts/identity-examples.py. Not a test framework: the daemon process, its
+"""A real `kronik serve` for the scripts that drive one: scripts/chaos.py,
+scripts/identity-examples.py and scripts/acceptance_m24.py. Not a test framework: the daemon process, its
 API over the Unix socket, and the CLI with --json."""
 
 import http.client
@@ -30,8 +30,11 @@ class UnixConnection(http.client.HTTPConnection):
 class Daemon:
     """`kronik serve` on a data directory, its output appended to `log`."""
 
-    def __init__(self, bin, data, sock, port, log, healthy_timeout=60.0):
+    def __init__(self, bin, data, sock, port, log, healthy_timeout=60.0, config=None):
+        """`config`, if given, is a configuration file for --config; the
+        data directory, gateway address and API socket flags override it."""
         self.bin, self.data, self.sock, self.port = bin, data, sock, port
+        self.config = config
         self.healthy_timeout = healthy_timeout
         self.log = open(log, "ab")
         self.proc = None
@@ -40,9 +43,12 @@ class Daemon:
         """Starts the daemon, with `env` added to its environment if given;
         returns (seconds until healthy, applied LSN then)."""
         started = time.time()
+        args = [self.bin, "serve", "--data-dir", self.data, "--http-listen", f"127.0.0.1:{self.port}",
+                "--api-socket", self.sock]
+        if self.config:
+            args += ["--config", self.config]
         self.proc = subprocess.Popen(
-            [self.bin, "serve", "--data-dir", self.data, "--http-listen", f"127.0.0.1:{self.port}",
-             "--api-socket", self.sock],
+            args,
             stdout=self.log, stderr=self.log, start_new_session=True, env={**os.environ, **(env or {})})
         while time.time() - started < self.healthy_timeout:
             if self.proc.poll() is not None:
