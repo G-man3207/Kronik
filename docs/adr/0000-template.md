@@ -6,6 +6,13 @@ and replace every section. Keep it short: what was decided and why.
 -->
 
 - **Status:** Proposed | Accepted | Superseded by NNNN | Deprecated
+
+<!--
+An ADR is Proposed until a maintainer accepts it. An ADR whose decision ships
+while it is still Proposed carries a note after its status that names the
+ruling it awaits (as ADR 0109 does); one that ships with no open ruling is
+marked Accepted.
+-->
 - **Date:** YYYY-MM-DD
 
 ## Context
