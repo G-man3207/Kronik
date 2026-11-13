@@ -194,8 +194,10 @@ export class Timers {
 /**
  * The WebSocket and SSE connections this actor accepted (see `kronik explain
  * connections`). Only the actor whose open accepted a connection may send on
- * it or close it; any other use traps with `CONNECTION_NOT_HELD`. A frame to
- * a closed connection is dropped and shows in the history.
+ * it or close it while it is live: another actor's use traps with
+ * `CONNECTION_NOT_HELD`. A frame to a connection that is not live (closed, or
+ * never accepted) is dropped and shows in the history, closing it does
+ * nothing, and `sendNow` returns false.
  */
 export class Connections {
   /** Sends `frame` to `connection` when this turn commits, in call order; nothing if the turn fails. */

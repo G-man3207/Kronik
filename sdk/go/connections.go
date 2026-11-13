@@ -213,9 +213,10 @@ func (*Ctx) Refuse(out Output, err error) (OpenReply, error) {
 
 // ConnectionOps are the WebSocket and SSE connections this actor accepted:
 // ctx.Connections (see `kronik explain connections`). Only the actor whose
-// open accepted a connection may send on it or close it; any other use
-// traps with CONNECTION_NOT_HELD. A frame to a closed connection is dropped
-// and shows in the history.
+// open accepted a connection may send on it or close it while it is live:
+// another actor's use traps with CONNECTION_NOT_HELD. A frame to a
+// connection that is not live (closed, or never accepted) is dropped and
+// shows in the history, closing it does nothing, and SendNow returns false.
 type ConnectionOps struct{}
 
 // Send sends frame to connection when this turn commits, in call order;

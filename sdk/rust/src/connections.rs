@@ -182,8 +182,10 @@ impl OpenReply {
 /// The WebSocket and SSE connections this actor accepted: [`Ctx::connections`](crate::Ctx::connections).
 ///
 /// Only the actor whose open accepted a connection may send on it or close
-/// it; any other use traps with `CONNECTION_NOT_HELD`. A frame to a closed
-/// connection is dropped and shows in the history.
+/// it while it is live: another actor's use traps with `CONNECTION_NOT_HELD`.
+/// A frame to a connection that is not live (closed, or never accepted) is
+/// dropped and shows in the history, closing it does nothing, and
+/// [`send_now`](Connections::send_now) answers `Ok(false)`.
 pub struct Connections {
     _private: (),
 }
