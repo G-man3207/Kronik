@@ -39,9 +39,11 @@ enforcement in CI.
 
 ### Segment
 
-- Header (28 bytes + branch): magic `KRNK`, `u32` format version (1),
+- Header (24 bytes + branch): magic `KRNK`, `u32` format version (1),
   `u64` start LSN, `u32` branch name length, branch name bytes, `u32`
-  crc32c of everything before it. All integers little endian.
+  crc32c of everything before it (the 20 bytes and the branch name). All
+  integers little endian. For the branch `main` the header is 28 bytes and
+  the first entry starts at offset 28.
 - Entries: `[u32 len][u32 crc32c][u64 lsn][u8 kind][protobuf]`. `len` is
   the protobuf length, and the crc covers `lsn`, `kind` and the protobuf.
   LSNs are strictly increasing by 1 across all record kinds and segments.
@@ -138,9 +140,14 @@ its plaintext form.
 | 16 | `StateRebase` | rollback --by-replay: rebased turns, the switch (M13) |
 | 17 | `GuardTriggered` | a `kronik watch` guard that fired (M11) |
 | 40 | `AuditEvent` | mutations outside the log, after they succeeded; changes no state (M28) |
+| 45 | `SecretVersion` | every secret version before its first use: `secret set` and `secret delete` of the built-in store, and the versions of a linked backend that the refresher, `secret refresh` or an effect sees (M23, ADR 0090) |
+| 46 | `SecretLink` | `secret link`, `secret unlink` (M23, ADR 0090) |
 
-0 and any other value (15 and 16 are reserved) are `STORAGE_CORRUPT`, except kind 255, the footer readers skip. The messages are in
-`proto/kronik/log/v1/` (`common`, `input`, `turn`, `config`, `branch`).
+Kind 0 and every value not in the table are `STORAGE_CORRUPT`, except kind
+255, the footer readers skip. The messages are in `proto/kronik/log/v1/`:
+`common`, `input`, `turn`, `config` and `branch`; `effects` holds the
+requests and responses an effect record carries, and `control` the
+control-plane operations an `AuditEvent` carries.
 Decisions beyond the brief:
 
 - `TurnRecord` adds `config_epoch` (20), `memory_peak_bytes` (21) and
