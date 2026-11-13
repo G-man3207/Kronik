@@ -1626,3 +1626,137 @@ fn a_snapshot_with_an_open_turn_stays_a_start_point_through_retention() {
         p.node.store().db().open_turns().unwrap().is_empty()
     });
 }
+
+/// Makes `actor` busy for about 0.75 s (a bounded spin) before anything
+/// queued after this returns, so a call to it times out (#30).
+fn keep_busy(p: &Proc, actor: &str) {
+    let started = p
+        .node
+        .probe
+        .turns_run
+        .load(std::sync::atomic::Ordering::SeqCst);
+    p.send_detached(actor, msg("spin", "250000000"));
+    p.wait_until("the spin to start", |p| {
+        p.node
+            .probe
+            .turns_run
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > started
+    });
+}
+
+/// The turns of `actor` whose input came by `source`.
+fn turns_from(p: &Proc, actor: &str, source: pb::MessageSource) -> usize {
+    turn_records(&p.records())
+        .iter()
+        .filter(|t| {
+            t.actor
+                .as_ref()
+                .is_some_and(|a| format!("{}/{}", a.kind, a.key) == actor)
+                && matches!(
+                    t.input.as_ref().and_then(|i| i.kind.as_ref()),
+                    Some(pb::input::Kind::Message(m)) if m.source == source as i32
+                )
+        })
+        .count()
+}
+
+/// #30: a call that times out while its callee is busy still commits at the
+/// callee. When the caller then fails, the callee's change is an orphan and
+/// the call's compensation is delivered, once, as soon as the callee's turn
+/// commits; a callee turn that fails leaves neither. Until then the
+/// compensation is held, also across a restart that loses the queued call.
+#[test]
+fn a_call_that_times_out_is_an_orphan_once_its_callee_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy();
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "counter".into(),
+            effect_timeout_ms: Some(100),
+            fuel: Some(5_000_000_000),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    let orphan_of = |p: &Proc, key: &str| {
+        p.node
+            .store()
+            .db()
+            .orphans(true)
+            .unwrap()
+            .into_iter()
+            .find(|o| o.callee.key == key)
+    };
+
+    // With a compensation.
+    keep_busy(&p, "counter/b");
+    let r = p.send(
+        "counter/a",
+        msg("call-fail", "counter/b increment increment"),
+    );
+    assert!(!r.committed());
+    assert!(r.outcome.message.contains("Timeout"), "{:?}", r.outcome);
+    // The callee has not run the call yet: nothing is known.
+    assert!(orphan_of(&p, "b").is_none());
+    assert_eq!(p.kv("counter/b", "n"), None);
+    p.wait_until("the call and its compensation", |p| {
+        p.kv("counter/b", "n").as_deref() == Some("2")
+    });
+    p.wait_until("the orphan to resolve", |p| {
+        orphan_of(p, "b").is_some_and(|o| o.resolved_lsn.is_some())
+    });
+    assert!(orphan_of(&p, "b").unwrap().compensation_id.is_some());
+    assert_eq!(
+        turns_from(&p, "counter/b", pb::MessageSource::Compensation),
+        1
+    );
+
+    // Without one: the change stays an orphan.
+    keep_busy(&p, "counter/c");
+    let r = p.send("counter/a", msg("call-fail", "counter/c increment"));
+    assert!(!r.committed());
+    p.wait_until("the orphan", |p| orphan_of(p, "c").is_some());
+    let o = orphan_of(&p, "c").unwrap();
+    assert!(
+        o.compensation_id.is_none() && o.resolved_lsn.is_none(),
+        "{o:?}"
+    );
+    assert_eq!(p.kv("counter/c", "n").as_deref(), Some("1"));
+
+    // A callee turn that fails changed nothing: no orphan, no compensation.
+    keep_busy(&p, "counter/d");
+    let r = p.send("counter/a", msg("call-fail", "counter/d fail increment"));
+    assert!(!r.committed());
+    p.wait_until("the callee's failed turn", |p| {
+        turns_from(p, "counter/d", pb::MessageSource::Call) == 1
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(orphan_of(&p, "d").is_none());
+    assert_eq!(p.kv("counter/d", "n"), None);
+    assert_eq!(
+        turns_from(&p, "counter/d", pb::MessageSource::Compensation),
+        0
+    );
+
+    // A restart loses the queued call: the held compensation never goes out.
+    keep_busy(&p, "counter/e");
+    let r = p.send(
+        "counter/a",
+        msg("call-fail", "counter/e increment increment"),
+    );
+    assert!(!r.committed());
+    drop(p);
+    let p = start(dir.path());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(orphan_of(&p, "e").is_none());
+    assert_eq!(p.kv("counter/e", "n"), None);
+    assert!(p.node.store().db().mailbox().unwrap().is_empty());
+    // The rest stands after the restart.
+    assert!(orphan_of(&p, "c").is_some_and(|o| o.resolved_lsn.is_none()));
+    assert_eq!(p.kv("counter/b", "n").as_deref(), Some("2"));
+}

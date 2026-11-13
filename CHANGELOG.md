@@ -169,6 +169,17 @@ M23, key and secret backends:
   changeset in the log and the actor database, also in privacy mode `on`.
   Blob cells are scrubbed byte for byte now and stay blobs, and a secret
   that is not UTF-8 is scrubbed from them too (#37).
+- A `call` that timed out while its callee was busy still committed at the
+  callee, but when the caller's turn then failed the change was neither an
+  orphan (`history --orphans`, `GET /v1/orphans`) nor compensated, and a
+  compensation attached to the call was dropped (#30). Such a call now
+  becomes an orphan, and its compensation is delivered exactly once, as soon
+  as the callee's turn commits, whether that is before or after the caller's
+  failure; a callee turn that fails leaves neither. A successful call whose
+  reply was withheld (`HOST_REDACTION_FAILURE`) is now an orphan too, as its
+  compensation already was delivered. The behavior diff counts orphans the
+  same way, so `errors.new_orphans` no longer reports production's orphan of
+  a timed-out call as new in the fork.
 
 ## v0.4.1 — 2026-11-07
 

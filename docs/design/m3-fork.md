@@ -291,7 +291,7 @@ whose drift grows: `{"actors_changed": N, "items": [{"actor", "keys": [...], "sq
 | --- | --- |
 | `introduced` | fork turns that fail where production committed, plus new turns that fail |
 | `fixed` | turns that committed in the fork but failed in production |
-| `new_orphans` | orphans created in the fork that production did not create |
+| `new_orphans` | orphans created in the fork that production did not create: calls without a compensation, in a failed turn, whose callee committed (a successful call, one whose reply was withheld, or one that timed out while its callee's turn still committed, as in the `orphans` table) |
 | `outcome_unknown` | fork effects matched to a production effect whose recorded status was outcome-unknown |
 | `items` | `[{"kind": "introduced" | "fixed" | "new_orphan" | "outcome_unknown", "error_code", "message", "turn_prod", "turn_fork", "input"}]`, at most 20 per kind |
 

@@ -1231,6 +1231,26 @@ impl Node {
     }
 
     /// Queues a pending message of the mailbox.
+    /// The compensation of the timed-out call `call_message_id` that the
+    /// record at `lsn` released (#30). A failed read leaves it in the
+    /// mailbox, where the next start delivers it.
+    pub(crate) fn released_compensation(
+        &self,
+        call_message_id: &str,
+        lsn: Lsn,
+    ) -> Option<kronik_store::db::MailboxRow> {
+        match self.store.db().released_compensation(call_message_id, lsn) {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "reading a released compensation failed; the next start delivers it"
+                );
+                None
+            }
+        }
+    }
+
     fn enqueue_mailbox(&self, row: kronik_store::db::MailboxRow) {
         let (parent_time, subject) = match &row.input.kind {
             Some(pb::input::Kind::Message(m)) => {
@@ -2086,6 +2106,20 @@ impl Node {
         // ends with EFFECT_OUTCOME_UNKNOWN, also when its record is too large:
         // `fit` and `fail` decide it on the final record, as a replay does.
         let committed = out.committed();
+        // Calls whose callee may still commit (#30), and, when this is the
+        // callee's turn of a call, that call's message id.
+        let timed_out: std::collections::BTreeSet<u32> = fxs
+            .records
+            .iter()
+            .filter(|e| e.timed_out_call())
+            .map(|e| e.ordinal)
+            .collect();
+        let call_message_id = match &input.kind {
+            Some(pb::input::Kind::Message(m)) if m.source == pb::MessageSource::Call as i32 => {
+                Some(m.message_id.clone())
+            }
+            _ => None,
+        };
         let mut record = pb::TurnRecord {
             execution_id,
             actor: Some(actor.to_pb()),
@@ -2173,6 +2207,14 @@ impl Node {
         if !committed {
             for m in fxs.compensations {
                 let compensates = causal::message_id(&key, m.ordinal);
+                // A timed-out call's compensation goes out only once its
+                // callee's turn commits (#30): now if that turn came first,
+                // else when it is applied.
+                if timed_out.contains(&m.ordinal)
+                    && self.released_compensation(&compensates, lsn).is_none()
+                {
+                    continue;
+                }
                 self.deliver(
                     actor,
                     &key,
@@ -2182,6 +2224,13 @@ impl Node {
                     &compensates,
                 );
             }
+        }
+        // The callee's turn of a call whose caller failed after the call
+        // timed out: the compensation it released (#30).
+        if let Some(call_message_id) = &call_message_id
+            && let Some(row) = self.released_compensation(call_message_id, lsn)
+        {
+            self.enqueue_mailbox(row);
         }
         if !timers.is_empty() {
             let mut w = lock(&self.wheel);

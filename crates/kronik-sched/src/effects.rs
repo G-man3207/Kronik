@@ -1933,7 +1933,7 @@ impl TurnFx {
             http: None,
         };
         if let Some(record) = self.recorded_keyed(&expected, &plain)? {
-            if record.successful_call() {
+            if record.successful_call() || record.timed_out_call() {
                 self.remember_compensation(ordinal, &to, cleanup);
             }
             let outcome = outcome_of_call(&record);
@@ -1985,7 +1985,9 @@ impl TurnFx {
         {
             return prepared;
         }
-        if record.successful_call() {
+        // A timed-out call's callee may still commit (#30): its compensation
+        // is recorded with a failed turn, and delivered only if it does.
+        if record.successful_call() || record.timed_out_call() {
             self.remember_compensation(ordinal, &to, cleanup);
         }
         self.record(record).await?;

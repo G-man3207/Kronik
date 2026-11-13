@@ -700,6 +700,12 @@ impl pb::EffectRecord {
                     && self.callee_source.is_some()
                     && self.observed_callee_status == Some(pb::EffectStatus::Ok as i32)))
     }
+
+    /// Whether a call timed out: its callee's turn was queued and may still
+    /// commit, before or after the caller learns of it (#30).
+    pub fn timed_out_call(&self) -> bool {
+        self.kind == "actor.call" && self.status == pb::EffectStatus::Timeout as i32
+    }
 }
 
 fn effect(value: Option<&pb::EffectRecord>, what: &'static str) -> Result<(), DecodeError> {

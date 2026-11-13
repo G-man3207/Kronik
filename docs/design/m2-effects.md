@@ -11,7 +11,7 @@ I6, I7, I8, I14 and I17.
 | `kronik-privacy` | `MasterKey` (load or create `[keys] master_key_file`), `SecretStore` (`keys/secrets.db`, XChaCha20-Poly1305 under a key derived from the master key, versioned values, version hashes). |
 | `kronik-effects` | Capability matching (`http:<host>`, `*.example.com`, `secret:<name>`, `secret-reveal:<name>`), `Config` (grants and limits as of an epoch), delivery classes, HTTP fingerprints, secret header rendering and response scrubbing, host-side crypto, the per grant and target rate limiter, the `EffectSimulator` trait with `RecordedMatch` and `FailClosed`. Pure code except the limiter's clock. |
 | `kronik-runtime` | The `EffectGate` trait the host calls for `http-client.fetch`, `messaging.call`, `crypto.*` and `secrets.reveal`; buffered `timers.schedule/cancel`; compensations in `TurnOutput`. |
-| `kronik-store` | Tables `grant_records`, `limit_records`, `open_turns`, `open_effects`, `timers`, `orphans`; saved call responses in `deliveries`. |
+| `kronik-store` | Tables `grant_records`, `limit_records`, `open_turns`, `open_effects`, `timers`, `orphans`, `timed_out_calls`; saved call responses in `deliveries`. |
 | `kronik-sched` | The per-turn gate (`TurnBegin`, `EffectResult`, replay of recorded results, re-execution by delivery class), `call` execution, compensations, the timer wheel, recovery re-runs, and `grant`/`revoke`/`set_limits`/secret operations. |
 | `kronik-core::env::real` | The outbound `Net`: hyper client over rustls with the system roots. |
 | `kronik-api` | The endpoints in §8. |
@@ -208,7 +208,8 @@ its ingress key belong to the re-run (an HTTP retry with the same
 - **Cycles.** `call_chain` is the caller's chain plus the caller. A call to
   an actor in the chain (or to itself) returns `reentrant` at once.
 - **Timeout.** The kind's effect timeout (10 s); then `timeout`, recorded.
-  (A cross-chain wait cycle ends this way.)
+  (A cross-chain wait cycle ends this way.) The callee's turn stays queued
+  and can still commit after the caller has given up.
 - **Dedup.** The callee's turn record is applied with
   `deliveries(message_id → lsn, outcome)`. A call whose message id is
   already in `deliveries` gets the saved outcome and the callee does not
@@ -222,11 +223,26 @@ its ingress key belong to the re-run (an HTTP retry with the same
   key `child(callee turn key, callee, COMPENSATION_ORDINAL = 2^32 - 2)`,
   message id = its `causal-id`, `compensates` = the call's message id.
 - **Orphans.** When the caller's turn fails, every successful call (status
-  OK) adds an `orphans` row: callee, callee turn, caller turn, call message
-  id, compensation message id (if any). A committed turn whose input has
-  `compensates = m` resolves the orphan for `m`. A failed compensation is a
-  dead letter; its resend keeps `compensates`, so a successful resend
-  resolves the orphan. `history --orphans` lists unresolved rows.
+  OK, or `HOST_REDACTION_FAILURE` that observed OK) adds an `orphans` row:
+  callee, callee turn, caller turn, call message id, compensation message id
+  (if any). A committed turn whose input has `compensates = m` resolves the
+  orphan for `m`. A failed compensation is a dead letter; its resend keeps
+  `compensates`, so a successful resend resolves the orphan. `history
+  --orphans` lists unresolved rows.
+- **A call that timed out** (#30) is such a call once its callee's turn
+  commits, which can happen before the caller's failed record or after it.
+  Its compensation, if any, is in `TurnRecord.compensations` too. The
+  applier decides from the log alone: when the callee's turn of the call
+  (its `deliveries` row) is already applied, a committed one makes the
+  orphan at once and its compensation goes out with the caller's record;
+  otherwise the call waits in `timed_out_calls` (ids only, no user data)
+  and its compensation is held in the mailbox (not loaded, not delivered)
+  until that turn is applied: committed, the orphan is added (callee turn
+  taken from `deliveries`) and the compensation released; failed, nothing
+  changed and the compensation is dropped. The node whose record released
+  a compensation delivers it (`released_lsn`); a released one not yet
+  delivered goes out at the next start. A queued call lost to a restart
+  never runs, so its compensation stays held and nothing is orphaned.
 
 ## 6. Grants, limits and rates
 

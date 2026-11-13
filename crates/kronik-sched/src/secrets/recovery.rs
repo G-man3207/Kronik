@@ -276,8 +276,12 @@ impl Node {
             ActorRef::new(actor_pb.kind.clone(), actor_pb.key.clone()).map_err(|_| corrupt())?;
         let key = begin.causal_key.as_ref().ok_or_else(corrupt)?;
         let mut compensations = Vec::new();
+        // A timed-out call's callee may still commit (#30): its compensation
+        // is recorded too, and delivered only if it does.
+        let mut timed_out = std::collections::BTreeSet::new();
         for effect in effects.iter().filter(|effect| {
-            effect.kind == "actor.call" && effect.status == pb::EffectStatus::Ok as i32
+            (effect.kind == "actor.call" && effect.status == pb::EffectStatus::Ok as i32)
+                || effect.timed_out_call()
         }) {
             if erased_calls
                 && effect
@@ -286,6 +290,9 @@ impl Node {
                     .is_some_and(|r| matches!(self.sealer().open(r), Opened::Erased { .. }))
             {
                 continue;
+            }
+            if effect.timed_out_call() {
+                timed_out.insert(effect.ordinal);
             }
             let bytes = request_bytes(self.sealer(), effect.request.as_ref())?;
             let request = pb::CallEffectRequest::decode(bytes.as_ref()).map_err(|_| corrupt())?;
@@ -363,6 +370,11 @@ impl Node {
         let lsn = self.commit(Record::TurnRecord(record)).await?;
         for message in compensations {
             let compensates = causal::message_id(&key, message.ordinal);
+            if timed_out.contains(&message.ordinal)
+                && self.released_compensation(&compensates, lsn).is_none()
+            {
+                continue;
+            }
             self.deliver(
                 &actor,
                 &key,

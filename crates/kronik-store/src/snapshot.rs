@@ -23,6 +23,8 @@ const HASHED_TABLES: &[&str] = &[
     "ingress_keys",
     "dead_letters",
     "orphans",
+    // Rows only: empty in every state from before it, whose hash it leaves.
+    "timed_out_calls",
     "deployments",
     "kinds",
     "config_records",
