@@ -7,6 +7,8 @@ fn reference(byte: &str, size: u64) -> BlobReference {
     BlobReference::from(&kronik_proto::log::v1::BlobRef {
         hash: format!("b3:{}", byte.repeat(32)),
         size,
+        key_version: 0,
+        subject: None,
     })
 }
 

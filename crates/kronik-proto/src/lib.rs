@@ -7,6 +7,7 @@
 //! missing required field, is an error (the log treats it as
 //! `STORAGE_CORRUPT`), never a default operation.
 
+pub mod blobs;
 pub mod connection;
 pub mod control;
 pub mod http;
@@ -234,8 +235,14 @@ impl Record {
         Ok(record)
     }
 
-    /// Checks enum values (0 and unknown are invalid) and required fields.
+    /// Checks enum values (0 and unknown are invalid), required fields and
+    /// every blob reference ([`blobs::validate`]).
     pub fn validate(&self) -> Result<(), DecodeError> {
+        self.validate_fields()?;
+        blobs::validate(self)
+    }
+
+    fn validate_fields(&self) -> Result<(), DecodeError> {
         match self {
             Record::TurnBegin(m) => {
                 actor(m.actor.as_ref(), "TurnBegin.actor")?;

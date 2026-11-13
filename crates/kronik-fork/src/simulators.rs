@@ -1639,6 +1639,7 @@ impl ModelAccess {
                                     .map(|(name, value)| pb::HeaderPair { name, value })
                                     .collect(),
                                 body: answer.body.into_bytes(),
+                                body_blob: None,
                             };
                             match kronik_sched::scrub::http_response(
                                 &mut response,
@@ -1833,6 +1834,7 @@ mod tests {
                         },
                     ],
                     body: b"ok".to_vec(),
+                    body_blob: None,
                 }
                 .encode_to_vec(),
             ),
@@ -1910,6 +1912,7 @@ mod tests {
                 status: 200,
                 headers: vec![],
                 body,
+                body_blob: None,
             }
             .encode_to_vec(),
         );
@@ -2192,6 +2195,7 @@ mod tests {
                         name: "x-echo".into(),
                         value: "sekret-value".into(),
                     }],
+                    body_blob: None,
                 }
                 .encode_to_vec(),
             ),
@@ -2343,6 +2347,7 @@ mod tests {
                     status: 200,
                     headers: Vec::new(),
                     body: b"recorded-body".to_vec(),
+                    body_blob: None,
                 }
                 .encode_to_vec(),
             ),

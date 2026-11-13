@@ -116,6 +116,14 @@ message Limits {
   // clears it); an unset one keeps it.
   NameList fingerprint_exclude_headers = 11;
   NameList fingerprint_exclude_query = 12;
+  // Blobs (M25/M26, ADR 0117 §7-§8). Fields 16 and 17 are kept for them.
+  // HTTP request bodies and effect responses above this become blobs for a
+  // kind whose code reads blobs; at most `message_bytes`.
+  optional uint64 blob_threshold_bytes = 13;
+  // The largest HTTP request body the gateway accepts for such a kind.
+  optional uint64 upload_bytes = 14;
+  // The bytes of the blobs an actor holds, and the bytes one turn creates.
+  optional uint64 blob_bytes_per_actor = 15;
 }
 
 // A list a record sets as a whole, so that an empty list and no list differ.

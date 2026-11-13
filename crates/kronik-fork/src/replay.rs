@@ -2616,6 +2616,7 @@ impl ReplayGate {
                         })
                         .collect(),
                     body: rule.body.clone().into_bytes(),
+                    body_blob: None,
                 };
                 let out = kronik_sched::effects::prepare_inline_fetch_response(
                     &mut rec,
@@ -2766,6 +2767,7 @@ impl ReplayGate {
                                     .map(|(name, value)| pb::HeaderPair { name, value })
                                     .collect(),
                                 body: a.body.into_bytes(),
+                                body_blob: None,
                             }
                             .encode_to_vec(),
                         ),
@@ -2866,6 +2868,7 @@ impl ReplayGate {
                         .map(|(name, value)| pb::HeaderPair { name, value })
                         .collect(),
                     body: resp.body.to_vec(),
+                    body_blob: None,
                 };
                 let out = kronik_sched::effects::prepare_inline_fetch_response(
                     &mut rec,
@@ -2955,6 +2958,7 @@ impl ReplayGate {
                         .map(|(name, value)| pb::HeaderPair { name, value })
                         .collect(),
                     body: resp.body.to_vec(),
+                    body_blob: None,
                 };
                 let out = kronik_sched::effects::prepare_inline_fetch_response(
                     &mut rec,

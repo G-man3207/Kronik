@@ -547,9 +547,9 @@ envelope kind. The numbers M24 takes are listed so both stay apart.
 | --- | --- | --- |
 | `BlobRef` (common.proto) | `optional string subject = 3`, `uint32 key_version = 4` | M25 |
 | `EffectRecord` (turn.proto) | `repeated BlobRef blobs = 14`: every blob its request and response reference, outside the sealed payloads | M25 |
-| `HttpEffectRequest` (effects.proto) | `BlobRef body_blob = 6` | M25 |
+| `HttpEffectRequest` (effects.proto) | `BlobRef body_blob = 8` (6 and 7 are ADR 0134's) | M25 |
 | `HttpEffectResponse` (effects.proto) | `BlobRef body_blob = 4` | M25 |
-| `Limits` (config.proto) | `optional uint64 blob_threshold_bytes = 11`, `upload_bytes = 12`, `blob_bytes_per_actor = 13`; 14–15 reserved | M25 |
+| `Limits` (config.proto) | `optional uint64 blob_threshold_bytes = 13`, `upload_bytes = 14`, `blob_bytes_per_actor = 15`; 16–17 reserved (11 and 12 are ADR 0134's) | M25 |
 | `TurnRecord` | `blob_refs = 19` (exists) used; 24–29 reserved | M26 |
 | `HttpInput.request_hash` | version byte 4 (§6.3) | M25 |
 | reserved for M24 | `Input` case 5, `TurnRecord` 30–34, `Outcome.output` case 6, `EffectStatus` 12, envelope kind 18 if ever | M24 |
@@ -557,18 +557,23 @@ envelope kind. The numbers M24 takes are listed so both stay apart.
 
 ### 8.2 Validation
 
-`kronik_proto` gains `blobs::refs(&Record) -> impl Iterator<Item = &BlobRef>`
-(every reference outside sealed payloads: input body, outcome bodies,
-messages, timers, compensations, `blob_refs`, `EffectRecord.blobs`, rebased
-turns) and validates on decode:
+`kronik_proto` gains `blobs::refs(&Record) -> Vec<&BlobRef>` (every
+reference outside sealed payloads: input body, outcome bodies, messages,
+timers, compensations, `blob_refs`, `EffectRecord.blobs`, rebased turns)
+and `Record::decode` validates them:
 
 - `hash` is `b3:` or `b3s:` followed by 64 lowercase hex characters;
 - `b3:` has no subject and key version 0; `b3s:` has a valid subject
-  (`valid_subject`) and key version ≥ 1;
-- `BlobRefOp.kind` 0 or unknown is `STORAGE_CORRUPT` (as the brief says);
-- an `HttpEffectRequest` or `HttpEffectResponse` with both `body` and
-  `body_blob` is `STORAGE_CORRUPT`, and its `body_blob` must also be listed
-  in `EffectRecord.blobs`.
+  (`valid_subject`, the one rule the keystore also uses) and key version ≥ 1;
+- one identity has one size, subject and key version throughout a record;
+- `BlobRefOp.kind` 0 or unknown, or a `BlobRefOp` without its blob, is
+  `STORAGE_CORRUPT` (as the brief says).
+
+An `HttpEffectRequest` or `HttpEffectResponse` sits inside a `Sealable` that
+may be sealed, so decoding the record cannot see it. Where the payload is
+decoded (the effect gate, replay), `blobs::check_http_payload_blob` refuses
+one with both `body` and `body_blob`, or whose `body_blob` is not listed in
+`EffectRecord.blobs`.
 
 ### 8.3 Fixtures
 

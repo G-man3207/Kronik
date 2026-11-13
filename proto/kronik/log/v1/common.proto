@@ -74,11 +74,20 @@ message Audit {
   uint64 wall_time_ms = 3;
 }
 
-// A content-addressed blob (M25/M26). Present in the format from v1.
+// A content-addressed blob (M25/M26, ADRs 0117 and 0118). Present in the
+// format from v1. Every BlobRef the host writes is complete, so a record says
+// whose blob it is and which key it needs without unsealing anything.
 message BlobRef {
-  // "b3:" + 64 hex characters.
+  // "b3:" + 64 lowercase hex characters (BLAKE3 of the content), or "b3s:" +
+  // 64 lowercase hex characters (BLAKE3 keyed per subject, ADR 0118).
   string hash = 1;
+  // The plaintext size in bytes.
   uint64 size = 2;
+  // Set exactly for "b3s:": the blob's data subject.
+  optional string subject = 3;
+  // At least 1 exactly for "b3s:": the subject key version that names and
+  // seals the blob; 0 for "b3:".
+  uint32 key_version = 4;
 }
 
 // An HTTP body: inline bytes, or a blob from M25.

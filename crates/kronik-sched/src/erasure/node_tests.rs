@@ -314,6 +314,7 @@ fn an_open_turns_recorded_value_of_an_erased_subject_is_not_served_again() {
                         status: 200,
                         headers: Vec::new(),
                         body: b"NEEDLE-RECORDED".to_vec(),
+                        body_blob: None,
                     }
                     .encode_to_vec(),
                 )),

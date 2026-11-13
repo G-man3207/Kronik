@@ -89,6 +89,9 @@ message EffectRecord {
   // For GROUNDING_SYNTHETIC: the simulator that answered ("stub",
   // "contract", "neighbor", "model" or "fail-closed"); empty otherwise (M12).
   string simulator = 13;
+  // Every blob the request and the response reference (M25), outside the
+  // sealed payloads: collection, shipping and history read them without keys.
+  repeated BlobRef blobs = 14;
   // Host-generated actual committed callee, outside subject-sealed reply data.
   // Absence is historical unknown, never inferred as native or member shard 0.
   ActorSource callee_source = 40;

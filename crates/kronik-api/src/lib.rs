@@ -2014,6 +2014,9 @@ impl Api {
                 .fingerprint_exclude_query
                 .clone()
                 .map(|names| pb::NameList { names }),
+            blob_bytes_per_actor: None,
+            blob_threshold_bytes: None,
+            upload_bytes: None,
         };
         let (epoch, lsn, effective, rules) = self
             .node

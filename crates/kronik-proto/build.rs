@@ -16,8 +16,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let descriptors = protox::compile(&files, [&root])?;
     // BTreeMap so that a record's bytes (and so its hash) are deterministic.
+    // prost derives Eq and Hash only for messages without a repeated message
+    // field; EffectRecord had them before its `blobs` (M25) and every field
+    // it holds still has them.
     prost_build::Config::new()
         .btree_map([".kronik.log.v1.AuditEvent.details"])
+        .type_attribute(".kronik.log.v1.EffectRecord", "#[derive(Eq, Hash)]")
         .compile_fds(descriptors)?;
     Ok(())
 }

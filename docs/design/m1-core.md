@@ -185,6 +185,12 @@ Decisions beyond the brief:
 - Every user-data field is `Sealable` (message bodies, header values, state
   values, SQL changesets, effect requests and responses). In M1 every
   `Sealable` is `plain` with its subject tag.
+- Blob references (M25/M26, [M25 §8](m25-streaming-bodies.md#8-log-format)):
+  `BlobRef` adds `subject` (3) and `key_version` (4), `EffectRecord` adds
+  `blobs` (14), `HttpEffectRequest` and `HttpEffectResponse` add
+  `body_blob` (8, 4), and `Limits` adds the blob limits (13 to 15). Every
+  reference outside a sealed payload is validated on decode
+  (`kronik_proto::blobs`).
 
 ### Materialized state (`state.db`)
 

@@ -225,6 +225,7 @@ impl EffectSimulator for ContractFake {
                     value: "application/json".into(),
                 }],
                 body: a.body,
+                body_blob: None,
             },
         ))
     }
@@ -466,6 +467,7 @@ mod tests {
                         status: 200,
                         headers: vec![],
                         body: answer.as_bytes().to_vec(),
+                        body_blob: None,
                     }
                     .encode_to_vec(),
                 ),

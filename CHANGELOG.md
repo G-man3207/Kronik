@@ -206,6 +206,14 @@ until the v1.0 compatibility promise takes effect.
   `connection-handler` export, and an `SSE` route conflicts with a `GET`
   route on the same pattern (`ROUTE_CONFLICT`). The SDKs build against the
   new version.
+  new version; until the rest of M24 lands, the `connections` functions
+  trap with `NOT_IMPLEMENTED` and the gateway opens no connections.
+- Log format v1 gains the blob fields of M25 and M26, all additive:
+  `BlobRef` names its subject and key version, `EffectRecord.blobs` lists
+  the blobs an effect references, HTTP effect requests and responses can
+  hold a `body_blob`, and `Limits` has the blob limits. Every blob reference
+  is validated when a record is read; logs from earlier releases read
+  unchanged.
 - A turn could commit a log record over the 128 MiB record limit (for
   example many large HTTP responses or state writes in one turn), which
   `history` then refused with `STORAGE_CORRUPT: entry length ...`, and after

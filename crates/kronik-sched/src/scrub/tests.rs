@@ -315,6 +315,7 @@ fn free_header_names_cannot_bypass_redaction_or_turn_into_invalid_wire_names() {
             value: "ok".into(),
         }],
         body: b"ok".to_vec(),
+        body_blob: None,
     };
     assert_eq!(
         http_response(&mut response, &matcher, 4096),
@@ -352,6 +353,7 @@ fn body_and_header_expansion_share_the_response_budget() {
             value: "a".into(),
         }],
         body: b"a".to_vec(),
+        body_blob: None,
     };
     assert_eq!(
         http_response(&mut response, &plan(&secrets), 20),

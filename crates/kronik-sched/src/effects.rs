@@ -171,6 +171,7 @@ pub fn prepare_inline_fetch_response(
                 status: u32::from(status),
                 headers: Vec::new(),
                 body: WITHHELD_EFFECT_BODY.to_vec(),
+                body_blob: None,
             }
             .encode_to_vec(),
         );
@@ -513,6 +514,7 @@ pub fn legacy_http_disclosure(
         status,
         headers: Vec::new(),
         body: WITHHELD_EFFECT_BODY.to_vec(),
+        body_blob: None,
     });
     for (payload, bytes) in [
         (&mut record.request, Some(request.encode_to_vec())),
@@ -1691,6 +1693,7 @@ impl TurnFx {
                         .map(|(name, value)| pb::HeaderPair { name, value })
                         .collect(),
                     body: Vec::from(response.body),
+                    body_blob: None,
                 },
                 &matcher,
                 self.spec

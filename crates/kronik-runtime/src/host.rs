@@ -708,12 +708,16 @@ pub(crate) fn message_to_pb(m: types::Message, subject: Option<String>) -> pb::M
             subject,
             value: Some(pb::sealable::Value::Plain(m.body)),
         }),
+        // `check_message` refuses message blobs until M26, whose turns
+        // complete each reference from the turn's references instead.
         blobs: m
             .blobs
             .into_iter()
             .map(|b| pb::BlobRef {
                 hash: b.hash,
                 size: b.size,
+                subject: None,
+                key_version: 0,
             })
             .collect(),
         retained_compensation_source: None,

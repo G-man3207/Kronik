@@ -45,6 +45,9 @@ message HttpEffectRequest {
   // default headers, sorted and without duplicates.
   repeated string fingerprint_excluded_headers = 6;
   repeated string fingerprint_excluded_query = 7;
+  // A body sent from a blob (M25): `body` is then empty, and the reference
+  // is also in EffectRecord.blobs.
+  BlobRef body_blob = 8;
 }
 
 message HeaderPair {
@@ -57,6 +60,9 @@ message HttpEffectResponse {
   uint32 status = 1;
   repeated HeaderPair headers = 2;
   bytes body = 3;
+  // A body above the kind's blob threshold, stored in the blob store (M25):
+  // `body` is then empty, and the reference is also in EffectRecord.blobs.
+  BlobRef body_blob = 4;
 }
 
 // actor.call request.

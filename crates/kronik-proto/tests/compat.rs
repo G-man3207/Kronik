@@ -6,6 +6,7 @@
 
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
+use prost::Message as _;
 
 fn fixture(name: &str, record: &Record) -> Vec<u8> {
     let path = format!("{}/tests/fixtures/{name}.hex", env!("CARGO_MANIFEST_DIR"));
@@ -886,6 +887,7 @@ fn effect_record_http_v3_v1() {
         fingerprint_version: 3,
         fingerprint_excluded_headers: vec!["x-api-key".into()],
         fingerprint_excluded_query: vec!["nonce".into(), "ts".into()],
+        body_blob: None,
     };
     let mut turn = turn();
     turn.effects = vec![pb::EffectRecord {
@@ -1148,4 +1150,211 @@ fn connection_close_v1() {
             "{name}"
         );
     }
+}
+
+fn blob_ref(byte: u8, size: u64) -> pb::BlobRef {
+    pb::BlobRef {
+        hash: format!("b3:{}", format!("{byte:02x}").repeat(32)),
+        size,
+        subject: None,
+        key_version: 0,
+    }
+}
+
+fn subject_blob_ref(byte: u8, size: u64) -> pb::BlobRef {
+    pb::BlobRef {
+        hash: format!("b3s:{}", format!("{byte:02x}").repeat(32)),
+        size,
+        subject: Some("user:7".into()),
+        key_version: 1,
+    }
+}
+
+/// M25: a turn whose upload and HTTP response are blobs, with a fetch whose
+/// response is a blob. The log holds only references.
+#[test]
+fn blob_bodies_v1() {
+    let upload = blob_ref(0x11, 314_572_800);
+    let fetched = blob_ref(0x22, 41_943_040);
+    let response = pb::HttpEffectResponse {
+        status: 200,
+        headers: vec![pb::HeaderPair {
+            name: "content-type".into(),
+            value: "application/pdf".into(),
+        }],
+        body: vec![],
+        body_blob: Some(fetched.clone()),
+    };
+    let mut t = turn();
+    t.input = Some(pb::Input {
+        kind: Some(pb::input::Kind::Http(pb::HttpInput {
+            method: "POST".into(),
+            path: "/media/a/upload".into(),
+            body: Some(pb::Body {
+                value: Some(pb::body::Value::Blob(upload.clone())),
+            }),
+            route: "/media/{key}/upload".into(),
+            ..Default::default()
+        })),
+    });
+    t.effects = vec![pb::EffectRecord {
+        ordinal: 0,
+        kind: "http.fetch".into(),
+        fingerprint: vec![9; 32],
+        response: Some(pb::Sealable {
+            subject: None,
+            value: Some(pb::sealable::Value::Plain(response.encode_to_vec())),
+        }),
+        status: pb::EffectStatus::Ok as i32,
+        grounding: pb::Grounding::Live as i32,
+        target: "http:files.example.com".into(),
+        blobs: vec![fetched.clone()],
+        ..Default::default()
+    }];
+    t.outcome = Some(pb::Outcome {
+        kind: pb::OutcomeKind::Committed as i32,
+        output: Some(pb::outcome::Output::Http(pb::HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(pb::Body {
+                value: Some(pb::body::Value::Blob(fetched.clone())),
+            }),
+        })),
+        ..Default::default()
+    });
+    let record = Record::TurnRecord(t);
+    let bytes = fixture("blob-bodies-v1", &record);
+    let decoded = Record::decode(kronik_proto::kind::TURN_RECORD, &bytes).unwrap();
+    assert_eq!(decoded, record);
+    assert_eq!(
+        kronik_proto::blobs::refs(&decoded),
+        [&upload, &fetched, &fetched]
+    );
+    let Some(pb::sealable::Value::Plain(payload)) = decoded.turn().unwrap().effects[0]
+        .response
+        .as_ref()
+        .and_then(|r| r.value.clone())
+    else {
+        panic!("plain response")
+    };
+    let payload = pb::HttpEffectResponse::decode(payload.as_slice()).unwrap();
+    kronik_proto::blobs::check_http_payload_blob(
+        &payload.body,
+        payload.body_blob.as_ref(),
+        &decoded.turn().unwrap().effects[0].blobs,
+    )
+    .unwrap();
+}
+
+/// M25: an effect result whose request body and response are a subject's
+/// blobs (`b3s:`, with subject and key version), payloads tagged with the
+/// subject as production records them.
+#[test]
+fn subject_blob_effect_result_v1() {
+    let sent = subject_blob_ref(0x33, 2_097_152);
+    let received = subject_blob_ref(0x44, 5_242_880);
+    let request = pb::HttpEffectRequest {
+        method: "PUT".into(),
+        url: "https://files.example.com/u/7".into(),
+        headers: vec![],
+        body: vec![],
+        fingerprint_version: 2,
+        fingerprint_excluded_headers: vec![],
+        fingerprint_excluded_query: vec![],
+        body_blob: Some(sent.clone()),
+    };
+    let response = pb::HttpEffectResponse {
+        status: 201,
+        headers: vec![],
+        body: vec![],
+        body_blob: Some(received.clone()),
+    };
+    let tagged = |bytes: Vec<u8>| pb::Sealable {
+        subject: Some("user:7".into()),
+        value: Some(pb::sealable::Value::Plain(bytes)),
+    };
+    let record = Record::EffectResult(pb::EffectResult {
+        execution_id: "00112233445566778899aabbccddeeff".into(),
+        effect: Some(pb::EffectRecord {
+            ordinal: 1,
+            kind: "http.fetch".into(),
+            fingerprint: vec![7; 32],
+            request: Some(tagged(request.encode_to_vec())),
+            response: Some(tagged(response.encode_to_vec())),
+            idempotency_key: "k".into(),
+            delivery: "idempotency-keyed".into(),
+            status: pb::EffectStatus::Ok as i32,
+            grounding: pb::Grounding::Live as i32,
+            target: "http:files.example.com".into(),
+            blobs: vec![sent.clone(), received.clone()],
+            ..Default::default()
+        }),
+    });
+    let bytes = fixture("subject-blob-effect-result-v1", &record);
+    let decoded = Record::decode(kronik_proto::kind::EFFECT_RESULT, &bytes).unwrap();
+    assert_eq!(decoded, record);
+    assert_eq!(kronik_proto::blobs::refs(&decoded), [&sent, &received]);
+}
+
+/// M25: the blob limits of a kind (Limits fields 11 to 13).
+#[test]
+fn blob_limits_v1() {
+    let record = Record::Limits(pb::Limits {
+        epoch: 12,
+        kind: "media".into(),
+        effect_response_bytes: Some(64 << 20),
+        audit: Some(pb::Audit {
+            token_id: "admin".into(),
+            reason: "large media".into(),
+            wall_time_ms: 1_793_000_000_000,
+        }),
+        blob_threshold_bytes: Some(1 << 20),
+        upload_bytes: Some(512 << 20),
+        blob_bytes_per_actor: Some(4 << 30),
+        ..Default::default()
+    });
+    let bytes = fixture("blob-limits-v1", &record);
+    assert_eq!(
+        Record::decode(kronik_proto::kind::LIMITS, &bytes).unwrap(),
+        record
+    );
+}
+
+/// References that break the rules of ADR 0118 do not decode.
+#[test]
+fn malformed_blob_references_are_corrupt() {
+    let with = |r: pb::BlobRef| {
+        let mut t = turn();
+        t.blob_refs = vec![pb::BlobRefOp {
+            kind: pb::blob_ref_op::Kind::Retain as i32,
+            blob: Some(r),
+        }];
+        Record::decode(
+            kronik_proto::kind::TURN_RECORD,
+            &Record::TurnRecord(t).encode(),
+        )
+    };
+    assert!(with(blob_ref(1, 1)).is_ok());
+    assert!(with(subject_blob_ref(1, 1)).is_ok());
+    let mut keyed_plain = blob_ref(1, 1);
+    keyed_plain.key_version = 3;
+    let mut short = blob_ref(1, 1);
+    short.hash.pop();
+    let mut no_subject = subject_blob_ref(1, 1);
+    no_subject.subject = None;
+    for bad in [keyed_plain, short, no_subject] {
+        assert!(with(bad).is_err());
+    }
+    let mut t = turn();
+    t.blob_refs = vec![pb::BlobRefOp {
+        kind: 0,
+        blob: Some(blob_ref(1, 1)),
+    }];
+    assert!(
+        Record::decode(
+            kronik_proto::kind::TURN_RECORD,
+            &Record::TurnRecord(t).encode()
+        )
+        .is_err()
+    );
 }
