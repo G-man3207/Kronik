@@ -756,7 +756,7 @@ without one from `<data_dir>/otel.key` (created at first use, mode 0600).
 The log is the audit trail: every mutation writes a log record with its
 token and reason (`kronik history` and the diff read them). With
 `[audit] sink` set, `kronik serve` also writes one JSON line
-(`kronik.audit/v2`) per audited record to the sink, in log order, at least
+(`kronik.audit/v3`) per audited record to the sink, in log order, at least
 once, from the `audit` cursor in `<data_dir>/export.json`: configuration
 changes, operator sends and resends, each `secret.reveal`, guards that
 fired (`watch.guard`), the switch of a rollback via replay
@@ -776,7 +776,8 @@ new applied generation. Only then is the restore marker removed and its
 parent synced, with exports on or off.
 
 - **A directory** (`file:///var/log/kronik/audit/`): lines go to
-  `audit-v2-<sequence:020>.jsonl` files (mode 0640), fsynced before the cursor
+  `audit-v2-<sequence:020>.jsonl` files (mode 0640; the `v2` names the
+  numbering scheme, the lines are v3), fsynced before the cursor
   moves; `file_max_bytes` (1 B–1 GiB, default 64 MiB) is a soft
   whole-batch rotation threshold, not an oversized-record drop limit.
   Exclusive-create names use an increasing sequence, independent of LSNs

@@ -552,16 +552,16 @@ Rules for `AuditEvent`:
   configuration record or `AuditEvent`. A new route without one fails the
   test.
 
-### 4.3 The JSON line (`kronik.audit/v2`)
+### 4.3 The JSON line (`kronik.audit/v3`)
 
 One object per line, UTF-8, `\n`-terminated, keys in this order:
 
 ```json
-{"schema":"kronik.audit/v2","lsn":1234,"kind":"deployment","action":"promote",
+{"schema":"kronik.audit/v3","lsn":1234,"kind":"deployment","action":"promote",
  "at_wall_ms":1761500000123,"token_id":"token:ci-promote","reason":"PR #12",
  "branch":"main","epoch":7,
  "details":{"proposal_id":"p-…","kinds":[{"kind":"counter","code_hash":"b3:…","schema_version":0}]},
- "record_hash":"b3:<64 hex>"}
+ "record_hash":"b3k:v3:<64 hex>"}
 ```
 
 - **The dedup key is (`lsn`, `effect`, `record_hash`)**.
@@ -570,19 +570,33 @@ One object per line, UTF-8, `\n`-terminated, keys in this order:
   an older ship point, new records reuse the LSNs of the lost tail. The
   `restore` event marks the point, and `kronik audit verify` reports lines
   that share an LSN but conflict.
-- **`record_hash`** is blake3 over `kronik.audit/v2\0`, the record kind
-  byte and canonical record encoding. Sealables become subject tags;
-  canonical free text is `WITHHELD` and token-scrubbed. Erasure subjects
-  and hidden actor keys use keyed labels. Resealing does not change it.
-  New emissions use v2 only. Verification derives the exact legacy v1
-  hash from the source record, including its historical subject masking;
-  it never accepts an arbitrary alternate hash. Known schema, hash and
-  identity fields must match. Mixed v1/v2 retries count as one logical
-  source item. Only trusted source restore records authorize superseding
-  cuts; a sink cannot authorize a cut.
+- **`record_hash`** is `b3k:v3:` and 64 hex: a keyed BLAKE3 hash, with the
+  purpose `kronik audit record v3` and the node's key derived from the
+  master key (the one its subject labels use), of the record kind byte and
+  the canonical record encoding. The canonical record is the source record
+  with every sealable's value removed (its subject tag stays), an
+  erasure's subject replaced by its keyed label (in its reason too), and
+  the key in an `AuditEvent`'s `details.actor` replaced by its keyed label.
+  Free text (reasons, messages, details) stays in the hashed bytes as it
+  was recorded, scrubbed for secret values and token spellings: the key,
+  not a placeholder, keeps the hash from confirming a guess of private
+  text. Building or verifying a line therefore needs the master key, which
+  the daemon loads at start; without it the hash is never replaced by a
+  public digest, and the line fails with `UNAVAILABLE` ("audit identity
+  requires the protected master key"). Resealing does not change the hash.
+  New emissions use v3 only.
+- **Earlier lines** are read-only compatibility: verification also accepts
+  `kronik.audit/v2` lines, whose `b3:` hash is the public BLAKE3 of
+  `kronik.audit/v2\0`, the kind byte and the same canonical encoding, and
+  `kronik.audit/v1` lines, whose hash has no prefix string and v1's subject
+  masking. It derives each from the source record and never accepts an
+  arbitrary alternate hash. Known schema, hash and identity fields must
+  match. Retries in mixed formats count as one logical source item. Only
+  trusted source restore records authorize superseding cuts; a sink cannot
+  authorize a cut.
 - **Positions:** `restore.through_lsn` and `audit.gap.from`/`to` are
-  action-specific validated `u64` values internally, JSON numbers in v2
-  and explicitly decimal strings in legacy v1. Key names do not exempt
+  action-specific validated `u64` values internally, JSON numbers in v3 and
+  v2, and explicitly decimal strings in legacy v1. Key names do not exempt
   generic details or free text from scrubbing.
 - **`action` and `details` per kind:**
 
@@ -626,7 +640,9 @@ One object per line, UTF-8, `\n`-terminated, keys in this order:
 
 ### 4.4 Sinks
 
-`[audit] sink` is one URL:
+`[audit] sink` is one URL. The `v2` in the file and object names below
+belongs to the numbered-slot scheme, not to the line format: the names are
+frozen, and the lines in them are `kronik.audit/v3`.
 
 - **Directory:** `file:///var/log/kronik/audit/`. Lines are appended to
   `audit-v2-<sequence:020>.jsonl` (mode 0640) and fsynced before the cursor

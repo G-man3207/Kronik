@@ -2277,6 +2277,8 @@ and safely rewind; restart alone does not prove durability repaired.
 create; no cursor advances. Configure a supporting backend, not an overwrite
 fallback. Current archive names are monotonic, independent of clock rollback:
 `audit-v2-<sequence>.jsonl` locally and `audit/v2/<sequence>.jsonl` remotely.
+The `v2` names the numbering scheme; the lines in them are
+`kronik.audit/v3`.
 Keep the remote namespace append-only; see the operations guide for rotation
 and backend-consistency requirements.
 
@@ -2316,7 +2318,7 @@ Next     kronik export status
 
 `kronik audit show [--from <LSN>] [--limit <N>]`
 
-Prints the audit lines (`kronik.audit/v2`) of main's log from `--from` (the
+Prints the audit lines (`kronik.audit/v3`) of main's log from `--from` (the
 first retained record by default), as an audit sink receives them, also
 when no sink is set (`GET /v1/audit`, scope `admin`: the lines name tokens
 and callers). `--limit` is 1 to 1000 lines, 100 by default; a page ends
@@ -2341,11 +2343,14 @@ Compares an audit sink with main's log (m28-otel §4.5): every audited
 record in (`--from`, `--to`] must have its line, deduplicated by `lsn`,
 `effect` and `record_hash`, and equal in kind, action, token and time;
 no line may be extra or conflict with the log's record. Known schema,
-source-derived hash and identity fields are validated. Exact legacy v1
-read compatibility counts mixed v1/v2 retries as one logical source item;
-new emissions are v2 only. Only trusted source restore records authorize
-superseding a tail, never a sink's own restore claim. Restore/gap positions
-are validated action-specific `u64`: v2 JSON numbers, v1 decimal strings.
+source-derived hash and identity fields are validated. New emissions are
+`kronik.audit/v3`, whose `record_hash` (`b3k:v3:`) is keyed with the master
+key, so verification loads the master key as the daemon does. Legacy v2 and
+v1 lines are read too, and retries in mixed formats count as one logical
+source item. Only trusted source restore records authorize superseding a
+tail, never a sink's own restore claim. Restore/gap positions are
+validated action-specific `u64`: JSON numbers in v3 and v2, decimal
+strings in v1.
 Needs no daemon: it reads the data directory (`--data-dir`, else `server.data_dir`)
 and the sink, `--sink` or `[audit] sink`: a `file://` directory or an
 `s3://` bucket (with `[audit] endpoint` and the `AWS_*` variables). A

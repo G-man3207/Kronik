@@ -260,10 +260,12 @@ that a turn generated from `random-bytes`.
   unambiguous in the log.
   Secret/token changes record intent before changing their stores and
   record a `.failed` event if the change fails; intent is not proof of
-  success. Audit export emits `kronik.audit/v2` only. Free text, names and
-  spans are scrubbed for secret values and token spellings; canonical
-  hashing withholds free text. Subject masking handles case, percent
-  encoding and identifier boundaries.
+  success. Audit export emits `kronik.audit/v3` only. Free text, names and
+  spans are scrubbed for secret values and token spellings. A line's
+  `record_hash` covers the scrubbed free text and is keyed with the master
+  key, so it does not confirm a guess of private text, and checking it
+  (`kronik audit verify`) needs the master key. Subject masking handles
+  case, percent encoding and identifier boundaries.
   If the inventory cannot be loaded, privacy-sensitive API projections
   return 503 `SECRET_UNAVAILABLE` and both exporters stall preparation
   without cursor advance. A mutation waits for a rebuild in flight (at
