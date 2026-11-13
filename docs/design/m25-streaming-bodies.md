@@ -799,7 +799,13 @@ removes the switch and the key.
 
 B1, B2 and B3 first (in parallel), then B4, then B5 and B6, then B7, B8,
 B9, B10 and B11 (largely in parallel), then B12 and B13. M26's slices
-(B14–B20) follow B6 and B11.
+(B14–B20) follow B6 and B11; [M26 §18.2](m26-blobs.md#182-order-and-parallel-work)
+has the full dependency table.
+
+Parallel work with M24 is development order only. The brief's rule for the
+road to v1.0 ("within a track the milestones' order applies") still decides
+when a milestone is closed: M25 is closed after M24, and M26 after M25, each
+when all its criteria pass.
 
 ## 19. Risks
 
