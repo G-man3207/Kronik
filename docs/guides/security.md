@@ -121,12 +121,13 @@ Secrets arrive with M2.
   answer `no recording`.
 - **Scrubbing.** When a turn used or revealed a secret, exact occurrences of
   the value are replaced by `[secret:<name>]` in the turn's state writes,
-  SQL text values, messages, timers, compensations, output, effect
-  requests and responses (each `EffectResult` before it is appended) and
-  log events before anything is written, so the value reaches neither the
-  log nor a state file. Fork turns are scrubbed the same way. Responses from HTTP targets are scrubbed of the inserted
+  SQL text and blob values (a blob stays a blob), messages, timers,
+  compensations, output, effect requests and responses (each
+  `EffectResult` before it is appended) and log events before anything is
+  written, so the value reaches neither the log nor a state file. Fork turns are scrubbed the same way. Responses from HTTP targets are scrubbed of the inserted
   values before the guest sees them, and the API's views of actors,
-  history, turns and dead letters replace the values of all live secrets.
+  history, turns, timers and dead letters replace the values of all live
+  secrets.
 
 Scrubbing matches exact bytes, and only values of at least 4 bytes other
 than `true`, `false` and `null` (which would break JSON). An

@@ -164,6 +164,11 @@ M23, key and secret backends:
   after a successful promote: the test guests answer the decimal n, and the
   script parsed JSON. It reads both now, and the M3 acceptance script runs
   that mode too (#50).
+- A revealed secret written into a SQL `BLOB` cell was not scrubbed: the
+  scrub covered text cells only, so its bytes reached the turn's SQL
+  changeset in the log and the actor database, also in privacy mode `on`.
+  Blob cells are scrubbed byte for byte now and stay blobs, and a secret
+  that is not UTF-8 is scrubbed from them too (#37).
 
 ## v0.4.1 — 2026-11-07
 
