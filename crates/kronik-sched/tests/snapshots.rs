@@ -386,6 +386,9 @@ fn an_erasure_whose_snapshot_fails_succeeds_and_retries_it() {
     panic!("no snapshot at or after the erasure at {erased}");
 }
 
+/// Pruning keeps the newest `snapshots_kept`, and the oldest snapshot as
+/// the history window's base to be: no snapshot is older than the 7-day
+/// window yet, and one must be when retention first deletes log (#66).
 #[test]
 fn old_snapshots_are_pruned_to_the_number_kept() {
     let dir = tempdir();
@@ -402,7 +405,18 @@ fn old_snapshots_are_pruned_to_the_number_kept() {
         );
     }
     let kept: Vec<u64> = p.node.snapshots().unwrap().iter().map(|m| m.lsn).collect();
-    assert_eq!(kept, lsns[2..].to_vec());
+    assert_eq!(kept, vec![lsns[0], lsns[2], lsns[3]]);
+    drop(p);
+    // With no history window the newest snapshot is the base: only the
+    // newest `snapshots_kept` stay.
+    let p = start_with(dir.path(), 2, Some(Duration::ZERO), None, None);
+    p.send("counter/k9", "increment", "");
+    let newest =
+        p.rt.block_on(p.node.snapshot("manual", p.owner()))
+            .unwrap()
+            .lsn;
+    let kept: Vec<u64> = p.node.snapshots().unwrap().iter().map(|m| m.lsn).collect();
+    assert_eq!(kept, vec![lsns[3], newest]);
 }
 
 /// The stop of `kronik serve` (`Node::shutdown_snapshot`, then the node
@@ -1191,11 +1205,13 @@ fn below_the_disk_reserve_incident_actions_and_retention_still_work() {
         ))
         .unwrap_err();
     assert_eq!(refused.code, kronik_core::error::ErrorCode::Unavailable);
-    // No new snapshot, but the two beyond `snapshots_kept` go.
+    // No new snapshot, but the one beyond `snapshots_kept` that retention
+    // does not need goes (the oldest stays as the history window's base to
+    // be, #66).
     assert_eq!(p.node.snapshots().unwrap().len(), 3);
     p.rt.block_on(p.node.snapshot("interval", p.owner()))
         .unwrap_err();
-    assert_eq!(p.node.snapshots().unwrap().len(), 1);
+    assert_eq!(p.node.snapshots().unwrap().len(), 2);
     // The saved response of the retry, not a 503.
     assert!(keyed_increment(&p, "k1").unwrap().committed());
     let bytes = guest("counter-step2");
@@ -1549,7 +1565,9 @@ fn a_read_only_plan_does_not_pass_when_an_actor_database_cannot_be_read() {
 /// database is the idle actor's, and a turn of it is parked with its
 /// savepoint open (the test hook, as in the snapshot test above), so a stamp
 /// would be rolled back with the turn. The pass stops with an error and the
-/// log is whole; with nothing open it deletes.
+/// log is whole; with nothing open it deletes. The parked turn's begin pins
+/// the log from its segment on (#35), so the traffic before it gives the pass
+/// segments to delete, below that begin.
 #[test]
 fn a_compaction_waits_for_an_actor_database_a_turn_has_open() {
     let dir = tempdir();
@@ -1577,6 +1595,13 @@ fn a_compaction_waits_for_an_actor_database_a_turn_has_open() {
             .unwrap();
     }
     p.send("notes/n", "add", "applied");
+    // Segments after the note and before the parked turn's begin.
+    for i in 0..40 {
+        p.send(&format!("counter/j{}", i % 5), "increment", "");
+        if i % 20 == 19 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     let before = p.node.applied_lsn();
     let node = p.node.clone();
     let held = p.rt.spawn(async move {

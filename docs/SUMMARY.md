@@ -110,3 +110,4 @@
 - [ADR 0111: The 1 000 turns/s target is across actors](adr/0111-cross-actor-throughput.md)
 - [ADR 0112: A grant chooses whether a fork may compute with a production key](adr/0112-fork-crypto-grant-mode.md)
 - [ADR 0130: A turn's record fits in one log record](adr/0130-one-log-record-per-turn.md)
+- [ADR 0131: Retention keeps a base for the whole history window](adr/0131-retention-keeps-a-base-for-the-window.md)

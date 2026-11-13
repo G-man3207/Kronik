@@ -748,7 +748,20 @@ impl Node {
         }
         let mut reruns = Vec::new();
         for t in open_turns {
-            let c = reader.read_at(t.pos).await?;
+            // Retention keeps the segment of an open turn's TurnBegin (#35);
+            // a directory an older release compacted may lack it.
+            let c = reader.read_at(t.pos).await.map_err(|e| match e {
+                LogError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                    StartError::Corrupt(format!(
+                        "the open turn {} of {} began at lsn {} in log segment {}, which is \
+                         gone (retention of a release before 0.5 deleted it), so it cannot run \
+                         again. Keep the data directory; restore a snapshot taken after the turn \
+                         ended, or a copy of that segment",
+                        t.execution_id, t.actor, t.lsn, t.pos.segment
+                    ))
+                }
+                other => StartError::Log(other),
+            })?;
             let Record::TurnBegin(begin) = c.record else {
                 return Err(StartError::Corrupt(format!(
                     "open turn {} does not point at a TurnBegin",

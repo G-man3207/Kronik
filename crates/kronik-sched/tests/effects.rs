@@ -1492,3 +1492,137 @@ fn a_rerun_after_an_echoed_revealed_value_does_not_diverge() {
     );
     server.release();
 }
+
+/// Copies a data directory (the daemon is dead).
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let target = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &target);
+        } else {
+            std::fs::copy(e.path(), target).unwrap();
+        }
+    }
+}
+
+/// Removes `state.db` and the actor databases: the next start installs the
+/// newest snapshot (a lost disk, a restore).
+fn lose_state(dir: &Path) {
+    let branch = dir.join("branches/main");
+    for f in ["state.db", "state.db-wal", "state.db-shm"] {
+        let _ = std::fs::remove_file(branch.join(f));
+    }
+    let _ = std::fs::remove_dir_all(branch.join("sql"));
+}
+
+/// A snapshot taken while a turn is open holds the turn as open, with the
+/// log position of its `TurnBegin` (#35). Retention keeps that segment while
+/// the turn is open in the live state or in a snapshot, so a start from the
+/// snapshot runs the turn again; a directory that lost the segment says so
+/// with the turn's execution id instead of failing on a missing file.
+#[test]
+fn a_snapshot_with_an_open_turn_stays_a_start_point_through_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start();
+    let config = || {
+        let mut storage = kronik_sched::snapshots::StorageConfig::new(dir.path().to_path_buf());
+        storage.history = Duration::ZERO;
+        storage.snapshots_kept = 1;
+        NodeConfig {
+            concurrency: 8,
+            storage: Some(storage),
+            segment_max_bytes: Some(1024),
+            ..NodeConfig::default()
+        }
+    };
+    let p = start_with(dir.path(), config());
+    p.deploy();
+    p.grant("http:127.0.0.1", None, None);
+    // Segments before the one the open turn begins in, for retention to take.
+    for _ in 0..20 {
+        p.send("counter/w", msg("increment", ""));
+    }
+    p.send_detached(
+        "counter/h",
+        msg("fetch", &format!("GET {}", server.url("/hang"))),
+    );
+    server.wait_for("/hang", 1);
+    let open = p.node.store().db().open_turns().unwrap();
+    assert_eq!(open.len(), 1);
+    let begin_segment = open[0].pos.segment;
+    let execution_id = open[0].execution_id.clone();
+    let segment_file = dir
+        .path()
+        .join("branches/main/log")
+        .join(kronik_log::segment_name(begin_segment));
+    // Many segments after the TurnBegin, two snapshots, two compactions with
+    // no history window: everything older than the newest snapshot would go.
+    for round in 0..2 {
+        for i in 0..30 {
+            p.send(&format!("counter/x{}", i % 3), msg("increment", ""));
+        }
+        let m = p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
+        assert!(m.lsn > open[0].lsn, "round {round}");
+        assert!(
+            m.segments
+                .contains(&kronik_log::segment_name(begin_segment)),
+            "the manifest names the segment a start needs: {:?}",
+            m.segments
+        );
+    }
+    let first = kronik_log::segment_starts(&dir.path().join("branches/main/log")).unwrap()[0];
+    assert!(first > 1, "compaction deleted nothing");
+    assert!(
+        segment_file.is_file(),
+        "retention deleted the open turn's segment"
+    );
+    drop(p); // the turn is still open
+
+    // A copy that lost the segment (a release before 0.5 deleted it) names
+    // the turn instead of failing on a missing file.
+    let lost = tempfile::tempdir().unwrap();
+    copy_dir(dir.path(), lost.path());
+    lose_state(lost.path());
+    std::fs::remove_file(
+        lost.path()
+            .join("branches/main/log")
+            .join(kronik_log::segment_name(begin_segment)),
+    )
+    .unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let err = rt
+        .block_on(async {
+            let env = Env::real(tokio::runtime::Handle::current());
+            let mut cfg = config();
+            if let Some(s) = &mut cfg.storage {
+                s.data_dir = lost.path().to_path_buf();
+            }
+            start_local(env, lost.path(), cfg).await
+        })
+        .err()
+        .expect("the start must not succeed without the TurnBegin");
+    let text = err.to_string();
+    assert!(
+        text.contains("STORAGE_CORRUPT") && text.contains(&execution_id),
+        "{text}"
+    );
+
+    // The snapshot is a start point: the open turn runs again.
+    lose_state(dir.path());
+    server.release();
+    let p = start_with(dir.path(), config());
+    server.wait_for("/hang", 2);
+    p.wait_until("the re-run's turn record", |p| {
+        turn_records(&p.records())
+            .iter()
+            .any(|t| t.execution_id == execution_id)
+    });
+    p.wait_until("no open turn", |p| {
+        p.node.store().db().open_turns().unwrap().is_empty()
+    });
+}

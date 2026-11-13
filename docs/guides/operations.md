@@ -216,15 +216,15 @@ and [0104](../adr/0104-admin-ui-as-a-public-api-client.md).
 | `group_commit_ms` | `2` | How long the log writer gathers records into one fsync |
 | `segment_max_mb` | `64` | The size at which a log segment is closed |
 | `segment_max_age_s` | `60` | The age at which a log segment is closed |
-| `disk_reserve` | `"512MiB"` | Below this much free space on the data directory's file system, new inputs, deployments, grants, `foreign add`, forks, proposals, approval requests and replays are refused with `UNAVAILABLE`, so new work does not drive the disk full. `foreign add` also refuses an image whose new layers would not fit above the reserve, before it fetches them. Turns already running finish, and timers, queued messages, foreign actors and the catch-up of a promote keep writing, so on a shared file system a log write can still fail: give `<data_dir>/foreign` its own file system. Idempotent retries still get their saved response; rollback, promote, approvals, `foreign remove`, revoke, `limits set` and erasure still work. No snapshot is taken (`kronik snapshot create` fails with `UNAVAILABLE`), but retention still deletes old segments, snapshots beyond `snapshots_kept` and partial copies. `/v1/health` and `/healthz` add `"low_disk": true`, and `kronik_disk_below_reserve` is 1. `"0B"` turns it off; `--disk-reserve` (`KRONIK_DISK_RESERVE`) overrides it |
+| `disk_reserve` | `"512MiB"` | Below this much free space on the data directory's file system, new inputs, deployments, grants, `foreign add`, forks, proposals, approval requests and replays are refused with `UNAVAILABLE`, so new work does not drive the disk full. `foreign add` also refuses an image whose new layers would not fit above the reserve, before it fetches them. Turns already running finish, and timers, queued messages, foreign actors and the catch-up of a promote keep writing, so on a shared file system a log write can still fail: give `<data_dir>/foreign` its own file system. Idempotent retries still get their saved response; rollback, promote, approvals, `foreign remove`, revoke, `limits set` and erasure still work. No snapshot is taken (`kronik snapshot create` fails with `UNAVAILABLE`), but retention still deletes old segments, the snapshots it no longer needs and partial copies. `/v1/health` and `/healthz` add `"low_disk": true`, and `kronik_disk_below_reserve` is 1. `"0B"` turns it off; `--disk-reserve` (`KRONIK_DISK_RESERVE`) overrides it |
 
 ### [retention]
 
 | Key | Default | Meaning |
 |---|---|---|
-| `history` | `"7d"` | How far back the log reaches: closed segments older than this are deleted once a kept snapshot covers them. See [snapshots and retention](#snapshots-and-retention) |
+| `history` | `"7d"` | How far back forks, replays and proposals can go: the log keeps every segment that holds a record inside this window, and a snapshot from which any point in it can start. See [snapshots and retention](#snapshots-and-retention) |
 | `snapshot_interval` | `"60m"` | How often a snapshot is taken, when something changed since the last one |
-| `snapshots_kept` | `48` | How many snapshots are kept |
+| `snapshots_kept` | `48` | How many of the newest snapshots are kept; older ones are thinned to about one per seventh of `history` |
 
 ### [sql]
 
@@ -1230,12 +1230,22 @@ hash and log hash then equal the source's, and `kronik audit show --from
 <that LSN + 1>` shows the `restore` line.
 
 After each snapshot the daemon applies retention. It keeps the newest
-`snapshots_kept` snapshots (48 by default) plus the oldest one the log
-still continues from. It deletes closed log segments older than
-`[retention] history` (7 days by default) whose records a kept snapshot
-already covers. A record without a logical time of its own, such as a
-deployment, counts as old as the next turn after it, so a segment is kept
-until a later turn has aged out of the window too. Before it deletes, it
+`snapshots_kept` snapshots (48 by default), the window's base (the newest
+snapshot from before the start of the `[retention] history` window, 7 days
+by default), and between them about one snapshot a day (a seventh of
+`history`). It deletes closed log segments older than the window whose
+records the base already covers, so every point inside the window can
+still be forked, replayed and read: the log on disk reaches back at most
+about a day further than `history`, and a node keeps about 48 + 6
+snapshots. Until a snapshot is old enough to be the base (on a young node
+for its first `history`; after an upgrade from v0.4.1 or older for up to
+about 5 days with the defaults), retention deletes no segment. A record
+without a logical time of its own, such as a deployment, counts as old as
+the next turn after it, so
+a segment is kept until a later turn has aged out of the window too. A
+segment that holds the begin of a turn still open (in the running state or
+in a kept snapshot) is kept too, with every later one, because a start
+from that snapshot runs the turn again from it. Before it deletes, it
 records on every actor database that has not changed for longer than the
 window that the database is complete through the snapshot, so that the
 next start does not look for a log that has been deleted. After an upgrade
@@ -1243,9 +1253,10 @@ from v0.3.0 or older, `snapshots_kept` also decides how long some reads
 answer 503: see [Upgrading from v0.3.0 or older](#upgrading-from-v030-or-older).
 
 When a proposal's `--window` reaches back before the oldest point still
-kept, the fork starts at the oldest usable snapshot and the proposal says
-so: `Warning: retention cut the window ...` in `kronik propose`, `warnings`
-in its JSON and `base.window_cut` in the diff.
+kept, or before the history window, the fork starts at the oldest point it
+may take and the proposal says so: `Warning: retention cut the window ...`
+in `kronik propose`, `warnings` in its JSON and `base.window_cut` in the
+diff.
 
 The same window is how far back a fork, a replay or a proposal may start:
 `history` of logical time back from the newest record. A fork point older
@@ -1538,7 +1549,12 @@ restart, as soon as retention has deleted the last snapshot that v0.3.0 or older
 wrote. Retention runs after each snapshot. It keeps the newest `snapshots_kept`
 (48 by default) and, when the log no longer starts at LSN 1, also the oldest
 snapshot that the log still continues from, because a replay of the log begins
-there; see [Snapshots and retention](#snapshots-and-retention). So the start of
+there; see [Snapshots and retention](#snapshots-and-retention). (This paragraph
+and the measurements below describe v0.4.x. From v0.5 retention also keeps the
+window's base, the newest snapshot from before the history window, and until
+one exists the oldest snapshot in its place: when that is a v0.3.0 snapshot,
+neither way below deletes it, and it goes when a newer snapshot has aged out of
+the history window, about one `history` of activity after the upgrade.) So the start of
 the log decides which of two cases a node is in. `kronik integrity` prints it as
 `Log first LSN` (`log_first_lsn` in `--json`), for example `Log first LSN 1` on
 the v0.3.0 and v0.1.0 data of the compatibility tests and `Log first LSN 57` on
@@ -1766,7 +1782,7 @@ operator meets:
 |---|---|---|
 | `BAD_REQUEST` at start | `kronik.toml` has an unknown key or a bad value | Fix the line the message names (`kronik doctor` checks the file too) |
 | `CERTIFICATE_INVALID` | The TLS certificate has expired, cannot be parsed, or its files cannot be read (`kronik doctor`'s `tls` or `dns01_hook` check) | Renew it, or fix the path and permissions of the PEM files; see [TLS](#tls) |
-| `STORAGE_CORRUPT` | The data directory is inconsistent: `state.db` is ahead of the log, a log record can't be read, or an applied record in the active segment is damaged (nothing is truncated). "state is at lsn N, but the log starts at M (compacted)": see [A start that stops at the log's start](#a-start-that-stops-at-the-logs-start). "state.db has applied lsn N, but the log ends at M": see [record size](#record-size) | Keep a copy of the data directory and look at the message. `state.db` is materialized from the log and can be rebuilt by moving it away and starting again; the log itself must not be edited |
+| `STORAGE_CORRUPT` | The data directory is inconsistent: `state.db` is ahead of the log, a log record can't be read, an applied record in the active segment is damaged (nothing is truncated), or an open turn's begin is in a deleted segment. "state is at lsn N, but the log starts at M (compacted)": see [A start that stops at the log's start](#a-start-that-stops-at-the-logs-start). "state.db has applied lsn N, but the log ends at M": see [record size](#record-size) | Keep a copy of the data directory and look at the message. `state.db` is materialized from the log and can be rebuilt by moving it away and starting again; the log itself must not be edited |
 | `UNAVAILABLE` | The node stopped after a storage failure (also `/healthz` 503) | The daemon exits and systemd restarts it; check the disk (`kronik doctor`'s `disk` check) and the journal |
 | `GATEWAY_TIMEOUT` | A turn took longer than `[gateway] timeout` | The turn still completes; clients that retry with the same `Idempotency-Key` get its response |
 | `PAYLOAD_TOO_LARGE` | A request body over 1 MiB | v0.1's limit |

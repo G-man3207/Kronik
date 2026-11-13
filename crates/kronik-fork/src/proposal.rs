@@ -673,16 +673,37 @@ impl Proposals {
             return Ok((head, None));
         };
         let start = newest.logical_time_ms.saturating_sub(window_ms);
-        let fork_lsn = index
+        let mut fork_lsn = index
             .roots
             .iter()
             .find(|r| r.logical_time_ms >= start)
             .map_or(head, |r| r.start_lsn - 1);
         // Turns before the base, inside the window, cannot be replayed.
-        let cut = base_time.filter(|t| *t >= start).map(|_| diff::WindowCut {
+        let mut cut = base_time.filter(|t| *t >= start).map(|_| diff::WindowCut {
             window_ms,
             kept_from_lsn: from,
         });
+        // Retention keeps the log back to the window's base, which is older
+        // than `[retention] history`, but a fork starts only inside that
+        // window (m6-storage §5): a longer proposal window starts at the
+        // oldest point a fork may take.
+        if let Some(cutoff) = self.node.retention_cutoff()?
+            && start < cutoff
+            && let Some(first) = index.roots.iter().find(|r| r.logical_time_ms >= cutoff)
+        {
+            let before = first.start_lsn - 1;
+            let at = match self.node.logical_time_at(before).await? {
+                Some(t) if t < cutoff => first.start_lsn,
+                _ => before,
+            };
+            if at > fork_lsn {
+                fork_lsn = at;
+                cut = Some(diff::WindowCut {
+                    window_ms,
+                    kept_from_lsn: at,
+                });
+            }
+        }
         Ok((fork_lsn, cut))
     }
 

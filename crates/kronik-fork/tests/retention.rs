@@ -431,9 +431,13 @@ fn a_window_cut_by_retention_is_reported() {
     for i in 0..5 {
         p.send(&format!("counter/k{i}"), "increment", "");
     }
+    // The window's base: once the pause has taken it out of the window,
+    // every fork point in the window can start from it, and retention
+    // deletes the log before it.
+    p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
     std::thread::sleep(Duration::from_secs(3));
-    p.send("counter/k5", "increment", "");
-    let snap = p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
+    let k5 = p.send("counter/k5", "increment", "");
+    p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
     assert!(
         kronik_log::segment_starts(&log_dir).unwrap()[0] > 1,
         "nothing was compacted"
@@ -441,8 +445,11 @@ fn a_window_cut_by_retention_is_reported() {
     p.send("counter/late", "increment", "");
     let props = open_props(&p, dir.path());
     let prop = propose_window(&p, &props);
+    // The fork starts at the oldest point inside the 2 s window: k5's turn,
+    // the first one in it (the point before it is k4's state, outside).
     assert_eq!(prop.summary["root_inputs"], 1, "{}", prop.summary);
     let cut = prop.window_cut.clone().expect("the cut is recorded");
+    let snap = k5.turn_id;
     assert_eq!((cut.window_ms, cut.kept_from_lsn), (3_600_000, snap.lsn));
     let warnings = prop.warnings();
     assert!(
@@ -459,4 +466,92 @@ fn a_window_cut_by_retention_is_reported() {
     );
     let md = String::from_utf8(p.rt.block_on(props.diff(&prop.id, true, false)).unwrap()).unwrap();
     assert!(md.contains("Window cut by retention"), "{md}");
+}
+
+/// A node with a short window, frequent snapshots and few kept, so the
+/// window's base moves within seconds.
+fn start_moving(dir: &Path) -> Proc {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let node = rt.block_on(async {
+        let env = Env::real(tokio::runtime::Handle::current());
+        let mut storage = StorageConfig::new(dir.to_path_buf());
+        storage.history = Duration::from_secs(3);
+        storage.snapshot_interval = Duration::from_millis(400);
+        storage.snapshots_kept = 2;
+        start_local(
+            env,
+            dir,
+            NodeConfig {
+                concurrency: 8,
+                storage: Some(storage),
+                segment_max_bytes: Some(1),
+                ..NodeConfig::default()
+            },
+        )
+        .await
+        .unwrap()
+    });
+    Proc { rt, node }
+}
+
+/// The history window is how far back forks and replay can go (the brief):
+/// after retention has moved the window's base several times, a fork at the
+/// oldest point still inside the window works (#66). Before, compaction
+/// followed the newest snapshot and pruning kept only the newest
+/// `snapshots_kept` and the oldest the log continued, so up to all but the
+/// newest `snapshots_kept` intervals of the window were "outside retention".
+#[test]
+fn a_fork_at_the_old_edge_of_the_window_works_after_the_base_moved() {
+    let dir = tempdir();
+    let data = dir.path();
+    let log_dir = data.join("branches/main/log");
+    let p = start_moving(data);
+    deploy(&p);
+    let mut first_snapshot = None;
+    // About 9 s of turns, a snapshot every 400 ms: three windows.
+    for i in 0..72 {
+        p.send(&format!("counter/k{}", i % 4), "increment", "");
+        std::thread::sleep(Duration::from_millis(125));
+        if i % 3 == 2 {
+            let m = p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
+            first_snapshot.get_or_insert(m.lsn);
+        }
+    }
+    let log_first = kronik_log::segment_starts(&log_dir).unwrap()[0];
+    assert!(log_first > 1, "nothing was compacted");
+    let snapshots: Vec<u64> = p.node.snapshots().unwrap().iter().map(|m| m.lsn).collect();
+    assert!(
+        !snapshots.contains(&first_snapshot.unwrap()),
+        "the base never moved: {snapshots:?}"
+    );
+    // The oldest fork point inside the window.
+    let cutoff = p.node.retention_cutoff().unwrap().unwrap();
+    let head = p.node.applied_lsn();
+    let oldest = (log_first..=head)
+        .find(|&lsn| {
+            p.rt.block_on(p.node.logical_time_at(lsn))
+                .unwrap()
+                .is_some_and(|t| t >= cutoff)
+        })
+        .expect("a turn inside the window");
+    let base = kronik_fork::pick_base(data, "main", oldest, false, None)
+        .unwrap_or_else(|e| panic!("lsn {oldest} (log from {log_first}, {snapshots:?}): {e}"))
+        .expect("a compacted log needs a base");
+    assert!(base.lsn <= oldest);
+    let props = open_props(&p, data);
+    let (fork, _) =
+        p.rt.block_on(props.create_fork(
+            Some("edge".into()),
+            oldest,
+            false,
+            audit(),
+            false,
+            p.owner(),
+        ))
+        .unwrap_or_else(|e| panic!("fork at {oldest}: {e}"));
+    assert_eq!(fork.fork_lsn, oldest);
 }

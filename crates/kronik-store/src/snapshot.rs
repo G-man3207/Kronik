@@ -385,6 +385,20 @@ pub fn sealed_keys(snapshot: &Path) -> Result<crate::db::SubjectKeys, StoreError
     crate::db::sealed_keys(&conn)
 }
 
+/// The first log segment a start from `snapshot` needs before the
+/// snapshot's own LSN: the one holding the `TurnBegin` of the oldest turn
+/// open at the snapshot (its re-run reads the begin from the log). `None`
+/// when no turn was open. Read without changing the snapshot.
+pub fn open_turn_segment(snapshot: &Path) -> Result<Option<kronik_core::ids::Lsn>, StoreError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        snapshot.join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let first: Option<i64> =
+        conn.query_row("SELECT min(segment) FROM open_turns", [], |r| r.get(0))?;
+    Ok(first.map(|segment| segment as kronik_core::ids::Lsn))
+}
+
 /// The code hashes the snapshot's `deployments` table names, as `<64 hex>`
 /// strings (the name a `code/` object carries before `.wasm`), read without
 /// changing the snapshot. A restore downloads these and the ones the

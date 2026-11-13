@@ -20,6 +20,32 @@ until the v1.0 compatibility promise takes effect.
   wrote, and a start never truncates a record `state.db` has applied: a
   damaged one is `STORAGE_CORRUPT` with nothing cut off. No log-format
   change.
+- Forks, replays and proposals now work at every point of the
+  `[retention] history` window, as the brief requires (#66). Retention kept
+  the log for the window but only the newest `snapshots_kept` snapshots and
+  the oldest one the log continued, so a point older than that snapshot
+  (between 2 and 7 days back with the defaults) had no snapshot to start
+  from and was refused as outside retention. Retention now keeps the
+  window's base (the newest snapshot from before the window) and about one
+  snapshot a day between it and the newest 48, and deletes only log that
+  the base covers. **After the upgrade an installation keeps more on disk:
+  about six more snapshots (each a full copy of the state), up to a day
+  more log than `history`, and right after the upgrade, while no kept
+  snapshot is older than the window yet, no log is deleted until one is (up
+  to about 5 days with the defaults, at most one `history`), so the log can
+  then reach back up to about twice `history`.** A proposal whose
+  `--window` reaches back before the history window starts at its oldest
+  point and says so (`window_cut`). Data from v0.3.0 or older: a v0.3.0
+  snapshot that is the base is kept until a newer one is old enough, and so
+  are the 503 answers described in the operations guide's "Upgrading from
+  v0.3.0 or older".
+- A snapshot taken while a turn was open could stop the next start that
+  used it with a bare `log I/O failed: No such file or directory`:
+  retention deleted the segment holding the open turn's begin, which the
+  start reads to run the turn again (#35). Retention now keeps that segment
+  while a turn is open in the state or in a kept snapshot, the snapshot's
+  manifest names it, and a directory that already lost it fails with
+  `STORAGE_CORRUPT` naming the turn's execution id.
 
 ## v0.4.1 — 2026-11-07
 
