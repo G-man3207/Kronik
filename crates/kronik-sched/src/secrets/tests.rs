@@ -2326,9 +2326,14 @@ impl Net for AwsPages {
             let body = if catalogue {
                 let page = self.pages.fetch_add(1, Ordering::SeqCst);
                 let token = if self.cycle {
-                    match page % 3 {
-                        0 => "a".into(),
-                        1 => "b".into(),
+                    // A provider whose pages lead back to one already
+                    // given: no token, then "a", "b" and "a" again. Each
+                    // listing meets it at its third page, whatever listed
+                    // before it.
+                    let sent: serde_json::Value =
+                        serde_json::from_slice(&request.body).unwrap_or_default();
+                    match sent["NextToken"].as_str() {
+                        Some("a") => "b".into(),
                         _ => "a".into(),
                     }
                 } else {
@@ -2349,20 +2354,30 @@ impl Net for AwsPages {
         })
     }
 }
-/// Wait for the revision-triggered background refresh to finish failing, so the
-/// page counter in the AWS tests measures only the explicit refresh below.
+/// Waits until the background cycle can list no catalogue before its failure
+/// backoff (seconds), so the page counter in the AWS tests measures only the
+/// explicit refresh below: a pass has failed against the registry as it is
+/// now, and none is in progress. A failed pass is not enough. When the
+/// registry changed while it ran (the link's first observation, the grant),
+/// the change woke the cycle, which runs a second pass at once; its listing
+/// raced the explicit refresh for the inventory lock and, when it won, put
+/// its pages in the count (one run in six).
 async fn settle_failing_catalogue_attempt(node: &Arc<Node>) {
     let runtime = node.runtime().unwrap();
     let mut certified = runtime.certified.subscribe();
-    let wanted = lock(&runtime.cache.state).revision;
     node.env
-        .timeout(Duration::from_secs(5), async {
+        .timeout(Duration::from_secs(10), async {
             loop {
                 let (revision, ok) = *certified.borrow_and_update();
-                if revision >= wanted && !ok {
+                if !ok && revision == lock(&runtime.cache.state).revision && runtime.cycle.settled()
+                {
                     break;
                 }
-                certified.changed().await.unwrap();
+                // A pass publishes before it ends: look again shortly.
+                let _ = node
+                    .env
+                    .timeout(Duration::from_millis(5), certified.changed())
+                    .await;
             }
         })
         .await
@@ -2445,8 +2460,9 @@ async fn actual_aws_multi_page_cycle_never_publishes_complete_inventory() {
     let (_data, node, pages) = aws_catalogue_node(true).await;
     let before = pages.pages.load(Ordering::SeqCst);
     assert!(node.refresh_secret_inventory(test_auth()).await.is_err());
+    // The client stops at the token it was given before: the third page.
     let fetched = pages.pages.load(Ordering::SeqCst) - before;
-    assert!(fetched > 1 && fetched <= 3);
+    assert_eq!(fetched, 3, "the refresh listed {fetched} pages");
     assert!(node.secret_values().is_err());
 }
 
