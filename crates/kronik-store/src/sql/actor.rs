@@ -65,9 +65,10 @@ pub struct TurnSql {
     pub changesets: Vec<(Option<String>, Vec<u8>)>,
     /// VM steps executed by the guest's statements.
     pub vm_steps: u64,
-    /// The unsplit changeset, used for the live apply (one
-    /// `sqlite3changeset_apply` call). Not written to the log; rebuilds
-    /// apply the per-subject changesets.
+    /// The unsplit changeset. Not written to the log, and the daemon never
+    /// applies it: the live apply, rebuilds, forks and replay all apply the
+    /// per-subject changesets of the record (ADR 0005, amended). `apply`
+    /// uses it when it is set, which only tests do.
     pub whole: Vec<u8>,
 }
 

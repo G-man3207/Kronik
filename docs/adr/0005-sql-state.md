@@ -65,8 +65,10 @@ with bundled SQLite 3.54.0 (`libsqlite3-sys =0.39.0`).
    - sets `_kronik_meta.applied_lsn`.
 
    Details:
-   - The live apply uses the unsplit changeset in one call. Rebuilds,
-     forks and replay apply the per-subject changesets from the log.
+   - The live apply was to use the unsplit changeset in one call, and
+     rebuilds, forks and replay the per-subject changesets from the log. As
+     built, every apply uses the per-subject changesets (see the amendment
+     at the end).
    - Triggers are disabled during apply (their effects are already in the
      changeset), but only when the schema has triggers, because toggling the
      flag expires every prepared statement.
@@ -467,3 +469,13 @@ from `[env]` in `.cargo/config.toml`, and sessions are called through
 
 The M0 spike notes are in the project wiki:
 https://github.com/G-man3207/Kronik/wiki/Spikes.
+
+## Amendment (2026-11-13): every apply uses the per-subject changesets
+
+§1 had the live apply use the unsplit changeset in one call, and only
+rebuilds, forks and replay apply the per-subject changesets from the log. M1
+built one path instead (`docs/design/m1-core.md` §7): the applier reads the
+turn record and applies its per-subject changesets, one
+`sqlite3changeset_apply_v2` call each, live as on a rebuild, so a live apply
+and a rebuild cannot differ. The unsplit changeset is not written to the log
+and only tests apply it. Applying it live remains a possible optimization.
