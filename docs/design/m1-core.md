@@ -118,7 +118,11 @@ its plaintext form.
   record (`TURN_TOO_LARGE`) under the `TurnBegin`'s own execution id,
   without running the guest again.
 - A fork's replay charges the same budget at the same points, so it makes
-  production's decisions and an identity replay stays empty.
+  production's decisions and an identity replay stays empty. It denies with
+  production's error texts, which the budget counts, and fits every answer
+  it makes up (a stub rule's, a contract fake's, a neighbor's or the
+  model's) as a live response is fitted: one larger than what is left of
+  the record is `too-large` for the guest.
 - One turn thus writes at most about twice the record limit to the log: its
   `EffectResult` records and its `TurnRecord`. Effects are not charged fuel;
   a per-turn limit on effect bytes below that is not built.

@@ -1996,7 +1996,10 @@ impl ReplayGate {
 
     /// As in production: a fetch result that does not fit in what is left of
     /// the turn's record is too large for this turn, and the guest never
-    /// sees it.
+    /// sees it. Every answer a fork makes up goes through it too (a stub
+    /// rule's, a contract fake's, a neighbor's, the model's): a large
+    /// synthetic answer is `too-large` for the guest, as a live one is, and
+    /// does not trap the turn when it is recorded.
     fn fit_fetch(
         &self,
         rec: &mut pb::EffectRecord,
@@ -2173,7 +2176,10 @@ impl ReplayGate {
             return Ok(FetchOutcome::Denied(e));
         }
         if foreign && self.config().foreign(&t.host).is_none() {
-            let e = format!("FOREIGN_NOT_FOUND: no foreign actor {}", t.host);
+            // Production's words exactly: the error is part of the effect's
+            // cost in the turn's record, so another text could make the
+            // budget decide otherwise.
+            let e = ErrorCode::ForeignNotFound.as_str().to_owned();
             self.push(self.denied(ordinal, kind, "foreign:[withheld]".into(), e.clone()))?;
             return Ok(FetchOutcome::Denied(e));
         }
@@ -2389,10 +2395,14 @@ impl ReplayGate {
                         .unwrap_or(usize::MAX)
                         .min(kronik_log::MAX_RECORD as usize),
                 );
+                // As for a live fetch: an answer that does not fit in what is
+                // left of the turn's record is too large for this turn.
+                let out = self.fit_fetch(&mut rec, out);
                 self.push(rec)?;
                 return out;
             }
             let out = self.prepare_http_record(&mut rec, &matcher);
+            let out = self.fit_fetch(&mut rec, out);
             self.push(rec)?;
             return out;
         }
@@ -2435,6 +2445,7 @@ impl ReplayGate {
                 let mut rec = answer.record;
                 rec.request = encoded;
                 let out = self.prepare_http_record(&mut rec, &matcher);
+                let out = self.fit_fetch(&mut rec, out);
                 self.push(rec)?;
                 return out;
             }
@@ -2451,8 +2462,13 @@ impl ReplayGate {
                 )? {
                     NeighborDisclosure::Decline => {}
                     NeighborDisclosure::Recorded(recorded) => {
-                        self.push(recorded.record)?;
-                        return Ok(recorded.outcome);
+                        let NeighborRecorded {
+                            mut record,
+                            outcome,
+                        } = *recorded;
+                        let out = self.fit_fetch(&mut record, Ok(outcome));
+                        self.push(record)?;
+                        return out;
                     }
                 }
             }
@@ -2524,7 +2540,9 @@ impl ReplayGate {
                         ),
                         ..Default::default()
                     };
+                    let mut rec = rec;
                     let out = outcome_of_fetch(&rec);
+                    let out = self.fit_fetch(&mut rec, out);
                     self.push(rec)?;
                     return out;
                 }

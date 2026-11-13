@@ -757,6 +757,69 @@ fn stub_rules_and_the_live_allowlist() {
     assert_eq!((row.method.as_str(), row.live), ("GET", 3));
 }
 
+/// A fork denies a call to a foreign actor that is not declared in
+/// production's words (review of the integration branch, item 6): the guest
+/// sees the same error, so the identity replay is empty, and the effect
+/// costs the turn's record the same bytes, so the record budget decides the
+/// same. The fork used to add "no foreign actor <name>" to the code.
+#[test]
+fn identity_replay_over_a_call_to_an_undeclared_foreign_actor_is_empty() {
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    p.grant("foreign:ghost");
+    let fork_lsn = p.settle();
+    let r = p.http("f", "fetch-ok", "GET foreign://ghost/x");
+    let body = http_body(&r);
+    assert!(body.contains("FOREIGN_NOT_FOUND"), "{body} {:?}", r.outcome);
+    let out = replay(&p, None, fork_lsn, &opts(Mode::Both), 1);
+    let s = &out.diff.summary;
+    assert!(!s.changed, "{}", String::from_utf8_lossy(&out.bytes));
+    assert_eq!(s.divergent_turns, 0);
+}
+
+/// An answer a fork makes up is fitted to what is left of the turn's record
+/// as a live answer is (review of the integration branch, item 6): a stub
+/// answer larger than that is `too-large` for the guest, which goes on,
+/// instead of trapping the turn with TURN_TOO_LARGE when it is recorded.
+#[test]
+fn a_stub_answer_over_what_is_left_of_the_record_is_too_large() {
+    let (addr, hits) = server();
+    let dir = tempdir();
+    let p = Proc::start_with(
+        dir.path(),
+        kronik_sched::NodeConfig {
+            concurrency: 8,
+            test_max_record_bytes: Some(512 << 10),
+            ..kronik_sched::NodeConfig::default()
+        },
+    );
+    p.grant("http:127.0.0.1");
+    let fork_lsn = p.settle();
+    p.http(
+        "pay",
+        "fetch-ok",
+        &format!("POST http://{addr}/v1/charges/0\n\namount=10"),
+    );
+    let stubbed = DiffOptions {
+        mode: Mode::Isolated,
+        stubs: vec![kronik_fork::stubs::StubRule {
+            method: Some("GET".into()),
+            url_prefix: format!("http://{addr}/v1/charges/"),
+            status: 200,
+            headers: vec![],
+            body: "s".repeat(600 << 10),
+            error: None,
+        }],
+        ..DiffOptions::default()
+    };
+    let out = replay(&p, Some("counter-fetch-extra"), fork_lsn, &stubbed, 1);
+    let body = serde_json::to_string(&out.diff.responses.items[0].body).unwrap();
+    assert!(body.contains("error FetchError::TooLarge"), "{body}");
+    assert!(!body.contains("TURN_TOO_LARGE"), "{body}");
+    assert_eq!(out.diff.summary.synthetic, 1);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
 /// A new schema version: `migrate(from)` runs in each isolated overlay
 /// before the root input's turn, once per actor in continuous replay, and
 /// the migration turns show in the diff.

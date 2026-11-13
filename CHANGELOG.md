@@ -23,7 +23,10 @@ until the v1.0 compatibility promise takes effect.
   the code `EFFECT_OUTCOME_UNKNOWN` also when its record was too large. A
   turn that an earlier release left open with an input this budget does not
   hold is closed as failed (`TURN_TOO_LARGE`) at the next start instead of
-  being refused at every start.
+  being refused at every start. A fork denies a call to an undeclared
+  foreign actor with production's text and fits the answers it makes up
+  (stub rules, contract fakes, neighbors, the model) to the record as it
+  fits live ones.
 - Forks, replays and proposals now work at every point of the
   `[retention] history` window, as the brief requires (#66). Retention kept
   the log for the window but only the newest `snapshots_kept` snapshots and
