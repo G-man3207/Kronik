@@ -1644,3 +1644,92 @@ async fn the_resolver_of_the_foreign_host_follows_the_nodes_links() {
         "an unlink"
     );
 }
+
+/// An open turn that cannot run again - its input belongs to a subject erased
+/// while it was open, or its kind is gone - is closed once, under its own
+/// execution id: its open_turns row goes, the next start runs nothing, and
+/// there is one dead letter each. Before, the closing record got a new
+/// execution id, so the row survived, every start added another dead letter,
+/// and the row kept the log from being compacted.
+#[test]
+fn an_open_turn_that_cannot_run_again_is_closed_once() {
+    let data = tempfile::tempdir().unwrap();
+    {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let node = crate::start_local(env(), data.path(), config())
+                .await
+                .unwrap();
+            let authority = node.local_operator_authority().unwrap();
+            node.deploy(
+                &std::fs::read(COUNTER).unwrap(),
+                audit(),
+                false,
+                authority.clone(),
+            )
+            .await
+            .unwrap();
+            node.set_privacy_mode(pb::PrivacyState::On, audit(), false, authority.clone())
+                .await
+                .unwrap();
+            // counter/a, its input sealed for user:1 when it is committed.
+            let mut erased = message_begin(&node);
+            erased.execution_id = "fedcba9876543210fedcba9876543210".into();
+            erased.actor = Some(ActorRef::parse("counter/a").unwrap().to_pb());
+            erased.causal_key = Some(causal::root("erased-root".into()));
+            erased.code_hash = node.store().db().kinds().unwrap()[0]
+                .version
+                .code_hash
+                .clone();
+            if let Some(pb::input::Kind::Message(m)) =
+                erased.input.as_mut().and_then(|i| i.kind.as_mut())
+            {
+                m.message_id = "erased-root".into();
+                if let Some(body) = m.msg.as_mut().and_then(|m| m.body.as_mut()) {
+                    body.subject = Some("user:1".into());
+                }
+            }
+            persist(&node, &erased, &[]).await;
+            // recover/blocked: a kind that is not deployed.
+            persist(&node, &message_begin(&node), &[]).await;
+            assert_eq!(node.store().db().open_turns().unwrap().len(), 2);
+            node.erase_subject("user:1", audit(), false, authority)
+                .await
+                .unwrap();
+        });
+    }
+    for start in ["the first start", "the second start"] {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let node = crate::start_local(env(), data.path(), config())
+                .await
+                .unwrap();
+            let letters = || node.store().db().dead_letters(0, 10).unwrap();
+            node.env
+                .timeout(Duration::from_secs(30), async {
+                    while letters().len() < 2 {
+                        node.env.clock.sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{start}: no dead letters: {:?}", letters()));
+            let mut codes: Vec<(String, String)> = letters()
+                .into_iter()
+                .map(|d| (d.actor.to_string(), d.error_code))
+                .collect();
+            codes.sort();
+            assert_eq!(
+                codes,
+                [
+                    ("counter/a".to_owned(), "SUBJECT_ERASED".to_owned()),
+                    ("recover/blocked".to_owned(), "ACTOR_NOT_FOUND".to_owned()),
+                ],
+                "{start}"
+            );
+            assert!(
+                node.store().db().open_turns().unwrap().is_empty(),
+                "{start}: the open turns were not closed"
+            );
+        });
+    }
+}

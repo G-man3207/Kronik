@@ -1501,37 +1501,61 @@ impl Node {
         }
         let (kind, mut epoch) = self.start_code(&actor.kind, &origin).await?;
         let Some(mut kind) = kind else {
-            return self
-                .record_unrun(
-                    actor,
-                    None,
-                    epoch,
-                    input,
-                    key,
-                    parent_time,
-                    ErrorCode::ActorNotFound,
-                    format!("no deployed kind {:?}", actor.kind),
-                    origin.clone(),
-                )
-                .await;
+            let message = format!("no deployed kind {:?}", actor.kind);
+            // An open turn is closed under its own execution id, or its
+            // open_turns row would outlive the failure and the next start
+            // would run it again (and it would keep the log from compaction).
+            return match rerun {
+                Some(r) => {
+                    self.close_open_turn(
+                        r.begin,
+                        r.recorded,
+                        ErrorCode::ActorNotFound,
+                        message,
+                        true,
+                    )
+                    .await
+                }
+                None => {
+                    self.record_unrun(
+                        actor,
+                        None,
+                        epoch,
+                        input,
+                        key,
+                        parent_time,
+                        ErrorCode::ActorNotFound,
+                        message,
+                        origin.clone(),
+                    )
+                    .await
+                }
+            };
         };
         // The guest gets plaintext; an input of an erased subject can't run
         // (docs/design/m8-privacy.md §5).
         if let Err(e) = self.check_input(&input) {
             let (code, message) = Node::unreadable_input(&e);
-            return self
-                .record_unrun(
-                    actor,
-                    Some(&kind),
-                    epoch,
-                    input,
-                    key,
-                    parent_time,
-                    code,
-                    message,
-                    origin.clone(),
-                )
-                .await;
+            return match rerun {
+                Some(r) => {
+                    self.close_open_turn(r.begin, r.recorded, code, message, true)
+                        .await
+                }
+                None => {
+                    self.record_unrun(
+                        actor,
+                        Some(&kind),
+                        epoch,
+                        input,
+                        key,
+                        parent_time,
+                        code,
+                        message,
+                        origin.clone(),
+                    )
+                    .await
+                }
+            };
         }
         let actor_version = || -> Result<u32, ApiError> {
             Ok(self
@@ -2143,7 +2167,8 @@ impl Node {
 
     /// Records a failed turn for an input that could not run (no deployed
     /// kind, failed migration), so messages leave the mailbox and appear in
-    /// the dead letters and the history.
+    /// the dead letters and the history. A new input only: an open turn is
+    /// closed under its own execution id ([`Node::close_open_turn`]).
     #[allow(clippy::too_many_arguments)]
     async fn record_unrun(
         &self,

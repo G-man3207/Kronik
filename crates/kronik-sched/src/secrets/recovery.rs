@@ -244,6 +244,33 @@ impl Node {
                 "Only definitive recorded secret loss can terminate recovery",
             ));
         }
+        self.close_open_turn(
+            begin,
+            effects,
+            code,
+            "A secret version that the turn recorded is no longer recoverable".into(),
+            false,
+        )
+        .await
+    }
+
+    /// Closes the open turn of `begin` as failed with `code`, without running
+    /// guest code: with the TurnBegin's own execution id, so applying the
+    /// record deletes its `open_turns` and `open_effects` rows and no later
+    /// start runs it again; with its recorded `effects`, so a successful call
+    /// stays an orphan, and the compensations those calls recorded are sent.
+    /// `erased_calls`: a call request of an erased subject cannot be opened,
+    /// so whether it had a compensation is gone with it; the call is skipped
+    /// instead of refusing the close (the turn's input or kind is gone for
+    /// good, so waiting would keep it open forever).
+    pub(crate) async fn close_open_turn(
+        &self,
+        begin: pb::TurnBegin,
+        effects: Vec<pb::EffectRecord>,
+        code: ErrorCode,
+        message: String,
+        erased_calls: bool,
+    ) -> Result<TurnResult, ApiError> {
         let actor_pb = begin.actor.as_ref().ok_or_else(corrupt)?;
         let actor =
             ActorRef::new(actor_pb.kind.clone(), actor_pb.key.clone()).map_err(|_| corrupt())?;
@@ -252,6 +279,14 @@ impl Node {
         for effect in effects.iter().filter(|effect| {
             effect.kind == "actor.call" && effect.status == pb::EffectStatus::Ok as i32
         }) {
+            if erased_calls
+                && effect
+                    .request
+                    .as_ref()
+                    .is_some_and(|r| matches!(self.sealer().open(r), Opened::Erased { .. }))
+            {
+                continue;
+            }
             let bytes = request_bytes(self.sealer(), effect.request.as_ref())?;
             let request = pb::CallEffectRequest::decode(bytes.as_ref()).map_err(|_| corrupt())?;
             let target = request.to.ok_or_else(corrupt)?;
@@ -273,7 +308,7 @@ impl Node {
         let outcome = pb::Outcome {
             kind: pb::OutcomeKind::Failed as i32,
             error_code: code.as_str().into(),
-            message: "A secret version that the turn recorded is no longer recoverable".into(),
+            message,
             output: None,
         };
         let time = begin.logical_time_ms;

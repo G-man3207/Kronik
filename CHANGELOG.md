@@ -46,6 +46,11 @@ until the v1.0 compatibility promise takes effect.
   while a turn is open in the state or in a kept snapshot, the snapshot's
   manifest names it, and a directory that already lost it fails with
   `STORAGE_CORRUPT` naming the turn's execution id.
+- An open turn whose re-run after a restart met an input of an erased
+  subject, or a kind that is no longer deployed, is closed once: its failed
+  record now carries the turn's own execution id and its recorded effects.
+  Before, the turn stayed open, every start added another dead letter for
+  it, and retention kept the log from its begin on for good.
 - `kronik upgrade check` passes after an erasure whose turns wrote state or
   SQL rows: those writes, and every other difference of a turn that met
   erased data (effects, response, errors, fuel), are no longer counted as
