@@ -24,6 +24,12 @@
 //! Responses require Content-Length unless HEAD/204/304; transfer encodings and
 //! interim responses are rejected rather than risking keep-alive desynchronization.
 //! Any request, framing, missed schedule, or worker failure makes exit status 1.
+//!
+//! `loadgen chat ...` runs WebSocket chat clients instead (M24; see chat.rs).
+
+mod chat;
+mod json;
+mod ws;
 
 use std::fmt::Write as _;
 use std::io::{self, BufReader, Read, Write};
@@ -460,7 +466,9 @@ fn worker(a: &Args, w: usize, start: Instant, measure_from: Instant, end: Instan
             if let Some(i) = interval {
                 let missed = missed_slots(next, measure_from, end, i);
                 if missed > 0 {
-                    local.error(missed, || "open-loop requests not sent before cutoff".into());
+                    local.error(missed, || {
+                        "open-loop requests not sent before cutoff".into()
+                    });
                 }
             }
             break;
@@ -490,7 +498,9 @@ fn worker(a: &Args, w: usize, start: Instant, measure_from: Instant, end: Instan
         let header = if a.header_half && !key.is_multiple_of(2) {
             None
         } else {
-            header_template.as_mut().map(|template| template.render(&key_text))
+            header_template
+                .as_mut()
+                .map(|template| template.render(&key_text))
         };
         if Instant::now() >= end {
             if interval.is_some() && scheduled >= measure_from {
@@ -541,7 +551,21 @@ fn json_string(value: &str) -> String {
 }
 
 fn main() {
-    let a = match parse(std::env::args().skip(1)) {
+    let mut args = std::env::args().skip(1).peekable();
+    if args.peek().is_some_and(|a| a == "chat") {
+        args.next();
+        let a = match chat::parse(args) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("loadgen chat: {e}");
+                std::process::exit(2);
+            }
+        };
+        let report = chat::run(&a);
+        println!("{}", report.json);
+        std::process::exit(if report.ok { 0 } else { 1 });
+    }
+    let a = match parse(args) {
         Ok(a) => Arc::new(a),
         Err(e) => {
             eprintln!("loadgen: {e}");

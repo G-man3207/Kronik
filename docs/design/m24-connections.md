@@ -1831,17 +1831,19 @@ test VPS: 2 vCPUs, about 4 GiB of RAM, no KVM.
 **Tool.** `tools/loadgen` gets a `chat` mode. It stays without
 dependencies: a minimal RFC 6455 client (handshake with the
 `Sec-WebSocket-Accept` check, masked text frames, ping replies, close), a
-thread per client with a 64 KiB stack, and JSON output like the HTTP
-modes.
+thread per client with a 256 KiB stack, and one JSON line of results like
+the HTTP modes. Its tests run it against a mock chat server and check that
+the accounting catches a dropped frame, a duplicate and a server close.
 
 ```text
 loadgen chat --addr 127.0.0.1:<port> --clients 1000 --rooms 50 \
-        --ramp 20 --interval 10 --seconds 600 \
-        --sources 127.0.0.1-127.0.0.4 --json
+        --ramp 20 --settle 5 --interval 10 --seconds 600 --drain 10
 ```
 
-`--sources` binds the clients to four loopback source addresses, so the
-per-client cap (§5.11) is not what is measured.
+Every client connects from the same loopback address: the standard
+library cannot bind a source address without a dependency. So the load
+run raises the per-client cap (§5.11) instead, and the cap is not what is
+measured.
 
 **Workload:**
 
@@ -1859,7 +1861,7 @@ per-client cap (§5.11) is not what is measured.
 
 - builds `chat-ts` and the release `kronik` and `loadgen`;
 - starts `kronik serve` on a fresh data directory, with `[connections]
-  max_open = 4096` and `max_per_client = 512`;
+  max_open = 4096` and `max_per_client = 2048`;
 - deploys `chat-ts` and runs the load;
 - samples the daemon's `VmRSS`, `VmHWM` and CPU every 10 s from `/proc`;
 - writes one JSON report.
