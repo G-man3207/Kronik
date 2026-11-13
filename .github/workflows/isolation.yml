@@ -1,0 +1,279 @@
+name: isolation
+
+# The M20 and M21 isolation proofs of ADR 0064 (ADR 0133), on GitHub-hosted
+# runners: disposable Ubuntu 24.04 virtual machines with systemd 255, root by
+# sudo and a /dev/kvm that a udev rule gives to the kvm group. Each proof changes its host
+# (a transient unit of the host's manager with most of root's capabilities,
+# listeners on the host's addresses, a sysctl), so it runs only here and never
+# on a machine that holds anything. Every job keeps its evidence as an
+# artifact, and a proof that is missing fails it: a skipped proof is not a
+# passed one.
+#
+#   m21           the nonroot service: the rootless_boundary driver (B1), then the
+#                 installed fixture with the hostile foreign-probe actor and the
+#                 program proof (the v0.1 demos without root, Postgres fork, UID
+#                 audit, ship and restore). Twice: with Ubuntu's AppArmor
+#                 restriction on unprivileged user namespaces active (R1, the
+#                 install target) and with it lifted, to tell R1 from the rest.
+#   microvm-tools the pinned microVM tool bundle (scripts/build-microvm-tools.sh),
+#                 cached on its recipe so that a rerun reuses it.
+#   m20           the microVM level on KVM: the installed fixture with microVM
+#                 actors (boot, vsock calls, no network device, ENOSPC, calibration,
+#                 full snapshot and fork restore, graceful STOP within a second with
+#                 no panic), with the restriction active.
+#
+# Manual only (ADR 0110): start it from the Actions tab, or with
+# `gh workflow run isolation.yml`.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # The run's records; collected into the evidence artifact at the end.
+  OUT: ${{ github.workspace }}/../isolation-run
+
+jobs:
+  m21:
+    name: M21 nonroot service, user namespaces ${{ matrix.userns }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        userns: [restricted, lifted]
+    env:
+      USERNS: ${{ matrix.userns }}
+    steps:
+      # The runner's preinstalled SDKs that these proofs do not use, for disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/share/swift /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Installs the toolchain pinned in rust-toolchain.toml, with its musl target.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: isolation
+          workspaces: |
+            . -> target
+            examples -> target
+
+      # Node.js for the TypeScript examples of the billing demo.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            sdk/ts/package-lock.json
+            examples/package-lock.json
+
+      - name: Record the host
+        run: python3 scripts/isolation-ci.py facts "$OUT"
+
+      - name: Build the product, the drivers, the examples and the images
+        run: python3 scripts/isolation-ci.py build "$OUT" --examples
+
+      # Trusted checkout setup only, as in the CI workflow.
+      - name: Install gVisor
+        run: |
+          sudo KRONIK_INSTALL_RUNSC=yes sh scripts/install-runsc.sh </dev/null
+          runsc --version
+
+      - name: Declare this runner disposable and set its user-namespace restriction
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_STEP_SUMMARY \
+            python3 scripts/isolation-ci.py mark "$OUT"
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_STEP_SUMMARY \
+            python3 scripts/isolation-ci.py userns "$USERNS" "$OUT"
+          python3 scripts/isolation-ci.py ids "$OUT"
+
+      - name: B1, the rootless boundary driver
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_STEP_SUMMARY \
+            python3 scripts/isolation-ci.py boundary "$OUT"
+
+      - name: B2, the installed fixture with the hostile actor and the program proof
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_STEP_SUMMARY \
+            python3 scripts/isolation-ci.py fixture "$OUT" --isolation gvisor --userns "$USERNS" \
+            --max-runtime 7200
+
+      - name: Collect the evidence
+        if: always()
+        run: |
+          sudo python3 scripts/isolation-ci.py collect "$OUT" "$RUNNER_TEMP/evidence" \
+            --owner "$(id -u):$(id -g)"
+
+      - name: Fail unless every proof ran and passed
+        if: always()
+        run: python3 scripts/isolation-ci.py verify m21 "$RUNNER_TEMP/evidence" --userns "$USERNS"
+
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: isolation-m21-${{ matrix.userns }}
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  microvm-tools:
+    name: M20 pinned microVM tool bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/share/swift /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      # The bundle is the recipe's output: the same pins give the same bundle,
+      # so a rerun restores it instead of compiling a kernel again.
+      - name: Restore the tool bundle
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/microvm/tools
+          key: microvm-tools-v1-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('scripts/build-microvm-tools.sh', 'scripts/e2fsprogs-1.47.2-directory-times.patch', 'crates/kronik-guest-init/**', 'crates/kronik-foreign/src/microvm_assets.rs', 'Cargo.lock', 'rust-toolchain.toml', 'scripts/package-release.py', 'scripts/licenses/**') }}
+
+      - name: Install the build prerequisites
+        if: steps.restore.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flex bison bc m4 pkg-config \
+            libelf-dev libssl-dev uuid-dev libblkid-dev zlib1g-dev
+
+      - name: Build the pinned tool bundle
+        if: steps.restore.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/microvm"
+          chmod 0755 "$RUNNER_TEMP/microvm"
+          bash scripts/build-microvm-tools.sh --execute --output "$RUNNER_TEMP/microvm/tools" \
+            --kernel-jobs "$(nproc)" --command-timeout 7200
+
+      - name: Save the tool bundle
+        if: steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/microvm/tools
+          key: ${{ steps.restore.outputs.cache-primary-key }}
+
+      - name: Keep the build's record
+        if: always()
+        run: python3 scripts/isolation-ci.py tool-record "$RUNNER_TEMP/microvm" "$RUNNER_TEMP/evidence"
+
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: isolation-microvm-tools
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  m20:
+    name: M20 microVM level on KVM
+    needs: microvm-tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/share/swift /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: isolation
+
+      - name: Restore the tool bundle
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/microvm/tools
+          key: microvm-tools-v1-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('scripts/build-microvm-tools.sh', 'scripts/e2fsprogs-1.47.2-directory-times.patch', 'crates/kronik-guest-init/**', 'crates/kronik-foreign/src/microvm_assets.rs', 'Cargo.lock', 'rust-toolchain.toml', 'scripts/package-release.py', 'scripts/licenses/**') }}
+          fail-on-cache-miss: true
+
+      - name: Record the host
+        run: python3 scripts/isolation-ci.py facts "$OUT"
+
+      # A runner without usable KVM fails here: a microVM proof without KVM is
+      # not a proof.
+      - name: Give /dev/kvm to the kvm group and prove the KVM API
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_STEP_SUMMARY \
+            python3 scripts/isolation-ci.py kvm "$OUT"
+
+      - name: Build the product, the drivers and the images
+        run: python3 scripts/isolation-ci.py build "$OUT"
+
+      # The fixture's private view binds the installed runsc for every run.
+      - name: Install gVisor
+        run: |
+          sudo KRONIK_INSTALL_RUNSC=yes sh scripts/install-runsc.sh </dev/null
+          runsc --version
+
+      - name: Declare this runner disposable and keep its user-namespace restriction
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_STEP_SUMMARY \
+            python3 scripts/isolation-ci.py mark "$OUT"
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_STEP_SUMMARY \
+            python3 scripts/isolation-ci.py userns restricted "$OUT"
+          python3 scripts/isolation-ci.py ids "$OUT"
+
+      - name: The installed fixture with microVM actors
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_STEP_SUMMARY \
+            python3 scripts/isolation-ci.py fixture "$OUT" --isolation microvm --userns restricted \
+            --tools "$RUNNER_TEMP/microvm/tools" --max-runtime 9000
+
+      - name: Collect the evidence
+        if: always()
+        run: |
+          sudo python3 scripts/isolation-ci.py collect "$OUT" "$RUNNER_TEMP/evidence" \
+            --owner "$(id -u):$(id -g)"
+          python3 scripts/isolation-ci.py tool-record "$RUNNER_TEMP/microvm" "$RUNNER_TEMP/evidence/tools"
+
+      - name: Fail unless every proof ran and passed
+        if: always()
+        run: python3 scripts/isolation-ci.py verify m20 "$RUNNER_TEMP/evidence" --userns restricted
+
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: isolation-m20
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+          retention-days: 30

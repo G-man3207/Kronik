@@ -96,7 +96,7 @@ Before any VM actor boot, that same service's owned user/mount namespace runs th
 
 The owned containment parent is bounded to 2 CPUs, 2 GiB, 1,024 tasks and 1,800 seconds; the generated product unit retains its own limits. Every required prerequisite/error/FAIL is nonzero. Missing KVM does not become a skipped or negative-only successful microVM job.
 
-`scripts/proof-rootless.sh` is written for an Ubuntu 24.04 host with systemd 255 and the kernel's AppArmor restriction on unprivileged user namespaces active, because that is the brief's install target. Kronik does not handle that restriction and has not been tested there, so the wrapper is a test of whether it works, not a claim that it does. It is not wired into CI: adding a CI step for it (and for the microVM job) is a separate decision.
+`scripts/proof-rootless.sh` is written for an Ubuntu 24.04 host with systemd 255 and the kernel's AppArmor restriction on unprivileged user namespaces active, because that is the brief's install target. Kronik does not handle that restriction and has not been tested there, so the wrapper is a test of whether it works, not a claim that it does. It is not a CI step; the manual `isolation` workflow runs it, and the microVM job, on GitHub-hosted runners ([ADR 0133](0133-isolation-proofs-on-hosted-runners.md)), and CI's `foreign` step runs a bounded hostile-actor test under the root daemon.
 
 On another host, use the same prebuilt artifacts and allocated IDs but invoke the non-shipped helper and conformance entry point explicitly. The result then says nothing about Ubuntu 24.04:
 

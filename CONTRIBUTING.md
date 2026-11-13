@@ -49,7 +49,12 @@ scripts/ci.sh clippy test    # selected steps
 `scripts/ci.sh` exits non-zero if any step fails. The M20 and M21 isolation
 checks are explicit and are not CI steps: they need root, runsc, systemd 255
 or newer and free numeric ids, the microVM ones also `/dev/kvm`, and the
-wrapper expects an Ubuntu 24.04 host (the brief's install target).
+wrapper expects an Ubuntu 24.04 host (the brief's install target). They change
+their host, so they run only on a disposable one: the manual `isolation`
+workflow runs them on GitHub-hosted runners and keeps their evidence
+([ADR 0133](docs/adr/0133-isolation-proofs-on-hosted-runners.md);
+`scripts/isolation-ci.py` is its driver, and refuses its host-changing steps
+anywhere else).
 `scripts/build-microvm-tools.sh` builds the pinned
 microVM tool bundle, `scripts/proof-rootless.sh` (and the commands of
 [ADR 0064](docs/adr/0064-foreign-isolation-conformance.md)) runs the
