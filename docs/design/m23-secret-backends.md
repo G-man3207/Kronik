@@ -88,9 +88,13 @@ Invariants that bind it:
 - The exceptions:
   - **production crash recovery of a reveal** reloads the recorded version;
   - an HTTP effect that must be re-sent loads its recorded version;
-  - **unmatched fork crypto** uses the *current* production value of a
-    built-in name (a known gap, unchanged here); a name linked to an external
-    backend at the fork point is refused (`SECRET_EXTERNAL`, see §6).
+  - **unmatched fork crypto** of a built-in name uses its *current*
+    production value only under a `compute` grant; a `recorded` grant, the
+    default for a new grant since ADR 0112, denies it (`replay: no
+    recording`) and uses no value. A grant written before the mode existed
+    is `compute`, so the gap remains for such grants. A name linked to an
+    external backend at the fork point is refused in either mode
+    (`SECRET_EXTERNAL`, see §6).
 
 **Scrubbing.** `Node::secret_values()` decrypts every non-deleted version of
 every secret for each scrubbed API response and for foreign logs.
@@ -1056,9 +1060,11 @@ plus API calls. Running it once before release is the maintainers' call (§13).
 - **Forks:**
   - A fork reads the links and versions of its fork point from the log.
   - A fork never fetches from a backend (§6); a name linked at the fork
-    point is refused for an unmatched `crypto.*` (the stopgap of §6), and with
-    the built-in store unmatched fork crypto keeps today's behaviour (a known
-    gap).
+    point is refused for an unmatched `crypto.*` (the stopgap of §6). With
+    the built-in store, unmatched fork crypto uses the current value only
+    under a `compute` grant; `recorded`, the default for a new grant since
+    ADR 0112, denies it. A grant from before the mode stays `compute` (the
+    known gap, now opt-in).
   - A fork never records new `SecretVersion`s in main's log.
 - **Cluster (M16):** each node fetches independently; the metadata leader
   allocates version numbers (§5.1).

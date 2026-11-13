@@ -138,14 +138,19 @@ the root id).
      matches, else `FailClosed`, which gives the guest
      `denied("replay: no recording")` (`GROUNDING_SYNTHETIC`); the turn is
      marked divergent.
-  Crypto matches exactly by fingerprint (name and data hash) or is
-  recomputed on the host with the production key (the key never leaves the
-  host, but the fork gets a real HMAC or signature over data its code
-  chose); it counts as exact either way. A name that is linked to an
-  external backend at the fork point is not recomputed: the built-in store
-  holds an older value of it or none, and a fork never fetches. The effect is
-  denied with `SECRET_EXTERNAL` and graded synthetic like any answer the fork
-  cannot give. `secret.reveal` in a fork never
+  Crypto matches exactly by fingerprint (name and data hash): the recorded
+  result is returned (exact). An unmatched call depends on the in-forks mode
+  of the `secret:<name>` grant (ADR 0112). `compute` recomputes it on the
+  host with the production key (the key never leaves the host, but the fork
+  gets a real HMAC or signature over data its code chose), and it counts as
+  exact. `recorded`, the default for a new grant, does not compute: the
+  guest gets `denied("replay: no recording")` and the effect is graded
+  synthetic (`fail-closed`). A grant written before the mode existed is
+  `compute`. A name that is linked to an external backend at the fork point
+  is not recomputed in either mode: the built-in store holds an older value
+  of it or none, and a fork never fetches. The effect is denied with
+  `SECRET_EXTERNAL` and graded synthetic like any answer the fork cannot
+  give. `secret.reveal` in a fork never
   gets the value: it answers the placeholder `[secret:<name>]` (exact when
   production revealed at that point, else synthetic). Production records
   HTTP and call requests, and fingerprints them, with the same placeholder
@@ -506,7 +511,10 @@ Proposal `status`: `evaluated`, `approved`, `promoted`, `rejected`
 - Identity replay of 10 000 recorded requests: empty diff, isolated and
   continuous. Counter `+2`: changed responses and state for every touched
   actor, 0 synthetic. Approximate effects (changed request body to a granted
-  target): approximate grounding, confidence < 1, per-target grounding.
+  target): approximate grounding, confidence < 1, per-target grounding. A
+  body the actor also signs (webhook-relay-rs) is approximate only under a
+  `compute` grant of the key; under `recorded` the signature is denied and
+  graded synthetic, and webhook-relay-rs then makes no request (ADR 0112).
   Isolation: an early change does not leak into later root inputs; diffs
   byte-identical at 1, 4 and 16 workers. Causal grouping: one origin with
   1 000 consequences. Continuous drift in `cumulative`. Sampling: same

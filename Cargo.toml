@@ -84,9 +84,11 @@ cel = { version = "=0.15.0", default-features = false }
 # Policy rules files (`kronik policy set rules.toml`).
 toml = { version = "1.1", default-features = false }
 # The official MCP SDK (ADR 0008). Pinned exactly: it implements the protocol
-# revisions agents speak, and it changes quickly. Features are enabled by the
+# revisions agents speak, and it changes quickly. At least 3.9.0: earlier
+# Streamable HTTP clients, which `kronik mcp` uses, read response bodies
+# without a size limit (RUSTSEC-2026-0462). Features are enabled by the
 # crates that use them.
-rmcp = { version = "=3.7.0", default-features = false }
+rmcp = { version = "=3.10.0", default-features = false }
 tower-service = "0.3"
 # JSON Schema for the API's types, from which the OpenAPI document and the
 # CLI's --json schemas are generated (docs/reference/openapi.json). Already in

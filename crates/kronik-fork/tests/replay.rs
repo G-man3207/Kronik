@@ -7,7 +7,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::*;
 use kronik_core::ids::Lsn;
@@ -439,11 +439,13 @@ fn identity_replay_of_10k_requests() {
     }
 }
 
-/// webhook-relay-rs with a changed request body: changed effects,
-/// approximate grounding, confidence below 1, grounding per target; the
-/// signature is recomputed on the host (exact).
-#[test]
-fn webhook_relay_with_a_changed_body() {
+/// The webhook-relay-rs scenario of M3: four webhooks relayed (each signed
+/// with `crypto.hmac-sha256`, then sent with `http.fetch`), an identity
+/// replay that must be unchanged, and a replay of the `body-v2` build, which
+/// forwards a changed body. `signing` is the in-forks mode of the signing
+/// key's grant (ADR 0112). Returns the `body-v2` replay and the test
+/// server's request count.
+fn webhook_relay_body_v2(signing: kronik_effects::InForks) -> (ReplayOutput, Arc<AtomicUsize>) {
     let (addr, hits) = server();
     let dir = tempdir();
     let p = Proc::start(dir.path());
@@ -459,13 +461,17 @@ fn webhook_relay_with_a_changed_body() {
         p.owner(),
     ))
     .unwrap();
-    for cap in ["http:127.0.0.1", "secret:relay-signing-key"] {
+    // The mode matters only for the secret: fork crypto is the only reader.
+    for (cap, mode) in [
+        ("http:127.0.0.1", kronik_effects::InForks::Recorded),
+        ("secret:relay-signing-key", signing),
+    ] {
         p.rt.block_on(p.node.grant(
             "webhook-relay",
             cap,
             None,
             None,
-            kronik_effects::InForks::Recorded,
+            mode,
             a.clone(),
             false,
             p.owner(),
@@ -515,6 +521,8 @@ fn webhook_relay_with_a_changed_body() {
         assert!(t.committed());
     }
     assert_eq!(hits.load(Ordering::SeqCst), 4);
+    // The same code signs the same bodies: every call matches its
+    // recording, in either mode.
     let same = replay(&p, None, fork_lsn, &opts(Mode::Both), 2);
     assert!(
         !same.diff.summary.changed,
@@ -528,6 +536,21 @@ fn webhook_relay_with_a_changed_body() {
         &opts(Mode::Both),
         2,
     );
+    (v2, hits)
+}
+
+/// webhook-relay-rs with a changed request body: changed effects,
+/// approximate grounding, confidence below 1, grounding per target; the
+/// signature is recomputed on the host (exact).
+///
+/// The signing key's grant is pinned to `compute`. New grants default to
+/// `recorded` (ADR 0112), which denies the signature of a changed body in
+/// the fork, so no request is sent and nothing is approximate (see the next
+/// test). This test keeps proving the M3 acceptance scenario, which needs
+/// the fork to sign the changed body.
+#[test]
+fn webhook_relay_with_a_changed_body() {
+    let (v2, hits) = webhook_relay_body_v2(kronik_effects::InForks::Compute);
     let d = &v2.diff;
     assert!(d.summary.confidence < 1.0, "{:?}", d.summary);
     assert_eq!(d.summary.synthetic, 0);
@@ -562,6 +585,81 @@ fn webhook_relay_with_a_changed_body() {
         fields.contains(&"body") && fields.contains(&"header:x-signature"),
         "{fields:?}"
     );
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+}
+
+/// The same changed body with the default mode of a new grant, `recorded`
+/// (ADR 0112). The fork does not sign the changed body: its HMAC has no
+/// recording, so the call is denied with `replay: no recording` and graded
+/// synthetic (`fail-closed`). webhook-relay-rs then fails the delivery
+/// without sending it, so production's four `http.fetch` effects are
+/// missing from the fork (removed, not approximate), each webhook's answer
+/// turns from 200 into 502, and with no exact or approximate answer left
+/// the confidence is 0.
+#[test]
+fn webhook_relay_with_a_changed_body_and_a_recorded_grant() {
+    let (v2, hits) = webhook_relay_body_v2(kronik_effects::InForks::Recorded);
+    let d = &v2.diff;
+    let s = &d.summary;
+    assert_eq!((s.exact, s.approximate, s.synthetic), (0, 0, 4), "{s:?}");
+    assert_eq!(s.synthetic_by.get("fail-closed"), Some(&4), "{s:?}");
+    assert_eq!(s.confidence, 0.0, "{s:?}");
+    assert_eq!(s.divergent_turns, 4, "{s:?}");
+    // The denied signatures are the only grounding: the fork sent nothing.
+    let rows: Vec<_> = d
+        .grounding
+        .iter()
+        .map(|g| {
+            (
+                g.kind.as_str(),
+                g.host.as_str(),
+                g.exact,
+                g.approximate,
+                g.synthetic,
+            )
+        })
+        .collect();
+    assert_eq!(rows, [("crypto.hmac-sha256", "relay-signing-key", 0, 0, 4)]);
+    let e = &d.effects;
+    assert_eq!((e.added, e.removed, e.changed), (0, 4, 4), "{e:?}");
+    for item in &e.items {
+        match item.change.as_ref() {
+            // Signed data changed, so the fingerprint did.
+            "changed" => assert_eq!(
+                (
+                    item.kind.as_str(),
+                    item.grounding.as_ref(),
+                    item.simulator.as_deref()
+                ),
+                ("crypto.hmac-sha256", "synthetic", Some("fail-closed")),
+                "{item:?}"
+            ),
+            "removed" => assert_eq!(
+                (
+                    item.kind.as_str(),
+                    item.method.as_str(),
+                    item.host.as_str(),
+                    item.route.as_str()
+                ),
+                ("http.fetch", "POST", "127.0.0.1", "/relay"),
+                "{item:?}"
+            ),
+            other => panic!("unexpected {other} effect: {item:?}"),
+        }
+    }
+    // The relay answers with the failed delivery record.
+    assert_eq!(d.responses.changed, 4);
+    let r = &d.responses.items[0];
+    assert_eq!((r.status.prod, r.status.fork), (Some(200), Some(502)));
+    let error = r.body.iter().find(|op| op.path == "/error").unwrap();
+    assert!(
+        error
+            .fork
+            .as_str()
+            .is_some_and(|text| text.contains("replay: no recording")),
+        "{error:?}"
+    );
+    // Replay never reached the server.
     assert_eq!(hits.load(Ordering::SeqCst), 4);
 }
 

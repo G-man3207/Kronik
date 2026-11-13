@@ -678,7 +678,7 @@ pub fn grant(r: &GrantResponse, rerun: &str) -> String {
         );
     }
     if g.capability.starts_with("secret:") {
-        field(&mut out, "In forks", &[g.in_forks.clone()], "");
+        field(&mut out, "In forks", std::slice::from_ref(&g.in_forks), "");
     }
     let cmds = if r.dry_run {
         vec![rerun.to_owned()]

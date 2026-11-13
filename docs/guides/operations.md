@@ -490,7 +490,9 @@ External backends are defined in `[secrets.backends.<id>]` tables; see the
 The model simulator (M12, [ADR 0015](../adr/0015-model-simulator.md)): off
 when the table is absent, and even then it answers only for targets whose
 `kronik stubs set` file has `model = true`. It never sees personal data: a
-turn that touched a subject's data fails closed instead. Answers are cached
+turn that touched a subject's data, or used a secret in any way (a
+`crypto.*` call, computed, served from its recording or denied, or a
+`secret.reveal`), fails closed instead. Answers are cached
 per proposal (`branches/<id>/simulator-cache.json`), so a proposal's diff
 stays the same when it is replayed again.
 
