@@ -2,7 +2,7 @@
 //! main's records up to the end of the window, its root inputs, and its
 //! turns by causal key.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kronik_core::causal;
 use kronik_core::ids::{ActorRef, Lsn};
@@ -141,9 +141,20 @@ pub struct ProductionIndex {
     /// Turn LSNs by root id, in LSN order.
     trees: BTreeMap<String, Vec<Lsn>>,
     pub roots: Vec<RootInput>,
+    /// Turn LSNs whose recorded values include one whose subject was erased.
+    /// Identity replay cannot verify such a turn against its input; it reports
+    /// it as unverifiable instead of divergent (S-16, ADR 0109).
+    pub erased_turns: BTreeSet<Lsn>,
+    /// For each turn of [`ProductionIndex::erased_turns`], the ordinals of the
+    /// effects whose recorded request was erased. Such a request cannot be
+    /// rebuilt from the revealed input, so replay serves the recording.
+    pub erased_effects: BTreeMap<Lsn, BTreeSet<u32>>,
     /// Opens production's sealed SQL changesets when a cursor applies them
     /// (M8); plain unless the index was revealed for a fork.
     pub sealer: std::sync::Arc<kronik_privacy::sealer::Sealer>,
+    /// Set by [`ProductionIndex::reveal`] for a `--no-pii` fork. The cursor
+    /// rewrites snapshot rows the same way revealed changesets were.
+    pub no_pii: bool,
 }
 
 impl ProductionIndex {
@@ -273,19 +284,47 @@ impl ProductionIndex {
             turns,
             trees,
             roots,
+            erased_turns: BTreeSet::new(),
+            erased_effects: BTreeMap::new(),
             sealer: std::sync::Arc::new(kronik_privacy::sealer::Sealer::plain()),
+            no_pii: false,
         }
     }
 
     /// Shows the index's user data as the fork may see it (M8 §5, §9):
     /// root inputs, recorded effects and turn records are revealed in place
-    /// (plaintext, or pseudonyms for `--no-pii`); SQL changesets stay as
-    /// recorded and are opened by the cursor's store with `privacy.sealer`.
+    /// (plaintext, or pseudonyms for `--no-pii`). Subject-tagged SQL
+    /// changesets are unsealed and, for `--no-pii`, pseudonymized before
+    /// the cursor's store applies them.
     pub fn reveal(&mut self, privacy: &crate::privacy::ForkPrivacy) {
         self.sealer = privacy.sealer.clone();
+        self.no_pii = privacy.no_pii;
         for c in std::sync::Arc::make_mut(&mut self.records) {
             match &mut c.record {
                 Record::TurnRecord(t) => {
+                    // Before it is replaced by `[erased]`: an erased value of
+                    // the turn means no replay can reproduce what the guest
+                    // read, so the turn is unverifiable (S-16, ADR 0109).
+                    let mut erased = false;
+                    kronik_proto::sealables::turn_mut(t, &mut |s| {
+                        erased |= privacy.opens_erased(s);
+                    });
+                    if erased {
+                        self.erased_turns.insert(c.lsn);
+                    }
+                    let effects: BTreeSet<u32> = t
+                        .effects
+                        .iter()
+                        .filter(|e| {
+                            e.request
+                                .as_ref()
+                                .is_some_and(|request| privacy.opens_erased(request))
+                        })
+                        .map(|e| e.ordinal)
+                        .collect();
+                    if !effects.is_empty() {
+                        self.erased_effects.insert(c.lsn, effects);
+                    }
                     privacy.reveal_turn(t);
                 }
                 Record::TurnBegin(b) => {
@@ -343,6 +382,11 @@ impl ProductionIndex {
             ProductionIndex::from_shared(std::sync::Arc::new(records), self.fork_lsn, to_lsn);
         index.base = self.base.clone();
         index.sealer = privacy.sealer.clone();
+        index.no_pii = privacy.no_pii;
+        index.erased_turns = self.erased_turns.clone();
+        index.erased_turns.extend(tail.erased_turns);
+        index.erased_effects = self.erased_effects.clone();
+        index.erased_effects.extend(tail.erased_effects);
         Ok(index)
     }
 

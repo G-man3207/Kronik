@@ -184,6 +184,7 @@ impl Fixture {
                         &format!("http:host-{n}.example.com"),
                         None,
                         None,
+                        kronik_effects::InForks::Recorded,
                         audit(),
                         false,
                         original,

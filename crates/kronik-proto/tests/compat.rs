@@ -207,6 +207,57 @@ fn state_rebase_switch_v1() {
     );
 }
 
+/// `Grant.in_forks` (field 8, ADR 0112). A record that writes `recorded`
+/// keeps that value. An older record without the field decodes with it
+/// empty, which is compute.
+#[test]
+fn grant_in_forks_v1() {
+    let record = Record::Grant(pb::Grant {
+        epoch: 4,
+        op: pb::GrantOp::Grant as i32,
+        kind: "counter".into(),
+        capability: "secret:signing-key".into(),
+        in_forks: "recorded".into(),
+        audit: Some(pb::Audit {
+            token_id: "admin".into(),
+            reason: "forks must not sign".into(),
+            wall_time_ms: 1_793_000_000_000,
+        }),
+        ..Default::default()
+    });
+    let bytes = fixture("grant-in-forks-v1", &record);
+    assert_eq!(
+        Record::decode(kronik_proto::kind::GRANT, &bytes).unwrap(),
+        record
+    );
+}
+
+/// Bytes of a grant written before field 8. Decoding leaves `in_forks`
+/// empty, and empty is compute (ADR 0112), not the default of a new grant.
+#[test]
+fn grant_without_in_forks_decodes_as_compute() {
+    let older = Record::Grant(pb::Grant {
+        epoch: 2,
+        op: pb::GrantOp::Grant as i32,
+        kind: "counter".into(),
+        capability: "secret:signing-key".into(),
+        ..Default::default()
+    });
+    let bytes = older.encode();
+    let decoded = Record::decode(kronik_proto::kind::GRANT, &bytes).unwrap();
+    let Record::Grant(grant) = decoded else {
+        panic!("not a grant");
+    };
+    assert!(grant.in_forks.is_empty(), "{grant:?}");
+    // The same rule Grant application uses: empty stays compute.
+    let mode = match grant.in_forks.as_str() {
+        "" | "compute" => "compute",
+        "recorded" => "recorded",
+        other => other,
+    };
+    assert_eq!(mode, "compute");
+}
+
 /// `ForeignActor.fork_mode` (field 12, M14, ADR 0019); an older record
 /// without it reads as empty (recorded).
 #[test]

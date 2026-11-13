@@ -375,3 +375,147 @@ fn a_copy_during_an_open_turn_holds_the_applied_rows() {
         .unwrap();
     a.end_turn(true).unwrap();
 }
+
+/// Text and blob cells are replaced; an integer primary key and `_subject`
+/// stay, and a later UPDATE still matches the rewritten old image.
+#[test]
+fn a_rewritten_changeset_applies_pseudonyms_and_keeps_the_primary_key() {
+    let schema = [
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
+         payload BLOB, _subject TEXT DEFAULT (kronik_subject()))",
+    ];
+    let mut live = actor("rewrite-live");
+    let (_, res) = commit(&mut live, &opts(1, 1, true), &schema, 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let mut o = opts(2, 2, false);
+    o.default_subject = Some("user:1".into());
+    let (t, res) = commit(
+        &mut live,
+        &o,
+        &[
+            "INSERT INTO notes(body, payload) VALUES ('ROW-u1-5e2c', x'0102')",
+            "INSERT INTO notes(body, payload) VALUES ('ROW-u1-5e2c', x'0102')",
+            "UPDATE notes SET body = 'ROW-u1-5e2c-next' WHERE id = 1",
+            "DELETE FROM notes WHERE id = 2",
+        ],
+        2,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let (subject, cs) = t.changesets.first().expect("one changeset");
+    assert_eq!(subject.as_deref(), Some("user:1"));
+    let rewritten = pseudonymize_changeset(cs, "user:1", |v| match v {
+        b"ROW-u1-5e2c" => b"pii:aaaa".to_vec(),
+        b"ROW-u1-5e2c-next" => b"pii:bbbb".to_vec(),
+        other => {
+            let mut out = b"pii:".to_vec();
+            out.extend_from_slice(&blake3::hash(other).as_bytes()[..6]);
+            out
+        }
+    })
+    .unwrap();
+    assert!(
+        !rewritten
+            .windows(b"ROW-u1-5e2c".len())
+            .any(|w| w == b"ROW-u1-5e2c"),
+        "rewritten changeset still holds the plaintext"
+    );
+    let mut fork = actor("rewrite-fork");
+    fork.apply(
+        &TurnSql {
+            ddl: schema.iter().map(|s| (*s).to_string()).collect(),
+            ..TurnSql::default()
+        },
+        1,
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    fork.apply(
+        &TurnSql {
+            changesets: vec![(subject.clone(), rewritten)],
+            ..TurnSql::default()
+        },
+        2,
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    fork.begin_turn(&opts(0, 0, false)).unwrap();
+    let rows = fork
+        .query(
+            "SELECT id, body, payload, _subject FROM notes ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    fork.end_turn(false).unwrap();
+    assert_eq!(rows.values.len(), 1, "{rows:?}");
+    assert_eq!(rows.values[0][0], Value::Integer(1));
+    assert_eq!(rows.values[0][1], Value::Text("pii:bbbb".into()));
+    let Value::Blob(payload) = &rows.values[0][2] else {
+        panic!("payload was not a blob: {rows:?}");
+    };
+    assert_ne!(payload.as_slice(), &[1, 2]);
+    assert!(payload.starts_with(b"pii:"), "{payload:?}");
+    assert_eq!(rows.values[0][3], Value::Text("user:1".into()));
+}
+
+/// A turn with a default subject may not write a table that has no
+/// `_subject` column. A turn without a subject may. Erasure of a tagged
+/// row is unchanged.
+#[test]
+fn a_subject_turn_cannot_write_a_table_without_subject_column() {
+    let schema = [
+        "CREATE TABLE tagged (id INTEGER PRIMARY KEY, body TEXT, \
+         _subject TEXT DEFAULT (kronik_subject()))",
+        "CREATE TABLE plain (id INTEGER PRIMARY KEY, body TEXT)",
+    ];
+    let mut a = actor("untagged");
+    let (_, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+
+    let mut with_subject = opts(2, 2, false);
+    with_subject.default_subject = Some("user:1".into());
+    a.begin_turn(&with_subject).unwrap();
+    assert!(
+        a.query("INSERT INTO plain(body) VALUES ('secret')", &[])
+            .is_ok()
+    );
+    let err = a.end_turn(true).unwrap_err();
+    assert!(err.contains("subjects/table-without-subject"), "{err}");
+    assert!(err.contains("plain"), "{err}");
+
+    a.begin_turn(&opts(3, 3, false)).unwrap();
+    let left = a.query("SELECT count(*) FROM plain", &[]).unwrap();
+    a.end_turn(false).unwrap();
+    assert_eq!(left.values[0][0], Value::Integer(0), "{left:?}");
+
+    let (t, res) = commit(
+        &mut a,
+        &opts(4, 4, false),
+        &["INSERT INTO plain(body) VALUES ('system')"],
+        2,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    assert!(!t.changesets.is_empty());
+
+    let (t, res) = commit(
+        &mut a,
+        &with_subject,
+        &["INSERT INTO tagged(body) VALUES ('kept')"],
+        3,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    assert!(
+        t.changesets
+            .iter()
+            .any(|(s, _)| s.as_deref() == Some("user:1")),
+        "{t:?}"
+    );
+    let erased = a.erase_subject("user:1", 4).unwrap();
+    assert!(erased >= 1, "tagged row was not erased");
+
+    a.begin_turn(&opts(5, 5, false)).unwrap();
+    let tagged = a.query("SELECT count(*) FROM tagged", &[]).unwrap();
+    let plain = a.query("SELECT body FROM plain", &[]).unwrap();
+    a.end_turn(false).unwrap();
+    assert_eq!(tagged.values[0][0], Value::Integer(0), "{tagged:?}");
+    assert_eq!(plain.values, [[Value::Text("system".into())]]);
+}

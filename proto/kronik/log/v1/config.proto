@@ -85,6 +85,12 @@ message Grant {
   // Unset means no rate limit.
   Rate rate = 6;
   Audit audit = 7;
+  // What a fork does with an unmatched crypto.hmac-sha256 or
+  // crypto.sign-ed25519 of this secret (ADR 0112): "recorded" returns a
+  // matching recording or denies the call; "compute" signs on the host.
+  // Empty in an older record is compute. A new grant writes "recorded"
+  // unless the operator passes compute. The key never leaves the host.
+  string in_forks = 8;
 }
 
 message Rate {

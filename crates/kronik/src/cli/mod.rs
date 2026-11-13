@@ -343,6 +343,24 @@ pub struct ExplainArgs {
     list: bool,
 }
 
+/// What a fork does with an unmatched crypto call of a granted secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum InForks {
+    /// Sign on the host. The key does not enter the guest.
+    Compute,
+    /// Return a matching recording, or deny the call. Do not compute.
+    Recorded,
+}
+
+impl InForks {
+    fn as_str(self) -> &'static str {
+        match self {
+            InForks::Compute => "compute",
+            InForks::Recorded => "recorded",
+        }
+    }
+}
+
 /// How a target tolerates retries: the delivery class of an `http:` grant.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum Delivery {
@@ -379,6 +397,11 @@ pub struct GrantArgs {
     /// capabilities, e.g. 2/s.
     #[arg(long, value_name = "N/s|N/m|N/h")]
     rate: Option<String>,
+    /// Unmatched crypto.hmac-sha256 and crypto.sign-ed25519 in a fork:
+    /// recorded denies the call, compute signs on the host. The default for
+    /// a new grant is recorded. An older grant with no mode stays compute.
+    #[arg(long, value_enum, default_value = "recorded")]
+    in_forks: InForks,
     #[command(flatten)]
     mutation: Mutation,
 }
@@ -1324,6 +1347,7 @@ fn grant(ctx: &Ctx, a: GrantArgs) -> Result<ExitCode, Error> {
             capability: a.capability.clone(),
             delivery: a.delivery.map(|d| d.as_str().to_owned()),
             rate: a.rate.clone(),
+            in_forks: Some(a.in_forks.as_str().to_owned()),
             reason: reason.to_owned(),
             dry_run: a.mutation.dry_run,
         },
@@ -1343,6 +1367,9 @@ fn grant(ctx: &Ctx, a: GrantArgs) -> Result<ExitCode, Error> {
     }
     if let Some(rate) = &a.rate {
         rerun.push_str(&format!(" --rate {}", shell_quote(rate)));
+    }
+    if a.in_forks == InForks::Compute {
+        rerun.push_str(" --in-forks compute");
     }
     rerun.push_str(&format!(" --reason {}", shell_quote(reason)));
     ctx.print(&render::grant(&r, &rerun));
@@ -1762,6 +1789,8 @@ pub(crate) fn report_error(json: bool, e: &kronik_core::error::ApiError) -> Exit
     ExitCode::FAILURE
 }
 
+#[cfg(test)]
+pub(crate) use render::error as render_error;
 pub(crate) use render::{field, next, shell_quote};
 pub(crate) use units::parse_duration_ms;
 

@@ -10,10 +10,13 @@ to run the *whole daemon* in a simulated world. That world has a virtual
 clock, a disk that loses unsynced writes and tears the last one, simulated
 external services with latency and faults, and crashes and restarts at
 random points. Everything runs on a single-threaded deterministic executor.
-The test volume is 200 seeds per PR, 10,000 seeds nightly, and at least one
-run of 1M steps. A failing seed must be reproducible with
-`cargo test -p kronik-sim -- --seed 12345`. All I/O goes through `Clock`,
-`Fs`, `Net`, `Spawner`, `EntropySource` and `ProcessRunner`, each with a real
+The test volume is 200 seeds in an ordinary CI run, 10,000 seeds in the long
+workflow, and at least one run of 1M steps. These volumes run when the
+workflow is started, not on every pull request or every night
+([ADR 0110](0110-manual-github-workflows.md)). A failing seed must be
+reproducible with `cargo test -p kronik-sim -- --seed 12345`. All I/O goes
+through `Clock`, `Fs`, `Net`, `Spawner`, `EntropySource` and
+`ProcessRunner`, each with a real
 and a simulated implementation. The question was `madsim` or our own
 executor. ADR 0001 already decided that host functions are async, so a turn
 is a future that a simulator can drive.
@@ -380,10 +383,13 @@ SQLite is not behind `Fs`.
   the mutation suite. New invariants (messages, timers, `call` dedup,
   compensations, forks without live effects) are added as checks in the
   same style.
-- **CI cost** at today's prototype rates:
-  - 200 seeds per PR: 2–6 s with 8 threads.
-  - 10,000 seeds nightly: about 7 min single-threaded or about 5 min with 8
-    threads on the development machine; about 5.6 min on the 2-vCPU VPS.
+- **CI cost** at today's prototype rates, for volumes that run when the
+  workflow is started, not on every pull request or every night
+  ([ADR 0110](0110-manual-github-workflows.md)):
+  - 200 seeds in an ordinary CI run: 2–6 s with 8 threads.
+  - 10,000 seeds in the long workflow: about 7 min single-threaded or about
+    5 min with 8 threads on the development machine; about 5.6 min on the
+    2-vCPU VPS.
   - The 1M-step run: about 4 min.
   These grow with daemon scope; keep recovery O(tail) and checks
   incremental.

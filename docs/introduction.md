@@ -39,7 +39,7 @@ What the code does today, on one node:
   `random()` and `datetime('now')` come from the host and derive from values
   recorded with the turn, so running a turn again gives the same outcome. A
   deterministic simulation of the whole daemon, with injected crashes, runs
-  in CI ([ADR 0004](adr/0004-deterministic-simulation.md)).
+  in the CI checks ([ADR 0004](adr/0004-deterministic-simulation.md)).
 - **Interfaces (M1).** `kronik serve` runs the daemon: an HTTP gateway that
   routes requests to actors by the routes in their manifests, and a JSON API
   on a Unix socket. The CLI deploys components, sends messages, shows actors
@@ -73,10 +73,12 @@ What the code does today, on one node:
   `--init --rootless` the nonroot service; that design (M21) is a proposal
   that has not been run on a systemd host, and is untested on Ubuntu 24.04.
 - **Privacy (M8).** Values with a subject can be sealed. `erase` deletes a
-  subject's keys and SQL rows that have a `_subject` column; rows in tables
-  without that column survive. `reseal` rewrites closed segments. A
-  `--no-pii` fork replays with pseudonyms, but its SQL rows are not
-  pseudonymized.
+  subject's keys and SQL rows that have a `_subject` value. A turn with a
+  subject cannot write a table without a `_subject` column. Old rows in
+  tables without that column, or with a NULL `_subject`, belong to nobody
+  and survive erasure. `reseal` rewrites closed segments. A
+  `--no-pii` fork replays with pseudonyms, including text and blob values
+  of subject-tagged SQL rows.
 
 There is no web interface. The CLI, the JSON API and MCP are the surface.
 

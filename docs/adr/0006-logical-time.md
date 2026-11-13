@@ -26,7 +26,8 @@ grows without bound:
 
 - M1 measured about 220 turns/s for one actor, and the brief's target is at
   least 1 000 turns/s for the Rust counter. At 2 000 turns/s logical time
-  gains one second per second.
+  gains one second per second. The 1 000 turns/s figure is the drift line,
+  not the throughput gate ([ADR 0111](0111-cross-actor-throughput.md)).
 - `now-ms` then reports times in the future: timestamps that guests store,
   compare with external systems, or show to users drift from reality.
 - Timers (M2) are due at a logical time. With logical time ahead of the

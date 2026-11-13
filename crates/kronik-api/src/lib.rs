@@ -1567,6 +1567,7 @@ impl Api {
             rate: g.rate.map(|r| r.render()),
             epoch: g.epoch,
             lsn,
+            in_forks: g.in_forks.as_str().to_owned(),
             reason: g.reason.clone(),
         }
     }
@@ -1594,6 +1595,15 @@ impl Api {
                 })
             })
             .transpose()?;
+        // Absent is not an explicit compute choice: a new grant is recorded.
+        let in_forks = match r.in_forks.as_deref() {
+            None | Some("") => kronik_effects::InForks::Recorded,
+            Some(mode) => kronik_effects::InForks::parse(mode).ok_or_else(|| {
+                bad(format!(
+                    "in_forks must be compute or recorded, got {mode:?}"
+                ))
+            })?,
+        };
         let (epoch, lsn) = self
             .node
             .grant(
@@ -1601,6 +1611,7 @@ impl Api {
                 &r.capability,
                 delivery,
                 rate,
+                in_forks,
                 self.audit(req, r.reason.clone()).await,
                 r.dry_run,
                 req.authority.clone(),
@@ -1617,6 +1628,7 @@ impl Api {
                 rate: rate.map(|x| x.render()),
                 epoch,
                 lsn,
+                in_forks: in_forks.as_str().to_owned(),
                 reason: r.reason,
             },
         })

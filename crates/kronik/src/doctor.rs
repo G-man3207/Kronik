@@ -1,6 +1,7 @@
 //! `kronik doctor`: what this host can run (the build brief, "The finished product",
 //! step 1; ADR 0003 for gVisor). Needs no daemon: it reads the configuration
-//! and looks at the host. Each check passes, warns or fails, with a hint.
+//! and looks at the host. Each check passes, warns or fails. A failure has a
+//! catalog code and a hint (I12); a pass or a warning may omit a hint.
 //! Foreign actors are optional (I10), so the checks of what only they need
 //! (`runsc`, `kvm`, `cgroup`, `runc`, `netns`, `run_dir`, `sandbox`) warn
 //! unless the configuration asks for what is missing: with `[foreign]
@@ -22,6 +23,8 @@ use std::time::{Duration, SystemTime};
 use clap::Args;
 use schemars::JsonSchema;
 use serde::Serialize;
+
+use kronik_core::error::ErrorCode;
 
 use crate::config::{Config, Platform, TlsMode};
 
@@ -55,9 +58,11 @@ struct Check {
     /// runs.
     name: &'static str,
     status: Status,
-    /// An error code from the catalog, when one applies.
+    /// An error code from the catalog. Set on every failure, and on a
+    /// warning when one applies.
     code: Option<&'static str>,
     message: String,
+    /// What to do next. Set on every failure; a pass or a warning may omit it.
     hint: Option<String>,
 }
 
@@ -81,6 +86,39 @@ impl Check {
         self.hint = Some(hint.into());
         self
     }
+}
+
+/// A failed check. I12: every failure has a catalog code and a non-empty hint.
+fn failed(
+    name: &'static str,
+    message: impl Into<String>,
+    code: ErrorCode,
+    hint: impl Into<String>,
+) -> Check {
+    let hint = hint.into();
+    debug_assert!(
+        !hint.is_empty() && !hint.chars().any(char::is_control),
+        "{name}: a failure hint must be one non-empty line"
+    );
+    check(name, Status::Fail, message)
+        .code(code.as_str())
+        .hint(hint)
+}
+
+/// One check as `kronik doctor` prints it. A failure includes its code and hint.
+fn format_check(c: &Check) -> String {
+    let status = match c.status {
+        Status::Pass => "pass",
+        Status::Warn => "warn",
+        Status::Fail => "FAIL",
+    };
+    let code = c.code.map(|code| format!(" ({code})")).unwrap_or_default();
+    let mut text = format!("  {status}  {:<7} {}{code}", c.name, c.message);
+    if let Some(hint) = &c.hint {
+        text.push('\n');
+        text.push_str(&format!("        {:<7} hint: {hint}", ""));
+    }
+    text
 }
 
 /// What `kronik doctor --json` prints.
@@ -121,11 +159,12 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
             config
         }
         Err(e) => {
-            checks.push(
-                check("config", Status::Fail, e.to_string())
-                    .code("BAD_REQUEST")
-                    .hint("fix the file; the other checks use the defaults"),
-            );
+            checks.push(failed(
+                "config",
+                e.to_string(),
+                ErrorCode::BadRequest,
+                "fix the file; the other checks use the defaults",
+            ));
             Config::default()
         }
     };
@@ -145,10 +184,12 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
                     ));
                 }
                 Err(e) => {
-                    checks.push(check(
+                    checks.push(failed(
                         "service_identity",
-                        Status::Fail,
                         format!("cannot become daemon user: {e}"),
+                        ErrorCode::RootlessUnavailable,
+                        "run doctor as root with CAP_SETUID and CAP_SETGID, or as the daemon's \
+                         user: sudo -u kronik kronik doctor --rootless",
                     ));
                 }
             },
@@ -221,16 +262,7 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
         println!("{}", serde_json::to_string(&report).unwrap_or_default());
     } else {
         for c in &report.checks {
-            let status = match c.status {
-                Status::Pass => "pass",
-                Status::Warn => "warn",
-                Status::Fail => "FAIL",
-            };
-            let code = c.code.map(|code| format!(" ({code})")).unwrap_or_default();
-            println!("  {status}  {:<7} {}{code}", c.name, c.message);
-            if let Some(hint) = &c.hint {
-                println!("        {:<7} hint: {hint}", "");
-            }
+            println!("{}", format_check(c));
         }
         println!(
             "{} passed, {} warnings, {} failed",
@@ -333,9 +365,12 @@ fn kvm(platform: Platform, usable: std::io::Result<()>) -> Check {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 hint.push_str(", or give this user access to /dev/kvm (the kvm group)");
             }
-            check("kvm", Status::Fail, format!("/dev/kvm: {e}"))
-                .code("KVM_UNAVAILABLE")
-                .hint(hint)
+            failed(
+                "kvm",
+                format!("/dev/kvm: {e}"),
+                ErrorCode::KvmUnavailable,
+                hint,
+            )
         }
         (Err(e), _) => check(
             "kvm",
@@ -535,12 +570,13 @@ fn rootless() -> Vec<Check> {
                 "the uid map is the host's identity map and the real, effective and saved \
                  uids agree: API callers keep their host uids",
             ),
-            Err(why) => check("uid_view", Status::Fail, why.to_string())
-                .code(code)
-                .hint(
-                    "the nonroot service refuses to start here; use the root service on this \
-                     host: sudo kronik serve --init --root",
-                ),
+            Err(why) => failed(
+                "uid_view",
+                why.to_string(),
+                ErrorCode::RootlessUnavailable,
+                "the nonroot service refuses to start here; use the root service on this \
+                 host: sudo kronik serve --init --root",
+            ),
         }
     });
     // As root, the `kronik` user; otherwise this user, as whom the daemon
@@ -565,10 +601,12 @@ fn rootless() -> Vec<Check> {
             .hint("sudo kronik serve --init --rootless creates the kronik user and its ranges"),
     });
     if !root && let Err(e) = sys::clear_capabilities() {
-        checks.push(check(
+        checks.push(failed(
             "caps",
-            Status::Fail,
             format!("cannot clear host capabilities: {e}"),
+            ErrorCode::RootlessUnavailable,
+            "the nonroot service clears its capabilities and sets no-new-privileges before it \
+             starts; check the seccomp and LSM policy that confines this process",
         ));
         return checks;
     }
@@ -603,17 +641,17 @@ fn rootless() -> Vec<Check> {
                 ),
             )
         }
-        (Ok(Some(p)), _) => check(
+        (Ok(Some(p)), _) => failed(
             "pin",
-            Status::Fail,
             format!(
                 "{USERNS_PIN} is owned by uid {} with maps {:?}: not what the user's ranges give, \
                  so the daemon refuses it",
                 p.owner, p.maps
             ),
-        )
-        .code(code)
-        .hint("stop consumers, unpin the owned namespace, then pin the expected identity"),
+            ErrorCode::RootlessUnavailable,
+            "stop kronik.service, then sudo kronik userns unpin and sudo systemctl restart \
+             kronik-userns, which pins the namespace the user's ranges give",
+        ),
     };
     let pin_ok = pin.status == Status::Pass;
     let pin_index = checks.len();
@@ -648,12 +686,14 @@ fn rootless() -> Vec<Check> {
         && let Ok(u) = &user
         && let Err(e) = sys::enter_userns(std::path::Path::new(USERNS_PIN), &u.maps())
     {
-        checks[pin_index] = check(
+        checks[pin_index] = failed(
             "pin",
-            Status::Fail,
             format!("cannot enter {USERNS_PIN}: {e}"),
-        )
-        .code(code);
+            ErrorCode::RootlessUnavailable,
+            "the nonroot service enters this namespace when it starts and refuses to start \
+             without it; check the kernel's user-namespace policy (AppArmor on Ubuntu) or use \
+             the root service: sudo kronik serve --init --root",
+        );
     }
     checks
 }
@@ -703,12 +743,12 @@ fn netns() -> Check {
             Status::Pass,
             "network namespaces with only lo can be created",
         ),
-        Ok(ifaces) => check(
+        Ok(ifaces) => failed(
             "netns",
-            Status::Fail,
             format!("a new namespace has {ifaces:?}, not only lo"),
-        )
-        .code("FOREIGN_UNAVAILABLE"),
+            ErrorCode::ForeignUnavailable,
+            "foreign actors would run without network isolation; check the kernel and any container runtime around the host",
+        ),
         Err(e) => check(
             "netns",
             Status::Warn,
@@ -819,12 +859,12 @@ fn caps(runsc: &Path, rootless: bool) -> Check {
             Status::Pass,
             format!("{who} has CAP_SETUID, which runsc needs"),
         ),
-        Some(false) if trap => check(
+        Some(false) if trap => failed(
             "caps",
-            Status::Fail,
-            format!("{who} lacks CAP_SETUID: no foreign actor can start (runsc's gofer fails with EPERM)"),
-        )
-        .hint(
+            format!(
+                "{who} lacks CAP_SETUID: no foreign actor can start (runsc's gofer fails with EPERM)"
+            ),
+            ErrorCode::ForeignUnavailable,
             "remove User= from kronik.service and its drop-ins; with it, systemd drops CAP_SETUID \
              under the unit's seccomp settings (docs/adr/0027-systemd-unit-hardening.md)",
         ),
@@ -941,16 +981,16 @@ fn free_bytes(dir: &Path) -> Option<u64> {
 fn disk(data_dir: &Path) -> Check {
     const GIB: u64 = 1 << 30;
     match free_bytes(data_dir) {
-        Some(free) if free < GIB => check(
+        Some(free) if free < GIB => failed(
             "disk",
-            Status::Fail,
             format!(
                 "{:.1} GiB free for {}",
                 free as f64 / GIB as f64,
                 data_dir.display()
             ),
-        )
-        .hint("the log and snapshots need room: free space or move server.data_dir"),
+            ErrorCode::Unavailable,
+            "the log and snapshots need room: free space or move server.data_dir",
+        ),
         Some(free) if free < 5 * GIB => check(
             "disk",
             Status::Warn,
@@ -1005,10 +1045,11 @@ fn days_left(expiry: SystemTime) -> i64 {
 fn certificate_check(source: &str, chain: &[u8], key: &[u8]) -> Check {
     match kronik_gateway::tls::parse_pem(chain, key) {
         Ok((_, expiry)) => match days_left(expiry) {
-            d if d < 0 => check(
+            d if d < 0 => failed(
                 "tls",
-                Status::Fail,
                 format!("{source}: the certificate has expired"),
+                ErrorCode::CertificateInvalid,
+                "renew the certificate; for files, replace the PEM, and for ACME read the daemon log",
             ),
             d if d < 30 => check(
                 "tls",
@@ -1021,7 +1062,12 @@ fn certificate_check(source: &str, chain: &[u8], key: &[u8]) -> Check {
                 format!("{source}: the certificate is valid for {d} more days"),
             ),
         },
-        Err(e) => check("tls", Status::Fail, format!("{source}: {e}")),
+        Err(e) => failed(
+            "tls",
+            format!("{source}: {e}"),
+            ErrorCode::CertificateInvalid,
+            "replace the PEM files; the message names what could not be parsed",
+        ),
     }
 }
 
@@ -1041,8 +1087,18 @@ fn tls(config: &Config) -> Check {
                 (Ok(chain), Ok(key_pem)) => {
                     certificate_check(&cert.display().to_string(), &chain, &key_pem)
                 }
-                (Err(e), _) => check("tls", Status::Fail, format!("{}: {e}", cert.display())),
-                (_, Err(e)) => check("tls", Status::Fail, format!("{}: {e}", key.display())),
+                (Err(e), _) => failed(
+                    "tls",
+                    format!("{}: {e}", cert.display()),
+                    ErrorCode::CertificateInvalid,
+                    "fix the path and permissions; [tls] mode = \"files\" needs readable cert_file and key_file",
+                ),
+                (_, Err(e)) => failed(
+                    "tls",
+                    format!("{}: {e}", key.display()),
+                    ErrorCode::CertificateInvalid,
+                    "fix the path and permissions; [tls] mode = \"files\" needs readable cert_file and key_file",
+                ),
             }
         }
         TlsMode::Acme => {
@@ -1077,21 +1133,21 @@ fn dns01_hook(config: &Config) -> Option<Check> {
             Status::Pass,
             format!("{} is the DNS-01 hook", hook.display()),
         ),
-        Ok(_) => check(
+        Ok(_) => failed(
             "dns01_hook",
-            Status::Fail,
             format!(
                 "{}: the DNS-01 hook is not an executable file",
                 hook.display()
             ),
-        )
-        .hint(hint),
-        Err(e) => check(
+            ErrorCode::BadRequest,
+            hint,
+        ),
+        Err(e) => failed(
             "dns01_hook",
-            Status::Fail,
             format!("{}: {e}", hook.display()),
-        )
-        .hint(hint),
+            ErrorCode::BadRequest,
+            hint,
+        ),
     })
 }
 
@@ -1121,9 +1177,13 @@ fn wildcard_certificate(config: &Config) -> Option<Check> {
     Some(c)
 }
 
-/// `host:port` of an `https://` or `http://` endpoint.
+/// `host:port` of an `https://` or `http://` endpoint. Anything else is not
+/// an http(s) URL, including a bare host and `s3://`.
 fn endpoint_authority(endpoint: &str) -> Option<String> {
     let (scheme, rest) = endpoint.split_once("://")?;
+    if !matches!(scheme, "http" | "https") {
+        return None;
+    }
     let authority = rest.split('/').next()?;
     if authority.contains(':') {
         Some(authority.to_owned())
@@ -1147,10 +1207,11 @@ fn ship(config: &Config) -> Check {
         );
     };
     let Some(authority) = endpoint_authority(endpoint) else {
-        return check(
+        return failed(
             "ship",
-            Status::Fail,
             format!("[ship] endpoint {endpoint:?} is not an http(s) URL"),
+            ErrorCode::BadRequest,
+            "set [ship] endpoint to an http:// or https:// URL",
         );
     };
     use std::net::ToSocketAddrs as _;
@@ -1164,7 +1225,10 @@ fn ship(config: &Config) -> Check {
             Status::Pass,
             format!("{endpoint} is reachable ({addr})"),
         ),
-        None => check("ship", Status::Fail, format!("{endpoint} is not reachable")).hint(
+        None => failed(
+            "ship",
+            format!("{endpoint} is not reachable"),
+            ErrorCode::Unavailable,
             "check the endpoint, DNS and the firewall; snapshots cannot ship until it answers",
         ),
     }
@@ -1299,13 +1363,13 @@ fn key_source(config: &Config) -> Check {
         );
     }
     let result = crate::restore::runtime()
-        .map_err(|e| e.code.as_str().to_owned())
+        .map_err(|e| e.code)
         .and_then(|runtime| {
             runtime.block_on(async {
                 let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
                 KeySource::load(env, config.keys.clone(), data, false)
                     .await
-                    .map_err(|e| e.api_error().code.as_str().to_owned())
+                    .map_err(|e| e.api_error().code)
             })
         });
     match result {
@@ -1322,8 +1386,12 @@ fn key_source(config: &Config) -> Check {
                 ),
             )
         }
-        Err(code) => check("key_source", Status::Fail, format!("{source}: {code}"))
-            .hint("check the configured provider, credentials, key version and memory-lock limit"),
+        Err(code) => failed(
+            "key_source",
+            format!("{source}: {code}"),
+            code,
+            "check the configured provider, credentials, key version and memory-lock limit",
+        ),
     }
 }
 
@@ -1476,6 +1544,8 @@ mod tests {
             Some("minio:9000".into())
         );
         assert_eq!(endpoint_authority("s3.example.com"), None);
+        assert_eq!(endpoint_authority("s3://bucket/kronik"), None);
+        assert_eq!(endpoint_authority("ftp://files.example"), None);
     }
 
     #[test]
@@ -1486,9 +1556,9 @@ mod tests {
         assert!(dns01_hook(&config).is_none());
         let hook = dir.path().join("hook");
         config.tls.dns01_hook = Some(hook.clone());
-        assert_eq!(dns01_hook(&config).unwrap().status, Status::Fail);
+        assert_i12(&dns01_hook(&config).unwrap(), "BAD_REQUEST");
         std::fs::write(&hook, "#!/bin/sh\n").unwrap();
-        assert_eq!(dns01_hook(&config).unwrap().status, Status::Fail);
+        assert_i12(&dns01_hook(&config).unwrap(), "BAD_REQUEST");
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(dns01_hook(&config).unwrap().status, Status::Pass);
     }
@@ -1512,11 +1582,103 @@ mod tests {
         std::fs::write(ca.join("wildcard.p.example.pem"), pem).unwrap();
         let c = wildcard_certificate(&config).unwrap();
         assert_eq!(
-            (c.name, c.status),
-            ("dns01_hook", Status::Fail),
+            (c.name, c.status, c.code),
+            ("dns01_hook", Status::Fail, Some("CERTIFICATE_INVALID")),
             "{}",
             c.message
         );
+        assert_i12(&c, "CERTIFICATE_INVALID");
+    }
+
+    /// I12: a failure the printer and `--json` both show has a catalog code
+    /// and a non-empty hint. Passing rows may still omit a hint.
+    #[test]
+    fn failed_checks_carry_a_code_and_a_hint() {
+        let (chain, key) = expired_pem();
+        let expired = certificate_check("cert.pem", chain.as_bytes(), key.as_bytes());
+        assert!(expired.message.contains("expired"), "{}", expired.message);
+        assert_i12(&expired, "CERTIFICATE_INVALID");
+
+        let garbage = certificate_check("cert.pem", b"not-pem", b"not-pem");
+        assert_i12(&garbage, "CERTIFICATE_INVALID");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.tls.mode = TlsMode::Files;
+        config.tls.cert_file = Some(dir.path().join("missing.pem"));
+        config.tls.key_file = Some(dir.path().join("missing-key.pem"));
+        let unread_cert = tls(&config);
+        assert!(
+            unread_cert.message.contains("missing.pem"),
+            "{}",
+            unread_cert.message
+        );
+        assert_i12(&unread_cert, "CERTIFICATE_INVALID");
+        std::fs::write(dir.path().join("cert.pem"), &chain).unwrap();
+        config.tls.cert_file = Some(dir.path().join("cert.pem"));
+        let unread_key = tls(&config);
+        assert!(
+            unread_key.message.contains("missing-key.pem"),
+            "{}",
+            unread_key.message
+        );
+        assert_i12(&unread_key, "CERTIFICATE_INVALID");
+
+        config.tls.mode = TlsMode::Off;
+        config.ship.enabled = true;
+        config.ship.endpoint = Some("s3.example.com".into());
+        let bad_endpoint = ship(&config);
+        assert!(
+            bad_endpoint.message.contains("http(s)"),
+            "{}",
+            bad_endpoint.message
+        );
+        assert_i12(&bad_endpoint, "BAD_REQUEST");
+        config.ship.endpoint = Some("s3://bucket/kronik".into());
+        assert_i12(&ship(&config), "BAD_REQUEST");
+
+        // A pass may omit the hint. The printed sample does the same.
+        let passed = check("kernel", Status::Pass, "Linux 6.12");
+        assert!(passed.hint.is_none());
+        assert!(!format_check(&passed).contains("hint:"));
+    }
+
+    fn expired_pem() -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut expired = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        expired.not_before = rcgen::date_time_ymd(2019, 1, 1);
+        expired.not_after = rcgen::date_time_ymd(2020, 1, 1);
+        (
+            expired.self_signed(&key).unwrap().pem(),
+            key.serialize_pem(),
+        )
+    }
+
+    /// Human output and `--json` both include the code and the hint.
+    fn assert_i12(c: &Check, code: &str) {
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert_eq!(c.code, Some(code), "{}", c.message);
+        assert!(
+            ErrorCode::parse(code).is_some(),
+            "{code} is not a catalog code"
+        );
+        let hint = c
+            .hint
+            .as_deref()
+            .unwrap_or_else(|| panic!("no hint: {c:?}"));
+        assert!(!hint.is_empty() && !hint.contains('\n'), "{hint}");
+        let text = format_check(c);
+        assert!(
+            text.starts_with("  FAIL  ") && text.contains(&format!("({code})")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("\n                hint: {hint}")),
+            "{text}"
+        );
+        let json = serde_json::to_value(c).unwrap();
+        assert_eq!(json["code"], code, "{json}");
+        assert_eq!(json["hint"], hint, "{json}");
     }
 
     /// ADR 0027's measured values: the shipped unit with `User=root`

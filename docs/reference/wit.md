@@ -375,9 +375,10 @@ cannot use a header template or `crypto`. It needs its own capability,
 version hash. Exact occurrences of a value that the turn used or revealed
 are replaced by `[secret:<name>]` before anything from the turn is written,
 but code that has seen a value can always leak it (I8). In a fork, `reveal`
-returns `[secret:<name>]` itself, never the value (`crypto` there still
-computes with the production key on the host); see the
-[security model](../guides/security.md#secrets).
+returns `[secret:<name>]` itself, never the value. `crypto` returns a
+matching recording, or else follows the grant's in-forks mode: `recorded`
+denies the call and `compute` signs on the host. The key never leaves the
+host. See the [security model](../guides/security.md#secrets).
 
 ## log
 

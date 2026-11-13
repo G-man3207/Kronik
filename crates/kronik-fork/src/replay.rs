@@ -13,7 +13,7 @@ use kronik_core::env::{BoxFuture, Env};
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
 use kronik_effects::http::{
-    CompiledScrubber, fingerprint, fingerprint_v2, parse_request_url, target_of,
+    CompiledScrubber, fingerprint, fingerprint_v2, parse_request_url, prepared_target, target_of,
 };
 use kronik_effects::{Config, ConfigHistory};
 use kronik_log::{Committed, Position};
@@ -96,6 +96,10 @@ pub struct ReplaySetup {
     /// answers from recordings only and leaves every consequence production
     /// has not run pending for main (m13-rebase §4, §8).
     pub rebase: bool,
+    /// A preview fork (M11, ADR 0025). An unmatched fetch is stubbed, denied,
+    /// or an allowlisted secret-less GET. The model simulator is a POST to a
+    /// configured endpoint, not that GET, so it is not used.
+    pub preview: bool,
     /// The fork's copies of `fork_mode = "sandbox"` foreign actors (M14,
     /// ADR 0019), used by continuous replay only.
     pub copies: Option<ForkCopies>,
@@ -183,6 +187,7 @@ impl ReplaySetup {
             prod_store: None,
             progress: None,
             rebase: false,
+            preview: false,
             dispatch,
         }
     }
@@ -232,9 +237,15 @@ pub struct ForkTurn {
     /// It read a pseudonym or an erased value: it did not run on real
     /// data, so failing where production committed is no introduced error.
     pub pseudonyms: bool,
+    /// It read a value whose subject was erased: the recording, not the
+    /// guest's input, is the only truth, so a difference from production is
+    /// `unverifiable` rather than divergent (S-16, ADR 0109).
+    pub erased: bool,
     /// `--no-pii` forks: it used SQL, called a turn that did, or was sent
-    /// by one, so its values may hold real SQL rows (SQL is not
-    /// pseudonymized). Implies `masked`; see [`crate::privacy::conceal_turn`].
+    /// by one. Its reply and record are concealed even though subject-tagged
+    /// text and blob cells in the actor database are pseudonyms: a value
+    /// copied into a name, key or URL is not tracked. Implies `masked`; see
+    /// [`crate::privacy::conceal_turn`].
     pub sql: bool,
     /// Its values may hold personal data, in any fork: its input was tagged
     /// or came from such a turn, it read tagged state, used SQL, recorded a
@@ -269,6 +280,23 @@ pub fn cursor(index: &ProductionIndex) -> Result<Arc<Store>, ReplayError> {
     };
     // Production's sealed SQL changesets are opened as they are applied.
     store.set_sealer(index.sealer.clone());
+    if index.no_pii {
+        // A snapshot already holds the rows. Rewrite them the same way
+        // revealed changesets were, before any later UPDATE is applied.
+        let actors = store.db().sql_actors()?;
+        for name in actors {
+            let db = store
+                .sql
+                .get(&name)
+                .map_err(|e| ReplayError::Host(e.to_string()))?;
+            let mut actor = db.lock().unwrap_or_else(|e| e.into_inner());
+            actor
+                .pseudonymize_subject_cells(|subject, value| {
+                    crate::privacy::ForkPrivacy::sql_cell(&index.sealer, subject, value)
+                })
+                .map_err(ReplayError::Host)?;
+        }
+    }
     Ok(store)
 }
 
@@ -313,7 +341,7 @@ struct Pending {
     key: pb::CausalKey,
     time: u64,
     subject: Option<String>,
-    /// Sent by a turn whose values may hold real SQL rows ([`ForkTurn::sql`]).
+    /// Sent by a turn that used SQL ([`ForkTurn::sql`]).
     sql: bool,
     /// Sent by a turn whose values may hold personal data
     /// ([`ForkTurn::personal`]).
@@ -698,6 +726,7 @@ impl Runner {
             masked: sql || pseudonyms,
             pseudonyms,
             sql,
+            erased: false,
             personal: p.personal || p.subject.is_some(),
         };
         lock(&self.turns).push(turn.clone());
@@ -794,6 +823,7 @@ impl Runner {
     ) -> Result<ForkTurn, ReplayError> {
         let prod = self.setup.index.turn(&p.key);
         let prod_lsn = prod.map(|(l, _)| l);
+        let erased_turn = prod_lsn.is_some_and(|lsn| self.setup.index.erased_turns.contains(&lsn));
         let (time, seed, prod_effects) = match prod {
             Some((_, t)) => (
                 t.logical_time_ms,
@@ -845,6 +875,10 @@ impl Runner {
             p.actor.clone(),
             self.setup.privacy.clone(),
         ));
+        let erased_effects = prod_lsn
+            .and_then(|lsn| self.setup.index.erased_effects.get(&lsn))
+            .cloned()
+            .unwrap_or_default();
         let gate = Arc::new(ReplayGate {
             dispatch,
             runner: self.clone(),
@@ -856,6 +890,7 @@ impl Runner {
             prod: prod_effects,
             call_chain,
             state: Mutex::new(GateState::default()),
+            erased_effects,
             input_tagged: p.subject.is_some()
                 || p.personal
                 || crate::privacy::tagged_input(Some(&p.input)),
@@ -1079,14 +1114,18 @@ impl Runner {
                     e.grounding != pb::Grounding::Live as i32
                         && e.response.as_ref().is_some_and(|r| r.subject.is_some())
                 }));
+        // A turn that met an erased recorded value (S-16, ADR 0109): mark it,
+        // whatever mode, so the diff reports it as unverifiable, not divergent.
+        let erased = erased_turn || state.erased();
         let turn = ForkTurn {
             id,
             record,
             lsn,
             prod_lsn,
-            masked: pseudonyms || (self.setup.privacy.no_pii && real_rows),
+            masked: pseudonyms || (self.setup.privacy.no_pii && real_rows) || erased,
             pseudonyms,
             sql: real_rows,
+            erased,
             personal,
         };
         lock(&self.turns).push(turn.clone());
@@ -1119,7 +1158,7 @@ struct GateState {
     records: Vec<pb::EffectRecord>,
     compensations: Vec<pb::OutboundMessage>,
     secrets: Vec<(String, Vec<u8>)>,
-    /// A callee's values may hold real SQL rows ([`ForkTurn::sql`]).
+    /// A callee used SQL ([`ForkTurn::sql`]).
     sql: bool,
     /// A callee's values may hold personal data ([`ForkTurn::personal`]).
     personal: bool,
@@ -1137,6 +1176,9 @@ struct ReplayGate {
     prod: Vec<pb::EffectRecord>,
     call_chain: Vec<ActorRef>,
     state: Mutex<GateState>,
+    /// The effect ordinals of this turn whose recorded request was erased
+    /// (S-16, ADR 0109): their outcome is served, not re-derived.
+    erased_effects: std::collections::BTreeSet<u32>,
     /// What the turn has seen of personal data, for the model simulator
     /// (ADR 0015): its root input's subject, state reads, SQL.
     input_tagged: bool,
@@ -1198,6 +1240,173 @@ pub(crate) fn prepared_outcome_safe(
         None => {}
     }
     kronik_sched::scrub::prepared_fields_safe(None, None, matcher, fields)
+        .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))
+}
+
+/// A neighbor hit after source-identity disclosure. Decline is not a
+/// disclosure: the next simulator may answer. A prerequisite is not a
+/// decline: the source answer must not reach the guest or a later external
+/// call. Contract fakes and stub rules are synthetic (ADR 0016) and must
+/// not be passed here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NeighborRecorded {
+    pub record: pb::EffectRecord,
+    pub outcome: FetchOutcome,
+}
+
+/// Decline carries no payload. The recorded arm is boxed so the enum stays
+/// small (the source effect is large).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NeighborDisclosure {
+    Decline,
+    Recorded(Box<NeighborRecorded>),
+}
+
+/// Store a neighbor hit as the source effect, or refuse it. The secret-use
+/// prefix is the one taken through the source ordinal. Unknown scope is not
+/// an empty scope, and a missing body is not an empty inline body.
+pub(crate) fn disclose_neighbor(
+    hit: &kronik_effects::simulator::NeighborHit<'_>,
+    ordinal: u32,
+    kind: &str,
+    current: Option<&[pb::SecretRef]>,
+    matcher: &CompiledScrubber<'_>,
+    sealer: &kronik_privacy::sealer::Sealer,
+) -> Result<NeighborDisclosure, GateError> {
+    if hit.source.kind != kind {
+        return Ok(NeighborDisclosure::Decline);
+    }
+    let request_bytes = match hit
+        .source
+        .request
+        .as_ref()
+        .and_then(|value| value.value.as_ref())
+    {
+        Some(pb::sealable::Value::Plain(bytes)) => bytes.as_slice(),
+        _ => return Err(GateError::Prerequisite(ErrorCode::Unavailable)),
+    };
+    let source_req = pb::HttpEffectRequest::decode(request_bytes)
+        .map_err(|_| GateError::Prerequisite(ErrorCode::Unavailable))?;
+    if hit.source.status == pb::EffectStatus::Ok as i32 {
+        match hit
+            .source
+            .response
+            .as_ref()
+            .and_then(|value| value.value.as_ref())
+        {
+            Some(pb::sealable::Value::Plain(_)) => {}
+            // A referenced or unreadable body is not an empty success.
+            _ => return Err(GateError::Prerequisite(ErrorCode::Unavailable)),
+        }
+    }
+    let subject = hit
+        .source
+        .request
+        .as_ref()
+        .and_then(|value| value.subject.as_deref());
+    let verified = match source_req.fingerprint_version {
+        0 => {
+            let plain_fp = fingerprint(&source_req).map_err(|_| {
+                GateError::Host("The legacy neighbor fingerprint is invalid".into())
+            })?;
+            sealer.fingerprint_matches(subject, &hit.source.fingerprint, &plain_fp)
+        }
+        2 => {
+            let Some(prefix) = hit.prefix else {
+                return Ok(NeighborDisclosure::Decline);
+            };
+            let target = prepared_target(&source_req)
+                .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?;
+            let plain_fp = fingerprint_v2(&source_req, &target)
+                .map_err(|_| GateError::Host("The neighbor fingerprint is invalid".into()))?;
+            if !sealer.fingerprint_matches(subject, &hit.source.fingerprint, &plain_fp) {
+                return Ok(NeighborDisclosure::Decline);
+            }
+            disclose_prepared_neighbor(&source_req, &target, hit.source, current, prefix, matcher)?;
+            true
+        }
+        _ => return Ok(NeighborDisclosure::Decline),
+    };
+    if !verified {
+        return Ok(NeighborDisclosure::Decline);
+    }
+    let mut record = hit.source.clone();
+    record.ordinal = ordinal;
+    record.grounding = pb::Grounding::Synthetic as i32;
+    record.simulator = kronik_effects::simulator::label::NEIGHBOR.into();
+    let record = if source_req.fingerprint_version == 0 {
+        kronik_sched::effects::legacy_http_disclosure(record, &source_req, matcher)?
+    } else {
+        record
+    };
+    let outcome = outcome_of_fetch(&record)?;
+    Ok(NeighborDisclosure::Recorded(Box::new(NeighborRecorded {
+        record,
+        outcome,
+    })))
+}
+
+/// Version-2 neighbor bytes stay unchanged only with a covering source
+/// prefix or a no-match proof. `current: None` is unknown, not empty.
+fn disclose_prepared_neighbor(
+    req: &pb::HttpEffectRequest,
+    target: &kronik_effects::http::Target,
+    source: &pb::EffectRecord,
+    current: Option<&[pb::SecretRef]>,
+    prefix: &[pb::SecretRef],
+    matcher: &CompiledScrubber<'_>,
+) -> Result<(), GateError> {
+    let response_bytes = match source
+        .response
+        .as_ref()
+        .and_then(|value| value.value.as_ref())
+    {
+        Some(pb::sealable::Value::Plain(bytes)) => bytes.as_slice(),
+        _ => return Err(GateError::Prerequisite(ErrorCode::Unavailable)),
+    };
+    let response = pb::HttpEffectResponse::decode(response_bytes)
+        .map_err(|_| GateError::Prerequisite(ErrorCode::Unavailable))?;
+    // Coverage first. A miss still scans the real fields; it does not treat
+    // unknown scope as a proved empty set, and it does not replace a
+    // referenced body with an empty inline substitute.
+    if kronik_sched::scrub::secret_scope_is_subset(current, Some(prefix))
+        .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?
+    {
+        return Ok(());
+    }
+    if kronik_sched::scrub::http_url_contains(target, &target.host, &|bytes| {
+        matcher.is_match(bytes)
+    })
+    .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?
+    {
+        return Err(GateError::Prerequisite(ErrorCode::SecretUnavailable));
+    }
+    let mut fields = Vec::new();
+    if !kronik_sched::scrub::protocol_method(&req.method) {
+        fields.push(req.method.as_bytes());
+    }
+    fields.push(req.body.as_slice());
+    for header in &req.headers {
+        fields.push(header.name.as_bytes());
+        match &header.value {
+            Some(pb::http_effect_header::Value::Text(value)) => fields.push(value.as_bytes()),
+            Some(pb::http_effect_header::Value::Secret(reference)) => {
+                if !reference.template.is_empty() {
+                    fields.push(reference.template.as_bytes());
+                }
+            }
+            // A missing header value is not an empty proved-clear field.
+            None => return Err(GateError::Prerequisite(ErrorCode::Unavailable)),
+        }
+    }
+    fields.push(response.body.as_slice());
+    for header in &response.headers {
+        fields.push(header.name.as_bytes());
+        fields.push(header.value.as_bytes());
+    }
+    // Original scope is the source prefix. Unknown current scope does not
+    // skip the scan, and is not passed as a proved empty set.
+    kronik_sched::scrub::prepared_fields_safe(current, Some(prefix), matcher, fields)
         .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))
 }
 
@@ -1500,6 +1709,20 @@ impl ReplayGate {
             self.push(record);
             return Err(GateError::HostRedactionFailure);
         }
+        // The recorded request was erased: its plaintext is gone, so no
+        // request the guest can build is comparable with it. The recording is
+        // the only outcome there is - serve it, and mark the turn unverifiable
+        // (S-16, ADR 0109). Only a fetch-like recording is served this way; an
+        // effect of another kind at this ordinal is a real divergence.
+        if self.erased_effects.contains(&ordinal)
+            && let Some(mut record) = self.prod_at(ordinal).cloned()
+            && matches!(record.kind.as_str(), "http.fetch" | "foreign.http")
+        {
+            record.grounding = pb::Grounding::Exact as i32;
+            let out = outcome_of_fetch(&record)?;
+            self.push(record);
+            return Ok(out);
+        }
         let (matcher, prepared_scope) = self.matcher_with_scope()?;
         let (t, raw_host) = match parse_request_url(&req.url) {
             Ok(t) => t,
@@ -1726,6 +1949,8 @@ impl ReplayGate {
             .or_else(|| sims.and_then(|s| crate::stubs::find(&s.stubs, &req.method, &req.url)));
         if let Some(rule) = rule {
             let mut rec = self.synthetic(ordinal, kind, cap, fp, encoded);
+            // ADR 0016: a stub answer is synthetic. It is not a neighbor hit
+            // and does not carry a source effect's secret-use prefix.
             rec.simulator = kronik_effects::simulator::label::STUB.into();
             rec.error = String::new();
             rec.status = match rule.error.as_deref() {
@@ -1795,36 +2020,42 @@ impl ReplayGate {
             let neighbor = s
                 .neighbor
                 .then(|| setup.simulators.neighbor(&setup.index, &cap));
-            let contract = s
+            // Contract fakes stay synthetic (ADR 0016). They are not neighbor
+            // hits and do not take a source secret-use prefix.
+            if let Some(answer) = s
                 .contract
                 .as_ref()
-                .and_then(|contract| contract.respond(&ereq, &ctx));
-            let raw_contract = contract.is_some();
-            let answer =
-                contract.or_else(|| neighbor.and_then(|neighbor| neighbor.respond(&ereq, &ctx)));
-            if let Some(a) = answer {
-                let mut rec = a.record;
+                .and_then(|contract| contract.respond(&ereq, &ctx))
+            {
+                let mut rec = answer.record;
                 rec.request = encoded;
-                let out = if raw_contract {
-                    self.prepare_http_record(&mut rec, &matcher)
-                } else {
-                    let outcome = outcome_of_fetch(&rec)?;
-                    if let FetchOutcome::Ok(response) = &outcome {
-                        let fields = std::iter::once(response.body.as_slice()).chain(
-                            response
-                                .headers
-                                .iter()
-                                .flat_map(|(name, value)| [name.as_bytes(), value.as_bytes()]),
-                        );
-                        kronik_sched::scrub::prepared_fields_safe(None, None, &matcher, fields)
-                            .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?;
-                    }
-                    Ok(outcome)
-                };
+                let out = self.prepare_http_record(&mut rec, &matcher);
                 self.push(rec);
                 return out;
             }
-            if s.model
+            if let Some(neighbor) = &neighbor
+                && let Some(hit) = neighbor.find(&request)
+            {
+                match disclose_neighbor(
+                    &hit,
+                    ordinal,
+                    kind,
+                    prepared_scope.as_deref(),
+                    &matcher,
+                    self.runner.setup.privacy.sealer.as_ref(),
+                )? {
+                    NeighborDisclosure::Decline => {}
+                    NeighborDisclosure::Recorded(recorded) => {
+                        self.push(recorded.record);
+                        return Ok(recorded.outcome);
+                    }
+                }
+            }
+            // A preview reaches the outside world only through an allowlisted
+            // secret-less GET (ADR 0025). The model is a POST, so it is not
+            // asked even if a client was attached.
+            if !setup.preview
+                && s.model
                 && let Some(model) = &setup.model
             {
                 let cached = model.has_cached_answer(&cap, &fp).map_err(model_error)?;
@@ -2239,11 +2470,13 @@ impl ReplayGate {
             CryptoAlgorithm::SignEd25519 => ("crypto.sign-ed25519", "sign-ed25519"),
         };
         let cap = format!("secret:{secret}");
-        if self.config().grant(&self.actor.kind, &cap).is_none() {
+        let Some(grant) = self.config().grant(&self.actor.kind, &cap) else {
             let e = format!("CAPABILITY_NOT_GRANTED: {cap}");
             self.push(self.denied(ordinal, kind, cap, e.clone()));
             return CryptoOutcome::Denied(e);
-        }
+        };
+        // Copy the mode: the grant reference does not outlive the match below.
+        let in_forks = grant.in_forks;
         let data_hash = blake3::hash(&data).as_bytes().to_vec();
         let mut h = blake3::Hasher::new();
         h.update(alg.as_bytes());
@@ -2269,7 +2502,8 @@ impl ReplayGate {
             self.push(rec);
             return out;
         }
-        // Unmatched: computed on the host, the value never leaves it.
+        // Unmatched. A linked name is denied. A recorded grant does not
+        // compute. Compute signs on the host; the key never leaves it.
         let store = self.runner.setup.secrets.as_deref();
         let v = match unmatched_key(self.config(), store.map(|s| s as &dyn KeyStore), &secret) {
             UnmatchedKey::Value(v) => v,
@@ -2287,6 +2521,23 @@ impl ReplayGate {
                 return denied;
             }
         };
+        // A recorded grant returns a matching recording or denies the call.
+        // It does not compute, so the production key is not used.
+        if in_forks == kronik_effects::InForks::Recorded {
+            drop(v);
+            self.push(self.synthetic(ordinal, kind, cap, fp, None));
+            return CryptoOutcome::Denied(NO_RECORDING.into());
+        }
+        tracing::info!(
+            algorithm = alg,
+            name = %secret,
+            kind = %self.actor.kind,
+            "fork computed a crypto effect; the key stayed on the host"
+        );
+        kronik_metrics::inc(
+            "kronik_fork_crypto_computations_total",
+            &[("algorithm", alg)],
+        );
         let result = match algorithm {
             CryptoAlgorithm::HmacSha256 => Ok(kronik_effects::crypto::hmac_sha256(&v.value, &data)),
             CryptoAlgorithm::SignEd25519 => kronik_effects::crypto::sign_ed25519(&v.value, &data),

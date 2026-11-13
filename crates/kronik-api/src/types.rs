@@ -418,6 +418,10 @@ pub struct GrantRequest {
     /// `N/s`, `N/m` or `N/h`.
     #[serde(default)]
     pub rate: Option<String>,
+    /// `compute` or `recorded`. Absent on a new grant means `recorded`
+    /// (ADR 0112). An older stored grant with the field absent is `compute`.
+    #[serde(default)]
+    pub in_forks: Option<String>,
     /// Required: missing or blank answers REASON_REQUIRED.
     #[serde(default)]
     pub reason: String,
@@ -434,6 +438,9 @@ pub struct GrantView {
     pub epoch: u64,
     /// 0 for dry runs.
     pub lsn: u64,
+    /// `compute` or `recorded`. What a fork does with an unmatched crypto
+    /// call of this secret (ADR 0112).
+    pub in_forks: String,
     /// Required: missing or blank answers REASON_REQUIRED.
     #[serde(default)]
     pub reason: String,

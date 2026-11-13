@@ -60,6 +60,15 @@ and add only the needed fixture grant; the manifest's request grants nothing.
 kronik grant counter secret:fixture-key --reason "allow the fixture HMAC key"
 ```
 
+## CERTIFICATE_INVALID
+
+An owned fixture's TLS certificate has expired, or its PEM files cannot be
+read. Renew or replace the certificate; do not serve with the expired files.
+
+```sh
+kronik doctor --config /owned/fixture/expired-cert.toml
+```
+
 ## DEAD_LETTER_ALREADY_RESENT
 
 Attempt a second resend of a dead letter that already names its `resent_as`

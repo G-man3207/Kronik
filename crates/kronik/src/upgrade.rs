@@ -62,6 +62,10 @@ struct UpgradeCheckOutput {
     checked_through_lsn: u64,
     root_inputs: u64,
     turns: u64,
+    /// Turns the identity replay could not verify: their recorded input was
+    /// erased (S-16, ADR 0109).
+    #[serde(default)]
+    unverifiable: u64,
     diff_hash: String,
     passed: bool,
     checked_wall_ms: u64,
@@ -245,6 +249,7 @@ fn execute(args: CheckArgs) -> Result<Done, ApiError> {
         checked_through_lsn: checked.report.checked_through_lsn,
         root_inputs: checked.report.root_inputs,
         turns: checked.report.turns,
+        unverifiable: checked.report.unverifiable,
         diff_hash: checked.report.diff_hash.clone(),
         passed: checked.report.passed,
         checked_wall_ms: checked.report.checked_wall_ms,
@@ -327,13 +332,24 @@ fn state_note(plan: &kronik_sched::snapshots::StatePlan) -> Option<String> {
             manifest.lsn
         ));
     }
-    if plan.unread > 0 {
-        parts.push(format!(
-            "note: {} actor database(s) are held by a running daemon and were not read",
-            plan.unread
-        ));
-    }
+    // A database that could not be read is an error from `plan_state`, not a
+    // note on a passing check: ignoring it would report a pass the start may
+    // refuse.
     (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+/// The report line for turns an identity replay could not verify because the
+/// input they ran on was erased (S-16, ADR 0109). None when there are none:
+/// silence is the normal case, and the line names what the passing check did
+/// not verify.
+fn unverifiable_line(turns: u64) -> Option<String> {
+    if turns == 0 {
+        return None;
+    }
+    let plural = if turns == 1 { "" } else { "s" };
+    Some(format!(
+        "  Unverifiable  {turns} turn{plural} unverifiable: erased"
+    ))
 }
 
 fn diverge_error(v: &UpgradeCheckOutput, window: &str) -> ApiError {
@@ -351,10 +367,10 @@ fn diverge_error(v: &UpgradeCheckOutput, window: &str) -> ApiError {
     )
     .with_hint(format!(
         "Keep the current binary.{where_} Report the diff with both engine versions. \
-         If a subject was erased after the last snapshot, make one new turn with the \
-         current binary and rerun with a window shorter than the time since the \
-         erasure (for example `--window 1m`): the erased request cannot be replayed \
-         from the log, and a snapshot does not move the check's fork point."
+         Erased requests are unverifiable, not divergent, as of v0.5.0 (the report \
+         counts them in `unverifiable`), so this diff records a real difference in \
+         verified behaviour - or a recording that could not be read. The fork point \
+         comes from the root inputs, not from snapshots."
     ))
 }
 
@@ -375,6 +391,10 @@ fn render(
     );
     field(&mut out, "Root inputs", &[v.root_inputs.to_string()], "");
     field(&mut out, "Turns", &[v.turns.to_string()], "");
+    if let Some(line) = unverifiable_line(v.unverifiable) {
+        out.push_str(&line);
+        out.push('\n');
+    }
     field(&mut out, "Diff", std::slice::from_ref(&v.diff_hash), "");
     if let Some(path) = &v.report_path {
         field(&mut out, "Report", std::slice::from_ref(path), "");
@@ -542,5 +562,23 @@ mod order_tests {
         assert!(!body.contains("validate_staged_stores"));
         assert!(sealer.contains("validate_staged_stores"));
         assert!(sealer.contains("offline_sealer_with("));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::unverifiable_line;
+
+    #[test]
+    fn the_unverifiable_line_is_silent_at_zero_and_counts_above() {
+        assert_eq!(unverifiable_line(0), None);
+        assert_eq!(
+            unverifiable_line(1).as_deref(),
+            Some("  Unverifiable  1 turn unverifiable: erased")
+        );
+        let many = unverifiable_line(7).unwrap();
+        assert_eq!(many, "  Unverifiable  7 turns unverifiable: erased");
     }
 }

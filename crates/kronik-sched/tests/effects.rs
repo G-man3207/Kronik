@@ -247,10 +247,16 @@ impl Proc {
 
     fn grant(&self, cap: &str, delivery: Option<Delivery>, rate: Option<Rate>) {
         self.rt
-            .block_on(
-                self.node
-                    .grant("counter", cap, delivery, rate, audit(), false, self.owner()),
-            )
+            .block_on(self.node.grant(
+                "counter",
+                cap,
+                delivery,
+                rate,
+                kronik_effects::InForks::Recorded,
+                audit(),
+                false,
+                self.owner(),
+            ))
             .unwrap();
     }
 
@@ -1048,6 +1054,7 @@ fn revealed_values_are_scrubbed_from_state_messages_replies_sql_and_files() {
         "secret-reveal:db-password",
         None,
         None,
+        kronik_effects::InForks::Recorded,
         audit(),
         false,
         p.owner(),
@@ -1166,6 +1173,7 @@ fn deploy_warns_only_about_capabilities_not_granted() {
         "secret:relay-signing-key",
         None,
         None,
+        kronik_effects::InForks::Recorded,
         audit(),
         false,
         p.owner(),
@@ -1297,6 +1305,7 @@ fn an_unsafe_compensation_denies_the_call_and_the_node_restarts() {
         "secret-reveal:k1",
         None,
         None,
+        kronik_effects::InForks::Recorded,
         audit(),
         false,
         p.owner(),
@@ -1367,10 +1376,16 @@ fn a_revealed_value_in_a_fetch_is_not_written_anywhere() {
     )
     .unwrap();
     for cap in ["secret-reveal:k1", "http:127.0.0.1"] {
-        p.rt.block_on(
-            p.node
-                .grant("leaky", cap, None, None, audit(), false, p.owner()),
-        )
+        p.rt.block_on(p.node.grant(
+            "leaky",
+            cap,
+            None,
+            None,
+            kronik_effects::InForks::Recorded,
+            audit(),
+            false,
+            p.owner(),
+        ))
         .unwrap();
     }
     let r = p.send(
@@ -1414,10 +1429,16 @@ fn a_rerun_after_an_echoed_revealed_value_does_not_diverge() {
     )
     .unwrap();
     for cap in ["secret-reveal:k1", "http:127.0.0.1"] {
-        p.rt.block_on(
-            p.node
-                .grant("leaky", cap, None, None, audit(), false, p.owner()),
-        )
+        p.rt.block_on(p.node.grant(
+            "leaky",
+            cap,
+            None,
+            None,
+            kronik_effects::InForks::Recorded,
+            audit(),
+            false,
+            p.owner(),
+        ))
         .unwrap();
     }
     p.send_detached(

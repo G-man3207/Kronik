@@ -49,10 +49,10 @@ clients to one actor) took 45.9 s on the development machine and 58.4 s on the V
 ## Against the build brief's targets
 
 - **At least 1 000 committed turns/s for the Rust counter with group
-  commit.** Met across actors: about 7 900/s on the development machine
-  and 2 770/s on the 2-vCPU VPS, with no errors. **Not met for a single actor**, which commits
-  about 180 to 210 turns/s, five times below the target, if the target is
-  meant per actor.
+  commit.** The target is across actors, not per actor, and it is met
+  ([ADR 0111](adr/0111-cross-actor-throughput.md)): about 7 900/s on the
+  development machine and 2 770/s on the 2-vCPU VPS, with no errors. The
+  per-actor rate is not a gate. One actor commits about 180 to 210 turns/s.
   - Why: an actor runs one turn at a time, and its next turn starts only
     after the previous turn record is fsynced and applied (the turn must
     read its own committed state). Each turn therefore waits for the group
@@ -64,10 +64,10 @@ clients to one actor) took 45.9 s on the development machine and 58.4 s on the V
     throughput scales until the CPU is the limit: the 64- and 256-actor rows
     give the same rate, and on the VPS the load generator and daemon share
     two vCPUs.
-  - Not tuned yet. Options, to be decided against measurements: a shorter
-    or adaptive window (commit immediately when the writer is idle), and
-    pipelining an actor's next turn on top of its uncommitted state while
-    still answering only after fsync.
+  - Not required for this target. A shorter or adaptive window (commit
+    immediately when the writer is idle), and pipelining an actor's next
+    turn on top of its uncommitted state while still answering only after
+    fsync, remain unmeasured options and are not a gate.
 - **Gateway p99 below 25 ms at 200 req/s.** Met: 11.8 ms on the development
   machine and 22.9 ms on the VPS, where the margin is small (the load
   generator runs on the same two vCPUs).
@@ -462,8 +462,8 @@ only the M8 commits on top (`c99061f`, the API fix `ed47360`, `c90a633`,
 
 The Definition of done asks for a crash test of 1 000 `kill -9` cycles and
 for DST over 10 000 seeds plus a long run of at least 1 000 000 steps,
-all without violations. `.github/workflows/nightly.yml` runs these every
-night with the commands below, once the repository is on GitHub.
+all without violations. `.github/workflows/nightly.yml` is started by hand
+and runs these with the commands below. It does not run on a schedule.
 
 ### Method
 

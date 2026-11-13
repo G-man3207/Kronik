@@ -10,4 +10,4 @@ pub mod http;
 pub mod rate;
 pub mod simulator;
 
-pub use config::{Capability, Config, ConfigHistory, Delivery, Grant, KindLimits, Rate};
+pub use config::{Capability, Config, ConfigHistory, Delivery, Grant, InForks, KindLimits, Rate};

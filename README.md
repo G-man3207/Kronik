@@ -63,12 +63,13 @@ for how the brief maps to the tree.
 
 - **Durable turns.** A turn's state writes, SQL changes and outgoing messages
   commit together or not at all, and nothing is applied or answered until the
-  turn's record is fsynced. Recovery from the log is exercised by a nightly
-  crash test of 1,000 `kill -9` cycles.
+  turn's record is fsynced. Recovery from the log is exercised by a crash
+  test of 1,000 `kill -9` cycles (`scripts/chaos.sh`, also the manual nightly
+  workflow).
 - **Deterministic replay.** Time, randomness and SQL functions such as
   `random()` derive from values recorded with the turn, so running a turn again
   gives the same outcome. A deterministic simulation of the whole daemon, with
-  injected crashes, runs in CI.
+  injected crashes, runs in the CI checks (`scripts/ci.sh`).
 - **Effects and capabilities.** Outgoing HTTP, actor-to-actor calls, timers and
   host-side cryptography with secret handles. Every effect is denied until the
   operator grants a capability, and each result is recorded and returned on
@@ -219,12 +220,15 @@ are missing is skipped with a message, for example `foreign` without root and
 gVisor's `runsc`. Pass step names to run a subset, for example `scripts/ci.sh
 clippy test`.
 
-The nightly workflow adds what is too slow for every pull request: a crash
-test of 1,000 `kill -9` cycles, deterministic simulation with 10,000 seeds
-over every workload and a million-step run, and the release build.
+The CI and nightly GitHub workflows start only when someone runs them
+(`workflow_dispatch`). A push or pull request does not. The nightly workflow
+adds what is too slow for an ordinary CI run: a crash test of 1,000 `kill -9`
+cycles, deterministic simulation with 10,000 seeds over every workload and a
+million-step run, and the release build. One manual run starts every one of
+those jobs; the same commands run locally.
 
-An informational job, which never turns the nightly red, also reports whether
-the upstream conditions for WASI 0.3 are met yet
+An informational job in that workflow, which never turns the run red, also
+reports whether the upstream conditions for WASI 0.3 are met yet
 (`scripts/check-wasi-p3-gate.py`, [ADR 0070](docs/adr/0070-wasi-http-outgoing-handler.md)).
 
 [`CONTRIBUTING.md`](CONTRIBUTING.md) has the conventions, and

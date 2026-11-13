@@ -229,14 +229,39 @@ impl EffectSimulator for ContractFake {
 /// One recorded exchange `RecordedNeighbor` may reuse.
 struct Neighbor {
     lsn: u64,
-    ordinal: u32,
     target: (String, String, String),
     items: std::collections::BTreeSet<Vec<u8>>,
+    source: pb::EffectRecord,
     response: pb::HttpEffectResponse,
+    /// Genuine secret-use prefix through the source ordinal. `None` means
+    /// it could not be taken from that turn. A version-2 hit is then
+    /// refused; inventory and later effects must not fill this in.
+    prefix: Option<std::sync::Arc<[pb::SecretRef]>>,
+}
+
+/// A production effect a neighbor may reuse, with the prefix taken through
+/// its ordinal. `prefix: None` is not an empty scope.
+pub struct NeighborSource {
+    pub lsn: u64,
+    pub effect: pb::EffectRecord,
+    pub prefix: Option<std::sync::Arc<[pb::SecretRef]>>,
+}
+
+/// The selected source answer. The response is the recorded one; identity
+/// is the source effect, not the fork request that matched it.
+#[derive(Debug, Clone, Copy)]
+pub struct NeighborHit<'a> {
+    pub lsn: u64,
+    pub source: &'a pb::EffectRecord,
+    pub response: &'a pb::HttpEffectResponse,
+    /// `None` is unknown, never a proved empty prefix.
+    pub prefix: Option<&'a [pb::SecretRef]>,
 }
 
 /// The recorded answer of the most similar recorded request to the same
-/// route (docs/design/m12-simulators.md §3.2).
+/// route (docs/design/m12-simulators.md §3.2). The hit keeps the source
+/// effect. Disclosure of that hit is the fork's, so the trait method does
+/// not mint a fresh record.
 #[derive(Default)]
 pub struct RecordedNeighbor {
     candidates: Vec<Neighbor>,
@@ -295,11 +320,23 @@ fn items(req: &pb::HttpEffectRequest) -> std::collections::BTreeSet<Vec<u8>> {
 }
 
 impl RecordedNeighbor {
-    /// Candidates from recorded effects `(lsn, record)`: HTTP effects with
-    /// status OK whose request and response are plain without a subject.
+    /// Candidates from recorded effects `(lsn, record)` whose source prefix
+    /// was not supplied. A version-2 hit on one of these is refused.
     pub fn new(records: impl IntoIterator<Item = (u64, pb::EffectRecord)>) -> RecordedNeighbor {
+        Self::from_sources(records.into_iter().map(|(lsn, effect)| NeighborSource {
+            lsn,
+            effect,
+            prefix: None,
+        }))
+    }
+
+    /// Candidates from recorded effects. HTTP effects with status OK whose
+    /// request and response are plain and without a subject. The prefix is
+    /// stored as given; this does not invent one.
+    pub fn from_sources(records: impl IntoIterator<Item = NeighborSource>) -> RecordedNeighbor {
         let mut candidates = Vec::new();
-        for (lsn, e) in records {
+        for source in records {
+            let e = source.effect;
             if !matches!(e.kind.as_str(), "http.fetch" | "foreign.http")
                 || e.status != pb::EffectStatus::Ok as i32
             {
@@ -319,19 +356,21 @@ impl RecordedNeighbor {
                 continue;
             };
             candidates.push(Neighbor {
-                lsn,
-                ordinal: e.ordinal,
+                lsn: source.lsn,
                 target,
                 items: items(&req),
+                source: e,
                 response,
+                prefix: source.prefix,
             });
         }
         RecordedNeighbor { candidates }
     }
 
-    /// The most similar candidate's response: most equal items, then the
-    /// highest LSN, then the lowest ordinal.
-    pub fn find(&self, req: &pb::HttpEffectRequest) -> Option<&pb::HttpEffectResponse> {
+    /// The most similar candidate: most equal items, then the highest LSN,
+    /// then the lowest ordinal. The hit is that source effect, not a new
+    /// fingerprint of `req`.
+    pub fn find(&self, req: &pb::HttpEffectRequest) -> Option<NeighborHit<'_>> {
         let target = target_of(req)?;
         let mine = items(req);
         self.candidates
@@ -342,16 +381,23 @@ impl RecordedNeighbor {
                 let sb = b.items.intersection(&mine).count();
                 sa.cmp(&sb)
                     .then(a.lsn.cmp(&b.lsn))
-                    .then(b.ordinal.cmp(&a.ordinal))
+                    .then(b.source.ordinal.cmp(&a.source.ordinal))
             })
-            .map(|c| &c.response)
+            .map(|c| NeighborHit {
+                lsn: c.lsn,
+                source: &c.source,
+                response: &c.response,
+                prefix: c.prefix.as_deref(),
+            })
     }
 }
 
 impl EffectSimulator for RecordedNeighbor {
-    fn respond(&self, req: &EffectRequest, _ctx: &ReplayContext<'_>) -> Option<EffectResponse> {
-        let response = self.find(req.http.as_ref()?)?.clone();
-        Some(synthetic_http(req, label::NEIGHBOR, response))
+    fn respond(&self, _req: &EffectRequest, _ctx: &ReplayContext<'_>) -> Option<EffectResponse> {
+        // A neighbor answer is not a synthetic record of the fork request.
+        // The fork discloses `find`'s source effect with its prefix, or
+        // refuses the hit. Contract fakes stay on `synthetic_http`.
+        None
     }
 }
 
@@ -459,8 +505,8 @@ mod tests {
             body: body.as_bytes().to_vec(),
             ..Default::default()
         };
-        let body = |r: Option<&pb::HttpEffectResponse>| {
-            r.map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        let body = |r: Option<NeighborHit<'_>>| {
+            r.map(|r| String::from_utf8_lossy(&r.response.body).into_owned())
         };
         assert_eq!(
             body(n.find(&req(
@@ -482,5 +528,77 @@ mod tests {
             Some("seven".into())
         );
         assert!(n.find(&req("http://b/v1/charges/3", "{}")).is_none());
+        let hit = n
+            .find(&req(
+                "http://a/v1/charges/3",
+                r#"{"amount": 5, "currency": "sek"}"#,
+            ))
+            .unwrap();
+        assert_eq!(hit.source.ordinal, 1);
+        assert!(hit.prefix.is_none(), "new() does not invent a prefix");
+    }
+
+    #[test]
+    fn neighbor_trait_respond_does_not_mint_a_fresh_effect_record() {
+        let n = RecordedNeighbor::new([recorded(
+            1,
+            "http://a/v1/charges/1",
+            r#"{"amount": 5}"#,
+            "five",
+        )]);
+        let http = pb::HttpEffectRequest {
+            method: "POST".into(),
+            url: "http://a/v1/charges/3".into(),
+            body: br#"{"amount": 5}"#.to_vec(),
+            ..Default::default()
+        };
+        let req = EffectRequest {
+            ordinal: 9,
+            kind: "http.fetch".into(),
+            target: "http:a".into(),
+            fingerprint: vec![4, 5, 6],
+            http: Some(http.clone()),
+        };
+        assert!(EffectSimulator::respond(&n, &req, &ReplayContext { recorded: &[] }).is_none());
+        let hit = n.find(&http).unwrap();
+        assert_eq!(hit.source.ordinal, 1);
+        assert_ne!(hit.source.fingerprint, req.fingerprint);
+    }
+
+    #[test]
+    fn contract_fake_stays_synthetic_and_is_not_labeled_neighbor() {
+        let doc = br#"{
+          "openapi": "3.0.3",
+          "info": {"title": "Charges", "version": "1"},
+          "paths": {
+            "/v1/charges/{id}": {"post": {"responses": {
+              "200": {"description": "ok", "content": {"application/json": {"schema": {
+                "type": "object", "properties": {"ok": {"type": "boolean"}}
+              }}}}
+            }}}
+          }
+        }"#;
+        let fake = ContractFake {
+            contract: Contract::parse(doc).unwrap(),
+        };
+        let req = EffectRequest {
+            ordinal: 1,
+            kind: "http.fetch".into(),
+            target: "http:pay.example".into(),
+            fingerprint: vec![7, 7, 7],
+            http: Some(pb::HttpEffectRequest {
+                method: "POST".into(),
+                url: "https://pay.example/v1/charges/3".into(),
+                ..Default::default()
+            }),
+        };
+        let answer = fake
+            .respond(&req, &ReplayContext { recorded: &[] })
+            .unwrap();
+        assert_eq!(answer.record.simulator, label::CONTRACT);
+        assert_ne!(answer.record.simulator, label::NEIGHBOR);
+        assert_eq!(answer.record.grounding, pb::Grounding::Synthetic as i32);
+        assert_eq!(answer.record.fingerprint, req.fingerprint);
+        assert_eq!(answer.record.ordinal, req.ordinal);
     }
 }

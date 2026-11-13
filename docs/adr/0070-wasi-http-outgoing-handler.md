@@ -479,9 +479,9 @@ descriptions and the dependency names of npm `latest` for `wasi:http@0.3`, and
 a hit is not proof. An exit status of 1 is therefore a prompt to run the
 checks above by hand.
 
-The nightly workflow runs the script as an informational job
-(`continue-on-error`, the table in the job summary), so it cannot turn the
-nightly red. Its unit tests use canned inputs and run in the `action` step of
+The nightly workflow, started by hand, runs the script as an informational job
+(`continue-on-error`, the table in the job summary), so it cannot turn that
+run red. Its unit tests use canned inputs and run in the `action` step of
 `scripts/ci.sh`. When the gate opens, record that in a further amendment,
 decide the async-handler ABI in its own ADR, and then follow §5.
 

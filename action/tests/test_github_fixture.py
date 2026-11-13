@@ -29,12 +29,21 @@ def archive(entries):
 
 
 class GithubFixtureTest(unittest.TestCase):
-    def test_only_one_exact_manifest_path_bypasses_aggregate_ci(self):
-        ci = yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+    def test_hosted_builds_start_only_by_hand_and_the_proof_path_stays_exact(self):
+        # CI, nightly and release must not start from a push, pull request or
+        # schedule. The proof workflow is not a general build: a dispatch
+        # cannot stand in for its real events, so it still starts only for one
+        # manifest path.
+        automatic = {"push", "pull_request", "pull_request_target", "schedule", "workflow_run"}
+        for name in ("ci.yml", "nightly.yml", "release.yml"):
+            workflow = yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
+            self.assertIn("workflow_dispatch", workflow["on"], name)
+            self.assertTrue(automatic.isdisjoint(workflow["on"]), name)
         flow = yaml.load((ROOT / ".github/workflows/kronik.yml").read_text(), Loader=yaml.BaseLoader)
         for trigger in ("push", "pull_request"):
-            self.assertEqual(ci["on"][trigger]["paths-ignore"], ["examples/github-flow/proof/change.json"])
             self.assertEqual(flow["on"][trigger]["paths"], ["examples/github-flow/proof/change.json"])
+        self.assertNotIn("workflow_dispatch", flow["on"])
+        self.assertNotIn("schedule", flow["on"])
         self.assertEqual(set(flow["jobs"]), {"propose", "verify", "promote"})
         self.assertIn("head.repo.full_name == github.repository", flow["jobs"]["propose"]["if"])
         self.assertEqual(flow["jobs"]["promote"]["environment"]["name"], "kronik-production")

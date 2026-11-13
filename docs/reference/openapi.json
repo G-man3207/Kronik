@@ -2448,7 +2448,7 @@
             "description": "Fork effects answered by a similar recording (same target, different request)."
           },
           "changed": {
-            "description": "Any difference anywhere in the diff.",
+            "description": "Any difference in the diff that a replay verified: not a difference of a turn that read a pseudonym or an erased value, which cannot be verified as a change (S-16, ADR 0109). The policy floor still reads `pii_masked + pii_unverified` (ADR 0031).",
             "type": "boolean"
           },
           "confidence": {
@@ -2517,6 +2517,10 @@
           "turns_prod": {
             "$ref": "#/components/schemas/DiffCount",
             "description": "Production turns of the replayed trees."
+          },
+          "unverifiable": {
+            "$ref": "#/components/schemas/DiffCount",
+            "description": "Turns whose recorded input was erased (S-16, ADR 0109): the replay served their effects from the recording, so their behaviour was not verified against the erased values and their differences are not changes. Any other difference of the same causal trees - including one in a turn that also met an erased value - still counts; a real divergence next to an unverifiable turn keeps `changed` true. Always written (0 when none); diffs and upgrade reports written before v0.5.0 lack it when 0."
           },
           "verified_through_lsn": {
             "$ref": "#/components/schemas/DiffCount",
@@ -2845,6 +2849,7 @@
                   "AUDIT_RANGE_GONE",
                   "BAD_REQUEST",
                   "CAPABILITY_NOT_GRANTED",
+                  "CERTIFICATE_INVALID",
                   "DEAD_LETTER_ALREADY_RESENT",
                   "DEAD_LETTER_NOT_FOUND",
                   "DEPLOYMENT_NOT_FOUND",
@@ -3901,6 +3906,14 @@
             "default": false,
             "type": "boolean"
           },
+          "in_forks": {
+            "default": null,
+            "description": "`compute` or `recorded`. Absent on a new grant means `recorded`\n(ADR 0112). An older stored grant with the field absent is `compute`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "kind": {
             "type": "string"
           },
@@ -3955,6 +3968,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "in_forks": {
+            "description": "`compute` or `recorded`. What a fork does with an unmatched crypto\ncall of this secret (ADR 0112).",
+            "type": "string"
+          },
           "kind": {
             "type": "string"
           },
@@ -3980,7 +3997,8 @@
           "kind",
           "capability",
           "epoch",
-          "lsn"
+          "lsn",
+          "in_forks"
         ],
         "type": "object"
       },

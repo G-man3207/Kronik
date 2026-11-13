@@ -21,6 +21,7 @@ TypeScript examples.
 | `examples/counter-go`, `notes-go`, `webhook-relay-go` | Go twins (`--entry ./step2` builds `counter-go-step2.wasm`). |
 | `scripts/install-sdk-tools.sh` | The pinned toolchains (ADR 0030). |
 | `scripts/build-examples-py.sh`, `build-examples-go.sh` | Build the examples into `examples/dist/` with `kronik build`. |
+| `scripts/acceptance-m15.sh` | Runs the section 5 commands for Python and Go. `scripts/ci.sh` `sdks` calls it. Skips with a message when the pinned tools are absent; does not skip when they are installed, and does not use `M1_GUESTS=test`. |
 
 The brief names `counter` and `webhook-relay` for both languages; `notes`
 is added in both because M1's acceptance (`scripts/acceptance-m1.sh`)
@@ -111,3 +112,7 @@ CI: `scripts/ci.sh sdks` installs the pinned tools, checks the Go bindings
 are generated from the WIT, runs the SDKs' unit tests, builds the examples
 with `kronik build`, checks their imports, runs the examples' tests, the
 determinism test on them, and `scripts/e2e-init.sh` for Python and Go.
+It then runs `scripts/acceptance-m15.sh`, the M1 to M3 commands in the
+table above, for both languages. That script is runnable on its own. It
+prints a skip and exits 0 when the pinned tools are absent, and it does
+not skip when they are installed. It does not run with `M1_GUESTS=test`.

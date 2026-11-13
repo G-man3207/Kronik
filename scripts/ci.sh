@@ -260,8 +260,12 @@ step_ts() {
 # examples with kronik build, lists their imports against the allowlist,
 # runs the examples' tests in test hosts and the determinism test on them,
 # and new projects from kronik init in both languages (scripts/e2e-init.sh).
-# Needs Linux x86_64, python3 with pip, and network access for the first
-# install and Go's module downloads.
+# Then scripts/acceptance-m15.sh runs the M1 to M3 commands in
+# docs/design/m15-sdks.md section 5 for both languages. That script skips
+# with a message when the pinned tools are absent; after the install below
+# they are present, so this step does not skip. Needs Linux x86_64, python3
+# with pip, and network access for the first install and Go's module
+# downloads.
 step_sdks() {
     local kronik tools
     tools="${KRONIK_SDK_TOOLS:-$HOME/.cache/kronik/sdk-tools}"
@@ -291,6 +295,9 @@ step_sdks() {
     KRONIK_DETERMINISM_COMPONENTS="$(printf '%s:' "$PWD"/examples/dist/{counter,notes,webhook-relay}-{py,go}.wasm)" \
         cargo test --locked -p kronik-sched --test sdk_determinism
     KRONIK_BIN="$kronik" E2E_INIT_LANGS="python go" scripts/e2e-init.sh
+    # M1 to M3 for the Python and Go examples (docs/design/m15-sdks.md
+    # section 5). Not a new step name: hygiene checks the step inventory.
+    KRONIK_BIN="$kronik" scripts/acceptance-m15.sh
 }
 
 # The simulator's acceptance run: 200 seeds of the counter workload (M1) and

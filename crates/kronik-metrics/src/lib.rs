@@ -93,6 +93,11 @@ pub const METRICS: &[Def] = &[
         kind: Type::Counter,
     },
     Def {
+        name: "kronik_fork_crypto_computations_total",
+        help: "Unmatched crypto effects a fork computed on the host, by algorithm. The key is not a label.",
+        kind: Type::Counter,
+    },
+    Def {
         name: "kronik_guard_triggered_total",
         help: "Guards of `kronik watch` that fired, by action and outcome.",
         kind: Type::Counter,

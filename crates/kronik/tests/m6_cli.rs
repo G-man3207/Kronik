@@ -466,6 +466,68 @@ fn upgrade_check_asks_the_question_the_start_asks() {
     );
 }
 
+/// A running daemon holds an actor database exclusively. When that applied
+/// LSN is behind the log and no snapshot reaches it, `kronik upgrade check`
+/// must not exit 0: it reads the LSN without taking the lock, then refuses
+/// with the start's own message.
+#[test]
+fn upgrade_check_does_not_pass_a_locked_actor_database_behind_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    compacted_past_an_idle_actor(dir.path());
+    lower_actor_markers(&dir.path().join("branches/main/sql"), 4);
+    std::fs::remove_dir_all(dir.path().join("snapshots")).unwrap();
+    // Every actor database, not only the first: an unlocked one at the same
+    // LSN would make the check refuse without proving the locked read.
+    let files = actor_databases(&dir.path().join("branches/main/sql"));
+    assert!(!files.is_empty(), "the idle actor database");
+    let _holds: Vec<_> = files
+        .iter()
+        .map(|file| {
+            let hold = rusqlite::Connection::open(file).unwrap();
+            hold.pragma_update(None, "locking_mode", "EXCLUSIVE")
+                .unwrap();
+            hold.pragma_update(None, "journal_mode", "WAL").unwrap();
+            hold.execute("UPDATE _kronik_meta SET v = v WHERE k = 'applied_lsn'", [])
+                .unwrap();
+            hold
+        })
+        .collect();
+
+    let refused = kronik(&[
+        "--json",
+        "upgrade",
+        "check",
+        "--data-dir",
+        dir.path().to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert_ne!(refused.code, 0, "{refused:?}");
+    let error = refused.json();
+    assert_eq!(error["error"]["code"], "STORAGE_CORRUPT", "{refused:?}");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("state is at lsn 4, but the log starts at ")
+            && message.contains("no snapshot reaches it"),
+        "{message}"
+    );
+}
+
+/// Actor database files under `root`.
+fn actor_databases(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(dirs) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for d in dirs.flatten() {
+        if d.file_type().unwrap().is_dir() {
+            out.extend(actor_databases(&d.path()));
+        } else if d.path().extension().is_some_and(|e| e == "db") {
+            out.push(d.path());
+        }
+    }
+    out
+}
+
 /// Ships the data directory `data` to the bucket `url` once, the way a node
 /// does every few seconds (`kronik_ship::ship_once`), without a running node.
 fn ship_now(data: &Path, url: &str) {

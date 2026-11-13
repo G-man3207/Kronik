@@ -100,16 +100,23 @@ Secrets arrive with M2.
   [A turn whose effect cannot get its secret](operations.md#a-turn-whose-effect-cannot-get-its-secret).
 - **Reveal.** `secrets.reveal` returns a raw value only with the capability
   `secret-reveal:<name>`. In a fork it returns the placeholder
-  `[secret:<name>]`, never the value. `crypto.*` in a fork, when no
-  recording matches, is still computed on the host with the production key
-  (brief): the key stays on the host, but code deployed into a fork (scope
-  `fork`) can obtain HMACs and signatures under production keys over data it
-  chooses, which is as good as the key for webhooks and tokens signed with
-  it. Grant `fork` only to callers you would trust with that. This holds for
-  built-in secrets: a name that is linked to an external backend at the fork
-  point is not computed in a fork (`SECRET_EXTERNAL`). A preview
-  (M11) answers whoever has its URL, so it gets no production key at all:
-  its `crypto.*` calls answer `no recording`.
+  `[secret:<name>]`, never the value. `crypto.*` in a fork returns a
+  matching recording when one exists. Otherwise the grant's in-forks mode
+  decides ([ADR 0112](../adr/0112-fork-crypto-grant-mode.md)): `recorded`,
+  the default for a new grant, denies the call (`replay: no recording`) and
+  does not compute; `compute` signs on the host with the production key.
+  The key stays on the host either way: it is not in the guest, the log, or
+  the diff. A `compute` grant still lets code in a fork (scope `fork`)
+  obtain HMACs and signatures under production keys over data it chooses,
+  which is as good as the key for webhooks and tokens signed with it. Each
+  such computation is a log line and a `kronik_fork_crypto_computations_total`
+  sample. Grant `fork`, and `compute`, only to callers you would trust with
+  that. An older grant with no mode stays `compute`; re-granting without
+  `--in-forks compute` writes `recorded`. This holds for built-in secrets:
+  a name that is linked to an external backend at the fork point is not
+  computed in a fork (`SECRET_EXTERNAL`). A preview (M11) answers whoever
+  has its URL, so it gets no production key at all: its `crypto.*` calls
+  answer `no recording`.
 - **Scrubbing.** When a turn used or revealed a secret, exact occurrences of
   the value are replaced by `[secret:<name>]` in the turn's state writes,
   SQL text values, messages, timers, compensations, output, effect

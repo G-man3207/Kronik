@@ -898,11 +898,36 @@ impl SqlActor {
         if cs.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
+        let tables = ffi::tables(&cs).map_err(|e| e.to_string())?;
+        // A turn with a default subject may only write tables that have a
+        // `_subject` column (ADR 0005 §6, option B). A turn without a
+        // subject may still write anywhere.
+        if self.default_subject.is_some() {
+            let mut missing = Vec::new();
+            for table in &tables {
+                if self
+                    .subject_col(table)
+                    .map_err(|e| e.to_string())?
+                    .is_none()
+                {
+                    missing.push(table.clone());
+                }
+            }
+            if !missing.is_empty() {
+                return Err(format!(
+                    "subjects/table-without-subject: {} has no _subject column",
+                    missing.join(", ")
+                ));
+            }
+        }
         // Fast path: no changed table has a `_subject` column, so the whole
         // changeset belongs to the turn's default subject.
         let mut any_subject_col = false;
-        for t in ffi::tables(&cs).map_err(|e| e.to_string())? {
-            any_subject_col |= self.subject_col(&t).map_err(|e| e.to_string())?.is_some();
+        for table in &tables {
+            any_subject_col |= self
+                .subject_col(table)
+                .map_err(|e| e.to_string())?
+                .is_some();
         }
         if !any_subject_col {
             return Ok((vec![(self.default_subject.clone(), cs.clone())], cs));
@@ -1010,9 +1035,10 @@ impl SqlActor {
     /// operation, not as a changeset (whose old values would be the erased
     /// data itself).
     ///
-    /// Tables without `_subject` are untouched here: see
-    /// [`rows_without_subject_column`] (the open question, ADR 0005 §6,
-    /// docs/design/m8-privacy.md §7).
+    /// Tables without `_subject` are untouched here. A turn with a subject
+    /// cannot write them (`subjects/table-without-subject`); rows written
+    /// before that decision, and rows whose `_subject` is NULL, belong to
+    /// nobody. See [`rows_without_subject_column`].
     pub fn erase_subject(&mut self, subject: &str, lsn: u64) -> Result<u64, String> {
         lock(&self.shared).host = true;
         let tables: Vec<String> = {
@@ -1055,6 +1081,61 @@ impl SqlActor {
             crate::db::checkpoint_truncate(&self.conn, "actor database");
         }
         Ok(n)
+    }
+
+    /// Replaces text and blob cells of rows tagged with `_subject`. Integer
+    /// and real values, and the `_subject` column itself, are left as they
+    /// are. A `--no-pii` fork does this to a snapshot it continues, with the
+    /// same function it uses on changesets, so a later UPDATE still matches
+    /// and the guest cannot read the plaintext.
+    pub fn pseudonymize_subject_cells(
+        &mut self,
+        mut rewrite: impl FnMut(&str, &[u8]) -> Vec<u8>,
+    ) -> Result<(), String> {
+        lock(&self.shared).host = true;
+        let tables: Vec<String> = {
+            let mut st = self
+                .conn
+                .prepare(
+                    "SELECT m.name FROM sqlite_schema m, pragma_table_info(m.name) c \
+                     WHERE m.type = 'table' AND c.name = '_subject' \
+                     AND m.name NOT LIKE '\\_kronik%' ESCAPE '\\' ORDER BY m.name",
+                )
+                .map_err(|e| e.to_string())?;
+            st.query_map([], |r| r.get(0))
+                .map_err(|e| e.to_string())?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(|e| e.to_string())?
+        };
+        if tables.is_empty() {
+            return Ok(());
+        }
+        use rusqlite::config::DbConfig;
+        self.conn
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .pragma_update(None, "foreign_keys", "OFF")
+            .map_err(|e| e.to_string())?;
+        self.host_batch("SAVEPOINT kronik_pii")
+            .map_err(|e| e.to_string())?;
+        let result = (|| {
+            for table in &tables {
+                rewrite_subject_table(&self.conn, table, &mut rewrite)?;
+            }
+            Ok(())
+        })();
+        let _ = self
+            .conn
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, true);
+        let _ = self.conn.pragma_update(None, "foreign_keys", "ON");
+        let end = if result.is_ok() {
+            "RELEASE kronik_pii"
+        } else {
+            "ROLLBACK TO kronik_pii; RELEASE kronik_pii"
+        };
+        self.host_batch(end).map_err(|e| e.to_string())?;
+        result
     }
 
     /// Sets the turn's default subject for the following statements (the
@@ -1230,6 +1311,126 @@ fn to_sql(v: &Val) -> Value {
     }
 }
 
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Rewrites text and blob cells of one `_subject` table. The row is matched
+/// by rowid, or by its primary key when the table has none.
+fn rewrite_subject_table(
+    conn: &Connection,
+    table: &str,
+    rewrite: &mut impl FnMut(&str, &[u8]) -> Vec<u8>,
+) -> Result<(), String> {
+    let cols: Vec<(String, i64)> = conn
+        .prepare("SELECT name, pk FROM pragma_table_info(?1) ORDER BY cid")
+        .and_then(|mut st| {
+            st.query_map([table], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect()
+        })
+        .map_err(|e| e.to_string())?;
+    let subject_at = cols
+        .iter()
+        .position(|(name, _)| name == "_subject")
+        .ok_or_else(|| format!("{table} has no _subject column"))?;
+    let without_rowid: bool = conn
+        .query_row(
+            "SELECT sql LIKE '%WITHOUT ROWID%' FROM sqlite_schema WHERE name = ?1",
+            [table],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let quoted = quote_ident(table);
+    let select = if without_rowid {
+        format!("SELECT * FROM {quoted} WHERE _subject IS NOT NULL")
+    } else {
+        format!("SELECT rowid, * FROM {quoted} WHERE _subject IS NOT NULL")
+    };
+    let mut st = conn.prepare(&select).map_err(|e| e.to_string())?;
+    let n = st.column_count();
+    let rows = st
+        .query_map([], |r| {
+            (0..n)
+                .map(|i| r.get::<_, Value>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    drop(st);
+    let data_at = usize::from(!without_rowid);
+    for row in rows {
+        let Some(Value::Text(subject)) = row.get(data_at + subject_at) else {
+            continue;
+        };
+        let mut sets = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        for (i, (name, _)) in cols.iter().enumerate() {
+            if i == subject_at {
+                continue;
+            }
+            let Some(value) = row.get(data_at + i) else {
+                continue;
+            };
+            let rewritten = match value {
+                Value::Text(text) => {
+                    let bytes = rewrite(subject, text.as_bytes());
+                    if bytes.as_slice() == text.as_bytes() {
+                        continue;
+                    }
+                    match String::from_utf8(bytes) {
+                        Ok(text) => Value::Text(text),
+                        Err(err) => {
+                            Value::Text(String::from_utf8_lossy(err.as_bytes()).into_owned())
+                        }
+                    }
+                }
+                Value::Blob(bytes) => {
+                    let next = rewrite(subject, bytes);
+                    if next == *bytes {
+                        continue;
+                    }
+                    Value::Blob(next)
+                }
+                _ => continue,
+            };
+            sets.push(format!("{} = ?{}", quote_ident(name), params.len() + 1));
+            params.push(rewritten);
+        }
+        if sets.is_empty() {
+            continue;
+        }
+        let where_sql = if without_rowid {
+            let mut pk: Vec<(i64, &str)> = cols
+                .iter()
+                .filter(|(_, pk)| *pk > 0)
+                .map(|(name, pk)| (*pk, name.as_str()))
+                .collect();
+            pk.sort_by_key(|(n, _)| *n);
+            if pk.is_empty() {
+                return Err(format!("{table} has no primary key to rewrite"));
+            }
+            let mut parts = Vec::new();
+            for (_, name) in pk {
+                let idx = cols.iter().position(|(n, _)| n == name).unwrap_or(0);
+                parts.push(format!("{} = ?{}", quote_ident(name), params.len() + 1));
+                params.push(row.get(data_at + idx).cloned().unwrap_or(Value::Null));
+            }
+            parts.join(" AND ")
+        } else {
+            let rowid = row.first().cloned().unwrap_or(Value::Null);
+            params.push(rowid);
+            format!("rowid = ?{}", params.len())
+        };
+        conn.execute(
+            &format!("UPDATE {quoted} SET {} WHERE {where_sql}", sets.join(", ")),
+            rusqlite::params_from_iter(params.iter()),
+        )
+        .map_err(|e| format!("pseudonymize {table}: {e}"))?;
+    }
+    Ok(())
+}
+
 impl SqlActor {
     /// The subject a change belongs to: the row's `_subject` value when the
     /// table has that column, otherwise the turn's default subject. An
@@ -1376,21 +1577,12 @@ pub fn canonical_hash_raw(conn: &Connection) -> rusqlite::Result<String> {
     Ok(format!("b3:{}", &h.finalize().to_hex()[..16]))
 }
 
-/// THE SEAM for the open question (docs/design/m8-privacy.md §7, ADR
-/// 0005 §6): rows that a turn with a default subject wrote to a table
-/// without a `_subject` column. Erasure deletes every row with `_subject =
-/// subject` (common to both options); what happens to these rows depends on
-/// the answer:
-///
-/// - Option A (such rows belong to the turn's default subject): the store
-///   would keep a host-side row-owner table maintained at apply, and this
-///   function would delete the rows it lists.
-/// - Option B (ADR 0005's recommendation): such writes are refused at turn
-///   time with `subjects/table-without-subject`, so there are no such rows
-///   and this function stays a no-op.
-///
-/// Until the maintainers decide, it deletes nothing and returns 0: such rows
-/// survive erasure, as `subjects/gap-without-column` documents.
+/// Rows in tables without a `_subject` column. A turn with a default
+/// subject may not write those tables (`subjects/table-without-subject`),
+/// so this stays a no-op: there is no owner to delete. Rows written before
+/// that decision, and rows whose `_subject` is NULL, belong to nobody and
+/// survive erasure. Erasure of rows that have a `_subject` value is the
+/// `DELETE` in [`SqlActor::erase_subject`], not this function.
 fn rows_without_subject_column(_conn: &Connection, _subject: &str) -> Result<u64, String> {
     Ok(0)
 }

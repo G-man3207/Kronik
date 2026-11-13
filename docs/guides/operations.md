@@ -716,8 +716,9 @@ certificate it has and retries after 1 minute, doubling up to 1 hour. Until
 the first certificate arrives, TLS handshakes fail; the daemon log says why
 the order failed.
 
-`kronik doctor` fails when the certificate (from the files or the cache)
-has expired and warns 30 days before.
+`kronik doctor` fails with `CERTIFICATE_INVALID` when the certificate
+(from the files or the cache) has expired or cannot be read, and warns 30
+days before.
 
 ### Preview forks: a wildcard certificate by DNS-01
 
@@ -800,9 +801,10 @@ esac
 The wildcard certificate is cached as `wildcard.<preview_domain>.pem` next
 to the main one and renewed the same way. The gateway serves it for every
 name exactly one label below `preview_domain`, and the main certificate for
-everything else. `kronik doctor`'s `dns01_hook` check fails when the hook is
-missing or not executable, and checks the cached wildcard certificate's
-expiry like `tls` does for the main one.
+everything else. `kronik doctor`'s `dns01_hook` check fails with
+`BAD_REQUEST` when the hook is missing or not executable, and checks the
+cached wildcard certificate's expiry like `tls` does for the main one
+(`CERTIFICATE_INVALID` when it has expired).
 
 ## kronik doctor
 
@@ -833,20 +835,20 @@ rather than fail, unless `kronik.toml` asks for what is missing
 | `userns` | User namespaces are off: `user.max_user_namespaces` is 0 or `kernel.unprivileged_userns_clone` is 0 (`ROOTLESS_UNAVAILABLE`, warning; `--rootless` only). Nothing else, such as a distribution's own restriction on unprivileged user namespaces, is checked | Allow them, or keep the root daemon with `sudo kronik serve --init --root` |
 | `uid_view` | The nonroot service would refuse to start here (`ROOTLESS_UNAVAILABLE`, failure; `--rootless` only): this process is in a user namespace whose uid map is not the host's identity map (a rootless container, a nested user namespace), or its real, effective and saved user ids differ. The kernel would translate every API caller's uid, so audit records and token attribution would name the wrong users. As root, the check is skipped: `sudo kronik doctor --rootless` becomes the `kronik` user and then runs it | The nonroot unit is not supported there: use the root service, `sudo kronik serve --init --root` |
 | `subid` | The `kronik` user (as root) or the current user has no safe subordinate id range in `/etc/subuid` and `/etc/subgid` (`ROOTLESS_UNAVAILABLE`, warning; `--rootless` only) | `sudo kronik serve --init --rootless` creates the user and its ranges |
-| `pin` | Nothing is pinned at `/run/kronik-userns/user`, or its maps are unreadable (warning); it has another owner or other maps than the user's ranges give, or this user cannot enter it (failure; `--rootless` only) | Start `kronik-userns.service`; for a mismatch, stop the consumers, unpin the owned namespace and pin the expected identity (`kronik userns`) |
+| `pin` | Nothing is pinned at `/run/kronik-userns/user`, or its maps are unreadable (`ROOTLESS_UNAVAILABLE`, warning); it has another owner or other maps than the user's ranges give, or this user cannot enter it (`ROOTLESS_UNAVAILABLE`, failure; `--rootless` only) | Start `kronik-userns.service`. For a mismatch, stop `kronik.service`, run `sudo kronik userns unpin` and restart `kronik-userns.service`, which pins the namespace the user's ranges give |
 | `delegate` | The cgroup this user runs in is not delegated to it (warning); skipped as root (`--rootless` only) | The daemon gets one in `kronik.service` (`Delegate=yes`); outside it foreign actors are unavailable |
-| `service_identity` | With `--rootless` as root: the `kronik` user cannot be proven (warning) or not become (failure) | Run `sudo kronik serve --init --rootless`, then doctor again |
+| `service_identity` | With `--rootless` as root: the `kronik` user cannot be proven (warning) or not become (`ROOTLESS_UNAVAILABLE`, failure) | Without the user, run `sudo kronik serve --init --rootless`, then doctor again. When it exists and cannot be become, run doctor as root with `CAP_SETUID` and `CAP_SETGID`, or as that user (`sudo -u kronik kronik doctor --rootless`) |
 | `root` | Not running as root (warning). With `--rootless` it names the identity the checks ran as instead: namespace-root authority, or an ordinary host user | The root daemon runs as root under systemd, so run doctor with `sudo` for the root-only checks. The nonroot service has no root of its own: use `doctor --rootless` for its boundary |
 | `runc` | `runc` is missing (`RUNC_MISSING`, warning) | Only foreign actors with `--isolation trusted` need it: `apt install runc` |
-| `netns` | A network namespace can't be created (`FOREIGN_UNAVAILABLE`, warning), or a new one has more than `lo` (failure); skipped without namespace-root authority, and not proven when the service identity is unavailable | Check the kernel and any container runtime around the host; only foreign actors need it |
+| `netns` | A network namespace can't be created (`FOREIGN_UNAVAILABLE`, warning), or a new one has more than `lo` (`FOREIGN_UNAVAILABLE`, failure); skipped without namespace-root authority, and not proven when the service identity is unavailable | Check the kernel and any container runtime around the host; foreign actors would run without network isolation |
 | `run_dir` | `[foreign] run_dir` can't be created or written (warning) | Point it at a writable directory, ideally on a tmpfs |
-| `caps` | The running root `kronik.service` (or, without one, `kronik doctor` itself) lacks `CAP_SETUID`, which `runsc` needs: no foreign actor can start (failure); skipped without runsc. A nonroot `kronik.service` is not examined, because it holds no host capability by design: doctor then looks at itself, and with `--rootless` an ordinary user's missing namespace-local `CAP_SETUID` is a warning instead of a failure | For a root unit, remove `User=` from it and its drop-ins ([ADR 0027](../adr/0027-systemd-unit-hardening.md)). For the nonroot service, check the pinned namespace and the delegated unit with `doctor --rootless` |
+| `caps` | The running root `kronik.service` (or, without one, `kronik doctor` itself) lacks `CAP_SETUID`, which `runsc` needs: no foreign actor can start (`FOREIGN_UNAVAILABLE`, failure); skipped without runsc. A nonroot `kronik.service` is not examined, because it holds no host capability by design: doctor then looks at itself, and with `--rootless` an ordinary user's missing namespace-local `CAP_SETUID` is a warning instead of a failure. With `--rootless`, a process that cannot clear its own host capabilities fails (`ROOTLESS_UNAVAILABLE`): the nonroot service would refuse to start | For a root unit, remove `User=` from it and its drop-ins ([ADR 0027](../adr/0027-systemd-unit-hardening.md)). For the nonroot service, check the pinned namespace and the delegated unit with `doctor --rootless` |
 | `sandbox` | `runsc ... do /bin/true` fails (`FOREIGN_UNAVAILABLE`): a warning, or a failure with `platform = "kvm"`; skipped without runsc or namespace-root authority, and not proven when the service identity is unavailable | See gVisor's compatibility notes and the host's seccomp/AppArmor setup |
-| `disk` | Under 1 GiB free in the data directory (failure) or under 5 GiB (warning) | Free space or move `server.data_dir` |
+| `disk` | Under 1 GiB free in the data directory (`UNAVAILABLE`, failure) or under 5 GiB (warning) | Free space or move `server.data_dir` |
 | `clock` | The clock is not synchronized by NTP (warning) | `timedatectl set-ntp true` |
-| `tls` | The certificate has expired or can't be read (failure), or expires within 30 days (warning). With `acme` and no certificate cached yet, it warns | Renew the files; for ACME see [TLS](#tls): the gateway orders a certificate when it starts |
-| `dns01_hook` | `[tls] dns01_hook` is set and is not an executable file (failure); the cached `*.<preview_domain>` certificate has expired (failure), expires within 30 days or isn't cached yet (warning) | `chmod +x` the hook, or fix the path; for the certificate, read the hook's output in the daemon log; see [Preview forks](#preview-forks-a-wildcard-certificate-by-dns-01) |
-| `ship` | `[ship] endpoint` is not reachable over TCP (failure); passes when shipping is off | Check the address and the network |
+| `tls` | The certificate has expired or can't be read (`CERTIFICATE_INVALID`, failure), or expires within 30 days (warning). With `acme` and no certificate cached yet, it warns | Renew the files; for ACME see [TLS](#tls): the gateway orders a certificate when it starts |
+| `dns01_hook` | `[tls] dns01_hook` is set and is not an executable file (`BAD_REQUEST`, failure); the cached `*.<preview_domain>` certificate has expired (`CERTIFICATE_INVALID`, failure), expires within 30 days or isn't cached yet (warning) | `chmod +x` the hook, or fix the path; for the certificate, read the hook's output in the daemon log; see [Preview forks](#preview-forks-a-wildcard-certificate-by-dns-01) |
+| `ship` | `[ship] endpoint` is not an `http://` or `https://` URL (`BAD_REQUEST`, failure) or is not reachable over TCP (`UNAVAILABLE`, failure); passes when shipping is off | Set an `http://` or `https://` endpoint, and check DNS and the firewall |
 | `export` | With `[otel]` or `[audit]` on and the daemon answering on `server.api_socket`: a stream with lag has not delivered for 10 × its `interval`, or the audit export has held retention for longer than `[retention] history` (warnings); passes without a daemon | `kronik export status` shows the sink's last error code; fix the sink, or see [the audit log](#the-audit-log) |
 
 ## Metrics and logs
@@ -877,6 +879,7 @@ with OIDC, Host must match the configured admin origin:
 | `kronik_gateway_requests_total` | counter | `status` | Gateway requests by HTTP status |
 | `kronik_gateway_request_duration_seconds` | histogram | `status` | Gateway request duration |
 | `kronik_replay_runs_total` | counter | `mode` | Fork replays by mode |
+| `kronik_fork_crypto_computations_total` | counter | `algorithm` | Unmatched crypto effects a fork computed on the host. The key is not a label |
 | `kronik_guard_triggered_total` | counter | `action`, `outcome` | Guards of `kronik watch` that fired |
 | `kronik_export_records_total` | counter | `stream` | Log records an export stream (`traces`, `audit`) delivered or skipped |
 | `kronik_export_lag_records` | gauge | `stream` | Committed records the stream has not delivered yet |
@@ -1620,23 +1623,36 @@ to it (`<engine>.diff.json`) and exits 1 with `ENGINE_UPGRADE_DIVERGED`:
 keep the current binary. `--dry-run` prints the result and writes neither
 file. A bad window or a directory with no log is `BAD_REQUEST`.
 
-If a subject was **erased** while the previous binary ran, a check can diverge for a
-reason that is not a behaviour change: the erased turn's sealed request can no longer
-be opened, so a replay produces a failed turn where the recorded turn succeeded. The
-fork point is chosen from the **root inputs**, not from snapshots: `snapshot create`
-does not move it, and on an idle node no window value ages the erased turn out. Make
-one new turn after the erasure, then run the check with `--window` shorter than the
-time since that erasure (for example `--window 1m`), and let that report be the last
-one written - `serve` reads the last report, not the newest check. The erased turn is
-unverifiable rather than different; v0.5.0 records it as such.
+If a subject was **erased**, the turn that read it is **unverifiable**: the
+erased values cannot be opened again, so the replay cannot be compared with the
+recording the way other turns are. v0.5.0 and later say so instead of calling it a
+difference. The check serves such a turn's effects from their recording, counts the
+turn, and passes when nothing else differs; the report line reads `N turns
+unverifiable: erased` and the same count is in `--json` as `unverifiable`. A diverging
+report from v0.5.0 therefore means a real change (or an unreadable recording), and
+`serve` starts from it as from any other passing report. The count is also how many
+turns the upgrade did not verify: look at the diff when it is non-zero, and re-run the
+check with a window that starts after them if you want a fully verified tail.
+
+On **v0.4.1 and older** the same directory diverges for a reason that is not a
+behaviour change: the erased turn's sealed request can no longer be opened, so a
+replay produces a failed turn where the recorded turn succeeded. The fork point is
+chosen from the **root inputs**, not from snapshots: `snapshot create` does not move
+it, and on an idle node no window value ages the erased turn out. Make one new turn
+after the erasure, then run the check with `--window` shorter than the time since
+that erasure (for example `--window 1m`), and let that report be the last one written
+- `serve` reads the last report, not the newest check. v0.5.0 records the erased
+turn as unverifiable instead.
 
 The check also asks the question the start asks of the data directory: the
 databases (`state.db` and the actor databases) must be reached by the log
 that retention kept. It prints a note when the start will repair that by
 installing a snapshot, and stops with `STORAGE_CORRUPT` and the start's own
 message when it cannot ([A start that stops at the log's
-start](#a-start-that-stops-at-the-logs-start)). Run it before every restart
-after an upgrade.
+start](#a-start-that-stops-at-the-logs-start)). An actor database a running
+daemon holds is read from a private temporary copy of that file and its WAL,
+without taking the lock; the copy is deleted after the read. If it cannot be
+read, the check does not pass. Run it before every restart after an upgrade.
 
 After the restart the data is the new engine's. Going back to the old
 binary is the same procedure the other way: its own `kronik upgrade check`
@@ -2038,6 +2054,7 @@ operator meets:
 | Code | When | What to do |
 |---|---|---|
 | `BAD_REQUEST` at start | `kronik.toml` has an unknown key or a bad value | Fix the line the message names (`kronik doctor` checks the file too) |
+| `CERTIFICATE_INVALID` | The TLS certificate has expired, cannot be parsed, or its files cannot be read (`kronik doctor`'s `tls` or `dns01_hook` check) | Renew it, or fix the path and permissions of the PEM files; see [TLS](#tls) |
 | `STORAGE_CORRUPT` | The data directory is inconsistent: `state.db` is ahead of the log, or a log record can't be read. "state is at lsn N, but the log starts at M (compacted)": see [A start that stops at the log's start](#a-start-that-stops-at-the-logs-start) | Keep a copy of the data directory and look at the message. `state.db` is materialized from the log and can be rebuilt by moving it away and starting again; the log itself must not be edited |
 | `UNAVAILABLE` | The node stopped after a storage failure (also `/healthz` 503) | The daemon exits and systemd restarts it; check the disk (`kronik doctor`'s `disk` check) and the journal |
 | `GATEWAY_TIMEOUT` | A turn took longer than `[gateway] timeout` | The turn still completes; clients that retry with the same `Idempotency-Key` get its response |

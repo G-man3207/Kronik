@@ -190,6 +190,7 @@ pub async fn check(
         root_inputs: out.diff.summary.root_inputs,
         turns: out.diff.summary.turns_prod,
         diff_hash: out.hash.clone(),
+        unverifiable: out.diff.summary.unverifiable,
         passed: !out.diff.summary.changed,
         checked_wall_ms: env.clock.wall_ms(),
     };

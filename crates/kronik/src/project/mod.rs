@@ -62,14 +62,17 @@ pub struct BuildArgs {
     entry: Option<String>,
 }
 
-/// An error with an optional next step, printed as `error:`/`hint:`, or
-/// with `--json` as the stable error JSON on stdout.
+/// A local error from `init`, `build` and `test-host`.
+///
+/// Human output matches [`crate::cli::report_error`]: the stable code, the
+/// message, a hint (the code's default when none was set) and the
+/// documentation command. `--json` prints the standard error object, using
+/// that same default hint.
 #[derive(Debug)]
 pub struct Failure {
     code: ErrorCode,
     message: String,
     hint: Option<String>,
-    docs: Option<String>,
 }
 
 impl Failure {
@@ -78,7 +81,6 @@ impl Failure {
             code: ErrorCode::BadRequest,
             message: message.into(),
             hint: None,
-            docs: None,
         }
     }
 
@@ -92,9 +94,32 @@ impl Failure {
         self
     }
 
-    fn docs(mut self, docs: impl Into<String>) -> Self {
-        self.docs = Some(docs.into());
-        self
+    /// The error JSON. A missing hint becomes the code's default, as
+    /// [`ApiError::new`] does.
+    fn api_error(self) -> ApiError {
+        self.into_error(false)
+    }
+
+    /// The human form. A message that already starts with its code (the
+    /// import check keeps that prefix in JSON) is not printed twice.
+    fn human_error(self) -> ApiError {
+        self.into_error(true)
+    }
+
+    fn into_error(self, human: bool) -> ApiError {
+        let code = self.code;
+        let mut message = self.message;
+        if human {
+            let prefix = format!("{code}: ");
+            if let Some(rest) = message.strip_prefix(&prefix) {
+                message = rest.to_owned();
+            }
+        }
+        let mut error = ApiError::new(code, message);
+        if let Some(hint) = self.hint {
+            error = error.with_hint(hint);
+        }
+        error
     }
 }
 
@@ -121,23 +146,10 @@ fn report<T: Serialize>(
             ExitCode::SUCCESS
         }
         Err(f) if json => {
-            let mut e = ApiError::new(f.code, f.message);
-            if let Some(hint) = f.hint {
-                e = e.with_hint(hint);
-            }
-            println!("{}", e.to_json());
+            println!("{}", f.api_error().to_json());
             ExitCode::FAILURE
         }
-        Err(f) => {
-            eprintln!("error: {}", f.message);
-            if let Some(hint) = f.hint {
-                eprintln!("hint:  {hint}");
-            }
-            if let Some(docs) = f.docs {
-                eprintln!("docs:  {docs}");
-            }
-            ExitCode::FAILURE
-        }
+        Err(f) => crate::cli::report_error(false, &f.human_error()),
     }
 }
 
@@ -169,4 +181,74 @@ pub fn init_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
 #[cfg(test)]
 pub fn build_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
     g.subschema_for::<build::BuildOutput>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nameless_package() -> Failure {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        match build::component(dir.path(), false, None) {
+            Err(failure) => failure,
+            Ok(_) => panic!("a package.json with no name must fail the build"),
+        }
+    }
+
+    /// I12: a package.json with no name is a coded human error, and the
+    /// JSON object keeps the message without a second copy of the code.
+    #[test]
+    fn a_nameless_package_json_names_its_code() {
+        let human = crate::cli::render_error(&nameless_package().human_error());
+        assert!(
+            human.starts_with("error: BAD_REQUEST: package.json has no name\n"),
+            "{human}"
+        );
+        assert!(human.contains("\nhint:  "), "{human}");
+        assert!(
+            human.ends_with("docs:  kronik explain BAD_REQUEST\n"),
+            "{human}"
+        );
+
+        let json = nameless_package().api_error().to_json();
+        assert_eq!(json["error"]["code"], "BAD_REQUEST");
+        assert_eq!(json["error"]["message"], "package.json has no name");
+        assert!(json["error"]["hint"].is_string());
+        assert_eq!(json["error"]["docs"], "kronik explain BAD_REQUEST");
+    }
+
+    /// The import check's message already starts with its code, for JSON.
+    /// The human line must not repeat it.
+    #[test]
+    fn a_coded_message_is_not_repeated_for_a_person() {
+        let failure = Failure::new(format!(
+            "{}: the component imports interfaces outside the allowlist: wasi:filesystem",
+            ErrorCode::ImportNotAllowed
+        ))
+        .code(ErrorCode::ImportNotAllowed)
+        .hint("remove the code that uses them");
+        let json = failure.api_error();
+        assert_eq!(
+            json.message,
+            "IMPORT_NOT_ALLOWED: the component imports interfaces outside the allowlist: wasi:filesystem"
+        );
+        let failure = Failure::new(format!(
+            "{}: the component imports interfaces outside the allowlist: wasi:filesystem",
+            ErrorCode::ImportNotAllowed
+        ))
+        .code(ErrorCode::ImportNotAllowed)
+        .hint("remove the code that uses them");
+        let human = crate::cli::render_error(&failure.human_error());
+        assert!(
+            human.starts_with(
+                "error: IMPORT_NOT_ALLOWED: the component imports interfaces outside the allowlist: wasi:filesystem\n"
+            ),
+            "{human}"
+        );
+        assert!(
+            !human.contains("IMPORT_NOT_ALLOWED: IMPORT_NOT_ALLOWED"),
+            "{human}"
+        );
+    }
 }

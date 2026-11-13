@@ -86,7 +86,13 @@ environment, masked; `read,propose` for `propose` and `verify`,
   plain HTTP to another host refused and to 127.0.0.1 accepted (criterion
   1); a proposal outlives its killed client, `status` and `wait` show
   progress at points held by the permits hook, `PROPOSAL_RUNNING` while
-  running, `--async` (criterion 2).
+  running, `--async` (criterion 2). A default run holds for
+  `KRONIK_TEST_HOLD_SECS` seconds (0), so it does not prove the duration.
+  The 30-minute proof, with `proposal wait` still attached, is not a
+  `scripts/ci.sh` step. Run `scripts/acceptance-m10-hold.sh`, which sets
+  the hold to 1800 seconds and runs `KRONIK_TEST_HOLD_SECS=1800 cargo test --locked -p kronik --test remote a_proposal_outlives_its_client_and_wait_shows_progress -- --exact`.
+  The test fails if the job is reaped, a token expires, or `proposal wait`
+  gives up before that hold ends.
 - `crates/kronik-fork/src/markdown.rs` (unit) and
   `crates/kronik/tests/privacy_mode.rs::the_diff_summary_shows_no_bodies_or_values`
   and `::the_diff_summary_shows_no_url_paths`: the summary against a marker

@@ -197,6 +197,11 @@ pub struct Summary {
     /// Always present; 0 in identity replays.
     #[serde(default)]
     pub pii_unverified: u64,
+    /// Turns whose recorded input was erased: the replay ran on what is left
+    /// of it (the recorded outcome), so a difference is unverifiable rather
+    /// than a change (S-16, ADR 0109). Always present; 0 when none.
+    #[serde(default)]
+    pub unverifiable: u64,
     /// Requests sent to a preview fork (M11): root inputs of their own,
     /// never compared with production nor counted as divergent.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -1369,6 +1374,13 @@ struct Acc {
     divergent: BTreeMap<Vec<u8>, String>,
     /// Differences of turns that read pseudonyms (`--no-pii`).
     pii_masked: BTreeSet<Vec<u8>>,
+    /// Differences of turns whose recorded input was erased (S-16, ADR 0109).
+    unverifiable: BTreeSet<Vec<u8>>,
+    /// Every replayed turn whose recorded input was erased, differing or not:
+    /// the replay cannot verify what the guest read (S-16, ADR 0109).
+    erased_seen: BTreeSet<Vec<u8>>,
+    /// The current turn pair is unverifiable: do not count its effects.
+    quiet: bool,
     /// Turns that read pseudonyms and came out identical, with their kind.
     pii_same: BTreeMap<Vec<u8>, String>,
     /// Requests sent to a preview fork (M11).
@@ -1420,6 +1432,9 @@ impl Acc {
             norm: Norm::new(opts, sealer),
             divergent: BTreeMap::new(),
             pii_masked: BTreeSet::new(),
+            unverifiable: BTreeSet::new(),
+            erased_seen: BTreeSet::new(),
+            quiet: false,
             pii_same: BTreeMap::new(),
             preview_inputs: 0,
             origins: 0,
@@ -1563,7 +1578,7 @@ impl Acc {
         // A turn that read pseudonyms did not run on real data: how it
         // differs from production (failing included) is `pii-masked`, not
         // an error of the code. SQL turns ran on real rows and count.
-        match (prod, fork.pseudonyms) {
+        match (prod, fork.pseudonyms || fork.erased) {
             (_, true) => {}
             (Some((lsn, p)), false) => {
                 if failed(f) && !failed(p) {
@@ -1603,10 +1618,12 @@ impl Acc {
         turn_prod: Option<Lsn>,
         turn_fork: Option<&str>,
     ) {
-        match change {
-            "added" => self.effects.added += 1,
-            "removed" => self.effects.removed += 1,
-            _ => self.effects.changed += 1,
+        if !self.quiet {
+            match change {
+                "added" => self.effects.added += 1,
+                "removed" => self.effects.removed += 1,
+                _ => self.effects.changed += 1,
+            }
         }
         if let Some(id) = turn_fork {
             let s = &mut self.samples.effects_changed;
@@ -1638,6 +1655,11 @@ impl Acc {
         fork: Option<&ForkTurn>,
         copied: bool,
     ) {
+        // An erased turn's effects are compared only for grounding: the guest
+        // ran on what is left of the erased input, so a difference is not a
+        // change (S-16, ADR 0109).
+        let quiet = fork.is_some_and(|f| f.erased);
+        self.quiet = quiet;
         let pick =
             |e: &&pb::EffectRecord| external(&e.kind) && self.copied.contains(&e.target) == copied;
         let pe: BTreeMap<u32, &pb::EffectRecord> = prod
@@ -1719,6 +1741,7 @@ impl Acc {
                 push_capped(&mut self.samples.synthetic, MAX_SAMPLES, f.id.clone());
             }
         }
+        self.quiet = false;
     }
 
     fn response(&mut self, root_lsn: Lsn, prod: (Lsn, &pb::TurnRecord), fork: Option<&ForkTurn>) {
@@ -1726,6 +1749,10 @@ impl Acc {
         else {
             return;
         };
+        // The response of an unverifiable turn is not a change either.
+        if fork.is_some_and(|f| f.erased) {
+            return;
+        }
         let http = |t: &pb::TurnRecord| match t.outcome.as_ref().and_then(|o| o.output.as_ref()) {
             Some(pb::outcome::Output::Http(r)) => Some(r.clone()),
             _ => None,
@@ -1850,6 +1877,12 @@ impl Acc {
                 continue;
             };
             let p = pmap.get(&key).copied();
+            // A turn the replay met with an erased recording is unverifiable
+            // even when it comes out identical: identity there is the served
+            // recording's, not the guest's (S-16, ADR 0109).
+            if f.erased {
+                self.erased_seen.insert(key.clone());
+            }
             self.turn_errors(p, f);
             match p {
                 Some(p) => {
@@ -1907,11 +1940,34 @@ impl Acc {
             })
             .map(|(k, _)| k.clone())
             .collect();
+        let erased = |c: Option<&Change<'_>>| matches!(c, Some(Change::Changed { fork, .. } | Change::New { fork }) if fork.erased);
+        let unverified_erased: BTreeSet<Vec<u8>> = changes
+            .iter()
+            .filter(|(_, c)| match c {
+                Change::Changed { .. } | Change::New { .. } => erased(Some(c)),
+                Change::Missing { prod } => prod.1.causal_key.as_ref().is_some_and(|ck| {
+                    (0..ck.path.len()).any(|n| erased(changes.get(&path_prefix(ck, n))))
+                }),
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
         for (key, change) in &changes {
             let masked = match change {
                 Change::Changed { fork, .. } | Change::New { fork } => fork.masked,
                 Change::Missing { .. } => unverified.contains(key),
             };
+            let erased = match change {
+                Change::Changed { fork, .. } | Change::New { fork } => fork.erased,
+                Change::Missing { .. } => unverified_erased.contains(key),
+            };
+            if erased {
+                // A replayed erased turn is counted once, whether or not it
+                // came out identical (fmap below) or differs; a production
+                // turn missing below one is the consequence.
+                if matches!(change, Change::Missing { .. }) {
+                    self.unverifiable.insert(key.clone());
+                }
+            }
             if masked {
                 if self.pii_masked.insert(key.clone())
                     && let Change::Changed { fork, .. } | Change::New { fork } = change
@@ -2635,8 +2691,10 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
             changed_code.contains(kind.as_str()) && !acc.pii_masked.contains(*key)
         })
         .count() as u64;
+    // `pii_masked` and `unverifiable` turns are not changes (S-16, ADR 0109;
+    // ADR 0031): their difference was not verified, so it is not evidence of
+    // a behavior change either. Every other difference stays fail-closed.
     let changed = !acc.divergent.is_empty()
-        || !acc.pii_masked.is_empty()
         || acc.responses.changed > 0
         || effects.added + effects.removed + effects.changed > 0
         || !acc.isolated_state.is_empty()
@@ -2658,6 +2716,7 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
         divergent_turns: acc.divergent.len() as u64,
         pii_masked: acc.pii_masked.len() as u64,
         pii_unverified,
+        unverifiable: (acc.erased_seen.len() + acc.unverifiable.len()) as u64,
         preview_inputs: acc.preview_inputs,
         origins: acc.origins,
         consequences: acc.consequences,
@@ -2818,6 +2877,7 @@ mod tests {
             value: Some(pb::sealable::Value::Plain(b"ROW-1".to_vec())),
         };
         let turn = |sql| ForkTurn {
+            erased: false,
             id: "f:1".into(),
             record: pb::TurnRecord {
                 input: Some(pb::Input::default()),

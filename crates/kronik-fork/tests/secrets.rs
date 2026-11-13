@@ -53,10 +53,16 @@ fn a_fork_reveals_only_the_placeholder_and_writes_no_secret_value() {
     )
     .unwrap();
     for cap in ["secret-reveal:k1", "http:127.0.0.1"] {
-        p.rt.block_on(
-            p.node
-                .grant("leaky", cap, None, None, audit(), false, p.owner()),
-        )
+        p.rt.block_on(p.node.grant(
+            "leaky",
+            cap,
+            None,
+            None,
+            kronik_effects::InForks::Recorded,
+            audit(),
+            false,
+            p.owner(),
+        ))
         .unwrap();
     }
     let fork_lsn = p.settle();

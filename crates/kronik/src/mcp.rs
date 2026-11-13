@@ -63,10 +63,7 @@ pub fn run(_args: McpArgs, global: &crate::cli::Global) -> ExitCode {
     }
     let socket = match crate::config::client_api_socket(global.socket.clone()) {
         Ok(socket) => socket,
-        Err(e) => {
-            eprintln!("error: BAD_REQUEST: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return crate::cli::report_error(false, &socket_config_error(&e)),
     };
     let token = match crate::cli::client_token_from(global.token.as_deref()) {
         Ok(token) => token,
@@ -77,10 +74,7 @@ pub fn run(_args: McpArgs, global: &crate::cli::Global) -> ExitCode {
         .build()
     {
         Ok(runtime) => runtime,
-        Err(e) => {
-            eprintln!("error: INTERNAL: starting the async runtime failed: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return crate::cli::report_error(false, &runtime_error(&e)),
     };
     match runtime.block_on(bridge(&socket, token)) {
         Ok(()) => ExitCode::SUCCESS,
@@ -89,6 +83,24 @@ pub fn run(_args: McpArgs, global: &crate::cli::Global) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The same words as the other client commands when the configuration file
+/// that names the API socket cannot be read.
+fn socket_config_error(e: &crate::config::ConfigError) -> ApiError {
+    ApiError::new(
+        ErrorCode::BadRequest,
+        format!("the configuration file is invalid: {e}"),
+    )
+    .with_hint("Fix the file, or name the socket with --socket <path> or $KRONIK_API_SOCKET.")
+}
+
+/// Tokio failed to start. The hint is the `INTERNAL` catalog hint.
+fn runtime_error(e: &std::io::Error) -> ApiError {
+    ApiError::new(
+        ErrorCode::Internal,
+        format!("starting the async runtime failed: {e}"),
+    )
 }
 
 async fn bridge(socket: &std::path::Path, token: Option<String>) -> Result<(), String> {
@@ -486,5 +498,49 @@ mod tests {
         );
         assert_eq!(id_of(&[r#"{"id":null,"method":"m"}"#]), None);
         assert_eq!(id_of(&[r#"{"idx":3,"id":4}"#]), Some(RequestId::Number(4)));
+    }
+
+    /// I12: resolving the API socket and starting the runtime print a code,
+    /// a hint and the documentation command, as `report_error` does.
+    #[test]
+    fn startup_errors_name_a_code_hint_and_docs() {
+        let socket = socket_config_error(&crate::config::ConfigError {
+            path: std::path::PathBuf::from("kronik.toml"),
+            line: Some(2),
+            message: "expected a value".into(),
+        });
+        let shown = crate::cli::render_error(&socket);
+        assert!(
+            shown.starts_with(
+                "error: BAD_REQUEST: the configuration file is invalid: kronik.toml:2: expected a value\n"
+            ),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(
+                "hint:  Fix the file, or name the socket with --socket <path> or $KRONIK_API_SOCKET.\n"
+            ),
+            "{shown}"
+        );
+        assert!(
+            shown.ends_with("docs:  kronik explain BAD_REQUEST\n"),
+            "{shown}"
+        );
+
+        let runtime = runtime_error(&std::io::Error::other("no runtime"));
+        let shown = crate::cli::render_error(&runtime);
+        assert!(
+            shown.starts_with("error: INTERNAL: starting the async runtime failed: no runtime\n"),
+            "{shown}"
+        );
+        assert!(shown.contains("\nhint:  "), "{shown}");
+        assert!(
+            runtime.hint.as_deref().is_some_and(|hint| !hint.is_empty()),
+            "{runtime:?}"
+        );
+        assert!(
+            shown.ends_with("docs:  kronik explain INTERNAL\n"),
+            "{shown}"
+        );
     }
 }

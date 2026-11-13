@@ -1010,6 +1010,7 @@ async fn counter_with_http_delivery(
             capability,
             delivery,
             None,
+            kronik_effects::InForks::Recorded,
             audit(),
             false,
             authority.clone(),

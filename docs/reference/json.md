@@ -492,13 +492,14 @@ against both.
 {
   "properties": {
     "code": {
-      "description": "An error code from the catalog, when one applies.",
+      "description": "An error code from the catalog. Set on every failure, and on a\nwarning when one applies.",
       "type": [
         "string",
         "null"
       ]
     },
     "hint": {
+      "description": "What to do next. Set on every failure; a pass or a warning may omit it.",
       "type": [
         "string",
         "null"
@@ -2493,7 +2494,7 @@ against both.
       "description": "Fork effects answered by a similar recording (same target, different request)."
     },
     "changed": {
-      "description": "Any difference anywhere in the diff.",
+      "description": "Any difference in the diff that a replay verified: not a difference of a turn that read a pseudonym or an erased value, which cannot be verified as a change (S-16, ADR 0109). The policy floor still reads `pii_masked + pii_unverified` (ADR 0031).",
       "type": "boolean"
     },
     "confidence": {
@@ -2562,6 +2563,10 @@ against both.
     "turns_prod": {
       "$ref": "#/components/schemas/DiffCount",
       "description": "Production turns of the replayed trees."
+    },
+    "unverifiable": {
+      "$ref": "#/components/schemas/DiffCount",
+      "description": "Turns whose recorded input was erased (S-16, ADR 0109): the replay served their effects from the recording, so their behaviour was not verified against the erased values and their differences are not changes. Any other difference of the same causal trees - including one in a turn that also met an erased value - still counts; a real divergence next to an unverifiable turn keeps `changed` true. Always written (0 when none); diffs and upgrade reports written before v0.5.0 lack it when 0."
     },
     "verified_through_lsn": {
       "$ref": "#/components/schemas/DiffCount",
@@ -2948,6 +2953,7 @@ against both.
             "AUDIT_RANGE_GONE",
             "BAD_REQUEST",
             "CAPABILITY_NOT_GRANTED",
+            "CERTIFICATE_INVALID",
             "DEAD_LETTER_ALREADY_RESENT",
             "DEAD_LETTER_NOT_FOUND",
             "DEPLOYMENT_NOT_FOUND",
@@ -3936,6 +3942,10 @@ against both.
       "minimum": 0,
       "type": "integer"
     },
+    "in_forks": {
+      "description": "`compute` or `recorded`. What a fork does with an unmatched crypto\ncall of this secret (ADR 0112).",
+      "type": "string"
+    },
     "kind": {
       "type": "string"
     },
@@ -3961,7 +3971,8 @@ against both.
     "kind",
     "capability",
     "epoch",
-    "lsn"
+    "lsn",
+    "in_forks"
   ],
   "type": "object"
 }
@@ -7738,6 +7749,13 @@ against both.
       "type": "string"
     },
     "turns": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "unverifiable": {
+      "default": 0,
+      "description": "Turns the identity replay could not verify: their recorded input was\nerased (S-16, ADR 0109).",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"

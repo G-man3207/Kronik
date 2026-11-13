@@ -1160,6 +1160,7 @@ fn below_the_disk_reserve_incident_actions_and_retention_still_work() {
             "http:example.com",
             None,
             None,
+            kronik_effects::InForks::Recorded,
             audit(),
             false,
             p.owner(),
@@ -1466,14 +1467,17 @@ fn the_read_only_plan_does_not_wait_for_a_node_that_holds_its_databases() {
     compacted_past_an_idle_actor(dir.path());
     // The node that runs holds `notes/n` exclusively once it has written to
     // it (the databases use exclusive locking). `kronik upgrade check` may run
-    // beside it: it counts what it cannot read and neither waits nor writes.
+    // beside it: it reads the held applied LSN without waiting or writing.
     let p = compacting(dir.path());
     p.send("notes/n", "add", "while the check runs");
     let started = std::time::Instant::now();
     let plan = kronik_sched::snapshots::plan_state(dir.path(), "main", true).unwrap();
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(plan.install.is_none());
-    assert_eq!(plan.unread, 1, "notes/n is held by the running node");
+    // The node holds `notes/n`, but that database is not behind: the start
+    // already repaired it, and the turn above moved it forward. The plan
+    // reads the held LSN without waiting, so it has nothing to install.
+    assert!(plan.install.is_none(), "{plan:?}");
+    assert_eq!(plan.unread, 0, "{plan:?}");
     drop(p);
     // A log that still starts at LSN 1 has nothing to ask of the actors.
     let young = tempdir();
@@ -1483,6 +1487,62 @@ fn the_read_only_plan_does_not_wait_for_a_node_that_holds_its_databases() {
     p.send("notes/n", "add", "hello");
     let plan = kronik_sched::snapshots::plan_state(young.path(), "main", true).unwrap();
     assert_eq!((plan.unread, plan.install.is_none()), (0, true));
+}
+
+/// A database the check cannot read is not treated as current, even when the
+/// databases it could read are not behind the log.
+#[test]
+fn a_read_only_plan_does_not_pass_when_an_actor_database_cannot_be_read() {
+    let dir = tempdir();
+    let branch = dir.path().join("branches/main");
+    std::fs::create_dir_all(branch.join("sql")).unwrap();
+    std::fs::create_dir_all(branch.join("log")).unwrap();
+    std::fs::write(branch.join("log/00000000000000000050.seg"), b"").unwrap();
+    let store = Store::open(
+        rusqlite::Connection::open(branch.join("state.db")).unwrap(),
+        SqlPool::new(
+            Arc::new(kronik_store::sql::FileOpener {
+                root: branch.join("sql"),
+            }),
+            Limits::default(),
+            8,
+        ),
+    )
+    .unwrap();
+    store
+        .db()
+        .conn()
+        .execute(
+            "INSERT INTO actors (kind, key, schema_version, first_lsn, last_lsn, turns, sql) \
+             VALUES ('notes', 'n', 0, 1, 80, 1, 1)",
+            [],
+        )
+        .unwrap();
+    store
+        .db()
+        .conn()
+        .execute("UPDATE meta SET v = 100 WHERE k = 'applied_lsn'", [])
+        .unwrap();
+    store
+        .sql
+        .get("notes/n")
+        .unwrap()
+        .lock()
+        .unwrap()
+        .stamp_applied(80)
+        .unwrap();
+    drop(store);
+    let file = kronik_store::sql::actor_file(&branch.join("sql"), "notes/n");
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+
+    let err = kronik_sched::snapshots::plan_state(dir.path(), "main", true).unwrap_err();
+    assert!(err.contains("1 actor database could not be read"), "{err}");
+    // The start opens the file itself and does not report a pass either.
+    assert!(
+        kronik_sched::snapshots::prepare_state(dir.path(), "main").is_err(),
+        "the start must not accept a database it cannot open"
+    );
 }
 
 /// A pass that cannot make an actor database current does not delete: the

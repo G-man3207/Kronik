@@ -297,8 +297,10 @@ pub struct StatePlan {
     /// actor databases, when there is a `state.db`. The start refuses to
     /// replay from the lowest one when the log no longer reaches it.
     pub state: Option<(Lsn, Lsn)>,
-    /// Actor databases a read-only plan could not read (a running daemon
-    /// holds them). Always 0 for the plan the start makes.
+    /// Actor databases a read-only plan could not read. Always 0 on a plan
+    /// that is returned: a non-zero count is an error, so the check does not
+    /// pass while the start's question is unanswered. Always 0 for the plan
+    /// the start makes.
     pub unread: usize,
 }
 
@@ -308,10 +310,13 @@ pub struct StatePlan {
 /// the lowest applied LSN of `state.db` and of every actor database), so
 /// this asks the same question before the store opens. `read_only` is for
 /// `kronik upgrade check`, which may run beside a daemon and so must neither
-/// wait for the databases it holds nor write.
+/// wait for the databases it holds nor write them. A held database's applied
+/// LSN is read from a private copy. One that still cannot be read makes the
+/// question unanswerable: this returns an error rather than a pass.
 ///
-/// An error is a start that cannot succeed: the log starts after what the
-/// databases hold, and no snapshot reaches the log.
+/// An error is a start that cannot succeed, or a check that cannot tell:
+/// the log starts after what the databases hold and no snapshot reaches it,
+/// or an actor database the check needed could not be read.
 pub fn plan_state(data: &Path, branch: &str, read_only: bool) -> Result<StatePlan, String> {
     let branch_dir = data.join("branches").join(branch);
     let starts = kronik_log::segment_starts(&branch_dir.join("log")).map_err(|e| e.to_string())?;
@@ -325,6 +330,13 @@ pub fn plan_state(data: &Path, branch: &str, read_only: bool) -> Result<StatePla
     };
     let state = markers.map(|m| (m.state, m.lowest));
     let unread = markers.map_or(0, |m| m.unread);
+    // An unread database is left out of `lowest`. Passing would tell the
+    // operator the start can proceed when that database may be the one the
+    // start refuses. The same rule applies when a snapshot would repair a
+    // gap the check has not actually seen.
+    if read_only && unread > 0 {
+        return Err(unread_actor_databases(unread));
+    }
     if !behind {
         return Ok(StatePlan {
             install: None,
@@ -354,6 +366,19 @@ pub fn plan_state(data: &Path, branch: &str, read_only: bool) -> Result<StatePla
         state,
         unread,
     })
+}
+
+/// Why a read-only plan cannot answer the start's question.
+fn unread_actor_databases(unread: usize) -> String {
+    let (subject, reaches) = if unread == 1 {
+        ("1 actor database".to_owned(), "it")
+    } else {
+        (format!("{unread} actor databases"), "them")
+    };
+    format!(
+        "{subject} could not be read, so the check cannot tell whether the log reaches {reaches}. \
+         If a daemon is running, stop it and run the check again"
+    )
 }
 
 /// Before the store opens: when `state.db` is missing, or the databases are

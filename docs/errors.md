@@ -38,6 +38,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`AUDIT_RANGE_GONE`](#audit_range_gone) | 410 | M28 | The requested log range is before the first retained record |
 | [`BAD_REQUEST`](#bad_request) | 400 | M1 | The request is malformed |
 | [`CAPABILITY_NOT_GRANTED`](#capability_not_granted) | 403 | M2 | The actor type lacks a capability for this effect |
+| [`CERTIFICATE_INVALID`](#certificate_invalid) | 400 | M6 | The TLS certificate cannot be used |
 | [`DEAD_LETTER_ALREADY_RESENT`](#dead_letter_already_resent) | 409 | M1 | The dead letter was already resent |
 | [`DEAD_LETTER_NOT_FOUND`](#dead_letter_not_found) | 404 | M1 | No such dead letter |
 | [`DEPLOYMENT_NOT_FOUND`](#deployment_not_found) | 404 | M3 | No such deployment |
@@ -186,6 +187,24 @@ To fix it, grant the capability to the actor type. Grants apply per actor type, 
     kronik grant billing http:payments.internal --reason "billing charges invoices"
 
 See also: [`capability`](concepts/glossary.md#capability), [`delivery-class`](concepts/glossary.md#delivery-class), [`effect`](concepts/glossary.md#effect).
+
+## CERTIFICATE_INVALID
+
+HTTP status 400, milestone M6. The TLS certificate cannot be used.
+
+Default hint: Renew the certificate, or fix the path and permissions of the PEM files.
+
+The TLS certificate configured for the gateway cannot be used. It has expired, its PEM cannot be parsed, or the certificate or private-key file cannot be read. A TLS handshake with that material fails, so the gateway cannot serve HTTPS until it is replaced. `kronik doctor` reports this from the `tls` check (files or a cached ACME certificate) and from the `dns01_hook` check (a cached wildcard certificate).
+
+Typical causes:
+
+- `[tls] cert_file` or `key_file` is missing, unreadable, or not PEM.
+- The certificate's not-after date has passed.
+- ACME renewal failed, so the cache still holds an expired certificate.
+
+To fix it, replace the files or let the gateway renew, then check again:
+
+    kronik doctor
 
 ## DEAD_LETTER_ALREADY_RESENT
 
@@ -1022,7 +1041,7 @@ To fix it, stop the daemon and keep the data directory as it is; do not delete o
 
     kronik restore --from s3://bucket/kronik
 
-The message "state is at lsn N, but the log starts at M (compacted)" is a different case and does not mean corruption: an actor database that has not changed for longer than `[retention] history` is behind the log that retention kept. Releases up to v0.4.0 can stop at the start for this; the fix raises those databases before it deletes log, and repairs such a directory at the next start from the newest snapshot. `kronik upgrade check` reports it before the restart. See "A start that stops at the log's start" in the operations guide.
+The message "state is at lsn N, but the log starts at M (compacted)" is a different case and does not mean corruption: an actor database that has not changed for longer than `[retention] history` is behind the log that retention kept. Releases up to v0.4.0 can stop at the start for this; the fix raises those databases before it deletes log, and repairs such a directory at the next start from the newest snapshot. `kronik upgrade check` reports it before the restart, including for an actor database a running daemon holds: that applied LSN is read without taking the daemon's lock. If the database cannot be read, the check does not pass. See "A start that stops at the log's start" in the operations guide.
 
 See also: [`segment`](concepts/glossary.md#segment), [`snapshot`](concepts/glossary.md#snapshot).
 
