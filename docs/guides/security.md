@@ -115,7 +115,8 @@ Secrets arrive with M2.
   `--in-forks compute` writes `recorded`. A name that is linked to an
   external backend at the fork point is computed with the value the node
   already holds for that link, and denied (`SECRET_UNAVAILABLE`) when it
-  holds none: a fork never asks the backend. A preview (M11) answers whoever
+  holds none: a fork never asks the backend. Both are graded synthetic
+  (ADR 0132). A preview (M11) answers whoever
   has its URL, so it gets no production key at all: its `crypto.*` calls
   answer `no recording`.
 - **Scrubbing.** When a turn used or revealed a secret, exact occurrences of

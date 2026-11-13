@@ -140,7 +140,8 @@ Invariants that bind it:
     recording`) and uses no value. A grant written before the mode existed
     is `compute`, so the gap remains for such grants. Under `compute`, a
     name linked to an external backend at the fork point uses the value
-    this process holds for that link, never a fetch (see §6).
+    this process holds for that link, never a fetch, graded synthetic
+    (see §6, ADR 0132).
 
 **Scrubbing.** `Node::secret_values()` decrypts every non-deleted version of
 every secret for each scrubbed API response and for foreign logs.
@@ -705,11 +706,14 @@ secrets, and only once Kronik has no usable value.
   otherwise it is denied in the fork and the diff marks it unverifiable. No
   provider audit log or bill sees a fork. Today that is an unmatched
   `crypto.*` under a `compute` grant (ADR 0112): with a value held for the
-  link it is computed on the host, as for a built-in name, and the value is
-  the one the cache holds now for that link (a later version after a
-  rotation without a relink, as the built-in store's current value is for a
-  built-in name); without one it is denied with `SECRET_UNAVAILABLE` and
-  graded synthetic, and the built-in store is not asked. A preview computes
+  link it is computed on the host, and the value is the one the cache holds
+  now for that link (a later version after a rotation without a relink, as
+  the built-in store's current value is for a built-in name); without one it
+  is denied with `SECRET_UNAVAILABLE`, and the built-in store is not asked.
+  Both are graded synthetic (ADR 0132): whether the process holds the value
+  depends on its memory (after a restart it holds none), so the grade of a
+  diff does not. The fork reads the value without touching production's
+  view of it: no stale mark, no `kronik_secret_stale`, no log line. A preview computes
   nothing. The fork point's configuration includes the links of its window,
   so a fork from before the link, or after an unlink, uses the built-in store
   as before. (Until this release a stopgap denied every such effect with

@@ -1740,9 +1740,14 @@ enum UnmatchedKey {
     /// The built-in store has no value of the name, or the fork has no store
     /// (a preview: no production key computes for it).
     Missing,
-    /// The built-in store's current value of a name that is not linked, or
-    /// the value this process holds for the link of the fork point.
+    /// The built-in store's current value of a name that is not linked.
     Value(kronik_privacy::SecretValue),
+    /// The value this process holds for the fork point's link of a linked
+    /// name. A computation with it is graded synthetic, not exact: it rests
+    /// on what this process holds (a later version after a rotation, nothing
+    /// after a restart), so a diff grades it the same whether it was held or
+    /// not.
+    Held(kronik_privacy::SecretValue),
 }
 
 /// The built-in store, as an unmatched `crypto.*` of a fork reads it.
@@ -1767,7 +1772,9 @@ pub trait HeldKeys: Send + Sync {
 
 impl HeldKeys for kronik_sched::secrets::SecretCache {
     fn held_key(&self, name: &str, config: &Config) -> Option<kronik_privacy::SecretValue> {
-        self.cached(name, None, config).ok().flatten()
+        // Read-only: a fork never changes production's stale tracking, its
+        // `kronik_secret_stale` gauge or its log.
+        self.fork_value(name, config)
     }
 }
 
@@ -1786,7 +1793,7 @@ fn unmatched_key(
     };
     if config.secret_is_linked(name) {
         return match held.and_then(|held| held.held_key(name, config)) {
-            Some(value) => UnmatchedKey::Value(value),
+            Some(value) => UnmatchedKey::Held(value),
             None => UnmatchedKey::Unheld,
         };
     }
@@ -2941,13 +2948,14 @@ impl ReplayGate {
         // the fork point's link of a linked name; the key never leaves it.
         let store = self.runner.setup.secrets.as_deref();
         let held = self.runner.setup.held_secrets.as_deref();
-        let v = match unmatched_key(
+        let (v, grounding) = match unmatched_key(
             self.config(),
             store.map(|s| s as &dyn KeyStore),
             held,
             &secret,
         ) {
-            UnmatchedKey::Value(v) => v,
+            UnmatchedKey::Value(v) => (v, pb::Grounding::Exact),
+            UnmatchedKey::Held(v) => (v, pb::Grounding::Synthetic),
             UnmatchedKey::Missing => {
                 self.push(self.synthetic(ordinal, kind, cap, fp, None))?;
                 return Ok(CryptoOutcome::Denied(NO_RECORDING.into()));
@@ -2992,7 +3000,7 @@ impl ReplayGate {
             kind: kind.into(),
             target: cap,
             fingerprint: fp,
-            grounding: pb::Grounding::Exact as i32,
+            grounding: grounding as i32,
             ..Default::default()
         };
         let out = match result {
@@ -3734,7 +3742,7 @@ mod linked_key_tests {
         keys.0.lock().unwrap().clear();
         assert!(matches!(
             unmatched_key(&config, store, Some(&held), "stripe"),
-            UnmatchedKey::Value(v) if v.value == b"held-backend-value"
+            UnmatchedKey::Held(v) if v.value == b"held-backend-value"
         ));
         // Nothing held (here: no cache, or another generation): denied.
         assert!(matches!(

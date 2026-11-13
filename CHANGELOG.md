@@ -94,7 +94,11 @@ M23, key and secret backends:
 - An unmatched `crypto.*` of a fork under a `compute` grant computes a name
   linked at the fork point with the value the node already holds for that
   link, and is denied with `SECRET_UNAVAILABLE` when it holds none, instead of
-  `SECRET_EXTERNAL` for every linked name. A fork still never asks a backend.
+  `SECRET_EXTERNAL` for every linked name. Both are graded synthetic (ADR
+  0132): what the node holds is not in the log, so the diff of a proposal
+  grades them the same after a restart. The fork reads the value without
+  touching production's stale tracking, `kronik_secret_stale` or its log. A
+  fork still never asks a backend.
 - After a restart, the crash re-run of a turn that used an older version of a
   linked secret made new effects use that version too, until `[secrets]
   refresh` passed, although a newer one had been recorded. Found against a

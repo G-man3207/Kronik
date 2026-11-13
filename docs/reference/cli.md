@@ -809,6 +809,8 @@ is granted again. Re-granting without `--in-forks compute` writes
 `recorded`. Under `compute`, a name linked to an external backend at the
 fork point is computed with the value the node holds for that link, and is
 denied with `SECRET_UNAVAILABLE` when it holds none: a fork never fetches.
+Either way the effect is graded synthetic (ADR 0132), as what the node
+holds is not part of the log.
 
 For `http:` capabilities, `--delivery` says how the target tolerates
 retries after a crash: `replay-safe` and `idempotency-keyed` requests are
