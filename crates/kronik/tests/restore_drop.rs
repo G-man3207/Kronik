@@ -4,9 +4,10 @@
 //! binary, a real drop of privileges and a bucket over HTTP that checks the
 //! signature of every request.
 //!
-//! The binary runs in a mount namespace of its own in which `/etc` is a copy
-//! with a `kronik` user (uid and gid 64999) added, so nothing of the host's
-//! accounts changes. The tests need root and `unshare`; elsewhere they say so
+//! The binary runs in a mount namespace of its own in which `/etc` is a small
+//! tree the test writes, with a `kronik` user (uid and gid 64999), so nothing
+//! of the host's accounts changes and nothing of the host's `/etc` but two
+//! public files (the loader's cache and the CA bundle) is copied. The tests need root and `unshare`; elsewhere they say so
 //! and skip, or fail under `KRONIK_FOREIGN_TESTS=require`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
@@ -55,7 +56,7 @@ fn can_run() -> Option<String> {
 /// owner reads the bucket and writes the data directory after the drop).
 struct World {
     dir: tempfile::TempDir,
-    /// The copy of `/etc` that the binary sees.
+    /// The `/etc` that the binary sees (`synthetic_etc`).
     etc: PathBuf,
     /// The shipped data: what a restore reads.
     bucket: PathBuf,
@@ -78,6 +79,65 @@ fn chown(path: &Path, uid: u32, gid: u32) {
 fn mkdir(path: &Path, mode: u32) {
     std::fs::create_dir_all(path).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// The CA bundles of the common distributions, relative to `/etc`: the TLS
+/// client loads the system's roots when it starts, and finds them at one of
+/// these.
+const CA_BUNDLES: [&str; 4] = [
+    "ssl/certs/ca-certificates.crt",
+    "pki/tls/certs/ca-bundle.crt",
+    "ssl/ca-bundle.pem",
+    "ssl/cert.pem",
+];
+
+/// Makes the `/etc` that the binary sees in its mount namespace: the identity
+/// files with the played `kronik` user and its ranges, `localhost`, a name
+/// service that reads only those files, and two public files of the host's,
+/// the dynamic loader's cache and the CA bundle. Root's and the played
+/// user's alone (0750): the binary reads it before and after the drop, and
+/// nobody else needs it.
+fn synthetic_etc(etc: &Path) {
+    mkdir(etc, 0o750);
+    chown(etc, 0, OWNER);
+    let write = |name: &str, bytes: &[u8]| {
+        let path = etc.join(name);
+        let parent = path.parent().unwrap();
+        if !parent.exists() {
+            mkdir(parent, 0o755);
+        }
+        std::fs::write(&path, bytes).unwrap();
+        chown(&path, 0, 0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    };
+    write(
+        "passwd",
+        format!(
+            "root:x:0:0:root:/root:/usr/sbin/nologin\n\
+             kronik:x:{OWNER}:{OWNER}::/nonexistent:/usr/sbin/nologin\n"
+        )
+        .as_bytes(),
+    );
+    write(
+        "group",
+        format!("root:x:0:\nkronik:x:{OWNER}:\n").as_bytes(),
+    );
+    write("subuid", b"kronik:300000:65536\n");
+    write("subgid", b"kronik:300000:65536\n");
+    write("hosts", b"127.0.0.1 localhost\n::1 localhost\n");
+    write(
+        "nsswitch.conf",
+        b"passwd: files\ngroup: files\nhosts: files\n",
+    );
+    for name in ["ld.so.cache"].into_iter().chain(CA_BUNDLES) {
+        if let Ok(bytes) = std::fs::read(Path::new("/etc").join(name)) {
+            write(name, &bytes);
+        }
+    }
+    assert!(
+        CA_BUNDLES.iter().any(|bundle| etc.join(bundle).is_file()),
+        "no CA bundle found under /etc ({CA_BUNDLES:?})"
+    );
 }
 
 impl World {
@@ -111,47 +171,9 @@ impl World {
             outside: dir.path().join("outside"),
             dir,
         };
-        // A copy of /etc with the played user.
-        mkdir(&world.etc, 0o755);
-        // Whatever of /etc can be copied (the key store of the TLS client
-        // needs the certificates); the four identity files are made below.
-        let _ = Command::new("cp")
-            .args(["-a", "/etc/.", world.etc.to_str().unwrap()])
-            .status()
-            .unwrap();
-        // Root's, and closed to others, whatever the host's /etc was.
-        chown(&world.etc, 0, 0);
-        std::fs::set_permissions(&world.etc, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let append = |file: &str, line: &str| {
-            let path = world.etc.join(file);
-            let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-            if !text.is_empty() && !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(line);
-            text.push('\n');
-            // Replaced, not written through: the copy is a file of its own.
-            let _ = std::fs::remove_file(&path);
-            std::fs::write(&path, text).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        };
-        append(
-            "passwd",
-            &format!("kronik:x:{OWNER}:{OWNER}::/nonexistent:/usr/sbin/nologin"),
-        );
-        append("group", &format!("kronik:x:{OWNER}:"));
-        append("subuid", "kronik:300000:65536");
-        append("subgid", "kronik:300000:65536");
-        for (file, mode) in [
-            ("passwd", 0o644),
-            ("group", 0o644),
-            ("subuid", 0o644),
-            ("subgid", 0o644),
-        ] {
-            let path = world.etc.join(file);
-            chown(&path, 0, 0);
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-        }
+        // The /etc the binary sees, made from scratch: nothing of the host's
+        // own (no shadow file, no host keys, no private TLS keys) is copied.
+        synthetic_etc(&world.etc);
         mkdir(&world.tmp, 0o777);
         // The destination, as the installer leaves it.
         mkdir(&world.data, 0o700);
@@ -185,9 +207,9 @@ impl World {
         format!("file://{}", self.bucket.display())
     }
 
-    /// `kronik ARGS` in a mount namespace where `/etc` is the copy with the
-    /// played user, as root, with nothing of the host's environment but
-    /// `env`.
+    /// `kronik ARGS` in a mount namespace where `/etc` is the synthetic one
+    /// with the played user, as root, with nothing of the host's environment
+    /// but `env`.
     fn kronik(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut command = Command::new("unshare");
         command

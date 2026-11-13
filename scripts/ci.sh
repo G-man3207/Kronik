@@ -352,7 +352,8 @@ step_foreign() {
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik-privacy --lib key_source::tests
     # `kronik restore` as root into the nonroot service's directory, with the
     # real drop of privileges: it needs root, a second uid and a private
-    # mount namespace in which /etc is a copy with that user.
+    # mount namespace in which /etc is a small tree the test writes with that
+    # user (no copy of the host's /etc).
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --bin kronik restore::tests
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --test restore_drop
 }
