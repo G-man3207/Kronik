@@ -456,10 +456,14 @@ def check(root, binary):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--binary", type=Path,
+                        help="the kronik binary to inventory (default: ROOT/target/debug/kronik)")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()
-    result = check(args.root.resolve(strict=True), args.binary.resolve(strict=True))
+    binary = args.binary or args.root / "target/debug/kronik"
+    if not binary.is_file():
+        parser.error(f"no kronik binary at {binary}: build it (cargo build -p kronik) or pass --binary")
+    result = check(args.root.resolve(strict=True), binary.resolve(strict=True))
     print(json.dumps(result, allow_nan=False))
     return 0 if result["passed"] else 1
 
