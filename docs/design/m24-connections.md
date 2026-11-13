@@ -1050,8 +1050,13 @@ Operations on ids without a row are ignored (a refused open's own frames).
 - **Other uses of the table.** It is in `snapshot.rs`'s `HASHED_TABLES`, so
   recovery and rebuild checks cover it. It is rebuilt from the log like
   every table (I4). It travels in snapshots and restores. Retention's index
-  compaction deletes closed rows whose `closed_lsn` is older than
-  `retention.history`.
+  compaction keeps closed rows, like `kv` rows: a turn's ownership check
+  reads them (a frame to a connection the actor closed long ago is
+  recorded and dropped, one to another actor's traps), so deleting them at
+  a time the log does not record would make a turn's outcome depend on
+  when compaction ran, in production and in replay (I1). A row is about
+  200 bytes; a deterministic compaction (one the log records) is a later
+  option.
 - **Replay.** Isolated replay's production cursor holds the table as of
   each root input's LSN, and the overlay applies the fork's turns to it.
   Continuous replay's fork store evolves its own table.

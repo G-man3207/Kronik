@@ -484,6 +484,9 @@ fn turns_are_deterministic_and_hide_the_execution_id() {
         fn timer_pending(&self, _: u64) -> Result<bool, String> {
             Ok(false)
         }
+        fn connection(&self, _: &str) -> Result<Option<kronik_runtime::ConnectionView>, String> {
+            Ok(None)
+        }
     }
     let rerun = |rec: &pb::TurnRecord| {
         p.rt.block_on(program.run(
