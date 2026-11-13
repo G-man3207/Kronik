@@ -156,7 +156,8 @@ pub fn too_large_outcome(limit: usize) -> pb::Outcome {
         error_code: ErrorCode::TurnTooLarge.as_str().into(),
         message: format!(
             "the turn's record does not fit in one log record (at most {limit} bytes for a \
-             turn); its state writes, messages, timers, SQL changes and output were dropped"
+             turn); its state writes, messages, timers, frames, SQL changes and output were \
+             dropped"
         ),
         output: None,
     }
@@ -239,6 +240,7 @@ pub fn fail(
     record.writes.clear();
     record.messages.clear();
     record.timers.clear();
+    record.connection_ops.clear();
     record.sql_changes.clear();
     record.sql_schema.clear();
     record.blob_refs.clear();

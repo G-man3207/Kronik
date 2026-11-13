@@ -52,6 +52,9 @@ parts that come later with their own milestone, for example "(M3)". The
 | [`isolation-level`](#isolation-level) | How code is sandboxed: wasm, gvisor, trusted or microvm | M7 |
 | [`snapshot`](#snapshot) | A consistent copy of materialized state at an LSN | M6 |
 | [`segment`](#segment) | A log file; closed segments are immutable | M1 |
+| [`connections`](#connections) | WebSocket and SSE connections that the gateway holds for the actor that accepted them | M24 |
+| [`frame`](#frame) | One message on a connection: WebSocket text or binary, or an SSE event | M24 |
+| [`send-now`](#send-now) | Sending a frame during a turn, as an effect with the delivery class unsafe | M24 |
 
 ## actor
 
@@ -383,3 +386,37 @@ A log file; closed segments are immutable. Milestone M1.
 A segment is a log file. The active segment is written to. A segment is closed at 64 MiB or after 60 seconds; a closed segment is immutable, gets a footer index from actor to offset (M3) and can be shipped (M6). Every record in a segment sits in the envelope `[u32 len][u32 crc32c][u64 lsn][u8 kind][protobuf]`. A torn last record after a crash is truncated at startup; a corrupt record in the middle of a segment gives `STORAGE_CORRUPT`. Segments older than the retention window are deleted once a snapshot covers them (M6).
 
 See also: [`lsn`](#lsn), [`snapshot`](#snapshot), [`STORAGE_CORRUPT`](../errors.md#storage_corrupt).
+
+## connections
+
+WebSocket and SSE connections that the gateway holds for the actor that accepted them. Milestone M24.
+
+A long-lived connection is a WebSocket or a server-sent-events (SSE) stream between a client and the gateway (M24). A route with the method `WEBSOCKET` or `SSE` names one actor, and that actor's `connection-handler` decides in its open turn whether to accept or refuse. The client gets its `101 Switching Protocols` or the `200` event stream only after that turn's record is durable. The actor that accepted a connection is its owner for its whole life: only the owner's turns may send on it or close it (`CONNECTION_NOT_HELD` otherwise), and the open, every incoming frame and the close are inputs of the owner, each a root input with its own turn.
+
+`connections.send`, `broadcast` and `close` are buffered like `send`: the frames are recorded with the turn and handed to the connection after it commits, in order; a failed turn sends nothing. An acknowledged turn means that its frames are recorded and were handed over, not that the client received them; frames to a closed connection are recorded and dropped, and `history` shows each frame as written, dropped, queued or unknown. Every accepted connection gets exactly one close input, also after a crash: a restart closes every connection the last process held with the reason `restart` (code 1012), and clients reconnect. The gateway holds the connection, not the actor, so a connection lives on while the actor sleeps between its inputs.
+
+In replay, connection inputs are root inputs like HTTP requests, and outgoing frames are compared as responses: a changed message format shows as changed frames in the diff.
+
+    kronik history chat/lobby --limit 20
+
+See also: [`frame`](#frame), [`send-now`](#send-now), [`root-input`](#root-input), [`CONNECTION_NOT_HELD`](../errors.md#connection_not_held), [`CONNECTION_LIMIT`](../errors.md#connection_limit).
+
+## frame
+
+One message on a connection: WebSocket text or binary, or an SSE event. Milestone M24.
+
+A frame is one message on a long-lived connection (M24): a WebSocket text or binary message, or an SSE event with its `event`, `id` and data. Frames go both ways. An incoming frame (WebSocket only) is a root input of the connection's owner, numbered 0, 1, 2, ... in the order the client sent them. An outgoing frame has its own sequence number per connection, in the order the frames go out. Frame data is the subject's data like a message body: it can be sealed and erased. An SSE event's `event` and `id` are recorded in plain text, so keep personal data out of them.
+
+    kronik history chat/lobby --limit 20
+
+See also: [`connections`](#connections), [`send-now`](#send-now), [`message`](#message).
+
+## send-now
+
+Sending a frame during a turn, as an effect with the delivery class unsafe. Milestone M24.
+
+`connections.send-now` sends a frame during the turn instead of after it commits (M24), for intermediate results such as the tokens of a streamed answer. It is an effect with the delivery class `unsafe`: it needs the capability `connection:send-now`, its turn's `TurnBegin` is durable before the frame goes out, and its result is recorded before the guest sees it. `ok` means the frame was handed to the connection in order, not that the client received it; `closed` means it was not sent. After a crash a re-run never sends it again: the guest gets `outcome-unknown`, and a turn that does not handle it fails with `EFFECT_OUTCOME_UNKNOWN`. A stream can reach the client before its turn fails: that is the price of streaming. Use `send` for final notices, such as "payment complete".
+
+    kronik grant chat connection:send-now --reason "stream the bot's answers"
+
+See also: [`connections`](#connections), [`effect`](#effect), [`delivery-class`](#delivery-class), [`EFFECT_OUTCOME_UNKNOWN`](../errors.md#effect_outcome_unknown).

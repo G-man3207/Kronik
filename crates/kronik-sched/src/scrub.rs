@@ -222,6 +222,7 @@ pub fn output(
     if out.writes.is_empty()
         && out.messages.is_empty()
         && out.timers.is_empty()
+        && out.connection_ops.is_empty()
         && out.outcome.message.is_empty()
         && out.outcome.output.is_none()
         && (out.outcome.error_code.is_empty() || host_trap_code)
@@ -238,6 +239,20 @@ pub fn output(
     }
     for t in &mut out.timers {
         message_budget(&mut t.msg, matcher, remaining)?;
+    }
+    // M24: buffered frames and close reasons, as they will be sent.
+    for op in &mut out.connection_ops {
+        match &mut op.op {
+            Some(pb::connection_op::Op::Send(frame)) => {
+                sealable_budget(&mut frame.data, matcher, remaining)?;
+                text_budget(&mut frame.event, matcher, remaining)?;
+                text_budget(&mut frame.id, matcher, remaining)?;
+            }
+            Some(pb::connection_op::Op::Close(close)) => {
+                sealable_budget(&mut close.reason, matcher, remaining)?;
+            }
+            None => {}
+        }
     }
     charge(remaining, out.outcome.error_code.len())?;
     // Guest Rejected/Failed codes remain free text even if they happen to

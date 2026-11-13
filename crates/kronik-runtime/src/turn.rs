@@ -12,6 +12,7 @@ use crate::engine::FUEL_YIELD_INTERVAL;
 use crate::host::bindings::ActorPre;
 use crate::host::bindings::kronik::actor::types;
 use crate::host::connection_bindings::ActorConnectionsPre;
+use crate::host::connection_bindings::kronik::actor::connections as conn_wit;
 use crate::host::{
     CONNECTION_HANDLER_EXPORT, EffectGate, HostInit, LogEvent, SqlHost, StateView, TurnHost,
     TurnLimits, build_linker, message_to_pb,
@@ -36,6 +37,8 @@ pub struct TurnOutput {
     pub writes: Vec<pb::StateWrite>,
     pub messages: Vec<pb::OutboundMessage>,
     pub timers: Vec<pb::TimerOp>,
+    /// The buffered connection operations, with their outgoing seqs (M24).
+    pub connection_ops: Vec<pb::ConnectionOp>,
     pub fuel_used: u64,
     pub memory_peak_bytes: u64,
     pub logs: Vec<LogEvent>,
@@ -166,7 +169,9 @@ impl Program {
     }
 
     /// Runs one turn on a fresh instance. Guest failures become a failed
-    /// outcome; only host failures are errors.
+    /// outcome; only host failures are errors. A connection input (M24)
+    /// calls the component's `connection-handler`, every other input
+    /// `handle`.
     pub async fn run(
         &self,
         req: TurnRequest,
@@ -174,10 +179,13 @@ impl Program {
         sql: Option<Box<dyn SqlHost>>,
         gate: Option<Arc<dyn EffectGate>>,
     ) -> Result<TurnOutput, RunError> {
-        let input = input_to_wit(&req.input)?;
+        let call = match &req.input.kind {
+            Some(pb::input::Kind::Connection(c)) => Call::Connection(connection_to_wit(c)?),
+            _ => Call::Handle(input_to_wit(&req.input)?),
+        };
         let fuel = req.limits.fuel;
         let message_bytes = req.limits.message_bytes;
-        let host = TurnHost::new(HostInit {
+        let mut host = TurnHost::new(HostInit {
             actor: req.actor,
             causal_key: req.causal_key,
             now_ms: req.logical_time_ms,
@@ -189,15 +197,53 @@ impl Program {
             gate,
             describe_only: false,
         });
+        // The connection an open input names is held, and opens when the
+        // turn commits.
+        let offered = match &call {
+            Call::Connection(ConnCall::Open(o)) => {
+                host.conns.opening = Some((o.connection.clone(), protocol_to_pb(o.protocol)));
+                Some((o.subprotocols.clone(), o.protocol))
+            }
+            _ => None,
+        };
         let mut store = self.store(host, fuel)?;
-        let result = match self.pre.instantiate_async(&mut store).await {
-            Ok(actor) => {
-                actor
+        let result = match call {
+            Call::Handle(input) => match self.pre.instantiate_async(&mut store).await {
+                Ok(actor) => actor
                     .kronik_actor_handler()
                     .call_handle(&mut store, &input)
                     .await
-            }
-            Err(e) => Err(e),
+                    .map(|r| r.map(Answer::Output)),
+                Err(e) => Err(e),
+            },
+            Call::Connection(call) => match &self.connections {
+                // Recorded as a failed turn, without running (M24 §2.3).
+                None => Ok(Err(types::HandlerError::Failed(
+                    "the kind's code does not handle connections: it does not export \
+                     kronik:actor/connection-handler"
+                        .into(),
+                ))),
+                Some(pre) => match pre.instantiate_async(&mut store).await {
+                    Ok(actor) => {
+                        let handler = actor.kronik_actor_connection_handler();
+                        match call {
+                            ConnCall::Open(o) => handler
+                                .call_open(&mut store, &o)
+                                .await
+                                .map(|r| r.map(Answer::Open)),
+                            ConnCall::Frame(f) => handler
+                                .call_frame(&mut store, &f)
+                                .await
+                                .map(|r| r.map(|()| Answer::Output(types::Output::None))),
+                            ConnCall::Close(c) => handler
+                                .call_close(&mut store, &c)
+                                .await
+                                .map(|r| r.map(|()| Answer::Output(types::Output::None))),
+                        }
+                    }
+                    Err(e) => Err(e),
+                },
+            },
         };
         let fuel_used = fuel - store.get_fuel().unwrap_or(0);
         let mut host = store.into_data();
@@ -207,7 +253,11 @@ impl Program {
         host.warn_unsent();
         let subject = host.subject.clone();
         let mut outcome = match result {
-            Ok(Ok(output)) => committed(output, subject, message_bytes),
+            Ok(Ok(Answer::Output(output))) => committed(output, subject, message_bytes),
+            Ok(Ok(Answer::Open(reply))) => {
+                let (offered, protocol) = offered.unwrap_or((Vec::new(), conn_wit::Protocol::Sse));
+                open_outcome(reply, &offered, protocol, subject, message_bytes)
+            }
             Ok(Err(types::HandlerError::Rejected(m))) => {
                 failed(pb::OutcomeKind::Rejected, "TURN_FAILED", m)
             }
@@ -256,11 +306,116 @@ impl Program {
             } else {
                 Vec::new()
             },
+            // A failed turn records no operation and sends nothing (§4.3).
+            connection_ops: if ok {
+                host.conns.take_ops()
+            } else {
+                Vec::new()
+            },
             fuel_used,
             memory_peak_bytes: host.limiter.peak_bytes as u64,
             logs: host.logs.take(),
             sql: host.sql.take(),
         })
+    }
+}
+
+/// What a turn calls: `handle`, or a `connection-handler` function (M24).
+enum Call {
+    Handle(types::Input),
+    Connection(ConnCall),
+}
+
+enum ConnCall {
+    Open(conn_wit::OpenRequest),
+    Frame(conn_wit::IncomingFrame),
+    Close(conn_wit::Closed),
+}
+
+/// What the guest answered.
+enum Answer {
+    Output(types::Output),
+    Open(conn_wit::OpenReply),
+}
+
+/// Whether `subject` can be a subject: 1 to 256 bytes of printable ASCII
+/// without spaces, such as `user:123` (the keystore's rule, m8-privacy §1).
+fn valid_subject(subject: &str) -> bool {
+    !subject.is_empty() && subject.len() <= 256 && subject.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// The outcome of an open turn that answered (M24 §4.2). An accept is
+/// checked before the turn is recorded: its subprotocol is one the client
+/// offered (none for SSE), its headers are valid and its subject is one. A
+/// refusal is an HTTP response with a final status.
+fn open_outcome(
+    reply: conn_wit::OpenReply,
+    offered: &[String],
+    protocol: conn_wit::Protocol,
+    subject: Option<String>,
+    limit: usize,
+) -> pb::Outcome {
+    let bad = |m: String| failed(pb::OutcomeKind::Trap, "TURN_FAILED", m);
+    match reply {
+        conn_wit::OpenReply::Refuse(response) => {
+            if !(200..=599).contains(&response.status) {
+                return bad(format!(
+                    "the open's refusal has status {}; refuse with a status from 200 to 599",
+                    response.status
+                ));
+            }
+            committed(types::Output::Http(response), subject, limit)
+        }
+        conn_wit::OpenReply::Accept(accept) => {
+            if let Some(p) = &accept.subprotocol {
+                if protocol == conn_wit::Protocol::Sse {
+                    return bad(format!(
+                        "the open's accept selects the subprotocol {p:?}, but SSE has none"
+                    ));
+                }
+                if !offered.contains(p) {
+                    return bad(format!(
+                        "the open's accept selects the subprotocol {p:?}, which the client did \
+                         not offer"
+                    ));
+                }
+            }
+            for h in &accept.headers {
+                if http::HeaderName::from_bytes(h.name.as_bytes()).is_err()
+                    || http::HeaderValue::from_str(&h.value).is_err()
+                {
+                    return bad(format!(
+                        "the open's accept has an invalid header {:?}",
+                        h.name
+                    ));
+                }
+            }
+            if let Some(s) = &accept.subject
+                && !valid_subject(s)
+            {
+                return bad(format!(
+                    "the open's accept sets the subject {s:?}, which is not one: 1 to 256 \
+                     printable ASCII characters without spaces, such as user:123"
+                ));
+            }
+            pb::Outcome {
+                kind: pb::OutcomeKind::Committed as i32,
+                error_code: String::new(),
+                message: String::new(),
+                output: Some(pb::outcome::Output::Accept(pb::ConnectionAccept {
+                    subprotocol: accept.subprotocol.unwrap_or_default(),
+                    headers: accept
+                        .headers
+                        .into_iter()
+                        .map(|h| pb::Header {
+                            name: h.name,
+                            value: Some(plain(subject.clone(), h.value.into_bytes())),
+                        })
+                        .collect(),
+                    subject: accept.subject,
+                })),
+            }
+        }
     }
 }
 
@@ -394,6 +549,8 @@ fn classify_error(e: &wasmtime::Error, memory_limit_hit: bool) -> pb::Outcome {
         "NOT_IMPLEMENTED"
     } else if msg.starts_with("REPLAY_DIVERGED") {
         "REPLAY_DIVERGED"
+    } else if msg.starts_with(crate::host::connections::NOT_HELD) {
+        crate::host::connections::NOT_HELD
     } else {
         "TURN_FAILED"
     };
@@ -449,29 +606,116 @@ fn body_to_wit(b: Option<&pb::Body>) -> Result<types::HttpBody, RunError> {
     })
 }
 
+fn http_to_wit(h: &pb::HttpInput) -> Result<types::HttpRequest, RunError> {
+    Ok(types::HttpRequest {
+        method: h.method.clone(),
+        // Plain or the sealable copies of a subject's request (unsealed
+        // for the guest before the turn).
+        path: h.path_text(),
+        query: h.query_text(),
+        params: h.param_values(),
+        headers: h
+            .headers
+            .iter()
+            .map(|hd| {
+                Ok(types::Header {
+                    name: hd.name.clone(),
+                    value: String::from_utf8_lossy(&sealed_bytes(hd.value.as_ref())?).into_owned(),
+                })
+            })
+            .collect::<Result<_, RunError>>()?,
+        body: body_to_wit(h.body.as_ref())?,
+    })
+}
+
+fn protocol_to_pb(p: conn_wit::Protocol) -> pb::ConnectionProtocol {
+    match p {
+        conn_wit::Protocol::Websocket => pb::ConnectionProtocol::Websocket,
+        conn_wit::Protocol::Sse => pb::ConnectionProtocol::Sse,
+    }
+}
+
+fn frame_to_wit(f: Option<&pb::Frame>) -> Result<conn_wit::Frame, RunError> {
+    let f =
+        f.ok_or_else(|| RunError::Input("a connection frame input without its frame".into()))?;
+    let data = sealed_bytes(f.data.as_ref())?;
+    Ok(match pb::frame::Kind::try_from(f.kind) {
+        Ok(pb::frame::Kind::Text) => {
+            conn_wit::Frame::Text(String::from_utf8_lossy(&data).into_owned())
+        }
+        Ok(pb::frame::Kind::Binary) => conn_wit::Frame::Binary(data),
+        Ok(pb::frame::Kind::Event) => conn_wit::Frame::Event(conn_wit::SseEvent {
+            event: f.event.clone(),
+            id: f.id.clone(),
+            data: String::from_utf8_lossy(&data).into_owned(),
+        }),
+        _ => return Err(RunError::Input("a frame without a kind".into())),
+    })
+}
+
+/// The `connection-handler` call of a connection input (M24): the open's
+/// request, an incoming frame, or the close; a host close's reason is its
+/// cause, such as `restart`.
+fn connection_to_wit(c: &pb::ConnectionInput) -> Result<ConnCall, RunError> {
+    use pb::connection_input::Event;
+    let protocol = match pb::ConnectionProtocol::try_from(c.protocol) {
+        Ok(pb::ConnectionProtocol::Websocket) => conn_wit::Protocol::Websocket,
+        Ok(pb::ConnectionProtocol::Sse) => conn_wit::Protocol::Sse,
+        _ => {
+            return Err(RunError::Input(
+                "a connection input without a protocol".into(),
+            ));
+        }
+    };
+    Ok(match &c.event {
+        Some(Event::Open(o)) => {
+            ConnCall::Open(conn_wit::OpenRequest {
+                connection: c.connection.clone(),
+                protocol,
+                request: http_to_wit(o.request.as_ref().ok_or_else(|| {
+                    RunError::Input("a connection open without its request".into())
+                })?)?,
+                subprotocols: o.subprotocols.clone(),
+            })
+        }
+        Some(Event::Frame(f)) => ConnCall::Frame(conn_wit::IncomingFrame {
+            connection: c.connection.clone(),
+            seq: f.seq,
+            frame: frame_to_wit(f.frame.as_ref())?,
+        }),
+        Some(Event::Close(close)) => {
+            let initiator = match pb::CloseCause::try_from(close.cause) {
+                Ok(pb::CloseCause::Client) => conn_wit::CloseInitiator::Client,
+                Ok(pb::CloseCause::Actor) => conn_wit::CloseInitiator::Actor,
+                _ => conn_wit::CloseInitiator::Host,
+            };
+            let reason = match initiator {
+                conn_wit::CloseInitiator::Host => {
+                    kronik_proto::connection::cause_name(close.cause).to_owned()
+                }
+                _ => String::from_utf8_lossy(&sealed_bytes(close.reason.as_ref())?).into_owned(),
+            };
+            ConnCall::Close(conn_wit::Closed {
+                connection: c.connection.clone(),
+                info: conn_wit::CloseInfo {
+                    initiator,
+                    code: u16::try_from(close.code).unwrap_or(u16::MAX),
+                    reason,
+                },
+            })
+        }
+        None => {
+            return Err(RunError::Input(
+                "a connection input without an event".into(),
+            ));
+        }
+    })
+}
+
 fn input_to_wit(input: &pb::Input) -> Result<types::Input, RunError> {
     use pb::input::Kind;
     Ok(match &input.kind {
-        Some(Kind::Http(h)) => types::Input::Http(types::HttpRequest {
-            method: h.method.clone(),
-            // Plain or the sealable copies of a subject's request (unsealed
-            // for the guest before the turn).
-            path: h.path_text(),
-            query: h.query_text(),
-            params: h.param_values(),
-            headers: h
-                .headers
-                .iter()
-                .map(|hd| {
-                    Ok(types::Header {
-                        name: hd.name.clone(),
-                        value: String::from_utf8_lossy(&sealed_bytes(hd.value.as_ref())?)
-                            .into_owned(),
-                    })
-                })
-                .collect::<Result<_, RunError>>()?,
-            body: body_to_wit(h.body.as_ref())?,
-        }),
+        Some(Kind::Http(h)) => types::Input::Http(http_to_wit(h)?),
         Some(Kind::Message(m)) => types::Input::Message(types::Incoming {
             sender: m.sender.as_ref().map(|s| types::ActorRef {
                 kind: s.kind.clone(),

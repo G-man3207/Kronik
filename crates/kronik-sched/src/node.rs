@@ -234,6 +234,10 @@ impl Job {
             {
                 TurnId::parse(&m.resend_of).map(|t| t.lsn)
             }
+            // M24 §4.9: a resent frame or close.
+            Some(pb::input::Kind::Connection(c)) if !c.resend_of.is_empty() => {
+                TurnId::parse(&c.resend_of).map(|t| t.lsn)
+            }
             _ => None,
         }
     }
@@ -435,6 +439,8 @@ pub struct Node {
     retention_hold: crate::snapshots::RetentionHold,
     /// What the last retention pass kept for an open turn.
     pub(crate) retention_pin: Mutex<crate::snapshots::PinState>,
+    /// The live WebSocket and SSE connections of this node (M24).
+    pub(crate) hub: Arc<crate::connections::Hub>,
     /// How often retention compacted the index rows (`db.compact`).
     pub(crate) db_compactions: std::sync::atomic::AtomicU64,
     me: Weak<Node>,
@@ -890,6 +896,7 @@ impl Node {
             retention_hold: Default::default(),
             retention_pin: Default::default(),
             db_compactions: Default::default(),
+            hub: crate::connections::Hub::new(env.clone(), config.connections.clone()),
             me: me.clone(),
             foreign: config.foreign.0.clone(),
             cfg: config,
@@ -897,6 +904,7 @@ impl Node {
         native_execution
             .bind_node(Arc::downgrade(&node))
             .map_err(|error| StartError::Corrupt(error.to_string()))?;
+        node.hub.bind(Arc::downgrade(&node), last);
         let mut startup = NativeStartupGuard(Some(node.clone()));
         if let Some(runtime) = &node.secret_runtime {
             runtime
@@ -969,6 +977,9 @@ impl Node {
         // Open turns first: each is the delivery of its input, so its mailbox
         // entry is skipped and its ingress key joins the re-run.
         let mut rerun_messages = HashSet::new();
+        // Connections whose close input is re-run: the restart closes below
+        // skip them, so each still gets exactly one (M24 §4.8).
+        let mut rerun_closes = HashSet::new();
         let rerun_count = reruns.len();
         for (actor, begin, recorded, begun_at) in reruns {
             let input = begin.input.clone().unwrap_or_default();
@@ -978,6 +989,12 @@ impl Node {
                 Some(pb::input::Kind::Message(m)) => {
                     rerun_messages.insert(m.message_id.clone());
                     subject = body_subject(m.msg.as_ref());
+                }
+                Some(pb::input::Kind::Connection(c)) => {
+                    subject = kronik_proto::connection::input_subject(c);
+                    if matches!(c.event, Some(pb::connection_input::Event::Close(_))) {
+                        rerun_closes.insert(c.connection.clone());
+                    }
                 }
                 Some(pb::input::Kind::Http(h)) if !h.idempotency_key.is_empty() => {
                     let waiter = Arc::new(Waiter::default());
@@ -1017,6 +1034,19 @@ impl Node {
             }
             node.enqueue_mailbox(row);
         }
+        // Every connection still open in state.db lost its socket with the
+        // last process: a host close with the reason `restart` (M24 §4.8),
+        // after the re-runs and the mailbox and before the gateway takes
+        // traffic, so in each actor the old connections close before new
+        // ones open.
+        let open_connections = node.store.db().open_connections()?;
+        let restart_closes = open_connections.len();
+        for row in open_connections {
+            if rerun_closes.contains(&row.id) {
+                continue;
+            }
+            node.admit_restart_close(row, last);
+        }
         {
             let now = node.timer_now();
             let mut w = lock(&node.wheel);
@@ -1043,6 +1073,7 @@ impl Node {
             pending_messages = pending,
             reruns = rerun_count,
             timers = timers.len(),
+            restart_closes,
             "node started"
         );
         startup.0 = None;
@@ -2222,6 +2253,7 @@ impl Node {
             }
             _ => None,
         };
+        let connection_input = kronik_proto::connection::input(Some(&input)).cloned();
         let mut record = pb::TurnRecord {
             execution_id,
             actor: Some(actor.to_pb()),
@@ -2248,7 +2280,11 @@ impl Node {
             config_epoch: epoch,
             memory_peak_bytes: out.memory_peak_bytes,
             schema_version: if committed { schema_version } else { 0 },
-            connection_ops: Vec::new(),
+            connection_ops: if committed {
+                std::mem::take(&mut out.connection_ops)
+            } else {
+                Vec::new()
+            },
             duration_us: u64::try_from(
                 self.env
                     .clock
@@ -2292,6 +2328,11 @@ impl Node {
         } else {
             Vec::new()
         };
+        let connection_ops = if committed {
+            record.connection_ops.clone()
+        } else {
+            Vec::new()
+        };
         let authorized = !fxs.begun && matches!(&origin, OperationOrigin::Request(_));
         let completion = if fxs.begun {
             OperationOrigin::Internal
@@ -2310,6 +2351,17 @@ impl Node {
         let lsn = lsn?;
         if authorized {
             Self::observe_turn(&actor.kind, Some(&outcome));
+        }
+        // M24 §4.3: the record is fsynced and applied; the connection
+        // opens (or not), and the buffered frames and closes go to their
+        // writers, before messages, timers and the turn's result.
+        if let Some(c) = &connection_input
+            && matches!(c.event, Some(pb::connection_input::Event::Open(_)))
+        {
+            self.hub.settle_open(actor, c, &outcome);
+        }
+        if !connection_ops.is_empty() {
+            self.hub.deliver(&connection_ops);
         }
         for m in messages {
             self.deliver(actor, &key, time, m, pb::MessageSource::Actor, "", born);
@@ -3170,6 +3222,136 @@ impl Node {
         });
     }
 
+    /// The live connections of this node (M24).
+    pub fn hub(&self) -> &Arc<crate::connections::Hub> {
+        &self.hub
+    }
+
+    /// Admits the open of a long-lived connection (M24 §5.3, §5.4): a root
+    /// input of `actor` with the upgrade request or the GET, registered
+    /// with the hub within its caps (`CONNECTION_LIMIT`; `cap_exempt` for a
+    /// trusted proxy's clients). Returns the connection id (`c-` and the
+    /// root id) and the open turn's waiter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connection_open(
+        &self,
+        actor: ActorRef,
+        mut request: pb::HttpInput,
+        subprotocols: Vec<String>,
+        protocol: pb::ConnectionProtocol,
+        subject: Option<String>,
+        client: Option<std::net::IpAddr>,
+        cap_exempt: bool,
+    ) -> Result<(String, Arc<Waiter>), ApiError> {
+        self.check_running()?;
+        // The log requires a body (an empty one for the request).
+        if request.body.is_none() {
+            request.body = Some(pb::Body {
+                value: Some(pb::body::Value::Inline(pb::Sealable {
+                    subject: subject.clone(),
+                    value: Some(pb::sealable::Value::Plain(Vec::new())),
+                })),
+            });
+        }
+        // Opens are not deduplicated at ingress (§4.2).
+        request.idempotency_key.clear();
+        request.request_hash.clear();
+        let root = random_id(&self.env);
+        let id = kronik_proto::connection::id_for_root(&root);
+        let route = request.route.clone();
+        self.hub.register(
+            &id,
+            &actor,
+            protocol,
+            &route,
+            subject.clone(),
+            client,
+            cap_exempt,
+        )?;
+        let input = pb::Input {
+            kind: Some(pb::input::Kind::Connection(pb::ConnectionInput {
+                connection: id.clone(),
+                protocol: protocol as i32,
+                route,
+                event: Some(pb::connection_input::Event::Open(pb::ConnectionOpen {
+                    request: Some(request),
+                    subprotocols,
+                })),
+                ..Default::default()
+            })),
+        };
+        let rx = self.start_root(actor, root, input, subject, OperationOrigin::Internal);
+        let waiter = Arc::new(Waiter::default());
+        let hub = self.hub.clone();
+        let done = waiter.clone();
+        let conn = id.clone();
+        self.env.spawn("connection-open", async move {
+            let r = rx.await.unwrap_or_else(|_| {
+                Err(ApiError::new(
+                    ErrorCode::Unavailable,
+                    "the turn was abandoned",
+                ))
+            });
+            // A committed turn settled the open before its result came
+            // (accepted or not); one that ended otherwise (no record, or a
+            // failed record without a run) did not.
+            hub.open_finished(&conn);
+            done.complete(r);
+        });
+        Ok((id, waiter))
+    }
+
+    /// Admits a frame or the close of a connection as a root input of its
+    /// owner (M24 §4.1). A close is admitted whenever the node runs, also
+    /// below the disk reserve, so the connection's lifecycle completes.
+    pub(crate) fn admit_connection(
+        &self,
+        actor: ActorRef,
+        input: pb::ConnectionInput,
+        subject: Option<String>,
+        close: bool,
+    ) -> Result<oneshot::Receiver<Result<TurnResult, ApiError>>, ApiError> {
+        if close {
+            self.check_alive()?;
+        } else {
+            self.check_running()?;
+        }
+        let root = random_id(&self.env);
+        let input = pb::Input {
+            kind: Some(pb::input::Kind::Connection(input)),
+        };
+        Ok(self.start_root(actor, root, input, subject, OperationOrigin::Internal))
+    }
+
+    /// The close input of a connection the last process held (M24 §4.8):
+    /// the host's cause `restart`, code 1012, the frames written unknown,
+    /// and the log's last LSN at the start.
+    fn admit_restart_close(&self, row: kronik_store::db::ConnectionRow, last: Lsn) {
+        let input = pb::ConnectionInput {
+            connection: row.id.clone(),
+            protocol: row.protocol,
+            route: row.route.clone(),
+            event: Some(pb::connection_input::Event::Close(pb::ConnectionClose {
+                cause: pb::CloseCause::Restart as i32,
+                code: u32::from(crate::connections::RESTART_CODE),
+                // Empty, tagged with the connection's subject: the close
+                // turn's default subject (§4.10).
+                reason: Some(pb::Sealable {
+                    subject: row.subject.clone(),
+                    value: Some(pb::sealable::Value::Plain(Vec::new())),
+                }),
+                frames_written: 0,
+                frames_written_known: false,
+                frames_received: 0,
+                restart_after_lsn: last,
+            })),
+            ..Default::default()
+        };
+        if let Err(e) = self.admit_connection(row.actor, input, row.subject, true) {
+            tracing::warn!(connection = %row.id, error = %e, "cannot admit a restart close");
+        }
+    }
+
     fn check_message(&self, kind: &str, msg: &pb::Message) -> Result<(), ApiError> {
         if !self.kind_exists(kind) {
             return Err(ApiError::new(
@@ -3274,6 +3456,43 @@ impl Node {
                     }
                 ),
             ));
+        }
+        // M24 §4.9: a failed frame or close turn runs again as a new root
+        // input of the connection's owner: the same connection, the same
+        // incoming seq and frame or the same close, with `resend_of` and
+        // the audit. A closed connection's frames are then dropped.
+        if let Some(pb::input::Kind::Connection(c)) = &dl.input.kind {
+            if !self.kind_exists(&dl.actor.kind) {
+                return Err(ApiError::new(
+                    ErrorCode::ActorNotFound,
+                    format!("no deployed kind {:?}", dl.actor.kind),
+                ));
+            }
+            if dry_run {
+                return Ok(None);
+            }
+            self.hold_resend().await;
+            if !lock(&self.resending).insert(lsn) {
+                return Err(ApiError::new(
+                    ErrorCode::DeadLetterAlreadyResent,
+                    format!("dead letter {id} is being resent"),
+                ));
+            }
+            let mut input = c.clone();
+            input.resend_of = id.to_string();
+            input.audit = Some(audit);
+            let subject = kronik_proto::connection::input_subject(&input);
+            let root = random_id(&self.env);
+            let rx = self.start_root(
+                dl.actor,
+                root.clone(),
+                pb::Input {
+                    kind: Some(pb::input::Kind::Connection(input)),
+                },
+                subject,
+                OperationOrigin::Request(authority.clone()),
+            );
+            return self.wait_root(rx, &root, authority).await.map(Some);
         }
         // A resent compensation keeps the call it compensates, so its
         // success resolves the orphan.

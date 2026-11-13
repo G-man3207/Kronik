@@ -17,6 +17,7 @@
 //! interval/shutdown and irreversible recovery continuations are separate host paths;
 //! audit metadata never chooses operation authority.
 
+pub mod connections;
 pub mod effects;
 mod erasure;
 mod gate;
@@ -124,6 +125,8 @@ pub struct NodeConfig {
     /// (`record_budget`) without 128 MiB turns.
     #[doc(hidden)]
     pub test_max_record_bytes: Option<u32>,
+    /// `[connections]` (M24): the hub's caps and transport settings.
+    pub connections: connections::ConnectionsConfig,
 }
 
 impl Default for NodeConfig {
@@ -148,6 +151,7 @@ impl Default for NodeConfig {
             bulk_replay_min: 8_192,
             startup_apply_batch: 131_072,
             test_max_record_bytes: None,
+            connections: connections::ConnectionsConfig::default(),
         }
     }
 }

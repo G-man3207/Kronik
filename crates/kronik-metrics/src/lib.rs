@@ -157,6 +157,41 @@ pub const METRICS: &[Def] = &[
         help: "Log ranges retention deleted before an export stream read them, by stream.",
         kind: Type::Counter,
     },
+    Def {
+        name: "kronik_connections_open",
+        help: "Long-lived connections open on this node, by actor kind and protocol (websocket, sse).",
+        kind: Type::Gauge,
+    },
+    Def {
+        name: "kronik_connections_opened_total",
+        help: "Connection opens, by actor kind, protocol and result (accepted, refused, failed, limit).",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_connections_closed_total",
+        help: "Connections closed, by actor kind, protocol and cause (client, actor, or the host's reason).",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_connection_frames_total",
+        help: "Frames, by actor kind, protocol and direction (in, out).",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_connection_frame_bytes_total",
+        help: "Frame payload bytes, by actor kind, protocol and direction (in, out).",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_connection_frames_dropped_total",
+        help: "Outgoing frames never written: their connection was closed, closing or not live, by actor kind and protocol.",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_connection_queued_bytes",
+        help: "Bytes all outgoing connection queues hold.",
+        kind: Type::Gauge,
+    },
 ];
 
 /// Histogram bucket bounds, in seconds.

@@ -39,6 +39,8 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`BAD_REQUEST`](#bad_request) | 400 | M1 | The request is malformed |
 | [`CAPABILITY_NOT_GRANTED`](#capability_not_granted) | 403 | M2 | The actor type lacks a capability for this effect |
 | [`CERTIFICATE_INVALID`](#certificate_invalid) | 400 | M6 | The TLS certificate cannot be used |
+| [`CONNECTION_LIMIT`](#connection_limit) | 503 | M24 | The gateway holds as many connections as it may |
+| [`CONNECTION_NOT_HELD`](#connection_not_held) | 403 | M24 | The actor used a connection it did not accept |
 | [`DEAD_LETTER_ALREADY_RESENT`](#dead_letter_already_resent) | 409 | M1 | The dead letter was already resent |
 | [`DEAD_LETTER_NOT_FOUND`](#dead_letter_not_found) | 404 | M1 | No such dead letter |
 | [`DEPLOYMENT_NOT_FOUND`](#deployment_not_found) | 404 | M3 | No such deployment |
@@ -208,6 +210,34 @@ Typical causes:
 To fix it, replace the files or let the gateway renew, then check again:
 
     kronik doctor
+
+## CONNECTION_LIMIT
+
+HTTP status 503, milestone M24. The gateway holds as many connections as it may.
+
+Default hint: Try again later; operators raise `[connections] max_open`, `max_per_actor` or `max_per_client`.
+
+The gateway refused to open a WebSocket or SSE connection because it already holds as many as it may: in total (`[connections] max_open`, which the open-file limit can lower further), for the actor that the route names (`max_per_actor`), or for the client's address (`max_per_client`; clients behind `[gateway] trusted_proxies` are not counted per address). No turn ran and nothing was recorded. The answer is 503 with `retry-after: 5`.
+
+Clients should reconnect with jittered backoff. Operators who expect more connections raise the limits in `kronik.toml` and give the daemon a higher open-file limit (the shipped unit has `LimitNOFILE=65536`); `kronik doctor` warns when the open-file limit is below `max_open`.
+
+    kronik doctor
+
+See also: [`connections`](concepts/glossary.md#connections), [`UNAVAILABLE`](#unavailable).
+
+## CONNECTION_NOT_HELD
+
+HTTP status 403, milestone M24. The actor used a connection it did not accept.
+
+Default hint: Only the actor that accepted a connection can send on it or close it; send that actor a message instead (`kronik explain connections`).
+
+A turn used a connection that its actor does not hold: `connections.send`, `broadcast`, `close` or `send-now` named a connection id that another actor accepted, or one that no actor accepted. Only the actor whose open turn accepted a connection (its owner) may send on it or close it, and an id is data, not a capability: storing it or sending it in a message grants nothing (ADR 0114). The turn failed with this code; an HTTP client gets `TURN_FAILED`, and a failed message, timer or frame input is a dead letter.
+
+To reach clients whose connections another actor holds, send that actor a message and let it forward the frame on its own connection, or let one actor (such as a room) accept all the connections it broadcasts to.
+
+    kronik history chat/lobby --limit 10
+
+See also: [`connections`](concepts/glossary.md#connections), [`dead-letters`](concepts/glossary.md#dead-letters), [`TURN_FAILED`](#turn_failed).
 
 ## DEAD_LETTER_ALREADY_RESENT
 

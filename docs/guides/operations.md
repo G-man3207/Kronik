@@ -936,6 +936,13 @@ with OIDC, Host must match the configured admin origin:
 | `kronik_export_errors_total` | counter | `stream` | Failed attempts, retried with backoff |
 | `kronik_export_dropped_total` | counter | `stream` | Records in batches the sink refused for good (OTLP 400) |
 | `kronik_export_gaps_total` | counter | `stream` | Ranges retention deleted before the stream read them |
+| `kronik_connections_open` | gauge | `kind`, `protocol` | WebSocket and SSE connections open on this node (M24) |
+| `kronik_connections_opened_total` | counter | `kind`, `protocol`, `result` | Opens: `accepted`, `refused`, `failed` or `limit` |
+| `kronik_connections_closed_total` | counter | `kind`, `protocol`, `cause` | Closes: `client`, `actor` or the host's reason |
+| `kronik_connection_frames_total` | counter | `kind`, `protocol`, `direction` | Frames `in` and `out` |
+| `kronik_connection_frame_bytes_total` | counter | `kind`, `protocol`, `direction` | Frame payload bytes `in` and `out` |
+| `kronik_connection_frames_dropped_total` | counter | `kind`, `protocol` | Outgoing frames never written (closed or closing connection) |
+| `kronik_connection_queued_bytes` | gauge | | Bytes all outgoing connection queues hold |
 
 A Prometheus scrape job:
 
