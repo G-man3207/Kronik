@@ -864,16 +864,7 @@ impl Ctx {
             self.print_raw(&error_json(e));
             return;
         }
-        let mut text = match e {
-            Error::Local(e) => render::error(e),
-            Error::Remote { status, body } => match serde_json::from_slice::<ApiError>(body) {
-                Ok(e) => render::error(&e),
-                Err(_) => format!(
-                    "error: the daemon answered HTTP {status}: {}\n",
-                    String::from_utf8_lossy(body).trim()
-                ),
-            },
-        };
+        let mut text = error_text(e);
         if let Some(url) = &self.url_flag
             && text
                 .lines()
@@ -903,15 +894,47 @@ fn error_json(e: &Error) -> Vec<u8> {
         Error::Remote { body, .. } if serde_json::from_slice::<ApiError>(body).is_ok() => {
             return body.clone();
         }
-        Error::Remote { status, .. } => ApiError::new(
-            ErrorCode::Unavailable,
-            format!("the API answered HTTP {status} without a Kronik error"),
-        )
-        .with_hint(
-            "Something between the CLI and the daemon (a proxy or a load balancer) answered; check that the URL is the daemon's server.api_listen.",
-        ),
+        Error::Remote { status, body } => foreign_answer(*status, body),
     };
     serde_json::to_vec(&local).unwrap_or_else(|_| local.to_json().to_string().into_bytes())
+}
+
+/// The human text of an error: code, message, hint and docs, the same error
+/// as [`error_json`] prints, so an answer that is not the API's is
+/// `UNAVAILABLE` with its hint in both (#41).
+fn error_text(e: &Error) -> String {
+    match e {
+        Error::Local(e) => render::error(e),
+        Error::Remote { status, body } => match serde_json::from_slice::<ApiError>(body) {
+            Ok(e) => render::error(&e),
+            Err(_) => render::error(&foreign_answer(*status, body)),
+        },
+    }
+}
+
+/// How much of an answer that is not the API's goes into the error message.
+const FOREIGN_EXCERPT_CHARS: usize = 200;
+
+/// The error of an answer that is not a Kronik error (a proxy's HTML page,
+/// an empty body): `UNAVAILABLE`, with the start of the body on one line.
+fn foreign_answer(status: u16, body: &[u8]) -> ApiError {
+    let text = String::from_utf8_lossy(body);
+    let mut excerpt = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if excerpt.chars().count() > FOREIGN_EXCERPT_CHARS {
+        excerpt = excerpt
+            .chars()
+            .take(FOREIGN_EXCERPT_CHARS)
+            .collect::<String>()
+            + "...";
+    }
+    let message = if excerpt.is_empty() {
+        format!("the API answered HTTP {status} without a Kronik error")
+    } else {
+        format!("the API answered HTTP {status} without a Kronik error: {excerpt}")
+    };
+    ApiError::new(ErrorCode::Unavailable, message).with_hint(
+        "Something between the CLI and the daemon (a proxy or a load balancer) answered; check that the URL is the daemon's server.api_listen.",
+    )
 }
 
 /// Whether a failed request may succeed when repeated: the daemon was not
@@ -1815,6 +1838,62 @@ mod tests {
         };
         assert_eq!(error_json(&e), api.into_bytes());
         assert!(!transient(&e));
+    }
+
+    /// #41: the human error for an answer that is not the API's is the same
+    /// UNAVAILABLE error as the JSON one: code, message, hint and docs.
+    #[test]
+    fn a_non_api_error_answer_becomes_unavailable_text() {
+        let e = Error::Remote {
+            status: 502,
+            body: b"<html>\n<body>Bad   Gateway</body>\n</html>".to_vec(),
+        };
+        let text = error_text(&e);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(
+            lines[0].starts_with("error: UNAVAILABLE: the API answered HTTP 502")
+                && lines[0].ends_with("<html> <body>Bad Gateway</body> </html>"),
+            "{text}"
+        );
+        assert!(
+            lines[1].starts_with("hint:") && lines[1].contains("proxy"),
+            "{text}"
+        );
+        assert_eq!(lines[2], "docs:  kronik explain UNAVAILABLE", "{text}");
+        // The same error as --json prints.
+        let v: serde_json::Value = serde_json::from_slice(&error_json(&e)).unwrap();
+        assert_eq!(
+            format!(
+                "error: UNAVAILABLE: {}",
+                v["error"]["message"].as_str().unwrap()
+            ),
+            lines[0]
+        );
+        // A long page is cut, an empty body says so.
+        let long = Error::Remote {
+            status: 504,
+            body: "x".repeat(10_000).into_bytes(),
+        };
+        assert!(error_text(&long).lines().next().unwrap().len() < 300);
+        let empty = Error::Remote {
+            status: 503,
+            body: Vec::new(),
+        };
+        assert!(
+            error_text(&empty).starts_with(
+                "error: UNAVAILABLE: the API answered HTTP 503 without a Kronik error\n"
+            ),
+            "{}",
+            error_text(&empty)
+        );
+        // A Kronik error is rendered as it came.
+        let api = ApiError::new(ErrorCode::ScopeMissing, "no");
+        let e = Error::Remote {
+            status: 403,
+            body: api.to_json().to_string().into_bytes(),
+        };
+        assert_eq!(error_text(&e), render::error(&api));
     }
 
     #[test]

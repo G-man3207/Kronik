@@ -116,6 +116,17 @@ hint:  Start the daemon with `kronik serve --api-socket /run/kronik/api.sock`, o
 docs:  kronik explain UNAVAILABLE
 ```
 
+An answer that is not the API's, such as a proxy's error page, is the same
+`UNAVAILABLE` error in both forms, with the start of the page in the
+message:
+
+```text
+$ kronik --url https://kronik.example.com actors list
+error: UNAVAILABLE: the API answered HTTP 502 without a Kronik error: <html><body>Bad Gateway</body></html>
+hint:  Something between the CLI and the daemon (a proxy or a load balancer) answered; check that the URL is the daemon's server.api_listen.
+docs:  kronik explain UNAVAILABLE
+```
+
 ## kronik serve
 
 Runs the daemon: it recovers from the log in the data directory, serves the

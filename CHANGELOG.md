@@ -144,6 +144,11 @@ M23, key and secret backends:
   holds a `+` (which the gateway creates and serves) answered `BAD_REQUEST`
   at `/v1/actors/<kind>/<key>` unless the client wrote `%2B`. A `+` in a path
   is now literal; in a query it still means a space (#47).
+- An answer that is not the API's (a proxy's error page, an empty body) made
+  the human CLI print an uncoded `error: the daemon answered HTTP 502: ...`
+  while `--json` printed `UNAVAILABLE` with a hint. Both now print the same
+  `UNAVAILABLE` error, with its hint, `docs:` line and the start of the page
+  (#41).
 
 ## v0.4.1 — 2026-11-07
 
