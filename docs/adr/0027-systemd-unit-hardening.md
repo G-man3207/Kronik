@@ -16,8 +16,9 @@ foreign-actor test runs the daemon outside systemd. When the unit was
 tested on test-vps it
 failed in two ways.
 
-1. **No sandbox starts.** Under the unit shipped with 927c80a, every
-   foreign actor fails with "creating container: cannot create gofer
+1. **No sandbox starts.** Under the unit shipped with the v0.1 release
+   candidate of 2026-10-27 (a development build before the public history),
+   every foreign actor fails with "creating container: cannot create gofer
    process: gofer: fork/exec /proc/self/exe: operation not permitted".
    Turning off one setting at a time, only `NoNewPrivileges=no` cures it.
 2. **`runsc restore` fails.** With `RestrictSUIDSGID=yes` it stops at
@@ -81,7 +82,8 @@ filter, so Kronik cannot work around it.
   restored a sandbox, kept it. Without it a sandbox's host side applies a
   setuid or setgid bit a guest sets: the residual risk below.
   - Image unpacking clears setuid and setgid bits (`mode & 0o1777`, the
-    sticky bit kept; 2858e0b), so no setid file comes from an image, and
+    sticky bit kept; `crates/kronik-foreign/src/oci.rs`), so no setid file
+    comes from an image, and
     images with such entries, such as postgres:17-alpine's
     `run/postgresql` (2777), start under any unit. The image builder
     (`tar_dir`) masks modes the same way, and so does `copy_tree`, which
@@ -130,8 +132,8 @@ the residual risk, which is wider than a compromised process:
 
 - **On test-vps, 2026-10-27, 20:09 UTC.**
   - Setup:
-    - The 927c80a release, installed by `install.sh` and
-      `kronik serve --init`.
+    - The v0.1 release candidate build of 2026-10-27, installed by
+      `install.sh` and `kronik serve --init`.
     - Then the installed unit replaced by this change's
       `deploy/systemd/kronik.service` (only `@KRONIK@` substituted;
       `diff` against the file: identical), `daemon-reload`, restart.

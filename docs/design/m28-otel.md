@@ -110,7 +110,7 @@ Further fixes:
 M28 builds on v0.1 and needs no other v0.2+ milestone. It can use M11's
 `TurnRecord.duration_us` (field 23) if M11 is implemented first (§3.3).
 
-## 1. What exists today (main 07bdeae)
+## 1. What existed when M28 was designed (2026-10-27, before v0.1.0)
 
 - **Log.** Every turn commits one `TurnRecord` (kind 3), with its `CausalKey
   {root, path}`, `logical_time_ms`, input, effects (`EffectRecord`, with

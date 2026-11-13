@@ -277,7 +277,8 @@ starts a background compaction that requires the mode to be `on`:
 - The fork's host never hands a real value to the fork's guests. Every
   tagged value a turn reads, sealed or plain, is replaced by
   `Pseudonyms::of(subject, plaintext)` = `pii:` + 12 hex of a keyed BLAKE3
-  (key `derive_key("kronik pseudonym v1", master)`, done in 895ff28). The
+  (key `derive_key("kronik pseudonym v1", master)`, in
+  `crates/kronik-privacy/src/keystore.rs`). The
   host unseals transiently to compute it, so equal values get equal
   pseudonyms and equality checks in guest logic still hold. Without the key,
   a pseudonym can't be checked against a guessed value. A production value

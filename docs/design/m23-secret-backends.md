@@ -86,7 +86,7 @@ Invariants that bind it:
 - **I2:** secrets reach guest code only through recorded host calls.
 - **I5:** configuration that changes behaviour goes through the log.
 
-## 1. Historical baseline (main 6c04dea)
+## 1. Historical baseline (2026-10-28, before v0.1.0)
 
 **The master key.**
 - `MasterKey([u8; 32])` (`kronik-privacy/src/lib.rs:43`) is a seed. Six

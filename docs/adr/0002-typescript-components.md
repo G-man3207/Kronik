@@ -43,9 +43,10 @@ Spike B has:
 The M0 spike notes are in the project wiki:
 https://github.com/G-man3207/Kronik/wiki/Spikes.
 
-The spike used `wit/kronik-actor.wit` as of `5a8d400`. The amendments in
-`b8a3b39` (`state.set-for`, `privacy.current-subject`) add functions to
-existing interfaces and change nothing below.
+The spike used the first draft of `wit/kronik-actor.wit`, the brief's
+`kronik:actor@0.1.0` of 2026-10-24. The amendments that M1 made to it
+(`state.set-for`, `privacy.current-subject`; `docs/design/m1-core.md` §5) add
+functions to existing interfaces and change nothing below.
 
 **Versions.** Node.js 26.10.0 and npm 11.19.1; `@bytecodealliance/jco` 1.39.0
 (it bundles TypeScript with rolldown 1.2.15); `@bytecodealliance/componentize-js`

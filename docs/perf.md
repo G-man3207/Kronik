@@ -3,6 +3,12 @@
 Measurements of the daemon against the build brief's targets. Every number here
 comes from a script in the repository; rerun it before quoting a number.
 
+The public history starts with the first `v0.1.0` release candidate
+(`ac93821c`, 2026-10-28). The development commits before it are not in the
+repository, so a result measured before it names its date and the change it
+measured instead of a commit, and the file that holds the change where that
+helps.
+
 ## Method
 
 - `scripts/perf-m1.sh [WORKDIR] [PORT] [SECONDS]` starts the release
@@ -31,7 +37,7 @@ comes from a script in the repository; rerun it before quoting a number.
 | OS | Debian 13 | Debian 13, no `/dev/kvm` |
 | 4 KiB `O_DSYNC` write | 1.08 ms | 0.85 ms |
 
-## Results (M1, 2026-10-25, commit 560d350)
+## Results (M1, 2026-10-25)
 
 Committed turns per second, and request latency in ms:
 
@@ -97,7 +103,7 @@ divided by the replay wall time (docs/design/m3-fork.md §10).
   replay without the diff and the diff build alone.
 - `scripts/acceptance-m3.sh` runs it with 12 000 requests at 200 req/s.
 
-### Results (development machine, 2026-10-25, commit 0047670)
+### Results (development machine, 2026-10-25)
 
 The numbers move by a factor of up to two between runs.
 
@@ -131,7 +137,7 @@ rebuilt store. Index time is building the root and causal maps.
 Isolated and continuous meet 20x. Both does not. The target is not lowered.
 An earlier bulk `turn_index` catch-up (1.73 s / 2.26 s / 3.26 s) is not this code.
 
-### Results (VPS, 2026-10-26, commit 970cb81)
+### Results (VPS, 2026-10-26, with the changes below)
 
 test VPS, release, `replay_speed --workers 2`, 12 000 requests at
 200 req/s, 60.01 s production window, identity diff empty in every run.
@@ -139,11 +145,11 @@ The load average is the 1-minute value from `uptime` before each run.
 
 | Run | Binary | Load | Isolated | Continuous | Both |
 | --- | --- | --- | --- | --- | --- |
-| before | 7e50134 | 1.49 | 1.87 s, 32.0x | 2.30 s, 26.1x | 3.43 s, 17.5x |
-| before | 7e50134 | 1.45 | 1.99 s, 30.2x | 2.34 s, 25.6x | 3.33 s, 18.0x |
-| 1 | 970cb81 | 2.22 | 1.47 s, 40.9x | 2.20 s, 27.2x | 2.54 s, 23.6x |
-| 2 | 970cb81 | 1.55 | 1.49 s, 40.4x | 2.10 s, 28.6x | 2.68 s, 22.4x |
-| 3 | 970cb81 | 1.45 | 1.72 s, 34.8x | 2.22 s, 27.1x | 2.47 s, 24.3x |
+| before | without the changes | 1.49 | 1.87 s, 32.0x | 2.30 s, 26.1x | 3.43 s, 17.5x |
+| before | without the changes | 1.45 | 1.99 s, 30.2x | 2.34 s, 25.6x | 3.33 s, 18.0x |
+| 1 | with the changes | 2.22 | 1.47 s, 40.9x | 2.20 s, 27.2x | 2.54 s, 23.6x |
+| 2 | with the changes | 1.55 | 1.49 s, 40.4x | 2.10 s, 28.6x | 2.68 s, 22.4x |
+| 3 | with the changes | 1.45 | 1.72 s, 34.8x | 2.22 s, 27.1x | 2.47 s, 24.3x |
 
 **Both meets 20x** in three consecutive runs; isolated and continuous got
 faster too.
@@ -165,14 +171,14 @@ What the profile showed:
 What changed:
 
 - The pooling allocator keeps up to 2 MiB of a reused linear memory
-  resident and zeroes it with memset (38a47ee). The kernel's share fell to
-  3%; isolated replay on the VPS went from 1.9 s to 1.4 to 1.7 s. Production
-  turns gain the same; a slot keeps at most what its instances used
-  resident.
+  resident and zeroes it with memset (`crates/kronik-runtime/src/engine.rs`).
+  The kernel's share fell to 3%; isolated replay on the VPS went from 1.9 s
+  to 1.4 to 1.7 s. Production turns gain the same; a slot keeps at most what
+  its instances used resident.
 - Each applied turn no longer writes the never-read `turn_actor` table,
-  and a batch no longer rewrites an unchanged `config_epoch` (8c3f83e).
+  and a batch no longer rewrites an unchanged `config_epoch`.
 - Isolated replay splits ranges for idle workers, and in both modes the
-  continuous task joins once it is done (970cb81). On this workload the
+  continuous task joins once it is done. On this workload the
   two halves finish close together, so the split rarely triggers; it pays
   when continuous replay is much shorter than isolated replay.
 - Measured and not kept: caching the overlay's `SAVEPOINT` and
@@ -180,7 +186,7 @@ What changed:
   5.6 s on the VPS); the split alone, without the memory change, left both
   at 3.38 and 3.40 s.
 
-### Memory cost of the resident Wasm memories (38a47ee)
+### Memory cost of the resident Wasm memories
 
 The pool has `2 × concurrency` linear memory slots per engine (one engine
 per daemon; forks and replays share it, `kronik upgrade check` builds its
@@ -249,7 +255,7 @@ the replay times below on a cold start only.
    example with another `--apply-batch`, the size of the batches that
    startup replay applies in one transaction (`NodeConfig.apply_batch`).
 
-### Results (development machine, 2026-10-26, commit c4d1904)
+### Results (development machine, 2026-10-26)
 
 The log after the snapshot: 3 072 001 records, 1.00 GiB, about 350 bytes
 per counter turn record. Absolute times are pessimistic; the ratios between
@@ -316,7 +322,7 @@ statement and builds the `(kind, key, lsn)` index when the replay finishes.
 Buffering `turn_index` and loading it in one transaction was slower
 (37.33 s, 33.48 s, 33.30 s) and is not this code.
 
-### Results (VPS, 2026-10-26, commit c852dae, streamed catch-up)
+### Results (VPS, 2026-10-26, streamed catch-up)
 
 test VPS, release, `startup_speed --gib 1.0 --reuse` on a log this
 tool wrote the same day (3 002 369 records, 1.00 GiB after the snapshot).
@@ -325,17 +331,17 @@ Three consecutive runs; the load average is the 1-minute value from
 
 | Run | Load | Without `state.db` | `state.db` at the snapshot |
 | --- | --- | --- | --- |
-| before (dd16701) | 1.54 | 32.73 s | 30.66 s |
-| before (dd16701) | 2.03 | 32.95 s | 33.82 s |
+| before | 1.54 | 32.73 s | 30.66 s |
+| before | 2.03 | 32.95 s | 33.82 s |
 | 1 | 0.07 | 19.71 s | 17.19 s |
 | 2 | 1.18 | 18.84 s | 16.85 s |
 | 3 | 1.61 | 19.43 s | 16.94 s |
-| 1 (7e50134) | 0.00 | 20.09 s | 16.76 s |
-| 2 (7e50134) | 1.13 | 18.76 s | 16.70 s |
-| 3 (7e50134) | 1.75 | 19.01 s | 16.92 s |
+| 1, later build | 0.00 | 20.09 s | 16.76 s |
+| 2, later build | 1.13 | 18.76 s | 16.70 s |
+| 3, later build | 1.75 | 19.01 s | 16.92 s |
 
 **The 30 s target is met.** (The load average before runs 2 and 3 is the
-previous run's own work.) The 7e50134 rows include the crash marker, the
+previous run's own work.) The later-build rows include the crash marker, the
 actor index on every node and the default page size (below); later commits
 do not change startup replay.
 
@@ -380,7 +386,7 @@ thread busy about 7 s) plus 6 to 7 s of rebuild.
 **`state.db` keeps SQLite's default page size.** The bulk replay used to
 rebuild `state.db` with 64 KiB pages first (a `VACUUM`), which stayed for
 the node's life and would have changed what the live applier writes per
-commit. Measured on the VPS at 2110c8c, `KRONIK_STARTUP_ONCE=1
+commit. Measured on the VPS on 2026-10-26, `KRONIK_STARTUP_ONCE=1
 startup_speed --reuse`, alternating binaries: 20.65, 21.00 and 19.88 s with
 64 KiB pages, 20.53, 20.70 and 19.41 s without (load average 0.1 to 1.8).
 The larger page bought nothing once `trees` is copied with SQLite's row
@@ -391,7 +397,7 @@ double-counted `state.db` behind: the replay keeps a marker file beside it,
 fsynced before journaling goes off and removed after `state.db` is fsynced
 at the end; a start that finds the marker discards `state.db` and rebuilds
 it from the snapshot and the log. The final fsync is part of the times
-above (about 1 s more than at c852dae).
+above (about 1 s more than with the streamed catch-up alone).
 
 
 ## Privacy mode overhead (M8)
@@ -423,9 +429,11 @@ the difference is under 2 standard deviations or under 3 %.
 
 ### Results (development machine, 2026-10-25)
 
-BASE is `28aac17`, the parent of the sealing commit. NEW is `28aac17` with
-only the M8 commits on top (`c99061f`, the API fix `ed47360`, `c90a633`,
-`eaf56b8`). 5 runs, niceness -10, on a loaded development machine:
+BASE is the development tree of 2026-10-25 just before M8's sealing. NEW is
+BASE with only the M8 changes on top: sealing, unsealing, erasure and
+`--no-pii` forks, a fix of the OpenAPI document, the recovery of an erasure
+without its record, and the change that keeps `off` mode free of copies. 5
+runs, niceness -10, on a loaded development machine:
 
 | Workload | Build | turns/s | p50 ms | p99 ms | CPU µs/record | log B/record |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -450,7 +458,7 @@ only the M8 commits on top (`c99061f`, the API fix `ed47360`, `c90a633`,
   looking for a sealed one, an integer column written and read with each
   state value (`kv.sealed`), and the subject tag on fetch and call effect
   records. A guest's state read moves the stored bytes out as before M8,
-  and plain SQL changesets are applied as before (`eaf56b8`).
+  and plain SQL changesets are applied as before.
 - **`on` costs log size more than time.** Each sealed value carries a key
   version, a 24-byte nonce and a 16-byte tag: +32 % log bytes per record
   for counter, +34 % for send, +57 % for notes (every tagged value of a turn
@@ -521,7 +529,7 @@ and runs these with the commands below. It does not run on a schedule.
   This runs the counter workload as one run of at least 1 000 000 executor
   steps, with a crash about every 0.3 to 1 s of virtual time.
 
-### Results (development machine, 2026-10-25, commit 2e3740f)
+### Results (development machine, 2026-10-25)
 
 The development machine was loaded during these runs, and the runs
 overlapped. Wall times are therefore upper bounds.
@@ -875,10 +883,10 @@ pair.
 
 These reports preserve observations made on `d9b946f2`-based and historical
 release builds, not on the current integrated binary.
-The immutable follow-up `d6759bc28a0724eb4a8ed1bd09eeb2685966ff30` removes
-implementation-only pointer/borrow/call-count assertions. Its seven tests check
-rendered bytes across all slots and shrinking substitutions, failure totals and
-first cause, histogram bounds, HTTP framing, invalid settings and missed slots.
-The older eight-test receipt remains unchanged. Current-product compatibility,
-documentation generation and real release-regression results must use the
-final coherent built product; physical M32 targets remain open.
+Since `58644b12`, the seven tests of `tools/loadgen` no longer assert
+implementation-only pointer, borrow or call counts; they check rendered bytes
+across all slots and shrinking substitutions, failure totals and first cause,
+histogram bounds, HTTP framing, invalid settings and missed slots.
+Current-product compatibility, documentation generation and real
+release-regression results must use the final coherent built product;
+physical M32 targets remain open.
