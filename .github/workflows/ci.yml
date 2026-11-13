@@ -34,6 +34,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The full history and tags: the ts step compares every released
+          # contract snapshot with its source at the release's producer
+          # revision (scripts/verify-compatibility.py), which a shallow
+          # checkout does not have, so the comparison would be skipped.
+          fetch-depth: 0
 
       # Installs the toolchain pinned in rust-toolchain.toml.
       - name: Install Rust
