@@ -46,6 +46,11 @@ until the v1.0 compatibility promise takes effect.
   while a turn is open in the state or in a kept snapshot, the snapshot's
   manifest names it, and a directory that already lost it fails with
   `STORAGE_CORRUPT` naming the turn's execution id.
+- `kronik upgrade check` passes after an erasure whose turns wrote state or
+  SQL rows: those writes, and every other difference of a turn that met
+  erased data (effects, response, errors, fuel), are no longer counted as
+  changes. Before, `ENGINE_UPGRADE_DIVERGED` failed the check and `serve`
+  refused the directory (issues #16, #27). A verified difference still fails.
 
 ## v0.4.1 — 2026-11-07
 

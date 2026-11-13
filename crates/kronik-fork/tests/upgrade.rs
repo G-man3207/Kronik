@@ -721,6 +721,204 @@ fn an_erased_turns_state_write_is_not_a_change() {
     keep(&dir, "erased-state");
 }
 
+/// One step of a privacy workload (the erasure tests, issue #48).
+enum Step<'a> {
+    /// A message to `actor` running `op` on `body`, sealed for `subject`
+    /// when there is one. It must commit, and every message it sends is
+    /// consumed before the next step, so production holds its whole tree.
+    Send(&'a str, &'a str, &'a str, Option<&'a str>),
+    /// `privacy erase <subject>`.
+    Erase(&'a str),
+}
+
+/// Waits until the turn at `lsn` is applied and every message committed so
+/// far is consumed: the mailbox holds a message from its sender's apply to
+/// its receiver's, in the same transaction as the receiver's own sends.
+async fn settle(node: &Node, lsn: u64) {
+    node.store().applied.wait(lsn).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let idle = {
+            let db = node.store().db();
+            db.mailbox().unwrap().is_empty() && db.open_turns().unwrap().is_empty()
+        };
+        if idle {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the workload's messages were not consumed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Deploys `guests`, turns privacy mode on and runs `steps`.
+fn privacy_workload(rt: &Runtime, dir: &Path, guests: &[&str], steps: &[Step<'_>]) {
+    let node = start(rt, dir).unwrap();
+    rt.block_on(async {
+        for g in guests {
+            node.deploy(&guest(g), audit(), false, owner(&node))
+                .await
+                .unwrap();
+        }
+        node.set_privacy_mode(pb::PrivacyState::On, audit(), false, owner(&node))
+            .await
+            .unwrap();
+        for step in steps {
+            match step {
+                Step::Send(actor, op, body, subject) => {
+                    let m = match subject {
+                        Some(s) => subject_msg(op, body, s),
+                        None => msg(op, body),
+                    };
+                    let r = node
+                        .send(
+                            ActorRef::parse(actor).unwrap(),
+                            m,
+                            audit(),
+                            false,
+                            owner(&node),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(r.committed(), "{actor} {op}: {r:?}");
+                    settle(&node, r.turn_id.lsn).await;
+                }
+                Step::Erase(subject) => {
+                    let done = node
+                        .erase_subject(subject, audit(), false, owner(&node))
+                        .await
+                        .unwrap();
+                    settle(&node, done.lsn.unwrap()).await;
+                }
+            }
+        }
+    });
+    drop(node);
+}
+
+/// Appends a crafted recording of a turn the guest cannot reproduce: a root
+/// `increment` that claims to have failed, with no effects and no writes. A
+/// replay of it is a verified difference (S-16 (2)).
+fn forge_failed_increment(rt: &Runtime, dir: &Path) {
+    let node = start_when_released(rt, dir);
+    let head = node.applied_lsn();
+    let (hash, input, epoch) = rt.block_on(async {
+        let mut hash = Vec::new();
+        let mut input = None;
+        let mut epoch = 0;
+        node.reader()
+            .read(1, head, |c| {
+                match &c.record {
+                    Record::Deployment(d) => {
+                        for k in &d.kinds {
+                            if k.kind == "counter" {
+                                hash = k.code_hash.clone();
+                            }
+                        }
+                    }
+                    Record::TurnRecord(t) if input.is_none() => {
+                        let msg = match t.input.as_ref().and_then(|i| i.kind.as_ref()) {
+                            Some(pb::input::Kind::Message(m)) => m.msg.as_ref(),
+                            _ => None,
+                        };
+                        if msg.is_some_and(|m| m.name == "increment") {
+                            input = t.input.clone();
+                            epoch = t.config_epoch;
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        (hash, input.unwrap(), epoch)
+    });
+    drop(node);
+    let forged = pb::TurnRecord {
+        execution_id: String::new(),
+        actor: Some(pb::ActorRef {
+            kind: "counter".into(),
+            key: "forged".into(),
+        }),
+        code_hash: hash,
+        engine_version: ENGINE_VERSION.into(),
+        causal_key: Some(pb::CausalKey {
+            root: "forged-root".into(),
+            path: Vec::new(),
+        }),
+        logical_time_ms: 0,
+        random_seed: vec![0u8; 32],
+        input: Some(input),
+        effects: Vec::new(),
+        outcome: Some(pb::Outcome {
+            kind: pb::OutcomeKind::Failed as i32,
+            error_code: "TURN_FAILED".into(),
+            message: "forged: the recording says this failed".into(),
+            output: None,
+        }),
+        config_epoch: epoch,
+        ..Default::default()
+    };
+    rt.block_on(async {
+        let env = Env::real(tokio::runtime::Handle::current());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (fatal, _fatal_rx) = tokio::sync::oneshot::channel();
+        let (log, _) = kronik_log::Log::open(
+            &env,
+            kronik_log::LogConfig::new(dir.join("branches").join("main").join("log"), "main"),
+            tx,
+            fatal,
+        )
+        .await
+        .unwrap();
+        log.append(Record::TurnRecord(forged)).await.unwrap();
+        drop(log);
+        drop(rx);
+    });
+}
+
+/// Issue #27 (workload d4b): an erased turn that wrote a state value sealed
+/// for the subject is unverifiable; its write is no change in either state
+/// section, so the check passes. A real divergence next to it still fails.
+#[test]
+fn an_erased_turns_state_value_is_no_change_but_a_real_divergence_fails() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter"],
+        &[
+            // `s` sealed for user:1 and `t` for user:2.
+            Step::Send("counter/a", "subject", "", Some("user:1")),
+            Step::Erase("user:1"),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(checked.report.passed, "{text}");
+    assert_eq!(checked.report.root_inputs, 2);
+    assert_eq!(checked.report.unverifiable, 1, "{text}");
+    assert_eq!(checked.diff.summary.divergent_turns, 0, "{text}");
+    assert!(!checked.diff.summary.changed);
+    assert!(checked.diff.state.isolated.is_empty(), "{text}");
+    assert!(checked.diff.state.continuous.is_empty(), "{text}");
+
+    forge_failed_increment(&rt, dir.path());
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(!checked.report.passed, "{text}");
+    assert!(checked.diff.summary.changed);
+    assert_eq!(checked.diff.summary.unverifiable, 1, "{text}");
+    assert_eq!(checked.diff.summary.divergent_turns, 1, "{text}");
+    keep(&dir, "erased-kv-and-real");
+}
+
 /// S-16 (5): the replay serves the recorded outcome of an erased request - an
 /// exact effect, not a synthetic denial the guest has to handle.
 #[test]
@@ -821,88 +1019,7 @@ fn a_real_divergence_still_fails_next_to_an_unverifiable_turn() {
     let passed = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
     assert!(passed.report.passed);
     assert_eq!(passed.report.unverifiable, 1);
-    let head = passed.report.checked_through_lsn;
-
-    // A crafted recording of a turn the guest cannot reproduce: a root
-    // increment that claims to have failed, with no effects and no writes.
-    let node = start(&rt, dir.path()).unwrap();
-    let (hash, input, epoch) = rt.block_on(async {
-        let mut hash = Vec::new();
-        let mut input = None;
-        let mut epoch = 0;
-        node.reader()
-            .read(1, head, |c| {
-                match &c.record {
-                    Record::Deployment(d) => {
-                        for k in &d.kinds {
-                            if k.kind == "counter" {
-                                hash = k.code_hash.clone();
-                            }
-                        }
-                    }
-                    Record::TurnRecord(t) if input.is_none() => {
-                        let msg = match t.input.as_ref().and_then(|i| i.kind.as_ref()) {
-                            Some(pb::input::Kind::Message(m)) => m.msg.as_ref(),
-                            _ => None,
-                        };
-                        if msg.is_some_and(|m| m.name == "increment") {
-                            input = t.input.clone();
-                            epoch = t.config_epoch;
-                        }
-                    }
-                    _ => {}
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
-        (hash, input.unwrap(), epoch)
-    });
-    drop(node);
-    let forged = pb::TurnRecord {
-        execution_id: String::new(),
-        actor: Some(pb::ActorRef {
-            kind: "counter".into(),
-            key: "forged".into(),
-        }),
-        code_hash: hash,
-        engine_version: ENGINE_VERSION.into(),
-        causal_key: Some(pb::CausalKey {
-            root: "forged-root".into(),
-            path: Vec::new(),
-        }),
-        logical_time_ms: 0,
-        random_seed: vec![0u8; 32],
-        input: Some(input),
-        effects: Vec::new(),
-        outcome: Some(pb::Outcome {
-            kind: pb::OutcomeKind::Failed as i32,
-            error_code: "TURN_FAILED".into(),
-            message: "forged: the recording says this failed".into(),
-            output: None,
-        }),
-        config_epoch: epoch,
-        ..Default::default()
-    };
-    rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let (fatal, _fatal_rx) = tokio::sync::oneshot::channel();
-        let (log, _) = kronik_log::Log::open(
-            &env,
-            kronik_log::LogConfig::new(
-                dir.path().join("branches").join("main").join("log"),
-                "main",
-            ),
-            tx,
-            fatal,
-        )
-        .await
-        .unwrap();
-        log.append(Record::TurnRecord(forged)).await.unwrap();
-        drop(log);
-        drop(rx);
-    });
+    forge_failed_increment(&rt, dir.path());
 
     let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
     assert!(!checked.report.passed, "{:?}", checked.report);

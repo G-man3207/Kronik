@@ -232,7 +232,7 @@ built: `live` (§11), `stubs`, `live_allowlist` and `no_pii` in `options`,
 | `exact`, `approximate`, `synthetic`, `live` | int | effect groundings over all fork effects (`live`: §11) |
 | `confidence` | number | `exact / (exact + approximate + synthetic + live)`; 1.0 without effects |
 | `verified_through_lsn` | int | the last main LSN whose root inputs ran through the fork's code |
-| `changed` | bool | any difference anywhere in the diff |
+| `changed` | bool | any difference the replay verified: not one of a turn that read pseudonyms or met erased data (S-16, ADR 0109); a policy's approval floor reads `pii_masked + pii_unverified` instead (ADR 0031) |
 | `pii_masked` | int | in a `--no-pii` fork, differing turns that read pseudonyms, not counted as divergent (M8); absent when 0 |
 | `preview_inputs` | int | in a preview fork, the requests it took at its URL (M11, §11); absent when 0 |
 

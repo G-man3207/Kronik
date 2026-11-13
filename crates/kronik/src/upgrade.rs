@@ -279,7 +279,8 @@ fn diverge_error(v: &UpgradeCheckOutput, window: &str) -> ApiError {
     ApiError::new(
         ErrorCode::EngineUpgradeDiverged,
         format!(
-            "identity replay of the last {window} is not empty ({} root inputs, diff {})",
+            "identity replay of the last {window} has a verified difference ({} root inputs, \
+             diff {})",
             v.root_inputs, v.diff_hash
         ),
     )

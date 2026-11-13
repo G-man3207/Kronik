@@ -1,7 +1,7 @@
 # 0109. Erased recorded input is unverifiable, not divergence
 
 - **Status:** Proposed
-- **Date:** 2026-11-08
+- **Date:** 2026-11-08, amended 2026-11-13 (point 3, issue #27)
 
 ## Context
 
@@ -56,9 +56,9 @@ divergent. Identity replay and `kronik upgrade check` treat it that way:
    are served this way: at an erased ordinal of another effect kind the guest
    asked for something else and the difference is real.
 3. **Do not count it.** A turn that met erased data is classified
-   `unverifiable`, and its differences - effects, response, errors, outcome -
-   are not counted as changes. Every other difference keeps the existing
-   fail-closed treatment.
+   `unverifiable`, and its differences - effects, response, errors, outcome,
+   the state and SQL rows it wrote, its fuel - are not counted as changes.
+   Every other difference keeps the existing fail-closed treatment.
 4. **Only pii-masked exclusion is wider.** `DiffSummary.changed` no longer
    includes `pii_masked`: a proposal whose only differences are turns that
    read pseudonyms also does not change observable behaviour. ADR 0031's
