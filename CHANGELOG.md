@@ -79,6 +79,44 @@ until the v1.0 compatibility promise takes effect.
 - A `--no-pii` fork replaces a production value that already looks like a
   pseudonym (`pii:` and 12 hex characters) like any other tagged value; only
   a value the fork itself wrote is read back as it is (#69).
+M23, key and secret backends:
+
+- Foreign actors get a secret linked to an external backend through the
+  node's secret cache, as the effects of turns do: `foreign add --secret` and
+  every start read it from the cache or its backend (`SECRET_UNAVAILABLE`
+  while the backend does not answer and nothing is cached; the next start
+  retries) instead of refusing the name with `SECRET_EXTERNAL`.
+- An unmatched `crypto.*` of a fork under a `compute` grant computes a name
+  linked at the fork point with the value the node already holds for that
+  link, and is denied with `SECRET_UNAVAILABLE` when it holds none, instead of
+  `SECRET_EXTERNAL` for every linked name. A fork still never asks a backend.
+- After a restart, the crash re-run of a turn that used an older version of a
+  linked secret made new effects use that version too, until `[secrets]
+  refresh` passed, although a newer one had been recorded. Found against a
+  real OpenBao.
+- An effect whose backend did not answer in time could fail with
+  `SECRET_UNAVAILABLE` although a value younger than `[secrets] max_stale` was
+  held. Found by the new DST scenario `secret-outage`.
+- The AWS Secrets Manager client takes an empty `NextToken` as the last page
+  (moto sends one), and the Azure Key Vault client reads a secret whose
+  `attributes` has no `enabled` (the emulator omits it).
+- New metrics `kronik_secret_fetch_total`, `kronik_secret_fetch_seconds`,
+  `kronik_secret_stale` and `kronik_secret_versions_total`, and
+  `kronik_key_source_up` is exported at last: it was set on every scrape and
+  dropped, as it was missing from the catalog (#38). A test now fails when the
+  daemon records a metric that the catalog lacks.
+- `kronik secret backends` (and its API) shows each backend's last success,
+  last error and the linked names without a cached value; the new `kronik
+  doctor` check `secrets` warns about them.
+- DST scenarios `--scenario allocator` (one allocator of secret versions under
+  concurrent first uses, refreshes and crashes) and `--scenario
+  secret-outage`; `scripts/dst.sh` runs them.
+- `scripts/e2e-secrets.sh` runs the external-secret criteria against OpenBao
+  (token and AppRole), moto's Secrets Manager and the GCP and Azure
+  emulators, pinned by digest; `scripts/e2e-cloud-secrets.sh` runs them
+  against the real clouds with an operator's credentials (not run by the
+  project); `scripts/e2e-pkcs11.sh` runs the `kronik-keyhelper` flow against
+  SoftHSM2.
 
 ## v0.4.1 — 2026-11-07
 

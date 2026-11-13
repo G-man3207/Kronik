@@ -265,7 +265,9 @@ the fork point's link. `kronik secret backends` shows each backend's last
 answer and last error and the linked names that have no cached value; the
 doctor check `secrets` warns about the same, and the metrics
 `kronik_secret_fetch_total`, `kronik_secret_fetch_seconds`,
-`kronik_secret_stale` and `kronik_secret_versions_total` count them.
+`kronik_secret_stale` and `kronik_secret_versions_total` count them. The
+end-to-end runs against OpenBao, moto, and the GCP and Azure emulators, and
+the script for the real clouds, are described in the design's §9.
 
 ### [privacy]
 
@@ -1927,11 +1929,14 @@ memory, so the loss can go unnoticed until the next start.
   variables when the daemon starts, so a change is seen at the next start. The
   node then records the new value as the next version, and the old value,
   which the provider cannot serve any more, keeps the inventory incomplete.
-- A KV version that the provider removed: destroyed by hand, or removed by the
+- A version that the provider removed: destroyed by hand, or removed by the
   mount's version limit when newer versions were written. This was checked
-  only against a local test server that answers 404 for such a version, as the
-  client expects. A real OpenBao, its default version limit, soft deletion and
-  undelete, and AWS, GCP and Azure were not tried.
+  against a local test server and, with `scripts/e2e-secrets.sh`, against a
+  real OpenBao (`kv destroy`), moto's Secrets Manager (the secret deleted
+  without recovery), the GCP Secret Manager emulator (`DestroySecretVersion`)
+  and the Azure Key Vault emulator (the version disabled): after a restart
+  the reads that scrub answered 503 on each. OpenBao's version limit, soft
+  deletion and undelete, and the real clouds were not tried.
 
 **What ends it.** If the provider serves the version again, the reads come
 back without a restart. This was checked four times with the test server,

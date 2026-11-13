@@ -1,22 +1,68 @@
 # M23: Key and secret backends (design)
 
 Status: B1 KMS lifecycle is implemented for OpenBao, AWS, GCP and Azure. B2
-to B4 (the backend trait, links and versions in the log, the cache and the
-five secret providers) have been in the code since v0.4.0. None of B2–B6 is
-accepted as a milestone; the project status page on the wiki has the state. Sections 1–13 contain the design proposal, including its historical
-loader inventory and the acceptance plan: where a sentence there says
-"planned", the table below decides. The B1 design gate at the end records the
-design that was implemented first. Implementation evidence is tracked with the
-code; a plan is not a pass.
+to B6 are in the code, and each has run as the table below says; whether M23
+is accepted is the maintainers' decision, and the project status page on the
+wiki has it. Sections 1–13 contain the design proposal, including its
+historical loader inventory and the acceptance plan: where a sentence there
+says "planned", the table below decides. The B1 design gate at the end records
+the design that was implemented first. Implementation evidence is tracked with
+the code; a plan is not a pass.
 
 | Slice | In the code | Has run | Not done |
 | --- | --- | --- | --- |
 | B1 master key in a KMS | OpenBao, AWS, GCP and Azure wrapping; `file` and `env` seeds; `keys wrap`, `rewrap`, `status` | `scripts/e2e-keys.sh` on pinned service images (the status page has the runs) | |
-| B2 trait, links, versions | `SecretBackend`; `SecretVersion` (kind 45) and `SecretLink` (kind 46); `secret link`, `unlink`, `refresh`, `history`, `backends`; effects resolve through links; re-runs fetch by `source_version`; `secrets` in the effects of `history` (added after v0.4.0) | `crates/kronik/tests/secret_backends.rs`: a real daemon against a stand-in for OpenBao's KV v2 (§9, criteria 2 and 3, steps 1 to 7) | the DST scenario "one allocator" |
-| B3 cache and outages | the cache and the refresher; `fetch_timeout`; `max_stale`; the failure cache of 5 s; an error result for an effect that cannot get its secret; scrubbing that fails closed; forks that never fetch | the same file: a hanging, a refusing and an unconfigured backend, restarts, crash re-runs (the stale-use bounds only by unit tests) | the resolver for foreign actors and forks (a stopgap refuses linked names, §6); the metrics and the doctor section of §6; the DST scenario `secret-outage` |
-| B4 providers | clients for `env`, `openbao` (KV v2, token, AppRole, certificate), `aws` (Secrets Manager), `gcp` and `azure` | unit tests for each (with a fake network for the four REST clients); OpenBao's KV v2 shape through the stand-in | any run against a real service, moto or an emulator |
-| B5 proof and docs | `secret_backends.rs`; the `[secrets]` table and two troubleshooting sections of the operations guide; the CLI, JSON, OpenAPI and error references | | the e2e suite with real services; `scripts/e2e-cloud-secrets.sh`, which has not been written |
-| B6 PKCS#11 | the `kronik-keyhelper` crate and its default-off release asset (ADR 0093) | | integrated acceptance with SoftHSM2 or a device |
+| B2 trait, links, versions | `SecretBackend`; `SecretVersion` (kind 45) and `SecretLink` (kind 46); `secret link`, `unlink`, `refresh`, `history`, `backends`; effects resolve through links; re-runs fetch by `source_version`; `secrets` in the effects of `history` | `crates/kronik/tests/secret_backends.rs` (§9, criteria 2 and 3, steps 1 to 7, against a stand-in for OpenBao's KV v2); the DST scenario `allocator` ("one allocator", step 8): seeds 0..40 pass | |
+| B3 cache and outages | the cache and the refresher; `fetch_timeout`; `max_stale`; the failure cache of 5 s; an error result for an effect that cannot get its secret; scrubbing that fails closed; foreign actors through the cache; forks that use only a held value and never fetch; the four metrics and `kronik doctor`'s `secrets` check (§6) | the same file (outage, refusal, restart and crash re-run cases, a fork and `foreign add` with a linked name); the DST scenario `secret-outage`: seeds 0..16 pass (4 of them fail without the stale fallback of this release); `scripts/e2e-secrets.sh` with each real service paused, and OpenBao also stopped | a foreign actor's start with a linked name has run only in unit tests and through `foreign add` (a start needs a sandbox) |
+| B4 providers | clients for `env`, `openbao` (KV v2, token, AppRole, certificate), `aws` (Secrets Manager), `gcp` and `azure` | unit tests for each; `scripts/e2e-secrets.sh` against the real services below, all passing on one run | OpenBao's certificate login and token renewal, and the cloud metadata/IMDS logins, against a real service; any real cloud |
+| B5 proof and docs | `secret_backends.rs`; `scripts/e2e-secrets.sh`; `scripts/e2e-cloud-secrets.sh`; the `[secrets]` table and the troubleshooting sections of the operations guide; the CLI, JSON, OpenAPI and error references | `scripts/e2e-secrets.sh`, see below | `scripts/e2e-cloud-secrets.sh` has **not been run**: the project has no AWS, GCP or Azure account for it |
+| B6 PKCS#11 | the `kronik-keyhelper` crate and its default-off release asset (ADR 0093); `[keys] source = "pkcs11"`; `keys enroll` | `scripts/e2e-pkcs11.sh` against SoftHSM2 2.6.1 with a **development build** of `kronik` and `kronik-keyhelper --features pkcs11`, see below | the release artifacts (musl daemon, glibc helper asset); a physical HSM; the rest of ADR 0093's acceptance list (staged restore, migration with `keys wrap`, helper crash/timeout/overflow drills) |
+
+**`scripts/e2e-secrets.sh`, 2026-11-13** (a development build of `kronik`,
+0.5.0-dev, SHA-256 `55fe5dd7…cb38514`; images by digest, ports on loopback):
+
+| Service | Image | Outcome |
+| --- | --- | --- |
+| OpenBao, KV v2 behind TLS, token auth | `openbao/openbao@sha256:5046911075e137e154ce49ab051502f4ec7cf367d484ae4a4dce665d9b90561f` (the B1 pin) | pass |
+| OpenBao, AppRole auth | the same | pass |
+| AWS Secrets Manager | `motoserver/moto@sha256:59a1965d845249b04def37a0e2565f9cc6c44543cb89b68e90f28f344b3b0d1a` (moto 5.2.5, the B1 pin) | pass, with a loopback shim: moto answers ListSecretVersionIds with the secret's name in `ARN`, and the shim puts back the ARN that DescribeSecret gives (10 answers corrected in a run of this service alone) |
+| GCP Secret Manager | `ghcr.io/blackwell-systems/gcp-secret-manager-emulator-dual@sha256:2c9d3bb0453fdff102b29af00b4abd9b2c6fa466031a9d8e6d93a270ba22a6e2` (1.9.0) | pass; the token from a loopback fixture that verifies the service-account RS256 JWT |
+| Azure Key Vault | `ghcr.io/rokeller/azure-keyvault-emulator@sha256:126d8433d11f4983dba5337352311bcf9278a566b415b0cbfd5eea2b7d8e9d88` (the B1 pin) | pass; client credentials through a loopback authority (the emulator checks the token's syntax only) |
+
+Each passed criterion 2 (the `SecretVersion` in the log, read from the
+segment files, has the hash a `file` node computes for the same value under
+the same master key and the service's own version id, and the effect's
+`SecretRef` names it; no value in a file, the daemon's output, or an answer of
+the API, the CLI or MCP) and criterion 3 steps 1 to 6 (§9: rotation, `secret
+history`, `@v1`/`@v2` in `history`, a fork from before the rotation replayed
+with 2 exact turns, no divergence and no synthetic or live effect while the
+service was paused; the crash re-run of a recorded reveal got the recorded
+version's value; a destroyed version made the re-run fail with
+`SECRET_VERSION_GONE`). With the service paused, turns without a secret that
+arrived through the gateway took at most 50 ms, also right after a restart,
+and a turn with an uncached secret failed in 1.8–1.9 s (`fetch_timeout` 2 s)
+with `SECRET_UNAVAILABLE` recorded; with OpenBao stopped or sealed, in under
+70 ms, as the connection is refused. Observed, not asserted: the first
+`kronik send` after a restart waited about 2 s while the service was paused,
+as an operator's mutation waits for the inventory before its reason is
+scrubbed (`[secrets] fetch_timeout`); and after a destroyed version and a
+restart, the reads that scrub answered 503 `SECRET_UNAVAILABLE` on all five
+(the known defect of the operations guide). The run found and this release
+fixes three defects: a re-run's older version became the current value after
+a restart, moto's empty `NextToken` was refused, and a Key Vault answer
+without `attributes.enabled` was refused.
+
+**`scripts/e2e-pkcs11.sh`, 2026-11-13** (development builds: `kronik`
+`55fe5dd7…cb38514`, `kronik-keyhelper` `e7b8a3eb…3ef99781`; Debian
+`softhsm2` 2.6.1-3 and `opensc` 0.26.1-2, module SHA-256 `f2c19104…2f753fd`):
+pass. `keys enroll` refused an extractable, modifiable key; a start with
+`source = "pkcs11"` wrote only `master.wrapped`; a secret survived a restart
+(unwrap through the helper) and a `keys rewrap`; the seed, learned by running
+the helper on the envelope, opened a copy of the data directory as an `env`
+key; neither the seed (raw, hex, base64), the PIN nor the secret's value was
+in the data directory, the configuration directory (the PIN file excepted),
+the daemon's output or SoftHSM's token directory; a wrong PIN stopped the
+start with `KEY_HELPER_FAILED` and wrote nothing.
 
 ## The brief
 
@@ -92,9 +138,9 @@ Invariants that bind it:
     production value only under a `compute` grant; a `recorded` grant, the
     default for a new grant since ADR 0112, denies it (`replay: no
     recording`) and uses no value. A grant written before the mode existed
-    is `compute`, so the gap remains for such grants. A name linked to an
-    external backend at the fork point is refused in either mode
-    (`SECRET_EXTERNAL`, see §6).
+    is `compute`, so the gap remains for such grants. Under `compute`, a
+    name linked to an external backend at the fork point uses the value
+    this process holds for that link, never a fetch (see §6).
 
 **Scrubbing.** `Node::secret_values()` decrypts every non-deleted version of
 every secret for each scrubbed API response and for foreign logs.
@@ -553,12 +599,12 @@ The third criterion: "Rotation of a secret shows up as a new version in
 ## 6. Caching, outages and timeouts (B3, ADR 0091)
 
 Built: the cache and the refresher, `fetch_timeout`, `max_stale`, the failure
-cache, scrubbing that fails closed and the error result of an effect that
-cannot get its secret. `secret_backends.rs` exercises the outage, refusal and
-restart cases against the stand-in, and unit tests the stale-use bounds. Not
-built, and marked below where they occur: the metrics, the doctor section, the
-resolver for foreign actors and forks (a stopgap refuses linked names) and the
-DST scenario `secret-outage`.
+cache, scrubbing that fails closed, the error result of an effect that cannot
+get its secret, the resolver for foreign actors and forks, the four metrics,
+the doctor section and the DST scenario `secret-outage`. `secret_backends.rs`
+exercises the outage, refusal and restart cases against the stand-in,
+`scripts/e2e-secrets.sh` against the real services (§9), and unit tests the
+stale-use bounds.
 
 The rule (I10): a backend that is down affects only effects that need its
 secrets, and only once Kronik has no usable value.
@@ -577,8 +623,13 @@ secrets, and only once Kronik has no usable value.
 - **An effect that needs a secret:**
   - **fresh cache:** uses it, with no I/O;
   - **stale cache** (refresh failed): uses it until `[secrets] max_stale`
-    (default 24 h). The gauge `kronik_secret_stale{name}` and a warning are
-    planned; a stale value is used without either;
+    (default 24 h). The gauge `kronik_secret_stale{name}` is 1 and the log
+    warns (`secret used stale`) while effects use a value older than
+    `refresh`; a fresh value sets it back to 0. A value is used stale also
+    when the fetch of a cold effect gives up at `fetch_timeout` (the
+    resolver's own deadline): the DST scenario `secret-outage` found a turn
+    that failed with `SECRET_UNAVAILABLE` there although a usable value was
+    held;
   - **no cache:** fetches with `[secrets] fetch_timeout` (default 2 s, Env
     timer).
     - On failure, the effect gets an error result, `SECRET_UNAVAILABLE`.
@@ -605,24 +656,29 @@ secrets, and only once Kronik has no usable value.
     - Only a failure is cached: for 5 s, so a burst of turns does not
       queue on a dead backend.
 - **Turns that use no linked secret never touch the cache or a backend.**
-  The DST scenario `secret-outage` (not written yet) is to assert this with a
-  backend that hangs forever: such turns commit at their normal rate.
-  `secret_backends.rs` shows it in a daemon with a hanging stand-in.
+  The DST scenario `secret-outage` asserts this with a backend that hangs:
+  such turns commit at their normal rate. `secret_backends.rs` shows it in a
+  daemon with a hanging stand-in, and `scripts/e2e-secrets.sh` with real
+  services stopped or paused.
 - **Retries:** the refresher backs off from 1 s up to `refresh`. A refused
   fetch (bad credentials) is logged as `secret fetch failed`, once for each 5 s
-  that the failure is remembered; it is not counted yet.
+  that the failure is remembered, and every request to a backend is counted
+  in `kronik_secret_fetch_total{backend,result}`.
 - **Token lifetimes:** OpenBao tokens are renewed with `renew-self` at half
   their TTL. AppRole logs in again when renewal fails. Cloud access tokens
   are refreshed before `expires_in`.
 - **Foreign actors:**
-  - They get their values from the same cache at start. A backend that is
-    down stops only a foreign start that has no cached value; the
-    supervisor's existing retry applies. **Until the resolver serves foreign
-    actors, the stopgap refuses a linked name:** `foreign add --secret` and
-    every start answer `SECRET_EXTERNAL` for a name that the node's
-    configuration of that moment links to a backend (the built-in store holds
-    an older value of it or none), and a name that is not linked is read as
-    before.
+  - They get their values from the same cache at start, through the node's
+    resolver with the configuration of that moment: a name that is not
+    linked is read from the built-in store, a linked one is the cache's value
+    of its link, fetched within `fetch_timeout` when none is held (and
+    recorded as a `SecretVersion` when that version is new). A backend that
+    is down stops only a foreign start that has no cached value: the start
+    fails with `SECRET_UNAVAILABLE` and the supervisor's existing retry
+    applies. `foreign add --secret` checks each name the same way. A link or
+    an unlink made after an actor was declared is seen by its next start.
+    (Until this release a stopgap refused a linked name with
+    `SECRET_EXTERNAL`.)
   - A rotation does not restart a running foreign actor. Its next start
     (after a crash or a daemon restart), or removing and adding it again,
     picks the new version; no command restarts one actor.
@@ -645,22 +701,38 @@ secrets, and only once Kronik has no usable value.
   refresh`.
 - **Forks never fetch** (I7): an unmatched effect in a fork that
   needs an external secret uses a value this process already holds for the
-  fork point's link and version; otherwise it is denied in the fork and the
-  diff marks it unverifiable. No provider audit log or bill sees a fork.
-  **Until the resolver serves forks, the stopgap denies every such effect:**
-  an unmatched `crypto.*` of a name that the fork point's configuration links
-  to a backend is denied with `SECRET_EXTERNAL` and graded synthetic, and the
-  built-in store is not asked. The fork point's configuration includes the
-  links of its window, so a fork from before the link, or after an unlink,
-  uses the built-in store as before.
-- **Metrics (planned; none of these four exists, and of the `kronik_secret_*`
-  family only `kronik_secret_recovery_stalled` does):**
-  - `kronik_secret_fetch_total{backend,result}`;
+  fork point's link (its backend, binding, reference and generation);
+  otherwise it is denied in the fork and the diff marks it unverifiable. No
+  provider audit log or bill sees a fork. Today that is an unmatched
+  `crypto.*` under a `compute` grant (ADR 0112): with a value held for the
+  link it is computed on the host, as for a built-in name, and the value is
+  the one the cache holds now for that link (a later version after a
+  rotation without a relink, as the built-in store's current value is for a
+  built-in name); without one it is denied with `SECRET_UNAVAILABLE` and
+  graded synthetic, and the built-in store is not asked. A preview computes
+  nothing. The fork point's configuration includes the links of its window,
+  so a fork from before the link, or after an unlink, uses the built-in store
+  as before. (Until this release a stopgap denied every such effect with
+  `SECRET_EXTERNAL`.)
+- **Metrics:**
+  - `kronik_secret_fetch_total{backend,result}`: every request to a backend
+    (current value, a version by its id, a page of the version list, a
+    link's check), with `result` `ok`, `unavailable`, `denied`,
+    `not_found`, `version_gone`, `invalid` or `cancelled`;
   - `kronik_secret_fetch_seconds{backend}`;
   - `kronik_secret_stale{name}`;
-  - `kronik_secret_versions_total{backend}`.
-- **Doctor (planned; `kronik doctor` has no such section):** each backend's
-  last success and error, and linked names with no cached value.
+  - `kronik_secret_versions_total{backend}`: versions this node recorded
+    (`file` for the built-in store);
+  - and, outside the family, `kronik_secret_recovery_stalled` and
+    `kronik_key_source_up`. Every name the daemon records is in the
+    catalog of `kronik-metrics`, which `/metrics` and OTLP walk; a test reads
+    the sources and fails when one is not (`crates/kronik-metrics/tests/catalog.rs`).
+- **Doctor:** the `secrets` check reads `GET /v1/secrets/backends` from a
+  running daemon: each backend's last success and last error, and the linked
+  names with no value an effect could use. It warns (`SECRET_UNAVAILABLE`)
+  when a backend's last request failed after its last answer, or a linked
+  name has no cached value. `kronik secret backends` shows the same
+  columns.
 
 ### 6.1 Configured immutable host MACs
 
@@ -912,19 +984,20 @@ Milestone "M23".
 ## 9. Acceptance plan and what has run
 
 The original full-M23 plan uses the following free services. The B1 KMS
-lifecycle has run against them. The external-secret criteria have run only
-against a stand-in for OpenBao's KV v2 shape (`secret_backends.rs`): the
-repository has no run of them against OpenBao itself, moto's Secrets Manager,
-the GCP and Azure emulators or the real clouds, and PKCS#11 runs remain
-planned.
+lifecycle has run against them. The external-secret criteria run against a
+stand-in for OpenBao's KV v2 shape (`secret_backends.rs`) and, with
+`scripts/e2e-secrets.sh`, against OpenBao itself, moto's Secrets Manager and
+the GCP and Azure emulators (the table at the top has the images and the
+outcomes). They have not run against the real clouds. The PKCS#11 flow runs
+against SoftHSM2 with `scripts/e2e-pkcs11.sh`; no physical HSM was used.
 
 | What | With | Licence |
 |---|---|---|
 | Vault-compatible backend and the KMS path | `openbao/openbao` (KV v2 + transit), dev mode | MPL-2.0 (a separately run server, not linked) |
-| AWS KMS, and Secrets Manager (secrets: run planned) | `motoserver/moto` | Apache-2.0 |
-| GCP Secret Manager (run planned) | Blackwell Systems REST emulator | Apache-2.0, third party |
-| Azure Key Vault RSA wrap/unwrap (secrets: run planned) | rokeller emulator, pinned B1 version/digest | Apache-2.0, third party |
-| PKCS#11 (maintainer-gated B6 proposal) | proposed SoftHSM2 run, not exercised by B1 | BSD-2-Clause |
+| AWS KMS, and Secrets Manager | `motoserver/moto` | Apache-2.0 |
+| GCP Secret Manager | Blackwell Systems REST emulator (`gcp-secret-manager-emulator-dual`) | Apache-2.0, third party |
+| Azure Key Vault RSA wrap/unwrap, and secrets | rokeller emulator, the pinned B1 digest | Apache-2.0, third party |
+| PKCS#11 | SoftHSM2 2.6.1 (Debian package), with OpenSC 0.26.1 | BSD-2-Clause |
 | GCP Cloud KMS | Blackwell Systems dual REST KMS emulator, pinned B1 digest | Apache-2.0, third party |
 
 Not used:
@@ -955,19 +1028,26 @@ being written to disk"** (`scripts/e2e-keys.sh`; observed runs are in the projec
    configuration. The restored node installs the shipped `master.wrapped`,
    unwraps through OpenBao, and its secrets and sealed values decrypt.
 
-The same flow runs for `aws` (moto KMS), `azure` (emulator wrapkey) and
-`pkcs11` (SoftHSM2: `softhsm2-util --init-token`, then an AES key created
-with `pkcs11-tool --keygen` as non-extractable). For `pkcs11` the needle
-search also covers SoftHSM's token directory, which holds its own encrypted
-key store. All of these run the **release artifacts** (`kronik-*-musl` and
-`kronik-keyhelper`), never a development build.
+The same flow runs for `aws` (moto KMS) and `azure` (emulator wrapkey), on
+the **release artifacts**. For `pkcs11`, `scripts/e2e-pkcs11.sh` runs it
+against SoftHSM2: `softhsm2-util --init-token`, then an AES-256 key made
+through PKCS#11 itself (`C_GenerateKey`; `pkcs11-tool --keygen` cannot set
+`CKA_MODIFIABLE`, which the helper requires to be false), `kronik keys
+enroll`, a fresh start, a secret, a restart, `keys rewrap` and a wrong PIN;
+it learns the seed by running the helper on the envelope and proves it by
+opening a copy of the data directory with it. Its needle search also covers
+SoftHSM's token directory, which holds its own encrypted key store. It ran on
+a **development build** of `kronik` and of `kronik-keyhelper --features
+pkcs11` (the table at the top); a run of the release artifacts, and of a
+physical HSM, is not claimed.
 
 **B2–B4 criterion 2: "Secrets from an external backend get a version
 hash in the log, just as with the built-in store"**
 (`crates/kronik/tests/secret_backends.rs` runs steps 1 to 4 below, and the
 steps of criterion 3, against a real `kronik serve` and a local fake that
-speaks the KV v2 shape of the OpenBao client; a run against `openbao/openbao`
-itself is still planned):
+speaks the KV v2 shape of the OpenBao client; `scripts/e2e-secrets.sh` runs
+the same steps against each real service, reading the `SecretVersion` and
+the effect's `SecretRef` from the log's segment files itself):
 1. Link `stripe` to `secret/payments#key`. A turn uses it in an HMAC.
 2. The log has a `SecretVersion {stripe, 1, hash, backend "bao",
    source_version "1"}`. The effect's `SecretRef` has version 1 and the
@@ -1001,29 +1081,56 @@ in `history`, and replay of old turns is not affected":**
    uses and the refresher on a rotated backend gives exactly one record per
    `source_version`, with dense numbers.
 
-Steps 1 to 7 of criterion 3 run in `secret_backends.rs`; step 8 is a DST
-scenario and is still planned. The fake answers 404 for a version it has
-destroyed, as the client expects; what a real OpenBao answers is what the
-planned run against it must show.
+Steps 1 to 7 of criterion 3 run in `secret_backends.rs`, and steps 1 to 6
+in `scripts/e2e-secrets.sh` against each service: there the fork of step 4
+runs while the service is paused, so it cannot have asked it, and the
+destroyed version of step 6 is the service's own (OpenBao `kv destroy`, GCP
+`DestroySecretVersion`; Secrets Manager destroys no single version, so the
+script deletes the secret without recovery, and Key Vault disables the
+version). Step 8 is the DST scenario `allocator` (`scripts/dst.sh 0..N 8
+--scenario allocator`): two to four clients HMAC with the linked name in
+bursts, the simulated OpenBao rotates it, an operator refreshes it, the
+refresher runs every 100 to 600 ms, the node crashes, and after each rotation
+two turns of two actors need the new version in the same instant. Every
+version number of the name is reserved once and ends active or failed, the
+numbers are dense after the format fence, each `source_version` has exactly
+one active number, each recorded HMAC was made with the value of the version
+its `SecretRef` names, and both first uses after a rotation use the new
+version.
 
 **Outages (I10):**
-- DST scenario `secret-outage`: a fake backend that hangs. Turns without
-  secrets commit at their normal rate. Turns with a cached secret use it.
-  Turns with an uncached secret fail with, or handle, `SECRET_UNAVAILABLE`
-  within `fetch_timeout`, and leave no open `TurnBegin`.
+- DST scenario `secret-outage` (`--scenario secret-outage`): the simulated
+  OpenBao hangs for four fetch timeouts and up to 3 s more. Turns without
+  secrets commit at their normal rate (within 250 ms of virtual time). Turns
+  with a cached secret use it. Turns with an uncached secret fail with, or
+  handle, `SECRET_UNAVAILABLE` within `fetch_timeout`, the error recorded as
+  the effect's result, and leave no open `TurnBegin`. After the outage and
+  the 5 s for which a failure is remembered, the uncached secret works.
 - `secret_backends.rs` makes the fake hang and checks the same in a real
   daemon: turns without secrets commit at once, and a turn with an uncached
   secret ends within `fetch_timeout` as a failed turn that names
   `SECRET_UNAVAILABLE`, with nothing sent to the target, no open `TurnBegin`
   (also for a timer's turn and after a restart) and no second request for one
   `Idempotency-Key`. Every scenario of that file ends by checking that no
-  `TurnBegin` is open once the daemon is quiet. A run that stops a real
-  OpenBao mid-run is still planned.
+  `TurnBegin` is open once the daemon is quiet.
+- `scripts/e2e-secrets.sh` does the same with each real service paused
+  (`docker pause`: every request hangs), and OpenBao also stopped and started
+  again (it comes back sealed, and requests are refused until it is
+  unsealed): turns without a secret that arrive through the gateway commit
+  within milliseconds, also right after a restart; a cached secret is used; a
+  turn with an uncached secret fails within `fetch_timeout` with
+  `SECRET_UNAVAILABLE: <name>` as its effect's recorded error and no open
+  `TurnBegin`; the crash re-run of a recorded reveal waits while the service
+  is down and then gets the recorded version's value.
 
-**Cloud providers for real** (planned): `scripts/e2e-cloud-secrets.sh` is to
-run against real AWS, GCP and Azure only with the operator's own credentials.
-It does not exist yet. It would not be in CI: about $1 a month per KMS key,
-plus API calls. Running it once before release is the maintainers' call (§13).
+**Cloud providers for real:** `scripts/e2e-cloud-secrets.sh` runs the
+checks of `scripts/e2e-secrets.sh` against the real AWS Secrets Manager, GCP
+Secret Manager and Azure Key Vault with the operator's own credentials (the
+cloud CLIs for the test's own writes; environment variables and credential
+files for the daemon), except the outages, as a test cannot stop a real
+service. It makes one secret per cloud and deletes it. It is not in CI and
+**has not been run**: the project has no cloud accounts for it. Running it
+once before a release is the maintainers' call (§13).
 
 ## 10. Determinism and invariants
 
@@ -1049,9 +1156,9 @@ plus API calls. Running it once before release is the maintainers' call (§13).
   records an error result for the effect instead of abandoning its `TurnBegin`
   (§6). Two checks guard the invariant in general: every daemon scenario of
   `secret_backends.rs` ends by checking that no `TurnBegin` is open once the
-  daemon is quiet, and DST checks the same after every drain. No DST scenario
-  makes a secret unavailable, so the secret case itself is guarded by
-  `secret_backends.rs`.
+  daemon is quiet, and DST checks the same after every drain, also in the
+  scenario `secret-outage`, where a backend hangs while turns need its
+  secrets.
 - **I10:** both features are opt-in. `file` stays the default for both,
   with no behaviour change for existing nodes apart from the new
   `SecretVersion` records.
@@ -1059,12 +1166,13 @@ plus API calls. Running it once before release is the maintainers' call (§13).
   pre-M23 binary refuses a log with them, as for every new kind.
 - **Forks:**
   - A fork reads the links and versions of its fork point from the log.
-  - A fork never fetches from a backend (§6); a name linked at the fork
-    point is refused for an unmatched `crypto.*` (the stopgap of §6). With
-    the built-in store, unmatched fork crypto uses the current value only
-    under a `compute` grant; `recorded`, the default for a new grant since
-    ADR 0112, denies it. A grant from before the mode stays `compute` (the
-    known gap, now opt-in).
+  - A fork never fetches from a backend (§6); under a `compute` grant an
+    unmatched `crypto.*` of a name linked at the fork point uses the value
+    this process holds for that link or is denied. With the built-in store,
+    unmatched fork crypto uses the current value only under a `compute`
+    grant; `recorded`, the default for a new grant since ADR 0112, denies
+    it. A grant from before the mode stays `compute` (the known gap, now
+    opt-in).
   - A fork never records new `SecretVersion`s in main's log.
 - **Cluster (M16):** each node fetches independently; the metadata leader
   allocates version numbers (§5.1).
