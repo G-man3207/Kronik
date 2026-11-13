@@ -524,9 +524,19 @@ fn microvm_leaf(bundle: bool, unit: Option<RootUnit>) -> Option<Check> {
 /// Whether the process runs as root. Without `--rootless` this says what it
 /// said before M21; with it, the identity the checks ran as.
 fn root(rootless: bool) -> Check {
-    use std::os::unix::fs::MetadataExt as _;
-    match (std::fs::metadata("/proc/self").map(|m| m.uid()), rootless) {
-        (Ok(0), false) => check(
+    // The effective uid itself: the owner of /proc/self is root for a process
+    // that is not dumpable, which `--rootless` makes the doctor before it
+    // becomes the service user.
+    let initial_namespace = std::fs::read_to_string("/proc/self/uid_map")
+        .is_ok_and(|map| kronik_foreign::sys::parse_map(&map) == [[0, 0, u32::MAX]]);
+    root_identity(kronik_foreign::sys::euid(), initial_namespace, rootless)
+}
+
+/// [`root`] for an effective uid, and whether the process is in the initial
+/// user namespace.
+fn root_identity(euid: u32, initial_namespace: bool, rootless: bool) -> Check {
+    match (euid, rootless) {
+        (0, false) => check(
             "root",
             Status::Pass,
             "running as root, as the daemon does in v0.1",
@@ -537,15 +547,28 @@ fn root(rootless: bool) -> Check {
             "not running as root: some checks see less than the daemon will",
         )
         .hint("sudo kronik doctor"),
-        (Ok(0), true) => check(
-            "root",
-            Status::Pass,
-            "running with namespace root authority (host-root only in explicit root mode)",
-        ),
-        (_, true) => check(
+        (0, true) if initial_namespace => check(
             "root",
             Status::Warn,
-            "running as a nonroot host user; namespace setup is reported separately",
+            "running as host root, not as the nonroot service's user: the checks below see more \
+             than the service will",
+        )
+        .hint(
+            "let `sudo kronik doctor --rootless` become the kronik user \
+             (`sudo kronik serve --init --rootless` creates it), or run doctor as that user",
+        ),
+        (0, true) => check(
+            "root",
+            Status::Pass,
+            "running as root of a user namespace: namespace-local authority only",
+        ),
+        (uid, true) => check(
+            "root",
+            Status::Pass,
+            format!(
+                "running as host uid {uid}, as the nonroot service does; its namespace is \
+                 checked by `pin`"
+            ),
         ),
     }
 }
@@ -1688,6 +1711,28 @@ mod tests {
         let passed = check("kernel", Status::Pass, "Linux 6.12");
         assert!(passed.hint.is_none());
         assert!(!format_check(&passed).contains("hint:"));
+    }
+
+    /// The `root` row names the identity the checks ran as. With `--rootless`
+    /// that is the service's host user, root of a user namespace, or host root,
+    /// which only warns: the checks then see more than the service will.
+    #[test]
+    fn the_root_row_names_the_identity_the_checks_ran_as() {
+        let row = |euid, initial, rootless| {
+            let c = root_identity(euid, initial, rootless);
+            (c.status, c.message)
+        };
+        assert_eq!(row(0, true, false).0, Status::Pass);
+        assert_eq!(row(1000, true, false).0, Status::Warn);
+        let (status, message) = row(0, true, true);
+        assert_eq!(status, Status::Warn);
+        assert!(message.contains("host root"), "{message}");
+        let (status, message) = row(0, false, true);
+        assert_eq!(status, Status::Pass);
+        assert!(message.contains("user namespace"), "{message}");
+        let (status, message) = row(998, true, true);
+        assert_eq!(status, Status::Pass);
+        assert!(message.contains("host uid 998"), "{message}");
     }
 
     /// `sudo kronik doctor --rootless` checks the key source as root, before
