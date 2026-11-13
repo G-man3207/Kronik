@@ -4,6 +4,7 @@
   "description": "The TypeScript example actors, built with `kronik build` (scripts/build-examples-ts.sh).",
   "workspaces": [
     "billing-ts",
+    "chat-ts",
     "counter-ts",
     "notes-ts",
     "todo-ts",

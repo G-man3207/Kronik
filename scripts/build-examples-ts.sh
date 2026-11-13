@@ -7,6 +7,10 @@
 #   counter-ts-step2.wasm                  counter-ts adding 2, for the M3
 #                                          demo (COUNTER_NEW)
 #   todo-ts.wasm                           to-do lists with a sweep timer
+#   chat-ts.wasm                           chat rooms over WebSocket and SSE
+#                                          (M24)
+#   chat-ts-step2.wasm                     chat-ts with a changed message
+#                                          format, for the M24 acceptance
 #   uptime-ts.wasm                         uptime checks with standard fetch
 #                                          through wasi:http (M22)
 #   webhook-relay-ts.wasm                  twin of webhook-relay-rs
@@ -30,12 +34,14 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 bin="${KRONIK_BIN:-${CARGO_TARGET_DIR:-target}/release/kronik}"
 npm ci --prefix examples --no-audit --no-fund
 mkdir -p examples/dist
-for example in counter-ts notes-ts todo-ts uptime-ts webhook-relay-ts; do
+for example in chat-ts counter-ts notes-ts todo-ts uptime-ts webhook-relay-ts; do
     "$bin" build --dir "examples/$example"
     cp "examples/$example/dist/$example.wasm" "examples/dist/$example.wasm"
 done
 "$bin" build --dir examples/counter-ts --entry src/step2.ts
 cp examples/counter-ts/dist/counter-ts-step2.wasm examples/dist/counter-ts-step2.wasm
+"$bin" build --dir examples/chat-ts --entry src/step2.ts
+cp examples/chat-ts/dist/chat-ts-step2.wasm examples/dist/chat-ts-step2.wasm
 # billing-ts's package is called billing, so its dist/ matches the brief's
 # ./dist/billing.wasm.
 for entry in actor ledger eu-vat; do
