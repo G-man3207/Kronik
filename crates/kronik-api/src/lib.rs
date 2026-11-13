@@ -1938,6 +1938,10 @@ impl Api {
                     binding: source.binding,
                     configured: source.configured,
                     inventory_complete: source.inventory_complete,
+                    last_success_ms: source.last_success_ms,
+                    last_error_ms: source.last_error_ms,
+                    last_error: source.last_error,
+                    uncached: source.uncached,
                 })
                 .collect(),
         })

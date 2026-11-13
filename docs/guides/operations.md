@@ -258,7 +258,14 @@ and [0104](../adr/0104-admin-ui-as-a-public-api-client.md).
 | `fetch_timeout` | `"2s"` | The longest a request to a backend, or a secret change waiting for the inventory to be published again, takes; at most `"60s"`. When the wait for the inventory runs out, `kronik secret set`, `delete`, `link`, `unlink` and `refresh` answer 503 `SECRET_UNAVAILABLE` saying that the change is already committed: it is made, so do not repeat it. A mutation that begins while the inventory is being rebuilt waits for it for this long plus 5 s before its reason is recorded |
 
 External backends are defined in `[secrets.backends.<id>]` tables; see the
-[M23 design](../design/m23-secret-backends.md).
+[M23 design](../design/m23-secret-backends.md). Effects, foreign actors'
+starts and `foreign add --secret` all read a linked name through the same
+in-memory cache, and a fork uses only a value the cache already holds for
+the fork point's link. `kronik secret backends` shows each backend's last
+answer and last error and the linked names that have no cached value; the
+doctor check `secrets` warns about the same, and the metrics
+`kronik_secret_fetch_total`, `kronik_secret_fetch_seconds`,
+`kronik_secret_stale` and `kronik_secret_versions_total` count them.
 
 ### [privacy]
 
@@ -619,6 +626,8 @@ rather than fail, unless `kronik.toml` asks for what is missing
 | `dns01_hook` | `[tls] dns01_hook` is set and is not an executable file (`BAD_REQUEST`, failure); the cached `*.<preview_domain>` certificate has expired (`CERTIFICATE_INVALID`, failure), expires within 30 days or isn't cached yet (warning) | `chmod +x` the hook, or fix the path; for the certificate, read the hook's output in the daemon log; see [Preview forks](#preview-forks-a-wildcard-certificate-by-dns-01) |
 | `ship` | `[ship] endpoint` is not an `http://` or `https://` URL (`BAD_REQUEST`, failure) or is not reachable over TCP (`UNAVAILABLE`, failure); passes when shipping is off | Set an `http://` or `https://` endpoint, and check DNS and the firewall |
 | `export` | With `[otel]` or `[audit]` on and the daemon answering on `server.api_socket`: a stream with lag has not delivered for 10 × its `interval`, or the audit export has held retention for longer than `[retention] history` (warnings); passes without a daemon | `kronik export status` shows the sink's last error code; fix the sink, or see [the audit log](#the-audit-log) |
+| `key_source` | The configured master-key source cannot load the key (its error code, such as `KEY_SOURCE_UNAVAILABLE` or `KEY_HELPER_FAILED`, failure), or a bootstrap credential lies under the data directory (warning). With a running daemon it asks `GET /v1/keys` instead | Check the provider, the credentials, the key version and the memory-lock limit; see [the master key](#the-master-key) |
+| `secrets` | With the daemon answering on `server.api_socket`: an external secret backend's last request failed after its last answer, or a linked name has no cached value (`SECRET_UNAVAILABLE`, warning); passes without a daemon or without external backends | `kronik secret backends` shows each backend's last answer and error; the log's `secret fetch failed` lines say why. See [a turn whose effect cannot get its secret](#a-turn-whose-effect-cannot-get-its-secret) |
 
 ## Metrics and logs
 
@@ -642,6 +651,10 @@ with OIDC, Host must match the configured admin origin:
 | `kronik_disk_below_reserve` | gauge | | 1 while free space is below `[log] disk_reserve` (also `"low_disk": true` in `/v1/health` and `/healthz`) |
 | `kronik_key_source_up` | gauge | | 1 when the master key was loaded through its source, 0 on a node without a secret store. A KMS or HSM outage stops only a start, and a daemon that did not start exports nothing: alert on the scrape failing (Prometheus `up == 0`); `kronik doctor`'s `key_source` check then names the code |
 | `kronik_secret_recovery_stalled` | gauge | | Re-runs of open turns waiting for a recorded secret value or an unavailable prerequisite |
+| `kronik_secret_fetch_total` | counter | `backend`, `result` | Requests to external secret backends: `ok`, `unavailable`, `denied`, `not_found`, `version_gone`, `invalid` or `cancelled` |
+| `kronik_secret_fetch_seconds` | histogram | `backend` | How long a backend took to answer, or until the request gave up |
+| `kronik_secret_stale` | gauge | `name` | 1 while effects use a secret's cached value past `[secrets] refresh` because its backend does not answer (until `max_stale`) |
+| `kronik_secret_versions_total` | counter | `backend` | Secret versions this node recorded (`file` for the built-in store) |
 | `kronik_turns_total` | counter | `kind`, `outcome` | Turns by actor type and outcome: `committed`, `rejected` or `failed` |
 | `kronik_turn_duration_seconds` | histogram | `kind` | Turn duration |
 | `kronik_log_records_appended_total` | counter | | Records written to the log |

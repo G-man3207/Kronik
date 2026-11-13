@@ -667,6 +667,23 @@ pub struct SecretBackendView {
     pub binding: String,
     pub configured: bool,
     pub inventory_complete: bool,
+    /// When this node last got an answer from the backend (wall clock, ms).
+    /// Absent before its first answer, and for `file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_ms: Option<u64>,
+    /// When a request of this node to the backend last failed (wall clock,
+    /// ms). Absent when none has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_ms: Option<u64>,
+    /// How it failed: `unavailable`, `denied`, `not_found`, `version_gone`
+    /// or `invalid`. Never a provider's words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Names linked to the backend that have no value an effect could use
+    /// now: the next effect that needs one asks the backend, and fails with
+    /// SECRET_UNAVAILABLE while it does not answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncached: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

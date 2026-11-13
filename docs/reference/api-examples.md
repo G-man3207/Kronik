@@ -280,7 +280,10 @@ Never use a production credential for this example.
 
 Inspect actual backend IDs, kinds, bindings, `configured` and
 `inventory_complete` before selecting a source. Configuration and complete
-historical inventory are separate facts, not a provider health guarantee.
+historical inventory are separate facts, not a provider health guarantee;
+`last_success_ms`, `last_error_ms`, `last_error` and `uncached` say what
+this node last heard from each external backend and which linked names it
+would have to fetch.
 
 ```http
 GET /v1/secrets/backends HTTP/1.1

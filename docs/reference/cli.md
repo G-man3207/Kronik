@@ -180,6 +180,10 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_disk_below_reserve` | gauge | 1 while the log's file system is below [log] disk_reserve: new inputs and changes are refused. |
 | `kronik_key_source_up` | gauge | 1 when the daemon loaded its master key through its key source ([keys] source); 0 without a secret store. |
 | `kronik_secret_recovery_stalled` | gauge | Re-runs of open turns waiting for a recorded secret value or for an unavailable prerequisite. |
+| `kronik_secret_fetch_total` | counter | Requests to external secret backends, by backend and result (ok, unavailable, denied, not_found, version_gone, invalid, cancelled). |
+| `kronik_secret_fetch_seconds` | histogram | Time an external secret backend took to answer, or until the request gave up, by backend. |
+| `kronik_secret_stale` | gauge | 1 while effects use a secret's cached value past [secrets] refresh because its backend does not answer, by secret name. |
+| `kronik_secret_versions_total` | counter | Secret versions this node recorded, by backend (file for the built-in store). |
 | `kronik_turns_total` | counter | Turns recorded, by actor kind and outcome. |
 | `kronik_turn_duration_seconds` | histogram | Time from the start of a turn to its record, by actor kind. |
 | `kronik_log_records_appended_total` | counter | Records written to the log. |
@@ -982,6 +986,12 @@ reason; a dry run does not commit them.
 List configured backend identities without contacting providers. Inspect
 `configured` and `inventory_complete` separately; neither the command's
 presence nor an identity listing proves an external service is healthy.
+LAST SUCCESS and LAST ERROR (`last_success_ms`, `last_error_ms` and
+`last_error` in JSON: `unavailable`, `denied`, `not_found`, `version_gone` or
+`invalid`, never a provider's words) are what this node last heard from each
+external backend since it started; UNCACHED (`uncached`) lists the linked
+names that have no value an effect could use now, so the next effect that
+needs one asks the backend. `kronik doctor` warns about both.
 
 ```sh
 kronik --socket /owned/fixture/api.sock secret backends

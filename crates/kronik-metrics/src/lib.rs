@@ -58,6 +58,26 @@ pub const METRICS: &[Def] = &[
         kind: Type::Gauge,
     },
     Def {
+        name: "kronik_secret_fetch_total",
+        help: "Requests to external secret backends, by backend and result (ok, unavailable, denied, not_found, version_gone, invalid, cancelled).",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_secret_fetch_seconds",
+        help: "Time an external secret backend took to answer, or until the request gave up, by backend.",
+        kind: Type::Histogram,
+    },
+    Def {
+        name: "kronik_secret_stale",
+        help: "1 while effects use a secret's cached value past [secrets] refresh because its backend does not answer, by secret name.",
+        kind: Type::Gauge,
+    },
+    Def {
+        name: "kronik_secret_versions_total",
+        help: "Secret versions this node recorded, by backend (file for the built-in store).",
+        kind: Type::Counter,
+    },
+    Def {
         name: "kronik_turns_total",
         help: "Turns recorded, by actor kind and outcome.",
         kind: Type::Counter,

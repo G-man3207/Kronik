@@ -6317,6 +6317,38 @@
           },
           "kind": {
             "type": "string"
+          },
+          "last_error": {
+            "description": "How it failed: `unavailable`, `denied`, `not_found`, `version_gone`\nor `invalid`. Never a provider's words.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error_ms": {
+            "description": "When a request of this node to the backend last failed (wall clock,\nms). Absent when none has.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_success_ms": {
+            "description": "When this node last got an answer from the backend (wall clock, ms).\nAbsent before its first answer, and for `file`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "uncached": {
+            "description": "Names linked to the backend that have no value an effect could use\nnow: the next effect that needs one asks the backend, and fails with\nSECRET_UNAVAILABLE while it does not answer.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
