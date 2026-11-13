@@ -3452,6 +3452,7 @@ impl Node {
                 ApiError::new(ErrorCode::TurnFailed, format!("describe failed: {m}"))
             })?;
             validate_manifest(&manifest)?;
+            check_connection_export(&manifest, program.handles_connections())?;
             Ok((hash, program, manifest))
         })
         .await
@@ -3480,13 +3481,15 @@ impl Node {
             for r in &manifest.routes {
                 let norm = normalize_pattern(&r.pattern);
                 if let Some(other) = routes.iter().find(|o| {
-                    o.kind != *kind && o.method == r.method && normalize_pattern(&o.pattern) == norm
+                    o.kind != *kind
+                        && methods_conflict(&o.method, &r.method)
+                        && normalize_pattern(&o.pattern) == norm
                 }) {
                     return Err(ApiError::new(
                         ErrorCode::RouteConflict,
                         format!(
-                            "{} {} is already served by kind {:?} ({})",
-                            r.method, r.pattern, other.kind, other.pattern
+                            "{} {} is already served by kind {:?} ({} {})",
+                            r.method, r.pattern, other.kind, other.method, other.pattern
                         ),
                     ));
                 }
@@ -4802,8 +4805,32 @@ async fn timer_loop(node: Weak<Node>) {
     }
 }
 
-/// The HTTP methods a route may declare (and the gateway accepts).
-pub const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+/// The methods a route may declare: the HTTP methods the gateway accepts,
+/// and the pseudo-methods `WEBSOCKET` and `SSE` of connection routes (M24,
+/// ADR 0113), which a WebSocket upgrade or an event-stream GET matches.
+pub const METHODS: &[&str] = &[
+    "GET",
+    "HEAD",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "OPTIONS",
+    "WEBSOCKET",
+    "SSE",
+];
+
+/// The pseudo-methods of connection routes (M24): a kind that declares one
+/// must export `kronik:actor/connection-handler`.
+pub const CONNECTION_METHODS: &[&str] = &["WEBSOCKET", "SSE"];
+
+/// Whether two routes with the same normalized pattern serve the same
+/// requests: the same method, or `SSE` and `GET`, which both answer a plain
+/// GET (docs/design/m24-connections.md §2.5). `WEBSOCKET` and `GET` may
+/// share a pattern: an upgrade matches only `WEBSOCKET` routes.
+pub fn methods_conflict(a: &str, b: &str) -> bool {
+    a == b || matches!((a, b), ("SSE", "GET") | ("GET", "SSE"))
+}
 
 /// `{name}` segments become `{}` so that patterns differing only in
 /// parameter names compare equal.
@@ -4855,7 +4882,47 @@ fn validate_manifest(m: &pb::Manifest) -> Result<(), ApiError> {
             return bad(format!("route {} {} is listed twice", r.method, r.pattern));
         }
     }
+    // M24: an SSE and a GET route on one pattern would both answer a plain
+    // GET, within one manifest as between kinds.
+    for (i, a) in m.routes.iter().enumerate() {
+        let norm = normalize_pattern(&a.pattern);
+        if let Some(b) = m.routes[i + 1..].iter().find(|b| {
+            a.method != b.method
+                && methods_conflict(&a.method, &b.method)
+                && normalize_pattern(&b.pattern) == norm
+        }) {
+            return Err(ApiError::new(
+                ErrorCode::RouteConflict,
+                format!(
+                    "{} {} and {} {} both answer a GET of the same path",
+                    a.method, a.pattern, b.method, b.pattern
+                ),
+            ));
+        }
+    }
     Ok(())
+}
+
+/// BAD_REQUEST when the manifest declares a WebSocket or SSE route but the
+/// component has no `connection-handler` export (M24, ADR 0113): such a
+/// route could open connections that no code handles.
+fn check_connection_export(m: &pb::Manifest, handles_connections: bool) -> Result<(), ApiError> {
+    if handles_connections
+        || !m
+            .routes
+            .iter()
+            .any(|r| CONNECTION_METHODS.contains(&r.method.as_str()))
+    {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        ErrorCode::BadRequest,
+        format!(
+            "kind {} declares WebSocket or SSE routes but its component does not export \
+             kronik:actor/connection-handler; build it with an SDK from v0.5",
+            m.kind
+        ),
+    ))
 }
 
 async fn applier(
@@ -4951,5 +5018,98 @@ async fn applier(
             ));
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    fn manifest(routes: &[(&str, &str)]) -> pb::Manifest {
+        pb::Manifest {
+            kind: "chat".into(),
+            schema_version: 0,
+            routes: routes
+                .iter()
+                .map(|(method, pattern)| pb::Route {
+                    method: (*method).into(),
+                    pattern: (*pattern).into(),
+                })
+                .collect(),
+            capabilities: vec![],
+        }
+    }
+
+    fn code(r: Result<(), ApiError>) -> Option<ErrorCode> {
+        r.err().map(|e| e.code)
+    }
+
+    /// M24 §2.5: the pseudo-methods are route methods; SSE and GET on one
+    /// pattern conflict within a manifest, WEBSOCKET and GET may share one.
+    #[test]
+    fn connection_routes_in_one_manifest() {
+        let ok = |routes: &[(&str, &str)]| code(validate_manifest(&manifest(routes)));
+        assert_eq!(
+            ok(&[
+                ("WEBSOCKET", "/chat/{key}/ws"),
+                ("SSE", "/chat/{key}/events"),
+                ("GET", "/chat/{key}/ws"),
+                ("HEAD", "/chat/{key}/events"),
+            ]),
+            None
+        );
+        assert_eq!(
+            ok(&[
+                ("SSE", "/chat/{key}/events"),
+                ("GET", "/chat/{room}/events")
+            ]),
+            Some(ErrorCode::RouteConflict)
+        );
+        assert_eq!(
+            ok(&[
+                ("GET", "/chat/{key}"),
+                ("POST", "/x"),
+                ("SSE", "/chat/{id}")
+            ]),
+            Some(ErrorCode::RouteConflict)
+        );
+        assert_eq!(
+            ok(&[
+                ("WEBSOCKET", "/chat/{key}/ws"),
+                ("WEBSOCKET", "/chat/{k}/ws")
+            ]),
+            Some(ErrorCode::BadRequest)
+        );
+        assert_eq!(ok(&[("CONNECT", "/chat")]), Some(ErrorCode::BadRequest));
+        assert_eq!(ok(&[("websocket", "/chat")]), Some(ErrorCode::BadRequest));
+    }
+
+    #[test]
+    fn methods_conflict_on_the_same_requests() {
+        assert!(methods_conflict("GET", "GET"));
+        assert!(methods_conflict("WEBSOCKET", "WEBSOCKET"));
+        assert!(methods_conflict("SSE", "SSE"));
+        assert!(methods_conflict("SSE", "GET"));
+        assert!(methods_conflict("GET", "SSE"));
+        assert!(!methods_conflict("WEBSOCKET", "GET"));
+        assert!(!methods_conflict("WEBSOCKET", "SSE"));
+        assert!(!methods_conflict("SSE", "HEAD"));
+        assert!(!methods_conflict("POST", "GET"));
+    }
+
+    /// ADR 0113: connection routes need the `connection-handler` export.
+    #[test]
+    fn connection_routes_need_the_export() {
+        let m = manifest(&[("GET", "/chat/{key}"), ("SSE", "/chat/{key}/events")]);
+        assert_eq!(code(check_connection_export(&m, true)), None);
+        let err = check_connection_export(&m, false).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert_eq!(
+            err.message,
+            "kind chat declares WebSocket or SSE routes but its component does not export \
+             kronik:actor/connection-handler; build it with an SDK from v0.5"
+        );
+        let plain = manifest(&[("GET", "/chat/{key}")]);
+        assert_eq!(code(check_connection_export(&plain, false)), None);
     }
 }

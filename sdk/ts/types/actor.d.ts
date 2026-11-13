@@ -10,17 +10,17 @@
 /// <reference path="./interfaces/kronik-actor-state.d.ts" />
 /// <reference path="./interfaces/kronik-actor-timers.d.ts" />
 /// <reference path="./interfaces/kronik-actor-types.d.ts" />
-declare module 'kronik:actor/actor@0.1.0' {
-  export type * as KronikActorContext010 from 'kronik:actor/context@0.1.0'; // import kronik:actor/context@0.1.0
-  export type * as KronikActorCrypto010 from 'kronik:actor/crypto@0.1.0'; // import kronik:actor/crypto@0.1.0
-  export type * as KronikActorHttpClient010 from 'kronik:actor/http-client@0.1.0'; // import kronik:actor/http-client@0.1.0
-  export type * as KronikActorLog010 from 'kronik:actor/log@0.1.0'; // import kronik:actor/log@0.1.0
-  export type * as KronikActorMessaging010 from 'kronik:actor/messaging@0.1.0'; // import kronik:actor/messaging@0.1.0
-  export type * as KronikActorPrivacy010 from 'kronik:actor/privacy@0.1.0'; // import kronik:actor/privacy@0.1.0
-  export type * as KronikActorSecrets010 from 'kronik:actor/secrets@0.1.0'; // import kronik:actor/secrets@0.1.0
-  export type * as KronikActorSql010 from 'kronik:actor/sql@0.1.0'; // import kronik:actor/sql@0.1.0
-  export type * as KronikActorState010 from 'kronik:actor/state@0.1.0'; // import kronik:actor/state@0.1.0
-  export type * as KronikActorTimers010 from 'kronik:actor/timers@0.1.0'; // import kronik:actor/timers@0.1.0
-  export type * as KronikActorTypes010 from 'kronik:actor/types@0.1.0'; // import kronik:actor/types@0.1.0
-  export * as handler from 'kronik:actor/handler@0.1.0'; // export kronik:actor/handler@0.1.0
+declare module 'kronik:actor/actor@0.1.1' {
+  export type * as KronikActorContext011 from 'kronik:actor/context@0.1.1'; // import kronik:actor/context@0.1.1
+  export type * as KronikActorCrypto011 from 'kronik:actor/crypto@0.1.1'; // import kronik:actor/crypto@0.1.1
+  export type * as KronikActorHttpClient011 from 'kronik:actor/http-client@0.1.1'; // import kronik:actor/http-client@0.1.1
+  export type * as KronikActorLog011 from 'kronik:actor/log@0.1.1'; // import kronik:actor/log@0.1.1
+  export type * as KronikActorMessaging011 from 'kronik:actor/messaging@0.1.1'; // import kronik:actor/messaging@0.1.1
+  export type * as KronikActorPrivacy011 from 'kronik:actor/privacy@0.1.1'; // import kronik:actor/privacy@0.1.1
+  export type * as KronikActorSecrets011 from 'kronik:actor/secrets@0.1.1'; // import kronik:actor/secrets@0.1.1
+  export type * as KronikActorSql011 from 'kronik:actor/sql@0.1.1'; // import kronik:actor/sql@0.1.1
+  export type * as KronikActorState011 from 'kronik:actor/state@0.1.1'; // import kronik:actor/state@0.1.1
+  export type * as KronikActorTimers011 from 'kronik:actor/timers@0.1.1'; // import kronik:actor/timers@0.1.1
+  export type * as KronikActorTypes011 from 'kronik:actor/types@0.1.1'; // import kronik:actor/types@0.1.1
+  export * as handler from 'kronik:actor/handler@0.1.1'; // export kronik:actor/handler@0.1.1
 }

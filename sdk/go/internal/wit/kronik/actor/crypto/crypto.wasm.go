@@ -6,12 +6,12 @@ import (
 	"go.bytecodealliance.org/cm"
 )
 
-// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.0".
+// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.1".
 
-//go:wasmimport kronik:actor/crypto@0.1.0 hmac-sha256
+//go:wasmimport kronik:actor/crypto@0.1.1 hmac-sha256
 //go:noescape
 func wasmimport_HmacSha256(secret0 *uint8, secret1 uint32, data0 *uint8, data1 uint32, result *cm.Result[CryptoErrorShape, cm.List[uint8], CryptoError])
 
-//go:wasmimport kronik:actor/crypto@0.1.0 sign-ed25519
+//go:wasmimport kronik:actor/crypto@0.1.1 sign-ed25519
 //go:noescape
 func wasmimport_SignEd25519(secret0 *uint8, secret1 uint32, data0 *uint8, data1 uint32, result *cm.Result[CryptoErrorShape, cm.List[uint8], CryptoError])

@@ -1,8 +1,8 @@
 // HTTP for actors: the incoming request, outgoing requests and their
 // responses, and secret handles. No host calls here.
 
-import type { HttpRequest, Message as WitMessage } from 'kronik:actor/types@0.1.0';
-import type { HeaderValue, Request as WitRequest, Response as WitResponse } from 'kronik:actor/http-client@0.1.0';
+import type { HttpRequest, Message as WitMessage } from 'kronik:actor/types@0.1.1';
+import type { HeaderValue, Request as WitRequest, Response as WitResponse } from 'kronik:actor/http-client@0.1.1';
 import { KronikError } from './errors.ts';
 
 const encoder = new TextEncoder();

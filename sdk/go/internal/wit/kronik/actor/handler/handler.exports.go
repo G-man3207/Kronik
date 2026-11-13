@@ -6,7 +6,7 @@ import (
 	"go.bytecodealliance.org/cm"
 )
 
-// Exports represents the caller-defined exports from "kronik:actor/handler@0.1.0".
+// Exports represents the caller-defined exports from "kronik:actor/handler@0.1.1".
 var Exports struct {
 	// Describe represents the caller-defined, exported function "describe".
 	//

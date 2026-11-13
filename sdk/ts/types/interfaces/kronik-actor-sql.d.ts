@@ -1,4 +1,4 @@
-declare module 'kronik:actor/sql@0.1.0' {
+declare module 'kronik:actor/sql@0.1.1' {
   /**
    * per-actor SQLite owned by the host; changes are recorded as changesets.
    * DDL is allowed only in a migrate turn, before its first DML statement.

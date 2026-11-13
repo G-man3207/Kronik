@@ -1,6 +1,7 @@
 //! Deploy-time import allowlist (`IMPORT_NOT_ALLOWED`).
 //!
-//! A component may import Kronik's own interfaces plus a deterministic WASI
+//! A component may import Kronik's own interfaces (`connections` since M24,
+//! at `0.1.x` like the rest) plus a deterministic WASI
 //! subset: `wasi:clocks` (logical time), `wasi:random` (turn seed), `wasi:cli`
 //! (stdout/stderr become log events, empty environment, no args), outgoing
 //! `wasi:http` (`types` and `outgoing-handler`, the `http.fetch` effect, M22)
@@ -28,6 +29,9 @@ const KRONIK_INTERFACES: &[&str] = &[
     "secrets",
     "log",
     "privacy",
+    // M24 (ADR 0113): an import of the world `actor-connections`. Its export
+    // `connection-handler` is not an import and is not listed.
+    "connections",
 ];
 
 /// Allowed WASI 0.2 interfaces, per package.
@@ -157,6 +161,10 @@ mod tests {
         // ComponentizeJS 0.23's `fetch` (M22).
         assert!(is_allowed("wasi:http/types@0.2.10"));
         assert!(is_allowed("wasi:http/outgoing-handler@0.2.10"));
+        // v0.5 components import the 0.1.1 names; 0.1.0 ones still pass.
+        assert!(is_allowed("kronik:actor/state@0.1.1"));
+        assert!(is_allowed("kronik:actor/connections@0.1.1"));
+        assert!(is_allowed("kronik:actor/connections@0.1.7"));
     }
 
     #[test]
@@ -172,6 +180,12 @@ mod tests {
         assert!(!is_allowed("wasi:io/streams"));
         assert!(!is_allowed("kronik:actor/state@0.2.0"));
         assert!(!is_allowed("kronik:actor/blobs@0.1.0"));
+        // Exports are never imports, and unknown interfaces stay refused.
+        assert!(!is_allowed("kronik:actor/connection-handler@0.1.1"));
+        assert!(!is_allowed("kronik:actor/handler@0.1.1"));
+        assert!(!is_allowed("kronik:actor/sockets@0.1.1"));
+        assert!(!is_allowed("kronik:actor/connections@0.2.0"));
+        assert!(!is_allowed("kronik:actor/connections"));
         assert!(!is_allowed("my-func"));
     }
 }

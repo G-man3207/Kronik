@@ -1,11 +1,21 @@
 # WIT reference
 
-Guest code is a WebAssembly component for the world `actor` of the package
-`kronik:actor@0.1.0`, defined in `wit/kronik-actor.wit` in the repository.
-It exports `handler` and may import Kronik's interfaces and a deterministic
-part of WASI, nothing else. The WIT is frozen for v0.1: it changes only by
-additions that existing components keep linking against
-([M1 core design](../design/m1-core.md), §5).
+Guest code is a WebAssembly component for the package `kronik:actor@0.1.1`,
+defined in `wit/kronik-actor.wit` in the repository. Most actors use the
+world `actor`: they export `handler` and may import Kronik's interfaces and a
+deterministic part of WASI, nothing else. An actor that holds WebSocket or
+SSE connections (M24) uses the world `actor-connections`, which adds the
+`connections` import and the `connection-handler` export.
+
+The package grows on the 0.1 track by additions only
+([ADR 0113](../adr/0113-v05-actor-abi.md)): existing interfaces, types,
+functions and worlds never change, new functionality comes as new
+interfaces that are complete when they first appear, and a new export is
+optional. Components built for `kronik:actor@0.1.0` link and run unchanged
+([M1 core design](../design/m1-core.md), §5). The brief's single entry
+point holds for the log, the scheduler and replay, where a connection event
+is one more kind of input; in the WIT, a component that holds connections
+has a second export.
 
 This page covers every interface and function, what the host guarantees
 about each, the determinism rules, the limits, and what v0.1 does not offer.
@@ -25,8 +35,10 @@ The [complete WIT](#the-complete-wit) is at the end.
 | [`secrets`](#secrets) | Raw secret values, by exception | M2 |
 | [`log`](#log) | Log events | M1 |
 | [`privacy`](#privacy) | The subject that written values belong to | M1 |
+| [`connections`](#connections) | Frames to WebSocket and SSE clients, and closing their connections | M24 |
+| [`connection-handler`](#connection-handler) (export) | `open`, `frame` and `close` of a connection | M24 |
 
-A turn is one call of `handle`. Everything it writes or sends is buffered by
+A turn is one call of `handle`, or of one `connection-handler` function. Everything it writes or sends is buffered by
 the host and committed together with the turn record, or discarded if the
 turn fails. A trap ends the turn as failed; so does a host function that
 traps because a rule on this page is broken, with the rule in the turn's
@@ -53,8 +65,15 @@ effects, and returns the manifest:
 - `routes`: the HTTP routes, each a method and a pattern such as
   `/counter/{key}/increment`. A `{name}` segment matches one path segment
   and arrives in `http-request.params`; `{key}` names the actor's key, and a
-  route without `{key}` goes to the actor `<kind>/_`. Two kinds with the
-  same method and pattern are `ROUTE_CONFLICT` at deploy.
+  route without `{key}` goes to the actor `<kind>/_`. The method is `GET`,
+  `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` or `OPTIONS`, or from M24 the
+  pseudo-method `WEBSOCKET` or `SSE` of a [connection](#connections) route;
+  a kind with a connection route must export `connection-handler`, or
+  deploy and propose refuse it with `BAD_REQUEST`. Two kinds with the same
+  method and pattern are `ROUTE_CONFLICT` at deploy. So are an `SSE` and a
+  `GET` route on the same pattern, also within one manifest, because both
+  answer a plain GET; a `WEBSOCKET` and a `GET` route may share a pattern
+  (one URL serves the page and its socket).
 - `capabilities`: the capabilities the kind asks for. Asking grants nothing:
   deploy answers with a warning and the `kronik grant` command for each
   requested capability, and only the operator's grants count (M2).
@@ -419,6 +438,123 @@ In v0.1 every value carries its subject tag in the log, but values are
 stored in plaintext until privacy mode seals them under the subject's key
 (M8).
 
+## connections
+
+```wit
+interface connections {
+  type connection-id = string;
+  enum protocol { websocket, sse }
+  record sse-event { event: string, id: string, data: string }
+  variant frame { text(string), binary(list<u8>), event(sse-event) }
+  record open-request { connection: connection-id, protocol: protocol, request: http-request, subprotocols: list<string> }
+  record incoming-frame { connection: connection-id, seq: u64, frame: frame }
+  enum close-initiator { client, actor, host }
+  record close-info { initiator: close-initiator, code: u16, reason: string }
+  record closed { connection: connection-id, info: close-info }
+  record accept { subprotocol: option<string>, headers: list<header>, subject: option<string> }
+  variant open-reply { accept(accept), refuse(http-response) }
+  variant send-error { closed, outcome-unknown, denied(string) }
+  send: func(conn: connection-id, frame: frame);
+  broadcast: func(conns: list<connection-id>, frame: frame);
+  close: func(conn: connection-id, code: u16, reason: string);
+  send-now: func(conn: connection-id, frame: frame) -> result<_, send-error>;
+}
+```
+
+Long-lived connections (M24,
+[the design](../design/m24-connections.md)): the gateway holds every
+WebSocket and server-sent-events (SSE) connection, and the actor that
+accepted it, its **owner**, sends on it and closes it
+([ADR 0114](../adr/0114-only-the-accepting-actor-sends.md)). The open,
+every incoming frame and the close are inputs of the owner, delivered to
+[`connection-handler`](#connection-handler).
+
+M24 is being built: until its parts land, these functions trap with
+`NOT_IMPLEMENTED`, and the gateway does not open connections yet.
+
+- **Connection ids** are `c-` and 32 lowercase hex characters, assigned
+  when the connection opens, recorded and the same in replay. An id is
+  data, not a capability: storing it or sending it in a message grants
+  nothing.
+- **Frames.** On a WebSocket, `text` and `event` (its data) are text frames
+  and `binary` is a binary frame. On SSE, `event` is an event, `text` is an
+  event with only data, and `binary` traps. An event's `event` and `id`
+  must not contain CR, LF or NUL; they are recorded in plain text, so keep
+  personal data out of them.
+- **Ownership.** A turn may use the connection its `open` input names and
+  the connections its actor accepted earlier. Any other id traps with
+  `CONNECTION_NOT_HELD`.
+- **`send`, `broadcast` and `close` are buffered**, like `messaging.send`:
+  they are recorded in the turn record in call order and handed to the
+  connections after the turn commits, before its response or reply goes
+  out. A failed turn sends nothing. `broadcast` records one frame for many
+  connections; duplicate ids are ignored. `close` closes the connection
+  after the frames before it, with `code` (1000, 1001, 1003, 1007, 1008,
+  1009, 1011, or 3000 to 4999) and `reason` (at most 123 bytes); an SSE
+  stream just ends. Frames after a close are never written.
+- **`send-now`** sends during the turn, as an effect with the delivery class
+  `unsafe` that needs a grant of `connection:send-now` (else
+  `denied("CAPABILITY_NOT_GRANTED: connection:send-now")`). Its `TurnBegin`
+  is fsynced first (I14) and its result before the guest sees it. `ok`
+  means the frame was handed to the connection in order, not that the
+  client received it; `closed` means it was not sent. After a crash, a
+  re-run never sends it again: the guest gets `outcome-unknown`, and a turn
+  that then fails fails with `EFFECT_OUTCOME_UNKNOWN` (I17). It cannot be
+  used on the connection that the current turn opens. Use it for
+  intermediate results, such as the tokens of a streamed answer, and `send`
+  for final notices, such as "payment complete": a stream can reach the
+  client before its turn fails.
+- **Order.** A connection's frames go out in one order: within a turn its
+  `send-now` frames first, then its buffered ones; and a turn's frames
+  before the next turn's.
+- **Delivery.** An acknowledged turn means that its frames are recorded and
+  were handed to their connections, or dropped because a connection was
+  closed; not that a client received them. Frames to a closed connection
+  are recorded and dropped, and history shows each frame as written,
+  dropped, queued or unknown. Apps that need confirmation number their
+  messages.
+- **Limits** per turn: 10,000 `send`, `broadcast` and `close` calls, 100,000
+  frame targets, 16 MiB of buffered frame payload; one frame's payload is
+  at most the kind's message limit (1 MiB by default). Breaking one traps.
+- **Subjects.** Frame data and close reasons are tagged with the turn's
+  default subject at the call, like message bodies.
+
+## connection-handler
+
+```wit
+interface connection-handler {
+  use types.{handler-error};
+  use connections.{open-request, open-reply, incoming-frame, closed};
+  open: func(request: open-request) -> result<open-reply, handler-error>;
+  frame: func(event: incoming-frame) -> result<_, handler-error>;
+  close: func(event: closed) -> result<_, handler-error>;
+}
+```
+
+The export of the world `actor-connections`. Each call is one turn of the
+connection's owner, the actor that the `WEBSOCKET` or `SSE` route names. A
+component without the export runs exactly as before, but a kind with a
+connection route needs it.
+
+- **`open`**: a client asks to open a connection. `accept` may select one of
+  the offered subprotocols (WebSocket only), add response headers, and set
+  the subject of the connection's later inputs (none: the request's).
+  `refuse` answers with an HTTP response; refusing an SSE request with 204
+  tells the browser's EventSource to stop reconnecting. The client gets
+  `101 Switching Protocols` or the `200` event stream only after the open
+  turn's record is durable; frames that `open` sends follow it. A failed
+  open answers 500 `TURN_FAILED`, as for HTTP, and is not a dead letter.
+- **`frame`**: one incoming WebSocket message, with its incoming `seq` (0, 1,
+  2, ... in the order the client sent them). SSE has no incoming frames.
+- **`close`**: the connection ended, by the client, the actor (a committed
+  `connections.close`) or the host. Every accepted connection gets exactly
+  one, after its frames, also after a crash. The host's reasons are
+  `restart` (code 1012, after any restart), `ping-timeout`, `too-large`,
+  `slow-consumer`, `protocol`, `operator`, `rebase`, `abandoned` and
+  `unavailable`.
+- A failed `frame` or `close` turn is a dead letter, and `kronik
+  dead-letters resend` runs it again.
+
 ## Determinism
 
 Every source of non-determinism reaches the guest through the host, and the
@@ -474,7 +610,7 @@ reads the component's imports before compiling it and accepts only these:
 
 | Package | Interfaces | Version | Host implementation |
 | --- | --- | --- | --- |
-| `kronik:actor` | `types`, `state`, `sql`, `context`, `messaging`, `timers`, `http-client`, `crypto`, `secrets`, `log`, `privacy` | `0.1.x` | Kronik |
+| `kronik:actor` | `types`, `state`, `sql`, `context`, `messaging`, `timers`, `http-client`, `crypto`, `secrets`, `log`, `privacy`, `connections` | `0.1.x` | Kronik |
 | `wasi:io` | `error`, `poll`, `streams` | `0.2.x` | Wasmtime's; `poll`, `pollable.block` and the blocking stream calls first run the turn's outgoing `wasi:http` requests, and a wait that could never end traps |
 | `wasi:clocks` | `wall-clock`, `monotonic-clock` | `0.2.x` | Logical time, 1 ms resolution; sleeps return at once |
 | `wasi:random` | `random`, `insecure`, `insecure-seed` | `0.2.x` | ChaCha20 from the turn's seed |

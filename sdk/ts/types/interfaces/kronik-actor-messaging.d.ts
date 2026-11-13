@@ -1,5 +1,5 @@
 /// <reference path="./kronik-actor-types.d.ts" />
-declare module 'kronik:actor/messaging@0.1.0' {
+declare module 'kronik:actor/messaging@0.1.1' {
   /**
    * buffered; delivered exactly once, and only if this turn commits
    */
@@ -9,8 +9,8 @@ declare module 'kronik:actor/messaging@0.1.0' {
    * compensate is delivered exactly once to the callee if this turn fails afterwards
    */
   export function call(to: ActorRef, msg: Message, compensate: Message | undefined): Message | undefined;
-  export type ActorRef = import('kronik:actor/types@0.1.0').ActorRef;
-  export type Message = import('kronik:actor/types@0.1.0').Message;
+  export type ActorRef = import('kronik:actor/types@0.1.1').ActorRef;
+  export type Message = import('kronik:actor/types@0.1.1').Message;
   export type CallError = CallErrorNotFound | CallErrorRejected | CallErrorFailed | CallErrorReentrant | CallErrorTimeout;
   export interface CallErrorNotFound {
     tag: 'not-found',

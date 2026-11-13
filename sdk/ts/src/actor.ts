@@ -1,7 +1,7 @@
 // actor(): the handler export, built from an actor's spec.
 
-import { emit, type Level } from 'kronik:actor/log@0.1.0';
-import type { HandlerError, Input, Manifest, Output, Route } from 'kronik:actor/types@0.1.0';
+import { emit, type Level } from 'kronik:actor/log@0.1.1';
+import type { HandlerError, Input, Manifest, Output, Route } from 'kronik:actor/types@0.1.1';
 import { Ctx } from './ctx.ts';
 import { Rejected } from './errors.ts';
 import { Message, Request, toJson } from './http.ts';

@@ -1,16 +1,16 @@
 // The turn's access to the host. Every method is a synchronous host call.
 
-import { get as stateGet, set as stateSet, setFor as stateSetFor, delete as stateDelete, keys as stateKeys } from 'kronik:actor/state@0.1.0';
-import { query as sqlQuery, execute as sqlExecute } from 'kronik:actor/sql@0.1.0';
-import { selfRef, causalId, nowMs, randomBytes } from 'kronik:actor/context@0.1.0';
-import { send as messagingSend, call as messagingCall } from 'kronik:actor/messaging@0.1.0';
-import { schedule as timersSchedule, cancel as timersCancel } from 'kronik:actor/timers@0.1.0';
-import { fetch as httpFetch } from 'kronik:actor/http-client@0.1.0';
-import { hmacSha256, signEd25519 } from 'kronik:actor/crypto@0.1.0';
-import { reveal } from 'kronik:actor/secrets@0.1.0';
-import { emit, type Level } from 'kronik:actor/log@0.1.0';
-import { setSubject, currentSubject } from 'kronik:actor/privacy@0.1.0';
-import type { ActorRef, Message as WitMessage, Output } from 'kronik:actor/types@0.1.0';
+import { get as stateGet, set as stateSet, setFor as stateSetFor, delete as stateDelete, keys as stateKeys } from 'kronik:actor/state@0.1.1';
+import { query as sqlQuery, execute as sqlExecute } from 'kronik:actor/sql@0.1.1';
+import { selfRef, causalId, nowMs, randomBytes } from 'kronik:actor/context@0.1.1';
+import { send as messagingSend, call as messagingCall } from 'kronik:actor/messaging@0.1.1';
+import { schedule as timersSchedule, cancel as timersCancel } from 'kronik:actor/timers@0.1.1';
+import { fetch as httpFetch } from 'kronik:actor/http-client@0.1.1';
+import { hmacSha256, signEd25519 } from 'kronik:actor/crypto@0.1.1';
+import { reveal } from 'kronik:actor/secrets@0.1.1';
+import { emit, type Level } from 'kronik:actor/log@0.1.1';
+import { setSubject, currentSubject } from 'kronik:actor/privacy@0.1.1';
+import type { ActorRef, Message as WitMessage, Output } from 'kronik:actor/types@0.1.1';
 import { hostError } from './errors.ts';
 import { type Body, encodeBody, FetchResponse, type FetchRequest, json, Message, own, Secret, text, toJson, toWitRequest } from './http.ts';
 import { hasOrderBy, SqlRows, toSql, type SqlParam } from './sql.ts';

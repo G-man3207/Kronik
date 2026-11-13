@@ -6,8 +6,8 @@ import (
 	"go.bytecodealliance.org/cm"
 )
 
-// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.0".
+// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.1".
 
-//go:wasmimport kronik:actor/secrets@0.1.0 reveal
+//go:wasmimport kronik:actor/secrets@0.1.1 reveal
 //go:noescape
 func wasmimport_Reveal(name0 *uint8, name1 uint32, result *cm.Result[string, string, string])

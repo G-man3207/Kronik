@@ -7,4 +7,4 @@ export { Crypto, Ctx, Http, Log, Random, Secrets, Sql, State, Timers, type Actor
 export { KronikError, Rejected } from './errors.ts';
 export { FetchResponse, Message, Request, Secret, SecretHeader, type Body, type FetchRequest } from './http.ts';
 export { SqlRows, type Row, type SqlParam, type SqlResult } from './sql.ts';
-export type { ActorRef, Manifest, Output, Route } from 'kronik:actor/types@0.1.0';
+export type { ActorRef, Manifest, Output, Route } from 'kronik:actor/types@0.1.1';

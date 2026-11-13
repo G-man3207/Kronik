@@ -1,4 +1,4 @@
-declare module 'kronik:actor/types@0.1.0' {
+declare module 'kronik:actor/types@0.1.1' {
   /**
    * "kind/key", e.g. billing/acme
    */

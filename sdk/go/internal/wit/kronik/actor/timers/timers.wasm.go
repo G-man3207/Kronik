@@ -6,12 +6,12 @@ import (
 	"kronik.dev/sdk/internal/wit/kronik/actor/types"
 )
 
-// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.0".
+// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.1".
 
-//go:wasmimport kronik:actor/timers@0.1.0 schedule
+//go:wasmimport kronik:actor/timers@0.1.1 schedule
 //go:noescape
 func wasmimport_Schedule(delayMs0 uint64, msg0 *uint8, msg1 uint32, msg2 *uint8, msg3 uint32, msg4 *uint8, msg5 uint32, msg6 *types.BlobRef, msg7 uint32) (result0 uint64)
 
-//go:wasmimport kronik:actor/timers@0.1.0 cancel
+//go:wasmimport kronik:actor/timers@0.1.1 cancel
 //go:noescape
 func wasmimport_Cancel(id0 uint64) (result0 uint32)

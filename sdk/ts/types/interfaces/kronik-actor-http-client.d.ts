@@ -1,10 +1,10 @@
 /// <reference path="./kronik-actor-types.d.ts" />
-declare module 'kronik:actor/http-client@0.1.0' {
+declare module 'kronik:actor/http-client@0.1.1' {
   /**
    * url may be https://... or foreign://<name>/...
    */
   export function fetch(req: Request): Response;
-  export type HttpBody = import('kronik:actor/types@0.1.0').HttpBody;
+  export type HttpBody = import('kronik:actor/types@0.1.1').HttpBody;
   /**
    * the host inserts the secret at the effect boundary, e.g. template "Bearer {}"
    */

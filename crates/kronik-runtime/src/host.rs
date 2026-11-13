@@ -35,12 +35,43 @@ pub mod bindings {
     });
 }
 
+/// The world `actor-connections` (M24, ADR 0113): the `actor` world plus the
+/// `connections` import and the optional `connection-handler` export. The
+/// `actor` world's interfaces are reused with `with:`, so one [`TurnHost`]
+/// implements both worlds and their types are the same Rust types.
+pub mod connection_bindings {
+    wasmtime::component::bindgen!({
+        world: "actor-connections",
+        path: "../../wit/kronik-actor.wit",
+        imports: { default: async | trappable },
+        exports: { default: async },
+        with: {
+            "kronik:actor/types": crate::host::bindings::kronik::actor::types,
+            "kronik:actor/state": crate::host::bindings::kronik::actor::state,
+            "kronik:actor/sql": crate::host::bindings::kronik::actor::sql,
+            "kronik:actor/context": crate::host::bindings::kronik::actor::context,
+            "kronik:actor/messaging": crate::host::bindings::kronik::actor::messaging,
+            "kronik:actor/timers": crate::host::bindings::kronik::actor::timers,
+            "kronik:actor/http-client": crate::host::bindings::kronik::actor::http_client,
+            "kronik:actor/crypto": crate::host::bindings::kronik::actor::crypto,
+            "kronik:actor/secrets": crate::host::bindings::kronik::actor::secrets,
+            "kronik:actor/log": crate::host::bindings::kronik::actor::log,
+            "kronik:actor/privacy": crate::host::bindings::kronik::actor::privacy,
+        },
+    });
+}
+
+/// The name under which a component exports the connection handler. Wasmtime
+/// resolves it semver-compatibly, so a later `0.1.x` export is found too.
+pub const CONNECTION_HANDLER_EXPORT: &str = "kronik:actor/connection-handler@0.1.1";
+
 use bindings::kronik::actor::{
     context, crypto, http_client, log, messaging, privacy, secrets, sql, state, timers, types,
 };
 
 pub use sql::{Rows as SqlRows, SqlError, SqlValue};
 
+mod connections;
 mod wasi_http;
 
 /// Maximum bytes per random request; larger requests trap.
@@ -1060,6 +1091,12 @@ pub(crate) fn build_linker(
 
     let mut l = wasmtime::component::Linker::<TurnHost>::new(engine);
     bindings::Actor::add_to_linker::<TurnHost, HasSelf<TurnHost>>(&mut l, |s| s)?;
+    // M24: linked for every component; one built for `actor` never imports
+    // it, and an unused definition changes nothing for it.
+    connection_bindings::kronik::actor::connections::add_to_linker::<TurnHost, HasSelf<TurnHost>>(
+        &mut l,
+        |s| s,
+    )?;
     wasmtime_wasi_io::bindings::wasi::io::error::add_to_linker::<TurnHost, HasIo>(&mut l, |s| {
         &mut s.table
     })?;

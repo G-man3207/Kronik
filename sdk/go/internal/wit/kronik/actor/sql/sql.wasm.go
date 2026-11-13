@@ -6,12 +6,12 @@ import (
 	"go.bytecodealliance.org/cm"
 )
 
-// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.0".
+// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.1".
 
-//go:wasmimport kronik:actor/sql@0.1.0 query
+//go:wasmimport kronik:actor/sql@0.1.1 query
 //go:noescape
 func wasmimport_Query(statement0 *uint8, statement1 uint32, params0 *SQLValue, params1 uint32, result *cm.Result[RowsShape, Rows, SQLError])
 
-//go:wasmimport kronik:actor/sql@0.1.0 execute
+//go:wasmimport kronik:actor/sql@0.1.1 execute
 //go:noescape
 func wasmimport_Execute(statement0 *uint8, statement1 uint32, params0 *SQLValue, params1 uint32, result *cm.Result[SQLErrorShape, uint64, SQLError])
