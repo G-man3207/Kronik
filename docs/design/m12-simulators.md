@@ -87,10 +87,12 @@ order; the first that answers wins:
    `fail-closed`.
 
 Steps 3 to 9 are synthetic grounding (`GROUNDING_SYNTHETIC`), and the turn
-is divergent as before. Crypto keeps its M3 behavior (exact by fingerprint
-or recomputed on the host). `secret.reveal` in a fork answers the
-placeholder `[secret:<name>]`, never the value (v0.1): exact where
-production revealed at that point, else synthetic with the label
+is divergent as before. Crypto keeps its M3 behavior: exact by
+fingerprint, else what the grant's in-forks mode says (ADR 0112): recomputed
+on the host under `compute`, denied and graded synthetic (`fail-closed`)
+under `recorded`, the default for a new grant. `secret.reveal` in a fork
+answers the placeholder `[secret:<name>]`, never the value (v0.1): exact
+where production revealed at that point, else synthetic with the label
 `placeholder`, so every synthetic answer has a label. `actor.call` is
 re-executed. A simulator that cannot answer (no matching operation in the
 contract, no neighbor, the model declines) passes to the next step.
