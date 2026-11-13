@@ -630,6 +630,7 @@ rather than fail, unless `kronik.toml` asks for what is missing
 | `export` | With `[otel]` or `[audit]` on and the daemon answering on `server.api_socket`: a stream with lag has not delivered for 10 × its `interval`, or the audit export has held retention for longer than `[retention] history` (warnings); passes without a daemon | `kronik export status` shows the sink's last error code; fix the sink, or see [the audit log](#the-audit-log) |
 | `key_source` | The configured master-key source cannot load the key (its error code, such as `KEY_SOURCE_UNAVAILABLE` or `KEY_HELPER_FAILED`, failure), or a bootstrap credential lies under the data directory (warning). With a running daemon it asks `GET /v1/keys` instead | Check the provider, the credentials, the key version and the memory-lock limit; see [the master key](#the-master-key) |
 | `secrets` | With the daemon answering on `server.api_socket`: an external secret backend's last request failed after its last answer, or a linked name has no cached value (`SECRET_UNAVAILABLE`, warning); passes without a daemon or without external backends | `kronik secret backends` shows each backend's last answer and error; the log's `secret fetch failed` lines say why. See [a turn whose effect cannot get its secret](#a-turn-whose-effect-cannot-get-its-secret) |
+| `retention` | With the daemon answering on `server.api_socket`: the last retention pass kept log segments past `[retention] history` for an open turn, which it names (warning); passes without a daemon | See [an open turn that keeps the log](#an-open-turn-that-keeps-the-log) |
 
 ## Metrics and logs
 
@@ -653,6 +654,7 @@ with OIDC, Host must match the configured admin origin:
 | `kronik_disk_below_reserve` | gauge | | 1 while free space is below `[log] disk_reserve` (also `"low_disk": true` in `/v1/health` and `/healthz`) |
 | `kronik_key_source_up` | gauge | | 1 when the master key was loaded through its source, 0 on a node without a secret store. A KMS or HSM outage stops only a start, and a daemon that did not start exports nothing: alert on the scrape failing (Prometheus `up == 0`); `kronik doctor`'s `key_source` check then names the code |
 | `kronik_secret_recovery_stalled` | gauge | | Re-runs of open turns waiting for a recorded secret value or an unavailable prerequisite |
+| `kronik_retention_open_turn_segments` | gauge | `source` | Closed log segments that the last retention pass kept only for an open turn: `live` (open in the running state) or `snapshot` (held open by a kept snapshot). See [an open turn that keeps the log](#an-open-turn-that-keeps-the-log) |
 | `kronik_secret_fetch_total` | counter | `backend`, `result` | Requests to external secret backends: `ok`, `unavailable`, `denied`, `not_found`, `version_gone`, `invalid` or `cancelled` |
 | `kronik_secret_fetch_seconds` | histogram | `backend` | How long a backend took to answer, or until the request gave up |
 | `kronik_secret_stale` | gauge | `name` | 1 while effects use a secret's cached value past `[secrets] refresh` because its backend does not answer (until `max_stale`) |
@@ -1295,7 +1297,9 @@ the next turn after it, so
 a segment is kept until a later turn has aged out of the window too. A
 segment that holds the begin of a turn still open (in the running state or
 in a kept snapshot) is kept too, with every later one, because a start
-from that snapshot runs the turn again from it. Before it deletes, it
+from that snapshot runs the turn again from it; when that keeps a segment
+the pass would otherwise delete, the daemon says so (see [an open turn that
+keeps the log](#an-open-turn-that-keeps-the-log)). Before it deletes, it
 records on every actor database that has not changed for longer than the
 window that the database is complete through the snapshot, so that the
 next start does not look for a log that has been deleted. After an upgrade
@@ -1889,6 +1893,42 @@ release compacted, at the next start, from the newest snapshot (it logs
 - Do not edit the databases or the log by hand: a wrong edit discards
   changes without a message. Keep a copy of the data directory and ask for
   help.
+
+### An open turn that keeps the log
+
+The log on disk grows past `[retention] history`, and the daemon logs
+`an open turn keeps log segments past [retention] history` (a warning) or
+`a kept snapshot holds an open turn and keeps log segments` (info, and a
+warning once it lasts longer than a snapshot stays the window's base,
+about a day). `kronik doctor` warns in its `retention` check,
+`/v1/health` has `retention_pin`, and
+`kronik_retention_open_turn_segments` is above 0. The line comes again
+every hour while the same turn holds.
+
+**What it means.** A turn that wrote its `TurnBegin` (before its first
+effect) and has no record yet is open: a start runs it again from that
+begin, so retention keeps the segment that holds it, and every later one.
+Normally a turn ends in seconds and this keeps nothing. The message names
+what holds the log:
+
+- `live`: a turn open in the running state, with its execution id, its
+  actor and the LSN of its begin. It has been open for longer than
+  `history`. A re-run that waits for what it needs (a secret version whose
+  backend does not answer: `kronik_secret_recovery_stalled`, and the log's
+  `the re-run of an open turn is waiting for what it needs` with the same
+  execution id) ends when that is back. A turn that does not end and does
+  not wait is a defect: keep a copy of the data directory and report it
+  with the execution id and the log around it.
+- `snapshot`: a kept snapshot was taken while a turn was open, and a start
+  from it would run that turn again; the turn itself may have ended long
+  since. Retention keeps the segment until the snapshot is deleted, which
+  happens when a newer snapshot becomes the window's base (within about a
+  day, a seventh of `history`). It lasting longer means that snapshots are
+  not being taken or deleted: check `kronik snapshot list` and the log's
+  snapshot and compaction lines.
+
+`kronik history <actor>` shows the turn's begin under its execution id. Do
+not delete segments or edit `state.db` by hand: a start needs the begin.
 
 ### Secrets that an external backend no longer serves
 

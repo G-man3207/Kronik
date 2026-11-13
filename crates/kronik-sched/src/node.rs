@@ -403,6 +403,8 @@ pub struct Node {
     pub probe: Probe,
     /// The audit export's floor under retention (ADR 0084).
     retention_hold: crate::snapshots::RetentionHold,
+    /// What the last retention pass kept for an open turn.
+    pub(crate) retention_pin: Mutex<crate::snapshots::PinState>,
     /// How often retention compacted the index rows (`db.compact`).
     pub(crate) db_compactions: std::sync::atomic::AtomicU64,
     me: Weak<Node>,
@@ -835,6 +837,7 @@ impl Node {
             rebase: rebase.clone(),
             probe: Probe::default(),
             retention_hold: Default::default(),
+            retention_pin: Default::default(),
             db_compactions: Default::default(),
             me: me.clone(),
             foreign: config.foreign.0.clone(),

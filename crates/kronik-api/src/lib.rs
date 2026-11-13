@@ -1292,6 +1292,22 @@ impl Api {
             http_listen: self.http_listen.clone(),
             disk_free_bytes: self.node.disk_free(),
             low_disk: self.node.disk_below_reserve().is_some(),
+            retention_pin: self.node.retention_pin().map(|held| RetentionPinView {
+                source: if held.pin.snapshot.is_some() {
+                    "snapshot"
+                } else {
+                    "live"
+                }
+                .into(),
+                execution_id: held.pin.execution_id,
+                actor: held.pin.actor,
+                begin_lsn: held.pin.lsn,
+                snapshot: held.pin.snapshot,
+                segment: held.pin.segment,
+                held_segments: held.held_segments,
+                held_bytes: held.held_bytes,
+                since_ms: held.since_ms,
+            }),
         })
     }
 

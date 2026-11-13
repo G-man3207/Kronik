@@ -399,6 +399,24 @@ pub fn open_turn_segment(snapshot: &Path) -> Result<Option<kronik_core::ids::Lsn
     Ok(first.map(|segment| segment as kronik_core::ids::Lsn))
 }
 
+/// The turn open at `snapshot` whose `TurnBegin` is in the oldest segment
+/// ([`open_turn_segment`]): that segment's first LSN and the turn's
+/// execution id, which retention names when it keeps the segment for it.
+/// `None` when no turn was open. Read without changing the snapshot.
+pub fn oldest_open_turn(snapshot: &Path) -> Result<Option<(Lsn, String)>, StoreError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        snapshot.join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let mut statement =
+        conn.prepare("SELECT segment, execution_id FROM open_turns ORDER BY segment, lsn LIMIT 1")?;
+    let mut rows = statement.query([])?;
+    Ok(match rows.next()? {
+        Some(row) => Some((row.get::<_, i64>(0)? as Lsn, row.get::<_, String>(1)?)),
+        None => None,
+    })
+}
+
 /// The code hashes the snapshot's `deployments` table names, as `<64 hex>`
 /// strings (the name a `code/` object carries before `.wasm`), read without
 /// changing the snapshot. A restore downloads these and the ones the

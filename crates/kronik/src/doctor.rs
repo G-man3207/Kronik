@@ -183,6 +183,7 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
     checks.push(export(&config));
     checks.push(key_source(&config));
     checks.push(secrets(&config));
+    checks.push(retention(&config));
     let count = |s| checks.iter().filter(|c| c.status == s).count();
     let report = Report {
         pass: count(Status::Pass),
@@ -1050,6 +1051,98 @@ fn secrets(config: &Config) -> Check {
     }
 }
 
+/// Whether an open turn keeps the log of a running daemon from retention:
+/// its `GET /v1/health` on the configured API socket, which carries what the
+/// last retention pass kept for one.
+fn retention(config: &Config) -> Check {
+    let socket = &config.server.api_socket;
+    let token = match crate::cli::client_token_from(None) {
+        Ok(token) => token,
+        Err(_) => {
+            return check("retention", Status::Warn, "cannot load the API token")
+                .hint("check KRONIK_TOKEN and its token file");
+        }
+    };
+    let endpoint = crate::cli::http::Endpoint::Unix(socket.clone());
+    match crate::cli::http::request(
+        &endpoint,
+        "GET",
+        "/v1/health",
+        None,
+        token.as_deref(),
+        None,
+        Duration::from_secs(5),
+    ) {
+        Ok(r) if r.status == 200 => {
+            match serde_json::from_slice::<kronik_api::types::HealthResponse>(&r.body) {
+                Ok(health) => retention_pin(health.retention_pin.as_ref(), now_ms()),
+                Err(_) => check(
+                    "retention",
+                    Status::Warn,
+                    "the API returned an invalid health answer",
+                )
+                .hint("check the selected API socket and daemon version"),
+            }
+        }
+        Ok(r) => check(
+            "retention",
+            Status::Warn,
+            format!("cannot read the daemon's health: HTTP {}", r.status),
+        )
+        .hint("set KRONIK_TOKEN to a token with the read scope"),
+        Err(crate::cli::http::Failure::Connect(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            check(
+                "retention",
+                Status::Pass,
+                format!(
+                    "no daemon on {}: retention is not checked",
+                    socket.display()
+                ),
+            )
+        }
+        Err(_) => check(
+            "retention",
+            Status::Warn,
+            "cannot reach the API socket: retention is not checked",
+        )
+        .hint("check the API socket and the daemon"),
+    }
+}
+
+/// Warns when the last retention pass kept log segments for an open turn,
+/// which it would have deleted otherwise: the log grows past `[retention]
+/// history` until the turn ends (or, for a turn a kept snapshot holds open,
+/// until that snapshot is deleted).
+fn retention_pin(pin: Option<&kronik_api::types::RetentionPinView>, now: u64) -> Check {
+    let Some(pin) = pin else {
+        return check(
+            "retention",
+            Status::Pass,
+            "no open turn keeps the log from retention",
+        );
+    };
+    let held = format!("{:.1} MiB", pin.held_bytes as f64 / f64::from(1u32 << 20));
+    let since = crate::cli::units::duration(now.saturating_sub(pin.since_ms) / 1000 * 1000);
+    let message = match (&pin.snapshot, &pin.actor) {
+        (Some(snapshot), _) => format!(
+            "snapshot {snapshot} holds turn {} open: retention keeps {} log segments ({held}) \
+             past [retention] history for it, for {since} now, until that snapshot is deleted",
+            pin.execution_id, pin.held_segments
+        ),
+        (None, actor) => format!(
+            "turn {} of {} is open since lsn {}: retention keeps {} log segments ({held}) past \
+             [retention] history for it, for {since} now",
+            pin.execution_id,
+            actor.as_deref().unwrap_or("an actor"),
+            pin.begin_lsn.unwrap_or(pin.segment),
+            pin.held_segments
+        ),
+    };
+    check("retention", Status::Warn, message).hint(
+        "find out why the turn does not end; see the operations guide, An open turn that keeps the log",
+    )
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -1342,6 +1435,47 @@ mod tests {
         assert_eq!(has_cap_setuid(&status("000001f3fdfeff7f")), Some(false));
         assert_eq!(has_cap_setuid("Name:\tkronik\n"), None);
         assert_eq!(has_cap_setuid(&status("zz")), None);
+    }
+
+    #[test]
+    fn an_open_turn_that_keeps_the_log_warns() {
+        use kronik_api::types::RetentionPinView;
+        let now = 10_000_000;
+        let c = retention_pin(None, now);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        let mut pin = RetentionPinView {
+            execution_id: "e1".into(),
+            source: "live".into(),
+            actor: Some("billing/acme".into()),
+            begin_lsn: Some(1482),
+            snapshot: None,
+            segment: 1400,
+            held_segments: 3,
+            held_bytes: 3 << 20,
+            since_ms: now - 2 * 3_600_000,
+        };
+        let c = retention_pin(Some(&pin), now);
+        assert_eq!(c.status, Status::Warn);
+        assert!(
+            c.message
+                .contains("turn e1 of billing/acme is open since lsn 1482")
+                && c.message.contains("keeps 3 log segments")
+                && c.message.contains("for 2h now"),
+            "{}",
+            c.message
+        );
+        pin.source = "snapshot".into();
+        pin.actor = None;
+        pin.begin_lsn = None;
+        pin.snapshot = Some("main-00000000000000001500".into());
+        let c = retention_pin(Some(&pin), now);
+        assert_eq!(c.status, Status::Warn);
+        assert!(
+            c.message
+                .contains("snapshot main-00000000000000001500 holds turn e1 open"),
+            "{}",
+            c.message
+        );
     }
 
     #[test]

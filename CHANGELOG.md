@@ -52,7 +52,11 @@ until the v1.0 compatibility promise takes effect.
   start reads to run the turn again (#35). Retention now keeps that segment
   while a turn is open in the state or in a kept snapshot, the snapshot's
   manifest names it, and a directory that already lost it fails with
-  `STORAGE_CORRUPT` naming the turn's execution id.
+  `STORAGE_CORRUPT` naming the turn's execution id. When that keeps a
+  segment past `[retention] history`, the daemon says so: a log line naming
+  the turn (a warning for a turn open in the running state), the gauge
+  `kronik_retention_open_turn_segments`, `retention_pin` in `/v1/health`,
+  and the new `kronik doctor` check `retention`.
 - An open turn whose re-run after a restart met an input of an erased
   subject, or a kind that is no longer deployed, is closed once: its failed
   record now carries the turn's own execution id and its recorded effects.

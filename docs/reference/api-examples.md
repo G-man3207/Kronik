@@ -23,7 +23,11 @@ history or committed documentation.
 
 Observe this installation's actual engine, applied LSN and advertised gateway
 address before selecting an upgrade/recovery point. This is management health,
-not proof that a proposed component or a lost cluster member is safe.
+not proof that a proposed component or a lost cluster member is safe. When the
+last retention pass kept log segments past `[retention] history` for an open
+turn, `retention_pin` names the turn (its execution id, and its actor and the
+LSN of its begin, or the snapshot that holds it open) and the segments and
+bytes kept; `kronik doctor` warns about it in its `retention` check.
 
 ```http
 GET /v1/health HTTP/1.1

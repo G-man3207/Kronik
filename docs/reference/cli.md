@@ -180,6 +180,7 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_disk_below_reserve` | gauge | 1 while the log's file system is below [log] disk_reserve: new inputs and changes are refused. |
 | `kronik_key_source_up` | gauge | 1 when the daemon loaded its master key through its key source ([keys] source); 0 without a secret store. |
 | `kronik_secret_recovery_stalled` | gauge | Re-runs of open turns waiting for a recorded secret value or for an unavailable prerequisite. |
+| `kronik_retention_open_turn_segments` | gauge | Closed log segments that the last retention pass kept only for an open turn, by source (live: open in the running state; snapshot: held open by a kept snapshot). |
 | `kronik_secret_fetch_total` | counter | Requests to external secret backends, by backend and result (ok, unavailable, denied, not_found, version_gone, invalid, cancelled). |
 | `kronik_secret_fetch_seconds` | histogram | Time an external secret backend took to answer, or until the request gave up, by backend. |
 | `kronik_secret_stale` | gauge | 1 while effects use a secret's cached value past [secrets] refresh because its backend does not answer, by secret name. |
@@ -218,7 +219,10 @@ Checks what this host can run (M6): the configuration file, the kernel,
 gVisor's `runsc`, KVM, cgroups, whether it runs as root, and for foreign
 actors `runc`, network namespaces, the run directory and a sandbox; then
 free disk for the data directory, clock synchronization, the TLS
-certificate and shipping. Each check passes, warns or fails. A failure
+certificate, shipping and the master key's source; and, from a daemon that
+answers on the API socket, its export streams, its secret backends and
+whether an open turn keeps the log past `[retention] history` (`retention`).
+Each check passes, warns or fails. A failure
 includes a catalog code and a hint; a pass or a warning may omit a hint.
 The checks of what only foreign actors need warn rather than fail, unless
 the configuration asks for what is missing (`platform = "kvm"`); the

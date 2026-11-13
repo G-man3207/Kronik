@@ -180,6 +180,46 @@ pub struct RetentionPlan {
     pub keep: std::collections::BTreeSet<Lsn>,
 }
 
+/// A turn that keeps log segments from retention (#35): a start runs it
+/// again from its `TurnBegin`, which the first of them holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTurnPin {
+    /// The first LSN of the segment that holds the `TurnBegin`: retention
+    /// keeps it and every later segment.
+    pub segment: Lsn,
+    /// The turn's execution id.
+    pub execution_id: String,
+    /// For a turn open in the running state: its actor and the LSN of its
+    /// `TurnBegin`.
+    pub actor: Option<String>,
+    pub lsn: Option<Lsn>,
+    /// For a turn that a kept snapshot holds open (it may have ended since):
+    /// that snapshot's id. Retention keeps the segments until it is deleted.
+    pub snapshot: Option<String>,
+}
+
+/// What the last retention pass kept for an open turn: the closed segments
+/// that it would have deleted otherwise (older than the history window,
+/// covered by the window's base, no other hold).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionPin {
+    pub pin: OpenTurnPin,
+    pub held_segments: u64,
+    pub held_bytes: u64,
+    /// Wall time (ms) of the first pass that kept segments for this turn.
+    pub since_ms: u64,
+}
+
+/// [`Node::retention_pin`], and when it was last logged.
+#[derive(Debug, Default)]
+pub(crate) struct PinState {
+    current: Option<RetentionPin>,
+    logged_ms: u64,
+}
+
+/// A pin that keeps holding is logged again after this long.
+const PIN_LOG_EVERY_MS: u64 = 3_600_000;
+
 /// How far apart the snapshots between the base and the newest
 /// `snapshots_kept` are kept: a seventh of `history` (a day with the default
 /// 7 days), and at least `snapshot_interval`. The base moves in steps of at
@@ -987,30 +1027,156 @@ impl Node {
 
     /// The first segment a start may still need for a turn that is open in
     /// the live state or in a snapshot: the one holding its `TurnBegin`,
-    /// which the re-run reads from the log (#35). A snapshot does not cover
-    /// a segment it still needs, so retention keeps it and every later one.
-    fn open_turn_pin(&self, all: &[(PathBuf, Manifest)]) -> Result<Option<Lsn>, ApiError> {
+    /// which the re-run reads from the log (#35), and the turn. A snapshot
+    /// does not cover a segment it still needs, so retention keeps it and
+    /// every later one. Of a turn open both live and in a snapshot, the live
+    /// one is named.
+    fn open_turn_pin(&self, all: &[(PathBuf, Manifest)]) -> Result<Option<OpenTurnPin>, ApiError> {
         let mut pin = self
             .store()
             .db()
             .open_turns()
             .map_err(crate::node::store_err)?
-            .iter()
-            .map(|t| t.pos.segment)
-            .min();
+            .into_iter()
+            .min_by_key(|t| (t.pos.segment, t.lsn))
+            .map(|t| OpenTurnPin {
+                segment: t.pos.segment,
+                execution_id: t.execution_id,
+                actor: Some(t.actor.to_string()),
+                lsn: Some(t.lsn),
+                snapshot: None,
+            });
         for (dir, m) in all {
-            let first = kronik_store::snapshot::open_turn_segment(dir).map_err(|e| {
+            let first = kronik_store::snapshot::oldest_open_turn(dir).map_err(|e| {
                 ApiError::new(
                     ErrorCode::Internal,
                     format!("reading the open turns of snapshot {}: {e}", m.id),
                 )
             })?;
-            pin = match (pin, first) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
+            if let Some((segment, execution_id)) = first
+                && pin.as_ref().is_none_or(|p| segment < p.segment)
+            {
+                pin = Some(OpenTurnPin {
+                    segment,
+                    execution_id,
+                    actor: None,
+                    lsn: None,
+                    snapshot: Some(m.id.clone()),
+                });
+            }
         }
         Ok(pin)
+    }
+
+    /// What the last retention pass kept for an open turn, when it kept a
+    /// segment that it would have deleted otherwise (`GET /v1/health`,
+    /// `kronik doctor`).
+    pub fn retention_pin(&self) -> Option<RetentionPin> {
+        self.retention_pin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .current
+            .clone()
+    }
+
+    /// Records what the open-turn pin kept in a pass (`held`: the first LSNs
+    /// of the segments only it kept, in `dir`): the gauge
+    /// `kronik_retention_open_turn_segments`, the status
+    /// [`Node::retention_pin`] reports, and a log line naming the turn when
+    /// it starts to hold and every hour while it does. A turn open in the
+    /// running state that keeps a segment has been open for longer than
+    /// `history`: a warning. A turn a kept snapshot holds open keeps it until
+    /// the snapshot goes, which is within a thinning step of it leaving the
+    /// base: an info line, and a warning once it has held longer than that.
+    fn note_retention_pin(
+        &self,
+        storage: &StorageConfig,
+        dir: &Path,
+        pin: Option<OpenTurnPin>,
+        held: &[Lsn],
+    ) {
+        const METRIC: &str = "kronik_retention_open_turn_segments";
+        let pin = pin.filter(|_| !held.is_empty());
+        let live = pin.as_ref().is_some_and(|p| p.snapshot.is_none());
+        let count = held.len() as f64;
+        kronik_metrics::set(
+            METRIC,
+            &[("source", "live")],
+            if live { count } else { 0.0 },
+        );
+        kronik_metrics::set(
+            METRIC,
+            &[("source", "snapshot")],
+            if pin.is_some() && !live { count } else { 0.0 },
+        );
+        let mut state = self.retention_pin.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pin) = pin else {
+            state.current = None;
+            return;
+        };
+        let now = self.env.clock.wall_ms();
+        let same = state
+            .current
+            .as_ref()
+            .filter(|c| c.pin.execution_id == pin.execution_id && c.pin.snapshot == pin.snapshot);
+        let since_ms = same.map_or(now, |c| c.since_ms);
+        let due = same.is_none() || now.saturating_sub(state.logged_ms) >= PIN_LOG_EVERY_MS;
+        let held_bytes = held
+            .iter()
+            .map(|start| {
+                std::fs::metadata(dir.join(kronik_log::segment_name(*start))).map_or(0, |m| m.len())
+            })
+            .sum();
+        let status = RetentionPin {
+            pin,
+            held_segments: held.len() as u64,
+            held_bytes,
+            since_ms,
+        };
+        if due {
+            state.logged_ms = now;
+            let p = &status.pin;
+            match &p.snapshot {
+                None => tracing::warn!(
+                    execution_id = %p.execution_id,
+                    actor = p.actor.as_deref().unwrap_or_default(),
+                    begin_lsn = p.lsn.unwrap_or_default(),
+                    segment = p.segment,
+                    segments = status.held_segments,
+                    bytes = status.held_bytes,
+                    "an open turn keeps log segments past [retention] history: a start runs it \
+                     again from its TurnBegin; see the operations guide, An open turn that keeps \
+                     the log"
+                ),
+                Some(snapshot) => {
+                    let bound =
+                        thinning_step(storage) + storage.snapshot_interval.as_millis() as u64;
+                    if now.saturating_sub(since_ms) > bound {
+                        tracing::warn!(
+                            execution_id = %p.execution_id,
+                            snapshot = %snapshot,
+                            segment = p.segment,
+                            segments = status.held_segments,
+                            bytes = status.held_bytes,
+                            "a kept snapshot holds an open turn and keeps log segments past \
+                             [retention] history, for longer than a snapshot stays the window's \
+                             base: check that snapshots are taken and deleted"
+                        );
+                    } else {
+                        tracing::info!(
+                            execution_id = %p.execution_id,
+                            snapshot = %snapshot,
+                            segment = p.segment,
+                            segments = status.held_segments,
+                            bytes = status.held_bytes,
+                            "a kept snapshot holds an open turn and keeps log segments past \
+                             [retention] history until the snapshot is deleted"
+                        );
+                    }
+                }
+            }
+        }
+        state.current = Some(status);
     }
 
     /// Keeps the newest `snapshots_kept`, the window's base and one
@@ -1155,11 +1321,12 @@ impl Node {
         // delete (m6-storage §5): a crash anywhere in between leaves the log
         // whole or a prefix shorter, and every database ahead of it.
         let mut doomed: Vec<(Lsn, Lsn, Option<Lsn>)> = Vec::new();
+        // The segments only the open-turn pin keeps: every other rule would
+        // delete them. They are counted, not deleted.
+        let mut held: Vec<Lsn> = Vec::new();
         for w in starts.windows(2).take_while(|_| !rebase_hold) {
             let (start, next) = (w[0], w[1]);
-            if pin.is_some_and(|p| start >= p) {
-                break;
-            }
+            let pinned = pin.as_ref().is_some_and(|p| start >= p.segment);
             let last_lsn = next - 1;
             let Some(&(_, _, last_time)) = ranges.iter().find(|(s, _, _)| *s == start) else {
                 break;
@@ -1183,8 +1350,13 @@ impl Node {
                 }
                 released_floor = Some(floor);
             }
+            if pinned {
+                held.push(start);
+                continue;
+            }
             doomed.push((start, next, released_floor));
         }
+        self.note_retention_pin(storage, &dir, pin, &held);
         if let Some(&(_, next, _)) = doomed.last() {
             self.raise_idle_markers(next - 1)?;
             #[cfg(test)]

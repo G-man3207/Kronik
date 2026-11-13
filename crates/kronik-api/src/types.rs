@@ -403,6 +403,40 @@ pub struct HealthResponse {
     /// changes are refused. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub low_disk: bool,
+    /// A turn that the last retention pass kept log segments for, which it
+    /// would have deleted otherwise. Omitted when no turn kept any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_pin: Option<RetentionPinView>,
+}
+
+/// An open turn that keeps log segments from retention: its re-run reads its
+/// `TurnBegin` from the first of them (docs/guides/operations.md, "An open
+/// turn that keeps the log").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RetentionPinView {
+    /// The open turn's execution id.
+    pub execution_id: String,
+    /// `live`: the turn is open in the running state; `snapshot`: a kept
+    /// snapshot holds it open (it may have ended since), and the segments
+    /// are kept until that snapshot is deleted.
+    pub source: String,
+    /// The turn's actor, for a `live` turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// The LSN of its `TurnBegin`, for a `live` turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub begin_lsn: Option<u64>,
+    /// The snapshot's id, for `snapshot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    /// The first LSN of the segment that holds the `TurnBegin`.
+    pub segment: u64,
+    /// The closed segments retention keeps only for this turn, and their
+    /// size.
+    pub held_segments: u64,
+    pub held_bytes: u64,
+    /// Since when retention passes keep segments for it, Unix milliseconds.
+    pub since_ms: u64,
 }
 
 // ------------------------------------------------------------------ M2
