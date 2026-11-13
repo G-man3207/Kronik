@@ -338,6 +338,12 @@ step_foreign() {
         return 0
     fi
     scripts/build-foreign-examples.sh
+    # The hostile actor (M21's malicious foreign actor, bounded for CI): the
+    # foreign tests run it, root in a gVisor sandbox, against the host's
+    # listeners, files, processes and devices and a neighbouring sandbox
+    # (a_hostile_actor_reaches_nothing_of_the_host_or_its_neighbour). The full
+    # proof under the installed nonroot service is the isolation workflow.
+    scripts/build-foreign-examples.sh --only foreign-probe
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --test foreign -- --test-threads=1
     # The isolation work's tests that need root or user and mount namespaces,
     # which an unprivileged run skips: the rehearsals of the microVM launcher

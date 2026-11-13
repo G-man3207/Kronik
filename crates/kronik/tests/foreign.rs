@@ -1,8 +1,10 @@
 //! M7 acceptance with a real `kronik serve`, real runsc and the
-//! `foreign-echo` image (docs/design/m7-foreign.md §14). Needs root, runsc
-//! and `scripts/build-foreign-examples.sh`; without them the tests say why
-//! and pass, unless `KRONIK_FOREIGN_TESTS=require` (`scripts/ci.sh foreign`),
-//! which turns that into a failure.
+//! `foreign-echo` image (docs/design/m7-foreign.md §14), and M21's hostile
+//! actor, bounded for CI, with the `foreign-probe` image. Needs root, runsc
+//! and `scripts/build-foreign-examples.sh` (`--only foreign-probe` for the
+//! probe); without them the tests say why and pass, unless
+//! `KRONIK_FOREIGN_TESTS=require` (`scripts/ci.sh foreign`), which turns that
+//! into a failure.
 
 // Test harness code: unwraps, std threads and std time are fine here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
@@ -1422,4 +1424,407 @@ fn a_checkpoint_counts_the_sandbox_memory_against_the_reserve() {
         d.serve_log()
     );
     assert!(d.serve_log().contains("no checkpoint"), "{}", d.serve_log());
+}
+
+fn probe_layout() -> PathBuf {
+    Path::new(ROOT).join("examples/dist/foreign-probe.oci")
+}
+
+/// 32 lowercase hex digits from the kernel's random source: the probe's token
+/// and the name of everything it may leave behind.
+fn random_token() -> String {
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .unwrap()
+        .read_exact(&mut bytes)
+        .unwrap();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The report of one check of the probe `actor`, asked through the counter
+/// guest and the recorded bridge, as any actor's call is.
+fn probe(d: &Daemon, actor: &str, path: &str) -> Value {
+    let reply = d.fetch(&format!("GET foreign://{actor}{path}"));
+    assert!(reply.starts_with("200 "), "{actor}{path}: {reply}");
+    let report: Value = serde_json::from_str(&reply[4..]).unwrap();
+    assert_eq!(report["check"], path.split('?').next().unwrap(), "{report}");
+    report
+}
+
+/// Every item of `report` was kept out: blocked with one of `errnos`, or absent.
+fn kept_out(report: &Value, errnos: &[i32], what: &str) {
+    let items = report["items"].as_array().unwrap();
+    assert!(!items.is_empty(), "{what}: {report}");
+    for item in items {
+        match item["outcome"].as_str() {
+            Some("absent") => {}
+            Some("blocked") => {
+                let errno = item["errno"].as_i64().unwrap_or(-1);
+                assert!(
+                    errnos.iter().any(|&e| i64::from(e) == errno),
+                    "{what}: blocked with an unexpected errno: {item}"
+                );
+            }
+            _ => panic!("{what}: reached, or an unexpected error: {item}"),
+        }
+    }
+}
+
+/// Every item of `report` was reached: the positive control that the check works.
+fn reached(report: &Value, what: &str) -> Vec<Value> {
+    let items = report["items"].as_array().unwrap().clone();
+    assert!(!items.is_empty(), "{what}: {report}");
+    for item in &items {
+        assert_eq!(item["outcome"], "reached", "{what}: {item}");
+    }
+    items
+}
+
+/// What the probe may report as the reason a host resource stayed out of reach.
+const NET_BLOCKED: [i32; 10] = [
+    libc::EPERM,
+    libc::EACCES,
+    libc::ENOENT,
+    libc::ECONNREFUSED,
+    libc::ENETUNREACH,
+    libc::EHOSTUNREACH,
+    libc::ETIMEDOUT,
+    libc::EAFNOSUPPORT,
+    libc::EADDRNOTAVAIL,
+    libc::EAGAIN,
+];
+const PATH_BLOCKED: [i32; 4] = [libc::ENOENT, libc::ENOTDIR, libc::EACCES, libc::EPERM];
+
+/// The host's listeners and other resources that a sandboxed actor must not
+/// reach, each made by this test and named by its token.
+struct HostCanaries {
+    token: String,
+    tcp: Vec<std::net::TcpListener>,
+    udp: std::net::UdpSocket,
+    unix: std::os::unix::net::UnixListener,
+    unix_path: PathBuf,
+    abstract_listener: std::os::unix::net::UnixListener,
+    marker: PathBuf,
+    process: Child,
+}
+
+impl HostCanaries {
+    /// Listens on TCP 127.0.0.1, ::1 (where the host has it) and the host's
+    /// own outward address (where it has a route), UDP 127.0.0.1, a Unix
+    /// socket and an abstract one; writes a marker file; and starts a process
+    /// whose command line holds the token. Each listener is shown to work
+    /// before the actor tries it.
+    fn new(dir: &Path) -> HostCanaries {
+        use std::net::{TcpListener, TcpStream, UdpSocket};
+        use std::os::linux::net::SocketAddrExt as _;
+        use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+        let token = random_token();
+        let mut tcp = vec![TcpListener::bind("127.0.0.1:0").unwrap()];
+        tcp.extend(TcpListener::bind("[::1]:0").ok());
+        // The address of the host's outward route, without sending anything.
+        let outward = UdpSocket::bind("0.0.0.0:0")
+            .and_then(|s| s.connect("192.0.2.1:9").and_then(|()| s.local_addr()))
+            .ok()
+            .filter(|a| !a.ip().is_loopback() && !a.ip().is_unspecified());
+        if let Some(address) = outward {
+            tcp.extend(TcpListener::bind((address.ip(), 0)).ok());
+        }
+        for listener in &tcp {
+            TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            listener.accept().unwrap();
+        }
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.send_to(b"control", udp.local_addr().unwrap()).unwrap();
+        let mut buffer = [0u8; 16];
+        assert_eq!(udp.recv(&mut buffer).unwrap(), 7);
+        let unix_path = dir.join(format!("host-{token}.sock"));
+        let unix = UnixListener::bind(&unix_path).unwrap();
+        UnixStream::connect(&unix_path).unwrap();
+        unix.accept().unwrap();
+        let name = format!("kronik-host-{token}");
+        let abstract_address = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let abstract_listener = UnixListener::bind_addr(&abstract_address).unwrap();
+        UnixStream::connect_addr(&abstract_address).unwrap();
+        abstract_listener.accept().unwrap();
+        let marker = dir.join(format!("host-marker-{token}"));
+        std::fs::write(&marker, &token).unwrap();
+        // One process whose command line holds the token (as its argv[0]),
+        // so that killing it leaves nothing behind.
+        let process = {
+            use std::os::unix::process::CommandExt as _;
+            Command::new("sleep")
+                .arg0(format!("kronik-host-canary-{token}"))
+                .arg("600")
+                .spawn()
+                .unwrap()
+        };
+        for listener in &tcp {
+            listener.set_nonblocking(true).unwrap();
+        }
+        udp.set_nonblocking(true).unwrap();
+        unix.set_nonblocking(true).unwrap();
+        abstract_listener.set_nonblocking(true).unwrap();
+        HostCanaries {
+            token,
+            tcp,
+            udp,
+            unix,
+            unix_path,
+            abstract_listener,
+            marker,
+            process,
+        }
+    }
+
+    /// The probe's `/check/network` query for every listener.
+    fn network_query(&self) -> String {
+        let mut pairs: Vec<String> = self
+            .tcp
+            .iter()
+            .map(|l| format!("tcp={}", l.local_addr().unwrap()))
+            .collect();
+        pairs.push(format!("udp={}", self.udp.local_addr().unwrap()));
+        pairs.push(format!("unix={}", self.unix_path.display()));
+        pairs.push(format!("abstract=kronik-host-{}", self.token));
+        format!("/check/network?{}", pairs.join("&"))
+    }
+
+    /// No listener saw a connection or a datagram since its control.
+    fn untouched(&self) {
+        let quiet = |result: std::io::Result<()>, what: &str| match result {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("the host's {what} was reached by the actor: {other:?}"),
+        };
+        for listener in &self.tcp {
+            let address = listener.local_addr().unwrap();
+            quiet(
+                listener.accept().map(drop),
+                &format!("TCP listener {address}"),
+            );
+        }
+        let mut buffer = [0u8; 512];
+        quiet(self.udp.recv(&mut buffer).map(drop), "UDP socket");
+        quiet(self.unix.accept().map(drop), "Unix socket");
+        quiet(
+            self.abstract_listener.accept().map(drop),
+            "abstract Unix socket",
+        );
+    }
+}
+
+impl Drop for HostCanaries {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+}
+
+/// M21's malicious actor, bounded for CI: the hostile `foreign-probe`, root in
+/// its gVisor sandbox (OCI user 0), tries the host's network listeners
+/// (loopback, IPv6 loopback, the outward address, UDP, Unix and abstract
+/// sockets), the host's files and processes, a marker file of the host, writes
+/// into the host's directories and the devices, and the network, processes and
+/// files of a neighbouring sandbox; every attempt must fail and no host
+/// listener may see a connection, while the probe's own controls (its files,
+/// sockets and child process) work. This runs under the root daemon of the CI
+/// `foreign` step, not the installed nonroot service: the full proof with the
+/// nonroot service, SysV shared memory and the program proof is the manual
+/// `isolation` workflow (ADR 0064).
+#[test]
+fn a_hostile_actor_reaches_nothing_of_the_host_or_its_neighbour() {
+    if !should_run() {
+        return;
+    }
+    if !probe_layout().join("index.json").exists() {
+        let why = format!(
+            "needs {} (scripts/build-foreign-examples.sh --only foreign-probe)",
+            probe_layout().display()
+        );
+        assert!(
+            std::env::var("KRONIK_FOREIGN_TESTS").as_deref() != Ok("require"),
+            "KRONIK_FOREIGN_TESTS=require, but the hostile actor test {why}"
+        );
+        eprintln!("skipped: the hostile actor test {why}");
+        return;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("kronik-hostile-")
+        .tempdir_in("/var/tmp")
+        .unwrap()
+        .keep();
+    let _cleanup = Cleanup(dir.clone());
+    let d = Daemon::start(&dir);
+    let wasm = base64::engine::general_purpose::STANDARD
+        .encode(std::fs::read(Path::new(ROOT).join("tests/guests/counter.wasm")).unwrap());
+    d.ok(
+        "POST",
+        "/v1/deployments",
+        json!({"wasm_base64": wasm, "reason": "hostile actor test"}),
+    );
+    let image = format!(
+        "oci-layout:{}",
+        probe_layout().canonicalize().unwrap().display()
+    );
+    let mut tokens = Vec::new();
+    for name in ["attacker", "neighbour"] {
+        let token = random_token();
+        d.ok(
+            "PUT",
+            &format!("/v1/secrets/probe-{name}"),
+            json!({"text": token, "reason": "hostile actor test"}),
+        );
+        d.ok(
+            "POST",
+            "/v1/foreign",
+            json!({"name": name, "image": image, "port": 8080, "memory_bytes": 268435456u64,
+                   "secrets": [format!("KRONIK_PROBE_TOKEN=probe-{name}")],
+                   "reason": "hostile actor test"}),
+        );
+        d.ok(
+            "POST",
+            "/v1/grants",
+            json!({"kind": "counter", "capability": format!("foreign:{name}"),
+                   "reason": "hostile actor test"}),
+        );
+        d.wait_until(&format!("{name} running"), |d| {
+            d.foreign(name)["status"]["state"] == "running"
+        });
+        tokens.push(token);
+    }
+    let neighbour = &tokens[1];
+
+    // The probes' own files, sockets and child process work: what follows
+    // is a boundary, not a broken probe.
+    for name in ["attacker", "neighbour"] {
+        assert_eq!(
+            reached(&probe(&d, name, "/check/control"), "control").len(),
+            9,
+            "{name}"
+        );
+        let interfaces = reached(&probe(&d, name, "/check/interfaces"), "interfaces");
+        assert_eq!(interfaces[0]["detail"], "lo", "{name}: {interfaces:?}");
+    }
+    let own = reached(
+        &probe(
+            &d,
+            "attacker",
+            &format!("/check/processes?token={}", tokens[0]),
+        ),
+        "own processes",
+    );
+    assert!(own[0]["detail"].as_str().unwrap().contains("--hold-token"));
+
+    // The host: its listeners, files, processes and devices.
+    let host = HostCanaries::new(&dir);
+    kept_out(
+        &probe(&d, "attacker", &host.network_query()),
+        &NET_BLOCKED,
+        "host network",
+    );
+    kept_out(
+        &probe(
+            &d,
+            "attacker",
+            &format!("/check/processes?token={}", host.token),
+        ),
+        &[],
+        "host processes",
+    );
+    kept_out(
+        &probe(
+            &d,
+            "attacker",
+            &format!(
+                "/check/marker?token={}&path={}",
+                host.token,
+                host.marker.display()
+            ),
+        ),
+        &PATH_BLOCKED,
+        "host marker",
+    );
+    kept_out(
+        &probe(
+            &d,
+            "attacker",
+            &format!(
+                "/check/paths?path={}&path={}",
+                dir.join("data").display(),
+                dir.join("run").display()
+            ),
+        ),
+        &PATH_BLOCKED,
+        "the daemon's directories",
+    );
+    kept_out(
+        &probe(&d, "attacker", "/check/devices"),
+        &PATH_BLOCKED,
+        "devices",
+    );
+    // Writes into the host's directories land, if anywhere, in the sandbox's
+    // own file system: nothing appears on the host.
+    let write = random_token();
+    let targets = [Path::new("/"), Path::new("/etc"), Path::new("/tmp"), &dir];
+    let query: Vec<String> = targets
+        .iter()
+        .map(|t| format!("dir={}", t.display()))
+        .collect();
+    probe(
+        &d,
+        "attacker",
+        &format!("/check/write?token={write}&{}", query.join("&")),
+    );
+    let mut leaked = Vec::new();
+    for target in targets {
+        let canary = target.join(format!(".kronik-probe-{write}"));
+        if canary.exists() {
+            leaked.push(canary.clone());
+            // Ours alone (the token is new): removed, after it was recorded.
+            let _ = std::fs::remove_file(&canary);
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "the actor wrote into the host: {leaked:?}"
+    );
+    host.untouched();
+
+    // The neighbour: its private TCP and UDP control port, its abstract
+    // socket, its processes and its data marker.
+    let port = 20000 + u16::from_str_radix(&neighbour[..4], 16).unwrap() % 40000;
+    kept_out(
+        &probe(
+            &d,
+            "attacker",
+            &format!(
+                "/check/network?tcp=127.0.0.1:{port}&udp=127.0.0.1:{port}&abstract={neighbour}"
+            ),
+        ),
+        &NET_BLOCKED,
+        "neighbour network",
+    );
+    kept_out(
+        &probe(
+            &d,
+            "attacker",
+            &format!("/check/processes?token={neighbour}"),
+        ),
+        &[],
+        "neighbour processes",
+    );
+    kept_out(
+        &probe(
+            &d,
+            "attacker",
+            &format!("/check/marker?token={neighbour}&path=/data/owned-{neighbour}"),
+        ),
+        &PATH_BLOCKED,
+        "neighbour data",
+    );
+    // And the neighbour still has all of it.
+    assert_eq!(
+        reached(&probe(&d, "neighbour", "/check/control"), "control").len(),
+        9
+    );
 }

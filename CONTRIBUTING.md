@@ -65,7 +65,13 @@ installer's hand-over of a data directory to another user, the key
 source's work in a tree that another user owns and `kronik restore` as root
 into the nonroot service's directory (`--test restore_drop`, which really
 gives up root), so that a host that cannot run them fails the step instead
-of leaving them out. The `action` step
+of leaving them out. It also builds the hostile `foreign-probe` image and runs
+M21's malicious actor, bounded for CI: root in its gVisor sandbox under the
+root daemon, the probe tries the host's TCP, UDP, Unix and abstract-socket
+listeners, its files, processes and devices, writes into its directories and a
+neighbouring sandbox, and must fail at all of it while its own controls work
+(about ten seconds). The full proof, under the installed nonroot service with
+SysV, demo and microVM checks, is the manual `isolation` workflow. The `action` step
 installs checksum-verified actionlint 1.7.12 into `target/tools/` and lints
 the actual workflows and composite action; a download or lint failure
 fails the step. Its additional YAML structure checks need PyYAML.
