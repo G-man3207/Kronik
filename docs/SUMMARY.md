@@ -55,6 +55,8 @@
 - [M14 foreign actors in forks design](design/m14-foreign-forks.md)
 - [M15 Python and Go SDKs design](design/m15-sdks.md)
 - [M23 key and secret backends (design)](design/m23-secret-backends.md)
+- [M25 streaming bodies design](design/m25-streaming-bodies.md)
+- [M26 blob storage for apps design](design/m26-blobs.md)
 - [M28 OpenTelemetry and audit export design](design/m28-otel.md)
 - [Threat model and integration limits](design/threat-model.md)
 - [Performance](perf.md)
