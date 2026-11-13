@@ -160,6 +160,10 @@ M23, key and secret backends:
   where every other view of a turn's data scrubs them or answers 503. It now
   scrubs names like a turn's `timers[].name` and fails closed with
   `SECRET_UNAVAILABLE` (#44).
+- `demo/verify-change.sh` with `GUESTS=test` stopped with a Python traceback
+  after a successful promote: the test guests answer the decimal n, and the
+  script parsed JSON. It reads both now, and the M3 acceptance script runs
+  that mode too (#50).
 
 ## v0.4.1 — 2026-11-07
 

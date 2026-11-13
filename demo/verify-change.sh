@@ -14,7 +14,8 @@
 # tests/guests/counter.wasm and counter-step2.wasm). COUNTER and COUNTER_NEW
 # override the two components (e.g. the TypeScript counter and its +2
 # build): any kind `counter` with POST /counter/{key}/increment answering
-# JSON {"n": N}. Needs curl and python3.
+# JSON {"n": N}, as the examples do, or the decimal N, as the test guests
+# do. Needs curl and python3.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -71,8 +72,9 @@ traffic() { # COUNT
         curl -sf -X POST "$gw$(inc "k$((i % 10))")" >/dev/null || fail "request $i"
     done
 }
-value() { # KEY -> n after one more increment
-    curl -sf -X POST "$gw$(inc "$1")" | python3 -c 'import json,sys; print(json.load(sys.stdin)["n"])'
+value() { # KEY -> n after one more increment: JSON {"n": N} or the decimal N
+    curl -sf -X POST "$gw$(inc "$1")" |
+        python3 -c 'import json,sys; v=json.load(sys.stdin); print(v["n"] if isinstance(v, dict) else int(v))'
 }
 
 step "serve"
