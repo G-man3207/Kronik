@@ -20,6 +20,17 @@ until the v1.0 compatibility promise takes effect.
   earlier release get their copy at the first start while the backend still
   serves them. **External secret values are now at rest, encrypted, in the
   data directory, its snapshots and the bucket.**
+- The actor WIT is now `kronik:actor@0.1.1` (M24, ADR 0113). It adds the
+  `connections` interface (WebSocket and SSE frames: `send`, `broadcast`,
+  `close`, `send-now`) and the world `actor-connections`, whose components
+  also export `connection-handler` (`open`, `frame`, `close`); nothing that
+  existed changes, and components built for `0.1.0` link and run as before.
+  Routes may declare the pseudo-methods `WEBSOCKET` and `SSE`; deploy and
+  propose refuse such a kind with `BAD_REQUEST` when its component lacks the
+  `connection-handler` export, and an `SSE` route conflicts with a `GET`
+  route on the same pattern (`ROUTE_CONFLICT`). The SDKs build against the
+  new version; until the rest of M24 lands, the `connections` functions
+  trap with `NOT_IMPLEMENTED` and the gateway opens no connections.
 - A turn could commit a log record over the 128 MiB record limit (for
   example many large HTTP responses or state writes in one turn), which
   `history` then refused with `STORAGE_CORRUPT: entry length ...`, and after

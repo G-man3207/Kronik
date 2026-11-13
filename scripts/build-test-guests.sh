@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Rebuilds the test guest components committed under tests/guests/*.wasm
-# (test-actor builds, the leaky guest, plus webhook-relay-rs copied from the
-# examples build).
+# (test-actor builds, the leaky and room guests, plus webhook-relay-rs copied
+# from the examples build).
 # They are checked in so `cargo test` needs no wasm toolchain; rerun this after
 # changing tests/guests/test-actor or wit/kronik-actor.wit.
 set -euo pipefail
@@ -21,6 +21,16 @@ done
 # leaky (I8 scrubbing tests): its own crate, kind `leaky`.
 (cd ../leaky && cargo build --locked --release --target wasm32-wasip2 --target-dir target &&
     cp target/wasm32-wasip2/release/kronik_test_leaky.wasm ../leaky.wasm)
+# room (M24 connections): its own crate, kind `room`, the world
+# actor-connections; fmt2 changes only the message format (replay tests),
+# bare declares the same routes without the connection export (deploy check).
+(cd ../room &&
+    cargo build --locked --release --target wasm32-wasip2 --target-dir target/room &&
+    cargo build --locked --release --target wasm32-wasip2 --target-dir target/fmt2 --features fmt2 &&
+    cargo build --locked --release --target wasm32-wasip2 --target-dir target/bare --features bare &&
+    cp target/room/wasm32-wasip2/release/kronik_test_room.wasm ../room.wasm &&
+    cp target/fmt2/wasm32-wasip2/release/kronik_test_room.wasm ../room-fmt2.wasm &&
+    cp target/bare/wasm32-wasip2/release/kronik_test_room.wasm ../room-bare.wasm)
 # Rollback via replay (M13): a schema-1 build that migrates and also makes
 # the extra GET, so the rolled-back code had a migration and effects the old
 # code would not make.

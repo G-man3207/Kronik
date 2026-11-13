@@ -306,6 +306,6 @@ mod tests {
         }
         on_disk.sort();
         assert_eq!(embedded, on_disk, "update GO_SDK in embed.rs");
-        assert!(WIT.starts_with("package kronik:actor@0.1.0;"));
+        assert!(WIT.starts_with("package kronik:actor@0.1.1;"));
     }
 }

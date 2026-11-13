@@ -1,4 +1,4 @@
-declare module 'kronik:actor/privacy@0.1.0' {
+declare module 'kronik:actor/privacy@0.1.1' {
   /**
    * default subject for values written from now on in this turn
    */

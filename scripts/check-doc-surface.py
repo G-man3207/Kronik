@@ -426,7 +426,9 @@ def check(root, binary):
     wit = wit_functions((root / "wit/kronik-actor.wit").read_text())
     for interface, function in wit:
         body = wit_doc.get(interface, "") + "\n" + wit_examples.get(interface, "")
-        if interface == "handler":
+        # The exports (`handler`, M24's `connection-handler`) are implemented
+        # by the guest, so their example is the function definition.
+        if interface in ("handler", "connection-handler"):
             token = r"\bfn\s+" + re.escape(function.replace("-", "_")) + r"\s*\("
         else:
             token = re.escape(interface.replace("-", "_")) + r"(?:::|\.)" + re.escape(function.replace("-", "_")) + r"\s*\("

@@ -2,8 +2,8 @@
 
 package log
 
-// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.0".
+// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.1".
 
-//go:wasmimport kronik:actor/log@0.1.0 emit
+//go:wasmimport kronik:actor/log@0.1.1 emit
 //go:noescape
 func wasmimport_Emit(lvl0 uint32, message0 *uint8, message1 uint32, fields0 *[2]string, fields1 uint32)

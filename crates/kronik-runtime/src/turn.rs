@@ -11,9 +11,10 @@ use wasmtime::{Engine, Store, Trap};
 use crate::engine::FUEL_YIELD_INTERVAL;
 use crate::host::bindings::ActorPre;
 use crate::host::bindings::kronik::actor::types;
+use crate::host::connection_bindings::ActorConnectionsPre;
 use crate::host::{
-    EffectGate, HostInit, LogEvent, SqlHost, StateView, TurnHost, TurnLimits, build_linker,
-    message_to_pb,
+    CONNECTION_HANDLER_EXPORT, EffectGate, HostInit, LogEvent, SqlHost, StateView, TurnHost,
+    TurnLimits, build_linker, message_to_pb,
 };
 
 /// Everything that determines a turn besides code, engine version and the
@@ -71,6 +72,9 @@ pub enum RunError {
 pub struct Program {
     engine: Engine,
     pre: ActorPre<TurnHost>,
+    /// The same component through the world `actor-connections`, when it
+    /// exports `connection-handler` (M24, ADR 0113): the export is optional.
+    connections: Option<ActorConnectionsPre<TurnHost>>,
     hash: CodeHash,
 }
 
@@ -81,16 +85,31 @@ impl Program {
         hash: CodeHash,
     ) -> wasmtime::Result<Program> {
         let linker = build_linker(engine)?;
-        let pre = ActorPre::new(linker.instantiate_pre(component)?)?;
+        let instance = linker.instantiate_pre(component)?;
+        // Looked up semver-compatibly: a later 0.1.x export is found too. A
+        // component that has the export with other types is invalid.
+        let connections = match component.get_export_index(None, CONNECTION_HANDLER_EXPORT) {
+            Some(_) => Some(ActorConnectionsPre::new(instance.clone())?),
+            None => None,
+        };
+        let pre = ActorPre::new(instance)?;
         Ok(Program {
             engine: engine.clone(),
             pre,
+            connections,
             hash,
         })
     }
 
     pub fn hash(&self) -> CodeHash {
         self.hash
+    }
+
+    /// Whether the component exports `kronik:actor/connection-handler`, so
+    /// it can take connection inputs (M24). A kind with WebSocket or SSE
+    /// routes needs it.
+    pub fn handles_connections(&self) -> bool {
+        self.connections.is_some()
     }
 
     fn store(&self, host: TurnHost, fuel: u64) -> Result<Store<TurnHost>, RunError> {

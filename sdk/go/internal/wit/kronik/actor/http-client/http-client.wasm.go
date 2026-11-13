@@ -6,8 +6,8 @@ import (
 	"go.bytecodealliance.org/cm"
 )
 
-// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.0".
+// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.1".
 
-//go:wasmimport kronik:actor/http-client@0.1.0 fetch
+//go:wasmimport kronik:actor/http-client@0.1.1 fetch
 //go:noescape
 func wasmimport_Fetch(req0 *uint8, req1 uint32, req2 *uint8, req3 uint32, req4 *RequestHeader, req5 uint32, req6 uint32, req7 uint32, req8 uint32, req9 uint64, result *cm.Result[ResponseShape, Response, FetchError])

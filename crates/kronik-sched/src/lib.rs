@@ -48,8 +48,9 @@ use kronik_store::sql::{FileOpener, Limits, SqlPool};
 
 pub use gate::Drain;
 pub use node::{
-    CodeSwitch, DeployResult, Ingress, METHODS, Node, NodeParts, Probe, RouteEntry, ShardReadPoint,
-    ShardReader, ShardRecordPage, StartError, SystemAudit, Waiter, normalize_pattern,
+    CONNECTION_METHODS, CodeSwitch, DeployResult, Ingress, METHODS, Node, NodeParts, Probe,
+    RouteEntry, ShardReadPoint, ShardReader, ShardRecordPage, StartError, SystemAudit, Waiter,
+    methods_conflict, normalize_pattern,
 };
 pub use privacy::{ErasureDone, PrivacyModeChange};
 pub use reseal::{

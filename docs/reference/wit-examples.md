@@ -168,7 +168,61 @@ let current = privacy::current_subject();
 state::set("label", b"known fixture data");
 ```
 
-Future connection/blob functions must gain their **actual** examples when the
-IO interfaces are complete. `scripts/check-doc-surface.py` reads the
-current WIT and will reject undocumented new functions; a baseline example
-page is not evidence that a later ABI has been synchronized or exercised.
+## connections
+
+These calls come from a component built for the world `actor-connections`
+(M24), in a turn that holds the connection: its `open` input's, or one this
+actor accepted earlier. `send`, `broadcast` and `close` are buffered until
+the turn commits. `send-now` sends at once and needs a grant of
+`connection:send-now`; after a crash it is never sent again, so handle
+`outcome-unknown`.
+
+```rust
+let conn = event.connection.clone();
+connections::send(&conn, &Frame::Text("welcome".into()));
+let message = Frame::Event(SseEvent {
+    event: "message".into(), id: "7".into(), data: "{\"seq\":7}".into(),
+});
+connections::broadcast(&members, &message);
+match connections::send_now(&conn, &Frame::Text("tok 0".into())) {
+    Ok(()) => {}
+    Err(SendError::Closed) => { /* not sent: the client is gone or too slow */ }
+    Err(SendError::OutcomeUnknown) => { /* after a crash: maybe sent, never resent */ }
+    Err(SendError::Denied(reason)) => return Err(HandlerError::Failed(reason)),
+}
+connections::close(&conn, 1000, "bye");
+```
+
+## connection-handler
+
+The generated exported `Guest` trait of `connection-handler` supplies these
+three methods; each call is one turn. Accept or refuse in `open`; the client
+gets its `101` or event stream after the open turn commits. Check `Origin`
+in `open` when the app authenticates by cookie.
+
+```rust
+fn open(request: OpenRequest) -> Result<OpenReply, HandlerError> {
+    if request.request.query.contains("deny=1") {
+        return Ok(OpenReply::Refuse(HttpResponse {
+            status: 403, headers: vec![], body: HttpBody::Inline(b"denied".to_vec()),
+        }));
+    }
+    connections::send(&request.connection, &Frame::Text("welcome".into()));
+    Ok(OpenReply::Accept(Accept {
+        subprotocol: None, headers: vec![], subject: Some("fixture-user".into()),
+    }))
+}
+fn frame(event: IncomingFrame) -> Result<(), HandlerError> {
+    connections::send(&event.connection, &event.frame);
+    Ok(())
+}
+fn close(event: Closed) -> Result<(), HandlerError> {
+    state::delete(&format!("member/{}", event.connection));
+    Ok(())
+}
+```
+
+Future blob functions must gain their **actual** examples when the IO
+interfaces are complete. `scripts/check-doc-surface.py` reads the current
+WIT and will reject undocumented new functions; a baseline example page is
+not evidence that a later ABI has been synchronized or exercised.

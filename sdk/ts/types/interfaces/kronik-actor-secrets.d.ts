@@ -1,4 +1,4 @@
-declare module 'kronik:actor/secrets@0.1.0' {
+declare module 'kronik:actor/secrets@0.1.1' {
   /**
    * exception only: requires capability secret-reveal:<name>
    */

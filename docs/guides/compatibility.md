@@ -1,8 +1,10 @@
 # Compatibility, versions and deprecation
 
 Kronik has **not reached the v0.9 compatibility freeze**. The actor package is
-currently `kronik:actor@0.1.0` in the committed baseline; the IO 0.2 interface
-changes the actual ABI before that freeze. This page defines the required
+currently `kronik:actor@0.1.1`, which grows only by new interfaces and
+optional exports, so components built for `0.1.0` keep running
+([ADR 0113](../adr/0113-v05-actor-abi.md)); the IO 0.2 interface changes the
+actual ABI before that freeze. This page defines the required
 compatibility policy, not a claim that unfinished interfaces are frozen or that
 v0.9/v1.0 is ready.
 

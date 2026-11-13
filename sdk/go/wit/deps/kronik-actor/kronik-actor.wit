@@ -1,4 +1,4 @@
-package kronik:actor@0.1.0;
+package kronik:actor@0.1.1;
 
 interface types {
   /// "kind/key", e.g. billing/acme
@@ -118,10 +118,119 @@ interface privacy {
   current-subject: func() -> option<string>;
 }
 
+/// Long-lived connections (M24): WebSocket and server-sent events. The
+/// gateway holds the connection; the actor that accepted it (its owner)
+/// sends on it and closes it.
+@since(version = 0.1.1)
+interface connections {
+  use types.{header, http-request, http-response};
+
+  /// "c-" and 32 lowercase hex characters: assigned when the connection
+  /// opens, recorded, and the same in replay. Data, not a capability.
+  type connection-id = string;
+
+  enum protocol { websocket, sse }
+
+  /// An SSE event. `event` and `id` must not contain CR, LF or NUL.
+  record sse-event {
+    /// the `event:` field; empty: none (the browser's default, "message")
+    event: string,
+    /// the `id:` field; empty: none. A reconnecting EventSource sends the
+    /// last one back as the `Last-Event-ID` header.
+    id: string,
+    data: string,
+  }
+
+  /// One frame. On a WebSocket, `text` and `event` (its data) are text
+  /// frames and `binary` is a binary frame. On SSE, `event` is an event,
+  /// `text` is an event with only data, and `binary` traps.
+  variant frame { text(string), binary(list<u8>), event(sse-event) }
+
+  record open-request {
+    connection: connection-id,
+    protocol: protocol,
+    /// the upgrade request (WebSocket) or the GET (SSE); the body is empty
+    request: http-request,
+    /// the subprotocols the client offered (Sec-WebSocket-Protocol), in order
+    subprotocols: list<string>,
+  }
+
+  record incoming-frame {
+    connection: connection-id,
+    /// 0, 1, 2, ... per connection, in the order the client sent them
+    seq: u64,
+    frame: frame,
+  }
+
+  enum close-initiator { client, actor, host }
+
+  record close-info {
+    initiator: close-initiator,
+    /// the WebSocket close code (1000 normal, 1006 gone without a close
+    /// frame, 1012 a restart, ...)
+    code: u16,
+    /// the client's or the actor's reason; for the host one of "restart",
+    /// "ping-timeout", "too-large", "slow-consumer", "protocol",
+    /// "operator", "rebase", "abandoned", "unavailable"
+    reason: string,
+  }
+
+  record closed { connection: connection-id, info: close-info }
+
+  record accept {
+    /// one of the offered subprotocols (WebSocket only)
+    subprotocol: option<string>,
+    /// extra response headers
+    headers: list<header>,
+    /// the subject of the connection's later inputs; none: the request's
+    subject: option<string>,
+  }
+
+  variant open-reply { accept(accept), refuse(http-response) }
+
+  variant send-error {
+    /// the connection is closed or closing, or the client could not keep
+    /// up: the frame was not sent
+    closed,
+    /// after a crash: the frame may or may not have been sent (I17)
+    outcome-unknown,
+    /// no grant of connection:send-now
+    denied(string),
+  }
+
+  /// Buffered: sent after this turn commits, in call order; nothing if the
+  /// turn fails. Traps on a connection this actor does not hold.
+  send: func(conn: connection-id, frame: frame);
+  /// `send` to each of `conns`, recorded once.
+  broadcast: func(conns: list<connection-id>, frame: frame);
+  /// Buffered like `send`: after the frames before it, the connection
+  /// closes with `code` and `reason` (WebSocket) or its stream ends (SSE).
+  close: func(conn: connection-id, code: u16, reason: string);
+  /// Sends now, before the turn commits: an effect with delivery class
+  /// unsafe that needs the capability connection:send-now. `ok` means
+  /// handed to the connection in order, not received. Never sent again
+  /// after a crash: the re-run gets `outcome-unknown`.
+  send-now: func(conn: connection-id, frame: frame) -> result<_, send-error>;
+}
+
 interface handler {
   use types.{input, output, handler-error, manifest};
   describe: func() -> manifest;
   handle: func(input: input) -> result<output, handler-error>;
+}
+
+/// The export of an actor that holds connections (M24). Each call is one
+/// turn.
+@since(version = 0.1.1)
+interface connection-handler {
+  use types.{handler-error};
+  use connections.{open-request, open-reply, incoming-frame, closed};
+  /// A client asks to open a connection: accept or refuse it.
+  open: func(request: open-request) -> result<open-reply, handler-error>;
+  /// One incoming frame (WebSocket only).
+  frame: func(event: incoming-frame) -> result<_, handler-error>;
+  /// The connection closed; always its last input.
+  close: func(event: closed) -> result<_, handler-error>;
 }
 
 world actor {
@@ -136,4 +245,14 @@ world actor {
   import log;
   import privacy;
   export handler;
+}
+
+/// The world of an actor that holds connections (M24): everything of
+/// `actor`, plus the `connections` import and the `connection-handler`
+/// export. Components built for `actor` run unchanged.
+@since(version = 0.1.1)
+world actor-connections {
+  include actor;
+  import connections;
+  export connection-handler;
 }

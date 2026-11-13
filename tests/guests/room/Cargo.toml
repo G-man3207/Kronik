@@ -1,0 +1,32 @@
+[package]
+name = "kronik-test-room"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Test guest (kind `room`) that holds WebSocket and SSE connections, for the M24 tests and the simulator"
+license = "Elastic-2.0"
+
+# Standalone project built for wasm32-wasip2; not part of the host workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.63.0"
+
+[features]
+# The formatting change of the M24 replay acceptance (room-fmt2.wasm):
+# message frames carry `body` instead of `text`, nothing else differs.
+fmt2 = []
+# The room's manifest for the world `actor`, without the connection export
+# (room-bare.wasm): deploy must refuse it.
+bare = []
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+strip = true
+panic = "abort"

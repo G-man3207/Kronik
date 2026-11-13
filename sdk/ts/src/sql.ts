@@ -1,7 +1,7 @@
 // Values and rows for ctx.sql. No host calls here, so the conversions can be
 // tested without a host.
 
-import type { Rows, SqlValue } from 'kronik:actor/sql@0.1.0';
+import type { Rows, SqlValue } from 'kronik:actor/sql@0.1.1';
 import { KronikError } from './errors.ts';
 import { isBytes, MAX_SAFE_BIGINT, MIN_SAFE_BIGINT, own } from './http.ts';
 

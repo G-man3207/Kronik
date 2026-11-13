@@ -1,4 +1,4 @@
-declare module 'kronik:actor/state@0.1.0' {
+declare module 'kronik:actor/state@0.1.1' {
   /**
    * values and messages are at most 1 MiB by default (per-kind limits)
    */

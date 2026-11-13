@@ -1,5 +1,5 @@
 /// <reference path="./kronik-actor-types.d.ts" />
-declare module 'kronik:actor/context@0.1.0' {
+declare module 'kronik:actor/context@0.1.1' {
   export function selfRef(): ActorRef;
   /**
    * derived from the causal key: identical in production and replay
@@ -14,5 +14,5 @@ declare module 'kronik:actor/context@0.1.0' {
    * deterministic per turn, seeded from the recorded seed
    */
   export function randomBytes(len: number): Uint8Array;
-  export type ActorRef = import('kronik:actor/types@0.1.0').ActorRef;
+  export type ActorRef = import('kronik:actor/types@0.1.1').ActorRef;
 }

@@ -6,12 +6,12 @@ import (
 	"go.bytecodealliance.org/cm"
 )
 
-// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.0".
+// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.1".
 
-//go:wasmimport kronik:actor/privacy@0.1.0 set-subject
+//go:wasmimport kronik:actor/privacy@0.1.1 set-subject
 //go:noescape
 func wasmimport_SetSubject(subject0 uint32, subject1 *uint8, subject2 uint32)
 
-//go:wasmimport kronik:actor/privacy@0.1.0 current-subject
+//go:wasmimport kronik:actor/privacy@0.1.1 current-subject
 //go:noescape
 func wasmimport_CurrentSubject(result *cm.Option[string])

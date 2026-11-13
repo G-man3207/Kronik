@@ -1,4 +1,4 @@
-declare module 'kronik:actor/log@0.1.0' {
+declare module 'kronik:actor/log@0.1.1' {
   /**
    * the host adds execution id and causal id to every event
    */

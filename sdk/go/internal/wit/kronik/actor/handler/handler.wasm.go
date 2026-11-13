@@ -6,18 +6,18 @@ import (
 	"go.bytecodealliance.org/cm"
 )
 
-// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.0".
+// This file contains wasmimport and wasmexport declarations for "kronik:actor@0.1.1".
 
-//go:wasmexport kronik:actor/handler@0.1.0#describe
-//export kronik:actor/handler@0.1.0#describe
+//go:wasmexport kronik:actor/handler@0.1.1#describe
+//export kronik:actor/handler@0.1.1#describe
 func wasmexport_Describe() (result *Manifest) {
 	result_ := Exports.Describe()
 	result = &result_
 	return
 }
 
-//go:wasmexport kronik:actor/handler@0.1.0#handle
-//export kronik:actor/handler@0.1.0#handle
+//go:wasmexport kronik:actor/handler@0.1.1#handle
+//export kronik:actor/handler@0.1.1#handle
 func wasmexport_Handle(input0 uint32, input1 uint64, input2 uint32, input3 uint32, input4 uint32, input5 uint32, input6 uint32, input7 uint32, input8 uint32, input9 uint32, input10 uint32, input11 uint32, input12 uint32, input13 uint32, input14 uint64) (result *cm.Result[OutputShape, Output, HandlerError]) {
 	input := lift_Input((uint32)(input0), (uint64)(input1), (uint32)(input2), (uint32)(input3), (uint32)(input4), (uint32)(input5), (uint32)(input6), (uint32)(input7), (uint32)(input8), (uint32)(input9), (uint32)(input10), (uint32)(input11), (uint32)(input12), (uint32)(input13), (uint64)(input14))
 	result_ := Exports.Handle(input)
