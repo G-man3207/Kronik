@@ -10,7 +10,9 @@ import { hmacSha256, signEd25519 } from 'kronik:actor/crypto@0.1.1';
 import { reveal } from 'kronik:actor/secrets@0.1.1';
 import { emit, type Level } from 'kronik:actor/log@0.1.1';
 import { setSubject, currentSubject } from 'kronik:actor/privacy@0.1.1';
+import { broadcast as connBroadcast, close as connClose, send as connSend, sendNow as connSendNow, type OpenReply } from 'kronik:actor/connections@0.1.1';
 import type { ActorRef, Message as WitMessage, Output } from 'kronik:actor/types@0.1.1';
+import { accept, type AcceptOptions, type FrameLike, sendNowFailure, toWitFrame } from './connections.ts';
 import { hostError } from './errors.ts';
 import { type Body, encodeBody, FetchResponse, type FetchRequest, json, Message, own, Secret, text, toJson, toWitRequest } from './http.ts';
 import { hasOrderBy, SqlRows, toSql, type SqlParam } from './sql.ts';
@@ -189,6 +191,55 @@ export class Timers {
   }
 }
 
+/**
+ * The WebSocket and SSE connections this actor accepted (see `kronik explain
+ * connections`). Only the actor whose open accepted a connection may send on
+ * it or close it; any other use traps with `CONNECTION_NOT_HELD`. A frame to
+ * a closed connection is dropped and shows in the history.
+ */
+export class Connections {
+  /** Sends `frame` to `connection` when this turn commits, in call order; nothing if the turn fails. */
+  send(connection: string, frame: FrameLike): void {
+    connSend(connection, toWitFrame(frame));
+  }
+
+  /** {@link send} to each of `connections`, recorded once: the way to fan a message out. */
+  broadcast(connections: Iterable<string>, frame: FrameLike): void {
+    connBroadcast([...connections], toWitFrame(frame));
+  }
+
+  /**
+   * Closes `connection` when this turn commits, after the frames sent before:
+   * a WebSocket with `code` and `reason`, an SSE stream by ending it. Its
+   * close input still follows.
+   */
+  close(connection: string, code = 1000, reason = ''): void {
+    connClose(connection, code, reason);
+  }
+
+  /**
+   * Sends `frame` now, before this turn commits, for intermediate results
+   * such as the tokens of a streamed answer; use {@link send} for final
+   * notices. An effect with delivery class `unsafe` that needs the
+   * capability `connection:send-now`. Returns `true` when the frame was
+   * handed to the connection (not that the client received it), `false`
+   * when the connection is closed or its client does not keep up. Throws
+   * {@link OutcomeUnknown} when a crash made the outcome unknown: the frame
+   * is never sent twice. Frames sent now go out before the turn's
+   * {@link send} frames.
+   */
+  sendNow(connection: string, frame: FrameLike): boolean {
+    try {
+      connSendNow(connection, toWitFrame(frame));
+      return true;
+    } catch (e) {
+      const failure = sendNowFailure(e);
+      if (failure === false) return false;
+      throw failure;
+    }
+  }
+}
+
 /** Randomness from the turn's recorded seed: a replay gets the same values. */
 export class Random {
   /** `length` random bytes (at most 1 MiB). */
@@ -249,6 +300,7 @@ export class Ctx {
   readonly secrets = new Secrets();
   readonly timers = new Timers();
   readonly random = new Random();
+  readonly connections = new Connections();
 
   /** Sends a message to `to`: buffered, delivered exactly once, only if this turn commits. */
   send(to: ActorLike, msg: OutgoingMessage): void {
@@ -297,6 +349,15 @@ export class Ctx {
   /** The current default subject. */
   currentSubject(): string | undefined {
     return currentSubject();
+  }
+
+  /**
+   * Accepts the connection that the current `connections.open` asks for:
+   * return it from the open handler. Returning an HTTP response instead
+   * (`ctx.status(403)`) refuses the connection with it.
+   */
+  accept(options?: AcceptOptions): OpenReply {
+    return accept(options);
   }
 
   /** An HTTP response with `value` as a JSON body. */

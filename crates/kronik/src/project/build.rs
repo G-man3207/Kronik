@@ -3,8 +3,9 @@
 //!
 //! TypeScript (ADR 0002): `tsc --noEmit`, then `jco componentize` with
 //! `--disable fetch-event stdio` (`http` stays on for standard `fetch`, ADR
-//! 0070) on an entry that exports the module's
-//! default export as `handler`. ComponentizeJS builds are not reproducible,
+//! 0070) on an entry that exports the module's default export as `handler`
+//! and, for the world `actor-connections` (ADR 0113), its connection
+//! handler as `connectionHandler`. ComponentizeJS builds are not reproducible,
 //! so the hash of every input goes into a custom section of the component,
 //! and a build whose inputs are unchanged keeps the previous component.
 //!
@@ -33,6 +34,44 @@ pub(super) const INPUT_SECTION: &str = "kronik-build-input";
 /// ComponentizeJS features Kronik's allowlist needs off (ADR 0002); `http`
 /// (standard `fetch`) is the `http.fetch` effect since M22 (ADR 0070).
 const DISABLED_FEATURES: [&str; 2] = ["fetch-event", "stdio"];
+
+/// The world an SDK's WIT builds: `actor-connections` from v0.5, whose
+/// components also export `kronik:actor/connection-handler` (ADR 0113), or
+/// `actor` for an SDK that an older `kronik init` vendored.
+pub(super) fn sdk_world(wit: &Path) -> Result<&'static str, Failure> {
+    let text = std::fs::read_to_string(wit)
+        .map_err(|e| Failure::new(format!("the SDK's WIT {}: {e}", wit.display())))?;
+    Ok(
+        if text
+            .lines()
+            .any(|line| line.trim_start().starts_with("world actor-connections"))
+        {
+            "actor-connections"
+        } else {
+            "actor"
+        },
+    )
+}
+
+/// The TypeScript entry `kronik build` writes: the exports of `world` from
+/// the module's default export.
+fn ts_entry(entry: &str, world: &str) -> String {
+    if world == "actor" {
+        return format!(
+            "// Written by kronik build: the actor's handler export.
+export {{ default as handler }} from '../{entry}';
+"
+        );
+    }
+    format!(
+        "// Written by kronik build: the actor's handler and connection-handler exports.
+         import actor from '../{entry}';
+         import {{ connectionHandlerOf }} from '@kronik/sdk';
+         export const handler = actor;
+         export const connectionHandler = connectionHandlerOf(actor);
+"
+    )
+}
 
 /// Directories whose contents are not build inputs.
 const SKIPPED_DIRS: [&str; 6] = [
@@ -198,6 +237,7 @@ fn typescript(dir: &Path, force: bool, entry: Option<&str>) -> Result<Built, Fai
                 .hint(format!("run: (cd {} && npm install)", dir.display()))
         })?;
     let wit = sdk.join("wit/kronik-actor.wit");
+    let world = sdk_world(&wit)?;
     let mut versions = Vec::new();
     for package in [
         "@bytecodealliance/jco",
@@ -220,7 +260,7 @@ fn typescript(dir: &Path, force: bool, entry: Option<&str>) -> Result<Built, Fai
     let mut hasher = blake3::Hasher::new();
     hasher.update(
         format!(
-            "kronik build ts\0{KRONIK_VERSION}\0{}\0{}\0{entry}\0",
+            "kronik build ts\0{KRONIK_VERSION}\0{world}\0{}\0{}\0{entry}\0",
             versions.join(","),
             DISABLED_FEATURES.join(",")
         )
@@ -259,12 +299,7 @@ fn typescript(dir: &Path, force: bool, entry: Option<&str>) -> Result<Built, Fai
         .map(drop)
     })?;
     let work = dir.join(".kronik");
-    std::fs::write(
-        work.join("entry.ts"),
-        format!(
-            "// Written by kronik build: the actor's handler export.\nexport {{ default as handler }} from '../{entry}';\n"
-        ),
-    )?;
+    std::fs::write(work.join("entry.ts"), ts_entry(&entry, world))?;
     let built = work.join(format!("{name}.wasm"));
     step("jco componentize", || {
         tool(
@@ -273,7 +308,7 @@ fn typescript(dir: &Path, force: bool, entry: Option<&str>) -> Result<Built, Fai
                 .arg(work.join("entry.ts"))
                 .arg("--wit")
                 .arg(&wit)
-                .args(["--world-name", "actor", "--disable"])
+                .args(["--world-name", world, "--disable"])
                 .args(DISABLED_FEATURES)
                 .arg("-o")
                 .arg(&built)
@@ -588,6 +623,36 @@ mod tests {
             custom_section(&bytes[..bytes.len() - 1], INPUT_SECTION),
             None
         );
+    }
+
+    #[test]
+    fn the_world_follows_the_sdks_wit() {
+        let dir = tempfile::tempdir().unwrap();
+        let wit = dir.path().join("kronik-actor.wit");
+        std::fs::write(&wit, "package kronik:actor@0.1.0;\nworld actor {\n}\n").unwrap();
+        assert_eq!(sdk_world(&wit).unwrap(), "actor");
+        std::fs::write(
+            &wit,
+            "package kronik:actor@0.1.1;\nworld actor {\n}\n\
+             @since(version = 0.1.1)\nworld actor-connections {\n  include actor;\n}\n",
+        )
+        .unwrap();
+        assert_eq!(sdk_world(&wit).unwrap(), "actor-connections");
+        assert!(sdk_world(&dir.path().join("missing.wit")).is_err());
+        // The repository's own WIT is the v0.5 one.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wit/kronik-actor.wit");
+        assert_eq!(sdk_world(&repo).unwrap(), "actor-connections");
+    }
+
+    #[test]
+    fn the_typescript_entry_exports_the_worlds_interfaces() {
+        let old = ts_entry("src/index.ts", "actor");
+        assert!(old.contains("export { default as handler } from '../src/index.ts';"));
+        assert!(!old.contains("connectionHandler"));
+        let new = ts_entry("src/index.ts", "actor-connections");
+        assert!(new.contains("import actor from '../src/index.ts';"));
+        assert!(new.contains("export const handler = actor;"));
+        assert!(new.contains("export const connectionHandler = connectionHandlerOf(actor);"));
     }
 
     #[test]

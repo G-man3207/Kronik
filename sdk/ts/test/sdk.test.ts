@@ -7,6 +7,7 @@ import { runInNewContext } from 'node:vm';
 import { explainTopic, hostError, KronikError } from '../src/errors.ts';
 import { encodeBody, json, own, Request, Secret, toJson, toWitRequest } from '../src/http.ts';
 import { fromSql, hasOrderBy, SqlRows, toSql } from '../src/sql.ts';
+import { accept, closedOf, Frame, IncomingFrame, OpenRequest, OutcomeUnknown, refusal, sendNowFailure, toOpenReply, toWitFrame } from '../src/connections.ts';
 
 test('host error codes become the explain topic', () => {
   assert.equal(explainTopic('CAPABILITY_NOT_GRANTED: http:api.example.com', 'capability'), 'CAPABILITY_NOT_GRANTED');
@@ -115,4 +116,87 @@ test('bytes from another realm are bytes', () => {
   assert.ok(fromSql({ tag: 'blob', val: foreign }) instanceof Uint8Array);
   const req = new Request({ method: 'POST', path: '/', query: '', params: [], headers: [], body: { tag: 'inline', val: foreign } });
   assert.ok(req.body instanceof Uint8Array);
+});
+
+test('frames for ctx.connections', () => {
+  assert.deepEqual(Frame.text('hi'), { tag: 'text', val: 'hi' });
+  assert.deepEqual(Frame.json({ n: 2n ** 60n }), { tag: 'text', val: '{"n":"1152921504606846976"}' });
+  assert.deepEqual(Frame.binary(new Uint8Array([1, 2])), { tag: 'binary', val: new Uint8Array([1, 2]) });
+  assert.deepEqual(Frame.event({ data: { seq: 7 }, id: 7 }), { tag: 'event', val: { event: '', id: '7', data: '{"seq":7}' } });
+  assert.deepEqual(Frame.event({ event: 'message', data: 'x' }), { tag: 'event', val: { event: 'message', id: '', data: 'x' } });
+  assert.deepEqual(toWitFrame('hi'), Frame.text('hi'));
+  assert.deepEqual(toWitFrame(new Uint8Array([3])), Frame.binary(new Uint8Array([3])));
+  const foreign = runInNewContext('new Uint8Array([4])') as Uint8Array;
+  assert.deepEqual(toWitFrame(foreign).tag, 'binary');
+  assert.equal(toWitFrame(Frame.json(1)).tag, 'text');
+  assert.throws(() => toWitFrame({ type: 'say' } as never), /not a frame.*kronik explain connections/);
+});
+
+test('the open request, incoming frames and the close', () => {
+  const req = new OpenRequest({
+    connection: 'c-0123',
+    protocol: 'websocket',
+    subprotocols: ['chat.v1'],
+    request: {
+      method: 'GET',
+      path: '/chat/lobby/ws',
+      query: 'user=ada',
+      params: [['key', 'lobby']],
+      headers: [
+        { name: 'Origin', value: 'https://chat.example' },
+        { name: 'Last-Event-ID', value: '41' },
+      ],
+      body: { tag: 'inline', val: new Uint8Array() },
+    },
+  });
+  assert.equal(req.connection, 'c-0123');
+  assert.equal(req.protocol, 'websocket');
+  assert.deepEqual(req.subprotocols, ['chat.v1']);
+  assert.equal(req.param('key'), 'lobby');
+  assert.equal(req.queryParam('user'), 'ada');
+  assert.equal(req.origin(), 'https://chat.example');
+  assert.equal(req.lastEventId(), '41');
+  const text = new IncomingFrame({ connection: 'c-0123', seq: 3n, frame: { tag: 'text', val: '{"type":"say"}' } });
+  assert.equal(text.seq, 3);
+  assert.equal(text.kind, 'text');
+  assert.deepEqual(text.json(), { type: 'say' });
+  assert.deepEqual([...text.bytes()], [...new TextEncoder().encode('{"type":"say"}')]);
+  const binary = new IncomingFrame({ connection: 'c-0123', seq: 4n, frame: { tag: 'binary', val: new TextEncoder().encode('hé') } });
+  assert.equal(binary.text(), 'hé');
+  const bad = new IncomingFrame({ connection: 'c-0123', seq: 5n, frame: { tag: 'binary', val: new Uint8Array([0xff]) } });
+  assert.throws(() => bad.text(), /the frame is not UTF-8.*kronik explain connections/);
+  assert.throws(() => new IncomingFrame({ connection: 'c', seq: 0n, frame: { tag: 'text', val: '{' } }).json(), /not the expected JSON/);
+  assert.deepEqual(closedOf({ connection: 'c-0123', info: { initiator: 'host', code: 1012, reason: 'restart' } }), {
+    connection: 'c-0123',
+    initiator: 'host',
+    code: 1012,
+    reason: 'restart',
+  });
+});
+
+test('an open handler accepts, or refuses with an HTTP response', () => {
+  assert.deepEqual(accept(), { tag: 'accept', val: { subprotocol: undefined, headers: [], subject: undefined } });
+  assert.deepEqual(accept({ subprotocol: 'chat.v1', headers: { 'x-room': 'lobby' }, subject: 'user:ada' }), {
+    tag: 'accept',
+    val: { subprotocol: 'chat.v1', headers: [{ name: 'x-room', value: 'lobby' }], subject: 'user:ada' },
+  });
+  const forbidden = { status: 403, headers: [], body: { tag: 'inline' as const, val: new Uint8Array() } };
+  assert.deepEqual(toOpenReply({ tag: 'http', val: forbidden }), { tag: 'refuse', val: forbidden });
+  assert.deepEqual(toOpenReply(accept()), accept());
+  assert.throws(() => toOpenReply({ tag: 'none' }), /must return ctx.accept\(\) or an HTTP response.*it returned none/);
+  const refused = refusal(404, 'no connections here');
+  assert.equal(refused.tag, 'refuse');
+  assert.equal(refused.tag === 'refuse' && refused.val.status, 404);
+});
+
+test('send-now failures: closed is false, the rest throw', () => {
+  assert.equal(sendNowFailure({ payload: { tag: 'closed' } }), false);
+  const unknown = sendNowFailure({ payload: { tag: 'outcome-unknown' } });
+  assert.ok(unknown instanceof OutcomeUnknown);
+  assert.equal((unknown as OutcomeUnknown).topic, 'EFFECT_OUTCOME_UNKNOWN');
+  assert.match((unknown as Error).message, /may or may not have reached the client \(see `kronik explain EFFECT_OUTCOME_UNKNOWN`\)/);
+  const denied = sendNowFailure({ payload: { tag: 'denied', val: 'CAPABILITY_NOT_GRANTED: connection:send-now' } }) as KronikError;
+  assert.equal(denied.kind, 'send-now.denied');
+  assert.equal(denied.topic, 'CAPABILITY_NOT_GRANTED');
+  assert.equal((sendNowFailure(new Error('boom')) as KronikError).kind, 'send-now.unknown');
 });

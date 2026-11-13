@@ -20,6 +20,7 @@ pub const WIT: &str = include_str!("../../../../wit/kronik-actor.wit");
 pub const TS_SDK: &[File] = sdk_files!("../../../../sdk/ts/":
     "package.json",
     "src/actor.ts",
+    "src/connections.ts",
     "src/ctx.ts",
     "src/errors.ts",
     "src/globals.d.ts",
@@ -28,7 +29,9 @@ pub const TS_SDK: &[File] = sdk_files!("../../../../sdk/ts/":
     "src/sql.ts",
     "testkit/index.ts",
     "testkit/tsconfig.json",
-    "types/actor.d.ts",
+    "types/actor-connections.d.ts",
+    "types/interfaces/kronik-actor-connection-handler.d.ts",
+    "types/interfaces/kronik-actor-connections.d.ts",
     "types/interfaces/kronik-actor-context.d.ts",
     "types/interfaces/kronik-actor-crypto.d.ts",
     "types/interfaces/kronik-actor-handler.d.ts",

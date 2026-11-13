@@ -2,6 +2,8 @@
 
 import { emit, type Level } from 'kronik:actor/log@0.1.1';
 import type { HandlerError, Input, Manifest, Output, Route } from 'kronik:actor/types@0.1.1';
+import type { Closed as WitClosed, IncomingFrame as WitIncomingFrame, OpenReply, OpenRequest as WitOpenRequest } from 'kronik:actor/connections@0.1.1';
+import { type Closed, closedOf, IncomingFrame, OpenRequest, refusal, toOpenReply } from './connections.ts';
 import { Ctx } from './ctx.ts';
 import { Rejected } from './errors.ts';
 import { Message, Request, toJson } from './http.ts';
@@ -10,6 +12,29 @@ import { Message, Request, toJson } from './http.ts';
 export interface Timer {
   id: bigint;
   message: Message;
+}
+
+/**
+ * The handlers of an actor type's WebSocket and SSE connections, for its
+ * `WEBSOCKET` and `SSE` routes (see `kronik explain connections`). Each
+ * input of a connection is a turn of the actor that accepted it.
+ */
+export interface ConnectionHandlers {
+  /**
+   * A client asks to open a connection: return `ctx.accept(...)` to accept
+   * it, or an HTTP response such as `ctx.status(403)` to refuse it. Frames
+   * sent here go out right after the handshake. Without this handler,
+   * opens are refused with 404.
+   */
+  open?(req: OpenRequest, ctx: Ctx): OpenReply | Output | Promise<OpenReply | Output>;
+  /** A frame from the client (WebSocket only). Without this handler, frames are rejected and become dead letters. */
+  frame?(frame: IncomingFrame, ctx: Ctx): void | Promise<void>;
+  /**
+   * The connection ended: its last input, exactly once, also after a
+   * restart (initiator `host`, reason `restart`). Without this handler,
+   * closes do nothing.
+   */
+  close?(closed: Closed, ctx: Ctx): void | Promise<void>;
 }
 
 /** An actor type: its manifest and the handlers for the inputs it takes. */
@@ -30,12 +55,23 @@ export interface ActorSpec {
   timer?(timer: Timer, ctx: Ctx): Output | Promise<Output>;
   /** Migrates the actor's state from schema version `from`; SQL DDL is allowed only here. */
   migrate?(from: number, ctx: Ctx): void | Promise<void>;
+  /** Handles the WebSocket and SSE connections of the kind's `WEBSOCKET` and `SSE` routes. */
+  connections?: ConnectionHandlers;
+}
+
+/** The `kronik:actor/connection-handler` export: one turn per call. */
+export interface ConnectionHandler {
+  open(request: WitOpenRequest): OpenReply;
+  frame(event: WitIncomingFrame): void;
+  close(event: WitClosed): void;
 }
 
 /** The `kronik:actor/handler` export: what `kronik build` exports from the module's default export. */
 export interface Handler {
   describe(): Manifest;
   handle(input: Input): Output;
+  /** The `kronik:actor/connection-handler` export, which `kronik build` exports next to it. */
+  connectionHandler?: ConnectionHandler;
 }
 
 // With the stdio feature disabled (ADR 0002), console output would be dropped;
@@ -81,6 +117,8 @@ for (const [method, level] of consoleLevels) {
  */
 export function actor(spec: ActorSpec): Handler {
   return {
+    connectionHandler: connectionHandler(spec.connections ?? {}),
+
     describe(): Manifest {
       return {
         kind: spec.kind,
@@ -120,6 +158,58 @@ function dispatch(spec: ActorSpec, input: Input, ctx: Ctx): Output | Promise<Out
       return done instanceof Promise ? done.then(() => ({ tag: 'none' })) : { tag: 'none' };
     }
   }
+}
+
+/**
+ * The connection-handler export of a module's default export: `actor()`'s,
+ * or for a hand-written handler one that refuses every connection. `kronik
+ * build` calls it.
+ */
+export function connectionHandlerOf(handler: Handler): ConnectionHandler {
+  return handler.connectionHandler ?? connectionHandler({});
+}
+
+/** Runs `run` as a turn's handler: its result, or its error as the WIT `handler-error`. */
+function turn<T, R>(run: (ctx: Ctx) => T | Promise<T>, done: (value: T) => R): R {
+  const ctx = new Ctx();
+  try {
+    const out = run(ctx);
+    // ComponentizeJS runs the event loop until a returned promise settles.
+    return out instanceof Promise ? (out.then(done).then(undefined, (e) => fail(e)) as unknown as R) : done(out);
+  } catch (e) {
+    fail(e);
+  }
+}
+
+function connectionHandler(handlers: ConnectionHandlers): ConnectionHandler {
+  return {
+    open(request: WitOpenRequest): OpenReply {
+      return turn(
+        (ctx) =>
+          handlers.open
+            ? handlers.open(new OpenRequest(request), ctx)
+            : refusal(404, unhandled(ctx, 'connections', 'connections.open', 'connections')),
+        toOpenReply,
+      );
+    },
+
+    frame(event: WitIncomingFrame): void {
+      turn(
+        (ctx) => {
+          if (!handlers.frame) throw new Rejected(unhandled(ctx, 'connection frames', 'connections.frame', 'connections'));
+          return handlers.frame(new IncomingFrame(event), ctx);
+        },
+        () => undefined,
+      );
+    },
+
+    close(event: WitClosed): void {
+      turn(
+        (ctx) => handlers.close?.(closedOf(event), ctx),
+        () => undefined,
+      );
+    },
+  };
 }
 
 /** Throws `e` as the WIT `handler-error`: ComponentizeJS turns a thrown
