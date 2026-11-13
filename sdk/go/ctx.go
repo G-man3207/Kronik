@@ -317,16 +317,17 @@ func (l Log) Error(message string, fields ...any) { l.Emit(LevelError, message, 
 
 // Ctx is a turn's access to the host: the names Kronik's SDKs share
 // (State, SQL, Send, Call, HTTP.Fetch, Crypto, Timers, Now, Random,
-// CausalID, Secret, Subject, Log) and helpers for outputs.
+// CausalID, Secret, Subject, Log, Connections) and helpers for outputs.
 type Ctx struct {
-	State   State
-	SQL     SQL
-	HTTP    HTTP
-	Crypto  Crypto
-	Secrets Secrets
-	Timers  Timers
-	Random  Random
-	Log     Log
+	State       State
+	SQL         SQL
+	HTTP        HTTP
+	Crypto      Crypto
+	Secrets     Secrets
+	Timers      Timers
+	Random      Random
+	Log         Log
+	Connections ConnectionOps
 }
 
 // Send sends msg to the actor to ("kind/key"): buffered, delivered exactly

@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"go.bytecodealliance.org/cm"
+	connectionhandler "kronik.dev/sdk/internal/wit/kronik/actor/connection-handler"
 	"kronik.dev/sdk/internal/wit/kronik/actor/handler"
 	"kronik.dev/sdk/internal/wit/kronik/actor/types"
 )
@@ -69,15 +70,30 @@ type Actor struct {
 	// Migrate migrates the actor's state from schema version from; SQL DDL
 	// is allowed only here.
 	Migrate func(from uint32, ctx *Ctx) error
+	// Connections handles the WebSocket and SSE connections of the actor
+	// type's WEBSOCKET and SSE routes.
+	Connections *Connections
 }
 
 type handleResult = cm.Result[handler.OutputShape, types.Output, types.HandlerError]
 
-// Export makes a the component's kronik:actor/handler export. Call it once,
-// from init.
+// Export makes a the component's kronik:actor/handler and
+// kronik:actor/connection-handler exports. Call it once, from init.
 func Export(a Actor) {
 	handler.Exports.Describe = a.describe
 	handler.Exports.Handle = a.handle
+	connectionhandler.Exports.Open = a.open
+	connectionhandler.Exports.Frame = a.frame
+	connectionhandler.Exports.Close = a.close
+}
+
+// handlerError is err as the WIT handler-error: [Rejected] is rejected,
+// anything else failed.
+func handlerError(err error) types.HandlerError {
+	if IsRejected(err) {
+		return types.HandlerErrorRejected(err.Error())
+	}
+	return types.HandlerErrorFailed(err.Error())
 }
 
 func (a *Actor) describe() types.Manifest {
@@ -101,10 +117,7 @@ func (a *Actor) handle(input types.Input) (result handleResult) {
 	}()
 	out, err := a.dispatch(&input, &Ctx{})
 	if err != nil {
-		if IsRejected(err) {
-			return cm.Err[handleResult](types.HandlerErrorRejected(err.Error()))
-		}
-		return cm.Err[handleResult](types.HandlerErrorFailed(err.Error()))
+		return cm.Err[handleResult](handlerError(err))
 	}
 	return cm.OK[handleResult](out.wit)
 }
