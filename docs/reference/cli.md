@@ -318,8 +318,8 @@ configuration with `--config` (or `KRONIK_CONFIG`). File/env sources use
 is refused; KMS never falls back to an environment seed or raw key file.
 
 A diff with no verified difference writes `<data-dir>/upgrade/<engine>.json`
-and exits 0; differences of turns whose recorded input was erased do not
-count as changes. A diff with a verified difference writes that report and
+and exits 0; differences of turns that met erased data do not count as
+changes. A diff with a verified difference writes that report and
 the diff next to it
 (`<data-dir>/upgrade/<engine>.diff.json`) and exits 1 with
 `ENGINE_UPGRADE_DIVERGED`. `--dry-run` runs the check and prints the
@@ -328,11 +328,15 @@ log is `BAD_REQUEST`. `--json` prints the report, and the diff path when
 one was written, even when the command exits 1.
 
 A turn whose recorded input was **erased** (`kronik privacy erase`, M8)
-is unverifiable, not divergent: the replay serves its effects from the
-recording, reports `N turns unverifiable: erased` (the report's
-`unverifiable` field, also in `--json`), and passes when nothing else
-differs. Any other difference still exits 1, so a check that fails after
-an erasure has found a real change or a recording that cannot be read.
+is unverifiable, not divergent, and so is every turn the erased data
+reached: one whose input or state it shaped, one that read a state value
+or SQL rows the erasure removed before production's own erasure did, and
+a production turn missing below an unverifiable one (ADR 0109). The
+replay serves their effects from the recording, reports `N turns
+unverifiable: erased` (the report's `unverifiable` field, also in
+`--json`), and passes when nothing else differs. Any other difference
+still exits 1, so a check that fails after an erasure has found a real
+change or a recording that cannot be read.
 Reports written by older binaries lack the field; the report schema stays
 `kronik.upgrade-check/v1`.
 

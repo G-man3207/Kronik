@@ -534,8 +534,10 @@ impl Store {
     }
 
     /// The erasure operation of `subject` through `key_version` again, on
-    /// `state.db` and every actor database, keeping the applied LSNs (a
-    /// rebase shadow after its staged turns, m13-rebase §3).
+    /// `state.db` and every actor database, keeping the applied LSNs: a
+    /// rebase shadow after its staged turns (m13-rebase §3), and a fork's
+    /// continuous replay at the place of production's `Erasure` record, so
+    /// the fork's state loses what production's lost there (ADR 0109).
     pub fn erase_again(&self, subject: &str, key_version: u32) -> Result<(), StoreError> {
         let _apply = self.apply_lock();
         for name in self.db().sql_actors()? {

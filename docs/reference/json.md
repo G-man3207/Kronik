@@ -2460,7 +2460,7 @@ against both.
       "description": "Fork effects answered by a similar recording (same target, different request)."
     },
     "changed": {
-      "description": "Any difference in the diff that a replay verified: not a difference of a turn that read a pseudonym or an erased value, which cannot be verified as a change (S-16, ADR 0109). The policy floor still reads `pii_masked + pii_unverified` (ADR 0031).",
+      "description": "Any difference in the diff that a replay verified: not a difference of a turn that read a pseudonym or met erased data, nor of a production turn missing below one, which cannot be verified as a change (S-16, ADR 0109). The policy floor still reads `pii_masked + pii_unverified` (ADR 0031).",
       "type": "boolean"
     },
     "confidence": {
@@ -2493,7 +2493,7 @@ against both.
     },
     "pii_masked": {
       "$ref": "#/components/schemas/DiffCount",
-      "description": "In a fork without personal data: differing turns that read pseudonyms instead of personal data, and production turns missing below them. They are not verified: not counted as divergent, errors or causes (M8), and the policy needs at least an approval while pii_masked + pii_unverified is above 0 (pii-masked-needs-approval, ADR 0031). Always written (0 when none); diffs written before v0.1 lack it when 0."
+      "description": "Differing turns that read pseudonyms instead of personal data (a fork without personal data) or met erased data, and production turns missing below them. They are not verified: not counted as divergent, errors or causes (M8, ADR 0109), and the policy needs at least an approval while pii_masked + pii_unverified is above 0 (pii-masked-needs-approval, ADR 0031). Always written (0 when none); diffs written before v0.1 lack it when 0."
     },
     "pii_unverified": {
       "$ref": "#/components/schemas/DiffCount",
@@ -2532,7 +2532,7 @@ against both.
     },
     "unverifiable": {
       "$ref": "#/components/schemas/DiffCount",
-      "description": "Turns whose recorded input was erased (S-16, ADR 0109): the replay served their effects from the recording, so their behaviour was not verified against the erased values and their differences are not changes. Any other difference of the same causal trees - including one in a turn that also met an erased value - still counts; a real divergence next to an unverifiable turn keeps `changed` true. Always written (0 when none); diffs and upgrade reports written before v0.5.0 lack it when 0."
+      "description": "Turns that met erased data, differing or not, each causal key once (S-16, ADR 0109): their recorded input or a state value they read was erased, or erased data shaped what they ran on (a message, call or timer of such a turn that production did not send the same way, state such a turn or a production turn missing below one left different, an actor database lacking an erased subject's rows that production still had, an unverifiable callee); and production turns missing below such a turn. The replay served their effects from the recording, so their behaviour was not verified and their differences are not changes. Every other difference still counts; a real divergence next to an unverifiable turn keeps `changed` true. Always written (0 when none); diffs and upgrade reports written before v0.5.0 lack it when 0."
     },
     "verified_through_lsn": {
       "$ref": "#/components/schemas/DiffCount",
@@ -7573,7 +7573,7 @@ against both.
     },
     "unverifiable": {
       "default": 0,
-      "description": "Turns the identity replay could not verify: their recorded input was\nerased (S-16, ADR 0109).",
+      "description": "Turns the identity replay could not verify because they met erased\ndata: their recorded input, a state value they read, or an input or\nstate that erased data shaped, and production turns missing below one\n(S-16, ADR 0109).",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"

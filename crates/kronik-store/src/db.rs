@@ -160,6 +160,8 @@ pub struct MailboxRow {
     pub input: pb::Input,
     /// The causal key of the receiving turn.
     pub causal_key: pb::CausalKey,
+    /// The lsn of the sending turn.
+    pub lsn: Lsn,
 }
 
 /// A saved ingress response.
@@ -883,7 +885,8 @@ impl StateDb {
     /// What an `Erasure` of `subject` through `key_version` does to
     /// state.db (its kv values, ingress keys and dead letters deleted, saved
     /// call outcomes and queued timer and message bodies tombstoned),
-    /// outside a record: a rebase shadow after its staged turns (M13).
+    /// outside a record: a rebase shadow after its staged turns (M13), and
+    /// a fork's continuous replay at the erasure's place.
     pub fn erase_subject_rows(&self, subject: &str, key_version: u32) -> Result<(), StoreError> {
         erase_rows(&self.conn, subject, key_version)
     }
@@ -1373,7 +1376,8 @@ impl StateDb {
     /// Every pending message, in commit order.
     pub fn mailbox(&self) -> Result<Vec<MailboxRow>, StoreError> {
         let mut st = self.conn.prepare_cached(
-            "SELECT message_id, to_kind, to_key, input, causal FROM mailbox ORDER BY lsn, ordinal",
+            "SELECT message_id, to_kind, to_key, input, causal, lsn FROM mailbox \
+             ORDER BY lsn, ordinal",
         )?;
         let rows = st.query_map([], |r| {
             Ok((
@@ -1382,16 +1386,18 @@ impl StateDb {
                 r.get::<_, String>(2)?,
                 r.get::<_, Vec<u8>>(3)?,
                 r.get::<_, Vec<u8>>(4)?,
+                r.get::<_, i64>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (message_id, kind, key, input, causal) = row?;
+            let (message_id, kind, key, input, causal, lsn) = row?;
             out.push(MailboxRow {
                 message_id,
                 to: kronik_core::ids::ActorRef { kind, key },
                 input: decode(&input, "mailbox input")?,
                 causal_key: decode(&causal, "mailbox causal key")?,
+                lsn: lsn as Lsn,
             });
         }
         Ok(out)

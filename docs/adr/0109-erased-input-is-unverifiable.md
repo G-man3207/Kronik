@@ -1,8 +1,8 @@
 # 0109. Erased recorded input is unverifiable, not divergence
 
 - **Status:** Proposed
-- **Date:** 2026-11-08, amended 2026-11-13 (points 1, 3 and 5, issues
-  #27, #28 and #49)
+- **Date:** 2026-11-08, amended 2026-11-13 (points 1, 3, 5, 7 and 8,
+  issues #27-#29 and #49)
 
 ## Context
 
@@ -73,8 +73,8 @@ divergent. Identity replay and `kronik upgrade check` treat it that way:
    approval floor still reads `pii_masked` (and `pii_unverified`), so such a
    proposal still needs an approval; `changed` is not the floor.
 5. **Report it.** `DiffSummary.unverifiable` and the upgrade report's
-   `unverifiable` count the turns of points 1 and 3, each causal key once,
-   whether they differ or not, and `kronik upgrade check`
+   `unverifiable` count the turns of points 1, 3 and 7, each causal key
+   once, whether they differ or not, and `kronik upgrade check`
    prints `N turns unverifiable: erased` (the upgrade report schema stays
    `kronik.upgrade-check/v1`; the field is additive and defaults to 0 for
    reports written by older binaries). A check passes when the only
@@ -84,6 +84,33 @@ divergent. Identity replay and `kronik upgrade check` treat it that way:
    readable recording. An erased request whose recorded outcome is also
    unreadable is not silently accepted: the check reports the error and
    does not pass. The erasure excuses the input, not the evidence.
+7. **Follow what the erased data shaped** (issue #29). A turn meets erased
+   data not only through its own recording. It is `unverifiable` as well
+   when, at its production position:
+   - an unverifiable turn sent its message, call or timer, and its input
+     differs from what production's counterpart received, or production has
+     none;
+   - it reads a state key, lists keys or asks whether a timer is pending
+     where an unverifiable turn left the state different from its production
+     counterpart's, or where a production turn missing below one wrote. Such
+     a mark lasts until a verified turn writes that key again, or, when only
+     one subject's values are involved on both sides, until that subject's
+     erasure deletes them on both sides;
+   - it uses the SQL database of an actor that an unverifiable turn (or a
+     production turn missing below one) left different, or whose replay
+     skipped an erased subject's changeset while production still had those
+     rows: before that subject's `Erasure`, or at any time when the database
+     has a table without `_subject`, whose rows an erasure does not delete (a
+     subject's turn could write one before ADR 0005 §6 option B);
+   - it calls a turn that is unverifiable.
+   These marks only classify: they never change what a guest reads. The
+   price is the same as point 3's: a real change in such a turn is reported
+   as unverifiable, not as a difference.
+8. **Follow the erasure.** Continuous replay applies production's `Erasure`
+   records at their place in the window, as isolated replay's production
+   cursor does: the fork's state loses what production's lost there, so a
+   later turn reads what production's read and the final states compare
+   (state written before the window and erased inside it is no difference).
 
 **Status note.** The ruling on replay semantics that this decision depends on
 was left open when the v0.4.1 release was decided; the recommendation there is
@@ -113,6 +140,13 @@ behaviour is new rather than settled, until the maintainers record the ruling.
   how the rest of the window behaves around their effects and consequences;
   replaying them from the recording is what makes the turn's children and
   responses comparable.
+- **Serve the recording for state too** (apply an unverifiable turn's
+  recorded writes to the fork's store instead of the guest's). Later turns
+  would read production's values, but the fork's state would no longer be
+  what its code computed (a proposal's or a rollback's), production turns
+  missing below the erased turn would still leave gaps, and an erased
+  subject's skipped rows still could not be rebuilt. The marks of point 7
+  classify instead and leave execution as it was.
 
 ## Consequences
 
@@ -120,15 +154,23 @@ A v0.4.0 (or older) directory on which a subject was erased can be upgraded
 to v0.5.0 with the default check, and then served: the passing report still
 records how many turns it could not verify, and the operator can see them
 (`--json`, `unverifiable`). A check that fails after v0.5.0 has found a real
-difference or an unreadable recording, not an erasure; the old workaround
-paragraph stays in the operations guide for v0.4.1 and older binaries.
+difference or an unreadable recording, not an erasure: the turns an erasure
+reaches are the ones points 1, 3, 7 and 8 classify - the turn that met an
+erased value, everything below it that production ran and the replay did
+not, and every turn that read what those left different or what the replay
+could not rebuild without the erased rows. The old workaround paragraph stays
+in the operations guide for v0.4.1 and older binaries.
 
 The erased turn's *behaviour* is not verified, only the recording is trusted:
 if the guest's change makes it take a different path on `[erased]` and the
 recording still answers, the check reports the turn unverifiable instead of
-diffing it. That is the price of passing, and it is reported, not hidden.
-Erasure also no longer voids the upgrade gate, so an operator can erase
-before upgrading without knowing the workaround.
+diffing it. The same holds for every turn point 7 reaches, which can be many
+when a shared actor's state or database is involved: an SQL database stays
+unverified for the rest of the window once an unverifiable turn changed rows
+of no subject (or of one that is not erased) in it. That is the price of
+passing, and it is reported, not hidden. Erasure also no longer voids the
+upgrade gate, so an operator can erase before upgrading without knowing the
+workaround.
 
 No format, WIT, engine-id or public-API break: the diff summary and upgrade
 report gain an additive field (`#[serde(default)]`), the CLI's `--json` gains

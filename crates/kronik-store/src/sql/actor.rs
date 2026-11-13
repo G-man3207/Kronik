@@ -1083,6 +1083,22 @@ impl SqlActor {
         Ok(n)
     }
 
+    /// Whether a table of the guest's has no `_subject` column. A subject's
+    /// erasure leaves such a table's rows, which a turn with a subject could
+    /// write before ADR 0005 §6 option B refused it.
+    pub fn has_table_without_subject(&self) -> Result<bool, String> {
+        lock(&self.shared).host = true;
+        self.conn
+            .query_row(
+                "SELECT count(*) > 0 FROM sqlite_schema m WHERE m.type = 'table' \
+                 AND m.name NOT LIKE '\\_kronik%' ESCAPE '\\' AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+                 AND NOT EXISTS (SELECT 1 FROM pragma_table_info(m.name) c WHERE c.name = '_subject')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())
+    }
+
     /// Replaces text and blob cells of rows tagged with `_subject`. Integer
     /// and real values, and the `_subject` column itself, are left as they
     /// are. A `--no-pii` fork does this to a snapshot it continues, with the

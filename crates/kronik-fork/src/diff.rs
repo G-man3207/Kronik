@@ -197,10 +197,13 @@ pub struct Summary {
     /// Always present; 0 in identity replays.
     #[serde(default)]
     pub pii_unverified: u64,
-    /// Turns whose recorded input was erased, differing or not, and
-    /// production turns missing below one: the replay ran on what is left
-    /// of it (the recorded outcome), so a difference is unverifiable rather
-    /// than a change (S-16, ADR 0109). Always present; 0 when none.
+    /// Turns that met erased data, differing or not: their recorded input,
+    /// a state value they read, or an input or state that erased data
+    /// shaped (a message of such a turn, state it or a production turn
+    /// missing below it left different, an actor database lacking an erased
+    /// subject's rows), and production turns missing below one. The replay
+    /// ran them on what is left, so a difference is unverifiable rather than
+    /// a change (S-16, ADR 0109). Always present; 0 when none.
     #[serde(default)]
     pub unverifiable: u64,
     /// Requests sent to a preview fork (M11): root inputs of their own,

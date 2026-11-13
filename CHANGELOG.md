@@ -51,11 +51,15 @@ until the v1.0 compatibility promise takes effect.
   erased data (effects, response, errors, fuel), are no longer counted as
   changes. Before, `ENGINE_UPGRADE_DIVERGED` failed the check and `serve`
   refused the directory (issues #16, #27). A verified difference still fails.
-- A production turn missing below a turn that met erased data (a message,
-  call or timer the erased value decided) is unverifiable, not a divergent
-  turn, an origin or a consequence, and the turn that met the erased data is
-  no longer counted as their origin; `unverifiable` counts each turn once
-  (#28).
+- An erasure no longer makes other turns verified divergences
+  ([ADR 0109](docs/adr/0109-erased-input-is-unverifiable.md), amended):
+  production turns missing below a turn that met erased data are
+  unverifiable, not divergent, origins or consequences (#28); a turn that
+  reads state or SQL rows an erasure removed or shaped, whose input an
+  unverifiable turn shaped, or that calls one, is unverifiable too (#29);
+  the continuous replay applies production's erasures in its window, so a
+  value written before the window and erased inside it is no difference;
+  and `unverifiable` counts each turn once.
 - In a fork, an erased state value reads as absent and marks the turn that
   read it, also when the value was written inside the replayed log; before,
   the guest read the bytes `[erased]` as the value (#49).

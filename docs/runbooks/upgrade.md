@@ -24,9 +24,10 @@ engine-compatibility exemption.
    Select a retained traffic window that covers the application's important
    behavior. Check the actual old/new engine pair, root and turn counts and
    that the diff holds no verified difference. A zero-input check is not
-   application evidence. Turns whose recorded input was erased are reported
-   `N turns unverifiable` and pass; read that count, not only the exit
-   code, because those turns were not verified. The
+   application evidence. Turns that met erased data (their own recorded
+   input, or state and messages it shaped) are reported `N turns
+   unverifiable` and pass; read that count, not only the exit code, because
+   those turns were not verified. The
    check also asks the question the start asks of the data directory, whether
    the log that retention kept reaches `state.db` and every actor database: it
    prints a note on stderr, also with `--json`, when the start will repair that

@@ -37,14 +37,16 @@ pub fn conceal_turn(t: &mut pb::TurnRecord) {
     }
 }
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use kronik_core::ids::ActorRef;
+use kronik_core::ids::{ActorRef, Lsn};
 use kronik_privacy::sealer::{Opened, Sealer};
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::StateView;
 use kronik_store::Store;
+
+use crate::taint::Taint;
 
 /// A fork's view of production values.
 #[derive(Clone, Debug)]
@@ -207,13 +209,18 @@ pub fn tagged_input(input: Option<&pb::Input>) -> bool {
 }
 
 /// A fork turn's state: production's (or the fork's) committed values, as
-/// [`ForkPrivacy::reveal`] shows them; remembers whether a read was masked.
+/// [`ForkPrivacy::reveal`] shows them; remembers whether a read was masked,
+/// and whether it read state the replay could not verify after an erasure.
 pub struct ForkState {
     store: Arc<Store>,
     actor: ActorRef,
     privacy: ForkPrivacy,
+    /// Where the store holds state the replay could not verify, and the
+    /// turn's production position (ADR 0109).
+    taint: Option<(Arc<Mutex<Taint>>, Lsn)>,
     masked: AtomicBool,
-    /// The turn read a state value whose subject was erased (S-16).
+    /// The turn read a state value whose subject was erased (S-16), or one
+    /// that erased data shaped ([`Taint`]).
     erased: AtomicBool,
     /// The turn read a state value with a subject (M12: the model
     /// simulator then declines).
@@ -226,10 +233,18 @@ impl ForkState {
             store,
             actor,
             privacy,
+            taint: None,
             masked: AtomicBool::new(false),
             erased: AtomicBool::new(false),
             saw_subject: AtomicBool::new(false),
         }
+    }
+
+    /// The turn at production position `at` reads state that `taint`
+    /// says may differ from production's: a read of it marks the turn.
+    pub fn with_taint(mut self, taint: Arc<Mutex<Taint>>, at: Lsn) -> ForkState {
+        self.taint = Some((taint, at));
+        self
     }
 
     /// Whether the turn read a pseudonym or an erased value.
@@ -237,7 +252,8 @@ impl ForkState {
         self.masked.load(Ordering::Relaxed)
     }
 
-    /// Whether the turn read an erased state value.
+    /// Whether the turn read an erased state value, or state that erased
+    /// data shaped.
     pub fn erased(&self) -> bool {
         self.erased.load(Ordering::Relaxed)
     }
@@ -246,10 +262,25 @@ impl ForkState {
     pub fn saw_subject(&self) -> bool {
         self.saw_subject.load(Ordering::Relaxed)
     }
+
+    fn actor_name(&self) -> String {
+        format!("{}/{}", self.actor.kind, self.actor.key)
+    }
+
+    /// Marks the turn when `unverified` says what it reads may differ.
+    fn check(&self, unverified: impl FnOnce(&Taint, &str, Lsn) -> bool) {
+        if let Some((taint, at)) = &self.taint {
+            let taint = taint.lock().unwrap_or_else(|e| e.into_inner());
+            if unverified(&taint, &self.actor_name(), *at) {
+                self.erased.store(true, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 impl StateView for ForkState {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        self.check(|t, actor, at| t.key(actor, key, at));
         let value = self
             .store
             .db()
@@ -278,6 +309,7 @@ impl StateView for ForkState {
     }
 
     fn keys(&self, prefix: &str) -> Result<Vec<String>, String> {
+        self.check(|t, actor, at| t.prefix(actor, prefix, at));
         self.store
             .db()
             .kv_keys(&self.actor.kind, &self.actor.key, prefix)
@@ -285,6 +317,7 @@ impl StateView for ForkState {
     }
 
     fn timer_pending(&self, id: u64) -> Result<bool, String> {
+        self.check(|t, actor, at| t.timer(actor, id, at));
         self.store
             .db()
             .timer_pending(&self.actor.kind, &self.actor.key, id)
@@ -375,6 +408,49 @@ mod tests {
             "an erased value reads as absent"
         );
         assert!(state.erased() && state.masked());
+    }
+
+    /// Issue #29: a read of state the taint marks (here `n`, from position
+    /// 10 on) marks the turn as one that met erased data, whatever it reads;
+    /// a turn before that position is not marked.
+    #[test]
+    fn a_read_of_unverified_state_marks_the_turn() {
+        let store = crate::replay::memory_store().unwrap();
+        let privacy = ForkPrivacy::plain();
+        let actor = ActorRef::parse("counter/a").unwrap();
+        let taint = Arc::new(Mutex::new(Taint::default()));
+        taint.lock().unwrap().missing_turn(
+            &pb::TurnRecord {
+                actor: Some(pb::ActorRef {
+                    kind: "counter".into(),
+                    key: "a".into(),
+                }),
+                outcome: Some(pb::Outcome {
+                    kind: pb::OutcomeKind::Committed as i32,
+                    ..Default::default()
+                }),
+                writes: vec![pb::StateWrite {
+                    key: "n".into(),
+                    op: pb::StateOp::Set as i32,
+                    value: None,
+                }],
+                ..Default::default()
+            },
+            10,
+        );
+        let at = |pos: Lsn| {
+            ForkState::new(store.clone(), actor.clone(), privacy.clone())
+                .with_taint(taint.clone(), pos)
+        };
+        let before = at(9);
+        assert_eq!(before.get("n").unwrap(), None);
+        assert!(!before.erased());
+        let after = at(10);
+        assert_eq!(after.get("n").unwrap(), None);
+        assert!(after.erased() && !after.masked());
+        let listing = at(11);
+        listing.keys("").unwrap();
+        assert!(listing.erased());
     }
 
     #[test]

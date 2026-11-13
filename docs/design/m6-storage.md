@@ -284,10 +284,11 @@ read:
    configuration and code overrides.
 2. A diff with no verified difference writes `DIR/upgrade/<to-engine>.json`
    with `{from_engine, to_engine, window, fork_lsn, checked_through_lsn,
-   diff_hash, report_hash}` and exits 0. Differences of turns whose recorded
-   input was erased are unverifiable, not a behavior change (ADR 0109). A
-   verified difference exits with `ENGINE_UPGRADE_DIVERGED`, writes the diff
-   next to it and prints a summary.
+   diff_hash, report_hash}` and exits 0. Differences of turns that met
+   erased data (their recorded input, a state value they read, or an input
+   or state that erased data shaped) are unverifiable, not a behavior change
+   (ADR 0109). A verified difference exits with `ENGINE_UPGRADE_DIVERGED`,
+   writes the diff next to it and prints a summary.
 3. When the new binary starts and the engine version recorded in `state.db`
    (`meta.engine_version`, written by the applier from the newest
    `TurnBegin`/`TurnRecord`/`EngineUpgrade`) differs from its own, it

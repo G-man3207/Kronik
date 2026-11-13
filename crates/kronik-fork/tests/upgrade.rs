@@ -999,6 +999,70 @@ fn a_timer_of_an_erased_subject_pending_at_the_fork_point_is_unverifiable() {
     keep(&dir, "erased-pending-timer");
 }
 
+/// Issue #29 (workload d2, SQL): the replay skips the erased subject's
+/// changeset, so until the erasure the actor database lacks a row that
+/// production's `count` read. That `count` is unverifiable, not divergent;
+/// the `count` after the erasure reads what production read and is verified.
+#[test]
+fn rows_an_erasure_removed_do_not_make_a_reader_diverge() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["notes"],
+        &[
+            Step::Send("notes/n1", "add", "note text", Some("user:1")),
+            Step::Send("notes/n1", "count", "", None),
+            Step::Erase("user:1"),
+            Step::Send("notes/n1", "count", "", None),
+        ],
+    );
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let d = &checked.diff;
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(checked.report.passed, "{text}");
+    assert_eq!(checked.report.root_inputs, 3);
+    assert_eq!(d.summary.divergent_turns, 0, "{text}");
+    assert_eq!(d.summary.origins, 0, "{text}");
+    assert_eq!(d.responses.changed, 0, "{text}");
+    // The erased `add` and the `count` that read its row.
+    assert_eq!(d.summary.unverifiable, 2, "{text}");
+    assert!(d.state.isolated.is_empty() && d.state.continuous.is_empty());
+    keep(&dir, "erased-sql-reader");
+}
+
+/// Issue #29 (KV): the erased body of `forward` named the actor production
+/// incremented. The replay increments another one, so production's write
+/// to `counter/k2` is missing from the fork's state, and the `get` that read
+/// it is unverifiable rather than a verified divergence, in both modes.
+#[test]
+fn a_reader_of_state_an_erased_turn_shaped_is_unverifiable() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter"],
+        &[
+            Step::Send("counter/w", "forward", "k2", Some("user:1")),
+            Step::Send("counter/k2", "get", "", None),
+            Step::Erase("user:1"),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let d = &checked.diff;
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(checked.report.passed, "{text}");
+    assert_eq!(d.summary.divergent_turns, 0, "{text}");
+    assert_eq!(d.responses.changed, 0, "{text}");
+    // `forward`, the turn its message started (on another actor in the
+    // replay) and the `get`.
+    assert_eq!(d.summary.unverifiable, 3, "{text}");
+    keep(&dir, "erased-kv-reader");
+}
+
 /// Issue #49: an erased state value reads as absent in a fork and marks the
 /// turn that read it, also when the value was written inside the replayed
 /// log: the writer and the reader are unverifiable (before, the reader got
@@ -1026,6 +1090,36 @@ fn a_reader_of_an_erased_state_value_is_unverifiable() {
     assert_eq!(d.summary.divergent_turns, 0, "{text}");
     assert_eq!(d.summary.unverifiable, 2, "{text}");
     keep(&dir, "erased-value-reader");
+}
+
+/// Issue #29: the window starts after a turn wrote a value of the subject
+/// and before its erasure. Production's erasure deletes the value; the
+/// continuous replay follows that erasure, so the final states agree.
+#[test]
+fn an_erasure_in_the_window_removes_state_written_before_it() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter"],
+        &[
+            Step::Send("counter/a", "subject", "", Some("user:1")),
+            Step::Pause(Duration::from_millis(600)),
+            Step::Send("counter/k1", "increment", "", None),
+            Step::Erase("user:1"),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
+    // The window holds the last two root inputs, not the write.
+    let checked = check_dir(&rt, dir.path(), Duration::from_millis(300));
+    let d = &checked.diff;
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert_eq!(checked.report.root_inputs, 2, "{text}");
+    assert!(checked.report.passed, "{text}");
+    assert!(d.state.continuous.is_empty(), "{text}");
+    assert_eq!(d.summary.unverifiable, 0, "{text}");
+    keep(&dir, "erased-before-window");
 }
 
 /// S-16 (5): the replay serves the recorded outcome of an erased request - an

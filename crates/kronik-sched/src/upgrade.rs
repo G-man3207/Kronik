@@ -24,12 +24,14 @@ pub struct UpgradeReport {
     pub turns: u64,
     /// The identity replay's diff (`b3:<hex>`).
     pub diff_hash: String,
-    /// Turns the diff could not verify because their recorded input was
-    /// erased (S-16, ADR 0109). They do not make `passed` false: the recorded
-    /// outcome is the only truth there is, and the replay served it.
+    /// Turns the diff could not verify because they met erased data: their
+    /// recorded input, a state value they read, or an input or state that
+    /// erased data shaped, and production turns missing below one (S-16,
+    /// ADR 0109). They do not make `passed` false: the recorded outcome is
+    /// the only truth there is, and the replay served it.
     #[serde(default)]
     pub unverifiable: u64,
-    /// The diff found no change.
+    /// The diff found no verified difference.
     pub passed: bool,
     pub checked_wall_ms: u64,
 }
@@ -115,8 +117,8 @@ pub(crate) fn gate(
     if !report.passed {
         return Gate::Refuse(format!(
             "{} records a diverging identity replay (diff {}); the upgrade is not safe. \
-             An erased request is unverifiable, not divergent, as of v0.5.0: run the check \
-             again with this binary and read its count. If this report is from a v0.4.1 or \
+             A turn that met erased data is unverifiable, not divergent, as of v0.5.0: run the \
+             check again with this binary and read its count. If this report is from a v0.4.1 or \
              older binary it may name only the erasure; then make one new turn and run the \
              check with a window shorter than the time since the erasure - the check forks \
              from the root inputs, not from snapshots, so an erased request is replayed \

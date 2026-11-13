@@ -106,6 +106,7 @@
 - [ADR 0106: Operational events follow committed records](adr/0106-operational-events.md)
 - [ADR 0107: Original authority through final enqueue](adr/0107-original-authority-final-admission.md)
 - [ADR 0108: Durable secret-coverage watermark](adr/0108-durable-secret-coverage-watermark.md)
+- [ADR 0109: Erased recorded input is unverifiable, not divergence](adr/0109-erased-input-is-unverifiable.md)
 - [ADR 0110: Hosted workflows start only by hand](adr/0110-manual-github-workflows.md)
 - [ADR 0111: The 1 000 turns/s target is across actors](adr/0111-cross-actor-throughput.md)
 - [ADR 0112: A grant chooses whether a fork may compute with a production key](adr/0112-fork-crypto-grant-mode.md)

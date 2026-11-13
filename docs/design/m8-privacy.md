@@ -603,7 +603,8 @@ Where the code differs from the sections above:
   it counts in `summary.pii_masked` and `samples.pii_masked`, not as
   divergent, an error or a cause. An erased subject's state value stays
   sealed in the fork's store, reads as absent and marks the reading turn as
-  one that met erased data (ADR 0109). HTTP root inputs keep the gateway's
+  one that met erased data (ADR 0109), as do reads of state that erased
+  data shaped there. HTTP root inputs keep the gateway's
   subject in forks (taken from the body's or a header's tag). A fork
   records its effects with the
   guest's subject as production does, and seals what it writes to disk (its
