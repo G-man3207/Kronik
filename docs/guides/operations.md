@@ -640,6 +640,8 @@ with OIDC, Host must match the configured admin origin:
 | `kronik_applied_lsn` | gauge | | The newest log record applied to the state |
 | `kronik_disk_free_bytes` | gauge | | Free bytes on the log's file system, when `[log] disk_reserve` is set |
 | `kronik_disk_below_reserve` | gauge | | 1 while free space is below `[log] disk_reserve` (also `"low_disk": true` in `/v1/health` and `/healthz`) |
+| `kronik_key_source_up` | gauge | | 1 when the master key was loaded through its source, 0 on a node without a secret store. A KMS or HSM outage stops only a start, and a daemon that did not start exports nothing: alert on the scrape failing (Prometheus `up == 0`); `kronik doctor`'s `key_source` check then names the code |
+| `kronik_secret_recovery_stalled` | gauge | | Re-runs of open turns waiting for a recorded secret value or an unavailable prerequisite |
 | `kronik_turns_total` | counter | `kind`, `outcome` | Turns by actor type and outcome: `committed`, `rejected` or `failed` |
 | `kronik_turn_duration_seconds` | histogram | `kind` | Turn duration |
 | `kronik_log_records_appended_total` | counter | | Records written to the log |

@@ -178,6 +178,8 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_applied_lsn` | gauge | The last log sequence number applied to the materialized state. |
 | `kronik_disk_free_bytes` | gauge | Free bytes on the log's file system (when [log] disk_reserve is set). |
 | `kronik_disk_below_reserve` | gauge | 1 while the log's file system is below [log] disk_reserve: new inputs and changes are refused. |
+| `kronik_key_source_up` | gauge | 1 when the daemon loaded its master key through its key source ([keys] source); 0 without a secret store. |
+| `kronik_secret_recovery_stalled` | gauge | Re-runs of open turns waiting for a recorded secret value or for an unavailable prerequisite. |
 | `kronik_turns_total` | counter | Turns recorded, by actor kind and outcome. |
 | `kronik_turn_duration_seconds` | histogram | Time from the start of a turn to its record, by actor kind. |
 | `kronik_log_records_appended_total` | counter | Records written to the log. |
