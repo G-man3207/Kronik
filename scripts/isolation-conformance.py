@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import signal
 import select
@@ -33,6 +34,12 @@ LIMIT = 8 * 1024 * 1024
 # seconds by default, and the guest's fill of its 1 GiB data drive is one call:
 # on a slow disk or nested virtualization that alone can fail the oracle.
 EFFECT_TIMEOUT_MS = 300_000
+# ADR 0096: the VMM must exit within a second of the guest's acknowledged STOP.
+STOP_LIMIT_MS = 1000
+# What a guest console shows when its kernel or its PID 1 panics. `panic=1` on the kernel
+# command line makes a panic restart the guest, which ends the VMM just as a clean stop does,
+# so only the console tells the two apart.
+PANIC = re.compile(r"Kernel panic|panicked at|Oops:|BUG: ")
 
 
 def require(condition, message):
@@ -751,6 +758,71 @@ def vm_processes(members, read_status, read_args):
     return launcher, vmm, seen[launcher][-1]
 
 
+def stop_record(line):
+    """The fields of the daemon's `microVM stopped` log line, text or JSON format."""
+    def field(key):
+        match = re.search(key + r'"?\s*[=:]\s*"?([A-Za-z0-9_]+)', line)
+        return match.group(1) if match else None
+    return {"acknowledged": field("acknowledged"), "exit_ms": field("exit_ms"), "forced": field("forced")}
+
+
+def console_panics(text):
+    """The lines of a guest console that show a kernel or PID 1 panic."""
+    return [line for line in text.splitlines() if PANIC.search(line)]
+
+
+def vm_stop_proof(root, cfg, name, offset):
+    """ADR 0096's graceful stop, after the removal of the microVM actor `name`: the daemon logs
+    the guest's acknowledged STOP and how long after it the VMM exited (`serve.log` after
+    `offset`). The VMM must exit by itself within STOP_LIMIT_MS, and the guest console must
+    show no panic: a panic ends the VMM as quickly as a clean stop does."""
+    log = root / "serve.log"
+    deadline = time.monotonic() + 60
+    while True:
+        with log.open("rb") as stream:
+            stream.seek(offset)
+            text = stream.read(LIMIT).decode(errors="replace")
+        lines = [line for line in text.splitlines() if "microVM stopped" in line and name in line]
+        if lines:
+            break
+        require(time.monotonic() < deadline, f"no microVM stop record for {name} in {log}")
+        time.sleep(0.2)
+    record = stop_record(lines[-1])
+    console = Path(cfg["data"])/"foreign/actors"/name/"output.log"
+    shown = console.read_bytes()[-LIMIT:].decode(errors="replace") if console.exists() else ""
+    panics = console_panics(shown)
+    evidence = {"actor":name,"log_line":lines[-1],**record,"limit_ms":STOP_LIMIT_MS,
+                "console":str(console),"console_bytes":len(shown),"panic_lines":panics}
+    (root/f"vm-stop-{name}.json").write_text(json.dumps(evidence,indent=2))
+    require(record["acknowledged"] == "true", f"the guest did not acknowledge STOP: {lines[-1]}")
+    require(record["forced"] == "false", f"the VMM had to be killed after STOP: {lines[-1]}")
+    require(record["exit_ms"] is not None and int(record["exit_ms"]) <= STOP_LIMIT_MS,
+            f"the VMM exited {record['exit_ms']} ms after the acknowledged STOP, more than {STOP_LIMIT_MS}")
+    require(shown.strip(), f"the guest console log {console} is missing or empty")
+    require(not panics, f"the guest console shows a panic: {panics}")
+    return evidence
+
+
+def vm_config(directory):
+    """Firecracker's whole configuration of a running VM (`GET /vm/config`)."""
+    conn = UnixConnection(str(directory/"jail/api.sock"),5)
+    try:
+        conn.request("GET","/vm/config")
+        response = conn.getresponse()
+        raw = response.read(LIMIT + 1)
+        require(response.status == 200 and len(raw) <= LIMIT, f"real Firecracker vm/config failed: {response.status}")
+        return json.loads(raw)
+    finally:
+        conn.close()
+
+
+def no_network_device(config):
+    """A VM configuration with a vsock device and no network interface (and so no MMDS)."""
+    require(not config.get("network-interfaces"), f"the VM has a network interface: {config.get('network-interfaces')}")
+    require(config.get("vsock"), "the VM has no vsock device, so no bridge")
+    require(not config.get("mmds-config"), "the VM has a metadata service")
+
+
 def vm_calibration(root, cfg, name, cpu, memory, candidates):
     require(len(candidates) == 1, "actual VM runtime root was not uniquely created")
     directory = next(iter(candidates))
@@ -815,8 +887,11 @@ def vm_calibration(root, cfg, name, cpu, memory, candidates):
     if name.startswith("probe-") or name.startswith("pg-"):
         require(data.stat().st_size == 1<<30 and data.stat().st_blocks*512 >= 1<<30,
                 "actual persistent drive is not fixed/reserved 1GiB")
+    whole = vm_config(directory)
+    no_network_device(whole)
     evidence = {"actor":name,"pid":pid,"launcher_pid":launcher,"runtime":str(directory),"cgroup":str(cg),
-                "machine_config":machine,"declared_cpu_millis":cpu,"declared_memory_bytes":memory,"limits":limits}
+                "machine_config":machine,"vm_config":whole,"declared_cpu_millis":cpu,
+                "declared_memory_bytes":memory,"limits":limits}
     (root/f"vm-calibration-{name}.json").write_text(json.dumps(evidence,indent=2))
     return directory, cg
 
@@ -866,6 +941,7 @@ def conformance(root, cfg, isolation):
         return result
     def query(path, pairs):
         return path + "?" + urllib.parse.urlencode(pairs)
+    completed = False
     try:
         identities = []
         control_ports = set()
@@ -901,6 +977,9 @@ def conformance(root, cfg, isolation):
                 time.sleep(0.2)
             controls = report_items(fetch(name, "/check/control"), 9, reached=True)
             identity = identity_report(fetch(name, "/check/identity"), isolation)
+            # The guest's own view of the network: loopback and nothing else.
+            interfaces = report_items(fetch(name, "/check/interfaces"), 1, reached=True)
+            require(interfaces[0]["detail"] == "lo", f"the actor sees a network interface: {interfaces}")
             fields = dict(line.split(":",1) for line in identity[0]["detail"].splitlines() if ":" in line)
             require(list(map(int,fields["Uid"].split())) == [0,0,0,0], "malicious actor image must actually run as UID0")
             require(int(fields["CapEff"],16) != 0, "malicious namespace-root capabilities were silently removed")
@@ -1008,9 +1087,11 @@ def conformance(root, cfg, isolation):
             require(not host.receipts, f"host listeners received actor traffic: {host.receipts}")
             evidence.append({"host_listener_receipts":host.receipts,"outside_paths":[str(p) for p in paths]})
         audit(root, cfg)
+        completed = True
     finally:
         (root / f"conformance-{isolation}.json").write_text(json.dumps(evidence, indent=2))
         cleanup = []
+        stop_offset = (root/"serve.log").stat().st_size if (root/"serve.log").exists() else 0
         for name in reversed(names):
             try:
                 ok(daemon, "DELETE", f"/v1/foreign/{name}", {"reason":reason})
@@ -1024,6 +1105,10 @@ def conformance(root, cfg, isolation):
                 cleanup.append({"secret":secret,"error":str(error)})
         (root / "actor-cleanup.json").write_text(json.dumps(cleanup, indent=2))
         require(not any("error" in row for row in cleanup), "owned actor cleanup failed")
+        # Only after the proof itself passed: a failure above stays the reported one.
+        if completed and isolation == "microvm":
+            for name in names:
+                vm_stop_proof(root, cfg, name, stop_offset)
 
 
 def wait_healthy(cfg, timeout=90):
@@ -1084,6 +1169,7 @@ def postgres_proof(root, cfg, daemon, isolation="gvisor"):
             require(time.monotonic()<deadline,"Postgres readiness timed out")
             time.sleep(0.2)
     fork = f"pg-fork-{cfg['token']}"
+    completed = False
     try:
         before_vm = vm_roots(cfg) if isolation == "microvm" else set()
         ok(daemon,"POST","/v1/foreign",{"name":name,"image":cfg["pg_image"],"port":8080,
@@ -1163,9 +1249,14 @@ def postgres_proof(root, cfg, daemon, isolation="gvisor"):
             time.sleep(0.1)
         require(sql("SELECT n FROM owned_proof")["reply"]["text"] == "200 43\n",
                 "fork cleanup stopped or damaged production Postgres")
+        completed = True
     finally:
         (root/"postgres-replies.json").write_text(json.dumps(replies,indent=2))
+        stop_offset = (root/"serve.log").stat().st_size if (root/"serve.log").exists() else 0
         ok(daemon,"DELETE",f"/v1/foreign/{name}",{"reason":reason})
+    # A Postgres VM with a live database stops gracefully as well (ADR 0096).
+    if completed and isolation == "microvm":
+        vm_stop_proof(root, cfg, name, stop_offset)
 
 
 def acceptor_restart(root,cfg):

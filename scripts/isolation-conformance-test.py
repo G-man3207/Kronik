@@ -101,6 +101,71 @@ class VmProcesses(unittest.TestCase):
         self.assertTrue(args and all(isinstance(a, bytes) for a in args) and args[0])
 
 
+class MicrovmStop(unittest.TestCase):
+    """ADR 0096's graceful stop and the VM's devices, from the daemon's log, the guest console
+    and Firecracker's configuration as they are written."""
+
+    TEXT = ('2026-11-13T21:00:00.000000Z  INFO kronik_foreign::supervisor: microVM stopped '
+            'foreign="probe-a" acknowledged=true exit_ms=231 forced=false')
+    JSON = ('{"timestamp":"2026-11-13T21:00:00Z","level":"INFO","fields":{"message":"microVM stopped",'
+            '"foreign":"probe-a","acknowledged":true,"exit_ms":231,"forced":false},'
+            '"target":"kronik_foreign::supervisor"}')
+
+    def test_the_stop_record_reads_both_log_formats(self):
+        for line in (self.TEXT, self.JSON):
+            self.assertEqual(proof.stop_record(line),
+                             {"acknowledged": "true", "exit_ms": "231", "forced": "false"}, line)
+        unacknowledged = 'WARN kronik_foreign::supervisor: microVM stopped foreign="b" acknowledged=false forced=true'
+        self.assertEqual(proof.stop_record(unacknowledged),
+                         {"acknowledged": "false", "exit_ms": None, "forced": "true"})
+
+    def test_a_panic_is_found_and_the_command_line_is_not_one(self):
+        boot = "[    0.000000] Kernel command line: console=ttyS0 reboot=k panic=1 pci=off nomodule init=/init\n"
+        self.assertEqual(proof.console_panics(boot), [])
+        for line in ["[    1.2] Kernel panic - not syncing: Attempted to kill init!",
+                     "thread 'main' panicked at crates/kronik-guest-init/src/main.rs:9:5",
+                     "[    3.1] BUG: kernel NULL pointer dereference, address: 0"]:
+            self.assertEqual(proof.console_panics(boot + line), [line])
+
+    def test_a_vm_has_vsock_and_no_network_device(self):
+        proof.no_network_device({"network-interfaces": [], "vsock": {"guest_cid": 3, "uds_path": "/v.sock"}})
+        proof.no_network_device({"vsock": {"guest_cid": 3}})
+        for config in ({"network-interfaces": [{"iface_id": "eth0"}], "vsock": {"guest_cid": 3}},
+                       {"network-interfaces": []},
+                       {"vsock": {"guest_cid": 3}, "mmds-config": {"version": "V2"}}):
+            with self.assertRaises(proof.Violation, msg=str(config)):
+                proof.no_network_device(config)
+
+    def stop(self, log, console, offset=0):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "serve.log").write_text(log)
+            actor = root / "data/foreign/actors/probe-a"
+            actor.mkdir(parents=True)
+            if console is not None:
+                (actor / "output.log").write_text(console)
+            evidence = proof.vm_stop_proof(root, {"data": str(root / "data")}, "probe-a", offset)
+            self.assertTrue((root / "vm-stop-probe-a.json").is_file())
+            return evidence
+
+    def test_a_clean_stop_within_a_second_passes_and_anything_else_fails(self):
+        console = "[    0.1] Linux version 6.18.25\nkronik-guest-init: stop\n[    9.9] reboot: Restarting system\n"
+        self.assertEqual(self.stop(self.TEXT + "\n", console)["exit_ms"], "231")
+        slow = self.TEXT.replace("exit_ms=231", "exit_ms=1001")
+        killed = self.TEXT.replace("forced=false", "forced=true")
+        silent = self.TEXT.replace("acknowledged=true", "acknowledged=false")
+        for log, shown in [(slow, console), (killed, console), (silent, console),
+                           (self.TEXT, console + "[ 9.8] Kernel panic - not syncing: VFS\n"),
+                           (self.TEXT, None), (self.TEXT, "")]:
+            with self.assertRaises(proof.Violation, msg=f"{log} {shown!r}"):
+                self.stop(log + "\n", shown)
+
+    def test_only_the_record_after_the_removal_counts(self):
+        older = self.TEXT.replace("exit_ms=231", "exit_ms=5000") + "\n"
+        console = "kronik-guest-init: stop\n"
+        self.assertEqual(self.stop(older + self.TEXT + "\n", console, offset=len(older))["exit_ms"], "231")
+
+
 class RuntimeOracles(unittest.TestCase):
     def test_wrong_actual_pid_and_root_expectation_are_refused(self):
         with self.assertRaises(proof.Violation):

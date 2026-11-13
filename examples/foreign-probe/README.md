@@ -24,6 +24,7 @@ objects.
 | `GET /check/processes?token=...` | Seeing or signalling processes outside the sandbox |
 | `GET /check/sysv?key=...` | Attaching to host SysV shared memory |
 | `GET /check/devices`, `/check/guest-disks`, `/check/identity` | Devices, the microVM's own disks and namespace identity |
+| `GET /check/interfaces` | The network interfaces it sees (`/proc/net/dev`): only `lo` in a sandbox without a network device |
 | `GET /check/fill-data?token=...` | Fills its data drive until `ENOSPC` |
 
 An unexpected error number is reported as an error, never as "absent".

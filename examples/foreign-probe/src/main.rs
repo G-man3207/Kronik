@@ -274,6 +274,12 @@ fn route(request: &Request, own: &Controls) -> Response {
         .iter()
         .map(|p| read_path(p, None))
         .collect(),
+        // The network interfaces the actor sees, sorted: in a sandbox without
+        // a network device, only `lo`.
+        "/check/interfaces" => vec![match fs::read_to_string("/proc/net/dev") {
+            Ok(text) => Item::seen("/proc/net/dev", interfaces(&text).join(" ")),
+            Err(e) => Item::failed("/proc/net/dev", e, &[]),
+        }],
         "/check/identity" => {
             let mut items: Vec<Item> = [
                 "/proc/self/status",
@@ -554,6 +560,20 @@ fn processes(token: &str) -> Item {
     }
 }
 
+/// The interface names of a `/proc/net/dev` text, sorted: two header lines,
+/// then one `name: counters` line per interface.
+fn interfaces(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = text
+        .lines()
+        .skip(2)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, _)| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
 fn control(own: &Controls) -> Vec<Item> {
     let mut items = vec![
         read_path(&format!("/data/owned-{}", own.token), Some(&own.token)),
@@ -654,6 +674,16 @@ mod tests {
         assert_eq!(item.errno, Some(libc::ENOTDIR));
         let e = fs::File::open("/proc/self/kronik-no-such-entry").unwrap_err();
         assert_eq!(Item::failed("missing", e, PATH_ERRORS).outcome, "blocked");
+    }
+    #[test]
+    fn interfaces_are_the_names_of_proc_net_dev_sorted() {
+        let text = "Inter-|   Receive |  Transmit\n face |bytes packets|bytes\n    lo: 1 2 3\n  eth0: 4 5 6\n";
+        assert_eq!(interfaces(text), ["eth0", "lo"]);
+        assert_eq!(interfaces("a\nb\n    lo: 0 0\n"), ["lo"]);
+        assert!(interfaces("only\nheaders\n").is_empty());
+        // This host's own view has at least its loopback.
+        let own = fs::read_to_string("/proc/net/dev").unwrap();
+        assert!(interfaces(&own).iter().any(|name| name == "lo"));
     }
     #[test]
     fn exclusive_canary_never_overwrites() {

@@ -578,26 +578,54 @@ async fn watch(a: &Actor, child: &Arc<dyn Process>) -> Watch {
     }
 }
 
-/// `TERM`, `KILL` after the grace period, then clean up.
+/// `TERM`, `KILL` after the grace period, then clean up. A microVM is asked to
+/// stop over its control port instead (ADR 0096), and how its stop went is
+/// logged: whether the guest acknowledged `STOP`, how long after that the VMM
+/// exited, and whether it had to be killed.
 async fn stop_running(ctx: &Ctx, a: &Actor, child: Arc<dyn Process>) {
     let id = container_id(a.name());
     let log = ctx.paths.log(a.name());
     let vm = lock(&a.vm).clone();
-    if let Some(vm) = &vm {
-        let _ = vm.shutdown(&ctx.env).await;
-    } else {
-        let _ = run_quick(&ctx.env, a.runtime.kill(&id, "TERM", &log), COMMAND_TIMEOUT).await;
-    }
-    if ctx
+    let acknowledged = match &vm {
+        Some(vm) => match vm.shutdown(&ctx.env).await {
+            Ok(()) => Some(ctx.env.clock.monotonic()),
+            Err(error) => {
+                tracing::warn!(foreign = a.name(), %error, "the microVM did not acknowledge STOP");
+                None
+            }
+        },
+        None => {
+            let _ = run_quick(&ctx.env, a.runtime.kill(&id, "TERM", &log), COMMAND_TIMEOUT).await;
+            None
+        }
+    };
+    let exited = ctx
         .env
         .timeout(ctx.timings.stop_grace, child.wait())
         .await
-        .is_err()
-    {
+        .is_ok();
+    if !exited {
         if vm.is_some() {
             let _ = child.kill().await;
         } else {
             let _ = run_quick(&ctx.env, a.runtime.kill(&id, "KILL", &log), COMMAND_TIMEOUT).await;
+        }
+    }
+    if vm.is_some() {
+        match acknowledged {
+            Some(at) => tracing::info!(
+                foreign = a.name(),
+                acknowledged = true,
+                exit_ms = ctx.env.clock.monotonic().saturating_sub(at).as_millis() as u64,
+                forced = !exited,
+                "microVM stopped"
+            ),
+            None => tracing::warn!(
+                foreign = a.name(),
+                acknowledged = false,
+                forced = !exited,
+                "microVM stopped"
+            ),
         }
     }
     cleanup(ctx, a, Some(child)).await;
