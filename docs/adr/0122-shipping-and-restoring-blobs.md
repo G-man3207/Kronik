@@ -62,16 +62,22 @@ and never shipped or restored; when it is lost, the shipper asks the bucket
 3. Snapshots: files (`blobs.idx` among them), then the manifest.
 4. Remote snapshots gone locally (manifest first), as today.
 5. Remote segments gone locally, as today.
-6. **Remote blobs gone locally**: deleted by the collector or by an erasure.
+6. **Remote blobs gone locally**, deleted by the collector or by an
+   erasure, and only in a round whose steps 4 and 5 completed: a shipped
+   blob whose local file is gone, that has no row in the `blobs` index or an
+   erased one, and that no local snapshot's `blobs.idx` lists. A shipped
+   blob whose file is gone while its index row is live was not collected:
+   the shipper keeps the remote object, logs an error and counts it in
+   `kronik_blob_missing_total`.
 
 Uploads come before the references that need them (steps 1 to 3); deletions
 of references come before the deletion of what they referenced (steps 4 to
 6). A round that stops anywhere leaves at most loose objects.
 
-Why mirroring local deletions is safe: local roots include every remote
-segment and every remote snapshot (remote ones are a subset of local ones,
-deleted after them), so a blob the collector deletes locally is referenced
-by no remote object that step 6 could orphan.
+Why mirroring local deletions is safe: after steps 4 and 5, the remote
+segments and snapshots are a subset of the local ones, whose references are
+roots locally, so a blob the collector deleted locally is referenced by no
+remote object that step 6 could orphan.
 
 ### 4. Reseal and erasure
 

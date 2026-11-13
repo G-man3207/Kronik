@@ -344,7 +344,9 @@ implementation specifics:
 - `ship_once` gains steps 1 and 6 of the ADR's order. Segment references are
   read with `kronik_log`'s decoder from the bytes the shipper reads anyway;
   for the active segment, from the offset recorded in `ship.json`
-  (`active_scanned`, additive, default 0).
+  (`active_scanned`, additive, default 0). Step 6 deletes a remote object
+  only under the ADR's three conditions (file gone, index row absent or
+  erased, in no local `blobs.idx`), read in one `state.db` transaction.
 - `<data>/ship-blobs.db`: `shipped (name TEXT PRIMARY KEY, body_digest BLOB
   NOT NULL)`. A blob whose body digest changed (resealed) is uploaded again;
   so is one with a `blobs/reupload/<name>` marker, which the upload clears.
