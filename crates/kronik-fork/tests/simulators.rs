@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use common::*;
 use kronik_core::error::ErrorCode;
+use kronik_effects::InForks;
 use kronik_fork::diff::DiffOptions;
 use kronik_fork::proposal::Proposals;
 use kronik_fork::simulators::{ModelAccess, ModelCache, ModelSecretSnapshot, SimulatorOverride};
@@ -888,19 +889,34 @@ fn an_override_cannot_turn_the_model_on() {
     assert!(all_synthetic_by(&d, "fail-closed"), "{d}");
 }
 
-/// Review M5 and N12-3: the model declines for a turn that read tagged
-/// state, used a secret, or called a turn that used SQL or read tagged
-/// state (personal data from another turn); a turn that saw none of that
-/// is simulated. The fetch-extra build does the `T` lines before its extra
-/// GET.
-#[test]
-fn the_model_declines_after_personal_data_from_any_path() {
+/// The model simulator's taint paths: production turns `fetch-ok` each
+/// `(key, head lines)` of `charges` with the plain build, which ignores the
+/// `T` lines; the fork's fetch-extra build does them before an extra GET of
+/// its own, which only a simulator can answer. `signing` is the in-forks
+/// mode of the `secret:api-key` grant (ADR 0112). Returns each extra GET's
+/// route and simulator in route order, the summary's `synthetic_by`, and
+/// the number of requests the model got.
+fn model_taint(
+    signing: InForks,
+    charges: &[(&str, &str)],
+) -> (Vec<(String, String)>, Value, usize) {
     let (addr, _hits) = server();
     let dir = tempdir();
     let p = Proc::start(dir.path());
     p.deploy("notes");
     p.grant("http:127.0.0.1");
-    p.grant("secret:api-key");
+    p.grant("secret-reveal:api-key");
+    p.rt.block_on(p.node.grant(
+        "counter",
+        "secret:api-key",
+        None,
+        None,
+        signing,
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
     // The production secret path: the certified inventory a replay's gate
     // uses must hold the committed value.
     let original = p.node.local_operator_authority().unwrap();
@@ -921,18 +937,13 @@ fn the_model_declines_after_personal_data_from_any_path() {
     }
     p.send("notes/n", "add", "a row");
     let fork_lsn = p.settle();
-    let charge = |key: &str, taint: &str| {
+    for (key, taint) in charges {
         p.http(
             key,
             "fetch-ok",
             &format!("POST http://{addr}/v1/charges/{key}{taint}\n\namount=1"),
         );
-    };
-    charge("plain", "");
-    charge("st", "\nT read s");
-    charge("sec", "\nT hmac api-key");
-    charge("sq", "\nT call notes/n count");
-    charge("cr", "\nT call counter/b read");
+    }
     p.settle();
     let (model_addr, seen) = model_server();
     let props = Arc::new(
@@ -942,7 +953,7 @@ fn the_model_declines_after_personal_data_from_any_path() {
     );
     fork(&p, &props, "try", fork_lsn);
     let d: Value = serde_json::from_slice(&replay(&p, &props, "try")).unwrap();
-    let by_route: Vec<(String, String)> = d["effects"]["items"]
+    let mut by_route: Vec<(String, String)> = d["effects"]["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -954,12 +965,85 @@ fn the_model_declines_after_personal_data_from_any_path() {
             )
         })
         .collect();
+    by_route.sort();
+    let requests = seen.lock().unwrap().len();
+    (by_route, d["summary"]["synthetic_by"].clone(), requests)
+}
+
+/// `(route, simulator)` pairs as [`model_taint`] returns them.
+fn routes(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(key, sim)| (format!("/v1/charges/{key}/extra"), (*sim).to_owned()))
+        .collect()
+}
+
+/// Review M5 and N12-3: the model declines for a turn that read tagged
+/// state, used a secret, or called a turn that used SQL or read tagged
+/// state (personal data from another turn); a turn that saw none of that
+/// is simulated. The fetch-extra build does the `T` lines before its extra
+/// GET. The `sec` turn's HMAC has no recording, and its grant is `compute`,
+/// so the fork signs it on the host (an exact answer, not synthetic).
+#[test]
+fn the_model_declines_after_personal_data_from_any_path() {
+    let (by_route, synthetic_by, seen) = model_taint(
+        InForks::Compute,
+        &[
+            ("plain", ""),
+            ("st", "\nT read s"),
+            ("sec", "\nT hmac api-key"),
+            ("sq", "\nT call notes/n count"),
+            ("cr", "\nT call counter/b read"),
+        ],
+    );
     assert_eq!(
-        d["summary"]["synthetic_by"],
+        by_route,
+        routes(&[
+            ("cr", "fail-closed"),
+            ("plain", "model"),
+            ("sec", "fail-closed"),
+            ("sq", "fail-closed"),
+            ("st", "fail-closed"),
+        ])
+    );
+    assert_eq!(
+        synthetic_by,
         json!({"fail-closed": 4, "model": 1}),
         "{by_route:?}"
     );
-    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(seen, 1);
+}
+
+/// ADR 0015: any use of a secret keeps the model away from the rest of the
+/// turn, not only a signature the fork computed. With a `recorded` grant,
+/// the default of a new grant (ADR 0112), the unmatched HMAC is denied and
+/// graded `fail-closed` itself; a reveal answers its placeholder. Neither
+/// turn's extra GET is sent to the model; the plain turn's is.
+#[test]
+fn the_model_declines_after_a_denied_signature_or_a_reveal() {
+    let (by_route, synthetic_by, seen) = model_taint(
+        InForks::Recorded,
+        &[
+            ("plain", ""),
+            ("sec", "\nT hmac api-key"),
+            ("rv", "\nT reveal api-key"),
+        ],
+    );
+    assert_eq!(
+        by_route,
+        routes(&[
+            ("plain", "model"),
+            ("rv", "fail-closed"),
+            ("sec", "fail-closed"),
+        ])
+    );
+    // The two extra GETs and the denied HMAC fail closed.
+    assert_eq!(
+        synthetic_by,
+        json!({"fail-closed": 3, "model": 1, "placeholder": 1}),
+        "{by_route:?}"
+    );
+    assert_eq!(seen, 1);
 }
 
 /// Review N12-6: a fork's reveal where production revealed nothing is

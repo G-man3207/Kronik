@@ -1153,10 +1153,62 @@ fn message_input(
     }
 }
 
+/// Whether a turn's effects used a secret (ADR 0015): a `crypto.*` effect or
+/// a `secret.reveal`, whatever answered it. A signature computed on the
+/// host, one served from production's recording (the guest holds a value
+/// made with the key), a denied call (a `recorded` grant, ADR 0112, a
+/// missing or linked key, no grant) and a reveal's placeholder all count,
+/// so the model simulator declines for the rest of the turn. Every crypto
+/// and reveal path of the gate records its effect, so the records are the
+/// complete account; the computed keys in `GateState::secrets` are not.
+fn used_a_secret(records: &[pb::EffectRecord]) -> bool {
+    records
+        .iter()
+        .any(|r| r.kind.starts_with("crypto.") || r.kind == "secret.reveal")
+}
+
+#[cfg(test)]
+#[test]
+fn every_crypto_or_reveal_record_is_a_secret_use() {
+    let record =
+        |kind: &str, grounding: pb::Grounding, status: pb::EffectStatus| pb::EffectRecord {
+            kind: kind.into(),
+            grounding: grounding as i32,
+            status: status as i32,
+            ..Default::default()
+        };
+    use pb::EffectStatus as S;
+    use pb::Grounding as G;
+    for used in [
+        // Computed on the host, or served from production's recording.
+        record("crypto.hmac-sha256", G::Exact, S::Ok),
+        record("crypto.sign-ed25519", G::Exact, S::Ok),
+        // Denied: a recorded grant or a missing or linked key, or no grant.
+        record("crypto.hmac-sha256", G::Synthetic, S::Denied),
+        record("crypto.sign-ed25519", G::Live, S::Denied),
+        // A reveal answers a placeholder, matched or not.
+        record("secret.reveal", G::Exact, S::Ok),
+        record("secret.reveal", G::Synthetic, S::Ok),
+    ] {
+        let others = [record("http.fetch", G::Exact, S::Ok), used.clone()];
+        assert!(used_a_secret(&others), "{used:?}");
+    }
+    for unused in [
+        record("http.fetch", G::Exact, S::Ok),
+        record("foreign.http", G::Synthetic, S::Denied),
+        record("actor.call", G::Exact, S::Ok),
+    ] {
+        assert!(!used_a_secret(std::slice::from_ref(&unused)), "{unused:?}");
+    }
+    assert!(!used_a_secret(&[]));
+}
+
 #[derive(Default)]
 struct GateState {
     records: Vec<pb::EffectRecord>,
     compensations: Vec<pb::OutboundMessage>,
+    /// The keys this turn computed with on the host, for scrubbing. Not
+    /// every secret use: see [`used_a_secret`].
     secrets: Vec<(String, Vec<u8>)>,
     /// A callee used SQL ([`ForkTurn::sql`]).
     sql: bool,
@@ -1684,13 +1736,14 @@ impl ReplayGate {
     /// [`ReplayGate::saw_personal`] with the gate's state at hand (SQL use
     /// aside): its input (tagged, or sent by a turn that saw personal data),
     /// tagged state it read, a callee that saw personal data or SQL rows,
-    /// a secret, a tagged effect value.
+    /// any use of a secret ([`used_a_secret`]), a tagged effect value.
     fn saw_personal_with(&self, state: &GateState) -> bool {
         self.input_tagged
             || self.fork_state.saw_subject()
             || state.personal
             || state.sql
             || !state.secrets.is_empty()
+            || used_a_secret(&state.records)
             || state.records.iter().any(|r| {
                 r.request.as_ref().is_some_and(|x| x.subject.is_some())
                     || r.response.as_ref().is_some_and(|x| x.subject.is_some())
