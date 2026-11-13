@@ -56,6 +56,14 @@ until the v1.0 compatibility promise takes effect.
   turn, an origin or a consequence, and the turn that met the erased data is
   no longer counted as their origin; `unverifiable` counts each turn once
   (#28).
+- `kronik privacy reseal` also seals the bodies of pending timers and
+  undelivered messages in `state.db`, and an erasure turns its subject's
+  queued bodies into tombstones, plain ones too: a timer scheduled in `off`
+  mode no longer hands an erased subject's value to its actor, or seals it
+  again under a new key version, after the erasure. Its turn fails with
+  `SUBJECT_ERASED` as a dead letter. `privacy status` counts an erasure as
+  pending while its subject has a plain value in `state.db`, not only in the
+  log (#31).
 
 ## v0.4.1 — 2026-11-07
 

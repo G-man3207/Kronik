@@ -811,8 +811,9 @@ impl StateDb {
                     epoch = epoch.max(e.epoch);
                     // The erasure operation on state.db (§6.3): the
                     // subject's state values and saved responses and dead
-                    // letters go with its keys.
-                    erase_rows(&tx, &e.subject)?;
+                    // letters go with its keys; its queued bodies become
+                    // tombstones.
+                    erase_rows(&tx, &e.subject, e.key_version)?;
                     tx.prepare_cached(
                         "INSERT OR REPLACE INTO erasures (subject, key_version, lsn) VALUES (?1, ?2, ?3)",
                     )?
@@ -879,13 +880,12 @@ impl StateDb {
         }
         Ok(())
     }
-    /// The erasure operation on `kv` again, outside a record (a rebase
-    /// shadow after its staged turns, m13-rebase §3).
-    /// What an `Erasure` deletes from state.db (its kv values, ingress
-    /// keys, dead letters and saved call outcomes), applied again after a
-    /// rebase's staged turns (M13).
-    pub fn erase_subject_rows(&self, subject: &str) -> Result<(), StoreError> {
-        erase_rows(&self.conn, subject)
+    /// What an `Erasure` of `subject` through `key_version` does to
+    /// state.db (its kv values, ingress keys and dead letters deleted, saved
+    /// call outcomes and queued timer and message bodies tombstoned),
+    /// outside a record: a rebase shadow after its staged turns (M13).
+    pub fn erase_subject_rows(&self, subject: &str, key_version: u32) -> Result<(), StoreError> {
+        erase_rows(&self.conn, subject, key_version)
     }
 
     /// The LSN of the newest `Erasure` applied.
@@ -1616,10 +1616,11 @@ impl StateDb {
 
     /// After a segment rewrite (docs/design/m8-privacy.md §8): the new
     /// offsets of that segment's records, and the rows its rewritten turns
-    /// (`turns`, by LSN) still own, in one transaction: `kv` values, saved
-    /// ingress and call responses, dead-letter inputs. A row is updated
-    /// only when its `lsn` is still the turn's, so a later write is left;
-    /// rows an erasure deleted or tombstoned stay so.
+    /// (`turns`, by LSN; a rebased turn of a `StateRebase` record too) still
+    /// own, in one transaction: `kv` values, queued timer and message bodies
+    /// (`timers`, `mailbox`), saved ingress and call responses, dead-letter
+    /// inputs. A row is updated only when its `lsn` is still the turn's, so
+    /// a later write is left; rows an erasure deleted or tombstoned stay so.
     pub fn fix_reseal(
         &mut self,
         segment: Lsn,
@@ -1652,6 +1653,59 @@ impl StateDb {
                      WHERE kind = ?4 AND key = ?5 AND k = ?6 AND lsn = ?7",
                     params![bytes, v.subject, sealed, actor.kind, actor.key, w.key, lsn],
                 )?;
+            }
+            // Queued work the turn left: the bodies its pending timers and
+            // undelivered messages carry, rebuilt the way `apply_turn` wrote
+            // them, so a timer that fires after an erasure meets the sealed
+            // (or tombstoned) body and fails with SUBJECT_ERASED (issue #31).
+            if let (Some(outcome), Some(parent)) = (&t.outcome, &t.causal_key) {
+                if outcome.kind == pb::OutcomeKind::Committed as i32 {
+                    for op in &t.timers {
+                        let Some(msg) = op.msg.as_ref() else { continue };
+                        if op.kind != pb::TimerOpKind::Schedule as i32 {
+                            continue;
+                        }
+                        tx.execute(
+                            "UPDATE timers SET msg = ?1 \
+                             WHERE kind = ?2 AND key = ?3 AND timer_id = ?4 AND lsn = ?5",
+                            params![
+                                msg.encode_to_vec(),
+                                actor.kind,
+                                actor.key,
+                                op.timer_id as i64,
+                                lsn
+                            ],
+                        )?;
+                    }
+                    for m in &t.messages {
+                        let input = message_input(
+                            pb::MessageSource::Actor,
+                            actor,
+                            m,
+                            t.logical_time_ms,
+                            "",
+                        );
+                        tx.execute(
+                            "UPDATE mailbox SET input = ?1 WHERE message_id = ?2 AND lsn = ?3",
+                            params![input.encode_to_vec(), m.message_id, lsn],
+                        )?;
+                    }
+                } else {
+                    for m in &t.compensations {
+                        let compensates = kronik_core::causal::message_id(parent, m.ordinal);
+                        let input = message_input(
+                            pb::MessageSource::Compensation,
+                            actor,
+                            m,
+                            t.logical_time_ms,
+                            &compensates,
+                        );
+                        tx.execute(
+                            "UPDATE mailbox SET input = ?1 WHERE message_id = ?2 AND lsn = ?3",
+                            params![input.encode_to_vec(), m.message_id, lsn],
+                        )?;
+                    }
+                }
             }
             let (Some(input), Some(outcome)) = (&t.input, &t.outcome) else {
                 continue;
@@ -2288,9 +2342,40 @@ fn erased_call_outcome() -> Vec<u8> {
     .encode_to_vec()
 }
 
+/// What a queued value of an erased subject becomes: a tombstone of its
+/// erased key version that opens as erased whatever the keystore holds (an
+/// empty nonce and ciphertext; reseal keeps it as its own tombstone).
+fn erased_value(key_version: u32) -> pb::sealable::Value {
+    pb::sealable::Value::Sealed(pb::Sealed {
+        key_version,
+        nonce: Vec::new(),
+        ciphertext: Vec::new(),
+    })
+}
+
+/// Replaces every value of `subject` with [`erased_value`]; whether any was.
+fn tombstone(subject: &str, key_version: u32) -> impl FnMut(&mut pb::Sealable) -> bool + '_ {
+    move |s: &mut pb::Sealable| {
+        if s.subject.as_deref() != Some(subject) {
+            return false;
+        }
+        let tomb = erased_value(key_version);
+        if s.value.as_ref() == Some(&tomb) {
+            return false;
+        }
+        s.value = Some(tomb);
+        true
+    }
+}
+
 /// The erasure operation on state.db's user data (§6.3), live, on rebuild
-/// and for erasures applied before these tables had a subject.
-fn erase_rows(tx: &Connection, subject: &str) -> Result<(), StoreError> {
+/// and for erasures applied before these tables had a subject. The queued
+/// timer and message bodies of the subject (written in `off` mode they are
+/// plain, and nothing else would stop them) become tombstones: the row
+/// stays, so its turn still runs, meets an erased input and becomes a
+/// `SUBJECT_ERASED` dead letter instead of handing the value to the guest
+/// and sealing it again under a new key version (issue #31).
+fn erase_rows(tx: &Connection, subject: &str, key_version: u32) -> Result<(), StoreError> {
     for sql in [
         "DELETE FROM kv WHERE subject = ?1",
         "DELETE FROM ingress_keys WHERE subject = ?1",
@@ -2300,6 +2385,35 @@ fn erase_rows(tx: &Connection, subject: &str) -> Result<(), StoreError> {
     }
     tx.prepare_cached("UPDATE deliveries SET outcome = ?2, subject = NULL WHERE subject = ?1")?
         .execute(params![subject, erased_call_outcome()])?;
+    let mut f = tombstone(subject, key_version);
+    let timers: Vec<(String, String, i64, Vec<u8>)> = tx
+        .prepare_cached("SELECT kind, key, timer_id, msg FROM timers")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<_, _>>()?;
+    for (kind, key, id, bytes) in timers {
+        let mut msg: pb::Message = decode(&bytes, "timer message")?;
+        let mut hit = false;
+        kronik_proto::sealables::message_mut(Some(&mut msg), &mut |s| hit |= f(s));
+        if hit {
+            tx.prepare_cached(
+                "UPDATE timers SET msg = ?4 WHERE kind = ?1 AND key = ?2 AND timer_id = ?3",
+            )?
+            .execute(params![kind, key, id, msg.encode_to_vec()])?;
+        }
+    }
+    let queued: Vec<(String, Vec<u8>)> = tx
+        .prepare_cached("SELECT message_id, input FROM mailbox")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for (id, bytes) in queued {
+        let mut input: pb::Input = decode(&bytes, "mailbox input")?;
+        let mut hit = false;
+        kronik_proto::sealables::input_mut(Some(&mut input), &mut |s| hit |= f(s));
+        if hit {
+            tx.prepare_cached("UPDATE mailbox SET input = ?2 WHERE message_id = ?1")?
+                .execute(params![id, input.encode_to_vec()])?;
+        }
+    }
     Ok(())
 }
 
@@ -2349,12 +2463,12 @@ fn add_subject_columns(conn: &Connection) -> Result<(), StoreError> {
             Ok(input_subject(&input).map(str::to_owned))
         },
     )?;
-    let erased: Vec<String> = tx
-        .prepare("SELECT subject FROM erasures")?
-        .query_map([], |r| r.get(0))?
+    let erased: Vec<(String, u32)> = tx
+        .prepare("SELECT subject, key_version FROM erasures")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
-    for s in &erased {
-        erase_rows(&tx, s)?;
+    for (s, v) in &erased {
+        erase_rows(&tx, s, *v)?;
     }
     tx.commit()?;
     Ok(())
@@ -3199,6 +3313,65 @@ pub fn note_sealed(keys: &mut SubjectKeys) -> impl FnMut(&mut pb::Sealable) + '_
     }
 }
 
+/// Every subject that still has a plain value in this state database:
+/// written in `off` mode and not resealed since (docs/design/m8-privacy.md
+/// §6.5, §8). The user data a reseal fixes, and an erasure deletes or
+/// tombstones: kv values, queued timer and message bodies, saved call and
+/// ingress responses, dead-letter inputs, and the recorded effects of turns
+/// still open. `privacy status` counts an erasure as pending while its
+/// subject has one here, as it does for one in the log (issue #31).
+pub fn plain_subjects(conn: &Connection) -> Result<std::collections::BTreeSet<String>, StoreError> {
+    use kronik_proto::sealables;
+    let mut out = std::collections::BTreeSet::new();
+    let mut st =
+        conn.prepare("SELECT DISTINCT subject FROM kv WHERE NOT sealed AND subject IS NOT NULL")?;
+    for s in st.query_map([], |r| r.get::<_, String>(0))? {
+        out.insert(s?);
+    }
+    let mut note = |s: &mut pb::Sealable| {
+        if let (Some(subject), Some(pb::sealable::Value::Plain(_))) = (&s.subject, &s.value) {
+            out.insert(subject.clone());
+        }
+    };
+    for (sql, what) in [
+        (
+            "SELECT outcome FROM deliveries WHERE outcome IS NOT NULL",
+            "outcome",
+        ),
+        ("SELECT outcome FROM ingress_keys", "outcome"),
+        ("SELECT input FROM mailbox", "input"),
+        ("SELECT input FROM dead_letters", "input"),
+        ("SELECT msg FROM timers", "message"),
+        ("SELECT record FROM open_effects", "effect"),
+    ] {
+        let mut st = conn.prepare(sql)?;
+        let mut q = st.query([])?;
+        while let Some(r) = q.next()? {
+            let b: Vec<u8> = r.get(0)?;
+            let bad = |e: prost::DecodeError| corrupt(format!("a stored {what}: {e}"));
+            match what {
+                "outcome" => sealables::outcome_mut(
+                    Some(&mut pb::Outcome::decode(b.as_slice()).map_err(bad)?),
+                    &mut note,
+                ),
+                "input" => sealables::input_mut(
+                    Some(&mut pb::Input::decode(b.as_slice()).map_err(bad)?),
+                    &mut note,
+                ),
+                "message" => sealables::message_mut(
+                    Some(&mut pb::Message::decode(b.as_slice()).map_err(bad)?),
+                    &mut note,
+                ),
+                _ => sealables::effect_mut(
+                    &mut pb::EffectRecord::decode(b.as_slice()).map_err(bad)?,
+                    &mut note,
+                ),
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Every subject key that a sealed value in this state database needs: kv
 /// values, call outcomes, saved responses, mailbox and dead-letter inputs,
 /// timer messages, open effects and protected approval identities. A restore checks them against the
@@ -3893,6 +4066,146 @@ mod tests {
         let (lsn, o) = db.call_outcome("c1").unwrap().unwrap();
         assert_eq!((lsn, o.error_code.as_str()), (4, "SUBJECT_ERASED"));
         assert!(o.output.is_none());
+    }
+
+    /// Issue #31: a reseal seals the bodies a rewritten turn left queued
+    /// (timers and undelivered messages), the completeness scan names a
+    /// subject while one of its values in state.db is plain, and an erasure
+    /// tombstones the subject's queued bodies, plain ones too, so the turn
+    /// that would hand one to a guest meets an erased input instead.
+    #[test]
+    fn queued_bodies_are_resealed_and_erased() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut db = StateDb::open(conn).unwrap();
+        let op = pb::MessageSource::Operator;
+        let body = |subject: &str| pb::Message {
+            name: "store".into(),
+            body: tagged(subject, "NEEDLE"),
+            ..Default::default()
+        };
+        let schedule = |exec: &str, subject: &str, id: u64| -> pb::TurnRecord {
+            let Record::TurnRecord(mut t) = turn(exec, exec, message(op, exec, subject)) else {
+                unreachable!("turn() builds a TurnRecord");
+            };
+            t.timers.push(pb::TimerOp {
+                kind: pb::TimerOpKind::Schedule as i32,
+                timer_id: id,
+                due_ms: 1_000,
+                msg: Some(body(subject)),
+                ordinal: 0,
+            });
+            t.messages.push(pb::OutboundMessage {
+                to: Some(pb::ActorRef {
+                    kind: "counter".into(),
+                    key: "b".into(),
+                }),
+                msg: Some(body(subject)),
+                ordinal: 1,
+                message_id: format!("{exec}-m"),
+            });
+            t
+        };
+        let (t1, t2) = (schedule("e1", "user:1", 1), schedule("e2", "user:2", 2));
+        db.apply(&[
+            committed(1, Record::TurnRecord(t1.clone())),
+            committed(2, Record::TurnRecord(t2)),
+        ])
+        .unwrap();
+        let plain = |db: &StateDb| plain_subjects(&db.conn).unwrap();
+        assert_eq!(
+            plain(&db),
+            ["user:1".to_owned(), "user:2".to_owned()].into()
+        );
+        let queued = |db: &StateDb| -> (pb::Sealable, pb::Sealable) {
+            let timer = db
+                .timers(None)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.timer_id == 1)
+                .unwrap();
+            let mail = db
+                .mailbox()
+                .unwrap()
+                .into_iter()
+                .find(|m| m.message_id == "e1-m")
+                .unwrap();
+            let Some(pb::input::Kind::Message(m)) = mail.input.kind else {
+                panic!("not a message: {mail:?}");
+            };
+            (timer.msg.body.unwrap(), m.msg.and_then(|m| m.body).unwrap())
+        };
+        // Reseal rewrites e1 with sealed bodies; the rows it still owns follow.
+        let sealed = pb::Sealed {
+            key_version: 1,
+            nonce: vec![1; 24],
+            ciphertext: vec![2; 8],
+        };
+        let mut resealed = t1;
+        kronik_proto::sealables::turn_mut(&mut resealed, &mut |s| {
+            if s.subject.as_deref() == Some("user:1") {
+                s.value = Some(pb::sealable::Value::Sealed(sealed.clone()));
+            }
+        });
+        db.fix_reseal(0, &[], &[(1, resealed)]).unwrap();
+        let (timer, mail) = queued(&db);
+        for v in [&timer, &mail] {
+            assert_eq!(
+                v.value,
+                Some(pb::sealable::Value::Sealed(sealed.clone())),
+                "{v:?}"
+            );
+        }
+        assert_eq!(plain(&db), ["user:2".to_owned()].into());
+        // Erasing user:2 (no key: version 0) tombstones its plain bodies and
+        // leaves user:1's.
+        db.apply(&[committed(
+            3,
+            Record::Erasure(pb::Erasure {
+                subject: "user:2".into(),
+                key_version: 0,
+                ..Default::default()
+            }),
+        )])
+        .unwrap();
+        assert!(plain(&db).is_empty(), "{:?}", plain(&db));
+        let timer = db
+            .timers(None)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.timer_id == 2)
+            .unwrap();
+        assert_eq!(timer.msg.body.unwrap().value, Some(erased_value(0)));
+        let mail = db
+            .mailbox()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.message_id == "e2-m")
+            .unwrap();
+        let Some(pb::input::Kind::Message(m)) = mail.input.kind else {
+            panic!("not a message: {mail:?}");
+        };
+        assert_eq!(
+            m.msg.and_then(|m| m.body).unwrap().value,
+            Some(erased_value(0))
+        );
+        assert_eq!(queued(&db), (timer_or(&sealed), timer_or(&sealed)));
+        // The tombstone opens as erased whatever the keystore holds.
+        let tomb = pb::Sealable {
+            subject: Some("user:2".into()),
+            value: Some(erased_value(0)),
+        };
+        let opened = kronik_privacy::sealer::Sealer::plain().open(&tomb);
+        assert!(
+            matches!(opened, kronik_privacy::sealer::Opened::Erased { .. }),
+            "{opened:?}"
+        );
+    }
+
+    fn timer_or(sealed: &pb::Sealed) -> pb::Sealable {
+        pb::Sealable {
+            subject: Some("user:1".into()),
+            value: Some(pb::sealable::Value::Sealed(sealed.clone())),
+        }
     }
 
     /// H9: a database from before the `subject` columns gains them, filled

@@ -221,7 +221,10 @@ The erasure itself:
    saved responses to requests with an `Idempotency-Key` (a repeated
    request runs anew) and its dead letters. A saved response of a call to
    an actor becomes an erased marker: a repeated call fails with
-   `SUBJECT_ERASED` instead of running again. The same happens when the
+   `SUBJECT_ERASED` instead of running again. So does the body of each of
+   its pending timers and undelivered messages, also one written in `off`
+   mode: its turn still runs, and fails with `SUBJECT_ERASED` (step 3)
+   instead of handing the value to the actor. The same happens when the
    state is rebuilt from the log, so a rebuild equals the live databases.
    The databases zero deleted rows (`secure_delete`) and their write-ahead
    logs are emptied right after (the keystore's before the record is
@@ -265,8 +268,9 @@ manifest first).
 closed log segments. The mode must already be `on`. A tagged plain value
 becomes sealed with the subject's current key; a value of an erased
 subject becomes a tombstone that can never be unsealed. LSNs and record
-order stay the same. The state values, saved responses and dead letters
-that the rewritten records hold in `state.db` are sealed the same way. The
+order stay the same. The state values, the bodies of pending timers and
+undelivered messages, saved responses and dead letters that the rewritten
+records hold in `state.db` are sealed the same way. The
 segment still being written is left until the next roll. A dry run reports
 how many closed segments would change and writes nothing. Run it after
 turning the mode on, before the first erasure. The command is `kronik
@@ -279,7 +283,8 @@ deletes backups older than `privacy.keystore_backup_retention` (30 days
 by default; `kronik serve` applies the file's value), always keeping the newest. `complete_after_ms` on the erase
 response is the erase's wall time plus that window. Count the erasure as
 complete when that time has passed and reseal and the snapshot replacement
-are done.
+are done: `privacy status` counts an erasure as pending while its subject
+still has a plain value in the log or in `state.db`.
 
 ## Forks without personal data
 

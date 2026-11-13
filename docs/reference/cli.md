@@ -2099,15 +2099,16 @@ Next     kronik privacy status
 
 Shows privacy mode, the configuration epoch it was last set in (`none yet`
 before the first change), the keystore's counts, how many erasures still
-have a plain value in the log, and reseal progress. If a rewritten segment
-has not been replaced in object storage yet, it says the shipped copy still
-holds the old bytes. Needs `read`.
+have a plain value in the log or in `state.db` (a state value, a queued
+timer or message body, a saved response, a dead letter), and reseal
+progress. If a rewritten segment has not been replaced in object storage
+yet, it says the shipped copy still holds the old bytes. Needs `read`.
 
 ```text
 $ kronik privacy status
   Mode          on (epoch 1)
   Keystore      0 subjects, 0 keys, 0 erased
-  Erasures      0 still have a plain value in the log
+  Erasures      0 still have a plain value in the log or state.db
   Reseal        0 of 0 segments, 0 values sealed, 0 tombstones
 Next     kronik privacy mode off --reason "..."
 ```
@@ -2147,8 +2148,11 @@ $ kronik --json privacy erase user:43 --reason "GDPR art. 17 request #1183"
 Rewrites closed log segments (M8). Privacy mode must already be on
 (`BAD_REQUEST` otherwise). A tagged plain value becomes sealed with the
 subject's current key; a value of an erased subject becomes a tombstone.
-The segment still being written is left until it rolls. `--dry-run` reports
-how many closed segments would change and writes nothing. Needs `operate`.
+The rows the rewritten records hold in `state.db` follow: state values, the
+bodies of pending timers and undelivered messages, saved responses and dead
+letters. The segment still being written is left until it rolls.
+`--dry-run` reports how many closed segments would change and writes
+nothing. Needs `operate`.
 
 ```text
 $ kronik privacy reseal --reason "seal history written before privacy mode" --dry-run

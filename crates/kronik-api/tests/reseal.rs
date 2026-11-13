@@ -321,3 +321,204 @@ async fn reseal_seals_dead_letters_in_state_db() {
         );
     }
 }
+
+/// A node with closed segments after every record, snapshots and a
+/// deployed counter, behind the API.
+async fn counter_node(dir: &std::path::Path) -> (Arc<kronik_sched::Node>, Api) {
+    let env = Env::real(tokio::runtime::Handle::current());
+    let mut storage = kronik_sched::snapshots::StorageConfig::new(dir.to_path_buf());
+    storage.history = std::time::Duration::from_millis(u64::MAX);
+    let node = start_local(
+        env,
+        dir,
+        NodeConfig {
+            segment_max_bytes: Some(1),
+            storage: Some(storage),
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let api = Api::new(node.clone());
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/deployments",
+        json!({"wasm_base64": wasm(), "reason": "r"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    (node, api)
+}
+
+/// The body of the pending timer `id` of `counter/t`, as `state.db` holds it.
+fn timer_body(node: &kronik_sched::Node, id: u64) -> Option<kronik_proto::log::v1::Sealable> {
+    node.store()
+        .db()
+        .timers(None)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.actor.key == "t" && t.timer_id == id)
+        .and_then(|t| t.msg.body)
+}
+
+/// Waits for the timer's turn and returns its dead letter.
+async fn timer_dead_letter(node: &kronik_sched::Node) -> kronik_store::db::DeadLetterRow {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let letters = node.store().db().dead_letters(0, 100).unwrap();
+        if let Some(d) = letters.into_iter().find(|d| d.actor.key == "t") {
+            return d;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the timer of counter/t did not fire"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Whether `state.db` or its WAL holds `mark`.
+fn state_db_holds(dir: &std::path::Path, mark: &str) -> bool {
+    ["state.db", "state.db-wal"].iter().any(|f| {
+        std::fs::read(dir.join("branches/main").join(f))
+            .unwrap_or_default()
+            .windows(mark.len())
+            .any(|w| w == mark.as_bytes())
+    })
+}
+
+/// Issue #31: a timer scheduled in `off` mode waits in `state.db` with its
+/// subject's body in plain text. Reseal seals that body with the records,
+/// so `state.db` keeps no copy, and once the subject is erased the timer's
+/// turn meets an erased input: a `SUBJECT_ERASED` dead letter. The value is
+/// not handed to the guest again, nor sealed again under a new key version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reseal_seals_a_pending_timer_and_after_erasure_it_fires_as_a_dead_letter() {
+    const MARK: &str = "NEEDLE-TIMER-9c1";
+    let dir = tempfile::tempdir().unwrap();
+    let (node, api) = counter_node(dir.path()).await;
+    // In `off` mode: `store` the mark in 8 s, for user:1.
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/actors/counter/t/messages",
+        json!({"name": "schedule", "text": format!("8000 store\n{MARK}"), "subject": "user:1", "reason": "r"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let id: u64 = v["reply"]["text"].as_str().unwrap().parse().unwrap();
+    // Closes the segment that holds it.
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/actors/counter/d/messages",
+        json!({"name": "increment", "reason": "r"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let body = timer_body(&node, id).unwrap();
+    assert_eq!(body.subject.as_deref(), Some("user:1"));
+    assert!(matches!(
+        body.value,
+        Some(kronik_proto::log::v1::sealable::Value::Plain(_))
+    ));
+    for (path, req) in [
+        (
+            "/v1/privacy/mode",
+            json!({"mode": "on", "reason": "seal history"}),
+        ),
+        ("/v1/privacy/reseal", json!({"reason": "seal history"})),
+    ] {
+        let (s, v) = call(&api, "POST", path, req).await;
+        assert_eq!(s, 200, "{v}");
+    }
+    let body = timer_body(&node, id).expect("the timer fired before the erasure: raise its delay");
+    assert!(
+        matches!(
+            body.value,
+            Some(kronik_proto::log::v1::sealable::Value::Sealed(_))
+        ),
+        "the pending timer's body is still plain after reseal: {body:?}"
+    );
+    assert!(
+        !state_db_holds(dir.path(), MARK),
+        "state.db still holds the timer's plain body"
+    );
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/privacy/erase",
+        json!({"subject": "user:1", "reason": "erasure request"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["plain_values"], 0, "{v}");
+    assert!(
+        timer_body(&node, id).is_some(),
+        "the timer fired before the erasure: raise its delay"
+    );
+    let status = call(&api, "GET", "/v1/privacy", Value::Null).await.1;
+    assert_eq!(status["pending_erasures"], 0, "{status}");
+    let dead = timer_dead_letter(&node).await;
+    assert_eq!(dead.error_code, "SUBJECT_ERASED", "{dead:?}");
+    assert!(
+        node.store()
+            .db()
+            .kv_get("counter", "t", "stored")
+            .unwrap()
+            .is_none(),
+        "the erased value reached the guest"
+    );
+    assert!(!state_db_holds(dir.path(), MARK));
+}
+
+/// Issue #31, the other order: the subject is erased before any reseal.
+/// The erasure itself turns the pending timer's plain body into a
+/// tombstone, so the timer's turn is a `SUBJECT_ERASED` dead letter as
+/// well, and `privacy status` counts the erasure as pending while the log
+/// still holds the subject's plain values.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_erasure_before_any_reseal_stops_a_pending_timer_too() {
+    const MARK: &str = "NEEDLE-TIMER-41d";
+    let dir = tempfile::tempdir().unwrap();
+    let (node, api) = counter_node(dir.path()).await;
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/actors/counter/t/messages",
+        json!({"name": "schedule", "text": format!("5000 store\n{MARK}"), "subject": "user:1", "reason": "r"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let id: u64 = v["reply"]["text"].as_str().unwrap().parse().unwrap();
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/privacy/erase",
+        json!({"subject": "user:1", "reason": "erasure request"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert!(v["plain_values"].as_u64().unwrap() > 0, "{v}");
+    let body = timer_body(&node, id).expect("the timer fired before the erasure: raise its delay");
+    assert!(
+        matches!(
+            body.value,
+            Some(kronik_proto::log::v1::sealable::Value::Sealed(_))
+        ),
+        "the erasure left the pending timer's body plain: {body:?}"
+    );
+    let status = call(&api, "GET", "/v1/privacy", Value::Null).await.1;
+    assert_eq!(status["pending_erasures"], 1, "{status}");
+    let dead = timer_dead_letter(&node).await;
+    assert_eq!(dead.error_code, "SUBJECT_ERASED", "{dead:?}");
+    assert!(
+        node.store()
+            .db()
+            .kv_get("counter", "t", "stored")
+            .unwrap()
+            .is_none(),
+        "the erased value reached the guest"
+    );
+}
