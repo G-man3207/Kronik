@@ -3340,14 +3340,18 @@ int main(void) {
     /// bits. A cargo test binary can be 0750 (a restrictive umask) and a CI
     /// checkout can be owned by another uid; copy it once, 0755, under `/tmp`
     /// (whose ancestors are world-searchable) and give every rehearsal the copy.
+    /// The copy is the whole test binary, tens of MiB: it is removed when this
+    /// test process exits, as the harness does after the last test.
     fn rehearsal_exe() -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         static COPY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         COPY.get_or_init(|| {
             let exe = std::env::current_exe().unwrap();
-            let dir = std::path::Path::new("/tmp")
-                .join(format!("kronik-foreign-rehearsal-{}", std::process::id()));
+            let dir = rehearsal_dir();
             std::fs::create_dir_all(&dir).unwrap();
+            // SAFETY: atexit registers a function that takes no argument; the
+            // C runtime calls it once, at the normal exit of this process.
+            assert_eq!(unsafe { libc::atexit(remove_rehearsal_dir) }, 0);
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
             let copy = dir.join("kronik-foreign");
             std::fs::copy(&exe, &copy).unwrap();
@@ -3355,6 +3359,16 @@ int main(void) {
             copy
         })
         .clone()
+    }
+
+    /// The directory of this test process's copy (see [`rehearsal_exe`]).
+    fn rehearsal_dir() -> std::path::PathBuf {
+        std::path::Path::new("/tmp")
+            .join(format!("kronik-foreign-rehearsal-{}", std::process::id()))
+    }
+
+    extern "C" fn remove_rehearsal_dir() {
+        let _ = std::fs::remove_dir_all(rehearsal_dir());
     }
 
     const PIDNS_DIR: &str = "KRONIK_TEST_PIDNS_DIR";
