@@ -35,6 +35,9 @@ impl StateView for Empty {
     fn timer_pending(&self, _: u64) -> Result<bool, String> {
         Ok(false)
     }
+    fn connection(&self, _: &str) -> Result<Option<kronik_runtime::ConnectionView>, String> {
+        Ok(None)
+    }
 }
 
 /// Logs each effect (ordinal and request) and echoes it, after 0 to 3 ms.

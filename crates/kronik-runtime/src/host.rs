@@ -104,6 +104,20 @@ impl Default for TurnLimits {
     }
 }
 
+/// A connection as a turn sees it (M24, docs/design/m24-connections.md
+/// §2.4): its `connections` row as of the turn's start. Only the owner's
+/// own turns change its row, so it does not change during the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionView {
+    /// Whether the turn's actor accepted it.
+    pub owner_is_self: bool,
+    pub protocol: pb::ConnectionProtocol,
+    /// The next outgoing seq: the frames handed over before this turn.
+    pub next_seq: u64,
+    /// Whether its owner closed it, or its close input is recorded.
+    pub closing: bool,
+}
+
 /// The actor's committed key-value state at turn start. An `Err` is a host
 /// failure: the turn is abandoned without a record.
 pub trait StateView: Send + Sync {
@@ -111,6 +125,9 @@ pub trait StateView: Send + Sync {
     fn keys(&self, prefix: &str) -> Result<Vec<String>, String>;
     /// Whether the actor has a committed, pending timer with this id.
     fn timer_pending(&self, id: u64) -> Result<bool, String>;
+    /// A connection's view, `None` when no actor accepted one with this id
+    /// (M24).
+    fn connection(&self, id: &str) -> Result<Option<ConnectionView>, String>;
 }
 
 /// A header of an outgoing HTTP effect: text, or a secret filled in by the

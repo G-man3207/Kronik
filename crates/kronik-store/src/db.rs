@@ -97,6 +97,22 @@ CREATE TABLE IF NOT EXISTS secret_links (
 CREATE TABLE IF NOT EXISTS secret_link_history (
   name TEXT NOT NULL, generation INTEGER NOT NULL, epoch INTEGER NOT NULL,
   record BLOB NOT NULL, PRIMARY KEY (name, generation)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS connections (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL, key TEXT NOT NULL,
+  protocol INTEGER NOT NULL,
+  route TEXT NOT NULL,
+  subject TEXT,
+  opened_lsn INTEGER NOT NULL,
+  closing_lsn INTEGER,
+  closed_lsn INTEGER,
+  cause INTEGER, code INTEGER,
+  frames_in INTEGER NOT NULL DEFAULT 0,
+  next_seq INTEGER NOT NULL DEFAULT 0,
+  frames_written INTEGER,
+  restart_after_lsn INTEGER);
+CREATE INDEX IF NOT EXISTS connections_owner ON connections (kind, key, closed_lsn);
+CREATE INDEX IF NOT EXISTS connections_open ON connections (id) WHERE closed_lsn IS NULL;
 ";
 
 /// One row of `actors`.
@@ -229,6 +245,81 @@ pub struct OrphanRow {
     pub caller_lsn: Lsn,
     pub compensation_id: Option<String>,
     pub resolved_lsn: Option<Lsn>,
+}
+
+/// A long-lived connection that its owner accepted (M24,
+/// docs/design/m24-connections.md §6.5): one row from the accepting open
+/// turn on, closed by its close input. Rows stay after the close, so the
+/// ownership check of a turn never depends on when a row went away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionRow {
+    pub id: String,
+    /// The owner: the actor whose open turn accepted the connection.
+    pub actor: kronik_core::ids::ActorRef,
+    /// `ConnectionProtocol`.
+    pub protocol: i32,
+    pub route: String,
+    /// The connection's subject: the accept's, else the request's.
+    pub subject: Option<String>,
+    pub opened_lsn: Lsn,
+    /// The first committed close operation of the owner.
+    pub closing_lsn: Option<Lsn>,
+    /// The close input's turn.
+    pub closed_lsn: Option<Lsn>,
+    /// `CloseCause` and the close code, from the close input.
+    pub cause: Option<i32>,
+    pub code: Option<u32>,
+    /// Frame inputs recorded (resends not counted).
+    pub frames_in: u64,
+    /// The next outgoing seq: frames handed over so far.
+    pub next_seq: u64,
+    /// From the close input, when known.
+    pub frames_written: Option<u64>,
+    pub restart_after_lsn: Option<Lsn>,
+}
+
+impl ConnectionRow {
+    /// Neither closing nor closed.
+    pub fn open(&self) -> bool {
+        self.closing_lsn.is_none() && self.closed_lsn.is_none()
+    }
+}
+
+const CONNECTION_COLUMNS: &str = "id, kind, key, protocol, route, subject, opened_lsn, \
+     closing_lsn, closed_lsn, cause, code, frames_in, next_seq, frames_written, restart_after_lsn";
+
+fn connection_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ConnectionRow> {
+    let opt = |i: usize| -> rusqlite::Result<Option<u64>> {
+        Ok(r.get::<_, Option<i64>>(i)?.map(|v| v as u64))
+    };
+    Ok(ConnectionRow {
+        id: r.get(0)?,
+        actor: kronik_core::ids::ActorRef {
+            kind: r.get(1)?,
+            key: r.get(2)?,
+        },
+        protocol: r.get(3)?,
+        route: r.get(4)?,
+        subject: r.get(5)?,
+        opened_lsn: r.get::<_, i64>(6)? as u64,
+        closing_lsn: opt(7)?,
+        closed_lsn: opt(8)?,
+        cause: r.get(9)?,
+        code: r.get::<_, Option<i64>>(10)?.map(|c| c as u32),
+        frames_in: r.get::<_, i64>(11)? as u64,
+        next_seq: r.get::<_, i64>(12)? as u64,
+        frames_written: opt(13)?,
+        restart_after_lsn: opt(14)?,
+    })
+}
+
+/// Which connections [`StateDb::connections`] lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// Without a close input (open or closing).
+    Open,
+    Closed,
+    All,
 }
 
 /// A kind's current code.
@@ -968,7 +1059,8 @@ impl StateDb {
     }
 
     /// Applies a StateRebase switch at `c` with `shadow` (ADR 0017): the
-    /// affected actors' rows, the mailbox, deliveries, dead letters and
+    /// affected actors' rows (with their connections), the mailbox,
+    /// deliveries, dead letters and
     /// orphans become the shadow's, the rebased turns join `turn_index`, and
     /// the switch's deployment is recorded; in one transaction with
     /// `applied_lsn`.
@@ -998,7 +1090,8 @@ impl StateDb {
         let base = i(sw.base_lsn);
         let tx = self.conn.savepoint()?;
         for (kind, key) in actors {
-            for table in ["actors", "kv", "timers"] {
+            // M24: the connections the rebased actors hold are the shadow's.
+            for table in ["actors", "kv", "timers", "connections"] {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE kind = ?1 AND key = ?2"),
                     params![kind, key],
@@ -1903,6 +1996,66 @@ impl StateDb {
         }
     }
 
+    /// A connection's row (M24).
+    pub fn connection(&self, id: &str) -> Result<Option<ConnectionRow>, StoreError> {
+        Ok(self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT {CONNECTION_COLUMNS} FROM connections WHERE id = ?1"
+            ))?
+            .query_row([id], connection_row)
+            .optional()?)
+    }
+
+    /// The connections without a close input, in id order: the ones a
+    /// restart closes (M24 §4.8).
+    pub fn open_connections(&self) -> Result<Vec<ConnectionRow>, StoreError> {
+        let mut st = self.conn.prepare_cached(&format!(
+            "SELECT {CONNECTION_COLUMNS} FROM connections WHERE closed_lsn IS NULL ORDER BY id"
+        ))?;
+        let rows = st.query_map([], connection_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Connections in id order after `after` (empty: from the start), at
+    /// most `limit`: those of one owner or one kind when given, and open
+    /// ones (no close input), closed ones or all.
+    pub fn connections(
+        &self,
+        owner: Option<(&str, Option<&str>)>,
+        state: ConnectionState,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<ConnectionRow>, StoreError> {
+        let state = match state {
+            ConnectionState::Open => " AND closed_lsn IS NULL",
+            ConnectionState::Closed => " AND closed_lsn IS NOT NULL",
+            ConnectionState::All => "",
+        };
+        let (kind, key) = owner.unwrap_or(("", None));
+        let mut st = self.conn.prepare_cached(&format!(
+            "SELECT {CONNECTION_COLUMNS} FROM connections WHERE id > ?1 \
+             AND (?2 = '' OR kind = ?2) AND (?3 IS NULL OR key = ?3){state} ORDER BY id LIMIT ?4"
+        ))?;
+        let rows = st.query_map(
+            params![after, kind, key, i64::try_from(limit).unwrap_or(i64::MAX)],
+            connection_row,
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// How many connections of `kind` have no close input (deploy's
+    /// warning, M24 §2.6).
+    pub fn open_connection_count(&self, kind: &str) -> Result<u64, StoreError> {
+        let n: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT count(*) FROM connections WHERE kind = ?1 AND closed_lsn IS NULL",
+            )?
+            .query_row([kind], |r| r.get(0))?;
+        Ok(n as u64)
+    }
+
     pub fn timer_pending(&self, kind: &str, key: &str, id: u64) -> Result<bool, StoreError> {
         Ok(self
             .conn
@@ -2279,6 +2432,7 @@ fn apply_turn(
         .input
         .as_ref()
         .ok_or_else(|| corrupt("turn record without input"))?;
+    apply_connections(tx, lsn, kind, key, t, input, outcome, committed)?;
     match &input.kind {
         Some(pb::input::Kind::Message(m)) => {
             let source =
@@ -2364,6 +2518,137 @@ fn apply_turn(
             .execute([&t.execution_id])?;
         tx.prepare_cached("DELETE FROM open_effects WHERE execution_id = ?1")?
             .execute([&t.execution_id])?;
+    }
+    Ok(())
+}
+
+/// A turn record's effect on the `connections` table (M24 §6.5), in this
+/// order: an accepted open inserts the row; every OK `connection.send-now`
+/// advances its target's `next_seq`, also in failed turns; a committed
+/// record's SEND targets advance it and its CLOSE sets `closing_lsn`; a
+/// frame input (not a resend) counts in `frames_in`; a close input closes
+/// the row whatever its turn's outcome. Operations on ids without a row are
+/// ignored. A failed frame or close turn is a dead letter, and a resend
+/// marks the dead letter it resends.
+#[allow(clippy::too_many_arguments)]
+fn apply_connections(
+    tx: &Connection,
+    lsn: i64,
+    kind: &str,
+    key: &str,
+    t: &pb::TurnRecord,
+    input: &pb::Input,
+    outcome: &pb::Outcome,
+    committed: bool,
+) -> Result<(), StoreError> {
+    use pb::connection_input::Event;
+    let conn_input = match &input.kind {
+        Some(pb::input::Kind::Connection(c)) => Some(c),
+        _ => None,
+    };
+    // 1. An accepted open.
+    if let Some(c) = conn_input
+        && let Some(Event::Open(open)) = &c.event
+        && committed
+        && let Some(pb::outcome::Output::Accept(accept)) = &outcome.output
+    {
+        let subject = accept.subject.as_deref().or_else(|| {
+            open.request
+                .as_ref()
+                .and_then(|h| http_subject(&h.headers, h.body.as_ref()))
+        });
+        tx.prepare_cached(
+            "INSERT OR IGNORE INTO connections (id, kind, key, protocol, route, subject, opened_lsn) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?
+        .execute(params![c.connection, kind, key, c.protocol, c.route, subject, lsn])?;
+    }
+    // 2. Frames sent now, also by a turn that then failed.
+    let mut advance =
+        tx.prepare_cached("UPDATE connections SET next_seq = max(next_seq, ?2) WHERE id = ?1")?;
+    for e in &t.effects {
+        if e.kind != "connection.send-now" || e.status != pb::EffectStatus::Ok as i32 {
+            continue;
+        }
+        // The id is the plain target; the seq is in the request, which may
+        // be sealed: then the target's next_seq comes from the next one.
+        let Some(id) = e.target.strip_prefix("connection:") else {
+            continue;
+        };
+        match pb::ConnectionSendRequest::decode(sealable_plain(e.request.as_ref()).as_slice()) {
+            Ok(r) if r.connection == id => {
+                advance.execute(params![id, i(r.seq.saturating_add(1))])?;
+            }
+            _ => {
+                tx.prepare_cached("UPDATE connections SET next_seq = next_seq + 1 WHERE id = ?1")?
+                    .execute([id])?;
+            }
+        }
+    }
+    // 3. The buffered operations of a committed turn.
+    if committed {
+        for op in &t.connection_ops {
+            match &op.op {
+                Some(pb::connection_op::Op::Send(_)) => {
+                    for (id, seq) in op.connections.iter().zip(&op.seqs) {
+                        advance.execute(params![id, i(seq.saturating_add(1))])?;
+                    }
+                }
+                Some(pb::connection_op::Op::Close(_)) => {
+                    for id in &op.connections {
+                        tx.prepare_cached(
+                            "UPDATE connections SET closing_lsn = ?2 \
+                             WHERE id = ?1 AND closing_lsn IS NULL",
+                        )?
+                        .execute(params![id, lsn])?;
+                    }
+                }
+                None => return Err(corrupt("a connection operation without op")),
+            }
+        }
+    }
+    let Some(c) = conn_input else {
+        return Ok(());
+    };
+    match &c.event {
+        // 4. An incoming frame.
+        Some(Event::Frame(_)) => {
+            if c.resend_of.is_empty() {
+                tx.prepare_cached(
+                    "UPDATE connections SET frames_in = frames_in + 1 WHERE id = ?1",
+                )?
+                .execute([&c.connection])?;
+            }
+        }
+        // 5. The close, whatever the turn's outcome.
+        Some(Event::Close(close)) => {
+            tx.prepare_cached(
+                "UPDATE connections SET closed_lsn = ?2, cause = ?3, code = ?4, \
+                 frames_written = ?5, restart_after_lsn = ?6 WHERE id = ?1 AND closed_lsn IS NULL",
+            )?
+            .execute(params![
+                c.connection,
+                lsn,
+                close.cause,
+                close.code,
+                close
+                    .frames_written_known
+                    .then_some(i(close.frames_written)),
+                (close.restart_after_lsn > 0).then_some(i(close.restart_after_lsn)),
+            ])?;
+        }
+        Some(Event::Open(_)) | None => {}
+    }
+    if let Some(of) = kronik_core::ids::TurnId::parse(&c.resend_of) {
+        tx.prepare_cached(
+            "UPDATE dead_letters SET resent_as = ?2 WHERE lsn = ?1 AND resent_as IS NULL",
+        )?
+        .execute(params![i(of.lsn), lsn])?;
+    }
+    // A failed frame or close turn is a dead letter; a failed open is not
+    // (its client got the error).
+    if !committed && matches!(c.event, Some(Event::Frame(_) | Event::Close(_))) {
+        dead_letter_insert(tx, lsn, kind, key, input, outcome)?;
     }
     Ok(())
 }
@@ -3305,6 +3590,7 @@ enum KvOp {
 
 fn simple_http(t: &pb::TurnRecord) -> bool {
     t.messages.is_empty()
+        && t.connection_ops.is_empty()
         && t.timers.is_empty()
         && t.compensations.is_empty()
         && t.effects.is_empty()

@@ -35,6 +35,8 @@ const HASHED_TABLES: &[&str] = &[
     "secret_format",
     "secret_links",
     "secret_link_history",
+    // M24: derived from the log like every table above.
+    "connections",
 ];
 
 /// What `Store::snapshot_to` wrote.

@@ -38,6 +38,9 @@ impl StateView for Map {
     fn timer_pending(&self, _id: u64) -> Result<bool, String> {
         Ok(false)
     }
+    fn connection(&self, _: &str) -> Result<Option<kronik_runtime::ConnectionView>, String> {
+        Ok(None)
+    }
 }
 
 fn store() -> CodeStore {

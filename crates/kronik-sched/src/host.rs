@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use kronik_core::ids::ActorRef;
 use kronik_privacy::sealer::Opened;
 use kronik_proto::log::v1 as pb;
-use kronik_runtime::{SqlError, SqlHost, SqlHostError, SqlRows, SqlValue, StateView};
+use kronik_runtime::{
+    ConnectionView, SqlError, SqlHost, SqlHostError, SqlRows, SqlValue, StateView,
+};
 use kronik_store::Store;
 use kronik_store::sql::{self, SqlActor, TurnOpts, TurnSql};
 use rusqlite::types::Value;
@@ -60,6 +62,38 @@ impl StateView for KvView {
             .timer_pending(&self.actor.kind, &self.actor.key, id)
             .map_err(|e| e.to_string())
     }
+
+    fn connection(&self, id: &str) -> Result<Option<ConnectionView>, String> {
+        connection_view(&self.store, &self.actor, id)
+    }
+}
+
+/// A connection's row as `actor`'s turn sees it (M24): the node's and a
+/// fork's state views share it.
+pub fn connection_view(
+    store: &Store,
+    actor: &ActorRef,
+    id: &str,
+) -> Result<Option<ConnectionView>, String> {
+    let row = store.db().connection(id).map_err(|e| e.to_string())?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let protocol = pb::ConnectionProtocol::try_from(row.protocol)
+        .ok()
+        .filter(|p| *p != pb::ConnectionProtocol::Unspecified)
+        .ok_or_else(|| {
+            format!(
+                "STORAGE_CORRUPT: connection {id} has protocol {}",
+                row.protocol
+            )
+        })?;
+    Ok(Some(ConnectionView {
+        owner_is_self: row.actor == *actor,
+        protocol,
+        next_seq: row.next_seq,
+        closing: !row.open(),
+    }))
 }
 
 /// The actor's SQL database for one turn, opened and begun on first use.

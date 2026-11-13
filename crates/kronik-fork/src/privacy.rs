@@ -353,6 +353,13 @@ impl StateView for ForkState {
             .timer_pending(&self.actor.kind, &self.actor.key, id)
             .map_err(|e| e.to_string())
     }
+
+    /// M24: the connections table of the state the replay runs on
+    /// (production's at the input in isolated replay, the fork's own in
+    /// continuous replay).
+    fn connection(&self, id: &str) -> Result<Option<kronik_runtime::ConnectionView>, String> {
+        kronik_sched::host::connection_view(&self.store, &self.actor, id)
+    }
 }
 
 #[cfg(test)]
