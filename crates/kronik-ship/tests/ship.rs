@@ -106,6 +106,21 @@ impl Proc {
         }
     }
 
+    /// One turn of `counter/tick` in a later millisecond than every turn so
+    /// far, then a retention pass. With `history` 0 the window holds the fork
+    /// points of the newest millisecond, so a snapshot becomes the window's
+    /// base only once a later turn has put it behind the window.
+    fn age_and_compact(&self) {
+        let hwm = self.node.store().db().time_hwm().unwrap();
+        while self.node.store().db().time_hwm().unwrap() <= hwm {
+            std::thread::sleep(Duration::from_millis(2));
+            self.send("counter/tick", "increment", "");
+        }
+        self.node
+            .compact(self.node.storage_config().unwrap())
+            .unwrap();
+    }
+
     fn ship(&self, remote: &Remote, dir: &Path) -> kronik_ship::ShipReport {
         let mut st = ShipState::load(dir).unwrap();
         self.rt
@@ -427,12 +442,14 @@ fn compacted_node_shipped(
         // long been uploaded as a closed one when retention gets to it.
         p.ship(remote, src);
     }
-    // The snapshot's retention pass compacts the log.
+    // Once the snapshot is the window's base, a retention pass compacts the
+    // log.
     p.rt.block_on(
         p.node
             .snapshot("manual", p.node.local_operator_authority().unwrap()),
     )
     .unwrap();
+    p.age_and_compact();
     let storage = p.node.storage_config().unwrap().clone();
     let first = p.node.log_first(&storage).unwrap();
     assert!(first > note + 1, "first {first}, the note's lsn {note}");
@@ -577,13 +594,15 @@ fn active_segment_deleted_before_it_was_closed(
     let (stale, _) = ShipState::load(src).unwrap().active.unwrap();
     // The partial upload is in the bucket.
     assert!(bucket_segments(bucket).contains(&stale));
-    // The bucket is out of reach for longer than `history`: the snapshot's
-    // retention pass deletes the segment locally.
+    // The bucket is out of reach for longer than `history`: once the
+    // snapshot is the window's base, a retention pass deletes the segment
+    // locally.
     p.rt.block_on(
         p.node
             .snapshot("manual", p.node.local_operator_authority().unwrap()),
     )
     .unwrap();
+    p.age_and_compact();
     let first = p
         .node
         .log_first(&p.node.storage_config().unwrap().clone())

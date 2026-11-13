@@ -1071,6 +1071,34 @@ async fn committed_pages_restart_rewind_and_prepared_webhook_survive_durable_rel
     );
 }
 
+/// One turn of `counter/tick` in a later millisecond than every turn so far,
+/// then a retention pass. With `history` 0 the window holds the fork points
+/// of the newest millisecond, so a snapshot becomes the window's base only
+/// once a later turn has put it behind the window.
+async fn age_and_compact(node: &Node, execution: &AuthLease) {
+    let hwm = node.store().db().time_hwm().unwrap();
+    while node.store().db().time_hwm().unwrap() <= hwm {
+        node.env()
+            .clock
+            .sleep(std::time::Duration::from_millis(2))
+            .await;
+        node.send(
+            kronik_core::ids::ActorRef::parse("counter/tick").unwrap(),
+            pb::Message {
+                name: "increment".into(),
+                ..Default::default()
+            },
+            audit().unwrap(),
+            false,
+            execution.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    node.compact(node.storage_config().unwrap()).unwrap();
+}
+
 #[tokio::test]
 async fn compacted_actor_pending_survives_restart_and_holds_gap_until_ack() {
     use hmac::{KeyInit as _, Mac as _};
@@ -1257,6 +1285,7 @@ async fn compacted_actor_pending_survives_restart_and_holds_gap_until_ack() {
         }
     }
     node.snapshot("manual", execution.clone()).await.unwrap();
+    age_and_compact(&node, &execution).await;
     let first = node.log_first(node.storage_config().unwrap()).unwrap();
     assert!(
         first > receipt,
@@ -1506,6 +1535,7 @@ async fn compaction_returns_an_explicit_repeatable_shard_gap_before_later_events
         }
     }
     let snapshot = node.snapshot("manual", execution.clone()).await.unwrap();
+    age_and_compact(&node, &execution).await;
     let first = node.log_first(node.storage_config().unwrap()).unwrap();
     assert!(first > 1);
     assert!(first <= snapshot.lsn + 1);

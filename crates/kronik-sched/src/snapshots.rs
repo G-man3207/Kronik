@@ -167,9 +167,12 @@ pub struct SnapshotPoint {
 /// from (docs/design/m6-storage.md §2, §5).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RetentionPlan {
-    /// The window's base: the newest snapshot whose state is no newer than
-    /// the window's start, so every fork point in the window can start from
-    /// it. Compaction deletes only segments it covers. `None` while no
+    /// The window's base: the newest snapshot whose state is older than the
+    /// window's start, so every fork point in the window can start from it.
+    /// A fork point is outside the window only when its logical time is
+    /// strictly before the cutoff ([`history_cutoff`]), so a snapshot whose
+    /// newest turn has the cutoff's own time may already hold an in-window
+    /// fork point (turns may share a millisecond) and is not the base. Compaction deletes only segments it covers. `None` while no
     /// snapshot is that old (a young node, or the first days after an
     /// upgrade): then nothing is deleted.
     pub base: Option<Lsn>,
@@ -213,7 +216,7 @@ pub fn retention_plan(
     let mut base = usable
         .iter()
         .rev()
-        .find(|s| s.logical_time_ms <= cutoff)
+        .find(|s| s.logical_time_ms < cutoff)
         .map(|s| s.lsn);
     if base.is_none() && erasure_floor.is_some() {
         base = usable.first().map(|s| s.lsn);

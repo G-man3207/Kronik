@@ -112,6 +112,21 @@ async fn history(node: &Node) -> Lsn {
         .last_lsn
 }
 
+/// One turn of `counter/tick` in a later millisecond than every turn so far.
+/// With `history` 0 the window holds the fork points of the newest
+/// millisecond, so a snapshot becomes the window's base only once it is
+/// older than that: a fork point of its own millisecond may lie before it.
+async fn age(node: &Node) {
+    let before = node.store().db().time_hwm().unwrap();
+    loop {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        send(node, "counter/tick", "increment", "").await;
+        if node.store().db().time_hwm().unwrap() > before {
+            return;
+        }
+    }
+}
+
 /// One life of a node: the runtime is dropped when it ends, which stops the
 /// node's tasks and closes its databases, as a kill does. (The hooks are
 /// thread-local: the test thread polls everything the hooks reach.)
@@ -141,12 +156,16 @@ fn a_crash_after_the_raise_deletes_nothing_and_the_next_pass_finishes() {
         let storage = node.storage_config().unwrap().clone();
         assert_eq!(node.log_first(&storage).unwrap(), 1);
 
-        // The snapshot's retention pass raises the databases, then "crashes".
-        CRASH_AFTER_RAISE.with(|c| c.set(true));
-        // (The operator's `snapshot` runs on a task of its own: the hooks are
-        // thread-local, so the pass is driven from this thread.)
+        // A snapshot covers the traffic, and a later turn makes it the
+        // window's base. A retention pass raises the databases, then
+        // "crashes". (The hooks are thread-local, so the pass is driven from
+        // this thread.)
         node.snapshot_configured("manual").await.unwrap();
+        age(&node).await;
+        CRASH_AFTER_RAISE.with(|c| c.set(true));
+        let crashed = node.compact(&storage);
         CRASH_AFTER_RAISE.with(|c| c.set(false));
+        assert!(crashed.is_err());
         // Nothing was deleted, and the raise is there already.
         assert_eq!(node.log_first(&storage).unwrap(), 1);
         assert!(
@@ -172,12 +191,15 @@ fn a_crash_after_a_delete_leaves_a_log_every_database_reaches() {
         let before = kronik_log::segment_starts(&log).unwrap();
         assert!(before.len() > 3, "{before:?}");
 
-        // The pass deletes one segment and "crashes".
-        CRASH_AFTER_DELETE.with(|c| c.set(true));
-        // (The operator's `snapshot` runs on a task of its own: the hooks are
-        // thread-local, so the pass is driven from this thread.)
+        // A snapshot covers the traffic, and a later turn makes it the
+        // window's base. The pass deletes one segment and "crashes". (The
+        // hooks are thread-local, so the pass is driven from this thread.)
         node.snapshot_configured("manual").await.unwrap();
+        age(&node).await;
+        CRASH_AFTER_DELETE.with(|c| c.set(true));
+        let crashed = node.compact(&storage);
         CRASH_AFTER_DELETE.with(|c| c.set(false));
+        assert!(crashed.is_err());
         let first = node.log_first(&storage).unwrap();
         assert_eq!(first, before[1], "exactly the first segment is gone");
         assert!(

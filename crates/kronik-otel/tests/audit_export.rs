@@ -81,6 +81,30 @@ fn webhook(
     url
 }
 
+/// One turn of `counter/tick` in a later millisecond than every turn so far,
+/// then a retention pass. With `history` 0 the window holds the fork points
+/// of the newest millisecond, so a snapshot becomes the window's base only
+/// once a later turn has put it behind the window.
+fn age_and_compact(rt: &tokio::runtime::Runtime, node: &Node) {
+    let hwm = node.store().db().time_hwm().unwrap();
+    while node.store().db().time_hwm().unwrap() <= hwm {
+        std::thread::sleep(Duration::from_millis(2));
+        rt.block_on(node.send(
+            ActorRef::parse("counter/tick").unwrap(),
+            pb::Message {
+                name: "increment".into(),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            node.local_operator_authority().unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+    }
+    node.compact(node.storage_config().unwrap()).unwrap();
+}
+
 #[test]
 fn a_released_hold_records_a_gap_and_the_node_keeps_serving() {
     let dir = tempfile::tempdir().unwrap();
@@ -176,10 +200,12 @@ fn a_released_hold_records_a_gap_and_the_node_keeps_serving() {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    // The sink is down, so the first batch is still pending; the snapshot's
-    // retention deletes past the released hold.
+    // The sink is down, so the first batch is still pending; once the
+    // snapshot is the window's base, retention deletes past the released
+    // hold.
     rt.block_on(node.snapshot("manual", node.local_operator_authority().unwrap()))
         .unwrap();
+    age_and_compact(&rt, &node);
     let first = node.log_first(node.storage_config().unwrap()).unwrap();
     assert!(first > 5, "{first}");
     assert_eq!(node.disk_below_reserve(), None);
@@ -505,6 +531,7 @@ fn source_gap_coverage_survives_a_failed_checkpoint_but_not_a_new_incarnation() 
     advance(&rt, &node);
     rt.block_on(node.snapshot("manual", node.local_operator_authority().unwrap()))
         .unwrap();
+    age_and_compact(&rt, &node);
     let first = node.log_first(node.storage_config().unwrap()).unwrap();
     assert!(first > 1);
     let cursors = Arc::new(
@@ -597,6 +624,7 @@ fn source_gap_coverage_survives_a_failed_checkpoint_but_not_a_new_incarnation() 
     advance(&rt, &node);
     rt.block_on(node.snapshot("manual", node.local_operator_authority().unwrap()))
         .unwrap();
+    age_and_compact(&rt, &node);
     let later_first = node.log_first(node.storage_config().unwrap()).unwrap();
     assert!(later_first > old_head);
     assert!(

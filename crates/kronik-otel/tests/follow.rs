@@ -103,6 +103,21 @@ impl Fixture {
         }
     }
 
+    /// One turn of `counter/tick` in a later millisecond than every turn so
+    /// far, then a retention pass. With no history the window holds the fork
+    /// points of the newest millisecond, so a snapshot becomes the window's
+    /// base only once a later turn has put it behind the window.
+    fn age_and_compact(&self) {
+        let hwm = self.node.store().db().time_hwm().unwrap();
+        while self.node.store().db().time_hwm().unwrap() <= hwm {
+            std::thread::sleep(Duration::from_millis(2));
+            self.send("counter/tick", "increment", b"");
+        }
+        self.node
+            .compact(self.node.storage_config().unwrap())
+            .unwrap();
+    }
+
     fn send(&self, to: &str, name: &str, body: &[u8]) {
         let msg = pb::Message {
             name: name.into(),
@@ -362,6 +377,7 @@ fn a_failed_gap_record_keeps_the_cursor_before_the_gap_and_is_retried() {
     // The first batch is pending; nothing holds retention.
     f.rt.block_on(f.node.snapshot("manual", f.original.clone()))
         .unwrap();
+    f.age_and_compact();
     // The snapshot's deletion is applied in the background, and it can arrive
     // in more than one step: the start of the log is a value that stops moving,
     // not one that is already final when the snapshot returns. Let it stop

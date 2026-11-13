@@ -24,8 +24,11 @@ again. Compaction could delete that segment (issue #35).
 
 ## Decision
 
-- **The window's base** is the newest snapshot whose state is no newer
-  than the start of the window (its logical time at or before the cutoff).
+- **The window's base** is the newest snapshot whose state is older than
+  the start of the window (its logical time strictly before the cutoff, as
+  a fork point is outside the window only when its time is: turns share
+  milliseconds, so a snapshot of the cutoff's own millisecond can be newer
+  than a fork point of that millisecond that is in the window).
   Compaction deletes only segments the base covers, so the log and a
   snapshot reach every point in the window. While no snapshot is old
   enough, nothing is deleted and the oldest snapshot is kept to become it.

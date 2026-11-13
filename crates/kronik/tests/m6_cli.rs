@@ -323,7 +323,9 @@ const NOTES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/not
 
 /// A data directory whose log retention has compacted past the only SQL
 /// change of `notes/n`, which is idle since: a node with no history,
-/// small segments, one note, traffic of another actor, a snapshot.
+/// small segments, one note, traffic of another actor, a snapshot, a turn of
+/// a later millisecond (which makes the snapshot the window's base) and a
+/// retention pass.
 fn compacted_past_an_idle_actor(dir: &Path) {
     use kronik_proto::log::v1 as pb;
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -384,6 +386,12 @@ fn compacted_past_an_idle_actor(dir: &Path) {
         }
         node.snapshot("manual", owner()).await.unwrap();
         let storage = node.storage_config().unwrap().clone();
+        let hwm = node.store().db().time_hwm().unwrap();
+        while node.store().db().time_hwm().unwrap() <= hwm {
+            std::thread::sleep(Duration::from_millis(2));
+            send("counter/tick", "increment", "").await.unwrap();
+        }
+        node.compact(&storage).unwrap();
         assert!(
             node.log_first(&storage).unwrap() > 3,
             "nothing was compacted"

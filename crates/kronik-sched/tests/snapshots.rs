@@ -128,6 +128,22 @@ impl Proc {
         assert!(r.committed(), "{r:?}");
     }
 
+    /// One turn of `counter/tick` in a later millisecond than every turn so
+    /// far. With `history` 0 the window holds the fork points of the newest
+    /// millisecond, so a snapshot becomes the window's base only once it is
+    /// older than that: a fork point of its own millisecond may lie before it
+    /// (docs/design/m6-storage.md section 5).
+    fn age(&self) {
+        let before = self.node.store().db().time_hwm().unwrap();
+        loop {
+            std::thread::sleep(Duration::from_millis(2));
+            self.send("counter/tick", "increment", "");
+            if self.node.store().db().time_hwm().unwrap() > before {
+                return;
+            }
+        }
+    }
+
     fn records(&self, upto: u64) -> Vec<kronik_log::Committed> {
         let mut out = Vec::new();
         self.rt
@@ -499,8 +515,13 @@ fn retention_deletes_old_segments_a_snapshot_covers() {
         ..StorageConfig::new(dir.path().to_path_buf())
     };
     assert_eq!(p.node.compact(&storage).unwrap(), 1);
-    // A snapshot covers them: closed segments past the window go.
+    // A snapshot covers them, and once a later turn has put it behind the
+    // window it is the base: closed segments past the window go. Before
+    // that, a fork point of its own millisecond may lie before it.
     let m = p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
+    assert_eq!(p.node.compact(&storage).unwrap(), 1);
+    p.age();
+    p.node.compact(&storage).unwrap();
     let after = kronik_log::segment_starts(&log_dir).unwrap();
     assert!(
         after[0] > 1 && after[0] <= m.lsn + 1,
@@ -553,7 +574,7 @@ fn retention_deletes_old_segments_a_snapshot_covers() {
 
 /// A node with small segments, no history window and `[log] disk_reserve`
 /// set to `disk_reserve`, its log filled with closed segments that a
-/// snapshot covers.
+/// snapshot covers, which a later turn has made the window's base.
 fn held(dir: &Path, disk_reserve: u64) -> Proc {
     held_on(dir, disk_reserve, None)
 }
@@ -600,6 +621,10 @@ fn held_on(dir: &Path, disk_reserve: u64, free: Option<Arc<AtomicU64>>) -> Proc 
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    // The snapshot that covers them, put behind the window: the base of
+    // every later pass.
+    p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
+    p.age();
     p
 }
 
@@ -1341,9 +1366,9 @@ fn reply(p: &Proc, actor: &str, name: &str) -> String {
 
 /// Builds a directory whose log was compacted past the only SQL change of
 /// `notes/n`, which is idle since: one note, then traffic of other actors
-/// until segments have rolled and time has moved, then a snapshot (whose
-/// retention pass compacts). Returns the LSN of the note and the log's first
-/// LSN afterwards. The node is stopped.
+/// until segments have rolled and time has moved, then a snapshot, a later
+/// turn and a retention pass. Returns the LSN of the note and the log's
+/// first LSN afterwards. The node is stopped.
 fn compacted_past_an_idle_actor(dir: &Path) -> (u64, u64) {
     let p = compacting(dir);
     p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false, p.owner()))
@@ -1359,6 +1384,10 @@ fn compacted_past_an_idle_actor(dir: &Path) -> (u64, u64) {
     }
     p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
     let storage = p.node.storage_config().unwrap().clone();
+    // The snapshot is the base once a later turn has put it behind the
+    // window; the next pass compacts.
+    p.age();
+    p.node.compact(&storage).unwrap();
     let first = p.node.log_first(&storage).unwrap();
     let note = p
         .node
@@ -1624,8 +1653,10 @@ fn a_compaction_waits_for_an_actor_database_a_turn_has_open() {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    // A snapshot covers the segments; its own pass runs into the open turn.
+    // A snapshot covers the segments, and a later turn makes it the base; a
+    // pass then runs into the open turn.
     p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
+    p.age();
     let storage = p.node.storage_config().unwrap().clone();
     assert_eq!(
         p.node.log_first(&storage).unwrap(),
