@@ -1,5 +1,6 @@
-//! The guards of the bring-up helper: the machine marker (G1), the ids (G2), the
-//! space (G4) and the runtime limit (G6). The helper includes the same file.
+//! The guards of the bring-up helper and the boundary driver: the machine marker
+//! (G1), the ids (G2), the flat-file allocations (G3), the space (G4) and the
+//! runtime limit (G6). Both include the same file.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
@@ -232,6 +233,80 @@ fn g2_getent_answers_for_an_id_every_host_has_and_one_none_has() {
     assert!(getent_knows(IdKind::Group, 0).unwrap());
     assert!(!getent_knows(IdKind::User, 3_999_999_001).unwrap());
     assert!(!getent_knows(IdKind::Group, 3_999_999_002).unwrap());
+}
+
+/// G3: the flat identity files of an `etc`, written by the test.
+fn flat_etc(passwd: &str, group: &str, subuid: &str, subgid: &str) -> tempfile::TempDir {
+    let etc = tempfile::tempdir().unwrap();
+    for (name, text) in [
+        ("passwd", passwd),
+        ("group", group),
+        ("subuid", subuid),
+        ("subgid", subgid),
+    ] {
+        fs::write(etc.path().join(name), text).unwrap();
+    }
+    etc
+}
+
+#[test]
+fn g3_chosen_ids_and_ranges_must_be_nobodys_in_the_flat_files() {
+    let ranges = [(3_000_000, 65_536), (3_100_000, 65_536)];
+    let passwd = "root:x:0:0::/:/bin/sh\nrunner:x:1001:1001::/home/runner:/bin/bash\n";
+    let group = "root:x:0:\nrunner:x:1001:\n";
+    let subids = "runner:100000:65536\n";
+    let fine = flat_etc(passwd, group, subids, subids);
+    require_free_ranges(fine.path(), &ranges, &IDS).unwrap();
+    // A missing file holds nothing.
+    let empty = tempfile::tempdir().unwrap();
+    require_free_ranges(empty.path(), &ranges, &IDS).unwrap();
+    // An account that already has a chosen id, as a user or as a group.
+    let taken = flat_etc(&format!("{passwd}x:x:10002:5::/:/bin/sh\n"), group, "", "");
+    assert!(message(require_free_ranges(taken.path(), &ranges, &IDS)).contains("10002"));
+    let taken = flat_etc(passwd, &format!("{group}x:x:10003:\n"), "", "");
+    assert!(message(require_free_ranges(taken.path(), &ranges, &IDS)).contains("10003"));
+    // A user id that is the number of a chosen group is no clash.
+    let other = flat_etc(&format!("{passwd}x:x:10003:5::/:/bin/sh\n"), group, "", "");
+    require_free_ranges(other.path(), &ranges, &IDS).unwrap();
+    // An account inside one of the ranges.
+    let inside = flat_etc(
+        &format!("{passwd}x:x:3100001:5::/:/bin/sh\n"),
+        group,
+        "",
+        "",
+    );
+    assert!(message(require_free_ranges(inside.path(), &ranges, &IDS)).contains("3100001"));
+    // A subordinate range that overlaps a chosen one, in subuid or in subgid.
+    for (subuid, subgid) in [
+        ("a:3065535:10\n", ""),
+        ("", "b:2999999:2\n"),
+        ("c:3000000:65536\n", ""),
+        ("", "d:3150000:1\n"),
+    ] {
+        let overlap = flat_etc(passwd, group, subuid, subgid);
+        let text = message(require_free_ranges(overlap.path(), &ranges, &IDS));
+        assert!(text.contains("overlaps"), "{subuid}{subgid}: {text}");
+    }
+    // Next to a chosen range is not over it.
+    let adjacent = flat_etc(passwd, group, "a:2934464:65536\n", "b:3065536:34464\n");
+    require_free_ranges(adjacent.path(), &ranges, &IDS).unwrap();
+    // A chosen id inside another account's range.
+    let within = flat_etc(passwd, group, "e:10000:100\n", "");
+    assert!(message(require_free_ranges(within.path(), &ranges, &IDS)).contains("e's range"));
+    // A line of the files that is no range, or overflows, is refused.
+    for bad in ["f:abc:10\n", "g:4294967290:100\n"] {
+        let broken = flat_etc(passwd, group, bad, "");
+        assert!(
+            require_free_ranges(broken.path(), &ranges, &IDS).is_err(),
+            "{bad}"
+        );
+    }
+    // A comment is no range.
+    let commented = flat_etc(passwd, group, "# a:3000000:9\n", "");
+    require_free_ranges(commented.path(), &ranges, &IDS).unwrap();
+    // A chosen range that overflows or is empty is no range.
+    assert!(require_free_ranges(fine.path(), &[(u32::MAX - 1, 65_536)], &IDS).is_err());
+    assert!(require_free_ranges(fine.path(), &[(3_000_000, 0)], &IDS).is_err());
 }
 
 #[test]

@@ -739,11 +739,8 @@ fn copy_tree(source: &Path, target: &Path) -> Result<()> {
 fn validate_ids(uid: u32, gid: u32, start: u32, operator: u32) -> Result<()> {
     // The flat files are read below; the name service and the running
     // processes know accounts that no file here lists (LDAP, SSSD, homed).
-    proof_guard::require_unused_ids(
-        &proof_guard::fixture_ids(uid, gid, operator, start, COUNT)?,
-        &proof_guard::getent_knows,
-        Path::new("/proc"),
-    )?;
+    let ids = proof_guard::fixture_ids(uid, gid, operator, start, COUNT)?;
+    proof_guard::require_unused_ids(&ids, &proof_guard::getent_knows, Path::new("/proc"))?;
     ensure!(
         uid > 0
             && gid > 0
@@ -761,46 +758,15 @@ fn validate_ids(uid: u32, gid: u32, start: u32, operator: u32) -> Result<()> {
             && !(start..end).contains(&operator),
         "identity overlaps mapped range"
     );
-    for (file, ids) in [
-        ("/etc/passwd", vec![uid, operator]),
-        ("/etc/group", vec![gid]),
-    ] {
-        for line in fs::read_to_string(file)?.lines() {
-            if let Some(n) = line.split(':').nth(2).and_then(|n| n.parse::<u32>().ok()) {
-                ensure!(
-                    !ids.contains(&n) && !(start..end).contains(&n),
-                    "identity already used in {file}"
-                );
-            }
-        }
-    }
-    for file in ["/etc/subuid", "/etc/subgid"] {
-        match fs::read_to_string(file) {
-            Ok(contents) => {
-                for line in contents.lines() {
-                    let p: Vec<_> = line.split(':').collect();
-                    if p.len() != 3 || line.trim().is_empty() {
-                        continue;
-                    }
-                    let lo: u32 = p[1].parse()?;
-                    let hi = lo
-                        .checked_add(p[2].parse()?)
-                        .context("existing subid overflow")?;
-                    ensure!(
-                        end <= lo || start >= hi,
-                        "range already allocated in {file}"
-                    );
-                    ensure!(
-                        ![uid, gid, operator].iter().any(|id| (lo..hi).contains(id)),
-                        "identity lies in another account's range"
-                    );
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
+    proof_guard::require_free_ranges(
+        Path::new("/etc"),
+        &[(start, COUNT)],
+        &[
+            (proof_guard::IdKind::User, uid),
+            (proof_guard::IdKind::User, operator),
+            (proof_guard::IdKind::Group, gid),
+        ],
+    )
 }
 
 fn create(args: &[String]) -> Result<()> {

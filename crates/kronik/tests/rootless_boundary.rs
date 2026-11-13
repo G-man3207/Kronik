@@ -1,7 +1,17 @@
 //! Explicit, one-thread privilege-boundary regression driver. The integration
 //! owner supplies five owned numeric IDs: uid gid subuid-start subgid-start operator-uid.
 //! Never run against global account files or a live service.
+//!
+//! Like the installed fixture's `create`, it refuses to run unless the operator
+//! has said, on this machine, that it is disposable (`cat /etc/machine-id >
+//! /etc/kronik-proof-host`, as root), and unless its ids and both 65,536-id
+//! ranges belong to nobody: no account the name service knows, no running
+//! process, no account or allocation in the flat identity files.
 #![allow(clippy::disallowed_methods, clippy::unwrap_used, clippy::expect_used)]
+
+#[path = "support/proof_guard.rs"]
+#[allow(dead_code)]
+mod proof_guard;
 
 use std::fs;
 use std::io::{BufRead as _, Read as _, Write as _};
@@ -233,6 +243,27 @@ fn owned_proof(ids: [u32; 5]) -> Result<()> {
         "this explicit proof requires its allocated setup authority"
     );
     assert!(uid != 0 && gid != 0 && operator != 0 && uid != operator);
+    // The doors of the installed fixture's `create`: a machine declared
+    // disposable, and ids and ranges that are nobody's.
+    proof_guard::require_proof_host(
+        Path::new(proof_guard::MARKER),
+        Path::new(proof_guard::MACHINE_ID),
+        0,
+    )?;
+    let mut ids = proof_guard::fixture_ids(uid, gid, operator, subuid, COUNT)?;
+    ids.extend(proof_guard::fixture_ids(uid, gid, operator, subgid, COUNT)?);
+    ids.sort_unstable_by_key(|&(kind, id)| (kind == proof_guard::IdKind::Group, id));
+    ids.dedup();
+    proof_guard::require_unused_ids(&ids, &proof_guard::getent_knows, Path::new("/proc"))?;
+    proof_guard::require_free_ranges(
+        Path::new("/etc"),
+        &[(subuid, COUNT), (subgid, COUNT)],
+        &[
+            (proof_guard::IdKind::User, uid),
+            (proof_guard::IdKind::User, operator),
+            (proof_guard::IdKind::Group, gid),
+        ],
+    )?;
     let proof = tempfile::Builder::new()
         .prefix("kronik-boundary-")
         .tempdir_in("/var/tmp")?

@@ -162,6 +162,87 @@ pub fn fixture_ids(
     ])
 }
 
+/// G3. The chosen ids and subordinate ranges must be nobody's in the flat files
+/// under `etc`: no account of `passwd` (`group`) has a chosen user (group) id or
+/// an id inside one of `ranges` (each `(start, count)`), no line of `subuid` or
+/// `subgid` overlaps one of them, and no chosen id of `ids` lies inside another
+/// account's range. The name service and the running processes are G2's; these
+/// files are where the shadow tools allocate, so an overlap there is someone
+/// else's allocation. A missing file holds nothing.
+pub fn require_free_ranges(etc: &Path, ranges: &[(u32, u32)], ids: &[(IdKind, u32)]) -> Result<()> {
+    let mut wanted = Vec::new();
+    for &(start, count) in ranges {
+        let end = start
+            .checked_add(count)
+            .context("a subordinate range overflows")?;
+        ensure!(count > 0, "a subordinate range is empty");
+        wanted.push((start, end));
+    }
+    let read = |name: &str| -> Result<String> {
+        match fs::read_to_string(etc.join(name)) {
+            Ok(text) => Ok(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", etc.join(name).display())),
+        }
+    };
+    for (name, kind) in [("passwd", IdKind::User), ("group", IdKind::Group)] {
+        for line in read(name)?.lines() {
+            let Some(id) = line.split(':').nth(2).and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
+            ensure!(
+                !ids.contains(&(kind, id)),
+                "{} already has an account with the chosen id {id}: choose another",
+                etc.join(name).display()
+            );
+            ensure!(
+                !wanted
+                    .iter()
+                    .any(|&(start, end)| (start..end).contains(&id)),
+                "{} has an account with id {id} inside a chosen subordinate range: choose another range",
+                etc.join(name).display()
+            );
+        }
+    }
+    for name in ["subuid", "subgid"] {
+        for line in read(name)?.lines() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            let fields: Vec<&str> = line.trim().split(':').collect();
+            let [owner, start, count] = fields[..] else {
+                continue;
+            };
+            // A line of three fields that is no range cannot be shown to
+            // leave the chosen ranges alone: refused, as is one that overflows.
+            let (Ok(start), Ok(count)) = (start.parse::<u32>(), count.parse::<u32>()) else {
+                bail!(
+                    "{} has a line that is not a range: {line:?}",
+                    etc.join(name).display()
+                );
+            };
+            let end = start.checked_add(count).with_context(|| {
+                format!(
+                    "{} has a range that overflows: {line:?}",
+                    etc.join(name).display()
+                )
+            })?;
+            ensure!(
+                wanted.iter().all(|&(lo, hi)| hi <= start || end <= lo),
+                "{} gives {owner} {start}+{count}, which overlaps a chosen subordinate range: choose another range",
+                etc.join(name).display()
+            );
+            if let Some((_, id)) = ids.iter().find(|(_, id)| (start..end).contains(id)) {
+                bail!(
+                    "id {id} lies inside {owner}'s range {start}+{count} in {}: choose another id",
+                    etc.join(name).display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// G2, on this host: `getent passwd <uid>` and `getent group <gid>` answer 0
 /// when the id is known and 2 when it is not; anything else is an error.
 pub fn getent_knows(kind: IdKind, id: u32) -> Result<bool> {
