@@ -222,7 +222,28 @@ fn close(event: Closed) -> Result<(), HandlerError> {
 }
 ```
 
-Future blob functions must gain their **actual** examples when the IO
-interfaces are complete. `scripts/check-doc-surface.py` reads the current
-WIT and will reject undocumented new functions; a baseline example page is
-not evidence that a later ABI has been synchronized or exercised.
+## blobs
+
+A component that imports `blobs` receives large request bodies and effect
+responses as `HttpBody::Blob`. Read them in ranges of at most 1 MiB; write a
+large response with a `writer` and return its reference as the body. Handle
+`not-held` (a reference the turn neither holds nor received) and `erased`.
+M25 and M26 are being built: until then these calls trap with
+`NOT_IMPLEMENTED`.
+
+```rust
+let HttpBody::Blob(upload) = &request.body else { return Err(HandlerError::Rejected("expected a blob body".into())) };
+let first = blobs::get(upload, 0, 1 << 20).map_err(|e| HandlerError::Failed(format!("{e:?}")))?;
+let writer = blobs::Writer::new();
+writer.write(&first).map_err(|e| HandlerError::Failed(format!("{e:?}")))?;
+let copy = writer.finish().map_err(|e| HandlerError::Failed(format!("{e:?}")))?;
+// M26: hold a blob across turns, and let go of it.
+let note = blobs::put(b"known fixture bytes").map_err(|e| HandlerError::Failed(format!("{e:?}")))?;
+blobs::retain(&copy).map_err(|e| HandlerError::Failed(format!("{e:?}")))?;
+blobs::release(&note).map_err(|e| HandlerError::Failed(format!("{e:?}")))?;
+Ok(Output::Http(HttpResponse { status: 200, headers: vec![], body: HttpBody::Blob(copy) }))
+```
+
+`scripts/check-doc-surface.py` reads the current WIT and rejects functions
+without examples; a resource's methods are documented as calls on it, such
+as `writer.write(...)`.

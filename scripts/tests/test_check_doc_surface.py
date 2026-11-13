@@ -46,6 +46,25 @@ class DocumentationSurfaceTest(unittest.TestCase):
         """
         self.assertEqual([("handler", "handle"), ("state", "get")], SURFACE["wit_functions"](text))
 
+    def test_resource_methods_are_listed_on_their_resource(self):
+        text = """
+        interface blobs {
+          get: func(len: u32) -> list<u8>;
+          resource writer {
+            constructor();
+            write: func(chunk: list<u8>);
+            finish: func() -> string;
+          }
+          put: func(bytes: list<u8>);
+        }
+        """
+        self.assertEqual(
+            [("blobs", "get"), ("blobs", "put"), ("blobs", "writer.finish"), ("blobs", "writer.write")],
+            SURFACE["wit_functions"](text),
+        )
+        with self.assertRaises(SURFACE["InvalidSurface"]):
+            SURFACE["wit_functions"]("interface x { resource r { m: func(); }")
+
     def test_empty_unterminated_or_duplicate_wit_inventory_fails_closed(self):
         for text in ("world actor {}", "interface x { get: func();", "interface x { get: func(); get: func(); }"):
             with self.subTest(text=text), self.assertRaises(SURFACE["InvalidSurface"]):

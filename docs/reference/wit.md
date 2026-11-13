@@ -3,7 +3,9 @@
 Guest code is a WebAssembly component for the package `kronik:actor@0.1.1`,
 defined in `wit/kronik-actor.wit` in the repository. Most actors use the
 world `actor`: they export `handler` and may import Kronik's interfaces and a
-deterministic part of WASI, nothing else. An actor that holds WebSocket or
+deterministic part of WASI, nothing else. Since `0.1.1` the world `actor` also
+imports [`blobs`](#blobs), for large bodies and apps' blobs (M25, M26). An
+actor that holds WebSocket or
 SSE connections (M24) uses the world `actor-connections`, which adds the
 `connections` import and the `connection-handler` export.
 
@@ -37,6 +39,7 @@ The [complete WIT](#the-complete-wit) is at the end.
 | [`privacy`](#privacy) | The subject that written values belong to | M1 |
 | [`connections`](#connections) | Frames to WebSocket and SSE clients, and closing their connections | M24 |
 | [`connection-handler`](#connection-handler) (export) | `open`, `frame` and `close` of a connection | M24 |
+| [`blobs`](#blobs) | Reading large bodies in chunks, writing and holding blobs | M25, M26 |
 
 A turn is one call of `handle`, or of one `connection-handler` function. Everything it writes or sends is buffered by
 the host and committed together with the turn record, or discarded if the
@@ -559,6 +562,55 @@ connection route needs it.
 - A failed `frame` or `close` turn is a dead letter, and `kronik
   dead-letters resend` runs it again.
 
+## blobs
+
+```wit
+interface blobs {
+  use types.{blob-ref};
+  variant blob-error { not-held, quota-exceeded, erased, invalid(string) }
+  get: func(blob: blob-ref, offset: u64, len: u32) -> result<list<u8>, blob-error>;
+  put: func(bytes: list<u8>) -> result<blob-ref, blob-error>;
+  retain: func(blob: blob-ref) -> result<_, blob-error>;
+  release: func(blob: blob-ref) -> result<_, blob-error>;
+  resource writer {
+    constructor();
+    write: func(chunk: list<u8>) -> result<_, blob-error>;
+    finish: func() -> result<blob-ref, blob-error>;
+  }
+}
+```
+
+Blobs hold large HTTP bodies and apps' own large objects outside the log
+([M25](../design/m25-streaming-bodies.md), [M26](../design/m26-blobs.md)).
+A `blob-ref` is the blob's identity and size, not a permission: every call
+checks the references the turn may use
+([ADR 0119](../adr/0119-blob-reference-graph.md)), and any other reference,
+whatever its hash, is `not-held` (`BLOB_NOT_HELD`).
+
+M25 and M26 are being built: until their parts land, these functions trap
+with `NOT_IMPLEMENTED`.
+
+- **Who gets blobs.** A component that imports `blobs` reads blob bodies:
+  an HTTP request body or an effect response above the kind's blob
+  threshold (1 MiB by default) reaches it as `http-body::blob`. A component
+  that does not import it keeps getting inline bodies and their limits.
+- **`get`** returns up to `len` bytes (at most 1 MiB) from `offset`, fewer
+  only at the end of the blob and none at or past it. Its result depends only
+  on the blob and the arguments; the host reads only the frames the range
+  touches.
+- **`writer`** writes a blob of any size in chunks of at most 1 MiB, with the
+  turn's default subject at construction. `finish` returns a reference the
+  turn may use: retain it, send it, or return it as a body. A writer that is
+  dropped, or still open when the turn ends, is discarded.
+- **`put`, `retain` and `release`** (M26) store and hold blobs: `put` and
+  `retain` make the actor hold the blob once the turn commits, and `release`
+  ends the actor's own hold at commit. Holds are recorded in the turn record
+  and change only when the turn commits.
+- **Subjects.** A blob with a subject is named with a hash keyed by the
+  subject's key, and sealed with it in privacy mode
+  ([ADR 0118](../adr/0118-sealed-blob-identity.md)); erasing the subject
+  makes it `erased`.
+
 ## Determinism
 
 Every source of non-determinism reaches the guest through the host, and the
@@ -614,7 +666,7 @@ reads the component's imports before compiling it and accepts only these:
 
 | Package | Interfaces | Version | Host implementation |
 | --- | --- | --- | --- |
-| `kronik:actor` | `types`, `state`, `sql`, `context`, `messaging`, `timers`, `http-client`, `crypto`, `secrets`, `log`, `privacy`, `connections` | `0.1.x` | Kronik |
+| `kronik:actor` | `types`, `state`, `sql`, `context`, `messaging`, `timers`, `http-client`, `crypto`, `secrets`, `log`, `privacy`, `connections`, `blobs` | `0.1.x` | Kronik |
 | `wasi:io` | `error`, `poll`, `streams` | `0.2.x` | Wasmtime's; `poll`, `pollable.block` and the blocking stream calls first run the turn's outgoing `wasi:http` requests, and a wait that could never end traps |
 | `wasi:clocks` | `wall-clock`, `monotonic-clock` | `0.2.x` | Logical time, 1 ms resolution; sleeps return at once |
 | `wasi:random` | `random`, `insecure`, `insecure-seed` | `0.2.x` | ChaCha20 from the turn's seed |
@@ -683,8 +735,8 @@ fork matching and simulators.
 
 ## Not in v0.1
 
-- Blobs: `blob-ref` and `http-body::blob` trap until M25, and
-  `message.blobs` must stay empty until M26.
+- Blobs: until M25 is complete, `http-body::blob` and the `blobs` functions
+  trap, and `message.blobs` must stay empty until M26.
 - `wasi:filesystem`, `wasi:sockets` and `wasi:http/incoming-handler`: no
   files or sockets, and no inbound HTTP but the gateway's. Outgoing HTTP is
   `http-client` or, since M22, `wasi:http/outgoing-handler` (both the

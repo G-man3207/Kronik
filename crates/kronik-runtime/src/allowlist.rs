@@ -1,7 +1,7 @@
 //! Deploy-time import allowlist (`IMPORT_NOT_ALLOWED`).
 //!
 //! A component may import Kronik's own interfaces (`connections` since M24,
-//! at `0.1.x` like the rest) plus a deterministic WASI
+//! `blobs` since M25, at `0.1.x` like the rest) plus a deterministic WASI
 //! subset: `wasi:clocks` (logical time), `wasi:random` (turn seed), `wasi:cli`
 //! (stdout/stderr become log events, empty environment, no args), outgoing
 //! `wasi:http` (`types` and `outgoing-handler`, the `http.fetch` effect, M22)
@@ -32,6 +32,9 @@ const KRONIK_INTERFACES: &[&str] = &[
     // M24 (ADR 0113): an import of the world `actor-connections`. Its export
     // `connection-handler` is not an import and is not listed.
     "connections",
+    // M25/M26 (ADR 0121): an import of the world `actor`. A component that
+    // imports it reads blob bodies (ADR 0119 §1).
+    "blobs",
 ];
 
 /// Allowed WASI 0.2 interfaces, per package.
@@ -165,6 +168,7 @@ mod tests {
         assert!(is_allowed("kronik:actor/state@0.1.1"));
         assert!(is_allowed("kronik:actor/connections@0.1.1"));
         assert!(is_allowed("kronik:actor/connections@0.1.7"));
+        assert!(is_allowed("kronik:actor/blobs@0.1.1"));
     }
 
     #[test]
@@ -179,7 +183,8 @@ mod tests {
         assert!(!is_allowed("wasi:io/streams@0.3.0"));
         assert!(!is_allowed("wasi:io/streams"));
         assert!(!is_allowed("kronik:actor/state@0.2.0"));
-        assert!(!is_allowed("kronik:actor/blobs@0.1.0"));
+        assert!(!is_allowed("kronik:actor/blobs@0.2.0"));
+        assert!(!is_allowed("kronik:actor/blobs"));
         // Exports are never imports, and unknown interfaces stay refused.
         assert!(!is_allowed("kronik:actor/connection-handler@0.1.1"));
         assert!(!is_allowed("kronik:actor/handler@0.1.1"));

@@ -208,6 +208,14 @@ until the v1.0 compatibility promise takes effect.
   new version.
   new version; until the rest of M24 lands, the `connections` functions
   trap with `NOT_IMPLEMENTED` and the gateway opens no connections.
+- The world `actor` imports the new `blobs` interface (M25 and M26,
+  [ADR 0121](docs/adr/0121-blob-interface-and-wasi-0-3.md)), complete from
+  its first version: `get` reads a blob in ranges, a `writer` resource
+  writes one in chunks, and `put`, `retain` and `release` hold blobs. The
+  import allowlist accepts `kronik:actor/blobs@0.1.x`; until the rest of
+  M25 and M26 lands, the functions trap with `NOT_IMPLEMENTED`. The Go
+  bindings and TypeScript types are regenerated; components built for
+  `0.1.0` link and run as before.
 - A new crate, `kronik-blob`, holds the blob store of M25 and M26: framed,
   content-addressed files under `<data>/blobs`, synced before their name
   exists and named durably before any record refers to them, sealed per

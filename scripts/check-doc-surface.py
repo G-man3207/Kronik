@@ -132,8 +132,23 @@ def wit_functions(text):
             end += 1
         if depth:
             raise InvalidSurface("unterminated WIT interface")
-        for function in re.finditer(r"\b([a-z][a-z0-9-]*)\s*:\s*func\s*\(", text[interface.end():end - 1]):
-            result.append((interface.group(1), function.group(1)))
+        body = text[interface.end():end - 1]
+        # A resource's methods are listed as `<resource>.<method>`: they are
+        # called on the resource, not on the interface.
+        resources = []
+        for resource in re.finditer(r"\bresource\s+([a-z][a-z0-9-]*)\s*\{", body):
+            inner = 1
+            stop = resource.end()
+            while inner and stop < len(body):
+                inner += (body[stop] == "{") - (body[stop] == "}")
+                stop += 1
+            if inner:
+                raise InvalidSurface("unterminated WIT resource")
+            resources.append((resource.start(), stop, resource.group(1)))
+        for function in re.finditer(r"\b([a-z][a-z0-9-]*)\s*:\s*func\s*\(", body):
+            owner = next((name for start, stop, name in resources if start < function.start() < stop), None)
+            name = function.group(1) if owner is None else owner + "." + function.group(1)
+            result.append((interface.group(1), name))
     if not result or len(result) > 512 or len(result) != len(set(result)):
         raise InvalidSurface("invalid or empty WIT function inventory")
     return sorted(result)
@@ -430,6 +445,11 @@ def check(root, binary):
         # by the guest, so their example is the function definition.
         if interface in ("handler", "connection-handler"):
             token = r"\bfn\s+" + re.escape(function.replace("-", "_")) + r"\s*\("
+        elif "." in function:
+            # A resource method is a call on the resource, such as
+            # `writer.write(` or `Writer::finish(`.
+            resource, method = function.split(".", 1)
+            token = r"(?i)\b" + re.escape(resource.replace("-", "_")) + r"\w*(?:::|\.)" + re.escape(method.replace("-", "_")) + r"\s*\("
         else:
             token = re.escape(interface.replace("-", "_")) + r"(?:::|\.)" + re.escape(function.replace("-", "_")) + r"\s*\("
         if not any(language != "wit" and re.search(token, example) for language, example in fences(body)):

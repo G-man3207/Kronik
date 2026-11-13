@@ -32,6 +32,9 @@ pub mod bindings {
         path: "../../wit/kronik-actor.wit",
         imports: { default: async | trappable },
         exports: { default: async },
+        with: {
+            "kronik:actor/blobs.writer": crate::host::blobs::GuestWriter,
+        },
     });
 }
 
@@ -57,6 +60,7 @@ pub mod connection_bindings {
             "kronik:actor/secrets": crate::host::bindings::kronik::actor::secrets,
             "kronik:actor/log": crate::host::bindings::kronik::actor::log,
             "kronik:actor/privacy": crate::host::bindings::kronik::actor::privacy,
+            "kronik:actor/blobs": crate::host::bindings::kronik::actor::blobs,
         },
     });
 }
@@ -71,6 +75,7 @@ use bindings::kronik::actor::{
 
 pub use sql::{Rows as SqlRows, SqlError, SqlValue};
 
+mod blobs;
 pub(crate) mod connections;
 mod wasi_http;
 

@@ -221,6 +221,48 @@ interface connections {
   send-now: func(conn: connection-id, frame: frame) -> result<_, send-error>;
 }
 
+/// Large bodies and apps' blobs (M25, M26). A blob-ref is an identity, not a
+/// permission: every call checks the turn's references (kronik explain blob).
+@since(version = 0.1.1)
+interface blobs {
+  use types.{blob-ref};
+
+  variant blob-error {
+    /// the turn neither holds nor borrows this reference (BLOB_NOT_HELD)
+    not-held,
+    /// over the actor's blob quota (BLOB_QUOTA_EXCEEDED)
+    quota-exceeded,
+    /// the blob belonged to an erased subject (SUBJECT_ERASED)
+    erased,
+    /// a call outside the limits, such as more than 1 MiB in one call
+    invalid(string),
+  }
+
+  /// Up to `len` bytes (at most 1 MiB) from `offset`. Fewer only at the end
+  /// of the blob; empty at or past the end.
+  get: func(blob: blob-ref, offset: u64, len: u32) -> result<list<u8>, blob-error>;
+
+  /// Stores `bytes` (at most 1 MiB) with the turn's default subject; the
+  /// actor holds the result once the turn commits.
+  put: func(bytes: list<u8>) -> result<blob-ref, blob-error>;
+
+  /// Holds a reference the turn may use, from commit on.
+  retain: func(blob: blob-ref) -> result<_, blob-error>;
+  /// Ends the actor's own hold at commit.
+  release: func(blob: blob-ref) -> result<_, blob-error>;
+
+  /// Writes a blob of any size in chunks, with the default subject at
+  /// construction. The reference `finish` returns is borrowed by the turn:
+  /// retain it, send it, or return it as a body.
+  resource writer {
+    constructor();
+    /// At most 1 MiB per call.
+    write: func(chunk: list<u8>) -> result<_, blob-error>;
+    /// Ends the blob; the writer takes no more data.
+    finish: func() -> result<blob-ref, blob-error>;
+  }
+}
+
 interface handler {
   use types.{input, output, handler-error, manifest};
   describe: func() -> manifest;
@@ -252,6 +294,8 @@ world actor {
   import secrets;
   import log;
   import privacy;
+  @since(version = 0.1.1)
+  import blobs;
   export handler;
 }
 

@@ -812,11 +812,16 @@ M24's slices.
 
 ### 18.2 Keeping `main` releasable
 
-Between B4 and the last slice of M26, `main` can run components that create
-blobs while collection, privacy or shipping are incomplete. Until then the
-allowlist accepts `kronik:actor/blobs` only when `NodeConfig::blobs` is set:
-tests set it, `kronik serve` sets it from an undocumented
-`[blobs] enabled = true` that defaults to false. M26's last slice (B20)
+Between B4 and the last slice of M26, `main` could otherwise run components
+that create blobs while collection, privacy or shipping are incomplete. B4
+lands the interface with every function trapping `NOT_IMPLEMENTED`, so the
+allowlist accepts `kronik:actor/blobs` from then on, as it accepts
+`connections` (refusing the import would also refuse components whose SDK
+imports it without using it). From B6, `NodeConfig::blobs` decides whether
+blobs work: tests set it, and `kronik serve` sets it from an undocumented
+`[blobs] enabled = true` that defaults to false. While it is off, every
+component behaves as one that does not import `blobs` (inline bodies and
+their limits), and the functions keep trapping. M26's last slice (B20)
 removes the switch and the key.
 
 ### 18.3 Order

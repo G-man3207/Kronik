@@ -1,3 +1,4 @@
+/// <reference path="./interfaces/kronik-actor-blobs.d.ts" />
 /// <reference path="./interfaces/kronik-actor-connection-handler.d.ts" />
 /// <reference path="./interfaces/kronik-actor-connections.d.ts" />
 /// <reference path="./interfaces/kronik-actor-context.d.ts" />
@@ -13,6 +14,7 @@
 /// <reference path="./interfaces/kronik-actor-timers.d.ts" />
 /// <reference path="./interfaces/kronik-actor-types.d.ts" />
 declare module 'kronik:actor/actor-connections@0.1.1' {
+  export type * as KronikActorBlobs011 from 'kronik:actor/blobs@0.1.1'; // import kronik:actor/blobs@0.1.1
   export type * as KronikActorConnections011 from 'kronik:actor/connections@0.1.1'; // import kronik:actor/connections@0.1.1
   export type * as KronikActorContext011 from 'kronik:actor/context@0.1.1'; // import kronik:actor/context@0.1.1
   export type * as KronikActorCrypto011 from 'kronik:actor/crypto@0.1.1'; // import kronik:actor/crypto@0.1.1
