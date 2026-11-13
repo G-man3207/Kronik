@@ -76,7 +76,10 @@ What the code does today, on one node:
   `--no-pii` fork replays with pseudonyms, including text and blob values
   of subject-tagged SQL rows.
 
-There is no web interface. The CLI, the JSON API and MCP are the surface.
+The CLI, the JSON API and MCP are the supported surface. An embedded admin web
+interface (M27) is partial and unreleased: with TLS, the `server.admin_listen`
+listener serves it under `/ui/`, as an ordinary client of the same API
+([operations guide](guides/operations.md)).
 
 ## Who it is for
 
