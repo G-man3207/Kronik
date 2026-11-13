@@ -51,7 +51,8 @@ root and `runsc` and is skipped with a message otherwise; without
 libfaketime, `identity` skips `todo-ts` the same way. The `action` step
 installs checksum-verified actionlint 1.7.12 into `target/tools/` and lints
 the actual workflows and composite action; a download or lint failure
-fails the step. Its additional YAML structure checks need PyYAML.
+fails the step. Its YAML structure checks of the workflows need PyYAML
+(Debian and Ubuntu: `python3-yaml`), and the step fails without it.
 The same step runs `scripts/e2e-release-signatures.py`: genuine public
 Sigstore bundles through the actual source/standalone installer and Action,
 including wrong-identity/artifact refusal and real authenticated EFBIG faults.

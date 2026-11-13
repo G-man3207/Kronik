@@ -220,10 +220,12 @@ scripts/ci.sh
 `scripts/ci.sh` runs the same checks as CI: formatting, clippy, repository
 hygiene, tests, docs, the book, the examples, the SDK tests, deterministic
 simulation, dependency policy, foreign and identity tests, and the GitHub
-Action. It needs `cargo-deny` and Node.js 22.20 or later; a step whose tools
-are missing is skipped with a message, for example `foreign` without root and
-gVisor's `runsc`. Pass step names to run a subset, for example `scripts/ci.sh
-clippy test`.
+Action. It needs `cargo-deny`, Node.js 22.20 or later and the pinned Python
+test runtime from [`CONTRIBUTING.md`](CONTRIBUTING.md); [`AGENTS.md`](AGENTS.md)
+lists what each step needs. A missing tool fails its step, except that
+`foreign` is skipped with a message without root and gVisor's `runsc`, and
+`identity` skips one example without libfaketime. Pass step names to run a
+subset, for example `scripts/ci.sh clippy test`.
 
 The CI and nightly GitHub workflows start only when someone runs them
 (`workflow_dispatch`). A push or pull request does not. The nightly workflow

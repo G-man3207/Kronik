@@ -159,9 +159,11 @@ PY
     python3 scripts/check-ci-steps.py
 }
 
+# The OIDC tests run the pinned Python runtime of CONTRIBUTING.md and fail
+# without it rather than skip (ADR 0104), so it is checked before the long run.
 step_test() {
-    cargo test --workspace --locked
     "${KRONIK_TEST_PYTHON:?Prepare the pinned Python runtime in CONTRIBUTING.md}" -I -c 'import jwt; from cryptography import x509'
+    cargo test --workspace --locked
 }
 
 # The error catalog (docs/errors.md) and the concepts page
