@@ -127,7 +127,7 @@ that is missing, unless the operator chose `--allow-missing-blobs`.
   prints the number and bytes of blobs it restored.
 - A node that ships after running without shipping uploads, with its first
   snapshot, every blob its state roots.
-- Verified by the M26 acceptance test against MinIO (the existing harness):
-  a blob referenced only by a timer survives the compaction of its creating
-  record, is restored, and the timer gets the right bytes; and by a fault
-  test that stops a round between each step.
+- Verified by the M26 acceptance test against a `file://` bucket and MinIO
+  (the existing harnesses): a blob referenced only by a timer survives the
+  compaction of its creating record, is restored, and the timer gets the
+  right bytes; and by a fault test that stops a round between each step.

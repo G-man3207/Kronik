@@ -83,10 +83,12 @@ this costs one comparison per blob, not a scan of the log.
 ### 4. The other roots
 
 - **Snapshots:** every kept local snapshot carries `blobs.idx`, the sorted
-  identities of its `blobs` rows that are not erased, written with the
+  identities its state roots (held or pinned, not erased), written with the
   snapshot and listed in its manifest. A blob that only a timer in a snapshot
   references stays as long as the snapshot is kept, locally and remotely
-  ([ADR 0122](0122-shipping-and-restoring-blobs.md)).
+  ([ADR 0122](0122-shipping-and-restoring-blobs.md)). Blobs only records
+  reference are not listed: a restore needs them only for the records it
+  restores, which root them.
 - **Forks:** at creation a fork writes `branches/<fork>/blobs.roots`, the
   identities its base state roots (the same query as `blobs.idx` on the state
   it starts from). Its own space holds the blobs it creates and is deleted
