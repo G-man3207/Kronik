@@ -420,15 +420,15 @@ and [0104](../adr/0104-admin-ui-as-a-public-api-client.md).
 | `group_commit_ms` | `2` | How long the log writer gathers records into one fsync |
 | `segment_max_mb` | `64` | The size at which a log segment is closed |
 | `segment_max_age_s` | `60` | The age at which a log segment is closed |
-| `disk_reserve` | `"512MiB"` | Below this much free space on the data directory's file system, new inputs, deployments, grants, `foreign add`, forks, proposals, approval requests and replays are refused with `UNAVAILABLE`, so new work does not drive the disk full. `foreign add` also refuses an image whose new layers would not fit above the reserve, before it fetches them. Turns already running finish, and timers, queued messages, foreign actors and the catch-up of a promote keep writing, so on a shared file system a log write can still fail: give `<data_dir>/foreign` its own file system. Idempotent retries still get their saved response; rollback, promote, approvals, `foreign remove`, revoke, `limits set` and erasure still work. No snapshot is taken (`kronik snapshot create` fails with `UNAVAILABLE`), but retention still deletes old segments, snapshots beyond `snapshots_kept` and partial copies. `/v1/health` and `/healthz` add `"low_disk": true`, and `kronik_disk_below_reserve` is 1. `"0B"` turns it off; `--disk-reserve` (`KRONIK_DISK_RESERVE`) overrides it |
+| `disk_reserve` | `"512MiB"` | Below this much free space on the data directory's file system, new inputs, deployments, grants, `foreign add`, forks, proposals, approval requests and replays are refused with `UNAVAILABLE`, so new work does not drive the disk full. `foreign add` also refuses an image whose new layers would not fit above the reserve, before it fetches them. Turns already running finish, and timers, queued messages, foreign actors and the catch-up of a promote keep writing, so on a shared file system a log write can still fail: give `<data_dir>/foreign` its own file system. Idempotent retries still get their saved response; rollback, promote, approvals, `foreign remove`, revoke, `limits set` and erasure still work. No snapshot is taken (`kronik snapshot create` fails with `UNAVAILABLE`), but retention still deletes old segments, the snapshots it no longer needs and partial copies. `/v1/health` and `/healthz` add `"low_disk": true`, and `kronik_disk_below_reserve` is 1. `"0B"` turns it off; `--disk-reserve` (`KRONIK_DISK_RESERVE`) overrides it |
 
 ### [retention]
 
 | Key | Default | Meaning |
 |---|---|---|
-| `history` | `"7d"` | How far back the log reaches: closed segments older than this are deleted once a kept snapshot covers them. See [snapshots and retention](#snapshots-and-retention) |
+| `history` | `"7d"` | How far back forks, replays and proposals can go: the log keeps every segment that holds a record inside this window, and a snapshot from which any point in it can start. See [snapshots and retention](#snapshots-and-retention) |
 | `snapshot_interval` | `"60m"` | How often a snapshot is taken, when something changed since the last one |
-| `snapshots_kept` | `48` | How many snapshots are kept |
+| `snapshots_kept` | `48` | How many of the newest snapshots are kept; older ones are thinned to about one per seventh of `history` |
 
 ### [sql]
 
@@ -449,7 +449,7 @@ and [0104](../adr/0104-admin-ui-as-a-public-api-client.md).
 | Key | Default | Meaning | Flag |
 |---|---|---|---|
 | `master_key_file` | `<data_dir>/keys/master.key` (`--init` writes `/etc/kronik/master.key`) | The file source's 64 hex characters. Conflicts with `KRONIK_MASTER_KEY` and with KMS sources | `--master-key-file`, `KRONIK_MASTER_KEY_FILE` |
-| `source` | `"file"` | `"file"`, `"env"`, `"openbao"`, `"aws"`, `"gcp"` or `"azure"`; see [the master key](#the-master-key) | |
+| `source` | `"file"` | `"file"`, `"env"`, `"openbao"`, `"aws"`, `"gcp"`, `"azure"` or `"pkcs11"`; see [the master key](#the-master-key) | |
 | `wrapped_file` | `"keys/master.wrapped"` | KMS ciphertext, relative to `data_dir`; absolute paths, `.` and `..` are refused | |
 | `start_timeout` | `"60s"` | Total retry/timeout budget for one high-level KMS load, wrap or rewrap, including encrypt and verification decrypt; a positive duration in `ms`, `s` or `m` | |
 
@@ -462,7 +462,16 @@ and [0104](../adr/0104-admin-ui-as-a-public-api-client.md).
 | `fetch_timeout` | `"2s"` | The longest a request to a backend, or a secret change waiting for the inventory to be published again, takes; at most `"60s"`. When the wait for the inventory runs out, `kronik secret set`, `delete`, `link`, `unlink` and `refresh` answer 503 `SECRET_UNAVAILABLE` saying that the change is already committed: it is made, so do not repeat it. A mutation that begins while the inventory is being rebuilt waits for it for this long plus 5 s before its reason is recorded |
 
 External backends are defined in `[secrets.backends.<id>]` tables; see the
-[M23 design](../design/m23-secret-backends.md).
+[M23 design](../design/m23-secret-backends.md). Effects, foreign actors'
+starts and `foreign add --secret` all read a linked name through the same
+in-memory cache, and a fork uses only a value the cache already holds for
+the fork point's link. `kronik secret backends` shows each backend's last
+answer and last error and the linked names that have no cached value; the
+doctor check `secrets` warns about the same, and the metrics
+`kronik_secret_fetch_total`, `kronik_secret_fetch_seconds`,
+`kronik_secret_stale` and `kronik_secret_versions_total` count them. The
+end-to-end runs against OpenBao, moto, and the GCP and Azure emulators, and
+the script for the real clouds, are described in the design's §9.
 
 ### [privacy]
 
@@ -589,6 +598,30 @@ clients on 256 actors (`docs/perf.md`): the daemon used 66 MiB with the Rust
 counter and 563 MiB with the TypeScript counter, which needs about 330 MiB
 for its compiled code alone. On a 4 GB machine the default leaves room;
 raise `--concurrency` only with the worst case above in mind.
+
+### Record size
+
+Everything one turn records goes into one log record of at most 128 MiB:
+its input, the request and result of every HTTP request and `call`, its
+state writes, messages, timers, SQL changes and output. This limit is fixed;
+it is not a setting, and `kronik limits set` does not raise it. A turn that
+would need more fails with `TURN_TOO_LARGE` instead (its writes and messages
+are discarded, its effects are recorded, a message input becomes a dead
+letter, and an HTTP client gets `TURN_FAILED`), and an HTTP response larger
+than what is left for the turn is `too-large` for the actor. So one turn
+writes at most about 256 MiB of log: its effect results as they happen and
+its record at the end. The per-kind limits (`effect_response_bytes`,
+`message_bytes`, `state_value_bytes`, `sql_bytes_per_actor`) apply within it.
+
+Releases up to v0.4.1 had no such check: a turn could commit a record over
+128 MiB, which their own `history` then refused (`STORAGE_CORRUPT: entry
+length ...`), and after a crash their start cut the record off as if it were
+a torn write and then stopped with "state.db has applied lsn N, but the log
+ends at M". v0.5 reads such a record again, and a start never cuts off an
+applied record. A data directory whose log a release before v0.5 already
+cut cannot get the record back from itself: restore it from a shipped copy
+(`kronik restore --from ...`) taken before the crash, or keep it as it is
+and ask for help.
 
 ## systemd
 
@@ -857,6 +890,8 @@ rather than fail, unless `kronik.toml` asks for what is missing
 | `dns01_hook` | `[tls] dns01_hook` is set and is not an executable file (`BAD_REQUEST`, failure); the cached `*.<preview_domain>` certificate has expired (`CERTIFICATE_INVALID`, failure), expires within 30 days or isn't cached yet (warning) | `chmod +x` the hook, or fix the path; for the certificate, read the hook's output in the daemon log; see [Preview forks](#preview-forks-a-wildcard-certificate-by-dns-01) |
 | `ship` | `[ship] endpoint` is not an `http://` or `https://` URL (`BAD_REQUEST`, failure) or is not reachable over TCP (`UNAVAILABLE`, failure); passes when shipping is off | Set an `http://` or `https://` endpoint, and check DNS and the firewall |
 | `export` | With `[otel]` or `[audit]` on and the daemon answering on `server.api_socket`: a stream with lag has not delivered for 10 × its `interval`, or the audit export has held retention for longer than `[retention] history` (warnings); passes without a daemon | `kronik export status` shows the sink's last error code; fix the sink, or see [the audit log](#the-audit-log) |
+| `key_source` | The configured master-key source cannot load the key (its error code, such as `KEY_SOURCE_UNAVAILABLE` or `KEY_HELPER_FAILED`, failure), or a bootstrap credential lies under the data directory (warning). With a running daemon it asks `GET /v1/keys` instead | Check the provider, the credentials, the key version and the memory-lock limit; see [the master key](#the-master-key) |
+| `secrets` | With the daemon answering on `server.api_socket`: an external secret backend's last request failed after its last answer, or a linked name has no cached value (`SECRET_UNAVAILABLE`, warning); passes without a daemon or without external backends | `kronik secret backends` shows each backend's last answer and error; the log's `secret fetch failed` lines say why. See [a turn whose effect cannot get its secret](#a-turn-whose-effect-cannot-get-its-secret) |
 
 ## Metrics and logs
 
@@ -878,6 +913,12 @@ with OIDC, Host must match the configured admin origin:
 | `kronik_applied_lsn` | gauge | | The newest log record applied to the state |
 | `kronik_disk_free_bytes` | gauge | | Free bytes on the log's file system, when `[log] disk_reserve` is set |
 | `kronik_disk_below_reserve` | gauge | | 1 while free space is below `[log] disk_reserve` (also `"low_disk": true` in `/v1/health` and `/healthz`) |
+| `kronik_key_source_up` | gauge | | 1 when the master key was loaded through its source, 0 on a node without a secret store. A KMS or HSM outage stops only a start, and a daemon that did not start exports nothing: alert on the scrape failing (Prometheus `up == 0`); `kronik doctor`'s `key_source` check then names the code |
+| `kronik_secret_recovery_stalled` | gauge | | Re-runs of open turns waiting for a recorded secret value or an unavailable prerequisite |
+| `kronik_secret_fetch_total` | counter | `backend`, `result` | Requests to external secret backends: `ok`, `unavailable`, `denied`, `not_found`, `version_gone`, `invalid` or `cancelled` |
+| `kronik_secret_fetch_seconds` | histogram | `backend` | How long a backend took to answer, or until the request gave up |
+| `kronik_secret_stale` | gauge | `name` | 1 while effects use a secret's cached value past `[secrets] refresh` because its backend does not answer (until `max_stale`) |
+| `kronik_secret_versions_total` | counter | `backend` | Secret versions this node recorded (`file` for the built-in store) |
 | `kronik_turns_total` | counter | `kind`, `outcome` | Turns by actor type and outcome: `committed`, `rejected` or `failed` |
 | `kronik_turn_duration_seconds` | histogram | `kind` | Turn duration |
 | `kronik_log_records_appended_total` | counter | | Records written to the log |
@@ -977,7 +1018,7 @@ without one from `<data_dir>/otel.key` (created at first use, mode 0600).
 The log is the audit trail: every mutation writes a log record with its
 token and reason (`kronik history` and the diff read them). With
 `[audit] sink` set, `kronik serve` also writes one JSON line
-(`kronik.audit/v2`) per audited record to the sink, in log order, at least
+(`kronik.audit/v3`) per audited record to the sink, in log order, at least
 once, from the `audit` cursor in `<data_dir>/export.json`: configuration
 changes, operator sends and resends, each `secret.reveal`, guards that
 fired (`watch.guard`), the switch of a rollback via replay
@@ -997,7 +1038,8 @@ new applied generation. Only then is the restore marker removed and its
 parent synced, with exports on or off.
 
 - **A directory** (`file:///var/log/kronik/audit/`): lines go to
-  `audit-v2-<sequence:020>.jsonl` files (mode 0640), fsynced before the cursor
+  `audit-v2-<sequence:020>.jsonl` files (mode 0640; the `v2` names the
+  numbering scheme, the lines are v3), fsynced before the cursor
   moves; `file_max_bytes` (1 B–1 GiB, default 64 MiB) is a soft
   whole-batch rotation threshold, not an oversized-record drop limit.
   Exclusive-create names use an increasing sequence, independent of LSNs
@@ -1323,8 +1365,40 @@ Azure `metadata_endpoint` may name a full loopback URL. These overrides
 are never read from the envelope, cannot target a non-loopback host and
 contain no inline credentials. Normal deployments leave them unset.
 
-PKCS#11 is not implemented by this slice. Neither an HSM module nor a
-keyhelper is loaded.
+**PKCS#11 (an HSM, or SoftHSM2 for tests):**
+
+```toml
+[keys]
+source = "pkcs11"
+
+[keys.pkcs11]
+helper_path = "/usr/local/libexec/kronik-keyhelper"
+module = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+module_sha256 = "<sha256 of the module file>"
+pin_file = "/etc/kronik/hsm.pin"
+manufacturer = "SoftHSM project"
+model = "SoftHSM v2"
+serial = "<the token's serial>"
+key_id = "<the key's CKA_ID in hex>"
+key_version = "1"
+```
+
+The daemon never loads the module: the optional `kronik-keyhelper` (ADR
+0093, a separate glibc build with `--features pkcs11`) does, once per
+operation, with an empty environment and the PIN on a private descriptor.
+The token is chosen by manufacturer, model and serial, the key by its
+`CKA_ID`; it must be an AES-256 secret key that is sensitive, not
+extractable and not modifiable, with AES-GCM allowed. Because the helper's
+environment is empty, SoftHSM2 reads its system configuration
+(`/etc/softhsm/softhsm2.conf`). `kronik keys enroll --config FILE` checks the
+key through the helper and prints a probe to add as `[keys.pkcs11.probe]`;
+a key with other attributes is refused (`KEY_HELPER_FAILED`). After that a
+start on an empty data directory makes the seed in memory and writes only
+its envelope, and later starts unwrap it through the helper. A wrong PIN, a
+missing helper or a token that does not answer stops the start with
+`KEY_HELPER_FAILED` and writes nothing. `scripts/e2e-pkcs11.sh` runs this
+flow against SoftHSM2 (the design's §9 has what it showed); no physical HSM
+has been tried.
 
 ### Migration and rewrap
 
@@ -1468,12 +1542,22 @@ hash and log hash then equal the source's, and `kronik audit show --from
 <that LSN + 1>` shows the `restore` line.
 
 After each snapshot the daemon applies retention. It keeps the newest
-`snapshots_kept` snapshots (48 by default) plus the oldest one the log
-still continues from. It deletes closed log segments older than
-`[retention] history` (7 days by default) whose records a kept snapshot
-already covers. A record without a logical time of its own, such as a
-deployment, counts as old as the next turn after it, so a segment is kept
-until a later turn has aged out of the window too. Before it deletes, it
+`snapshots_kept` snapshots (48 by default), the window's base (the newest
+snapshot from before the start of the `[retention] history` window, 7 days
+by default), and between them about one snapshot a day (a seventh of
+`history`). It deletes closed log segments older than the window whose
+records the base already covers, so every point inside the window can
+still be forked, replayed and read: the log on disk reaches back at most
+about a day further than `history`, and a node keeps about 48 + 6
+snapshots. Until a snapshot is old enough to be the base (on a young node
+for its first `history`; after an upgrade from v0.4.1 or older for up to
+about 5 days with the defaults), retention deletes no segment. A record
+without a logical time of its own, such as a deployment, counts as old as
+the next turn after it, so
+a segment is kept until a later turn has aged out of the window too. A
+segment that holds the begin of a turn still open (in the running state or
+in a kept snapshot) is kept too, with every later one, because a start
+from that snapshot runs the turn again from it. Before it deletes, it
 records on every actor database that has not changed for longer than the
 window that the database is complete through the snapshot, so that the
 next start does not look for a log that has been deleted. After an upgrade
@@ -1481,9 +1565,10 @@ from v0.3.0 or older, `snapshots_kept` also decides how long some reads
 answer 503: see [Upgrading from v0.3.0 or older](#upgrading-from-v030-or-older).
 
 When a proposal's `--window` reaches back before the oldest point still
-kept, the fork starts at the oldest usable snapshot and the proposal says
-so: `Warning: retention cut the window ...` in `kronik propose`, `warnings`
-in its JSON and `base.window_cut` in the diff.
+kept, or before the history window, the fork starts at the oldest point it
+may take and the proposal says so: `Warning: retention cut the window ...`
+in `kronik propose`, `warnings` in its JSON and `base.window_cut` in the
+diff.
 
 The same window is how far back a fork, a replay or a proposal may start:
 `history` of logical time back from the newest record. A fork point older
@@ -1624,8 +1709,9 @@ The check replays the last `--window` of logical time with the new engine
 and the same code. It reads the data directory, its privacy keystore and
 the same key-source configuration as `kronik serve`. A KMS-backed check
 needs the provider and its credentials, even while the old daemon keeps
-running. An empty diff writes `<data-dir>/upgrade/<engine>.json`
-and exits 0. A diff that is not empty writes that report and the diff next
+running. A diff with no verified difference writes
+`<data-dir>/upgrade/<engine>.json` and exits 0. A diff with a verified
+difference writes that report and the diff next
 to it (`<engine>.diff.json`) and exits 1 with `ENGINE_UPGRADE_DIVERGED`:
 keep the current binary. `--dry-run` prints the result and writes neither
 file. A bad window or a directory with no log is `BAD_REQUEST`.
@@ -1633,10 +1719,16 @@ file. A bad window or a directory with no log is `BAD_REQUEST`.
 If a subject was **erased**, the turn that read it is **unverifiable**: the
 erased values cannot be opened again, so the replay cannot be compared with the
 recording the way other turns are. v0.5.0 and later say so instead of calling it a
-difference. The check serves such a turn's effects from their recording, counts the
-turn, and passes when nothing else differs; the report line reads `N turns
-unverifiable: erased` and the same count is in `--json` as `unverifiable`. A diverging
-report from v0.5.0 therefore means a real change (or an unreadable recording), and
+difference. So is every turn the erased data reached: one an unverifiable turn sent
+a message, call or timer that production did not send the same way, one that read
+state such a turn left different (or that production wrote in a turn the replay
+could not run), one that used an actor's SQL database while it lacked the erased
+subject's rows production still had, and a production turn missing below an
+unverifiable one ([ADR 0109](../adr/0109-erased-input-is-unverifiable.md)). The
+check serves such a turn's effects from their recording, counts the turns, and
+passes when nothing else differs; the report line reads `N turns unverifiable:
+erased` and the same count is in `--json` as `unverifiable`. A diverging report
+from v0.5.0 therefore means a real change (or an unreadable recording), and
 `serve` starts from it as from any other passing report. The count is also how many
 turns the upgrade did not verify: look at the diff when it is non-zero, and re-run the
 check with a window that starts after them if you want a fully verified tail.
@@ -1778,7 +1870,12 @@ restart, as soon as retention has deleted the last snapshot that v0.3.0 or older
 wrote. Retention runs after each snapshot. It keeps the newest `snapshots_kept`
 (48 by default) and, when the log no longer starts at LSN 1, also the oldest
 snapshot that the log still continues from, because a replay of the log begins
-there; see [Snapshots and retention](#snapshots-and-retention). So the start of
+there; see [Snapshots and retention](#snapshots-and-retention). (This paragraph
+and the measurements below describe v0.4.x. From v0.5 retention also keeps the
+window's base, the newest snapshot from before the history window, and until
+one exists the oldest snapshot in its place: when that is a v0.3.0 snapshot,
+neither way below deletes it, and it goes when a newer snapshot has aged out of
+the history window, about one `history` of activity after the upgrade.) So the start of
 the log decides which of two cases a node is in. `kronik integrity` prints it as
 `Log first LSN` (`log_first_lsn` in `--json`), for example `Log first LSN 1` on
 the v0.3.0 and v0.1.0 data of the compatibility tests and `Log first LSN 57` on
@@ -2086,10 +2183,11 @@ operator meets:
 |---|---|---|
 | `BAD_REQUEST` at start | `kronik.toml` has an unknown key or a bad value | Fix the line the message names (`kronik doctor` checks the file too) |
 | `CERTIFICATE_INVALID` | The TLS certificate has expired, cannot be parsed, or its files cannot be read (`kronik doctor`'s `tls` or `dns01_hook` check) | Renew it, or fix the path and permissions of the PEM files; see [TLS](#tls) |
-| `STORAGE_CORRUPT` | The data directory is inconsistent: `state.db` is ahead of the log, or a log record can't be read. "state is at lsn N, but the log starts at M (compacted)": see [A start that stops at the log's start](#a-start-that-stops-at-the-logs-start) | Keep a copy of the data directory and look at the message. `state.db` is materialized from the log and can be rebuilt by moving it away and starting again; the log itself must not be edited |
+| `STORAGE_CORRUPT` | The data directory is inconsistent: `state.db` is ahead of the log, a log record can't be read, an applied record in the active segment is damaged (nothing is truncated), or an open turn's begin is in a deleted segment. "state is at lsn N, but the log starts at M (compacted)": see [A start that stops at the log's start](#a-start-that-stops-at-the-logs-start). "state.db has applied lsn N, but the log ends at M": see [record size](#record-size) | Keep a copy of the data directory and look at the message. `state.db` is materialized from the log and can be rebuilt by moving it away and starting again; the log itself must not be edited |
 | `UNAVAILABLE` | The node stopped after a storage failure (also `/healthz` 503) | The daemon exits and systemd restarts it; check the disk (`kronik doctor`'s `disk` check) and the journal |
 | `GATEWAY_TIMEOUT` | A turn took longer than `[gateway] timeout` | The turn still completes; clients that retry with the same `Idempotency-Key` get its response |
 | `PAYLOAD_TOO_LARGE` | A request body over 1 MiB | v0.1's limit |
+| `TURN_TOO_LARGE` | In `history` or a dead letter: a turn needed more than one log record (128 MiB) for its effects, writes, messages, SQL changes and output, so it failed instead of committing; an HTTP client got `TURN_FAILED` | Split the work over several turns; see [record size](#record-size). No limit setting raises it |
 | `REASON_REQUIRED` | A change without `--reason` | Every mutation is audited and needs a reason. `restore` and `upgrade check` write no log record, so they take no `--reason` |
 | `ENGINE_UPGRADE_DIVERGED` | `kronik upgrade check` found a behavior change | Keep the current binary. The diff is next to the report in `<data-dir>/upgrade/` |
 | `ENGINE_VERSION_MISMATCH` | A new binary started against data written by another engine, without a passing check | Run `kronik upgrade check --window 6h`, or start the recorded engine version. For data from v0.3.0 or older read [Upgrading from v0.3.0 or older](#upgrading-from-v030-or-older) first |
@@ -2176,11 +2274,14 @@ memory, so the loss can go unnoticed until the next start.
   variables when the daemon starts, so a change is seen at the next start. The
   node then records the new value as the next version, and the old value,
   which the provider cannot serve any more, keeps the inventory incomplete.
-- A KV version that the provider removed: destroyed by hand, or removed by the
+- A version that the provider removed: destroyed by hand, or removed by the
   mount's version limit when newer versions were written. This was checked
-  only against a local test server that answers 404 for such a version, as the
-  client expects. A real OpenBao, its default version limit, soft deletion and
-  undelete, and AWS, GCP and Azure were not tried.
+  against a local test server and, with `scripts/e2e-secrets.sh`, against a
+  real OpenBao (`kv destroy`), moto's Secrets Manager (the secret deleted
+  without recovery), the GCP Secret Manager emulator (`DestroySecretVersion`)
+  and the Azure Key Vault emulator (the version disabled): after a restart
+  the reads that scrub answered 503 on each. OpenBao's version limit, soft
+  deletion and undelete, and the real clouds were not tried.
 
 **What ends it.** If the provider serves the version again, the reads come
 back without a restart. This was checked four times with the test server,

@@ -1,6 +1,6 @@
 # 0108. Durable secret-coverage watermark
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-13; shipped in v0.4.1)
 - **Date:** 2026-11-02
 
 ## Context

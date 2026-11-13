@@ -250,7 +250,11 @@ impl Node {
             .transpose()
             .map_err(|e| ApiError::new(ErrorCode::Internal, format!("keystore: {e}")))
     }
-    /// Erasures that still have a plain value in the log (§6.5). The count
+    /// Erasures that still have a plain value in the log or in `state.db`
+    /// (§6.5, §8): a value written in `off` mode that no reseal has sealed
+    /// or tombstoned yet, there or in a row the log's records left in
+    /// `state.db` (state values, queued timer and message bodies, saved
+    /// responses, dead letters, open turns' effects; issue #31). The count
     /// names no subject.
     pub async fn pending_erasures(&self) -> Result<u64, ApiError> {
         let erased: std::collections::HashSet<String> = self
@@ -264,11 +268,16 @@ impl Node {
         if erased.is_empty() {
             return Ok(0);
         }
+        let mut pending: std::collections::HashSet<String> =
+            kronik_store::db::plain_subjects(self.store().db().conn())
+                .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?
+                .into_iter()
+                .filter(|s| erased.contains(s))
+                .collect();
         let upto = self.applied_lsn();
         if upto < 1 {
-            return Ok(0);
+            return Ok(pending.len() as u64);
         }
-        let mut pending = std::collections::HashSet::new();
         self.reader()
             .read(1, upto, |mut c| {
                 kronik_proto::sealables::record_mut(&mut c.record, &mut |s| {

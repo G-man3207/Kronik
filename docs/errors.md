@@ -96,6 +96,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`TOKEN_NOT_FOUND`](#token_not_found) | 404 | M5 | No API token with that name |
 | [`TURN_FAILED`](#turn_failed) | 500 | M1 | The turn failed |
 | [`TURN_NOT_FOUND`](#turn_not_found) | 404 | M1 | No turn with that id |
+| [`TURN_TOO_LARGE`](#turn_too_large) | 500 | M1 | The turn's record would not fit in one log record |
 | [`UNAUTHENTICATED`](#unauthenticated) | 401 | M5 | No valid token |
 | [`UNAVAILABLE`](#unavailable) | 503 | M1 | The daemon is not accepting requests |
 | [`VERIFY_REQUIRED`](#verify_required) | 409 | M1 | The actor type has history; verify the change first |
@@ -167,7 +168,9 @@ Default hint: Fix the field or value named in the message and send the request a
 
 The request could not be understood: invalid JSON, a missing or mistyped field, an invalid actor key or path segment, or a manifest from `describe` that breaks the naming rules. Kronik uses this generic code for malformed input that no more specific code covers, so that a client can tell a request it must fix from a failure on the server.
 
-The message names the field or value that is wrong. Fix it and send the request again; the same request always gives the same error.
+`kronik serve` also stops at start with this code when a `kronik.toml` setting is invalid, for example an empty `[gateway] idempotency_header`, or a `[secrets]` table with a zero `refresh` or a backend it cannot use.
+
+The message names the field or value that is wrong. Fix it and send the request again, or start the daemon again; the same input always gives the same error.
 
 ## CAPABILITY_NOT_GRANTED
 
@@ -274,7 +277,7 @@ HTTP status 409, milestone M6. The new engine version changes behavior.
 
 Default hint: Keep the current binary and report the diff from `kronik upgrade check`.
 
-`kronik upgrade check` ran an identity replay with the same code hashes under the new binary's engine version (Kronik plus Wasmtime), and the behavior diff is not empty. The diff must be empty before a new binary is swapped in; fuel is not compared between engine versions.
+`kronik upgrade check` ran an identity replay with the same code hashes under the new binary's engine version (Kronik plus Wasmtime), and the behavior diff has a verified difference. Differences of turns that met erased data (their recorded input, a state value they read, or an input or state that erased data shaped; ADR 0109) are not a behavior change, and a check whose only differences are those turns passes. A verified difference must be gone before a new binary is swapped in; fuel is not compared between engine versions.
 
 Typical cause: a change in Kronik or Wasmtime that alters what guests observe, so existing code would behave differently under the new version.
 
@@ -950,7 +953,7 @@ This name is linked to an external secret manager. Kronik does not write or dele
 
 Change or rotate the value using the backend's own authorized tools, then run `kronik secret refresh <name> --reason '...'`. To return future turns to the built-in store, an administrator can explicitly unlink the name. Unlinking does not redirect historical versions or make an old recorded value equal to the current one.
 
-A foreign actor and a fork do not read a linked name from its backend, and the built-in store holds an older value of that name or none, so they refuse it. `kronik foreign add --secret` refuses a linked name. An actor declared before the name was linked is not stopped and keeps the value it started with, as after a rotation; its next start fails with this code (`kronik foreign list` shows it, and the supervisor retries with its backoff) until the name is unlinked, or the actor is removed and added again with another secret. In a fork, an effect that has no recording to answer from (a turn the fork runs itself) is denied with this code when it needs a name that was linked at the fork point, and the diff marks it unverifiable; a fork from before the link, or from after an unlink, is not affected.
+A foreign actor gets a linked name through the node's secret cache, and a fork uses the value the node holds for the fork point's link; neither answers with this code. Releases before 0.5.0 refused a linked name there with it.
 
 ## SECRET_NOT_FOUND
 
@@ -1001,6 +1004,8 @@ Data written by v0.3.0 or older answers the same reads with this code after an u
 
 An effect of a turn that needs a secret that is not cached and cannot be had gets this code as its error: the backend did not answer within `[secrets] fetch_timeout`, or it refused (bad credentials, an answer Kronik cannot use), or the configuration no longer has the backend the link names. The guest is told the same in each case; the log line `secret fetch failed` names the secret, the backend and the reason (`unavailable`, `denied`, `invalid` or `binding`). The request is not answered with a 503 and the turn is not left open: the error is recorded in the turn before the guest sees it, as for a network error (`http.fetch` fails with `network`, `crypto.*` and `secrets.reveal` with a denial), and nothing is sent. The guest decides: a handler that fails ends the turn as failed (`TURN_FAILED`; a failed message or timer is a dead letter), one that handles the error commits. A request repeated with the same `Idempotency-Key` gets the recorded answer, so use a new key to try again, or resend the dead letter with `kronik dead-letters resend` once the cause is fixed. A failure is remembered for 5 s, so right after the backend is back an effect can still fail for up to 5 s.
 
+A foreign actor's start gets its secrets the same way: a linked name with no cached value whose backend does not answer fails the start with this code (`kronik foreign list` shows it), the supervisor retries with its backoff, and `kronik foreign add --secret` answers it. In a fork, an unmatched `crypto.*` under a `compute` grant of a name linked at the fork point is denied with this code when the node holds no value of it for that link, because a fork never fetches; the diff marks it unverifiable. `kronik doctor` (check `secrets`) and `kronik secret backends` show which backend failed and which linked names have no cached value.
+
 ## SECRET_VERSION_EXHAUSTED
 
 HTTP status 409, milestone M23. The secret version domain is exhausted.
@@ -1033,7 +1038,7 @@ HTTP status 500, milestone M1. The log or state on disk is corrupt.
 
 Default hint: Stop the daemon and keep the data directory; do not delete log segments.
 
-Kronik found data on disk that it cannot trust, such as a log record with a bad checksum in the middle of a segment, or a record with the enum value 0 or an unknown enum value. Kronik never applies such a record or reads it as a default value, and a corrupt record in the middle of a segment stops the startup. A torn last record after a crash is not corruption: it is truncated at startup.
+Kronik found data on disk that it cannot trust, such as a log record with a bad checksum in the middle of a segment, or a record with the enum value 0 or an unknown enum value. Kronik never applies such a record or reads it as a default value, and a corrupt record in the middle of a segment stops the startup. A torn last record after a crash is not corruption: it is truncated at startup. A record that `state.db` has already applied was written and acknowledged before, so it is never truncated: if it is damaged, the start stops with this code and changes nothing.
 
 Typical causes: disk or file system errors, or files in the data directory that something other than Kronik changed.
 
@@ -1043,7 +1048,9 @@ To fix it, stop the daemon and keep the data directory as it is; do not delete o
 
 The message "state is at lsn N, but the log starts at M (compacted)" is a different case and does not mean corruption: an actor database that has not changed for longer than `[retention] history` is behind the log that retention kept. Releases up to v0.4.0 can stop at the start for this; the fix raises those databases before it deletes log, and repairs such a directory at the next start from the newest snapshot. `kronik upgrade check` reports it before the restart, including for an actor database a running daemon holds: that applied LSN is read without taking the daemon's lock. If the database cannot be read, the check does not pass. See "A start that stops at the log's start" in the operations guide.
 
-See also: [`segment`](concepts/glossary.md#segment), [`snapshot`](concepts/glossary.md#snapshot).
+The message "state.db has applied lsn N, but the log ends at M" means the log lost records that were acknowledged. Releases up to v0.4.1 could cause it themselves: a turn could write a record over 128 MiB, which their start then cut off as if it were a torn write. Do not delete segments; restore from a shipped copy taken before the crash into a new data directory. The message "the open turn ... began ... in log segment ..., which is gone" means retention of a release before v0.5 deleted the log of a turn that was still open, so the turn cannot run again; restore a snapshot taken after the turn ended, or a copy of that segment.
+
+See also: [`segment`](concepts/glossary.md#segment), [`snapshot`](concepts/glossary.md#snapshot), [`TURN_TOO_LARGE`](#turn_too_large).
 
 ## SUBJECT_ERASED
 
@@ -1104,6 +1111,24 @@ To fix it, take the turn id from the actor's history, from a dead letter or from
     kronik history billing/acme
 
 See also: [`turn-id`](concepts/glossary.md#turn-id), [`lsn`](concepts/glossary.md#lsn).
+
+## TURN_TOO_LARGE
+
+HTTP status 500, milestone M1. The turn's record would not fit in one log record.
+
+Default hint: Split the work over several turns, or fetch and write less in one turn; see `kronik history <kind/key>`.
+
+Everything a turn records must fit in one log record of at most 128 MiB: its input, the request and result of every external effect and `call`, its state writes, messages, timers, SQL changes and schema changes, compensations and its output. This turn would have needed more, so it failed instead of writing a record that later reads could not accept. Nothing it buffered was committed (state writes, SQL changes, messages, timers), compensation messages for successful calls are delivered, and external effects that already happened stand and are recorded. A failed message or timer is in dead letters. This code is the error code of the failed turn in `history` and in dead letters; an HTTP client gets `TURN_FAILED`, as for `FUEL_EXHAUSTED`. The limit is the same on every node, so the same input fails the same way again.
+
+The turn fails at the effect that no longer fits, before that effect happens, or when it ends and its state writes, messages, SQL changes and output do not fit. An HTTP response that is larger than what is left of the turn's record is cut off like one over the actor type's `effect_response_bytes`: the guest gets `too-large` and may go on.
+
+Typical causes: many large HTTP responses in one turn, a loop that writes many large state values or sends many large messages, or one SQL transaction that changes a great many rows.
+
+To fix it, split the work over several turns, for example one message per page of a large download, and keep large data out of a single turn:
+
+    kronik history billing/acme
+
+See also: [`turn`](concepts/glossary.md#turn), [`dead-letters`](concepts/glossary.md#dead-letters), [`FUEL_EXHAUSTED`](#fuel_exhausted), [`PAYLOAD_TOO_LARGE`](#payload_too_large).
 
 ## UNAUTHENTICATED
 

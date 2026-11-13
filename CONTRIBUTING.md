@@ -79,7 +79,8 @@ neighbouring sandbox, and must fail at all of it while its own controls work
 SysV, demo and microVM checks, is the manual `isolation` workflow. The `action` step
 installs checksum-verified actionlint 1.7.12 into `target/tools/` and lints
 the actual workflows and composite action; a download or lint failure
-fails the step. Its additional YAML structure checks need PyYAML.
+fails the step. Its YAML structure checks of the workflows need PyYAML
+(Debian and Ubuntu: `python3-yaml`), and the step fails without it.
 The same step runs `scripts/e2e-release-signatures.py`: genuine public
 Sigstore bundles through the actual source/standalone installer and Action,
 including wrong-identity/artifact refusal and real authenticated EFBIG faults.

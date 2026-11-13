@@ -60,8 +60,10 @@ not sealable:
 **Scrubbed and capped:**
 - Free text, names and span labels are scrubbed for available secret
   values and token spellings, both at mutation recording and export.
-  Canonical audit hashing replaces free text with `WITHHELD` and applies
-  token scrubbing; it must not become a guessing oracle for private text.
+  The audit `record_hash` must not become a guessing oracle for private
+  text. It hashes the scrubbed free text, never replaced by a placeholder,
+  and `kronik.audit/v3` keys that hash with the master key (ADR 0083,
+  amended).
 - Subject masking recognizes case and percent-encoded spellings at
   identifier boundaries, rather than replacing arbitrary substrings.
 - `reason` is capped at 4 KiB in the line and at the API (`BAD_REQUEST`

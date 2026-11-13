@@ -31,6 +31,7 @@ use kronik_store::sql::{Limits, MemOpener, SqlPool, TurnOpts};
 use prost::Message as _;
 
 use crate::index::{ProductionIndex, RootInput};
+use crate::taint::Taint;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -75,6 +76,10 @@ pub struct ReplaySetup {
     pub(crate) upgrade_config: Option<Mutex<ConfigHistory>>,
     pub(crate) upgrade_code: BTreeMap<CodeHash, ForkKind>,
     pub secrets: Option<Arc<SecretStore>>,
+    /// The values of linked secrets this process already holds (the node's
+    /// secret cache): what an unmatched `crypto.*` of a `compute` grant uses
+    /// for a name linked at the fork point. A fork never fetches (I7).
+    pub held_secrets: Option<Arc<dyn HeldKeys>>,
     /// Canned answers for effects without a recording (synthetic).
     pub stubs: Vec<crate::stubs::StubRule>,
     /// `[fork] live_allowlist`: hosts whose unrecorded GETs without secret
@@ -103,6 +108,9 @@ pub struct ReplaySetup {
     /// The fork's copies of `fork_mode = "sandbox"` foreign actors (M14,
     /// ADR 0019), used by continuous replay only.
     pub copies: Option<ForkCopies>,
+    /// The budget of one turn's record (`kronik_sched::record_budget`):
+    /// production's, so a replay makes the decisions production made.
+    pub record_limit: usize,
     dispatch: ReplayDispatch,
 }
 
@@ -181,6 +189,7 @@ impl ReplaySetup {
             upgrade_config: None,
             upgrade_code: BTreeMap::new(),
             secrets,
+            held_secrets: None,
             stubs: Vec::new(),
             live: None,
             privacy: crate::privacy::ForkPrivacy::plain(),
@@ -188,6 +197,7 @@ impl ReplaySetup {
             progress: None,
             rebase: false,
             preview: false,
+            record_limit: kronik_sched::record_budget::turn_limit(kronik_log::MAX_RECORD as usize),
             dispatch,
         }
     }
@@ -237,9 +247,14 @@ pub struct ForkTurn {
     /// It read a pseudonym or an erased value: it did not run on real
     /// data, so failing where production committed is no introduced error.
     pub pseudonyms: bool,
-    /// It read a value whose subject was erased: the recording, not the
-    /// guest's input, is the only truth, so a difference from production is
-    /// `unverifiable` rather than divergent (S-16, ADR 0109).
+    /// It met erased data: its recording holds a value whose subject was
+    /// erased, it read an erased state value, or erased data shaped what it
+    /// ran on (an input an unverifiable turn sent, state such a turn or a
+    /// production turn missing below one left different, an actor database
+    /// lacking an erased subject's rows, an unverifiable callee). The
+    /// recording, not the guest's input, is the only truth, so a difference
+    /// from production is `unverifiable` rather than divergent (S-16, ADR
+    /// 0109; [`crate::taint`]).
     pub erased: bool,
     /// `--no-pii` forks: it used SQL, called a turn that did, or was sent
     /// by one. Its reply and record are concealed even though subject-tagged
@@ -346,6 +361,17 @@ struct Pending {
     /// Sent by a turn whose values may hold personal data
     /// ([`ForkTurn::personal`]).
     personal: bool,
+    /// Sent by a turn the replay could not verify ([`ForkTurn::erased`]): a
+    /// message whose body erased data shaped is unverifiable too.
+    unverified: bool,
+}
+
+/// What the scheduler runs next at its order key.
+enum Queued {
+    Turn(Box<Pending>),
+    /// Production's `Erasure` of a subject through a key version, at its
+    /// place: continuous replay deletes what production deleted there.
+    Erasure(String, u32),
 }
 
 struct Runner {
@@ -355,7 +381,7 @@ struct Runner {
     isolated: bool,
     counter: AtomicU64,
     turns: Mutex<Vec<ForkTurn>>,
-    queue: Mutex<BTreeMap<Vec<u64>, Pending>>,
+    queue: Mutex<BTreeMap<Vec<u64>, Queued>>,
     /// Queued fork timers: (actor, id) -> order key.
     timers: Mutex<BTreeMap<(ActorRef, u64), Vec<u64>>>,
     timer_seq: AtomicU64,
@@ -368,6 +394,15 @@ struct Runner {
     /// never applied (the overlay is rolled back and the diff is built
     /// from the records).
     leaves: Mutex<Vec<pb::TurnRecord>>,
+    /// State the store holds that the replay could not verify after an
+    /// erasure (ADR 0109): a turn that reads it is unverifiable too.
+    taint: Arc<Mutex<Taint>>,
+    /// The production LSN the store held everything through before this
+    /// runner's turns: a production turn at or below it is in the store,
+    /// not one the fork may leave out.
+    base: Lsn,
+    /// The production turns the fork has run (their LSNs).
+    ran: Mutex<std::collections::BTreeSet<Lsn>>,
 }
 
 impl Runner {
@@ -376,8 +411,11 @@ impl Runner {
         store: Arc<Store>,
         prefix: String,
         isolated: bool,
+        base: Lsn,
     ) -> Arc<Runner> {
         Arc::new(Runner {
+            base,
+            ran: Mutex::new(std::collections::BTreeSet::new()),
             setup,
             store,
             prefix,
@@ -389,6 +427,7 @@ impl Runner {
             timer_seq: AtomicU64::new(0),
             caught_up: Mutex::new(0),
             leaves: Mutex::new(Vec::new()),
+            taint: Arc::new(Mutex::new(Taint::default())),
         })
     }
 
@@ -404,7 +443,7 @@ impl Runner {
     }
 
     fn push(&self, order: Vec<u64>, p: Pending) {
-        lock(&self.queue).insert(order, p);
+        lock(&self.queue).insert(order, Queued::Turn(Box::new(p)));
     }
 
     /// The order key of a child turn: its production LSN when matched,
@@ -457,6 +496,7 @@ impl Runner {
         }
         let skip = self.setup.index.tree_lsns(&p.key.root);
         let mut batch = Vec::new();
+        let mut taint = lock(&self.taint);
         for lsn in from..prod_lsn {
             if skip.is_some_and(|s| s.binary_search(&lsn).is_ok()) {
                 continue;
@@ -469,6 +509,13 @@ impl Runner {
             {
                 continue;
             }
+            // Production's own record: from here on both sides hold what it
+            // wrote, and its erasure deletes on both sides.
+            match &c.record {
+                Record::TurnRecord(t) => taint.verified_turn(t, lsn),
+                Record::Erasure(e) => taint.erasure(&e.subject, lsn),
+                _ => {}
+            }
             let next = self.store.applied.get() + 1 + batch.len() as u64;
             batch.push(Committed {
                 lsn: next,
@@ -476,6 +523,7 @@ impl Runner {
                 record: c.record.clone(),
             });
         }
+        drop(taint);
         for chunk in batch.chunks(512) {
             self.store.apply(chunk)?;
         }
@@ -487,8 +535,15 @@ impl Runner {
     async fn drain(self: Arc<Self>, dispatch: ReplayDispatch) -> Result<(), ReplayError> {
         loop {
             let next = lock(&self.queue).pop_first();
-            let Some((order, p)) = next else {
+            let Some((order, queued)) = next else {
                 return Ok(());
+            };
+            let p = match queued {
+                Queued::Turn(p) => *p,
+                Queued::Erasure(subject, key_version) => {
+                    self.erase(&subject, key_version, order.first().copied().unwrap_or(0))?;
+                    continue;
+                }
             };
             self.flush_leaves()?;
             self.catch_up(&p)?;
@@ -514,6 +569,16 @@ impl Runner {
                 Progress::add(&progress.continuous_done, 1);
             }
         }
+    }
+
+    /// Production's `Erasure` of `subject` at `at`, followed by the
+    /// continuous store: it deletes and tombstones what production's did
+    /// there, so later turns read what production's read (ADR 0109).
+    fn erase(&self, subject: &str, key_version: u32, at: Lsn) -> Result<(), ReplayError> {
+        self.flush_leaves()?;
+        self.store.erase_again(subject, key_version)?;
+        lock(&self.taint).erasure(subject, at);
+        Ok(())
     }
 
     /// A dead-letter resend in the window whose original the fork ran with
@@ -542,10 +607,13 @@ impl Runner {
     /// A message production delivered runs at that turn's place; one it did
     /// not runs first, after `after` (a rebase leaves it for main).
     fn queue_pending(&self, after: Lsn) -> Result<(), ReplayError> {
-        for t in self.store.db().timers(None)? {
+        for mut t in self.store.db().timers(None)? {
             if lock(&self.timers).contains_key(&(t.actor.clone(), t.timer_id)) {
                 continue;
             }
+            kronik_proto::sealables::message_mut(Some(&mut t.msg), &mut |s| {
+                self.reveal_stored(s, t.lsn)
+            });
             let op = pb::TimerOp {
                 kind: pb::TimerOpKind::Schedule as i32,
                 timer_id: t.timer_id,
@@ -557,21 +625,30 @@ impl Runner {
             // as when the timer is queued in that turn's round (review
             // M13-1). Production scheduled the others: what that turn read
             // is unknown, so they count as personal (review N12-3).
-            let (by, sql, personal) = lock(&self.turns)
+            let (by, sql, personal, unverified) = lock(&self.turns)
                 .iter()
                 .find(|f| f.lsn == t.lsn)
                 .map_or_else(
-                    || (String::new(), false, true),
-                    |f| (f.id.clone(), f.sql, f.personal),
+                    || (String::new(), false, true, false),
+                    |f| (f.id.clone(), f.sql, f.personal, f.erased),
                 );
-            self.schedule_timer(&t.actor, t.causal_key, &op, &by, sql, personal);
+            self.schedule_timer(
+                &t.actor,
+                t.causal_key,
+                &op,
+                &by,
+                (sql, personal, unverified),
+            );
         }
-        for (i, m) in self.store.db().mailbox()?.into_iter().enumerate() {
+        for (i, mut m) in self.store.db().mailbox()?.into_iter().enumerate() {
             let order = match self.setup.index.turn(&m.causal_key) {
                 Some((lsn, _)) => vec![lsn],
                 None if self.setup.rebase => continue,
                 None => vec![after, i as u64],
             };
+            kronik_proto::sealables::input_mut(Some(&mut m.input), &mut |s| {
+                self.reveal_stored(s, m.lsn)
+            });
             let (subject, time) = match &m.input.kind {
                 Some(pb::input::Kind::Message(x)) => (
                     x.msg
@@ -582,6 +659,7 @@ impl Runner {
                 ),
                 _ => (None, 0),
             };
+            let unverified = lock(&self.turns).iter().any(|f| f.lsn == m.lsn && f.erased);
             self.push(
                 order,
                 Pending {
@@ -594,24 +672,40 @@ impl Runner {
                     // Production sent it (or a turn whose reads are not
                     // known here): counted as personal (review N12-3).
                     personal: true,
+                    unverified,
                 },
             );
         }
         Ok(())
     }
 
+    /// A value a queued timer or message carries in the store, as the
+    /// fork's guest may see it: one the base snapshot holds (`lsn` at or
+    /// below it) is production's and revealed like any recorded value, one
+    /// the replay wrote is revealed as written; an erased one (a tombstone
+    /// the erasure left) reads `[erased]` and its turn's recording is
+    /// unverifiable (ADR 0109).
+    fn reveal_stored(&self, s: &mut pb::Sealable, lsn: Lsn) {
+        if lsn > self.setup.index.base_lsn() {
+            self.setup.privacy.reveal_written(s);
+        } else {
+            self.setup.privacy.reveal(s);
+        }
+    }
+
     /// Schedules a fork timer. An isolated tree fires only the timers
     /// production fired in the window (the fork set the same timer: its turn
     /// has the production turn's causal key), at the production turn's
     /// place; continuous replay fires every timer that comes due.
+    /// `flags`: the scheduling turn's [`Pending::sql`], [`Pending::personal`]
+    /// and [`Pending::unverified`].
     fn schedule_timer(
         &self,
         actor: &ActorRef,
         key: pb::CausalKey,
         op: &pb::TimerOp,
         scheduled_by: &str,
-        sql: bool,
-        personal: bool,
+        (sql, personal, unverified): (bool, bool, bool),
     ) {
         let order = match self.setup.index.turn(&key) {
             Some((lsn, _)) => vec![lsn],
@@ -651,6 +745,7 @@ impl Runner {
                 subject,
                 sql,
                 personal,
+                unverified,
             },
         );
     }
@@ -689,6 +784,7 @@ impl Runner {
     fn record_unrun(
         &self,
         p: &Pending,
+        order: &[u64],
         hash: Option<CodeHash>,
         code: &str,
         message: String,
@@ -718,19 +814,88 @@ impl Runner {
         let sql = p.sql;
         let pseudonyms =
             self.setup.privacy.no_pii && crate::privacy::tagged_input(record.input.as_ref());
+        let prod = self.setup.index.turn(&p.key);
+        let erased = prod.is_some_and(|(l, _)| self.setup.index.erased_turns.contains(&l))
+            || self.shaped(p, prod.map(|(_, t)| t));
+        self.settle(&p.key, &record, prod, order, erased);
         let turn = ForkTurn {
             id: self.next_id(lsn),
             lsn,
-            prod_lsn: self.setup.index.turn(&p.key).map(|(l, _)| l),
+            prod_lsn: prod.map(|(l, _)| l),
             record,
-            masked: sql || pseudonyms,
+            masked: sql || pseudonyms || erased,
             pseudonyms,
             sql,
-            erased: false,
+            erased,
             personal: p.personal || p.subject.is_some(),
         };
         lock(&self.turns).push(turn.clone());
         Ok(turn)
+    }
+
+    /// Whether, at production position `at`, the actor's SQL database may
+    /// hold other rows than production's because of an erasure: an
+    /// unverifiable turn left it different ([`Taint`]), or an erased
+    /// subject's changeset was skipped and production had not erased the
+    /// rows yet ([`ProductionIndex::sql_gap`]).
+    fn sql_unverified(&self, actor: &ActorRef, at: Lsn) -> Result<bool, ReplayError> {
+        let name = format!("{}/{}", actor.kind, actor.key);
+        if !lock(&self.taint).has_sql(&name) && !self.setup.index.has_erased_sql(&name) {
+            return Ok(false);
+        }
+        let untagged = self
+            .store
+            .sql
+            .get(&name)
+            .map_err(|e| ReplayError::Host(e.to_string()))?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_table_without_subject()
+            .map_err(ReplayError::Host)?;
+        Ok(lock(&self.taint).sql(&name, at, untagged)
+            || self.setup.index.sql_gap(&name, at, untagged))
+    }
+
+    /// Whether erased data shaped `p`'s input: an unverifiable turn sent it
+    /// and it differs from what production's counterpart received (or there
+    /// is none). Such a turn ran on stand-in data even though its own
+    /// recording holds no erased value (ADR 0109).
+    fn shaped(&self, p: &Pending, prod: Option<&pb::TurnRecord>) -> bool {
+        p.unverified && prod.is_none_or(|t| !same_input(t.input.as_ref(), &p.input))
+    }
+
+    /// Updates the store's taint after the turn `record` at `order`: an
+    /// unverifiable turn marks where it left the state different from its
+    /// production counterpart's, and everything production turns below it
+    /// wrote, from their own positions (the fork may never run them); a
+    /// verified turn's writes replace what was marked before (ADR 0109).
+    fn settle(
+        &self,
+        key: &pb::CausalKey,
+        record: &pb::TurnRecord,
+        prod: Option<(Lsn, &pb::TurnRecord)>,
+        order: &[u64],
+        erased: bool,
+    ) {
+        let at = order.first().copied().unwrap_or(0);
+        if let Some((lsn, _)) = prod {
+            lock(&self.ran).insert(lsn);
+        }
+        if !erased {
+            lock(&self.taint).verified_turn(record, at);
+            return;
+        }
+        let ran = lock(&self.ran).clone();
+        let mut taint = lock(&self.taint);
+        taint.unverified_turn(Some(record), prod.map(|(_, t)| t), at);
+        // Below it: what production ran that the store does not hold and the
+        // fork has not run (a migration or a callee that committed first is
+        // in the store already, or ran in the fork).
+        for (lsn, below) in self.setup.index.below(key) {
+            if lsn > self.base && !ran.contains(&lsn) {
+                taint.missing_turn(below, lsn);
+            }
+        }
     }
 
     /// Runs one fork turn (with a migrate turn first when needed), applies
@@ -756,6 +921,7 @@ impl Runner {
             let Some(kind) = kind.cloned() else {
                 return self.record_unrun(
                     &p,
+                    &order,
                     None,
                     "ACTOR_NOT_FOUND",
                     format!("no deployed kind {:?}", p.actor.kind),
@@ -782,6 +948,7 @@ impl Runner {
                     subject: None,
                     sql: false,
                     personal: false,
+                    unverified: false,
                 };
                 let mut morder = order.clone();
                 morder.push(0);
@@ -794,6 +961,7 @@ impl Runner {
                 {
                     return self.record_unrun(
                         &p,
+                        &order,
                         Some(kind.hash),
                         "TURN_FAILED",
                         format!(
@@ -824,6 +992,12 @@ impl Runner {
         let prod = self.setup.index.turn(&p.key);
         let prod_lsn = prod.map(|(l, _)| l);
         let erased_turn = prod_lsn.is_some_and(|lsn| self.setup.index.erased_turns.contains(&lsn));
+        // What may make the turn unverifiable besides its own recording
+        // (ADR 0109): an input erased data shaped, and an actor database that
+        // lacks rows production had or holds rows an unverifiable turn wrote.
+        let at = order.first().copied().unwrap_or(0);
+        let shaped = self.shaped(&p, prod.map(|(_, t)| t));
+        let sql_unverified = self.sql_unverified(&p.actor, at)?;
         let (time, seed, prod_effects) = match prod {
             Some((_, t)) => (
                 t.logical_time_ms,
@@ -870,15 +1044,36 @@ impl Runner {
                 max_bytes: kl.sql_bytes_per_actor,
             },
         )));
-        let state = Arc::new(crate::privacy::ForkState::new(
-            self.store.clone(),
-            p.actor.clone(),
-            self.setup.privacy.clone(),
-        ));
+        let state = Arc::new(
+            crate::privacy::ForkState::new(
+                self.store.clone(),
+                p.actor.clone(),
+                self.setup.privacy.clone(),
+            )
+            .with_base(self.setup.index.base_lsn())
+            .with_taint(self.taint.clone(), at),
+        );
         let erased_effects = prod_lsn
             .and_then(|lsn| self.setup.index.erased_effects.get(&lsn))
             .cloned()
             .unwrap_or_default();
+        // The same record budget as production, started from what the
+        // record holds before any effect, so a replay makes the same
+        // decisions (kronik_sched::record_budget).
+        let input_cost = kronik_sched::record_budget::input_cost(&mut p.input.clone());
+        let record_limit = self.setup.record_limit;
+        let budget = kronik_sched::record_budget::Budget::new(
+            record_limit,
+            kronik_sched::record_budget::base_cost(
+                &p.actor.to_pb(),
+                &kind.hash.0,
+                &p.key,
+                time,
+                &seed,
+                input_cost,
+                epoch,
+            ),
+        );
         let gate = Arc::new(ReplayGate {
             dispatch,
             runner: self.clone(),
@@ -889,13 +1084,18 @@ impl Runner {
             order: order.clone(),
             prod: prod_effects,
             call_chain,
-            state: Mutex::new(GateState::default()),
+            state: Mutex::new(GateState {
+                budget,
+                ..GateState::default()
+            }),
             erased_effects,
             input_tagged: p.subject.is_some()
                 || p.personal
                 || crate::privacy::tagged_input(Some(&p.input)),
             fork_state: state.clone(),
             sql: sql.clone(),
+            unverified: erased_turn || shaped,
+            sql_unverified,
         });
         let req = TurnRequest {
             actor: p.actor.clone(),
@@ -937,7 +1137,16 @@ impl Runner {
                     return Err(ReplayError::Prerequisite(ErrorCode::SecretUnavailable));
                 }
             };
-        if kronik_sched::scrub::output(&mut out, &matcher).is_err() {
+        // Output larger than one log record holds fails the turn with
+        // TURN_TOO_LARGE, as in production.
+        let output = kronik_sched::scrub::output(&mut out, &matcher);
+        let output_too_large = matches!(output, Err(kronik_effects::http::ScrubError::OutputLimit));
+        if output_too_large {
+            out.writes.clear();
+            out.messages.clear();
+            out.timers.clear();
+            out.outcome = kronik_sched::record_budget::too_large_outcome(record_limit);
+        } else if output.is_err() {
             let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
             return Err(ReplayError::Prerequisite(ErrorCode::SecretUnavailable));
         }
@@ -980,10 +1189,21 @@ impl Runner {
         }
         let real_rows = self.setup.privacy.no_pii && (used_sql || gs.sql || p.sql);
         let personal = gate.saw_personal_with(&gs) || used_sql;
+        // A turn that met erased data (S-16, ADR 0109): its recording holds
+        // an erased value, erased data shaped its input, it read an erased
+        // value or state erased data shaped, used an actor database that
+        // lacks an erased subject's rows production had, or called a turn
+        // that did. Marked whatever the mode, so the diff reports it as
+        // unverifiable, not divergent.
+        let erased = gate.unverified
+            || state.erased()
+            || (sql_unverified && used_sql)
+            || gs.unverified_callee;
         let committed = out.committed();
         // As in production: a turn that did not commit after an effect whose
         // outcome is unknown fails with EFFECT_OUTCOME_UNKNOWN.
         if !committed
+            && !output_too_large
             && gs
                 .records
                 .iter()
@@ -992,13 +1212,8 @@ impl Runner {
             out.outcome.kind = pb::OutcomeKind::EffectOutcomeUnknown as i32;
             out.outcome.error_code = "EFFECT_OUTCOME_UNKNOWN".into();
         }
-        let leaf = self.isolated
-            && out.messages.is_empty()
-            && out.timers.is_empty()
-            && gs.compensations.is_empty()
-            && sql_changes.is_empty()
-            && sql_schema.is_empty();
-        let record = pb::TurnRecord {
+        let compensations = gs.compensations;
+        let mut record = pb::TurnRecord {
             execution_id: String::new(),
             actor: Some(p.actor.to_pb()),
             code_hash: kind.hash.0.to_vec(),
@@ -1017,7 +1232,7 @@ impl Runner {
             compensations: if committed {
                 Vec::new()
             } else {
-                gs.compensations
+                compensations.clone()
             },
             sql_schema,
             blob_refs: Vec::new(),
@@ -1027,6 +1242,27 @@ impl Runner {
             // A recomputed turn's wall time says nothing about production.
             duration_us: 0,
         };
+        // The record budget, decided as production decides it.
+        if output_too_large {
+            kronik_sched::record_budget::fail(
+                &mut record,
+                &compensations,
+                record_limit,
+                input_cost,
+            );
+        } else {
+            kronik_sched::record_budget::fit(&mut record, &compensations, record_limit, input_cost);
+        }
+        let committed = record
+            .outcome
+            .as_ref()
+            .is_some_and(|o| o.kind == pb::OutcomeKind::Committed as i32);
+        let leaf = self.isolated
+            && record.messages.is_empty()
+            && record.timers.is_empty()
+            && compensations.is_empty()
+            && record.sql_changes.is_empty()
+            && record.sql_schema.is_empty();
         // An isolated leaf's row is rolled back with the overlay, so it is
         // only buffered: if a later turn of the tree runs, it applies the
         // buffer first, because that turn may read what the leaf wrote (a
@@ -1065,13 +1301,14 @@ impl Runner {
                         subject,
                         sql: real_rows,
                         personal,
+                        unverified: erased,
                     },
                 );
             }
             for t in &record.timers {
                 if t.kind == pb::TimerOpKind::Schedule as i32 {
                     let key = causal::child(&p.key, &p.actor, t.ordinal);
-                    self.schedule_timer(&p.actor, key, t, &id, real_rows, personal);
+                    self.schedule_timer(&p.actor, key, t, &id, (real_rows, personal, erased));
                 } else {
                     self.cancel_timer(&p.actor, t.timer_id);
                 }
@@ -1103,10 +1340,12 @@ impl Runner {
                         subject: None,
                         sql: real_rows,
                         personal,
+                        unverified: erased,
                     },
                 );
             }
         }
+        self.settle(&p.key, &record, prod, &order, erased);
         let pseudonyms = self.setup.privacy.no_pii
             && (state.masked()
                 || crate::privacy::tagged_input(record.input.as_ref())
@@ -1114,9 +1353,6 @@ impl Runner {
                     e.grounding != pb::Grounding::Live as i32
                         && e.response.as_ref().is_some_and(|r| r.subject.is_some())
                 }));
-        // A turn that met an erased recorded value (S-16, ADR 0109): mark it,
-        // whatever mode, so the diff reports it as unverifiable, not divergent.
-        let erased = erased_turn || state.erased();
         let turn = ForkTurn {
             id,
             record,
@@ -1207,6 +1443,9 @@ fn every_crypto_or_reveal_record_is_a_secret_use() {
 struct GateState {
     records: Vec<pb::EffectRecord>,
     compensations: Vec<pb::OutboundMessage>,
+    /// What the turn's record may still take, charged as in production
+    /// (`kronik_sched::record_budget`).
+    budget: kronik_sched::record_budget::Budget,
     /// The keys this turn computed with on the host, for scrubbing. Not
     /// every secret use: see [`used_a_secret`].
     secrets: Vec<(String, Vec<u8>)>,
@@ -1214,6 +1453,9 @@ struct GateState {
     sql: bool,
     /// A callee's values may hold personal data ([`ForkTurn::personal`]).
     personal: bool,
+    /// A callee the replay could not verify ([`ForkTurn::erased`]): what it
+    /// answered need not be what production's answered.
+    unverified_callee: bool,
 }
 
 /// The replay effect gate of one fork turn.
@@ -1236,6 +1478,12 @@ struct ReplayGate {
     input_tagged: bool,
     fork_state: Arc<crate::privacy::ForkState>,
     sql: Arc<Mutex<SqlTurn>>,
+    /// The turn's recording holds an erased value, or erased data shaped
+    /// its input (ADR 0109).
+    unverified: bool,
+    /// The turn's actor database may differ from production's because of
+    /// an erasure; using it makes the turn unverifiable.
+    sql_unverified: bool,
 }
 
 struct GateHandle(Arc<ReplayGate>);
@@ -1473,24 +1721,27 @@ fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
 pub const NO_RECORDING: &str = "replay: no recording";
 
 /// The error of an unmatched effect of a fork that needs a secret which is
-/// linked to an external backend at the fork point (`SECRET_EXTERNAL`).
+/// linked to an external backend at the fork point, when this process holds
+/// no value of it for that link (`SECRET_UNAVAILABLE`).
 fn linked_secret_denial(name: &str) -> String {
     format!(
-        "SECRET_EXTERNAL: {name} is linked to an external secret manager, and a fork does \
-         not compute with it"
+        "SECRET_UNAVAILABLE: {name} is linked to an external secret manager, this node holds \
+         no value of it for the fork point's link, and a fork never fetches"
     )
 }
 
 /// What an unmatched `crypto.*` of a fork computes with.
 enum UnmatchedKey {
     /// The name is linked to an external backend in the configuration of the
-    /// fork point. The built-in store holds an older value of it, or none,
-    /// and a fork never fetches (I7): nothing is computed.
-    Linked,
+    /// fork point, and this process holds no value of it for that link: a
+    /// fork never fetches (I7), and the built-in store holds an older value
+    /// of the name or none. Nothing is computed.
+    Unheld,
     /// The built-in store has no value of the name, or the fork has no store
     /// (a preview: no production key computes for it).
     Missing,
-    /// The built-in store's current value of a name that is not linked.
+    /// The built-in store's current value of a name that is not linked, or
+    /// the value this process holds for the link of the fork point.
     Value(kronik_privacy::SecretValue),
 }
 
@@ -1505,15 +1756,39 @@ impl KeyStore for SecretStore {
     }
 }
 
+/// The values of linked secrets that this process already holds, as an
+/// unmatched `crypto.*` of a fork reads them (m23 §6): never a fetch.
+pub trait HeldKeys: Send + Sync {
+    /// The value held for `name` under the link of `config` (the fork
+    /// point's: its backend, binding, reference and generation), when the
+    /// backend is still trusted and the value has not been revoked.
+    fn held_key(&self, name: &str, config: &Config) -> Option<kronik_privacy::SecretValue>;
+}
+
+impl HeldKeys for kronik_sched::secrets::SecretCache {
+    fn held_key(&self, name: &str, config: &Config) -> Option<kronik_privacy::SecretValue> {
+        self.cached(name, None, config).ok().flatten()
+    }
+}
+
 /// The key for an unmatched `crypto.*` of `name` in a fork whose
-/// configuration is `config`. Without a store, nothing is computed, linked or
-/// not; with one, a link decides before the store is asked.
-fn unmatched_key(config: &Config, store: Option<&dyn KeyStore>, name: &str) -> UnmatchedKey {
+/// configuration is `config`. Without a store (a preview), nothing is
+/// computed, linked or not. A link at the fork point decides before the
+/// store is asked: a linked name is the held value of that link, or none.
+fn unmatched_key(
+    config: &Config,
+    store: Option<&dyn KeyStore>,
+    held: Option<&dyn HeldKeys>,
+    name: &str,
+) -> UnmatchedKey {
     let Some(store) = store else {
         return UnmatchedKey::Missing;
     };
     if config.secret_is_linked(name) {
-        return UnmatchedKey::Linked;
+        return match held.and_then(|held| held.held_key(name, config)) {
+            Some(value) => UnmatchedKey::Value(value),
+            None => UnmatchedKey::Unheld,
+        };
     }
     match store.current_key(name) {
         Some(value) => UnmatchedKey::Value(value),
@@ -1684,8 +1959,74 @@ impl ReplayGate {
         self.prod.iter().find(|e| e.ordinal == ordinal)
     }
 
-    fn push(&self, rec: pb::EffectRecord) {
-        lock(&self.state).records.push(rec);
+    /// Records an effect of the turn. As in production, a record that does
+    /// not fit in what is left of the turn's record traps the turn with
+    /// `TURN_TOO_LARGE` (`kronik_sched::record_budget`).
+    fn push(&self, mut rec: pb::EffectRecord) -> Result<(), GateError> {
+        let cost = kronik_sched::record_budget::effect_cost(&mut rec);
+        let mut state = lock(&self.state);
+        state.budget.take(cost, rec.ordinal, &rec.kind)?;
+        state.records.push(rec);
+        Ok(())
+    }
+
+    /// Production's response cap for a new fetch whose recorded request is
+    /// `encoded`: what is left of the turn's record after the request and a
+    /// result without a body, at most the kind's `effect_response_bytes`.
+    fn response_cap(&self, encoded: Option<&pb::Sealable>, effect_response_bytes: u64) -> u64 {
+        let len = match encoded.and_then(|s| s.value.as_ref()) {
+            Some(pb::sealable::Value::Plain(bytes)) => bytes.len(),
+            _ => 0,
+        };
+        let room = lock(&self.state).budget.clone();
+        kronik_sched::record_budget::response_room(
+            &room,
+            kronik_sched::record_budget::fetch_need(len),
+            effect_response_bytes,
+        )
+    }
+
+    /// The error of a response over `cap` ([`ReplayGate::response_cap`]),
+    /// worded as production words it.
+    fn too_large_error(cap: u64, effect_response_bytes: u64) -> String {
+        if cap < effect_response_bytes {
+            format!("the response exceeds {cap} bytes, what is left of the turn's record")
+        } else {
+            format!("the response exceeds {cap} bytes")
+        }
+    }
+
+    /// As in production: a fetch result that does not fit in what is left of
+    /// the turn's record is too large for this turn, and the guest never
+    /// sees it.
+    fn fit_fetch(
+        &self,
+        rec: &mut pb::EffectRecord,
+        out: Result<FetchOutcome, GateError>,
+    ) -> Result<FetchOutcome, GateError> {
+        if matches!(out, Ok(FetchOutcome::HostRedactionFailure) | Err(_)) {
+            return out;
+        }
+        let room = lock(&self.state).budget.clone();
+        if room.fits(kronik_sched::record_budget::effect_cost(rec)) {
+            return out;
+        }
+        rec.response = None;
+        rec.status = pb::EffectStatus::TooLarge as i32;
+        rec.error = "the response does not fit in what is left of the turn's record".into();
+        Ok(FetchOutcome::TooLarge)
+    }
+
+    /// Production's admission of a new effect: its `need` bytes must fit in
+    /// what is left of the turn's record, or the turn traps with
+    /// `TURN_TOO_LARGE` before the effect happens.
+    fn admit(&self, ordinal: u32, kind: &str, need: usize) -> Result<(), GateError> {
+        let state = lock(&self.state);
+        if state.budget.fits(need) {
+            Ok(())
+        } else {
+            Err(state.budget.refuse(ordinal, kind))
+        }
     }
 
     fn denied(&self, ordinal: u32, kind: &str, target: String, error: String) -> pb::EffectRecord {
@@ -1728,6 +2069,15 @@ impl ReplayGate {
         req.subject.is_some() || self.saw_personal()
     }
 
+    /// Whether the turn has met erased data so far ([`ForkTurn::erased`]):
+    /// a callee it calls now gets a message that data may have shaped.
+    fn unverified_so_far(&self) -> bool {
+        self.unverified
+            || self.fork_state.erased()
+            || (self.sql_unverified && lock(&self.sql).used())
+            || lock(&self.state).unverified_callee
+    }
+
     /// Whether the turn has seen personal data or a secret so far.
     fn saw_personal(&self) -> bool {
         lock(&self.sql).used() || self.saw_personal_with(&lock(&self.state))
@@ -1759,7 +2109,7 @@ impl ReplayGate {
             })
             .cloned()
         {
-            self.push(record);
+            self.push(record)?;
             return Err(GateError::HostRedactionFailure);
         }
         // The recorded request was erased: its plaintext is gone, so no
@@ -1773,7 +2123,7 @@ impl ReplayGate {
         {
             record.grounding = pb::Grounding::Exact as i32;
             let out = outcome_of_fetch(&record)?;
-            self.push(record);
+            self.push(record)?;
             return Ok(out);
         }
         let (matcher, prepared_scope) = self.matcher_with_scope()?;
@@ -1788,7 +2138,7 @@ impl ReplayGate {
                     "http.fetch",
                     "http:[withheld]".into(),
                     error.clone(),
-                ));
+                ))?;
                 return Ok(FetchOutcome::Denied(error));
             }
         };
@@ -1821,12 +2171,12 @@ impl ReplayGate {
             } else {
                 "http:[withheld]"
             };
-            self.push(self.denied(ordinal, kind, withheld.into(), e.clone()));
+            self.push(self.denied(ordinal, kind, withheld.into(), e.clone()))?;
             return Ok(FetchOutcome::Denied(e));
         }
         if foreign && self.config().foreign(&t.host).is_none() {
             let e = format!("FOREIGN_NOT_FOUND: no foreign actor {}", t.host);
-            self.push(self.denied(ordinal, kind, "foreign:[withheld]".into(), e.clone()));
+            self.push(self.denied(ordinal, kind, "foreign:[withheld]".into(), e.clone()))?;
             return Ok(FetchOutcome::Denied(e));
         }
         let prod = self.prod_at(ordinal).cloned();
@@ -1847,7 +2197,7 @@ impl ReplayGate {
                     let scap = format!("secret:{secret}");
                     if self.config().grant(&self.actor.kind, &scap).is_none() {
                         let e = format!("CAPABILITY_NOT_GRANTED: {scap}");
-                        self.push(self.denied(ordinal, kind, scap, e.clone()));
+                        self.push(self.denied(ordinal, kind, scap, e.clone()))?;
                         return Ok(FetchOutcome::Denied(e));
                     }
                     let recorded = prod_req.as_ref().and_then(|r| {
@@ -1872,7 +2222,7 @@ impl ReplayGate {
                         && let Err(error) = reference.resolved_version()
                     {
                         let error = error.to_string();
-                        self.push(self.denied(ordinal, kind, scap, error.clone()));
+                        self.push(self.denied(ordinal, kind, scap, error.clone()))?;
                         return Err(GateError::Prerequisite(ErrorCode::SecretUnavailable));
                     }
                     pb::http_effect_header::Value::Secret(recorded.unwrap_or(pb::SecretRef {
@@ -1929,7 +2279,7 @@ impl ReplayGate {
                         &matcher,
                     )?;
                     let outcome = outcome_of_fetch(&record);
-                    self.push(record);
+                    self.push(record)?;
                     return outcome;
                 }
                 2 => {}
@@ -1957,6 +2307,10 @@ impl ReplayGate {
             recorded_target.host
         );
         let encoded = tagged(&req.subject, request.encode_to_vec());
+        // Production admits a new fetch with room for its request and a
+        // result without a body; the same refusal keeps a replay identical.
+        let need = kronik_sched::record_budget::fetch_need(request.encoded_len());
+        self.admit(ordinal, kind, need)?;
         // A copy of the foreign actor answers in continuous replay (M14).
         if t.scheme == "foreign"
             && !self.runner.isolated
@@ -1982,7 +2336,7 @@ impl ReplayGate {
                 let mut rec = p;
                 rec.grounding = pb::Grounding::Exact as i32;
                 let out = outcome_of_fetch(&rec);
-                self.push(rec);
+                self.push(rec)?;
                 return out;
             }
             if target_of(&pr).is_some() && target_of(&pr) == target_of(&request) {
@@ -1991,7 +2345,7 @@ impl ReplayGate {
                 rec.fingerprint = fp;
                 rec.request = encoded;
                 let out = outcome_of_fetch(&rec);
-                self.push(rec);
+                self.push(rec)?;
                 return out;
             }
         }
@@ -2037,11 +2391,11 @@ impl ReplayGate {
                         .unwrap_or(usize::MAX)
                         .min(kronik_log::MAX_RECORD as usize),
                 );
-                self.push(rec);
+                self.push(rec)?;
                 return out;
             }
             let out = self.prepare_http_record(&mut rec, &matcher);
-            self.push(rec);
+            self.push(rec)?;
             return out;
         }
         // Live: an allowlisted host, a GET, no secret headers.
@@ -2083,7 +2437,7 @@ impl ReplayGate {
                 let mut rec = answer.record;
                 rec.request = encoded;
                 let out = self.prepare_http_record(&mut rec, &matcher);
-                self.push(rec);
+                self.push(rec)?;
                 return out;
             }
             if let Some(neighbor) = &neighbor
@@ -2099,7 +2453,7 @@ impl ReplayGate {
                 )? {
                     NeighborDisclosure::Decline => {}
                     NeighborDisclosure::Recorded(recorded) => {
-                        self.push(recorded.record);
+                        self.push(recorded.record)?;
                         return Ok(recorded.outcome);
                     }
                 }
@@ -2117,7 +2471,7 @@ impl ReplayGate {
                         .check()
                         .map_err(|error| GateError::Prerequisite(error.code))?;
                     if self.tainted(&req) {
-                        self.push(self.synthetic(ordinal, kind, cap, fp, encoded));
+                        self.push(self.synthetic(ordinal, kind, cap, fp, encoded))?;
                         return Ok(FetchOutcome::Denied(NO_RECORDING.into()));
                     }
                 }
@@ -2173,12 +2527,12 @@ impl ReplayGate {
                         ..Default::default()
                     };
                     let out = outcome_of_fetch(&rec);
-                    self.push(rec);
+                    self.push(rec)?;
                     return out;
                 }
             }
         }
-        self.push(self.synthetic(ordinal, kind, cap, fp, encoded));
+        self.push(self.synthetic(ordinal, kind, cap, fp, encoded))?;
         Ok(FetchOutcome::Denied(NO_RECORDING.into()))
     }
 
@@ -2203,6 +2557,7 @@ impl ReplayGate {
             .check()
             .map_err(|error| GateError::Prerequisite(error.code))?;
         let limits = self.config().limits(&self.actor.kind);
+        let cap_bytes = self.response_cap(encoded.as_ref(), limits.effect_response_bytes);
         let sealer = &self.runner.setup.privacy.sealer;
         let exact = prod.as_ref().is_some_and(|p| {
             sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &plain_fp)
@@ -2220,14 +2575,14 @@ impl ReplayGate {
             url: req.url,
             headers,
             body: req.body.into(),
-            max_response_bytes: limits.effect_response_bytes,
+            max_response_bytes: cap_bytes,
         });
         let answer = env.timeout(limits.effect_timeout, call).await;
         if let Some(p) = prod.filter(|_| exact) {
             let mut rec = p;
             rec.grounding = pb::Grounding::Exact as i32;
             let out = outcome_of_fetch(&rec);
-            self.push(rec);
+            self.push(rec)?;
             return out;
         }
         let mut rec = pb::EffectRecord {
@@ -2248,10 +2603,7 @@ impl ReplayGate {
                 pb::EffectStatus::Timeout
             }
             Ok(Err(kronik_core::env::NetError::TooLarge)) => {
-                rec.error = format!(
-                    "the response exceeds {} bytes",
-                    limits.effect_response_bytes
-                );
+                rec.error = Self::too_large_error(cap_bytes, limits.effect_response_bytes);
                 pb::EffectStatus::TooLarge
             }
             Ok(Err(kronik_core::env::NetError::Connect(e) | kronik_core::env::NetError::Io(e))) => {
@@ -2277,12 +2629,14 @@ impl ReplayGate {
                         .unwrap_or(usize::MAX)
                         .min(kronik_log::MAX_RECORD as usize),
                 );
-                self.push(rec);
+                let out = self.fit_fetch(&mut rec, out);
+                self.push(rec)?;
                 return out;
             }
         } as i32;
         let out = self.prepare_http_record(&mut rec, matcher);
-        self.push(rec);
+        let out = self.fit_fetch(&mut rec, out);
+        self.push(rec)?;
         out
     }
 
@@ -2300,6 +2654,7 @@ impl ReplayGate {
         matcher: &CompiledScrubber<'_>,
     ) -> Result<FetchOutcome, GateError> {
         let limits = self.config().limits(&self.actor.kind);
+        let cap_bytes = self.response_cap(encoded.as_ref(), limits.effect_response_bytes);
         let headers = req
             .headers
             .iter()
@@ -2324,7 +2679,7 @@ impl ReplayGate {
                 url: req.url,
                 headers,
                 body: req.body.into(),
-                max_response_bytes: limits.effect_response_bytes,
+                max_response_bytes: cap_bytes,
             },
             self.original()?.clone(),
         );
@@ -2337,10 +2692,7 @@ impl ReplayGate {
                 pb::EffectStatus::Timeout
             }
             Ok(Err(kronik_core::env::NetError::TooLarge)) => {
-                rec.error = format!(
-                    "the response exceeds {} bytes",
-                    limits.effect_response_bytes
-                );
+                rec.error = Self::too_large_error(cap_bytes, limits.effect_response_bytes);
                 pb::EffectStatus::TooLarge
             }
             Ok(Err(kronik_core::env::NetError::Connect(e) | kronik_core::env::NetError::Io(e))) => {
@@ -2366,12 +2718,14 @@ impl ReplayGate {
                         .unwrap_or(usize::MAX)
                         .min(kronik_log::MAX_RECORD as usize),
                 );
-                self.push(rec);
+                let out = self.fit_fetch(&mut rec, out);
+                self.push(rec)?;
                 return out;
             }
         } as i32;
         let out = self.prepare_http_record(&mut rec, matcher);
-        self.push(rec);
+        let out = self.fit_fetch(&mut rec, out);
+        self.push(rec)?;
         out
     }
 
@@ -2402,7 +2756,12 @@ impl ReplayGate {
                 | kronik_sched::scrub::CallRequestError::UnsafeCompensation,
             ) => {
                 let error = ErrorCode::PolicyDenied.as_str().to_owned();
-                self.push(self.denied(ordinal, "actor.call", format!("actor:{to}"), error.clone()));
+                self.push(self.denied(
+                    ordinal,
+                    "actor.call",
+                    format!("actor:{to}"),
+                    error.clone(),
+                ))?;
                 return Ok(CallOutcome::Failed(error));
             }
             Err(kronik_sched::scrub::CallRequestError::Redaction(_)) => {
@@ -2411,6 +2770,11 @@ impl ReplayGate {
         }
         let encoded = request.encode_to_vec();
         let compensate = request.compensate.take();
+        // Production admits a new call with room for its request, its
+        // compensation's copy and a result without a body.
+        let need =
+            kronik_sched::record_budget::call_need(encoded.len(), compensate.as_ref(), &to.to_pb());
+        self.admit(ordinal, "actor.call", need)?;
         let msg = request
             .msg
             .take()
@@ -2462,6 +2826,7 @@ impl ReplayGate {
                         subject,
                         sql: false,
                         personal: self.saw_personal(),
+                        unverified: self.unverified_so_far(),
                     },
                     order,
                     self.dispatch.clone(),
@@ -2476,17 +2841,27 @@ impl ReplayGate {
                 let mut state = lock(&self.state);
                 state.sql |= turn.sql;
                 state.personal |= turn.personal;
+                state.unverified_callee |= turn.erased;
             }
             (map_call_outcome(o)?, turn.id)
         };
+        // A reply larger than what is left of the turn's record is withheld,
+        // as in production.
+        let room = lock(&self.state).budget.clone();
+        let reply_bytes = kronik_sched::record_budget::response_room(
+            &room,
+            need,
+            self.config()
+                .limits(&self.actor.kind)
+                .effect_response_bytes
+                .min(u64::from(kronik_log::MAX_RECORD)),
+        );
         let out = kronik_sched::effects::prepare_call_outcome(
             &mut rec,
             outcome,
             turn_id,
             &matcher,
-            usize::try_from(self.config().limits(&self.actor.kind).effect_response_bytes)
-                .unwrap_or(usize::MAX)
-                .min(kronik_log::MAX_RECORD as usize),
+            usize::try_from(reply_bytes).unwrap_or(usize::MAX),
             None,
             None,
         );
@@ -2500,14 +2875,18 @@ impl ReplayGate {
             && let Some(c) = compensate
         {
             let key = causal::compensation(&self.key, &self.actor, ordinal, &to);
-            lock(&self.state).compensations.push(pb::OutboundMessage {
+            let mut compensation = pb::OutboundMessage {
                 to: Some(to.to_pb()),
                 msg: Some(c),
                 ordinal,
                 message_id: causal::causal_id(&key),
-            });
+            };
+            let cost = kronik_sched::record_budget::message_cost(&mut compensation);
+            let mut state = lock(&self.state);
+            state.budget.charge(cost);
+            state.compensations.push(compensation);
         }
-        self.push(rec);
+        self.push(rec)?;
         out
     }
 
@@ -2517,7 +2896,7 @@ impl ReplayGate {
         algorithm: CryptoAlgorithm,
         secret: String,
         data: Vec<u8>,
-    ) -> CryptoOutcome {
+    ) -> Result<CryptoOutcome, GateError> {
         let (kind, alg) = match algorithm {
             CryptoAlgorithm::HmacSha256 => ("crypto.hmac-sha256", "hmac-sha256"),
             CryptoAlgorithm::SignEd25519 => ("crypto.sign-ed25519", "sign-ed25519"),
@@ -2525,9 +2904,11 @@ impl ReplayGate {
         let cap = format!("secret:{secret}");
         let Some(grant) = self.config().grant(&self.actor.kind, &cap) else {
             let e = format!("CAPABILITY_NOT_GRANTED: {cap}");
-            self.push(self.denied(ordinal, kind, cap, e.clone()));
-            return CryptoOutcome::Denied(e);
+            self.push(self.denied(ordinal, kind, cap, e.clone()))?;
+            return Ok(CryptoOutcome::Denied(e));
         };
+        // Production admits a new crypto effect with room for its result.
+        self.admit(ordinal, kind, kronik_sched::record_budget::SMALL_NEED)?;
         // Copy the mode: the grant reference does not outlive the match below.
         let in_forks = grant.in_forks;
         let data_hash = blake3::hash(&data).as_bytes().to_vec();
@@ -2552,34 +2933,44 @@ impl ReplayGate {
             } else {
                 CryptoOutcome::Unsupported(rec.error.clone())
             };
-            self.push(rec);
-            return out;
+            self.push(rec)?;
+            return Ok(out);
         }
-        // Unmatched. A linked name is denied. A recorded grant does not
-        // compute. Compute signs on the host; the key never leaves it.
+        // Unmatched. A recorded grant does not compute. Compute signs on the
+        // host with the built-in store's value, or with the value held for
+        // the fork point's link of a linked name; the key never leaves it.
         let store = self.runner.setup.secrets.as_deref();
-        let v = match unmatched_key(self.config(), store.map(|s| s as &dyn KeyStore), &secret) {
+        let held = self.runner.setup.held_secrets.as_deref();
+        let v = match unmatched_key(
+            self.config(),
+            store.map(|s| s as &dyn KeyStore),
+            held,
+            &secret,
+        ) {
             UnmatchedKey::Value(v) => v,
             UnmatchedKey::Missing => {
-                self.push(self.synthetic(ordinal, kind, cap, fp, None));
-                return CryptoOutcome::Denied(NO_RECORDING.into());
+                self.push(self.synthetic(ordinal, kind, cap, fp, None))?;
+                return Ok(CryptoOutcome::Denied(NO_RECORDING.into()));
             }
             // Denied in the fork, and marked unverifiable like the other
-            // effects it cannot answer: with the cause as the guest's error.
-            UnmatchedKey::Linked => {
+            // effects it cannot answer: with the cause as the guest's error
+            // when the grant would have computed.
+            UnmatchedKey::Unheld => {
                 let mut record = self.synthetic(ordinal, kind, cap, fp, None);
-                record.error = linked_secret_denial(&secret);
+                if in_forks != kronik_effects::InForks::Recorded {
+                    record.error = linked_secret_denial(&secret);
+                }
                 let denied = CryptoOutcome::Denied(record.error.clone());
-                self.push(record);
-                return denied;
+                self.push(record)?;
+                return Ok(denied);
             }
         };
         // A recorded grant returns a matching recording or denies the call.
         // It does not compute, so the production key is not used.
         if in_forks == kronik_effects::InForks::Recorded {
             drop(v);
-            self.push(self.synthetic(ordinal, kind, cap, fp, None));
-            return CryptoOutcome::Denied(NO_RECORDING.into());
+            self.push(self.synthetic(ordinal, kind, cap, fp, None))?;
+            return Ok(CryptoOutcome::Denied(NO_RECORDING.into()));
         }
         tracing::info!(
             algorithm = alg,
@@ -2616,18 +3007,20 @@ impl ReplayGate {
                 CryptoOutcome::Unsupported(e)
             }
         };
-        self.push(rec);
-        out
+        self.push(rec)?;
+        Ok(out)
     }
 
-    fn reveal(&self, ordinal: u32, name: String) -> Result<String, String> {
+    fn reveal(&self, ordinal: u32, name: String) -> Result<Result<String, String>, GateError> {
         let kind = "secret.reveal";
         let cap = format!("secret-reveal:{name}");
         if self.config().grant(&self.actor.kind, &cap).is_none() {
             let e = format!("CAPABILITY_NOT_GRANTED: {cap}");
-            self.push(self.denied(ordinal, kind, cap, e.clone()));
-            return Err(e);
+            self.push(self.denied(ordinal, kind, cap, e.clone()))?;
+            return Ok(Err(e));
         }
+        // Production admits a new reveal with room for its result.
+        self.admit(ordinal, kind, kronik_sched::record_budget::SMALL_NEED)?;
         let fp = blake3::hash(format!("reveal\0{name}").as_bytes())
             .as_bytes()
             .to_vec();
@@ -2639,8 +3032,8 @@ impl ReplayGate {
             let mut rec = recorded.clone();
             rec.grounding = pb::Grounding::Exact as i32;
             let error = rec.error.clone();
-            self.push(rec);
-            return Err(error);
+            self.push(rec)?;
+            return Ok(Err(error));
         }
         // A fork never gets a secret's value (brief, effect table): reveal
         // answers the placeholder that production's records hold in place
@@ -2666,8 +3059,8 @@ impl ReplayGate {
                 kronik_effects::simulator::label::PLACEHOLDER.into()
             },
             ..Default::default()
-        });
-        Ok(format!("[secret:{name}]"))
+        })?;
+        Ok(Ok(format!("[secret:{name}]")))
     }
 }
 
@@ -2700,7 +3093,7 @@ impl EffectGate for GateHandle {
         data: Vec<u8>,
     ) -> BoxFuture<'static, Result<CryptoOutcome, GateError>> {
         let g = self.0.clone();
-        Box::pin(async move { Ok(g.crypto(ordinal, algorithm, secret, data)) })
+        Box::pin(async move { g.crypto(ordinal, algorithm, secret, data) })
     }
 
     fn reveal(
@@ -2709,7 +3102,7 @@ impl EffectGate for GateHandle {
         name: String,
     ) -> BoxFuture<'static, Result<Result<String, String>, GateError>> {
         let g = self.0.clone();
-        Box::pin(async move { Ok(g.reveal(ordinal, name)) })
+        Box::pin(async move { g.reveal(ordinal, name) })
     }
 }
 
@@ -2722,7 +3115,22 @@ fn root_pending(r: &RootInput) -> Pending {
         subject: r.subject.clone(),
         sql: false,
         personal: false,
+        unverified: false,
     }
+}
+
+/// Whether a fork turn received the input production's counterpart did. A
+/// timer input names the turn that scheduled it, the fork's own turn id in a
+/// fork, so that name is not compared.
+fn same_input(prod: Option<&pb::Input>, fork: &pb::Input) -> bool {
+    let plain = |i: &pb::Input| {
+        let mut i = i.clone();
+        if let Some(pb::input::Kind::Timer(t)) = i.kind.as_mut() {
+            t.scheduled_by.clear();
+        }
+        i
+    };
+    prod.is_some_and(|p| plain(p) == plain(fork))
 }
 
 /// Fewest root inputs left in a range that a worker with none splits: a
@@ -2825,6 +3233,7 @@ impl Shares {
                 store.clone(),
                 format!("{}:r{}.", setup.fork, r.lsn),
                 true,
+                before,
             );
             runner.push(vec![r.lsn], root_pending(r));
             let res = runner.clone().drain(setup.dispatch.clone()).await;
@@ -2943,6 +3352,7 @@ impl Continuous {
             store.clone(),
             format!("{}:", setup.fork),
             false,
+            setup.index.fork_lsn,
         );
         runner.queue_pending(setup.index.fork_lsn)?;
         let fork_lsn = setup.index.fork_lsn;
@@ -2969,6 +3379,20 @@ impl Continuous {
                 if let Some(progress) = &self.setup.progress {
                     Progress::add(&progress.continuous_total, 1);
                 }
+            }
+            // Production's erasures in the window, at their places: the fork
+            // store deletes what production's did there (ADR 0109), so a
+            // later turn reads what production's read and the final states
+            // agree.
+            for (lsn, subject, key_version) in self
+                .setup
+                .index
+                .erasures
+                .iter()
+                .filter(|(l, _, _)| *l > self.replayed_to && *l <= self.setup.index.to_lsn)
+            {
+                lock(&self.runner.queue)
+                    .insert(vec![*lsn], Queued::Erasure(subject.clone(), *key_version));
             }
             self.runner
                 .clone()
@@ -2997,10 +3421,13 @@ impl Continuous {
             self.store.clone(),
             format!("{}:", setup.fork),
             false,
+            self.runner.base,
         );
         *lock(&runner.turns) = turns;
         *lock(&runner.queue) = queue;
         *lock(&runner.timers) = timers;
+        *lock(&runner.taint) = std::mem::take(&mut *lock(&self.runner.taint));
+        *lock(&runner.ran) = std::mem::take(&mut *lock(&self.runner.ran));
         runner.timer_seq.store(
             self.runner.timer_seq.load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -3088,6 +3515,7 @@ impl Continuous {
                     subject,
                     sql: false,
                     personal: false,
+                    unverified: false,
                 },
                 order,
                 dispatch.clone(),
@@ -3266,53 +3694,89 @@ mod linked_key_tests {
         }
     }
 
+    /// What this process holds for a link: `stripe`'s value, for the link
+    /// of generation 1 only, and it remembers what it was asked.
+    struct Held(Mutex<Vec<String>>);
+
+    impl HeldKeys for Held {
+        fn held_key(&self, name: &str, config: &Config) -> Option<kronik_privacy::SecretValue> {
+            self.0.lock().unwrap().push(name.to_owned());
+            (name == "stripe" && config.secret_link(name).is_some_and(|l| l.generation == 1)).then(
+                || kronik_privacy::SecretValue {
+                    meta: kronik_privacy::SecretMeta {
+                        name: name.into(),
+                        version: 7,
+                        version_hash: vec![1; 16],
+                        created_wall_ms: 0,
+                    },
+                    value: b"held-backend-value".to_vec(),
+                },
+            )
+        }
+    }
+
     /// The link in force in the configuration of the fork decides, before the
-    /// built-in store is asked: a linked name is refused whatever the store
-    /// holds, any other name is the store's, and the record that an unlink
-    /// leaves makes the name the store's again.
+    /// built-in store is asked: a linked name is the value held for that
+    /// link, or none (never the store's older value, and never a fetch); any
+    /// other name is the store's; the record that an unlink leaves makes the
+    /// name the store's again.
     #[test]
-    fn a_linked_name_is_refused_before_the_store_is_asked() {
+    fn a_linked_name_is_the_held_value_of_its_link_and_never_the_stores() {
         let keys = Keys(Mutex::new(Vec::new()));
+        let held = Held(Mutex::new(Vec::new()));
         let store = Some(&keys as &dyn KeyStore);
         let mut config = Config::default();
         assert!(matches!(
-            unmatched_key(&config, store, "stripe"),
-            UnmatchedKey::Value(_)
+            unmatched_key(&config, store, Some(&held), "stripe"),
+            UnmatchedKey::Value(v) if v.value == b"older-built-in-value"
         ));
         config.apply(&link("stripe", "bao", 1));
         keys.0.lock().unwrap().clear();
         assert!(matches!(
-            unmatched_key(&config, store, "stripe"),
-            UnmatchedKey::Linked
+            unmatched_key(&config, store, Some(&held), "stripe"),
+            UnmatchedKey::Value(v) if v.value == b"held-backend-value"
+        ));
+        // Nothing held (here: no cache, or another generation): denied.
+        assert!(matches!(
+            unmatched_key(&config, store, None, "stripe"),
+            UnmatchedKey::Unheld
+        ));
+        let mut relinked = config.clone();
+        relinked.apply(&link("stripe", "bao", 3));
+        assert!(matches!(
+            unmatched_key(&relinked, store, Some(&held), "stripe"),
+            UnmatchedKey::Unheld
         ));
         assert!(keys.0.lock().unwrap().is_empty(), "the store was asked");
         assert!(matches!(
-            unmatched_key(&config, store, "plain"),
-            UnmatchedKey::Value(_)
+            unmatched_key(&config, store, Some(&held), "plain"),
+            UnmatchedKey::Value(v) if v.value == b"older-built-in-value"
         ));
         assert!(matches!(
-            unmatched_key(&config, store, "missing"),
+            unmatched_key(&config, store, Some(&held), "missing"),
             UnmatchedKey::Missing
         ));
         config.apply(&link("stripe", "", 2));
         assert!(matches!(
-            unmatched_key(&config, store, "stripe"),
-            UnmatchedKey::Value(_)
+            unmatched_key(&config, store, Some(&held), "stripe"),
+            UnmatchedKey::Value(v) if v.value == b"older-built-in-value"
         ));
     }
 
     /// A fork without a store (a preview) computes nothing, as before: also
-    /// for a linked name, which it does not even say is linked.
+    /// for a linked name whose value is held.
     #[test]
     fn a_fork_without_a_store_computes_nothing_linked_or_not() {
+        let held = Held(Mutex::new(Vec::new()));
         let mut config = Config::default();
         config.apply(&link("stripe", "bao", 1));
         for name in ["stripe", "plain"] {
             assert!(matches!(
-                unmatched_key(&config, None, name),
+                unmatched_key(&config, None, Some(&held), name),
                 UnmatchedKey::Missing
             ));
         }
+        assert!(held.0.lock().unwrap().is_empty());
     }
 
     /// What the guest of the fork reads when it is refused: the code and the
@@ -3321,7 +3785,7 @@ mod linked_key_tests {
     fn the_refusal_names_the_code_and_the_secret() {
         let text = linked_secret_denial("stripe");
         assert!(
-            text.starts_with("SECRET_EXTERNAL: stripe is linked"),
+            text.starts_with("SECRET_UNAVAILABLE: stripe is linked"),
             "{text}"
         );
     }

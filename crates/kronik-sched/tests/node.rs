@@ -590,3 +590,31 @@ fn below_the_disk_reserve_new_work_waits_and_the_node_stays_up() {
     }))
     .unwrap();
 }
+
+/// An invalid `[secrets]` setting stops the start with a code from the
+/// catalog, which `kronik explain` resolves.
+#[test]
+fn an_invalid_secrets_setting_names_a_catalog_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let shown = rt.block_on(async {
+        let env = Env::real(tokio::runtime::Handle::current());
+        let mut config = NodeConfig::default();
+        config.secret_settings.refresh = Duration::ZERO;
+        let Err(error) = start_local(env, dir.path(), config).await else {
+            panic!("a node started with [secrets] refresh = 0");
+        };
+        error.to_string()
+    });
+    let (code, message) = shown.split_once(": ").unwrap();
+    assert_eq!(
+        ErrorCode::parse(code),
+        Some(ErrorCode::BadRequest),
+        "{shown}"
+    );
+    assert!(message.contains("refresh"), "{shown}");
+}

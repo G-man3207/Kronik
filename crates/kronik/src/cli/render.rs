@@ -1095,6 +1095,7 @@ pub fn secret_history(r: &SecretHistoryResponse) -> String {
 }
 
 pub fn secret_backends(r: &SecretBackendsResponse) -> String {
+    let when = |ms: Option<u64>| ms.map_or_else(|| "-".to_owned(), crate::cli::units::utc);
     let rows = r
         .backends
         .iter()
@@ -1105,6 +1106,16 @@ pub fn secret_backends(r: &SecretBackendsResponse) -> String {
                 backend.binding.clone(),
                 backend.configured.to_string(),
                 backend.inventory_complete.to_string(),
+                when(backend.last_success_ms),
+                match (&backend.last_error, backend.last_error_ms) {
+                    (Some(error), at) => format!("{error} {}", when(at)),
+                    _ => "-".to_owned(),
+                },
+                if backend.uncached.is_empty() {
+                    "-".to_owned()
+                } else {
+                    backend.uncached.join(",")
+                },
             ]
         })
         .collect();
@@ -1115,6 +1126,9 @@ pub fn secret_backends(r: &SecretBackendsResponse) -> String {
             "BINDING",
             "CONFIGURED",
             "INVENTORY COMPLETE",
+            "LAST SUCCESS",
+            "LAST ERROR",
+            "UNCACHED",
         ],
         rows,
     );

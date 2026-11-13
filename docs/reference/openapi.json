@@ -2448,7 +2448,7 @@
             "description": "Fork effects answered by a similar recording (same target, different request)."
           },
           "changed": {
-            "description": "Any difference in the diff that a replay verified: not a difference of a turn that read a pseudonym or an erased value, which cannot be verified as a change (S-16, ADR 0109). The policy floor still reads `pii_masked + pii_unverified` (ADR 0031).",
+            "description": "Any difference in the diff that a replay verified: not a difference of a turn that read a pseudonym or met erased data, nor of a production turn missing below one, which cannot be verified as a change (S-16, ADR 0109). The policy floor still reads `pii_masked + pii_unverified` (ADR 0031).",
             "type": "boolean"
           },
           "confidence": {
@@ -2481,7 +2481,7 @@
           },
           "pii_masked": {
             "$ref": "#/components/schemas/DiffCount",
-            "description": "In a fork without personal data: differing turns that read pseudonyms instead of personal data, and production turns missing below them. They are not verified: not counted as divergent, errors or causes (M8), and the policy needs at least an approval while pii_masked + pii_unverified is above 0 (pii-masked-needs-approval, ADR 0031). Always written (0 when none); diffs written before v0.1 lack it when 0."
+            "description": "Differing turns that read pseudonyms instead of personal data (a fork without personal data) or met erased data, and production turns missing below them. They are not verified: not counted as divergent, errors or causes (M8, ADR 0109), and the policy needs at least an approval while pii_masked + pii_unverified is above 0 (pii-masked-needs-approval, ADR 0031). Always written (0 when none); diffs written before v0.1 lack it when 0."
           },
           "pii_unverified": {
             "$ref": "#/components/schemas/DiffCount",
@@ -2520,7 +2520,7 @@
           },
           "unverifiable": {
             "$ref": "#/components/schemas/DiffCount",
-            "description": "Turns whose recorded input was erased (S-16, ADR 0109): the replay served their effects from the recording, so their behaviour was not verified against the erased values and their differences are not changes. Any other difference of the same causal trees - including one in a turn that also met an erased value - still counts; a real divergence next to an unverifiable turn keeps `changed` true. Always written (0 when none); diffs and upgrade reports written before v0.5.0 lack it when 0."
+            "description": "Turns that met erased data, differing or not, each causal key once (S-16, ADR 0109): their recorded input or a state value they read was erased, or erased data shaped what they ran on (a message, call or timer of such a turn that production did not send the same way, state such a turn or a production turn missing below one left different, an actor database lacking an erased subject's rows that production still had, an unverifiable callee); and production turns missing below such a turn. The replay served their effects from the recording, so their behaviour was not verified and their differences are not changes. Every other difference still counts; a real divergence next to an unverifiable turn keeps `changed` true. Always written (0 when none); diffs and upgrade reports written before v0.5.0 lack it when 0."
           },
           "verified_through_lsn": {
             "$ref": "#/components/schemas/DiffCount",
@@ -2907,6 +2907,7 @@
                   "TOKEN_NOT_FOUND",
                   "TURN_FAILED",
                   "TURN_NOT_FOUND",
+                  "TURN_TOO_LARGE",
                   "UNAUTHENTICATED",
                   "UNAVAILABLE",
                   "VERIFY_REQUIRED",
@@ -5355,7 +5356,7 @@
           },
           "pending_erasures": {
             "default": 0,
-            "description": "Erasures that still have a plain value in the log (§6.5). The count\nnames no subject.",
+            "description": "Erasures whose subject still has a plain value in the log or in\n`state.db` (§6.5, §8: a state value, a queued timer or message body,\na saved response, a dead letter, an open turn's effect). The count\nnames no subject.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
@@ -6318,6 +6319,38 @@
           },
           "kind": {
             "type": "string"
+          },
+          "last_error": {
+            "description": "How it failed: `unavailable`, `denied`, `not_found`, `version_gone`\nor `invalid`. Never a provider's words.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error_ms": {
+            "description": "When a request of this node to the backend last failed (wall clock,\nms). Absent when none has.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_success_ms": {
+            "description": "When this node last got an answer from the backend (wall clock, ms).\nAbsent before its first answer, and for `file`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "uncached": {
+            "description": "Names linked to the backend that have no value an effect could use\nnow: the next effect that needs one asks the backend, and fails with\nSECRET_UNAVAILABLE while it does not answer.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -9563,7 +9596,7 @@
             "browserSession": []
           }
         ],
-        "summary": "The audit lines of main's log (kronik.audit/v2), as an audit sink receives them",
+        "summary": "The audit lines of main's log (kronik.audit/v3), as an audit sink receives them",
         "x-kronik-scope": "admin"
       }
     },

@@ -52,10 +52,12 @@ enum Status {
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct Check {
-    /// Stable check names, including userns/uid_view/subid/pin/delegate with
-    /// `--rootless`, service_identity when a root invocation requests it, and
-    /// microvm where a microVM tool bundle is installed and the root service
-    /// runs.
+    /// Stable: config, kernel, runsc, kvm, cgroup, root, runc, netns,
+    /// run_dir, caps, sandbox, disk, clock, tls, dns01_hook, wildcard, ship,
+    /// export, key_source, secrets; with `--rootless` also userns, uid_view,
+    /// subid, pin and delegate, and service_identity when a root invocation
+    /// becomes the service user; microvm where a microVM tool bundle is
+    /// installed and the root service runs.
     name: &'static str,
     status: Status,
     /// An error code from the catalog. Set on every failure, and on a
@@ -267,6 +269,7 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
     checks.push(ship(&config));
     checks.push(export(&config));
     checks.push(key_before_drop.unwrap_or_else(|| key_source(&config)));
+    checks.push(secrets(&config));
     let count = |s| checks.iter().filter(|c| c.status == s).count();
     let report = Report {
         pass: count(Status::Pass),
@@ -1532,6 +1535,128 @@ fn key_source_checked(config: &Config, scope: KeyCheck) -> Check {
     }
 }
 
+/// The external secret backends of a running daemon (m23 §6): its `GET
+/// /v1/secrets/backends` on the configured API socket. Each backend's last
+/// answer, and the linked names an effect would have to fetch.
+fn secrets(config: &Config) -> Check {
+    let socket = &config.server.api_socket;
+    let token = match crate::cli::client_token_from(None) {
+        Ok(token) => token,
+        Err(_) => {
+            return check("secrets", Status::Warn, "cannot load the API token")
+                .hint("check KRONIK_TOKEN and its token file");
+        }
+    };
+    let endpoint = crate::cli::http::Endpoint::Unix(socket.clone());
+    match crate::cli::http::request(
+        &endpoint,
+        "GET",
+        "/v1/secrets/backends",
+        None,
+        token.as_deref(),
+        None,
+        Duration::from_secs(5),
+    ) {
+        Ok(r) if r.status == 200 => {
+            match serde_json::from_slice::<kronik_api::types::SecretBackendsResponse>(&r.body) {
+                Ok(s) => secret_backends(&s.backends, now_ms()),
+                Err(_) => check(
+                    "secrets",
+                    Status::Warn,
+                    "the API returned an invalid list of secret backends",
+                )
+                .hint("check the selected API socket and daemon version"),
+            }
+        }
+        Ok(r) => check(
+            "secrets",
+            Status::Warn,
+            format!("cannot read the secret backends: HTTP {}", r.status),
+        )
+        .hint("set KRONIK_TOKEN to a token with the read scope"),
+        Err(crate::cli::http::Failure::Connect(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            check(
+                "secrets",
+                Status::Pass,
+                format!(
+                    "no daemon on {}: the secret backends are not checked",
+                    socket.display()
+                ),
+            )
+        }
+        Err(_) => check(
+            "secrets",
+            Status::Warn,
+            "cannot reach the API socket: the secret backends are not checked",
+        )
+        .hint("check the API socket and the daemon"),
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Warns for each external backend whose last request failed (it has not
+/// answered since), and for each linked name without a value an effect could
+/// use: while its backend does not answer, an effect that needs it fails
+/// with SECRET_UNAVAILABLE.
+fn secret_backends(backends: &[kronik_api::types::SecretBackendView], now: u64) -> Check {
+    let external: Vec<_> = backends.iter().filter(|b| b.kind != "file").collect();
+    if external.is_empty() {
+        return check(
+            "secrets",
+            Status::Pass,
+            "no external secret backend is configured",
+        );
+    }
+    let ago = |at: u64| crate::cli::units::duration(now.saturating_sub(at) / 1000 * 1000);
+    let mut warnings = Vec::new();
+    for b in &external {
+        if let (Some(error), Some(at)) = (&b.last_error, b.last_error_ms)
+            && b.last_success_ms.is_none_or(|ok| ok < at)
+        {
+            let since = b.last_success_ms.map_or_else(
+                || "it has not answered since the daemon started".to_owned(),
+                |ok| format!("its last answer was {} ago", ago(ok)),
+            );
+            warnings.push(format!(
+                "{}: the last request failed ({error}) {} ago; {since}",
+                b.id,
+                ago(at)
+            ));
+        }
+        if !b.uncached.is_empty() {
+            warnings.push(format!(
+                "{}: no cached value of {}",
+                b.id,
+                b.uncached.join(", ")
+            ));
+        }
+    }
+    if warnings.is_empty() {
+        let answered = external
+            .iter()
+            .filter(|b| b.last_success_ms.is_some())
+            .count();
+        return check(
+            "secrets",
+            Status::Pass,
+            format!(
+                "{} external backends, {answered} answered; every linked name has a cached value",
+                external.len()
+            ),
+        );
+    }
+    check("secrets", Status::Warn, warnings.join("; "))
+        .code(ErrorCode::SecretUnavailable.as_str())
+        .hint(
+            "check the backend and this node's credentials for it; `kronik secret backends` shows each backend's last answer, and the log's `secret fetch failed` lines say why",
+        )
+}
+
 /// Warns when a stream with lag has not delivered for 10 × its interval,
 /// and when the audit export has held retention for longer than
 /// `[retention] history` (the hold's age is the time since its last
@@ -1941,6 +2066,59 @@ mod tests {
             caps_subject(Some((1, "Name:\tkronik\n"))),
             CapsSubject::Process
         );
+    }
+
+    #[test]
+    fn a_failing_backend_and_an_uncached_name_warn() {
+        use kronik_api::types::SecretBackendView;
+        let view = |id: &str, kind: &str| SecretBackendView {
+            id: id.into(),
+            kind: kind.into(),
+            binding: "b".into(),
+            configured: true,
+            inventory_complete: true,
+            last_success_ms: None,
+            last_error_ms: None,
+            last_error: None,
+            uncached: Vec::new(),
+        };
+        let now = 10_000_000;
+        let c = secret_backends(&[view("file", "file")], now);
+        assert_eq!((c.status, c.code), (Status::Pass, None));
+        let mut bao = view("bao", "openbao");
+        bao.last_success_ms = Some(now - 60_000);
+        let c = secret_backends(&[view("file", "file"), bao.clone()], now);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        // An error after the last success, and a name with no cached value.
+        bao.last_error_ms = Some(now - 5_000);
+        bao.last_error = Some("unavailable".into());
+        bao.uncached = vec!["stripe".into()];
+        let c = secret_backends(&[bao.clone()], now);
+        assert_eq!(
+            (c.status, c.code),
+            (Status::Warn, Some("SECRET_UNAVAILABLE"))
+        );
+        assert!(
+            c.message
+                .contains("bao: the last request failed (unavailable) 5s ago"),
+            "{}",
+            c.message
+        );
+        assert!(
+            c.message.contains("its last answer was 1m ago"),
+            "{}",
+            c.message
+        );
+        assert!(
+            c.message.contains("no cached value of stripe"),
+            "{}",
+            c.message
+        );
+        assert!(c.hint.is_some());
+        // An error that a later answer superseded is history.
+        bao.last_success_ms = Some(now - 1_000);
+        bao.uncached.clear();
+        assert_eq!(secret_backends(&[bao], now).status, Status::Pass);
     }
 
     #[test]

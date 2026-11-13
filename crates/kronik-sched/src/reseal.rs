@@ -1,7 +1,8 @@
 //! Reseal via compaction (docs/design/m8-privacy.md §8): rewrite closed
 //! segments so tagged plain values are sealed and erased subjects become
 //! tombstones, then fix offsets and the state.db rows those records still
-//! own (`kv`, saved responses, dead letters).
+//! own (`kv`, queued timer and message bodies, saved responses, dead
+//! letters).
 
 use kronik_core::authority::AuthLease;
 use std::collections::{BTreeSet, HashMap};
@@ -400,7 +401,9 @@ impl Node {
             let path = log_dir.join(kronik_log::segment_name(start));
             let mut counts = (0u64, 0u64);
             // The changed turns: fix_reseal rewrites the state.db rows
-            // they still own (kv, saved responses, dead letters).
+            // they still own (kv, queued timer and message bodies, saved
+            // responses, dead letters), so nothing a turn left queued
+            // reaches a guest plain after its subject's erasure (#31).
             let mut turns: Vec<(Lsn, pb::TurnRecord)> = Vec::new();
             let rewritten = kronik_log::rewrite_segment(&path, |lsn, record| {
                 reseal_record(self.sealer(), record, &erased, &fill, wall).map(|(s, t)| {

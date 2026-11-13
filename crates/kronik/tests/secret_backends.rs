@@ -2169,19 +2169,19 @@ fn fork_hmac(d: &Daemon, fork: &str, secret: &str) -> (u16, Value) {
 }
 
 /// An unmatched `crypto.*` of a fork (a turn that has no recording to answer
-/// from) computes with the built-in store's value of a name, and that store
-/// holds an older value of a name that was linked later (here VALUE_1; the
-/// backend serves VALUE_2) or none. So the link in force at the fork point
-/// decides: a fork from after the link refuses the name (`SECRET_EXTERNAL`,
-/// graded synthetic, no backend request, nothing in the daemon's log), a fork
-/// from before the link or from after the unlink computes with the built-in
-/// value as it always did, and a name that was never linked is unaffected.
+/// from) under a `compute` grant computes on the host. For a name linked at
+/// the fork point it uses the value this process holds for that link (here
+/// VALUE_2, the backend's), never the built-in store's older value (VALUE_1)
+/// and never a fetch; when the process holds none (after a restart) the
+/// effect is denied with SECRET_UNAVAILABLE and graded synthetic. A fork from
+/// before the link or from after the unlink computes with the built-in value
+/// as it always did, and a name that was never linked is unaffected.
 #[test]
-fn a_fork_refuses_the_built_in_value_of_a_name_that_is_linked_at_its_fork_point() {
+fn a_fork_computes_a_linked_name_with_the_value_held_for_its_link_and_never_fetches() {
     let bao = Bao::start();
     assert_eq!(bao.put("payments", "stripe", VALUE_2), 1);
     let dir = tempfile::tempdir().unwrap();
-    let d = Daemon::start(dir.path(), Some(&bao), "2s");
+    let mut d = Daemon::start(dir.path(), Some(&bao), "2s");
     d.deploy("counter.wasm");
     for name in ["stripe", "plain"] {
         // compute: this test is the link decision, not the recorded default.
@@ -2199,6 +2199,12 @@ fn a_fork_refuses_the_built_in_value_of_a_name_that_is_linked_at_its_fork_point(
     }
     let before_link = d.applied_lsn();
     d.link("stripe", "secret/payments#stripe");
+    // A turn of main uses the linked value: the process holds it now.
+    let used = d.send("counter/h", "hmac", "stripe\npayload");
+    assert_eq!(
+        used["reply"]["text"],
+        hmac_hex(VALUE_2.as_bytes(), b"payload")
+    );
     let linked_at = d.applied_lsn();
     d.mutate(
         "DELETE",
@@ -2211,7 +2217,7 @@ fn a_fork_refuses_the_built_in_value_of_a_name_that_is_linked_at_its_fork_point(
     // before the count that the forks are measured against is taken.
     d.quiet(&bao);
     let requests = bao.requests();
-    let fork_at = |lsn: u64| {
+    let fork_at = |d: &Daemon, lsn: u64| {
         d.mutate(
             "POST",
             "/v1/forks",
@@ -2222,25 +2228,23 @@ fn a_fork_refuses_the_built_in_value_of_a_name_that_is_linked_at_its_fork_point(
             .to_owned()
     };
     let (before, linked, unlinked) = (
-        fork_at(before_link),
-        fork_at(linked_at),
-        fork_at(unlinked_at),
+        fork_at(&d, before_link),
+        fork_at(&d, linked_at),
+        fork_at(&d, unlinked_at),
     );
-    let computed = hmac_hex(VALUE_1.as_bytes(), b"payload");
+    let built_in = hmac_hex(VALUE_1.as_bytes(), b"payload");
+    let backend = hmac_hex(VALUE_2.as_bytes(), b"payload");
 
-    // After the link: refused; the other name is computed.
+    // After the link: the held value of the link; the other name is the
+    // built-in store's.
     let (status, answer) = fork_hmac(&d, &linked, "stripe");
     println!("linked fork, stripe: {status} {answer}");
     assert_eq!(status, 200, "{answer}");
-    let text = answer.to_string();
-    assert!(text.contains("SECRET_EXTERNAL: stripe is linked"), "{text}");
-    assert!(text.contains("synthetic"), "{text}");
-    for value in [&computed, &hmac_hex(VALUE_2.as_bytes(), b"payload")] {
-        assert!(!text.contains(value.as_str()), "{text}");
-    }
+    assert!(answer.to_string().contains(&backend), "{answer}");
+    assert!(!answer.to_string().contains(&built_in), "{answer}");
     let (status, answer) = fork_hmac(&d, &linked, "plain");
     assert_eq!(status, 200, "{answer}");
-    assert!(answer.to_string().contains(&computed), "{answer}");
+    assert!(answer.to_string().contains(&built_in), "{answer}");
 
     // Before the link and after the unlink: the built-in store's, as before.
     for (fork, when) in [
@@ -2252,32 +2256,52 @@ fn a_fork_refuses_the_built_in_value_of_a_name_that_is_linked_at_its_fork_point(
             println!("{when}, {name}: {status} {answer}");
             assert_eq!(status, 200, "{when}, {name}: {answer}");
             assert!(
-                answer.to_string().contains(&computed),
+                answer.to_string().contains(&built_in),
                 "{when}, {name}: {answer}"
             );
-            assert!(!answer.to_string().contains("SECRET_EXTERNAL"), "{answer}");
+            assert!(!answer.to_string().contains("SECRET_"), "{answer}");
         }
     }
-
-    // A fork never fetches, and the refusal is not logged by the daemon.
     assert_eq!(bao.requests(), requests, "a fork asked the backend");
+
+    // A restarted process holds no value of the old link (main no longer
+    // links the name, so nothing fetches it): denied, and graded synthetic.
+    d.kill9();
+    d = Daemon::start(dir.path(), Some(&bao), "2s");
+    d.settle();
+    d.quiet(&bao);
+    let requests = bao.requests();
+    let linked = fork_at(&d, linked_at);
+    let (status, answer) = fork_hmac(&d, &linked, "stripe");
+    println!("linked fork after a restart, stripe: {status} {answer}");
+    assert_eq!(status, 200, "{answer}");
+    let text = answer.to_string();
     assert!(
-        !d.serve_log().contains("SECRET_EXTERNAL"),
-        "{}",
-        d.serve_log()
+        text.contains("SECRET_UNAVAILABLE: stripe is linked"),
+        "{text}"
     );
+    assert!(text.contains("synthetic"), "{text}");
+    for value in [&built_in, &backend] {
+        assert!(!text.contains(value.as_str()), "{text}");
+    }
+    let (status, answer) = fork_hmac(&d, &linked, "plain");
+    assert_eq!(status, 200, "{answer}");
+    assert!(answer.to_string().contains(&built_in), "{answer}");
+    assert_eq!(bao.requests(), requests, "a fork asked the backend");
     assert_closed_when_quiet(&d, "a fork and a linked name");
 }
 
-/// A foreign actor reads the built-in store only, which holds an older value
-/// of a name that was linked later (or none): `foreign add --secret` refuses
-/// a linked name with `SECRET_EXTERNAL`, before the image is looked at, and
-/// any other name goes on to the image as it always did. An unlink makes the
-/// name the built-in store's again. (The start of an actor declared before the
-/// link needs a sandbox; the tests of `kronik-foreign` and of the node's link
-/// view cover it, and the foreign tests of this crate need root and runsc.)
+/// A foreign actor gets its secrets through the node's resolver, as the
+/// effects of turns do (m23 section 6): `foreign add --secret` checks a
+/// linked name through the cache (or its backend) and goes on to the image
+/// (which does not exist here), and so does a name in the built-in store.
+/// With the backend down and nothing cached, a linked name cannot be had:
+/// SECRET_UNAVAILABLE, and no value of the built-in store instead. An unlink
+/// makes the name the built-in store's again. (Starting an actor needs a
+/// sandbox; the tests of `kronik-foreign` and of the node's resolver cover the
+/// start, and the foreign tests of this crate need root and runsc.)
 #[test]
-fn a_foreign_actor_cannot_be_given_a_name_that_is_linked() {
+fn a_foreign_actor_gets_a_linked_name_through_the_resolver() {
     let bao = Bao::start();
     assert_eq!(bao.put("payments", "stripe", VALUE_2), 1);
     let dir = tempfile::tempdir().unwrap();
@@ -2290,7 +2314,7 @@ fn a_foreign_actor_cannot_be_given_a_name_that_is_linked() {
         dir.path().join("foreign-run"),
         runsc
     );
-    let d = Daemon::start_with(dir.path(), Some(&bao), "2s", &extra);
+    let mut d = Daemon::start_with(dir.path(), Some(&bao), "2s", &extra);
     for name in ["stripe", "plain"] {
         d.mutate(
             "PUT",
@@ -2299,11 +2323,7 @@ fn a_foreign_actor_cannot_be_given_a_name_that_is_linked() {
         );
     }
     d.link("stripe", "secret/payments#stripe");
-    // The link rebuilt the inventory in the background; let its fetch land
-    // before the count that the adds are measured against is taken.
-    d.quiet(&bao);
-    let requests = bao.requests();
-    let add = |secret: &str| {
+    let add = |d: &Daemon, secret: &str| {
         d.api(
             "POST",
             "/v1/foreign",
@@ -2312,51 +2332,48 @@ fn a_foreign_actor_cannot_be_given_a_name_that_is_linked() {
                    "reason": "a linked name"}),
         )
     };
+    let past_the_secrets = |what: &str, (status, answer): (u16, Value)| {
+        println!("{what}: {status} {answer}");
+        let code = answer["error"]["code"].as_str().unwrap_or("");
+        assert!(
+            !status.to_string().starts_with('2') && !code.starts_with("SECRET_"),
+            "{what}: {status} {answer}"
+        );
+        for value in [VALUE_1, VALUE_2] {
+            assert!(!answer.to_string().contains(value), "{what}: {answer}");
+        }
+    };
+    past_the_secrets("linked", add(&d, "stripe"));
+    past_the_secrets("built-in", add(&d, "plain"));
 
-    let (status, answer) = add("stripe");
-    println!("linked: {status} {answer}");
-    assert_eq!(status, 409, "{answer}");
-    assert_eq!(answer["error"]["code"], "SECRET_EXTERNAL", "{answer}");
-    assert!(answer.to_string().contains("stripe is linked"), "{answer}");
-    assert!(!answer.to_string().contains(VALUE_1), "{answer}");
-    assert_eq!(bao.requests(), requests, "the refusal asked the backend");
-
-    // Not linked: past the secrets, to the image that does not exist.
-    let (status, answer) = add("plain");
-    println!("not linked: {status} {answer}");
-    let code = answer["error"]["code"].as_str().unwrap_or("");
-    assert!(
-        !status.to_string().starts_with('2') && !code.starts_with("SECRET_"),
-        "{status} {answer}"
-    );
-    assert_eq!(
-        bao.requests(),
-        requests,
-        "the unresolvable name asked the backend"
-    );
+    // A restart with the backend down: nothing is cached.
+    d.kill9();
+    bao.set_mode(Mode::Unavailable);
+    d = Daemon::start_with(dir.path(), Some(&bao), "1s", &extra);
+    let (status, answer) = add(&d, "stripe");
+    println!("linked, backend down: {status} {answer}");
+    assert_eq!(status, 503, "{answer}");
+    assert_eq!(answer["error"]["code"], "SECRET_UNAVAILABLE", "{answer}");
+    for value in [VALUE_1, VALUE_2] {
+        assert!(!answer.to_string().contains(value), "{answer}");
+    }
+    past_the_secrets("built-in, backend down", add(&d, "plain"));
 
     // Unlinked again: the built-in store's name, as before.
+    bao.set_mode(Mode::Up);
+    std::thread::sleep(Duration::from_secs(6));
     d.mutate(
         "DELETE",
         "/v1/secrets/stripe/link",
         json!({"reason": "back to the built-in store"}),
     );
     d.settle();
-    // The unlink starts the same background rebuild, and `settle` is not a
-    // barrier for it: the name is built-in again, so the history read it makes
-    // no longer waits for external coverage.
     d.quiet(&bao);
     let requests = bao.requests();
-    let (status, answer) = add("stripe");
-    println!("unlinked: {status} {answer}");
-    let code = answer["error"]["code"].as_str().unwrap_or("");
-    assert!(!code.starts_with("SECRET_"), "{status} {answer}");
-
-    // Nothing was fetched from the backend, and the daemon did not log it.
-    assert_eq!(bao.requests(), requests, "an add asked the backend");
-    assert!(
-        !d.serve_log().contains("SECRET_EXTERNAL"),
-        "{}",
-        d.serve_log()
+    past_the_secrets("unlinked", add(&d, "stripe"));
+    assert_eq!(
+        bao.requests(),
+        requests,
+        "an unlinked name asked the backend"
     );
 }

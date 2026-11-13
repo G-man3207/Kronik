@@ -74,3 +74,14 @@ re-granted. A fork computation is visible in the daemon log and in
 Revisit this if the brief stops requiring host computation, or if a
 recorded denial needs a distinct stable code because guests cannot treat
 it as `replay: no recording`.
+
+## Amendment (0.5.0)
+
+The sentences above that keep a linked name at `SECRET_EXTERNAL` describe
+the stopgap this decision met. Since 0.5.0 an unmatched call of a name
+linked at the fork point follows the M23 design
+([§6](../design/m23-secret-backends.md#6-caching-outages-and-timeouts-b3-adr-0091)):
+under `compute` it uses the value the node already holds for that link and
+is denied with `SECRET_UNAVAILABLE` when it holds none; under `recorded` it
+is denied with `replay: no recording` as for a built-in name. A fork still
+never fetches (I7).

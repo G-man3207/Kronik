@@ -7,6 +7,7 @@
 //! Re-run a failing seed with `cargo test -p kronik-sim --release --test dst
 //! -- --seed N`.
 
+pub mod bao;
 pub mod exec;
 pub mod fs;
 pub mod scenario;

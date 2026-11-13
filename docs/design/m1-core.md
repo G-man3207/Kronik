@@ -11,7 +11,7 @@ formulas, the JSON API, and the guest SDK contract. The ADRs it relies on:
 | --- | --- |
 | `kronik-core` | `env` (`Clock`, `Spawner`, `EntropySource`, `Fs`/`File`, `Net`, `ProcessRunner`, `Env`, `JoinHandle`, `Env::{spawn, blocking, timeout, random_bytes}`); `env::real` behind feature `real` (tokio/std implementations, ADR 0004); `ids` (`ActorRef`, `Lsn`, `TurnId`, `ExecutionId`, `CodeHash`, `RootId`); `causal` (`CausalKey`, `causal_id()`, `message_id()`, `idempotency_key()`); `time` (`LogicalClock`, I15); `error` (`ErrorCode`, `ApiError`; content defined by the error catalog). |
 | `kronik-proto` | Generated prost types `kronik_proto::log::v1::*` from `proto/kronik/log/v1/*.proto` (built with `prost-build` + `protox`, no `protoc` needed); `Record` (enum over all record types) with `kind()`, `encode()`, `decode(kind, bytes)`; `validate()` that turns enum 0, unknown enum values and missing required oneofs into `Corrupt`. |
-| `kronik-log` | Segment format and envelope; `Log` (group-commit writer: `append(Record) -> Lsn` resolves after fsync; committed records are streamed in LSN order to the applier); `scan_dir()`/`LogReader` (read from an LSN); recovery (torn-tail truncation of the active segment, `STORAGE_CORRUPT` otherwise); segment rolling at 64 MiB or 60 s. |
+| `kronik-log` | Segment format and envelope; `Log` (group-commit writer: `append(Record) -> Lsn` resolves after fsync, and refuses a body over the record limit; committed records are streamed in LSN order to the applier); `scan_dir()`/`LogReader` (read from an LSN); recovery (torn-tail truncation of the active segment, never of an applied record; `STORAGE_CORRUPT` otherwise); segment rolling at 64 MiB or 60 s. |
 | `kronik-store` | `StateDb` (`state.db`, SQLite WAL) and the `Applier` (`apply(lsn, &Record)`, single writer, LSN order, `applied_lsn` + logical-time high-water mark in the same transaction); read queries for the API (actors, kv, history, dead letters, deployments, ingress keys); `sql::SqlActor` + `SqliteOpener` (`FileOpener`, `MemOpener`) + an LRU pool (ADR 0005). |
 | `kronik-runtime` | Engine configuration (ADR 0001), `CodeStore` (`code/<hex>.wasm` + `code/<hex>.<engine>.cwasm`), `check_imports()` (`IMPORT_NOT_ALLOWED`), `Program` (pre-linked component per hash), `describe()`, `run_turn(TurnRequest, &dyn TurnHostEnv) -> TurnOutput`, deterministic WASI, fuel and memory limits. |
 | `kronik-sched` | `Node`: actor activation and per-actor serialization, mailboxes, logical time, the turn pipeline (run → `TurnRecord` → durable → applied → deliver → respond), migrate turns, dead letters, startup recovery, `submit(RootInput) -> TurnResult`; `Probe` for DST observations. |
@@ -39,9 +39,11 @@ enforcement in CI.
 
 ### Segment
 
-- Header (28 bytes + branch): magic `KRNK`, `u32` format version (1),
+- Header (24 bytes + branch): magic `KRNK`, `u32` format version (1),
   `u64` start LSN, `u32` branch name length, branch name bytes, `u32`
-  crc32c of everything before it. All integers little endian.
+  crc32c of everything before it (the 20 bytes and the branch name). All
+  integers little endian. For the branch `main` the header is 28 bytes and
+  the first entry starts at offset 28.
 - Entries: `[u32 len][u32 crc32c][u64 lsn][u8 kind][protobuf]`. `len` is
   the protobuf length, and the crc covers `lsn`, `kind` and the protobuf.
   LSNs are strictly increasing by 1 across all record kinds and segments.
@@ -50,9 +52,71 @@ enforcement in CI.
   written then: a footer index from actor to offset (ADR 0011). Readers
   skip it, and a segment with no footer still reads.
 - Recovery: in the active (last) segment, everything from the first entry
-  that fails its length, CRC or LSN-continuity check is a torn tail and is
-  truncated (and fsynced). A failure in a closed segment, or an entry that
-  passes its CRC but does not decode or validate, is `STORAGE_CORRUPT`.
+  that is incomplete (its length runs past the end of the file) or fails its
+  CRC or LSN-continuity check is a torn tail and is truncated (and fsynced).
+  The start passes the state database's applied LSN to the log: an invalid
+  entry at or below it was fsynced and acknowledged before it was applied,
+  so it is `STORAGE_CORRUPT`, with nothing truncated. A failure in a closed
+  segment, or an entry that passes its CRC but does not decode or validate,
+  is `STORAGE_CORRUPT`. Its length alone never makes an entry torn: a
+  complete entry whose CRC holds is read, whatever its length (below).
+
+### Record size
+
+A writer appends a record body of at most `MAX_RECORD` (128 MiB). `Log`
+refuses a larger one (`LogError::TooLarge`): nothing is written, no LSN is
+used, and the writer goes on, so the node does not stop. This holds for
+every record kind, the `StateRebase` records a rollback by replay stages
+included; a segment rewrite (reseal) never makes a record that fit larger.
+
+Readers accept a larger entry when it is complete and its CRC holds:
+releases up to 0.4.1 could append one (a turn's record had no size check),
+and their logs must stay readable (I16). Before 0.5 every reader refused
+such an entry, `history` answered `STORAGE_CORRUPT`, and the start cut the
+acknowledged record off as a torn tail. A length field never makes a reader
+allocate more than the file holds.
+
+Everything a turn records goes into its one `TurnRecord`: its input, the
+request and result of every effect and `call`, its compensations, state
+writes, messages, timers, SQL changesets and schema changes, and its
+outcome. A turn is charged for all of it in one budget
+(`kronik_sched::record_budget`): the record limit less 4 KiB, which holds
+what differs between a run and its replay (the execution id, the engine
+version, the duration), the outcome of a failed record and a `StateRebase`
+wrapper. Every value counts 64 bytes more for sealing, sealed or not, so
+the decisions do not depend on the privacy mode, and the input counts in
+its plaintext form.
+
+- The effect gate charges each effect as it records it. A new effect whose
+  request and a result without a body (4 KiB) do not fit in what is left
+  does not happen, and the turn traps with `TURN_TOO_LARGE`. An HTTP
+  response is read up to what is left (and the kind's
+  `effect_response_bytes`): a larger one is `too-large` for the guest, as
+  one over `effect_response_bytes` is. A `call` reply larger than what is
+  left is withheld, as one over `effect_response_bytes` is
+  (`HOST_REDACTION_FAILURE`).
+- When the turn ends, a record over the budget (its writes, messages,
+  timers, SQL changes and output do not fit, or its output alone is more
+  than 128 MiB) becomes a failed turn with `TURN_TOO_LARGE` (a host trap):
+  its input, effects and compensations stay, its writes, messages, timers,
+  SQL changes and output go, its compensations are delivered and a message
+  becomes a dead letter. The gate kept the effects within the budget, which
+  starts with 512 bytes taken for the outcome of such a record, so that
+  failed record always fits and closes any `TurnBegin`; an HTTP client gets
+  `TURN_FAILED`, as for `FUEL_EXHAUSTED`.
+- An input whose record could hold nothing else is refused before its turn
+  runs (`PAYLOAD_TOO_LARGE`). With the default limits (1 MiB messages and
+  bodies) this does not happen.
+- A fork's replay charges the same budget at the same points, so it makes
+  production's decisions and an identity replay stays empty.
+- One turn thus writes at most about twice the record limit to the log: its
+  `EffectResult` records and its `TurnRecord`. Effects are not charged fuel;
+  a per-turn limit on effect bytes below that is not built.
+- Effects re-run from an earlier release's `EffectResult` records are
+  charged but never refused (they happened). Only they can make even the
+  failed record too large: then its effects keep their status and errors
+  without their requests and responses, which stay in the log's
+  `EffectResult` records.
 
 ### Record kinds (envelope `kind` byte)
 
@@ -76,9 +140,14 @@ enforcement in CI.
 | 16 | `StateRebase` | rollback --by-replay: rebased turns, the switch (M13) |
 | 17 | `GuardTriggered` | a `kronik watch` guard that fired (M11) |
 | 40 | `AuditEvent` | mutations outside the log, after they succeeded; changes no state (M28) |
+| 45 | `SecretVersion` | every secret version before its first use: `secret set` and `secret delete` of the built-in store, and the versions of a linked backend that the refresher, `secret refresh` or an effect sees (M23, ADR 0090) |
+| 46 | `SecretLink` | `secret link`, `secret unlink` (M23, ADR 0090) |
 
-0 and any other value (15 and 16 are reserved) are `STORAGE_CORRUPT`, except kind 255, the footer readers skip. The messages are in
-`proto/kronik/log/v1/` (`common`, `input`, `turn`, `config`, `branch`).
+Kind 0 and every value not in the table are `STORAGE_CORRUPT`, except kind
+255, the footer readers skip. The messages are in `proto/kronik/log/v1/`:
+`common`, `input`, `turn`, `config` and `branch`; `effects` holds the
+requests and responses an effect record carries, and `control` the
+control-plane operations an `AuditEvent` carries.
 Decisions beyond the brief:
 
 - `TurnRecord` adds `config_epoch` (20), `memory_peak_bytes` (21) and
@@ -211,7 +280,8 @@ M1: `ROUTE_NOT_FOUND` (404), `GATEWAY_TIMEOUT` (504), `BAD_REQUEST` (400,
 malformed API input), `PAYLOAD_TOO_LARGE` (413, message or body over the
 limit), `DEAD_LETTER_NOT_FOUND` (404), `DEAD_LETTER_ALREADY_RESENT` (409),
 `TURN_NOT_FOUND` (404), `UNAVAILABLE` (503, daemon starting or shutting
-down), `INTERNAL` (500, a bug).
+down), `INTERNAL` (500, a bug). Added in 0.5: `TURN_TOO_LARGE` (500, a
+turn's record would not fit in one log record; §2 "Record size").
 
 ## 5. Guest SDK contract
 
@@ -276,7 +346,12 @@ draft still link). The WIT is frozen for v0.1 from here.
 - **Torn tail.** In the active segment everything from the first invalid
   entry is truncated (ADR 0004): a torn batch can leave valid but
   unacknowledged entries after an invalid one. The brief's "a broken entry in
-  the middle of a segment is `STORAGE_CORRUPT`" applies to closed segments.
+  the middle of a segment is `STORAGE_CORRUPT`" applies to closed segments,
+  and, since 0.5, to an entry at or below the applied LSN of the active
+  segment: a torn write can only hit the batch being written when the
+  process died, never a record that was fsynced and applied. Before 0.5 a
+  length over 128 MiB also counted as invalid, so the start truncated a
+  complete record an earlier append had written past that limit (#26).
 - **The code store** writes `code/` with `std::fs` (write, fsync, rename,
   fsync dir) rather than `Env::fs`; the simulator keeps code in memory, as a
   code directory that survives crashes.

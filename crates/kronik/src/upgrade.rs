@@ -62,8 +62,10 @@ struct UpgradeCheckOutput {
     checked_through_lsn: u64,
     root_inputs: u64,
     turns: u64,
-    /// Turns the identity replay could not verify: their recorded input was
-    /// erased (S-16, ADR 0109).
+    /// Turns the identity replay could not verify because they met erased
+    /// data: their recorded input, a state value they read, or an input or
+    /// state that erased data shaped, and production turns missing below one
+    /// (S-16, ADR 0109).
     #[serde(default)]
     unverifiable: u64,
     diff_hash: String,
@@ -76,7 +78,7 @@ struct UpgradeCheckOutput {
     /// Set when a diverging diff was written.
     #[serde(skip_serializing_if = "Option::is_none")]
     diff_path: Option<String>,
-    /// `ENGINE_UPGRADE_DIVERGED` when the diff is not empty.
+    /// `ENGINE_UPGRADE_DIVERGED` when a verified difference remains.
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<String>,
 }
@@ -338,8 +340,8 @@ fn state_note(plan: &kronik_sched::snapshots::StatePlan) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
-/// The report line for turns an identity replay could not verify because the
-/// input they ran on was erased (S-16, ADR 0109). None when there are none:
+/// The report line for turns an identity replay could not verify because they
+/// met erased data (S-16, ADR 0109). None when there are none:
 /// silence is the normal case, and the line names what the passing check did
 /// not verify.
 fn unverifiable_line(turns: u64) -> Option<String> {
@@ -361,14 +363,15 @@ fn diverge_error(v: &UpgradeCheckOutput, window: &str) -> ApiError {
     ApiError::new(
         ErrorCode::EngineUpgradeDiverged,
         format!(
-            "identity replay of the last {window} is not empty ({} root inputs, diff {})",
+            "identity replay of the last {window} has a verified difference ({} root inputs, \
+             diff {})",
             v.root_inputs, v.diff_hash
         ),
     )
     .with_hint(format!(
         "Keep the current binary.{where_} Report the diff with both engine versions. \
-         Erased requests are unverifiable, not divergent, as of v0.5.0 (the report \
-         counts them in `unverifiable`), so this diff records a real difference in \
+         Turns that met erased data are unverifiable, not divergent, as of v0.5.0 (the \
+         report counts them in `unverifiable`), so this diff records a real difference in \
          verified behaviour - or a recording that could not be read. The fork point \
          comes from the root inputs, not from snapshots."
     ))

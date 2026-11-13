@@ -92,13 +92,29 @@ The full list is in `CONTRIBUTING.md`. In short:
 ## Running CI locally
 
 ```sh
-scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, dst, deny, foreign, identity and action, as in CI
+scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, foreign, identity and action, as in CI
 scripts/ci.sh clippy test    # selected steps
 ```
 
 It needs rustup, which installs the toolchain pinned in `rust-toolchain.toml`,
-`cargo-deny`, and Node.js 22.20 or later with npm for the `ts` step. The `book`
-step downloads the pinned mdBook with `curl` on first use. The `foreign` step
-needs root and `runsc` and is skipped with a message otherwise; without
-libfaketime, `identity` skips `todo-ts` the same way. The `action` step skips
-its YAML checks without PyYAML, and actionlint when it is not installed.
+and `cargo-deny`. Some steps need more:
+
+- `test` needs the pinned Python runtime of the OIDC tests, prepared as
+  `CONTRIBUTING.md` describes, in `KRONIK_TEST_PYTHON`. The step checks it
+  first; the tests that need it fail without it, they do not skip.
+- `ts` needs Node.js 22.20 or later with npm and network access.
+- `sdks` installs the pinned Python and Go toolchains with
+  `scripts/install-sdk-tools.sh` on first use (Linux x86_64, `python3` with
+  pip, network access).
+- `book` downloads the pinned mdBook and `action` the pinned actionlint, both
+  checksum-verified; a failed download or check fails the step. `action` also
+  needs PyYAML and HTTPS access.
+- `foreign` needs root and gVisor's `runsc` (`scripts/install-runsc.sh`) and
+  is skipped with a message without them, unless
+  `KRONIK_FOREIGN_TESTS=require`. When it runs, it also needs Docker for the
+  pinned Postgres image, and skopeo for the registry test.
+- `identity` needs libfaketime for `todo-ts`, which it skips with a message
+  otherwise.
+
+`ts` uses the local port 47831, and `ts`, `sdks` and `identity` work in fixed
+directories under `/var/tmp`, so two runs of them on one machine collide.

@@ -558,6 +558,17 @@ Select an actual id from history and respect retention boundaries.
 kronik trace main:999999
 ```
 
+## TURN_TOO_LARGE
+
+Send a fixture actor an input whose turn records more than one log record holds
+(128 MiB): a reply, state writes or fetched responses that add up past it. Find
+the failed turn in its history and split the work over several turns; raising a
+size limit does not help, the record limit is fixed.
+
+```sh
+kronik history counter/a --limit 10
+```
+
 ## UNAUTHENTICATED
 
 Send a protected management request without a valid bearer over TCP, or with a

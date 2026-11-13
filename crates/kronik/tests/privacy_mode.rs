@@ -1358,6 +1358,21 @@ fn a_no_pii_identity_replay_is_pii_masked_not_an_error() {
     assert_eq!(diff["errors"]["introduced"], 0, "{}", diff["errors"]);
     let s = &diff["summary"];
     assert_eq!(s["pii_masked"], 4, "{s}");
+    // The pseudonym-failed turns are not changes either (issue #16, ADR
+    // 0109 point 4): neither their responses nor the state they did not
+    // write sets `changed`.
+    assert_eq!(s["changed"], false, "{s}");
+    assert_eq!(diff["responses"]["changed"], 0, "{}", diff["responses"]);
+    assert!(
+        diff["state"]["isolated"]
+            .as_array()
+            .is_some_and(|a| a.is_empty())
+            && diff["state"]["continuous"]
+                .as_array()
+                .is_some_and(|a| a.is_empty()),
+        "{}",
+        diff["state"]
+    );
     assert_eq!(
         (&s["origins"], &s["consequences"]),
         (&json!(0), &json!(0)),

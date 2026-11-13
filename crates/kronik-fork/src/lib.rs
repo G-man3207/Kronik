@@ -11,6 +11,7 @@ pub mod replay;
 pub mod sample;
 pub mod simulators;
 pub mod stubs;
+pub mod taint;
 pub mod upgrade;
 pub mod watch;
 

@@ -24,6 +24,7 @@ mod native_execution;
 mod node;
 mod privacy;
 mod rebase;
+pub mod record_budget;
 pub use rebase::rebase_turn_bytes;
 mod reseal;
 pub mod scrub;
@@ -116,6 +117,11 @@ pub struct NodeConfig {
     /// are not simple turns (default 131 072). The live applier keeps
     /// `apply_batch`, so a crash there does not redo a huge batch.
     pub startup_apply_batch: usize,
+    /// Test hook: a log record limit below `kronik_log::MAX_RECORD` for
+    /// `start_local`, so a test reaches the turn record budget
+    /// (`record_budget`) without 128 MiB turns.
+    #[doc(hidden)]
+    pub test_max_record_bytes: Option<u32>,
 }
 
 impl Default for NodeConfig {
@@ -139,6 +145,7 @@ impl Default for NodeConfig {
             disk_reserve: 0,
             bulk_replay_min: 8_192,
             startup_apply_batch: 131_072,
+            test_max_record_bytes: None,
         }
     }
 }
@@ -255,6 +262,9 @@ pub async fn start_local_locked(
     }
     if let Some(w) = config.group_commit_window {
         log.group_commit_window = w;
+    }
+    if let Some(limit) = config.test_max_record_bytes {
+        log.max_record_bytes = limit;
     }
     let source =
         kronik_privacy::key_source::KeySource::load(env.clone(), config.keys.clone(), data, true)

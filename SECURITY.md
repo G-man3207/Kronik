@@ -38,15 +38,20 @@ Do not send real secrets or personal data from a production system.
 ## Security model
 
 Kronik assumes that actor code, foreign images and agents can be faulty or
-hostile, and limits what each of them can do. Kronik is pre-alpha, so most of
-the design below is not implemented yet; the
+hostile, and limits what each of them can do. Kronik is pre-alpha and its
+interfaces may still change, but the controls below are implemented and in
+the released versions. The
 [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
-shows what is.
+lists the tracks that are still absent or partial, among them the cluster,
+microVM isolation, the rootless daemon, fuzzing and an external security
+review.
 
 - **Actors** run in a Wasm sandbox with a fresh instance per turn, default-deny
   capabilities, and fuel and memory limits.
 - **Foreign actors** run in gVisor without external network access, with
-  images pinned by digest and resource limits.
+  images pinned by digest and resource limits. An operator can choose
+  `--isolation trusted` instead, which runs an image with plain `runc` on the
+  host kernel and says so with a warning.
 - **Agents and operators** use tokens with scopes. Policy and approvals gate
   changes, forks have no access to personal data by default, and every
   mutation requires a reason and is recorded.
@@ -57,8 +62,9 @@ shows what is.
   it.
 - **The API** listens on a Unix socket protected by file permissions; TCP
   access requires a token, and external traffic uses TLS.
-- **Root.** In v0.1 the daemon and `runsc` run as root under systemd, with the
-  hardening that systemd allows. Rootless operation comes after v0.1.
+- **Root.** The daemon and `runsc` run as root under systemd, with the
+  hardening that systemd allows. A rootless daemon (M21) is not implemented
+  yet.
 
 **The data directory and the log are sensitive.** The log contains the whole
 history of the system, including the random seeds that can recreate tokens

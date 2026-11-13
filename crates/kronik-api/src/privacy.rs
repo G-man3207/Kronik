@@ -77,7 +77,9 @@ pub struct PrivacyStatus {
     pub epoch: Option<u64>,
     /// `null` when the daemon runs without a keystore.
     pub keystore: Option<KeystoreCounts>,
-    /// Erasures that still have a plain value in the log (§6.5). The count
+    /// Erasures whose subject still has a plain value in the log or in
+    /// `state.db` (§6.5, §8: a state value, a queued timer or message body,
+    /// a saved response, a dead letter, an open turn's effect). The count
     /// names no subject.
     #[serde(default)]
     pub pending_erasures: u64,

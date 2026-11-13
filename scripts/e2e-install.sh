@@ -10,7 +10,8 @@
 #   3. Tampered and unsigned archives are refused without replacing a real binary.
 #   4. With RUNSC=1, as root with KRONIK_INSTALL_RUNSC=yes: the pinned gVisor
 #      release is downloaded and checked, runsc is installed, and
-#      `kronik doctor` finds it.
+#      `kronik doctor`'s runsc check passes on it. Doctor's own exit code is
+#      not checked here: its sandbox checks can fail in a container.
 #
 # Usage: [RUNSC=1] scripts/e2e-install.sh [RELEASE_DIR] [PORT]
 # Defaults: dist/release and port 47950 for the HTTP server. Needs docker and
@@ -88,7 +89,9 @@ if [ "$RUNSC" = 1 ]; then
     KRONIK_BASE_URL=file:///release KRONIK_INSTALL_RUNSC=yes sh /release/install.sh </dev/null
     runsc --version | head -n 1
     test -x /usr/local/bin/gvisor-bin/gvisor_sentry
-    kronik doctor || true
+    kronik doctor >/tmp/doctor.txt || true
+    cat /tmp/doctor.txt
+    grep -q -E "^  pass  runsc +/usr/local/bin/runsc release-" /tmp/doctor.txt
 fi
 echo "PASS: install.sh"
 '

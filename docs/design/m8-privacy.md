@@ -165,7 +165,9 @@ Concretely:
   reads, delivered message bodies, recorded effect responses on re-run). An
   erased state value reads as absent. Any other erased input (a queued
   message body, a recorded response) fails the turn with `SUBJECT_ERASED`
-  as a dead letter: the turn can't run on data that no longer exists.
+  as a dead letter: the turn can't run on data that no longer exists. A
+  queued timer or message body of an erased subject is a tombstone (§6.3),
+  also one written in `off` mode, so that holds for plain bodies too.
 - **API output** (`actors inspect`, `history`, diffs, MCP): with `pii:read`,
   sealed values are unsealed. Without it they show as `[sealed]` (as built:
   no subject id either, see §14), and erased ones as `[erased]` for every
@@ -192,9 +194,13 @@ Concretely:
    as a changeset, because a changeset's old values would be the erased data
    (ADR 0005 §6). For every actor with SQL state it runs `DELETE FROM t WHERE
    _subject = ?` on each table with a `_subject` column, and it deletes the
-   subject's KV rows from `state.db`. On rebuild the subject's changesets
-   can't be unsealed and are skipped; the operation is then replayed, and
-   the result equals the live database.
+   subject's KV rows from `state.db`. The bodies of the subject's pending
+   timers and undelivered messages become tombstones of its erased key
+   version: the rows stay, so their turns still run and fail with
+   `SUBJECT_ERASED` instead of handing the value to a guest, which would
+   seal it again under a new key version. On rebuild the subject's
+   changesets can't be unsealed and are skipped; the operation is then
+   replayed, and the result equals the live database.
 4. **Other subjects are unaffected:** their values in the same turns are
    separate `Sealable`s under other keys, their SQL changesets are separate,
    and `DELETE … WHERE _subject = ?` touches only the erased subject's rows.
@@ -256,7 +262,9 @@ starts a background compaction that requires the mode to be `on`:
   so reseal marks every rewritten segment for re-upload, and the shipped
   copy is replaced. Until it is, the shipped copy still holds the plain
   values, and `privacy status` counts such segments as pending.
-- It does the same for `state.db` values and takes a snapshot afterwards.
+- It does the same for the `state.db` rows the rewritten records still own
+  (state values, the bodies of pending timers and undelivered messages,
+  saved responses, dead-letter inputs) and takes a snapshot afterwards.
 - Progress (segments done/total, values sealed, tombstones) appears in
   `privacy status`. Docs recommend running reseal right after turning the
   mode on, before the first erasure.
@@ -269,11 +277,15 @@ starts a background compaction that requires the mode to be `on`:
 - The fork's host never hands a real value to the fork's guests. Every
   tagged value a turn reads, sealed or plain, is replaced by
   `Pseudonyms::of(subject, plaintext)` = `pii:` + 12 hex of a keyed BLAKE3
-  (key `derive_key("kronik pseudonym v1", master)`, done in 895ff28). The
+  (key `derive_key("kronik pseudonym v1", master)`, in
+  `crates/kronik-privacy/src/keystore.rs`). The
   host unseals transiently to compute it, so equal values get equal
   pseudonyms and equality checks in guest logic still hold. Without the key,
-  a pseudonym can't be checked against a guessed value. Erased values become
-  `[erased]`.
+  a pseudonym can't be checked against a guessed value. A production value
+  that already has the shape of a pseudonym is replaced too; only a value
+  the fork itself wrote (a revealed record's, or a guest's) is read back as
+  it is, so a pseudonym stays equal to itself (issue #69). Erased values
+  become `[erased]`, except an erased state value, which reads as absent.
 - Subject-tagged SQL changesets are pseudonymized before they are applied
   to the fork's actor database. Text and blob cell values become
   `Pseudonyms::of(subject, bytes)`; old and new images are rewritten the
@@ -462,9 +474,10 @@ Where the code differs from the sections above:
   rows (a repeated `Idempotency-Key` runs anew) and dead letters. A saved
   call response becomes a tombstone outcome (`SUBJECT_ERASED`, no output)
   and the row stays, so the message stays delivered and a repeated call
-  gets that failure instead of a second run. Dead letters a subject's
-  turns produce after its erasure stay (their input is sealed under the
-  erased key); resending one fails with `SUBJECT_ERASED`.
+  gets that failure instead of a second run. The bodies of its pending
+  timers and undelivered messages become tombstones (§6.3). Dead letters a
+  subject's turns produce after its erasure stay (their input is sealed
+  under the erased key); resending one fails with `SUBJECT_ERASED`.
 - **Nothing left in the files (v0.1 fix).** `state.db`, every actor
   database and `keys/keystore.db` run with `PRAGMA secure_delete = ON`, so
   deleted rows are zeroed in their pages. `Keystore::erase` runs
@@ -494,17 +507,24 @@ Where the code differs from the sections above:
   key, erased subjects replaced by a tombstone `Sealed` (erased version,
   zero nonce, empty ciphertext), checksums recomputed, written beside the
   old file, fsynced and renamed. `turn_index` and `open_turns` offsets,
-  and the rows the rewritten turns still own (`kv` values, saved ingress
-  and call responses, dead-letter inputs; a row a later turn replaced is
-  left), are fixed in one `state.db` transaction, followed by a WAL
-  checkpoint. Rows of an erased subject are already gone or tombstoned by
-  its `Erasure`; a value of it in a row that remains becomes a tombstone.
-  The active segment is left for the next roll. A snapshot
+  and the rows the rewritten turns (a rebased turn of a `StateRebase`
+  record too) still own (`kv` values, the bodies of their pending timers
+  and undelivered messages, saved ingress and call responses, dead-letter
+  inputs; a row a later turn replaced is left), are fixed in one
+  `state.db` transaction, followed by a WAL checkpoint (issue #31: a timer
+  scheduled in `off` mode kept its plain body after a reseal and was
+  handed to its guest after the subject's erasure). Rows of an erased
+  subject are already gone or tombstoned by its `Erasure`; a value of it
+  in a row that remains becomes a tombstone. The active segment is left for the next roll. A snapshot
   follows. Rewritten segments are marked for re-upload
   (`privacy/reupload/<start>`); `GET /v1/privacy` counts them in
   `reseal.pending_segments` until the shipper replaces the object. Status
   also reports `pending_erasures` and `reseal.{segments_done,
-  segments_total, values_sealed, tombstones}`. A dry run writes nothing.
+  segments_total, values_sealed, tombstones}`. `pending_erasures` counts
+  the erased subjects that still have a plain value in the log or in
+  `state.db` (state values, queued timer and message bodies, saved
+  responses, dead letters, the recorded effects of open turns). A dry run
+  writes nothing.
   A second reseal with nothing plain left rewrites nothing. No guest code
   runs. `kronik privacy reseal [--dry-run] --reason '...'` is the CLI
   wrapper.
@@ -585,7 +605,12 @@ Where the code differs from the sections above:
   A `--no-pii` turn is masked when its input or a recorded (non-live)
   effect response is tagged or it read a masked state value; if it differs,
   it counts in `summary.pii_masked` and `samples.pii_masked`, not as
-  divergent, an error or a cause. HTTP root inputs keep the gateway's
+  divergent, an error or a cause. A state value the base snapshot holds is
+  production's and is replaced like a recorded one; a value the replay wrote
+  that already is a pseudonym is read back as it is (issue #69). An erased
+  subject's state value stays sealed in the fork's store, reads as absent
+  and marks the reading turn as one that met erased data (ADR 0109), as do
+  reads of state that erased data shaped there. HTTP root inputs keep the gateway's
   subject in forks (taken from the body's or a header's tag). A fork
   records its effects with the
   guest's subject as production does, and seals what it writes to disk (its

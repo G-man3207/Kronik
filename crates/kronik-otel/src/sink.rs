@@ -1,7 +1,7 @@
 //! The audit export (docs/design/m28-otel.md §4.4–§4.6, §5; ADRs 0083,
 //! 0084): the sinks (a directory of JSON-lines files, a webhook, object
 //! storage) and the [`follow::Sink`] that turns committed records into
-//! `kronik.audit/v2` lines for them. It holds retention at its cursor and
+//! `kronik.audit/v3` lines for them. It holds retention at its cursor and
 //! records a gap as a system `audit.gap` event when the hold gave way.
 
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};

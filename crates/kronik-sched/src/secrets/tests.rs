@@ -766,6 +766,44 @@ async fn catalogue_observations_do_not_choose_the_operational_current_version() 
     );
 }
 
+/// A value fetched by its version id (what the crash re-run of a turn that
+/// used an older version does) may serve that version, but it is not the
+/// current value: after a restart nothing is current, and only an
+/// observation of the provider's current version makes a version current.
+/// Found against a real OpenBao (scripts/e2e-secrets.py): the re-run's fetch
+/// of version 2 became the current value, and a turn after it used version 2
+/// although `secret refresh` had recorded version 3 before the restart.
+#[tokio::test]
+async fn a_value_fetched_by_its_version_does_not_become_the_current_value() {
+    let (cache, _) = cache();
+    let old = external_row(1, 1, "secret/first#token");
+    cache.register(old.clone());
+    cache.register(external_row(2, 1, "secret/first#token"));
+    let stamp = cache.read_stamp(&Scope::row(&old)).unwrap();
+    cache
+        .insert(
+            &old,
+            Arc::new(Zeroizing::new(b"old-value".to_vec())),
+            true,
+            Some(&stamp),
+        )
+        .unwrap();
+    let mut config = Config::default();
+    config.apply(&Record::SecretLink(link("token", 1, "secret/first#token")));
+    assert_eq!(
+        cache
+            .cached("token", Some(1), &config)
+            .unwrap()
+            .unwrap()
+            .value,
+        b"old-value"
+    );
+    assert!(
+        cache.cached("token", None, &config).unwrap().is_none(),
+        "a value fetched by its version became the current one"
+    );
+}
+
 #[tokio::test]
 async fn complete_inventory_is_revision_and_epoch_bound_and_resource_failure_is_not_complete() {
     let (_data, node) = node().await;
@@ -2288,9 +2326,14 @@ impl Net for AwsPages {
             let body = if catalogue {
                 let page = self.pages.fetch_add(1, Ordering::SeqCst);
                 let token = if self.cycle {
-                    match page % 3 {
-                        0 => "a".into(),
-                        1 => "b".into(),
+                    // A provider whose pages lead back to one already
+                    // given: no token, then "a", "b" and "a" again. Each
+                    // listing meets it at its third page, whatever listed
+                    // before it.
+                    let sent: serde_json::Value =
+                        serde_json::from_slice(&request.body).unwrap_or_default();
+                    match sent["NextToken"].as_str() {
+                        Some("a") => "b".into(),
                         _ => "a".into(),
                     }
                 } else {
@@ -2311,20 +2354,30 @@ impl Net for AwsPages {
         })
     }
 }
-/// Wait for the revision-triggered background refresh to finish failing, so the
-/// page counter in the AWS tests measures only the explicit refresh below.
+/// Waits until the background cycle can list no catalogue before its failure
+/// backoff (seconds), so the page counter in the AWS tests measures only the
+/// explicit refresh below: a pass has failed against the registry as it is
+/// now, and none is in progress. A failed pass is not enough. When the
+/// registry changed while it ran (the link's first observation, the grant),
+/// the change woke the cycle, which runs a second pass at once; its listing
+/// raced the explicit refresh for the inventory lock and, when it won, put
+/// its pages in the count (one run in six).
 async fn settle_failing_catalogue_attempt(node: &Arc<Node>) {
     let runtime = node.runtime().unwrap();
     let mut certified = runtime.certified.subscribe();
-    let wanted = lock(&runtime.cache.state).revision;
     node.env
-        .timeout(Duration::from_secs(5), async {
+        .timeout(Duration::from_secs(10), async {
             loop {
                 let (revision, ok) = *certified.borrow_and_update();
-                if revision >= wanted && !ok {
+                if !ok && revision == lock(&runtime.cache.state).revision && runtime.cycle.settled()
+                {
                     break;
                 }
-                certified.changed().await.unwrap();
+                // A pass publishes before it ends: look again shortly.
+                let _ = node
+                    .env
+                    .timeout(Duration::from_millis(5), certified.changed())
+                    .await;
             }
         })
         .await
@@ -2407,8 +2460,9 @@ async fn actual_aws_multi_page_cycle_never_publishes_complete_inventory() {
     let (_data, node, pages) = aws_catalogue_node(true).await;
     let before = pages.pages.load(Ordering::SeqCst);
     assert!(node.refresh_secret_inventory(test_auth()).await.is_err());
+    // The client stops at the token it was given before: the third page.
     let fetched = pages.pages.load(Ordering::SeqCst) - before;
-    assert!(fetched > 1 && fetched <= 3);
+    assert_eq!(fetched, 3, "the refresh listed {fetched} pages");
     assert!(node.secret_values().is_err());
 }
 

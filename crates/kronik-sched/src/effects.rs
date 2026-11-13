@@ -715,6 +715,9 @@ pub(crate) struct TurnSpec {
     pub begin: pb::TurnBegin,
     /// Recorded results of an earlier execution (re-runs only).
     pub recorded: Option<Vec<pb::EffectRecord>>,
+    /// What the turn's record may take, with what it holds before any
+    /// effect already taken (crate::record_budget).
+    pub budget: crate::record_budget::Budget,
 }
 
 #[derive(Default)]
@@ -722,6 +725,10 @@ pub(crate) struct FxState {
     pub begun: bool,
     /// Every effect of the turn, denied ones included.
     pub records: Vec<pb::EffectRecord>,
+    /// What the turn's record may still take: every effect and compensation
+    /// is charged here, and a new effect that does not fit is refused before
+    /// it happens (`TURN_TOO_LARGE`).
+    pub budget: crate::record_budget::Budget,
     pub last_result_lsn: u64,
     /// Compensations of successful calls, delivered if the turn fails.
     pub compensations: Vec<pb::OutboundMessage>,
@@ -919,15 +926,43 @@ impl TurnFx {
 
     pub fn new(node: Arc<Node>, spec: TurnSpec, original_execution: AuthLease) -> Arc<TurnFx> {
         let begun = spec.recorded.is_some();
+        let budget = spec.budget.clone();
         Arc::new(TurnFx {
             node,
             spec,
             original_execution,
             state: Mutex::new(FxState {
                 begun,
+                budget,
                 ..FxState::default()
             }),
         })
+    }
+
+    /// Refuses a new effect whose `need` bytes (its request and a result
+    /// without a body) do not fit in what is left of the turn's record: it
+    /// does not happen and the turn traps with `TURN_TOO_LARGE`.
+    fn admit(&self, ordinal: u32, kind: &str, need: usize) -> Result<(), GateError> {
+        let state = lock(&self.state);
+        if state.budget.fits(need) {
+            Ok(())
+        } else {
+            Err(state.budget.refuse(ordinal, kind))
+        }
+    }
+
+    /// What is left of the turn's record.
+    fn room(&self) -> crate::record_budget::Budget {
+        lock(&self.state).budget.clone()
+    }
+
+    /// A result an earlier execution recorded (a re-run): the guest sees
+    /// it whatever its size, so it is charged and never refused.
+    fn push_recorded(&self, mut rec: pb::EffectRecord) {
+        let cost = crate::record_budget::effect_cost(&mut rec);
+        let mut state = lock(&self.state);
+        state.budget.charge(cost);
+        state.records.push(rec);
     }
 
     pub(crate) fn admitted_begin(&self) -> &pb::TurnBegin {
@@ -1028,6 +1063,23 @@ impl TurnFx {
             "kronik_effects_total",
             &[("kind", &rec.kind), ("status", &status)],
         );
+        // The caller admitted the effect with room for this result (its
+        // request, a capped response, a result without a body); a result
+        // that still does not fit is never appended.
+        let cost = crate::record_budget::effect_cost(&mut rec);
+        {
+            let mut state = lock(&self.state);
+            if !state.budget.fits(cost) {
+                tracing::warn!(
+                    kind = %rec.kind,
+                    ordinal = rec.ordinal,
+                    cost,
+                    "an effect result does not fit in what is left of its turn's record"
+                );
+                return Err(state.budget.refuse(rec.ordinal, &rec.kind));
+            }
+            state.budget.charge(cost);
+        }
         let lsn = self
             .node
             .append(Record::EffectResult(pb::EffectResult {
@@ -1043,8 +1095,14 @@ impl TurnFx {
     }
 
     /// A deterministic result that needs no fsync (denied by configuration).
-    fn note(&self, rec: pb::EffectRecord) {
-        lock(&self.state).records.push(rec);
+    /// Its record is charged like any other; one that does not fit traps
+    /// the turn with `TURN_TOO_LARGE`.
+    fn note(&self, mut rec: pb::EffectRecord) -> Result<(), GateError> {
+        let cost = crate::record_budget::effect_cost(&mut rec);
+        let mut state = lock(&self.state);
+        state.budget.take(cost, rec.ordinal, &rec.kind)?;
+        state.records.push(rec);
+        Ok(())
     }
 
     fn base(&self, ordinal: u32, kind: &str, target: String, fp: Vec<u8>) -> pb::EffectRecord {
@@ -1124,7 +1182,7 @@ impl TurnFx {
         {
             // A durable failure, including a prior safe terminal disclosure
             // projection, never becomes OK when an inventory later improves.
-            lock(&self.state).records.push(record.clone());
+            self.push_recorded(record.clone());
             return Ok(FetchOutcome::HostRedactionFailure);
         }
         let subject = req.subject.clone();
@@ -1137,7 +1195,7 @@ impl TurnFx {
                     "http.fetch",
                     "http:[withheld]".into(),
                     error.clone(),
-                ));
+                ))?;
                 return Ok(FetchOutcome::Denied(error));
             }
         };
@@ -1170,12 +1228,12 @@ impl TurnFx {
             } else {
                 "http:[withheld]"
             };
-            self.note(self.denied(ordinal, kind, withheld.into(), e.clone()));
+            self.note(self.denied(ordinal, kind, withheld.into(), e.clone()))?;
             return Ok(FetchOutcome::Denied(e));
         };
         if foreign && self.spec.config.foreign(&target.host).is_none() {
             let e = ErrorCode::ForeignNotFound.as_str().to_owned();
-            self.note(self.denied(ordinal, kind, "foreign:[withheld]".into(), e.clone()));
+            self.note(self.denied(ordinal, kind, "foreign:[withheld]".into(), e.clone()))?;
             return Ok(FetchOutcome::Denied(e));
         }
         for (header, value) in &req.headers {
@@ -1186,7 +1244,7 @@ impl TurnFx {
                 let cap = format!("secret:{name}");
                 if self.spec.config.grant(self.kind(), &cap).is_none() {
                     let error = not_granted(&cap);
-                    self.note(self.denied(ordinal, kind, cap, error.clone()));
+                    self.note(self.denied(ordinal, kind, cap, error.clone()))?;
                     return Ok(FetchOutcome::Denied(error));
                 }
             }
@@ -1199,7 +1257,7 @@ impl TurnFx {
             && req.headers.iter().any(|(header, value)| !header.eq_ignore_ascii_case("idempotency-key")
                 && matches!(value, FetchHeader::Secret { name, .. } if record.target == format!("secret:{name}")))
         {
-            lock(&self.state).records.push(record.clone());
+            self.push_recorded(record.clone());
             return Ok(FetchOutcome::Denied(record.error.clone()));
         }
         let recorded_req = self
@@ -1397,7 +1455,7 @@ impl TurnFx {
                 .ok_or_else(|| GateError::Host("The verified legacy result is missing".into()))?;
             let record = legacy_http_disclosure(record, source, &matcher)?;
             let outcome = outcome_of_fetch(&record);
-            lock(&self.state).records.push(record);
+            self.push_recorded(record);
             return outcome;
         }
         let body = std::mem::take(&mut request.body);
@@ -1435,9 +1493,13 @@ impl TurnFx {
         };
         if let Some(rec) = self.recorded_keyed(&ereq, &plain_fp)? {
             let outcome = outcome_of_fetch(&rec);
-            lock(&self.state).records.push(rec);
+            self.push_recorded(rec);
             return outcome;
         }
+        // A new effect: its request and a result without a body must fit in
+        // what is left of the turn's record, or it does not happen (#26).
+        let need = crate::record_budget::fetch_need(recorded.encoded_len());
+        self.admit(ordinal, kind, need)?;
         let idem = causal::idempotency_key(&self.spec.causal_key, ordinal);
         let mut rec = self.base(ordinal, kind, recorded_cap, fp);
         rec.request = tagged(&subject, recorded.encode_to_vec());
@@ -1515,12 +1577,19 @@ impl TurnFx {
         wire_headers.push(("idempotency-key".into(), idem));
         let started = self.node.env.clock.monotonic();
         rec.offset_us = started.saturating_sub(self.spec.started).as_micros() as u64;
+        // The response may take what is left of the turn's record after
+        // the request, at most the kind's effect_response_bytes.
+        let max_response_bytes = crate::record_budget::response_room(
+            &self.room(),
+            need,
+            self.spec.limits.effect_response_bytes,
+        );
         let wire = HttpRequest {
             method: req.method,
             url: req.url,
             headers: wire_headers,
             body: bytes::Bytes::from(req.body),
-            max_response_bytes: self.spec.limits.effect_response_bytes,
+            max_response_bytes,
         };
         let call: BoxFuture<'static, Result<kronik_core::env::HttpResponse, NetError>> =
             match (foreign, &self.node.foreign) {
@@ -1564,10 +1633,14 @@ impl TurnFx {
             }
             Ok(Err(NetError::TooLarge)) => {
                 rec.status = pb::EffectStatus::TooLarge as i32;
-                rec.error = format!(
-                    "the response exceeds {} bytes",
-                    self.spec.limits.effect_response_bytes
-                );
+                rec.error = if max_response_bytes < self.spec.limits.effect_response_bytes {
+                    format!(
+                        "the response exceeds {max_response_bytes} bytes, what is left of the \
+                         turn's record"
+                    )
+                } else {
+                    format!("the response exceeds {max_response_bytes} bytes")
+                };
                 FetchOutcome::TooLarge
             }
             Ok(Err(NetError::Connect(mut error) | NetError::Io(mut error))) => {
@@ -1604,21 +1677,42 @@ impl TurnFx {
                     .min(u64::from(kronik_log::MAX_RECORD)) as usize,
             )?,
         };
+        // With its headers (or a long error text) the result may still not
+        // fit in what is left of the turn's record: then it is too large for
+        // this turn, as a body over the cap is, and the guest never sees it.
+        let outcome = match outcome {
+            FetchOutcome::HostRedactionFailure => outcome,
+            _ if !self
+                .room()
+                .fits(crate::record_budget::effect_cost(&mut rec)) =>
+            {
+                rec.response = None;
+                rec.status = pb::EffectStatus::TooLarge as i32;
+                rec.error = "the response does not fit in what is left of the turn's record".into();
+                FetchOutcome::TooLarge
+            }
+            outcome => outcome,
+        };
         self.record(rec).await?;
         Ok(outcome)
     }
 
+    /// A successful call's compensation, which a failed turn records and
+    /// delivers. Its call was admitted with room for it ([`crate::record_budget::call_need`]),
+    /// or happened in an earlier execution: it is charged, never refused.
     fn remember_compensation(&self, ordinal: u32, to: &ActorRef, message: Option<pb::Message>) {
         if let Some(message) = message {
-            lock(&self.state)
-                .compensations
-                .push(crate::secrets::recovery::compensation(
-                    &self.spec.actor,
-                    &self.spec.causal_key,
-                    ordinal,
-                    to,
-                    message,
-                ));
+            let mut compensation = crate::secrets::recovery::compensation(
+                &self.spec.actor,
+                &self.spec.causal_key,
+                ordinal,
+                to,
+                message,
+            );
+            let cost = crate::record_budget::message_cost(&mut compensation);
+            let mut state = lock(&self.state);
+            state.budget.charge(cost);
+            state.compensations.push(compensation);
         }
     }
 
@@ -1693,7 +1787,7 @@ impl TurnFx {
                 }
                 self.remember_compensation(ordinal, &to, request.compensate.take());
             }
-            lock(&self.state).records.push(record.clone());
+            self.push_recorded(record.clone());
             return Err(GateError::HostRedactionFailure);
         }
         let source = self
@@ -1787,7 +1881,7 @@ impl TurnFx {
             let (record, cleanup) = legacy_call_disclosure(record, source, &matcher, None)?;
             self.remember_compensation(ordinal, &to, cleanup);
             let outcome = outcome_of_call(&record);
-            lock(&self.state).records.push(record);
+            self.push_recorded(record);
             return outcome;
         }
         match crate::scrub::call_request(&mut request, &matcher, kronik_log::MAX_RECORD as usize) {
@@ -1806,7 +1900,7 @@ impl TurnFx {
                     return Err(GateError::Prerequisite(ErrorCode::Unavailable));
                 }
                 let error = ErrorCode::PolicyDenied.as_str().to_owned();
-                self.note(self.denied(ordinal, kind, target, error.clone()));
+                self.note(self.denied(ordinal, kind, target, error.clone()))?;
                 return Ok(CallOutcome::Failed(error));
             }
             Err(crate::scrub::CallRequestError::Redaction(error)) => {
@@ -1846,9 +1940,14 @@ impl TurnFx {
                 self.remember_compensation(ordinal, &to, cleanup);
             }
             let outcome = outcome_of_call(&record);
-            lock(&self.state).records.push(record);
+            self.push_recorded(record);
             return outcome;
         }
+        // A new call: its request, its compensation's copy and a result
+        // without a body must fit in what is left of the turn's record, or
+        // it does not happen (#26).
+        let need = crate::record_budget::call_need(encoded.len(), cleanup.as_ref(), &to.to_pb());
+        self.admit(ordinal, kind, need)?;
         self.begin().await?;
         let mut record = self.base(ordinal, kind, target, fingerprint);
         record.request = tagged(&subject, encoded);
@@ -1864,15 +1963,22 @@ impl TurnFx {
             }
             None => String::new(),
         };
+        // A reply larger than what is left of the turn's record is withheld,
+        // as one over effect_response_bytes is.
+        let reply_bytes = crate::record_budget::response_room(
+            &self.room(),
+            need,
+            self.spec
+                .limits
+                .effect_response_bytes
+                .min(u64::from(kronik_log::MAX_RECORD)),
+        );
         let prepared = prepare_call_outcome(
             &mut record,
             outcome,
             turn_id,
             &matcher,
-            self.spec
-                .limits
-                .effect_response_bytes
-                .min(u64::from(kronik_log::MAX_RECORD)) as usize,
+            reply_bytes as usize,
             current_scope.as_deref(),
             prepared_scope.as_deref(),
         );
@@ -2020,7 +2126,7 @@ impl TurnFx {
         let cap = format!("secret:{secret}");
         if self.spec.config.grant(self.kind(), &cap).is_none() {
             let e = not_granted(&cap);
-            self.note(self.denied(ordinal, kind, cap, e.clone()));
+            self.note(self.denied(ordinal, kind, cap, e.clone()))?;
             return Ok(CryptoOutcome::Denied(e));
         }
         let data_hash = blake3::hash(&data).as_bytes().to_vec();
@@ -2065,7 +2171,7 @@ impl TurnFx {
             } else if rec.status == pb::EffectStatus::Ok as i32 {
                 return Err(GateError::Prerequisite(ErrorCode::SecretUnavailable));
             }
-            lock(&self.state).records.push(rec.clone());
+            self.push_recorded(rec.clone());
             return Ok(if rec.status == pb::EffectStatus::Ok as i32 {
                 CryptoOutcome::Ok(effect_plain_payload(rec.response.as_ref())?.to_vec())
             } else if rec.status == pb::EffectStatus::Denied as i32 {
@@ -2074,6 +2180,7 @@ impl TurnFx {
                 CryptoOutcome::Unsupported(rec.error)
             });
         }
+        self.admit(ordinal, kind, crate::record_budget::SMALL_NEED)?;
         self.begin().await?;
         let mut rec = self.base(ordinal, kind, cap, fp);
         let outcome = match self.new_secret_value(&secret).await? {
@@ -2133,7 +2240,7 @@ impl TurnFx {
         let cap = format!("secret-reveal:{name}");
         if self.spec.config.grant(self.kind(), &cap).is_none() {
             let e = not_granted(&cap);
-            self.note(self.denied(ordinal, kind, cap, e.clone()));
+            self.note(self.denied(ordinal, kind, cap, e.clone()))?;
             return Ok(Err(e));
         }
         let fp = blake3::hash(format!("reveal\0{name}").as_bytes())
@@ -2147,7 +2254,7 @@ impl TurnFx {
             http: None,
         };
         if let Some(rec) = self.recorded(&ereq)? {
-            lock(&self.state).records.push(rec.clone());
+            self.push_recorded(rec.clone());
             if rec.status != pb::EffectStatus::Ok as i32 {
                 return Ok(Err(rec.error));
             }
@@ -2177,6 +2284,7 @@ impl TurnFx {
                 None => return Err(GateError::Prerequisite(ErrorCode::SecretVersionGone)),
             });
         }
+        self.admit(ordinal, kind, crate::record_budget::SMALL_NEED)?;
         self.begin().await?;
         let mut rec = self.base(ordinal, kind, cap, fp);
         let out = match self.new_secret_value(&name).await? {

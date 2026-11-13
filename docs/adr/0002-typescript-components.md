@@ -43,9 +43,10 @@ Spike B has:
 The M0 spike notes are in the project wiki:
 https://github.com/G-man3207/Kronik/wiki/Spikes.
 
-The spike used `wit/kronik-actor.wit` as of `5a8d400`. The amendments in
-`b8a3b39` (`state.set-for`, `privacy.current-subject`) add functions to
-existing interfaces and change nothing below.
+The spike used the first draft of `wit/kronik-actor.wit`, the brief's
+`kronik:actor@0.1.0` of 2026-10-24. The amendments that M1 made to it
+(`state.set-for`, `privacy.current-subject`; `docs/design/m1-core.md` §5) add
+functions to existing interfaces and change nothing below.
 
 **Versions.** Node.js 26.10.0 and npm 11.19.1; `@bytecodealliance/jco` 1.39.0
 (it bundles TypeScript with rolldown 1.2.15); `@bytecodealliance/componentize-js`
@@ -218,9 +219,10 @@ Rust turn takes 45.6 µs on the same VPS.
   the whole `noop` turn takes 1.7, 1.9 and 2.4 ms instead of 1.3 ms, the
   counter 2.0, 2.3 and 2.5 ms instead of 1.7 ms.
   On the development machine 16 MiB does pay off (counter 0.82 ms instead of
-  1.3 ms), so the outcome depends on the machine; Kronik keeps Wasmtime's
-  default. The probe's digests and fuel were the same at every size, so no
-  state leaked between turns.
+  1.3 ms), so the outcome depends on the machine; Kronik kept Wasmtime's
+  default (0 for both). The probe's digests and fuel were the same at every
+  size, so no state leaked between turns. The daemon has since set 2 MiB and
+  64 KiB: see the amendment at the end.
 - **`--aot` (weval) does not help either.** The counter turn takes 1.8 ms
   instead of 1.7 ms, the JSON turn 6.7 ms instead of 7.1 ms with 10% less
   fuel, but the component grows from 12.8 to 19.0 MB, its compile time from
@@ -315,3 +317,18 @@ state the cost model and point to `kronik limits set <kind> --fuel`:
 - **Revisit** when ComponentizeJS or StarlingMonkey changes (a faster restore
   would change section 6), when WASI 0.3 arrives (M22), or if TypeScript turn
   cost dominates a real workload.
+
+## Amendment (2026-11-13): pool slots keep memory resident
+
+Section 6 measured resident pool slots on TypeScript turns and kept
+Wasmtime's default, 0 for `linear_memory_keep_resident` and
+`table_keep_resident`. To speed up replay, the engine then set both to
+64 KiB, and when the M3 replay profile still found the kernel spending a
+fifth of each turn faulting a reused slot's memory back in, it raised
+`linear_memory_keep_resident` to 2 MiB; `table_keep_resident` stays at
+64 KiB (`crates/kronik-runtime/src/engine.rs`). Isolated replay on the VPS
+went from 1.9 s to 1.4 to 1.7 s. A slot keeps at most what its instances
+used resident, so the whole pool keeps at most 256 MiB at the default
+concurrency of 64. The resident memory is still cleared before a slot is
+reused, so I3 holds. `docs/perf.md` ("Replay speed (M3)") has the
+measurements; the table in section 6 was taken with the default.

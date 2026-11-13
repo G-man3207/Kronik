@@ -86,7 +86,8 @@ of another), pass every changed component in one call as a list,
 fork, and promoted and rolled back together. Proposed one at a time, the
 caller's proposal fails against the running callee. A component whose code
 already runs, and ran at the fork point, is skipped and listed in
-`proposal.unchanged`; if every one is, the call fails with `BAD_REQUEST`.
+`proposal.unchanged`; if every one is, the call fails with
+`NOTHING_TO_PROPOSE`.
 If such a kind changes code before you promote, promote answers
 `PROPOSAL_STALE`: propose again.
 Optionally add `window_ms`, how much recent traffic to replay (one hour by
@@ -240,6 +241,7 @@ never “fix” missing key material by making a new seed over existing data.
 | `APPROVAL_REQUIRED` | The policy wants a human's approval first: `request_approval`. |
 | `POLICY_DENIED` | The policy denies the change. Read `policy.fired`, fix the code and propose again. |
 | `PROPOSAL_STALE` | Production changed since the proposal. Propose again. |
+| `NOTHING_TO_PROPOSE` | Main already runs every component you passed. Nothing changed: stop proposing, or change the code and build it again. |
 | `VERIFY_REQUIRED` | A kind with history only changes through `propose_change`. |
 | `CAPABILITY_NOT_GRANTED` | The code calls a target it has no grant for. In a fork that call is denied; in production a human grants it. |
 | `ACTOR_NOT_FOUND`, `FORK_NOT_FOUND`, `PROPOSAL_NOT_FOUND`, `TURN_NOT_FOUND` | Check the id: list again. |

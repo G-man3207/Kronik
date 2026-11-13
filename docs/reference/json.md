@@ -10,11 +10,26 @@ response body unchanged, so its schema is that of the operation it calls,
 as in [openapi.json](openapi.json), the OpenAPI 3.1 description that
 `GET /v1/openapi.json` serves. `explain`, `doctor`, `init`, `build`,
 `restore`, `upgrade check` and `audit verify` answer themselves. A
-failure prints the [`Error`](#error) object instead, with exit code 1,
-except `upgrade check`, which prints its report either way and exits 1
-when the replay is not empty (`code` is `ENGINE_UPGRADE_DIVERGED`), and
-`audit verify`, which prints its report either way and exits 1 when it
-is not `complete`. The
+command that fails prints the [`Error`](#error) object instead and exits 1.
+These commands also exit 1 for an outcome that is not an error, and then
+print their own object, not `Error`:
+
+- `upgrade check`: its report, when a verified difference remains (`code`
+  is `ENGINE_UPGRADE_DIVERGED`);
+- `audit verify`: its report, when it is not `complete`;
+- `doctor`: its report, when a check failed;
+- `proposal status` and `proposals show`: the proposal, when its `status`
+  is `failed`;
+- `watch` (when it ends) and `watches show`: the watch, when it is
+  `rolled_back` or `failed`, or a guard's rollback was refused or failed;
+- `integrity`: its answer, when `keys_missing` is not empty;
+- `foreign cleanup`: its counts, when `failed` is above 0;
+- `send` (also with `--fork`) and `dead-letters resend`: the turn, when it
+  ran and did not commit.
+
+So on exit 1 a script looks for the `error` member before it reads the
+command's own schema. A usage error, such as an unknown flag, exits 2 with a
+message on standard error and prints no JSON. The
 schemas are JSON Schema 2020-12; `$ref`s name the definitions below.
 
 Two bodies are not generated from types but written by hand, and also
@@ -509,7 +524,7 @@ against both.
       "type": "string"
     },
     "name": {
-      "description": "Stable check names, including userns/uid_view/subid/pin/delegate with\n`--rootless`, service_identity when a root invocation requests it, and\nmicrovm where a microVM tool bundle is installed and the root service\nruns.",
+      "description": "Stable: config, kernel, runsc, kvm, cgroup, root, runc, netns,\nrun_dir, caps, sandbox, disk, clock, tls, dns01_hook, wildcard, ship,\nexport, key_source, secrets; with `--rootless` also userns, uid_view,\nsubid, pin and delegate, and service_identity when a root invocation\nbecomes the service user; microvm where a microVM tool bundle is\ninstalled and the root service runs.",
       "type": "string"
     },
     "status": {
@@ -2494,7 +2509,7 @@ against both.
       "description": "Fork effects answered by a similar recording (same target, different request)."
     },
     "changed": {
-      "description": "Any difference in the diff that a replay verified: not a difference of a turn that read a pseudonym or an erased value, which cannot be verified as a change (S-16, ADR 0109). The policy floor still reads `pii_masked + pii_unverified` (ADR 0031).",
+      "description": "Any difference in the diff that a replay verified: not a difference of a turn that read a pseudonym or met erased data, nor of a production turn missing below one, which cannot be verified as a change (S-16, ADR 0109). The policy floor still reads `pii_masked + pii_unverified` (ADR 0031).",
       "type": "boolean"
     },
     "confidence": {
@@ -2527,7 +2542,7 @@ against both.
     },
     "pii_masked": {
       "$ref": "#/components/schemas/DiffCount",
-      "description": "In a fork without personal data: differing turns that read pseudonyms instead of personal data, and production turns missing below them. They are not verified: not counted as divergent, errors or causes (M8), and the policy needs at least an approval while pii_masked + pii_unverified is above 0 (pii-masked-needs-approval, ADR 0031). Always written (0 when none); diffs written before v0.1 lack it when 0."
+      "description": "Differing turns that read pseudonyms instead of personal data (a fork without personal data) or met erased data, and production turns missing below them. They are not verified: not counted as divergent, errors or causes (M8, ADR 0109), and the policy needs at least an approval while pii_masked + pii_unverified is above 0 (pii-masked-needs-approval, ADR 0031). Always written (0 when none); diffs written before v0.1 lack it when 0."
     },
     "pii_unverified": {
       "$ref": "#/components/schemas/DiffCount",
@@ -2566,7 +2581,7 @@ against both.
     },
     "unverifiable": {
       "$ref": "#/components/schemas/DiffCount",
-      "description": "Turns whose recorded input was erased (S-16, ADR 0109): the replay served their effects from the recording, so their behaviour was not verified against the erased values and their differences are not changes. Any other difference of the same causal trees - including one in a turn that also met an erased value - still counts; a real divergence next to an unverifiable turn keeps `changed` true. Always written (0 when none); diffs and upgrade reports written before v0.5.0 lack it when 0."
+      "description": "Turns that met erased data, differing or not, each causal key once (S-16, ADR 0109): their recorded input or a state value they read was erased, or erased data shaped what they ran on (a message, call or timer of such a turn that production did not send the same way, state such a turn or a production turn missing below one left different, an actor database lacking an erased subject's rows that production still had, an unverifiable callee); and production turns missing below such a turn. The replay served their effects from the recording, so their behaviour was not verified and their differences are not changes. Every other difference still counts; a real divergence next to an unverifiable turn keeps `changed` true. Always written (0 when none); diffs and upgrade reports written before v0.5.0 lack it when 0."
     },
     "verified_through_lsn": {
       "$ref": "#/components/schemas/DiffCount",
@@ -3011,6 +3026,7 @@ against both.
             "TOKEN_NOT_FOUND",
             "TURN_FAILED",
             "TURN_NOT_FOUND",
+            "TURN_TOO_LARGE",
             "UNAUTHENTICATED",
             "UNAVAILABLE",
             "VERIFY_REQUIRED",
@@ -5398,7 +5414,7 @@ against both.
     },
     "pending_erasures": {
       "default": 0,
-      "description": "Erasures that still have a plain value in the log (§6.5). The count\nnames no subject.",
+      "description": "Erasures whose subject still has a plain value in the log or in\n`state.db` (§6.5, §8: a state value, a queued timer or message body,\na saved response, a dead letter, an open turn's effect). The count\nnames no subject.",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
@@ -6384,6 +6400,38 @@ against both.
     },
     "kind": {
       "type": "string"
+    },
+    "last_error": {
+      "description": "How it failed: `unavailable`, `denied`, `not_found`, `version_gone`\nor `invalid`. Never a provider's words.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_error_ms": {
+      "description": "When a request of this node to the backend last failed (wall clock,\nms). Absent when none has.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "last_success_ms": {
+      "description": "When this node last got an answer from the backend (wall clock, ms).\nAbsent before its first answer, and for `file`.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "uncached": {
+      "description": "Names linked to the backend that have no value an effect could use\nnow: the next effect that needs one asks the backend, and fails with\nSECRET_UNAVAILABLE while it does not answer.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     }
   },
   "required": [
@@ -7700,7 +7748,7 @@ against both.
       "type": "integer"
     },
     "code": {
-      "description": "`ENGINE_UPGRADE_DIVERGED` when the diff is not empty.",
+      "description": "`ENGINE_UPGRADE_DIVERGED` when a verified difference remains.",
       "type": [
         "string",
         "null"
@@ -7755,7 +7803,7 @@ against both.
     },
     "unverifiable": {
       "default": 0,
-      "description": "Turns the identity replay could not verify: their recorded input was\nerased (S-16, ADR 0109).",
+      "description": "Turns the identity replay could not verify because they met erased\ndata: their recorded input, a state value they read, or an input or\nstate that erased data shaped, and production turns missing below one\n(S-16, ADR 0109).",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"

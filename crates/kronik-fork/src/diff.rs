@@ -185,10 +185,10 @@ pub struct Summary {
     /// Answers of the fork's copies of foreign actors (M14, ADR 0020).
     #[serde(default)]
     pub forked: u64,
-    /// Fork turns that read a pseudonym or an erased value (`--no-pii`)
-    /// and differ from production, and production turns missing below
-    /// them: `pii-masked`, not divergent (M8 §9). Always present, so a rule
-    /// can read it; diffs of older binaries lack it when 0.
+    /// Fork turns that read a pseudonym (`--no-pii`) or met erased data and
+    /// differ from production, and production turns missing below them:
+    /// `pii-masked`, not divergent (M8 §9, ADR 0109). Always present, so a
+    /// rule can read it; diffs of older binaries lack it when 0.
     #[serde(default)]
     pub pii_masked: u64,
     /// Fork turns of a kind whose code changed that read a pseudonym or an
@@ -197,9 +197,13 @@ pub struct Summary {
     /// Always present; 0 in identity replays.
     #[serde(default)]
     pub pii_unverified: u64,
-    /// Turns whose recorded input was erased: the replay ran on what is left
-    /// of it (the recorded outcome), so a difference is unverifiable rather
-    /// than a change (S-16, ADR 0109). Always present; 0 when none.
+    /// Turns that met erased data, differing or not: their recorded input,
+    /// a state value they read, or an input or state that erased data
+    /// shaped (a message of such a turn, state it or a production turn
+    /// missing below it left different, an actor database lacking an erased
+    /// subject's rows), and production turns missing below one. The replay
+    /// ran them on what is left, so a difference is unverifiable rather than
+    /// a change (S-16, ADR 0109). Always present; 0 when none.
     #[serde(default)]
     pub unverifiable: u64,
     /// Requests sent to a preview fork (M11): root inputs of their own,
@@ -1372,12 +1376,15 @@ struct Acc {
     norm: Norm,
     /// Divergent turns by causal key, with their actor kind.
     divergent: BTreeMap<Vec<u8>, String>,
-    /// Differences of turns that read pseudonyms (`--no-pii`).
+    /// Differences of turns that read pseudonyms (`--no-pii`) or met erased
+    /// data, and production turns missing below them.
     pii_masked: BTreeSet<Vec<u8>>,
-    /// Differences of turns whose recorded input was erased (S-16, ADR 0109).
+    /// Production turns missing below a turn that met erased data (S-16,
+    /// ADR 0109 point 3).
     unverifiable: BTreeSet<Vec<u8>>,
-    /// Every replayed turn whose recorded input was erased, differing or not:
-    /// the replay cannot verify what the guest read (S-16, ADR 0109).
+    /// Every replayed turn that met erased data ([`ForkTurn::erased`]),
+    /// differing or not: the replay cannot verify what the guest read
+    /// (S-16, ADR 0109).
     erased_seen: BTreeSet<Vec<u8>>,
     /// The current turn pair is unverifiable: do not count its effects.
     quiet: bool,
@@ -1417,6 +1424,43 @@ struct Acc {
 /// The actor kind of a turn.
 fn kind_of(t: &pb::TurnRecord) -> String {
     t.actor.as_ref().map(|a| a.kind.clone()).unwrap_or_default()
+}
+
+/// A turn the replay could not run on the recorded data: it read pseudonyms
+/// (`--no-pii`) or met a value whose subject was erased. What such a turn
+/// did measures stand-in data, not the code, so none of its differences
+/// count as changes (S-16, ADR 0109 points 3-4; ADR 0031).
+fn unverified_input(t: &ForkTurn) -> bool {
+    t.pseudonyms || t.erased
+}
+
+/// Causal keys of the production turns whose state writes are not evidence
+/// of a behavior change: the matched fork turn is [`unverified_input`], or
+/// the turn is missing below one that is (its absence is that turn's
+/// difference, not a verified change; S-16, ADR 0109 points 3-4).
+fn unverified_state_keys(prod: &[(Lsn, &pb::TurnRecord)], fork: &[ForkTurn]) -> BTreeSet<Vec<u8>> {
+    let unverified: BTreeSet<Vec<u8>> = fork
+        .iter()
+        .filter(|f| unverified_input(f))
+        .filter_map(|f| f.record.causal_key.as_ref().map(causal::encode))
+        .collect();
+    let replayed: BTreeSet<Vec<u8>> = fork
+        .iter()
+        .filter_map(|f| f.record.causal_key.as_ref().map(causal::encode))
+        .collect();
+    let mut out = unverified.clone();
+    for (_, t) in prod {
+        let Some(ck) = t.causal_key.as_ref() else {
+            continue;
+        };
+        let key = causal::encode(ck);
+        if !replayed.contains(&key)
+            && (0..ck.path.len()).any(|n| unverified.contains(&path_prefix(ck, n)))
+        {
+            out.insert(key);
+        }
+    }
+    out
 }
 
 fn path_prefix(key: &pb::CausalKey, n: usize) -> Vec<u8> {
@@ -1575,10 +1619,11 @@ impl Acc {
             .map(causal::encode)
             .unwrap_or_default();
         let f = &fork.record;
-        // A turn that read pseudonyms did not run on real data: how it
-        // differs from production (failing included) is `pii-masked`, not
-        // an error of the code. SQL turns ran on real rows and count.
-        match (prod, fork.pseudonyms || fork.erased) {
+        // A turn that read pseudonyms or erased data did not run on the
+        // recorded input: how it differs from production (failing included,
+        // and any SQL it wrote) is `pii-masked`/`unverifiable`, not an error
+        // of the code (issue #16, ADR 0109 points 3-4).
+        match (prod, unverified_input(fork)) {
             (_, true) => {}
             (Some((lsn, p)), false) => {
                 if failed(f) && !failed(p) {
@@ -1648,17 +1693,18 @@ impl Acc {
     }
 
     /// External effect differences of one turn pair: those to targets with
-    /// a copy when `copied`, else the others.
+    /// a copy when `copied`, else the others. `quiet`: the replay could not
+    /// run the turn on the recorded data (the fork turn read pseudonyms or
+    /// met erased data, or the production turn is missing below one that
+    /// did), so its effects are compared only for grounding and a
+    /// difference is not a change (S-16, ADR 0109 points 3-4).
     fn turn_effects(
         &mut self,
         prod: Option<(Lsn, &pb::TurnRecord)>,
         fork: Option<&ForkTurn>,
         copied: bool,
+        quiet: bool,
     ) {
-        // An erased turn's effects are compared only for grounding: the guest
-        // ran on what is left of the erased input, so a difference is not a
-        // change (S-16, ADR 0109).
-        let quiet = fork.is_some_and(|f| f.erased);
         self.quiet = quiet;
         let pick =
             |e: &&pb::EffectRecord| external(&e.kind) && self.copied.contains(&e.target) == copied;
@@ -1749,8 +1795,9 @@ impl Acc {
         else {
             return;
         };
-        // The response of an unverifiable turn is not a change either.
-        if fork.is_some_and(|f| f.erased) {
+        // The response of a turn the replay could not run on the recorded
+        // data is not a change either (S-16, ADR 0109 points 3-4).
+        if fork.is_some_and(unverified_input) {
             return;
         }
         let http = |t: &pb::TurnRecord| match t.outcome.as_ref().and_then(|o| o.output.as_ref()) {
@@ -1871,6 +1918,22 @@ impl Acc {
                 self.kind(kind_of(&f.record)).turns_fork += 1;
             }
         }
+        // Fork turns the replay could not run on the recorded data, and of
+        // them those that met erased data: a production turn missing below
+        // one is not evidence of a change either (issue #28).
+        let unverified_turns: BTreeSet<Vec<u8>> = fork
+            .iter()
+            .filter(|f| unverified_input(f))
+            .filter_map(|f| f.record.causal_key.as_ref().map(causal::encode))
+            .collect();
+        let erased_turns: BTreeSet<Vec<u8>> = fork
+            .iter()
+            .filter(|f| f.erased)
+            .filter_map(|f| f.record.causal_key.as_ref().map(causal::encode))
+            .collect();
+        let below = |set: &BTreeSet<Vec<u8>>, ck: Option<&pb::CausalKey>| {
+            ck.is_some_and(|ck| (0..ck.path.len()).any(|n| set.contains(&path_prefix(ck, n))))
+        };
         let mut changes: BTreeMap<Vec<u8>, Change<'a>> = BTreeMap::new();
         for f in fork {
             let Some(key) = f.record.causal_key.as_ref().map(causal::encode) else {
@@ -1886,14 +1949,18 @@ impl Acc {
             self.turn_errors(p, f);
             match p {
                 Some(p) => {
-                    if full {
+                    if full && !unverified_input(f) {
+                        // The fuel of a turn the replay could not run on the
+                        // recorded data measured a run on stand-in values,
+                        // not the code, so it feeds no percentile (ADR 0109
+                        // points 3-4).
                         self.fuel.0.push(p.1.fuel_used);
                         self.fuel.1.push(f.record.fuel_used);
                         self.memory.0.push(p.1.memory_peak_bytes);
                         self.memory.1.push(f.record.memory_peak_bytes);
                     }
                     if full || !self.copied.is_empty() {
-                        self.turn_effects(Some(p), Some(f), !full);
+                        self.turn_effects(Some(p), Some(f), !full, unverified_input(f));
                     }
                     if view(p.1, &self.norm) != view(&f.record, &self.norm) {
                         let same_input = input_bytes(p.1) == input_bytes(&f.record);
@@ -1912,7 +1979,7 @@ impl Acc {
                 }
                 None => {
                     if full || !self.copied.is_empty() {
-                        self.turn_effects(None, Some(f), !full);
+                        self.turn_effects(None, Some(f), !full, unverified_input(f));
                     }
                     changes.insert(key, Change::New { fork: f });
                 }
@@ -1921,7 +1988,8 @@ impl Acc {
         for (key, p) in &pmap {
             if !fmap.contains_key(key) {
                 if full || !self.copied.is_empty() {
-                    self.turn_effects(Some(*p), None, !full);
+                    let quiet = below(&unverified_turns, p.1.causal_key.as_ref());
+                    self.turn_effects(Some(*p), None, !full, quiet);
                 }
                 changes.insert(key.clone(), Change::Missing { prod: *p });
             }
@@ -1940,33 +2008,26 @@ impl Acc {
             })
             .map(|(k, _)| k.clone())
             .collect();
-        let erased = |c: Option<&Change<'_>>| matches!(c, Some(Change::Changed { fork, .. } | Change::New { fork }) if fork.erased);
-        let unverified_erased: BTreeSet<Vec<u8>> = changes
-            .iter()
-            .filter(|(_, c)| match c {
-                Change::Changed { .. } | Change::New { .. } => erased(Some(c)),
-                Change::Missing { prod } => prod.1.causal_key.as_ref().is_some_and(|ck| {
-                    (0..ck.path.len()).any(|n| erased(changes.get(&path_prefix(ck, n))))
-                }),
-            })
-            .map(|(k, _)| k.clone())
-            .collect();
+        // The differences that are evidence of a change, in this call: every
+        // other one is pii-masked or unverifiable, and neither an origin nor
+        // a consequence.
+        let mut counted: BTreeSet<Vec<u8>> = BTreeSet::new();
         for (key, change) in &changes {
-            let masked = match change {
-                Change::Changed { fork, .. } | Change::New { fork } => fork.masked,
-                Change::Missing { .. } => unverified.contains(key),
-            };
-            let erased = match change {
-                Change::Changed { fork, .. } | Change::New { fork } => fork.erased,
-                Change::Missing { .. } => unverified_erased.contains(key),
-            };
-            if erased {
-                // A replayed erased turn is counted once, whether or not it
-                // came out identical (fmap below) or differs; a production
-                // turn missing below one is the consequence.
-                if matches!(change, Change::Missing { .. }) {
-                    self.unverifiable.insert(key.clone());
+            let (masked, erased) = match change {
+                Change::Changed { fork, .. } | Change::New { fork } => (fork.masked, fork.erased),
+                // A production turn missing below a turn that met erased
+                // data: its absence is that turn's unverifiable difference,
+                // not a verified one (issue #28, ADR 0109 point 3).
+                Change::Missing { prod } => {
+                    let erased = below(&erased_turns, prod.1.causal_key.as_ref());
+                    (unverified.contains(key) || erased, erased)
                 }
+            };
+            // A replayed erased turn is counted once (`erased_seen`), whether
+            // it came out identical or differs; a production turn missing
+            // below one is counted here.
+            if erased && matches!(change, Change::Missing { .. }) {
+                self.unverifiable.insert(key.clone());
             }
             if masked {
                 if self.pii_masked.insert(key.clone())
@@ -1980,6 +2041,7 @@ impl Acc {
                     Change::Missing { prod } => prod.1,
                 };
                 self.divergent.insert(key.clone(), kind_of(t));
+                counted.insert(key.clone());
             }
         }
         // Responses of the HTTP root inputs; an isolated tree that calls a
@@ -2022,12 +2084,12 @@ impl Acc {
                         same_input: true,
                         ..
                     }
-                ) && !unverified.contains(*k)
+                ) && counted.contains(*k)
             })
             .map(|(k, _)| k.clone())
             .collect();
         for (key, c) in &changes {
-            if unverified.contains(key) {
+            if !counted.contains(key) {
                 continue;
             }
             let (t, id, lsn) = match c {
@@ -2139,8 +2201,25 @@ impl Acc {
             (w, r)
         }
         let sealer = self.norm.sealer.clone();
-        let (pw, pr) = collect(prod.iter().map(|(_, t)| *t), &sealer);
-        let (fw, fr) = collect(fork.iter().map(|f| &f.record), &sealer);
+        // The state a turn the replay could not run on the recorded data
+        // wrote is not evidence of a behavior change: neither the turn nor
+        // its production counterpart contributes, and a production turn
+        // missing below one does not either (S-16, ADR 0109 points 3-4).
+        let skip = unverified_state_keys(prod, fork);
+        let (pw, pr) = collect(
+            prod.iter().map(|(_, t)| *t).filter(|t| {
+                t.causal_key
+                    .as_ref()
+                    .is_none_or(|k| !skip.contains(&causal::encode(k)))
+            }),
+            &sealer,
+        );
+        let (fw, fr) = collect(
+            fork.iter()
+                .filter(|f| !unverified_input(f))
+                .map(|f| &f.record),
+            &sealer,
+        );
         let actors: BTreeSet<&String> = pw
             .keys()
             .chain(fw.keys())
@@ -2358,11 +2437,52 @@ fn all_actors(store: &Store) -> Result<Vec<(ActorRef, bool)>, ReplayError> {
     Ok(out)
 }
 
+/// The state a turn the replay could not run on the recorded data wrote
+/// ([`unverified_input`]): keys and SQL rows that are not evidence of a
+/// behavior change, so the continuous state comparison skips them (S-16,
+/// ADR 0109 points 3-4; ADR 0031).
+#[derive(Default)]
+struct StateTouches {
+    /// (actor, state key)
+    keys: BTreeSet<(String, String)>,
+    /// (actor, table, primary key as JSON)
+    rows: BTreeSet<(String, String, String)>,
+}
+
+impl StateTouches {
+    fn record(&mut self, t: &pb::TurnRecord) {
+        let actor = t
+            .actor
+            .as_ref()
+            .map(|a| format!("{}/{}", a.kind, a.key))
+            .unwrap_or_default();
+        for w in &t.writes {
+            self.keys.insert((actor.clone(), w.key.clone()));
+        }
+        for c in &t.sql_changes {
+            let Some(b) = sealable_bytes(c.changeset.as_ref()) else {
+                continue;
+            };
+            let Ok(rows) = changeset_rows(b) else {
+                continue;
+            };
+            for r in rows {
+                let pk = serde_json::to_string(&r.pk.iter().map(sql_json).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                self.rows.insert((actor.clone(), r.table.clone(), pk));
+            }
+        }
+    }
+}
+
 /// Each actor's final state in the fork store against production's.
+/// `excluded` holds the keys and rows written by turns the replay could not
+/// run on the recorded data; they are skipped, so they cannot set `changed`.
 fn continuous_state(
     fork: &Store,
     prod: &Store,
     sealer: &Sealer,
+    excluded: &StateTouches,
 ) -> Result<Vec<ActorState>, ReplayError> {
     let mut actors: BTreeMap<String, (ActorRef, bool, bool)> = BTreeMap::new();
     for (a, sql) in all_actors(prod)? {
@@ -2390,6 +2510,9 @@ fn continuous_state(
         let names: BTreeSet<&String> = pk.keys().chain(fk.keys()).collect();
         let mut keys = Vec::new();
         for k in names {
+            if excluded.keys.contains(&(name.clone(), k.clone())) {
+                continue;
+            }
             let (p, f) = (pk.get(k), fk.get(k));
             if p == f {
                 continue;
@@ -2420,6 +2543,12 @@ fn continuous_state(
             };
             let rows: BTreeSet<&(String, String)> = pt.keys().chain(ft.keys()).collect();
             for r in rows {
+                if excluded
+                    .rows
+                    .contains(&(name.clone(), r.0.clone(), r.1.clone()))
+                {
+                    continue;
+                }
                 let (p, f) = (pt.get(r), ft.get(r));
                 if p.map(|x| &x.1) == f.map(|x| &x.1) {
                     continue;
@@ -2538,7 +2667,23 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
             own = Cow::Owned(rest);
         }
         acc.compare(&prod, &sql_tagged(&own), None, full);
-        state_continuous = continuous_state(c.fork, c.prod, &index.sealer)?;
+        // The state a turn the replay could not run on the recorded data
+        // wrote is not evidence of a behavior change: every key and row such
+        // turns touched on either side is skipped in the comparison below
+        // (S-16, ADR 0109 points 3-4).
+        let mut touches = StateTouches::default();
+        for f in own.iter().filter(|f| unverified_input(f)) {
+            touches.record(&f.record);
+        }
+        let skip = unverified_state_keys(&prod, &own);
+        for t in prod.iter().map(|(_, t)| *t).filter(|t| {
+            t.causal_key
+                .as_ref()
+                .is_some_and(|k| skip.contains(&causal::encode(k)))
+        }) {
+            touches.record(t);
+        }
+        state_continuous = continuous_state(c.fork, c.prod, &index.sealer, &touches)?;
     }
     let cumulative: Vec<ActorState> = state_continuous
         .iter()
@@ -2716,7 +2861,9 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
         divergent_turns: acc.divergent.len() as u64,
         pii_masked: acc.pii_masked.len() as u64,
         pii_unverified,
-        unverifiable: (acc.erased_seen.len() + acc.unverifiable.len()) as u64,
+        // A key can be a replayed erased turn in one mode and a production
+        // turn missing below one in the other: it counts once.
+        unverifiable: acc.erased_seen.union(&acc.unverifiable).count() as u64,
         preview_inputs: acc.preview_inputs,
         origins: acc.origins,
         consequences: acc.consequences,

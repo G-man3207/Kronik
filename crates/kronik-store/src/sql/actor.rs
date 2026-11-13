@@ -65,9 +65,10 @@ pub struct TurnSql {
     pub changesets: Vec<(Option<String>, Vec<u8>)>,
     /// VM steps executed by the guest's statements.
     pub vm_steps: u64,
-    /// The unsplit changeset, used for the live apply (one
-    /// `sqlite3changeset_apply` call). Not written to the log; rebuilds
-    /// apply the per-subject changesets.
+    /// The unsplit changeset. Not written to the log, and the daemon never
+    /// applies it: the live apply, rebuilds, forks and replay all apply the
+    /// per-subject changesets of the record (ADR 0005, amended). `apply`
+    /// uses it when it is set, which only tests do.
     pub whole: Vec<u8>,
 }
 
@@ -1081,6 +1082,22 @@ impl SqlActor {
             crate::db::checkpoint_truncate(&self.conn, "actor database");
         }
         Ok(n)
+    }
+
+    /// Whether a table of the guest's has no `_subject` column. A subject's
+    /// erasure leaves such a table's rows, which a turn with a subject could
+    /// write before ADR 0005 §6 option B refused it.
+    pub fn has_table_without_subject(&self) -> Result<bool, String> {
+        lock(&self.shared).host = true;
+        self.conn
+            .query_row(
+                "SELECT count(*) > 0 FROM sqlite_schema m WHERE m.type = 'table' \
+                 AND m.name NOT LIKE '\\_kronik%' ESCAPE '\\' AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+                 AND NOT EXISTS (SELECT 1 FROM pragma_table_info(m.name) c WHERE c.name = '_subject')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())
     }
 
     /// Replaces text and blob cells of rows tagged with `_subject`. Integer

@@ -57,19 +57,18 @@ is a log record.
    a rebase's switch (16) or 40, a `TurnRecord` whose input is an `OPERATOR` or
    `DEAD_LETTER_RESEND` message, or a `secret.reveal` effect of any
    `TurnRecord` (the brief: a reveal "syns i audit"). The export writes one
-   JSON line (`kronik.audit/v2`, m28-otel §4.3) per audited item, in LSN
-   order:
+   JSON line (`kronik.audit/v3` since the amendment below, first
+   `kronik.audit/v2`; m28-otel §4.3) per audited item, in LSN order:
    - the record's `lsn`, the effect ordinal for a reveal, `kind`, `action`,
      `token_id`, `at_wall_ms`, scrubbed `reason`;
    - per-kind `details` under ADR 0082 (a reveal names the secret, never
      the value);
-   - `record_hash`, the domain-separated blake3 of the record's canonical
-     form: sealables become subject tags and free text is canonically
-     withheld/token-scrubbed, so a reseal does not change it.
-     An erasure's subject is replaced by its keyed label, and the key in a
+   - `record_hash`, a hash of the record's canonical form, in which
+     sealables become subject tags, so a reseal does not change it. An
+     erasure's subject is replaced by its keyed label, and the key in a
      `fork.send` event's `details.actor` by its keyed label (`kind/` plus
-     the label), so the hash cannot confirm a guessed
-     subject or actor key.
+     the label), so the hash cannot confirm a guessed subject or actor key.
+     v2's hash was a public blake3; v3's is keyed (see the amendment).
 
    A unit test fails when a record message with an `Audit` field is not
    classified.
@@ -80,13 +79,13 @@ is a log record.
    is not a key: after a restore from an older ship point, new records
    reuse the lost tail's LSNs.
    - Verification accepts only known schemas, exact source-derived hashes
-     and matching identity fields. Legacy `kronik.audit/v1` is read-only
-     compatibility, not an alternate emission format; mixed v1/v2 retries
-     represent one logical source item.
+     and matching identity fields. Legacy `kronik.audit/v1` and `v2` are
+     read-only compatibility, not alternate emission formats; retries in
+     mixed formats represent one logical source item.
    - Only trusted source restore records authorize superseding a lost tail;
      sink-supplied restore lines cannot authorize cuts. `restore.through_lsn`
      and `audit.gap.from`/`to` are action-specific validated `u64` positions:
-     v2 emits JSON numbers; legacy v1 requires decimal strings.
+     v3 and v2 lines carry JSON numbers; legacy v1 requires decimal strings.
    - `kronik audit verify --sink` computes this against the log.
    - `crates/kronik/tests/audit.rs` drives every mutating route, a reveal
      and a restore (dry runs too, which must export nothing), with a
@@ -170,3 +169,20 @@ is a log record.
 - These are not physical fsync-repair, cloud IAM or HSM proofs. Historical
   archive misordering is not repaired. Complete retained external/deleted
   secret inventory across restart remains M23 work.
+
+## Amendment (2026-11-13): keyed `kronik.audit/v3` lines
+
+The export now writes `kronik.audit/v3` lines only (m28-otel §4.3). Their
+`record_hash` is `b3k:v3:` and a keyed BLAKE3 hash, with the purpose
+`kronik audit record v3` and the node's key derived from the master key, of
+the kind byte and the canonical record of item 2. Free text was never
+replaced by a placeholder in it, although this ADR and ADR 0082 said
+"withheld": it is in the hashed bytes as recorded and scrubbed, and v2
+hashed it publicly. In v3 the key keeps the hash from confirming a guess of
+private text. A line can therefore be built or verified only with the
+master key, and nothing falls back to a public digest. `kronik.audit/v2` and
+`v1` lines stay readable by `kronik audit verify`, which derives their
+public hashes from the source records. The
+sink names keep `v2` (`audit-v2-<sequence:020>.jsonl`, `audit/v2/`): it
+names the numbered-slot scheme, the names are frozen, and v3 lines go into
+them.

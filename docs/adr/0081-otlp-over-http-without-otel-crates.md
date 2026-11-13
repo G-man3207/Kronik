@@ -1,6 +1,6 @@
 # 0081. OTLP over HTTP with vendored protos, no OpenTelemetry crates
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-13; shipped in v0.4.0)
 - **Date:** 2026-10-27
 
 ## Context

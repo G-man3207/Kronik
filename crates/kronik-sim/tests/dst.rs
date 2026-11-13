@@ -11,7 +11,10 @@
 //! or all three for every seed. `--scenario rebuild` (not part of `all`)
 //! runs the effects workload with tiny startup-replay thresholds and
 //! segments, and checks every start's recovered state against a rebuild
-//! from the log.
+//! from the log. `--scenario allocator` and `--scenario secret-outage` (not
+//! part of `all`) are M23's secret workloads against a simulated OpenBao:
+//! one allocator of version numbers under concurrent first uses, refreshes
+//! and crashes, and turns while the backend hangs.
 //! `--long STEPS` runs the counter workload as one long run per seed (default
 //! seed 0) of at least STEPS executor steps, with crashes throughout; the
 //! Definition of done asks for at least 1 000 000 (`--long 1000000`).
@@ -99,9 +102,20 @@ fn main() -> ExitCode {
                     scenarios = vec!["rebuild"];
                     i += 1;
                 }
+                Some("allocator") => {
+                    scenarios = vec!["allocator"];
+                    i += 1;
+                }
+                Some("secret-outage") => {
+                    scenarios = vec!["secret-outage"];
+                    i += 1;
+                }
                 Some("all") => i += 1,
                 _ => {
-                    eprintln!("--scenario needs counter, effects, webhook, rebuild or all");
+                    eprintln!(
+                        "--scenario needs counter, effects, webhook, rebuild, allocator, \
+                         secret-outage or all"
+                    );
                     return ExitCode::FAILURE;
                 }
             },
@@ -132,6 +146,10 @@ fn main() -> ExitCode {
             ScenarioConfig::webhook_for_seed(seed)
         } else if scenario == "rebuild" {
             ScenarioConfig::rebuild_for_seed(seed)
+        } else if scenario == "allocator" {
+            ScenarioConfig::allocator_for_seed(seed)
+        } else if scenario == "secret-outage" {
+            ScenarioConfig::outage_for_seed(seed)
         } else if let Some(steps) = long {
             ScenarioConfig::long(seed, steps)
         } else {

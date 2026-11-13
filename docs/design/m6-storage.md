@@ -44,8 +44,9 @@ snapshots/main/<L>/manifest.json     written last: the snapshot exists iff it do
  "state_hash": "b3:…"}
 ```
 
-- `segments`: the closed and active segments holding LSNs after `L` when
-  the snapshot was taken (what a restore needs next).
+- `segments`: the closed and active segments a start from the snapshot
+  reads, when it was taken: those holding LSNs after `L`, and from the one
+  holding the `TurnBegin` of a turn open at `L` on (§5, "Open turns").
 - `state_hash`: §8, so a restore can be checked against it.
 - **Consistency.** The store gets an apply lock that `Store::apply` holds
   for a whole batch (actor databases first, then `state.db`); the snapshot
@@ -66,9 +67,27 @@ snapshots/main/<L>/manifest.json     written last: the snapshot exists iff it do
   shutdown snapshots are not taken when nothing was applied since the
   newest snapshot but its own marker, so an idle node writes no copy of
   the state and appends no marker.
-- **Kept.** The newest `retention.snapshots_kept` (48), plus always the
-  newest snapshot at or below the oldest retained LSN (§5), which cursors
-  and startup need.
+- **Kept.** The newest `retention.snapshots_kept` (48); the window's
+  **base**, the newest snapshot whose state is no newer than the start of
+  the history window (§5: its `logical_time_ms` is at or before the
+  cutoff), from which every fork point in the window can start; and,
+  between the base and the newest `snapshots_kept`, one snapshot per seventh
+  of `history` (a day with the defaults; at least `snapshot_interval`
+  apart). As the window moves, the base moves to the next of them, so the
+  log reaches back at most that step (and an interval) further than
+  `history`. Before a snapshot is old enough to be the base (a young node
+  for its first `history`, or for up to one `history` after an upgrade from
+  0.4.1 or older), the oldest usable one is kept in its place and nothing
+  is deleted. With the defaults that is 48 hourly
+  snapshots and about six more. A snapshot at or before a rebase switch's
+  base is kept until a snapshot after the switch exists (ADR 0017). After an
+  erasure deleted the snapshots before it (m8 §6.6) and none after it is
+  old enough yet, the oldest one after it is the base: a fork point before
+  the erasure that the log alone cannot reach is outside retention anyway.
+  Before 0.5 this kept the newest `snapshots_kept` and the oldest snapshot
+  the log continued, while compaction deleted by the newest snapshot, so
+  up to all but the newest `snapshots_kept` intervals of the window could
+  not be forked (#66).
 - `kronik snapshot list` (`GET /v1/snapshots`): `{"snapshots": [{"id",
   "lsn", "created_wall_ms", "engine_version", "bytes", "shipped"}]}`.
 
@@ -114,8 +133,12 @@ point plus main's records up to it.
 
 **The brief's `kv_versions`** (production's state at any LSN in the window)
 is served by these cursors: state at LSN `x` = nearest snapshot ≤ `x` +
-records up to `x`. No per-key version table is kept; snapshots every
-60 min bound the records a cursor applies (§9 measures it).
+records up to `x`; the base (§2) is at or before every LSN in the window,
+so every one has a snapshot. No per-key version table is kept. The records a
+cursor applies are at most `snapshot_interval` of them for an `x` within the
+newest `snapshots_kept` intervals (48 h with the defaults), and at most a
+seventh of `history` (a day) plus an interval for an older `x`. §9 measures
+the start, not a cursor.
 
 ## 4. Shipping (`kronik-ship`)
 
@@ -171,10 +194,28 @@ each object compressed with zstd (level 3):
   (the first `Deployment` of a young node) has no logical time and gets an
   older turn's mark, or 0. Such a record is at most as old as the next
   turn, so as built a closed segment is deleted (locally, then remotely
-  when shipped) only when its `last_lsn` is at most the LSN of a kept
-  snapshot and the first later segment with a higher `last_time_ms` (the
+  when shipped) only when its `last_lsn` is at most the LSN of the window's
+  base (§2) and the first later segment with a higher `last_time_ms` (the
   one holding the next turn) is older than the window too. Without a later
-  turn the segment is kept. Compaction runs after each snapshot.
+  turn the segment is kept, and without a base nothing is deleted. A segment
+  that holds an LSN inside the window is never deleted, and the base the
+  log then starts from is at or before every LSN in the window, so a fork,
+  a replay or a cursor can start at any of them. Compaction runs after each
+  snapshot.
+- **Open turns.** The start re-runs a turn whose `TurnBegin` has no turn
+  record, and reads that `TurnBegin` from the log at the position
+  `open_turns` holds (its effect results are copied into `open_effects`).
+  A snapshot taken while a turn is open holds that row, so a segment that
+  holds the `TurnBegin` of a turn open in the live state or in any snapshot
+  is not deleted, nor any later one: a snapshot does not cover a segment it
+  still needs. That keeps the log the one copy of the turn's input. The
+  alternative, a copy of each open `TurnBegin` in `state.db`, would be a
+  second copy of turn inputs that reseal and erasure must also cover, and
+  it would not help a snapshot an older release took; the cost here is
+  that a turn open for longer than `history` holds back retention until it
+  ends and no kept snapshot holds it open. A start that still misses the
+  segment (a directory an older release compacted) is `STORAGE_CORRUPT`
+  naming the turn's execution id, not a bare I/O error (#35).
 - **Order of a pass.** Decide which segments go; raise the applied LSN of
   every actor database below the horizon to the applied LSN, under the
   apply lock (in batches of 64 databases, never the whole pass: turns wait
@@ -189,10 +230,13 @@ each object compressed with zstd (level 3):
   has open (its savepoint would roll the stamp back) is retried briefly and
   then stops the pass, as does a missing file.
 - **A window cut short.** A proposal's `--window` can reach back before
-  what the log and snapshots still hold. The fork then starts at the
-  oldest usable snapshot and the proposal says so: `warnings` in its JSON,
-  a `Warning:` line in the CLI, and `base.window_cut` (`window_ms`,
-  `kept_from_lsn`) in the diff (additive in `kronik.diff/v1`).
+  what the log and snapshots still hold, or before the history window. The
+  fork then starts at the oldest point it may take: the oldest usable
+  snapshot, or the first turn inside the history window when the window's
+  base is older than that, and the proposal says so: `warnings` in its
+  JSON, a `Warning:` line in the CLI, and `base.window_cut` (`window_ms`,
+  `kept_from_lsn`, the fork point it starts from) in the diff (additive in
+  `kronik.diff/v1`).
 - **Index compaction.** Rows of `turn_index` and `trees` for deleted LSNs
   are deleted; `history` and `trace` end at the oldest retained LSN.
   Dead letters keep their input (they don't need the segment); ingress
@@ -252,11 +296,13 @@ read:
    are history to reproduce, not engine differences. This upgrade-only
    policy must not replace ordinary forks' fixed fork-point/candidate
    configuration and code overrides.
-2. An empty diff writes `DIR/upgrade/<to-engine>.json` with `{from_engine,
-   to_engine, window, fork_lsn, checked_through_lsn, diff_hash,
-   report_hash}` and exits 0. A non-empty diff exits with
-   `ENGINE_UPGRADE_DIVERGED`, writes the diff next to it and prints a
-   summary.
+2. A diff with no verified difference writes `DIR/upgrade/<to-engine>.json`
+   with `{from_engine, to_engine, window, fork_lsn, checked_through_lsn,
+   diff_hash, report_hash}` and exits 0. Differences of turns that met
+   erased data (their recorded input, a state value they read, or an input
+   or state that erased data shaped) are unverifiable, not a behavior change
+   (ADR 0109). A verified difference exits with `ENGINE_UPGRADE_DIVERGED`,
+   writes the diff next to it and prints a summary.
 3. When the new binary starts and the engine version recorded in `state.db`
    (`meta.engine_version`, written by the applier from the newest
    `TurnBegin`/`TurnRecord`/`EngineUpgrade`) differs from its own, it
@@ -328,8 +374,12 @@ overlap.
   pinned by hooks (a crash after the raise deletes nothing, a crash after a
   delete leaves a log every database reaches).
 - Replay from a snapshot: identity and +2 diffs equal those from LSN 1.
-- Retention: old segments deleted only when covered by a kept snapshot;
-  forks outside the window refused; history/trace end at the window.
+- Retention: old segments deleted only when covered by the window's base;
+  forks outside the window refused; history/trace end at the window; a
+  fork at the oldest point of the window works after the base has moved
+  (and the plan keeps a base for every point over weeks of hourly
+  snapshots); a snapshot taken while a turn is open stays a start point
+  through retention.
 - Shipping and restore against MinIO in Docker (unique container name,
   random port, removed afterwards): restored state hash and log hash equal
   the source's; the idle-roll bound.

@@ -419,11 +419,28 @@ fn overview(o: &mut String, d: &Diff, policy: Option<&Value>, title: &str, publi
         num(s.consequences)
     );
     if s.pii_masked + s.pii_unverified > 0 {
+        let _ = if d.options.no_pii {
+            writeln!(
+                o,
+                "| PII-masked turns | {} ({} identical to production; ran on pseudonyms, not verified: re-run with a pii:read token) |",
+                num(s.pii_masked + s.pii_unverified),
+                num(s.pii_unverified)
+            )
+        } else {
+            // A fork with personal data reads no pseudonyms: what it masks
+            // met erased data (ADR 0109).
+            writeln!(
+                o,
+                "| PII-masked turns | {} (met erased data, not verified) |",
+                num(s.pii_masked + s.pii_unverified)
+            )
+        };
+    }
+    if s.unverifiable > 0 {
         let _ = writeln!(
             o,
-            "| PII-masked turns | {} ({} identical to production; ran on pseudonyms, not verified: re-run with a pii:read token) |",
-            num(s.pii_masked + s.pii_unverified),
-            num(s.pii_unverified)
+            "| Unverifiable turns | {} (met erased data: not verified, and no change; ADR 0109) |",
+            num(s.unverifiable)
         );
     }
     if s.preview_inputs > 0 {
@@ -747,6 +764,31 @@ mod tests {
     use super::{code, num, pct, render, summary};
     use crate::diff::{Cause, Diff, ErrorItem, GroundingRow, KindReport};
     use serde_json::{Value, json};
+
+    /// Issue #28: a diff whose only differences are turns that met erased
+    /// data says so, and not that they ran on pseudonyms.
+    #[test]
+    fn unverifiable_turns_are_named_as_such() {
+        let mut d = leaky_diff();
+        d.summary.pii_masked = 1;
+        d.summary.unverifiable = 6;
+        d.options.no_pii = false;
+        let md = render(&d, None);
+        assert!(
+            md.contains("| Unverifiable turns | 6 (met erased data"),
+            "{md}"
+        );
+        assert!(
+            md.contains("| PII-masked turns | 1 (met erased data"),
+            "{md}"
+        );
+        assert!(!md.contains("ran on pseudonyms"), "{md}");
+        assert!(summary(&d, None, &[]).contains("| Unverifiable turns | 6 "));
+        d.options.no_pii = true;
+        assert!(render(&d, None).contains("ran on pseudonyms"));
+        d.summary.unverifiable = 0;
+        assert!(!render(&d, None).contains("Unverifiable"));
+    }
 
     #[test]
     fn thousands() {

@@ -155,6 +155,95 @@ pub fn history_cutoff(time_hwm: u64, history: Duration) -> u64 {
     time_hwm.saturating_sub(history.as_millis() as u64)
 }
 
+/// One snapshot as retention sees it: its LSN and the logical-time
+/// high-water mark of the state it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotPoint {
+    pub lsn: Lsn,
+    pub logical_time_ms: u64,
+}
+
+/// Which snapshots retention keeps, and the one the history window starts
+/// from (docs/design/m6-storage.md §2, §5).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RetentionPlan {
+    /// The window's base: the newest snapshot whose state is no newer than
+    /// the window's start, so every fork point in the window can start from
+    /// it. Compaction deletes only segments it covers. `None` while no
+    /// snapshot is that old (a young node, or the first days after an
+    /// upgrade): then nothing is deleted.
+    pub base: Option<Lsn>,
+    /// The LSNs of the snapshots to keep.
+    pub keep: std::collections::BTreeSet<Lsn>,
+}
+
+/// How far apart the snapshots between the base and the newest
+/// `snapshots_kept` are kept: a seventh of `history` (a day with the default
+/// 7 days), and at least `snapshot_interval`. The base moves in steps of at
+/// most this much, so the log reaches back at most this much (and an
+/// interval) further than `history`.
+pub fn thinning_step(storage: &StorageConfig) -> u64 {
+    let step = storage.history.as_millis() as u64 / 7;
+    step.max(storage.snapshot_interval.as_millis() as u64)
+}
+
+/// The retention plan for `snapshots` (oldest first) of a log that starts
+/// at `log_first`, a window that starts at logical time `cutoff`, keeping
+/// the newest `kept` and one per `step_ms` between them and the base.
+///
+/// After an erasure the snapshots before it are deleted (m8-privacy §6.6):
+/// a fork point before the erasure that the log alone cannot reach is
+/// outside retention anyway. When that left no snapshot older than the
+/// window, the oldest snapshot after the erasure is the base, so retention
+/// does not stop for as long as erasures keep coming.
+pub fn retention_plan(
+    snapshots: &[SnapshotPoint],
+    log_first: Lsn,
+    cutoff: u64,
+    kept: usize,
+    step_ms: u64,
+    erasure_floor: Option<Lsn>,
+) -> RetentionPlan {
+    let usable: Vec<SnapshotPoint> = snapshots
+        .iter()
+        .copied()
+        .filter(|s| log_first <= 1 || s.lsn + 1 >= log_first)
+        .filter(|s| erasure_floor.is_none_or(|f| s.lsn >= f))
+        .collect();
+    let mut base = usable
+        .iter()
+        .rev()
+        .find(|s| s.logical_time_ms <= cutoff)
+        .map(|s| s.lsn);
+    if base.is_none() && erasure_floor.is_some() {
+        base = usable.first().map(|s| s.lsn);
+    }
+    let newest_from = snapshots.len().saturating_sub(kept.max(1));
+    let mut keep: std::collections::BTreeSet<Lsn> =
+        snapshots[newest_from..].iter().map(|s| s.lsn).collect();
+    // The chain from the base (or, before there is one, from the oldest
+    // usable snapshot, the base to be) to the newest kept: one per step.
+    let anchor = base.or_else(|| usable.first().map(|s| s.lsn));
+    if let Some(anchor) = anchor {
+        keep.insert(anchor);
+        let newest_kept = snapshots.get(newest_from).map(|s| s.lsn);
+        let mut last = usable
+            .iter()
+            .find(|s| s.lsn == anchor)
+            .map_or(0, |s| s.logical_time_ms);
+        for s in usable
+            .iter()
+            .filter(|s| s.lsn > anchor && newest_kept.is_none_or(|n| s.lsn < n))
+        {
+            if s.logical_time_ms.saturating_sub(last) >= step_ms {
+                keep.insert(s.lsn);
+                last = s.logical_time_ms;
+            }
+        }
+    }
+    RetentionPlan { base, keep }
+}
+
 /// One file of a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotFile {
@@ -173,7 +262,9 @@ pub struct Manifest {
     pub engine_version: String,
     pub created_wall_ms: u64,
     pub logical_time_ms: u64,
-    /// Segments holding LSNs after `lsn` when the snapshot was taken.
+    /// The segments a start from this snapshot reads, when it was taken:
+    /// those holding LSNs after `lsn`, and from the one holding the
+    /// `TurnBegin` of a turn open at `lsn` on.
     pub segments: Vec<String>,
     pub files: Vec<SnapshotFile>,
     pub state_hash: String,
@@ -626,7 +717,12 @@ impl Node {
         }
         let log_dir = storage.data_dir.join("branches").join(branch).join("log");
         let starts = kronik_log::segment_starts(&log_dir).map_err(|e| io_err("log", e))?;
-        let from = starts.iter().rposition(|s| *s <= copy.lsn + 1).unwrap_or(0);
+        // What a start from this snapshot reads: the records after it, and
+        // the TurnBegin of a turn open in it (#35).
+        let open = kronik_store::snapshot::open_turn_segment(tmp)
+            .map_err(|e| ApiError::new(ErrorCode::Internal, format!("snapshot: {e}")))?;
+        let needed = open.map_or(copy.lsn + 1, |segment| segment.min(copy.lsn + 1));
+        let from = starts.iter().rposition(|s| *s <= needed).unwrap_or(0);
         let segments = starts[from..]
             .iter()
             .map(|s| kronik_log::segment_name(*s))
@@ -857,20 +953,76 @@ impl Node {
             .unwrap_or(1))
     }
 
-    /// Keeps the newest `snapshots_kept`, plus the oldest snapshot the log
-    /// still continues (the base for replay at the start of the window).
+    /// The retention plan for `all` (this branch's snapshots, oldest first)
+    /// with the log starting at `log_first` ([`retention_plan`]).
+    fn retention_plan_now(
+        &self,
+        storage: &StorageConfig,
+        all: &[(PathBuf, Manifest)],
+        log_first: Lsn,
+    ) -> Result<RetentionPlan, ApiError> {
+        let db = self.store().db();
+        let hwm = db.time_hwm().map_err(crate::node::store_err)?;
+        let floor = db.erasure_floor().map_err(crate::node::store_err)?;
+        drop(db);
+        let points: Vec<SnapshotPoint> = all
+            .iter()
+            .map(|(_, m)| SnapshotPoint {
+                lsn: m.lsn,
+                logical_time_ms: m.logical_time_ms,
+            })
+            .collect();
+        Ok(retention_plan(
+            &points,
+            log_first,
+            history_cutoff(hwm, storage.history),
+            storage.snapshots_kept,
+            thinning_step(storage),
+            floor,
+        ))
+    }
+
+    /// The first segment a start may still need for a turn that is open in
+    /// the live state or in a snapshot: the one holding its `TurnBegin`,
+    /// which the re-run reads from the log (#35). A snapshot does not cover
+    /// a segment it still needs, so retention keeps it and every later one.
+    fn open_turn_pin(&self, all: &[(PathBuf, Manifest)]) -> Result<Option<Lsn>, ApiError> {
+        let mut pin = self
+            .store()
+            .db()
+            .open_turns()
+            .map_err(crate::node::store_err)?
+            .iter()
+            .map(|t| t.pos.segment)
+            .min();
+        for (dir, m) in all {
+            let first = kronik_store::snapshot::open_turn_segment(dir).map_err(|e| {
+                ApiError::new(
+                    ErrorCode::Internal,
+                    format!("reading the open turns of snapshot {}: {e}", m.id),
+                )
+            })?;
+            pin = match (pin, first) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        Ok(pin)
+    }
+
+    /// Keeps the newest `snapshots_kept`, the window's base and one
+    /// snapshot per [`thinning_step`] between them ([`retention_plan`]), and
+    /// the snapshot a rebase switch still needs.
     fn prune_snapshots(&self, storage: &StorageConfig) {
         let all = list(&storage.data_dir, self.branch());
-        let keep = storage.snapshots_kept.max(1);
-        if all.len() <= keep {
-            return;
-        }
-        // While the log still starts at LSN 1 replay needs no base.
         let log_first = self.log_first(storage).unwrap_or(1);
-        let base = all
-            .iter()
-            .find(|(_, m)| log_first > 1 && m.lsn + 1 >= log_first)
-            .map(|(_, m)| m.lsn);
+        let plan = match self.retention_plan_now(storage, &all, log_first) {
+            Ok(plan) => plan,
+            Err(e) => {
+                tracing::warn!(error = %e.message, "snapshot pruning skipped");
+                return;
+            }
+        };
         // Until a snapshot at or after the newest rebase switch exists, a
         // rebuild crosses it from a snapshot at or before its base (ADR 0017).
         let newest = all.last().map(|(_, m)| m.lsn);
@@ -885,8 +1037,8 @@ impl Node {
                     .find(|(_, m)| m.lsn <= b)
                     .map(|(_, m)| m.lsn)
             });
-        for (dir, m) in &all[..all.len() - keep] {
-            if Some(m.lsn) == base || Some(m.lsn) == rebase_base {
+        for (dir, m) in &all {
+            if plan.keep.contains(&m.lsn) || Some(m.lsn) == rebase_base {
                 continue;
             }
             if let Err(e) = std::fs::remove_dir_all(dir) {
@@ -942,8 +1094,11 @@ impl Node {
     }
 
     /// Retention (m6-storage §5): deletes closed segments older than
-    /// `history` whose records a kept snapshot covers, then the index rows
-    /// of what they held. Returns the log's first LSN afterwards.
+    /// `history` whose records the window's base covers (the newest snapshot
+    /// no newer than the window's start, [`retention_plan`]), and none from
+    /// the segment holding the `TurnBegin` of a turn open in the live state
+    /// or in a snapshot on, then the index rows of what they held. Returns
+    /// the log's first LSN afterwards.
     ///
     /// A segment's own time (the turn-time high-water mark at its last
     /// record) says nothing about records after its last turn: a
@@ -974,11 +1129,16 @@ impl Node {
         let hwm = self.store().db().time_hwm().map_err(store_err)?;
         let cutoff = history_cutoff(hwm, storage.history);
         let ranges = self.store().db().segments().map_err(store_err)?;
-        let newest_snapshot = list(&storage.data_dir, self.branch())
-            .last()
-            .map(|(_, m)| m.lsn);
+        let all = list(&storage.data_dir, self.branch());
+        let newest_snapshot = all.last().map(|(_, m)| m.lsn);
         let mut first = starts.first().copied().unwrap_or(1);
         let was_first = first;
+        // A segment goes only when the window's base covers it: every fork
+        // point in the window keeps a snapshot at or before it (#66).
+        let base = self.retention_plan_now(storage, &all, first)?.base;
+        // Nor while a turn open in the live state or in a snapshot began in
+        // it: its re-run reads that TurnBegin from the log (#35).
+        let pin = self.open_turn_pin(&all)?;
         // A rebuild may still have to cross the newest rebase switch from
         // before its base (ADR 0017): keep everything until a snapshot at or
         // after the switch exists.
@@ -994,6 +1154,9 @@ impl Node {
         let mut doomed: Vec<(Lsn, Lsn, Option<Lsn>)> = Vec::new();
         for w in starts.windows(2).take_while(|_| !rebase_hold) {
             let (start, next) = (w[0], w[1]);
+            if pin.is_some_and(|p| start >= p) {
+                break;
+            }
             let last_lsn = next - 1;
             let Some(&(_, _, last_time)) = ranges.iter().find(|(s, _, _)| *s == start) else {
                 break;
@@ -1006,7 +1169,7 @@ impl Node {
                 .filter(|(s, _, _)| *s > start)
                 .map(|&(_, _, t)| t)
                 .find(|t| *t > last_time);
-            let covered = newest_snapshot.is_some_and(|l| l >= last_lsn);
+            let covered = base.is_some_and(|l| l >= last_lsn);
             if bound.is_none_or(|b| b >= cutoff) || !covered {
                 break;
             }
@@ -1090,3 +1253,6 @@ pub(crate) async fn snapshot_loop(node: std::sync::Weak<Node>, interval: Duratio
 
 #[cfg(test)]
 mod retention_tests;
+
+#[cfg(test)]
+mod plan_tests;

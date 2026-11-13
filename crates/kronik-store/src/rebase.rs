@@ -32,8 +32,9 @@ pub struct Shadow {
     pub turns: u64,
     /// The fork LSN of the last of this rebase's turns fed.
     pub staged_fork_lsn: Lsn,
-    /// The subjects erased after the base, in order.
-    erased: Vec<String>,
+    /// The subjects erased after the base, with their erased key version,
+    /// in order.
+    erased: Vec<(String, u32)>,
 }
 
 impl Shadow {
@@ -120,7 +121,7 @@ impl Shadow {
                     }
                 }
                 Record::Erasure(e) => {
-                    self.erased.push(e.subject.clone());
+                    self.erased.push((e.subject.clone(), e.key_version));
                     apply.push(c.clone());
                 }
                 _ => {}
@@ -157,8 +158,8 @@ impl Shadow {
     /// back (m13-rebase §3).
     pub fn finish(&self, sw: &pb::RebaseSwitch) -> Result<(), StoreError> {
         self.check(sw)?;
-        for subject in &self.erased {
-            self.store.erase_again(subject)?;
+        for (subject, key_version) in &self.erased {
+            self.store.erase_again(subject, *key_version)?;
         }
         Ok(())
     }

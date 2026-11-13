@@ -7,7 +7,8 @@
 # Usage: scripts/dst.sh [SEEDS] [JOBS] [harness options...]
 #   SEEDS   A..B, default 0..10000
 #   JOBS    processes, default the number of CPUs
-#   harness options such as `--scenario webhook` or `--twice`;
+#   harness options such as `--scenario webhook` or `--twice`; the secret
+#   workloads (M23) are `--scenario allocator` and `--scenario secret-outage`;
 #   KRONIK_DST_RELAY=<component> runs the webhook workload with another
 #   relay, as in the harness. For the long run, call the harness directly:
 #   cargo test --release -p kronik-sim --test dst -- --long 1000000
@@ -58,7 +59,7 @@ grep -h '^dst:' "$logs"/shard-*.log
 if [ "$status" -ne 0 ]; then
     grep -h -B2 -A24 'violation\|nondeterminism\|ended after' "$logs"/shard-*.log | head -200 || true
 fi
-runs=$(cat "$logs"/shard-*.log | grep -cE '^[a-z]+ +seed ' || true)
+runs=$(cat "$logs"/shard-*.log | grep -cE '^[a-z-]+ +seed ' || true)
 failed=$(grep -h '^dst:' "$logs"/shard-*.log | sed -E 's/.*, ([0-9]+) failed.*/\1/' | awk '{ n += $1 } END { print n + 0 }')
 echo "dst.sh: seeds $seeds in $jobs processes ($*): $runs runs, $failed failed seeds, ${SECONDS} s; logs in $logs"
 exit "$status"

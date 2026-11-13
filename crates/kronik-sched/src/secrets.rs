@@ -93,6 +93,19 @@ fn failure_reason(error: BackendError) -> Option<&'static str> {
         BackendError::NotFound | BackendError::Unauthorized => None,
     }
 }
+/// The `result` label of `kronik_secret_fetch_total`, and the error that
+/// `kronik secret backends` and `kronik doctor` show.
+fn fetch_result(error: BackendError) -> &'static str {
+    match error {
+        BackendError::Unavailable => "unavailable",
+        BackendError::NotFound => "not_found",
+        BackendError::VersionGone => "version_gone",
+        BackendError::Denied => "denied",
+        BackendError::Invalid => "invalid",
+        BackendError::Unauthorized => "cancelled",
+    }
+}
+
 /// The line for an operator when a secret cannot be had from its backend: the
 /// name, the id of the backend in the configuration, the provider's own id of
 /// the version (`current` when the current one was asked for) and a category.
@@ -108,6 +121,29 @@ fn warn_fetch_failed(scope: &Scope, version: Option<&str>, reason: &str) {
         "secret fetch failed"
     );
 }
+/// `kronik_secret_stale` and the operator's line when a name's value turns
+/// stale (an effect used it past `refresh` because its backend did not
+/// answer) or fresh again. Never a value.
+fn note_stale(row: &pb::SecretVersion, stale: bool, age: Duration) {
+    kronik_metrics::set(
+        "kronik_secret_stale",
+        &[("name", &row.name)],
+        if stale { 1.0 } else { 0.0 },
+    );
+    if stale {
+        tracing::warn!(
+            target: "kronik::secrets",
+            name = %row.name,
+            backend = %row.backend,
+            version = row.version,
+            age_s = age.as_secs(),
+            "secret used stale: its backend did not answer, and effects use the cached value until [secrets] max_stale"
+        );
+    } else {
+        tracing::info!(target: "kronik::secrets", name = %row.name, "secret fresh again");
+    }
+}
+
 fn system_audit(env: &Env, reason: &str) -> pb::Audit {
     pb::Audit {
         token_id: "system".into(),
@@ -417,6 +453,9 @@ struct CacheState {
     native_certificate_live: Option<Arc<SnapshotLiveness>>,
     native_catalogue_capture: Option<Arc<NativeCatalogueCapture>>,
     bytes: usize,
+    /// Names whose last value an effect used was older than `refresh`
+    /// (`kronik_secret_stale`).
+    stale: BTreeSet<String>,
     native_current: native_current::NativeCurrentState,
     physical: Option<std::sync::Weak<crate::native_execution::Lifecycle>>,
     bound_runtime: std::sync::Weak<SecretRuntime>,
@@ -612,18 +651,78 @@ impl SecretCache {
                 .cloned(),
         }
     }
+    /// The value of `row` that an effect may use: operational and younger
+    /// than `refresh`, or than `max_stale` when `allow_stale` (an outage).
+    /// Using a value older than `refresh` marks its name stale
+    /// (`kronik_secret_stale` and a warning); a younger one clears the mark.
     fn held(&self, row: &pb::SecretVersion, allow_stale: bool) -> Option<Arc<Zeroizing<Vec<u8>>>> {
-        let state = lock(&self.state);
-        let held = state.values.get(&(row.name.clone(), row.version))?;
-        let age = self.env.clock.monotonic().saturating_sub(held.checked);
-        (held.operational
-            && age
-                <= if allow_stale {
-                    self.settings.max_stale
-                } else {
-                    self.settings.refresh
-                })
-        .then(|| held.bytes.clone())
+        let (bytes, changed) = {
+            let mut state = lock(&self.state);
+            let held = state.values.get(&(row.name.clone(), row.version))?;
+            let age = self.env.clock.monotonic().saturating_sub(held.checked);
+            let limit = if allow_stale {
+                self.settings.max_stale
+            } else {
+                self.settings.refresh
+            };
+            if !held.operational || age > limit {
+                return None;
+            }
+            let bytes = held.bytes.clone();
+            let stale = row.backend != "file" && age > self.settings.refresh;
+            let changed = if stale {
+                state.stale.insert(row.name.clone())
+            } else {
+                state.stale.remove(&row.name)
+            };
+            (bytes, changed.then_some((stale, age)))
+        };
+        if let Some((stale, age)) = changed {
+            note_stale(row, stale, age);
+        }
+        Some(bytes)
+    }
+    /// Whether `scope` has a value an effect could use now, also during an
+    /// outage (younger than `max_stale`); marks nothing. For `kronik doctor`.
+    fn usable(&self, scope: &Scope) -> bool {
+        let Some(row) = self.row(scope, None) else {
+            return false;
+        };
+        // A failure other than `Unavailable` already took the value out of
+        // operational use.
+        lock(&self.state)
+            .values
+            .get(&(row.name.clone(), row.version))
+            .is_some_and(|held| {
+                held.operational
+                    && self.env.clock.monotonic().saturating_sub(held.checked)
+                        <= self.settings.max_stale
+            })
+    }
+    /// The value an outage lets an effect use: the operational value of the
+    /// scope's current version (or of `version`), younger than `max_stale`,
+    /// unless a failure other than `Unavailable` revoked it. Never for the
+    /// built-in store, which has no outage to bridge.
+    fn stale_fallback(&self, scope: &Scope, version: Option<u64>) -> Option<SecretValue> {
+        if scope.backend == "file" {
+            return None;
+        }
+        let row = self.row(scope, version)?;
+        if !active(&row) || row.deleted {
+            return None;
+        }
+        let exact = version.map(|_| row.source_version.as_str());
+        if self
+            .negative_version(scope, exact)
+            .is_some_and(|error| error != BackendError::Unavailable)
+        {
+            return None;
+        }
+        let bytes = self.held(&row, true)?;
+        Some(SecretValue {
+            meta: meta(&row),
+            value: bytes.to_vec(),
+        })
     }
     fn insert(
         &self,
@@ -684,22 +783,19 @@ impl SecretCache {
                 operational,
             },
         );
+        let fresh = operational && state.stale.remove(&row.name);
         // A linked row is selected for its link scope through the CURRENT
-        // map: the unversioned resolve of a non-file scope reads it. Only an
-        // OPERATIONAL value chooses the pointer (a catalogue observation is
-        // not the current value), and the newest version wins; a deleted row
-        // releases a pointer that names it.
-        if row.backend != "file" {
+        // map, which the unversioned resolve of a non-file scope reads. Only
+        // an observation of the provider's current version chooses it
+        // ([`Node::hold_secret_observation`]); an insert never does. A
+        // catalogue observation is not the current value, and neither is the
+        // value of a version fetched by its id: after a restart nothing is
+        // current, and the crash re-run of a turn that used an older version
+        // must not make new effects use that version. A deleted or inactive
+        // row releases a pointer that names it.
+        if row.backend != "file" && (row.deleted || !active(row)) {
             let scope = Scope::row(row);
-            if operational && !row.deleted && active(row) {
-                let superseded = state
-                    .current
-                    .get(&scope)
-                    .is_some_and(|(name, version)| *name == row.name && *version >= row.version);
-                if !superseded {
-                    state.current.insert(scope, (row.name.clone(), row.version));
-                }
-            } else if state
+            if state
                 .current
                 .get(&scope)
                 .is_some_and(|(name, version)| *name == row.name && *version == row.version)
@@ -709,6 +805,9 @@ impl SecretCache {
         }
         drop(state);
         drop(retired);
+        if fresh {
+            note_stale(row, false, Duration::ZERO);
+        }
         Ok(())
     }
     fn insert_scrub_file(
@@ -977,6 +1076,8 @@ pub struct SecretRuntime {
     stats: CertificationStats,
     /// What the background cycle is doing.
     cycle: CycleState,
+    /// Each backend's last answer, for `kronik secret backends` and doctor.
+    health: Mutex<BTreeMap<String, BackendHealth>>,
     initialized: AtomicBool,
     background: AtomicBool,
     // The ADR-0004-compliant replacement ripples through the wait/notify
@@ -1043,6 +1144,22 @@ pub struct SecretBackendStatus {
     pub binding: String,
     pub configured: bool,
     pub inventory_complete: bool,
+    /// When this node last got an answer from the backend (wall ms).
+    pub last_success_ms: Option<u64>,
+    /// When a request of this node to the backend last failed (wall ms),
+    /// and how: unavailable, denied, not_found, version_gone or invalid.
+    pub last_error_ms: Option<u64>,
+    pub last_error: Option<String>,
+    /// Names linked to the backend that have no value an effect could use
+    /// now: the next effect that needs one asks the backend for it.
+    pub uncached: Vec<String>,
+}
+
+/// What a node last heard from one backend.
+#[derive(Clone, Debug, Default)]
+struct BackendHealth {
+    last_success_ms: Option<u64>,
+    last_error: Option<(u64, &'static str)>,
 }
 impl SecretRuntime {
     /// Whether waiting for the certificate can end well: the cycle runs, and
@@ -1113,6 +1230,7 @@ impl SecretRuntime {
             watermark_io: AsyncMutex::new(()),
             stats: CertificationStats::default(),
             cycle: CycleState::default(),
+            health: Mutex::new(BTreeMap::new()),
             failed_row: Mutex::new(None),
             initialized: AtomicBool::new(false),
             background: AtomicBool::new(false),
@@ -1154,6 +1272,31 @@ impl SecretRuntime {
     fn take_failed_row(&self) -> String {
         lock(&self.failed_row).take().unwrap_or_default()
     }
+    /// Counts one request to an external backend (`kronik_secret_fetch_total`,
+    /// `kronik_secret_fetch_seconds`) and keeps its outcome for `kronik
+    /// secret backends` and `kronik doctor`. A caller whose authority ended
+    /// learned nothing about the backend.
+    fn observe_fetch(&self, backend: &str, started: Duration, result: Result<(), BackendError>) {
+        let elapsed = self.env.clock.monotonic().saturating_sub(started);
+        let label = result.err().map_or("ok", fetch_result);
+        kronik_metrics::inc(
+            "kronik_secret_fetch_total",
+            &[("backend", backend), ("result", label)],
+        );
+        kronik_metrics::observe(
+            "kronik_secret_fetch_seconds",
+            &[("backend", backend)],
+            elapsed,
+        );
+        let wall = self.env.clock.wall_ms();
+        let mut health = lock(&self.health);
+        let entry = health.entry(backend.to_owned()).or_default();
+        match result {
+            Ok(()) => entry.last_success_ms = Some(wall),
+            Err(BackendError::Unauthorized) => {}
+            Err(_) => entry.last_error = Some((wall, label)),
+        }
+    }
     fn source(
         &self,
         scope: &Scope,
@@ -1188,7 +1331,9 @@ impl SecretRuntime {
                 .await
         } else {
             let source = self.source(scope).map_err(|_| BackendError::Invalid)?;
-            self.env
+            let started = self.env.clock.monotonic();
+            let result = self
+                .env
                 .timeout(self.settings.fetch_timeout, async {
                     match version {
                         Some(version) => {
@@ -1206,7 +1351,13 @@ impl SecretRuntime {
                     }
                 })
                 .await
-                .unwrap_or(Err(BackendError::Unavailable))
+                .unwrap_or(Err(BackendError::Unavailable));
+            self.observe_fetch(
+                &scope.backend,
+                started,
+                result.as_ref().map(|_| ()).map_err(|error| *error),
+            );
+            result
         };
         original.check().map_err(|_| BackendError::Unauthorized)?;
         let Fetched {
@@ -1321,6 +1472,33 @@ impl SecretRuntime {
             })
             .await
             .ok_or_else(unavailable)?
+    }
+}
+
+/// [`Node::foreign_secret_source`]: a foreign actor's start, and `foreign
+/// add`, resolve a secret as an effect does, through the cache, with the
+/// configuration of the moment. A version a start observes first is recorded
+/// like any other.
+pub(crate) struct ForeignSecretSource {
+    pub(crate) node: std::sync::Weak<Node>,
+    pub(crate) original: AuthLease,
+}
+impl kronik_effects::foreign::ForeignSecrets for ForeignSecretSource {
+    fn current(
+        &self,
+        name: &str,
+    ) -> kronik_core::env::BoxFuture<'static, Result<Option<Zeroizing<Vec<u8>>>, ApiError>> {
+        let node = self.node.clone();
+        let original = self.original.clone();
+        let name = name.to_owned();
+        Box::pin(async move {
+            let node = node.upgrade().ok_or_else(unavailable)?;
+            let config = node.config_now();
+            Ok(node
+                .resolve_secret(&name, None, &config, original)
+                .await?
+                .map(|secret| Zeroizing::new(secret.value)))
+        })
     }
 }
 
@@ -1729,6 +1907,14 @@ impl Node {
             Phase::Failed as i32
         };
         self.secret_publish(row.clone()).await?;
+        if success && !row.deleted {
+            let backend = if row.backend.is_empty() {
+                "file"
+            } else {
+                row.backend.as_str()
+            };
+            kronik_metrics::inc("kronik_secret_versions_total", &[("backend", backend)]);
+        }
         Ok(row)
     }
 
@@ -2269,6 +2455,7 @@ impl Node {
                         "The reference is not allowed by trusted backend configuration",
                     ));
                 }
+                let started = node.env.clock.monotonic();
                 let fetched = node
                     .env
                     .timeout(
@@ -2276,8 +2463,13 @@ impl Node {
                         source.client.current(&reference, auth.clone()),
                     )
                     .await
-                    .map_err(|_| unavailable())?
-                    .map_err(backend_error)?;
+                    .unwrap_or(Err(BackendError::Unavailable));
+                runtime.observe_fetch(
+                    &backend,
+                    started,
+                    fetched.as_ref().map(|_| ()).map_err(|error| *error),
+                );
+                let fetched = fetched.map_err(backend_error)?;
                 if fetched.canonical_ref.is_empty() || fetched.source_version.is_empty() {
                     return Err(gone());
                 }
@@ -2438,21 +2630,38 @@ impl Node {
             return Vec::new();
         };
         let complete = runtime.cache.complete(self.epoch());
+        let config = self.config_now();
+        let health = lock(&runtime.health).clone();
         let mut result = vec![SecretBackendStatus {
             id: "file".into(),
             kind: "file".into(),
             binding: "file".into(),
             configured: true,
             inventory_complete: complete,
+            last_success_ms: None,
+            last_error_ms: None,
+            last_error: None,
+            uncached: Vec::new(),
         }];
         for id in runtime.backends.ids() {
             if let Some(source) = runtime.backends.get(id) {
+                let seen = health.get(id).cloned().unwrap_or_default();
+                let uncached = config
+                    .secret_links()
+                    .filter(|link| link.backend == id)
+                    .filter(|link| !runtime.cache.usable(&Scope::link(link)))
+                    .map(|link| link.name.clone())
+                    .collect();
                 result.push(SecretBackendStatus {
                     id: id.into(),
                     kind: source.kind.into(),
                     binding: source.binding.clone(),
                     configured: true,
                     inventory_complete: complete,
+                    last_success_ms: seen.last_success_ms,
+                    last_error_ms: seen.last_error.map(|(at, _)| at),
+                    last_error: seen.last_error.map(|(_, what)| what.to_owned()),
+                    uncached,
                 });
             }
         }
@@ -2664,7 +2873,7 @@ impl Node {
             node.resolve_secret_cold(work_scope, version, started, original)
                 .await
         });
-        match self.env.timeout(runtime.settings.fetch_timeout, work).await {
+        let result = match self.env.timeout(runtime.settings.fetch_timeout, work).await {
             Ok(Some(result)) => result,
             Ok(None) => Err(unavailable()),
             Err(_) => {
@@ -2675,6 +2884,19 @@ impl Node {
                 );
                 Err(unavailable())
             }
+        };
+        // The backend did not answer in time: a value it served, still
+        // operational and younger than `max_stale`, is used (m23 §6). The
+        // cold path does the same when its own fetch times out, but its
+        // deadline is this one, and this timeout can fire first: a turn then
+        // failed with SECRET_UNAVAILABLE although a usable value was held
+        // (found by the DST workload `secret-outage`).
+        match result {
+            Err(error) if error.code == ErrorCode::SecretUnavailable => runtime
+                .cache
+                .stale_fallback(&scope, version)
+                .map_or(Err(error), |value| Ok(Some(value))),
+            other => other,
         }
     }
 
@@ -3212,8 +3434,16 @@ impl Node {
                         reveal_names.insert(name.to_owned());
                     }
                 }
+                // A foreign actor gets the values of its secrets, and its
+                // logs and answers may hold them. Its entries are `VAR=name`
+                // or `name` (older records).
                 Record::ForeignActor(actor) => {
-                    reveal_names.extend(actor.secrets.iter().cloned());
+                    reveal_names.extend(actor.secrets.iter().map(|entry| {
+                        entry
+                            .split_once('=')
+                            .map_or(entry.as_str(), |(_, name)| name)
+                            .to_owned()
+                    }));
                 }
                 _ => {}
             }
@@ -3248,7 +3478,8 @@ impl Node {
             let mut ids = BTreeSet::new();
             let mut complete = false;
             for _ in 0..MAX_CATALOGUE_PAGES {
-                let page = match self
+                let started = self.env.clock.monotonic();
+                let listed = self
                     .env
                     .timeout(
                         runtime.settings.fetch_timeout,
@@ -3258,8 +3489,17 @@ impl Node {
                             original.clone(),
                         ),
                     )
-                    .await
-                {
+                    .await;
+                runtime.observe_fetch(
+                    &scope.backend,
+                    started,
+                    match &listed {
+                        Ok(Ok(_)) => Ok(()),
+                        Ok(Err(error)) => Err(*error),
+                        Err(_) => Err(BackendError::Unavailable),
+                    },
+                );
+                let page = match listed {
                     Ok(Ok(page)) => page,
                     result => {
                         let error = match result {

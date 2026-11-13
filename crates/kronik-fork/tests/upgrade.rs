@@ -643,6 +643,485 @@ fn an_erased_request_is_unverifiable_not_divergence() {
     keep(&dir, "erased-only");
 }
 
+/// Issue #16 (ADR 0109 points 3-5): an erased turn that committed a state or
+/// SQL write in production and does not reproduce it from `[erased]` is
+/// unverifiable, not a behavior change. The write is not counted in either
+/// state section, so the check passes and `serve` keeps accepting the
+/// directory.
+#[test]
+fn an_erased_turns_state_write_is_not_a_change() {
+    let dir = tempdir();
+    let rt = rt();
+    {
+        let node = start(&rt, dir.path()).unwrap();
+        rt.block_on(async {
+            node.deploy(&guest("counter"), audit(), false, owner(&node))
+                .await
+                .unwrap();
+            node.deploy(&guest("notes"), audit(), false, owner(&node))
+                .await
+                .unwrap();
+            node.set_privacy_mode(pb::PrivacyState::On, audit(), false, owner(&node))
+                .await
+                .unwrap();
+            // The note's body is sealed for user:1, so the turn's recorded
+            // input is erased with the subject; production commits the insert.
+            let r = node
+                .send(
+                    ActorRef::parse("notes/n1").unwrap(),
+                    subject_msg("add", "note text", "user:1"),
+                    audit(),
+                    false,
+                    owner(&node),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(r.committed(), "{r:?}");
+            node.erase_subject("user:1", audit(), false, owner(&node))
+                .await
+                .unwrap();
+            // Make the default window unambiguous about the gap.
+            std::thread::sleep(Duration::from_millis(50));
+            let r = node
+                .send(
+                    ActorRef::parse("counter/k9").unwrap(),
+                    msg("increment", ""),
+                    audit(),
+                    false,
+                    owner(&node),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(r.committed(), "{r:?}");
+        });
+    }
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    assert!(
+        checked.report.passed,
+        "{}",
+        String::from_utf8_lossy(&checked.diff_bytes)
+    );
+    assert_eq!(checked.report.root_inputs, 2);
+    assert_eq!(checked.report.unverifiable, 1);
+    assert_eq!(checked.diff.summary.unverifiable, 1);
+    assert_eq!(checked.diff.summary.divergent_turns, 0);
+    assert!(!checked.diff.summary.changed);
+    assert!(
+        checked.diff.state.isolated.is_empty(),
+        "{:?}",
+        checked.diff.state.isolated
+    );
+    assert!(
+        checked.diff.state.continuous.is_empty(),
+        "{:?}",
+        checked.diff.state.continuous
+    );
+    keep(&dir, "erased-state");
+}
+
+/// One step of a privacy workload (the erasure tests, issue #48).
+enum Step<'a> {
+    /// A message to `actor` running `op` on `body`, sealed for `subject`
+    /// when there is one. It must commit, and every message it sends is
+    /// consumed before the next step, so production holds its whole tree.
+    Send(&'a str, &'a str, &'a str, Option<&'a str>),
+    /// `privacy erase <subject>`.
+    Erase(&'a str),
+    /// Logical time passes: a window can start after the steps before.
+    Pause(Duration),
+}
+
+/// Waits until the turn at `lsn` is applied and every message committed so
+/// far is consumed: the mailbox holds a message from its sender's apply to
+/// its receiver's, in the same transaction as the receiver's own sends.
+async fn settle(node: &Node, lsn: u64) {
+    node.store().applied.wait(lsn).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let idle = {
+            let db = node.store().db();
+            db.mailbox().unwrap().is_empty() && db.open_turns().unwrap().is_empty()
+        };
+        if idle {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the workload's messages were not consumed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Deploys `guests`, turns privacy mode on and runs `steps`.
+fn privacy_workload(rt: &Runtime, dir: &Path, guests: &[&str], steps: &[Step<'_>]) {
+    let node = start(rt, dir).unwrap();
+    rt.block_on(async {
+        for g in guests {
+            node.deploy(&guest(g), audit(), false, owner(&node))
+                .await
+                .unwrap();
+        }
+        node.set_privacy_mode(pb::PrivacyState::On, audit(), false, owner(&node))
+            .await
+            .unwrap();
+        for step in steps {
+            match step {
+                Step::Send(actor, op, body, subject) => {
+                    let m = match subject {
+                        Some(s) => subject_msg(op, body, s),
+                        None => msg(op, body),
+                    };
+                    let r = node
+                        .send(
+                            ActorRef::parse(actor).unwrap(),
+                            m,
+                            audit(),
+                            false,
+                            owner(&node),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(r.committed(), "{actor} {op}: {r:?}");
+                    settle(&node, r.turn_id.lsn).await;
+                }
+                Step::Erase(subject) => {
+                    let done = node
+                        .erase_subject(subject, audit(), false, owner(&node))
+                        .await
+                        .unwrap();
+                    settle(&node, done.lsn.unwrap()).await;
+                }
+                Step::Pause(d) => tokio::time::sleep(*d).await,
+            }
+        }
+    });
+    drop(node);
+}
+
+/// Appends a crafted recording of a turn the guest cannot reproduce: a root
+/// `increment` that claims to have failed, with no effects and no writes. A
+/// replay of it is a verified difference (S-16 (2)).
+fn forge_failed_increment(rt: &Runtime, dir: &Path) {
+    let node = start_when_released(rt, dir);
+    let head = node.applied_lsn();
+    let (hash, input, epoch) = rt.block_on(async {
+        let mut hash = Vec::new();
+        let mut input = None;
+        let mut epoch = 0;
+        node.reader()
+            .read(1, head, |c| {
+                match &c.record {
+                    Record::Deployment(d) => {
+                        for k in &d.kinds {
+                            if k.kind == "counter" {
+                                hash = k.code_hash.clone();
+                            }
+                        }
+                    }
+                    Record::TurnRecord(t) if input.is_none() => {
+                        let msg = match t.input.as_ref().and_then(|i| i.kind.as_ref()) {
+                            Some(pb::input::Kind::Message(m)) => m.msg.as_ref(),
+                            _ => None,
+                        };
+                        if msg.is_some_and(|m| m.name == "increment") {
+                            input = t.input.clone();
+                            epoch = t.config_epoch;
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        (hash, input.unwrap(), epoch)
+    });
+    drop(node);
+    let forged = pb::TurnRecord {
+        execution_id: String::new(),
+        actor: Some(pb::ActorRef {
+            kind: "counter".into(),
+            key: "forged".into(),
+        }),
+        code_hash: hash,
+        engine_version: ENGINE_VERSION.into(),
+        causal_key: Some(pb::CausalKey {
+            root: "forged-root".into(),
+            path: Vec::new(),
+        }),
+        logical_time_ms: 0,
+        random_seed: vec![0u8; 32],
+        input: Some(input),
+        effects: Vec::new(),
+        outcome: Some(pb::Outcome {
+            kind: pb::OutcomeKind::Failed as i32,
+            error_code: "TURN_FAILED".into(),
+            message: "forged: the recording says this failed".into(),
+            output: None,
+        }),
+        config_epoch: epoch,
+        ..Default::default()
+    };
+    rt.block_on(async {
+        let env = Env::real(tokio::runtime::Handle::current());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (fatal, _fatal_rx) = tokio::sync::oneshot::channel();
+        let (log, _) = kronik_log::Log::open(
+            &env,
+            kronik_log::LogConfig::new(dir.join("branches").join("main").join("log"), "main"),
+            tx,
+            fatal,
+        )
+        .await
+        .unwrap();
+        log.append(Record::TurnRecord(forged)).await.unwrap();
+        drop(log);
+        drop(rx);
+    });
+}
+
+/// Issue #27 (workload d4b): an erased turn that wrote a state value sealed
+/// for the subject is unverifiable; its write is no change in either state
+/// section, so the check passes. A real divergence next to it still fails.
+#[test]
+fn an_erased_turns_state_value_is_no_change_but_a_real_divergence_fails() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter"],
+        &[
+            // `s` sealed for user:1 and `t` for user:2.
+            Step::Send("counter/a", "subject", "", Some("user:1")),
+            Step::Erase("user:1"),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(checked.report.passed, "{text}");
+    assert_eq!(checked.report.root_inputs, 2);
+    assert_eq!(checked.report.unverifiable, 1, "{text}");
+    assert_eq!(checked.diff.summary.divergent_turns, 0, "{text}");
+    assert!(!checked.diff.summary.changed);
+    assert!(checked.diff.state.isolated.is_empty(), "{text}");
+    assert!(checked.diff.state.continuous.is_empty(), "{text}");
+
+    forge_failed_increment(&rt, dir.path());
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(!checked.report.passed, "{text}");
+    assert!(checked.diff.summary.changed);
+    assert_eq!(checked.diff.summary.unverifiable, 1, "{text}");
+    assert_eq!(checked.diff.summary.divergent_turns, 1, "{text}");
+    keep(&dir, "erased-kv-and-real");
+}
+
+/// Issue #28 (workload d3): the erased body of `fanout` decided how many
+/// messages production sent. The replay sends none, and the five production
+/// turns missing below the erased root are unverifiable like it: no
+/// divergence, no origin, no consequence, no cause.
+#[test]
+fn production_turns_missing_below_an_erased_turn_are_unverifiable() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter"],
+        &[
+            Step::Send("counter/src", "fanout", "5", Some("user:1")),
+            Step::Erase("user:1"),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let d = &checked.diff;
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(checked.report.passed, "{text}");
+    assert_eq!(d.summary.turns_prod, 7, "{text}");
+    assert_eq!(d.summary.divergent_turns, 0, "{text}");
+    assert_eq!(
+        (d.summary.origins, d.summary.consequences),
+        (0, 0),
+        "{text}"
+    );
+    assert!(d.causes.is_empty(), "{text}");
+    assert!(d.samples.origins.is_empty() && d.samples.consequences.is_empty());
+    assert_eq!(d.summary.unverifiable, 6, "{text}");
+    assert_eq!(checked.report.unverifiable, 6);
+    assert_eq!(d.effects.removed + d.effects.added + d.effects.changed, 0);
+    keep(&dir, "erased-fanout");
+}
+
+/// A timer of the erased subject is pending at the fork point. Its body in
+/// the fork's store is a tombstone since the erasure, which the replay
+/// handed to the guest still sealed: the check failed for a missing key.
+/// The body reads `[erased]` now, and the timer's turn (a SUBJECT_ERASED
+/// dead letter in production) is unverifiable.
+#[test]
+fn a_timer_of_an_erased_subject_pending_at_the_fork_point_is_unverifiable() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter"],
+        &[
+            // `store` the body in 2.5 s, for user:1.
+            Step::Send(
+                "counter/t",
+                "schedule",
+                "2500 store\nNEEDLE",
+                Some("user:1"),
+            ),
+            Step::Erase("user:1"),
+            Step::Pause(Duration::from_millis(800)),
+            Step::Send("counter/k1", "increment", "", None),
+            // The timer fires here.
+            Step::Pause(Duration::from_millis(2500)),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
+    // The window starts at `counter/k1`: after the erasure, before the timer.
+    let checked = check_dir(&rt, dir.path(), Duration::from_millis(3000));
+    let d = &checked.diff;
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert_eq!(checked.report.root_inputs, 2, "{text}");
+    assert!(checked.report.passed, "{text}");
+    assert_eq!(d.summary.unverifiable, 1, "the timer's turn: {text}");
+    assert_eq!(d.summary.divergent_turns, 0, "{text}");
+    keep(&dir, "erased-pending-timer");
+}
+
+/// Issue #29 (workload d2, SQL): the replay skips the erased subject's
+/// changeset, so until the erasure the actor database lacks a row that
+/// production's `count` read. That `count` is unverifiable, not divergent;
+/// the `count` after the erasure reads what production read and is verified.
+#[test]
+fn rows_an_erasure_removed_do_not_make_a_reader_diverge() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["notes"],
+        &[
+            Step::Send("notes/n1", "add", "note text", Some("user:1")),
+            Step::Send("notes/n1", "count", "", None),
+            Step::Erase("user:1"),
+            Step::Send("notes/n1", "count", "", None),
+        ],
+    );
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let d = &checked.diff;
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(checked.report.passed, "{text}");
+    assert_eq!(checked.report.root_inputs, 3);
+    assert_eq!(d.summary.divergent_turns, 0, "{text}");
+    assert_eq!(d.summary.origins, 0, "{text}");
+    assert_eq!(d.responses.changed, 0, "{text}");
+    // The erased `add` and the `count` that read its row.
+    assert_eq!(d.summary.unverifiable, 2, "{text}");
+    assert!(d.state.isolated.is_empty() && d.state.continuous.is_empty());
+    keep(&dir, "erased-sql-reader");
+}
+
+/// Issue #29 (KV): the erased body of `forward` named the actor production
+/// incremented. The replay increments another one, so production's write
+/// to `counter/k2` is missing from the fork's state, and the `get` that read
+/// it is unverifiable rather than a verified divergence, in both modes.
+#[test]
+fn a_reader_of_state_an_erased_turn_shaped_is_unverifiable() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter"],
+        &[
+            Step::Send("counter/w", "forward", "k2", Some("user:1")),
+            Step::Send("counter/k2", "get", "", None),
+            Step::Erase("user:1"),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let d = &checked.diff;
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(checked.report.passed, "{text}");
+    assert_eq!(d.summary.divergent_turns, 0, "{text}");
+    assert_eq!(d.responses.changed, 0, "{text}");
+    // `forward`, the turn its message started (on another actor in the
+    // replay) and the `get`.
+    assert_eq!(d.summary.unverifiable, 3, "{text}");
+    keep(&dir, "erased-kv-reader");
+}
+
+/// Issue #49: an erased state value reads as absent in a fork and marks the
+/// turn that read it, also when the value was written inside the replayed
+/// log: the writer and the reader are unverifiable (before, the reader got
+/// the 8 bytes `[erased]` as present data, as long as the value it had read).
+#[test]
+fn a_reader_of_an_erased_state_value_is_unverifiable() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter-fetch-extra"],
+        &[
+            // `s` is "personal", sealed for user:1; `read` replies its length.
+            Step::Send("counter/a", "subject", "", Some("user:1")),
+            Step::Send("counter/a", "read", "", None),
+            Step::Erase("user:1"),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let d = &checked.diff;
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(checked.report.passed, "{text}");
+    assert_eq!(d.summary.divergent_turns, 0, "{text}");
+    assert_eq!(d.summary.unverifiable, 2, "{text}");
+    keep(&dir, "erased-value-reader");
+}
+
+/// Issue #29: the window starts after a turn wrote a value of the subject
+/// and before its erasure. Production's erasure deletes the value; the
+/// continuous replay follows that erasure, so the final states agree.
+#[test]
+fn an_erasure_in_the_window_removes_state_written_before_it() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter"],
+        &[
+            Step::Send("counter/a", "subject", "", Some("user:1")),
+            Step::Pause(Duration::from_millis(600)),
+            Step::Send("counter/k1", "increment", "", None),
+            Step::Erase("user:1"),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
+    // The window holds the last two root inputs, not the write.
+    let checked = check_dir(&rt, dir.path(), Duration::from_millis(300));
+    let d = &checked.diff;
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert_eq!(checked.report.root_inputs, 2, "{text}");
+    assert!(checked.report.passed, "{text}");
+    assert!(d.state.continuous.is_empty(), "{text}");
+    assert_eq!(d.summary.unverifiable, 0, "{text}");
+    keep(&dir, "erased-before-window");
+}
+
 /// S-16 (5): the replay serves the recorded outcome of an erased request - an
 /// exact effect, not a synthetic denial the guest has to handle.
 #[test]
@@ -743,88 +1222,7 @@ fn a_real_divergence_still_fails_next_to_an_unverifiable_turn() {
     let passed = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
     assert!(passed.report.passed);
     assert_eq!(passed.report.unverifiable, 1);
-    let head = passed.report.checked_through_lsn;
-
-    // A crafted recording of a turn the guest cannot reproduce: a root
-    // increment that claims to have failed, with no effects and no writes.
-    let node = start(&rt, dir.path()).unwrap();
-    let (hash, input, epoch) = rt.block_on(async {
-        let mut hash = Vec::new();
-        let mut input = None;
-        let mut epoch = 0;
-        node.reader()
-            .read(1, head, |c| {
-                match &c.record {
-                    Record::Deployment(d) => {
-                        for k in &d.kinds {
-                            if k.kind == "counter" {
-                                hash = k.code_hash.clone();
-                            }
-                        }
-                    }
-                    Record::TurnRecord(t) if input.is_none() => {
-                        let msg = match t.input.as_ref().and_then(|i| i.kind.as_ref()) {
-                            Some(pb::input::Kind::Message(m)) => m.msg.as_ref(),
-                            _ => None,
-                        };
-                        if msg.is_some_and(|m| m.name == "increment") {
-                            input = t.input.clone();
-                            epoch = t.config_epoch;
-                        }
-                    }
-                    _ => {}
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
-        (hash, input.unwrap(), epoch)
-    });
-    drop(node);
-    let forged = pb::TurnRecord {
-        execution_id: String::new(),
-        actor: Some(pb::ActorRef {
-            kind: "counter".into(),
-            key: "forged".into(),
-        }),
-        code_hash: hash,
-        engine_version: ENGINE_VERSION.into(),
-        causal_key: Some(pb::CausalKey {
-            root: "forged-root".into(),
-            path: Vec::new(),
-        }),
-        logical_time_ms: 0,
-        random_seed: vec![0u8; 32],
-        input: Some(input),
-        effects: Vec::new(),
-        outcome: Some(pb::Outcome {
-            kind: pb::OutcomeKind::Failed as i32,
-            error_code: "TURN_FAILED".into(),
-            message: "forged: the recording says this failed".into(),
-            output: None,
-        }),
-        config_epoch: epoch,
-        ..Default::default()
-    };
-    rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let (fatal, _fatal_rx) = tokio::sync::oneshot::channel();
-        let (log, _) = kronik_log::Log::open(
-            &env,
-            kronik_log::LogConfig::new(
-                dir.path().join("branches").join("main").join("log"),
-                "main",
-            ),
-            tx,
-            fatal,
-        )
-        .await
-        .unwrap();
-        log.append(Record::TurnRecord(forged)).await.unwrap();
-        drop(log);
-        drop(rx);
-    });
+    forge_failed_increment(&rt, dir.path());
 
     let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
     assert!(!checked.report.passed, "{:?}", checked.report);

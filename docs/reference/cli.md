@@ -22,7 +22,7 @@ except where a sample names another address.
 | `--socket <PATH>` | The daemon's API socket. Default: `$KRONIK_API_SOCKET`, else `server.api_socket` in `/etc/kronik/kronik.toml` when that file exists, else `/run/kronik/api.sock` (the same as `kronik serve`). Not with `--url`. |
 | `--url <URL>` | A remote API (M10): `https://host:port`, the daemon's `server.api_listen` with TLS on. The port is required: 443 or 80 is usually the gateway, which would record the token with the request. Default: `$KRONIK_URL`. Plain `http://` is accepted only to `localhost` or a loopback address; anything else is refused before a connection is made, so a token never crosses a network in the clear. `localhost` is never looked up: the CLI dials `[::1]`, then `127.0.0.1` (RFC 6761), and over plain HTTP it dials only loopback addresses. The scheme is lower case. An error about the URL names only its scheme, host and port, never user info, a path or a query. |
 | `--token <TOKEN>` | The ordinary API bearer. Default: `$KRONIK_TOKEN`, preferred because flags appear in shell history and process listings. A blank explicit bearer is refused. Within `fleet`, use `--api-token` for this bearer; `fleet enroll --token` is the distinct one-time enrollment credential. `kronik mcp` also accepts the ordinary bearer. |
-| `--json` | Print the unchanged API response or local result, and stable error JSON on failure. `events tail` instead writes NDJSON event envelopes and a final typed resume checkpoint. Other commands print one object; non-API error responses become `UNAVAILABLE`. [JSON output](json.md) gives the schemas and [openapi.json](openapi.json) the API. `upgrade check` prints its report even when it exits 1. |
+| `--json` | Print the unchanged API response or local result, and stable error JSON on failure. `events tail` instead writes NDJSON event envelopes and a final typed resume checkpoint. Other commands print one object; non-API error responses become `UNAVAILABLE`. [JSON output](json.md) gives the schemas and [openapi.json](openapi.json) the API. A command that reports an outcome that is not an error with exit 1, such as `upgrade check`, `doctor`, `send` or `integrity`, prints its own object, not the error JSON; [JSON output](json.md) lists them. |
 
 They can go before or after the command: `kronik --json actors list` and
 `kronik actors list --json` are the same. `kronik serve` takes none of
@@ -179,6 +179,12 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_applied_lsn` | gauge | The last log sequence number applied to the materialized state. |
 | `kronik_disk_free_bytes` | gauge | Free bytes on the log's file system (when [log] disk_reserve is set). |
 | `kronik_disk_below_reserve` | gauge | 1 while the log's file system is below [log] disk_reserve: new inputs and changes are refused. |
+| `kronik_key_source_up` | gauge | 1 when the daemon loaded its master key through its key source ([keys] source); 0 without a secret store. |
+| `kronik_secret_recovery_stalled` | gauge | Re-runs of open turns waiting for a recorded secret value or for an unavailable prerequisite. |
+| `kronik_secret_fetch_total` | counter | Requests to external secret backends, by backend and result (ok, unavailable, denied, not_found, version_gone, invalid, cancelled). |
+| `kronik_secret_fetch_seconds` | histogram | Time an external secret backend took to answer, or until the request gave up, by backend. |
+| `kronik_secret_stale` | gauge | 1 while effects use a secret's cached value past [secrets] refresh because its backend does not answer, by secret name. |
+| `kronik_secret_versions_total` | counter | Secret versions this node recorded, by backend (file for the built-in store). |
 | `kronik_turns_total` | counter | Turns recorded, by actor kind and outcome. |
 | `kronik_turn_duration_seconds` | histogram | Time from the start of a turn to its record, by actor kind. |
 | `kronik_log_records_appended_total` | counter | Records written to the log. |
@@ -380,8 +386,10 @@ configuration with `--config` (or `KRONIK_CONFIG`). File/env sources use
 `master.wrapped`, provider key and credentials. Missing/mismatched material
 is refused; KMS never falls back to an environment seed or raw key file.
 
-An empty diff writes `<data-dir>/upgrade/<engine>.json` and exits 0. A
-diff that is not empty writes that report and the diff next to it
+A diff with no verified difference writes `<data-dir>/upgrade/<engine>.json`
+and exits 0; differences of turns that met erased data do not count as
+changes. A diff with a verified difference writes that report and
+the diff next to it
 (`<data-dir>/upgrade/<engine>.diff.json`) and exits 1 with
 `ENGINE_UPGRADE_DIVERGED`. `--dry-run` runs the check and prints the
 result, and writes neither file. A bad window or a data directory with no
@@ -389,11 +397,15 @@ log is `BAD_REQUEST`. `--json` prints the report, and the diff path when
 one was written, even when the command exits 1.
 
 A turn whose recorded input was **erased** (`kronik privacy erase`, M8)
-is unverifiable, not divergent: the replay serves its effects from the
-recording, reports `N turns unverifiable: erased` (the report's
-`unverifiable` field, also in `--json`), and passes when nothing else
-differs. Any other difference still exits 1, so a check that fails after
-an erasure has found a real change or a recording that cannot be read.
+is unverifiable, not divergent, and so is every turn the erased data
+reached: one whose input or state it shaped, one that read a state value
+or SQL rows the erasure removed before production's own erasure did, and
+a production turn missing below an unverifiable one (ADR 0109). The
+replay serves their effects from the recording, reports `N turns
+unverifiable: erased` (the report's `unverifiable` field, also in
+`--json`), and passes when nothing else differs. Any other difference
+still exits 1, so a check that fails after an erasure has found a real
+change or a recording that cannot be read.
 Reports written by older binaries lack the field; the report schema stays
 `kronik.upgrade-check/v1`.
 
@@ -410,7 +422,7 @@ If it cannot be read, the check does not pass: it exits 1 with
 `STORAGE_CORRUPT` rather than treating the database as current.
 
 A Wasmtime patch also changes the recorded engine identity: 50.0.0 to
-50.0.1 still requires this check, with an empty behavior diff in both
+50.0.1 still requires this check, with no verified difference in both
 replay modes. The new daemon refuses the old directory until the exact
 pair has a passing report, then writes one `EngineUpgrade` before serving.
 Do not rewrite recorded engine metadata or relabel precompiled caches.
@@ -857,8 +869,9 @@ default for a new grant, returns a matching recording or denies the call.
 `compute` signs on the host; the key does not enter the guest, the log, or
 the diff. A grant written before the field existed stays `compute` until it
 is granted again. Re-granting without `--in-forks compute` writes
-`recorded`. A name linked to an external backend is not computed in a fork
-either way.
+`recorded`. Under `compute`, a name linked to an external backend at the
+fork point is computed with the value the node holds for that link, and is
+denied with `SECRET_UNAVAILABLE` when it holds none: a fork never fetches.
 
 For `http:` capabilities, `--delivery` says how the target tolerates
 retries after a crash: `replay-safe` and `idempotency-keyed` requests are
@@ -1036,6 +1049,12 @@ reason; a dry run does not commit them.
 List configured backend identities without contacting providers. Inspect
 `configured` and `inventory_complete` separately; neither the command's
 presence nor an identity listing proves an external service is healthy.
+LAST SUCCESS and LAST ERROR (`last_success_ms`, `last_error_ms` and
+`last_error` in JSON: `unavailable`, `denied`, `not_found`, `version_gone` or
+`invalid`, never a provider's words) are what this node last heard from each
+external backend since it started; UNCACHED (`uncached`) lists the linked
+names that have no value an effect could use now, so the next effect that
+needs one asks the backend. `kronik doctor` warns about both.
 
 ```sh
 kronik --socket /owned/fixture/api.sock secret backends
@@ -1965,10 +1984,11 @@ A layout outside `[foreign] layout_dirs` needs `admin` (the daemon reads it
 as root); symbolic links inside a layout are refused. Pulls stop after
 `[foreign] pull_timeout` (default 10 minutes) and above 8 GiB.
 `--secret` passes a secret as an environment variable at every start (the
-program sees the value). A name that is linked to an external secret manager
-is refused (`SECRET_EXTERNAL`), at the add and at the next start of an actor
-whose name was linked later: the built-in store holds an older value of it or
-none. `trusted` runs plain runc with a warning, a
+program sees the value), read as the effects of turns read it: from the
+built-in store, or, for a name linked to an external secret manager, from the
+node's cache or the backend (`SECRET_UNAVAILABLE` while the backend does not
+answer and nothing is cached; the next start retries). A link made later is
+seen by the next start. `trusted` runs plain runc with a warning, a
 seccomp filter and no user namespace: it is not a security boundary.
 `microvm` (M20) is **experimental**: it has not yet booted on KVM hardware,
 and every add answers with a warning that says so. Its VMM runs as the
@@ -1988,7 +2008,7 @@ checkpoint, with no network and its own disk, deleted with the fork; its
 answers are graded `forked`.
 To change the mode, remove and add the actor again. Errors:
 `FOREIGN_EXISTS`, `IMAGE_INVALID`, `RUNSC_MISSING`, `RUNC_MISSING`,
-`SECRET_NOT_FOUND`, `SECRET_EXTERNAL`, `SCOPE_MISSING`, `UNAVAILABLE` when the image's new
+`SECRET_NOT_FOUND`, `SECRET_UNAVAILABLE`, `SCOPE_MISSING`, `UNAVAILABLE` when the image's new
 layers do not fit above `[log] disk_reserve`, and `FOREIGN_UNAVAILABLE`
 when another daemon holds `[foreign] run_dir` or the registry (or layout
 directory) did not answer within `[foreign] pull_timeout`. See
@@ -2224,15 +2244,16 @@ Next     kronik privacy status
 
 Shows privacy mode, the configuration epoch it was last set in (`none yet`
 before the first change), the keystore's counts, how many erasures still
-have a plain value in the log, and reseal progress. If a rewritten segment
-has not been replaced in object storage yet, it says the shipped copy still
-holds the old bytes. Needs `read`.
+have a plain value in the log or in `state.db` (a state value, a queued
+timer or message body, a saved response, a dead letter), and reseal
+progress. If a rewritten segment has not been replaced in object storage
+yet, it says the shipped copy still holds the old bytes. Needs `read`.
 
 ```text
 $ kronik privacy status
   Mode          on (epoch 1)
   Keystore      0 subjects, 0 keys, 0 erased
-  Erasures      0 still have a plain value in the log
+  Erasures      0 still have a plain value in the log or state.db
   Reseal        0 of 0 segments, 0 values sealed, 0 tombstones
 Next     kronik privacy mode off --reason "..."
 ```
@@ -2272,8 +2293,11 @@ $ kronik --json privacy erase user:43 --reason "GDPR art. 17 request #1183"
 Rewrites closed log segments (M8). Privacy mode must already be on
 (`BAD_REQUEST` otherwise). A tagged plain value becomes sealed with the
 subject's current key; a value of an erased subject becomes a tombstone.
-The segment still being written is left until it rolls. `--dry-run` reports
-how many closed segments would change and writes nothing. Needs `operate`.
+The rows the rewritten records hold in `state.db` follow: state values, the
+bodies of pending timers and undelivered messages, saved responses and dead
+letters. The segment still being written is left until it rolls.
+`--dry-run` reports how many closed segments would change and writes
+nothing. Needs `operate`.
 
 ```text
 $ kronik privacy reseal --reason "seal history written before privacy mode" --dry-run
@@ -2380,6 +2404,8 @@ and safely rewind; restart alone does not prove durability repaired.
 create; no cursor advances. Configure a supporting backend, not an overwrite
 fallback. Current archive names are monotonic, independent of clock rollback:
 `audit-v2-<sequence>.jsonl` locally and `audit/v2/<sequence>.jsonl` remotely.
+The `v2` names the numbering scheme; the lines in them are
+`kronik.audit/v3`.
 Keep the remote namespace append-only; see the operations guide for rotation
 and backend-consistency requirements.
 
@@ -2419,7 +2445,7 @@ Next     kronik export status
 
 `kronik audit show [--from <LSN>] [--limit <N>]`
 
-Prints the audit lines (`kronik.audit/v2`) of main's log from `--from` (the
+Prints the audit lines (`kronik.audit/v3`) of main's log from `--from` (the
 first retained record by default), as an audit sink receives them, also
 when no sink is set (`GET /v1/audit`, scope `admin`: the lines name tokens
 and callers). `--limit` is 1 to 1000 lines, 100 by default; a page ends
@@ -2444,11 +2470,14 @@ Compares an audit sink with main's log (m28-otel §4.5): every audited
 record in (`--from`, `--to`] must have its line, deduplicated by `lsn`,
 `effect` and `record_hash`, and equal in kind, action, token and time;
 no line may be extra or conflict with the log's record. Known schema,
-source-derived hash and identity fields are validated. Exact legacy v1
-read compatibility counts mixed v1/v2 retries as one logical source item;
-new emissions are v2 only. Only trusted source restore records authorize
-superseding a tail, never a sink's own restore claim. Restore/gap positions
-are validated action-specific `u64`: v2 JSON numbers, v1 decimal strings.
+source-derived hash and identity fields are validated. New emissions are
+`kronik.audit/v3`, whose `record_hash` (`b3k:v3:`) is keyed with the master
+key, so verification loads the master key as the daemon does. Legacy v2 and
+v1 lines are read too, and retries in mixed formats count as one logical
+source item. Only trusted source restore records authorize superseding a
+tail, never a sink's own restore claim. Restore/gap positions are
+validated action-specific `u64`: JSON numbers in v3 and v2, decimal
+strings in v1.
 Needs no daemon: it reads the data directory (`--data-dir`, else `server.data_dir`)
 and the sink, `--sink` or `[audit] sink`: a `file://` directory or an
 `s3://` bucket (with `[audit] endpoint` and the `AWS_*` variables). A

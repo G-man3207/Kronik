@@ -18,9 +18,19 @@
 //!   a torn footer is a torn tail and is truncated on open.
 //!
 //! Recovery (ADR 0004): in the active (last) segment, everything from the
-//! first entry that fails its length, CRC or LSN check is a torn tail and is
-//! truncated durably. Any such failure in a closed segment, and any entry
-//! that passes its CRC but does not decode or validate, is `STORAGE_CORRUPT`.
+//! first entry that is incomplete (it runs past the end of the file) or
+//! fails its CRC or LSN check is a torn tail and is truncated durably,
+//! unless that entry is at or below the LSN the caller knows to be
+//! acknowledged ([`LogConfig::acknowledged_through`]): that is
+//! `STORAGE_CORRUPT`, and nothing is truncated. Any such failure in a closed
+//! segment, and any entry that passes its CRC but does not decode or
+//! validate, is `STORAGE_CORRUPT`.
+//!
+//! Record size: a writer never appends a body larger than [`MAX_RECORD`]
+//! ([`LogError::TooLarge`], nothing written). Readers accept a larger entry
+//! when it is complete and its CRC holds, because releases before 0.5 could
+//! write one (I16); such an entry is never mistaken for a torn tail. A
+//! length field never makes a reader allocate more than the file holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -54,8 +64,11 @@ pub const MAGIC: &[u8; 4] = b"KRNK";
 pub const FORMAT_VERSION: u32 = 1;
 /// Envelope bytes before the protobuf: len, crc, lsn, kind.
 pub const ENVELOPE_LEN: usize = 17;
-/// The largest record body accepted (a turn's writes, messages and SQL
-/// changes together).
+/// The largest record body a writer appends: everything a turn records (its
+/// input, effects, writes, messages, timers, SQL changes and output)
+/// together. [`Log::append`] refuses a larger body. Readers still accept a
+/// larger complete entry with a valid CRC: releases up to 0.4.1 could write
+/// one, and their logs must stay readable (I16).
 pub const MAX_RECORD: u32 = 128 << 20;
 /// Closed-segment footer index (ADR 0011). Not an LSN and not a [`Record`];
 /// readers skip it. See [`footer_index`].
@@ -87,6 +100,17 @@ pub struct LogConfig {
     /// The LSN of a new log's first record (default 1; a fork's log starts
     /// after its fork point, docs/design/m3-fork.md §2).
     pub first_lsn: Lsn,
+    /// Every record up to this LSN is known to have been acknowledged: the
+    /// caller's state database has applied it, which happens only after its
+    /// fsync (default 0: nothing known). [`Log::open`] never truncates such a
+    /// record as a torn tail; an invalid entry at or below it in the active
+    /// segment is `STORAGE_CORRUPT` instead.
+    pub acknowledged_through: Lsn,
+    /// Test hook: the largest body [`Log::append`] accepts, so a test can
+    /// reach the limit without 128 MiB records. Values above [`MAX_RECORD`]
+    /// count as [`MAX_RECORD`].
+    #[doc(hidden)]
+    pub max_record_bytes: u32,
 }
 
 impl LogConfig {
@@ -99,7 +123,14 @@ impl LogConfig {
             group_commit_window: Duration::from_millis(2),
             mutation_ack_before_fsync: false,
             first_lsn: 1,
+            acknowledged_through: 0,
+            max_record_bytes: MAX_RECORD,
         }
+    }
+
+    /// The largest record body an append accepts.
+    pub fn record_limit(&self) -> usize {
+        self.max_record_bytes.min(MAX_RECORD) as usize
     }
 }
 
@@ -112,6 +143,23 @@ pub enum LogError {
     Io(#[from] io::Error),
     #[error("log writer stopped: {0}")]
     Stopped(String),
+    /// An append whose body is over the record limit. Nothing was written,
+    /// no LSN was used and the writer goes on: this is a refusal, not a
+    /// storage failure.
+    #[error("a record of kind {kind} is {bytes} bytes, over the {limit}-byte log record limit")]
+    TooLarge {
+        kind: u8,
+        bytes: usize,
+        limit: usize,
+    },
+}
+
+impl LogError {
+    /// Whether the error refused one record and left the log as it was
+    /// ([`LogError::TooLarge`]), so the writer is still healthy.
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, LogError::TooLarge { .. })
+    }
 }
 
 /// Authorization refusal is not storage failure and must not make the node fatal.
@@ -452,14 +500,18 @@ struct RawEntry<'a> {
     end: usize,
 }
 
+/// The entry at `off`, or `None` when it is incomplete (it runs past the end
+/// of `image`) or its CRC fails. A body larger than [`MAX_RECORD`] is
+/// accepted when it is complete and its CRC holds: a release before 0.5
+/// could append one. The length only selects a slice of `image`; it never
+/// sizes an allocation.
 fn parse_entry(image: &[u8], off: usize) -> Option<RawEntry<'_>> {
     let len = u32_at(image, off)?;
-    if len > MAX_RECORD {
-        return None;
-    }
-    let crc = u32_at(image, off + 4)?;
-    let end = off + ENVELOPE_LEN + len as usize;
-    let body = image.get(off + 8..end)?;
+    let crc = u32_at(image, off.checked_add(4)?)?;
+    let end = off
+        .checked_add(ENVELOPE_LEN)?
+        .checked_add(usize::try_from(len).ok()?)?;
+    let body = image.get(off.checked_add(8)?..end)?;
     if crc32c::crc32c(body) != crc {
         return None;
     }
@@ -616,7 +668,9 @@ pub struct SegmentRewrite {
 /// If any record changed, the old footer is dropped and a new one is written
 /// at the end with the new offsets, then fsynced with the image. If nothing
 /// changed, the file is left alone, including a missing footer: a no-op
-/// rewrite must not invent one.
+/// rewrite must not invent one. An edit that would push a record that fit
+/// over [`MAX_RECORD`] fails with [`LogError::TooLarge`] and leaves the file
+/// alone.
 ///
 /// The active segment must not be passed here: the writer holds it open.
 pub fn rewrite_segment(
@@ -649,6 +703,18 @@ pub fn rewrite_segment(
         let mut record = Record::decode(e.kind, e.payload)
             .map_err(|err| corrupt(format!("record at lsn {}: {err}", e.lsn)))?;
         let edited = edit(e.lsn, &mut record).map_err(corrupt)?;
+        if edited {
+            // A record that fit stays within the limit; one a release
+            // before 0.5 wrote over it may only keep its size class.
+            let bytes = record.encoded_len();
+            if bytes > MAX_RECORD as usize && e.payload.len() <= MAX_RECORD as usize {
+                return Err(LogError::TooLarge {
+                    kind: record.kind(),
+                    bytes,
+                    limit: MAX_RECORD as usize,
+                });
+            }
+        }
         let new_off = out.len() as u64;
         offsets.push((e.lsn, new_off));
         remember_turn(&mut index, &record, new_off);
@@ -750,6 +816,8 @@ pub struct Log {
     /// The writer task's fsynced head, shared so readers can tell whether
     /// the applier has drained every committed record.
     committed_head: Arc<AtomicU64>,
+    /// The largest body an append accepts ([`LogConfig::record_limit`]).
+    max_record: usize,
 }
 
 struct Segment {
@@ -792,6 +860,26 @@ impl Log {
         self.committed_head.load(Ordering::Acquire)
     }
 
+    /// The largest record body an append accepts: [`MAX_RECORD`] unless a
+    /// test lowered it ([`LogConfig::max_record_bytes`]).
+    pub fn record_limit(&self) -> usize {
+        self.max_record
+    }
+
+    /// Refuses a body over the record limit before it reaches the writer, so
+    /// nothing is written and no LSN is used.
+    fn admit_size(&self, record: &Record) -> Result<(), LogError> {
+        let bytes = record.encoded_len();
+        if bytes > self.max_record {
+            return Err(LogError::TooLarge {
+                kind: record.kind(),
+                bytes,
+                limit: self.max_record,
+            });
+        }
+        Ok(())
+    }
+
     /// Opens the log, truncates a torn tail durably and starts the writer.
     /// Every durable record is sent to `committed` in LSN order after its
     /// fsync; `fatal` fires if the writer stops on an I/O error (the daemon
@@ -819,6 +907,15 @@ impl Log {
                 let path = cfg.dir.join(segment_name(start));
                 let image = read_file(env, path.clone()).await?;
                 match parse_header(&image) {
+                    None if start <= cfg.acknowledged_through => {
+                        // A segment is created, header fsynced, before its
+                        // first record; this one held an acknowledged record.
+                        return Err(corrupt(format!(
+                            "segment {} has no valid header, but lsn {start} in it was \
+                             acknowledged and applied; nothing was truncated",
+                            path.display()
+                        )));
+                    }
                     None => {
                         // A torn header: the segment was being created and
                         // can hold no acknowledged record.
@@ -853,6 +950,22 @@ impl Log {
                                 scan.next_lsn,
                             )
                         } else {
+                            if scan.has_tail && scan.next_lsn <= cfg.acknowledged_through {
+                                // A torn write can only hit the batch being
+                                // written when the process died; an
+                                // applied record was fsynced before.
+                                return Err(corrupt(format!(
+                                    "the active segment {} is invalid at offset {} (lsn {}), \
+                                     but records through lsn {} were acknowledged and \
+                                     applied: an acknowledged record is damaged, not a torn \
+                                     tail, and nothing was truncated. Keep the data \
+                                     directory; restore it from a shipped copy or a backup",
+                                    path.display(),
+                                    scan.valid_end,
+                                    scan.next_lsn,
+                                    cfg.acknowledged_through
+                                )));
+                            }
                             let file = env.fs.open(path, OpenMode::ReadWriteCreate).await?;
                             if scan.has_tail {
                                 truncated_bytes = image.len() as u64 - scan.valid_end;
@@ -885,6 +998,7 @@ impl Log {
         let native_writer = Arc::new(NativeWriterState::new());
         let rx = NativeInbox::new(rx, native_writer.clone());
         let committed_head = Arc::new(AtomicU64::new(next_lsn.saturating_sub(1)));
+        let max_record = cfg.record_limit();
         env.spawn(
             "log-writer",
             writer(
@@ -904,6 +1018,7 @@ impl Log {
                 authorized_slots: Arc::new(tokio::sync::Semaphore::new(AUTHORIZED_QUEUE_CAPACITY)),
                 native_writer,
                 committed_head,
+                max_record,
             },
             Opened {
                 next_lsn,
@@ -916,8 +1031,13 @@ impl Log {
     }
 
     /// Appends records in order; resolves with the last LSN once all are
-    /// fsynced. Records queued together share writes and fsyncs.
+    /// fsynced. Records queued together share writes and fsyncs. One record
+    /// over the limit refuses them all ([`LogError::TooLarge`]): none is
+    /// written.
     pub async fn append_all(&self, records: Vec<Record>) -> Result<Option<Lsn>, LogError> {
+        for record in &records {
+            self.admit_size(record)?;
+        }
         let mut waiting = Vec::with_capacity(records.len());
         for record in records {
             let (done, rx) = oneshot::channel();
@@ -941,8 +1061,10 @@ impl Log {
         Ok(last)
     }
 
-    /// Appends a record; resolves with its LSN once it is fsynced.
+    /// Appends a record; resolves with its LSN once it is fsynced. A body
+    /// over the limit is refused ([`LogError::TooLarge`]) and not written.
     pub async fn append(&self, record: Record) -> Result<Lsn, LogError> {
+        self.admit_size(&record)?;
         let (done, rx) = oneshot::channel();
         self.tx
             .send(Append {
@@ -962,6 +1084,7 @@ impl Log {
         record: Record,
         authority: AuthLease,
     ) -> Result<Lsn, AuthorizedAppendError> {
+        self.admit_size(&record)?;
         let slot = tokio::select! {
             biased;
             () = authority.cancelled() => return Err(AuthorizedAppendError::Authority(ApiError::new(
@@ -1364,11 +1487,18 @@ impl LogReader {
     }
 }
 
+/// The length field never sizes a read past the end of the file: a damaged
+/// one is `STORAGE_CORRUPT`, not an allocation. A body over [`MAX_RECORD`]
+/// that is complete and passes its CRC reads (a release before 0.5 wrote it).
 async fn read_entry_at(file: &dyn File, pos: Position) -> Result<Committed, LogError> {
     let head = file.read_at(pos.offset, ENVELOPE_LEN).await?;
     let len = u32_at(&head, 0).ok_or_else(|| corrupt("short entry header"))?;
-    if len > MAX_RECORD {
-        return Err(corrupt(format!("entry length {len} at {pos:?}")));
+    let file_len = file.len().await?;
+    let end = pos.offset.checked_add(ENVELOPE_LEN as u64 + u64::from(len));
+    if end.is_none_or(|end| end > file_len) {
+        return Err(corrupt(format!(
+            "entry length {len} at {pos:?} runs past the end of the segment ({file_len} bytes)"
+        )));
     }
     let mut image = head;
     image.extend(

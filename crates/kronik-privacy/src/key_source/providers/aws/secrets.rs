@@ -393,8 +393,11 @@ fn catalogue(
         }
         ids.push(id.to_owned());
     }
+    // Secrets Manager omits NextToken on the last page; moto answers an empty
+    // one. An empty token continues nothing, so it ends the list as well.
     let next = match r.get("NextToken") {
         None => None,
+        Some(Value::String(token)) if token.is_empty() => None,
         Some(Value::String(token)) if prior != Some(token.as_str()) => {
             Some(cursor(&canonical_ref, token)?)
         }
@@ -586,6 +589,27 @@ mod tests {
         for malformed in ["https://evil/?secret=value", "../token", ""] {
             assert!(continuation(malformed, ARN).is_err());
         }
+    }
+
+    /// The last page has no NextToken, or an empty one (moto): both end the
+    /// list, and the page's versions are its whole catalogue.
+    #[test]
+    fn an_empty_next_token_ends_the_catalogue() {
+        let reference = Reference::parse(ARN, "us-east-1").unwrap();
+        for last in [
+            json!({"ARN":ARN,"Name":"team/service","Versions":[{"VersionId":VERSION}]}),
+            json!({"ARN":ARN,"Name":"team/service","Versions":[{"VersionId":VERSION}],"NextToken":""}),
+        ] {
+            let page = catalogue(&reference, "us-east-1", &last, None).unwrap();
+            assert_eq!(
+                (page.ids.as_slice(), page.next),
+                ([VERSION.to_owned()].as_slice(), None)
+            );
+        }
+        let mut r = json!({"ARN":ARN,"Name":"team/service","Versions":[],"NextToken":null});
+        assert!(catalogue(&reference, "us-east-1", &r, None).is_err());
+        r["NextToken"] = json!(7);
+        assert!(catalogue(&reference, "us-east-1", &r, None).is_err());
     }
 
     #[test]

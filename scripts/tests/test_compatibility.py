@@ -112,6 +112,51 @@ class CompatibilityIndexTest(unittest.TestCase):
         with self.assertRaises(VERIFY["Violation"]):
             self.load()
 
+    def test_an_edited_snapshot_names_its_releases_blob_and_the_edit(self):
+        edited = next(contract for case in self.index["releases"]
+                      for contract in case["contracts"].values() if "producer_git_blob" in contract)
+        for change in ({"edit": ""}, {"producer_git_blob": edited["git_blob"]},
+                       {"producer_git_blob": "not a blob"}):
+            index = copy.deepcopy(self.index)
+            target = next(contract for case in index["releases"]
+                          for contract in case["contracts"].values() if "producer_git_blob" in contract)
+            target.update(change)
+            with self.subTest(change=change), self.assertRaisesRegex(VERIFY["Violation"], "edited contract"):
+                self.load(index)
+
+
+class ContractLineageTest(unittest.TestCase):
+    """Each snapshot against its source file at the producer revision, in this clone."""
+
+    def setUp(self):
+        self.cases = VERIFY["load_index"](FIXTURES / "releases.json")
+        if not VERIFY["contract_lineage"](self.cases, FIXTURES):
+            self.skipTest("the producer revisions are not in this clone (a shallow clone)")
+
+    def edited(self, cases):
+        return next(contract for case in cases for contract in case["contracts"].values()
+                    if "producer_git_blob" in contract)
+
+    def test_an_undeclared_edit_is_refused(self):
+        cases = copy.deepcopy(self.cases)
+        edited = self.edited(cases)
+        del edited["producer_git_blob"], edited["edit"]
+        with self.assertRaisesRegex(VERIFY["Violation"], "declares no edit"):
+            VERIFY["contract_lineage"](cases, FIXTURES)
+
+    def test_a_declared_edit_names_the_blob_its_release_had(self):
+        cases = copy.deepcopy(self.cases)
+        self.edited(cases)["producer_git_blob"] = "a" * 40
+        with self.assertRaisesRegex(VERIFY["Violation"], "declares no edit"):
+            VERIFY["contract_lineage"](cases, FIXTURES)
+
+    def test_an_unedited_snapshot_cannot_claim_an_edit(self):
+        cases = copy.deepcopy(self.cases)
+        api = cases[0]["contracts"]["api"]
+        api["producer_git_blob"], api["edit"] = "a" * 40, "invented"
+        with self.assertRaisesRegex(VERIFY["Violation"], "declares no edit"):
+            VERIFY["contract_lineage"](cases, FIXTURES)
+
 
 class OriginalRootIdentityTest(unittest.TestCase):
     def summary(self, roots=9):

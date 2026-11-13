@@ -85,14 +85,18 @@ fn enabled(response: &Value) -> Result<(), BackendError> {
     if response.get("recoveryId").is_some() || response.get("deletedDate").is_some() {
         return Err(BackendError::VersionGone);
     }
-    match response
+    // `attributes` is required, `enabled` optional in the Key Vault API (the
+    // emulator omits it): a version that is not disabled is readable. Key
+    // Vault refuses to read a disabled one (403); a listed one says false.
+    let attributes = response
         .get("attributes")
-        .and_then(|a| a.get("enabled"))
-        .and_then(Value::as_bool)
-    {
-        Some(true) => Ok(()),
-        Some(false) => Err(BackendError::Denied),
-        None => Err(BackendError::Invalid),
+        .and_then(Value::as_object)
+        .ok_or(BackendError::Invalid)?;
+    match attributes.get("enabled") {
+        None => Ok(()),
+        Some(Value::Bool(true)) => Ok(()),
+        Some(Value::Bool(false)) => Err(BackendError::Denied),
+        Some(_) => Err(BackendError::Invalid),
     }
 }
 
@@ -468,6 +472,22 @@ mod tests {
         assert!(matches!(
             fetched(PATH, None, &response),
             Err(BackendError::Denied)
+        ));
+        // `enabled` is optional; `attributes` and a boolean are not.
+        response["attributes"] = json!({"created": 1});
+        assert_eq!(
+            fetched(PATH, None, &response).unwrap().value.as_slice(),
+            b"x"
+        );
+        response["attributes"]["enabled"] = json!("true");
+        assert!(matches!(
+            fetched(PATH, None, &response),
+            Err(BackendError::Invalid)
+        ));
+        response.as_object_mut().unwrap().remove("attributes");
+        assert!(matches!(
+            fetched(PATH, None, &response),
+            Err(BackendError::Invalid)
         ));
         for bad in [
             "https://evil/secrets/password",

@@ -533,10 +533,12 @@ impl Store {
         Ok(())
     }
 
-    /// The erasure operation of `subject` again, on `kv` and every actor
-    /// database, keeping the applied LSNs (a rebase shadow after its staged
-    /// turns, m13-rebase §3).
-    pub fn erase_again(&self, subject: &str) -> Result<(), StoreError> {
+    /// The erasure operation of `subject` through `key_version` again, on
+    /// `state.db` and every actor database, keeping the applied LSNs: a
+    /// rebase shadow after its staged turns (m13-rebase §3), and a fork's
+    /// continuous replay at the place of production's `Erasure` record, so
+    /// the fork's state loses what production's lost there (ADR 0109).
+    pub fn erase_again(&self, subject: &str, key_version: u32) -> Result<(), StoreError> {
         let _apply = self.apply_lock();
         for name in self.db().sql_actors()? {
             let db = self.sql.get(&name)?;
@@ -545,6 +547,6 @@ impl Store {
             db.erase_subject(subject, applied)
                 .map_err(|e| StoreError::Corrupt(format!("erasure in {name}: {e}")))?;
         }
-        self.db().erase_subject_rows(subject)
+        self.db().erase_subject_rows(subject, key_version)
     }
 }

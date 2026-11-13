@@ -280,7 +280,10 @@ Never use a production credential for this example.
 
 Inspect actual backend IDs, kinds, bindings, `configured` and
 `inventory_complete` before selecting a source. Configuration and complete
-historical inventory are separate facts, not a provider health guarantee.
+historical inventory are separate facts, not a provider health guarantee;
+`last_success_ms`, `last_error_ms`, `last_error` and `uncached` say what
+this node last heard from each external backend and which linked names it
+would have to fetch.
 
 ```http
 GET /v1/secrets/backends HTTP/1.1
@@ -348,9 +351,14 @@ Content-Type: application/json
 ## Admin listener, embedded UI and cluster observations: current surface
 
 These operations are declared by the current generated OpenAPI and served
-by its binary. They are absent from the published v0.3.0 binary. The
-authentication operations are public OpenAPI operations on the admin listener
-only; product operations are never routed there. The browser flows are driven
+by its binary. They are absent from the published v0.3.0 binary. The browser
+authentication operations (`/v1/auth/session`, `/v1/auth/login`,
+`/v1/auth/callback` and `/v1/auth/logout`) are public OpenAPI operations on the
+admin listener only. Every other `/v1` operation is served there as well,
+through the same router and scope checks as on the Unix socket and TCP, so the
+embedded UI is an ordinary API client
+([ADR 0104](../adr/0104-admin-ui-as-a-public-api-client.md)). The listener also
+answers `/metrics` and `/healthz`. The browser flows are driven
 by a browser, not scripted: the examples document the request heads the daemon
 must receive, not an invitation to automate a login. Cookie mutations require
 the session's exact CSRF token and the configured Origin; a bearer supplied

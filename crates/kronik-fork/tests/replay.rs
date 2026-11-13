@@ -84,6 +84,7 @@ fn replay_with(
             env: node.env().clone(),
         });
         setup.progress = progress;
+        setup.record_limit = node.turn_record_limit();
         let setup = Arc::new(setup);
         kronik_fork::run(
             node.env(),
@@ -939,6 +940,48 @@ fn identity_replay_over_outcome_unknown_turns_is_empty() {
     assert!(!s.changed, "{}", String::from_utf8_lossy(&out.bytes));
     assert_eq!(s.divergent_turns, 0);
     assert!(out.diff.errors.outcome_unknown >= 1);
+}
+
+/// Identity replay is empty over turns that failed because their record
+/// did not fit (#26): one whose output was too large, and one whose second
+/// effect was refused before it happened. The fork keeps production's
+/// record budget and decides the same.
+#[test]
+fn identity_replay_over_turns_too_large_for_their_record_is_empty() {
+    let (addr, hits) = server();
+    let dir = tempdir();
+    let p = Proc::start_with(
+        dir.path(),
+        kronik_sched::NodeConfig {
+            concurrency: 8,
+            test_max_record_bytes: Some(512 << 10),
+            ..kronik_sched::NodeConfig::default()
+        },
+    );
+    p.grant("http:127.0.0.1");
+    let fork_lsn = p.settle();
+    let big = p.send("counter/a", "big", &(600 << 10).to_string());
+    assert_eq!(
+        big.outcome.error_code, "TURN_TOO_LARGE",
+        "{:?}",
+        big.outcome
+    );
+    let body = "a".repeat(150 << 10);
+    let spec = format!("POST http://{addr}/one\n\n{body}\n---\nPOST http://{addr}/two\n\n{body}");
+    let two = p.send("counter/b", "fetch2", &spec);
+    assert_eq!(
+        two.outcome.error_code, "TURN_TOO_LARGE",
+        "{:?}",
+        two.outcome
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    p.http("c", "increment", "");
+    let out = replay(&p, None, fork_lsn, &opts(Mode::Both), 2);
+    let s = &out.diff.summary;
+    assert!(!s.changed, "{}", String::from_utf8_lossy(&out.bytes));
+    assert_eq!(s.divergent_turns, 0);
+    // The replay sent nothing (I7).
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
 #[test]

@@ -144,8 +144,7 @@ mod tests {
         fn reconcile(
             &self,
             _declared: Vec<pb::ForeignActor>,
-            _secrets: Option<Arc<SecretStore>>,
-            _links: kronik_effects::foreign::SecretLinks,
+            _secrets: Option<kronik_effects::foreign::SecretSource>,
         ) -> BoxFuture<'static, ()> {
             let release = self.release.lock().unwrap().take().unwrap();
             self.entered

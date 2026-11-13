@@ -149,6 +149,13 @@ pub struct ProductionIndex {
     /// effects whose recorded request was erased. Such a request cannot be
     /// rebuilt from the revealed input, so replay serves the recording.
     pub erased_effects: BTreeMap<Lsn, BTreeSet<u32>>,
+    /// (lsn, actor, subject) of every SQL changeset whose subject was
+    /// erased. A store skips it when it applies the record, so the actor's
+    /// database lacks rows production had until the subject's `Erasure`
+    /// deleted them ([`ProductionIndex::sql_gap`]; ADR 0109).
+    pub erased_sql: Vec<(Lsn, String, String)>,
+    /// (lsn, subject, key version) of the `Erasure` records, in LSN order.
+    pub erasures: Vec<(Lsn, String, u32)>,
     /// Opens production's sealed SQL changesets when a cursor applies them
     /// (M8); plain unless the index was revealed for a fork.
     pub sealer: std::sync::Arc<kronik_privacy::sealer::Sealer>,
@@ -217,7 +224,11 @@ impl ProductionIndex {
         let mut trees: BTreeMap<String, Vec<Lsn>> = BTreeMap::new();
         let mut roots = Vec::new();
         let mut begins: BTreeMap<String, Lsn> = BTreeMap::new();
+        let mut erasures = Vec::new();
         for c in records.iter().take_while(|c| c.lsn <= to_lsn) {
+            if let Record::Erasure(e) = &c.record {
+                erasures.push((c.lsn, e.subject.clone(), e.key_version));
+            }
             if let Record::TurnBegin(b) = &c.record
                 && let Some(key) = &b.causal_key
                 && key.path.is_empty()
@@ -286,6 +297,8 @@ impl ProductionIndex {
             roots,
             erased_turns: BTreeSet::new(),
             erased_effects: BTreeMap::new(),
+            erased_sql: Vec::new(),
+            erasures,
             sealer: std::sync::Arc::new(kronik_privacy::sealer::Sealer::plain()),
             no_pii: false,
         }
@@ -324,6 +337,19 @@ impl ProductionIndex {
                         .collect();
                     if !effects.is_empty() {
                         self.erased_effects.insert(c.lsn, effects);
+                    }
+                    let actor = t
+                        .actor
+                        .as_ref()
+                        .map(|a| format!("{}/{}", a.kind, a.key))
+                        .unwrap_or_default();
+                    for cs in t.sql_changes.iter().filter_map(|c| c.changeset.as_ref()) {
+                        if let Some(subject) = &cs.subject
+                            && privacy.opens_erased(cs)
+                        {
+                            self.erased_sql
+                                .push((c.lsn, actor.clone(), subject.clone()));
+                        }
                     }
                     privacy.reveal_turn(t);
                 }
@@ -387,7 +413,61 @@ impl ProductionIndex {
         index.erased_turns.extend(tail.erased_turns);
         index.erased_effects = self.erased_effects.clone();
         index.erased_effects.extend(tail.erased_effects);
+        index.erased_sql = self.erased_sql.clone();
+        index.erased_sql.extend(tail.erased_sql);
         Ok(index)
+    }
+
+    /// The LSN of the snapshot the records continue (0 without one): a
+    /// store's state written at or below it is the snapshot's, the rest the
+    /// replay's.
+    pub fn base_lsn(&self) -> Lsn {
+        self.base.as_ref().map_or(0, |b| b.lsn)
+    }
+
+    /// Whether, at production position `at`, the replay's database of
+    /// `actor` lacks rows production had: an erased subject's changeset was
+    /// skipped before `at`, and that subject's `Erasure`, which deleted the
+    /// rows in production too, comes after it (ADR 0109). `untagged`: the
+    /// database has a table without `_subject`, so the changeset may have
+    /// held rows the erasure left in production (a subject's turn could
+    /// write such a table before ADR 0005 §6 option B), and the gap stays.
+    pub fn sql_gap(&self, actor: &str, at: Lsn, untagged: bool) -> bool {
+        self.erased_sql
+            .iter()
+            .filter(|(lsn, a, _)| a == actor && *lsn < at)
+            .any(|(lsn, _, subject)| {
+                untagged
+                    || self
+                        .erasures
+                        .iter()
+                        .find(|(e, s, _)| s == subject && e > lsn)
+                        .is_none_or(|(e, _, _)| at < *e)
+            })
+    }
+
+    /// Whether an erased subject's changeset of `actor` was skipped at all.
+    pub fn has_erased_sql(&self, actor: &str) -> bool {
+        self.erased_sql.iter().any(|(_, a, _)| a == actor)
+    }
+
+    /// The production turns below `key` in its causal tree (messages,
+    /// calls, timers and compensations it caused, and theirs), in LSN order.
+    pub fn below(&self, key: &pb::CausalKey) -> Vec<(Lsn, &pb::TurnRecord)> {
+        self.trees
+            .get(&key.root)
+            .into_iter()
+            .flatten()
+            .filter_map(|l| match &self.record(*l)?.record {
+                Record::TurnRecord(t) => Some((*l, t)),
+                _ => None,
+            })
+            .filter(|(_, t)| {
+                t.causal_key
+                    .as_ref()
+                    .is_some_and(|k| k.path.len() > key.path.len() && k.path.starts_with(&key.path))
+            })
+            .collect()
     }
 
     pub fn record(&self, lsn: Lsn) -> Option<&Committed> {

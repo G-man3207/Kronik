@@ -1091,6 +1091,267 @@ fn footer_index_rejects_a_footer_that_does_not_parse() {
     assert!(err.to_string().contains("outside the segment"), "{err}");
 }
 
+/// An `EffectResult` whose body is `body` bytes of response plus a few
+/// bytes of envelope fields.
+fn effect_result_with(body: Vec<u8>) -> Record {
+    Record::EffectResult(pb::EffectResult {
+        execution_id: "e".into(),
+        effect: Some(pb::EffectRecord {
+            response: Some(pb::Sealable {
+                subject: None,
+                value: Some(pb::sealable::Value::Plain(body)),
+            }),
+            ..effect()
+        }),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_append_over_the_limit_is_refused_and_writes_nothing() {
+    let mut h = harness();
+    h.cfg.max_record_bytes = 4096;
+    let (log, _, _rx) = h.open().await.unwrap();
+    assert_eq!(log.record_limit(), 4096);
+    log.append(samples()[3].clone()).await.unwrap();
+    let seg = h.segment_files().pop().unwrap();
+    let before = std::fs::read(&seg).unwrap();
+
+    let big = effect_result_with(vec![7; 4096]);
+    let bytes = big.encoded_len();
+    let err = log.append(big.clone()).await.unwrap_err();
+    assert!(
+        matches!(err, LogError::TooLarge { kind, bytes: b, limit: 4096 }
+            if kind == kronik_proto::kind::EFFECT_RESULT && b == bytes),
+        "{err:?}"
+    );
+    assert!(err.is_refusal(), "{err}");
+    // A batch with one record over the limit writes none of them.
+    let err = log
+        .append_all(vec![samples()[4].clone(), big])
+        .await
+        .unwrap_err();
+    assert!(err.is_refusal(), "{err}");
+    assert_eq!(
+        std::fs::read(&seg).unwrap(),
+        before,
+        "a refused body was written"
+    );
+
+    // No LSN was used and the writer goes on; a body at the limit fits.
+    assert_eq!(log.append(samples()[4].clone()).await.unwrap(), 2);
+    // Between 128 and 16 383 body bytes every length prefix keeps its size.
+    let overhead = effect_result_with(vec![1; 4000]).encoded_len() - 4000;
+    let at_limit = effect_result_with(vec![1; 4096 - overhead]);
+    assert_eq!(at_limit.encoded_len(), 4096);
+    assert_eq!(log.append(at_limit).await.unwrap(), 3);
+    drop(log);
+    assert_eq!(h.read_all().await.unwrap().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_default_limit_is_max_record() {
+    let h = harness();
+    let (log, _, _rx) = h.open().await.unwrap();
+    assert_eq!(log.record_limit(), MAX_RECORD as usize);
+    // `vec![0; n]` maps zero pages lazily and `encoded_len` never touches
+    // them: this costs no 128 MiB of memory.
+    let err = log
+        .append(effect_result_with(vec![0; MAX_RECORD as usize]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, LogError::TooLarge { limit, bytes, .. }
+            if limit == MAX_RECORD as usize && bytes > limit),
+        "{err:?}"
+    );
+    // A test hook above the format's limit does not raise it.
+    let mut cfg = h.cfg.clone();
+    cfg.max_record_bytes = u32::MAX;
+    assert_eq!(cfg.record_limit(), MAX_RECORD as usize);
+}
+
+/// Writes one complete, CRC-valid entry for `record` at the end of the
+/// segment file `path` without copying its body a second time.
+fn append_raw_entry(path: &Path, lsn: Lsn, record: &Record) {
+    use std::io::Write as _;
+    let payload = record.encode();
+    let mut crc = crc32c::crc32c(&lsn.to_le_bytes());
+    crc = crc32c::crc32c_append(crc, &[record.kind()]);
+    crc = crc32c::crc32c_append(crc, &payload);
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(&(payload.len() as u32).to_le_bytes())
+        .unwrap();
+    file.write_all(&crc.to_le_bytes()).unwrap();
+    file.write_all(&lsn.to_le_bytes()).unwrap();
+    file.write_all(&[record.kind()]).unwrap();
+    file.write_all(&payload).unwrap();
+    file.sync_all().unwrap();
+}
+
+/// A release before 0.5 could append a record over `MAX_RECORD`, and its
+/// own start then cut that acknowledged record off as a "torn tail". The
+/// record is complete and its CRC holds: it is read, never truncated.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_complete_record_over_the_limit_is_read_and_never_truncated() {
+    let h = harness();
+    let (log, _, _rx) = h.open().await.unwrap();
+    log.append(samples()[3].clone()).await.unwrap();
+    drop(log);
+    let seg = h.segment_files().pop().unwrap();
+    let body = MAX_RECORD as usize + 4096;
+    append_raw_entry(&seg, 2, &effect_result_with(vec![0x5a; body]));
+    let len = std::fs::metadata(&seg).unwrap().len();
+    assert!(len > u64::from(MAX_RECORD));
+
+    let (log, opened, _rx) = h.open().await.unwrap();
+    assert_eq!(
+        opened.truncated_bytes, 0,
+        "an acknowledged record was cut off"
+    );
+    assert_eq!(opened.next_lsn, 3);
+    assert_eq!(std::fs::metadata(&seg).unwrap().len(), len);
+    assert_eq!(log.append(samples()[4].clone()).await.unwrap(), 3);
+    drop(log);
+
+    let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
+    let mut seen = Vec::new();
+    reader
+        .read(2, 3, |c| {
+            seen.push((c.lsn, c.record.encoded_len(), c.pos));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].0, 2);
+    assert!(seen[0].1 > MAX_RECORD as usize);
+    // The positional read (history) and the bounded reader agree.
+    let at = reader.read_at(seen[0].2).await.unwrap();
+    assert_eq!((at.lsn, at.record.encoded_len()), (2, seen[0].1));
+    let mut bounded = Vec::new();
+    reader
+        .read_while(2, 3, |c| {
+            bounded.push(c.lsn);
+            Ok(true)
+        })
+        .await
+        .unwrap();
+    assert_eq!(bounded, vec![2, 3]);
+}
+
+/// An incomplete entry, whatever its length says, is still a torn tail;
+/// a length that runs past the file sizes no read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_incomplete_entry_is_torn_and_its_length_sizes_no_read() {
+    let mut h = harness();
+    let (log, _, mut rx) = h.open().await.unwrap();
+    log.append(samples()[3].clone()).await.unwrap();
+    let first = rx.recv().await.unwrap();
+    drop(log);
+    let seg = h.segment_files().pop().unwrap();
+    let full = std::fs::read(&seg).unwrap();
+    // The envelope of an entry that claims nearly 4 GiB, then 100 bytes.
+    let mut torn = full.clone();
+    torn.extend_from_slice(&(u32::MAX - 16).to_le_bytes());
+    torn.extend_from_slice(&[0xab; 4 + 8 + 1 + 100]);
+    std::fs::write(&seg, &torn).unwrap();
+
+    // A positional read of it is corrupt, and no read asks for more bytes
+    // than the file has.
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let plain_env = h.env.clone();
+    h.env.fs = Arc::new(ReadFs {
+        inner: plain_env.fs.clone(),
+        calls: calls.clone(),
+    });
+    let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
+    let pos = Position {
+        segment: first.pos.segment,
+        offset: full.len() as u64,
+    };
+    assert!(matches!(
+        reader.read_at(pos).await,
+        Err(LogError::Corrupt(_))
+    ));
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|&(_, len)| len <= torn.len()),
+        "{:?}",
+        calls.lock().unwrap()
+    );
+    // The bounded reader treats it as the unacknowledged tail it is.
+    reader.read_while(1, Lsn::MAX, |_| Ok(true)).await.unwrap();
+    h.env = plain_env;
+
+    let (_log, opened, _rx) = h.open().await.unwrap();
+    assert_eq!(opened.next_lsn, 2);
+    assert_eq!(opened.truncated_bytes, (torn.len() - full.len()) as u64);
+    assert_eq!(std::fs::read(&seg).unwrap(), full);
+}
+
+/// The state database applied records through `acknowledged_through`, so
+/// they were fsynced and acknowledged: a damaged one is corruption, never a
+/// torn tail. Past that LSN the torn-tail rule is unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledged_record_is_never_truncated() {
+    let mut h = harness();
+    let (log, _, _rx) = h.open().await.unwrap();
+    for r in samples().into_iter().skip(3).take(3) {
+        log.append(r).await.unwrap();
+    }
+    drop(log);
+    let seg = h.segment_files().pop().unwrap();
+    let mut damaged = std::fs::read(&seg).unwrap();
+    // Flip a byte of the last record's body: its CRC fails.
+    let n = damaged.len();
+    damaged[n - 1] ^= 0xff;
+    std::fs::write(&seg, &damaged).unwrap();
+
+    h.cfg.acknowledged_through = 3;
+    let err = h
+        .open()
+        .await
+        .err()
+        .expect("an acknowledged record was damaged");
+    assert!(matches!(err, LogError::Corrupt(_)), "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("lsn 3") && text.contains("nothing was truncated"),
+        "{text}"
+    );
+    assert_eq!(std::fs::read(&seg).unwrap(), damaged, "the file changed");
+
+    // Applied through 2 only: lsn 3 may be the torn last batch.
+    h.cfg.acknowledged_through = 2;
+    let (_log, opened, _rx) = h.open().await.unwrap();
+    assert_eq!(opened.next_lsn, 3);
+    assert!(opened.truncated_bytes > 0);
+
+    // A segment whose header is damaged after it held an applied record
+    // is not recreated as an empty one.
+    let h2 = harness();
+    let (log, _, _rx) = h2.open().await.unwrap();
+    log.append(samples()[3].clone()).await.unwrap();
+    drop(log);
+    let seg = h2.segment_files().pop().unwrap();
+    let mut header_damaged = std::fs::read(&seg).unwrap();
+    header_damaged[0] ^= 0xff;
+    std::fs::write(&seg, &header_damaged).unwrap();
+    let mut cfg = h2.cfg.clone();
+    cfg.acknowledged_through = 1;
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (ftx, _frx) = oneshot::channel();
+    let err = Log::open(&h2.env, cfg, tx, ftx)
+        .await
+        .err()
+        .expect("refused");
+    assert!(matches!(err, LogError::Corrupt(_)), "{err}");
+    assert_eq!(std::fs::read(&seg).unwrap(), header_damaged);
+}
+
 #[tokio::test]
 async fn canceling_an_unpolled_real_writer_publishes_native_closure_synchronously() {
     struct HeldWriter {
