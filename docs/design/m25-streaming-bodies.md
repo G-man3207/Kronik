@@ -82,11 +82,14 @@ The crate depends on `kronik-core` (Env), `kronik-proto` (`BlobRef`),
 
 ```rust
 /// "b3:<hex>" (no subject) or "b3s:<hex>" (keyed, ADR 0118).
-pub struct BlobId { pub keyed: bool, pub digest: [u8; 32] }
+pub struct BlobId { /* keyed, digest */ }
 impl BlobId {
+    pub const fn plain(digest: [u8; 32]) -> BlobId;
+    pub const fn keyed(digest: [u8; 32]) -> BlobId;
     pub fn parse(s: &str) -> Result<BlobId, BlobError>;
     pub fn file_name(&self) -> String;                 // "b3-<hex>" or "b3s-<hex>"
-    pub fn shard(&self) -> u8;                         // digest[0]
+    pub fn from_file_name(name: &str) -> Option<BlobId>;
+    pub fn shard(&self) -> String;                     // digest[0] as two hex digits
 }
 /// A complete reference (ADR 0118 §3).
 pub struct BlobMeta { pub id: BlobId, pub size: u64, pub subject: Option<String>, pub key_version: u32 }
@@ -101,54 +104,64 @@ pub struct BlobKeys {
     pub identity: Zeroizing<[u8; 32]>,          // K_id
     pub seal: Option<Zeroizing<[u8; 32]>>,      // the blob key derived from K(s, v), when privacy mode is on
 }
-/// Opens sealed frames: the blob key of (subject, version), or why not.
+/// Keys for readers, never created by a lookup.
 pub trait KeyAccess: Send + Sync {
-    fn open_key(&self, subject: &str, version: u32) -> KeyAnswer;   // Found(blob key) | Erased | Missing
+    fn seal_key(&self, subject: &str, version: u32) -> KeyAnswer;      // Found(blob key) | Erased | Missing
+    fn identity_key(&self, subject: &str, version: u32) -> KeyAnswer;  // K_id, to verify an identity
 }
 pub enum Space { Main, Fork(String), Scratch(PathBuf) }
 
-pub struct BlobStore { /* env, paths, claim lock, dirty shards, leases, reserve */ }
+pub struct BlobStore { /* env, paths, per-directory claim and sync locks, leases, free space */ }
 impl BlobStore {
     /// Creates the layout if missing, syncs the 256 shard directories,
     /// deletes tmp/ (ADR 0117 §4.4).
     pub async fn open(env: Env, data_dir: &Path, cfg: StoreConfig) -> Result<Arc<BlobStore>, BlobError>;
-    pub async fn writer(self: &Arc<Self>, space: Space, keys: Option<BlobKeys>, lease: Lease)
+    /// The same for a fork or scratch space, once per space per process.
+    pub async fn prepare(&self, space: &Space) -> Result<(), BlobError>;
+    /// A writer of at most `limit` plaintext bytes; the blob joins `lease`.
+    pub async fn writer(self: &Arc<Self>, space: Space, keys: Option<BlobKeys>, limit: u64, lease: Lease)
         -> Result<BlobWriter, BlobError>;
     pub async fn reader(&self, space: &Space, meta: &BlobMeta, keys: &dyn KeyAccess)
         -> Result<BlobReader, BlobError>;
-    /// One sync_dir per dirty shard directory holding `ids` (ADR 0117 §4.3).
-    pub async fn ensure_durable(&self, ids: &[BlobId]) -> Result<(), BlobError>;
-    pub fn leases(&self) -> &Leases;
+    /// One sync_dir per shard directory holding a name of `ids` not yet
+    /// synced, shared by concurrent callers (ADR 0117 §4.3).
+    pub async fn ensure_durable(&self, space: &Space, ids: &[BlobId]) -> Result<(), BlobError>;
+    pub fn leases(&self) -> &Arc<Leases>;
+    pub async fn refresh_free(&self) -> Result<u64, BlobError>;
+    pub fn set_free(&self, bytes: u64);
     /// Free bytes when below `[blobs] disk_reserve`, else None.
     pub fn below_reserve(&self) -> Option<u64>;
-    pub async fn delete_space(&self, space: &Space) -> Result<(), BlobError>;
-    /// M26: the sweep and erasure (m26-blobs §6, §9).
-    pub async fn sweep(&self, roots: &dyn Roots, opts: SweepOptions) -> Result<SweepReport, BlobError>;
-    pub async fn delete(&self, ids: &[BlobId]) -> Result<u64, BlobError>;
+    pub async fn contains(&self, space: &Space, id: &BlobId) -> Result<bool, BlobError>;
+    // From B10/B11: delete_space, delete, and the sweep (m26-blobs §6, §9).
 }
 impl BlobWriter {
     pub async fn write(&mut self, chunk: &[u8]) -> Result<(), BlobError>;  // checks the limit and the reserve
     pub fn written(&self) -> u64;
     /// Header, sync_data, rename or claim (ADR 0117 §4.2, §6).
     pub async fn finish(self) -> Result<BlobMeta, BlobError>;
+    pub async fn abort(self);   // dropping a writer also deletes its part file
 }
 impl BlobReader {
     pub fn meta(&self) -> &BlobMeta;
     /// Up to `len` bytes from `offset`, reading and checking only the frames touched.
     pub async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes, BlobError>;
-    /// Sequential frames from `offset`, for the gateway and the shipper.
-    pub fn frames(self, offset: u64) -> BlobFrames;
+    /// One frame, checked: sequential readers (the gateway, the shipper).
+    pub async fn frame(&self, index: u64) -> Result<Bytes, BlobError>;
+    pub fn frames(&self) -> u64;
+    /// Every frame, the body digest and the identity.
+    pub async fn verify(&self, keys: &dyn KeyAccess) -> Result<(), BlobError>;
 }
 pub enum BlobError {
     NotFound(BlobId), Corrupt { id: BlobId, why: String }, StoreFull { free: u64, reserve: u64 },
-    Erased, KeyMissing, TooLarge { limit: u64 }, Invalid(String), Io(String),
+    Erased, KeyMissing(String /* subject */), TooLarge { limit: u64 }, Invalid(String), Io(String),
 }
 ```
 
-`StoreConfig { reserve: u64, max_blob: u64 }`. Errors map to codes in §14:
-`Corrupt` is `STORAGE_CORRUPT`, `NotFound` of a committed reference is
-`BLOB_MISSING`, `StoreFull` is `BLOB_STORE_FULL`, `Erased` is
-`SUBJECT_ERASED`.
+`StoreConfig { reserve: u64, lease_ttl: Duration }`; each writer gets its
+own limit. Errors map to codes in §14: `Corrupt` is `STORAGE_CORRUPT`,
+`NotFound` of a committed reference is `BLOB_MISSING`, `StoreFull` is
+`BLOB_STORE_FULL`, `Erased` is `SUBJECT_ERASED`, `KeyMissing` is
+`KEYSTORE_INCOMPLETE`.
 
 ### 4.2 Layout and format
 
@@ -176,7 +189,8 @@ because the fork's space is deleted with the fork.
 
 `reader` opens the object in the given space, then in main's store; checks
 the header; `read_at` reads only the touched frames. A sealed file needs
-`KeyAccess::open_key`: `Erased` gives `BlobError::Erased`, `Missing` gives
+`KeyAccess::seal_key`, and nothing in its header is trusted before the header
+tag checks out under that key: `Erased` gives `BlobError::Erased`, `Missing` gives
 `KeyMissing` (`KEYSTORE_INCOMPLETE` at the API, a host failure in a turn, as
 for sealed values today).
 
@@ -778,7 +792,7 @@ M24's slices.
 | Slice | Touches | Proven by | M24 |
 | --- | --- | --- | --- |
 | **B1** store core | new `crates/kronik-blob` (layout, format v1, identity type, writer, reader, `ensure_durable`, claims, start sweep, reserve, leases), workspace `Cargo.toml` | unit tests on a temporary directory; `kronik-sim/tests/blob_store.rs` crash tests; fixtures; nothing else changes | parallel |
-| **B2** subject keys for blobs | `kronik-privacy` (`identity_key`, `blob_keys`, `blob_key_access`), sealed frames in `kronik-blob` | keystore tests (off mode creates the key once; erase gives `Erased`; a restored backup covers it); a sealed fixture | parallel |
+| **B2** subject keys for blobs | `kronik-privacy` (`identity_key`, `blob_keys`, `blob_key_access`); the sealed frames themselves landed with B1's format | keystore tests (off mode creates the key once; erase gives `Erased`; a restored backup covers it); a sealed fixture | parallel |
 | **B3** log format | `proto/kronik/log/v1/{common,turn,effects,config}.proto`, `kronik-proto` (`blobs::refs`, validation), fixtures, `docs/design/m1-core.md` note | decode fixtures; v0.4.1 fixtures unchanged | rebase on M24's proto edits (different fields) |
 | **B4** WIT 0.1.1 and `blobs` | `wit/kronik-actor.wit`, SDK WIT copies, `allowlist.rs` (+ its test), host stubs (`NOT_IMPLEMENTED`), `docs/reference/wit.md`, `wit-examples.md` | allowlist tests; a v0.4 component still runs; the doc-surface gate | **serialize** with M24's WIT slice: the first bumps to 0.1.1 |
 | **B5** runtime blob host | `kronik-runtime` (`BlobHost`, `reads_blobs`, bodies in and out, `FetchBody`, budget, trap codes) | runtime tests with an in-memory `BlobHost` | parallel (textual edits in `host.rs`) |

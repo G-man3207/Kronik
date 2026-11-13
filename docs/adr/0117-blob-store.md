@@ -71,7 +71,8 @@ A 512-byte header, then frames of 64 KiB of plaintext each.
 | 96 | 16 | nonce prefix (sealed; zero otherwise) |
 | 112 | 2 | subject length, `u16`, at most 256 |
 | 114 | 256 | subject, zero padded |
-| 370 | 138 | reserved, zero |
+| 370 | 16 | header tag (sealed; zero otherwise) |
+| 386 | 122 | reserved, zero |
 | 508 | 4 | CRC32C of bytes 0 to 507 |
 
 Integers are little endian. Frame `i` carries plaintext bytes
@@ -80,15 +81,35 @@ Integers are little endian. Frame `i` carries plaintext bytes
 - **plain:** the bytes, then their CRC32C (4 bytes);
 - **sealed:** XChaCha20-Poly1305 under the blob key
   `BLAKE3-derive-key("kronik blob seal v1", K(s, v))`, derived from the
-  subject key of the key version (so blob frames and sealed values never
-  share a key), nonce = nonce prefix ‖ `u64_le(i)`, associated data =
-  `"kronik blob v1" 0x00 subject 0x00 u32_le(key version) identity digest
-  u64_le(i) u8(last)`; the ciphertext and its 16-byte tag. A sealed blob has
-  at least one frame, so even an empty one authenticates its end.
+  subject key of the key version with a label no other use of the subject
+  key has (sealed values use the subject key itself, a blob's identity the
+  label `"kronik blob identity v1"`), so blob frames and sealed values never
+  share a key. Its nonce is 24 bytes: the file's random 16-byte nonce prefix
+  followed by `u64_le(i)`. Associated data =
+  `"kronik blob v1" 0x00 subject 0x00 u32_le(key version) u64_le(i)
+  u8(last)`; the ciphertext and its 16-byte tag. A sealed blob has at least
+  one frame, so even an empty one authenticates its end.
+- **header tag** (sealed): the XChaCha20-Poly1305 tag of an empty message
+  under the blob key, with the header's bytes 0 to 369 as associated data
+  and the nonce prefix followed by `u64_le(2^64 - 1)`, which no frame uses.
+  It authenticates the identity, the size, the body digest and the nonce
+  prefix.
 
 The file length is a function of the header, so a truncated file is
-detected before any frame is read. Overhead: 512 bytes per file and 4 (plain)
-or 16 (sealed) bytes per 64 KiB.
+detected before any frame is read. A reader of a sealed file checks the
+header tag before it trusts any header field; a frame sealed as the last one
+in another position, a missing last frame, a frame from another file
+(another nonce prefix) or frames in another order fail their tags, and each
+is `STORAGE_CORRUPT`. Overhead: 512 bytes per file and 4 (plain) or 16
+(sealed) bytes per 64 KiB.
+
+*Amended 2026-11-13: streaming-compatible framing.* The accepted text put the
+identity digest into each frame's associated data. The identity is a hash of
+all the plaintext, known only after the last frame, while frames must be
+written as data arrives (a 300 MB upload otherwise sits in memory, or as
+plaintext on disk). The identity moved to the header tag, which is written
+last; the random per-file nonce prefix binds every frame to its file, and
+the index and last flag bind its position and the file's end.
 
 ### 3. Identity
 

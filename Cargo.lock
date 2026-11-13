@@ -1970,6 +1970,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kronik-blob"
+version = "0.5.0-dev"
+dependencies = [
+ "blake3",
+ "bytes",
+ "chacha20poly1305",
+ "crc32c",
+ "kronik-core",
+ "kronik-proto",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "kronik-core"
 version = "0.5.0-dev"
 dependencies = [
@@ -2359,6 +2376,7 @@ dependencies = [
  "blake3",
  "bytes",
  "chacha20",
+ "kronik-blob",
  "kronik-core",
  "kronik-effects",
  "kronik-fork",

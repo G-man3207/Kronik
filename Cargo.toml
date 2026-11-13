@@ -11,6 +11,7 @@ publish = false
 
 [workspace.dependencies]
 kronik-api = { path = "crates/kronik-api" }
+kronik-blob = { path = "crates/kronik-blob" }
 kronik-core = { path = "crates/kronik-core" }
 kronik-gateway = { path = "crates/kronik-gateway" }
 kronik-log = { path = "crates/kronik-log" }
