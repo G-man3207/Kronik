@@ -1,12 +1,12 @@
 # 0060. Stable-user namespace setup and irreversible startup boundary
 
-- **Status:** Proposed. Implemented, not yet run on this revision; awaits maintainer ratification.
+- **Status:** Accepted (2026-11-13). Implemented; the proofs that need root, systemd 255 or newer and free numeric ids have not been run on this revision (see Consequences and proof).
 - **Date:** 2026-11-07
 - **Relates to:** ADR 0003 (gVisor bridge), ADR 0027 (unit hardening) and the data-directory descriptor lock of the key-source boundary (ADR 0092).
 
 ## Context
 
-The build brief's M21 says "`runsc` runs in rootless mode where the kernel allows it". This ADR and ADR 0061 do not do that: `runsc` runs as root **inside** a user namespace that the service user owns, because the measurements behind ADR 0061 show that `runsc --rootless` cannot run the sandbox network, `create` or `restore` that Kronik needs. That is a deviation from the brief's wording and awaits maintainer ratification; the rest of M21 follows the brief.
+The build brief's M21 says "`runsc` runs in rootless mode where the kernel allows it". This ADR and ADR 0061 do not do that: `runsc` runs as root **inside** a user namespace that the service user owns, because the measurements behind ADR 0061 show that `runsc --rootless` cannot run the sandbox network, `create` or `restore` that Kronik needs. That is a deviation from the brief's wording, which the maintainer ratified on 2026-11-13; the rest of M21 follows the brief.
 
 The long-running daemon must not have root authority in the host user namespace. Foreign runtimes still need namespace-local ownership, mounts and capabilities. An unprivileged namespace creator alone is insufficient on hosts whose user-namespace policy restricts creation.
 

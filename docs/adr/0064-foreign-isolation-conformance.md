@@ -1,6 +1,6 @@
 # 0064. Required real foreign-isolation conformance
 
-- **Status:** Proposed. The scripts and drivers exist; none of them has been run on this revision. Awaits maintainer ratification.
+- **Status:** Accepted (2026-11-13). The scripts and drivers exist; none of them has been run on this revision.
 - **Date:** 2026-11-07
 
 ## Decision

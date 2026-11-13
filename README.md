@@ -52,8 +52,9 @@ fleet and hardening tracks (M27–M34). The microVM level (M20) and the nonroot
 daemon (M21) are in the tree as opt-in, experimental work that has not yet been
 run on every host it needs: `isolation = "microvm"` has not booted a VM on a
 KVM host, and `kronik serve --init --rootless` has passed on Debian 13 and is
-owed the Ubuntu 24.04/AppArmor proof (R1). Their decisions are ADRs 0060–0065,
-0095, 0096 and 0109, which await the maintainers.
+owed the Ubuntu 24.04/AppArmor proof (R1). The nonroot daemon's decisions,
+ADRs 0060–0065, were accepted on 2026-11-13; the microVM level's, ADRs 0095 and
+0096, await the maintainers.
 See the [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
 for the state of each milestone, the open questions and the known gaps, and the
 [compliance audit](https://github.com/G-man3207/Kronik/wiki/Compliance-audit)

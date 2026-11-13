@@ -337,13 +337,14 @@ Prefer a preview domain wherever previews take traffic from browsers.
 
 `kronik serve --init` installs the root service of v0.1 to v0.4. Its opt-in
 alternative, `kronik serve --init --rootless` (M21), uses root only for setup
-and installs the nonroot `kronik` service. That service is a proposal that has
-not been run on a host with systemd: the design is in
-[ADR 0060](../adr/0060-non-root-daemon-user-namespace.md),
+and installs the nonroot `kronik` service. Its design is accepted
+([ADR 0060](../adr/0060-non-root-daemon-user-namespace.md),
 [ADR 0061](../adr/0061-runsc-in-the-kronik-user-namespace.md),
 [ADR 0062](../adr/0062-non-root-systemd-units.md) and
-[ADR 0065](../adr/0065-api-peer-identity-acceptor.md), and it is untested on
-Ubuntu 24.04: Kronik checks `user.max_user_namespaces` and
+[ADR 0065](../adr/0065-api-peer-identity-acceptor.md)), but the installed
+proofs of [ADR 0064](../adr/0064-foreign-isolation-conformance.md) have not
+been run on this revision, and the service is untested on Ubuntu 24.04:
+Kronik checks `user.max_user_namespaces` and
 `kernel.unprivileged_userns_clone` and does not handle that distribution's
 AppArmor restriction on unprivileged user namespaces.
 
@@ -362,8 +363,8 @@ the namespace's type, owner and exact maps through one open descriptor and
 enters that descriptor; namespace root is the nonzero host uid, never host
 root. `runsc` and `runc` then run as namespace root inside it. The brief's M21
 says "`runsc` runs in rootless mode where the kernel allows it"; Kronik does
-not use `runsc --rootless`, whose limits ADR 0061 describes. That deviation
-from the brief's wording awaits the maintainers' ratification. A missing pin
+not use `runsc --rootless`, whose limits ADR 0061 describes. The maintainers
+ratified that deviation from the brief's wording on 2026-11-13. A missing pin
 or delegation gives typed foreign unavailability (`FOREIGN_UNAVAILABLE` with
 the reason), never an automatic trusted runtime or a root fallback.
 
@@ -393,14 +394,16 @@ The nonroot service is `kronik serve --rootless` (M21,
 `serve --init --rootless` writes passes the flag. The daemon needs write access to the
 data directory and to the socket's directory (by default `/var/lib/kronik` and
 `/run/kronik`). While it still has one thread it takes the data directory's
-lock, binds its listeners and starts a small acceptor process that stays in
-the initial user namespace without any capability and hands each API
-connection over together with its caller's host uid, so the audit trail and
-token attribution keep real uids. It then empties all its capability sets,
-sets `no_new_privs`, and enters the pinned Kronik user namespace if one exists
-and its cgroup is delegated to it. Without them it still serves Wasm actors,
-and foreign actors answer `FOREIGN_UNAVAILABLE` with the reason; it never
-falls back to a weaker backend or to unbounded resources. `kronik userns
+lock and binds its listeners, then empties all its capability sets and sets
+`no_new_privs`, moves into a `daemon` leaf of its cgroup when that cgroup is
+delegated to it, and starts a small acceptor process that stays in the initial
+user namespace without any capability and hands each API connection over
+together with its caller's host uid, so the audit trail and token attribution
+keep real uids. Last it enters the pinned Kronik user namespace if one exists.
+Foreign actors need both the namespace and the delegated cgroup. Without them
+it still serves Wasm actors, and foreign actors answer `FOREIGN_UNAVAILABLE`
+with the reason; it never falls back to a weaker backend or to unbounded
+resources. `kronik userns
 status` shows the namespace.
 
 `--rootless` fails closed. It stops with `ROOTLESS_UNAVAILABLE`, before it

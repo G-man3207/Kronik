@@ -1,6 +1,6 @@
 # 0065. Initial-namespace Unix API attribution
 
-- **Status:** Proposed. Implemented, not yet run on this revision; awaits maintainer ratification.
+- **Status:** Accepted (2026-11-13). Implemented; the boundary driver has not been run on this revision.
 - **Date:** 2026-11-07
 
 ## Context

@@ -1,6 +1,6 @@
 # 0063. An existing installation is not converted in place
 
-- **Status:** Proposed. Implemented as the behavior of `kronik serve --init`; awaits maintainer ratification. An in-place migration is the alternative; it is kept out of this decision as a separate, optional patch.
+- **Status:** Accepted (2026-11-13). Implemented as the behavior of `kronik serve --init`. An in-place migration is the alternative; it is kept out of this decision as a separate, optional patch.
 - **Date:** 2026-11-07
 
 ## Context

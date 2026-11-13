@@ -1,11 +1,11 @@
 # 0061. Foreign runtime namespaces and delegated cgroup leaves
 
-- **Status:** Proposed. Implemented, not yet run on this revision; awaits maintainer ratification.
+- **Status:** Accepted (2026-11-13). Implemented; the runtime acceptance under Consequences and proof has not been run on this revision.
 - **Date:** 2026-11-07
 
 ## Deviation from the build brief
 
-The brief says "`runsc` runs in rootless mode where the kernel allows it". This ADR does not use `runsc --rootless`; it runs `runsc` (and `runc`) as namespace root in the pinned user namespace of ADR 0060 and passes no `--rootless` override. The findings that led here come from earlier design experiments and have not been repeated on this revision: `runsc --rootless` refuses `--network=sandbox` and refuses `create` and `restore` (the M14 sandbox copies); a single-uid namespace runs and limits correctly but breaks images that chown `/data` to a non-root id (Postgres `initdb` fails); a pinned namespace with a subordinate range ran Postgres, the bridge, blocked egress and checkpoint/restore. The literal reading of the brief would therefore remove the loopback-only network namespace and port-forward bridge of ADR 0003, the resource limits and the M14 copies. This is a deviation from the brief's sentence and awaits maintainer ratification (the brief is the owner's to amend).
+The brief says "`runsc` runs in rootless mode where the kernel allows it". This ADR does not use `runsc --rootless`; it runs `runsc` (and `runc`) as namespace root in the pinned user namespace of ADR 0060 and passes no `--rootless` override. The findings that led here come from earlier design experiments and have not been repeated on this revision: `runsc --rootless` refuses `--network=sandbox` and refuses `create` and `restore` (the M14 sandbox copies); a single-uid namespace runs and limits correctly but breaks images that chown `/data` to a non-root id (Postgres `initdb` fails); a pinned namespace with a subordinate range ran Postgres, the bridge, blocked egress and checkpoint/restore. The literal reading of the brief would therefore remove the loopback-only network namespace and port-forward bridge of ADR 0003, the resource limits and the M14 copies. This is a deviation from the brief's sentence; the maintainer ratified it on 2026-11-13 (the brief is the owner's to amend).
 
 ## Context
 

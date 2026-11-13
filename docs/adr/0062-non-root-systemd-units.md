@@ -1,8 +1,8 @@
 # 0062. Stable-user systemd units and source-aware credentials
 
-- **Status:** Proposed. Implemented, not yet run on this revision; awaits maintainer ratification.
+- **Status:** Accepted (2026-11-13). Implemented; the installed fixture has not been run on this revision (see Doctor and proof).
 - **Date:** 2026-11-07
-- **Amends:** ADR 0027 for the stable-user installation, if accepted; the root service keeps its separate template, which is the unit of v0.4.0 byte for byte (a test pins its digest), and ADR 0027's constraints.
+- **Amends:** ADR 0027 for the stable-user installation; the root service keeps its separate template, which is the unit of v0.4.0 byte for byte (a test pins its digest), and ADR 0027's constraints.
 
 ## Decision
 
