@@ -149,6 +149,12 @@ M23, key and secret backends:
   while `--json` printed `UNAVAILABLE` with a hint. Both now print the same
   `UNAVAILABLE` error, with its hint, `docs:` line and the start of the page
   (#41).
+- `kronik mcp` ignored `--json` when it could not start (no daemon on the
+  socket, a refused `--url`, a bad configuration), so an agent host decoding
+  stdout got nothing, and the unreachable-daemon error had no `docs:` line. A
+  failure to start is now the error JSON on stdout with `--json` and a full
+  error (code, hint, `docs:`) otherwise, and a token the daemon refuses is
+  `UNAUTHENTICATED` instead of `UNAVAILABLE` (#42).
 
 ## v0.4.1 — 2026-11-07
 

@@ -22,7 +22,9 @@ use rmcp::model::{
 };
 use rmcp::service::{Peer, RequestContext, RunningService, ServiceError};
 use rmcp::transport::Transport;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::streamable_http_client::{
+    AuthRequiredError, StreamableHttpClientTransportConfig,
+};
 use rmcp::transport::{StreamableHttpClientTransport, UnixSocketHttpClient};
 use rmcp::{ErrorData, RoleClient, RoleServer, ServerHandler, ServiceExt};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Stdin, Stdout};
@@ -59,29 +61,33 @@ pub fn run(_args: McpArgs, global: &crate::cli::Global) -> ExitCode {
         .with_hint(
             "For a remote daemon, point the agent's MCP client at https://<host>:<port>/mcp of its server.api_listen (Streamable HTTP) with the header `Authorization: Bearer <token>`.",
         );
-        return crate::cli::report_error(false, &e);
+        return crate::cli::report_error(global.json, &e);
     }
     let socket = match crate::config::client_api_socket(global.socket.clone()) {
         Ok(socket) => socket,
-        Err(e) => return crate::cli::report_error(false, &socket_config_error(&e)),
+        Err(e) => return crate::cli::report_error(global.json, &socket_config_error(&e)),
     };
     let token = match crate::cli::client_token_from(global.token.as_deref()) {
         Ok(token) => token,
-        Err(e) => return crate::cli::report_error(false, &e),
+        Err(e) => return crate::cli::report_error(global.json, &e),
     };
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
-        Err(e) => return crate::cli::report_error(false, &runtime_error(&e)),
+        Err(e) => return crate::cli::report_error(global.json, &runtime_error(&e)),
     };
-    match runtime.block_on(bridge(&socket, token)) {
+    // Until stdio serves MCP, stdout is free: a failure to start is the error
+    // JSON there with --json (#42). Once the session runs, stdout belongs to
+    // the protocol, and a failure goes to stderr.
+    let daemon = match runtime.block_on(connect(&socket, token)) {
+        Ok(daemon) => daemon,
+        Err(e) => return crate::cli::report_error(global.json, &e),
+    };
+    match runtime.block_on(bridge(daemon)) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("{message}");
-            ExitCode::FAILURE
-        }
+        Err(e) => crate::cli::report_error(false, &e),
     }
 }
 
@@ -103,27 +109,73 @@ fn runtime_error(e: &std::io::Error) -> ApiError {
     )
 }
 
-async fn bridge(socket: &std::path::Path, token: Option<String>) -> Result<(), String> {
-    let client = UnixSocketHttpClient::new(&socket.to_string_lossy(), ENDPOINT);
-    let hint = if token.is_some() {
-        "hint: check that `kronik serve` runs with that API socket, and that the token \
-         (--token or $KRONIK_TOKEN) is live (`kronik token list`)"
-    } else {
-        "hint: start the daemon with `kronik serve`, or pass its API socket with --socket"
+/// Whether the daemon refused the handshake's token (HTTP 401): rmcp's
+/// `AuthRequiredError` is among the sources of the transport's error. The
+/// initialize error does not name its transport error as its source, so the
+/// walk starts there.
+fn token_refused(error: &rmcp::service::ClientInitializeError) -> bool {
+    let rmcp::service::ClientInitializeError::TransportError { error, .. } = error else {
+        return false;
     };
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = cause {
+        if e.is::<AuthRequiredError>() {
+            return true;
+        }
+        cause = e.source();
+    }
+    false
+}
+
+/// Connects to the daemon's MCP endpoint over its API socket and completes
+/// the handshake.
+async fn connect(
+    socket: &std::path::Path,
+    token: Option<String>,
+) -> Result<RunningService<RoleClient, ()>, ApiError> {
+    let client = UnixSocketHttpClient::new(&socket.to_string_lossy(), ENDPOINT);
+    let with_token = token.is_some();
     let mut config = StreamableHttpClientTransportConfig::with_uri(ENDPOINT);
     if let Some(token) = token {
         config = config.auth_header(token);
     }
     let transport = StreamableHttpClientTransport::with_client(client, config);
-    let daemon: RunningService<RoleClient, ()> = ().serve(transport).await.map_err(|e| {
-        format!(
-            "error: UNAVAILABLE: cannot reach the Kronik daemon's MCP endpoint on {}: {e}\n{hint}",
-            socket.display()
+    ().serve(transport).await.map_err(|e| {
+        if token_refused(&e) {
+            return ApiError::new(
+                ErrorCode::Unauthenticated,
+                format!(
+                    "the Kronik daemon on {} refused the token (--token or $KRONIK_TOKEN)",
+                    socket.display()
+                ),
+            )
+            .with_hint(
+                "Check that the token is live with `kronik token list`, or create one with `kronik token create`.",
+            );
+        }
+        let hint = if with_token {
+            "Check that `kronik serve` runs with that API socket, and that the token (--token or $KRONIK_TOKEN) is live (`kronik token list`)."
+        } else {
+            "Start the daemon with `kronik serve`, or pass its API socket with --socket."
+        };
+        ApiError::new(
+            ErrorCode::Unavailable,
+            format!(
+                "cannot reach the Kronik daemon's MCP endpoint on {}: {e}",
+                socket.display()
+            ),
         )
-    })?;
+        .with_hint(hint)
+    })
+}
+
+/// Serves MCP on stdio with the daemon's answers until stdin closes.
+async fn bridge(daemon: RunningService<RoleClient, ()>) -> Result<(), ApiError> {
+    let internal = |m: String| ApiError::new(ErrorCode::Internal, m);
     let Some(info) = daemon.peer_info() else {
-        return Err("error: INTERNAL: the daemon's MCP endpoint did not describe itself".into());
+        return Err(internal(
+            "the daemon's MCP endpoint did not describe itself".into(),
+        ));
     };
     let mut config = ServerConfig::new(info.capabilities.clone())
         .with_instructions(info.instructions.clone().unwrap_or_default());
@@ -137,11 +189,11 @@ async fn bridge(socket: &std::path::Path, token: Option<String>) -> Result<(), S
     let stdio = proxy
         .serve(Stdio::new())
         .await
-        .map_err(|e| format!("error: INTERNAL: serving MCP on stdio failed: {e}"))?;
+        .map_err(|e| internal(format!("serving MCP on stdio failed: {e}")))?;
     stdio
         .waiting()
         .await
-        .map_err(|e| format!("error: INTERNAL: the stdio session failed: {e}"))?;
+        .map_err(|e| internal(format!("the stdio session failed: {e}")))?;
     Ok(())
 }
 

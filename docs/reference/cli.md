@@ -2657,15 +2657,19 @@ Historical native scenario receipts do not establish this newer source cohort.
 
 Serves the Model Context Protocol on stdin and stdout for an agent's MCP
 client, and forwards each request to the daemon's MCP endpoint, `/mcp` on
-the API socket (`--socket` and `$KRONIK_API_SOCKET` apply; `--json` does
-not). With `--token` or `$KRONIK_TOKEN`, the agent acts as that token,
-with its scopes; an agent's token has `read`, `fork` and `propose`.
-Without a token, it acts as the socket's caller, with every scope. The same
-endpoint answers over TCP with `--api-listen` and a bearer token, so
-`kronik mcp --url` is refused (`BAD_REQUEST`, exit 1), as is a set
-`$KRONIK_URL` unless `--socket` is given, with the hint to
-point the agent's MCP client at `https://<host>:<port>/mcp` (Streamable
-HTTP) with `Authorization: Bearer <token>`. See
+the API socket (`--socket` and `$KRONIK_API_SOCKET` apply). With `--token`
+or `$KRONIK_TOKEN`, the agent acts as that token, with its scopes; an
+agent's token has `read`, `fork` and `propose`. Without a token, it acts as
+the socket's caller, with every scope. The same endpoint answers over TCP
+with `--api-listen` and a bearer token, so `kronik mcp --url` is refused
+(`BAD_REQUEST`, exit 1), as is a set `$KRONIK_URL` unless `--socket` is
+given, with the hint to point the agent's MCP client at
+`https://<host>:<port>/mcp` (Streamable HTTP) with `Authorization: Bearer
+<token>`. A failure to start is an error like any other command's, exit 1:
+`UNAVAILABLE` when no daemon answers on the socket, `UNAUTHENTICATED` when
+it refuses the token, with code, message, hint and `docs:` on stderr, or,
+with `--json`, the error JSON on stdout. Once the session runs, stdout
+belongs to the protocol and a failure goes to stderr. See
 [ADR 0008](../adr/0008-mcp-server.md) and the
 [agent guide](../guides/agent.md).
 
