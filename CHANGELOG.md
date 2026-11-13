@@ -51,6 +51,11 @@ until the v1.0 compatibility promise takes effect.
   erased data (effects, response, errors, fuel), are no longer counted as
   changes. Before, `ENGINE_UPGRADE_DIVERGED` failed the check and `serve`
   refused the directory (issues #16, #27). A verified difference still fails.
+- A production turn missing below a turn that met erased data (a message,
+  call or timer the erased value decided) is unverifiable, not a divergent
+  turn, an origin or a consequence, and the turn that met the erased data is
+  no longer counted as their origin; `unverifiable` counts each turn once
+  (#28).
 
 ## v0.4.1 — 2026-11-07
 

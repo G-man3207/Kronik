@@ -919,6 +919,43 @@ fn an_erased_turns_state_value_is_no_change_but_a_real_divergence_fails() {
     keep(&dir, "erased-kv-and-real");
 }
 
+/// Issue #28 (workload d3): the erased body of `fanout` decided how many
+/// messages production sent. The replay sends none, and the five production
+/// turns missing below the erased root are unverifiable like it: no
+/// divergence, no origin, no consequence, no cause.
+#[test]
+fn production_turns_missing_below_an_erased_turn_are_unverifiable() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter"],
+        &[
+            Step::Send("counter/src", "fanout", "5", Some("user:1")),
+            Step::Erase("user:1"),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let d = &checked.diff;
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(checked.report.passed, "{text}");
+    assert_eq!(d.summary.turns_prod, 7, "{text}");
+    assert_eq!(d.summary.divergent_turns, 0, "{text}");
+    assert_eq!(
+        (d.summary.origins, d.summary.consequences),
+        (0, 0),
+        "{text}"
+    );
+    assert!(d.causes.is_empty(), "{text}");
+    assert!(d.samples.origins.is_empty() && d.samples.consequences.is_empty());
+    assert_eq!(d.summary.unverifiable, 6, "{text}");
+    assert_eq!(checked.report.unverifiable, 6);
+    assert_eq!(d.effects.removed + d.effects.added + d.effects.changed, 0);
+    keep(&dir, "erased-fanout");
+}
+
 /// S-16 (5): the replay serves the recorded outcome of an erased request - an
 /// exact effect, not a synthetic denial the guest has to handle.
 #[test]

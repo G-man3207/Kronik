@@ -1,7 +1,8 @@
 # 0109. Erased recorded input is unverifiable, not divergence
 
 - **Status:** Proposed
-- **Date:** 2026-11-08, amended 2026-11-13 (point 3, issue #27)
+- **Date:** 2026-11-08, amended 2026-11-13 (points 3 and 5, issues #27
+  and #28)
 
 ## Context
 
@@ -57,15 +58,20 @@ divergent. Identity replay and `kronik upgrade check` treat it that way:
    asked for something else and the difference is real.
 3. **Do not count it.** A turn that met erased data is classified
    `unverifiable`, and its differences - effects, response, errors, outcome,
-   the state and SQL rows it wrote, its fuel - are not counted as changes.
-   Every other difference keeps the existing fail-closed treatment.
+   the state and SQL rows it wrote, its fuel - are not counted as changes. A
+   production turn missing below it (a message, call or timer the erased
+   value decided) is `unverifiable` too: neither a divergent turn nor an
+   origin or a consequence, and its effects and writes are not changes
+   either (issue #28). Every other difference keeps the existing fail-closed
+   treatment.
 4. **Only pii-masked exclusion is wider.** `DiffSummary.changed` no longer
    includes `pii_masked`: a proposal whose only differences are turns that
    read pseudonyms also does not change observable behaviour. ADR 0031's
    approval floor still reads `pii_masked` (and `pii_unverified`), so such a
    proposal still needs an approval; `changed` is not the floor.
 5. **Report it.** `DiffSummary.unverifiable` and the upgrade report's
-   `unverifiable` count the replayed erased turns, and `kronik upgrade check`
+   `unverifiable` count the turns of points 1 and 3, each causal key once,
+   whether they differ or not, and `kronik upgrade check`
    prints `N turns unverifiable: erased` (the upgrade report schema stays
    `kronik.upgrade-check/v1`; the field is additive and defaults to 0 for
    reports written by older binaries). A check passes when the only

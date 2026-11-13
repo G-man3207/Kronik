@@ -178,6 +178,10 @@ byte-identical to production's (the root turn of a tree, or a turn whose
 message did not change). Every other difference in the same tree (a turn
 with a changed input, a turn that is new in the fork, a production turn
 missing in the fork) is a **consequence** of its nearest differing ancestor.
+A turn the replay could not verify is neither: one that read pseudonyms
+(`pii_masked`, M8) or met erased data (`unverifiable`, ADR 0109), and a
+production turn missing below one. Its differences are not counted as
+changes.
 
 ## 5. `kronik.diff/v1`
 
@@ -227,13 +231,15 @@ built: `live` (§11), `stubs`, `live_allowlist` and `no_pii` in `options`,
 | `sample` | number | `replayed / root_inputs` (1.0 when the window is empty) |
 | `turns_prod` | int | production turns of the replayed trees |
 | `turns_fork` | int | fork turns of the replayed trees |
-| `divergent_turns` | int | turns that differ (§4), both modes deduplicated by causal key |
+| `divergent_turns` | int | turns that differ (§4) and are not `pii_masked` or `unverifiable`, both modes deduplicated by causal key |
 | `origins`, `consequences` | int | §4 |
 | `exact`, `approximate`, `synthetic`, `live` | int | effect groundings over all fork effects (`live`: §11) |
 | `confidence` | number | `exact / (exact + approximate + synthetic + live)`; 1.0 without effects |
 | `verified_through_lsn` | int | the last main LSN whose root inputs ran through the fork's code |
-| `changed` | bool | any difference the replay verified: not one of a turn that read pseudonyms or met erased data (S-16, ADR 0109); a policy's approval floor reads `pii_masked + pii_unverified` instead (ADR 0031) |
-| `pii_masked` | int | in a `--no-pii` fork, differing turns that read pseudonyms, not counted as divergent (M8); absent when 0 |
+| `changed` | bool | any difference the replay verified: not one of a turn that read pseudonyms or met erased data, nor of a production turn missing below one (S-16, ADR 0109); a policy's approval floor reads `pii_masked + pii_unverified` instead (ADR 0031) |
+| `pii_masked` | int | differing turns that read pseudonyms (a `--no-pii` fork, M8) or met erased data, and production turns missing below them; not counted as divergent; always written |
+| `pii_unverified` | int | turns of a kind whose code changed that read pseudonyms and came out identical (ADR 0031); always written |
+| `unverifiable` | int | turns that met erased data, differing or not, and production turns missing below one (ADR 0109); always written |
 | `preview_inputs` | int | in a preview fork, the requests it took at its URL (M11, §11); absent when 0 |
 
 ### 5.2 `causes`
