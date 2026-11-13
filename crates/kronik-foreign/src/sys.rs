@@ -1325,16 +1325,32 @@ pub fn cgroup_leaf() -> io::Result<Option<String>> {
 /// groups: an offline command run as root that works on the non-root
 /// daemon's data directory. Call it while the process has one thread.
 pub fn become_user(uid: u32, gid: u32) -> io::Result<()> {
-    if uid == 0 || gid == 0 || uid == u32::MAX || gid == u32::MAX || threads_settled(1)? != 1 {
+    become_user_with_groups(uid, gid, &[])
+}
+
+/// [`become_user`] with the supplementary groups `groups`, as the service
+/// manager starts a unit with `User=`: the user's own groups and the unit's
+/// `SupplementaryGroups=` (`kronik doctor --rootless` as root, so that its
+/// checks see what the service sees). Group 0 and the invalid id are refused.
+pub fn become_user_with_groups(uid: u32, gid: u32, groups: &[u32]) -> io::Result<()> {
+    if uid == 0
+        || gid == 0
+        || uid == u32::MAX
+        || gid == u32::MAX
+        || groups.iter().any(|&g| g == 0 || g == u32::MAX)
+        || groups.len() > 65_536
+        || threads_settled(1)? != 1
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "becoming a service user requires valid nonroot IDs and one thread",
+            "becoming a service user requires valid nonroot IDs and groups, and one thread",
         ));
     }
-    // SAFETY: plain credential system calls; setgroups reads no memory
-    // with a count of 0.
+    let groups: Vec<libc::gid_t> = groups.to_vec();
+    // SAFETY: plain credential system calls; setgroups reads `groups.len()`
+    // ids from the live vector (none when it is empty).
     unsafe {
-        check(libc::setgroups(0, std::ptr::null()), "setgroups")?;
+        check(libc::setgroups(groups.len(), groups.as_ptr()), "setgroups")?;
         check(libc::setresgid(gid, gid, gid), "setresgid")?;
         check(libc::setresuid(uid, uid, uid), "setresuid")?;
         // UID transitions reset dumpability; protect preloaded keys before
@@ -2197,6 +2213,53 @@ mod tests {
         assert!(!pin.exists());
         // SAFETY: as above.
         assert_eq!(unsafe { (libc::geteuid(), libc::getegid()) }, before);
+    }
+
+    /// A service identity as root: in a child, the uid, the gid and exactly
+    /// the given supplementary groups, no capability and `no_new_privs`, as a
+    /// program executed with them reports. Needs root; elsewhere it says so,
+    /// or fails under `KRONIK_FOREIGN_TESTS=require`.
+    #[test]
+    fn a_service_identity_has_exactly_its_groups_and_no_capability() {
+        use std::os::unix::process::CommandExt as _;
+        if !is_root() {
+            assert!(
+                std::env::var("KRONIK_FOREIGN_TESTS").as_deref() != Ok("require"),
+                "KRONIK_FOREIGN_TESTS=require, but changing identity needs root"
+            );
+            eprintln!("skipped: changing identity needs root");
+            return;
+        }
+        // Refused before anything changes: root's group and the invalid id.
+        assert!(become_user_with_groups(64_998, 64_997, &[0]).is_err());
+        assert!(become_user_with_groups(64_998, 64_997, &[u32::MAX]).is_err());
+        let mut command = std::process::Command::new("cat");
+        command.arg("/proc/self/status");
+        // SAFETY: the closure runs in the forked child before exec and makes
+        // the credential calls of the function under test there; glibc's
+        // allocator is usable after fork.
+        unsafe {
+            command.pre_exec(|| become_user_with_groups(64_998, 64_997, &[64_996, 44]));
+        }
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let status = String::from_utf8(out.stdout).unwrap();
+        let field = |name: &str| -> Vec<String> {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .unwrap_or_else(|| panic!("no {name} in {status}"))
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(field("Uid:"), ["64998"; 4]);
+        assert_eq!(field("Gid:"), ["64997"; 4]);
+        assert_eq!(field("Groups:"), ["44", "64996"]);
+        for set in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
+            assert_eq!(field(set), ["0000000000000000"], "{set}");
+        }
+        assert_eq!(field("NoNewPrivs:"), ["1"]);
     }
 
     #[test]

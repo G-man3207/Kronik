@@ -179,13 +179,24 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
     let key_before_drop = (args.rootless && !service_identity).then(|| key_source_as_root(&config));
     if args.rootless && !service_identity {
         match crate::cli::userns::kronik_user(crate::cli::userns::USER, None) {
-            Ok(user) => match kronik_foreign::sys::become_user(user.uid, user.gid) {
+            Ok(user) => match kronik_foreign::sys::become_user_with_groups(
+                user.uid,
+                user.gid,
+                &service_groups(&user.name, user.gid),
+            ) {
                 Ok(()) => {
                     service_identity = true;
+                    let groups = rustix::process::getgroups()
+                        .map(|groups| groups.iter().map(|g| g.as_raw()).collect::<Vec<_>>())
+                        .unwrap_or_default();
                     checks.push(check(
                         "service_identity",
                         Status::Pass,
-                        format!("smoke runs as {} (host uid {})", user.name, user.uid),
+                        format!(
+                            "smoke runs as {} (host uid {}, gid {}, supplementary groups {groups:?}), \
+                             as the service manager starts the unit",
+                            user.name, user.uid, user.gid
+                        ),
                     ));
                 }
                 Err(e) => {
@@ -519,6 +530,62 @@ fn microvm_leaf(bundle: bool, unit: Option<RootUnit>) -> Option<Check> {
         .code("FOREIGN_UNAVAILABLE")
         .hint(root_leaf_advice())
     })
+}
+
+/// The supplementary groups the service manager gives the nonroot unit: the
+/// user's memberships in /etc/group, as `initgroups` finds them for `User=`,
+/// and the unit's `SupplementaryGroups=` (the managed KVM drop-in grants the
+/// group of /dev/kvm that way). `sudo kronik doctor --rootless` takes them
+/// when it becomes the user, so that its kvm, netns and sandbox checks see
+/// the devices the service can open.
+fn service_groups(user: &str, gid: u32) -> Vec<u32> {
+    let group_file = std::fs::read_to_string("/etc/group").unwrap_or_default();
+    let unit = Command::new("systemctl")
+        .args([
+            "show",
+            "--property=SupplementaryGroups",
+            "--value",
+            "kronik.service",
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .unwrap_or_default();
+    groups_of(&group_file, user, gid, &unit)
+}
+
+/// [`service_groups`] from the text of /etc/group and the unit's
+/// `SupplementaryGroups=` value (names or numbers, separated by spaces).
+/// Group 0, the invalid id and the user's own group are left out, and so is a
+/// name that /etc/group does not know.
+fn groups_of(group_file: &str, user: &str, gid: u32, supplementary: &str) -> Vec<u32> {
+    let mut by_name = std::collections::BTreeMap::new();
+    let mut groups = std::collections::BTreeSet::new();
+    for line in group_file.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        let [name, _, id, members] = fields[..] else {
+            continue;
+        };
+        let Ok(id) = id.parse::<u32>() else {
+            continue;
+        };
+        by_name.insert(name, id);
+        if members.split(',').any(|member| member == user) {
+            groups.insert(id);
+        }
+    }
+    for word in supplementary.split_whitespace() {
+        if let Some(id) = word
+            .parse::<u32>()
+            .ok()
+            .or_else(|| by_name.get(word).copied())
+        {
+            groups.insert(id);
+        }
+    }
+    groups.retain(|&id| id != 0 && id != u32::MAX && id != gid);
+    groups.into_iter().collect()
 }
 
 /// Whether the process runs as root. Without `--rootless` this says what it
@@ -1711,6 +1778,28 @@ mod tests {
         let passed = check("kernel", Status::Pass, "Linux 6.12");
         assert!(passed.hint.is_none());
         assert!(!format_check(&passed).contains("hint:"));
+    }
+
+    /// `sudo kronik doctor --rootless` becomes the service user with the groups
+    /// the service manager would give the unit: the user's memberships and the
+    /// unit's SupplementaryGroups=, by name or by number, never group 0.
+    #[test]
+    fn the_service_identity_takes_the_units_groups() {
+        let group_file = "root:x:0:\nkvm:x:993:\nkronik:x:998:\ndocker:x:990:kronik,alice\n\
+                          video:x:44:alice\nwheel:x:10:kronik\nbroken\nodd:x:nan:kronik\n";
+        assert_eq!(groups_of(group_file, "kronik", 998, ""), [10, 990]);
+        // The managed KVM drop-in's numeric group, a name, an unknown name and root.
+        assert_eq!(
+            groups_of(group_file, "kronik", 998, "993 video nosuch 0\n"),
+            [10, 44, 990, 993]
+        );
+        // The user's own group is the primary one, not a supplementary one.
+        assert_eq!(
+            groups_of(group_file, "kronik", 998, "kronik 998"),
+            [10, 990]
+        );
+        assert!(groups_of("", "kronik", 998, "").is_empty());
+        assert!(groups_of(group_file, "nobody", 998, "").is_empty());
     }
 
     /// The `root` row names the identity the checks ran as. With `--rootless`

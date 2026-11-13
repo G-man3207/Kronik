@@ -250,7 +250,9 @@ that adds it (the microVM level is experimental).
 With `--rootless` (M21) it also checks what the nonroot service needs
 (`userns`, `uid_view`, `subid`, `pin` and `delegate`) and runs the network
 namespace and sandbox checks under the service's identity: as root it first
-becomes the `kronik` user, and when it cannot, those two checks say that they
+becomes the `kronik` user, with the unit's supplementary groups (the
+user's memberships and the unit's `SupplementaryGroups=`, for example the
+group of `/dev/kvm`), and when it cannot, those two checks say that they
 are not proven instead of counting a root smoke as proof for the service.
 The exit code is 1 when a check fails, so a provisioning script can stop on
 it; `--json` gives the report as data.

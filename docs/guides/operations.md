@@ -818,8 +818,10 @@ With `--rootless` (M21) it also checks the nonroot service's boundary
 (`userns`, `uid_view`, `subid`, `pin`, `delegate`), and the sandbox checks then
 run under the identity the daemon would have: an ordinary user enters the
 pinned Kronik user namespace, and `sudo kronik doctor --rootless` becomes the
-`kronik` user first (`service_identity`) instead of counting a root smoke as
-proof for the service. When that identity cannot be established the `netns` and
+`kronik` user first (`service_identity`), with the groups the service manager
+gives the unit (the user's memberships in `/etc/group` and the unit's
+`SupplementaryGroups=`, such as the group of `/dev/kvm` that the managed KVM
+drop-in grants), instead of counting a root smoke as proof for the service. When that identity cannot be established the `netns` and
 `sandbox` checks warn that they are not proven. The key source is checked
 before that change, as root, the way systemd reads the key file for the unit's
 credential; over a data directory that the service user owns only the key is
