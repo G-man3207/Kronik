@@ -386,7 +386,8 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
             "tls",
             "ship",
             "export",
-            "key_source"
+            "key_source",
+            "secrets"
         ]
     );
     assert_eq!(status(&report, "config")["status"], "pass");
@@ -479,7 +480,7 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
     let (report, ok) = doctor(&config);
     assert!(!ok);
     assert_eq!(status(&report, "config")["status"], "fail");
-    assert_eq!(report["checks"].as_array().unwrap().len(), 17);
+    assert_eq!(report["checks"].as_array().unwrap().len(), 18);
 }
 
 #[test]
