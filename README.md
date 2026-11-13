@@ -45,10 +45,16 @@ and the defects found since `v0.4.0` in restart, retention, secret handling and
 the audit export; the engine is `kronik-0.4.1+wasmtime-50.0.1`. `v0.3.0` and
 `v0.1.0` are the historical unsigned releases.
 
-`main` is an unreleased `0.5.0-dev` work in progress. Major areas remain
-absent or partial: the cluster (M16–M19), microVMs (M20), the rootless daemon
-(M21), the WASI 0.3 remainder (M22), long-lived connections (M24), blobs
-(M25–M26), and the UI, OpenTelemetry, fleet and hardening tracks (M27–M34).
+`main` is an unreleased `0.5.0-dev` work in progress; the
+[changelog](CHANGELOG.md) lists what changed since `v0.4.1`. The external
+secret backends (M23 B2–B6) are in the code and have run against pinned
+services, emulators and SoftHSM2, not against a real cloud or a physical HSM;
+they are not accepted yet. The designs of long-lived connections (M24),
+streaming bodies (M25) and blob storage (M26) are accepted, and their
+implementation has not landed. Major areas remain absent or partial: the
+cluster (M16–M19), microVMs (M20), the rootless daemon (M21), the WASI 0.3
+remainder (M22), connections, streaming bodies and blobs (M24–M26), and the
+UI, fleet and hardening tracks (M27 and M29–M34).
 See the [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
 for the state of each milestone, the open questions and the known gaps, and the
 [compliance audit](https://github.com/G-man3207/Kronik/wiki/Compliance-audit)
@@ -87,6 +93,10 @@ for how the brief maps to the tree.
   same recorded boundary, and can be copied into a fork from a checkpoint.
 - **Agent interface.** The JSON API is described by OpenAPI, and `kronik mcp`
   serves the same operations as MCP tools with token scopes.
+- **Observability.** Turns become OpenTelemetry traces over OTLP, metrics are
+  served for Prometheus and sent over OTLP, and the audit export writes every
+  mutation to files, object storage or a webhook; `kronik audit verify`
+  checks a file or object-storage sink against the log.
 
 ## Getting started
 
