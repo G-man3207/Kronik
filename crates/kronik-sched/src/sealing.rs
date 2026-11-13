@@ -26,22 +26,31 @@ fn message_sealed(m: Option<&pb::Message>) -> bool {
     is_sealed(m.and_then(|m| m.body.as_ref()))
 }
 
+fn http_sealed(h: &pb::HttpInput) -> bool {
+    is_sealed(h.sealed_path.as_ref())
+        || is_sealed(h.sealed_query.as_ref())
+        || h.params.iter().any(|p| is_sealed(p.sealed_value.as_ref()))
+        || h.headers.iter().any(|h| is_sealed(h.value.as_ref()))
+        || matches!(
+            h.body.as_ref().and_then(|b| b.value.as_ref()),
+            Some(pb::body::Value::Inline(s)) if is_sealed(Some(s))
+        )
+}
+
 /// Whether an input holds a sealed value (no allocation).
 pub(crate) fn input_sealed(input: &pb::Input) -> bool {
+    use pb::connection_input::Event;
     use pb::input::Kind;
     match &input.kind {
-        Some(Kind::Http(h)) => {
-            is_sealed(h.sealed_path.as_ref())
-                || is_sealed(h.sealed_query.as_ref())
-                || h.params.iter().any(|p| is_sealed(p.sealed_value.as_ref()))
-                || h.headers.iter().any(|h| is_sealed(h.value.as_ref()))
-                || matches!(
-                    h.body.as_ref().and_then(|b| b.value.as_ref()),
-                    Some(pb::body::Value::Inline(s)) if is_sealed(Some(s))
-                )
-        }
+        Some(Kind::Http(h)) => http_sealed(h),
         Some(Kind::Message(m)) => message_sealed(m.msg.as_ref()),
         Some(Kind::Timer(t)) => message_sealed(t.msg.as_ref()),
+        Some(Kind::Connection(c)) => match &c.event {
+            Some(Event::Open(o)) => o.request.as_ref().is_some_and(http_sealed),
+            Some(Event::Frame(f)) => is_sealed(f.frame.as_ref().and_then(|f| f.data.as_ref())),
+            Some(Event::Close(close)) => is_sealed(close.reason.as_ref()),
+            None => false,
+        },
         Some(Kind::Migrate(_)) | None => false,
     }
 }

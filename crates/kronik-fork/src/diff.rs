@@ -1068,6 +1068,25 @@ fn view(t: &pb::TurnRecord, n: &Norm) -> TurnView {
             v.extend(n.body_key(http_body(r)));
             v
         }
+        // M24 (ADR 0116): an open turn's accept, against a refusal's
+        // `http` above.
+        Some(pb::outcome::Output::Accept(a)) => {
+            let mut v = format!(
+                "accept\0{}\0{}\0",
+                a.subprotocol,
+                a.subject.as_deref().unwrap_or("")
+            )
+            .into_bytes();
+            for (name, vals) in n.headers(&a.headers) {
+                v.extend_from_slice(name.as_bytes());
+                for x in vals {
+                    v.push(1);
+                    v.extend(x);
+                }
+                v.push(0);
+            }
+            v
+        }
         None => Vec::new(),
     };
     TurnView {

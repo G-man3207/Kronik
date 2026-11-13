@@ -28,7 +28,9 @@ pub struct RootInput {
     pub subject: Option<String>,
 }
 
-/// `METHOD /route` for HTTP, `message <name>` or `timer <name>` otherwise.
+/// `METHOD /route` for HTTP, `message <name>` or `timer <name>`, and
+/// `connection <open|frame|close> <WEBSOCKET|SSE> /route` for a connection
+/// input (M24): never the connection id or a frame's data.
 pub fn input_label(input: Option<&pb::Input>) -> String {
     match input.and_then(|i| i.kind.as_ref()) {
         Some(pb::input::Kind::Http(h)) => {
@@ -47,6 +49,23 @@ pub fn input_label(input: Option<&pb::Input>) -> String {
             format!("timer {}", t.msg.as_ref().map_or("", |m| m.name.as_str()))
         }
         Some(pb::input::Kind::Migrate(m)) => format!("migrate {}", m.to_schema_version),
+        Some(pb::input::Kind::Connection(c)) => {
+            let event = match &c.event {
+                Some(pb::connection_input::Event::Open(_)) => "open",
+                Some(pb::connection_input::Event::Frame(_)) => "frame",
+                Some(pb::connection_input::Event::Close(_)) => "close",
+                None => "(no event)",
+            };
+            let route = if c.route.is_empty() {
+                "(no route)"
+            } else {
+                c.route.as_str()
+            };
+            format!(
+                "connection {event} {} {route}",
+                kronik_proto::connection::protocol_method(c.protocol)
+            )
+        }
         None => String::new(),
     }
 }

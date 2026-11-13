@@ -49,6 +49,7 @@ url = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+boon = { workspace = true }
 kronik-core = { workspace = true, features = ["real"] }
 kronik-ui = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser"] }

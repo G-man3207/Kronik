@@ -62,11 +62,16 @@ message TurnRecord {
   // turn's start to its record (M11, for `kronik watch` latency guards).
   // 0 in records from before M11 and in turns a fork recomputes.
   uint64 duration_us = 23;
+  // 24 to 29: M25/M26.
+  // The turn's buffered connection operations (M24): `send`, `broadcast`
+  // and `close`, in call order; empty when the turn failed. 31 to 34 stay
+  // free for M24 follow-ups.
+  repeated ConnectionOp connection_ops = 30;
 }
 
 message EffectRecord {
   uint32 ordinal = 1;
-  string kind = 2;          // http.fetch, foreign.http, actor.call, crypto.hmac-sha256, crypto.sign-ed25519, secret.reveal
+  string kind = 2;          // http.fetch, foreign.http, actor.call, crypto.hmac-sha256, crypto.sign-ed25519, secret.reveal, connection.send-now
   bytes fingerprint = 3;    // normalized request hash, secret values excluded
   Sealable request = 4;     // secret headers stored as name + version hash, never the value
   Sealable response = 5;
@@ -76,7 +81,8 @@ message EffectRecord {
   EffectStatus status = 9;
   // How the result was obtained (live, or matched in a fork, M3).
   Grounding grounding = 10;
-  // http:<host>, actor:<kind>/<key>, secret:<name> or secret-reveal:<name>.
+  // http:<host>, actor:<kind>/<key>, secret:<name>, secret-reveal:<name>
+  // or connection:<id>.
   string target = 11;
   // The guest-visible error for statuses other than OK.
   string error = 12;
@@ -111,6 +117,9 @@ enum EffectStatus {
   EFFECT_STATUS_REENTRANT = 10;
   // The wire response arrived, but its free text could not be safely recorded.
   EFFECT_STATUS_HOST_REDACTION_FAILURE = 11;
+  // connection.send-now (M24): the connection was closed or closing, or not
+  // live on this node; the frame was not sent.
+  EFFECT_STATUS_CLOSED = 12;
 }
 
 enum Grounding {
@@ -189,8 +198,10 @@ message Outcome {
     Message reply = 4;
     // output::http
     HttpResponse http = 5;
+    // An open turn's accept (M24); a refusal is `http`.
+    ConnectionAccept accept = 6;
   }
-  // Neither reply nor http set means output::none.
+  // Neither reply, http nor accept set means output::none.
 }
 
 message SqlChangeset {
@@ -209,4 +220,31 @@ message BlobRefOp {
   }
   Kind kind = 1;
   BlobRef blob = 2;
+}
+
+// A buffered connection operation of a turn (M24), in call order.
+message ConnectionOp {
+  // SEND: one or more connections (`broadcast`), each with its seq at the
+  // same index. CLOSE: exactly one connection, no seqs.
+  repeated string connections = 1;
+  repeated uint64 seqs = 2;
+  oneof op {
+    Frame send = 3;
+    ConnectionCloseRequest close = 4;
+  }
+}
+
+message ConnectionCloseRequest {
+  uint32 code = 1;
+  // Tagged with the turn's default subject at the call.
+  Sealable reason = 2;
+}
+
+// The open turn's accept (Outcome.output.accept).
+message ConnectionAccept {
+  // Empty: none selected.
+  string subprotocol = 1;
+  repeated Header headers = 2;
+  // The connection's subject from now on; unset: the request's.
+  optional string subject = 3;
 }

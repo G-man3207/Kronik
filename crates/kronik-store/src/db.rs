@@ -2588,19 +2588,40 @@ fn outcome_subject(o: &pb::Outcome) -> Option<&str> {
     match &o.output {
         Some(pb::outcome::Output::Reply(m)) => m.body.as_ref()?.subject.as_deref(),
         Some(pb::outcome::Output::Http(h)) => http_subject(&h.headers, h.body.as_ref()),
+        // M24: an open turn's accept; its header values carry the turn's
+        // default subject.
+        Some(pb::outcome::Output::Accept(a)) => a
+            .headers
+            .iter()
+            .find_map(|h| h.value.as_ref()?.subject.as_deref()),
         None => None,
     }
 }
 
-/// The subject of an input's body (message, timer) or request.
+/// The subject of an input's body (message, timer) or request; for a
+/// connection input (M24), of its request, frame data or close reason.
 fn input_subject(input: &pb::Input) -> Option<&str> {
     let msg = match &input.kind {
         Some(pb::input::Kind::Http(h)) => return http_subject(&h.headers, h.body.as_ref()),
         Some(pb::input::Kind::Message(m)) => m.msg.as_ref(),
         Some(pb::input::Kind::Timer(t)) => t.msg.as_ref(),
+        Some(pb::input::Kind::Connection(c)) => return connection_subject(c),
         _ => None,
     };
     msg?.body.as_ref()?.subject.as_deref()
+}
+
+fn connection_subject(c: &pb::ConnectionInput) -> Option<&str> {
+    use pb::connection_input::Event;
+    match &c.event {
+        Some(Event::Open(o)) => {
+            let h = o.request.as_ref()?;
+            http_subject(&h.headers, h.body.as_ref())
+        }
+        Some(Event::Frame(f)) => f.frame.as_ref()?.data.as_ref()?.subject.as_deref(),
+        Some(Event::Close(close)) => close.reason.as_ref()?.subject.as_deref(),
+        None => None,
+    }
 }
 
 /// What a saved call response of an erased subject becomes: the message

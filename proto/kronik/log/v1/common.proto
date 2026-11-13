@@ -114,3 +114,28 @@ message HttpResponse {
   repeated Header headers = 2;
   Body body = 3;
 }
+
+// The protocol of a long-lived connection (M24).
+enum ConnectionProtocol {
+  CONNECTION_PROTOCOL_UNSPECIFIED = 0;
+  CONNECTION_PROTOCOL_WEBSOCKET = 1;
+  CONNECTION_PROTOCOL_SSE = 2;
+}
+
+// One frame of a long-lived connection (M24), in either direction.
+message Frame {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    TEXT = 1;
+    BINARY = 2;
+    EVENT = 3;
+  }
+  Kind kind = 1;
+  // TEXT: UTF-8 text; BINARY: bytes; EVENT: the event's data. Tagged with
+  // its subject (I9).
+  Sealable data = 2;
+  // EVENT only: the SSE `event:` and `id:` fields (application constants
+  // and cursors, never personal data; the docs say so).
+  string event = 3;
+  string id = 4;
+}

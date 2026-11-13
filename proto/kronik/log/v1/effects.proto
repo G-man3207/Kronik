@@ -89,3 +89,15 @@ message CryptoEffectRequest {
 message RevealEffectRequest {
   SecretRef secret = 1;
 }
+
+// connection.send-now request (M24). There is no response payload: the
+// status is the result.
+message ConnectionSendRequest {
+  string connection = 1;
+  // The frame's outgoing seq; 0 unless the status is OK.
+  uint64 seq = 2;
+  Frame.Kind kind = 3;
+  bytes data = 4;
+  string event = 5;
+  string id = 6;
+}

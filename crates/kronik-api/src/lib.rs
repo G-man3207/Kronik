@@ -353,7 +353,8 @@ fn turn_response(r: Option<TurnResult>) -> Result<TurnResponse> {
                 }
             }
         }
-        None => None,
+        // Only an open turn accepts (M24); it has no reply.
+        Some(pb::outcome::Output::Accept(_)) | None => None,
     };
     Ok(TurnResponse {
         dry_run: false,
@@ -411,11 +412,42 @@ fn input_summary(i: Option<&pb::Input>, pii: bool) -> InputSummary {
                 m.from_schema_version, m.to_schema_version
             ),
         ),
+        Some(Kind::Connection(c)) => ("connection", connection_summary(c)),
         None => ("unknown", String::new()),
     };
     InputSummary {
         kind: kind.into(),
         summary,
+    }
+}
+
+/// `open <id> WEBSOCKET /chat/{key}/ws`, `frame <id> #12 text 42 B` or
+/// `close <id> client 1000` (M24): never a frame's data or a reason.
+fn connection_summary(c: &pb::ConnectionInput) -> String {
+    use kronik_proto::connection;
+    match &c.event {
+        Some(pb::connection_input::Event::Open(_)) => format!(
+            "open {} {} {}",
+            c.connection,
+            connection::protocol_method(c.protocol),
+            c.route
+        ),
+        Some(pb::connection_input::Event::Frame(f)) => {
+            let (kind, bytes) = f.frame.as_ref().map_or(("unspecified", 0), |frame| {
+                (
+                    connection::frame_kind_name(frame.kind),
+                    connection::frame_bytes(frame),
+                )
+            });
+            format!("frame {} #{} {kind} {bytes} B", c.connection, f.seq)
+        }
+        Some(pb::connection_input::Event::Close(close)) => format!(
+            "close {} {} {}",
+            c.connection,
+            connection::cause_name(close.cause),
+            close.code
+        ),
+        None => format!("{} (no event)", c.connection),
     }
 }
 
@@ -494,6 +526,8 @@ fn effect_status(s: i32) -> &'static str {
         Ok(pb::EffectStatus::Rejected) => "rejected",
         Ok(pb::EffectStatus::Failed) => "failed",
         Ok(pb::EffectStatus::Reentrant) => "reentrant",
+        // connection.send-now (M24): the connection was closed or closing.
+        Ok(pb::EffectStatus::Closed) => "closed",
         _ => "unspecified",
     }
 }
@@ -608,31 +642,155 @@ pub(crate) fn redact_credentials(t: &mut pb::TurnRecord, pii: bool) {
             }
         }
     };
-    if let Some(pb::input::Kind::Http(h)) = t.input.as_mut().and_then(|i| i.kind.as_mut()) {
-        redact(&mut h.headers);
+    match t.input.as_mut().and_then(|i| i.kind.as_mut()) {
+        Some(pb::input::Kind::Http(h)) => redact(&mut h.headers),
+        Some(pb::input::Kind::Connection(pb::ConnectionInput {
+            event: Some(pb::connection_input::Event::Open(o)),
+            ..
+        })) => {
+            if let Some(h) = o.request.as_mut() {
+                redact(&mut h.headers);
+            }
+        }
+        _ => {}
     }
-    if let Some(pb::outcome::Output::Http(h)) = t.outcome.as_mut().and_then(|o| o.output.as_mut()) {
-        redact(&mut h.headers);
+    match t.outcome.as_mut().and_then(|o| o.output.as_mut()) {
+        Some(pb::outcome::Output::Http(h)) => redact(&mut h.headers),
+        Some(pb::outcome::Output::Accept(a)) => redact(&mut a.headers),
+        _ => {}
     }
+}
+
+/// A frame as JSON (M24): its kind, its data as a sealable, and an SSE
+/// event's `event` and `id`.
+fn frame_json(f: Option<&pb::Frame>) -> serde_json::Value {
+    match f {
+        Some(f) => serde_json::json!({
+            "kind": kronik_proto::connection::frame_kind_name(f.kind),
+            "data": sealable_json(f.data.as_ref()),
+            "event": f.event,
+            "id": f.id,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn headers_json(headers: &[pb::Header]) -> Vec<serde_json::Value> {
+    headers
+        .iter()
+        .map(|hd| {
+            serde_json::json!({
+                "name": hd.name, "value": sealable_json(hd.value.as_ref()),
+            })
+        })
+        .collect()
+}
+
+/// An HTTP request's fields as JSON: an HTTP input, or a connection open's
+/// request (M24).
+fn http_request_json(h: &pb::HttpInput) -> serde_json::Map<String, serde_json::Value> {
+    let v = serde_json::json!({
+        "method": h.method, "path": h.path_text(), "query": h.query_text(),
+        "route": h.route,
+        "params": h.param_values(),
+        "headers": headers_json(&h.headers),
+        "body": match h.body.as_ref().and_then(|b| b.value.as_ref()) {
+            Some(pb::body::Value::Inline(s)) => sealable_json(Some(s)),
+            _ => serde_json::Value::Null,
+        },
+        "idempotency_key": h.idempotency_key,
+    });
+    match v {
+        serde_json::Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// A connection input as JSON (M24): the event and its facts.
+fn connection_input_json(c: &pb::ConnectionInput) -> serde_json::Value {
+    use kronik_proto::connection;
+    use pb::connection_input::Event;
+    let event = match &c.event {
+        Some(Event::Open(_)) => "open",
+        Some(Event::Frame(_)) => "frame",
+        Some(Event::Close(_)) => "close",
+        None => "unspecified",
+    };
+    let request = match &c.event {
+        Some(Event::Open(o)) => o.request.as_ref().map_or(serde_json::Value::Null, |h| {
+            serde_json::Value::Object(http_request_json(h))
+        }),
+        _ => serde_json::Value::Null,
+    };
+    let subprotocols = match &c.event {
+        Some(Event::Open(o)) => o.subprotocols.clone(),
+        _ => Vec::new(),
+    };
+    let (seq, frame) = match &c.event {
+        Some(Event::Frame(f)) => (serde_json::json!(f.seq), frame_json(f.frame.as_ref())),
+        _ => (serde_json::Value::Null, serde_json::Value::Null),
+    };
+    let close = match &c.event {
+        Some(Event::Close(close)) => serde_json::json!({
+            "initiator": connection::initiator(close.cause),
+            "cause": connection::cause_name(close.cause),
+            "code": close.code,
+            "reason": close.reason.as_ref().map(|r| sealable_json(Some(r))),
+            "frames_written": close.frames_written_known.then_some(close.frames_written),
+            "frames_received": close.frames_received,
+            "restart_after_lsn": (close.restart_after_lsn > 0).then_some(close.restart_after_lsn),
+        }),
+        _ => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "type": "connection",
+        "event": event,
+        "connection": c.connection,
+        "protocol": connection::protocol_name(c.protocol),
+        "route": c.route,
+        "request": request,
+        "subprotocols": subprotocols,
+        "seq": seq,
+        "frame": frame,
+        "close": close,
+        "resend_of": c.resend_of,
+        "reason": c.audit.as_ref().map(|a| a.reason.clone()),
+        "token_id": c.audit.as_ref().map(|a| a.token_id.clone()),
+    })
+}
+
+/// A turn's buffered connection operations as JSON (M24).
+fn connection_ops_json(t: &pb::TurnRecord) -> Vec<serde_json::Value> {
+    t.connection_ops
+        .iter()
+        .map(|op| match &op.op {
+            Some(pb::connection_op::Op::Send(f)) => serde_json::json!({
+                "op": "send", "connections": op.connections, "seqs": op.seqs,
+                "frame": frame_json(Some(f)), "code": null, "reason": null,
+            }),
+            Some(pb::connection_op::Op::Close(c)) => serde_json::json!({
+                "op": "close", "connections": op.connections, "seqs": op.seqs,
+                "frame": null, "code": c.code,
+                "reason": c.reason.as_ref().map(|r| sealable_json(Some(r))),
+            }),
+            None => serde_json::json!({
+                "op": "unspecified", "connections": op.connections, "seqs": op.seqs,
+                "frame": null, "code": null, "reason": null,
+            }),
+        })
+        .collect()
 }
 
 /// The full turn record as JSON.
 fn turn_json(branch: &str, lsn: u64, t: &pb::TurnRecord) -> TurnJson {
     use pb::input::Kind;
     let input = match t.input.as_ref().and_then(|i| i.kind.as_ref()) {
-        Some(Kind::Http(h)) => serde_json::json!({
-            "type": "http", "method": h.method, "path": h.path_text(), "query": h.query_text(),
-            "route": h.route,
-            "params": h.param_values(),
-            "headers": h.headers.iter().map(|hd| serde_json::json!({
-                "name": hd.name, "value": sealable_json(hd.value.as_ref()),
-            })).collect::<Vec<_>>(),
-            "body": match h.body.as_ref().and_then(|b| b.value.as_ref()) {
-                Some(pb::body::Value::Inline(s)) => sealable_json(Some(s)),
-                _ => serde_json::Value::Null,
-            },
-            "idempotency_key": h.idempotency_key,
-        }),
+        Some(Kind::Http(h)) => {
+            let mut m = serde_json::Map::new();
+            m.insert("type".into(), "http".into());
+            m.extend(http_request_json(h));
+            serde_json::Value::Object(m)
+        }
         Some(Kind::Message(m)) => serde_json::json!({
             "type": "message",
             "source": pb::MessageSource::try_from(m.source).map_or("unspecified", |s| s.as_str_name()),
@@ -651,6 +809,7 @@ fn turn_json(branch: &str, lsn: u64, t: &pb::TurnRecord) -> TurnJson {
         Some(Kind::Migrate(m)) => serde_json::json!({
             "type": "migrate", "from": m.from_schema_version, "to": m.to_schema_version,
         }),
+        Some(Kind::Connection(c)) => connection_input_json(c),
         None => serde_json::Value::Null,
     };
     let output = match t.outcome.as_ref().and_then(|o| o.output.as_ref()) {
@@ -659,13 +818,16 @@ fn turn_json(branch: &str, lsn: u64, t: &pb::TurnRecord) -> TurnJson {
         }
         Some(pb::outcome::Output::Http(h)) => serde_json::json!({"http": {
             "status": h.status,
-            "headers": h.headers.iter().map(|hd| serde_json::json!({
-                "name": hd.name, "value": sealable_json(hd.value.as_ref()),
-            })).collect::<Vec<_>>(),
+            "headers": headers_json(&h.headers),
             "body": match h.body.as_ref().and_then(|b| b.value.as_ref()) {
                 Some(pb::body::Value::Inline(s)) => sealable_json(Some(s)),
                 _ => serde_json::Value::Null,
             },
+        }}),
+        Some(pb::outcome::Output::Accept(a)) => serde_json::json!({"accept": {
+            "subprotocol": (!a.subprotocol.is_empty()).then(|| a.subprotocol.clone()),
+            "headers": headers_json(&a.headers),
+            "subject": a.subject,
         }}),
         None => serde_json::Value::Null,
     };
@@ -716,6 +878,7 @@ fn turn_json(branch: &str, lsn: u64, t: &pb::TurnRecord) -> TurnJson {
             "to": actor_json(m.to.as_ref()), "message_id": m.message_id,
             "msg": message_json(m.msg.as_ref()),
         })).collect::<Vec<_>>(),
+        "connection_ops": connection_ops_json(t),
     }))
 }
 
@@ -2329,8 +2492,17 @@ pub(crate) fn input_has_sealed(input: Option<&pb::Input>) -> bool {
 /// (which drops the seals) and for records from before the path was a
 /// sealable field (v0.1 re-review R4).
 pub(crate) fn hide_request_line(t: &mut pb::TurnRecord) {
-    let Some(pb::input::Kind::Http(h)) = t.input.as_mut().and_then(|i| i.kind.as_mut()) else {
-        return;
+    let h = match t.input.as_mut().and_then(|i| i.kind.as_mut()) {
+        Some(pb::input::Kind::Http(h)) => h,
+        // M24: a connection open's request, likewise.
+        Some(pb::input::Kind::Connection(pb::ConnectionInput {
+            event: Some(pb::connection_input::Event::Open(o)),
+            ..
+        })) => match o.request.as_mut() {
+            Some(h) => h,
+            None => return,
+        },
+        _ => return,
     };
     let sealed = || {
         Some(pb::Sealable {
@@ -2354,7 +2526,18 @@ pub(crate) fn hide_request_line(t: &mut pb::TurnRecord) {
 /// parameter values and `Idempotency-Key` are the subject's data, also in
 /// records written before path and query were sealable fields (H10, H8).
 pub(crate) fn hide_http_identity(turn: &mut serde_json::Value) {
-    let Some(input) = turn.get_mut("input").filter(|i| i["type"] == "http") else {
+    let Some(input) = turn.get_mut("input") else {
+        return;
+    };
+    // M24: a connection open's request, likewise.
+    let input = if input["type"] == "connection" {
+        match input.get_mut("request").filter(|r| r.is_object()) {
+            Some(request) => request,
+            None => return,
+        }
+    } else if input["type"] == "http" {
+        input
+    } else {
         return;
     };
     let sealed = serde_json::Value::String(kronik_proto::http::SEALED.to_owned());
@@ -2474,5 +2657,201 @@ mod tests {
             "accept, content-type: {without}"
         );
         assert_eq!(shown(true).matches("s3cret").count(), 7);
+    }
+}
+
+/// M24: the turn JSON of connection turns, against the hand-written turn
+/// schema (docs/reference/turn.schema.json).
+#[cfg(test)]
+mod connection_turn_json_tests {
+    use prost::Message as _;
+
+    use super::*;
+
+    const CONN: &str = "c-0123456789abcdef0123456789abcdef";
+
+    fn plain(subject: Option<&str>, v: &[u8]) -> Option<pb::Sealable> {
+        Some(pb::Sealable {
+            subject: subject.map(String::from),
+            value: Some(pb::sealable::Value::Plain(v.to_vec())),
+        })
+    }
+
+    fn turn(event: pb::connection_input::Event) -> pb::TurnRecord {
+        pb::TurnRecord {
+            actor: Some(pb::ActorRef {
+                kind: "room".into(),
+                key: "lobby".into(),
+            }),
+            code_hash: vec![1; 32],
+            causal_key: Some(pb::CausalKey {
+                root: "0123456789abcdef0123456789abcdef".into(),
+                path: vec![],
+            }),
+            input: Some(pb::Input {
+                kind: Some(pb::input::Kind::Connection(pb::ConnectionInput {
+                    connection: CONN.into(),
+                    protocol: pb::ConnectionProtocol::Websocket as i32,
+                    route: "/room/{key}/ws".into(),
+                    event: Some(event),
+                    ..Default::default()
+                })),
+            }),
+            outcome: Some(pb::Outcome {
+                kind: pb::OutcomeKind::Committed as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn validate(v: &serde_json::Value) {
+        let url = "file:///kronik/docs/reference/turn.schema.json";
+        let mut schemas = boon::Schemas::new();
+        let mut c = boon::Compiler::new();
+        c.set_default_draft(boon::Draft::V2020_12);
+        c.add_resource(url, serde_json::from_str(openapi::TURN_SCHEMA).unwrap())
+            .unwrap();
+        let index = c.compile(url, &mut schemas).unwrap();
+        if let Err(e) = schemas.validate(v, index) {
+            panic!(
+                "the turn JSON does not match its schema:\n{e:#}\n{}",
+                serde_json::to_string_pretty(v).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn connection_turns_match_the_turn_schema() {
+        use pb::connection_input::Event;
+        let mut open = turn(Event::Open(pb::ConnectionOpen {
+            request: Some(pb::HttpInput {
+                method: "GET".into(),
+                path: "/room/lobby/ws".into(),
+                query: "user=ada".into(),
+                params: vec![pb::Param {
+                    name: "key".into(),
+                    value: "lobby".into(),
+                    sealed_value: None,
+                }],
+                headers: vec![pb::Header {
+                    name: "authorization".into(),
+                    value: plain(None, b"Bearer x"),
+                }],
+                body: Some(pb::Body {
+                    value: Some(pb::body::Value::Inline(plain(None, b"").unwrap())),
+                }),
+                route: "/room/{key}/ws".into(),
+                ..Default::default()
+            }),
+            subprotocols: vec!["room.v1".into()],
+        }));
+        open.outcome = Some(pb::Outcome {
+            kind: pb::OutcomeKind::Committed as i32,
+            output: Some(pb::outcome::Output::Accept(pb::ConnectionAccept {
+                subprotocol: "room.v1".into(),
+                headers: vec![pb::Header {
+                    name: "x-room".into(),
+                    value: plain(None, b"lobby"),
+                }],
+                subject: Some("user:ada".into()),
+            })),
+            ..Default::default()
+        });
+        open.connection_ops = vec![
+            pb::ConnectionOp {
+                connections: vec![CONN.into()],
+                seqs: vec![0],
+                op: Some(pb::connection_op::Op::Send(pb::Frame {
+                    kind: pb::frame::Kind::Event as i32,
+                    data: plain(Some("user:ada"), b"{}"),
+                    event: "message".into(),
+                    id: "1".into(),
+                })),
+            },
+            pb::ConnectionOp {
+                connections: vec![CONN.into()],
+                seqs: vec![],
+                op: Some(pb::connection_op::Op::Close(pb::ConnectionCloseRequest {
+                    code: 1000,
+                    reason: plain(None, b"bye"),
+                })),
+            },
+        ];
+        redact_credentials(&mut open, false);
+        let v = turn_json("main", 7, &open).0;
+        validate(&v);
+        assert_eq!(v["input"]["type"], "connection");
+        assert_eq!(v["input"]["event"], "open");
+        assert_eq!(v["input"]["request"]["route"], "/room/{key}/ws");
+        assert_eq!(
+            v["input"]["request"]["headers"][0]["value"]["value"]["text"],
+            "[redacted]"
+        );
+        assert_eq!(v["output"]["accept"]["subprotocol"], "room.v1");
+        assert_eq!(v["output"]["accept"]["subject"], "user:ada");
+        assert_eq!(v["connection_ops"][0]["frame"]["kind"], "event");
+        assert_eq!(v["connection_ops"][1]["op"], "close");
+        assert_eq!(v["connection_ops"][1]["code"], 1000);
+        // Without pii:read, a sealed open's request line is hidden like an
+        // HTTP request's.
+        let mut hidden = v.clone();
+        hide_http_identity(&mut hidden);
+        assert_eq!(hidden["input"]["request"]["path"], "[sealed]");
+        validate(&hidden);
+
+        let mut frame = turn(Event::Frame(pb::ConnectionFrame {
+            seq: 4,
+            frame: Some(pb::Frame {
+                kind: pb::frame::Kind::Text as i32,
+                data: plain(Some("user:ada"), b"stream 1"),
+                ..Default::default()
+            }),
+        }));
+        frame.effects = vec![pb::EffectRecord {
+            kind: "connection.send-now".into(),
+            target: format!("connection:{CONN}"),
+            status: pb::EffectStatus::Closed as i32,
+            grounding: pb::Grounding::Live as i32,
+            delivery: "unsafe".into(),
+            request: plain(
+                None,
+                &pb::ConnectionSendRequest {
+                    connection: CONN.into(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ),
+            ..Default::default()
+        }];
+        let v = turn_json("main", 8, &frame).0;
+        validate(&v);
+        assert_eq!(v["input"]["seq"], 4);
+        assert_eq!(v["input"]["frame"]["data"]["value"]["text"], "stream 1");
+        assert_eq!(v["effects"][0]["kind"], "connection.send-now");
+        assert_eq!(
+            input_summary(frame.input.as_ref(), true).summary,
+            format!("frame {CONN} #4 text 8 B")
+        );
+
+        let close = turn(Event::Close(pb::ConnectionClose {
+            cause: pb::CloseCause::Restart as i32,
+            code: 1012,
+            restart_after_lsn: 41,
+            ..Default::default()
+        }));
+        let v = turn_json("main", 9, &close).0;
+        validate(&v);
+        assert_eq!(v["input"]["close"]["initiator"], "host");
+        assert_eq!(v["input"]["close"]["cause"], "restart");
+        assert_eq!(
+            v["input"]["close"]["frames_written"],
+            serde_json::Value::Null
+        );
+        assert_eq!(v["input"]["close"]["restart_after_lsn"], 41);
+        assert_eq!(
+            input_summary(close.input.as_ref(), true).summary,
+            format!("close {CONN} restart 1012")
+        );
     }
 }

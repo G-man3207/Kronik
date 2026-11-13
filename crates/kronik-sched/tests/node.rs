@@ -113,7 +113,7 @@ fn reply_text(r: &TurnResult) -> String {
             Some(pb::sealable::Value::Plain(b)) => b.clone(),
             _ => vec![],
         },
-        None => vec![],
+        Some(pb::outcome::Output::Accept(_)) | None => vec![],
     };
     String::from_utf8(bytes).unwrap()
 }

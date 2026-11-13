@@ -920,3 +920,222 @@ fn effect_record_http_v3_v1() {
         request
     );
 }
+
+const CONN: &str = "c-00112233445566778899aabbccddeeff";
+
+fn sealed_plain(subject: Option<&str>, bytes: &[u8]) -> Option<pb::Sealable> {
+    Some(pb::Sealable {
+        subject: subject.map(String::from),
+        value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
+    })
+}
+
+fn connection_turn(event: pb::connection_input::Event) -> pb::TurnRecord {
+    pb::TurnRecord {
+        execution_id: "ffeeddccbbaa99887766554433221100".into(),
+        actor: Some(pb::ActorRef {
+            kind: "room".into(),
+            key: "lobby".into(),
+        }),
+        code_hash: vec![7; 32],
+        engine_version: "kronik-0.5.0+wasmtime-50.0.1".into(),
+        causal_key: Some(pb::CausalKey {
+            root: "00112233445566778899aabbccddeeff".into(),
+            path: vec![],
+        }),
+        logical_time_ms: 1_793_000_000_000,
+        random_seed: vec![1; 32],
+        input: Some(pb::Input {
+            kind: Some(pb::input::Kind::Connection(pb::ConnectionInput {
+                connection: CONN.into(),
+                protocol: pb::ConnectionProtocol::Websocket as i32,
+                route: "/room/{key}/ws".into(),
+                event: Some(event),
+                ..Default::default()
+            })),
+        }),
+        outcome: Some(pb::Outcome {
+            kind: pb::OutcomeKind::Committed as i32,
+            ..Default::default()
+        }),
+        config_epoch: 3,
+        ..Default::default()
+    }
+}
+
+/// M24: an open turn's `ConnectionInput` (Input case 5) with its request
+/// and subprotocols, its accept (`Outcome.output` case 6) and its buffered
+/// operations (`TurnRecord.connection_ops`, field 30): a welcome event and
+/// a close.
+#[test]
+fn connection_open_v1() {
+    let mut t = connection_turn(pb::connection_input::Event::Open(pb::ConnectionOpen {
+        request: Some(pb::HttpInput {
+            method: "GET".into(),
+            path: "/room/lobby/ws".into(),
+            query: "user=ada".into(),
+            params: vec![pb::Param {
+                name: "key".into(),
+                value: "lobby".into(),
+                sealed_value: None,
+            }],
+            headers: vec![pb::Header {
+                name: "origin".into(),
+                value: sealed_plain(None, b"https://example.com"),
+            }],
+            body: Some(pb::Body {
+                value: Some(pb::body::Value::Inline(
+                    sealed_plain(None, b"").unwrap_or_default(),
+                )),
+            }),
+            route: "/room/{key}/ws".into(),
+            ..Default::default()
+        }),
+        subprotocols: vec!["room.v1".into(), "room.v0".into()],
+    }));
+    if let Some(o) = t.outcome.as_mut() {
+        o.output = Some(pb::outcome::Output::Accept(pb::ConnectionAccept {
+            subprotocol: "room.v1".into(),
+            headers: vec![pb::Header {
+                name: "x-room".into(),
+                value: sealed_plain(Some("user:ada"), b"lobby"),
+            }],
+            subject: Some("user:ada".into()),
+        }));
+    }
+    t.connection_ops = vec![
+        pb::ConnectionOp {
+            connections: vec![CONN.into()],
+            seqs: vec![0],
+            op: Some(pb::connection_op::Op::Send(pb::Frame {
+                kind: pb::frame::Kind::Event as i32,
+                data: sealed_plain(Some("user:ada"), br#"{"type":"welcome"}"#),
+                event: "welcome".into(),
+                id: "0".into(),
+            })),
+        },
+        pb::ConnectionOp {
+            connections: vec![CONN.into()],
+            seqs: vec![],
+            op: Some(pb::connection_op::Op::Close(pb::ConnectionCloseRequest {
+                code: 4000,
+                reason: sealed_plain(Some("user:ada"), b"kicked"),
+            })),
+        },
+    ];
+    let record = Record::TurnRecord(t);
+    let bytes = fixture("connection-open-v1", &record);
+    assert_eq!(
+        Record::decode(kronik_proto::kind::TURN_RECORD, &bytes).unwrap(),
+        record
+    );
+}
+
+/// M24: a frame turn (`ConnectionFrame`) with a `connection.send-now`
+/// effect (`ConnectionSendRequest`, status OK, and one CLOSED, status 12)
+/// and a broadcast to two connections with their seqs.
+#[test]
+fn connection_frame_v1() {
+    use prost::Message as _;
+    let mut t = connection_turn(pb::connection_input::Event::Frame(pb::ConnectionFrame {
+        seq: 4,
+        frame: Some(pb::Frame {
+            kind: pb::frame::Kind::Text as i32,
+            data: sealed_plain(Some("user:ada"), b"stream 2"),
+            ..Default::default()
+        }),
+    }));
+    let send_now = |ordinal: u32, seq: u64, status: pb::EffectStatus| pb::EffectRecord {
+        ordinal,
+        kind: "connection.send-now".into(),
+        fingerprint: vec![9; 32],
+        request: sealed_plain(
+            Some("user:ada"),
+            &pb::ConnectionSendRequest {
+                connection: CONN.into(),
+                seq,
+                kind: pb::frame::Kind::Text as i32,
+                data: format!("tok {ordinal}").into_bytes(),
+                event: String::new(),
+                id: String::new(),
+            }
+            .encode_to_vec(),
+        ),
+        delivery: "unsafe".into(),
+        status: status as i32,
+        grounding: pb::Grounding::Live as i32,
+        target: format!("connection:{CONN}"),
+        error: if status == pb::EffectStatus::Closed {
+            "closed".into()
+        } else {
+            String::new()
+        },
+        ..Default::default()
+    };
+    t.effects = vec![
+        send_now(0, 5, pb::EffectStatus::Ok),
+        send_now(1, 0, pb::EffectStatus::Closed),
+    ];
+    t.connection_ops = vec![pb::ConnectionOp {
+        connections: vec![CONN.into(), "c-ffeeddccbbaa99887766554433221100".into()],
+        seqs: vec![6, 2],
+        op: Some(pb::connection_op::Op::Send(pb::Frame {
+            kind: pb::frame::Kind::Binary as i32,
+            data: sealed_plain(Some("user:ada"), &[0, 1, 2]),
+            ..Default::default()
+        })),
+    }];
+    let record = Record::TurnRecord(t);
+    let bytes = fixture("connection-frame-v1", &record);
+    let decoded = Record::decode(kronik_proto::kind::TURN_RECORD, &bytes).unwrap();
+    assert_eq!(decoded, record);
+    let Some(turn) = decoded.turn() else {
+        panic!("not a turn")
+    };
+    let Some(pb::sealable::Value::Plain(request)) = turn.effects[0]
+        .request
+        .as_ref()
+        .and_then(|r| r.value.as_ref())
+    else {
+        panic!("no plain request")
+    };
+    let request = pb::ConnectionSendRequest::decode(request.as_slice()).unwrap();
+    assert_eq!((request.connection.as_str(), request.seq), (CONN, 5));
+    assert_eq!(turn.effects[1].status, pb::EffectStatus::Closed as i32);
+}
+
+/// M24: the close input after a restart (`ConnectionClose`, cause RESTART,
+/// `frames_written` unknown, `restart_after_lsn`), and a client's close.
+#[test]
+fn connection_close_v1() {
+    let restart = connection_turn(pb::connection_input::Event::Close(pb::ConnectionClose {
+        cause: pb::CloseCause::Restart as i32,
+        code: 1012,
+        reason: None,
+        frames_written: 0,
+        frames_written_known: false,
+        frames_received: 0,
+        restart_after_lsn: 41,
+    }));
+    let client = connection_turn(pb::connection_input::Event::Close(pb::ConnectionClose {
+        cause: pb::CloseCause::Client as i32,
+        code: 1000,
+        reason: sealed_plain(Some("user:ada"), b"tab closed"),
+        frames_written: 7,
+        frames_written_known: true,
+        frames_received: 3,
+        restart_after_lsn: 0,
+    }));
+    for (name, t) in [
+        ("connection-close-restart-v1", restart),
+        ("connection-close-client-v1", client),
+    ] {
+        let record = Record::TurnRecord(t);
+        let bytes = fixture(name, &record);
+        assert_eq!(
+            Record::decode(kronik_proto::kind::TURN_RECORD, &bytes).unwrap(),
+            record,
+            "{name}"
+        );
+    }
+}

@@ -2416,6 +2416,9 @@ pub fn map_call_outcome(outcome: pb::Outcome) -> Result<CallOutcome, GateError> 
         .map_err(|_| GateError::Host("The committed callee outcome kind is invalid".into()))?;
     Ok(match kind {
         pb::OutcomeKind::Committed => CallOutcome::Ok(match outcome.output {
+            // Only an open turn accepts (M24), and a callee's turn is a
+            // message turn: no reply.
+            Some(pb::outcome::Output::Accept(_)) => None,
             Some(pb::outcome::Output::Reply(message)) => {
                 validate_call_reply(Some(&message))?;
                 Some(message)

@@ -12,6 +12,8 @@ message Input {
     MessageInput message = 2;
     TimerInput timer = 3;
     MigrateInput migrate = 4;
+    // A long-lived connection's open, frame or close (M24).
+    ConnectionInput connection = 5;
   }
 }
 
@@ -101,4 +103,74 @@ message TimerInput {
 message MigrateInput {
   uint32 from_schema_version = 1;
   uint32 to_schema_version = 2;
+}
+
+// A root input of a long-lived connection (M24). Exactly one event is set.
+message ConnectionInput {
+  // "c-" + the open input's root id: the same in every input.
+  string connection = 1;
+  ConnectionProtocol protocol = 2;
+  // The matched route pattern, e.g. "/chat/{key}/ws".
+  string route = 3;
+  oneof event {
+    ConnectionOpen open = 4;
+    ConnectionFrame frame = 5;
+    ConnectionClose close = 6;
+  }
+  // Resends of a dead letter: the failed turn ("<branch>:<lsn>").
+  string resend_of = 7;
+  // Who resent the input, or who closed the connection (operator closes).
+  Audit audit = 8;
+  // The gateway node that holds the socket; empty on a single node.
+  // Reserved for the cluster.
+  string gateway = 9;
+}
+
+message ConnectionOpen {
+  // The upgrade request or the GET, as an HTTP input: method, path, query,
+  // params, headers and route, sealed fields when it has a subject; the
+  // body empty; idempotency_key and request_hash empty.
+  HttpInput request = 1;
+  // Sec-WebSocket-Protocol values in the order offered.
+  repeated string subprotocols = 2;
+}
+
+message ConnectionFrame {
+  // Per connection from 0, in the order the client sent them.
+  uint64 seq = 1;
+  Frame frame = 2;
+}
+
+enum CloseCause {
+  CLOSE_CAUSE_UNSPECIFIED = 0;
+  CLOSE_CAUSE_CLIENT = 1;
+  CLOSE_CAUSE_ACTOR = 2;
+  CLOSE_CAUSE_RESTART = 3;
+  CLOSE_CAUSE_PING_TIMEOUT = 4;
+  CLOSE_CAUSE_TOO_LARGE = 5;
+  CLOSE_CAUSE_SLOW_CONSUMER = 6;
+  CLOSE_CAUSE_PROTOCOL = 7;
+  CLOSE_CAUSE_OPERATOR = 8;
+  CLOSE_CAUSE_REBASE = 9;
+  CLOSE_CAUSE_ABANDONED = 10;
+  CLOSE_CAUSE_UNAVAILABLE = 11;
+}
+
+message ConnectionClose {
+  // CLIENT, ACTOR, or one of the host's causes.
+  CloseCause cause = 1;
+  // The WebSocket close code received (client) or sent (actor, host).
+  uint32 code = 2;
+  // The client's or the actor's reason, tagged with the connection's
+  // subject; unset for host causes.
+  Sealable reason = 3;
+  // Outgoing frames written to the socket: seq < frames_written were
+  // written, the rest dropped. Unknown (false) after a restart.
+  uint64 frames_written = 4;
+  bool frames_written_known = 5;
+  // Incoming messages read, admitted or not.
+  uint64 frames_received = 6;
+  // RESTART only: the last LSN of the log when the node started; frames
+  // in later records were never written.
+  uint64 restart_after_lsn = 7;
 }
