@@ -67,6 +67,11 @@ until the v1.0 compatibility promise takes effect.
   `SUBJECT_ERASED` as a dead letter. `privacy status` counts an erasure as
   pending while its subject has a plain value in `state.db`, not only in the
   log (#31).
+- A replay hands the guest a pending timer's or an undelivered message's
+  body the way it hands it any recorded value: opened, pseudonymized in a
+  `--no-pii` fork, and `[erased]` for an erased subject, whose turn is then
+  unverifiable. Before, the body went to the guest as the fork's store held
+  it, sealed when a base snapshot held it.
 
 ## v0.4.1 — 2026-11-07
 

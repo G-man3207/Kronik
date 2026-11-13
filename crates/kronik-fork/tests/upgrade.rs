@@ -729,6 +729,8 @@ enum Step<'a> {
     Send(&'a str, &'a str, &'a str, Option<&'a str>),
     /// `privacy erase <subject>`.
     Erase(&'a str),
+    /// Logical time passes: a window can start after the steps before.
+    Pause(Duration),
 }
 
 /// Waits until the turn at `lsn` is applied and every message committed so
@@ -793,6 +795,7 @@ fn privacy_workload(rt: &Runtime, dir: &Path, guests: &[&str], steps: &[Step<'_>
                         .unwrap();
                     settle(&node, done.lsn.unwrap()).await;
                 }
+                Step::Pause(d) => tokio::time::sleep(*d).await,
             }
         }
     });
@@ -954,6 +957,46 @@ fn production_turns_missing_below_an_erased_turn_are_unverifiable() {
     assert_eq!(checked.report.unverifiable, 6);
     assert_eq!(d.effects.removed + d.effects.added + d.effects.changed, 0);
     keep(&dir, "erased-fanout");
+}
+
+/// A timer of the erased subject is pending at the fork point. Its body in
+/// the fork's store is a tombstone since the erasure, which the replay
+/// handed to the guest still sealed: the check failed for a missing key.
+/// The body reads `[erased]` now, and the timer's turn (a SUBJECT_ERASED
+/// dead letter in production) is unverifiable.
+#[test]
+fn a_timer_of_an_erased_subject_pending_at_the_fork_point_is_unverifiable() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter"],
+        &[
+            // `store` the body in 2.5 s, for user:1.
+            Step::Send(
+                "counter/t",
+                "schedule",
+                "2500 store\nNEEDLE",
+                Some("user:1"),
+            ),
+            Step::Erase("user:1"),
+            Step::Pause(Duration::from_millis(800)),
+            Step::Send("counter/k1", "increment", "", None),
+            // The timer fires here.
+            Step::Pause(Duration::from_millis(2500)),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
+    // The window starts at `counter/k1`: after the erasure, before the timer.
+    let checked = check_dir(&rt, dir.path(), Duration::from_millis(3000));
+    let d = &checked.diff;
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert_eq!(checked.report.root_inputs, 2, "{text}");
+    assert!(checked.report.passed, "{text}");
+    assert_eq!(d.summary.unverifiable, 1, "the timer's turn: {text}");
+    assert_eq!(d.summary.divergent_turns, 0, "{text}");
+    keep(&dir, "erased-pending-timer");
 }
 
 /// Issue #49: an erased state value reads as absent in a fork and marks the

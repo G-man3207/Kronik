@@ -546,10 +546,11 @@ impl Runner {
     /// A message production delivered runs at that turn's place; one it did
     /// not runs first, after `after` (a rebase leaves it for main).
     fn queue_pending(&self, after: Lsn) -> Result<(), ReplayError> {
-        for t in self.store.db().timers(None)? {
+        for mut t in self.store.db().timers(None)? {
             if lock(&self.timers).contains_key(&(t.actor.clone(), t.timer_id)) {
                 continue;
             }
+            kronik_proto::sealables::message_mut(Some(&mut t.msg), &mut |s| self.reveal_stored(s));
             let op = pb::TimerOp {
                 kind: pb::TimerOpKind::Schedule as i32,
                 timer_id: t.timer_id,
@@ -570,12 +571,13 @@ impl Runner {
                 );
             self.schedule_timer(&t.actor, t.causal_key, &op, &by, sql, personal);
         }
-        for (i, m) in self.store.db().mailbox()?.into_iter().enumerate() {
+        for (i, mut m) in self.store.db().mailbox()?.into_iter().enumerate() {
             let order = match self.setup.index.turn(&m.causal_key) {
                 Some((lsn, _)) => vec![lsn],
                 None if self.setup.rebase => continue,
                 None => vec![after, i as u64],
             };
+            kronik_proto::sealables::input_mut(Some(&mut m.input), &mut |s| self.reveal_stored(s));
             let (subject, time) = match &m.input.kind {
                 Some(pb::input::Kind::Message(x)) => (
                     x.msg
@@ -602,6 +604,15 @@ impl Runner {
             );
         }
         Ok(())
+    }
+
+    /// A value a queued timer or message carries in the store, as the
+    /// fork's guest may see it, like any recorded value: a sealed one (a
+    /// base snapshot's) opens, a tagged one becomes its pseudonym in a
+    /// `--no-pii` fork, and an erased one (a tombstone the erasure left)
+    /// reads `[erased]`, its turn's recording being unverifiable (ADR 0109).
+    fn reveal_stored(&self, s: &mut pb::Sealable) {
+        self.setup.privacy.reveal(s);
     }
 
     /// Schedules a fork timer. An isolated tree fires only the timers
