@@ -12,3 +12,11 @@ src = "."
 [build]
 build-dir = "../target/book"
 create-missing = false
+
+# Full-text search covers the guides, concepts and references. The design
+# notes and ADRs are long contributor rationale, reached from the table of
+# contents; indexing them pushed the search index past mdBook's 10 MB warning
+# (a page that opens search downloads the whole index).
+[output.html.search.chapter]
+"design" = { enable = false }
+"adr" = { enable = false }
