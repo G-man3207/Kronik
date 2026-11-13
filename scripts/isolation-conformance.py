@@ -242,7 +242,7 @@ def consumed_service(root, cfg, pid):
     actual = os.readlink(f"/proc/{pid}/ns/cgroup")
     require((actual != initial) == (version >= 257),
             f"systemd {version} did not consume the version-specific cgroup protection")
-    view = Path(f"/proc/{pid}/root/sys/fs/cgroup/cgroup.controllers").read_text().split()
+    view = (Path(f"/proc/{pid}") / "root" / "sys/fs/cgroup/cgroup.controllers").read_text().split()
     require({"cpu", "memory", "pids"} <= set(view), "consumed cgroup mount lacks required controllers")
     (root / "consumed-service.json").write_text(json.dumps({
         "systemd":version, "pid":pid, "credential_path":str(selected),

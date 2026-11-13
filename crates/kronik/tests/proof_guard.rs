@@ -252,7 +252,7 @@ fn flat_etc(passwd: &str, group: &str, subuid: &str, subgid: &str) -> tempfile::
 #[test]
 fn g3_chosen_ids_and_ranges_must_be_nobodys_in_the_flat_files() {
     let ranges = [(3_000_000, 65_536), (3_100_000, 65_536)];
-    let passwd = "root:x:0:0::/:/bin/sh\nrunner:x:1001:1001::/home/runner:/bin/bash\n";
+    let passwd = "root:x:0:0::/:/bin/sh\nrunner:x:1001:1001::/nonexistent:/bin/bash\n";
     let group = "root:x:0:\nrunner:x:1001:\n";
     let subids = "runner:100000:65536\n";
     let fine = flat_etc(passwd, group, subids, subids);
