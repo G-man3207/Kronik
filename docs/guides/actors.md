@@ -59,7 +59,8 @@ export default actor({
 
 `actor()` takes the manifest (`kind`, `schemaVersion`, `routes`,
 `capabilities`) and the handlers `http(req, ctx)`, `message(msg, ctx)`,
-`timer(timer, ctx)` and `migrate(from, ctx)`. `ctx` has the same parts as the
+`timer(timer, ctx)` and `migrate(from, ctx)`, and `connections` for
+WebSocket and SSE ([Connections](connections.md)). `ctx` has the same parts as the
 Rust SDK's `Ctx`: `state`, `sql`, `http`, `crypto`, `secrets`, `timers`,
 `random`, `log`, and `send`, `call`, `now`, `causalId`, `self`, `secret`,
 `subject`, plus the outputs `json`, `text`, `status`, `reply` and `none`.
@@ -144,7 +145,8 @@ handler = actor(
 
 `actor()` takes the manifest (`kind`, `schema_version`, `routes`,
 `capabilities`) and the handlers `http(req, ctx)`, `message(msg, ctx)`,
-`timer(timer, ctx)` and `migrate(from_version, ctx)`. `ctx` has the parts of
+`timer(timer, ctx)` and `migrate(from_version, ctx)`, and `connections`
+([Connections](connections.md)). `ctx` has the parts of
 the other SDKs in Python's spelling: `state` (`get`, `get_text`, `get_json`,
 `set`, `set_json`, `set_for`, `delete`, `keys`), `sql`, `http.fetch`,
 `crypto.hmac_sha256` and `sign_ed25519`, `secrets.reveal`, `timers`,
@@ -196,7 +198,8 @@ func main() {}
 ```
 
 `kronik.Actor` has the manifest (`Kind`, `SchemaVersion`, `Routes`,
-`Capabilities`) and the handlers `HTTP`, `Message`, `Timer` and `Migrate`.
+`Capabilities`) and the handlers `HTTP`, `Message`, `Timer` and `Migrate`,
+and `Connections` ([Connections](connections.md)).
 `*kronik.Ctx` has `State`, `SQL`, `HTTP.Fetch`, `Crypto`, `Secrets`,
 `Timers`, `Random`, `Log`, and `Send`, `Call`, `Now`, `CausalID`, `Self`,
 `Secret`, `Subject`, `CurrentSubject`, plus the outputs `JSON`, `Text`,
@@ -340,6 +343,7 @@ of the Rust ones, with the same routes and JSON.
 | `counter-rs` | `counter-ts` | `counter-py` | `counter-go` | The brief's counter |
 | `notes-rs` | `notes-ts` | `notes-py` | `notes-go` | Notes in SQL state, paged, with a two-step migration |
 | | `todo-ts` | | | To-do lists with a timer that removes done items a day later |
+| | `chat-ts` | | | Chat rooms over WebSocket, followers over SSE, a bot that streams with `sendNow`; `src/step2.ts` changes the message format ([Connections](connections.md)) |
 | `webhook-relay-rs` | `webhook-relay-ts` | `webhook-relay-py` | `webhook-relay-go` | Signed webhook forwarding with retries by timer |
 | | `billing-ts` | | | Invoices with VAT, a `call` to a ledger with a compensation, charges through `payments.internal`; `src/eu-vat.ts` is the change to propose |
 

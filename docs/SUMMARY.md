@@ -24,6 +24,7 @@
 - [Operating Kronik](guides/operations.md)
 - [Privacy mode](guides/privacy.md)
 - [Writing actors](guides/actors.md)
+- [WebSocket and SSE connections](guides/connections.md)
 - [Agent guide](guides/agent.md)
 - [GitHub Action](guides/github-action.md)
 - [Security model](guides/security.md)

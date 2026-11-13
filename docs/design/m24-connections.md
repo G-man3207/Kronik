@@ -1702,9 +1702,18 @@ languages (ADR 0113):
   bindings are regenerated with the pinned wit-bindgen-go.
 
 The SDKs' own WIT copies (`sdk/python/wit`, `sdk/go/wit/deps`) are
-regenerated from `wit/kronik-actor.wit`. An actor without `connections`
-handlers gets defaults that refuse opens with 404 and reject frames and
-closes, as the other unhandled inputs are rejected.
+regenerated from `wit/kronik-actor.wit`.
+
+An actor without `connections` handlers refuses opens with 404 and rejects
+frames, which become dead letters, as the other unhandled inputs are. A
+close without a handler does nothing. It carries no data the actor must act
+on, and the connection closes whatever its turn does (§4.8). A rejected
+close would also make a dead letter of every connection of an actor that
+implements only `open`, such as an SSE feed.
+
+`kronik build` takes the world from the SDK's own WIT: `actor-connections`
+when it defines that world, else `actor`. A project that an older `kronik
+init` vendored an SDK into therefore keeps building with the new binary.
 
 **Test kits.** Each SDK's test kit gains `openConnection(actor,
 request)`, which returns `{connection, accepted, response}`, plus
