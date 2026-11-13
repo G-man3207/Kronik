@@ -28,7 +28,8 @@ const COUNTER: &str = concat!(
 /// The log's record limit in these tests: 512 KiB instead of 128 MiB.
 const LIMIT: u32 = 512 << 10;
 
-/// A test server: `/big/<n>` answers `n` bytes, anything else `ok`.
+/// A test server: `/big/<n>` answers `n` bytes, `/hang` never answers (for
+/// a minute), anything else `ok`.
 struct Server {
     addr: String,
     seen: Arc<Mutex<Vec<String>>>,
@@ -88,6 +89,10 @@ fn serve(stream: TcpStream, seen: Arc<Mutex<Vec<String>>>) {
             return;
         }
         seen.lock().unwrap().push(path.clone());
+        if path == "/hang" {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            return;
+        }
         let reply = match path.strip_prefix("/big/") {
             Some(n) => "b".repeat(n.parse().unwrap_or(0)),
             None => "ok".to_owned(),
@@ -108,6 +113,11 @@ struct Proc {
 }
 
 fn start(dir: &Path) -> Proc {
+    start_limit(dir, LIMIT)
+}
+
+/// [`start`] with the log's record limit `limit`.
+fn start_limit(dir: &Path, limit: u32) -> Proc {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -120,7 +130,7 @@ fn start(dir: &Path) -> Proc {
             dir,
             NodeConfig {
                 concurrency: 4,
-                test_max_record_bytes: Some(LIMIT),
+                test_max_record_bytes: Some(limit),
                 ..NodeConfig::default()
             },
         )
@@ -359,4 +369,111 @@ fn a_response_over_what_is_left_is_too_large_and_the_record_fits() {
     );
     drop(p);
     assert_every_record_fits(dir.path());
+}
+
+/// A turn begun by an earlier release, before this budget existed, can have
+/// an input that does not fit in a turn's record under it (review of the
+/// integration branch, item 6). Its re-run refused it with
+/// PAYLOAD_TOO_LARGE at every start and never closed it, so it ran again at
+/// each start and kept its segment from retention for ever. Now the re-run
+/// closes it with a failed record under the TurnBegin's own execution id:
+/// the turn is no longer open, the record fits the log, and a second start
+/// has nothing to run.
+///
+/// The earlier release is played by a larger record limit: the turn begins
+/// under it and the node stops while its fetch hangs; the next start has a
+/// limit whose turn budget the input does not fit, while the log still
+/// takes the closing record.
+#[test]
+fn an_open_turn_whose_input_no_longer_fits_is_closed_not_rerun_for_ever() {
+    let server = Server::start();
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy();
+    p.grant("http:127.0.0.1");
+    let spec = format!("POST {}\n\n{}", server.url("/hang"), "a".repeat(200 << 10));
+    let node = p.node.clone();
+    let owner = p.owner();
+    p.rt.spawn(async move {
+        let _ = node
+            .send(
+                ActorRef::parse("counter/h").unwrap(),
+                msg("fetch", spec.as_bytes()),
+                audit(),
+                false,
+                owner,
+            )
+            .await;
+    });
+    for _ in 0..600 {
+        if server.seen().iter().any(|path| path == "/hang") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        server.seen().iter().any(|path| path == "/hang"),
+        "{:?}",
+        server.seen()
+    );
+    // A crash: the TurnBegin is durable, the turn's record is never written.
+    // The fetch's blocking thread is left to the server's timeout.
+    let Proc { rt, node } = p;
+    drop(node);
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    let begin = bodies(dir.path())
+        .into_iter()
+        .find_map(|(_, record, _)| match record {
+            Record::TurnBegin(begin) => Some(begin),
+            _ => None,
+        })
+        .expect("the turn began");
+    let base = {
+        let mut input = begin.input.clone().unwrap();
+        let input_cost = kronik_sched::record_budget::input_cost(&mut input);
+        kronik_sched::record_budget::base_cost(
+            begin.actor.as_ref().unwrap(),
+            &begin.code_hash,
+            begin.causal_key.as_ref().unwrap(),
+            begin.logical_time_ms,
+            &begin.random_seed,
+            input_cost,
+            begin.config_epoch,
+        )
+    };
+    // A turn's budget is the log's limit less 4 KiB: this limit holds the
+    // closing record, and its budget is less than the input needs.
+    let limit = u32::try_from(base + 2048).unwrap();
+    assert!(base > kronik_sched::record_budget::turn_limit(limit as usize));
+
+    let p = start_limit(dir.path(), limit);
+    let mut closed = None;
+    for _ in 0..600 {
+        closed = bodies(dir.path())
+            .into_iter()
+            .find_map(|(_, record, _)| match record {
+                Record::TurnRecord(t) if t.execution_id == begin.execution_id => Some(t),
+                _ => None,
+            });
+        if closed.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let closed = closed.expect("the open turn was never closed");
+    let len = Record::TurnRecord(closed.clone()).encoded_len();
+    assert!(len <= limit as usize, "the closing record is {len} bytes");
+    assert_eq!(closed.input, begin.input);
+    let outcome = closed.outcome.unwrap();
+    assert_eq!(outcome.kind, pb::OutcomeKind::Failed as i32, "{outcome:?}");
+    assert_eq!(outcome.error_code, "TURN_TOO_LARGE", "{outcome:?}");
+    assert!(p.node.store().db().open_turns().unwrap().is_empty());
+    // The fetch was not sent again, and a second start has nothing to run.
+    drop(p);
+    let p = start_limit(dir.path(), limit);
+    assert!(p.node.store().db().open_turns().unwrap().is_empty());
+    assert_eq!(
+        server.seen().iter().filter(|path| *path == "/hang").count(),
+        1
+    );
 }

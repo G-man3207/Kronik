@@ -1826,16 +1826,43 @@ impl Node {
             epoch,
         );
         if base > record_limit {
-            // Not even a failed record could hold this input. Nothing of the
-            // turn was written; a root input is refused like a body over
-            // the limit.
-            return Err(ApiError::new(
-                ErrorCode::PayloadTooLarge,
-                format!(
-                    "the input of {actor} needs {base} bytes of its turn's record, which holds \
-                     at most {record_limit}; the turn did not run"
-                ),
-            ));
+            // Not even a failed record could hold this input within the
+            // budget. A new input: nothing of the turn was written, and it is
+            // refused like a body over the limit.
+            let Some(begin) = recovery_begin else {
+                return Err(ApiError::new(
+                    ErrorCode::PayloadTooLarge,
+                    format!(
+                        "the input of {actor} needs {base} bytes of its turn's record, which \
+                         holds at most {record_limit}; the turn did not run"
+                    ),
+                ));
+            };
+            // An open turn whose TurnBegin an earlier release wrote, before
+            // this budget existed: refusing it would leave it open, run it
+            // again at every start and keep its segment from retention for
+            // ever. Close it as failed under its own execution id.
+            tracing::warn!(
+                actor = %actor,
+                execution_id = %begin.execution_id,
+                needed = base,
+                limit = record_limit,
+                "the input of an open turn does not fit in a turn's record under this release's \
+                 budget: the turn is closed as failed without running again"
+            );
+            return self
+                .close_open_turn(
+                    begin,
+                    recorded.unwrap_or_default(),
+                    ErrorCode::TurnTooLarge,
+                    format!(
+                        "the turn's input needs {base} bytes of its record, which holds at \
+                         most {record_limit}: the turn, begun by an earlier release, did not \
+                         run again"
+                    ),
+                    false,
+                )
+                .await;
         }
         let fx = TurnFx::new(
             me,
@@ -2052,11 +2079,10 @@ impl Node {
         } else {
             None
         };
+        // A turn that does not commit after an effect whose outcome is unknown
+        // ends with EFFECT_OUTCOME_UNKNOWN, also when its record is too large:
+        // `fit` and `fail` decide it on the final record, as a replay does.
         let committed = out.committed();
-        if !committed && fxs.outcome_unknown && !output_too_large {
-            out.outcome.kind = pb::OutcomeKind::EffectOutcomeUnknown as i32;
-            out.outcome.error_code = ErrorCode::EffectOutcomeUnknown.as_str().into();
-        }
         let mut record = pb::TurnRecord {
             execution_id,
             actor: Some(actor.to_pb()),
@@ -2099,12 +2125,20 @@ impl Node {
         } else {
             crate::record_budget::fit(&mut record, &fxs.compensations, record_limit, input_cost)
         };
-        if fitted != crate::record_budget::Fit::Fits {
-            tracing::warn!(
+        match fitted {
+            crate::record_budget::Fit::Fits => {}
+            crate::record_budget::Fit::Over => tracing::error!(
+                actor = %actor,
+                execution_id = %record.execution_id,
+                "the turn's failed record is over the turn budget even without its effects \
+                 (an earlier release recorded its input or compensations past it); appending \
+                 it anyway"
+            ),
+            _ => tracing::warn!(
                 actor = %actor,
                 stripped = fitted == crate::record_budget::Fit::Stripped,
                 "the turn's record did not fit in one log record: it fails with TURN_TOO_LARGE"
-            );
+            ),
         }
         let outcome = record.outcome.clone().unwrap_or_default();
         let committed = outcome.kind == pb::OutcomeKind::Committed as i32;

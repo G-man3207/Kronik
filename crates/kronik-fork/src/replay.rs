@@ -1199,19 +1199,10 @@ impl Runner {
             || state.erased()
             || (sql_unverified && used_sql)
             || gs.unverified_callee;
+        // As in production: a turn that does not commit after an effect
+        // whose outcome is unknown ends with EFFECT_OUTCOME_UNKNOWN, decided by
+        // `fit` and `fail` below on the final record.
         let committed = out.committed();
-        // As in production: a turn that did not commit after an effect whose
-        // outcome is unknown fails with EFFECT_OUTCOME_UNKNOWN.
-        if !committed
-            && !output_too_large
-            && gs
-                .records
-                .iter()
-                .any(|e| e.status == pb::EffectStatus::OutcomeUnknown as i32)
-        {
-            out.outcome.kind = pb::OutcomeKind::EffectOutcomeUnknown as i32;
-            out.outcome.error_code = "EFFECT_OUTCOME_UNKNOWN".into();
-        }
         let compensations = gs.compensations;
         let mut record = pb::TurnRecord {
             execution_id: String::new(),

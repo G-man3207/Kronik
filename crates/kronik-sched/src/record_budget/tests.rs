@@ -285,6 +285,116 @@ fn effects_an_earlier_release_recorded_past_the_budget_are_left_out_last() {
     assert_eq!(record.outcome.unwrap().error_code, "TURN_TOO_LARGE");
 }
 
+/// `Fit::Stripped` promises a record that fits: when leaving out the
+/// payloads of what an earlier release recorded is not enough, the effects
+/// themselves go too (their results stay in the log), and when even that is
+/// over the limit the answer says so instead of claiming it fits.
+#[test]
+fn a_stripped_record_fits_or_says_it_does_not() {
+    // Many effects whose bodies are small: the payloads are not the bulk.
+    let mut record = turn(0, 0);
+    record.effects = (0..2_000)
+        .map(|o| pb::EffectRecord {
+            target: "t".repeat(200),
+            ..effect(o, 1)
+        })
+        .collect();
+    let input = ic(&mut record);
+    let limit = 60_000;
+    assert_eq!(fail(&mut record, &[], limit, input), Fit::Stripped);
+    assert!(turn_cost(&mut record, input) <= limit);
+    assert!(record.effects.is_empty());
+    let message = record.outcome.as_ref().unwrap().message.clone();
+    assert!(
+        message.contains("its 2000 effects are only in its effect results"),
+        "{message}"
+    );
+
+    // fit_closing applies the same ladder to a record that closes a turn.
+    let mut closing = turn(0, 0);
+    closing.writes.clear();
+    closing.messages.clear();
+    closing.timers.clear();
+    closing.effects = (0..2_000)
+        .map(|o| pb::EffectRecord {
+            target: "t".repeat(200),
+            ..effect(o, 1)
+        })
+        .collect();
+    let input = ic(&mut closing);
+    assert_eq!(fit_closing(&mut closing, limit, input), Fit::Stripped);
+    assert!(turn_cost(&mut closing, input) <= limit);
+
+    // An input over the limit cannot be left out: Over, not Stripped.
+    let mut over = turn(0, 0);
+    let input = ic(&mut over) + limit;
+    assert_eq!(fail(&mut over, &[], limit, input), Fit::Over);
+    let mut over = turn(0, 0);
+    assert_eq!(fit_closing(&mut over, limit, input), Fit::Over);
+}
+
+/// A turn that fails after an effect whose outcome is unknown ends with
+/// EFFECT_OUTCOME_UNKNOWN also when its record was too large: the effect's
+/// record stays, and so does the code a client acts on. A committed turn
+/// keeps its outcome, and a failed turn without such an effect is
+/// TURN_TOO_LARGE as before.
+#[test]
+fn an_unknown_outcome_survives_a_record_that_is_too_large() {
+    let unknown = |mut record: pb::TurnRecord| {
+        record.effects[1].status = pb::EffectStatus::OutcomeUnknown as i32;
+        record.effects[1].response = None;
+        record
+    };
+    let mut big = unknown(turn(100, 1_000));
+    big.outcome = Some(pb::Outcome {
+        kind: pb::OutcomeKind::Failed as i32,
+        error_code: "TURN_FAILED".into(),
+        ..Default::default()
+    });
+    let input = ic(&mut big);
+    let mut small = turn(2, 10);
+    let limit = turn_cost(&mut small, input);
+    assert_eq!(fit(&mut big, &[], limit, input), Fit::Failed);
+    let outcome = big.outcome.clone().unwrap();
+    assert_eq!(outcome.kind, pb::OutcomeKind::EffectOutcomeUnknown as i32);
+    assert_eq!(outcome.error_code, "EFFECT_OUTCOME_UNKNOWN");
+    assert!(
+        outcome.message.contains("does not fit in one log record"),
+        "{outcome:?}"
+    );
+    assert!(
+        big.effects
+            .iter()
+            .any(|e| e.status == pb::EffectStatus::OutcomeUnknown as i32)
+    );
+    assert!(turn_cost(&mut big, input) <= limit);
+
+    // `fail` (an output too large) decides the same.
+    let mut output = unknown(turn(2, 10));
+    assert_eq!(fail(&mut output, &[], limit * 4, input), Fit::Failed);
+    assert_eq!(output.outcome.unwrap().error_code, "EFFECT_OUTCOME_UNKNOWN");
+
+    // A record that fits and did not commit is marked as well; one that
+    // committed is not.
+    let mut failed = unknown(turn(2, 10));
+    failed.outcome = Some(pb::Outcome {
+        kind: pb::OutcomeKind::Trap as i32,
+        error_code: "TURN_FAILED".into(),
+        ..Default::default()
+    });
+    assert_eq!(fit(&mut failed, &[], limit * 4, input), Fit::Fits);
+    assert_eq!(failed.outcome.unwrap().error_code, "EFFECT_OUTCOME_UNKNOWN");
+    let mut committed = unknown(turn(2, 10));
+    let before = committed.outcome.clone();
+    assert_eq!(fit(&mut committed, &[], limit * 4, input), Fit::Fits);
+    assert_eq!(committed.outcome, before);
+
+    // Without such an effect, TURN_TOO_LARGE as before.
+    let mut plain = turn(100, 1_000);
+    assert_eq!(fit(&mut plain, &[], limit, input), Fit::Failed);
+    assert_eq!(plain.outcome.unwrap().error_code, "TURN_TOO_LARGE");
+}
+
 #[test]
 fn the_budget_refuses_what_does_not_fit_and_charges_what_happened() {
     let mut budget = Budget::new(1_000, 400);

@@ -103,10 +103,20 @@ its plaintext form.
   becomes a dead letter. The gate kept the effects within the budget, which
   starts with 512 bytes taken for the outcome of such a record, so that
   failed record always fits and closes any `TurnBegin`; an HTTP client gets
-  `TURN_FAILED`, as for `FUEL_EXHAUSTED`.
+  `TURN_FAILED`, as for `FUEL_EXHAUSTED`. A turn that does not commit after
+  an effect whose outcome is unknown (an `unsafe` effect a re-run did not
+  perform again) ends with `EFFECT_OUTCOME_UNKNOWN` instead, also when its
+  record was too large: the outcome's message says why it failed, the
+  effect's record stays, and the code tells a client that the effect may
+  have happened. Production and its replays decide this on the final
+  record (`record_budget::mark_unknown_outcome`).
 - An input whose record could hold nothing else is refused before its turn
   runs (`PAYLOAD_TOO_LARGE`). With the default limits (1 MiB messages and
-  bodies) this does not happen.
+  bodies) this does not happen. The re-run of an open turn whose input an
+  earlier release accepted past this budget is not refused, which would
+  leave it open and run it again at every start: it is closed with a failed
+  record (`TURN_TOO_LARGE`) under the `TurnBegin`'s own execution id,
+  without running the guest again.
 - A fork's replay charges the same budget at the same points, so it makes
   production's decisions and an identity replay stays empty.
 - One turn thus writes at most about twice the record limit to the log: its
@@ -115,8 +125,12 @@ its plaintext form.
 - Effects re-run from an earlier release's `EffectResult` records are
   charged but never refused (they happened). Only they can make even the
   failed record too large: then its effects keep their status and errors
-  without their requests and responses, which stay in the log's
-  `EffectResult` records.
+  without their requests and responses, and if that is still too large the
+  record leaves the effects out; the log's `EffectResult` records keep them
+  and the outcome's message says so. Each step is checked. A record that is
+  still over the budget (an input or compensations an earlier release
+  recorded past it) is appended as it is, with an error in the log: the log
+  takes 4 KiB more than the budget.
 
 ### Record kinds (envelope `kind` byte)
 

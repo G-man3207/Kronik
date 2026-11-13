@@ -732,8 +732,6 @@ pub(crate) struct FxState {
     pub last_result_lsn: u64,
     /// Compensations of successful calls, delivered if the turn fails.
     pub compensations: Vec<pb::OutboundMessage>,
-    /// A guest received `outcome-unknown`.
-    pub outcome_unknown: bool,
     /// Revealed or used secret values, scrubbed from guest logs.
     pub secrets: Vec<(String, Arc<Zeroizing<Vec<u8>>>)>,
     /// Identity-only metadata of exactly the same acquired values, in order.
@@ -1521,7 +1519,6 @@ impl TurnFx {
             rec.status = pb::EffectStatus::OutcomeUnknown as i32;
             rec.error = "outcome unknown: the daemon stopped before the result was recorded".into();
             self.record(rec).await?;
-            lock(&self.state).outcome_unknown = true;
             return Ok(FetchOutcome::OutcomeUnknown);
         }
         self.begin().await?;
