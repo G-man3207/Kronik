@@ -2493,12 +2493,20 @@ fn apply_turn(
 
 /// A turn record's effect on the `connections` table (M24 §6.5), in this
 /// order: an accepted open inserts the row; every OK `connection.send-now`
-/// advances its target's `next_seq`, also in failed turns; a committed
-/// record's SEND targets advance it and its CLOSE sets `closing_lsn`; a
-/// frame input (not a resend) counts in `frames_in`; a close input closes
-/// the row whatever its turn's outcome. Operations on ids without a row are
-/// ignored. A failed frame or close turn is a dead letter, and a resend
-/// marks the dead letter it resends.
+/// advances its target's `next_seq` by one, also in failed turns; a
+/// committed record's SEND targets advance it and its CLOSE sets
+/// `closing_lsn`; a frame input (not a resend) counts in `frames_in`; a
+/// close input closes the row whatever its turn's outcome. Every update
+/// names the turn's actor as the owner: a record cannot move another
+/// actor's row (ADR 0114), and an id without such a row is ignored. A
+/// failed frame or close turn is a dead letter, and a resend marks the dead
+/// letter it resends.
+///
+/// A send-now advances by one, never to its recorded seq: its request may
+/// be sealed, and production applies sealed records while a fork applies
+/// revealed ones, so both must take the same path. The host gives a
+/// turn's OK send-now frames to one connection consecutive seqs from
+/// `next_seq`, so the two agree.
 #[allow(clippy::too_many_arguments)]
 fn apply_connections(
     tx: &Connection,
@@ -2533,43 +2541,39 @@ fn apply_connections(
         .execute(params![c.connection, kind, key, c.protocol, c.route, subject, lsn])?;
     }
     // 2. Frames sent now, also by a turn that then failed.
-    let mut advance =
-        tx.prepare_cached("UPDATE connections SET next_seq = max(next_seq, ?2) WHERE id = ?1")?;
     for e in &t.effects {
         if e.kind != "connection.send-now" || e.status != pb::EffectStatus::Ok as i32 {
             continue;
         }
-        // The id is the plain target; the seq is in the request, which may
-        // be sealed: then the target's next_seq comes from the next one.
         let Some(id) = e.target.strip_prefix("connection:") else {
             continue;
         };
-        match pb::ConnectionSendRequest::decode(sealable_plain(e.request.as_ref()).as_slice()) {
-            Ok(r) if r.connection == id => {
-                advance.execute(params![id, i(r.seq.saturating_add(1))])?;
-            }
-            _ => {
-                tx.prepare_cached("UPDATE connections SET next_seq = next_seq + 1 WHERE id = ?1")?
-                    .execute([id])?;
-            }
-        }
+        tx.prepare_cached(
+            "UPDATE connections SET next_seq = next_seq + 1 \
+             WHERE id = ?1 AND kind = ?2 AND key = ?3",
+        )?
+        .execute(params![id, kind, key])?;
     }
     // 3. The buffered operations of a committed turn.
     if committed {
         for op in &t.connection_ops {
             match &op.op {
                 Some(pb::connection_op::Op::Send(_)) => {
+                    let mut advance = tx.prepare_cached(
+                        "UPDATE connections SET next_seq = max(next_seq, ?4) \
+                         WHERE id = ?1 AND kind = ?2 AND key = ?3",
+                    )?;
                     for (id, seq) in op.connections.iter().zip(&op.seqs) {
-                        advance.execute(params![id, i(seq.saturating_add(1))])?;
+                        advance.execute(params![id, kind, key, i(seq.saturating_add(1))])?;
                     }
                 }
                 Some(pb::connection_op::Op::Close(_)) => {
                     for id in &op.connections {
                         tx.prepare_cached(
-                            "UPDATE connections SET closing_lsn = ?2 \
-                             WHERE id = ?1 AND closing_lsn IS NULL",
+                            "UPDATE connections SET closing_lsn = ?4 \
+                             WHERE id = ?1 AND kind = ?2 AND key = ?3 AND closing_lsn IS NULL",
                         )?
-                        .execute(params![id, lsn])?;
+                        .execute(params![id, kind, key, lsn])?;
                     }
                 }
                 None => return Err(corrupt("a connection operation without op")),
@@ -2584,19 +2588,23 @@ fn apply_connections(
         Some(Event::Frame(_)) => {
             if c.resend_of.is_empty() {
                 tx.prepare_cached(
-                    "UPDATE connections SET frames_in = frames_in + 1 WHERE id = ?1",
+                    "UPDATE connections SET frames_in = frames_in + 1 \
+                     WHERE id = ?1 AND kind = ?2 AND key = ?3",
                 )?
-                .execute([&c.connection])?;
+                .execute(params![c.connection, kind, key])?;
             }
         }
         // 5. The close, whatever the turn's outcome.
         Some(Event::Close(close)) => {
             tx.prepare_cached(
-                "UPDATE connections SET closed_lsn = ?2, cause = ?3, code = ?4, \
-                 frames_written = ?5, restart_after_lsn = ?6 WHERE id = ?1 AND closed_lsn IS NULL",
+                "UPDATE connections SET closed_lsn = ?4, cause = ?5, code = ?6, \
+                 frames_written = ?7, restart_after_lsn = ?8 \
+                 WHERE id = ?1 AND kind = ?2 AND key = ?3 AND closed_lsn IS NULL",
             )?
             .execute(params![
                 c.connection,
+                kind,
+                key,
                 lsn,
                 close.cause,
                 close.code,

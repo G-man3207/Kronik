@@ -384,3 +384,32 @@ fn compaction_keeps_closed_connections() {
     let row = store.db().connection(C1).unwrap().unwrap();
     assert_eq!(row.closed_lsn, Some(8));
 }
+
+/// Every row update names the turn's actor as the owner (ADR 0114): a
+/// record of another actor that names the connection moves nothing.
+#[test]
+fn another_actors_record_does_not_move_a_row() {
+    let store = Store::memory().unwrap();
+    let records = records();
+    store.apply(&records[..1]).unwrap();
+    let before = store.db().connection(C1).unwrap().unwrap();
+    let mut foreign = turn(frame(C1, 9, ""), pb::OutcomeKind::Committed);
+    foreign.actor = Some(pb::ActorRef {
+        kind: "room".into(),
+        key: "other".into(),
+    });
+    foreign.effects = vec![send_now(0, C1, 1, pb::EffectStatus::Ok)];
+    foreign.connection_ops = vec![send(&[(C1, 1)], text("x")), close_op(C1)];
+    let mut foreign_close = turn(
+        close(C1, pb::CloseCause::Client, Some(0), ""),
+        pb::OutcomeKind::Committed,
+    );
+    foreign_close.actor = foreign.actor.clone();
+    store
+        .apply(&[
+            committed(2, Record::TurnRecord(foreign)),
+            committed(3, Record::TurnRecord(foreign_close)),
+        ])
+        .unwrap();
+    assert_eq!(store.db().connection(C1).unwrap().unwrap(), before);
+}

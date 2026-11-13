@@ -162,7 +162,8 @@ message ConnectionClose {
   // The WebSocket close code received (client) or sent (actor, host).
   uint32 code = 2;
   // The client's or the actor's reason, tagged with the connection's
-  // subject; unset for host causes.
+  // subject; empty for host causes, but tagged too, so the close turn's
+  // default subject is the connection's.
   Sealable reason = 3;
   // Outgoing frames written to the socket: seq < frames_written were
   // written, the rest dropped. Unknown (false) after a restart.
