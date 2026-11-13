@@ -1709,8 +1709,14 @@ impl Api {
         out
     }
 
-    fn limits_view(kind: &str, l: &kronik_effects::KindLimits) -> LimitsView {
+    fn limits_view(
+        kind: &str,
+        l: &kronik_effects::KindLimits,
+        rules: &kronik_effects::http::FingerprintRules,
+    ) -> LimitsView {
         LimitsView {
+            fingerprint_exclude_headers: rules.headers().to_vec(),
+            fingerprint_exclude_query: rules.query().to_vec(),
             kind: kind.to_owned(),
             fuel: l.fuel,
             memory_bytes: l.memory_bytes,
@@ -1738,8 +1744,16 @@ impl Api {
             effect_timeout_ms: r.effect_timeout_ms,
             effect_response_bytes: r.effect_response_bytes,
             audit: None,
+            fingerprint_exclude_headers: r
+                .fingerprint_exclude_headers
+                .clone()
+                .map(|names| pb::NameList { names }),
+            fingerprint_exclude_query: r
+                .fingerprint_exclude_query
+                .clone()
+                .map(|names| pb::NameList { names }),
         };
-        let (epoch, lsn, effective) = self
+        let (epoch, lsn, effective, rules) = self
             .node
             .set_limits(
                 limits,
@@ -1748,7 +1762,7 @@ impl Api {
                 req.authority.clone(),
             )
             .await?;
-        let mut view = Self::limits_view(&r.kind, &effective);
+        let mut view = Self::limits_view(&r.kind, &effective, &rules);
         view.epoch = Some(epoch);
         view.lsn = Some(lsn);
         ok(&LimitsResponse {
@@ -1774,7 +1788,7 @@ impl Api {
         ok(&LimitsListResponse {
             limits: kinds
                 .iter()
-                .map(|k| Self::limits_view(k, &config.limits(k)))
+                .map(|k| Self::limits_view(k, &config.limits(k), &config.fingerprint_rules(k)))
                 .collect(),
         })
     }

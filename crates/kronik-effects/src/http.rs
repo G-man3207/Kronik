@@ -14,6 +14,168 @@ pub const FINGERPRINT_EXCLUDED: &[&str] = &[
     "x-request-id",
 ];
 
+/// Whether a request's policy version uses the prepared component encoding:
+/// 2, and 3, which adds the actor type's fingerprint exclusions (ADR 0134).
+pub fn prepared_version(version: u32) -> bool {
+    matches!(version, 2 | 3)
+}
+
+/// An actor type's fingerprint rules (ADR 0134): header and query-parameter
+/// names left out of its HTTP fingerprints besides [`FINGERPRINT_EXCLUDED`],
+/// which always stay out. Canonical: header names lowercase and none of the
+/// defaults, both lists sorted and without duplicates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FingerprintRules {
+    headers: Vec<String>,
+    query: Vec<String>,
+}
+
+impl FingerprintRules {
+    /// The most names in one list.
+    pub const MAX_NAMES: usize = 64;
+    /// The longest name.
+    pub const MAX_NAME_BYTES: usize = 128;
+
+    /// The rules for names an operator gave, checked and made canonical.
+    pub fn new(headers: &[String], query: &[String]) -> Result<FingerprintRules, String> {
+        let mut rules = FingerprintRules::default();
+        rules.set_headers(headers)?;
+        rules.set_query(query)?;
+        Ok(rules)
+    }
+
+    pub fn headers(&self) -> &[String] {
+        &self.headers
+    }
+
+    pub fn query(&self) -> &[String] {
+        &self.query
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.headers.is_empty() && self.query.is_empty()
+    }
+
+    /// Replaces the header list: a `Limits` record sets each list whole.
+    pub fn set_headers(&mut self, names: &[String]) -> Result<(), String> {
+        self.headers = canonical(names, "header", |name| {
+            if name.is_empty() || !name.bytes().all(token_byte) {
+                return Err(format!(
+                    "{name:?} is not an HTTP header name (letters, digits and !#$%&'*+-.^_`|~)"
+                ));
+            }
+            let lower = name.to_ascii_lowercase();
+            Ok((!FINGERPRINT_EXCLUDED.contains(&lower.as_str())).then_some(lower))
+        })?;
+        Ok(())
+    }
+
+    /// Replaces the query-parameter list. A name is compared with the
+    /// parameter's name as the URL writes it, case and percent-encoding
+    /// included.
+    pub fn set_query(&mut self, names: &[String]) -> Result<(), String> {
+        self.query = canonical(names, "query parameter", |name| {
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_graphic() && !matches!(b, b'&' | b'=' | b'#'))
+            {
+                return Err(format!(
+                    "{name:?} is not a query parameter name (visible ASCII without &, = or #)"
+                ));
+            }
+            Ok(Some(name.to_owned()))
+        })?;
+        Ok(())
+    }
+
+    /// The rules a version 3 request was recorded with: there are some, and
+    /// they are canonical, so that one set of rules has one encoding.
+    fn recorded(req: &pb::HttpEffectRequest) -> Result<FingerprintRules, String> {
+        let rules = FingerprintRules::new(
+            &req.fingerprint_excluded_headers,
+            &req.fingerprint_excluded_query,
+        )
+        .ok()
+        .filter(|rules| {
+            !rules.is_empty()
+                && rules.headers == req.fingerprint_excluded_headers
+                && rules.query == req.fingerprint_excluded_query
+        });
+        rules.ok_or_else(|| "invalid version 3 HTTP fingerprint exclusions".into())
+    }
+
+    /// Records these rules in a prepared request: version 3 with the lists
+    /// when there are rules, version 2 without them otherwise.
+    pub fn apply(&self, req: &mut pb::HttpEffectRequest) -> Result<(), String> {
+        if !prepared_version(req.fingerprint_version) {
+            return Err("fingerprint rules apply to a prepared HTTP request".into());
+        }
+        req.fingerprint_version = if self.is_empty() { 2 } else { 3 };
+        req.fingerprint_excluded_headers = self.headers.clone();
+        req.fingerprint_excluded_query = self.query.clone();
+        Ok(())
+    }
+}
+
+/// RFC 9110 `tchar`.
+fn token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// `names` checked one by one (`check` answers the canonical name, or none
+/// to leave it out), bounded, sorted and without duplicates.
+fn canonical(
+    names: &[String],
+    what: &str,
+    check: impl Fn(&str) -> Result<Option<String>, String>,
+) -> Result<Vec<String>, String> {
+    if names.len() > FingerprintRules::MAX_NAMES {
+        return Err(format!(
+            "at most {} {what} names can be left out of the fingerprint",
+            FingerprintRules::MAX_NAMES
+        ));
+    }
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        if name.len() > FingerprintRules::MAX_NAME_BYTES {
+            return Err(format!(
+                "a {what} name is at most {} bytes",
+                FingerprintRules::MAX_NAME_BYTES
+            ));
+        }
+        out.extend(check(name)?);
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// `req` with the fingerprint rules `recording` was recorded under, so that
+/// their fingerprints compare (ADR 0134): a recording's fingerprint is its
+/// own rules', never the configuration's now. A legacy recording (version
+/// 0) has none.
+pub fn under_rules_of(
+    req: &pb::HttpEffectRequest,
+    recording: &pb::HttpEffectRequest,
+) -> pb::HttpEffectRequest {
+    let mut out = req.clone();
+    if prepared_version(out.fingerprint_version) {
+        out.fingerprint_version = if recording.fingerprint_version == 3 {
+            3
+        } else {
+            2
+        };
+        out.fingerprint_excluded_headers = recording.fingerprint_excluded_headers.clone();
+        out.fingerprint_excluded_query = recording.fingerprint_excluded_query.clone();
+        if out.fingerprint_version == 2 {
+            out.fingerprint_excluded_headers.clear();
+            out.fingerprint_excluded_query.clear();
+        }
+    }
+    out
+}
+
 /// The parts of an effect URL Kronik needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
@@ -85,10 +247,11 @@ fn parsed_url(url: &str) -> Result<(http::Uri, Target), String> {
     Ok((uri, target))
 }
 
-/// Read the internal v2 component encoding, not a live URI or a new redaction input.
+/// Read the internal v2 component encoding (versions 2 and 3), not a live
+/// URI or a new redaction input.
 pub fn prepared_target(req: &pb::HttpEffectRequest) -> Result<Target, String> {
-    if req.fingerprint_version != 2 {
-        return Err("prepared HTTP target requires policy version 2".into());
+    if !prepared_version(req.fingerprint_version) {
+        return Err("prepared HTTP target requires policy version 2 or 3".into());
     }
     let invalid = || "invalid prepared HTTP target".to_owned();
     let (scheme, rest) = req.url.split_once("://").ok_or_else(invalid)?;
@@ -183,7 +346,7 @@ pub fn route_pattern(path: &str) -> String {
 pub fn target_of(req: &pb::HttpEffectRequest) -> Option<(String, String, String)> {
     let t = match req.fingerprint_version {
         0 => parse_url(&req.url),
-        2 => prepared_target(req),
+        2 | 3 => prepared_target(req),
         _ => return None,
     }
     .ok()?;
@@ -201,35 +364,72 @@ pub fn fingerprint(req: &pb::HttpEffectRequest) -> Result<Vec<u8>, String> {
     if req.fingerprint_version != 0 {
         return Err("legacy HTTP fingerprint requires policy version 0".into());
     }
-    Ok(fingerprint_fields(req, &parse_url(&req.url)?, false))
+    Ok(fingerprint_fields(
+        req,
+        &parse_url(&req.url)?,
+        Policy::Legacy,
+    ))
 }
 
 /// Current policy hashes already-scrubbed typed URL components, not a reparsed
 /// marker-bearing URI. The caller retains the original request for the wire.
+/// Version 3 also leaves out the header and query-parameter names its
+/// request records, and hashes those names (ADR 0134): a recording's
+/// fingerprint follows its own rules.
 pub fn fingerprint_v2(req: &pb::HttpEffectRequest, target: &Target) -> Result<Vec<u8>, String> {
-    if req.fingerprint_version != 2 {
-        return Err("strict HTTP fingerprint requires policy version 2".into());
+    match req.fingerprint_version {
+        2 if req.fingerprint_excluded_headers.is_empty()
+            && req.fingerprint_excluded_query.is_empty() =>
+        {
+            Ok(fingerprint_fields(req, target, Policy::Strict))
+        }
+        2 => Err("a version 2 HTTP fingerprint has no exclusions".into()),
+        3 => {
+            let rules = FingerprintRules::recorded(req)?;
+            Ok(fingerprint_fields(req, target, Policy::Excluding(&rules)))
+        }
+        _ => Err("strict HTTP fingerprint requires policy version 2 or 3".into()),
     }
-    Ok(fingerprint_fields(req, target, true))
 }
 
-fn fingerprint_fields(req: &pb::HttpEffectRequest, t: &Target, strict: bool) -> Vec<u8> {
+/// What a fingerprint hashes: the legacy normalization (version 0), the
+/// strict one (version 2), or the strict one less an actor type's names
+/// (version 3).
+#[derive(Clone, Copy)]
+enum Policy<'a> {
+    Legacy,
+    Strict,
+    Excluding(&'a FingerprintRules),
+}
+
+fn fingerprint_fields(req: &pb::HttpEffectRequest, t: &Target, policy: Policy<'_>) -> Vec<u8> {
+    let (strict, rules) = match policy {
+        Policy::Legacy => (false, None),
+        Policy::Strict => (true, None),
+        Policy::Excluding(rules) => (true, Some(rules)),
+    };
     let mut h = blake3::Hasher::new();
     let mut field = |b: &[u8]| {
         h.update(&(b.len() as u64).to_le_bytes());
         h.update(b);
     };
-    field(if strict {
-        b"kronik.fingerprint.http.v2"
-    } else {
-        b"kronik.fingerprint.http.v1"
+    field(match policy {
+        Policy::Legacy => b"kronik.fingerprint.http.v1",
+        Policy::Strict => b"kronik.fingerprint.http.v2",
+        Policy::Excluding(_) => b"kronik.fingerprint.http.v3",
     });
     field(req.method.to_ascii_uppercase().as_bytes());
     field(t.scheme.as_bytes());
     field(t.host.as_bytes());
     field(&t.port.unwrap_or(0).to_le_bytes());
     field(t.path.as_bytes());
-    let mut query: Vec<&str> = t.query.split('&').filter(|p| !p.is_empty()).collect();
+    let name = |p: &str| p.split_once('=').map_or(p, |(k, _)| k).to_owned();
+    let mut query: Vec<&str> = t
+        .query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .filter(|p| rules.is_none_or(|r| !r.query.contains(&name(p))))
+        .collect();
     query.sort_by_key(|p| (p.split_once('=').map_or(*p, |(k, _)| k), *p));
     for q in query {
         field(q.as_bytes());
@@ -238,7 +438,11 @@ fn fingerprint_fields(req: &pb::HttpEffectRequest, t: &Target, strict: bool) -> 
     let mut headers: Vec<(String, Vec<u8>)> = req
         .headers
         .iter()
-        .filter(|hd| !FINGERPRINT_EXCLUDED.contains(&hd.name.to_ascii_lowercase().as_str()))
+        .filter(|hd| {
+            let lower = hd.name.to_ascii_lowercase();
+            !FINGERPRINT_EXCLUDED.contains(&lower.as_str())
+                && rules.is_none_or(|r| !r.headers.contains(&lower))
+        })
         .map(|hd| {
             let v = match &hd.value {
                 Some(pb::http_effect_header::Value::Text(t)) => t.as_bytes().to_vec(),
@@ -262,6 +466,19 @@ fn fingerprint_fields(req: &pb::HttpEffectRequest, t: &Target, strict: bool) -> 
     for (n, v) in headers {
         field(n.as_bytes());
         field(&v);
+    }
+    // The rules themselves: fingerprints under different rules never meet.
+    if let Some(rules) = rules {
+        for (what, names) in [
+            (&b"excluded headers"[..], &rules.headers),
+            (&b"excluded query"[..], &rules.query),
+        ] {
+            field(what);
+            field(&(names.len() as u64).to_le_bytes());
+            for n in names {
+                field(n.as_bytes());
+            }
+        }
     }
     h.finalize().as_bytes().to_vec()
 }
@@ -955,6 +1172,153 @@ mod tests {
             body: body.to_vec(),
             ..Default::default()
         }
+    }
+
+    /// A prepared request and its target, as the gate fingerprints them.
+    fn prepared(api_key: &str, ts: &str) -> (pb::HttpEffectRequest, Target) {
+        let query = format!("ts={ts}&a=b");
+        let mut request = req(
+            &format!("https://api.example.com/v1/charges?{query}"),
+            vec![
+                ("x-api-key", api_key),
+                ("X-Tenant", "t1"),
+                ("user-agent", "kronik"),
+            ],
+            b"{}",
+        );
+        request.fingerprint_version = 2;
+        let target = Target {
+            scheme: "https".into(),
+            host: "api.example.com".into(),
+            port: None,
+            path: "/v1/charges".into(),
+            query,
+        };
+        (request, target)
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Version 2 fingerprints are recorded in every log: their bytes never
+    /// change (ADR 0134 adds version 3 beside them). The request is decoded
+    /// from the bytes a release before it wrote, without fields 6 and 7.
+    #[test]
+    fn version_2_fingerprints_keep_their_bytes() {
+        let (request, target) = prepared("k1", "1");
+        let written = "0a04504f5354122b68747470733a2f2f6170692e6578616d706c652e636f6d2f76312f636861726765733f74733d3126613d621a0f0a09782d6170692d6b657912026b311a0e0a08582d54656e616e74120274311a140a0a757365722d6167656e7412066b726f6e696b22027b7d2802";
+        assert_eq!(hex(&prost::Message::encode_to_vec(&request)), written);
+        let bytes: Vec<u8> = (0..written.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&written[i..i + 2], 16).unwrap())
+            .collect();
+        let decoded: pb::HttpEffectRequest = prost::Message::decode(bytes.as_slice()).unwrap();
+        assert!(decoded.fingerprint_excluded_headers.is_empty());
+        assert_eq!(
+            hex(&fingerprint_v2(&decoded, &target).unwrap()),
+            "cec9e17d3cb7e67aaa3084a97864380f06d3f0cb249041bdb1e33431521d1aaf"
+        );
+    }
+
+    fn rules(headers: &[&str], query: &[&str]) -> FingerprintRules {
+        let owned = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        FingerprintRules::new(&owned(headers), &owned(query)).unwrap()
+    }
+
+    /// #39: version 3 leaves out the names its request records and hashes
+    /// them; everything else counts as in version 2.
+    #[test]
+    fn version_3_leaves_out_the_recorded_names() {
+        let under = |key: &str, ts: &str, rules: &FingerprintRules| {
+            let (mut request, target) = prepared(key, ts);
+            rules.apply(&mut request).unwrap();
+            fingerprint_v2(&request, &target).unwrap()
+        };
+        let api = rules(&["x-api-key"], &["ts"]);
+        assert_eq!(under("k1", "1", &api), under("k2", "2", &api));
+        // Pinned: the version 3 algorithm is recorded in logs too.
+        assert_eq!(
+            hex(&under("k1", "1", &api)),
+            "c73c79e113ed6c74198962f550cee01df6bdc04fab31440005ab931550ddfe92"
+        );
+        // A name the rules leave in still counts, and the rules themselves do.
+        let (mut tenant, target) = prepared("k1", "1");
+        tenant.headers[1] = pb::HttpEffectHeader {
+            name: "X-Tenant".into(),
+            value: Some(pb::http_effect_header::Value::Text("t2".into())),
+        };
+        api.apply(&mut tenant).unwrap();
+        assert_ne!(
+            fingerprint_v2(&tenant, &target).unwrap(),
+            under("k1", "1", &api)
+        );
+        assert_ne!(
+            under("k1", "1", &rules(&["x-api-key", "x-other"], &["ts"])),
+            under("k1", "1", &api)
+        );
+        // No rules is version 2, byte for byte.
+        let (plain, target) = prepared("k1", "1");
+        assert_eq!(
+            under("k1", "1", &FingerprintRules::default()),
+            fingerprint_v2(&plain, &target).unwrap()
+        );
+        // Version 2 without names or version 3 with canonical names, nothing
+        // in between.
+        let (mut odd, target) = prepared("k1", "1");
+        odd.fingerprint_excluded_headers = vec!["x-api-key".into()];
+        assert!(fingerprint_v2(&odd, &target).is_err());
+        odd.fingerprint_version = 3;
+        assert!(fingerprint_v2(&odd, &target).is_ok());
+        odd.fingerprint_excluded_headers = vec!["X-Api-Key".into()];
+        assert!(fingerprint_v2(&odd, &target).is_err());
+        odd.fingerprint_excluded_headers = vec!["x-b".into(), "x-a".into()];
+        assert!(fingerprint_v2(&odd, &target).is_err());
+        odd.fingerprint_excluded_headers.clear();
+        assert!(fingerprint_v2(&odd, &target).is_err());
+        // Version 3 is prepared like version 2.
+        assert!(prepared_target(&odd).is_ok());
+    }
+
+    #[test]
+    fn fingerprint_rules_are_checked_and_canonical() {
+        let r = rules(
+            &["X-B", "x-a", "Authorization", "x-a"],
+            &["ts", "nonce", "ts", "Big"],
+        );
+        assert_eq!(r.headers(), ["x-a", "x-b"]);
+        assert_eq!(r.query(), ["Big", "nonce", "ts"]);
+        let one = |h: &str, q: &str| FingerprintRules::new(&[h.to_owned()], &[q.to_owned()]);
+        assert!(one("bad header", "q").is_err());
+        assert!(one("x-a", "a=b").is_err());
+        assert!(one("x-a", "a&b").is_err());
+        assert!(one("", "q").is_err());
+        assert!(one(&"x".repeat(129), "q").is_err());
+        let many: Vec<String> = (0..65).map(|i| format!("x-{i}")).collect();
+        assert!(FingerprintRules::new(&many, &[]).is_err());
+        // Only defaults: no rules.
+        assert!(rules(&["cookie"], &[]).is_empty());
+    }
+
+    /// A request compares with a recording under the recording's rules.
+    #[test]
+    fn a_request_takes_the_rules_of_the_recording_it_compares_with() {
+        let (mut recording, target) = prepared("k1", "1");
+        rules(&["x-api-key"], &[]).apply(&mut recording).unwrap();
+        let (request, _) = prepared("k2", "1");
+        let under = under_rules_of(&request, &recording);
+        assert_eq!(under.fingerprint_version, 3);
+        assert_eq!(
+            fingerprint_v2(&under, &target).unwrap(),
+            fingerprint_v2(&recording, &target).unwrap()
+        );
+        // Under a version 2 recording, the request has no names.
+        let (plain, _) = prepared("k1", "1");
+        let mut with = request.clone();
+        rules(&["x-api-key"], &[]).apply(&mut with).unwrap();
+        let back = under_rules_of(&with, &plain);
+        assert_eq!(back.fingerprint_version, 2);
+        assert!(back.fingerprint_excluded_headers.is_empty());
     }
 
     #[test]

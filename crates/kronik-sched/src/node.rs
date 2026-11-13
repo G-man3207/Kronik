@@ -10,6 +10,7 @@ use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, CodeHash, Lsn, TurnId, random_id};
 use kronik_core::time::LogicalClock;
+use kronik_effects::http::FingerprintRules;
 use kronik_effects::rate::RateLimiter;
 use kronik_effects::{Capability, Config, ConfigHistory, Delivery, KindLimits, Rate};
 use kronik_log::{Committed, Log, LogConfig, LogError, LogReader};
@@ -4210,14 +4211,15 @@ impl Node {
         Ok((epoch, lsn))
     }
 
-    /// `kronik limits set`: unset fields keep their value.
+    /// `kronik limits set`: unset fields keep their value. Answers the
+    /// kind's limits and fingerprint rules in force after it.
     pub async fn set_limits(
         &self,
         mut limits: pb::Limits,
         audit: pb::Audit,
         dry_run: bool,
         authority: AuthLease,
-    ) -> Result<(u64, Lsn, KindLimits), ApiError> {
+    ) -> Result<(u64, Lsn, KindLimits, FingerprintRules), ApiError> {
         authority.check()?;
         self.check_alive()?;
         if !kronik_core::ids::valid_kind(&limits.kind) {
@@ -4225,6 +4227,19 @@ impl Node {
                 ErrorCode::BadRequest,
                 format!("{:?} is not a valid kind", limits.kind),
             ));
+        }
+        // The fingerprint lists (ADR 0134) are checked here and recorded
+        // canonical: lowercase headers, sorted, without duplicates or the
+        // default headers, which are always left out.
+        let bad = |message: String| ApiError::new(ErrorCode::BadRequest, message);
+        let mut checked = FingerprintRules::default();
+        if let Some(list) = limits.fingerprint_exclude_headers.as_mut() {
+            checked.set_headers(&list.names).map_err(bad)?;
+            list.names = checked.headers().to_vec();
+        }
+        if let Some(list) = limits.fingerprint_exclude_query.as_mut() {
+            checked.set_query(&list.names).map_err(bad)?;
+            list.names = checked.query().to_vec();
         }
         let guard = self.lock_deploy_authorized(&authority).await?;
         let epoch = self.epoch() + 1;
@@ -4234,13 +4249,14 @@ impl Node {
         let record = Record::Limits(limits.clone());
         preview.apply(&record);
         let effective = preview.limits(&limits.kind);
+        let rules = preview.fingerprint_rules(&limits.kind);
         if dry_run {
-            return Ok((epoch, 0, effective));
+            return Ok((epoch, 0, effective, rules));
         }
         let lsn = self
             .commit_config_authorized(guard, epoch, record, authority)
             .await?;
-        Ok((epoch, lsn, effective))
+        Ok((epoch, lsn, effective, rules))
     }
 
     /// Reads one record of this branch's log.

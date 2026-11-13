@@ -276,6 +276,7 @@ mod tests {
                 },
             ],
             body: b"SELECT 1".to_vec(),
+            ..Default::default()
         };
         let e = pb::EffectRecord {
             kind: "foreign.http".into(),

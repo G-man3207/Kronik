@@ -13,7 +13,7 @@ use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, TurnId};
 use kronik_effects::http::{
     CompiledScrubber, ScrubError, fingerprint as legacy_http_fingerprint, fingerprint_v2,
-    parse_request_url,
+    parse_request_url, prepared_version,
 };
 use kronik_effects::simulator::{EffectRequest, RecordedMatch, ReplayContext};
 use kronik_effects::{Config, Delivery, KindLimits};
@@ -84,7 +84,7 @@ pub fn saved_header_reference<'a>(
     header_name: &str,
     secret: &str,
 ) -> Result<Option<&'a pb::SecretRef>, GateError> {
-    if !matches!(source.fingerprint_version, 0 | 2) {
+    if !matches!(source.fingerprint_version, 0 | 2 | 3) {
         return Err(GateError::Host(
             "The recorded HTTP fingerprint version is invalid".into(),
         ));
@@ -384,7 +384,7 @@ pub fn legacy_http_disclosure(
     source: &pb::HttpEffectRequest,
     matcher: &CompiledScrubber<'_>,
 ) -> Result<pb::EffectRecord, GateError> {
-    if source.fingerprint_version == 2
+    if prepared_version(source.fingerprint_version)
         || record.status == pb::EffectStatus::HostRedactionFailure as i32
     {
         return Ok(record);
@@ -507,6 +507,7 @@ pub fn legacy_http_disclosure(
         headers,
         body: WITHHELD_EFFECT_BODY.to_vec(),
         fingerprint_version: 0,
+        ..Default::default()
     };
     let response = status.map(|status| pb::HttpEffectResponse {
         status,
@@ -1386,6 +1387,7 @@ impl TurnFx {
             headers,
             body: req.body.clone(),
             fingerprint_version: 2,
+            ..Default::default()
         };
         // Recorded and fingerprinted without the values of secrets revealed
         // so far (I8), so a fork's placeholder (`[secret:<name>]`) matches
@@ -1402,7 +1404,7 @@ impl TurnFx {
                     crate::scrub::legacy_verification_fingerprint(&mut request, source, &patterns)
                         .map_err(|error| GateError::Host(error.to_string()))?,
                 )),
-                Some(source) if source.fingerprint_version == 2 => None,
+                Some(source) if prepared_version(source.fingerprint_version) => None,
                 Some(_) => {
                     return Err(GateError::Host(
                         "The recorded HTTP fingerprint version is invalid".into(),
@@ -1469,6 +1471,13 @@ impl TurnFx {
             kronik_log::MAX_RECORD as usize,
         )
         .map_err(|error| GateError::Host(error.to_string()))?;
+        // The actor type's fingerprint rules at the turn's epoch, recorded in
+        // the request they fingerprint it under (ADR 0134).
+        self.spec
+            .config
+            .fingerprint_rules(&self.spec.actor.kind)
+            .apply(&mut recorded)
+            .map_err(GateError::Host)?;
         if recorded.encoded_len() > kronik_log::MAX_RECORD as usize {
             return Err(GateError::Host(ScrubError::OutputLimit.to_string()));
         }

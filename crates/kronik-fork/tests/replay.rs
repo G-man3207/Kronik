@@ -1354,3 +1354,79 @@ fn identity_replay_over_a_withheld_call_reply_is_empty() {
         ]
     );
 }
+
+/// ADR 0134 (#39): turns recorded before and after an actor type's
+/// fingerprint rules change replay exactly, each under the rules of its own
+/// epoch that its recording holds, and the replay sends nothing.
+#[test]
+fn identity_replay_across_a_fingerprint_rules_change_is_exact() {
+    use kronik_proto::log::v1 as pb;
+    let (addr, hits) = server();
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    p.grant("http:127.0.0.1");
+    let fork_lsn = p.settle();
+    let spec = |n: &str| format!("GET http://{addr}/ok?ts={n}&a=b\nH x-api-key key-{n}");
+    let r = p.send("counter/a", "fetch-ok", &spec("1"));
+    assert!(r.committed(), "{:?}", r.outcome);
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "counter".into(),
+            fingerprint_exclude_headers: Some(pb::NameList {
+                names: vec!["x-api-key".into()],
+            }),
+            fingerprint_exclude_query: Some(pb::NameList {
+                names: vec!["ts".into()],
+            }),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    let r = p.send("counter/b", "fetch-ok", &spec("2"));
+    assert!(r.committed(), "{:?}", r.outcome);
+    let sent = hits.load(Ordering::SeqCst);
+    assert_eq!(sent, 2);
+    for mode in [Mode::Both, Mode::Isolated] {
+        let out = replay(&p, None, fork_lsn, &opts(mode), 2);
+        let s = &out.diff.summary;
+        assert!(
+            !s.changed,
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&out.bytes)
+        );
+        assert_eq!(s.divergent_turns, 0, "{mode:?}");
+        assert_eq!(
+            (s.exact >= 2, s.approximate),
+            (true, 0),
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&out.bytes)
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), sent, "the replay sent nothing");
+    // The fork records each turn's request under its turn's rules, as
+    // production did: version 2 before the change, 3 with the names after.
+    let out = replay(&p, None, fork_lsn, &opts(Mode::Continuous), 1);
+    let turns = out.continuous.unwrap().turns();
+    let request_of = |key: &str| {
+        let turn = turns
+            .iter()
+            .find(|t| t.record.actor.as_ref().is_some_and(|a| a.key == key))
+            .unwrap();
+        let Some(pb::sealable::Value::Plain(bytes)) = turn.record.effects[0]
+            .request
+            .as_ref()
+            .and_then(|r| r.value.as_ref())
+        else {
+            panic!("a plain request");
+        };
+        <pb::HttpEffectRequest as prost::Message>::decode(bytes.as_slice()).unwrap()
+    };
+    assert_eq!(request_of("a").fingerprint_version, 2);
+    let after = request_of("b");
+    assert_eq!(after.fingerprint_version, 3);
+    assert_eq!(after.fingerprint_excluded_headers, ["x-api-key"]);
+    assert_eq!(after.fingerprint_excluded_query, ["ts"]);
+}

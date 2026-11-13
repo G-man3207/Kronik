@@ -91,8 +91,7 @@ Effect kinds (`EffectRecord.kind`): `http.fetch`, `actor.call`,
 `blake3(body)`, and the headers sorted by lowercase name, without
 `authorization`, `cookie`, `date`, `idempotency-key`, `user-agent` and
 `x-request-id`; a secret header contributes its name, secret name and
-version hash. Per-kind rules come with forks (M3). Other kinds fingerprint
-their encoded request.
+version hash. Other kinds fingerprint their encoded request.
 
 New HTTP requests use fingerprint version 2 and the canonical
 `kronik.fingerprint.http.v2` domain. The producer parses the ORIGINAL URL
@@ -104,6 +103,20 @@ exact, private historical verifier, never a new writer or hash alias.
 Raw host data is matched before case normalization. A raw no-match falls
 back only to that original component's existing canonical v2 normalization;
 unmatched host case and its existing fingerprint bytes remain unchanged.
+
+**Per-kind rules, version 3 (ADR 0134).** An actor type may leave further
+header names and query-parameter names out of its `http.fetch` and
+`foreign.http` fingerprints (`kronik limits set <kind>
+--fingerprint-exclude-header ... --fingerprint-exclude-query ...`, fields
+11 and 12 of the `Limits` record; the six default headers always stay out).
+A turn uses the rules of its configuration epoch. A request with rules is
+recorded as version 3: version 2's encoding and hash less those names, the
+names themselves in `HttpEffectRequest` fields 6 and 7 (canonical: lowercase
+headers, sorted, without duplicates), hashed after the headers under the
+domain `kronik.fingerprint.http.v3`. Without rules a request stays version
+2, byte for byte. A recording's fingerprint is recomputed from the
+recording alone; a fork compares its request with a recording under that
+recording's names, never under the configuration's now.
 
 **Disclosure failure after a durable external result.** An actual HTTP
 response whose structured redaction fails records status
@@ -304,7 +317,7 @@ its ingress key belong to the re-run (an HTTP retry with the same
 | `POST /v1/grants` | `{"kind","capability","delivery":"replay-safe"\|"idempotency-keyed"\|"unsafe"\|null,"rate":"2/s"\|null,"reason","dry_run"}` | `{"dry_run","grant":{"kind","capability","delivery","rate","epoch","lsn"}}` |
 | `POST /v1/grants/revoke` | `{"kind","capability","reason","dry_run"}` | `{"dry_run","revoked":{"kind","capability","epoch","lsn"}}`; `CAPABILITY_NOT_GRANTED` if absent |
 | `GET /v1/grants?kind=` | | `{"grants":[{"kind","capability","delivery","rate","epoch","lsn","reason"}]}` |
-| `POST /v1/limits` | `{"kind","fuel","memory_bytes","message_bytes","state_value_bytes","sql_bytes_per_actor","effect_timeout_ms","effect_response_bytes","reason","dry_run"}` (omitted fields unchanged) | `{"dry_run","limits":{"kind", every field with its effective value,"epoch","lsn"}}` |
+| `POST /v1/limits` | `{"kind","fuel","memory_bytes","message_bytes","state_value_bytes","sql_bytes_per_actor","effect_timeout_ms","effect_response_bytes","fingerprint_exclude_headers":[...],"fingerprint_exclude_query":[...],"reason","dry_run"}` (omitted fields unchanged; a list replaces the kind's and `[]` clears it) | `{"dry_run","limits":{"kind", every field with its effective value,"epoch","lsn"}}` |
 | `GET /v1/limits?kind=` | | `{"limits":[{"kind", every field}]}` |
 | `PUT /v1/secrets/{name}` | `{"text"\|"base64","reason","dry_run"}` | `{"dry_run","secret":{"name","version","version_hash","created_wall_ms"}}` |
 | `GET /v1/secrets` | | `{"secrets":[{"name","version","version_hash","created_wall_ms"}]}` (never values) |

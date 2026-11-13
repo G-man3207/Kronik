@@ -708,6 +708,7 @@ fn the_model_never_sees_or_caches_secret_values() {
         headers: vec![],
         body: body.as_bytes().to_vec(),
         fingerprint_version: 0,
+        ..Default::default()
     };
     // Preserve the existing known-literal legacy refusal/no-wire contract.
     let unprepared = req("key=sk-live-0123456789");

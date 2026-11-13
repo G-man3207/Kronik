@@ -4445,6 +4445,22 @@ against both.
         "null"
       ]
     },
+    "fingerprint_exclude_headers": {
+      "default": [],
+      "description": "Header names (lowercase) left out of the kind's HTTP fingerprints\nbesides the six default ones (ADR 0134), sorted.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "fingerprint_exclude_query": {
+      "default": [],
+      "description": "Query-parameter names left out of them, sorted.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "fuel": {
       "format": "uint64",
       "minimum": 0,

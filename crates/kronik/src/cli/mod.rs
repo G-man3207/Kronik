@@ -447,6 +447,8 @@ pub enum LimitsCommand {
             "sql_size",
             "effect_timeout",
             "effect_response_size",
+            "fingerprint_exclude_header",
+            "fingerprint_exclude_query",
         ])
 ))]
 pub struct LimitsSetArgs {
@@ -473,6 +475,15 @@ pub struct LimitsSetArgs {
     /// Largest effect response, e.g. 10Mi.
     #[arg(long, value_name = "SIZE", value_parser = units::parse_size)]
     effect_response_size: Option<u64>,
+    /// Header names to leave out of this type's HTTP fingerprints besides
+    /// the six defaults, e.g. x-api-key (comma-separated); replaces the
+    /// type's list, and '' clears it.
+    #[arg(long, value_name = "NAMES", value_delimiter = ',')]
+    fingerprint_exclude_header: Option<Vec<String>>,
+    /// Query-parameter names to leave out of them, as the URL writes them,
+    /// e.g. ts,nonce; replaces the type's list, and '' clears it.
+    #[arg(long, value_name = "NAMES", value_delimiter = ',')]
+    fingerprint_exclude_query: Option<Vec<String>>,
     #[command(flatten)]
     mutation: Mutation,
 }
@@ -1430,6 +1441,18 @@ fn grants(ctx: &Ctx, kind: Option<String>) -> Result<ExitCode, Error> {
 
 fn limits_set(ctx: &Ctx, a: LimitsSetArgs) -> Result<ExitCode, Error> {
     let reason = reason(&a.mutation)?;
+    // '' (or only commas) is an empty list: it clears the type's list.
+    let names = |v: &Option<Vec<String>>| {
+        v.as_ref().map(|names| {
+            names
+                .iter()
+                .map(|n| n.trim().to_owned())
+                .filter(|n| !n.is_empty())
+                .collect::<Vec<_>>()
+        })
+    };
+    let exclude_headers = names(&a.fingerprint_exclude_header);
+    let exclude_query = names(&a.fingerprint_exclude_query);
     let body = ctx.post(
         "/v1/limits",
         &LimitsRequest {
@@ -1441,6 +1464,8 @@ fn limits_set(ctx: &Ctx, a: LimitsSetArgs) -> Result<ExitCode, Error> {
             sql_bytes_per_actor: a.sql_size,
             effect_timeout_ms: a.effect_timeout,
             effect_response_bytes: a.effect_response_size,
+            fingerprint_exclude_headers: exclude_headers.clone(),
+            fingerprint_exclude_query: exclude_query.clone(),
             reason: reason.to_owned(),
             dry_run: a.mutation.dry_run,
         },
@@ -1464,6 +1489,14 @@ fn limits_set(ctx: &Ctx, a: LimitsSetArgs) -> Result<ExitCode, Error> {
         (
             "--effect-response-size",
             a.effect_response_size.map(units::size_flag),
+        ),
+        (
+            "--fingerprint-exclude-header",
+            exclude_headers.map(|names| shell_quote(&names.join(","))),
+        ),
+        (
+            "--fingerprint-exclude-query",
+            exclude_query.map(|names| shell_quote(&names.join(","))),
         ),
     ] {
         if let Some(v) = value {

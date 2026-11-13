@@ -110,6 +110,17 @@ message Limits {
   optional uint64 effect_timeout_ms = 8;
   optional uint64 effect_response_bytes = 9;
   Audit audit = 10;
+  // The kind's HTTP fingerprint rules (ADR 0134): header and query-parameter
+  // names left out of its http.fetch and foreign.http fingerprints besides
+  // the six default headers. A set list replaces the previous one (empty
+  // clears it); an unset one keeps it.
+  NameList fingerprint_exclude_headers = 11;
+  NameList fingerprint_exclude_query = 12;
+}
+
+// A list a record sets as a whole, so that an empty list and no list differ.
+message NameList {
+  repeated string names = 1;
 }
 
 message Policy {

@@ -810,7 +810,7 @@ pub fn limits_set(r: &LimitsResponse, rerun: &str) -> String {
 }
 
 /// Every limit, labelled, in human units.
-fn limit_values(l: &LimitsView) -> [(&'static str, String); 7] {
+fn limit_values(l: &LimitsView) -> [(&'static str, String); 8] {
     [
         ("Fuel", l.fuel.to_string()),
         ("Memory", units::size(l.memory_bytes)),
@@ -819,7 +819,28 @@ fn limit_values(l: &LimitsView) -> [(&'static str, String); 7] {
         ("SQL size", units::size(l.sql_bytes_per_actor)),
         ("Effect timeout", units::duration(l.effect_timeout_ms)),
         ("Effect response", units::size(l.effect_response_bytes)),
+        ("Not fingerprinted", not_fingerprinted(l)),
     ]
+}
+
+/// The header and query-parameter names left out of the type's HTTP
+/// fingerprints besides the six default headers (ADR 0134), or `-`.
+fn not_fingerprinted(l: &LimitsView) -> String {
+    let mut parts = Vec::new();
+    if !l.fingerprint_exclude_headers.is_empty() {
+        parts.push(format!(
+            "headers {}",
+            l.fingerprint_exclude_headers.join(",")
+        ));
+    }
+    if !l.fingerprint_exclude_query.is_empty() {
+        parts.push(format!("query {}", l.fingerprint_exclude_query.join(",")));
+    }
+    if parts.is_empty() {
+        "-".to_owned()
+    } else {
+        parts.join("; ")
+    }
 }
 
 pub fn limits(r: &LimitsListResponse) -> String {
@@ -847,6 +868,7 @@ pub fn limits(r: &LimitsListResponse) -> String {
             "SQL",
             "EFFECT TIMEOUT",
             "EFFECT RESPONSE",
+            "NOT FINGERPRINTED",
         ],
         rows,
     );

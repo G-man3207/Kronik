@@ -883,7 +883,7 @@ Next     kronik revoke counter http:api.example.com --reason "..."
 
 ## kronik limits set
 
-`kronik limits set <KIND> [--fuel <N>] [--memory <SIZE>] [--message-size <SIZE>] [--state-value-size <SIZE>] [--sql-size <SIZE>] [--effect-timeout <DURATION>] [--effect-response-size <SIZE>] --reason <REASON> [--dry-run]`
+`kronik limits set <KIND> [--fuel <N>] [--memory <SIZE>] [--message-size <SIZE>] [--state-value-size <SIZE>] [--sql-size <SIZE>] [--effect-timeout <DURATION>] [--effect-response-size <SIZE>] [--fingerprint-exclude-header <NAMES>] [--fingerprint-exclude-query <NAMES>] --reason <REASON> [--dry-run]`
 
 Changes an actor type's limits (M2); limits that are not named keep their
 value, and at least one must be named. Turns use the limits of their
@@ -904,6 +904,23 @@ configuration epoch. The output shows every limit in force afterwards.
 | `--sql-size` | Largest SQL database per actor | 1 GiB |
 | `--effect-timeout` | How long an effect may take | 10s |
 | `--effect-response-size` | Largest effect response | 10 MiB |
+| `--fingerprint-exclude-header` | Header names left out of HTTP fingerprints | none (the six defaults always) |
+| `--fingerprint-exclude-query` | Query-parameter names left out of HTTP fingerprints | none |
+
+`--fingerprint-exclude-header` and `--fingerprint-exclude-query` take
+comma-separated names (ADR 0134). They leave a header or query parameter
+that changes on every request, such as a rotating `x-api-key` or a `ts`
+timestamp, out of the fingerprint of the type's `http.fetch` and
+`foreign.http` requests, so that a re-run or a fork still matches the
+recording exactly. `authorization`, `cookie`, `date`, `idempotency-key`,
+`user-agent` and `x-request-id` are always left out. A list replaces the
+type's list, `''` clears it, and the request itself is still recorded
+whole. Header names are matched without case; query names as the URL
+writes them.
+
+```text
+$ kronik limits set billing --fingerprint-exclude-header x-api-key --fingerprint-exclude-query ts,nonce --reason "rotating key and timestamp"
+```
 
 ```text
 $ kronik limits set counter --fuel 100M --memory 128Mi --effect-timeout 2s --reason "invoices with many lines"
@@ -915,6 +932,7 @@ Set the limits of counter at lsn 5, epoch 4
   SQL size          1 GiB
   Effect timeout    2s
   Effect response   10 MiB
+  Not fingerprinted -
 Next     kronik limits show --kind counter
 ```
 
@@ -927,8 +945,8 @@ deployed or not.
 
 ```text
 $ kronik limits show
-KIND     FUEL       MEMORY   MESSAGE  STATE VALUE  SQL    EFFECT TIMEOUT  EFFECT RESPONSE
-counter  100000000  128 MiB  1 MiB    1 MiB        1 GiB  2s              10 MiB
+KIND     FUEL       MEMORY   MESSAGE  STATE VALUE  SQL    EFFECT TIMEOUT  EFFECT RESPONSE  NOT FINGERPRINTED
+counter  100000000  128 MiB  1 MiB    1 MiB        1 GiB  2s              10 MiB           -
 Next     kronik limits set counter --fuel <n> --reason "..."
 ```
 

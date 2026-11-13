@@ -19,6 +19,7 @@ use kronik_effects::{Delivery, Rate};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Node, NodeConfig, TurnResult, start_local};
+use prost::Message as _;
 use tokio::runtime::Runtime;
 
 const COUNTER: &str = concat!(
@@ -1861,4 +1862,113 @@ fn a_clock_step_back_delays_no_timer() {
             assert!(t.logical_time_ms >= input.due_ms);
         }
     }
+}
+
+/// #39 (ADR 0134): an actor type's fingerprint rules leave out the header
+/// and query-parameter names they list, for that type only. A request is
+/// recorded with the rules of its turn's epoch (version 3 and the names) and
+/// its fingerprint is recomputed from the recording alone.
+#[test]
+fn fingerprint_rules_apply_to_their_kind_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start();
+    let p = start(dir.path());
+    p.deploy();
+    p.grant("http:127.0.0.1", None, None);
+    let set = |kind: &str, headers: &[&str], query: &[&str]| {
+        let list = |names: &[&str]| {
+            Some(pb::NameList {
+                names: names.iter().map(|n| (*n).to_owned()).collect(),
+            })
+        };
+        p.rt.block_on(p.node.set_limits(
+            pb::Limits {
+                kind: kind.into(),
+                fingerprint_exclude_headers: list(headers),
+                fingerprint_exclude_query: list(query),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            p.owner(),
+        ))
+        .unwrap()
+    };
+    // The recorded request and fingerprint of one fetch.
+    let fetch = |key: &str, ts: &str, tenant: &str| {
+        let spec = format!(
+            "GET http://{}/ok?ts={ts}&a=b\nH X-Api-Key key-{key}\nH x-tenant {tenant}",
+            server.addr
+        );
+        let r = p.send(&format!("counter/{key}"), msg("fetch-ok", &spec));
+        assert!(reply(&r).starts_with("200"), "{}", reply(&r));
+        let turns = turn_records(&p.records());
+        let effect = turns.last().unwrap().effects[0].clone();
+        let Some(pb::sealable::Value::Plain(bytes)) =
+            effect.request.as_ref().and_then(|r| r.value.as_ref())
+        else {
+            panic!("a plain request");
+        };
+        let request = pb::HttpEffectRequest::decode(bytes.as_slice()).unwrap();
+        // The recording's fingerprint follows from the recording alone.
+        let target = kronik_effects::http::prepared_target(&request).unwrap();
+        assert_eq!(
+            kronik_effects::http::fingerprint_v2(&request, &target).unwrap(),
+            effect.fingerprint
+        );
+        (request, effect.fingerprint)
+    };
+    // Rules for another kind leave counter's fingerprints alone.
+    let (_, _, _, rules) = set("billing", &["x-api-key"], &["ts"]);
+    assert_eq!(rules.headers(), ["x-api-key"]);
+    let (a, fa) = fetch("a", "1", "t1");
+    let (_, fb) = fetch("b", "2", "t1");
+    assert_eq!(a.fingerprint_version, 2);
+    assert!(a.fingerprint_excluded_headers.is_empty());
+    assert_ne!(fa, fb);
+    // Counter's own rules: the names are canonical (lowercase, sorted, the
+    // default user-agent dropped) and recorded in its requests.
+    let (_, _, _, rules) = set("counter", &["X-Api-Key", "user-agent"], &["ts", "nonce"]);
+    assert_eq!(rules.headers(), ["x-api-key"]);
+    assert_eq!(rules.query(), ["nonce", "ts"]);
+    let (c, fc) = fetch("c", "3", "t1");
+    let (_, fd) = fetch("d", "4", "t1");
+    assert_eq!(c.fingerprint_version, 3);
+    assert_eq!(c.fingerprint_excluded_headers, ["x-api-key"]);
+    assert_eq!(c.fingerprint_excluded_query, ["nonce", "ts"]);
+    assert_eq!(fc, fd, "the key and ts differ only");
+    // A header the rules do not name still counts.
+    let (_, fe) = fetch("e", "5", "t2");
+    assert_ne!(fc, fe);
+    // An empty list clears; the other list stays.
+    let (_, _, _, rules) =
+        p.rt.block_on(p.node.set_limits(
+            pb::Limits {
+                kind: "counter".into(),
+                fingerprint_exclude_headers: Some(pb::NameList { names: vec![] }),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            p.owner(),
+        ))
+        .unwrap();
+    assert!(rules.headers().is_empty());
+    assert_eq!(rules.query(), ["nonce", "ts"]);
+    // An invalid name is refused before anything is written.
+    let error =
+        p.rt.block_on(p.node.set_limits(
+            pb::Limits {
+                kind: "counter".into(),
+                fingerprint_exclude_headers: Some(pb::NameList {
+                    names: vec!["bad header".into()],
+                }),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            p.owner(),
+        ))
+        .unwrap_err();
+    assert_eq!(error.code, kronik_core::error::ErrorCode::BadRequest);
 }

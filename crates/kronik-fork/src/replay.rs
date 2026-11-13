@@ -13,7 +13,8 @@ use kronik_core::env::{BoxFuture, Env};
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
 use kronik_effects::http::{
-    CompiledScrubber, fingerprint, fingerprint_v2, parse_request_url, prepared_target, target_of,
+    CompiledScrubber, fingerprint, fingerprint_v2, parse_request_url, prepared_target,
+    prepared_version, target_of, under_rules_of,
 };
 use kronik_effects::{Config, ConfigHistory};
 use kronik_log::{Committed, Position};
@@ -1602,7 +1603,7 @@ pub(crate) fn disclose_neighbor(
             })?;
             sealer.fingerprint_matches(subject, &hit.source.fingerprint, &plain_fp)
         }
-        2 => {
+        2 | 3 => {
             let Some(prefix) = hit.prefix else {
                 return Ok(NeighborDisclosure::Decline);
             };
@@ -2249,6 +2250,7 @@ impl ReplayGate {
             headers,
             body: req.body.clone(),
             fingerprint_version: 2,
+            ..Default::default()
         };
         // Keyed for a subject's request, as production records it.
         let sealer = &self.runner.setup.privacy.sealer;
@@ -2286,7 +2288,7 @@ impl ReplayGate {
                     self.push(record)?;
                     return outcome;
                 }
-                2 => {}
+                2 | 3 => {}
                 _ => {
                     return Err(GateError::Host(
                         "The HTTP fingerprint policy is invalid".into(),
@@ -2302,8 +2304,23 @@ impl ReplayGate {
             kronik_log::MAX_RECORD as usize,
         )
         .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?;
+        // The actor type's fingerprint rules for this turn, recorded in the
+        // fork's request as production records its own (ADR 0134).
+        self.config()
+            .fingerprint_rules(&self.actor.kind)
+            .apply(&mut request)
+            .map_err(GateError::Host)?;
         let plain_fp = fingerprint_v2(&request, &recorded_target).map_err(GateError::Host)?;
         let fp = sealer.effect_fingerprint(req.subject.as_deref(), plain_fp.clone());
+        // A recording is compared under its own rules, never the fork's: the
+        // fork's request as that recording's rules fingerprint it.
+        let matching_fp = match &prod_req {
+            Some(source) if prepared_version(source.fingerprint_version) => {
+                fingerprint_v2(&under_rules_of(&request, source), &recorded_target)
+                    .map_err(GateError::Host)?
+            }
+            _ => plain_fp.clone(),
+        };
         let original_cap = cap;
         let cap = format!(
             "{}:{}",
@@ -2325,7 +2342,7 @@ impl ReplayGate {
                 .fetch_copy(
                     ordinal,
                     cap,
-                    (fp, plain_fp),
+                    (fp, matching_fp),
                     encoded,
                     req,
                     prod,
@@ -2336,7 +2353,7 @@ impl ReplayGate {
                 .await;
         }
         if let (Some(p), Some(pr)) = (prod, prod_req) {
-            if sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &plain_fp) {
+            if sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &matching_fp) {
                 let mut rec = p;
                 rec.grounding = pb::Grounding::Exact as i32;
                 let out = outcome_of_fetch(&rec);
@@ -2561,7 +2578,7 @@ impl ReplayGate {
         &self,
         ordinal: u32,
         cap: String,
-        (fp, plain_fp): (Vec<u8>, Vec<u8>),
+        (fp, matching_fp): (Vec<u8>, Vec<u8>),
         encoded: Option<pb::Sealable>,
         req: FetchRequest,
         prod: Option<pb::EffectRecord>,
@@ -2576,7 +2593,7 @@ impl ReplayGate {
         let cap_bytes = self.response_cap(encoded.as_ref(), limits.effect_response_bytes);
         let sealer = &self.runner.setup.privacy.sealer;
         let exact = prod.as_ref().is_some_and(|p| {
-            sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &plain_fp)
+            sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &matching_fp)
         });
         let headers = req
             .headers

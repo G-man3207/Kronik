@@ -533,6 +533,15 @@ pub struct LimitsRequest {
     pub effect_timeout_ms: Option<u64>,
     #[serde(default)]
     pub effect_response_bytes: Option<u64>,
+    /// Header names left out of the kind's `http.fetch` and `foreign.http`
+    /// fingerprints besides the six default ones (ADR 0134). A list replaces
+    /// the kind's, `[]` clears it, and omitted keeps it.
+    #[serde(default)]
+    pub fingerprint_exclude_headers: Option<Vec<String>>,
+    /// Query-parameter names left out of those fingerprints, as the URL
+    /// writes them; as `fingerprint_exclude_headers`.
+    #[serde(default)]
+    pub fingerprint_exclude_query: Option<Vec<String>>,
     /// Required: missing or blank answers REASON_REQUIRED.
     #[serde(default)]
     pub reason: String,
@@ -550,6 +559,13 @@ pub struct LimitsView {
     pub sql_bytes_per_actor: u64,
     pub effect_timeout_ms: u64,
     pub effect_response_bytes: u64,
+    /// Header names (lowercase) left out of the kind's HTTP fingerprints
+    /// besides the six default ones (ADR 0134), sorted.
+    #[serde(default)]
+    pub fingerprint_exclude_headers: Vec<String>,
+    /// Query-parameter names left out of them, sorted.
+    #[serde(default)]
+    pub fingerprint_exclude_query: Vec<String>,
     /// Set in responses to `POST /v1/limits` (lsn 0 for dry runs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<u64>,

@@ -19,7 +19,9 @@ use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::Lsn;
 use kronik_effects::contract::Contract;
 use kronik_effects::http::ScrubError;
-use kronik_effects::http::{CompiledScrubber, Target, parse_request_url, parse_url, route_pattern};
+use kronik_effects::http::{
+    CompiledScrubber, Target, parse_request_url, parse_url, prepared_version, route_pattern,
+};
 use kronik_effects::simulator::{ContractFake, NeighborSource, RecordedNeighbor};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
@@ -983,7 +985,7 @@ fn request_view(req: &pb::HttpEffectRequest) -> Option<serde_json::Value> {
                 // Credentials never go to the model: the list API readers
                 // without pii:read are also spared (kronik-core http).
                 if !kronik_core::http::credential_header(&h.name) {
-                    let name = if req.fingerprint_version == 2 {
+                    let name = if prepared_version(req.fingerprint_version) {
                         h.name.clone()
                     } else {
                         h.name.to_ascii_lowercase()
@@ -995,16 +997,16 @@ fn request_view(req: &pb::HttpEffectRequest) -> Option<serde_json::Value> {
             _ => return None,
         }
     }
-    // Version 2 already rendered its typed, scrubbed components. Never
-    // lowercase or otherwise reparse a generated marker in its host.
+    // Versions 2 and 3 already rendered their typed, scrubbed components.
+    // Never lowercase or otherwise reparse a generated marker in its host.
     if req.fingerprint_version == 0 {
         parse_url(&req.url).ok()?;
-    } else if req.fingerprint_version != 2 {
+    } else if !prepared_version(req.fingerprint_version) {
         return None;
     }
     let body = text(&req.body)?;
     Some(serde_json::json!({
-        "method": if req.fingerprint_version == 2 { req.method.clone() } else { req.method.to_ascii_uppercase() },
+        "method": if prepared_version(req.fingerprint_version) { req.method.clone() } else { req.method.to_ascii_uppercase() },
         "url": req.url,
         "headers": headers,
         "body": body,
@@ -1046,7 +1048,7 @@ fn prepared_request_safe(
     current_scope: Option<&[pb::SecretRef]>,
     prepared_scope: Option<&[pb::SecretRef]>,
 ) -> Result<(), ScrubError> {
-    if req.fingerprint_version != 2 {
+    if !prepared_version(req.fingerprint_version) {
         return Err(ScrubError::SourceScopeUnavailable);
     }
     if req.encoded_len() > kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES {
@@ -1162,7 +1164,7 @@ pub fn model_examples(
                         return None;
                     }
                 }
-                2 => {
+                2 | 3 => {
                     let target = kronik_effects::http::prepared_target(&req).ok()?;
                     prepared_request_safe(&req, &target, matcher, current_scope, prefix.as_deref())
                         .ok()?;
@@ -2171,6 +2173,7 @@ mod tests {
             }],
             body: br#"{"amount":5}"#.to_vec(),
             fingerprint_version: 2,
+            ..Default::default()
         };
         let source_target = prepared_target(&source_req).unwrap();
         let source_fp = fingerprint_v2(&source_req, &source_target).unwrap();

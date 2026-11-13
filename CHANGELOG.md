@@ -195,6 +195,17 @@ M23, key and secret backends:
   nothing recorded changes. DST's webhook workload steps its clock back 5 to
   10 minutes and no longer corrects it before draining, and every run checks
   that a timer turn runs at or after its due time.
+- An actor type can leave more headers and query parameters out of its HTTP
+  fingerprints than the six default headers (#39, ADR 0134): `kronik limits
+  set <kind> --fingerprint-exclude-header x-api-key
+  --fingerprint-exclude-query ts,nonce` (and `fingerprint_exclude_headers` /
+  `fingerprint_exclude_query` in `POST /v1/limits`), so a rotating key or a
+  timestamp no longer makes a re-run diverge or a fork's match approximate.
+  The rules are part of the log: a request with rules is recorded as
+  fingerprint version 3 with the names it left out, and every recording is
+  matched under its own rules. Requests without rules stay version 2, byte
+  for byte; a binary from before this release refuses a log with version 3
+  requests.
 
 ## v0.4.1 — 2026-11-07
 
