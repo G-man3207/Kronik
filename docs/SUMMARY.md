@@ -115,6 +115,7 @@
 - [ADR 0113: The v0.5 actor ABI: additive 0.1.1 with an optional connection export](adr/0113-v05-actor-abi.md)
 - [ADR 0114: Only the actor that accepted a connection sends on it or closes it](adr/0114-only-the-accepting-actor-sends.md)
 - [ADR 0115: Connection inputs, buffered frames, send-now and closes](adr/0115-connection-turn-semantics.md)
+- [ADR 0116: Connections in replay and the behavior diff](adr/0116-connections-in-replay-and-diff.md)
 - [ADR 0117: The blob store](adr/0117-blob-store.md)
 - [ADR 0118: How a sealed blob is identified, and where its metadata is recorded](adr/0118-sealed-blob-identity.md)
 - [ADR 0119: Blob references and the authorization graph](adr/0119-blob-reference-graph.md)
