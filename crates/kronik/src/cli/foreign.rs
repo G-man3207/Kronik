@@ -22,7 +22,9 @@ pub enum Isolation {
     Gvisor,
     /// Plain runc on the host kernel: only for images you trust.
     Trusted,
-    /// Firecracker: reserved, not implemented in v0.1.
+    /// Firecracker microVM (M20), experimental: not yet booted on KVM
+    /// hardware. Needs a usable /dev/kvm and the pinned tool bundle; without
+    /// KVM the add is refused with KVM_UNAVAILABLE (use gvisor).
     Microvm,
 }
 
@@ -68,7 +70,8 @@ pub enum ForeignCommand {
         secrets: Vec<String>,
         /// What forks do with calls to it: `recorded` (default) matches
         /// them against recordings; `sandbox` answers changed calls from a
-        /// copy restored from the nearest checkpoint (M14; gvisor only).
+        /// copy restored from the nearest checkpoint (M14; gvisor, or the
+        /// experimental microvm).
         #[arg(long, value_enum)]
         fork_mode: Option<ForkMode>,
         #[command(flatten)]
@@ -93,8 +96,9 @@ pub enum ForeignCommand {
     /// With the daemon stopped (crashed or killed): delete what its
     /// sandboxes left behind, such as containers, network namespaces,
     /// bridge sockets and config.json files with secret values. The
-    /// systemd unit runs it as ExecStopPost=. Local, as root; refused while
-    /// a daemon holds [foreign] run_dir.
+    /// systemd unit runs it as ExecStopPost=. Local, as root or as the data
+    /// directory's owner (the nonroot service's user); refused while a
+    /// daemon holds [foreign] run_dir.
     Cleanup {
         /// The configuration file [default: /etc/kronik/kronik.toml if it
         /// exists].

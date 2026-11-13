@@ -146,6 +146,14 @@ fn microvm_without_kvm_is_a_503_with_the_gvisor_suggestion_and_declares_nothing(
         error["error"]["hint"].as_str().unwrap().contains("gvisor"),
         "{error}"
     );
+    // The level is offered as an experimental opt-in, and says so.
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("experimental"),
+        "{error}"
+    );
     let after = d.cli(&["--json", "foreign", "list"]);
     assert!(after.status.success(), "{after:?}");
     assert_eq!(

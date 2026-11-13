@@ -22,12 +22,16 @@ pub struct ForeignAddRequest {
     pub cpu_millis: Option<u32>,
     #[serde(default)]
     pub memory_bytes: Option<u64>,
+    /// `gvisor` (default), `trusted` (plain runc, with a warning) or
+    /// `microvm` (Firecracker, M20; experimental, with a warning, and
+    /// `KVM_UNAVAILABLE` without a usable `/dev/kvm`).
     #[serde(default)]
     pub isolation: Option<String>,
     #[serde(default)]
     pub secrets: Vec<String>,
     /// What forks do with calls to it: `recorded` (default) or `sandbox`
-    /// (a copy from the nearest checkpoint answers, M14).
+    /// (a copy from the nearest checkpoint answers, M14; gvisor or the
+    /// experimental microvm).
     #[serde(default)]
     pub fork_mode: Option<String>,
     pub reason: String,

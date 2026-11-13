@@ -41,7 +41,8 @@ mod supervisor;
 pub use checkpoint::Copy;
 pub use image::{ImageError, ImageRef};
 pub use manager::{
-    AddPlan, AddRequest, Cleaned, Foreign, ForeignConfig, Host, Isolation, LogTail, Platform,
-    Privilege, RUN_LOCK, TESTED_RUNSC, TRUSTED_WARNING, cleanup, lock_run_dir,
+    AddPlan, AddRequest, Cleaned, Foreign, ForeignConfig, Host, Isolation, LogTail,
+    MICROVM_WARNING, Platform, Privilege, RUN_LOCK, TESTED_RUNSC, TRUSTED_WARNING, cleanup,
+    lock_run_dir,
 };
 pub use supervisor::{LastExit, State, Status};

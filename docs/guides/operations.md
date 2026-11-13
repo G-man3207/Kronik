@@ -521,7 +521,7 @@ stays the same when it is replayed again.
 | Key | Default | Meaning |
 |---|---|---|
 | `runsc_path` | `"/usr/local/bin/runsc"` | gVisor's `runsc` |
-| `microvm_dir` | `"/usr/local/lib/kronik/microvm"` | The protected, offline bundle for `isolation = "microvm"`: the pinned Firecracker, guest kernel, guest init and filesystem tools, with a digest manifest (ADR 0095). The daemon never downloads or builds it; `scripts/build-microvm-tools.sh` makes one. The files, the directory and every directory above it must be real directories (no symbolic link) owned by root or by the daemon's user, with no write access for group or others, because the files are checked and then executed; a bundle that someone else could replace is refused. Some distributions make `/usr/local` and `/usr/local/lib` group-writable (`root:staff`, mode 2775), and the default path is then refused with the directory it objects to named: put the bundle where only root writes, such as `/opt/kronik/microvm`, and set `microvm_dir` to it |
+| `microvm_dir` | `"/usr/local/lib/kronik/microvm"` | The protected, offline bundle for `isolation = "microvm"` (experimental): the pinned Firecracker, guest kernel, guest init and filesystem tools, with a digest manifest (ADR 0095). The daemon never downloads or builds it; `scripts/build-microvm-tools.sh` makes one. The files, the directory and every directory above it must be real directories (no symbolic link) owned by root or by the daemon's user, with no write access for group or others, because the files are checked and then executed; a bundle that someone else could replace is refused. Some distributions make `/usr/local` and `/usr/local/lib` group-writable (`root:staff`, mode 2775), and the default path is then refused with the directory it objects to named: put the bundle where only root writes, such as `/opt/kronik/microvm`, and set `microvm_dir` to it |
 | `platform` | `"auto"` | `"auto"`, `"systrap"` or `"kvm"`: gVisor's platform. `auto` is systrap; `kvm` needs a `/dev/kvm` the daemon can open |
 | `run_dir` | `"/run/kronik"` | Runtime state of the sandboxes: runsc's root, network namespaces and bridge sockets. Best on a tmpfs; nothing in it survives a reboot. One daemon per directory: a second daemon runs without foreign actors |
 | `layout_dirs` | `[]` | Absolute directories whose `oci-layout:` images an `operate` token may add; any other directory needs `admin` |
@@ -1867,8 +1867,8 @@ Other values of `snapshots_kept`, deleting snapshot directories by hand, v0.2.0
 ## Foreign actors
 
 Foreign actors are ordinary programs (OCI images) that run in gVisor
-sandboxes next to the daemon, or, with `--isolation microvm` (M20), in a
-Firecracker microVM. Kronik reaches them only through its bridge (vsock for a
+sandboxes next to the daemon, or, with the experimental `--isolation microvm`
+(M20), in a Firecracker microVM. Kronik reaches them only through its bridge (vsock for a
 microVM), and they record their calls like other effects
 ([M7 design](../design/m7-foreign.md), [ADR 0003](../adr/0003-gvisor-bridge.md),
 [ADR 0095](../adr/0095-pinned-firecracker-guest.md)). They need:
@@ -1888,8 +1888,9 @@ microVM), and they record their calls like other effects
   in `[foreign] microvm_dir` (`scripts/build-microvm-tools.sh` builds one, and
   takes `--command-timeout` and `--kernel-jobs` for a slow machine;
   the daemon never downloads or builds it). Without KVM the add is refused
-  with `KVM_UNAVAILABLE`, which suggests `gvisor`. The microVM level has not
-  been run on a host with KVM.
+  with `KVM_UNAVAILABLE`, which suggests `gvisor`. The microVM level is
+  experimental: it has not been run on a host with KVM, and every add
+  answers with a warning that says so. Use `gvisor` for actors you rely on.
 
 ### MicroVM actors on the root service
 

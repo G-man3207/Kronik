@@ -43,7 +43,7 @@ actors as at its fork point, and `kronik history` shows every change.
 | `port` | The TCP port the program listens on inside the sandbox, 1 to 65535. Required. |
 | `cpu_millis` | `--cpu` in thousandths of a CPU (default 1000). `cpu.max` quota over a 100 ms period. |
 | `memory_bytes` | `--memory` (default 512Mi, at least 16Mi for the OCI backends). `memory.max`, and no swap. A microVM's guest RAM is at least 128Mi, floored to MiB; its host cgroup adds a fixed 128Mi allowance for the VMM (ADR 0095). |
-| `isolation` | `gvisor` (default), `trusted` (plain `runc`; the response carries a warning), `microvm` (Firecracker, M20; without a usable `/dev/kvm` it is `KVM_UNAVAILABLE`, and with KVM but without the tool bundle `FOREIGN_UNAVAILABLE`; nothing is written either way). |
+| `isolation` | `gvisor` (default), `trusted` (plain `runc`; the response carries a warning), `microvm` (Firecracker, M20, experimental; the response carries a warning; without a usable `/dev/kvm` it is `KVM_UNAVAILABLE`, and with KVM but without the tool bundle `FOREIGN_UNAVAILABLE`; nothing is written either way). |
 | `secrets` | `--secret <name>` or `--secret <ENV>=<name>`, stored as `ENV=name`. Without `ENV=`, the variable is the name in upper case with `-` and `.` replaced by `_` (`stripe-key` → `STRIPE_KEY`). Each secret must exist (`SECRET_NOT_FOUND`). §9. |
 | `platform` | `systrap` or `kvm`: `[foreign] platform` at add time (`auto` means `systrap`, as the brief says; `kvm` only when the operator chooses it). Empty for `trusted`. |
 
@@ -248,7 +248,7 @@ runtime was killed by a signal), `next_start_ms` and `error`.
 | --- | --- | --- |
 | `gvisor` | `runsc` with `--platform=systrap` (or `kvm`), `--network=sandbox` | yes, the default |
 | `trusted` | plain `runc` with the same bundle and a seccomp filter | yes; every add answers with the warning "isolation trusted runs the image with plain runc and the host kernel: only use it for images you trust" |
-| `microvm` | Firecracker | M20: needs `/dev/kvm` and the pinned tool bundle; see ADR 0095 |
+| `microvm` | Firecracker | M20, experimental: needs `/dev/kvm` and the pinned tool bundle; every add answers with a warning; see ADR 0095 |
 
 **Network namespace with only `lo`** (ADR 0003 §2). Before each start,
 Kronik creates a namespace by `unshare(CLONE_NEWNET)` on a short-lived

@@ -68,10 +68,11 @@ What the code does today, on one node:
   and `/metrics` exist. There is no cluster.
 - **Foreign actors (M7, M20, M21).** Linux programs from OCI images run in
   gVisor. With `isolation = "microvm"` they run in a Firecracker VM on a host
-  with KVM; that level is implemented but has not been run on a KVM host.
-  `kronik serve --init` installs the root service as before, and
-  `--init --rootless` the nonroot service; that design (M21) is a proposal
-  that has not been run on a systemd host, and is untested on Ubuntu 24.04.
+  with KVM; that level is experimental: implemented, but not yet run on a KVM
+  host. `kronik serve --init` installs the root service as before, and
+  `--init --rootless` the nonroot service (M21), an opt-in whose design is
+  accepted (ADRs 0060–0065) but whose installed proofs have not been run on
+  this revision, and which is untested on Ubuntu 24.04.
 - **Privacy (M8).** Values with a subject can be sealed. `erase` deletes a
   subject's keys and SQL rows that have a `_subject` value. A turn with a
   subject cannot write a table without a `_subject` column. Old rows in

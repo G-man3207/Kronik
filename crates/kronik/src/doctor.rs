@@ -357,7 +357,7 @@ fn kvm(platform: Platform, usable: std::io::Result<()>) -> Check {
         (Ok(()), _) => check(
             "kvm",
             Status::Pass,
-            "/dev/kvm is usable: platforms kvm and systrap",
+            "/dev/kvm is usable: gVisor's platforms kvm and systrap, and isolation microvm (experimental)",
         ),
         (Err(e), Platform::Kvm) => {
             let mut hint =
@@ -375,10 +375,13 @@ fn kvm(platform: Platform, usable: std::io::Result<()>) -> Check {
         (Err(e), _) => check(
             "kvm",
             Status::Warn,
-            format!("/dev/kvm: {e}; platform systrap only"),
+            format!("/dev/kvm: {e}; gVisor's platform systrap only, and no isolation microvm"),
         )
         .code("KVM_UNAVAILABLE")
-        .hint("fine for most hosts: foreign actors use systrap without KVM"),
+        .hint(
+            "fine for most hosts: foreign actors use gVisor with systrap without KVM; only the \
+             experimental isolation microvm needs it",
+        ),
     }
 }
 
@@ -498,7 +501,9 @@ fn microvm_leaf(bundle: bool, unit: Option<RootUnit>) -> Option<Check> {
         check(
             "microvm",
             Status::Pass,
-            format!("{where_}: the daemon has the delegated leaf microVM actors need"),
+            format!(
+                "{where_}: the daemon has the delegated leaf that microVM actors (experimental) need"
+            ),
         )
     } else {
         check(

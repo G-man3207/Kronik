@@ -245,7 +245,7 @@ the configuration asks for what is missing (`platform = "kvm"`); the
 [operations guide](../guides/operations.md#kronik-doctor) lists them all.
 Where a microVM tool bundle is installed and the root service runs, `microvm`
 warns when the daemon has no delegated cgroup leaf and prints the drop-in
-that adds it.
+that adds it (the microVM level is experimental).
 With `--rootless` (M21) it also checks what the nonroot service needs
 (`userns`, `uid_view`, `subid`, `pin` and `delegate`) and runs the network
 namespace and sandbox checks under the service's identity: as root it first
@@ -260,8 +260,8 @@ $ kronik doctor
                 hint: kronik serve --init writes /etc/kronik/kronik.toml
   pass  kernel  Linux 6.12.111+deb13-cloud-amd64
   pass  runsc   /usr/local/bin/runsc release-20261019.0
-  warn  kvm     /dev/kvm: No such file or directory (os error 2); platform systrap only (KVM_UNAVAILABLE)
-                hint: fine for most hosts: foreign actors use systrap without KVM
+  warn  kvm     /dev/kvm: No such file or directory (os error 2); gVisor's platform systrap only, and no isolation microvm (KVM_UNAVAILABLE)
+                hint: fine for most hosts: foreign actors use gVisor with systrap without KVM; only the experimental isolation microvm needs it
   pass  cgroup  cgroup v2 with cpu, memory and pids
   pass  root    running as root, as the daemon does in v0.1
   pass  runc    /usr/bin/runc: isolation trusted is available
@@ -1966,13 +1966,15 @@ program sees the value). A name that is linked to an external secret manager
 is refused (`SECRET_EXTERNAL`), at the add and at the next start of an actor
 whose name was linked later: the built-in store holds an older value of it or
 none. `trusted` runs plain runc with a warning, a
-seccomp filter and no user namespace: it is not a security boundary;
-`microvm` (M20) runs the image in a Firecracker VM with a pinned guest
-kernel and no network device; it needs a usable `/dev/kvm` and the pinned
-tool bundle in `[foreign] microvm_dir`, and without KVM the add is
-`KVM_UNAVAILABLE` (use `gvisor`) and nothing is written. `--fork-mode` (M14)
-says how forks answer calls to it: `recorded` (the default) matches
-production's recordings; `sandbox` (gVisor or microVM) checkpoints the actor
+seccomp filter and no user namespace: it is not a security boundary.
+`microvm` (M20) is **experimental**: it has not yet booted on KVM hardware,
+and every add answers with a warning that says so. It runs the image in a
+Firecracker VM with a pinned guest kernel and no network device; it needs a
+usable `/dev/kvm` and the pinned tool bundle in `[foreign] microvm_dir`, and
+without KVM the add is `KVM_UNAVAILABLE` (use `gvisor`) and nothing is
+written. `--fork-mode` (M14) says how forks answer calls to it: `recorded`
+(the default) matches production's recordings; `sandbox` (gVisor, or the
+experimental microVM) checkpoints the actor
 with every snapshot, and each continuous fork gets a copy from the nearest
 checkpoint, with no network and its own disk, deleted with the fork; its
 answers are graded `forked`.
