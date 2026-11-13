@@ -140,6 +140,10 @@ M23, key and secret backends:
 - The gateway sent an actor's status of 600 to 999 to the client as it was,
   although an actor answers with 200 to 599; like an informational status, it
   is now answered with `TURN_FAILED` (#68).
+- The API read a `+` in a path segment as a space, so an actor whose key
+  holds a `+` (which the gateway creates and serves) answered `BAD_REQUEST`
+  at `/v1/actors/<kind>/<key>` unless the client wrote `%2B`. A `+` in a path
+  is now literal; in a query it still means a space (#47).
 
 ## v0.4.1 — 2026-11-07
 

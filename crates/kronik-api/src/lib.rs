@@ -173,7 +173,19 @@ fn ok<T: Serialize>(v: &T) -> Result<ApiResponse> {
     })
 }
 
-fn decode(s: &str) -> Option<String> {
+/// Percent-decodes a path segment. `+` is a literal character in a path
+/// (RFC 3986 §3.3): an actor key `a+b` arrives as `a+b`, as at the gateway.
+fn decode_path(s: &str) -> Option<String> {
+    percent_decode(s, false)
+}
+
+/// Percent-decodes a query name or value, where `+` stands for a space
+/// (`application/x-www-form-urlencoded`).
+fn decode_query(s: &str) -> Option<String> {
+    percent_decode(s, true)
+}
+
+fn percent_decode(s: &str, plus_is_space: bool) -> Option<String> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -184,7 +196,7 @@ fn decode(s: &str) -> Option<String> {
                 out.push(u8::from_str_radix(hex, 16).ok()?);
                 i += 3;
             }
-            b'+' => {
+            b'+' if plus_is_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -204,8 +216,8 @@ impl Query {
         let mut out = Vec::new();
         for part in q.split('&').filter(|p| !p.is_empty()) {
             let (k, v) = part.split_once('=').unwrap_or((part, ""));
-            let k = decode(k).ok_or_else(|| bad(format!("invalid query {part:?}")))?;
-            let v = decode(v).ok_or_else(|| bad(format!("invalid query {part:?}")))?;
+            let k = decode_query(k).ok_or_else(|| bad(format!("invalid query {part:?}")))?;
+            let v = decode_query(v).ok_or_else(|| bad(format!("invalid query {part:?}")))?;
             out.push((k, v));
         }
         Ok(Query(out))
@@ -795,7 +807,7 @@ impl Api {
             .path
             .split('/')
             .skip(1)
-            .map(|segment| decode(segment).ok_or_else(|| bad("invalid API path")))
+            .map(|segment| decode_path(segment).ok_or_else(|| bad("invalid API path")))
             .collect::<Result<Vec<_>>>()?;
         let segments = segments.iter().map(String::as_str).collect::<Vec<_>>();
         Ok(auth::required_scope(&req.method, &segments))
@@ -1177,7 +1189,7 @@ impl Api {
             .path
             .split('/')
             .skip(1)
-            .map(|s| decode(s).ok_or_else(|| bad(format!("invalid path segment {s:?}"))))
+            .map(|s| decode_path(s).ok_or_else(|| bad(format!("invalid path segment {s:?}"))))
             .collect::<Result<_>>()?;
         let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
         caller.require(auth::required_scope(&req.method, &segs))?;
@@ -2355,6 +2367,18 @@ mod tests {
     use prost::Message as _;
 
     use super::*;
+
+    /// `+` is literal in a path segment (#47) and a space in a query.
+    #[test]
+    fn a_plus_is_literal_in_a_path_and_a_space_in_a_query() {
+        assert_eq!(decode_path("a+b").as_deref(), Some("a+b"));
+        assert_eq!(decode_path("a%2Bb").as_deref(), Some("a+b"));
+        assert_eq!(decode_path("a%20b").as_deref(), Some("a b"));
+        assert_eq!(decode_path("a%2").as_deref(), None);
+        let q = Query::parse("cursor=a+b&n=a%2Bb").unwrap();
+        assert_eq!(q.get("cursor"), Some("a b"));
+        assert_eq!(q.get("n"), Some("a+b"));
+    }
 
     #[test]
     fn request_lines_show_method_host_and_path_only() {
