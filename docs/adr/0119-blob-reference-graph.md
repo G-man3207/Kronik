@@ -30,7 +30,7 @@ The WIT has carried `blob-ref`, `message.blobs` and `http-body.blob` since
 v0.1, and the host refuses them today (`NOT_IMPLEMENTED`). Components built
 before v0.5 do not know blobs: their SDKs read only inline bodies.
 
-ADR 0113 (M24, WIT surface and ABI versioning) keeps v0.5 on the
+ADR 0113 (M24's design: the v0.5 actor ABI) keeps v0.5 on the
 `kronik:actor` 0.1 track: version 0.1.1 adds new interfaces and one optional
 export, never new functions in existing interfaces or changed types. The
 `blobs` interface is one such new interface

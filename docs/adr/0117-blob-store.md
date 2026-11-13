@@ -31,7 +31,9 @@ per-actor size cap (ADR 0005 §5).
 How a blob of a data subject is named and sealed is
 [ADR 0118](0118-sealed-blob-identity.md); who may use a reference is
 [ADR 0119](0119-blob-reference-graph.md); when a file is deleted is
-[ADR 0120](0120-blob-gc-roots-and-leases.md).
+[ADR 0120](0120-blob-gc-roots-and-leases.md). The designs that build on these
+decisions are [M25 streaming bodies](../design/m25-streaming-bodies.md) and
+[M26 blob storage for apps](../design/m26-blobs.md).
 
 ## Decision
 
@@ -76,8 +78,10 @@ Integers are little endian. Frame `i` carries plaintext bytes
 `[i * 65536, min(size, (i + 1) * 65536))`:
 
 - **plain:** the bytes, then their CRC32C (4 bytes);
-- **sealed:** XChaCha20-Poly1305 under the subject key of the key version,
-  nonce = nonce prefix ‖ `u64_le(i)`, associated data =
+- **sealed:** XChaCha20-Poly1305 under the blob key
+  `BLAKE3-derive-key("kronik blob seal v1", K(s, v))`, derived from the
+  subject key of the key version (so blob frames and sealed values never
+  share a key), nonce = nonce prefix ‖ `u64_le(i)`, associated data =
   `"kronik blob v1" 0x00 subject 0x00 u32_le(key version) identity digest
   u64_le(i) u8(last)`; the ciphertext and its 16-byte tag. A sealed blob has
   at least one frame, so even an empty one authenticates its end.

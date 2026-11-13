@@ -116,6 +116,8 @@ The interface is the one [ADR 0121](../adr/0121-blob-interface-and-wasi-0-3.md)
   `RELEASE` for `held_at_start \ held_now`, sorted by identity, at most 1 024.
   A failed turn records none.
 - **`T` only grows** within a turn: a released blob stays readable.
+- **Secrets.** `put`'s bytes are scrubbed of the values the turn has revealed
+  so far, like a writer's (M25 §5.2).
 - `check_message` stops refusing `blobs`; a message to a component that does
   not read blobs still carries them, and that component cannot use them.
 - The SDK chooses a subject for `put` with `privacy.set-subject` around the
@@ -258,7 +260,7 @@ impl Drop for Lease { /* removes it */ }
 | a turn (`TurnBlobs`) | a set: `T` and created blobs | every host call and every 30 s while it waits | after its record is applied, or when the attempt is abandoned |
 | an upload | a set: its blob | the spool, and the job while queued | after the root turn's record is applied |
 | a response or API download | a set: its blob | per frame | at the end of the stream |
-| a replay, proposal, catch-up, rebase, preview run | a floor at its fork point, and a set for blobs it reads from fork spaces | per root input | at the end of the run |
+| a replay, proposal, catch-up, rebase, preview run | a floor at its fork point, and a set for blobs it reads from fork spaces or (rebase) copies into main's store | per root input | at the end of the run, after the records that reference copied blobs are applied |
 
 `kronik upgrade check` runs in its own process and takes no lease (ADR 0120
 §4).
@@ -270,7 +272,7 @@ impl Drop for Lease { /* removes it */ }
 ```text
 for shard in 00..ff:
     names   = read_dir(objects/<shard>)                     # one shard in memory
-    rooted  = index rows in this shard (blobs table)
+    rooted  = index rows in this shard (blobs table, not erased)
             ∪ snapshot idx entries in this shard (sorted files, merged)
             ∪ fork roots in this shard ∪ leased identities in this shard
     for name in names - rooted:
@@ -285,7 +287,8 @@ for shard in 00..ff:
 - A pass reads the index in one `state.db` read transaction at the applied
   LSN; a record appended but not yet applied references only blobs that a
   turn or upload lease still covers.
-- Erased blobs' files are deleted at the erasure (§9.3), not by the sweep.
+- Erased blobs' files are deleted at the erasure (§9.3); a file the erasure
+  missed has no root and the sweep deletes it too.
 - Fork spaces are deleted with their fork; scratch spaces with their tree.
 - Runs after every retention pass and on `kronik blobs gc`; never during
   startup recovery (the gateway and the sweep start after it).
@@ -309,7 +312,10 @@ blob of main's store without a root, now, ignoring the two-phase grace:
 `reason`: `loose` (no committed record ever referenced it), `released` (its
 last holder released it), `out-of-retention` (its last reference is below the
 floor), `fork-deleted` (only a deleted fork referenced it). `subject` is
-null without `pii:read`. `kronik blobs gc --reason R [--immediate]` (`POST
+null without `pii:read`. `--verify` also recomputes the pins by decoding the
+rows they mirror (mailbox, timers, dead letters, ingress keys, deliveries,
+open turns and effects) and reports any difference from `blob_pins` as
+`"drift"`; it should always be empty. `kronik blobs gc --reason R [--immediate]` (`POST
 /v1/blobs/gc`, scope `operate`, `dry_run` supported) runs a pass now and
 records an `AuditEvent` `blobs.gc`. `kronik blobs inspect <hash>` lists the
 roots that keep a blob (`{"roots": [{"kind": "held", "actor": "media/alice"},
@@ -391,8 +397,8 @@ round (ADR 0122 §3, step 6).
 
 `kronik privacy reseal` gains a blob pass after the segments: for every
 `blobs` row with a subject, not erased, whose file is plain, it writes the
-sealed file (`K(subject, key_version)`) as a part file, fsyncs it, renames
-it over the plain one, syncs the directory and writes a
+file sealed under the row's key version (ADR 0117 §2) as a part file, fsyncs
+it, renames it over the plain one, syncs the directory and writes a
 `blobs/reupload/<name>` marker. Progress: `reseal.blobs_sealed` and
 `reseal.pending_blobs` in `GET /v1/privacy`.
 
@@ -473,8 +479,7 @@ Metrics, added to the catalog:
 | `kronik_blob_ship_pending` | gauge | |
 | `kronik_blob_erased_total` | counter | |
 
-Errors: `BLOB_QUOTA_EXCEEDED` (409) and `BLOB_NOT_FOUND` (404), with M25's
-three (M25 §14).
+Errors: `BLOB_QUOTA_EXCEEDED` (409), with M25's four (M25 §14).
 
 ## 14. Deterministic simulation
 
@@ -589,7 +594,7 @@ M25's slices (B1–B13, M25 §18) come first. M26's:
 
 | Slice | Touches | Proven by | M24 |
 | --- | --- | --- | --- |
-| **B14** holds and edges | `kronik-runtime` (`put`, `retain`, `release`, blobs in messages, replies and timers, net operations, quota), `kronik-sched` (`TurnBlobs` holds, call and compensation edges, `EffectRecord.blobs` for calls), `kronik-store` (`blob_refs`, pins 1, 2, 3, 5, state hash, rebase switch), error codes `BLOB_QUOTA_EXCEEDED`, `BLOB_NOT_FOUND` | criteria 2 and 10; state hash unchanged for states without blobs; rebuild equals live | parallel (textual edits in `host.rs`, `node.rs`) |
+| **B14** holds and edges | `kronik-runtime` (`put`, `retain`, `release`, blobs in messages, replies and timers, net operations, quota), `kronik-sched` (`TurnBlobs` holds, call and compensation edges, `EffectRecord.blobs` for calls), `kronik-store` (`blob_refs`, pins 1, 2, 3, 5, state hash, rebase switch), error code `BLOB_QUOTA_EXCEEDED` | criteria 2 and 10; state hash unchanged for states without blobs; rebuild equals live | parallel (textual edits in `host.rs`, `node.rs`) |
 | **B15** privacy | `kronik-sched` (erasure deletion, reseal pass), `kronik-store` (erased marking), `kronik-privacy` (restore key check), `kronik-api` (privacy fields) | criterion 12 | parallel |
 | **B16** collection for holds | the roots of M26 in `Roots`, dry-run reasons, `inspect` roots, MCP `blob_gc_plan`, actors' `blobs` views | criteria 5, 7, 11 | parallel |
 | **B17** simulation | `kronik-sim` (the `blobs` workload, fault points, invariants, mutations), `scripts/dst.sh`, `tests/guests` | 200 seeds; the mutations fail | parallel |
@@ -599,16 +604,17 @@ M25's slices (B1–B13, M25 §18) come first. M26's:
 
 ### 18.2 Order and parallel work
 
-```text
-B1 ─┬─ B4 ─ B5 ─ B6 ─┬─ B7 ─┐
-B2 ─┤                ├─ B8 ─┤
-B3 ─┘                ├─ B9  ├─ B12 ─┐
-                     ├─ B10 ┘       ├─ B13
-                     └─ B11 ────────┤
-                                    ├─ B14 ─┬─ B15 ─┐
-                                    │       ├─ B16 ─┼─ B18 ─ B19 ─ B20
-                                    │       └─ B17 ─┘
-```
+| Slice | Needs | Slice | Needs |
+| --- | --- | --- | --- |
+| B1, B2, B3 | nothing (in parallel) | B12 | B3, B11 |
+| B4 | nothing; serialized with M24's WIT slice | B13 | B7, B8, B9, B10, B11, B12 |
+| B5 | B3, B4 | B14 | B6, B11 |
+| B6 | B1, B2, B5 | B15 | B14 |
+| B7, B8, B11 | B6 | B16 | B11, B14 |
+| B9 | B7 | B17 | B14, B16 |
+| B10 | B6, B7 | B18 | B12, B14, B15, B16 |
+| | | B19 | B13, B14 |
+| | | B20 | every other slice, and M24's last WIT change |
 
 Conflicts with M24, all agreed with its design: the WIT file, the allowlist
 and the version bump (B4, serialized: whoever lands first bumps to 0.1.1);

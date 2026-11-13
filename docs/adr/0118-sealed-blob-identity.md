@@ -70,9 +70,9 @@ Deduplication is invisible to the guest (ADR 0117 §6).
 
 ### 2. Sealing
 
-In privacy mode `on`, a subject's blob is sealed when it is written, with
-`K(s, v)` for the same `v` (frames, ADR 0117 §2). In mode `off` it is stored
-plain. Whether a file is sealed is a physical property of the file (its
+In privacy mode `on`, a subject's blob is sealed when it is written, under a
+key derived from `K(s, v)` for the same `v` (frames, ADR 0117 §2). In mode
+`off` it is stored plain. Whether a file is sealed is a physical property of the file (its
 header), not part of the identity or of the log: `reseal` seals a plain file
 in place, under the same name and identity.
 
@@ -120,8 +120,8 @@ their `BlobRef` is complete like every other changes nothing about them.
   turn unverifiable. Rebuilding `state.db` applies the same record and gets
   the same result.
 - **Reseal.** With the mode `on`, every plain file of a subject's blob
-  (written in mode `off`) is rewritten sealed with `K(s, key version)` under
-  the same name; the shipper re-uploads it.
+  (written in mode `off`) is rewritten sealed under its recorded key version,
+  with the same name; the shipper re-uploads it.
 - **Restore.** The index comes from the snapshot and the segments; blobs of
   erased subjects count as erased, not as missing.
 
@@ -163,6 +163,8 @@ their `BlobRef` is complete like every other changes nothing about them.
   test key.
 - Log format v1 gains two optional `BlobRef` fields: additive (I16), with a
   compatibility fixture of a `b3s:` reference.
+- How erase, reseal and restore use this is specified in
+  [M26 §9](../design/m26-blobs.md#9-privacy).
 - Revisit if subject key rotation is ever exposed for data subjects (blobs
   would keep their identity version and seal with it), or if a production
   pilot shows that cross-subject duplicates cost too much disk.

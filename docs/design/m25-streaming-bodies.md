@@ -11,9 +11,9 @@ The decisions are ADRs [0117](../adr/0117-blob-store.md) (the store),
 [0120](../adr/0120-blob-gc-roots-and-leases.md) (collection),
 [0121](../adr/0121-blob-interface-and-wasi-0-3.md) (the interface) and
 [0122](../adr/0122-shipping-and-restoring-blobs.md) (shipping). ADR 0113 of
-the M24 design (WIT surface and ABI versioning) sets the rule both
-milestones follow: v0.5 is `kronik:actor@0.1.1`, which only adds
-interfaces. M26 ([blob storage for apps](m26-blobs.md)) completes ownership,
+the M24 design (the v0.5 actor ABI) sets the rule both milestones follow:
+v0.5 is `kronik:actor@0.1.1`, which grows only by new interfaces (and M24's
+one optional export), each complete when it first appears. M26 ([blob storage for apps](m26-blobs.md)) completes ownership,
 collection, privacy and shipping; both milestones land before v0.5.0.
 
 ## 1. Scope
@@ -99,11 +99,11 @@ pub struct BlobKeys {
     pub subject: String,
     pub key_version: u32,
     pub identity: Zeroizing<[u8; 32]>,          // K_id
-    pub seal: Option<Zeroizing<[u8; 32]>>,      // K(s, v) when privacy mode is on
+    pub seal: Option<Zeroizing<[u8; 32]>>,      // the blob key derived from K(s, v), when privacy mode is on
 }
-/// Opens sealed frames: the subject key of (subject, version), or why not.
+/// Opens sealed frames: the blob key of (subject, version), or why not.
 pub trait KeyAccess: Send + Sync {
-    fn open_key(&self, subject: &str, version: u32) -> KeyAnswer;   // Found(key) | Erased | Missing
+    fn open_key(&self, subject: &str, version: u32) -> KeyAnswer;   // Found(blob key) | Erased | Missing
 }
 pub enum Space { Main, Fork(String), Scratch(PathBuf) }
 
@@ -309,7 +309,9 @@ scheduler's implementation, `TurnBlobs` in `kronik-sched`, owns:
   `TRAP` with code `BLOB_NOT_HELD`. `http-body::inline` keeps its
   `message_bytes` limit.
 - **`http-client.fetch`.** `FetchRequest.body` becomes
-  `enum FetchBody { Inline(Vec<u8>), Blob(BlobMeta) }`; a `blob` request body
+  `enum FetchBody { Inline(Vec<u8>), Blob(pb::BlobRef) }` (a complete
+  reference, so `kronik-runtime` needs no dependency on `kronik-blob`); a
+  `blob` request body
   not in `T` reaches the gate as a denial (§7.2). `FetchResponse.body`
   becomes the same enum; a `Blob` response is added to `T` and given to the
   guest as `http-body::blob`.
@@ -683,8 +685,8 @@ reserve.
 | `BLOB_NOT_HELD` | 403 | M25 | A reference outside the turn's references (outcome code, effect error, API) |
 | `BLOB_STORE_FULL` | 503 | M25 | The blob store is below `[blobs] disk_reserve` |
 | `BLOB_MISSING` | 500 | M25 | A committed reference's bytes are not in the store (never expected; a restore with `--allow-missing-blobs` can cause it) |
+| `BLOB_NOT_FOUND` | 404 | M25 | The API knows no such blob (`/v1/blobs/{hash}`) |
 | `BLOB_QUOTA_EXCEEDED` | 409 | M26 | Over `blob_bytes_per_actor` |
-| `BLOB_NOT_FOUND` | 404 | M26 | The API knows no such blob |
 
 Each gets its catalog entry (status, title, hint) in `kronik-core` and an
 explanation in `crates/kronik-core/explain/codes/`, and `docs/errors.md` is
@@ -720,7 +722,7 @@ bodies.
 | read in chunks | `ctx.blobs().reader(&b)` (`Read + Seek`) | `ctx.blobs.stream(b)` (`ReadableStream`) | `ctx.blobs.reader(b)` (`io.RawIOBase`) | `ctx.Blobs().Reader(b)` (`io.ReaderAt`, `io.Reader`) |
 | write a large body | `ctx.blobs().writer()` (`Write`), `.finish()` | `ctx.blobs.writer()`, `.write()`, `.finish()` | `ctx.blobs.writer()` | `ctx.Blobs().Writer()` (`io.Writer`), `.Finish()` |
 | respond with a blob | `HttpResponse::blob(200, &b, "application/pdf")` | `ctx.blob(200, b, 'application/pdf')` | `ctx.blob(200, b, ...)` | `kronik.BlobResponse(200, b, ...)` |
-| fetch with a blob body | `Request::post(url).body_blob(&b)` | `fetch({ body: b })` | `body=b` | `req.BodyBlob = &b` |
+| fetch with a blob body | `Request::post(url).body_blob(&b)` | `ctx.http.fetch({ url, method: 'POST', body: b })` | `ctx.http.fetch(url, method="POST", body=b)` | `kronik.FetchRequest{Body: …, BodyBlob: &b}` |
 | fetch response | `res.read_body()?`, `res.blob()` | `res.body` (lazy), `res.blob` | `res.body`, `res.blob` | `res.Body()`, `res.Blob()` |
 
 Rust keeps `body_bytes()` (inline only) and makes `text()` and `json()` on a
@@ -780,7 +782,7 @@ M24's slices.
 | **B8** gateway | `kronik-gateway` (`body.rs`, `server.rs`, body phase, response streaming, previews), `kronik-sched` (`ingress_peek`, version 4 hash, upload lease in `Job`), `kronik` (`body_idle_timeout`) | gateway tests; idempotent retry of an upload; criterion 1 at CI size | **coordinate** with M24's gateway slices (`body.rs` either order, agreed) |
 | **B9** `wasi:http` bodies | `kronik-runtime/src/host/wasi_http.rs` | the 100-run transcript test with 3 MiB bodies | parallel |
 | **B10** replay and forks | `kronik-fork` (gate, spaces, scratch, disclosure guards, diff, erased and `--no-pii` reads), `diff-v1.schema.json` | identity replay with blob bodies (criterion 2's replay half); `--no-pii` fork test | **coordinate**: M24 edits `replay.rs` and `diff.rs` too |
-| **B11** index, floor, leases, sweep, snapshot index | `kronik-blob` (sweep), `kronik-store` (compaction of `blobs`), `kronik-sched/src/snapshots.rs` (`blobs.idx`, manifest field, sweep after retention), fork `blobs.roots`, replay leases, API/CLI `kronik blobs status`, `inspect`, `get`, `gc` (M26 §12) | sweep tests; snapshot fixture with `blobs.idx`; dry run | parallel |
+| **B11** index, floor, leases, sweep, snapshot index | `kronik-blob` (sweep), `kronik-store` (compaction of `blobs`), `kronik-sched/src/snapshots.rs` (`blobs.idx`, manifest field, sweep after retention), fork `blobs.roots`, replay leases, API/CLI `kronik blobs status`, `inspect`, `get`, `gc` (M26 §12), error code `BLOB_NOT_FOUND` | sweep tests; snapshot fixture with `blobs.idx`; dry run | parallel |
 | **B12** shipping and restore | `kronik-ship` (order of ADR 0122, `ship-blobs.db`, multipart, restore), `kronik` (`restore --allow-missing-blobs`) | MinIO test: restore of uploaded and fetched blobs; a round stopped between steps | parallel |
 | **B13** SDKs and acceptance | `sdk/{rust,ts,python,go}` (§16), test kits, `tests/guests` (`blobs` feature), `crates/kronik/tests/blobs_streaming.rs`, `scripts/acceptance-m25.sh`, `docs/perf.md`, `docs/guides/{actors,operations}.md` | criteria 1–5; `scripts/ci.sh ts sdks examples` | textual conflicts in SDK files |
 
