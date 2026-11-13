@@ -1,6 +1,6 @@
 # 0122. Shipping and restoring blobs: uploads before references, deletions after them
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-13)
 - **Date:** 2026-11-13
 
 ## Context

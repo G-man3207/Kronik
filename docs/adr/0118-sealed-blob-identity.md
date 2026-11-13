@@ -1,6 +1,6 @@
 # 0118. How a sealed blob is identified, and where its subject and key version are recorded
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-13)
 - **Date:** 2026-11-13
 
 ## Context

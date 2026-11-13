@@ -1,6 +1,6 @@
 # 0131. Retention keeps a base for the whole history window
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-13)
 - **Date:** 2026-11-13
 
 ## Context

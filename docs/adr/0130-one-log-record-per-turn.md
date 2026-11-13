@@ -1,6 +1,6 @@
 # 0130. A turn's record fits in one log record
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-13)
 - **Date:** 2026-11-13
 
 ## Context

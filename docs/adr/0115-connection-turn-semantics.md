@@ -1,6 +1,6 @@
 # 0115. Connection inputs, buffered frames, send-now and closes
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-13)
 - **Date:** 2026-11-13
 
 ## Context

@@ -1,6 +1,6 @@
 # M24 long-lived connections (WebSocket and SSE)
 
-Status: design for M24, proposed. Nothing in it is built yet. It builds on
+Status: design for M24, accepted on 2026-11-13. Nothing in it is built yet. It builds on
 [m1-core](m1-core.md), [m2-effects](m2-effects.md), [m3-fork](m3-fork.md),
 [m8-privacy](m8-privacy.md) and [m11-preview](m11-preview.md), and on these
 sections of the build brief: "Turn semantics", "Effects and capabilities",
@@ -1855,6 +1855,9 @@ dependencies: 5 needs 4; 6, 7 and 8 need 5; 9 needs 4; 11 needs 5 and 8;
    anyway.
 
 ## 21. Open questions for the maintainers
+
+Decided on 2026-11-13: the maintainers accepted all four recommendations
+below, and ADRs 0113–0116 are Accepted.
 
 1. **Q1. The ABI (project status).** A new minor ABI (0.2.0), or additions
    within 0.1 with a second, optional export? **Recommendation:** additive

@@ -1,6 +1,6 @@
 # 0117. The blob store: content-addressed files, durable before they are referenced
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-13)
 - **Date:** 2026-11-13
 
 ## Context

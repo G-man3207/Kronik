@@ -1,6 +1,6 @@
 # 0113. The v0.5 actor ABI: additive 0.1.1 with an optional connection export
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-13)
 - **Date:** 2026-11-13
 
 ## Context

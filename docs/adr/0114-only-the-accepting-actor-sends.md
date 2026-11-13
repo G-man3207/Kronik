@@ -1,6 +1,6 @@
 # 0114. Only the actor that accepted a connection sends on it or closes it
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-13)
 - **Date:** 2026-11-13
 
 ## Context

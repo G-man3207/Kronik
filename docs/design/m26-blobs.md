@@ -1,6 +1,6 @@
 # M26 blob storage for apps: design
 
-Status: proposed design for M26 (v0.5). It completes
+Status: accepted design for M26 (v0.5), 2026-11-13. It completes
 [M25 streaming bodies](m25-streaming-bodies.md), whose store, interface,
 gateway and effect paths it uses, and fixes what the slices of §18 build.
 The decisions are ADRs [0117](../adr/0117-blob-store.md) to
@@ -639,6 +639,9 @@ regenerates). Everything else runs in parallel.
 | Cross-subject duplicates cost disk | accepted (ADR 0118); revisit with pilot data |
 
 ## 20. Open questions
+
+Decided on 2026-11-13: the maintainers accepted every recommendation below
+and those of M25 §20, and ADRs 0117–0122 are Accepted.
 
 Each with a recommendation; M25 §20 has two more on default limits.
 

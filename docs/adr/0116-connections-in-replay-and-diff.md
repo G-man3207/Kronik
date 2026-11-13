@@ -1,6 +1,6 @@
 # 0116. Connections in replay and the behavior diff
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-13)
 - **Date:** 2026-11-13
 
 ## Context

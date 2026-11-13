@@ -1,6 +1,6 @@
 # M25 streaming bodies: design
 
-Status: proposed design for M25 (v0.5). It fixes what the implementation
+Status: accepted design for M25 (v0.5), 2026-11-13. It fixes what the implementation
 slices of §18 build, so that none of them has to decide anything again. It
 builds on [M1 core](m1-core.md), [M2 effects](m2-effects.md),
 [M3 fork](m3-fork.md), [M6 storage](m6-storage.md),
@@ -826,6 +826,9 @@ be on a majority of the shard's replicas before the record that references
 it commits; the self-describing references allow it).
 
 ## 20. Open questions
+
+Decided on 2026-11-13: the maintainers accepted both recommendations below
+and those of M26 §20, and ADRs 0117–0122 are Accepted.
 
 Two questions decide defaults; the rest are in [M26 §20](m26-blobs.md#20-open-questions).
 

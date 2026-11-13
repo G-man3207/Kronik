@@ -1,6 +1,6 @@
 # 0121. Reading and writing blobs on WASI 0.2, and the path to WASI 0.3 streams
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-13)
 - **Date:** 2026-11-13
 
 ## Context
