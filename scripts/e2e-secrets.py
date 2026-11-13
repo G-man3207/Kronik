@@ -1511,6 +1511,9 @@ def main():
                         daemon.kill9()
                 if service is not None:
                     service.close()
+                    for key in ("shim_corrections",):
+                        if key in service.evidence:
+                            evidence[key] = service.evidence[key]
                 for leftover in (root / name).glob("*/api.sock") if (root / name).exists() else []:
                     leftover.unlink(missing_ok=True)
                 results["services"][name] = evidence
