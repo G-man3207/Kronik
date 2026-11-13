@@ -20,6 +20,10 @@
 //! open, or a record the start itself writes) is a daemon that exits: the
 //! supervisor starts it again and recovery has to cope with what the failed
 //! start left behind. Any other failure to start is a violation.
+//!
+//! The secret workloads (M23, [`SecretWorkload`], `secrets.rs`) link secret
+//! names to a simulated OpenBao (`bao.rs`) and check the secret invariants
+//! instead of the counters.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -40,11 +44,16 @@ use kronik_store::Store;
 use kronik_store::sql::{Limits, MemOpener, SqlPool};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::bao::{SimBao, SimNet};
 use crate::exec::{Executor, Handle, NodeId, RunEnd, SUPERVISOR};
 use crate::fs::{CrashModel, Disk, DiskFaults, INJECTED_FSYNC_EIO, SimFs};
 use crate::service::{ServiceFaults, SimService};
+
+mod secrets;
 use crate::{SimClock, SimEntropy, SimNoNet, SimProcs, SimRng, SimSpawner, Trace};
 use kronik_effects::{Delivery, Rate};
+use secrets::SecretState;
+pub use secrets::SecretWorkload;
 
 /// The counter guest (tests/guests/counter.wasm).
 pub const COUNTER: &[u8] = include_bytes!("../../../tests/guests/counter.wasm");
@@ -105,6 +114,8 @@ pub struct ScenarioConfig {
     /// turns and their recorded effects) must equal a plain rebuild from
     /// the log up to the same LSN, as scripts/chaos.py checks.
     pub check_recovery: bool,
+    /// A secret workload instead of the counter workload.
+    pub secrets: Option<SecretWorkload>,
 }
 
 /// The effects workload's knobs.
@@ -144,6 +155,7 @@ impl ScenarioConfig {
             bulk_replay_min: kronik_sched::NodeConfig::default().bulk_replay_min,
             startup_apply_batch: kronik_sched::NodeConfig::default().startup_apply_batch,
             check_recovery: false,
+            secrets: None,
         }
     }
 
@@ -198,6 +210,51 @@ impl ScenarioConfig {
         if let Some(fx) = cfg.effects.as_mut() {
             fx.webhook = true;
         }
+        cfg
+    }
+
+    /// The "one allocator" workload for `seed` (`--scenario allocator`):
+    /// counters HMAC with a linked secret while the simulated OpenBao rotates
+    /// it, an operator refreshes it and the background refresher runs every
+    /// 100 to 600 ms, under the counter workload's crashes and faults.
+    pub fn allocator_for_seed(seed: u64) -> ScenarioConfig {
+        let r = SimRng::new(seed, b"allocator-config");
+        let mut cfg = ScenarioConfig::for_seed(seed);
+        cfg.forward_p = 0.0;
+        cfg.clients = 2 + r.below(3) as usize;
+        cfg.requests_per_client = 4 + r.below(12) as usize;
+        cfg.secrets = Some(SecretWorkload::Allocator {
+            refresh: Duration::from_millis(100 + r.below(500)),
+            rotations: 2 + r.below(5) as u32,
+        });
+        cfg
+    }
+
+    /// The `secret-outage` workload for `seed` (`--scenario secret-outage`):
+    /// the simulated OpenBao hangs for four fetch timeouts and up to 3 s more
+    /// while turns with and without secrets run. No crashes, fsync failures
+    /// or clock jumps: the workload measures how long turns take.
+    pub fn outage_for_seed(seed: u64) -> ScenarioConfig {
+        let r = SimRng::new(seed, b"outage-config");
+        let mut cfg = ScenarioConfig::for_seed(seed);
+        cfg.forward_p = 0.0;
+        cfg.clients = 3;
+        cfg.actors = 3;
+        cfg.max_crashes = 0;
+        cfg.fsync_error = 0.0;
+        cfg.clock_jump_p = 0.0;
+        let fetch_timeout =
+            [Duration::from_millis(500), Duration::from_secs(2)][r.below(2) as usize];
+        cfg.secrets = Some(SecretWorkload::Outage {
+            refresh: [
+                Duration::from_millis(300),
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+            ][r.below(3) as usize],
+            fetch_timeout,
+            baseline: Duration::from_millis(200 + r.below(800)),
+            outage: fetch_timeout * 4 + Duration::from_millis(r.below(3_000)),
+        });
         cfg
     }
 
@@ -304,6 +361,7 @@ struct State {
     turns: u64,
     finished: bool,
     notes: String,
+    secrets: SecretState,
 }
 
 struct World {
@@ -319,6 +377,8 @@ struct World {
     code: Arc<CodeStore>,
     fatal_tx: mpsc::UnboundedSender<NodeId>,
     service: Option<Arc<SimService>>,
+    /// The simulated OpenBao of the secret workloads.
+    bao: Option<Arc<SimBao>>,
     /// The real directory backing the file-backed secret stores; held for
     /// the whole run. Each node start opens its own store under it with
     /// production custody (lock_data + open_owned) and passes the ownership
@@ -384,9 +444,13 @@ impl World {
                     fsync_error: self.cfg.fsync_error,
                 },
             )),
-            net: match &self.service {
-                Some(s) => s.net(node),
-                None => Arc::new(SimNoNet),
+            net: match (&self.service, &self.bao) {
+                (service, Some(bao)) => Arc::new(SimNet {
+                    bao: Some(bao.clone()),
+                    service: service.as_ref().map(|s| s.net(node)),
+                }),
+                (Some(s), None) => s.net(node),
+                (None, None) => Arc::new(SimNoNet),
             },
             procs: Arc::new(SimProcs {
                 clock: self.clock.clone(),
@@ -497,6 +561,7 @@ impl World {
                 storage: Some(kronik_sched::snapshots::StorageConfig::new(PathBuf::from(
                     "/data",
                 ))),
+                secret_settings: self.cfg.secrets.map(|w| w.settings()).unwrap_or_default(),
                 ..NodeConfig::default()
             },
             log: self.log_config(),
@@ -587,6 +652,13 @@ impl World {
             && let Err(e) = self.setup_webhook(&node, &authority).await
         {
             self.event(format!("webhook setup failed: {e}"));
+            let _ = self.fatal_tx.send(node_id);
+            return;
+        }
+        if self.cfg.secrets.is_some()
+            && let Err(e) = self.setup_secrets(&node, &authority).await
+        {
+            self.event(format!("secret setup failed: {e}"));
             let _ = self.fatal_tx.send(node_id);
             return;
         }
@@ -742,6 +814,9 @@ impl World {
     }
 
     async fn client(self: Arc<Self>, client: usize) {
+        if self.cfg.secrets.is_some() {
+            return self.secret_client(client).await;
+        }
         for r in 0..self.cfg.requests_per_client {
             if self
                 .cfg
@@ -989,6 +1064,7 @@ impl World {
         self.check_log(&node).await;
         self.check_no_open_turns(&node).await;
         self.check_effects(&node).await;
+        self.check_secrets(&node).await;
         let turns = node
             .probe
             .turns_run
@@ -1323,7 +1399,9 @@ impl World {
             let Some(actor) = t.actor.as_ref().map(ActorRef::from_pb) else {
                 continue;
             };
-            if t.outcome.as_ref().map(|o| o.kind) != Some(pb::OutcomeKind::Committed as i32) {
+            if t.outcome.as_ref().map(|o| o.kind) != Some(pb::OutcomeKind::Committed as i32)
+                && !self.expected_failure(t)
+            {
                 self.violation(format!("failed turn at lsn {}: {:?}", c.lsn, t.outcome));
             }
             let last = times.entry(actor.clone()).or_default();
@@ -1458,10 +1536,8 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
     let service = cfg
         .effects
         .map(|fx| SimService::new(clock.clone(), SimRng::new(seed, b"service"), fx.faults));
-    let secrets_root = match cfg
-        .effects
-        .filter(|fx| fx.webhook)
-        .map(|_| tempfile::tempdir().map_err(|e| e.to_string()))
+    let secrets_root = match (cfg.effects.is_some_and(|fx| fx.webhook) || cfg.secrets.is_some())
+        .then(|| tempfile::tempdir().map_err(|e| e.to_string()))
         .transpose()
     {
         Ok(root) => root,
@@ -1487,9 +1563,19 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
 
     let mut disk = Disk::default();
     disk.fail_syncs(cfg.fail_fsyncs.iter().copied());
+    let bao = cfg.secrets.map(|workload| {
+        disk.install(
+            std::path::Path::new(secrets::TOKEN_FILE),
+            crate::bao::TOKEN.as_bytes(),
+        );
+        let bao = SimBao::new(clock.clone(), SimRng::new(seed, b"bao"));
+        workload.prepare(&bao);
+        bao
+    });
     let world = Arc::new(World {
         secrets_root,
         service,
+        bao,
         seed,
         exec: handle.clone(),
         clock,
@@ -1515,6 +1601,14 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
             SUPERVISOR,
             "client",
             Box::pin(async move { w.client(c).await }),
+        );
+    }
+    if world.cfg.secrets.is_some() {
+        let w = world.clone();
+        handle.spawn(
+            SUPERVISOR,
+            "secret-director",
+            Box::pin(async move { w.secret_director().await }),
         );
     }
     let w = world.clone();

@@ -125,6 +125,33 @@ impl Disk {
         self.fail_sync_calls.extend(calls);
     }
 
+    /// A durable regular file that was on the disk before the run, with its
+    /// directories, such as a credential file an operator provisioned. A
+    /// crash keeps it, as it keeps every synced file.
+    pub fn install(&mut self, path: &Path, bytes: &[u8]) {
+        let mut dir = parent(path);
+        loop {
+            self.dirs.insert(dir.clone());
+            match dir.parent() {
+                Some(up) if !up.as_os_str().is_empty() => dir = up.to_path_buf(),
+                _ => break,
+            }
+        }
+        self.next_inode += 1;
+        let ino = self.next_inode;
+        self.inodes.insert(
+            ino,
+            Inode {
+                current: bytes.to_vec(),
+                durable: bytes.to_vec(),
+                pending: Vec::new(),
+                private: true,
+            },
+        );
+        self.names.insert(path.to_path_buf(), ino);
+        self.durable_names.insert(path.to_path_buf(), ino);
+    }
+
     /// The bytes of `path` that are guaranteed to survive a crash right now:
     /// durable contents of a durably named file.
     pub fn durable_contents(&self, path: &Path) -> Option<Vec<u8>> {

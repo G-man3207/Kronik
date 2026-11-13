@@ -2349,6 +2349,7 @@ dependencies = [
  "kronik-runtime",
  "kronik-sched",
  "kronik-store",
+ "prost",
  "rusqlite",
  "serde_json",
  "tempfile",

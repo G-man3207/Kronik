@@ -20,6 +20,7 @@ kronik-proto = { workspace = true }
 kronik-runtime = { workspace = true }
 kronik-sched = { workspace = true }
 kronik-store = { workspace = true }
+prost = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "macros"] }
