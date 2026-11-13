@@ -235,6 +235,7 @@ fn core_spelling_is_not_guest_code_provenance_but_real_host_traps_remain_structu
         writes: Vec::new(),
         messages: Vec::new(),
         timers: Vec::new(),
+        connection_ops: Vec::new(),
         fuel_used: 13,
         memory_peak_bytes: 29,
         logs: Vec::new(),

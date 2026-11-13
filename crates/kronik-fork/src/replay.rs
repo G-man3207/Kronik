@@ -1255,6 +1255,7 @@ impl Runner {
                 out.writes.clear();
                 out.messages.clear();
                 out.timers.clear();
+                out.connection_ops.clear();
             }
         }
         let real_rows = self.setup.privacy.no_pii && (used_sql || gs.sql || p.sql);
@@ -1300,7 +1301,13 @@ impl Runner {
             config_epoch: epoch,
             memory_peak_bytes: out.memory_peak_bytes,
             schema_version: if committed { schema_version } else { 0 },
-            connection_ops: Vec::new(),
+            // M24: the fork's own connections table follows its turns'
+            // buffered operations, as production's does (ADR 0116).
+            connection_ops: if committed {
+                out.connection_ops
+            } else {
+                Vec::new()
+            },
             // A recomputed turn's wall time says nothing about production.
             duration_us: 0,
         };

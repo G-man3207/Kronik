@@ -135,6 +135,9 @@ concepts! {
     "isolation-level" => "M7", "How code is sandboxed: wasm, gvisor, trusted or microvm";
     "snapshot" => "M6", "A consistent copy of materialized state at an LSN";
     "segment" => "M1", "A log file; closed segments are immutable";
+    "connections" => "M24", "WebSocket and SSE connections that the gateway holds for the actor that accepted them";
+    "frame" => "M24", "One message on a connection: WebSocket text or binary, or an SSE event";
+    "send-now" => "M24", "Sending a frame during a turn, as an effect with the delivery class unsafe";
 }
 
 /// Every topic: the concepts, the guides, then the error codes in catalog
@@ -160,7 +163,7 @@ mod tests {
     use super::*;
 
     /// The concepts that `kronik explain` must cover.
-    const REQUIRED_CONCEPTS: [&str; 35] = [
+    const REQUIRED_CONCEPTS: [&str; 38] = [
         "actor",
         "kind",
         "message",
@@ -196,6 +199,9 @@ mod tests {
         "isolation-level",
         "snapshot",
         "segment",
+        "connections",
+        "frame",
+        "send-now",
     ];
 
     #[test]
@@ -251,8 +257,9 @@ mod tests {
 
     #[test]
     fn names_are_unique_and_texts_are_complete() {
-        const MILESTONES: [&str; 14] = [
-            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M21", "M23", "M28",
+        const MILESTONES: [&str; 15] = [
+            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M21", "M23",
+            "M24", "M28",
         ];
         let mut seen = HashSet::new();
         for t in list() {

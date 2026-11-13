@@ -71,7 +71,7 @@ use bindings::kronik::actor::{
 
 pub use sql::{Rows as SqlRows, SqlError, SqlValue};
 
-mod connections;
+pub(crate) mod connections;
 mod wasi_http;
 
 /// Maximum bytes per random request; larger requests trap.
@@ -378,6 +378,8 @@ pub struct TurnHost {
     gate: Option<Arc<dyn EffectGate>>,
     next_ordinal: u32,
     http: wasi_http::State,
+    /// The turn's connections and buffered connection operations (M24).
+    pub(crate) conns: connections::TurnConnections,
     /// A host failure (not guest-visible); the turn is abandoned.
     pub(crate) fatal: Option<RunError>,
 }
@@ -447,6 +449,7 @@ impl TurnHost {
             gate: init.gate,
             next_ordinal: 0,
             http: wasi_http::State::new(),
+            conns: connections::TurnConnections::default(),
             fatal: None,
         }
     }

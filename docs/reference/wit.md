@@ -469,8 +469,8 @@ accepted it, its **owner**, sends on it and closes it
 every incoming frame and the close are inputs of the owner, delivered to
 [`connection-handler`](#connection-handler).
 
-M24 is being built: until its parts land, these functions trap with
-`NOT_IMPLEMENTED`, and the gateway does not open connections yet.
+M24 is being built: `send-now` traps with `NOT_IMPLEMENTED` until its part
+lands, and the gateway does not open connections yet.
 
 - **Connection ids** are `c-` and 32 lowercase hex characters, assigned
   when the connection opens, recorded and the same in replay. An id is

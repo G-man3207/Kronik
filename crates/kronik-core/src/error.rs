@@ -116,6 +116,12 @@ codes! {
     CertificateInvalid = "CERTIFICATE_INVALID", 400, "M6",
         "The TLS certificate cannot be used",
         "Renew the certificate, or fix the path and permissions of the PEM files.";
+    ConnectionLimit = "CONNECTION_LIMIT", 503, "M24",
+        "The gateway holds as many connections as it may",
+        "Try again later; operators raise `[connections] max_open`, `max_per_actor` or `max_per_client`.";
+    ConnectionNotHeld = "CONNECTION_NOT_HELD", 403, "M24",
+        "The actor used a connection it did not accept",
+        "Only the actor that accepted a connection can send on it or close it; send that actor a message instead (`kronik explain connections`).";
     DeadLetterAlreadyResent = "DEAD_LETTER_ALREADY_RESENT", 409, "M1",
         "The dead letter was already resent",
         "See its `resent_as` turn in `kronik dead-letters list`.";
@@ -562,8 +568,9 @@ mod tests {
 
     #[test]
     fn every_code_has_a_status_milestone_title_hint_and_explanation() {
-        const MILESTONES: [&str; 14] = [
-            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M21", "M23", "M28",
+        const MILESTONES: [&str; 15] = [
+            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M21", "M23",
+            "M24", "M28",
         ];
         for &code in ErrorCode::ALL {
             assert!((400..600).contains(&code.http_status()), "{code}");

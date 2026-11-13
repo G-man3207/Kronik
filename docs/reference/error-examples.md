@@ -69,6 +69,27 @@ read. Renew or replace the certificate; do not serve with the expired files.
 kronik doctor --config /owned/fixture/expired-cert.toml
 ```
 
+## CONNECTION_LIMIT
+
+Open more WebSocket connections to a fixture actor than `[connections]
+max_per_actor` allows: the next upgrade request answers 503 with
+`retry-after: 5`, and no turn runs. Reconnect later with backoff; operators
+raise the limit in `kronik.toml` and check the open-file limit.
+
+```sh
+kronik doctor
+```
+
+## CONNECTION_NOT_HELD
+
+A fixture room actor's frame turn sends to a connection id that another
+actor accepted. The turn fails with this code and its frame input is a dead
+letter. Find the failed turn, then send the owning actor a message instead.
+
+```sh
+kronik history room/lobby --limit 10
+```
+
 ## DEAD_LETTER_ALREADY_RESENT
 
 Attempt a second resend of a dead letter that already names its `resent_as`
