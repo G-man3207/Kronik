@@ -10,11 +10,26 @@ response body unchanged, so its schema is that of the operation it calls,
 as in [openapi.json](openapi.json), the OpenAPI 3.1 description that
 `GET /v1/openapi.json` serves. `explain`, `doctor`, `init`, `build`,
 `restore`, `upgrade check` and `audit verify` answer themselves. A
-failure prints the [`Error`](#error) object instead, with exit code 1,
-except `upgrade check`, which prints its report either way and exits 1
-when a verified difference remains (`code` is `ENGINE_UPGRADE_DIVERGED`), and
-`audit verify`, which prints its report either way and exits 1 when it
-is not `complete`. The
+command that fails prints the [`Error`](#error) object instead and exits 1.
+These commands also exit 1 for an outcome that is not an error, and then
+print their own object, not `Error`:
+
+- `upgrade check`: its report, when a verified difference remains (`code`
+  is `ENGINE_UPGRADE_DIVERGED`);
+- `audit verify`: its report, when it is not `complete`;
+- `doctor`: its report, when a check failed;
+- `proposal status` and `proposals show`: the proposal, when its `status`
+  is `failed`;
+- `watch` (when it ends) and `watches show`: the watch, when it is
+  `rolled_back` or `failed`, or a guard's rollback was refused or failed;
+- `integrity`: its answer, when `keys_missing` is not empty;
+- `foreign cleanup`: its counts, when `failed` is above 0;
+- `send` (also with `--fork`) and `dead-letters resend`: the turn, when it
+  ran and did not commit.
+
+So on exit 1 a script looks for the `error` member before it reads the
+command's own schema. A usage error, such as an unknown flag, exits 2 with a
+message on standard error and prints no JSON. The
 schemas are JSON Schema 2020-12; `$ref`s name the definitions below.
 
 Two bodies are not generated from types but written by hand, and also

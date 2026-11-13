@@ -462,11 +462,24 @@ pub(crate) fn page() -> String {
          as in [openapi.json](openapi.json), the OpenAPI 3.1 description that\n\
          `GET /v1/openapi.json` serves. `explain`, `doctor`, `init`, `build`,\n\
          `restore`, `upgrade check` and `audit verify` answer themselves. A\n\
-         failure prints the [`Error`](#error) object instead, with exit code 1,\n\
-         except `upgrade check`, which prints its report either way and exits 1\n\
-         when a verified difference remains (`code` is `ENGINE_UPGRADE_DIVERGED`), and\n\
-         `audit verify`, which prints its report either way and exits 1 when it\n\
-         is not `complete`. The\n\
+         command that fails prints the [`Error`](#error) object instead and exits 1.\n\
+         These commands also exit 1 for an outcome that is not an error, and then\n\
+         print their own object, not `Error`:\n\n\
+         - `upgrade check`: its report, when a verified difference remains (`code`\n  \
+         is `ENGINE_UPGRADE_DIVERGED`);\n\
+         - `audit verify`: its report, when it is not `complete`;\n\
+         - `doctor`: its report, when a check failed;\n\
+         - `proposal status` and `proposals show`: the proposal, when its `status`\n  \
+         is `failed`;\n\
+         - `watch` (when it ends) and `watches show`: the watch, when it is\n  \
+         `rolled_back` or `failed`, or a guard's rollback was refused or failed;\n\
+         - `integrity`: its answer, when `keys_missing` is not empty;\n\
+         - `foreign cleanup`: its counts, when `failed` is above 0;\n\
+         - `send` (also with `--fork`) and `dead-letters resend`: the turn, when it\n  \
+         ran and did not commit.\n\n\
+         So on exit 1 a script looks for the `error` member before it reads the\n\
+         command's own schema. A usage error, such as an unknown flag, exits 2 with a\n\
+         message on standard error and prints no JSON. The\n\
          schemas are JSON Schema 2020-12; `$ref`s name the definitions below.\n\n\
          Two bodies are not generated from types but written by hand, and also\n\
          stand alone for validators: the behavior diff,\n\
