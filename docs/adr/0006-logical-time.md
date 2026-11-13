@@ -66,7 +66,8 @@ Implemented in `kronik-core::time::LogicalClock` and recovered in
 - **Clock jumps.** Each assignment takes the maximum with `hwm`, the
   largest time already handed out, so a host clock that moves backwards
   never lowers `now-ms` (unit test `clock_jump_back_never_lowers_time`; the
-  simulator moves the wall clock back by up to 10 s in every run).
+  simulator moves the wall clock back by up to 10 s in every run, and the
+  webhook workload once by 5 to 10 minutes).
 - **Restarts and leadership changes.** A new process starts above every
   time in the log. Times handed out by the old process to turns that never
   reached the log were never observed durably: such a turn sent no response,
@@ -100,10 +101,66 @@ message).
   separate host function if guests need unique ordered timestamps.
   Not needed now.
 
+## Timers (2026-11-13)
+
+The first version of this ADR said that timers "can be due against
+[`now-ms`] directly". The wheel compared due times with the wall clock
+alone, though. After the host clock stepped back by Δ (an NTP correction, a
+VM resume, an operator fixing a clock that ran ahead), a timer already due
+in logical time waited until the wall clock had climbed back by Δ. The
+simulator corrected its clock before it waited for the webhook retries, so
+that runs could finish (issue #40).
+
+A timer is due when either of these comes first:
+
+- logical time, `max(wall clock, hwm)`, reaches its due time;
+- the delay it had left when the wheel took it has passed on the
+  monotonic clock. The wheel takes a timer when its turn commits, or at
+  start for the rows in `state.db`, and the delay left is the due time
+  less the logical time then.
+
+The deadline lives only in memory. Nothing recorded changes: the due time,
+the `TimerInput` and the timer turn's `now-ms`, `max(wall, hwm, due)`, are
+as before, and I15 holds as above. Only the moment a timer fires changes,
+and that is not recorded.
+
+So a host clock that steps back delays no timer. Logical time holds still
+at `hwm` until the wall clock catches up, except that a timer turn runs at
+its due time. A timer that fires during the catch-up therefore moves
+logical time forward to its due time. `now-ms` stays at most Δ ahead of the
+wall clock and returns to it once timers stop firing. It cannot run further
+ahead: a due time is its scheduling turn's time plus a delay, and the
+monotonic clock has counted that delay too. A clock that steps forward
+fires at once the timers that logical time passes, as before.
+
+Alternatives considered:
+
+- **Compare due times with `max(wall, hwm)` only.** Timers already due fire
+  at once, but one due later still waits out the step, since logical time
+  holds still. Adding 1 ms per turn while the wall clock is behind moves
+  logical time only with traffic. Rejected.
+- **A wall-clock deadline per timer.** A step back after the timer was set
+  delays it just the same. Rejected.
+- **Keep the stall and document it.** Retries, leases and holds built on
+  timers would be late by the step, minutes after an NTP correction.
+  Rejected.
+
+Tested by the wheel's unit tests, by `a_clock_step_back_delays_no_timer`
+in `crates/kronik-sched/tests/effects.rs` (a 1 s timer set before and one
+set after a 5-minute step back both fire after about 1 s), and by DST:
+the webhook workload's wall clock steps back 5 to 10 minutes once and is
+no longer corrected before the drain, and every run checks that a timer
+turn runs at or after its due time.
+
 ## Consequences
 
 - `now-ms` stays within the host clock's error of real time under any
-  load, so timers (M2) can be due against it directly.
+  load. After the host clock steps back by Δ, it holds still for up to Δ
+  (or runs at the due times of the timers that fire meanwhile) until the
+  wall clock catches up.
+- A timer fires when logical time reaches its due time or when its delay
+  has passed on the monotonic clock, whichever is first, so a clock step
+  back does not delay it (see Timers above).
 - Equal `now-ms` values in different turns are normal; guests must not use
   `now-ms` as a unique key (docs for the SDK should say so).
 - Revisit if the maintainers prefer the literal formula, or if a cluster design

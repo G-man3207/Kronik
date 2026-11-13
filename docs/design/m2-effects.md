@@ -285,10 +285,17 @@ its ingress key belong to the re-run (an HTTP retry with the same
   `now-ms + delay`; `cancel(id)` buffers `CANCEL` and returns whether the
   timer is pending (committed or scheduled earlier in the turn). Applied
   with the turn record into `timers (kind, key, id, due_ms, msg, causal
-  key)`. The timer wheel fires a due timer (wall clock ≥ due) as a turn
-  with `TimerInput`, logical time ≥ due, causal key `child(scheduling turn
-  key, actor, ordinal)`; the row is removed when that turn's record is
-  applied, and a failed timer turn is a dead letter.
+  key)`. The timer wheel fires a timer as a turn with `TimerInput`, logical
+  time ≥ due, causal key `child(scheduling turn key, actor, ordinal)`; the
+  row is removed when that turn's record is applied, and a failed timer
+  turn is a dead letter. A timer is due when logical time
+  (`max(wall clock, high-water mark)`) reaches its due time, or when the
+  delay it had left when the wheel took it (at commit, or at start for the
+  rows in `state.db`: due less logical time then) has passed on the
+  monotonic clock, whichever is first (ADR 0006). So a host clock that
+  steps back, which holds logical time still at its high-water mark until
+  the wall clock catches up, delays no timer; one that steps forward fires
+  the timers logical time passes.
 
 ## 8. API additions (`/v1`, same conventions as m1-core §4)
 

@@ -186,6 +186,15 @@ M23, key and secret backends:
   `UNAVAILABLE`. The fork's record now names the fork's callee turn, and the
   fork withholds the reply, fails the turn and delivers the call's
   compensation as production did.
+- After the host clock stepped back (an NTP correction, a VM resume, an
+  operator fixing a clock that ran ahead), every timer waited until the wall
+  clock had climbed back by the step, minutes late for webhook retries,
+  leases and holds, although ADR 0006 said timers are due against logical
+  time (#40). A timer now fires when logical time reaches its due time or
+  when its delay has passed on the monotonic clock, whichever comes first;
+  nothing recorded changes. DST's webhook workload steps its clock back 5 to
+  10 minutes and no longer corrects it before draining, and every run checks
+  that a timer turn runs at or after its due time.
 
 ## v0.4.1 — 2026-11-07
 

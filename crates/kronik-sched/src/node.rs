@@ -966,9 +966,10 @@ impl Node {
             node.enqueue_mailbox(row);
         }
         {
+            let now = node.timer_now();
             let mut w = lock(&node.wheel);
             for t in &timers {
-                w.add(t.actor.clone(), t.timer_id, t.due_ms);
+                w.add(t.actor.clone(), t.timer_id, t.due_ms, now);
             }
         }
         let weak = Arc::downgrade(&node);
@@ -1231,6 +1232,16 @@ impl Node {
     }
 
     /// Queues a pending message of the mailbox.
+    /// The present for the timer wheel: the logical time a turn starting now
+    /// gets but for its parent, `max(wall clock, high-water mark)`, and the
+    /// monotonic clock (ADR 0006, #40).
+    pub(crate) fn timer_now(&self) -> crate::timers::Now {
+        crate::timers::Now {
+            logical_ms: self.env.clock.wall_ms().max(self.clock.high_water()),
+            monotonic: self.env.clock.monotonic(),
+        }
+    }
+
     /// The compensation of the timed-out call `call_message_id` that the
     /// record at `lsn` released (#30). A failed read leaves it in the
     /// mailbox, where the next start delivers it.
@@ -1296,10 +1307,11 @@ impl Node {
             )
         };
         {
+            let now = self.timer_now();
             let mut w = lock(&self.wheel);
             *w = Wheel::default();
             for t in &timers {
-                w.add(t.actor.clone(), t.timer_id, t.due_ms);
+                w.add(t.actor.clone(), t.timer_id, t.due_ms, now);
             }
         }
         self.wheel_notify.notify_one();
@@ -2233,10 +2245,11 @@ impl Node {
             self.enqueue_mailbox(row);
         }
         if !timers.is_empty() {
+            let now = self.timer_now();
             let mut w = lock(&self.wheel);
             for t in &timers {
                 if t.kind == pb::TimerOpKind::Schedule as i32 {
-                    w.add(actor.clone(), t.timer_id, t.due_ms);
+                    w.add(actor.clone(), t.timer_id, t.due_ms, now);
                 } else {
                     w.remove(actor, t.timer_id);
                 }
@@ -4430,23 +4443,24 @@ async fn disk_space_loop(node: Weak<Node>, dir: std::path::PathBuf) {
     }
 }
 
-/// Fires due timers: sleeps until the next due time (wall clock) or until a
-/// new timer arrives, then queues each due timer's turn.
+/// Fires due timers: sleeps until the next timer is due, by logical time or
+/// by its monotonic deadline ([`Wheel`]), or until a new timer arrives, then
+/// queues each due timer's turn.
 async fn timer_loop(node: Weak<Node>) {
     loop {
         let Some(n) = node.upgrade() else { return };
-        let now = n.env.clock.wall_ms();
+        let now = n.timer_now();
         let (due, next) = {
             let mut w = lock(&n.wheel);
-            (w.take_due(now), w.next_due())
+            (w.take_due(now), w.next_wait(now))
         };
         for (actor, id, due_ms) in due {
             n.fire_timer(actor, id, due_ms);
         }
         let wait = next
-            .map_or(60_000, |d| d.saturating_sub(now))
-            .clamp(1, 60_000);
-        let sleep = n.env.clock.sleep(Duration::from_millis(wait));
+            .unwrap_or(Duration::from_secs(60))
+            .clamp(Duration::from_millis(1), Duration::from_secs(60));
+        let sleep = n.env.clock.sleep(wait);
         let notify = n.wheel_notify.clone();
         drop(n);
         let notified = notify.notified();

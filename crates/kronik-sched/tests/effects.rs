@@ -1760,3 +1760,105 @@ fn a_call_that_times_out_is_an_orphan_once_its_callee_commits() {
     assert!(orphan_of(&p, "c").is_some_and(|o| o.resolved_lsn.is_none()));
     assert_eq!(p.kv("counter/b", "n").as_deref(), Some("2"));
 }
+
+/// The real clock with a wall clock the test steps, as NTP or an operator
+/// would.
+struct SteppedClock {
+    real: Arc<dyn kronik_core::env::Clock>,
+    offset_ms: std::sync::atomic::AtomicI64,
+}
+
+impl kronik_core::env::Clock for SteppedClock {
+    fn wall_ms(&self) -> u64 {
+        let offset = self.offset_ms.load(std::sync::atomic::Ordering::SeqCst);
+        u64::try_from(i64::try_from(self.real.wall_ms()).unwrap() + offset).unwrap()
+    }
+
+    fn monotonic(&self) -> Duration {
+        self.real.monotonic()
+    }
+
+    fn sleep(&self, d: Duration) -> kronik_core::env::BoxFuture<'static, ()> {
+        self.real.sleep(d)
+    }
+}
+
+/// #40 (ADR 0006): after the host clock steps back 5 minutes, logical time
+/// holds still at its high-water mark, but a 1 s timer set before the step
+/// and one set after it both fire after about 1 s, not 5 minutes later.
+/// Logical time never goes back, and each timer turn's time is at least its
+/// due time.
+#[test]
+fn a_clock_step_back_delays_no_timer() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut clock = None;
+    let node = rt.block_on(async {
+        let mut env = Env::real(tokio::runtime::Handle::current());
+        let stepped = Arc::new(SteppedClock {
+            real: env.clock.clone(),
+            offset_ms: std::sync::atomic::AtomicI64::new(0),
+        });
+        env.clock = stepped.clone();
+        clock = Some(stepped);
+        start_local(
+            env,
+            dir.path(),
+            NodeConfig {
+                concurrency: 8,
+                ..NodeConfig::default()
+            },
+        )
+        .await
+        .unwrap()
+    });
+    let clock = clock.unwrap();
+    let p = Proc { rt, node };
+    p.deploy();
+    let started = Instant::now();
+    p.send("counter/before", msg("schedule", "1000 increment"));
+    clock
+        .offset_ms
+        .fetch_sub(300_000, std::sync::atomic::Ordering::SeqCst);
+    let after = Instant::now();
+    p.send("counter/after", msg("schedule", "1000 increment"));
+    // wait_until gives up after about 10 s.
+    p.wait_until("the timer set before the step", |p| {
+        p.kv("counter/before", "n").as_deref() == Some("1")
+    });
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    p.wait_until("the timer set after the step", |p| {
+        p.kv("counter/after", "n").as_deref() == Some("1")
+    });
+    assert!(after.elapsed() >= Duration::from_secs(1));
+    p.wait_until("both timer turns in the log", |p| {
+        turn_records(&p.records())
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.input.as_ref().and_then(|i| i.kind.as_ref()),
+                    Some(pb::input::Kind::Timer(_))
+                )
+            })
+            .count()
+            == 2
+    });
+    // Per actor, as ADR 0006 promises (concurrent turns of two actors may
+    // commit in the other order of their times).
+    let mut last: BTreeMap<String, u64> = BTreeMap::new();
+    for t in turn_records(&p.records()) {
+        let actor = t.actor.as_ref().map(|a| a.key.clone()).unwrap_or_default();
+        let previous = last.insert(actor, t.logical_time_ms).unwrap_or(0);
+        assert!(
+            t.logical_time_ms >= previous,
+            "logical time went back: {t:?}"
+        );
+        if let Some(pb::input::Kind::Timer(input)) = t.input.and_then(|i| i.kind) {
+            assert!(t.logical_time_ms >= input.due_ms);
+        }
+    }
+}

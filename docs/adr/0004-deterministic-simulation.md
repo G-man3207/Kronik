@@ -48,7 +48,8 @@ executors:
   per-sector reordering; unsynced directory entries lost; a stale `state.db`
   after a crash (WAL `synchronous=NORMAL`); injected fsync EIO; connect
   failures, lost responses and hung requests; wall-clock jumps of up to
-  5 s backwards.
+  10 s backwards, and in the webhook workload one step back of 5 to 10
+  minutes that is not corrected before the drain (ADR 0006, timers).
 - **Invariants checked:**
   - No acknowledged turn is lost, and every acknowledgement matches its
     `TurnRecord`.
@@ -62,7 +63,10 @@ executors:
     receives the request.
   - An `unsafe` effect is never delivered twice.
   - Logical time handed out is always above every durable logical time and
-    above the previous assignment (I15).
+    above the previous assignment (I15). A message turn never runs before
+    its message was sent, nor a timer turn before its due time.
+  - The mailbox and the timers drain within the drain's bound of virtual
+    time, whatever the wall clock did.
   - Every request gets a definite answer.
   - Same seed gives the same event-trace hash.
 
