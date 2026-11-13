@@ -343,8 +343,12 @@ def derive_names(attributes):
 
 
 def rename_all(attributes):
+    """The command names' case: clap's `rename_all`, never serde's (a `#[serde(...)]` rename
+    is a JSON spelling, not a command name)."""
     found = None
     for attr in attributes:
+        if not attr.startswith("#[command(") and not attr.startswith("#[clap("):
+            continue
         match = re.search(r"\brename_all\s*=\s*\"([^\"]+)\"", attr)
         if match:
             if found and found != match.group(1):
