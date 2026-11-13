@@ -129,7 +129,10 @@ pub enum StartError {
     Key(kronik_privacy::PrivacyError),
     #[error(transparent)]
     KeySource(kronik_privacy::key_source::KeySourceError),
-    #[error("BAD_CONFIG: {0}")]
+    /// An invalid `[secrets]` setting. Like the other `kronik.toml` settings
+    /// the daemon refuses, it is a `BAD_REQUEST`: a catalog code that
+    /// `kronik explain` resolves.
+    #[error("BAD_REQUEST: {0}")]
     SecretConfig(String),
     #[error(transparent)]
     Secret(#[from] ApiError),
