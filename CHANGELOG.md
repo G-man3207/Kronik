@@ -76,6 +76,9 @@ until the v1.0 compatibility promise takes effect.
   `--no-pii` fork, and `[erased]` for an erased subject, whose turn is then
   unverifiable. Before, the body went to the guest as the fork's store held
   it, sealed when a base snapshot held it.
+- A `--no-pii` fork replaces a production value that already looks like a
+  pseudonym (`pii:` and 12 hex characters) like any other tagged value; only
+  a value the fork itself wrote is read back as it is (#69).
 
 ## v0.4.1 — 2026-11-07
 

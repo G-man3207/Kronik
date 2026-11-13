@@ -1234,6 +1234,28 @@ impl StateDb {
             .transpose()
     }
 
+    /// [`StateDb::kv_get_sealable`] with the LSN of the record that wrote
+    /// the value (a fork tells a value its base snapshot holds from one its
+    /// replay wrote).
+    pub fn kv_get_written(
+        &self,
+        kind: &str,
+        key: &str,
+        k: &str,
+    ) -> Result<Option<(pb::Sealable, Lsn)>, StoreError> {
+        let row: Option<(Vec<u8>, Option<String>, bool, i64)> = self
+            .conn
+            .prepare_cached(
+                "SELECT value, subject, sealed, lsn FROM kv WHERE kind = ?1 AND key = ?2 AND k = ?3",
+            )?
+            .query_row([kind, key, k], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .optional()?;
+        row.map(|(v, s, sealed, lsn)| Ok((sealable_of(v, s, sealed)?, lsn as Lsn)))
+            .transpose()
+    }
+
     pub fn kv_keys(&self, kind: &str, key: &str, prefix: &str) -> Result<Vec<String>, StoreError> {
         let mut st = self.conn.prepare_cached(
             "SELECT k FROM kv WHERE kind = ?1 AND key = ?2 AND k >= ?3 ORDER BY k",

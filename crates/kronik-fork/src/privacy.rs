@@ -56,8 +56,10 @@ pub struct ForkPrivacy {
     pub no_pii: bool,
 }
 
-/// Whether `v` already is a pseudonym (`pii:` + 12 lowercase hex): state
-/// written by a revealed production record is not pseudonymized twice.
+/// Whether `v` has the shape of a pseudonym (`pii:` + 12 lowercase hex).
+/// Only a value the fork itself wrote may be taken for one (a revealed
+/// record's, or a guest's): a production value of that shape is still
+/// production data and is pseudonymized like any other (issue #69).
 fn is_pseudonym(v: &[u8]) -> bool {
     v.len() == 16
         && v.starts_with(b"pii:")
@@ -75,19 +77,31 @@ impl ForkPrivacy {
         }
     }
 
-    /// Replaces a recorded value in place with what the fork sees. Returns
-    /// whether it was masked (pseudonymized or erased). Values this keystore
-    /// cannot open stay as they are.
+    /// Replaces a recorded production value in place with what the fork
+    /// sees. Returns whether it was masked (pseudonymized or erased). Values
+    /// this keystore cannot open stay as they are. In a `--no-pii` fork every
+    /// tagged value becomes its pseudonym, also one that already has the
+    /// shape of a pseudonym: production data is never taken for the fork's
+    /// own (issue #69).
     pub fn reveal(&self, s: &mut pb::Sealable) -> bool {
+        self.reveal_as(s, false)
+    }
+
+    /// [`ForkPrivacy::reveal`] of a value the fork itself wrote (a revealed
+    /// record or a guest did): one that already is a pseudonym stays as it
+    /// is, so equal values stay equal when they are read back.
+    pub fn reveal_written(&self, s: &mut pb::Sealable) -> bool {
+        self.reveal_as(s, true)
+    }
+
+    fn reveal_as(&self, s: &mut pb::Sealable, written: bool) -> bool {
         let (shown, masked) = match self.sealer.open(s) {
             Opened::Value(v) => match (&s.subject, self.no_pii) {
-                (Some(subject), true) if !is_pseudonym(&v) => {
-                    match self.sealer.pseudonym(subject, &v) {
-                        Some(p) => (p.into_bytes(), true),
-                        None => (b"[pii]".to_vec(), true),
-                    }
-                }
-                (Some(_), true) => (v.into_owned(), true),
+                (Some(_), true) if written && is_pseudonym(&v) => (v.into_owned(), true),
+                (Some(subject), true) => match self.sealer.pseudonym(subject, &v) {
+                    Some(p) => (p.into_bytes(), true),
+                    None => (b"[pii]".to_vec(), true),
+                },
                 _ => (v.into_owned(), false),
             },
             Opened::Erased { .. } => (b"[erased]".to_vec(), true),
@@ -173,12 +187,11 @@ impl ForkPrivacy {
         }
     }
 
-    /// The pseudonym of one SQL cell, or `[pii]` when this sealer has no
-    /// pseudonym key. A value that is already a pseudonym is left as it is.
+    /// The pseudonym of one SQL cell of production's (a revealed changeset,
+    /// a snapshot row), or `[pii]` when this sealer has no pseudonym key.
+    /// Every cell is replaced, also one that has the shape of a pseudonym
+    /// (issue #69): each is rewritten once, before the fork applies it.
     pub(crate) fn sql_cell(sealer: &Sealer, subject: &str, value: &[u8]) -> Vec<u8> {
-        if is_pseudonym(value) {
-            return value.to_vec();
-        }
         match sealer.pseudonym(subject, value) {
             Some(pseudonym) => pseudonym.into_bytes(),
             None => b"[pii]".to_vec(),
@@ -215,6 +228,10 @@ pub struct ForkState {
     store: Arc<Store>,
     actor: ActorRef,
     privacy: ForkPrivacy,
+    /// Values written at or below this LSN are the base snapshot's, that is
+    /// production's; the others the replay wrote (a revealed record, a fork
+    /// turn).
+    base_lsn: Lsn,
     /// Where the store holds state the replay could not verify, and the
     /// turn's production position (ADR 0109).
     taint: Option<(Arc<Mutex<Taint>>, Lsn)>,
@@ -233,11 +250,19 @@ impl ForkState {
             store,
             actor,
             privacy,
+            base_lsn: 0,
             taint: None,
             masked: AtomicBool::new(false),
             erased: AtomicBool::new(false),
             saw_subject: AtomicBool::new(false),
         }
+    }
+
+    /// The store continues the base snapshot at `lsn`: values at or below
+    /// it are production's own, never taken for the fork's pseudonyms.
+    pub fn with_base(mut self, lsn: Lsn) -> ForkState {
+        self.base_lsn = lsn;
+        self
     }
 
     /// The turn at production position `at` reads state that `taint`
@@ -284,9 +309,9 @@ impl StateView for ForkState {
         let value = self
             .store
             .db()
-            .kv_get_sealable(&self.actor.kind, &self.actor.key, key)
+            .kv_get_written(&self.actor.kind, &self.actor.key, key)
             .map_err(|e| e.to_string())?;
-        let Some(mut value) = value else {
+        let Some((mut value, written)) = value else {
             return Ok(None);
         };
         if value.subject.is_some() {
@@ -299,7 +324,12 @@ impl StateView for ForkState {
             self.erased.store(true, Ordering::Relaxed);
             return Ok(None);
         }
-        if self.privacy.reveal(&mut value) {
+        let masked = if written > self.base_lsn {
+            self.privacy.reveal_written(&mut value)
+        } else {
+            self.privacy.reveal(&mut value)
+        };
+        if masked {
             self.masked.store(true, Ordering::Relaxed);
         }
         match value.value {
@@ -334,6 +364,100 @@ mod tests {
         assert!(is_pseudonym(b"pii:0123456789ab"));
         assert!(!is_pseudonym(b"pii:0123456789AB"));
         assert!(!is_pseudonym(b"alice"));
+    }
+
+    fn no_pii() -> ForkPrivacy {
+        let master = kronik_privacy::MasterKey::from_bytes([9; 32]).unwrap();
+        ForkPrivacy {
+            sealer: Arc::new(
+                Sealer::plain()
+                    .with_pseudonyms(kronik_privacy::keystore::Pseudonyms::new(&master).unwrap()),
+            ),
+            no_pii: true,
+        }
+    }
+
+    const SHAPED: &[u8] = b"pii:0123456789ab";
+
+    /// Issue #69: a production value that has the shape of a pseudonym is
+    /// still production data. A `--no-pii` fork replaces it like any other
+    /// tagged value, in records and in SQL cells; only what the fork itself
+    /// wrote is read back as it is.
+    #[test]
+    fn production_values_shaped_like_pseudonyms_are_replaced() {
+        let p = no_pii();
+        let tagged = || pb::Sealable {
+            subject: Some("user:1".into()),
+            value: Some(pb::sealable::Value::Plain(SHAPED.to_vec())),
+        };
+        let pseudonym = p.sealer.pseudonym("user:1", SHAPED).unwrap();
+        assert_ne!(pseudonym.as_bytes(), SHAPED);
+        let mut v = tagged();
+        assert!(p.reveal(&mut v));
+        assert_eq!(
+            v.value,
+            Some(pb::sealable::Value::Plain(pseudonym.clone().into_bytes()))
+        );
+        let mut v = tagged();
+        assert!(p.reveal_written(&mut v));
+        assert_eq!(v.value, Some(pb::sealable::Value::Plain(SHAPED.to_vec())));
+        assert_eq!(
+            ForkPrivacy::sql_cell(&p.sealer, "user:1", SHAPED),
+            pseudonym.into_bytes()
+        );
+    }
+
+    /// Issue #69 through a fork turn's state reads: a value the base
+    /// snapshot holds (written at or below its LSN) is production's and is
+    /// replaced; one the replay wrote is the fork's and is read back as is.
+    #[test]
+    fn state_reads_replace_production_values_by_provenance() {
+        use kronik_log::{Committed, Position};
+        use kronik_proto::Record;
+        let store = crate::replay::memory_store().unwrap();
+        store
+            .apply(&[Committed {
+                lsn: 1,
+                pos: Position {
+                    segment: 0,
+                    offset: 0,
+                },
+                record: Record::TurnRecord(pb::TurnRecord {
+                    actor: Some(pb::ActorRef {
+                        kind: "counter".into(),
+                        key: "a".into(),
+                    }),
+                    causal_key: Some(kronik_core::causal::root("r1".to_owned())),
+                    input: Some(pb::Input {
+                        kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
+                    }),
+                    outcome: Some(pb::Outcome {
+                        kind: pb::OutcomeKind::Committed as i32,
+                        ..Default::default()
+                    }),
+                    writes: vec![pb::StateWrite {
+                        key: "k".into(),
+                        op: pb::StateOp::Set as i32,
+                        value: Some(pb::Sealable {
+                            subject: Some("user:1".into()),
+                            value: Some(pb::sealable::Value::Plain(SHAPED.to_vec())),
+                        }),
+                    }],
+                    ..Default::default()
+                }),
+            }])
+            .unwrap();
+        let p = no_pii();
+        let actor = ActorRef::parse("counter/a").unwrap();
+        let read = |base: Lsn| {
+            let state = ForkState::new(store.clone(), actor.clone(), p.clone()).with_base(base);
+            let v = state.get("k").unwrap().unwrap();
+            assert!(state.masked());
+            v
+        };
+        let pseudonym = p.sealer.pseudonym("user:1", SHAPED).unwrap();
+        assert_eq!(read(1), pseudonym.into_bytes(), "the snapshot's value");
+        assert_eq!(read(0), SHAPED, "a value the replay wrote");
     }
 
     /// Issue #49: an erased state value the replayed log wrote stays sealed

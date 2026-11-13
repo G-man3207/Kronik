@@ -418,6 +418,13 @@ impl ProductionIndex {
         Ok(index)
     }
 
+    /// The LSN of the snapshot the records continue (0 without one): a
+    /// store's state written at or below it is the snapshot's, the rest the
+    /// replay's.
+    pub fn base_lsn(&self) -> Lsn {
+        self.base.as_ref().map_or(0, |b| b.lsn)
+    }
+
     /// Whether, at production position `at`, the replay's database of
     /// `actor` lacks rows production had: an erased subject's changeset was
     /// skipped before `at`, and that subject's `Erasure`, which deleted the

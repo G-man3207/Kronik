@@ -606,7 +606,9 @@ impl Runner {
             if lock(&self.timers).contains_key(&(t.actor.clone(), t.timer_id)) {
                 continue;
             }
-            kronik_proto::sealables::message_mut(Some(&mut t.msg), &mut |s| self.reveal_stored(s));
+            kronik_proto::sealables::message_mut(Some(&mut t.msg), &mut |s| {
+                self.reveal_stored(s, t.lsn)
+            });
             let op = pb::TimerOp {
                 kind: pb::TimerOpKind::Schedule as i32,
                 timer_id: t.timer_id,
@@ -639,7 +641,9 @@ impl Runner {
                 None if self.setup.rebase => continue,
                 None => vec![after, i as u64],
             };
-            kronik_proto::sealables::input_mut(Some(&mut m.input), &mut |s| self.reveal_stored(s));
+            kronik_proto::sealables::input_mut(Some(&mut m.input), &mut |s| {
+                self.reveal_stored(s, m.lsn)
+            });
             let (subject, time) = match &m.input.kind {
                 Some(pb::input::Kind::Message(x)) => (
                     x.msg
@@ -671,12 +675,17 @@ impl Runner {
     }
 
     /// A value a queued timer or message carries in the store, as the
-    /// fork's guest may see it, like any recorded value: a sealed one (a
-    /// base snapshot's) opens, a tagged one becomes its pseudonym in a
-    /// `--no-pii` fork, and an erased one (a tombstone the erasure left)
-    /// reads `[erased]`, its turn's recording being unverifiable (ADR 0109).
-    fn reveal_stored(&self, s: &mut pb::Sealable) {
-        self.setup.privacy.reveal(s);
+    /// fork's guest may see it: one the base snapshot holds (`lsn` at or
+    /// below it) is production's and revealed like any recorded value, one
+    /// the replay wrote is revealed as written; an erased one (a tombstone
+    /// the erasure left) reads `[erased]` and its turn's recording is
+    /// unverifiable (ADR 0109).
+    fn reveal_stored(&self, s: &mut pb::Sealable, lsn: Lsn) {
+        if lsn > self.setup.index.base_lsn() {
+            self.setup.privacy.reveal_written(s);
+        } else {
+            self.setup.privacy.reveal(s);
+        }
     }
 
     /// Schedules a fork timer. An isolated tree fires only the timers
@@ -1036,6 +1045,7 @@ impl Runner {
                 p.actor.clone(),
                 self.setup.privacy.clone(),
             )
+            .with_base(self.setup.index.base_lsn())
             .with_taint(self.taint.clone(), at),
         );
         let erased_effects = prod_lsn

@@ -291,7 +291,8 @@ still has a plain value in the log or in `state.db`.
 `kronik fork create --no-pii` gives a fork whose actors never see real
 personal data, in every privacy mode (values are tagged in `off` too):
 every tagged value they read is replaced with a pseudonym, `pii:` and 12
-hex characters. Pseudonyms are a keyed hash of the subject
+hex characters, also a value of production's that already looks like one.
+Pseudonyms are a keyed hash of the subject
 and the value, so equal values get equal pseudonyms (equality checks in the
 code still hold), and without the installation's key a pseudonym can't be
 checked against a guessed value. Erased values read as `[erased]`, and an

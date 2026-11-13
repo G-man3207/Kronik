@@ -280,7 +280,10 @@ starts a background compaction that requires the mode to be `on`:
   (key `derive_key("kronik pseudonym v1", master)`, done in 895ff28). The
   host unseals transiently to compute it, so equal values get equal
   pseudonyms and equality checks in guest logic still hold. Without the key,
-  a pseudonym can't be checked against a guessed value. Erased values
+  a pseudonym can't be checked against a guessed value. A production value
+  that already has the shape of a pseudonym is replaced too; only a value
+  the fork itself wrote (a revealed record's, or a guest's) is read back as
+  it is, so a pseudonym stays equal to itself (issue #69). Erased values
   become `[erased]`, except an erased state value, which reads as absent.
 - Subject-tagged SQL changesets are pseudonymized before they are applied
   to the fork's actor database. Text and blob cell values become
@@ -601,10 +604,12 @@ Where the code differs from the sections above:
   A `--no-pii` turn is masked when its input or a recorded (non-live)
   effect response is tagged or it read a masked state value; if it differs,
   it counts in `summary.pii_masked` and `samples.pii_masked`, not as
-  divergent, an error or a cause. An erased subject's state value stays
-  sealed in the fork's store, reads as absent and marks the reading turn as
-  one that met erased data (ADR 0109), as do reads of state that erased
-  data shaped there. HTTP root inputs keep the gateway's
+  divergent, an error or a cause. A state value the base snapshot holds is
+  production's and is replaced like a recorded one; a value the replay wrote
+  that already is a pseudonym is read back as it is (issue #69). An erased
+  subject's state value stays sealed in the fork's store, reads as absent
+  and marks the reading turn as one that met erased data (ADR 0109), as do
+  reads of state that erased data shaped there. HTTP root inputs keep the gateway's
   subject in forks (taken from the body's or a header's tag). A fork
   records its effects with the
   guest's subject as production does, and seals what it writes to disk (its
