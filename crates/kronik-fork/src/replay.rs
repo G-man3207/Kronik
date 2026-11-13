@@ -2809,10 +2809,10 @@ impl ReplayGate {
             grounding: pb::Grounding::Live as i32,
             ..Default::default()
         };
-        let (outcome, turn_id) = if to == self.actor || self.call_chain.contains(&to) {
-            (CallOutcome::Reentrant, String::new())
+        let (outcome, turn_id, callee_lsn) = if to == self.actor || self.call_chain.contains(&to) {
+            (CallOutcome::Reentrant, String::new(), None)
         } else if !self.runner.setup.kinds.contains_key(&to.kind) {
-            (CallOutcome::NotFound, String::new())
+            (CallOutcome::NotFound, String::new(), None)
         } else {
             let mut chain = self.call_chain.clone();
             chain.push(self.actor.clone());
@@ -2859,8 +2859,20 @@ impl ReplayGate {
                 state.personal |= turn.personal;
                 state.unverified_callee |= turn.erased;
             }
-            (map_call_outcome(o)?, turn.id)
+            (map_call_outcome(o)?, turn.id, Some(turn.lsn))
         };
+        // The callee's turn ran in the fork, so its source is the fork's: its
+        // position in the fork's store, in the fork's namespace, as
+        // production names the callee's turn in its log. With a source, a
+        // reply over what is left of the turn's record is withheld and
+        // recorded as HOST_REDACTION_FAILURE with the callee's status, as in
+        // production, instead of failing the whole replay as a missing
+        // prerequisite.
+        rec.callee_source = callee_lsn.map(|lsn| pb::ActorSource {
+            shard: None,
+            lsn,
+            branch: self.runner.setup.fork.clone(),
+        });
         // A reply larger than what is left of the turn's record is withheld,
         // as in production.
         let room = lock(&self.state).budget.clone();

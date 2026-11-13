@@ -180,6 +180,12 @@ M23, key and secret backends:
   compensation already was delivered. The behavior diff counts orphans the
   same way, so `errors.new_orphans` no longer reports production's orphan of
   a timed-out call as new in the fork.
+- A fork could not replay a turn whose call reply production had withheld
+  as over the caller's response limit (`HOST_REDACTION_FAILURE`): the fork's
+  call record named no callee source, so the replay stopped with
+  `UNAVAILABLE`. The fork's record now names the fork's callee turn, and the
+  fork withholds the reply, fails the turn and delivers the call's
+  compensation as production did.
 
 ## v0.4.1 — 2026-11-07
 

@@ -117,7 +117,12 @@ the root id).
   serialized in that order. So matched turns run in production order and
   new turns run right after their causal parent.
 - **Calls** run the callee's turn in the fork (re-executed, not taken from
-  the recording); its result is internal.
+  the recording); its result is internal. The call's record names that
+  fork turn as its callee source (`callee_source`: the fork's name and the
+  turn's LSN in the fork's store), as production names the callee's turn
+  in its log, so a reply over what the caller may take is withheld and
+  recorded as `HOST_REDACTION_FAILURE` with the callee's status, as in
+  production.
 - **Fork-only timers** (continuous): a timer due at `d` fires at the first
   production position whose logical time is ≥ `d`, before that root input:
   its order key is `[that root input's LSN - 1, u64::MAX, seq]`, which sorts
