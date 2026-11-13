@@ -112,6 +112,7 @@
 - [ADR 0110: Hosted workflows start only by hand](adr/0110-manual-github-workflows.md)
 - [ADR 0111: The 1 000 turns/s target is across actors](adr/0111-cross-actor-throughput.md)
 - [ADR 0112: A grant chooses whether a fork may compute with a production key](adr/0112-fork-crypto-grant-mode.md)
+- [ADR 0113: The v0.5 actor ABI: additive 0.1.1 with an optional connection export](adr/0113-v05-actor-abi.md)
 - [ADR 0117: The blob store](adr/0117-blob-store.md)
 - [ADR 0118: How a sealed blob is identified, and where its metadata is recorded](adr/0118-sealed-blob-identity.md)
 - [ADR 0119: Blob references and the authorization graph](adr/0119-blob-reference-graph.md)
