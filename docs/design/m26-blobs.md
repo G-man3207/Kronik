@@ -489,7 +489,7 @@ A new workload in `kronik-sim` (`ScenarioConfig::blobs_for_seed`, `--scenario
 blobs`), run by `scripts/dst.sh` with the others (200 seeds per change,
 10 000 nightly).
 
-- **Guest:** the test actor's `blobs` feature (kind `media`): messages that
+- **Guest:** the test guest `media` (M25 §17; kind `media`): messages that
   `put` seeded bytes and store their digest in state, `retain`, `release`,
   `send` a reference to another actor, schedule a timer carrying one with a
   long delay, and read a held or received blob and check its digest.

@@ -103,6 +103,7 @@ concepts! {
     "actor" => "M1", "An instance with its own state, identified by kind/key";
     "kind" => "M1", "An actor type: the code for one sort of actor";
     "message" => "M1", "Data sent to an actor: name, content type and body";
+    "blob" => "M25", "A large body or object stored outside the log, named by its hash";
     "effect" => "M2", "A call from guest code to the outside world, via the host";
     "hash" => "M1", "The BLAKE3 hash of a component: the identity of its code";
     "fork" => "M3", "A branch of the system's history from an LSN";
@@ -165,10 +166,11 @@ mod tests {
     use super::*;
 
     /// The concepts that `kronik explain` must cover.
-    const REQUIRED_CONCEPTS: [&str; 40] = [
+    const REQUIRED_CONCEPTS: [&str; 41] = [
         "actor",
         "kind",
         "message",
+        "blob",
         "effect",
         "hash",
         "fork",
@@ -261,9 +263,9 @@ mod tests {
 
     #[test]
     fn names_are_unique_and_texts_are_complete() {
-        const MILESTONES: [&str; 15] = [
+        const MILESTONES: [&str; 16] = [
             "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M21", "M23",
-            "M24", "M28",
+            "M24", "M25", "M28",
         ];
         let mut seen = HashSet::new();
         for t in list() {

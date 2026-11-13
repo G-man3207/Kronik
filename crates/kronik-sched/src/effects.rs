@@ -20,8 +20,8 @@ use kronik_effects::{Config, Delivery, KindLimits};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::{
-    CallOutcome, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchHeader, FetchOutcome,
-    FetchRequest, FetchResponse, GateError, SendNowOutcome, SendNowRequest,
+    CallOutcome, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchBody, FetchHeader, FetchOutcome,
+    FetchRequest, FetchResponse, FetchResponseBody, GateError, SendNowOutcome, SendNowRequest,
 };
 use prost::Message as _;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -186,7 +186,7 @@ pub fn prepare_inline_fetch_response(
             .into_iter()
             .map(|header| (header.name, header.value))
             .collect(),
-        body: response.body,
+        body: FetchResponseBody::Inline(response.body),
     }))
 }
 
@@ -1399,11 +1399,21 @@ impl TurnFx {
                 value: Some(value),
             });
         }
+        // Blob request bodies arrive with M25 slice B7; before it no turn
+        // has a blob host that could send one.
+        let wire_body = match &req.body {
+            FetchBody::Inline(bytes) => bytes.clone(),
+            FetchBody::Blob(_) | FetchBody::NotHeld { .. } => {
+                return Err(GateError::Host(
+                    "NOT_IMPLEMENTED: blob request bodies are not supported yet".into(),
+                ));
+            }
+        };
         let mut request = pb::HttpEffectRequest {
             method: req.method.clone(),
             url: req.url.clone(),
             headers,
-            body: req.body.clone(),
+            body: wire_body.clone(),
             fingerprint_version: 2,
             ..Default::default()
         };
@@ -1612,7 +1622,7 @@ impl TurnFx {
             method: req.method,
             url: req.url,
             headers: wire_headers,
-            body: bytes::Bytes::from(req.body),
+            body: bytes::Bytes::from(wire_body),
             max_response_bytes,
         };
         let call: BoxFuture<'static, Result<kronik_core::env::HttpResponse, NetError>> =
@@ -2477,6 +2487,14 @@ pub fn outcome_of_fetch(rec: &pb::EffectRecord) -> Result<FetchOutcome, GateErro
                         .map_err(|_| {
                             GateError::Host("The recorded HTTP response is invalid".into())
                         })?;
+                // A recorded blob body (M25) is given back as the same
+                // reference; it must be listed in the record's blobs.
+                kronik_proto::blobs::check_http_payload_blob(
+                    &response.body,
+                    response.body_blob.as_ref(),
+                    &rec.blobs,
+                )
+                .map_err(|_| GateError::Host("The recorded HTTP response is invalid".into()))?;
                 FetchOutcome::Ok(FetchResponse {
                     status: u16::try_from(response.status).map_err(|_| {
                         GateError::Host("The recorded HTTP status is invalid".into())
@@ -2486,7 +2504,10 @@ pub fn outcome_of_fetch(rec: &pb::EffectRecord) -> Result<FetchOutcome, GateErro
                         .into_iter()
                         .map(|header| (header.name, header.value))
                         .collect(),
-                    body: response.body,
+                    body: match response.body_blob {
+                        Some(blob) => FetchResponseBody::Blob(blob),
+                        None => FetchResponseBody::Inline(response.body),
+                    },
                 })
             }
             pb::EffectStatus::HostRedactionFailure => FetchOutcome::HostRedactionFailure,

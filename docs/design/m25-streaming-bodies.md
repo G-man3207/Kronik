@@ -292,52 +292,61 @@ Forks and replays use the flag of the code they run.
 
 ### 5.4 The turn's references
 
-`kronik-runtime` defines the host side as a trait the scheduler and the fork
-engine implement:
+The rules live in `kronik-runtime` (`host/blobs.rs`), so production and
+every replay apply the same ones: `TurnHost` keeps `T` as a map from
+(hash, size) to the complete reference, the open writers, the bytes the turn
+created and the bytes it moved. Storage sits behind a trait the scheduler and
+the fork engine implement:
 
 ```rust
 pub trait BlobHost: Send + Sync {
-    fn get(&self, r: &BlobRefWit, offset: u64, len: u32) -> BoxFuture<'_, Result<Result<Vec<u8>, BlobErr>, GateError>>;
-    fn open_writer(&self, subject: Option<String>) -> BoxFuture<'_, Result<WriterId, GateError>>;
-    fn write(&self, w: WriterId, chunk: Vec<u8>) -> BoxFuture<'_, Result<Result<(), BlobErr>, GateError>>;
-    fn finish(&self, w: WriterId) -> BoxFuture<'_, Result<Result<BlobRefWit, BlobErr>, GateError>>;
-    fn drop_writer(&self, w: WriterId);
-    /// Completes references the guest put into an output or a record;
-    /// Err(the first one not in T).
-    fn complete(&self, refs: &[BlobRefWit]) -> Result<Vec<pb::BlobRef>, BlobRefWit>;
-    /// M26: put, retain, release, and the net operations at commit.
+    /// Up to `len` bytes of `blob` from `offset`: fewer only at its end.
+    fn read(&self, blob: &pb::BlobRef, offset: u64, len: u32) -> BoxFuture<'static, Result<Vec<u8>, BlobHostError>>;
+    /// Starts a blob of `subject`; returns the writer's id.
+    fn create(&self, subject: Option<String>) -> BoxFuture<'static, Result<u64, BlobHostError>>;
+    fn write(&self, writer: u64, chunk: Vec<u8>) -> BoxFuture<'static, Result<(), BlobHostError>>;
+    /// Ends the writer and names its blob: a complete reference.
+    fn finish(&self, writer: u64) -> BoxFuture<'static, Result<pb::BlobRef, BlobHostError>>;
+    fn discard(&self, writer: u64);
+    // M26: holds (put, retain, release) and the held references.
 }
+pub enum BlobHostError { Erased, KeyMissing(String), StoreFull(String), Host(String) }
 ```
 
-`TurnHost` holds `Option<Arc<dyn BlobHost>>` (none in `describe`). The
-scheduler's implementation, `TurnBlobs` in `kronik-sched`, owns:
-
-- `T` as a map from identity to complete metadata, seeded with the input's
-  references (§5.5); held references (M26) are looked up in `blob_refs` on
-  first use rather than loaded;
-- the turn's lease (ADR 0120 §4), which covers `T` and every blob the turn
-  created, until the turn's record is applied;
-- open writers, the created bytes and the blob budget.
+`Program::run_with_blobs(req, state, sql, gate, Option<Arc<dyn BlobHost>>)`
+runs a turn with blobs; `Program::run` passes none, and without a blob host
+every blob function traps with `NOT_IMPLEMENTED`. `BlobHostError::Erased`
+is the guest's `blob-error::erased`; `KeyMissing` abandons the turn with
+`RunError::KeyMissing` (`KEYSTORE_INCOMPLETE`), `StoreFull` with
+`RunError::BlobStoreFull`, which the scheduler retries in place (§4.7), and
+`Host` is a host failure. The scheduler's implementation (B6) writes to the
+turn's space, scrubs writes of revealed secrets (§5.2) and keeps the turn's
+lease (ADR 0120 §4), which covers every blob the turn read or created until
+its record is applied.
 
 ### 5.5 Bodies in and out of the guest
 
-- **Input.** `input_to_wit` already maps `Body.blob` to `http-body::blob`;
-  `TurnBlobs` adds the reference to `T` as borrowed.
+- **Input.** `input_to_wit` maps `Body.blob` to `http-body::blob`, and
+  `run_with_blobs` adds every reference of the input to `T`.
 - **Output.** `committed()` (runtime `turn.rs`) maps `http-body::blob(r)` to
-  `Body.blob(complete(r))`; a reference not in `T` fails the turn: outcome
-  `TRAP` with code `BLOB_NOT_HELD`. `http-body::inline` keeps its
-  `message_bytes` limit.
-- **`http-client.fetch`.** `FetchRequest.body` becomes
-  `enum FetchBody { Inline(Vec<u8>), Blob(pb::BlobRef) }` (a complete
-  reference, so `kronik-runtime` needs no dependency on `kronik-blob`); a
-  `blob` request body
-  not in `T` reaches the gate as a denial (§7.2). `FetchResponse.body`
-  becomes the same enum; a `Blob` response is added to `T` and given to the
-  guest as `http-body::blob`.
+  `Body.blob` with the complete reference from `T`; a reference not in `T`
+  fails the turn: outcome `TRAP` with code `BLOB_NOT_HELD`.
+  `http-body::inline` keeps its `message_bytes` limit.
+- **`http-client.fetch`.** `FetchRequest.body` is
+  `FetchBody { Inline(Vec<u8>), Blob(pb::BlobRef), NotHeld { hash, size } }`:
+  a complete reference when the body is in `T`, else `NotHeld`, which the
+  gate turns into a recorded denial (§7.2). `kronik-runtime` needs no
+  dependency on `kronik-blob`. `FetchResponse.body` is
+  `FetchResponseBody { Inline(Vec<u8>), Blob(pb::BlobRef) }`; a `Blob`
+  response is added to `T` and given to the guest as `http-body::blob`. A
+  recorded `body_blob` (a re-run, a replay) decodes to the same `Blob`
+  (`outcome_of_fetch`, checked against `EffectRecord.blobs`).
 - **Messages.** Until M26, a message, timer, call or reply with `blobs`
   still traps with `NOT_IMPLEMENTED` (`check_message`).
 - **Traps.** `classify_error` maps a host message starting with
   `BLOB_NOT_HELD` to outcome code `BLOB_NOT_HELD`, like `NOT_IMPLEMENTED`.
+- **Who reads blobs.** `Program::reads_blobs()` is true when the component
+  imports `kronik:actor/blobs@0.1.x`.
 
 A component that does not read blobs never receives a blob body; if one
 arrives anyway (a deployment switched to such code between admission and
@@ -759,10 +768,12 @@ The test kits implement the interface in memory with the same `T` rules.
 
 ## 17. Acceptance plan
 
-Tests use the test guest `tests/guests/test-actor` with a new feature
-`blobs` (kind `media`, built by `scripts/build-test-guests.sh` into
-`tests/guests/blobs.wasm`): routes to upload, fetch, read ranges, write a
-blob of a requested size, respond with a blob and store a hash string.
+Tests use the test guest `tests/guests/media`, a crate of its own like M24's
+`room` (kind `media`, built by `scripts/build-test-guests.sh` into
+`tests/guests/media.wasm`), so the committed `test-actor` builds keep their
+bytes: operations to describe, sum and read ranges of a body, echo it, write
+a blob of a requested size, fetch and post blobs, and store a hash string
+and use it in a later turn.
 Memory is the daemon's peak RSS (`VmHWM` from `/proc/<pid>/status`,
 sampled every 50 ms); "constant" means two sizes a factor of ten apart grow
 the peak by the same amount within 16 MiB, and neither by more than
@@ -808,7 +819,7 @@ M24's slices.
 | **B10** replay and forks | `kronik-fork` (gate, spaces, scratch, disclosure guards, diff, erased and `--no-pii` reads), `diff-v1.schema.json` | identity replay with blob bodies (criterion 2's replay half); `--no-pii` fork test | **coordinate**: M24 edits `replay.rs` and `diff.rs` too |
 | **B11** index, floor, leases, sweep, snapshot index | `kronik-blob` (sweep), `kronik-store` (compaction of `blobs`), `kronik-sched/src/snapshots.rs` (`blobs.idx`, manifest field, sweep after retention), fork `blobs.roots`, replay leases, API/CLI `kronik blobs status`, `inspect`, `get`, `gc` (M26 §12), error code `BLOB_NOT_FOUND` | sweep tests; snapshot fixture with `blobs.idx`; dry run | parallel |
 | **B12** shipping and restore | `kronik-ship` (order of ADR 0122, `ship-blobs.db`, multipart, restore), `kronik` (`restore --allow-missing-blobs`) | S3 test (`scripts/s3.sh`): restore of uploaded and fetched blobs; a round stopped between steps | parallel |
-| **B13** SDKs and acceptance | `sdk/{rust,ts,python,go}` (§16), test kits, `tests/guests` (`blobs` feature), `crates/kronik/tests/blobs_streaming.rs`, `scripts/acceptance-m25.sh`, `docs/perf.md`, `docs/guides/{actors,operations}.md` | criteria 1–5; `scripts/ci.sh ts sdks examples` | textual conflicts in SDK files |
+| **B13** SDKs and acceptance | `sdk/{rust,ts,python,go}` (§16), test kits, `tests/guests/media` (M25 operations), `crates/kronik/tests/blobs_streaming.rs`, `scripts/acceptance-m25.sh`, `docs/perf.md`, `docs/guides/{actors,operations}.md` | criteria 1–5; `scripts/ci.sh ts sdks examples` | textual conflicts in SDK files |
 
 ### 18.2 Keeping `main` releasable
 

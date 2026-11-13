@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rebuilds the test guest components committed under tests/guests/*.wasm
-# (test-actor builds, the leaky and room guests, plus webhook-relay-rs copied
+# (test-actor builds, the leaky, room and media guests, plus webhook-relay-rs copied
 # from the examples build).
 # They are checked in so `cargo test` needs no wasm toolchain; rerun this after
 # changing tests/guests/test-actor or wit/kronik-actor.wit.
@@ -34,6 +34,11 @@ done
     cp target/fmt2/wasm32-wasip2/release/kronik_test_room.wasm ../room-fmt2.wasm &&
     cp target/refuse/wasm32-wasip2/release/kronik_test_room.wasm ../room-refuse.wasm &&
     cp target/bare/wasm32-wasip2/release/kronik_test_room.wasm ../room-bare.wasm)
+# media (M25/M26 blobs): its own crate, kind `media`, the world actor with
+# the blobs import.
+(cd ../media &&
+    cargo build --locked --release --target wasm32-wasip2 --target-dir target &&
+    cp target/wasm32-wasip2/release/kronik_test_media.wasm ../media.wasm)
 # Rollback via replay (M13): a schema-1 build that migrates and also makes
 # the extra GET, so the rolled-back code had a migration and effects the old
 # code would not make.

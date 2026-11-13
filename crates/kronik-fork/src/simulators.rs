@@ -2281,7 +2281,10 @@ mod tests {
         assert_eq!(stored_secret.version_hash, vec![9; 16]);
         match outcome {
             kronik_runtime::FetchOutcome::Ok(response) => {
-                assert_eq!(response.body, secret_value);
+                assert_eq!(
+                    response.body,
+                    kronik_runtime::FetchResponseBody::Inline(secret_value.to_vec())
+                );
             }
             other => panic!("covered source bytes must stay unchanged, got {other:?}"),
         }
@@ -2390,7 +2393,10 @@ mod tests {
         assert_eq!(stored.url, source_req.url);
         match recorded.outcome {
             kronik_runtime::FetchOutcome::Ok(response) => {
-                assert_eq!(response.body, b"recorded-body");
+                assert_eq!(
+                    response.body,
+                    kronik_runtime::FetchResponseBody::Inline(b"recorded-body".to_vec())
+                );
             }
             other => panic!("clean legacy bytes must stay unchanged, got {other:?}"),
         }

@@ -5233,6 +5233,8 @@ fn turn_limits(l: &KindLimits) -> TurnLimits {
         memory_bytes: size(l.memory_bytes),
         message_bytes: size(l.message_bytes),
         state_value_bytes: size(l.state_value_bytes),
+        // The kind's blob limits come with M25 slice B6.
+        blob_bytes: TurnLimits::default().blob_bytes,
     }
 }
 

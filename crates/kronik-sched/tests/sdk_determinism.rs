@@ -24,7 +24,8 @@ use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::{
     CallOutcome, CodeStore, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchOutcome, FetchRequest,
-    FetchResponse, GateError, PoolSize, Program, TurnLimits, TurnRequest, build_engine,
+    FetchResponse, FetchResponseBody, GateError, PoolSize, Program, TurnLimits, TurnRequest,
+    build_engine,
 };
 use kronik_sched::host::{KvView, SqlHandle, SqlTurn};
 use kronik_store::Store;
@@ -52,7 +53,7 @@ impl EffectGate for StubGate {
             Ok(FetchOutcome::Ok(FetchResponse {
                 status: if first { 503 } else { 200 },
                 headers: vec![("content-type".into(), "application/json".into())],
-                body: br#"{"ok":true}"#.to_vec(),
+                body: FetchResponseBody::Inline(br#"{"ok":true}"#.to_vec()),
             }))
         })
     }

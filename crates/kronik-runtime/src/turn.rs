@@ -11,12 +11,17 @@ use wasmtime::{Engine, Store, Trap};
 use crate::engine::FUEL_YIELD_INTERVAL;
 use crate::host::bindings::ActorPre;
 use crate::host::bindings::kronik::actor::types;
+use crate::host::blobs::{BlobHost, TurnBlobs, not_held};
 use crate::host::connection_bindings::ActorConnectionsPre;
 use crate::host::connection_bindings::kronik::actor::connections as conn_wit;
 use crate::host::{
     CONNECTION_HANDLER_EXPORT, EffectGate, HostInit, LogEvent, SqlHost, StateView, TurnHost,
     TurnLimits, build_linker, message_to_pb,
 };
+
+/// The import name prefix of the `blobs` interface: a component that
+/// imports it reads blob bodies (ADR 0119 §1).
+const BLOBS_IMPORT: &str = "kronik:actor/blobs@";
 
 /// Everything that determines a turn besides code, engine version and the
 /// actor's state at turn start.
@@ -62,6 +67,10 @@ pub enum RunError {
     Prerequisite(ErrorCode),
     #[error("invalid input: {0}")]
     Input(String),
+    /// The blob store is below its disk reserve or full (ADR 0117 §9): the
+    /// turn attempt is abandoned without a record and runs again later.
+    #[error("BLOB_STORE_FULL: {0}")]
+    BlobStoreFull(String),
     /// A sealed value reached the turn unopened: its subject's key is not
     /// in this node's privacy keystore (`KEYSTORE_INCOMPLETE`).
     #[error(
@@ -78,6 +87,8 @@ pub struct Program {
     /// The same component through the world `actor-connections`, when it
     /// exports `connection-handler` (M24, ADR 0113): the export is optional.
     connections: Option<ActorConnectionsPre<TurnHost>>,
+    /// Whether the component imports `kronik:actor/blobs` (M25).
+    reads_blobs: bool,
     hash: CodeHash,
 }
 
@@ -96,10 +107,15 @@ impl Program {
             None => None,
         };
         let pre = ActorPre::new(instance)?;
+        let reads_blobs = component
+            .component_type()
+            .imports(engine)
+            .any(|(name, _)| name.starts_with(BLOBS_IMPORT));
         Ok(Program {
             engine: engine.clone(),
             pre,
             connections,
+            reads_blobs,
             hash,
         })
     }
@@ -113,6 +129,13 @@ impl Program {
     /// routes needs it.
     pub fn handles_connections(&self) -> bool {
         self.connections.is_some()
+    }
+
+    /// Whether the component imports `kronik:actor/blobs`, so it may get
+    /// HTTP bodies and effect responses as blobs (M25, ADR 0119 §1). A
+    /// component that does not keeps inline bodies and their limits.
+    pub fn reads_blobs(&self) -> bool {
+        self.reads_blobs
     }
 
     fn store(&self, host: TurnHost, fuel: u64) -> Result<Store<TurnHost>, RunError> {
@@ -140,6 +163,7 @@ impl Program {
             state: None,
             sql: None,
             gate: None,
+            blobs: None,
             describe_only: true,
         });
         let mut store = self.store(host, limits.fuel).map_err(|e| e.to_string())?;
@@ -179,12 +203,27 @@ impl Program {
         sql: Option<Box<dyn SqlHost>>,
         gate: Option<Arc<dyn EffectGate>>,
     ) -> Result<TurnOutput, RunError> {
+        self.run_with_blobs(req, state, sql, gate, None).await
+    }
+
+    /// [`Program::run`] with blob storage (M25): the turn may read the blobs
+    /// its input references and create blobs through `blobs`. Without it,
+    /// every blob function traps with `NOT_IMPLEMENTED`.
+    pub async fn run_with_blobs(
+        &self,
+        req: TurnRequest,
+        state: Arc<dyn StateView>,
+        sql: Option<Box<dyn SqlHost>>,
+        gate: Option<Arc<dyn EffectGate>>,
+        blobs: Option<Arc<dyn BlobHost>>,
+    ) -> Result<TurnOutput, RunError> {
         let call = match &req.input.kind {
             Some(pb::input::Kind::Connection(c)) => Call::Connection(connection_to_wit(c)?),
             _ => Call::Handle(input_to_wit(&req.input)?),
         };
         let fuel = req.limits.fuel;
         let message_bytes = req.limits.message_bytes;
+        let with_blobs = blobs.is_some();
         let mut host = TurnHost::new(HostInit {
             actor: req.actor,
             causal_key: req.causal_key,
@@ -195,6 +234,7 @@ impl Program {
             state: Some(state),
             sql,
             gate,
+            blobs,
             describe_only: false,
         });
         // The connection an open input names is held, and opens when the
@@ -206,6 +246,14 @@ impl Program {
             }
             _ => None,
         };
+        if with_blobs {
+            // The input's references are the turn's to read (ADR 0119 §2).
+            let mut refs = Vec::new();
+            kronik_proto::blobs::input(Some(&req.input), &mut refs);
+            for blob in refs {
+                host.blob_state.admit(blob.clone());
+            }
+        }
         let mut store = self.store(host, fuel)?;
         let result = match call {
             Call::Handle(input) => match self.pre.instantiate_async(&mut store).await {
@@ -247,16 +295,24 @@ impl Program {
         };
         let fuel_used = fuel - store.get_fuel().unwrap_or(0);
         let mut host = store.into_data();
+        // Writers still open when the turn ends are discarded.
+        let open = host.blob_state.take_open();
+        if let Some(blobs) = &host.blobs {
+            for writer in open {
+                blobs.discard(writer);
+            }
+        }
         if let Some(fatal) = host.fatal.take() {
             return Err(fatal);
         }
         host.warn_unsent();
         let subject = host.subject.clone();
+        let refs = with_blobs.then_some(&host.blob_state);
         let mut outcome = match result {
-            Ok(Ok(Answer::Output(output))) => committed(output, subject, message_bytes),
+            Ok(Ok(Answer::Output(output))) => committed(output, subject, message_bytes, refs),
             Ok(Ok(Answer::Open(reply))) => {
                 let (offered, protocol) = offered.unwrap_or((Vec::new(), conn_wit::Protocol::Sse));
-                open_outcome(reply, &offered, protocol, subject, message_bytes)
+                open_outcome(reply, &offered, protocol, subject, message_bytes, refs)
             }
             Ok(Err(types::HandlerError::Rejected(m))) => {
                 failed(pb::OutcomeKind::Rejected, "TURN_FAILED", m)
@@ -354,6 +410,7 @@ fn open_outcome(
     protocol: conn_wit::Protocol,
     subject: Option<String>,
     limit: usize,
+    refs: Option<&TurnBlobs>,
 ) -> pb::Outcome {
     let bad = |m: String| failed(pb::OutcomeKind::Trap, "TURN_FAILED", m);
     match reply {
@@ -364,7 +421,9 @@ fn open_outcome(
                     response.status
                 ));
             }
-            committed(types::Output::Http(response), subject, limit)
+            // A refusal's body may be a blob: the turn must hold it, as for
+            // any response (M25 §5.4).
+            committed(types::Output::Http(response), subject, limit, refs)
         }
         conn_wit::OpenReply::Accept(accept) => {
             // Recorded as its first position among the offered values, never
@@ -446,7 +505,14 @@ fn failed(kind: pb::OutcomeKind, code: &str, message: String) -> pb::Outcome {
     }
 }
 
-fn committed(output: types::Output, subject: Option<String>, limit: usize) -> pb::Outcome {
+/// The outcome of a turn that returned `output`. A blob body must be one of
+/// the turn's references (`refs`; None: blobs are off).
+fn committed(
+    output: types::Output,
+    subject: Option<String>,
+    limit: usize,
+    refs: Option<&TurnBlobs>,
+) -> pb::Outcome {
     let output = match output {
         types::Output::None => None,
         types::Output::Reply(m) => {
@@ -471,13 +537,23 @@ fn committed(output: types::Output, subject: Option<String>, limit: usize) -> pb
                     }
                     pb::body::Value::Inline(plain(subject.clone(), b))
                 }
-                types::HttpBody::Blob(_) => {
-                    return failed(
-                        pb::OutcomeKind::Trap,
-                        "TURN_FAILED",
-                        "NOT_IMPLEMENTED: blob bodies arrive in a later version".into(),
-                    );
-                }
+                types::HttpBody::Blob(blob) => match refs.map(|refs| refs.complete(&blob)) {
+                    None => {
+                        return failed(
+                            pb::OutcomeKind::Trap,
+                            "NOT_IMPLEMENTED",
+                            "NOT_IMPLEMENTED: blob bodies are not available in this turn".into(),
+                        );
+                    }
+                    Some(None) => {
+                        return failed(
+                            pb::OutcomeKind::Trap,
+                            ErrorCode::BlobNotHeld.as_str(),
+                            not_held(&blob),
+                        );
+                    }
+                    Some(Some(full)) => pb::body::Value::Blob(full),
+                },
             };
             Some(pb::outcome::Output::Http(pb::HttpResponse {
                 status: u32::from(r.status),
@@ -565,6 +641,8 @@ fn classify_error(e: &wasmtime::Error, memory_limit_hit: bool) -> pb::Outcome {
     }
     let code = if msg.starts_with("NOT_IMPLEMENTED") {
         "NOT_IMPLEMENTED"
+    } else if msg.starts_with("BLOB_NOT_HELD") {
+        ErrorCode::BlobNotHeld.as_str()
     } else if msg.starts_with("REPLAY_DIVERGED") {
         "REPLAY_DIVERGED"
     } else {

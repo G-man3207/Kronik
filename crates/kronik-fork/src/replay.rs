@@ -22,7 +22,7 @@ use kronik_privacy::SecretStore;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::{
-    CallOutcome, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchHeader, FetchOutcome,
+    CallOutcome, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchBody, FetchHeader, FetchOutcome,
     FetchRequest, GateError, Program, SendNowOutcome, SendNowRequest, TurnLimits, TurnRequest,
 };
 use kronik_sched::effects::{map_call_outcome, outcome_of_fetch, outcome_of_send_now};
@@ -1151,6 +1151,8 @@ impl Runner {
             memory_bytes: size(kl.memory_bytes),
             message_bytes: size(kl.message_bytes),
             state_value_bytes: size(kl.state_value_bytes),
+            // The kind's blob limits come with M25 slice B6.
+            blob_bytes: TurnLimits::default().blob_bytes,
         };
         let call_chain = match &p.input.kind {
             Some(pb::input::Kind::Message(m)) => {
@@ -1654,6 +1656,18 @@ struct GateState {
     /// A callee the replay could not verify ([`ForkTurn::erased`]): what it
     /// answered need not be what production's answered.
     unverified_callee: bool,
+}
+
+/// The inline bytes of a fork turn's request body. Blob request bodies
+/// reach forks with M25 slice B10; before it no fork turn has a blob host
+/// that could send one.
+fn inline_request_body(body: &FetchBody) -> Result<&[u8], GateError> {
+    match body {
+        FetchBody::Inline(bytes) => Ok(bytes),
+        FetchBody::Blob(_) | FetchBody::NotHeld { .. } => Err(GateError::Host(
+            "NOT_IMPLEMENTED: blob request bodies are not supported in forks yet".into(),
+        )),
+    }
 }
 
 /// The replay effect gate of one fork turn.
@@ -2462,7 +2476,7 @@ impl ReplayGate {
             method: req.method.clone(),
             url: req.url.clone(),
             headers,
-            body: req.body.clone(),
+            body: inline_request_body(&req.body)?.to_vec(),
             fingerprint_version: 2,
             ..Default::default()
         };
@@ -2823,7 +2837,7 @@ impl ReplayGate {
             method: req.method,
             url: req.url,
             headers,
-            body: req.body.into(),
+            body: inline_request_body(&req.body)?.to_vec().into(),
             max_response_bytes: cap_bytes,
         });
         let answer = env.timeout(limits.effect_timeout, call).await;
@@ -2928,7 +2942,7 @@ impl ReplayGate {
                 method: req.method,
                 url: req.url,
                 headers,
-                body: req.body.into(),
+                body: inline_request_body(&req.body)?.to_vec().into(),
                 max_response_bytes: cap_bytes,
             },
             self.original()?.clone(),

@@ -110,6 +110,9 @@ codes! {
     BadRequest = "BAD_REQUEST", 400, "M1",
         "The request is malformed",
         "Fix the field or value named in the message and send the request again.";
+    BlobNotHeld = "BLOB_NOT_HELD", 403, "M25",
+        "The turn used a blob reference it neither holds nor received",
+        "Use the reference the turn received in its input, from a fetch or a writer, or one the actor holds; a hash stored as data is not a reference.";
     CapabilityNotGranted = "CAPABILITY_NOT_GRANTED", 403, "M2",
         "The actor type lacks a capability for this effect",
         "Grant it with `kronik grant <kind> <capability> --reason '...'`.";
@@ -568,9 +571,9 @@ mod tests {
 
     #[test]
     fn every_code_has_a_status_milestone_title_hint_and_explanation() {
-        const MILESTONES: [&str; 15] = [
+        const MILESTONES: [&str; 16] = [
             "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M21", "M23",
-            "M24", "M28",
+            "M24", "M25", "M28",
         ];
         for &code in ErrorCode::ALL {
             assert!((400..600).contains(&code.http_status()), "{code}");

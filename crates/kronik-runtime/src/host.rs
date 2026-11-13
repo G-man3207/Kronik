@@ -75,7 +75,7 @@ use bindings::kronik::actor::{
 
 pub use sql::{Rows as SqlRows, SqlError, SqlValue};
 
-mod blobs;
+pub(crate) mod blobs;
 pub(crate) mod connections;
 mod wasi_http;
 
@@ -96,6 +96,9 @@ pub struct TurnLimits {
     pub memory_bytes: usize,
     pub message_bytes: usize,
     pub state_value_bytes: usize,
+    /// The bytes one turn may write into blobs (`blob_bytes_per_actor`,
+    /// M25/M26): a `write` past it is `quota-exceeded`.
+    pub blob_bytes: u64,
 }
 
 impl Default for TurnLimits {
@@ -105,6 +108,7 @@ impl Default for TurnLimits {
             memory_bytes: crate::engine::DEFAULT_MEMORY_BYTES,
             message_bytes: 1 << 20,
             state_value_bytes: 1 << 20,
+            blob_bytes: 1 << 30,
         }
     }
 }
@@ -143,12 +147,35 @@ pub enum FetchHeader {
     Secret { name: String, template: String },
 }
 
+/// The body of an outgoing HTTP effect (M25).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchBody {
+    Inline(Vec<u8>),
+    /// A blob the turn may use, as a complete reference: the gate streams
+    /// it from the blob store.
+    Blob(pb::BlobRef),
+    /// A blob reference the turn neither holds nor received: the gate
+    /// records a denied effect and the guest gets `denied("BLOB_NOT_HELD")`.
+    NotHeld {
+        hash: String,
+        size: u64,
+    },
+}
+
+/// The body of an HTTP effect's response (M25): inline, or a blob above the
+/// kind's threshold, which joins the turn's references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchResponseBody {
+    Inline(Vec<u8>),
+    Blob(pb::BlobRef),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchRequest {
     pub method: String,
     pub url: String,
     pub headers: Vec<(String, FetchHeader)>,
-    pub body: Vec<u8>,
+    pub body: FetchBody,
     /// The guest's default subject at the call: the request and its
     /// response are that subject's data (docs/design/m8-privacy.md §4).
     pub subject: Option<String>,
@@ -158,7 +185,7 @@ pub struct FetchRequest {
 pub struct FetchResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub body: FetchResponseBody,
 }
 
 /// `http-client.fetch` results (`fetch-error` in the WIT).
@@ -428,6 +455,9 @@ pub struct TurnHost {
     pub(crate) messages: Vec<pb::OutboundMessage>,
     pub(crate) timers: Vec<pb::TimerOp>,
     gate: Option<Arc<dyn EffectGate>>,
+    /// Blob storage for this turn (M25), when the node has blobs on.
+    pub(crate) blobs: Option<Arc<dyn blobs::BlobHost>>,
+    pub(crate) blob_state: blobs::TurnBlobs,
     next_ordinal: u32,
     http: wasi_http::State,
     /// The turn's connections and buffered connection operations (M24).
@@ -452,6 +482,7 @@ pub(crate) struct HostInit {
     pub state: Option<Arc<dyn StateView>>,
     pub sql: Option<Box<dyn SqlHost>>,
     pub gate: Option<Arc<dyn EffectGate>>,
+    pub blobs: Option<Arc<dyn blobs::BlobHost>>,
     pub describe_only: bool,
 }
 
@@ -499,6 +530,8 @@ impl TurnHost {
             messages: Vec::new(),
             timers: Vec::new(),
             gate: init.gate,
+            blobs: init.blobs,
+            blob_state: blobs::TurnBlobs::default(),
             next_ordinal: 0,
             http: wasi_http::State::new(),
             conns: connections::TurnConnections::default(),
@@ -852,18 +885,27 @@ impl http_client::Host for TurnHost {
     ) -> wasmtime::Result<Result<http_client::Response, http_client::FetchError>> {
         self.deny_in_describe("http-client")?;
         let body = match req.body {
-            types::HttpBody::Inline(b) => b,
-            types::HttpBody::Blob(_) => {
-                bail!("NOT_IMPLEMENTED: blob bodies arrive in a later version")
+            types::HttpBody::Inline(b) => {
+                if b.len() > self.limits.message_bytes {
+                    bail!(
+                        "request body is {} bytes, the limit is {}",
+                        b.len(),
+                        self.limits.message_bytes
+                    );
+                }
+                FetchBody::Inline(b)
             }
+            // A blob body needs blobs on; one the turn may not use is the
+            // gate's to deny (recorded, BLOB_NOT_HELD).
+            types::HttpBody::Blob(blob) => match (&self.blobs, self.blob_state.complete(&blob)) {
+                (None, _) => bail!("NOT_IMPLEMENTED: blob bodies are not available in this turn"),
+                (Some(_), Some(full)) => FetchBody::Blob(full),
+                (Some(_), None) => FetchBody::NotHeld {
+                    hash: blob.hash,
+                    size: blob.size,
+                },
+            },
         };
-        if body.len() > self.limits.message_bytes {
-            bail!(
-                "request body is {} bytes, the limit is {}",
-                body.len(),
-                self.limits.message_bytes
-            );
-        }
         let headers = req
             .headers
             .into_iter()
@@ -893,11 +935,26 @@ impl http_client::Host for TurnHost {
             )
             .await;
         Ok(match res.map_err(|e| self.gate_failure(e))? {
-            FetchOutcome::Ok(r) => Ok(http_client::Response {
-                status: r.status,
-                headers: r.headers,
-                body: types::HttpBody::Inline(r.body),
-            }),
+            FetchOutcome::Ok(r) => {
+                let body = match r.body {
+                    FetchResponseBody::Inline(b) => types::HttpBody::Inline(b),
+                    FetchResponseBody::Blob(full) => {
+                        if self.blobs.is_none() {
+                            return Err(
+                                self.host_failure("a blob response in a turn without blobs".into())
+                            );
+                        }
+                        let guest = blobs::to_wit(&full);
+                        self.blob_state.admit(full);
+                        types::HttpBody::Blob(guest)
+                    }
+                };
+                Ok(http_client::Response {
+                    status: r.status,
+                    headers: r.headers,
+                    body,
+                })
+            }
             FetchOutcome::Denied(m) => Err(http_client::FetchError::Denied(m)),
             FetchOutcome::Network(m) => Err(http_client::FetchError::Network(m)),
             FetchOutcome::Timeout => Err(http_client::FetchError::Timeout),

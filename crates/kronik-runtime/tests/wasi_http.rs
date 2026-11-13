@@ -16,9 +16,9 @@ use kronik_core::env::BoxFuture;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::{
-    CallOutcome, CodeStore, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchHeader, FetchOutcome,
-    FetchRequest, FetchResponse, GateError, PoolSize, Program, StateView, TurnLimits, TurnRequest,
-    build_engine,
+    CallOutcome, CodeStore, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchBody, FetchHeader,
+    FetchOutcome, FetchRequest, FetchResponse, FetchResponseBody, GateError, PoolSize, Program,
+    StateView, TurnLimits, TurnRequest, build_engine,
 };
 
 const GUEST: &[u8] = include_bytes!("../../../tests/guests/counter-wasi-http.wasm");
@@ -83,13 +83,15 @@ impl EffectGate for Gate {
                 _ => FetchOutcome::Ok(FetchResponse {
                     status: 200,
                     headers: vec![("content-type".into(), "text/plain".into())],
-                    body: format!(
-                        "{} {} {}",
-                        req.method,
-                        req.url,
-                        String::from_utf8_lossy(&req.body)
-                    )
-                    .into_bytes(),
+                    body: FetchResponseBody::Inline(
+                        format!(
+                            "{} {} {}",
+                            req.method,
+                            req.url,
+                            String::from_utf8_lossy(inline(&req.body))
+                        )
+                        .into_bytes(),
+                    ),
                 }),
             })
         })
@@ -305,6 +307,14 @@ async fn a_secret_placeholder_reaches_the_gate_as_a_secret_header() {
     assert!(r.logs.contains("not sent"), "{}", r.logs);
 }
 
+/// An inline request body's bytes; this guest never sends a blob.
+fn inline(body: &FetchBody) -> &[u8] {
+    match body {
+        FetchBody::Inline(bytes) => bytes,
+        other => panic!("an inline body, not {other:?}"),
+    }
+}
+
 /// A body written one byte at a time, more writes than the body buffer
 /// holds: each wait drains what was written, the effect gets it whole.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -316,7 +326,7 @@ async fn a_streamed_body_arrives_whole_and_deterministically() {
     let spec = format!("POST http://up.example/x\n\n{payload}");
     let first = run(&p, "wstream", &spec, seed(0)).await;
     assert_eq!(first.effects.len(), 1);
-    assert_eq!(first.effects[0].1.body, payload.as_bytes());
+    assert_eq!(inline(&first.effects[0].1.body), payload.as_bytes());
     for i in 1..10 {
         let again = run(&p, "wstream", &spec, seed(i)).await;
         assert_eq!(

@@ -35,7 +35,9 @@ use wasmtime_wasi_http::{
 use wasmtime_wasi_io::bindings::wasi::io::{poll, streams};
 use wasmtime_wasi_io::streams::{DynInputStream, DynOutputStream, StreamError, StreamResult};
 
-use super::{FetchHeader, FetchOutcome, FetchRequest, LogEvent, TurnHost};
+use super::{
+    FetchBody, FetchHeader, FetchOutcome, FetchRequest, FetchResponseBody, LogEvent, TurnHost,
+};
 
 /// Requests a turn may have started and not yet waited for: each holds up to
 /// a request body in host memory.
@@ -163,7 +165,7 @@ fn fetch_request(
         method: parts.method.to_string(),
         url: parts.uri.to_string(),
         headers,
-        body,
+        body: FetchBody::Inline(body),
         subject,
     })
 }
@@ -175,11 +177,21 @@ type Answer =
 fn answer(outcome: FetchOutcome) -> Result<Answer, super::HostRedactionFailure> {
     match outcome {
         FetchOutcome::Ok(r) => {
+            let bytes = match r.body {
+                FetchResponseBody::Inline(bytes) => bytes,
+                // Blob bodies reach wasi:http with M25 slice B9; before it
+                // no gate answers a wasi:http request with one.
+                FetchResponseBody::Blob(_) => {
+                    return Ok(Err(HttpErr::InternalError(Some(
+                        "NOT_IMPLEMENTED: blob responses through wasi:http".into(),
+                    ))));
+                }
+            };
             let mut b = http::Response::builder().status(r.status);
             for (name, value) in r.headers {
                 b = b.header(name, value);
             }
-            let body = Full::new(Bytes::from(r.body))
+            let body = Full::new(Bytes::from(bytes))
                 .map_err(|never| match never {})
                 .boxed_unsync();
             let response = b

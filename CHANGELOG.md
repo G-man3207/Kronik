@@ -216,6 +216,13 @@ until the v1.0 compatibility promise takes effect.
   M25 and M26 lands, the functions trap with `NOT_IMPLEMENTED`. The Go
   bindings and TypeScript types are regenerated; components built for
   `0.1.0` link and run as before.
+- The runtime can run a turn with blob storage (M25): a component that
+  imports `blobs` reads the blobs its input carries in ranges, writes blobs
+  and returns one as its HTTP response, and a fetch's request or response
+  body can be a blob. A reference the turn neither holds nor received gives
+  the new code `BLOB_NOT_HELD`, whatever its hash; one call moves at most
+  1 MiB, and a turn moves at most 64 bytes per unit of its fuel limit. The
+  daemon does not run turns with blobs yet.
 - A new crate, `kronik-blob`, holds the blob store of M25 and M26: framed,
   content-addressed files under `<data>/blobs`, synced before their name
   exists and named durably before any record refers to them, sealed per
