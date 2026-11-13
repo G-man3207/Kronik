@@ -14,8 +14,8 @@ use kronik_runtime::KRONIK_VERSION;
 
 use super::Failure;
 use super::build::{
-    Built, INPUT_SECTION, append_custom_section, check_imports, custom_section, hash_tree, step,
-    summary, tool, write_output,
+    Built, INPUT_SECTION, append_custom_section, check_imports, custom_section, hash_tree,
+    sdk_world, step, summary, tool, write_output,
 };
 
 pub const COMPONENTIZE_PY: &str = "0.25.1";
@@ -244,6 +244,7 @@ pub fn python(dir: &Path, force: bool, entry: Option<&str>) -> Result<Built, Fai
         .hint("set [tool.kronik] entry in pyproject.toml, or pass --entry"));
     }
     let name = variant(&name, &entry, &default_entry)?;
+    let world = sdk_world(&sdk.join("wit/kronik-actor.wit"))?;
     let bin = tools_bin();
     let versions = vec![
         version(&bin, "componentize-py", &["--version"], &[COMPONENTIZE_PY])?,
@@ -255,26 +256,18 @@ pub fn python(dir: &Path, force: bool, entry: Option<&str>) -> Result<Built, Fai
         name,
         lang: "Python",
         versions,
-        flags: entry.clone(),
+        flags: format!("{entry}\0{world}"),
         sdk: &sdk,
     };
     job.run(force, |raw| {
         let work = dir.join(".kronik");
-        std::fs::write(
-            work.join("kronik_entry.py"),
-            format!(
-                "# Written by kronik build: the actor's handler export.\n\
-                 from {entry} import handler as _handler\n\
-                 from kronik._export import export as _export\n\
-                 Handler = _export(_handler)\n"
-            ),
-        )?;
+        std::fs::write(work.join("kronik_entry.py"), py_entry(&entry, world))?;
         step("componentize-py componentize", || {
             tool(
                 command(&bin, "componentize-py")?
                     .arg("-d")
                     .arg(sdk.join("wit/kronik-actor.wit"))
-                    .args(["-w", "actor", "componentize"])
+                    .args(["-w", world, "componentize"])
                     .arg("-p")
                     .arg(&work)
                     .arg("-p")
@@ -289,6 +282,24 @@ pub fn python(dir: &Path, force: bool, entry: Option<&str>) -> Result<Built, Fai
             .map(drop)
         })
     })
+}
+
+/// The Python entry `kronik build` writes: the exports of `world` from the
+/// entry module's `handler`.
+fn py_entry(entry: &str, world: &str) -> String {
+    let mut text = format!(
+        "# Written by kronik build: the actor's exports.\n\
+         from {entry} import handler as _handler\n\
+         from kronik._export import export as _export\n\
+         Handler = _export(_handler)\n"
+    );
+    if world != "actor" {
+        text.push_str(
+            "from kronik._export import export_connections as _export_connections\n\
+             ConnectionHandler = _export_connections(_handler)\n",
+        );
+    }
+    text
 }
 
 /// A Go project: `go.mod` whose module path's last element is the name and
@@ -398,6 +409,16 @@ mod tests {
         assert_eq!(m.as_deref(), Some("example.com/a/notes"));
         assert_eq!(s.as_deref(), Some("./vendor/kronik-sdk"));
         assert_eq!(parse_go_mod("go 1.27\n"), (None, None));
+    }
+
+    #[test]
+    fn the_python_entry_exports_the_worlds_interfaces() {
+        let old = py_entry("actor", "actor");
+        assert!(old.contains("Handler = _export(_handler)"));
+        assert!(!old.contains("ConnectionHandler"));
+        let new = py_entry("actor", "actor-connections");
+        assert!(new.contains("from actor import handler as _handler"));
+        assert!(new.contains("ConnectionHandler = _export_connections(_handler)"));
     }
 
     #[test]

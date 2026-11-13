@@ -66,6 +66,7 @@ pub const PY_SDK: &[File] = sdk_files!("../../../../sdk/python/":
     "kronik/_export.py",
     "kronik/_host.py",
     "kronik/actor.py",
+    "kronik/connections.py",
     "kronik/ctx.py",
     "kronik/errors.py",
     "kronik/http.py",

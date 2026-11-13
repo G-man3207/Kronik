@@ -6,6 +6,7 @@
 # "content_type": ...}; the body (bytes, str, or a value as JSON) and the
 # content type (default: what follows from the body) are optional.
 
+from .connections import send_now_failure, to_wit_frame
 from .errors import host_error
 from .http import FetchResponse, Message, Secret, SecretHeader, encode_body, parse_json, text, to_json
 from .sql import SqlRows, has_order_by, to_sql
@@ -201,6 +202,51 @@ class Timers:
         return self._h.timers.cancel(id)
 
 
+class ConnectionOps:
+    """The WebSocket and SSE connections this actor accepted: `ctx.connections`
+    (see `kronik explain connections`). Only the actor whose open accepted a
+    connection may send on it or close it; any other use traps with
+    CONNECTION_NOT_HELD. A frame to a closed connection is dropped and shows in
+    the history. A frame is a Frame, a str (text) or bytes (binary)."""
+
+    def __init__(self, h):
+        self._h = h
+
+    def send(self, connection, frame):
+        """Sends `frame` to `connection` when this turn commits, in call order; nothing if the turn fails."""
+        c = self._h.connections
+        c.send(connection, to_wit_frame(frame, c))
+
+    def broadcast(self, connections, frame):
+        """send() to each of `connections`, recorded once: the way to fan a message out."""
+        c = self._h.connections
+        c.broadcast(list(connections), to_wit_frame(frame, c))
+
+    def close(self, connection, code=1000, reason=""):
+        """Closes `connection` when this turn commits, after the frames sent before:
+        a WebSocket with `code` and `reason`, an SSE stream by ending it. Its close input still follows."""
+        self._h.connections.close(connection, code, reason)
+
+    def send_now(self, connection, frame):
+        """Sends `frame` now, before this turn commits, for intermediate results
+        such as the tokens of a streamed answer; use send() for final notices.
+        An effect with delivery class `unsafe` that needs the capability
+        `connection:send-now`. True when the frame was handed to the connection
+        (not that the client received it), False when the connection is closed
+        or its client does not keep up. Raises OutcomeUnknown when a crash made
+        the outcome unknown: a frame is never sent twice. Frames sent now go out
+        before the turn's send() frames."""
+        c = self._h.connections
+        try:
+            c.send_now(connection, to_wit_frame(frame, c))
+            return True
+        except self._h.Err as e:
+            failure = send_now_failure(e.value)
+            if failure is False:
+                return False
+            raise failure from None
+
+
 class Random:
     """Randomness from the turn's recorded seed: a replay gets the same values."""
 
@@ -259,6 +305,7 @@ class Ctx:
         self.secrets = Secrets(h)
         self.timers = Timers(h)
         self.random = Random(h)
+        self.connections = ConnectionOps(h)
 
     def send(self, to, msg):
         """Sends a message to `to`: buffered, delivered exactly once, only if this turn commits."""
@@ -299,6 +346,15 @@ class Ctx:
     def current_subject(self):
         """The current default subject, or None."""
         return self._h.privacy.current_subject()
+
+    def accept(self, subprotocol=None, headers=None, subject=None):
+        """Accepts the connection the current open asks for: return it from the
+        open handler. `subprotocol` is one the client offered (WebSocket only),
+        `headers` a dict of extra response headers, `subject` the subject of the
+        connection's later inputs (by default the request's). Returning an HTTP
+        response instead (`ctx.status(403)`) refuses the connection."""
+        c, t = self._h.connections, self._h.types
+        return c.OpenReply_Accept(c.Accept(subprotocol, [t.Header(n, v) for n, v in (headers or {}).items()], subject))
 
     def _http(self, status, content_type, body):
         t = self._h.types

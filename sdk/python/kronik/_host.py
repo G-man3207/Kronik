@@ -3,6 +3,7 @@
 
 from componentize_py_types import Err  # noqa: F401
 from wit_world.imports import (  # noqa: F401
+    connections,
     context,
     crypto,
     http_client,

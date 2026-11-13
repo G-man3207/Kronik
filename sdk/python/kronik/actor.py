@@ -5,7 +5,7 @@
 class ActorSpec:
     """An actor type: its manifest and the handlers for the inputs it takes. Made by actor()."""
 
-    def __init__(self, kind, schema_version, routes, capabilities, http, message, timer, migrate):
+    def __init__(self, kind, schema_version, routes, capabilities, http, message, timer, migrate, connections=None):
         self.kind = kind
         self.schema_version = schema_version
         self.routes = routes
@@ -14,13 +14,50 @@ class ActorSpec:
         self.message = message
         self.timer = timer
         self.migrate = migrate
+        self.connections = connections
 
     def manifest(self):
         """What `describe` returns: kind, schema_version, routes as (method, pattern), capabilities."""
         return self.kind, self.schema_version, [(r["method"], r["pattern"]) for r in self.routes], list(self.capabilities)
 
 
-def actor(*, kind, schema_version, routes=(), capabilities=(), http=None, message=None, timer=None, migrate=None):
+class Route:
+    """Routes as actor() takes them: Route.post("/counter/{key}") is
+    {"method": "POST", "pattern": "/counter/{key}"}. WEBSOCKET and SSE routes
+    open connections, handled by actor(connections=...)."""
+
+    @staticmethod
+    def get(pattern):
+        return {"method": "GET", "pattern": pattern}
+
+    @staticmethod
+    def post(pattern):
+        return {"method": "POST", "pattern": pattern}
+
+    @staticmethod
+    def put(pattern):
+        return {"method": "PUT", "pattern": pattern}
+
+    @staticmethod
+    def patch(pattern):
+        return {"method": "PATCH", "pattern": pattern}
+
+    @staticmethod
+    def delete(pattern):
+        return {"method": "DELETE", "pattern": pattern}
+
+    @staticmethod
+    def websocket(pattern):
+        """A WebSocket route: an upgrade request opens a connection."""
+        return {"method": "WEBSOCKET", "pattern": pattern}
+
+    @staticmethod
+    def sse(pattern):
+        """A server-sent events route: a GET opens an event stream."""
+        return {"method": "SSE", "pattern": pattern}
+
+
+def actor(*, kind, schema_version, routes=(), capabilities=(), http=None, message=None, timer=None, migrate=None, connections=None):
     """Builds an actor type from its spec; the entry module binds it to `handler`:
 
         handler = actor(
@@ -36,7 +73,9 @@ def actor(*, kind, schema_version, routes=(), capabilities=(), http=None, messag
     `timer(timer, ctx)` return an output (`ctx.json(...)`, `ctx.reply(...)`,
     `ctx.none()`, ...); `migrate(from_version, ctx)` migrates the state from
     schema version `from_version`, and SQL DDL is allowed only there. Above
-    schema version 0, a new actor runs `migrate(0)` first.
+    schema version 0, a new actor runs `migrate(0)` first. `connections`
+    (a Connections) handles the WebSocket and SSE connections of the
+    actor type's WEBSOCKET and SSE routes.
 
     Every input runs as one turn on a fresh instance: module-level variables
     do not survive it, and module scope itself runs at build time. A handler
@@ -51,7 +90,11 @@ def actor(*, kind, schema_version, routes=(), capabilities=(), http=None, messag
     for r in routes:
         if not isinstance(r, dict) or not isinstance(r.get("method"), str) or not isinstance(r.get("pattern"), str):
             raise TypeError(f"route {r!r} must be a dict with str method and pattern (see `kronik explain actor`)")
-    return ActorSpec(kind, schema_version, list(routes), list(capabilities), http, message, timer, migrate)
+    from .connections import Connections
+
+    if connections is not None and not isinstance(connections, Connections):
+        raise TypeError("actor(connections=...) must be a Connections(open=..., frame=..., close=...) (see `kronik explain connections`)")
+    return ActorSpec(kind, schema_version, list(routes), list(capabilities), http, message, timer, migrate, connections)
 
 
 def unhandled(kind, what, param, topic):

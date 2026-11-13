@@ -9,8 +9,11 @@ from types import SimpleNamespace
 SDK = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SDK))
 
-from kronik import KronikError, Rejected, actor  # noqa: E402
-from kronik._export import handle  # noqa: E402
+from enum import Enum  # noqa: E402
+
+from kronik import Connections, Frame, KronikError, OutcomeUnknown, Rejected, Route, actor  # noqa: E402
+from kronik._export import connection_closed, connection_frame, handle, open_connection  # noqa: E402
+from kronik.connections import IncomingFrame, OpenRequest, closed_of, send_now_failure, to_wit_frame  # noqa: E402
 from kronik.ctx import actor_ref, wit_message  # noqa: E402
 from kronik.errors import explain_topic, host_error, variant_tag  # noqa: E402
 from kronik.http import Request, encode_body, parse_json, to_json  # noqa: E402
@@ -57,6 +60,56 @@ def fake_host(writes):
 def http_input(method="POST", query="", body=b""):
     req = types.HttpRequest(method, "/x", query, [("key", "alice")], [types.Header("Content-Type", "text/plain")], types.HttpBody_Inline(body))
     return types.Input_Http(req)
+
+
+class Protocol(Enum):
+    WEBSOCKET = 0
+    SSE = 1
+
+
+class CloseInitiator(Enum):
+    CLIENT = 0
+    ACTOR = 1
+    HOST = 2
+
+
+conn = SimpleNamespace(
+    **{n: _variant(n, "value") for n in ["Frame_Text", "Frame_Binary", "Frame_Event", "OpenReply_Accept", "OpenReply_Refuse", "SendError_Denied"]},
+    SendError_Closed=_variant("SendError_Closed"),
+    SendError_OutcomeUnknown=_variant("SendError_OutcomeUnknown"),
+    SseEvent=_variant("SseEvent", "event", "id", "data"),
+    Accept=_variant("Accept", "subprotocol", "headers", "subject"),
+    OpenRequest=_variant("OpenRequest", "connection", "protocol", "request", "subprotocols"),
+    IncomingFrame=_variant("IncomingFrame", "connection", "seq", "frame"),
+    CloseInfo=_variant("CloseInfo", "initiator", "code", "reason"),
+    Closed=_variant("Closed", "connection", "info"),
+    Protocol=Protocol,
+    CloseInitiator=CloseInitiator,
+)
+
+
+def connection_host(calls, send_now_error=None):
+    """A fake host whose connections functions record their calls."""
+
+    def send_now(c, frame):
+        calls.append(("send_now", c, frame))
+        if send_now_error is not None:
+            raise Err(send_now_error)
+
+    h = fake_host([])
+    h.connections = SimpleNamespace(
+        **vars(conn),
+        send=lambda c, frame: calls.append(("send", c, frame)),
+        broadcast=lambda cs, frame: calls.append(("broadcast", cs, frame)),
+        close=lambda c, code, reason: calls.append(("close", c, code, reason)),
+        send_now=send_now,
+    )
+    return h
+
+
+def open_request(query="user=ada", headers=()):
+    req = types.HttpRequest("GET", "/chat/lobby/ws", query, [("key", "lobby")], [types.Header(n, v) for n, v in headers], types.HttpBody_Inline(b""))
+    return conn.OpenRequest("c-0123", Protocol.WEBSOCKET, req, ["chat.v1"])
 
 
 class ErrorsTest(unittest.TestCase):
@@ -205,6 +258,121 @@ class ActorTest(unittest.TestCase):
             types.HandlerError_Rejected("actor type counter does not handle messages: give actor() a message= handler (see `kronik explain message`)"),
         )
         self.assertEqual(handle(spec, fake_host(writes), types.Input_Migrate(0)), types.Output_None_())
+
+
+class ConnectionsTest(unittest.TestCase):
+    def test_frames(self):
+        self.assertEqual(Frame.text("hi"), Frame("text", "hi"))
+        self.assertEqual(Frame.json({"n": 1}), Frame("text", '{"n":1}'))
+        self.assertEqual(Frame.binary(bytearray(b"ab")), Frame("binary", b"ab"))
+        self.assertEqual(Frame.event({"seq": 7}, id=7), Frame("event", '{"seq":7}', "", "7"))
+        self.assertEqual(to_wit_frame("hi", conn), conn.Frame_Text("hi"))
+        self.assertEqual(to_wit_frame(b"\x01", conn), conn.Frame_Binary(b"\x01"))
+        self.assertEqual(to_wit_frame(Frame.event("x", event="message"), conn), conn.Frame_Event(conn.SseEvent("message", "", "x")))
+        with self.assertRaisesRegex(KronikError, "not a frame.*kronik explain connections"):
+            to_wit_frame({"type": "say"}, conn)
+
+    def test_routes(self):
+        self.assertEqual(Route.websocket("/chat/{key}/ws"), {"method": "WEBSOCKET", "pattern": "/chat/{key}/ws"})
+        self.assertEqual(Route.sse("/e"), {"method": "SSE", "pattern": "/e"})
+        self.assertEqual(Route.post("/p"), {"method": "POST", "pattern": "/p"})
+
+    def test_the_open_request_incoming_frames_and_the_close(self):
+        req = OpenRequest(open_request(headers=[("Origin", "https://chat.example"), ("Last-Event-ID", "41")]))
+        self.assertEqual((req.connection, req.protocol, req.subprotocols), ("c-0123", "websocket", ["chat.v1"]))
+        self.assertEqual(req.param("key"), "lobby")
+        self.assertEqual(req.query_param("user"), "ada")
+        self.assertEqual(req.origin(), "https://chat.example")
+        self.assertEqual(req.last_event_id(), "41")
+        frame = IncomingFrame(conn.IncomingFrame("c-0123", 3, conn.Frame_Text('{"type":"say"}')))
+        self.assertEqual((frame.connection, frame.seq, frame.kind), ("c-0123", 3, "text"))
+        self.assertEqual(frame.json(), {"type": "say"})
+        binary = IncomingFrame(conn.IncomingFrame("c-0123", 4, conn.Frame_Binary(b"\xff")))
+        self.assertEqual(binary.bytes(), b"\xff")
+        with self.assertRaisesRegex(KronikError, "the frame is not UTF-8"):
+            binary.text()
+        closed = closed_of(conn.Closed("c-0123", conn.CloseInfo(CloseInitiator.HOST, 1012, "restart")))
+        self.assertEqual((closed.initiator, closed.code, closed.reason), ("host", 1012, "restart"))
+
+    def test_open_accepts_refuses_and_defaults_to_404(self):
+        calls = []
+        h = connection_host(calls)
+
+        def join(req, ctx):
+            if req.query_param("user") == "mallory":
+                return ctx.status(403)
+            if req.query_param("user") == "none":
+                return ctx.none()
+            ctx.connections.send(req.connection, Frame.json({"type": "welcome"}))
+            return ctx.accept(subject="user:ada", headers={"x-room": "lobby"})
+
+        spec = actor(kind="chat", schema_version=0, connections=Connections(open=join))
+        out = open_connection(spec, h, open_request())
+        self.assertEqual(out, conn.OpenReply_Accept(conn.Accept(None, [types.Header("x-room", "lobby")], "user:ada")))
+        self.assertEqual(calls, [("send", "c-0123", conn.Frame_Text('{"type":"welcome"}'))])
+        out = open_connection(spec, h, open_request("user=mallory"))
+        self.assertEqual(out, conn.OpenReply_Refuse(types.HttpResponse(403, [], types.HttpBody_Inline(b""))))
+        with self.assertRaises(Err) as cm:
+            open_connection(spec, h, open_request("user=none"))
+        self.assertIn("must return ctx.accept()", cm.exception.value.value)
+        bare = actor(kind="chat", schema_version=0)
+        out = open_connection(bare, h, open_request())
+        self.assertEqual(out.value.status, 404)
+        self.assertIn(b"does not handle connections", out.value.body.value)
+        with self.assertRaisesRegex(TypeError, "kronik explain connections"):
+            actor(kind="chat", schema_version=0, connections={"open": join})
+
+    def test_frames_are_rejected_and_closes_ignored_without_handlers(self):
+        h = connection_host([])
+        frame = conn.IncomingFrame("c-0123", 0, conn.Frame_Text("x"))
+        closed = conn.Closed("c-0123", conn.CloseInfo(CloseInitiator.CLIENT, 1000, ""))
+        bare = actor(kind="chat", schema_version=0)
+        with self.assertRaises(Err) as cm:
+            connection_frame(bare, h, frame)
+        self.assertEqual(
+            cm.exception.value,
+            types.HandlerError_Rejected(
+                "actor type counter does not handle connection frames: give actor() connections=Connections(frame=...) (see `kronik explain connections`)"
+            ),
+        )
+        self.assertIsNone(connection_closed(bare, h, closed))
+        seen = []
+
+        def boom(f, ctx):
+            raise ValueError("bad frame")
+
+        spec = actor(kind="chat", schema_version=0, connections=Connections(frame=boom, close=lambda c, ctx: seen.append(c)))
+        with self.assertRaises(Err) as cm:
+            connection_frame(spec, h, frame)
+        self.assertEqual(cm.exception.value, types.HandlerError_Failed("ValueError: bad frame"))
+        connection_closed(spec, h, closed)
+        self.assertEqual(seen[0].code, 1000)
+
+    def test_ctx_connections(self):
+        from kronik.ctx import Ctx
+
+        calls = []
+        ctx = Ctx(connection_host(calls))
+        ctx.connections.send("c-1", "hi")
+        ctx.connections.broadcast(("c-1", "c-2"), Frame.binary(b"x"))
+        ctx.connections.close("c-1", 4000, "bye")
+        self.assertTrue(ctx.connections.send_now("c-1", "tok"))
+        self.assertEqual(
+            calls,
+            [
+                ("send", "c-1", conn.Frame_Text("hi")),
+                ("broadcast", ["c-1", "c-2"], conn.Frame_Binary(b"x")),
+                ("close", "c-1", 4000, "bye"),
+                ("send_now", "c-1", conn.Frame_Text("tok")),
+            ],
+        )
+        self.assertFalse(Ctx(connection_host([], conn.SendError_Closed())).connections.send_now("c-1", "x"))
+        with self.assertRaises(OutcomeUnknown) as cm:
+            Ctx(connection_host([], conn.SendError_OutcomeUnknown())).connections.send_now("c-1", "x")
+        self.assertEqual(cm.exception.topic, "EFFECT_OUTCOME_UNKNOWN")
+        with self.assertRaisesRegex(KronikError, r"sending now denied: CAPABILITY_NOT_GRANTED: connection:send-now \(see `kronik explain CAPABILITY_NOT_GRANTED`\)"):
+            Ctx(connection_host([], conn.SendError_Denied("CAPABILITY_NOT_GRANTED: connection:send-now"))).connections.send_now("c-1", "x")
+        self.assertEqual(send_now_failure(object()).kind, "send-now.unknown")
 
 
 class WitTest(unittest.TestCase):
