@@ -956,6 +956,35 @@ fn production_turns_missing_below_an_erased_turn_are_unverifiable() {
     keep(&dir, "erased-fanout");
 }
 
+/// Issue #49: an erased state value reads as absent in a fork and marks the
+/// turn that read it, also when the value was written inside the replayed
+/// log: the writer and the reader are unverifiable (before, the reader got
+/// the 8 bytes `[erased]` as present data, as long as the value it had read).
+#[test]
+fn a_reader_of_an_erased_state_value_is_unverifiable() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter-fetch-extra"],
+        &[
+            // `s` is "personal", sealed for user:1; `read` replies its length.
+            Step::Send("counter/a", "subject", "", Some("user:1")),
+            Step::Send("counter/a", "read", "", None),
+            Step::Erase("user:1"),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let d = &checked.diff;
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(checked.report.passed, "{text}");
+    assert_eq!(d.summary.divergent_turns, 0, "{text}");
+    assert_eq!(d.summary.unverifiable, 2, "{text}");
+    keep(&dir, "erased-value-reader");
+}
+
 /// S-16 (5): the replay serves the recorded outcome of an erased request - an
 /// exact effect, not a synthetic denial the guest has to handle.
 #[test]

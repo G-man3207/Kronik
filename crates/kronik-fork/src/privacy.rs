@@ -107,17 +107,30 @@ impl ForkPrivacy {
     /// unsealed so the store can apply them. In a `--no-pii` fork a
     /// subject-tagged changeset's text and blob cells are pseudonymized
     /// first (integer and real values, and the `_subject` column, stay).
-    /// An erased subject's changeset stays sealed so the store skips it.
-    /// Returns whether any value was masked.
+    /// An erased subject's changeset stays sealed so the store skips it,
+    /// and so does an erased state value: the store keeps it sealed, and a
+    /// fork turn that reads it gets nothing and is marked as one that met
+    /// erased data ([`ForkState`]; issue #49) instead of reading the bytes
+    /// `[erased]` as if they were the value. Returns whether any value was
+    /// masked.
     pub fn reveal_turn(&self, t: &mut pb::TurnRecord) -> bool {
         let mut sql = std::mem::take(&mut t.sql_changes);
+        let mut writes = std::mem::take(&mut t.writes);
         let mut masked = false;
         kronik_proto::sealables::turn_mut(t, &mut |s| masked |= self.reveal(s));
+        for v in writes.iter_mut().filter_map(|w| w.value.as_mut()) {
+            if self.opens_erased(v) {
+                masked = true;
+            } else {
+                masked |= self.reveal(v);
+            }
+        }
         for c in &mut sql {
             if let Some(cs) = c.changeset.as_mut() {
                 self.reveal_changeset(cs);
             }
         }
+        t.writes = writes;
         t.sql_changes = sql;
         masked
     }
@@ -248,6 +261,8 @@ impl StateView for ForkState {
         if value.subject.is_some() {
             self.saw_subject.store(true, Ordering::Relaxed);
         }
+        // An erased value reads as absent (docs/design/m8-privacy.md §5),
+        // and the replay cannot verify a turn that read it (ADR 0109).
         if matches!(self.privacy.sealer.open(&value), Opened::Erased { .. }) {
             self.masked.store(true, Ordering::Relaxed);
             self.erased.store(true, Ordering::Relaxed);
@@ -286,6 +301,80 @@ mod tests {
         assert!(is_pseudonym(b"pii:0123456789ab"));
         assert!(!is_pseudonym(b"pii:0123456789AB"));
         assert!(!is_pseudonym(b"alice"));
+    }
+
+    /// Issue #49: an erased state value the replayed log wrote stays sealed
+    /// in the fork's store, reads as absent and marks the turn that read it
+    /// (before, it was the 8 bytes `[erased]`, read as the value).
+    #[test]
+    fn an_erased_state_value_stays_sealed_and_reads_as_absent() {
+        let master = kronik_privacy::MasterKey::from_bytes([7; 32]).unwrap();
+        let keystore = kronik_privacy::keystore::Keystore::open_memory(&master).unwrap();
+        let sealer = Arc::new(Sealer::new(Arc::new(keystore)));
+        sealer.set_on(true);
+        let privacy = ForkPrivacy {
+            sealer: sealer.clone(),
+            no_pii: false,
+        };
+        let write = |key: &str, value: &[u8]| {
+            let mut v = pb::Sealable {
+                subject: Some("user:1".into()),
+                value: Some(pb::sealable::Value::Plain(value.to_vec())),
+            };
+            sealer
+                .seal_value(&mut v, &|b: &mut [u8]| b.fill(3), 1)
+                .unwrap();
+            pb::StateWrite {
+                key: key.into(),
+                op: pb::StateOp::Set as i32,
+                value: Some(v),
+            }
+        };
+        let mut t = pb::TurnRecord {
+            actor: Some(pb::ActorRef {
+                kind: "counter".into(),
+                key: "a".into(),
+            }),
+            causal_key: Some(kronik_core::causal::root("r1".to_owned())),
+            input: Some(pb::Input {
+                kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
+            }),
+            outcome: Some(pb::Outcome {
+                kind: pb::OutcomeKind::Committed as i32,
+                ..Default::default()
+            }),
+            writes: vec![write("s", b"personal")],
+            ..Default::default()
+        };
+        sealer.erase("user:1", 2).unwrap();
+        assert!(privacy.reveal_turn(&mut t));
+        assert!(
+            matches!(
+                t.writes[0].value.as_ref().and_then(|v| v.value.as_ref()),
+                Some(pb::sealable::Value::Sealed(_))
+            ),
+            "an erased state value must stay sealed: {:?}",
+            t.writes[0]
+        );
+        let store = crate::replay::memory_store().unwrap();
+        store
+            .apply(&[kronik_log::Committed {
+                lsn: 1,
+                pos: kronik_log::Position {
+                    segment: 0,
+                    offset: 0,
+                },
+                record: kronik_proto::Record::TurnRecord(t),
+            }])
+            .unwrap();
+        let actor = ActorRef::parse("counter/a").unwrap();
+        let state = ForkState::new(store.clone(), actor.clone(), privacy.clone());
+        assert_eq!(
+            state.get("s").unwrap(),
+            None,
+            "an erased value reads as absent"
+        );
+        assert!(state.erased() && state.masked());
     }
 
     #[test]

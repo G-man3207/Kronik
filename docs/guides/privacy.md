@@ -294,7 +294,8 @@ every tagged value they read is replaced with a pseudonym, `pii:` and 12
 hex characters. Pseudonyms are a keyed hash of the subject
 and the value, so equal values get equal pseudonyms (equality checks in the
 code still hold), and without the installation's key a pseudonym can't be
-checked against a guessed value. Erased values read as `[erased]`. That
+checked against a guessed value. Erased values read as `[erased]`, and an
+erased state value as absent. That
 includes an HTTP request's path, query and route parameters, so code that
 dispatches on a route parameter can take another branch or fail.
 

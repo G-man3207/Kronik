@@ -280,8 +280,8 @@ starts a background compaction that requires the mode to be `on`:
   (key `derive_key("kronik pseudonym v1", master)`, done in 895ff28). The
   host unseals transiently to compute it, so equal values get equal
   pseudonyms and equality checks in guest logic still hold. Without the key,
-  a pseudonym can't be checked against a guessed value. Erased values become
-  `[erased]`.
+  a pseudonym can't be checked against a guessed value. Erased values
+  become `[erased]`, except an erased state value, which reads as absent.
 - Subject-tagged SQL changesets are pseudonymized before they are applied
   to the fork's actor database. Text and blob cell values become
   `Pseudonyms::of(subject, bytes)`; old and new images are rewritten the
@@ -601,7 +601,9 @@ Where the code differs from the sections above:
   A `--no-pii` turn is masked when its input or a recorded (non-live)
   effect response is tagged or it read a masked state value; if it differs,
   it counts in `summary.pii_masked` and `samples.pii_masked`, not as
-  divergent, an error or a cause. HTTP root inputs keep the gateway's
+  divergent, an error or a cause. An erased subject's state value stays
+  sealed in the fork's store, reads as absent and marks the reading turn as
+  one that met erased data (ADR 0109). HTTP root inputs keep the gateway's
   subject in forks (taken from the body's or a header's tag). A fork
   records its effects with the
   guest's subject as production does, and seals what it writes to disk (its

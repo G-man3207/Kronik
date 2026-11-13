@@ -56,6 +56,9 @@ until the v1.0 compatibility promise takes effect.
   turn, an origin or a consequence, and the turn that met the erased data is
   no longer counted as their origin; `unverifiable` counts each turn once
   (#28).
+- In a fork, an erased state value reads as absent and marks the turn that
+  read it, also when the value was written inside the replayed log; before,
+  the guest read the bytes `[erased]` as the value (#49).
 - `kronik privacy reseal` also seals the bodies of pending timers and
   undelivered messages in `state.db`, and an erasure turns its subject's
   queued bodies into tombstones, plain ones too: a timer scheduled in `off`

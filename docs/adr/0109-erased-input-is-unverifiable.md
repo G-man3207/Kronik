@@ -1,8 +1,8 @@
 # 0109. Erased recorded input is unverifiable, not divergence
 
 - **Status:** Proposed
-- **Date:** 2026-11-08, amended 2026-11-13 (points 3 and 5, issues #27
-  and #28)
+- **Date:** 2026-11-08, amended 2026-11-13 (points 1, 3 and 5, issues
+  #27, #28 and #49)
 
 ## Context
 
@@ -48,8 +48,11 @@ divergent. Identity replay and `kronik upgrade check` treat it that way:
    `Erased`; `ProductionIndex::reveal` records, before replacing the value
    with `[erased]`, the turn LSNs whose recorded input, effects, writes,
    messages, timers or outcome contain an erased value, and the effect
-   ordinals whose recorded request is erased. `ForkState` records an erased
-   state read. The replay marks such a turn (`ForkTurn::erased`).
+   ordinals whose recorded request is erased. An erased state value is not
+   replaced: it stays sealed, so the fork's store holds it unreadable, as
+   production's did until its erasure. `ForkState` reads it as absent and
+   records the read, also for a value written inside the replayed log
+   (issue #49). The replay marks such a turn (`ForkTurn::erased`).
 2. **Serve the recording.** At the marked effect ordinal of such a turn the
    effect gate does not decode or re-derive the recorded request and does not
    compare fingerprints; it pushes the recorded effect and returns the
