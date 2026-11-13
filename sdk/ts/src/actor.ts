@@ -194,7 +194,8 @@ function connectionHandler(handlers: ConnectionHandlers): ConnectionHandler {
     },
 
     frame(event: WitIncomingFrame): void {
-      turn(
+      // Returned: an async handler's promise is what ComponentizeJS waits for.
+      return turn(
         (ctx) => {
           if (!handlers.frame) throw new Rejected(unhandled(ctx, 'connection frames', 'connections.frame', 'connections'));
           return handlers.frame(new IncomingFrame(event), ctx);
@@ -204,7 +205,7 @@ function connectionHandler(handlers: ConnectionHandlers): ConnectionHandler {
     },
 
     close(event: WitClosed): void {
-      turn(
+      return turn(
         (ctx) => handlers.close?.(closedOf(event), ctx),
         () => undefined,
       );
