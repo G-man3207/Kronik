@@ -146,11 +146,11 @@ the root id).
   exact. `recorded`, the default for a new grant, does not compute: the
   guest gets `denied("replay: no recording")` and the effect is graded
   synthetic (`fail-closed`). A grant written before the mode existed is
-  `compute`. A name that is linked to an external backend at the fork point
-  is not recomputed in either mode: the built-in store holds an older value
-  of it or none, and a fork never fetches. The effect is denied with
-  `SECRET_EXTERNAL` and graded synthetic like any answer the fork cannot
-  give. `secret.reveal` in a fork never
+  `compute`. Under `compute`, a name that is linked to an external backend
+  at the fork point is recomputed with the value the node already holds for
+  that link (m23 §6); when it holds none the effect is denied with
+  `SECRET_UNAVAILABLE` and graded synthetic like any answer the fork cannot
+  give, as a fork never fetches. `secret.reveal` in a fork never
   gets the value: it answers the placeholder `[secret:<name>]` (exact when
   production revealed at that point, else synthetic). Production records
   HTTP and call requests, and fingerprints them, with the same placeholder

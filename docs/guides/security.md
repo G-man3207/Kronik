@@ -112,9 +112,10 @@ Secrets arrive with M2.
   such computation is a log line and a `kronik_fork_crypto_computations_total`
   sample. Grant `fork`, and `compute`, only to callers you would trust with
   that. An older grant with no mode stays `compute`; re-granting without
-  `--in-forks compute` writes `recorded`. This holds for built-in secrets:
-  a name that is linked to an external backend at the fork point is not
-  computed in a fork (`SECRET_EXTERNAL`). A preview (M11) answers whoever
+  `--in-forks compute` writes `recorded`. A name that is linked to an
+  external backend at the fork point is computed with the value the node
+  already holds for that link, and denied (`SECRET_UNAVAILABLE`) when it
+  holds none: a fork never asks the backend. A preview (M11) answers whoever
   has its URL, so it gets no production key at all: its `crypto.*` calls
   answer `no recording`.
 - **Scrubbing.** When a turn used or revealed a secret, exact occurrences of

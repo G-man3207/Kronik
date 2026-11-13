@@ -757,6 +757,13 @@ impl Proposals {
         setup.preview = preview;
         // Production's turn record budget, so the replay decides as it did.
         setup.record_limit = self.node.turn_record_limit();
+        // Values of linked secrets this process holds; a preview computes nothing.
+        if !preview {
+            setup.held_secrets = self
+                .node
+                .secret_cache()
+                .map(|cache| cache as Arc<dyn crate::replay::HeldKeys>);
+        }
         setup.simulators = Arc::new(crate::simulators::Simulators::new(
             &setup.index,
             &options.simulator_overrides,

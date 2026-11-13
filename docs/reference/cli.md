@@ -802,8 +802,9 @@ default for a new grant, returns a matching recording or denies the call.
 `compute` signs on the host; the key does not enter the guest, the log, or
 the diff. A grant written before the field existed stays `compute` until it
 is granted again. Re-granting without `--in-forks compute` writes
-`recorded`. A name linked to an external backend is not computed in a fork
-either way.
+`recorded`. Under `compute`, a name linked to an external backend at the
+fork point is computed with the value the node holds for that link, and is
+denied with `SECRET_UNAVAILABLE` when it holds none: a fork never fetches.
 
 For `http:` capabilities, `--delivery` says how the target tolerates
 retries after a crash: `replay-safe` and `idempotency-keyed` requests are
@@ -1910,10 +1911,11 @@ A layout outside `[foreign] layout_dirs` needs `admin` (the daemon reads it
 as root); symbolic links inside a layout are refused. Pulls stop after
 `[foreign] pull_timeout` (default 10 minutes) and above 8 GiB.
 `--secret` passes a secret as an environment variable at every start (the
-program sees the value). A name that is linked to an external secret manager
-is refused (`SECRET_EXTERNAL`), at the add and at the next start of an actor
-whose name was linked later: the built-in store holds an older value of it or
-none. `trusted` runs plain runc with a warning, a
+program sees the value), read as the effects of turns read it: from the
+built-in store, or, for a name linked to an external secret manager, from the
+node's cache or the backend (`SECRET_UNAVAILABLE` while the backend does not
+answer and nothing is cached; the next start retries). A link made later is
+seen by the next start. `trusted` runs plain runc with a warning, a
 seccomp filter and no user namespace: it is not a security boundary;
 `microvm` is `NOT_IMPLEMENTED`. `--fork-mode` (M14) says how forks answer
 calls to it: `recorded` (the default) matches production's recordings;
@@ -1922,7 +1924,7 @@ continuous fork gets a copy from the nearest checkpoint, with no network
 and its own disk, deleted with the fork; its answers are graded `forked`.
 To change the mode, remove and add the actor again. Errors:
 `FOREIGN_EXISTS`, `IMAGE_INVALID`, `RUNSC_MISSING`, `RUNC_MISSING`,
-`SECRET_NOT_FOUND`, `SECRET_EXTERNAL`, `SCOPE_MISSING`, `UNAVAILABLE` when the image's new
+`SECRET_NOT_FOUND`, `SECRET_UNAVAILABLE`, `SCOPE_MISSING`, `UNAVAILABLE` when the image's new
 layers do not fit above `[log] disk_reserve`, and `FOREIGN_UNAVAILABLE`
 when another daemon holds `[foreign] run_dir` or the registry (or layout
 directory) did not answer within `[foreign] pull_timeout`. See

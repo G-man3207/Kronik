@@ -10,17 +10,14 @@ use std::time::Duration;
 
 use kronik_core::env::{BoxFuture, Env, HttpRequest, HttpResponse, NetError};
 use kronik_core::error::{ApiError, ErrorCode};
-use kronik_effects::foreign::{ForeignHost, SecretLinks, unavailable, valid_name};
-use kronik_privacy::SecretStore;
+use kronik_effects::foreign::{ForeignHost, SecretSource, unavailable, valid_name};
 use kronik_proto::log::v1 as pb;
 
 use crate::blobs::BlobStore;
 use crate::fetch::{FetchOptions, Resolved};
 use crate::image::{ImageError, ImageRef};
 use crate::runtime::{Engine, Runtime, container_id, find_runc, is_executable, run_quick};
-use crate::supervisor::{
-    Actor, Ctx, Paths, State, Status, Timings, linked_secret_message, secret_binding, supervise,
-};
+use crate::supervisor::{Actor, Ctx, Paths, State, Status, Timings, secret_binding, supervise};
 
 /// The tested gVisor release (ADR 0003).
 pub const TESTED_RUNSC: &str = "release-20261019.0";
@@ -411,15 +408,14 @@ impl Foreign {
     }
 
     /// Validates an add and resolves its image into the blob store
-    /// (digests verified). Nothing is written to the log. `linked` says
-    /// whether a secret name is linked to an external backend now: such a name
-    /// is refused (`SECRET_EXTERNAL`), as a foreign actor reads the built-in
-    /// store only.
+    /// (digests verified). Nothing is written to the log. Each secret must
+    /// have a value now, as the actor's start reads it: through the node's
+    /// resolver `secrets`, from the built-in store or, for a linked name,
+    /// from the cache or its backend (m23 §6).
     pub async fn prepare_add(
         &self,
         req: AddRequest,
-        secrets: Option<&SecretStore>,
-        linked: &(dyn Fn(&str) -> bool + Send + Sync),
+        secrets: Option<SecretSource>,
     ) -> Result<AddPlan, ApiError> {
         if let Some(why) = self.off() {
             return Err(ApiError::new(ErrorCode::ForeignUnavailable, why).with_hint(
@@ -521,22 +517,10 @@ impl Foreign {
             if !vars.insert(var.clone()) {
                 return Err(bad(format!("two secrets set the variable {var}")));
             }
-            if linked(&secret) {
-                return Err(ApiError::new(
-                    ErrorCode::SecretExternal,
-                    linked_secret_message(&secret),
-                )
-                .with_hint(
-                    "Bind a secret that is stored in Kronik (`kronik secret set`); a foreign \
-                             actor does not read a name that is linked to an external manager.",
-                ));
-            }
-            let exists = secrets
-                .map(|s| s.current(&secret))
-                .transpose()
-                .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?
-                .flatten()
-                .is_some();
+            let exists = match &secrets {
+                Some(source) => source.current(&secret).await?.is_some(),
+                None => false,
+            };
             if !exists {
                 return Err(ApiError::new(
                     ErrorCode::SecretNotFound,
@@ -1003,8 +987,7 @@ impl Foreign {
     async fn reconcile_now(
         self: Arc<Self>,
         declared: Vec<pb::ForeignActor>,
-        secrets: Option<Arc<SecretStore>>,
-        links: SecretLinks,
+        secrets: Option<SecretSource>,
     ) {
         let mut cleaned = self.reconcile.lock().await;
         if self.run_lock.is_err() {
@@ -1063,11 +1046,10 @@ impl Foreign {
             for (name, decl) in wanted {
                 if let Some(a) = actors.get(&name) {
                     *lock(&a.secrets) = secrets.clone();
-                    *lock(&a.links) = links.clone();
                     continue;
                 }
                 let runtime = self.runtime_for(&decl);
-                let a = Actor::new(&self.ctx, decl, runtime, secrets.clone(), links.clone());
+                let a = Actor::new(&self.ctx, decl, runtime, secrets.clone());
                 actors.insert(name, a.clone());
                 self.ctx
                     .env
@@ -1111,10 +1093,9 @@ impl ForeignHost for Host {
     fn reconcile(
         &self,
         declared: Vec<pb::ForeignActor>,
-        secrets: Option<Arc<SecretStore>>,
-        links: SecretLinks,
+        secrets: Option<SecretSource>,
     ) -> BoxFuture<'static, ()> {
-        Box::pin(self.0.clone().reconcile_now(declared, secrets, links))
+        Box::pin(self.0.clone().reconcile_now(declared, secrets))
     }
 
     fn http(
@@ -1306,7 +1287,6 @@ mod tests {
                     ..AddRequest::default()
                 },
                 None,
-                &|_| false,
             )
             .await
             .unwrap_err();
@@ -1380,9 +1360,7 @@ mod tests {
         .unwrap();
         let f = Foreign::new(Env::real(tokio::runtime::Handle::current()), cfg);
         // The first reconcile (no actor declared) allows garbage collection.
-        f.clone()
-            .reconcile_now(Vec::new(), None, Arc::new(|_| false))
-            .await;
+        f.clone().reconcile_now(Vec::new(), None).await;
         (f, format!("oci-layout:{}", layout.display()))
     }
 
@@ -1415,7 +1393,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (f, image) = manager_and_image(tmp.path(), 256 << 10).await;
         let e = f
-            .prepare_add(add(&image, Some(64 << 10)), None, &|_| false)
+            .prepare_add(add(&image, Some(64 << 10)), None)
             .await
             .unwrap_err();
         assert_eq!(e.code, ErrorCode::Unavailable, "{e}");
@@ -1424,7 +1402,7 @@ mod tests {
         // Enough room: the image is fetched, held while the add runs, and
         // gone after a dry run.
         let plan = f
-            .prepare_add(add(&image, Some(1 << 30)), None, &|_| false)
+            .prepare_add(add(&image, Some(1 << 30)), None)
             .await
             .unwrap();
         assert_eq!(blobs(&f).len(), 3, "manifest, config, layer");
@@ -1432,43 +1410,61 @@ mod tests {
         assert!(blobs(&f).is_empty(), "{:?}", blobs(&f));
     }
 
-    /// A secret linked to an external backend cannot be bound to a foreign
-    /// actor: `SECRET_EXTERNAL`, before the image is fetched and whatever the
-    /// built-in store holds. Any other name is checked as it always was (here
-    /// with no store, so it is missing), also after an unlink.
+    /// The secrets of an add are checked through the node's resolver, as the
+    /// start reads them: a name with a value passes on to the image, whether
+    /// it is linked to a backend or in the built-in store; one without a
+    /// value is SECRET_NOT_FOUND, one whose backend does not answer keeps the
+    /// resolver's SECRET_UNAVAILABLE, both before the image is fetched.
     #[tokio::test]
-    async fn an_add_refuses_a_secret_linked_to_an_external_backend() {
+    async fn an_add_checks_its_secrets_through_the_resolver() {
+        struct Resolver;
+        impl kronik_effects::foreign::ForeignSecrets for Resolver {
+            fn current(
+                &self,
+                name: &str,
+            ) -> BoxFuture<'static, Result<Option<zeroize::Zeroizing<Vec<u8>>>, ApiError>>
+            {
+                let answer = match name {
+                    "stripe" => Ok(Some(zeroize::Zeroizing::new(b"linked".to_vec()))),
+                    "down" => Err(ApiError::new(ErrorCode::SecretUnavailable, "unavailable")),
+                    _ => Ok(None),
+                };
+                Box::pin(async move { answer })
+            }
+        }
         let tmp = tempfile::tempdir().unwrap();
         let (f, image) = manager_and_image(tmp.path(), 4096).await;
         let binding = |entry: &str| AddRequest {
             secrets: vec![entry.to_owned()],
             ..add(&image, None)
         };
-        let linked = std::sync::atomic::AtomicBool::new(true);
-        let view =
-            |name: &str| name == "stripe" && linked.load(std::sync::atomic::Ordering::SeqCst);
+        let source: SecretSource = Arc::new(Resolver);
+        for (entry, code) in [
+            ("TOKEN=missing", ErrorCode::SecretNotFound),
+            ("TOKEN=down", ErrorCode::SecretUnavailable),
+        ] {
+            let e = f
+                .prepare_add(binding(entry), Some(source.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, code, "{entry}: {e}");
+            assert!(
+                blobs(&f).is_empty(),
+                "the image was fetched: {:?}",
+                blobs(&f)
+            );
+        }
         let e = f
-            .prepare_add(binding("TOKEN=stripe"), None, &view)
-            .await
-            .unwrap_err();
-        assert_eq!(e.code, ErrorCode::SecretExternal, "{e}");
-        assert!(e.message.contains("stripe is linked"), "{e}");
-        assert!(
-            blobs(&f).is_empty(),
-            "the image was fetched: {:?}",
-            blobs(&f)
-        );
-        let e = f
-            .prepare_add(binding("TOKEN=plain"), None, &view)
-            .await
-            .unwrap_err();
-        assert_eq!(e.code, ErrorCode::SecretNotFound, "{e}");
-        linked.store(false, std::sync::atomic::Ordering::SeqCst);
-        let e = f
-            .prepare_add(binding("TOKEN=stripe"), None, &view)
+            .prepare_add(binding("TOKEN=stripe"), None)
             .await
             .unwrap_err();
         assert_eq!(e.code, ErrorCode::SecretNotFound, "{e}");
+        let plan = f
+            .prepare_add(binding("TOKEN=stripe"), Some(source))
+            .await
+            .unwrap();
+        assert_eq!(plan.record.secrets, ["TOKEN=stripe"]);
+        f.finish_add(plan, false).await;
     }
 
     #[test]
@@ -1495,7 +1491,7 @@ mod tests {
         let plan = f
             .ctx
             .env
-            .timeout(quick, f.prepare_add(add(&image, None), None, &|_| false))
+            .timeout(quick, f.prepare_add(add(&image, None), None))
             .await
             .expect("the add waited for the stalled fetch")
             .unwrap();
@@ -1526,10 +1522,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (f, image) = manager_and_image(tmp.path(), 16 << 10).await;
         let stalled = f.ctx.fetch_shared().await;
-        let plan = f
-            .prepare_add(add(&image, None), None, &|_| false)
-            .await
-            .unwrap();
+        let plan = f.prepare_add(add(&image, None), None).await.unwrap();
         f.finish_add(plan, false).await;
         assert_eq!(blobs(&f).len(), 3);
         // Stopped (or killed) before the fetch ended: the round never ran.
@@ -1540,9 +1533,7 @@ mod tests {
         cfg.runsc_path = "/bin/true".into();
         let f = Foreign::new(Env::real(tokio::runtime::Handle::current()), cfg);
         assert_eq!(f.ctx.blobs.dir(), dir);
-        f.clone()
-            .reconcile_now(Vec::new(), None, Arc::new(|_| false))
-            .await;
+        f.clone().reconcile_now(Vec::new(), None).await;
         assert!(blobs(&f).is_empty(), "{:?}", blobs(&f));
     }
 }

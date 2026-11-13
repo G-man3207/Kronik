@@ -1,8 +1,9 @@
 //! The links of a fork (docs/design/m23-secret-backends.md section 6): the
 //! configuration of a fork is main's at its fork point, links included. An
-//! unmatched `crypto.*` of a fork refuses a name that is linked to an
-//! external backend there (`SECRET_EXTERNAL`) instead of computing with the
-//! built-in store's older value of it.
+//! unmatched `crypto.*` of a fork computes a name that is linked to an
+//! external backend there with the value this process holds for that link,
+//! or is denied (`SECRET_UNAVAILABLE`), never with the built-in store's older
+//! value of it and never with a fetch.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 

@@ -1345,6 +1345,33 @@ impl SecretRuntime {
     }
 }
 
+/// [`Node::foreign_secret_source`]: a foreign actor's start, and `foreign
+/// add`, resolve a secret as an effect does, through the cache, with the
+/// configuration of the moment. A version a start observes first is recorded
+/// like any other.
+pub(crate) struct ForeignSecretSource {
+    pub(crate) node: std::sync::Weak<Node>,
+    pub(crate) original: AuthLease,
+}
+impl kronik_effects::foreign::ForeignSecrets for ForeignSecretSource {
+    fn current(
+        &self,
+        name: &str,
+    ) -> kronik_core::env::BoxFuture<'static, Result<Option<Zeroizing<Vec<u8>>>, ApiError>> {
+        let node = self.node.clone();
+        let original = self.original.clone();
+        let name = name.to_owned();
+        Box::pin(async move {
+            let node = node.upgrade().ok_or_else(unavailable)?;
+            let config = node.config_now();
+            Ok(node
+                .resolve_secret(&name, None, &config, original)
+                .await?
+                .map(|secret| Zeroizing::new(secret.value)))
+        })
+    }
+}
+
 async fn owned<T, F, Fut>(node: &Node, run: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
@@ -3246,8 +3273,16 @@ impl Node {
                         reveal_names.insert(name.to_owned());
                     }
                 }
+                // A foreign actor gets the values of its secrets, and its
+                // logs and answers may hold them. Its entries are `VAR=name`
+                // or `name` (older records).
                 Record::ForeignActor(actor) => {
-                    reveal_names.extend(actor.secrets.iter().cloned());
+                    reveal_names.extend(actor.secrets.iter().map(|entry| {
+                        entry
+                            .split_once('=')
+                            .map_or(entry.as_str(), |(_, name)| name)
+                            .to_owned()
+                    }));
                 }
                 _ => {}
             }

@@ -9,18 +9,31 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use kronik_core::env::{BoxFuture, HttpRequest, HttpResponse, NetError};
-use kronik_privacy::SecretStore;
+use kronik_core::error::ApiError;
 use kronik_proto::log::v1 as pb;
+use zeroize::Zeroizing;
 
-/// Whether a secret name is linked to an external backend in the node's
-/// configuration *now* (`Config::secret_is_linked`). The node answers from
-/// its current epoch at every call, so a link made or removed after an actor
-/// was declared is seen by that actor's next start.
-///
-/// A foreign actor gets its secrets from the built-in store only. For a
-/// linked name that store holds an older value or none, so the host refuses
-/// such a name (`SECRET_EXTERNAL`) instead of injecting it.
-pub type SecretLinks = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// Where a foreign actor's start, and `foreign add`, get the value of a
+/// secret (docs/design/m23-secret-backends.md §6): the node's secret
+/// resolver, through the same cache as the effects of turns, with the
+/// configuration of the moment. A name that is not linked is read from the
+/// built-in store; a linked name is the cache's value, fetched from its
+/// backend within `[secrets] fetch_timeout` when the cache holds none (and
+/// recorded as a `SecretVersion` when that version is new). So a link or an
+/// unlink made after an actor was declared is seen by its next start, and a
+/// backend that is down stops only a start whose name has no cached value.
+pub trait ForeignSecrets: Send + Sync + 'static {
+    /// The current value of `name`; `Ok(None)` when it has none. An error
+    /// carries its stable code (`SECRET_UNAVAILABLE`, `SECRET_VERSION_GONE`,
+    /// ...) and never a value.
+    fn current(
+        &self,
+        name: &str,
+    ) -> BoxFuture<'static, Result<Option<Zeroizing<Vec<u8>>>, ApiError>>;
+}
+
+/// The resolver a node hands to its foreign host.
+pub type SecretSource = Arc<dyn ForeignSecrets>;
 
 pub trait ForeignHost: Send + Sync + 'static {
     /// Starts every declared actor that is not running and stops every
@@ -28,11 +41,11 @@ pub trait ForeignHost: Send + Sync + 'static {
     /// the `ForeignActor` records of the current epoch). Resolves once each
     /// newly started actor is running or has failed its first start, so the
     /// node can call it before re-running open turns.
+    /// `secrets` is `None` on a node without a secret store.
     fn reconcile(
         &self,
         declared: Vec<pb::ForeignActor>,
-        secrets: Option<Arc<SecretStore>>,
-        links: SecretLinks,
+        secrets: Option<SecretSource>,
     ) -> BoxFuture<'static, ()>;
 
     /// Sends one request to `req.url` (`foreign://<name>/...`). Errors follow

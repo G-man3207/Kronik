@@ -82,8 +82,7 @@ impl ForeignHost for Host {
     fn reconcile(
         &self,
         _: Vec<pb::ForeignActor>,
-        _: Option<Arc<kronik_privacy::SecretStore>>,
-        _: kronik_effects::foreign::SecretLinks,
+        _: Option<kronik_effects::foreign::SecretSource>,
     ) -> BoxFuture<'static, ()> {
         Box::pin(async {})
     }

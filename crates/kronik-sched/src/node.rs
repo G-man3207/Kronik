@@ -3971,21 +3971,28 @@ impl Node {
             return;
         };
         let declared: Vec<pb::ForeignActor> = self.config_now().foreign_actors().cloned().collect();
-        host.reconcile(declared, self.secrets.clone(), self.foreign_secret_links())
-            .await;
+        let secrets = self
+            .native_recovery_authority()
+            .ok()
+            .and_then(|authority| self.foreign_secret_source(authority));
+        host.reconcile(declared, secrets).await;
     }
 
-    /// What a foreign actor's start asks before it takes a secret from the
-    /// built-in store: is the name linked to an external backend in the
-    /// configuration of *now*? The answer follows later links and unlinks.
-    /// A node that is going away answers yes for every name: nothing is
-    /// injected from the built-in store when the link cannot be looked up.
-    pub(crate) fn foreign_secret_links(&self) -> kronik_effects::foreign::SecretLinks {
-        let me = self.me.clone();
-        Arc::new(move |name| {
-            me.upgrade()
-                .is_none_or(|node| node.config_now().secret_is_linked(name))
-        })
+    /// Where a foreign actor's start and `foreign add` get the value of a
+    /// secret: the node's resolver, through the same cache as the effects
+    /// of turns, with the configuration of the moment (m23 §6). `original`
+    /// is the authority the resolver's provider I/O runs under: the node's
+    /// own for the supervisor's starts, the caller's for an add. `None` on a
+    /// node without a secret store.
+    pub fn foreign_secret_source(
+        &self,
+        original: AuthLease,
+    ) -> Option<kronik_effects::foreign::SecretSource> {
+        self.secrets.as_ref()?;
+        Some(Arc::new(crate::secrets::ForeignSecretSource {
+            node: self.me.clone(),
+            original,
+        }))
     }
 
     /// `kronik foreign add`: writes a `ForeignActor` add record (the caller

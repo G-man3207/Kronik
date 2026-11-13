@@ -1517,21 +1517,20 @@ async fn a_failed_certification_names_the_version_it_could_not_get() {
     assert!(!named.contains("immutable-provider-value"));
 }
 
-// ---------------------------------------- the links a foreign host is given
+// ------------------------------------- the resolver a foreign host is given
 
-/// A foreign host that keeps the link view the node gives it.
+/// A foreign host that keeps the resolver the node gives it.
 #[derive(Default)]
-struct ViewHost {
-    view: Mutex<Option<kronik_effects::foreign::SecretLinks>>,
+struct SourceHost {
+    source: Mutex<Option<kronik_effects::foreign::SecretSource>>,
 }
-impl kronik_effects::foreign::ForeignHost for ViewHost {
+impl kronik_effects::foreign::ForeignHost for SourceHost {
     fn reconcile(
         &self,
         _declared: Vec<pb::ForeignActor>,
-        _secrets: Option<Arc<kronik_privacy::SecretStore>>,
-        links: kronik_effects::foreign::SecretLinks,
+        secrets: Option<kronik_effects::foreign::SecretSource>,
     ) -> BoxFuture<'static, ()> {
-        *self.view.lock().unwrap() = Some(links);
+        *self.source.lock().unwrap() = secrets;
         Box::pin(async {})
     }
     fn http(
@@ -1544,14 +1543,16 @@ impl kronik_effects::foreign::ForeignHost for ViewHost {
     }
 }
 
-/// What the node gives its foreign host to ask, at every start of an actor,
-/// whether a name is linked: an answer from the configuration of the
-/// moment, not of the reconcile. A link made later counts, an unlink counts,
-/// and a name that was never linked does not.
+/// What a foreign actor's start reads its secrets from (m23 §6): the node's
+/// resolver, with the configuration of the moment, not of the reconcile. A
+/// name is the built-in store's until it is linked; a link made after the
+/// hand-over serves the backend's value through the cache (and records the
+/// version it observed), an unlink makes the name the store's again, and a
+/// name that has no value is `None`.
 #[tokio::test]
-async fn the_link_view_of_the_foreign_host_follows_the_nodes_configuration() {
+async fn the_resolver_of_the_foreign_host_follows_the_nodes_links() {
     let _serial = TESTS.lock().await;
-    let host = Arc::new(ViewHost::default());
+    let host = Arc::new(SourceHost::default());
     let data = tempfile::tempdir().unwrap();
     let bao = new_bao(200);
     let node = provider_node_with(
@@ -1560,8 +1561,13 @@ async fn the_link_view_of_the_foreign_host_follows_the_nodes_configuration() {
         kronik_effects::foreign::ForeignSlot(Some(host.clone())),
     )
     .await;
-    // The node reconciled once at its start and handed the view over then.
-    let view = host.view.lock().unwrap().clone().expect("no reconcile");
+    // The node reconciled once at its start and handed the resolver over then.
+    let source = host
+        .source
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("no resolver at the reconcile");
     let runtime = node.runtime().unwrap();
     node.env
         .timeout(Duration::from_secs(60), async {
@@ -1572,7 +1578,30 @@ async fn the_link_view_of_the_foreign_host_follows_the_nodes_configuration() {
         .await
         .unwrap();
     let original = node.local_operator_authority().unwrap();
-    assert!(!view("token"), "linked before any link");
+    node.secret_set(
+        "token",
+        b"built-in-value".to_vec(),
+        &audit(),
+        false,
+        original.clone(),
+    )
+    .await
+    .unwrap();
+    let value = |name: &'static str| {
+        let source = source.clone();
+        async move {
+            source
+                .current(name)
+                .await
+                .unwrap()
+                .map(|value| value.to_vec())
+        }
+    };
+    assert_eq!(
+        value("token").await.as_deref(),
+        Some(&b"built-in-value"[..])
+    );
+    assert_eq!(value("never-set").await, None);
     node.secret_link(
         "token",
         "bao",
@@ -1583,10 +1612,35 @@ async fn the_link_view_of_the_foreign_host_follows_the_nodes_configuration() {
     )
     .await
     .unwrap();
-    assert!(view("token"), "a link made after the hand-over");
-    assert!(!view("other"), "a name that was not linked");
+    let gets = bao.gets.load(Ordering::SeqCst);
+    assert_eq!(
+        value("token").await.as_deref(),
+        Some(&b"immutable-provider-value"[..]),
+        "a link made after the hand-over"
+    );
+    assert!(
+        node.secret_history("token").await.unwrap().iter().any(
+            |row| row.backend == "bao" && row.phase == pb::secret_version::Phase::Active as i32
+        ),
+        "the version the start used is recorded"
+    );
+    // Cached: a second start does not ask the backend.
+    let gets = bao.gets.load(Ordering::SeqCst).max(gets);
+    assert_eq!(
+        value("token").await.as_deref(),
+        Some(&b"immutable-provider-value"[..])
+    );
+    assert_eq!(
+        bao.gets.load(Ordering::SeqCst),
+        gets,
+        "a cached value was fetched again"
+    );
     node.secret_unlink("token", &audit(), false, original)
         .await
         .unwrap();
-    assert!(!view("token"), "an unlink");
+    assert_eq!(
+        value("token").await.as_deref(),
+        Some(&b"built-in-value"[..]),
+        "an unlink"
+    );
 }

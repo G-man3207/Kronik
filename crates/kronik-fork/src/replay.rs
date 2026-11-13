@@ -76,6 +76,10 @@ pub struct ReplaySetup {
     pub(crate) upgrade_config: Option<Mutex<ConfigHistory>>,
     pub(crate) upgrade_code: BTreeMap<CodeHash, ForkKind>,
     pub secrets: Option<Arc<SecretStore>>,
+    /// The values of linked secrets this process already holds (the node's
+    /// secret cache): what an unmatched `crypto.*` of a `compute` grant uses
+    /// for a name linked at the fork point. A fork never fetches (I7).
+    pub held_secrets: Option<Arc<dyn HeldKeys>>,
     /// Canned answers for effects without a recording (synthetic).
     pub stubs: Vec<crate::stubs::StubRule>,
     /// `[fork] live_allowlist`: hosts whose unrecorded GETs without secret
@@ -185,6 +189,7 @@ impl ReplaySetup {
             upgrade_config: None,
             upgrade_code: BTreeMap::new(),
             secrets,
+            held_secrets: None,
             stubs: Vec::new(),
             live: None,
             privacy: crate::privacy::ForkPrivacy::plain(),
@@ -1716,24 +1721,27 @@ fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
 pub const NO_RECORDING: &str = "replay: no recording";
 
 /// The error of an unmatched effect of a fork that needs a secret which is
-/// linked to an external backend at the fork point (`SECRET_EXTERNAL`).
+/// linked to an external backend at the fork point, when this process holds
+/// no value of it for that link (`SECRET_UNAVAILABLE`).
 fn linked_secret_denial(name: &str) -> String {
     format!(
-        "SECRET_EXTERNAL: {name} is linked to an external secret manager, and a fork does \
-         not compute with it"
+        "SECRET_UNAVAILABLE: {name} is linked to an external secret manager, this node holds \
+         no value of it for the fork point's link, and a fork never fetches"
     )
 }
 
 /// What an unmatched `crypto.*` of a fork computes with.
 enum UnmatchedKey {
     /// The name is linked to an external backend in the configuration of the
-    /// fork point. The built-in store holds an older value of it, or none,
-    /// and a fork never fetches (I7): nothing is computed.
-    Linked,
+    /// fork point, and this process holds no value of it for that link: a
+    /// fork never fetches (I7), and the built-in store holds an older value
+    /// of the name or none. Nothing is computed.
+    Unheld,
     /// The built-in store has no value of the name, or the fork has no store
     /// (a preview: no production key computes for it).
     Missing,
-    /// The built-in store's current value of a name that is not linked.
+    /// The built-in store's current value of a name that is not linked, or
+    /// the value this process holds for the link of the fork point.
     Value(kronik_privacy::SecretValue),
 }
 
@@ -1748,15 +1756,39 @@ impl KeyStore for SecretStore {
     }
 }
 
+/// The values of linked secrets that this process already holds, as an
+/// unmatched `crypto.*` of a fork reads them (m23 §6): never a fetch.
+pub trait HeldKeys: Send + Sync {
+    /// The value held for `name` under the link of `config` (the fork
+    /// point's: its backend, binding, reference and generation), when the
+    /// backend is still trusted and the value has not been revoked.
+    fn held_key(&self, name: &str, config: &Config) -> Option<kronik_privacy::SecretValue>;
+}
+
+impl HeldKeys for kronik_sched::secrets::SecretCache {
+    fn held_key(&self, name: &str, config: &Config) -> Option<kronik_privacy::SecretValue> {
+        self.cached(name, None, config).ok().flatten()
+    }
+}
+
 /// The key for an unmatched `crypto.*` of `name` in a fork whose
-/// configuration is `config`. Without a store, nothing is computed, linked or
-/// not; with one, a link decides before the store is asked.
-fn unmatched_key(config: &Config, store: Option<&dyn KeyStore>, name: &str) -> UnmatchedKey {
+/// configuration is `config`. Without a store (a preview), nothing is
+/// computed, linked or not. A link at the fork point decides before the
+/// store is asked: a linked name is the held value of that link, or none.
+fn unmatched_key(
+    config: &Config,
+    store: Option<&dyn KeyStore>,
+    held: Option<&dyn HeldKeys>,
+    name: &str,
+) -> UnmatchedKey {
     let Some(store) = store else {
         return UnmatchedKey::Missing;
     };
     if config.secret_is_linked(name) {
-        return UnmatchedKey::Linked;
+        return match held.and_then(|held| held.held_key(name, config)) {
+            Some(value) => UnmatchedKey::Value(value),
+            None => UnmatchedKey::Unheld,
+        };
     }
     match store.current_key(name) {
         Some(value) => UnmatchedKey::Value(value),
@@ -2904,20 +2936,30 @@ impl ReplayGate {
             self.push(rec)?;
             return Ok(out);
         }
-        // Unmatched. A linked name is denied. A recorded grant does not
-        // compute. Compute signs on the host; the key never leaves it.
+        // Unmatched. A recorded grant does not compute. Compute signs on the
+        // host with the built-in store's value, or with the value held for
+        // the fork point's link of a linked name; the key never leaves it.
         let store = self.runner.setup.secrets.as_deref();
-        let v = match unmatched_key(self.config(), store.map(|s| s as &dyn KeyStore), &secret) {
+        let held = self.runner.setup.held_secrets.as_deref();
+        let v = match unmatched_key(
+            self.config(),
+            store.map(|s| s as &dyn KeyStore),
+            held,
+            &secret,
+        ) {
             UnmatchedKey::Value(v) => v,
             UnmatchedKey::Missing => {
                 self.push(self.synthetic(ordinal, kind, cap, fp, None))?;
                 return Ok(CryptoOutcome::Denied(NO_RECORDING.into()));
             }
             // Denied in the fork, and marked unverifiable like the other
-            // effects it cannot answer: with the cause as the guest's error.
-            UnmatchedKey::Linked => {
+            // effects it cannot answer: with the cause as the guest's error
+            // when the grant would have computed.
+            UnmatchedKey::Unheld => {
                 let mut record = self.synthetic(ordinal, kind, cap, fp, None);
-                record.error = linked_secret_denial(&secret);
+                if in_forks != kronik_effects::InForks::Recorded {
+                    record.error = linked_secret_denial(&secret);
+                }
                 let denied = CryptoOutcome::Denied(record.error.clone());
                 self.push(record)?;
                 return Ok(denied);
@@ -3652,53 +3694,89 @@ mod linked_key_tests {
         }
     }
 
+    /// What this process holds for a link: `stripe`'s value, for the link
+    /// of generation 1 only, and it remembers what it was asked.
+    struct Held(Mutex<Vec<String>>);
+
+    impl HeldKeys for Held {
+        fn held_key(&self, name: &str, config: &Config) -> Option<kronik_privacy::SecretValue> {
+            self.0.lock().unwrap().push(name.to_owned());
+            (name == "stripe" && config.secret_link(name).is_some_and(|l| l.generation == 1)).then(
+                || kronik_privacy::SecretValue {
+                    meta: kronik_privacy::SecretMeta {
+                        name: name.into(),
+                        version: 7,
+                        version_hash: vec![1; 16],
+                        created_wall_ms: 0,
+                    },
+                    value: b"held-backend-value".to_vec(),
+                },
+            )
+        }
+    }
+
     /// The link in force in the configuration of the fork decides, before the
-    /// built-in store is asked: a linked name is refused whatever the store
-    /// holds, any other name is the store's, and the record that an unlink
-    /// leaves makes the name the store's again.
+    /// built-in store is asked: a linked name is the value held for that
+    /// link, or none (never the store's older value, and never a fetch); any
+    /// other name is the store's; the record that an unlink leaves makes the
+    /// name the store's again.
     #[test]
-    fn a_linked_name_is_refused_before_the_store_is_asked() {
+    fn a_linked_name_is_the_held_value_of_its_link_and_never_the_stores() {
         let keys = Keys(Mutex::new(Vec::new()));
+        let held = Held(Mutex::new(Vec::new()));
         let store = Some(&keys as &dyn KeyStore);
         let mut config = Config::default();
         assert!(matches!(
-            unmatched_key(&config, store, "stripe"),
-            UnmatchedKey::Value(_)
+            unmatched_key(&config, store, Some(&held), "stripe"),
+            UnmatchedKey::Value(v) if v.value == b"older-built-in-value"
         ));
         config.apply(&link("stripe", "bao", 1));
         keys.0.lock().unwrap().clear();
         assert!(matches!(
-            unmatched_key(&config, store, "stripe"),
-            UnmatchedKey::Linked
+            unmatched_key(&config, store, Some(&held), "stripe"),
+            UnmatchedKey::Value(v) if v.value == b"held-backend-value"
+        ));
+        // Nothing held (here: no cache, or another generation): denied.
+        assert!(matches!(
+            unmatched_key(&config, store, None, "stripe"),
+            UnmatchedKey::Unheld
+        ));
+        let mut relinked = config.clone();
+        relinked.apply(&link("stripe", "bao", 3));
+        assert!(matches!(
+            unmatched_key(&relinked, store, Some(&held), "stripe"),
+            UnmatchedKey::Unheld
         ));
         assert!(keys.0.lock().unwrap().is_empty(), "the store was asked");
         assert!(matches!(
-            unmatched_key(&config, store, "plain"),
-            UnmatchedKey::Value(_)
+            unmatched_key(&config, store, Some(&held), "plain"),
+            UnmatchedKey::Value(v) if v.value == b"older-built-in-value"
         ));
         assert!(matches!(
-            unmatched_key(&config, store, "missing"),
+            unmatched_key(&config, store, Some(&held), "missing"),
             UnmatchedKey::Missing
         ));
         config.apply(&link("stripe", "", 2));
         assert!(matches!(
-            unmatched_key(&config, store, "stripe"),
-            UnmatchedKey::Value(_)
+            unmatched_key(&config, store, Some(&held), "stripe"),
+            UnmatchedKey::Value(v) if v.value == b"older-built-in-value"
         ));
     }
 
     /// A fork without a store (a preview) computes nothing, as before: also
-    /// for a linked name, which it does not even say is linked.
+    /// for a linked name whose value is held.
     #[test]
     fn a_fork_without_a_store_computes_nothing_linked_or_not() {
+        let held = Held(Mutex::new(Vec::new()));
         let mut config = Config::default();
         config.apply(&link("stripe", "bao", 1));
         for name in ["stripe", "plain"] {
             assert!(matches!(
-                unmatched_key(&config, None, name),
+                unmatched_key(&config, None, Some(&held), name),
                 UnmatchedKey::Missing
             ));
         }
+        assert!(held.0.lock().unwrap().is_empty());
     }
 
     /// What the guest of the fork reads when it is refused: the code and the
@@ -3707,7 +3785,7 @@ mod linked_key_tests {
     fn the_refusal_names_the_code_and_the_secret() {
         let text = linked_secret_denial("stripe");
         assert!(
-            text.starts_with("SECRET_EXTERNAL: stripe is linked"),
+            text.starts_with("SECRET_UNAVAILABLE: stripe is linked"),
             "{text}"
         );
     }

@@ -263,8 +263,7 @@ impl Api {
                     max_new_bytes: self.node.disk_budget(),
                     fork_mode: r.fork_mode.clone(),
                 },
-                self.node.secrets().map(|s| s.as_ref()),
-                &|name| self.node.config_now().secret_is_linked(name),
+                self.node.foreign_secret_source(req.authority.clone()),
             )
             .await?;
         let audit = self.audit(req, r.reason.clone()).await;
