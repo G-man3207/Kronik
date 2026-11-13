@@ -699,12 +699,50 @@ fn connection_input(c: &pb::ConnectionInput) -> Result<(), DecodeError> {
                     "an SSE connection has no incoming frames",
                 ));
             }
-            frame(f.frame.as_ref(), "ConnectionFrame.frame")
+            frame(f.frame.as_ref(), "ConnectionFrame.frame")?;
+            // Clients send WebSocket text and binary messages, never events.
+            if f.frame.as_ref().map(|f| f.kind) == Some(pb::frame::Kind::Event as i32) {
+                return Err(invalid(
+                    "ConnectionFrame.frame",
+                    "an incoming frame is text or binary",
+                ));
+            }
+            Ok(())
         }
         Some(Event::Close(close)) => {
             enum_value::<pb::CloseCause>(close.cause, "ConnectionClose.cause")?;
             if close.reason.is_some() {
                 sealable(close.reason.as_ref(), "ConnectionClose.reason")?;
+            }
+            let host = !matches!(
+                pb::CloseCause::try_from(close.cause),
+                Ok(pb::CloseCause::Client | pb::CloseCause::Actor)
+            );
+            // A host close carries an empty reason, tagged with the
+            // connection's subject (§4.10); a sealed one cannot be checked.
+            if host
+                && matches!(
+                    close.reason.as_ref().and_then(|r| r.value.as_ref()),
+                    Some(pb::sealable::Value::Plain(b)) if !b.is_empty()
+                )
+            {
+                return Err(invalid(
+                    "ConnectionClose.reason",
+                    "a host close has no reason of its own",
+                ));
+            }
+            let restart = close.cause == pb::CloseCause::Restart as i32;
+            if restart && close.frames_written_known {
+                return Err(invalid(
+                    "ConnectionClose.frames_written_known",
+                    "after a restart the frames written are unknown",
+                ));
+            }
+            if !restart && close.restart_after_lsn != 0 {
+                return Err(invalid(
+                    "ConnectionClose.restart_after_lsn",
+                    "only a restart close has it",
+                ));
             }
             Ok(())
         }
@@ -727,6 +765,11 @@ fn connection_op(op: &pb::ConnectionOp) -> Result<(), DecodeError> {
                     "ConnectionOp",
                     "a send needs connections and one seq per connection",
                 ));
+            }
+            // The host records each target once (`broadcast` drops repeats).
+            let mut seen = std::collections::HashSet::new();
+            if !op.connections.iter().all(|c| seen.insert(c.as_str())) {
+                return Err(invalid("ConnectionOp.connections", "a connection twice"));
             }
             frame(Some(f), "ConnectionOp.send")
         }
@@ -834,7 +877,12 @@ fn effect(value: Option<&pb::EffectRecord>, what: &'static str) -> Result<(), De
         }
         None => {}
     }
-    if e.kind == "connection.send-now" && !e.target.starts_with("connection:") {
+    if e.kind == "connection.send-now"
+        && !e
+            .target
+            .strip_prefix("connection:")
+            .is_some_and(connection::valid_id)
+    {
         return Err(invalid(
             "EffectRecord.target",
             "connection.send-now needs the target connection:<id>",
@@ -1454,6 +1502,52 @@ mod connection_tests {
                     ..ok.clone()
                 },
             ),
+            (
+                "incoming event",
+                pb::ConnectionInput {
+                    event: Some(pb::connection_input::Event::Frame(pb::ConnectionFrame {
+                        seq: 0,
+                        frame: Some(pb::Frame {
+                            kind: pb::frame::Kind::Event as i32,
+                            ..text("x")
+                        }),
+                    })),
+                    ..ok.clone()
+                },
+            ),
+            (
+                "host close with a reason",
+                pb::ConnectionInput {
+                    event: Some(pb::connection_input::Event::Close(pb::ConnectionClose {
+                        cause: pb::CloseCause::PingTimeout as i32,
+                        reason: plain(b"why"),
+                        ..Default::default()
+                    })),
+                    ..ok.clone()
+                },
+            ),
+            (
+                "restart close with frames written",
+                pb::ConnectionInput {
+                    event: Some(pb::connection_input::Event::Close(pb::ConnectionClose {
+                        cause: pb::CloseCause::Restart as i32,
+                        frames_written_known: true,
+                        ..Default::default()
+                    })),
+                    ..ok.clone()
+                },
+            ),
+            (
+                "restart lsn on a client close",
+                pb::ConnectionInput {
+                    event: Some(pb::connection_input::Event::Close(pb::ConnectionClose {
+                        cause: pb::CloseCause::Client as i32,
+                        restart_after_lsn: 3,
+                        ..Default::default()
+                    })),
+                    ..ok.clone()
+                },
+            ),
         ];
         for (what, input) in cases {
             assert!(
@@ -1524,6 +1618,10 @@ mod connection_tests {
             ("send with a seq missing", send(vec![CONN, CONN], vec![0])),
             ("send to a bad id", send(vec!["x"], vec![0])),
             ("close with seqs", close(vec![CONN], vec![1])),
+            (
+                "send to one connection twice",
+                send(vec![CONN, CONN], vec![0, 1]),
+            ),
             ("close of two", close(vec![CONN, CONN], vec![])),
             (
                 "send kind 0",
@@ -1580,8 +1678,11 @@ mod connection_tests {
         let mut good = t.clone();
         good.effects = vec![effect(&format!("connection:{CONN}"))];
         assert!(check(good).is_ok());
-        let mut wrong = t;
+        let mut wrong = t.clone();
         wrong.effects = vec![effect("http:example.com")];
         assert!(check(wrong).is_err());
+        let mut bad_id = t;
+        bad_id.effects = vec![effect("connection:c-xyz")];
+        assert!(check(bad_id).is_err());
     }
 }

@@ -81,15 +81,45 @@ pub fn cause_name(cause: i32) -> &'static str {
     }
 }
 
-/// The frame's payload size as the per-turn and per-frame limits count it:
-/// the data, plus the event and id of an SSE event.
+/// The bytes of a sealed value's AEAD tag: `Sealed` is XChaCha20-Poly1305
+/// (common.proto), whose ciphertext is the plaintext and a 16-byte tag.
+const SEAL_TAG_BYTES: usize = 16;
+
+/// A frame's payload size, the same whether its data is sealed or not: the
+/// data's plaintext, plus the event and id of an SSE event. The runtime's
+/// limits count the same bytes, before sealing.
 pub fn frame_bytes(frame: &pb::Frame) -> usize {
     let data = match frame.data.as_ref().and_then(|d| d.value.as_ref()) {
         Some(pb::sealable::Value::Plain(b)) => b.len(),
-        Some(pb::sealable::Value::Sealed(s)) => s.ciphertext.len(),
+        Some(pb::sealable::Value::Sealed(s)) => s.ciphertext.len().saturating_sub(SEAL_TAG_BYTES),
         None => 0,
     };
     data + frame.event.len() + frame.id.len()
+}
+
+/// The subject of a connection input (M24 §4.10), which is its turn's
+/// default subject: an open's request's (the gateway tags its headers and
+/// body with it), a frame's data's, a close's reason's. The gateway and the
+/// node tag every later input of a connection with the connection's
+/// subject, a host close an empty reason, so a re-run and a replay derive
+/// the same subject from the recorded input.
+pub fn input_subject(c: &pb::ConnectionInput) -> Option<String> {
+    use pb::connection_input::Event;
+    match &c.event {
+        Some(Event::Open(o)) => {
+            let h = o.request.as_ref()?;
+            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
+                Some(pb::body::Value::Inline(s)) if s.subject.is_some() => s.subject.clone(),
+                _ => h
+                    .headers
+                    .iter()
+                    .find_map(|h| h.value.as_ref().and_then(|v| v.subject.clone())),
+            }
+        }
+        Some(Event::Frame(f)) => f.frame.as_ref()?.data.as_ref()?.subject.clone(),
+        Some(Event::Close(close)) => close.reason.as_ref()?.subject.clone(),
+        None => None,
+    }
 }
 
 /// The connection input of `input`, if it is one.

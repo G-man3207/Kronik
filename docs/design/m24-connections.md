@@ -515,7 +515,9 @@ connection. It comes after the connection's admitted frames:
 - The **connection's subject** is the accept's `subject` when it is set,
   and otherwise the request's subject.
 - Every later input of the connection is tagged with it: frame data, the
-  close reason. The turn's default subject is the connection's subject.
+  close reason (empty for a host close, but tagged). The turn's default
+  subject is the connection's subject, derived from the recorded input,
+  so a re-run and a replay get the same one.
 - Browsers cannot set headers on a WebSocket. Behind a trusted proxy that
   adds the subject header, `subject_from` works. Otherwise the actor checks
   a token (in the query or a cookie) in `open` and sets the subject in its
@@ -904,7 +906,8 @@ message ConnectionClose {
   // The WebSocket close code received (client) or sent (actor, host).
   uint32 code = 2;
   // The client's or the actor's reason, tagged with the connection's
-  // subject; unset for host causes.
+  // subject; empty for host causes, but tagged too, so the close turn's
+  // default subject is the connection's.
   Sealable reason = 3;
   // Outgoing frames written to the socket: seq < frames_written were
   // written, the rest dropped. Unknown (false) after a restart.
