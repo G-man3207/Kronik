@@ -172,6 +172,11 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
     // plain `kronik doctor` reports what it always did.
     let rootless_mode = args.rootless;
     let mut service_identity = !kronik_foreign::sys::is_root();
+    // The nonroot unit's key reaches the daemon as a systemd credential, which
+    // the service manager reads as root: the service user cannot read the
+    // root-only key file itself. So root checks the key source here, before
+    // it becomes that user below, the way the unit gets it.
+    let key_before_drop = (args.rootless && !service_identity).then(|| key_source_as_root(&config));
     if args.rootless && !service_identity {
         match crate::cli::userns::kronik_user(crate::cli::userns::USER, None) {
             Ok(user) => match kronik_foreign::sys::become_user(user.uid, user.gid) {
@@ -250,7 +255,7 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
     checks.extend(wildcard_certificate(&config));
     checks.push(ship(&config));
     checks.push(export(&config));
-    checks.push(key_source(&config));
+    checks.push(key_before_drop.unwrap_or_else(|| key_source(&config)));
     let count = |s| checks.iter().filter(|c| c.status == s).count();
     let report = Report {
         pass: count(Status::Pass),
@@ -1302,7 +1307,36 @@ fn export(config: &Config) -> Check {
     }
 }
 
+/// [`key_source`] for `sudo kronik doctor --rootless`, run as root before the
+/// doctor becomes the service user. Over a data directory that another user
+/// owns, root reads the key and nothing else (ADR 0062): the stores in that
+/// directory are the service's, and it checks them against the key when it
+/// starts. A root-owned directory gets the full check, as without
+/// `--rootless`.
+fn key_source_as_root(config: &Config) -> Check {
+    use std::os::unix::fs::MetadataExt as _;
+    let another_users = std::fs::metadata(&config.server.data_dir).is_ok_and(|m| m.uid() != 0);
+    if another_users {
+        key_source_checked(config, KeyCheck::MasterOnly)
+    } else {
+        key_source(config)
+    }
+}
+
+/// How much of the key source `key_source_checked` loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyCheck {
+    /// The key, and the data directory's stores against it.
+    Full,
+    /// The key alone; nothing in the data directory but a KMS envelope.
+    MasterOnly,
+}
+
 fn key_source(config: &Config) -> Check {
+    key_source_checked(config, KeyCheck::Full)
+}
+
+fn key_source_checked(config: &Config, scope: KeyCheck) -> Check {
     use kronik_privacy::key_source::KeySource;
     let source = config.keys.source.as_str();
     let data = &config.server.data_dir;
@@ -1372,25 +1406,33 @@ fn key_source(config: &Config) -> Check {
         .and_then(|runtime| {
             runtime.block_on(async {
                 let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
-                KeySource::load(env, config.keys.clone(), data, false)
-                    .await
-                    .map_err(|e| e.api_error().code)
+                match scope {
+                    KeyCheck::Full => KeySource::load(env, config.keys.clone(), data, false)
+                        .await
+                        .map(|loaded| {
+                            let status = loaded.status();
+                            format!(
+                                "{} {} {}; key checks match",
+                                status.source,
+                                status.key.unwrap_or_default(),
+                                status.key_version.unwrap_or_default()
+                            )
+                        }),
+                    KeyCheck::MasterOnly => KeySource::load_master(&env, config.keys.clone(), data)
+                        .await
+                        .map(|_| {
+                            format!(
+                                "{source}: the master key loads as root, as the unit's \
+                                     credential does; the service checks its stores against it \
+                                     when it starts"
+                            )
+                        }),
+                }
+                .map_err(|e| e.api_error().code)
             })
         });
     match result {
-        Ok(loaded) => {
-            let status = loaded.status();
-            check(
-                "key_source",
-                Status::Pass,
-                format!(
-                    "{} {} {}; key checks match",
-                    status.source,
-                    status.key.unwrap_or_default(),
-                    status.key_version.unwrap_or_default()
-                ),
-            )
-        }
+        Ok(message) => check("key_source", Status::Pass, message),
         Err(code) => failed(
             "key_source",
             format!("{source}: {code}"),
@@ -1646,6 +1688,35 @@ mod tests {
         let passed = check("kernel", Status::Pass, "Linux 6.12");
         assert!(passed.hint.is_none());
         assert!(!format_check(&passed).contains("hint:"));
+    }
+
+    /// `sudo kronik doctor --rootless` checks the key source as root, before
+    /// it becomes the service user, and over a data directory that another
+    /// user owns it reads the key alone: stores that the key would not open
+    /// are the service's to check when it starts, and are not opened here.
+    #[test]
+    fn the_key_check_before_the_drop_reads_the_key_and_no_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(data.join("keys")).unwrap();
+        // Not a database: the full check, which opens the stores, fails on it.
+        std::fs::write(data.join("keys/secrets.db"), b"not a database").unwrap();
+        let key = dir.path().join("master.key");
+        std::fs::write(&key, "11".repeat(32)).unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = data;
+        config.server.api_socket = dir.path().join("no-daemon.sock");
+        config.keys.master_key_file = Some(key);
+        let only = key_source_checked(&config, KeyCheck::MasterOnly);
+        assert_eq!(only.status, Status::Pass, "{}", only.message);
+        assert!(
+            only.message.contains("checks its stores"),
+            "{}",
+            only.message
+        );
+        let full = key_source_checked(&config, KeyCheck::Full);
+        assert_eq!(full.status, Status::Fail, "{}", full.message);
+        assert!(full.code.is_some() && full.hint.is_some(), "{full:?}");
     }
 
     fn expired_pem() -> (String, String) {
