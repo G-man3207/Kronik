@@ -218,14 +218,19 @@ impl Sealer {
     /// K_id and, when the mode is on, the sealing key of that version.
     pub fn blob_keys(&self, subject: &str, fill: Fill<'_>, wall_ms: u64) -> Result<BlobKeys, PrivacyError>;
     /// `KeyAccess` for readers: the key of an exact version, never created.
-    pub fn blob_key_access(&self) -> impl KeyAccess + '_;
+    pub fn blob_key_access(&self) -> BlobKeyAccess<'_>;   // impl KeyAccess
 }
 ```
 
-Both go through the existing revision-bound key cache. `Sealer::plain()`
-(tests, the simulator) derives `K_id` from a fixed test key and the subject;
-a production node without a keystore refuses a blob with a subject
-(`KEYSTORE_INCOMPLETE`).
+`K_id` is `BLAKE3-derive-key("kronik blob identity v1", K(s, v))` and the
+frame key `BLAKE3-derive-key("kronik blob seal v1", K(s, v))`
+(`BLOB_IDENTITY_LABEL`, `BLOB_SEAL_LABEL`); values are sealed with `K(s, v)`
+itself, so no two uses share a key. Both go through the existing
+revision-bound key cache, which also remembers each subject's oldest live
+version. A daemon always opens a keystore, in either privacy mode.
+`Sealer::plain()` (tests, the simulator) names blobs with a fixed test key of
+version 1 derived from the subject and never seals; a sealed blob it is asked
+to read has no key there (`KEYSTORE_INCOMPLETE`).
 
 ### 4.7 A full store
 

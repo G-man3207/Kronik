@@ -56,14 +56,13 @@ BEGIN UPDATE keystore_revision SET revision = revision + 1 WHERE id = 1; END;
 const BACKUP_MAGIC: &[u8; 8] = b"KRKSTOR1";
 
 /// The longest subject accepted, in bytes.
-pub const MAX_SUBJECT_BYTES: usize = 256;
+pub const MAX_SUBJECT_BYTES: usize = kronik_proto::blobs::MAX_SUBJECT_BYTES;
 
 /// Whether `subject` can be a subject: 1 to [`MAX_SUBJECT_BYTES`] bytes of
-/// printable ASCII without spaces, such as `user:123`.
+/// printable ASCII without spaces, such as `user:123`. The log format checks
+/// the subjects of blob references with the same rule.
 pub fn valid_subject(subject: &str) -> bool {
-    !subject.is_empty()
-        && subject.len() <= MAX_SUBJECT_BYTES
-        && subject.bytes().all(|b| b.is_ascii_graphic())
+    kronik_proto::blobs::valid_subject(subject)
 }
 
 /// One version of a subject's key.
@@ -71,6 +70,37 @@ pub fn valid_subject(subject: &str) -> bool {
 pub struct SubjectKey {
     pub version: u32,
     key: Zeroizing<[u8; 32]>,
+}
+
+impl SubjectKey {
+    /// A key derived from this one for one purpose (BLAKE3's key
+    /// derivation with `label` as its context). Values are sealed with the
+    /// subject key itself; every derived use has a label of its own.
+    pub(crate) fn derive(&self, label: &str) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(blake3::derive_key(label, &self.key[..]))
+    }
+}
+
+/// Without a keystore (tests, the simulator): a fixed key of version 1 for
+/// `subject`, derived from the subject alone. Never used by a daemon, which
+/// always opens a keystore.
+pub(crate) fn test_subject_key(subject: &str) -> SubjectKey {
+    SubjectKey {
+        version: 1,
+        key: Zeroizing::new(blake3::derive_key(
+            "kronik test subject key v1",
+            subject.as_bytes(),
+        )),
+    }
+}
+
+/// Which existing version a lookup that may create the first key wants.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// The newest: sealing values.
+    Newest,
+    /// The oldest one not erased: naming and sealing blobs (ADR 0118).
+    Oldest,
 }
 
 impl std::fmt::Debug for SubjectKey {
@@ -651,7 +681,7 @@ impl Keystore {
         wall_ms: u64,
     ) -> Result<SubjectKey, PrivacyError> {
         let fresh = Zeroizing::new(fresh);
-        self.sealing_key_inner(subject, &fresh, nonce, wall_ms, None)
+        self.sealing_key_inner(subject, &fresh, nonce, wall_ms, None, Pick::Newest)
             .map(|(_, key)| key)
     }
 
@@ -663,7 +693,33 @@ impl Keystore {
         wall_ms: u64,
     ) -> Result<(KeyRevision, SubjectKey), PrivacyError> {
         let fresh = Zeroizing::new(fresh);
-        self.sealing_key_inner(subject, &fresh, nonce, wall_ms, None)
+        self.sealing_key_inner(subject, &fresh, nonce, wall_ms, None, Pick::Newest)
+    }
+
+    /// The subject's oldest key version that is not erased, which names and
+    /// seals its blobs (ADR 0118 §1). A subject without one gets a new key
+    /// from `fresh` and `nonce`, numbered after any erased versions, in either
+    /// privacy mode. Only an erasure of the subject changes the answer.
+    pub fn identity_key(
+        &self,
+        subject: &str,
+        fresh: [u8; 32],
+        nonce: [u8; 24],
+        wall_ms: u64,
+    ) -> Result<SubjectKey, PrivacyError> {
+        self.identity_key_at_revision(subject, fresh, nonce, wall_ms)
+            .map(|(_, key)| key)
+    }
+
+    pub(crate) fn identity_key_at_revision(
+        &self,
+        subject: &str,
+        fresh: [u8; 32],
+        nonce: [u8; 24],
+        wall_ms: u64,
+    ) -> Result<(KeyRevision, SubjectKey), PrivacyError> {
+        let fresh = Zeroizing::new(fresh);
+        self.sealing_key_inner(subject, &fresh, nonce, wall_ms, None, Pick::Oldest)
     }
 
     pub(crate) fn plain_source_key_at_revision(
@@ -681,6 +737,7 @@ impl Keystore {
             nonce,
             wall_ms,
             Some(expected_erasure_floor),
+            Pick::Newest,
         )
     }
 
@@ -691,6 +748,7 @@ impl Keystore {
         nonce: [u8; 24],
         wall_ms: u64,
         expected_erasure_floor: Option<Option<u32>>,
+        pick: Pick,
     ) -> Result<(KeyRevision, SubjectKey), PrivacyError> {
         if !valid_subject(subject) {
             return Err(PrivacyError::InvalidSubject(subject.to_owned()));
@@ -713,14 +771,20 @@ impl Keystore {
             None
         };
         type Row = (u32, Vec<u8>, Vec<u8>);
-        let newest: Option<Row> = tx
-            .query_row(
-                "SELECT version, nonce, wrapped FROM subject_keys WHERE subject = ?1 ORDER BY version DESC LIMIT 1",
-                [subject],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+        // An erasure deletes every version through its floor, so the oldest
+        // row left is the oldest version that is not erased.
+        let query = match pick {
+            Pick::Newest => {
+                "SELECT version, nonce, wrapped FROM subject_keys WHERE subject = ?1 ORDER BY version DESC LIMIT 1"
+            }
+            Pick::Oldest => {
+                "SELECT version, nonce, wrapped FROM subject_keys WHERE subject = ?1 ORDER BY version ASC LIMIT 1"
+            }
+        };
+        let existing: Option<Row> = tx
+            .query_row(query, [subject], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
-        let key = if let Some((version, nonce, wrapped)) = newest {
+        let key = if let Some((version, nonce, wrapped)) = existing {
             self.unwrap_key(subject, version, &nonce, &wrapped)?
         } else {
             let floor = if expected_erasure_floor.is_some() {

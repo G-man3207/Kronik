@@ -72,6 +72,9 @@ pub enum KeyAnswer {
     Erased,
     /// This node has no such key (`KEYSTORE_INCOMPLETE`).
     Missing,
+    /// The keystore could not answer (an I/O or database failure): neither
+    /// erased nor missing.
+    Unavailable(String),
 }
 
 /// Keys for reading subjects' blobs, never created by a lookup.
@@ -667,6 +670,9 @@ impl BlobReader {
                 KeyAnswer::Found(key) => key,
                 KeyAnswer::Erased => return Err(BlobError::Erased),
                 KeyAnswer::Missing => return Err(BlobError::KeyMissing(subject)),
+                KeyAnswer::Unavailable(why) => {
+                    return Err(BlobError::Io(format!("reading a blob key: {why}")));
+                }
             };
             // Nothing in a sealed header is trusted before its tag.
             header.verify(&key).map_err(corrupt)?;
@@ -811,6 +817,9 @@ impl BlobReader {
                 KeyAnswer::Found(k) => Some(blake3::Hasher::new_keyed(&k)),
                 KeyAnswer::Erased => return Err(BlobError::Erased),
                 KeyAnswer::Missing => None,
+                KeyAnswer::Unavailable(why) => {
+                    return Err(BlobError::Io(format!("reading a blob key: {why}")));
+                }
             },
             _ => Some(blake3::Hasher::new()),
         };

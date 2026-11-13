@@ -19,6 +19,8 @@ use zeroize::{Zeroize, Zeroizing};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 
+use kronik_blob::{BlobKeys, KeyAnswer};
+
 use crate::PrivacyError;
 use crate::keystore::{
     KeyLookup, KeyRevision, Keystore, Pseudonyms, SealedValue, SubjectKey, seal, unseal,
@@ -98,6 +100,8 @@ struct KeyCache {
     keys: BTreeMap<String, BTreeMap<u32, SubjectKey>>,
     key_count: usize,
     newest: BTreeMap<String, u32>,
+    /// The oldest version that is not erased: the one blobs use (ADR 0118).
+    oldest: BTreeMap<String, u32>,
     erasure_floors: BTreeMap<String, Option<u32>>,
 }
 impl KeyCache {
@@ -105,6 +109,7 @@ impl KeyCache {
         self.keys.clear();
         self.key_count = 0;
         self.newest.clear();
+        self.oldest.clear();
         self.erasure_floors.clear();
         self.revision = None;
     }
@@ -173,6 +178,28 @@ fn is_tombstone(s: &pb::Sealable, version: u32) -> bool {
 }
 
 pub type Fill<'a> = &'a dyn Fn(&mut [u8]);
+
+/// The context of the key derived from a subject key to key the identities
+/// of the subject's blobs (ADR 0118 §1).
+pub const BLOB_IDENTITY_LABEL: &str = "kronik blob identity v1";
+/// The context of the key derived from a subject key to seal the frames of
+/// the subject's blobs (ADR 0117 §2). Values are sealed with the subject key
+/// itself, so no two uses share a key.
+pub const BLOB_SEAL_LABEL: &str = "kronik blob seal v1";
+
+/// Keys for reading subjects' blobs: exact versions, never created
+/// ([`Sealer::blob_key_access`]).
+pub struct BlobKeyAccess<'a>(&'a Sealer);
+
+impl kronik_blob::KeyAccess for BlobKeyAccess<'_> {
+    fn seal_key(&self, subject: &str, version: u32) -> KeyAnswer {
+        self.0.blob_key(subject, version, BLOB_SEAL_LABEL)
+    }
+
+    fn identity_key(&self, subject: &str, version: u32) -> KeyAnswer {
+        self.0.blob_key(subject, version, BLOB_IDENTITY_LABEL)
+    }
+}
 
 impl Sealer {
     /// A sealer with a keystore, starting `off` (the node sets the mode
@@ -265,6 +292,7 @@ impl Sealer {
             cache.key_count -= versions.len();
         }
         cache.newest.remove(subject);
+        cache.oldest.remove(subject);
         cache.erasure_floors.remove(subject);
     }
 
@@ -417,6 +445,105 @@ impl Sealer {
             KeyLookup::Erased | KeyLookup::Missing => Err(PrivacyError::Decrypt(
                 "the original subject key version is missing or erased".into(),
             )),
+        }
+    }
+
+    /// The keys of `subject`'s blobs (ADR 0118 §1, ADR 0117 §2): the identity
+    /// key and, while the mode is on, the frame key, both derived from the
+    /// subject's oldest key version that is not erased. A subject without a
+    /// key gets one, in either mode (the only keystore write in mode off),
+    /// so that an erasure can later unlink its blobs' identities. Without a
+    /// keystore (tests, the simulator) the keys come from a fixed test key
+    /// of version 1 and nothing is sealed.
+    pub fn blob_keys(
+        &self,
+        subject: &str,
+        fill: Fill<'_>,
+        wall_ms: u64,
+    ) -> Result<BlobKeys, PrivacyError> {
+        if !crate::keystore::valid_subject(subject) {
+            return Err(PrivacyError::InvalidSubject(subject.to_owned()));
+        }
+        let Some(ks) = &self.keystore else {
+            let key = crate::keystore::test_subject_key(subject);
+            return Ok(BlobKeys {
+                subject: subject.to_owned(),
+                key_version: key.version,
+                identity: key.derive(BLOB_IDENTITY_LABEL),
+                seal: None,
+            });
+        };
+        let key = self.blob_identity_key(ks, subject, fill, wall_ms)?;
+        Ok(BlobKeys {
+            subject: subject.to_owned(),
+            key_version: key.version,
+            identity: key.derive(BLOB_IDENTITY_LABEL),
+            seal: self.is_on().then(|| key.derive(BLOB_SEAL_LABEL)),
+        })
+    }
+
+    fn blob_identity_key(
+        &self,
+        ks: &Keystore,
+        subject: &str,
+        fill: Fill<'_>,
+        wall_ms: u64,
+    ) -> Result<SubjectKey, PrivacyError> {
+        {
+            let cache = self.cache_at_revision(ks)?;
+            if let Some(version) = cache.oldest.get(subject)
+                && let Some(key) = cache
+                    .keys
+                    .get(subject)
+                    .and_then(|versions| versions.get(version))
+            {
+                return Ok(key.clone());
+            }
+        }
+        let mut fresh = Zeroizing::new([0u8; 32]);
+        let mut nonce = [0u8; 24];
+        fill(&mut fresh[..]);
+        fill(&mut nonce);
+        let (revision, key) = match ks.identity_key_at_revision(subject, *fresh, nonce, wall_ms) {
+            Ok(found) => found,
+            Err(error) => {
+                lock(&self.cache).clear();
+                return Err(error);
+            }
+        };
+        self.cache_put(subject, &key, revision, false);
+        let mut cache = lock(&self.cache);
+        if cache.revision == Some(revision) {
+            cache.oldest.insert(subject.to_owned(), key.version);
+        }
+        Ok(key)
+    }
+
+    /// Keys for reading subjects' blobs ([`kronik_blob::KeyAccess`]): the
+    /// exact version a blob names, never created and never the newest.
+    pub fn blob_key_access(&self) -> BlobKeyAccess<'_> {
+        BlobKeyAccess(self)
+    }
+
+    fn blob_key(&self, subject: &str, version: u32, label: &str) -> KeyAnswer {
+        if version == 0 || !crate::keystore::valid_subject(subject) {
+            return KeyAnswer::Missing;
+        }
+        if self.keystore.is_none() {
+            // Without a keystore nothing is sealed: a sealed blob needs a key
+            // this sealer does not have (KEYSTORE_INCOMPLETE).
+            let key = crate::keystore::test_subject_key(subject);
+            return if label == BLOB_IDENTITY_LABEL && version == key.version {
+                KeyAnswer::Found(key.derive(label))
+            } else {
+                KeyAnswer::Missing
+            };
+        }
+        match self.opening_key(subject, version) {
+            Ok(KeyLookup::Found(key)) => KeyAnswer::Found(key.derive(label)),
+            Ok(KeyLookup::Erased) => KeyAnswer::Erased,
+            Ok(KeyLookup::Missing) => KeyAnswer::Missing,
+            Err(error) => KeyAnswer::Unavailable(error.to_string()),
         }
     }
 
@@ -1386,5 +1513,143 @@ mod tests {
         assert_eq!(body.subject.as_deref(), Some("user:1"));
         assert_eq!(header, val(Some("user:2"), b"bob"));
         assert!(!is_erased(&header));
+    }
+}
+
+#[cfg(test)]
+mod blob_key_tests {
+    use super::*;
+    use crate::MasterKey;
+    use kronik_blob::KeyAccess as _;
+
+    fn master() -> MasterKey {
+        MasterKey::from_bytes([1; 32]).unwrap()
+    }
+
+    fn sealer() -> Sealer {
+        Sealer::new(Arc::new(Keystore::open_memory(&master()).unwrap()))
+    }
+
+    fn fill(byte: u8) -> impl Fn(&mut [u8]) {
+        move |b: &mut [u8]| b.fill(byte)
+    }
+
+    fn found(answer: KeyAnswer) -> Zeroizing<[u8; 32]> {
+        match answer {
+            KeyAnswer::Found(key) => key,
+            KeyAnswer::Erased => panic!("erased"),
+            KeyAnswer::Missing => panic!("missing"),
+            KeyAnswer::Unavailable(why) => panic!("unavailable: {why}"),
+        }
+    }
+
+    #[test]
+    fn a_subjects_first_blob_creates_its_key_once_in_either_mode() {
+        let s = sealer();
+        let off = s.blob_keys("user:1", &fill(7), 1).unwrap();
+        assert_eq!((off.subject.as_str(), off.key_version), ("user:1", 1));
+        assert!(off.seal.is_none(), "mode off seals nothing");
+        let again = s.blob_keys("user:1", &fill(8), 2).unwrap();
+        assert_eq!(*again.identity, *off.identity);
+        assert_eq!(s.keystore().unwrap().stats().unwrap().keys, 1);
+        // The derivation is fixed: the subject key here is [7; 32].
+        assert_eq!(
+            *off.identity,
+            blake3::derive_key(BLOB_IDENTITY_LABEL, &[7; 32])
+        );
+
+        s.set_on(true);
+        let on = s.blob_keys("user:1", &fill(9), 3).unwrap();
+        assert_eq!((on.key_version, *on.identity), (1, *off.identity));
+        let seal = on.seal.unwrap();
+        assert_eq!(*seal, blake3::derive_key(BLOB_SEAL_LABEL, &[7; 32]));
+        // Distinct from each other and from the subject key that seals values.
+        assert_ne!(*seal, *on.identity);
+        assert_ne!(*seal, [7; 32]);
+        assert_ne!(*on.identity, [7; 32]);
+
+        let access = s.blob_key_access();
+        assert_eq!(*found(access.identity_key("user:1", 1)), *off.identity);
+        assert_eq!(*found(access.seal_key("user:1", 1)), *seal);
+        // Exact versions only, never created.
+        assert!(matches!(access.seal_key("user:1", 2), KeyAnswer::Missing));
+        assert!(matches!(access.seal_key("user:2", 1), KeyAnswer::Missing));
+        assert!(matches!(access.seal_key("user 1", 1), KeyAnswer::Missing));
+        assert_eq!(s.keystore().unwrap().stats().unwrap().keys, 1);
+        assert!(matches!(
+            s.blob_keys("user 1", &fill(1), 0),
+            Err(PrivacyError::InvalidSubject(_))
+        ));
+    }
+
+    #[test]
+    fn blobs_keep_the_oldest_live_version_until_it_is_erased() {
+        let s = sealer();
+        s.set_on(true);
+        // A value sealed first creates version 1; blobs use it too.
+        let mut value = pb::Sealable {
+            subject: Some("user:1".into()),
+            value: Some(pb::sealable::Value::Plain(b"x".to_vec())),
+        };
+        s.seal_value(&mut value, &fill(3), 1).unwrap();
+        let first = s.blob_keys("user:1", &fill(4), 2).unwrap();
+        assert_eq!(first.key_version, 1);
+        // A newer version seals values from now on; blobs keep version 1, so
+        // equal content keeps its identity.
+        let ks = s.keystore().unwrap();
+        assert_eq!(ks.rotate("user:1", [5; 32], [5; 24], 3).unwrap(), 2);
+        let still = s.blob_keys("user:1", &fill(6), 4).unwrap();
+        assert_eq!((still.key_version, *still.identity), (1, *first.identity));
+        // After an erasure every old version reads as erased, and the
+        // subject's next blob gets a key numbered after them.
+        assert_eq!(s.erase("user:1", 5).unwrap(), 2);
+        let access = s.blob_key_access();
+        assert!(matches!(access.seal_key("user:1", 1), KeyAnswer::Erased));
+        assert!(matches!(
+            access.identity_key("user:1", 2),
+            KeyAnswer::Erased
+        ));
+        let after = s.blob_keys("user:1", &fill(7), 6).unwrap();
+        assert_eq!(after.key_version, 3);
+        assert_ne!(*after.identity, *first.identity);
+    }
+
+    #[test]
+    fn a_restored_keystore_opens_the_same_blobs() {
+        let s = sealer();
+        s.set_on(true);
+        let keys = s.blob_keys("user:9", &fill(2), 1).unwrap();
+        let backup = s.keystore().unwrap().export_backup([1; 24]).unwrap();
+        let restored = Sealer::new(Arc::new(
+            Keystore::restore_memory(&master(), &backup).unwrap(),
+        ));
+        let access = restored.blob_key_access();
+        assert_eq!(
+            *found(access.identity_key("user:9", keys.key_version)),
+            *keys.identity
+        );
+        assert_eq!(
+            *found(access.seal_key("user:9", keys.key_version)),
+            *keys.seal.unwrap()
+        );
+    }
+
+    #[test]
+    fn without_a_keystore_a_fixed_test_key_names_blobs() {
+        let s = Sealer::plain();
+        s.set_on(true);
+        let k = s.blob_keys("user:1", &fill(1), 0).unwrap();
+        assert_eq!(k.key_version, 1);
+        assert!(k.seal.is_none());
+        assert_eq!(
+            *found(s.blob_key_access().identity_key("user:1", 1)),
+            *k.identity
+        );
+        let other = Sealer::plain().blob_keys("user:2", &fill(1), 0).unwrap();
+        assert_ne!(*other.identity, *k.identity);
+        assert!(matches!(
+            s.blob_key_access().identity_key("user:1", 2),
+            KeyAnswer::Missing
+        ));
     }
 }

@@ -214,6 +214,11 @@ until the v1.0 compatibility promise takes effect.
   subject with XChaCha20-Poly1305
   ([ADR 0117](docs/adr/0117-blob-store.md), amended for streaming writes).
   The daemon does not use it yet.
+- The privacy keystore provides the keys of a subject's blobs
+  ([ADR 0118](docs/adr/0118-sealed-blob-identity.md)): derived, with labels
+  of their own, from the subject's oldest key version that is not erased.
+  A subject's first blob creates its key also in privacy mode `off`, so a
+  later erasure can unlink its blobs.
 - Log format v1 gains the blob fields of M25 and M26, all additive:
   `BlobRef` names its subject and key version, `EffectRecord.blobs` lists
   the blobs an effect references, HTTP effect requests and responses can
