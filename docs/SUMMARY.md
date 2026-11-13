@@ -57,6 +57,7 @@
 - [M23 key and secret backends (design)](design/m23-secret-backends.md)
 - [M25 streaming bodies design](design/m25-streaming-bodies.md)
 - [M26 blob storage for apps design](design/m26-blobs.md)
+- [M24 long-lived connections design](design/m24-connections.md)
 - [M28 OpenTelemetry and audit export design](design/m28-otel.md)
 - [Threat model and integration limits](design/threat-model.md)
 - [Performance](perf.md)
