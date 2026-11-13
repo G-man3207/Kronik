@@ -625,6 +625,31 @@ impl SecretCache {
                 })
         .then(|| held.bytes.clone())
     }
+    /// The value an outage lets an effect use: the operational value of the
+    /// scope's current version (or of `version`), younger than `max_stale`,
+    /// unless a failure other than `Unavailable` revoked it. Never for the
+    /// built-in store, which has no outage to bridge.
+    fn stale_fallback(&self, scope: &Scope, version: Option<u64>) -> Option<SecretValue> {
+        if scope.backend == "file" {
+            return None;
+        }
+        let row = self.row(scope, version)?;
+        if !active(&row) || row.deleted {
+            return None;
+        }
+        let exact = version.map(|_| row.source_version.as_str());
+        if self
+            .negative_version(scope, exact)
+            .is_some_and(|error| error != BackendError::Unavailable)
+        {
+            return None;
+        }
+        let bytes = self.held(&row, true)?;
+        Some(SecretValue {
+            meta: meta(&row),
+            value: bytes.to_vec(),
+        })
+    }
     fn insert(
         &self,
         row: &pb::SecretVersion,
@@ -685,21 +710,17 @@ impl SecretCache {
             },
         );
         // A linked row is selected for its link scope through the CURRENT
-        // map: the unversioned resolve of a non-file scope reads it. Only an
-        // OPERATIONAL value chooses the pointer (a catalogue observation is
-        // not the current value), and the newest version wins; a deleted row
-        // releases a pointer that names it.
-        if row.backend != "file" {
+        // map, which the unversioned resolve of a non-file scope reads. Only
+        // an observation of the provider's current version chooses it
+        // ([`Node::hold_secret_observation`]); an insert never does. A
+        // catalogue observation is not the current value, and neither is the
+        // value of a version fetched by its id: after a restart nothing is
+        // current, and the crash re-run of a turn that used an older version
+        // must not make new effects use that version. A deleted or inactive
+        // row releases a pointer that names it.
+        if row.backend != "file" && (row.deleted || !active(row)) {
             let scope = Scope::row(row);
-            if operational && !row.deleted && active(row) {
-                let superseded = state
-                    .current
-                    .get(&scope)
-                    .is_some_and(|(name, version)| *name == row.name && *version >= row.version);
-                if !superseded {
-                    state.current.insert(scope, (row.name.clone(), row.version));
-                }
-            } else if state
+            if state
                 .current
                 .get(&scope)
                 .is_some_and(|(name, version)| *name == row.name && *version == row.version)
@@ -2664,7 +2685,7 @@ impl Node {
             node.resolve_secret_cold(work_scope, version, started, original)
                 .await
         });
-        match self.env.timeout(runtime.settings.fetch_timeout, work).await {
+        let result = match self.env.timeout(runtime.settings.fetch_timeout, work).await {
             Ok(Some(result)) => result,
             Ok(None) => Err(unavailable()),
             Err(_) => {
@@ -2675,6 +2696,19 @@ impl Node {
                 );
                 Err(unavailable())
             }
+        };
+        // The backend did not answer in time: a value it served, still
+        // operational and younger than `max_stale`, is used (m23 §6). The
+        // cold path does the same when its own fetch times out, but its
+        // deadline is this one, and this timeout can fire first: a turn then
+        // failed with SECRET_UNAVAILABLE although a usable value was held
+        // (found by the DST workload `secret-outage`).
+        match result {
+            Err(error) if error.code == ErrorCode::SecretUnavailable => runtime
+                .cache
+                .stale_fallback(&scope, version)
+                .map_or(Err(error), |value| Ok(Some(value))),
+            other => other,
         }
     }
 
