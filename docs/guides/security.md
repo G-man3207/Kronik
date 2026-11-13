@@ -296,8 +296,9 @@ that a turn generated from `random-bytes`.
   which exempts it from the share. An actor's response cannot set
   `Content-Length`, `Connection`, `Transfer-Encoding` or another hop-by-hop
   header, nor `kronik-turn-id`, so it cannot spill into the next response
-  on a connection; an informational status (1xx) is answered with
-  `TURN_FAILED`. A failure inside Kronik is answered with a generic
+  on a connection; a status outside 200 to 599, an informational one (1xx)
+  or one of 600 and above, is answered with `TURN_FAILED`. A failure inside
+  Kronik is answered with a generic
   `INTERNAL`, and the daemon's log has the details. Without TLS, keep the
   gateway on a private address or behind a proxy that terminates TLS.
 - **File descriptors.** `kronik serve` raises its soft limit on open files

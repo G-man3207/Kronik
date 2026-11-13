@@ -475,15 +475,23 @@ pub fn turn_response(r: &TurnResult) -> HttpResponse {
             // A final response only. The length and the connection are
             // hyper's, and the turn id is Kronik's: an actor's would let it
             // spill into the next response on the connection, or spoof one.
-            let status = u16::try_from(h.status).unwrap_or(500);
-            if status < 200 {
+            // The contract is 200 to 599: an informational status is no final
+            // response, and 600 and above are no HTTP status a client or a
+            // proxy in front of Kronik knows.
+            let status = u16::try_from(h.status).unwrap_or(1000);
+            if !(200..=599).contains(&status) {
                 // The actor's mistake, so not INTERNAL, which hides the message.
+                let why = if status < 200 {
+                    "which is not a final response"
+                } else {
+                    "which is not an HTTP status"
+                };
                 let mut resp = error(&ApiError::new(
                     ErrorCode::TurnFailed,
                     format!(
-                        "turn {} answered with status {status}, which is not a final \
-                         response: an actor answers with 200 to 599",
-                        r.turn_id
+                        "turn {} answered with status {}, {why}: an actor answers with 200 \
+                         to 599",
+                        r.turn_id, h.status
                     ),
                 ));
                 resp.headers.push(id);
@@ -861,6 +869,48 @@ mod tests {
                 ("content-security-policy".to_owned(), "sandbox".to_owned()),
             ]
         );
+    }
+
+    /// The contract is 200 to 599 (#68): an actor's 1xx, 600 to 999 and
+    /// anything that does not fit a status is `TURN_FAILED`; 200 and 599 pass.
+    #[test]
+    fn only_statuses_200_to_599_reach_the_client() {
+        let answered = |status: u32| {
+            turn_response(&TurnResult {
+                turn_id: kronik_core::ids::TurnId {
+                    branch: "main".into(),
+                    lsn: 7,
+                },
+                outcome: pb::Outcome {
+                    kind: pb::OutcomeKind::Committed as i32,
+                    output: Some(pb::outcome::Output::Http(pb::HttpResponse {
+                        status,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                scrubbed_with: None,
+            })
+        };
+        for status in [200, 404, 599] {
+            assert_eq!(answered(status).status, status as u16);
+        }
+        for status in [0, 101, 199, 600, 700, 999, 1000, 70_000] {
+            let r = answered(status);
+            let body = String::from_utf8(r.body).unwrap();
+            assert_eq!(r.status, 500, "{status}: {body}");
+            assert!(
+                body.contains("\"TURN_FAILED\"") && body.contains(&format!("status {status},")),
+                "{status}: {body}"
+            );
+            assert!(
+                r.headers
+                    .iter()
+                    .any(|(n, v)| n == TURN_ID_HEADER && v == "main:7"),
+                "{:?}",
+                r.headers
+            );
+        }
     }
 
     #[test]

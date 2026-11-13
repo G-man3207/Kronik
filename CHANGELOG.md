@@ -137,6 +137,9 @@ M23, key and secret backends:
   against the real clouds with an operator's credentials (not run by the
   project); `scripts/e2e-pkcs11.sh` runs the `kronik-keyhelper` flow against
   SoftHSM2.
+- The gateway sent an actor's status of 600 to 999 to the client as it was,
+  although an actor answers with 200 to 599; like an informational status, it
+  is now answered with `TURN_FAILED` (#68).
 
 ## v0.4.1 — 2026-11-07
 
