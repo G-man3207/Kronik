@@ -110,9 +110,17 @@ establish the complete M33 release corpus or all future interfaces.
 `published_releases` set must exactly match its covered cases. It pins the actual
 published v0.1.0, v0.3.0, v0.4.0 and v0.4.1 producer binary digests, source commits,
 immutable exported manifest digests, original root counts, genuine counter/SQL
-component bytes, and original API, CLI JSON, diff and WIT source snapshots from
-those tags. There was no published v0.2.0 artifact in the inspected release set;
-do not invent one. The v0.1.0 artifact actually reports `kronik 0.1.0-dev` and
+component bytes, and the API, CLI JSON, diff and WIT source snapshots of those
+tags. Every snapshot is its tag's bytes except the CLI-JSON snapshots of v0.1.0,
+v0.3.0 and v0.4.0: the public-release preparation edited one word of their
+introduction's prose (253fa961), and their index entries say so, with the Git
+blob each tag has (`producer_git_blob`) and the edit (`edit`). Their schemas are
+the tags'. `scripts/verify-compatibility.py` compares every snapshot with its
+source file at the producer revision and refuses a difference the index does not
+declare; it needs those revisions in the clone and says so when it cannot compare
+(a shallow clone or a source archive). There was no published v0.2.0 artifact in
+the inspected release set; do not invent one. The v0.1.0 artifact actually
+reports `kronik 0.1.0-dev` and
 records Wasmtime 50.0.0; its real identity is retained rather than rewritten.
 The v0.4.0 artifact reports `kronik 0.4.0` and records Wasmtime 50.0.1.
 The v0.4.1 artifact reports `kronik 0.4.1`, records Wasmtime 50.0.1 and names
@@ -290,7 +298,9 @@ The currently retained v0.1.0/v0.3.0/v0.4.0/v0.4.1 snapshots were read directly 
 source commits `f4d9d9e2cccf515cb5cc4952c0e8a3f643372e34`,
 `d9d460bc89f6ae30962ef16238b8fcaa6485a8de`,
 `90e0c92194514ad141a6273f26fc99f34145acff` and
-`34f0a8ce4251f10c44b243d337cbf0e9a203cdfc`.
+`34f0a8ce4251f10c44b243d337cbf0e9a203cdfc`, apart from the declared edit of
+three CLI-JSON snapshots above. A later edit of a snapshot declares itself the
+same way, or the verifier refuses it.
 
 The case is produced from the published binary, never from a build or from the
 candidate:

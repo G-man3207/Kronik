@@ -83,6 +83,13 @@ def load_index(path):
             if (type(snapshot.get("bytes")) is not int or len(content) != snapshot["bytes"]
                     or corpus.digest(payload) != snapshot.get("sha256") or git_blob != snapshot.get("git_blob")):
                 raise Violation("released contract snapshot differs from pinned source bytes")
+            # A snapshot edited after its release says so: the Git blob the
+            # release had, and what the edit changed (contract_lineage checks it).
+            if "producer_git_blob" in snapshot or "edit" in snapshot:
+                original, edit = snapshot.get("producer_git_blob"), snapshot.get("edit")
+                if (not isinstance(original, str) or not re.fullmatch(r"[0-9a-f]{40}", original)
+                        or original == git_blob or not isinstance(edit, str) or not edit.strip()):
+                    raise Violation("an edited contract snapshot must name its release's Git blob and the edit")
         manifest_path = fixture_file(path.parent, case["manifest"])
         if corpus.digest(manifest_path) != case["manifest_sha256"]:
             raise Violation("frozen producer manifest digest mismatch")
@@ -106,6 +113,35 @@ def load_index(path):
     if seen != set(published):
         raise Violation("published release coverage is incomplete")
     return cases
+
+
+def contract_lineage(cases, repository):
+    """Compares every contract snapshot with its source file at the producer revision.
+
+    A snapshot must be the bytes its release had, or declare the edit made to it
+    since (`producer_git_blob`, `edit`). The comparison needs the producer
+    revisions in the Git repository; a shallow clone or a source archive has none.
+    Returns whether the comparison ran.
+    """
+    def git(*arguments):
+        try:
+            result = subprocess.run(["git", "-C", str(repository), *arguments], capture_output=True,
+                                    text=True, timeout=60, check=False)
+        except FileNotFoundError:
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    for case in cases:
+        if git("cat-file", "-e", case["producer_revision"] + "^{commit}") is None:
+            return False
+    for case in cases:
+        for role, snapshot in case["contracts"].items():
+            released = git("rev-parse", "--verify", "--quiet",
+                           f"{case['producer_revision']}:{snapshot['source_path']}")
+            if released != snapshot.get("producer_git_blob", snapshot["git_blob"]):
+                raise Violation(f"the {case['release']} {role} contract snapshot is not its release's "
+                                f"{snapshot['source_path']}, and declares no edit")
+    return True
 
 
 def deploy_component(command, work, name):
@@ -215,6 +251,12 @@ def main():
     args.binary = args.binary.resolve(strict=True)
     args.index = args.index.resolve(strict=True)
     cases = load_index(args.index)
+    # The repository that holds the index, which has the producer revisions
+    # unless it is a shallow clone.
+    lineage = contract_lineage(cases, args.index.parent)
+    if not lineage:
+        print("compatibility verification: the producer revisions are not in this clone, so the "
+              "contract snapshots were not compared with them", file=sys.stderr)
     args.workdir = args.workdir.resolve()
     args.workdir.mkdir(mode=0o700)
     proofs = []
@@ -227,7 +269,7 @@ def main():
         proofs.append(check_components(args, case, args.index.parent, args.workdir / f"{case['release']}-components"))
     result = {"format": "kronik.compatibility-index-proof/v2", "candidate_revision": args.revision,
               "candidate_binary_sha256": corpus.digest(args.binary), "index_sha256": corpus.digest(args.index),
-              "releases": proofs, "passed": True}
+              "contract_lineage_checked": lineage, "releases": proofs, "passed": True}
     (args.workdir / "proof.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     print(json.dumps(result, allow_nan=False))
 

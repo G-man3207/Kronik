@@ -27,7 +27,9 @@
           "source_path": "docs/reference/json.md",
           "git_blob": "bd68d0afc0ab11be1a9edb1fd421826707076bc7",
           "sha256": "b5c56663ed0a135b9772890b8594180edc0902a325aeacd0e8eae4300212658d",
-          "bytes": 98135
+          "bytes": 98135,
+          "producer_git_blob": "6bd15ef6c56205579fab1393387c867ac375b5a6",
+          "edit": "Edited in the public-release preparation (253fa961): one word of the introduction's prose on line 8; every schema is the release's"
         },
         "diff": {
           "path": "v0.1.0/contracts/diff-v1.schema.json",
@@ -83,7 +85,9 @@
           "source_path": "docs/reference/json.md",
           "git_blob": "cb3800de18ca204e7baf5d7810c90cc7b01cf0b7",
           "sha256": "c00add9d415cd42d0161bc33943cff1ab9971ccab0921b5cef928d1ebaf801ba",
-          "bytes": 124386
+          "bytes": 124386,
+          "producer_git_blob": "aa3db75300ee436a6632f3ab9658ee262a8dd910",
+          "edit": "Edited in the public-release preparation (253fa961): one word of the introduction's prose on line 8; every schema is the release's"
         },
         "diff": {
           "path": "v0.3.0/contracts/diff-v1.schema.json",
@@ -139,7 +143,9 @@
           "source_path": "docs/reference/json.md",
           "git_blob": "150dcc4863ff4a26221d41623bdbec5369185d8c",
           "sha256": "13422e9f6c3f11bc7017e07f775401e65dd4c6972c461472d96b941a4cecf4a4",
-          "bytes": 154313
+          "bytes": 154313,
+          "producer_git_blob": "bab2f921e39e3d3dbb6bf6aba1ca80bd3f8c36c9",
+          "edit": "Edited in the public-release preparation (253fa961): one word of the introduction's prose on line 8; every schema is the release's"
         },
         "diff": {
           "path": "v0.4.0/contracts/diff-v1.schema.json",
