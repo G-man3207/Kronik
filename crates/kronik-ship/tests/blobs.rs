@@ -1,6 +1,6 @@
 //! Shipping and restoring blobs (ADR 0122, M25 slice B12) against a local
 //! directory bucket, and against S3 when `KRONIK_TEST_S3_URL` is set
-//! (scripts/minio.sh runs a MinIO container for it): blobs go up before what
+//! (scripts/s3.sh runs an S3 server for it): blobs go up before what
 //! references them, a multipart upload for a blob above 8 MiB; a round
 //! stopped at any step never leaves a segment or snapshot in the bucket whose
 //! blobs are not there; blobs the collector deleted leave the bucket after the
@@ -420,6 +420,173 @@ fn ship_and_restore_blobs(remote: &Remote) {
     assert_eq!(r.blobs.missing, std::slice::from_ref(&saved.hash), "{r:?}");
 }
 
+/// The text answer of a turn.
+fn text(o: &pb::Outcome) -> String {
+    match &o.output {
+        Some(pb::outcome::Output::Http(h)) => {
+            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
+                Some(pb::body::Value::Inline(s)) => match &s.value {
+                    Some(pb::sealable::Value::Plain(b)) => String::from_utf8_lossy(b).into_owned(),
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// What the media guest's `held-sum` answers for `size` bytes of its
+/// pattern: the size and its FNV-1a 64 digest.
+fn pattern_sum(size: u64) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for i in 0..size {
+        h ^= u64::from(((i.wrapping_mul(31) + 7) % 251) as u8);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{size} {h:016x}")
+}
+
+/// M26 criterion 13: a blob whose only root is a timer, the records that
+/// created and referenced it compacted away, is shipped and restored. No
+/// record or snapshot in the bucket references a missing blob; the restore
+/// downloads it; when the timer fires on the restored node, its turn
+/// retains the blob, and the actor reads the right bytes.
+fn restore_keeps_a_timer_only_blob(remote: &Remote) {
+    let src = tempdir("blob-timer-src-");
+    let p = start(src.path());
+    p.deploy();
+    let put = text(&p.ingress("put", "size=6000", ""));
+    let hash = put.split(' ').nth(1).unwrap().to_owned();
+    // The timer carries the blob, due after the restore (90 s: longer than
+    // the steps up to it take on a loaded machine); the actor lets it go, so
+    // the timer is its only root.
+    let scheduled = std::time::Instant::now();
+    assert_eq!(
+        text(&p.ingress("schedule", "delay=90000&op=retain", "")),
+        "scheduled"
+    );
+    assert_eq!(text(&p.ingress("release", "", "")), "released");
+    let referenced = p
+        .node
+        .store()
+        .db()
+        .blob(&hash)
+        .unwrap()
+        .unwrap()
+        .last_ref_lsn;
+    p.traffic(80);
+    p.compact();
+    assert!(
+        p.node.blob_floor().unwrap() > referenced,
+        "the records that reference the blob are still in the log"
+    );
+    for _ in 0..2 {
+        p.rt.block_on(p.node.blob_gc(SweepOptions {
+            immediate: true,
+            ..Default::default()
+        }))
+        .unwrap();
+    }
+    let id = BlobId::parse(&hash).unwrap();
+    assert!(
+        p.node
+            .blob_store()
+            .unwrap()
+            .object_path(&Space::Main, &id)
+            .exists(),
+        "the timer keeps it"
+    );
+    p.ship(remote, src.path()).unwrap();
+    assert_references_complete(&p.rt, remote);
+    assert!(bucket_blobs(&p.rt, remote).contains(&hash));
+    assert!(
+        p.node
+            .store()
+            .db()
+            .held("media", "a", &hash)
+            .unwrap()
+            .is_none(),
+        "the timer fired {:?} after it was scheduled, before the restore: the machine \
+         is too loaded for this test",
+        scheduled.elapsed()
+    );
+    let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
+    drop(p);
+
+    let dst = tempdir("blob-timer-dst-");
+    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
+    std::fs::write(dst.path().join("keys/master.key"), &key).unwrap();
+    let r = {
+        let rt = rt();
+        rt.block_on(restore_with_options(
+            remote,
+            dst.path(),
+            "main",
+            false,
+            &Env::real(rt.handle().clone()),
+            &Default::default(),
+            KeystoreMode::Require,
+            RestoreOptions {
+                allow_missing_blobs: false,
+            },
+        ))
+        .unwrap()
+    };
+    assert!(r.blobs.missing.is_empty(), "{r:?}");
+    let q = start(dst.path());
+    assert!(
+        q.node
+            .blob_store()
+            .unwrap()
+            .object_path(&Space::Main, &id)
+            .exists(),
+        "the restore downloaded the timer's blob"
+    );
+    // Up to 150 s: the timer was due 90 s after it was scheduled.
+    let mut waited = 0;
+    while q
+        .node
+        .store()
+        .db()
+        .held("media", "a", &hash)
+        .unwrap()
+        .is_none()
+    {
+        waited += 1;
+        assert!(
+            waited < 7500,
+            "the restored node's timer never retained the blob"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(text(&q.ingress("held-sum", "", "")), pattern_sum(6000));
+}
+
+#[test]
+fn restore_keeps_a_timer_only_blob_from_a_directory_bucket() {
+    let bucket = tempdir("blob-timer-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    restore_keeps_a_timer_only_blob(&remote);
+}
+
+#[test]
+fn restore_keeps_a_timer_only_blob_from_s3() {
+    let Ok(url) = std::env::var("KRONIK_TEST_S3_URL") else {
+        eprintln!("KRONIK_TEST_S3_URL is not set; run scripts/s3.sh for this test");
+        return;
+    };
+    // A prefix of its own: other tests share the bucket and its prefix.
+    let url = format!(
+        "{}/timer-blob-{}",
+        url.trim_end_matches('/'),
+        std::process::id()
+    );
+    let endpoint = std::env::var("KRONIK_TEST_S3_ENDPOINT").ok();
+    let remote = Remote::open(&url, endpoint.as_deref()).unwrap();
+    restore_keeps_a_timer_only_blob(&remote);
+}
+
 #[test]
 fn ship_and_restore_blobs_from_a_directory_bucket() {
     let bucket = tempdir("blob-ship-bucket-");
@@ -430,7 +597,7 @@ fn ship_and_restore_blobs_from_a_directory_bucket() {
 #[test]
 fn ship_and_restore_blobs_from_s3() {
     let Ok(url) = std::env::var("KRONIK_TEST_S3_URL") else {
-        eprintln!("KRONIK_TEST_S3_URL is not set; run scripts/minio.sh for this test");
+        eprintln!("KRONIK_TEST_S3_URL is not set; run scripts/s3.sh for this test");
         return;
     };
     // A prefix of its own: other tests share the bucket and its prefix.

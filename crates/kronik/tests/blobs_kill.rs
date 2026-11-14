@@ -1,9 +1,11 @@
-//! Crashes around a turn that writes a blob (docs/design/m26-blobs.md §11,
-//! §17), with a real `kronik serve`, its hidden `--test-hold` and `kill -9`:
-//! after the blob's finish and before the record, the bytes are loose and
-//! nothing records them; before the commit, the blob is durable and nothing
-//! records it; after the record's sync and before its apply, the restart
-//! applies it (also from the log alone) and its blob answers.
+//! Crashes around a turn that writes a blob or changes what its actor holds
+//! (docs/design/m26-blobs.md §11, §17; criteria 3, 4, 8 and 9), with a real
+//! `kronik serve`, its hidden `--test-hold` and `kill -9`: after the blob's
+//! finish and before the record, the bytes are loose, the dry run says so
+//! and two passes delete them; before the commit, a release leaves the hold
+//! and a retain or a put adds none, its bytes loose; after the record's sync
+//! and before its apply, the restart applies it (also from the log alone),
+//! the hold exists and a pass keeps its blob.
 
 // Test harness code: unwraps, std threads and std time are fine here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
@@ -19,6 +21,23 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
+
+/// The daemon: this build's, or `KRONIK_M26_KRONIK` (the test machine runs
+/// the test binary and a static `kronik` away from the checkout,
+/// scripts/acceptance-m26.sh).
+fn kronik_bin() -> PathBuf {
+    std::env::var_os("KRONIK_M26_KRONIK").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_kronik")),
+        PathBuf::from,
+    )
+}
+
+/// The test guest: the checkout's, or `KRONIK_M26_MEDIA`.
+fn media_wasm() -> Vec<u8> {
+    let path =
+        std::env::var_os("KRONIK_M26_MEDIA").map_or_else(|| PathBuf::from(MEDIA), PathBuf::from);
+    std::fs::read(path).unwrap()
+}
 
 struct Daemon {
     dir: PathBuf,
@@ -42,7 +61,7 @@ impl Daemon {
             .append(true)
             .open(dir.join("serve.log"))
             .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_kronik"))
+        let child = Command::new(kronik_bin())
             .arg("serve")
             .env("KRONIK_DISK_RESERVE", "0B")
             .arg("--config")
@@ -132,7 +151,7 @@ impl Daemon {
     }
 
     fn media(&self) {
-        let wasm = base64::engine::general_purpose::STANDARD.encode(std::fs::read(MEDIA).unwrap());
+        let wasm = base64::engine::general_purpose::STANDARD.encode(media_wasm());
         self.api(
             "POST",
             "/v1/deployments",
@@ -152,15 +171,67 @@ impl Daemon {
         v["turns"].as_array().cloned().unwrap_or_default()
     }
 
+    /// The text answer of `POST /media/a/<op>?<query>`, which must be 200.
+    fn ok(&self, op: &str, query: &str) -> String {
+        let (status, body) = call(&self.http, &request(op, query));
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert_eq!(status, 200, "{op}?{query}: {text}");
+        text
+    }
+
+    /// The hashes `media/a` holds (M26 §12).
+    fn holds(&self) -> Vec<String> {
+        let (status, v) = self
+            .try_api("GET", "/v1/actors/media/a/blobs", Value::Null)
+            .unwrap_or_else(|| panic!("holds failed: {}", self.log()));
+        assert_eq!(status, 200, "{v}");
+        let mut out: Vec<String> = v["blobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["hash"].as_str().unwrap().to_owned())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The collector's dry run: each file without a root and its reason.
+    fn plan(&self) -> Vec<(String, String)> {
+        let v = self.api("GET", "/v1/blobs/gc", Value::Null);
+        let mut out: Vec<(String, String)> = v["blobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                (
+                    b["hash"].as_str().unwrap().to_owned(),
+                    b["reason"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A pass of the collector now.
+    fn gc(&self, immediate: bool) -> Value {
+        self.api(
+            "POST",
+            "/v1/blobs/gc",
+            json!({"reason": "blob crash test", "immediate": immediate}),
+        )
+    }
+
     /// Arms the hold, sends `request` on a thread of its own (it never gets
     /// an answer), waits until a turn waits at the hold, then kills the
     /// daemon with SIGKILL.
-    fn crash_at_hold(&mut self, request: String) {
+    fn crash_at_hold(&mut self, request: impl Into<Vec<u8>>) {
+        let request = request.into();
         std::fs::write(self.data().join("test-hold-armed"), b"").unwrap();
         let http = self.http.clone();
         std::thread::spawn(move || {
             if let Ok(mut s) = TcpStream::connect(http) {
-                let _ = s.write_all(request.as_bytes());
+                let _ = s.write_all(&request);
                 let mut sink = Vec::new();
                 let _ = s.read_to_end(&mut sink);
             }
@@ -215,6 +286,30 @@ fn pattern(n: u64) -> Vec<u8> {
     (0..n).map(|i| ((i * 31 + 7) % 251) as u8).collect()
 }
 
+/// `POST /media/a/<op>?<query>` without a body.
+fn request(op: &str, query: &str) -> String {
+    format!(
+        "POST /media/a/{op}?{query} HTTP/1.1\r\nhost: x\r\ncontent-length: 0\r\n\
+         connection: close\r\n\r\n"
+    )
+}
+
+/// The identity of a blob without a subject: `b3:` and its BLAKE3.
+fn hash(bytes: &[u8]) -> String {
+    format!("b3:{}", blake3::hash(bytes).to_hex())
+}
+
+/// What the media guest's `sum` and `held-sum` answer for `size` bytes of
+/// the pattern: the size and its FNV-1a 64 digest.
+fn pattern_sum(size: u64) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in pattern(size) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{size} {h:016x}")
+}
+
 /// The files of the blob store's objects.
 fn objects(data: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -246,6 +341,15 @@ fn a_crash_after_the_blob_leaves_loose_bytes() {
     let d = Daemon::start(dir.path(), &[]);
     assert_eq!(objects(&d.data()).len(), 1, "the finished blob's file");
     assert!(d.turns().is_empty(), "no record of the turn");
+    // M26: the dry run lists it as loose, and two passes delete it.
+    let loose = hash(&pattern(300_000));
+    assert_eq!(d.plan(), [(loose, "loose".to_owned())]);
+    let first = d.gc(false);
+    assert_eq!(first["deleted"], 0, "{first}");
+    assert_eq!(first["candidates"], 1, "{first}");
+    let second = d.gc(false);
+    assert_eq!(second["deleted"], 1, "{second}");
+    assert!(objects(&d.data()).is_empty());
     let (status, body) = call(&d.http, &write_request(300_000, "k1"));
     assert_eq!(status, 200);
     assert!(body == pattern(300_000), "the retry's answer");
@@ -295,5 +399,98 @@ fn a_crash_before_apply_applies_the_record_at_restart() {
             "the saved answer streams its blob"
         );
         assert_eq!(d.turns().len(), 1, "no second execution");
+    }
+}
+
+/// Criterion 3: the actor holds a blob; a turn that releases it is killed
+/// before its commit. After the restart the actor still holds it, and a new
+/// turn reads it.
+#[test]
+fn a_crash_before_commit_keeps_a_released_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = Daemon::start(dir.path(), &["--test-hold", "before-commit"]);
+    d.media();
+    let put = d.ok("put", "size=3000");
+    let held = hash(&pattern(3000));
+    assert_eq!(put, format!("blob {held} 3000"));
+    assert_eq!(d.holds(), std::slice::from_ref(&held));
+    d.crash_at_hold(request("release", ""));
+    let d = Daemon::start(dir.path(), &[]);
+    assert_eq!(d.holds(), [held], "the release did not commit");
+    assert_eq!(d.ok("held-sum", ""), pattern_sum(3000));
+}
+
+/// Criterion 4: a turn that retains a borrowed blob (an upload), and one
+/// that puts a blob, are killed before their commits. After each restart
+/// the actor holds nothing new, and the bytes those turns left are loose.
+#[test]
+fn a_crash_before_commit_adds_no_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = Daemon::start(dir.path(), &["--test-hold", "before-commit"]);
+    d.media();
+    // A body above the blob threshold (1 MiB) is an upload: the turn
+    // borrows it, and `retain` would make the actor hold it.
+    let body = vec![b'u'; (1 << 20) + 4096];
+    let mut retain = format!(
+        "POST /media/a/retain HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\
+         connection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    retain.extend_from_slice(&body);
+    d.crash_at_hold(retain);
+    let mut d = Daemon::start(dir.path(), &["--test-hold", "before-commit"]);
+    assert!(d.holds().is_empty(), "the retain did not commit");
+    let upload = hash(&body);
+    assert_eq!(d.plan(), [(upload.clone(), "loose".to_owned())]);
+
+    d.crash_at_hold(request("put", "size=5000"));
+    let d = Daemon::start(dir.path(), &[]);
+    assert!(d.holds().is_empty(), "the put did not commit");
+    let put = hash(&pattern(5000));
+    let mut expected = vec![(upload, "loose".to_owned()), (put, "loose".to_owned())];
+    expected.sort();
+    assert_eq!(d.plan(), expected);
+}
+
+/// Criterion 9: a put's record is in the log and not applied when the
+/// daemon is killed. The restart applies it, also from the log alone
+/// (`state.db` deleted): the actor holds the blob, a new turn reads it, and
+/// a pass keeps it.
+#[test]
+fn a_crash_before_apply_rebuilds_the_edge() {
+    for drop_state in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = Daemon::start(dir.path(), &["--test-hold", "record-appended"]);
+        d.media();
+        d.crash_at_hold(request("put", "size=4000"));
+        if drop_state {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(
+                    dir.path()
+                        .join(format!("data/branches/main/state.db{suffix}")),
+                );
+            }
+        }
+        let d = Daemon::start(dir.path(), &[]);
+        let held = hash(&pattern(4000));
+        assert_eq!(
+            d.holds(),
+            std::slice::from_ref(&held),
+            "state.db deleted: {drop_state}"
+        );
+        assert_eq!(d.ok("held-sum", ""), pattern_sum(4000));
+        let pass = d.gc(true);
+        assert_eq!(pass["deleted"], 0, "{pass}");
+        let inspect = d.api("GET", &format!("/v1/blobs/{held}"), Value::Null);
+        assert_eq!(inspect["state"], "live", "{inspect}");
+        assert!(
+            inspect["roots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["kind"] == "held" && r["actor"] == "media/a"),
+            "{inspect}"
+        );
     }
 }

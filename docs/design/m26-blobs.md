@@ -737,23 +737,25 @@ and `blobs_kill.rs` run `kronik serve` as a child process, with hidden
 `serve` flags for test holds like `--test-hold-after-call` today:
 `--test-hold blob-finished`, `record-appended` and `before-commit` hold the
 turn at that point and signal the harness, which `kill -9`s the daemon.
-`scripts/acceptance-m26.sh` runs the release-binary tests on the test VPS.
+`scripts/acceptance-m26.sh` runs the release-binary tests (`blobs_kill.rs` and
+`blobs.rs`, in release mode) on the test VPS, also away from the checkout
+(`KRONIK_M26_KRONIK`, `KRONIK_M26_MEDIA`).
 
 | # | Test | What it does |
 | --- | --- | --- |
 | 1 | `scripts/identity-examples.sh` with `media-ts`; `kronik/tests/blobs.rs` `media_ts_round_trip` | the workload of §15, then a fork with the same code: empty diff in both modes; the downloaded bytes equal the uploaded ones |
 | 2 | `kronik-sched/tests/blobs.rs` `a_learned_hash_is_not_a_reference` | A `put`s and sends the hash as message body text to B; B's `get` and `retain` give `not-held`, and its turn that responds with it fails with `BLOB_NOT_HELD`; A sends the reference in `message.blobs`; B reads it, retains it, and still reads it in a later turn |
 | 3 | `kronik/tests/blobs_kill.rs` `a_crash_before_commit_keeps_a_released_hold` | the actor holds a blob; a turn releases it and holds `before-commit`; `kill -9`; restart: `blob_refs` and a read in a new turn show the hold |
-| 4 | same file, `a_crash_before_commit_adds_no_hold` | a turn retains a borrowed blob (and `put`s another), holds `before-commit`; `kill -9`; restart: no hold; the `put` blob is loose (dry run lists it as `loose`) |
+| 4 | same file, `a_crash_before_commit_adds_no_hold` | a turn that retains a borrowed blob (an upload above the blob threshold) and, after a restart, one that `put`s another hold `before-commit`; `kill -9` each time; after each restart: no hold, and the dry run lists the upload and the `put` blob as `loose` |
 | 5 | `kronik-sched/tests/blobs.rs` `roots_keep_and_the_window_releases` | with `history` of seconds: one blob only in a fork's base state, one only in a snapshot's index (its holder released after the snapshot), one only in a retained record; two immediate passes keep all three; after the fork is deleted, the snapshot pruned and the record compacted, two passes delete them |
-| 6 | DST seeds of §14, and `kronik-sched/tests/blobs.rs` `a_timer_outlives_the_window` | a timer due after 30 days of virtual time (DST) or 30 s with `history` = 5 s (in-process) carries the only reference; snapshots, compactions and passes run past the window; the timer fires and its turn reads the right digest |
+| 6 | DST seeds of §14; `kronik-sched/tests/blob_holds.rs` `a_timer_carries_a_blob_through_retention` (in-process, `history` 0); `kronik/tests/blobs.rs` `a_timer_outlives_the_window` (a real `kronik serve` whose window is seconds long) | a timer due after 30 days of virtual time (DST), or seconds later, carries the only reference; snapshots, compactions and passes run past the window (the dry run does not list it, `inspect` shows the timer's pin and no record); the timer fires and its turn reads the right digest |
 | 7 | `kronik-sched/tests/blobs.rs` `a_running_replay_keeps_what_it_reads` | a replay paused by a test hook after it began reading a blob whose only root was a retained record; the record is compacted and immediate passes run; the replay resumes and reads every byte; after it ends, the blob is collected |
 | 8 | `blobs_kill.rs` `a_crash_after_the_blob_leaves_loose_bytes` | hold `blob-finished`; `kill -9`; restart: the file exists, the dry run lists it as `loose`, two passes delete it |
 | 9 | `blobs_kill.rs` `a_crash_before_apply_rebuilds_the_edge` | hold `record-appended` (the turn record is fsynced, not applied); `kill -9`; restart: the hold exists, the blob reads, a pass keeps it; also with `state.db` deleted before the restart |
 | 10 | `kronik-sched/tests/blobs.rs` `bytes_in_state_keep_nothing` | blob 1's hash in state and SQL only, blob 2 retained; after its record leaves retention, two passes delete 1 and keep 2 |
 | 11 | same file, `the_dry_run_lists_exactly_the_unrooted` | a store with one blob for each root kind and five without a root (loose, released, out of retention, fork deleted, and an erased-and-deleted control); the dry run's set equals the five, with their reasons |
 | 12 | `kronik/tests/privacy_mode.rs` `erasing_a_subject_erases_its_blobs` | mode `on`: a subject's upload and `put`, a second subject's blob from the same turn; erase the first; reads give `SUBJECT_ERASED`, the files are gone, a scan of the data directory finds no plaintext; delete `state.db`, restart: still erased, the second subject's blob still reads; again in mode `off` (files deleted, identity unlinkable) |
-| 13 | `kronik/tests/m6_cli.rs` `restore_keeps_a_timer_only_blob` (a `file://` bucket), and the same against an S3 server (`scripts/s3.sh`) in `kronik-ship/tests/ship.rs` | a blob whose only root is a timer; the creating record compacted away (short `history`, snapshots); shipping; `restore` into a new directory; the restored node's timer fires and reads the right bytes; a check over every restored reference finds none missing |
+| 13 | `kronik/tests/blobs.rs` `restore_keeps_a_timer_only_blob` (a real `kronik serve`, a `file://` bucket, `kronik restore`), and `kronik-ship/tests/blobs.rs` `restore_keeps_a_timer_only_blob_from_a_directory_bucket` and `..._from_s3` (an S3 server: `scripts/s3.sh`) | a blob whose only root is a timer; the creating and releasing records compacted away; shipping; `restore` into a new directory reports no missing blob; the restored node's timer fires and its turn reads the right bytes; a check over every reference in the bucket finds none missing |
 
 DST (§14) covers criteria 3, 4, 5, 6, 8 and 9 under random crashes as well.
 
