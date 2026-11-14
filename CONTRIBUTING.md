@@ -136,6 +136,13 @@ locally, and start the GitHub workflow by hand when a hosted run is needed.
 The Release workflow was already manual. See
 [ADR 0110](docs/adr/0110-manual-github-workflows.md).
 
+CI runs the steps of `scripts/ci.sh` in parallel jobs, each step once: fmt,
+clippy, hygiene, docs, book and deny; test; dst; foreign; examples, ts, sdks
+and identity, in one job because identity replays the examples the others
+build; and action. A job runs its steps in the script's order. The hygiene
+step checks both with `scripts/check-ci-steps.py`, so a new default step in
+`scripts/ci.sh` must also go into one of the jobs.
+
 The synthetic M10 workflow (`.github/workflows/kronik.yml`) is not a general
 build. It still starts only when `examples/github-flow/proof/change.json`
 changes, and only on a real pull request or push, because a manual dispatch
