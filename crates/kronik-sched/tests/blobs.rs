@@ -1045,3 +1045,140 @@ fn the_body_policy_follows_the_kinds_code_and_the_store() {
     let p = start(dir.path(), None);
     assert_eq!(p.node.body_policy("media"), BodyPolicy::Inline);
 }
+
+/// Real files, except that naming a blob (the rename into `objects/`)
+/// fails with an I/O error while `fail` is set.
+struct FailingFs {
+    inner: Arc<dyn kronik_core::env::Fs>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl kronik_core::env::Fs for FailingFs {
+    fn create_dir_all(
+        &self,
+        path: std::path::PathBuf,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
+        self.inner.create_dir_all(path)
+    }
+    fn open(
+        &self,
+        path: std::path::PathBuf,
+        mode: kronik_core::env::OpenMode,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<Arc<dyn kronik_core::env::File>>>
+    {
+        self.inner.open(path, mode)
+    }
+    fn exists(
+        &self,
+        path: std::path::PathBuf,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<bool>> {
+        self.inner.exists(path)
+    }
+    fn read_dir(
+        &self,
+        dir: std::path::PathBuf,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<Vec<String>>> {
+        self.inner.read_dir(dir)
+    }
+    fn rename(
+        &self,
+        from: std::path::PathBuf,
+        to: std::path::PathBuf,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst)
+            && to.components().any(|c| c.as_os_str() == "objects")
+        {
+            return Box::pin(async { Err(std::io::Error::other("injected EIO")) });
+        }
+        self.inner.rename(from, to)
+    }
+    fn remove_file(
+        &self,
+        path: std::path::PathBuf,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
+        self.inner.remove_file(path)
+    }
+    fn sync_dir(
+        &self,
+        dir: std::path::PathBuf,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
+        self.inner.sync_dir(dir)
+    }
+}
+
+/// Found by the blob simulation (B17): the blob store's disk failing in a
+/// turn that already recorded an effect abandoned the turn while the node
+/// kept running, so a retry under the same key started a second execution.
+/// Now the node stops, as for a failure of its log; the retry is refused,
+/// and after the restart the open turn runs again and answers it.
+#[allow(clippy::disallowed_methods)]
+#[test]
+fn a_blob_store_io_failure_stops_the_node_and_the_turn_runs_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let node = rt.block_on(async {
+        let mut env = Env::real(tokio::runtime::Handle::current());
+        env.fs = Arc::new(FailingFs {
+            inner: env.fs.clone(),
+            fail: fail.clone(),
+        });
+        let config = NodeConfig {
+            concurrency: 8,
+            blobs: Some(BlobsConfig::default()),
+            ..NodeConfig::default()
+        };
+        start_local(env, dir.path(), config).await.unwrap()
+    });
+    let p = Proc { rt, node };
+    let owner = p.node.local_operator_authority().unwrap();
+    p.rt.block_on(
+        p.node
+            .deploy(&std::fs::read(MEDIA).unwrap(), audit(), false, owner),
+    )
+    .unwrap();
+    p.effect_setup(1 << 20, None);
+    let (addr, requests) = counting_server();
+    let keyed = || {
+        let mut h = http(
+            "fetch-write",
+            "size=300000",
+            inline(format!("http://{addr}/x").as_bytes()),
+        );
+        h.idempotency_key = "io-1".into();
+        h.request_hash = {
+            let mut v = vec![kronik_sched::INGRESS_HASH_VERSION];
+            v.extend_from_slice(blake3::hash(b"io-1").as_bytes());
+            v
+        };
+        h
+    };
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let failed = p.ingress_with(keyed(), IngressExtras::default());
+    assert!(failed.is_err(), "{:?}", failed.map(|r| r.outcome));
+    assert!(p.node.fatal().is_some(), "the node stopped");
+    let retry = p.ingress_with(keyed(), IngressExtras::default());
+    assert!(retry.is_err(), "no second execution on a stopped node");
+    assert_eq!(p.node.store().db().open_turns().unwrap().len(), 1);
+    drop(p);
+
+    // The restart runs the open turn again; the retry gets its answer.
+    let p = start(dir.path(), Some(BlobsConfig::default()));
+    p.effect_setup(1 << 20, None);
+    for _ in 0..200 {
+        if p.node.store().db().open_turns().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(p.node.store().db().open_turns().unwrap().is_empty());
+    let answered = p.ingress_with(keyed(), IngressExtras::default()).unwrap();
+    assert!(answered.committed(), "{:?}", answered.outcome);
+    let blob = blob_answer(&answered);
+    assert_eq!(blob.size, 300_000);
+    assert!(requests.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+}

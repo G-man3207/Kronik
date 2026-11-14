@@ -60,8 +60,12 @@ pub enum BlobHostError {
     /// scrubbed from it: `blob-error::quota-exceeded`.
     TooLarge,
     /// A committed reference's bytes are not in the store (`BLOB_MISSING`):
-    /// the turn is abandoned without a record.
+    /// the turn fails.
     Missing(String),
+    /// The blob store's disk failed (an I/O error, a failed sync): what is
+    /// durable there is unknown, so the node stops, as for a failure of its
+    /// log, and the restart runs the turn again.
+    Io(String),
     /// A host failure (a missing or damaged blob, I/O): the turn is
     /// abandoned without a record.
     Host(String),
@@ -189,6 +193,10 @@ impl TurnHost {
             }
             BlobHostError::TooLarge => {
                 self.host_failure("a blob too large where nothing was written".into())
+            }
+            BlobHostError::Io(message) => {
+                self.fatal = Some(RunError::BlobIo(message.clone()));
+                wasmtime::format_err!("the blob store failed: {message}")
             }
             BlobHostError::Host(message) => self.host_failure(message),
         }

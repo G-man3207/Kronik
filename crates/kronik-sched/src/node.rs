@@ -2557,8 +2557,36 @@ impl Node {
                 self.stash_blob_wait(actor, begun, fx.admitted_begin(), last);
                 return Err(ApiError::new(ErrorCode::BlobStoreFull, message));
             }
+            // The blob store's disk failed: what it holds durably is
+            // unknown, so the node stops, as for a failure of its log; the
+            // restart runs an open turn again (M25 §4.7).
+            Err(kronik_runtime::RunError::BlobIo(message)) => {
+                let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
+                let message = format!("the blob store failed: {message}");
+                tracing::error!(actor = %actor, "{message}");
+                self.fatal.set(message.clone());
+                return Err(ApiError::new(ErrorCode::Unavailable, message));
+            }
+            // A blob the turn needs is gone (never expected): running the
+            // turn again cannot help, so a turn that recorded effects is
+            // closed as failed under its execution id, and one that did not
+            // fails without a record.
             Err(kronik_runtime::RunError::BlobMissing(message)) => {
                 let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
+                let begun = lock(&fx.state).begun;
+                if begun {
+                    let effects = std::mem::take(&mut lock(&fx.state).records);
+                    return self
+                        .close_open_turn(
+                            fx.admitted_begin().clone(),
+                            effects,
+                            ErrorCode::BlobMissing,
+                            message,
+                            false,
+                            born,
+                        )
+                        .await;
+                }
                 return Err(ApiError::new(ErrorCode::BlobMissing, message));
             }
             Err(e) => {
@@ -2781,6 +2809,14 @@ impl Node {
                         fxs.last_result_lsn,
                     );
                     ApiError::new(ErrorCode::BlobStoreFull, error.to_string())
+                }
+                // Naming the blobs failed on disk: the node stops, as for
+                // a failure of its log (M25 §4.7).
+                kronik_blob::BlobError::Io(message) => {
+                    let message = format!("the blob store failed: {message}");
+                    tracing::error!(actor = %actor, "{message}");
+                    self.fatal.set(message.clone());
+                    ApiError::new(ErrorCode::Unavailable, message)
                 }
                 other => internal(other),
             });

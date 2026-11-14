@@ -220,6 +220,8 @@ enum Exchanged {
     },
     /// The response could not be stored: the blob store is below its reserve.
     StoreFull(String),
+    /// The blob store's disk failed while storing the response.
+    StoreFailed(String),
     /// The response could not be stored for another reason.
     Failed(String),
 }
@@ -1604,6 +1606,9 @@ impl TurnFx {
         {
             blobs.ensure_durable().await.map_err(|e| match e {
                 kronik_blob::BlobError::StoreFull { .. } => GateError::BlobStoreFull(e.to_string()),
+                kronik_blob::BlobError::Io(m) => {
+                    GateError::BlobIo(format!("naming a request body blob: {m}"))
+                }
                 other => GateError::Host(format!("naming a request body blob: {other}")),
             })?;
         }
@@ -1769,6 +1774,7 @@ impl TurnFx {
                         Err(crate::blobs::StreamError::TooLarge) => Err(NetError::TooLarge),
                         Err(crate::blobs::StreamError::Source(e)) => Err(NetError::Io(e)),
                         Err(crate::blobs::StreamError::StoreFull(m)) => Ok(Exchanged::StoreFull(m)),
+                        Err(crate::blobs::StreamError::Io(m)) => Ok(Exchanged::StoreFailed(m)),
                         Err(crate::blobs::StreamError::Store(m)) => Ok(Exchanged::Failed(m)),
                     }
                 })
@@ -1871,6 +1877,11 @@ impl TurnFx {
             // a crash once the request left (M25 §4.7, I17).
             Ok(Ok(Exchanged::StoreFull(message))) => {
                 return Err(GateError::BlobStoreFull(message));
+            }
+            Ok(Ok(Exchanged::StoreFailed(message))) => {
+                return Err(GateError::BlobIo(format!(
+                    "storing a response blob: {message}"
+                )));
             }
             Ok(Ok(Exchanged::Failed(message))) => {
                 return Err(GateError::Host(format!(

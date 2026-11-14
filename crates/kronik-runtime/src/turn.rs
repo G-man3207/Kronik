@@ -75,6 +75,11 @@ pub enum RunError {
     /// (`BLOB_MISSING`); never expected, as a record follows its blobs.
     #[error("BLOB_MISSING: {0}")]
     BlobMissing(String),
+    /// The blob store's disk failed: its durability is unknown, so the
+    /// node stops as for a failure of its log (the restart runs the turn
+    /// again).
+    #[error("the blob store failed: {0}")]
+    BlobIo(String),
     /// A sealed value reached the turn unopened: its subject's key is not
     /// in this node's privacy keystore (`KEYSTORE_INCOMPLETE`).
     #[error(

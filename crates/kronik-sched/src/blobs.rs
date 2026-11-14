@@ -305,6 +305,8 @@ pub(crate) enum StreamError {
     /// The blob store is below its reserve: the turn runs again later, as
     /// after a crash once the request left (M25 §4.7).
     StoreFull(String),
+    /// The blob store's disk failed: the node stops (M25 §4.7).
+    Io(String),
     /// Any other store failure: a host failure.
     Store(String),
 }
@@ -313,6 +315,7 @@ impl StreamError {
     fn from_blob(error: BlobError) -> StreamError {
         match error {
             BlobError::StoreFull { .. } => StreamError::StoreFull(error.to_string()),
+            BlobError::Io(message) => StreamError::Io(message),
             other => StreamError::Store(other.to_string()),
         }
     }
@@ -359,6 +362,7 @@ fn host_error(error: BlobError) -> BlobHostError {
             kronik_metrics::inc("kronik_blob_missing_total", &[]);
             BlobHostError::Missing(format!("blob {id} is not in the blob store"))
         }
+        BlobError::Io(message) => BlobHostError::Io(message),
         other => BlobHostError::Host(other.to_string()),
     }
 }

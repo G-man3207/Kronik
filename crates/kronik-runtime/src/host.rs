@@ -287,6 +287,9 @@ pub enum GateError {
     /// its reserve. The turn attempt is abandoned without its result, as
     /// after a crash once the request left (M25 §4.7), and runs again.
     BlobStoreFull(String),
+    /// The blob store's disk failed storing a response or naming a blob
+    /// (M25): the node stops, as for a failure of its log.
+    BlobIo(String),
 }
 
 /// A typed trap cause; guest strings cannot forge this downcast.
@@ -620,6 +623,10 @@ impl TurnHost {
             GateError::BlobStoreFull(msg) => {
                 self.fatal = Some(RunError::BlobStoreFull(msg.clone()));
                 wasmtime::format_err!("BLOB_STORE_FULL: {msg}")
+            }
+            GateError::BlobIo(msg) => {
+                self.fatal = Some(RunError::BlobIo(msg.clone()));
+                wasmtime::format_err!("the blob store failed: {msg}")
             }
         }
     }
