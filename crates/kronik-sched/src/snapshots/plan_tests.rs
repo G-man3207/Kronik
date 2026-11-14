@@ -119,9 +119,11 @@ fn no_base_is_chosen_before_a_snapshot_is_older_than_the_window() {
 }
 
 #[test]
-fn a_zero_window_bases_on_the_newest_snapshot() {
-    // history = 0 (tests): the newest snapshot's state is the window's
-    // start, so it is the base and nothing older is kept.
+fn a_zero_window_bases_on_the_newest_snapshot_older_than_the_last_turn() {
+    // history = 0 (tests): the window holds the fork points at the newest
+    // turn's time. The newest snapshot holds a turn of that time, so the one
+    // before it is the base; after one more turn the newest is older than
+    // the window and becomes the base.
     let snaps: Vec<SnapshotPoint> = (1..=5)
         .map(|i| SnapshotPoint {
             lsn: i * 10,
@@ -129,8 +131,36 @@ fn a_zero_window_bases_on_the_newest_snapshot() {
         })
         .collect();
     let plan = retention_plan(&snaps, 25, 5000, 2, 3_600_000, None);
-    assert_eq!(plan.base, Some(50));
+    assert_eq!(plan.base, Some(40));
     assert_eq!(plan.keep.iter().copied().collect::<Vec<_>>(), vec![40, 50]);
+    let plan = retention_plan(&snaps, 25, 5001, 2, 3_600_000, None);
+    assert_eq!(plan.base, Some(50));
+}
+
+/// The review's boundary case: turns share a millisecond, so the first
+/// turn in the window can have exactly the cutoff's time. A fork there is
+/// inside the window (only `t < cutoff` is outside), and a snapshot taken
+/// after it, whose newest turn has that same time, cannot start it: it is
+/// not the base, and compaction keeps the log from the older one.
+#[test]
+fn a_snapshot_at_the_cutoffs_own_millisecond_is_not_the_base() {
+    let cutoff = 7 * DAY;
+    let snaps = [
+        SnapshotPoint {
+            lsn: 100,
+            logical_time_ms: cutoff - 1,
+        },
+        // The turns at lsn 101..=120 have the time `cutoff`: a fork at 110
+        // is in the window and needs a snapshot at or before 110.
+        SnapshotPoint {
+            lsn: 120,
+            logical_time_ms: cutoff,
+        },
+    ];
+    let plan = retention_plan(&snaps, 1, cutoff, 1, DAY, None);
+    assert_eq!(plan.base, Some(100));
+    assert!(plan.keep.contains(&100));
+    assert_eq!(base_for(&snaps, 101, 110).map(|s| s.lsn), Some(100));
 }
 
 #[test]

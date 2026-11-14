@@ -10,6 +10,7 @@ use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, CodeHash, Lsn, TurnId, random_id};
 use kronik_core::time::LogicalClock;
+use kronik_effects::http::FingerprintRules;
 use kronik_effects::rate::RateLimiter;
 use kronik_effects::{Capability, Config, ConfigHistory, Delivery, KindLimits, Rate};
 use kronik_log::{Committed, Log, LogConfig, LogError, LogReader};
@@ -403,6 +404,8 @@ pub struct Node {
     pub probe: Probe,
     /// The audit export's floor under retention (ADR 0084).
     retention_hold: crate::snapshots::RetentionHold,
+    /// What the last retention pass kept for an open turn.
+    pub(crate) retention_pin: Mutex<crate::snapshots::PinState>,
     /// How often retention compacted the index rows (`db.compact`).
     pub(crate) db_compactions: std::sync::atomic::AtomicU64,
     me: Weak<Node>,
@@ -835,6 +838,7 @@ impl Node {
             rebase: rebase.clone(),
             probe: Probe::default(),
             retention_hold: Default::default(),
+            retention_pin: Default::default(),
             db_compactions: Default::default(),
             me: me.clone(),
             foreign: config.foreign.0.clone(),
@@ -963,9 +967,10 @@ impl Node {
             node.enqueue_mailbox(row);
         }
         {
+            let now = node.timer_now();
             let mut w = lock(&node.wheel);
             for t in &timers {
-                w.add(t.actor.clone(), t.timer_id, t.due_ms);
+                w.add(t.actor.clone(), t.timer_id, t.due_ms, now);
             }
         }
         let weak = Arc::downgrade(&node);
@@ -1228,6 +1233,36 @@ impl Node {
     }
 
     /// Queues a pending message of the mailbox.
+    /// The present for the timer wheel: the logical time a turn starting now
+    /// gets but for its parent, `max(wall clock, high-water mark)`, and the
+    /// monotonic clock (ADR 0006, #40).
+    pub(crate) fn timer_now(&self) -> crate::timers::Now {
+        crate::timers::Now {
+            logical_ms: self.env.clock.wall_ms().max(self.clock.high_water()),
+            monotonic: self.env.clock.monotonic(),
+        }
+    }
+
+    /// The compensation of the timed-out call `call_message_id` that the
+    /// record at `lsn` released (#30). A failed read leaves it in the
+    /// mailbox, where the next start delivers it.
+    pub(crate) fn released_compensation(
+        &self,
+        call_message_id: &str,
+        lsn: Lsn,
+    ) -> Option<kronik_store::db::MailboxRow> {
+        match self.store.db().released_compensation(call_message_id, lsn) {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "reading a released compensation failed; the next start delivers it"
+                );
+                None
+            }
+        }
+    }
+
     fn enqueue_mailbox(&self, row: kronik_store::db::MailboxRow) {
         let (parent_time, subject) = match &row.input.kind {
             Some(pb::input::Kind::Message(m)) => {
@@ -1273,10 +1308,11 @@ impl Node {
             )
         };
         {
+            let now = self.timer_now();
             let mut w = lock(&self.wheel);
             *w = Wheel::default();
             for t in &timers {
-                w.add(t.actor.clone(), t.timer_id, t.due_ms);
+                w.add(t.actor.clone(), t.timer_id, t.due_ms, now);
             }
         }
         self.wheel_notify.notify_one();
@@ -1826,16 +1862,43 @@ impl Node {
             epoch,
         );
         if base > record_limit {
-            // Not even a failed record could hold this input. Nothing of the
-            // turn was written; a root input is refused like a body over
-            // the limit.
-            return Err(ApiError::new(
-                ErrorCode::PayloadTooLarge,
-                format!(
-                    "the input of {actor} needs {base} bytes of its turn's record, which holds \
-                     at most {record_limit}; the turn did not run"
-                ),
-            ));
+            // Not even a failed record could hold this input within the
+            // budget. A new input: nothing of the turn was written, and it is
+            // refused like a body over the limit.
+            let Some(begin) = recovery_begin else {
+                return Err(ApiError::new(
+                    ErrorCode::PayloadTooLarge,
+                    format!(
+                        "the input of {actor} needs {base} bytes of its turn's record, which \
+                         holds at most {record_limit}; the turn did not run"
+                    ),
+                ));
+            };
+            // An open turn whose TurnBegin an earlier release wrote, before
+            // this budget existed: refusing it would leave it open, run it
+            // again at every start and keep its segment from retention for
+            // ever. Close it as failed under its own execution id.
+            tracing::warn!(
+                actor = %actor,
+                execution_id = %begin.execution_id,
+                needed = base,
+                limit = record_limit,
+                "the input of an open turn does not fit in a turn's record under this release's \
+                 budget: the turn is closed as failed without running again"
+            );
+            return self
+                .close_open_turn(
+                    begin,
+                    recorded.unwrap_or_default(),
+                    ErrorCode::TurnTooLarge,
+                    format!(
+                        "the turn's input needs {base} bytes of its record, which holds at \
+                         most {record_limit}: the turn, begun by an earlier release, did not \
+                         run again"
+                    ),
+                    false,
+                )
+                .await;
         }
         let fx = TurnFx::new(
             me,
@@ -2052,11 +2115,24 @@ impl Node {
         } else {
             None
         };
+        // A turn that does not commit after an effect whose outcome is unknown
+        // ends with EFFECT_OUTCOME_UNKNOWN, also when its record is too large:
+        // `fit` and `fail` decide it on the final record, as a replay does.
         let committed = out.committed();
-        if !committed && fxs.outcome_unknown && !output_too_large {
-            out.outcome.kind = pb::OutcomeKind::EffectOutcomeUnknown as i32;
-            out.outcome.error_code = ErrorCode::EffectOutcomeUnknown.as_str().into();
-        }
+        // Calls whose callee may still commit (#30), and, when this is the
+        // callee's turn of a call, that call's message id.
+        let timed_out: std::collections::BTreeSet<u32> = fxs
+            .records
+            .iter()
+            .filter(|e| e.timed_out_call())
+            .map(|e| e.ordinal)
+            .collect();
+        let call_message_id = match &input.kind {
+            Some(pb::input::Kind::Message(m)) if m.source == pb::MessageSource::Call as i32 => {
+                Some(m.message_id.clone())
+            }
+            _ => None,
+        };
         let mut record = pb::TurnRecord {
             execution_id,
             actor: Some(actor.to_pb()),
@@ -2099,12 +2175,20 @@ impl Node {
         } else {
             crate::record_budget::fit(&mut record, &fxs.compensations, record_limit, input_cost)
         };
-        if fitted != crate::record_budget::Fit::Fits {
-            tracing::warn!(
+        match fitted {
+            crate::record_budget::Fit::Fits => {}
+            crate::record_budget::Fit::Over => tracing::error!(
+                actor = %actor,
+                execution_id = %record.execution_id,
+                "the turn's failed record is over the turn budget even without its effects \
+                 (an earlier release recorded its input or compensations past it); appending \
+                 it anyway"
+            ),
+            _ => tracing::warn!(
                 actor = %actor,
                 stripped = fitted == crate::record_budget::Fit::Stripped,
                 "the turn's record did not fit in one log record: it fails with TURN_TOO_LARGE"
-            );
+            ),
         }
         let outcome = record.outcome.clone().unwrap_or_default();
         let committed = outcome.kind == pb::OutcomeKind::Committed as i32;
@@ -2136,6 +2220,14 @@ impl Node {
         if !committed {
             for m in fxs.compensations {
                 let compensates = causal::message_id(&key, m.ordinal);
+                // A timed-out call's compensation goes out only once its
+                // callee's turn commits (#30): now if that turn came first,
+                // else when it is applied.
+                if timed_out.contains(&m.ordinal)
+                    && self.released_compensation(&compensates, lsn).is_none()
+                {
+                    continue;
+                }
                 self.deliver(
                     actor,
                     &key,
@@ -2146,11 +2238,19 @@ impl Node {
                 );
             }
         }
+        // The callee's turn of a call whose caller failed after the call
+        // timed out: the compensation it released (#30).
+        if let Some(call_message_id) = &call_message_id
+            && let Some(row) = self.released_compensation(call_message_id, lsn)
+        {
+            self.enqueue_mailbox(row);
+        }
         if !timers.is_empty() {
+            let now = self.timer_now();
             let mut w = lock(&self.wheel);
             for t in &timers {
                 if t.kind == pb::TimerOpKind::Schedule as i32 {
-                    w.add(actor.clone(), t.timer_id, t.due_ms);
+                    w.add(actor.clone(), t.timer_id, t.due_ms, now);
                 } else {
                     w.remove(actor, t.timer_id);
                 }
@@ -4111,14 +4211,15 @@ impl Node {
         Ok((epoch, lsn))
     }
 
-    /// `kronik limits set`: unset fields keep their value.
+    /// `kronik limits set`: unset fields keep their value. Answers the
+    /// kind's limits and fingerprint rules in force after it.
     pub async fn set_limits(
         &self,
         mut limits: pb::Limits,
         audit: pb::Audit,
         dry_run: bool,
         authority: AuthLease,
-    ) -> Result<(u64, Lsn, KindLimits), ApiError> {
+    ) -> Result<(u64, Lsn, KindLimits, FingerprintRules), ApiError> {
         authority.check()?;
         self.check_alive()?;
         if !kronik_core::ids::valid_kind(&limits.kind) {
@@ -4126,6 +4227,19 @@ impl Node {
                 ErrorCode::BadRequest,
                 format!("{:?} is not a valid kind", limits.kind),
             ));
+        }
+        // The fingerprint lists (ADR 0134) are checked here and recorded
+        // canonical: lowercase headers, sorted, without duplicates or the
+        // default headers, which are always left out.
+        let bad = |message: String| ApiError::new(ErrorCode::BadRequest, message);
+        let mut checked = FingerprintRules::default();
+        if let Some(list) = limits.fingerprint_exclude_headers.as_mut() {
+            checked.set_headers(&list.names).map_err(bad)?;
+            list.names = checked.headers().to_vec();
+        }
+        if let Some(list) = limits.fingerprint_exclude_query.as_mut() {
+            checked.set_query(&list.names).map_err(bad)?;
+            list.names = checked.query().to_vec();
         }
         let guard = self.lock_deploy_authorized(&authority).await?;
         let epoch = self.epoch() + 1;
@@ -4135,13 +4249,14 @@ impl Node {
         let record = Record::Limits(limits.clone());
         preview.apply(&record);
         let effective = preview.limits(&limits.kind);
+        let rules = preview.fingerprint_rules(&limits.kind);
         if dry_run {
-            return Ok((epoch, 0, effective));
+            return Ok((epoch, 0, effective, rules));
         }
         let lsn = self
             .commit_config_authorized(guard, epoch, record, authority)
             .await?;
-        Ok((epoch, lsn, effective))
+        Ok((epoch, lsn, effective, rules))
     }
 
     /// Reads one record of this branch's log.
@@ -4344,23 +4459,24 @@ async fn disk_space_loop(node: Weak<Node>, dir: std::path::PathBuf) {
     }
 }
 
-/// Fires due timers: sleeps until the next due time (wall clock) or until a
-/// new timer arrives, then queues each due timer's turn.
+/// Fires due timers: sleeps until the next timer is due, by logical time or
+/// by its monotonic deadline ([`Wheel`]), or until a new timer arrives, then
+/// queues each due timer's turn.
 async fn timer_loop(node: Weak<Node>) {
     loop {
         let Some(n) = node.upgrade() else { return };
-        let now = n.env.clock.wall_ms();
+        let now = n.timer_now();
         let (due, next) = {
             let mut w = lock(&n.wheel);
-            (w.take_due(now), w.next_due())
+            (w.take_due(now), w.next_wait(now))
         };
         for (actor, id, due_ms) in due {
             n.fire_timer(actor, id, due_ms);
         }
         let wait = next
-            .map_or(60_000, |d| d.saturating_sub(now))
-            .clamp(1, 60_000);
-        let sleep = n.env.clock.sleep(Duration::from_millis(wait));
+            .unwrap_or(Duration::from_secs(60))
+            .clamp(Duration::from_millis(1), Duration::from_secs(60));
+        let sleep = n.env.clock.sleep(wait);
         let notify = n.wheel_notify.clone();
         drop(n);
         let notified = notify.notified();

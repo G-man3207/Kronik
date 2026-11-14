@@ -115,17 +115,19 @@ Secrets arrive with M2.
   `--in-forks compute` writes `recorded`. A name that is linked to an
   external backend at the fork point is computed with the value the node
   already holds for that link, and denied (`SECRET_UNAVAILABLE`) when it
-  holds none: a fork never asks the backend. A preview (M11) answers whoever
+  holds none: a fork never asks the backend. Both are graded synthetic
+  (ADR 0132). A preview (M11) answers whoever
   has its URL, so it gets no production key at all: its `crypto.*` calls
   answer `no recording`.
 - **Scrubbing.** When a turn used or revealed a secret, exact occurrences of
   the value are replaced by `[secret:<name>]` in the turn's state writes,
-  SQL text values, messages, timers, compensations, output, effect
-  requests and responses (each `EffectResult` before it is appended) and
-  log events before anything is written, so the value reaches neither the
-  log nor a state file. Fork turns are scrubbed the same way. Responses from HTTP targets are scrubbed of the inserted
+  SQL text and blob values (a blob stays a blob), messages, timers,
+  compensations, output, effect requests and responses (each
+  `EffectResult` before it is appended) and log events before anything is
+  written, so the value reaches neither the log nor a state file. Fork turns are scrubbed the same way. Responses from HTTP targets are scrubbed of the inserted
   values before the guest sees them, and the API's views of actors,
-  history, turns and dead letters replace the values of all live secrets.
+  history, turns, timers and dead letters replace the values of all live
+  secrets.
 
 Scrubbing matches exact bytes, and only values of at least 4 bytes other
 than `true`, `false` and `null` (which would break JSON). An
@@ -295,8 +297,9 @@ that a turn generated from `random-bytes`.
   which exempts it from the share. An actor's response cannot set
   `Content-Length`, `Connection`, `Transfer-Encoding` or another hop-by-hop
   header, nor `kronik-turn-id`, so it cannot spill into the next response
-  on a connection; an informational status (1xx) is answered with
-  `TURN_FAILED`. A failure inside Kronik is answered with a generic
+  on a connection; a status outside 200 to 599, an informational one (1xx)
+  or one of 600 and above, is answered with `TURN_FAILED`. A failure inside
+  Kronik is answered with a generic
   `INTERNAL`, and the daemon's log has the details. Without TLS, keep the
   gateway on a private address or behind a proxy that terminates TLS.
 - **File descriptors.** `kronik serve` raises its soft limit on open files

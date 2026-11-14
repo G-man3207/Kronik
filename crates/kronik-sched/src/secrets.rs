@@ -954,6 +954,39 @@ impl SecretCache {
             value: bytes.to_vec(),
         }))
     }
+    /// What a fork may compute an unmatched `crypto.*` with (m23 section 6):
+    /// the value this process holds for the current version of `config`'s
+    /// link of `name`, while it is still authorized (operational, younger
+    /// than `max_stale`, not revoked by a definitive failure). Never the
+    /// built-in store, never a fetch, and read-only: unlike [`Self::cached`]
+    /// it marks no value stale and logs nothing, so a fork never changes
+    /// production's `kronik_secret_stale` or its log.
+    pub fn fork_value(&self, name: &str, config: &Config) -> Option<SecretValue> {
+        if !kronik_privacy::valid_name(name) {
+            return None;
+        }
+        let scope = Scope::config(name, config);
+        if scope.backend == "file" || !self.trusted(&scope) {
+            return None;
+        }
+        let row = self.row(&scope, None)?;
+        if !active(&row) || row.deleted {
+            return None;
+        }
+        if self
+            .negative(&scope)
+            .is_some_and(|error| error != BackendError::Unavailable)
+        {
+            return None;
+        }
+        let state = lock(&self.state);
+        let held = state.values.get(&(row.name.clone(), row.version))?;
+        let age = self.env.clock.monotonic().saturating_sub(held.checked);
+        (held.operational && age <= self.settings.max_stale).then(|| SecretValue {
+            meta: meta(&row),
+            value: held.bytes.to_vec(),
+        })
+    }
     /// Native fingerprint/privacy verification only. Retained bytes never
     /// authorize a reveal, a resend, a fork or an operational provider fallback.
     pub(crate) fn scrub_reference(

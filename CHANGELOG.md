@@ -19,7 +19,14 @@ until the v1.0 compatibility promise takes effect.
   it. Readers accept a complete over-limit record that an earlier release
   wrote, and a start never truncates a record `state.db` has applied: a
   damaged one is `STORAGE_CORRUPT` with nothing cut off. No log-format
-  change.
+  change. A turn that fails after an effect whose outcome is unknown keeps
+  the code `EFFECT_OUTCOME_UNKNOWN` also when its record was too large. A
+  turn that an earlier release left open with an input this budget does not
+  hold is closed as failed (`TURN_TOO_LARGE`) at the next start instead of
+  being refused at every start. A fork denies a call to an undeclared
+  foreign actor with production's text and fits the answers it makes up
+  (stub rules, contract fakes, neighbors, the model) to the record as it
+  fits live ones.
 - Forks, replays and proposals now work at every point of the
   `[retention] history` window, as the brief requires (#66). Retention kept
   the log for the window but only the newest `snapshots_kept` snapshots and
@@ -45,7 +52,11 @@ until the v1.0 compatibility promise takes effect.
   start reads to run the turn again (#35). Retention now keeps that segment
   while a turn is open in the state or in a kept snapshot, the snapshot's
   manifest names it, and a directory that already lost it fails with
-  `STORAGE_CORRUPT` naming the turn's execution id.
+  `STORAGE_CORRUPT` naming the turn's execution id. When that keeps a
+  segment past `[retention] history`, the daemon says so: a log line naming
+  the turn (a warning for a turn open in the running state), the gauge
+  `kronik_retention_open_turn_segments`, `retention_pin` in `/v1/health`,
+  and the new `kronik doctor` check `retention`.
 - An open turn whose re-run after a restart met an input of an erased
   subject, or a kind that is no longer deployed, is closed once: its failed
   record now carries the turn's own execution id and its recorded effects.
@@ -94,7 +105,11 @@ M23, key and secret backends:
 - An unmatched `crypto.*` of a fork under a `compute` grant computes a name
   linked at the fork point with the value the node already holds for that
   link, and is denied with `SECRET_UNAVAILABLE` when it holds none, instead of
-  `SECRET_EXTERNAL` for every linked name. A fork still never asks a backend.
+  `SECRET_EXTERNAL` for every linked name. Both are graded synthetic (ADR
+  0132): what the node holds is not in the log, so the diff of a proposal
+  grades them the same after a restart. The fork reads the value without
+  touching production's stale tracking, `kronik_secret_stale` or its log. A
+  fork still never asks a backend.
 - After a restart, the crash re-run of a turn that used an older version of a
   linked secret made new effects use that version too, until `[secrets]
   refresh` passed, although a newer one had been recorded. Found against a
@@ -122,6 +137,75 @@ M23, key and secret backends:
   against the real clouds with an operator's credentials (not run by the
   project); `scripts/e2e-pkcs11.sh` runs the `kronik-keyhelper` flow against
   SoftHSM2.
+- The gateway sent an actor's status of 600 to 999 to the client as it was,
+  although an actor answers with 200 to 599; like an informational status, it
+  is now answered with `TURN_FAILED` (#68).
+- The API read a `+` in a path segment as a space, so an actor whose key
+  holds a `+` (which the gateway creates and serves) answered `BAD_REQUEST`
+  at `/v1/actors/<kind>/<key>` unless the client wrote `%2B`. A `+` in a path
+  is now literal; in a query it still means a space (#47).
+- An answer that is not the API's (a proxy's error page, an empty body) made
+  the human CLI print an uncoded `error: the daemon answered HTTP 502: ...`
+  while `--json` printed `UNAVAILABLE` with a hint. Both now print the same
+  `UNAVAILABLE` error, with its hint, `docs:` line and the start of the page
+  (#41).
+- `kronik mcp` ignored `--json` when it could not start (no daemon on the
+  socket, a refused `--url`, a bad configuration), so an agent host decoding
+  stdout got nothing, and the unreachable-daemon error had no `docs:` line. A
+  failure to start is now the error JSON on stdout with `--json` and a full
+  error (code, hint, `docs:`) otherwise, and a token the daemon refuses is
+  `UNAUTHENTICATED` instead of `UNAVAILABLE` (#42).
+- `GET /v1/actors/{kind}/{key}/timers` returned pending timers' message names
+  unscrubbed, and answered 200 while the secret inventory was unavailable,
+  where every other view of a turn's data scrubs them or answers 503. It now
+  scrubs names like a turn's `timers[].name` and fails closed with
+  `SECRET_UNAVAILABLE` (#44).
+- `demo/verify-change.sh` with `GUESTS=test` stopped with a Python traceback
+  after a successful promote: the test guests answer the decimal n, and the
+  script parsed JSON. It reads both now, and the M3 acceptance script runs
+  that mode too (#50).
+- A revealed secret written into a SQL `BLOB` cell was not scrubbed: the
+  scrub covered text cells only, so its bytes reached the turn's SQL
+  changeset in the log and the actor database, also in privacy mode `on`.
+  Blob cells are scrubbed byte for byte now and stay blobs, and a secret
+  that is not UTF-8 is scrubbed from them too (#37).
+- A `call` that timed out while its callee was busy still committed at the
+  callee, but when the caller's turn then failed the change was neither an
+  orphan (`history --orphans`, `GET /v1/orphans`) nor compensated, and a
+  compensation attached to the call was dropped (#30). Such a call now
+  becomes an orphan, and its compensation is delivered exactly once, as soon
+  as the callee's turn commits, whether that is before or after the caller's
+  failure; a callee turn that fails leaves neither. A successful call whose
+  reply was withheld (`HOST_REDACTION_FAILURE`) is now an orphan too, as its
+  compensation already was delivered. The behavior diff counts orphans the
+  same way, so `errors.new_orphans` no longer reports production's orphan of
+  a timed-out call as new in the fork.
+- A fork could not replay a turn whose call reply production had withheld
+  as over the caller's response limit (`HOST_REDACTION_FAILURE`): the fork's
+  call record named no callee source, so the replay stopped with
+  `UNAVAILABLE`. The fork's record now names the fork's callee turn, and the
+  fork withholds the reply, fails the turn and delivers the call's
+  compensation as production did.
+- After the host clock stepped back (an NTP correction, a VM resume, an
+  operator fixing a clock that ran ahead), every timer waited until the wall
+  clock had climbed back by the step, minutes late for webhook retries,
+  leases and holds, although ADR 0006 said timers are due against logical
+  time (#40). A timer now fires when logical time reaches its due time or
+  when its delay has passed on the monotonic clock, whichever comes first;
+  nothing recorded changes. DST's webhook workload steps its clock back 5 to
+  10 minutes and no longer corrects it before draining, and every run checks
+  that a timer turn runs at or after its due time.
+- An actor type can leave more headers and query parameters out of its HTTP
+  fingerprints than the six default headers (#39, ADR 0134): `kronik limits
+  set <kind> --fingerprint-exclude-header x-api-key
+  --fingerprint-exclude-query ts,nonce` (and `fingerprint_exclude_headers` /
+  `fingerprint_exclude_query` in `POST /v1/limits`), so a rotating key or a
+  timestamp no longer makes a re-run diverge or a fork's match approximate.
+  The rules are part of the log: a request with rules is recorded as
+  fingerprint version 3 with the names it left out, and every recording is
+  matched under its own rules. Requests without rules stay version 2, byte
+  for byte; a binary from before this release refuses a log with version 3
+  requests.
 
 ## v0.4.1 — 2026-11-07
 

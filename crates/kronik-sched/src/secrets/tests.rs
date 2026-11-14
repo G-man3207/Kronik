@@ -804,6 +804,38 @@ async fn a_value_fetched_by_its_version_does_not_become_the_current_value() {
     );
 }
 
+/// A fork reads a held value without touching production's view of it
+/// (review of integration, item 7): a value older than `refresh` is not
+/// marked stale, so neither `kronik_secret_stale` nor the log changes, while
+/// an effect's read of the same value marks it. Nothing held, a revoked
+/// value or a built-in name give nothing.
+#[tokio::test]
+async fn a_fork_reads_a_held_value_without_marking_it_stale() {
+    let (cache, clock) = cache();
+    let current = external_row(1, 1, "secret/first#token");
+    hold(&cache, &current, true);
+    let mut config = Config::default();
+    config.apply(&Record::SecretLink(link("token", 1, "secret/first#token")));
+    // Older than `refresh` (5 minutes), younger than `max_stale`.
+    clock.advance(10 * 60);
+    let value = cache.fork_value("token", &config).unwrap();
+    assert_eq!(value.meta.version, 1);
+    assert_eq!(value.value, b"sensitive-value");
+    assert!(
+        lock(&cache.state).stale.is_empty(),
+        "a fork marked a production value stale"
+    );
+    // The same read by an effect (with the backend unavailable) marks it.
+    cache.failure(&Scope::row(&current), BackendError::Unavailable);
+    assert!(cache.cached("token", None, &config).unwrap().is_some());
+    assert!(lock(&cache.state).stale.contains("token"));
+    // A definitive failure revokes it for forks too.
+    cache.failure(&Scope::row(&current), BackendError::Denied);
+    assert!(cache.fork_value("token", &config).is_none());
+    // Unlinked: a fork never computes a built-in name from this cache.
+    assert!(cache.fork_value("token", &Config::default()).is_none());
+}
+
 #[tokio::test]
 async fn complete_inventory_is_revision_and_epoch_bound_and_resource_failure_is_not_complete() {
     let (_data, node) = node().await;

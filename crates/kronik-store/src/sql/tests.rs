@@ -519,3 +519,81 @@ fn a_subject_turn_cannot_write_a_table_without_subject_column() {
     assert_eq!(tagged.values[0][0], Value::Integer(0), "{tagged:?}");
     assert_eq!(plain.values, [[Value::Text("system".into())]]);
 }
+
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// #37: a revealed secret is scrubbed from blob cells as from text cells,
+/// so neither the changeset (the log) nor the applied database holds it. A
+/// blob stays a blob, and a secret that is not UTF-8 is scrubbed from blobs.
+#[test]
+fn scrubbing_covers_blob_cells_and_binary_secrets() {
+    let mut a = actor("scrub-blobs");
+    let schema = ["CREATE TABLE keys (id INTEGER PRIMARY KEY, t TEXT, b BLOB)"];
+    let (_, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let text = "sk-live-0123456789";
+    let binary: &[u8] = &[0x00, 0xff, 0x10, 0x80, 0x7f, 0x01];
+    let blob = |parts: &[&[u8]]| Value::Blob(parts.concat());
+    a.begin_turn(&opts(2, 2, false)).unwrap();
+    for (sql, params) in [
+        (
+            "INSERT INTO keys(t, b) VALUES (?1, ?2)",
+            vec![
+                Value::Text(format!("x{text}y")),
+                blob(&[b"pre-", text.as_bytes(), b"-post"]),
+            ],
+        ),
+        (
+            "INSERT INTO keys(t, b) VALUES ('binary', ?1)",
+            vec![blob(&[b"\x00\x01", binary, b"\x02", binary])],
+        ),
+        (
+            "INSERT INTO keys(t, b) VALUES ('cast', CAST(?1 AS BLOB))",
+            vec![Value::Text(text.into())],
+        ),
+    ] {
+        a.execute(sql, &params).unwrap();
+    }
+    let changed = a
+        .scrub(&[("api", text.as_bytes()), ("bin", binary)])
+        .unwrap();
+    assert_eq!(changed, 4, "the text cell and three blob cells");
+    let t = a.end_turn(true).unwrap();
+    for (_, cs) in &t.changesets {
+        assert!(!holds(cs, text.as_bytes()), "the log holds the text secret");
+        assert!(!holds(cs, binary), "the log holds the binary secret");
+    }
+    a.apply(&t, 2, &BTreeSet::new()).unwrap();
+    a.begin_turn(&opts(3, 3, false)).unwrap();
+    let rows = a
+        .query("SELECT t, typeof(b), b FROM keys ORDER BY id", &[])
+        .unwrap();
+    // The host's replace is not the guest's.
+    assert!(
+        a.query("SELECT kronik_scrub_replace(x'01', x'01', 'x')", &[])
+            .is_err()
+    );
+    a.end_turn(false).unwrap();
+    assert_eq!(
+        rows.values,
+        [
+            vec![
+                Value::Text("x[secret:api]y".into()),
+                Value::Text("blob".into()),
+                blob(&[b"pre-[secret:api]-post"]),
+            ],
+            vec![
+                Value::Text("binary".into()),
+                Value::Text("blob".into()),
+                blob(&[b"\x00\x01[secret:bin]\x02[secret:bin]"]),
+            ],
+            vec![
+                Value::Text("cast".into()),
+                Value::Text("blob".into()),
+                blob(&[b"[secret:api]"]),
+            ],
+        ]
+    );
+}

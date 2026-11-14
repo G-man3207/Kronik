@@ -276,8 +276,12 @@ impl Node {
             ActorRef::new(actor_pb.kind.clone(), actor_pb.key.clone()).map_err(|_| corrupt())?;
         let key = begin.causal_key.as_ref().ok_or_else(corrupt)?;
         let mut compensations = Vec::new();
+        // A timed-out call's callee may still commit (#30): its compensation
+        // is recorded too, and delivered only if it does.
+        let mut timed_out = std::collections::BTreeSet::new();
         for effect in effects.iter().filter(|effect| {
-            effect.kind == "actor.call" && effect.status == pb::EffectStatus::Ok as i32
+            (effect.kind == "actor.call" && effect.status == pb::EffectStatus::Ok as i32)
+                || effect.timed_out_call()
         }) {
             if erased_calls
                 && effect
@@ -286,6 +290,9 @@ impl Node {
                     .is_some_and(|r| matches!(self.sealer().open(r), Opened::Erased { .. }))
             {
                 continue;
+            }
+            if effect.timed_out_call() {
+                timed_out.insert(effect.ordinal);
             }
             let bytes = request_bytes(self.sealer(), effect.request.as_ref())?;
             let request = pb::CallEffectRequest::decode(bytes.as_ref()).map_err(|_| corrupt())?;
@@ -335,18 +342,39 @@ impl Node {
             config_epoch: begin.config_epoch,
             ..Default::default()
         };
-        if crate::record_budget::fit_closing(&mut record, self.turn_record_limit(), input_cost)
-            != crate::record_budget::Fit::Fits
-        {
-            tracing::warn!(
+        match crate::record_budget::fit_closing(&mut record, self.turn_record_limit(), input_cost) {
+            crate::record_budget::Fit::Fits => {}
+            crate::record_budget::Fit::Over => {
+                // The log takes TURN_RESERVE more than the budget. A TurnBegin
+                // that an earlier release wrote within a few hundred bytes of
+                // the log's own limit leaves no room for the outcome's text:
+                // keep its code only.
+                if Record::TurnRecord(record.clone()).encoded_len() > self.record_limit()
+                    && let Some(outcome) = record.outcome.as_mut()
+                {
+                    outcome.message.clear();
+                }
+                tracing::error!(
+                    execution_id = %record.execution_id,
+                    "the record closing the turn is over the turn budget even without its \
+                     effects (an earlier release recorded its input or compensations past it); \
+                     appending it anyway"
+                );
+            }
+            _ => tracing::warn!(
                 execution_id = %record.execution_id,
                 "the record closing the turn left out its effects' payloads to fit in one log \
                  record; the effect results in the log keep them"
-            );
+            ),
         }
         let lsn = self.commit(Record::TurnRecord(record)).await?;
         for message in compensations {
             let compensates = causal::message_id(&key, message.ordinal);
+            if timed_out.contains(&message.ordinal)
+                && self.released_compensation(&compensates, lsn).is_none()
+            {
+                continue;
+            }
             self.deliver(
                 &actor,
                 &key,

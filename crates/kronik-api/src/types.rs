@@ -403,6 +403,40 @@ pub struct HealthResponse {
     /// changes are refused. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub low_disk: bool,
+    /// A turn that the last retention pass kept log segments for, which it
+    /// would have deleted otherwise. Omitted when no turn kept any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_pin: Option<RetentionPinView>,
+}
+
+/// An open turn that keeps log segments from retention: its re-run reads its
+/// `TurnBegin` from the first of them (docs/guides/operations.md, "An open
+/// turn that keeps the log").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RetentionPinView {
+    /// The open turn's execution id.
+    pub execution_id: String,
+    /// `live`: the turn is open in the running state; `snapshot`: a kept
+    /// snapshot holds it open (it may have ended since), and the segments
+    /// are kept until that snapshot is deleted.
+    pub source: String,
+    /// The turn's actor, for a `live` turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// The LSN of its `TurnBegin`, for a `live` turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub begin_lsn: Option<u64>,
+    /// The snapshot's id, for `snapshot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    /// The first LSN of the segment that holds the `TurnBegin`.
+    pub segment: u64,
+    /// The closed segments retention keeps only for this turn, and their
+    /// size.
+    pub held_segments: u64,
+    pub held_bytes: u64,
+    /// Since when retention passes keep segments for it, Unix milliseconds.
+    pub since_ms: u64,
 }
 
 // ------------------------------------------------------------------ M2
@@ -499,6 +533,15 @@ pub struct LimitsRequest {
     pub effect_timeout_ms: Option<u64>,
     #[serde(default)]
     pub effect_response_bytes: Option<u64>,
+    /// Header names left out of the kind's `http.fetch` and `foreign.http`
+    /// fingerprints besides the six default ones (ADR 0134). A list replaces
+    /// the kind's, `[]` clears it, and omitted keeps it.
+    #[serde(default)]
+    pub fingerprint_exclude_headers: Option<Vec<String>>,
+    /// Query-parameter names left out of those fingerprints, as the URL
+    /// writes them; as `fingerprint_exclude_headers`.
+    #[serde(default)]
+    pub fingerprint_exclude_query: Option<Vec<String>>,
     /// Required: missing or blank answers REASON_REQUIRED.
     #[serde(default)]
     pub reason: String,
@@ -516,6 +559,13 @@ pub struct LimitsView {
     pub sql_bytes_per_actor: u64,
     pub effect_timeout_ms: u64,
     pub effect_response_bytes: u64,
+    /// Header names (lowercase) left out of the kind's HTTP fingerprints
+    /// besides the six default ones (ADR 0134), sorted.
+    #[serde(default)]
+    pub fingerprint_exclude_headers: Vec<String>,
+    /// Query-parameter names left out of them, sorted.
+    #[serde(default)]
+    pub fingerprint_exclude_query: Vec<String>,
     /// Set in responses to `POST /v1/limits` (lsn 0 for dry runs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<u64>,

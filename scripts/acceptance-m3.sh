@@ -4,7 +4,8 @@
 #      recorded requests (release, the ignored test included);
 #   2. the M3 API endpoints (forks, replay, diffs, proposals, approval,
 #      promote, rollback and policy) against a real node;
-#   3. demo/verify-change.sh end to end with the release binary;
+#   3. demo/verify-change.sh end to end with the release binary, with the
+#      example actors and with the test guests (GUESTS=test);
 #   4. the replay speed of the reference counter workload
 #      (crates/kronik-fork/examples/replay_speed.rs, 200 req/s).
 # Usage: scripts/acceptance-m3.sh [REQUESTS for step 4, default 12000]
@@ -23,6 +24,8 @@ cargo test --locked --release -p kronik-api --test api
 echo "== 3. demo/verify-change.sh"
 cargo build --locked --release -p kronik
 demo/verify-change.sh
+# The test guests answer the decimal n, not JSON (#50).
+GUESTS=test REQUESTS=100 demo/verify-change.sh /var/tmp/kronik-verify-change-test 47422
 
 echo "== 4. replay speed (reference counter workload, 200 req/s)"
 cargo run --locked --release -p kronik-fork --example replay_speed -- \

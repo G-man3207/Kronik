@@ -328,6 +328,22 @@ fn an_actor_cannot_set_connection_headers_or_the_turn_id() {
         body.contains("\"TURN_FAILED\"") && body.contains("status 101"),
         "{body}"
     );
+    // Nor is anything above 599 an HTTP status a client knows (#68).
+    for answered in [600, 999] {
+        let (status, _, body) = request(
+            &s.http,
+            "POST",
+            "/counter/b/respond",
+            "",
+            &format!("{answered}\n\n"),
+        );
+        assert_eq!(status, 500, "{answered}");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("\"TURN_FAILED\"") && body.contains(&format!("status {answered},")),
+            "{body}"
+        );
+    }
 }
 
 /// Over TCP the token is checked before the body is read: a bogus token with

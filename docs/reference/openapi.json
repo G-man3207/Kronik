@@ -4129,6 +4129,17 @@
             "description": "The log's file system is below `[log] disk_reserve`: new inputs and\nchanges are refused. Omitted when false.",
             "type": "boolean"
           },
+          "retention_pin": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RetentionPinView"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A turn that the last retention pass kept log segments for, which it\nwould have deleted otherwise. Omitted when no turn kept any."
+          },
           "status": {
             "description": "`ok` while the node runs (a stopped node answers an error).",
             "type": "string"
@@ -4458,6 +4469,28 @@
               "null"
             ]
           },
+          "fingerprint_exclude_headers": {
+            "default": null,
+            "description": "Header names left out of the kind's `http.fetch` and `foreign.http`\nfingerprints besides the six default ones (ADR 0134). A list replaces\nthe kind's, `[]` clears it, and omitted keeps it.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "fingerprint_exclude_query": {
+            "default": null,
+            "description": "Query-parameter names left out of those fingerprints, as the URL\nwrites them; as `fingerprint_exclude_headers`.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "fuel": {
             "default": null,
             "format": "uint64",
@@ -4552,6 +4585,22 @@
               "integer",
               "null"
             ]
+          },
+          "fingerprint_exclude_headers": {
+            "default": [],
+            "description": "Header names (lowercase) left out of the kind's HTTP fingerprints\nbesides the six default ones (ADR 0134), sorted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "fingerprint_exclude_query": {
+            "default": [],
+            "description": "Query-parameter names left out of them, sorted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "fuel": {
             "format": "uint64",
@@ -6156,6 +6205,74 @@
           "schema",
           "identity",
           "streams"
+        ],
+        "type": "object"
+      },
+      "RetentionPinView": {
+        "description": "An open turn that keeps log segments from retention: its re-run reads its\n`TurnBegin` from the first of them (docs/guides/operations.md, \"An open\nturn that keeps the log\").",
+        "properties": {
+          "actor": {
+            "description": "The turn's actor, for a `live` turn.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "begin_lsn": {
+            "description": "The LSN of its `TurnBegin`, for a `live` turn.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "execution_id": {
+            "description": "The open turn's execution id.",
+            "type": "string"
+          },
+          "held_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "held_segments": {
+            "description": "The closed segments retention keeps only for this turn, and their\nsize.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "segment": {
+            "description": "The first LSN of the segment that holds the `TurnBegin`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "since_ms": {
+            "description": "Since when retention passes keep segments for it, Unix milliseconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "snapshot": {
+            "description": "The snapshot's id, for `snapshot`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "`live`: the turn is open in the running state; `snapshot`: a kept\nsnapshot holds it open (it may have ended since), and the segments\nare kept until that snapshot is deleted.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "execution_id",
+          "source",
+          "segment",
+          "held_segments",
+          "held_bytes",
+          "since_ms"
         ],
         "type": "object"
       },

@@ -734,6 +734,17 @@ impl ScrubbedOutput for GrantsResponse {
     }
 }
 
+/// A pending timer's message name, as `timers[].name` in a turn's JSON
+/// (#44): the guest chose it, so it may hold a secret value.
+impl ScrubbedOutput for TimersResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for timer in &mut self.timers {
+            text(&mut timer.name, secrets);
+        }
+        Ok(())
+    }
+}
+
 impl ScrubbedOutput for SecretHistoryResponse {
     fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
         for version in &mut self.versions {

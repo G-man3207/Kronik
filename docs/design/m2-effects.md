@@ -11,7 +11,7 @@ I6, I7, I8, I14 and I17.
 | `kronik-privacy` | `MasterKey` (load or create `[keys] master_key_file`), `SecretStore` (`keys/secrets.db`, XChaCha20-Poly1305 under a key derived from the master key, versioned values, version hashes). |
 | `kronik-effects` | Capability matching (`http:<host>`, `*.example.com`, `secret:<name>`, `secret-reveal:<name>`), `Config` (grants and limits as of an epoch), delivery classes, HTTP fingerprints, secret header rendering and response scrubbing, host-side crypto, the per grant and target rate limiter, the `EffectSimulator` trait with `RecordedMatch` and `FailClosed`. Pure code except the limiter's clock. |
 | `kronik-runtime` | The `EffectGate` trait the host calls for `http-client.fetch`, `messaging.call`, `crypto.*` and `secrets.reveal`; buffered `timers.schedule/cancel`; compensations in `TurnOutput`. |
-| `kronik-store` | Tables `grant_records`, `limit_records`, `open_turns`, `open_effects`, `timers`, `orphans`; saved call responses in `deliveries`. |
+| `kronik-store` | Tables `grant_records`, `limit_records`, `open_turns`, `open_effects`, `timers`, `orphans`, `timed_out_calls`; saved call responses in `deliveries`. |
 | `kronik-sched` | The per-turn gate (`TurnBegin`, `EffectResult`, replay of recorded results, re-execution by delivery class), `call` execution, compensations, the timer wheel, recovery re-runs, and `grant`/`revoke`/`set_limits`/secret operations. |
 | `kronik-core::env::real` | The outbound `Net`: hyper client over rustls with the system roots. |
 | `kronik-api` | The endpoints in §8. |
@@ -91,8 +91,7 @@ Effect kinds (`EffectRecord.kind`): `http.fetch`, `actor.call`,
 `blake3(body)`, and the headers sorted by lowercase name, without
 `authorization`, `cookie`, `date`, `idempotency-key`, `user-agent` and
 `x-request-id`; a secret header contributes its name, secret name and
-version hash. Per-kind rules come with forks (M3). Other kinds fingerprint
-their encoded request.
+version hash. Other kinds fingerprint their encoded request.
 
 New HTTP requests use fingerprint version 2 and the canonical
 `kronik.fingerprint.http.v2` domain. The producer parses the ORIGINAL URL
@@ -104,6 +103,20 @@ exact, private historical verifier, never a new writer or hash alias.
 Raw host data is matched before case normalization. A raw no-match falls
 back only to that original component's existing canonical v2 normalization;
 unmatched host case and its existing fingerprint bytes remain unchanged.
+
+**Per-kind rules, version 3 (ADR 0134).** An actor type may leave further
+header names and query-parameter names out of its `http.fetch` and
+`foreign.http` fingerprints (`kronik limits set <kind>
+--fingerprint-exclude-header ... --fingerprint-exclude-query ...`, fields
+11 and 12 of the `Limits` record; the six default headers always stay out).
+A turn uses the rules of its configuration epoch. A request with rules is
+recorded as version 3: version 2's encoding and hash less those names, the
+names themselves in `HttpEffectRequest` fields 6 and 7 (canonical: lowercase
+headers, sorted, without duplicates), hashed after the headers under the
+domain `kronik.fingerprint.http.v3`. Without rules a request stays version
+2, byte for byte. A recording's fingerprint is recomputed from the
+recording alone; a fork compares its request with a recording under that
+recording's names, never under the configuration's now.
 
 **Disclosure failure after a durable external result.** An actual HTTP
 response whose structured redaction fails records status
@@ -208,7 +221,8 @@ its ingress key belong to the re-run (an HTTP retry with the same
 - **Cycles.** `call_chain` is the caller's chain plus the caller. A call to
   an actor in the chain (or to itself) returns `reentrant` at once.
 - **Timeout.** The kind's effect timeout (10 s); then `timeout`, recorded.
-  (A cross-chain wait cycle ends this way.)
+  (A cross-chain wait cycle ends this way.) The callee's turn stays queued
+  and can still commit after the caller has given up.
 - **Dedup.** The callee's turn record is applied with
   `deliveries(message_id → lsn, outcome)`. A call whose message id is
   already in `deliveries` gets the saved outcome and the callee does not
@@ -222,11 +236,26 @@ its ingress key belong to the re-run (an HTTP retry with the same
   key `child(callee turn key, callee, COMPENSATION_ORDINAL = 2^32 - 2)`,
   message id = its `causal-id`, `compensates` = the call's message id.
 - **Orphans.** When the caller's turn fails, every successful call (status
-  OK) adds an `orphans` row: callee, callee turn, caller turn, call message
-  id, compensation message id (if any). A committed turn whose input has
-  `compensates = m` resolves the orphan for `m`. A failed compensation is a
-  dead letter; its resend keeps `compensates`, so a successful resend
-  resolves the orphan. `history --orphans` lists unresolved rows.
+  OK, or `HOST_REDACTION_FAILURE` that observed OK) adds an `orphans` row:
+  callee, callee turn, caller turn, call message id, compensation message id
+  (if any). A committed turn whose input has `compensates = m` resolves the
+  orphan for `m`. A failed compensation is a dead letter; its resend keeps
+  `compensates`, so a successful resend resolves the orphan. `history
+  --orphans` lists unresolved rows.
+- **A call that timed out** (#30) is such a call once its callee's turn
+  commits, which can happen before the caller's failed record or after it.
+  Its compensation, if any, is in `TurnRecord.compensations` too. The
+  applier decides from the log alone: when the callee's turn of the call
+  (its `deliveries` row) is already applied, a committed one makes the
+  orphan at once and its compensation goes out with the caller's record;
+  otherwise the call waits in `timed_out_calls` (ids only, no user data)
+  and its compensation is held in the mailbox (not loaded, not delivered)
+  until that turn is applied: committed, the orphan is added (callee turn
+  taken from `deliveries`) and the compensation released; failed, nothing
+  changed and the compensation is dropped. The node whose record released
+  a compensation delivers it (`released_lsn`); a released one not yet
+  delivered goes out at the next start. A queued call lost to a restart
+  never runs, so its compensation stays held and nothing is orphaned.
 
 ## 6. Grants, limits and rates
 
@@ -269,10 +298,17 @@ its ingress key belong to the re-run (an HTTP retry with the same
   `now-ms + delay`; `cancel(id)` buffers `CANCEL` and returns whether the
   timer is pending (committed or scheduled earlier in the turn). Applied
   with the turn record into `timers (kind, key, id, due_ms, msg, causal
-  key)`. The timer wheel fires a due timer (wall clock ≥ due) as a turn
-  with `TimerInput`, logical time ≥ due, causal key `child(scheduling turn
-  key, actor, ordinal)`; the row is removed when that turn's record is
-  applied, and a failed timer turn is a dead letter.
+  key)`. The timer wheel fires a timer as a turn with `TimerInput`, logical
+  time ≥ due, causal key `child(scheduling turn key, actor, ordinal)`; the
+  row is removed when that turn's record is applied, and a failed timer
+  turn is a dead letter. A timer is due when logical time
+  (`max(wall clock, high-water mark)`) reaches its due time, or when the
+  delay it had left when the wheel took it (at commit, or at start for the
+  rows in `state.db`: due less logical time then) has passed on the
+  monotonic clock, whichever is first (ADR 0006). So a host clock that
+  steps back, which holds logical time still at its high-water mark until
+  the wall clock catches up, delays no timer; one that steps forward fires
+  the timers logical time passes.
 
 ## 8. API additions (`/v1`, same conventions as m1-core §4)
 
@@ -281,7 +317,7 @@ its ingress key belong to the re-run (an HTTP retry with the same
 | `POST /v1/grants` | `{"kind","capability","delivery":"replay-safe"\|"idempotency-keyed"\|"unsafe"\|null,"rate":"2/s"\|null,"reason","dry_run"}` | `{"dry_run","grant":{"kind","capability","delivery","rate","epoch","lsn"}}` |
 | `POST /v1/grants/revoke` | `{"kind","capability","reason","dry_run"}` | `{"dry_run","revoked":{"kind","capability","epoch","lsn"}}`; `CAPABILITY_NOT_GRANTED` if absent |
 | `GET /v1/grants?kind=` | | `{"grants":[{"kind","capability","delivery","rate","epoch","lsn","reason"}]}` |
-| `POST /v1/limits` | `{"kind","fuel","memory_bytes","message_bytes","state_value_bytes","sql_bytes_per_actor","effect_timeout_ms","effect_response_bytes","reason","dry_run"}` (omitted fields unchanged) | `{"dry_run","limits":{"kind", every field with its effective value,"epoch","lsn"}}` |
+| `POST /v1/limits` | `{"kind","fuel","memory_bytes","message_bytes","state_value_bytes","sql_bytes_per_actor","effect_timeout_ms","effect_response_bytes","fingerprint_exclude_headers":[...],"fingerprint_exclude_query":[...],"reason","dry_run"}` (omitted fields unchanged; a list replaces the kind's and `[]` clears it) | `{"dry_run","limits":{"kind", every field with its effective value,"epoch","lsn"}}` |
 | `GET /v1/limits?kind=` | | `{"limits":[{"kind", every field}]}` |
 | `PUT /v1/secrets/{name}` | `{"text"\|"base64","reason","dry_run"}` | `{"dry_run","secret":{"name","version","version_hash","created_wall_ms"}}` |
 | `GET /v1/secrets` | | `{"secrets":[{"name","version","version_hash","created_wall_ms"}]}` (never values) |

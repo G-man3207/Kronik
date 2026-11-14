@@ -13,7 +13,8 @@ use kronik_core::env::{BoxFuture, Env};
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
 use kronik_effects::http::{
-    CompiledScrubber, fingerprint, fingerprint_v2, parse_request_url, prepared_target, target_of,
+    CompiledScrubber, fingerprint, fingerprint_v2, parse_request_url, prepared_target,
+    prepared_version, target_of, under_rules_of,
 };
 use kronik_effects::{Config, ConfigHistory};
 use kronik_log::{Committed, Position};
@@ -1199,19 +1200,10 @@ impl Runner {
             || state.erased()
             || (sql_unverified && used_sql)
             || gs.unverified_callee;
+        // As in production: a turn that does not commit after an effect
+        // whose outcome is unknown ends with EFFECT_OUTCOME_UNKNOWN, decided by
+        // `fit` and `fail` below on the final record.
         let committed = out.committed();
-        // As in production: a turn that did not commit after an effect whose
-        // outcome is unknown fails with EFFECT_OUTCOME_UNKNOWN.
-        if !committed
-            && !output_too_large
-            && gs
-                .records
-                .iter()
-                .any(|e| e.status == pb::EffectStatus::OutcomeUnknown as i32)
-        {
-            out.outcome.kind = pb::OutcomeKind::EffectOutcomeUnknown as i32;
-            out.outcome.error_code = "EFFECT_OUTCOME_UNKNOWN".into();
-        }
         let compensations = gs.compensations;
         let mut record = pb::TurnRecord {
             execution_id: String::new(),
@@ -1611,7 +1603,7 @@ pub(crate) fn disclose_neighbor(
             })?;
             sealer.fingerprint_matches(subject, &hit.source.fingerprint, &plain_fp)
         }
-        2 => {
+        2 | 3 => {
             let Some(prefix) = hit.prefix else {
                 return Ok(NeighborDisclosure::Decline);
             };
@@ -1740,9 +1732,14 @@ enum UnmatchedKey {
     /// The built-in store has no value of the name, or the fork has no store
     /// (a preview: no production key computes for it).
     Missing,
-    /// The built-in store's current value of a name that is not linked, or
-    /// the value this process holds for the link of the fork point.
+    /// The built-in store's current value of a name that is not linked.
     Value(kronik_privacy::SecretValue),
+    /// The value this process holds for the fork point's link of a linked
+    /// name. A computation with it is graded synthetic, not exact: it rests
+    /// on what this process holds (a later version after a rotation, nothing
+    /// after a restart), so a diff grades it the same whether it was held or
+    /// not.
+    Held(kronik_privacy::SecretValue),
 }
 
 /// The built-in store, as an unmatched `crypto.*` of a fork reads it.
@@ -1767,7 +1764,9 @@ pub trait HeldKeys: Send + Sync {
 
 impl HeldKeys for kronik_sched::secrets::SecretCache {
     fn held_key(&self, name: &str, config: &Config) -> Option<kronik_privacy::SecretValue> {
-        self.cached(name, None, config).ok().flatten()
+        // Read-only: a fork never changes production's stale tracking, its
+        // `kronik_secret_stale` gauge or its log.
+        self.fork_value(name, config)
     }
 }
 
@@ -1786,7 +1785,7 @@ fn unmatched_key(
     };
     if config.secret_is_linked(name) {
         return match held.and_then(|held| held.held_key(name, config)) {
-            Some(value) => UnmatchedKey::Value(value),
+            Some(value) => UnmatchedKey::Held(value),
             None => UnmatchedKey::Unheld,
         };
     }
@@ -1998,7 +1997,10 @@ impl ReplayGate {
 
     /// As in production: a fetch result that does not fit in what is left of
     /// the turn's record is too large for this turn, and the guest never
-    /// sees it.
+    /// sees it. Every answer a fork makes up goes through it too (a stub
+    /// rule's, a contract fake's, a neighbor's, the model's): a large
+    /// synthetic answer is `too-large` for the guest, as a live one is, and
+    /// does not trap the turn when it is recorded.
     fn fit_fetch(
         &self,
         rec: &mut pb::EffectRecord,
@@ -2175,7 +2177,10 @@ impl ReplayGate {
             return Ok(FetchOutcome::Denied(e));
         }
         if foreign && self.config().foreign(&t.host).is_none() {
-            let e = format!("FOREIGN_NOT_FOUND: no foreign actor {}", t.host);
+            // Production's words exactly: the error is part of the effect's
+            // cost in the turn's record, so another text could make the
+            // budget decide otherwise.
+            let e = ErrorCode::ForeignNotFound.as_str().to_owned();
             self.push(self.denied(ordinal, kind, "foreign:[withheld]".into(), e.clone()))?;
             return Ok(FetchOutcome::Denied(e));
         }
@@ -2245,6 +2250,7 @@ impl ReplayGate {
             headers,
             body: req.body.clone(),
             fingerprint_version: 2,
+            ..Default::default()
         };
         // Keyed for a subject's request, as production records it.
         let sealer = &self.runner.setup.privacy.sealer;
@@ -2282,7 +2288,7 @@ impl ReplayGate {
                     self.push(record)?;
                     return outcome;
                 }
-                2 => {}
+                2 | 3 => {}
                 _ => {
                     return Err(GateError::Host(
                         "The HTTP fingerprint policy is invalid".into(),
@@ -2298,8 +2304,23 @@ impl ReplayGate {
             kronik_log::MAX_RECORD as usize,
         )
         .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?;
+        // The actor type's fingerprint rules for this turn, recorded in the
+        // fork's request as production records its own (ADR 0134).
+        self.config()
+            .fingerprint_rules(&self.actor.kind)
+            .apply(&mut request)
+            .map_err(GateError::Host)?;
         let plain_fp = fingerprint_v2(&request, &recorded_target).map_err(GateError::Host)?;
         let fp = sealer.effect_fingerprint(req.subject.as_deref(), plain_fp.clone());
+        // A recording is compared under its own rules, never the fork's: the
+        // fork's request as that recording's rules fingerprint it.
+        let matching_fp = match &prod_req {
+            Some(source) if prepared_version(source.fingerprint_version) => {
+                fingerprint_v2(&under_rules_of(&request, source), &recorded_target)
+                    .map_err(GateError::Host)?
+            }
+            _ => plain_fp.clone(),
+        };
         let original_cap = cap;
         let cap = format!(
             "{}:{}",
@@ -2321,7 +2342,7 @@ impl ReplayGate {
                 .fetch_copy(
                     ordinal,
                     cap,
-                    (fp, plain_fp),
+                    (fp, matching_fp),
                     encoded,
                     req,
                     prod,
@@ -2332,7 +2353,7 @@ impl ReplayGate {
                 .await;
         }
         if let (Some(p), Some(pr)) = (prod, prod_req) {
-            if sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &plain_fp) {
+            if sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &matching_fp) {
                 let mut rec = p;
                 rec.grounding = pb::Grounding::Exact as i32;
                 let out = outcome_of_fetch(&rec);
@@ -2391,10 +2412,14 @@ impl ReplayGate {
                         .unwrap_or(usize::MAX)
                         .min(kronik_log::MAX_RECORD as usize),
                 );
+                // As for a live fetch: an answer that does not fit in what is
+                // left of the turn's record is too large for this turn.
+                let out = self.fit_fetch(&mut rec, out);
                 self.push(rec)?;
                 return out;
             }
             let out = self.prepare_http_record(&mut rec, &matcher);
+            let out = self.fit_fetch(&mut rec, out);
             self.push(rec)?;
             return out;
         }
@@ -2437,6 +2462,7 @@ impl ReplayGate {
                 let mut rec = answer.record;
                 rec.request = encoded;
                 let out = self.prepare_http_record(&mut rec, &matcher);
+                let out = self.fit_fetch(&mut rec, out);
                 self.push(rec)?;
                 return out;
             }
@@ -2453,8 +2479,13 @@ impl ReplayGate {
                 )? {
                     NeighborDisclosure::Decline => {}
                     NeighborDisclosure::Recorded(recorded) => {
-                        self.push(recorded.record)?;
-                        return Ok(recorded.outcome);
+                        let NeighborRecorded {
+                            mut record,
+                            outcome,
+                        } = *recorded;
+                        let out = self.fit_fetch(&mut record, Ok(outcome));
+                        self.push(record)?;
+                        return out;
                     }
                 }
             }
@@ -2526,7 +2557,9 @@ impl ReplayGate {
                         ),
                         ..Default::default()
                     };
+                    let mut rec = rec;
                     let out = outcome_of_fetch(&rec);
+                    let out = self.fit_fetch(&mut rec, out);
                     self.push(rec)?;
                     return out;
                 }
@@ -2545,7 +2578,7 @@ impl ReplayGate {
         &self,
         ordinal: u32,
         cap: String,
-        (fp, plain_fp): (Vec<u8>, Vec<u8>),
+        (fp, matching_fp): (Vec<u8>, Vec<u8>),
         encoded: Option<pb::Sealable>,
         req: FetchRequest,
         prod: Option<pb::EffectRecord>,
@@ -2560,7 +2593,7 @@ impl ReplayGate {
         let cap_bytes = self.response_cap(encoded.as_ref(), limits.effect_response_bytes);
         let sealer = &self.runner.setup.privacy.sealer;
         let exact = prod.as_ref().is_some_and(|p| {
-            sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &plain_fp)
+            sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &matching_fp)
         });
         let headers = req
             .headers
@@ -2793,10 +2826,10 @@ impl ReplayGate {
             grounding: pb::Grounding::Live as i32,
             ..Default::default()
         };
-        let (outcome, turn_id) = if to == self.actor || self.call_chain.contains(&to) {
-            (CallOutcome::Reentrant, String::new())
+        let (outcome, turn_id, callee_lsn) = if to == self.actor || self.call_chain.contains(&to) {
+            (CallOutcome::Reentrant, String::new(), None)
         } else if !self.runner.setup.kinds.contains_key(&to.kind) {
-            (CallOutcome::NotFound, String::new())
+            (CallOutcome::NotFound, String::new(), None)
         } else {
             let mut chain = self.call_chain.clone();
             chain.push(self.actor.clone());
@@ -2843,8 +2876,20 @@ impl ReplayGate {
                 state.personal |= turn.personal;
                 state.unverified_callee |= turn.erased;
             }
-            (map_call_outcome(o)?, turn.id)
+            (map_call_outcome(o)?, turn.id, Some(turn.lsn))
         };
+        // The callee's turn ran in the fork, so its source is the fork's: its
+        // position in the fork's store, in the fork's namespace, as
+        // production names the callee's turn in its log. With a source, a
+        // reply over what is left of the turn's record is withheld and
+        // recorded as HOST_REDACTION_FAILURE with the callee's status, as in
+        // production, instead of failing the whole replay as a missing
+        // prerequisite.
+        rec.callee_source = callee_lsn.map(|lsn| pb::ActorSource {
+            shard: None,
+            lsn,
+            branch: self.runner.setup.fork.clone(),
+        });
         // A reply larger than what is left of the turn's record is withheld,
         // as in production.
         let room = lock(&self.state).budget.clone();
@@ -2941,13 +2986,14 @@ impl ReplayGate {
         // the fork point's link of a linked name; the key never leaves it.
         let store = self.runner.setup.secrets.as_deref();
         let held = self.runner.setup.held_secrets.as_deref();
-        let v = match unmatched_key(
+        let (v, grounding) = match unmatched_key(
             self.config(),
             store.map(|s| s as &dyn KeyStore),
             held,
             &secret,
         ) {
-            UnmatchedKey::Value(v) => v,
+            UnmatchedKey::Value(v) => (v, pb::Grounding::Exact),
+            UnmatchedKey::Held(v) => (v, pb::Grounding::Synthetic),
             UnmatchedKey::Missing => {
                 self.push(self.synthetic(ordinal, kind, cap, fp, None))?;
                 return Ok(CryptoOutcome::Denied(NO_RECORDING.into()));
@@ -2992,7 +3038,7 @@ impl ReplayGate {
             kind: kind.into(),
             target: cap,
             fingerprint: fp,
-            grounding: pb::Grounding::Exact as i32,
+            grounding: grounding as i32,
             ..Default::default()
         };
         let out = match result {
@@ -3734,7 +3780,7 @@ mod linked_key_tests {
         keys.0.lock().unwrap().clear();
         assert!(matches!(
             unmatched_key(&config, store, Some(&held), "stripe"),
-            UnmatchedKey::Value(v) if v.value == b"held-backend-value"
+            UnmatchedKey::Held(v) if v.value == b"held-backend-value"
         ));
         // Nothing held (here: no cache, or another generation): denied.
         assert!(matches!(

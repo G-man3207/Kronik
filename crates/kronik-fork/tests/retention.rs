@@ -337,6 +337,15 @@ fn fork_create_refuses_a_point_the_log_no_longer_covers() {
     let before = kronik_log::segment_starts(&log_dir).unwrap();
     assert!(before.len() > 3, "{before:?}");
     let _ = p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
+    // With history 0 the snapshot is the window's base once a turn of a later
+    // millisecond has put it behind the window; the next pass compacts.
+    let hwm = p.node.store().db().time_hwm().unwrap();
+    while p.node.store().db().time_hwm().unwrap() <= hwm {
+        std::thread::sleep(Duration::from_millis(2));
+        p.send("counter/tick", "increment", "");
+    }
+    let storage = p.node.storage_config().unwrap().clone();
+    p.node.compact(&storage).unwrap();
     let after = kronik_log::segment_starts(&log_dir).unwrap();
     assert!(
         after[0] > 1,

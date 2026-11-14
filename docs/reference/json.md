@@ -131,7 +131,7 @@ against both.
 | `kronik events schemas` | [kronik events schemas output](#kronik-events-schemas-output) (`GET /v1/events/schemas`) |
 | `kronik events webhooks status` | [`WebhooksResponse`](#webhooksresponse) (`GET /v1/events/webhooks`) |
 | `kronik events webhooks replay` | [`ReplayResponse2`](#replayresponse2) (`POST /v1/events/webhooks/{name}/replay`) |
-| `kronik mcp` | no JSON: MCP's JSON-RPC on stdout instead |
+| `kronik mcp` | no JSON: MCP's JSON-RPC on stdout instead; a failure to start is the error JSON |
 | `kronik explain` | [explain output](#explain-output), from the CLI itself |
 
 ## Schemas
@@ -4594,6 +4594,22 @@ against both.
         "integer",
         "null"
       ]
+    },
+    "fingerprint_exclude_headers": {
+      "default": [],
+      "description": "Header names (lowercase) left out of the kind's HTTP fingerprints\nbesides the six default ones (ADR 0134), sorted.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "fingerprint_exclude_query": {
+      "default": [],
+      "description": "Query-parameter names left out of them, sorted.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     },
     "fuel": {
       "format": "uint64",

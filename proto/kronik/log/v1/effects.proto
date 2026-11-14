@@ -35,9 +35,16 @@ message HttpEffectRequest {
   string url = 2;
   repeated HttpEffectHeader headers = 3;
   bytes body = 4;
-  // 0: exact legacy v1 normalization; 2: strict typed-component redaction.
-  // New requests use 2. Other versions are invalid.
+  // 0: exact legacy v1 normalization; 2: strict typed-component redaction;
+  // 3: version 2 less the names in fields 6 and 7, which it also hashes
+  // (ADR 0134). New requests use 3 when the actor type has fingerprint rules
+  // and 2 otherwise. Other versions are invalid.
   uint32 fingerprint_version = 5;
+  // Version 3 only: the header names (lowercase) and query-parameter names
+  // the actor type's rules left out of the fingerprint besides the six
+  // default headers, sorted and without duplicates.
+  repeated string fingerprint_excluded_headers = 6;
+  repeated string fingerprint_excluded_query = 7;
 }
 
 message HeaderPair {

@@ -757,6 +757,69 @@ fn stub_rules_and_the_live_allowlist() {
     assert_eq!((row.method.as_str(), row.live), ("GET", 3));
 }
 
+/// A fork denies a call to a foreign actor that is not declared in
+/// production's words (review of the integration branch, item 6): the guest
+/// sees the same error, so the identity replay is empty, and the effect
+/// costs the turn's record the same bytes, so the record budget decides the
+/// same. The fork used to add "no foreign actor <name>" to the code.
+#[test]
+fn identity_replay_over_a_call_to_an_undeclared_foreign_actor_is_empty() {
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    p.grant("foreign:ghost");
+    let fork_lsn = p.settle();
+    let r = p.http("f", "fetch-ok", "GET foreign://ghost/x");
+    let body = http_body(&r);
+    assert!(body.contains("FOREIGN_NOT_FOUND"), "{body} {:?}", r.outcome);
+    let out = replay(&p, None, fork_lsn, &opts(Mode::Both), 1);
+    let s = &out.diff.summary;
+    assert!(!s.changed, "{}", String::from_utf8_lossy(&out.bytes));
+    assert_eq!(s.divergent_turns, 0);
+}
+
+/// An answer a fork makes up is fitted to what is left of the turn's record
+/// as a live answer is (review of the integration branch, item 6): a stub
+/// answer larger than that is `too-large` for the guest, which goes on,
+/// instead of trapping the turn with TURN_TOO_LARGE when it is recorded.
+#[test]
+fn a_stub_answer_over_what_is_left_of_the_record_is_too_large() {
+    let (addr, hits) = server();
+    let dir = tempdir();
+    let p = Proc::start_with(
+        dir.path(),
+        kronik_sched::NodeConfig {
+            concurrency: 8,
+            test_max_record_bytes: Some(512 << 10),
+            ..kronik_sched::NodeConfig::default()
+        },
+    );
+    p.grant("http:127.0.0.1");
+    let fork_lsn = p.settle();
+    p.http(
+        "pay",
+        "fetch-ok",
+        &format!("POST http://{addr}/v1/charges/0\n\namount=10"),
+    );
+    let stubbed = DiffOptions {
+        mode: Mode::Isolated,
+        stubs: vec![kronik_fork::stubs::StubRule {
+            method: Some("GET".into()),
+            url_prefix: format!("http://{addr}/v1/charges/"),
+            status: 200,
+            headers: vec![],
+            body: "s".repeat(600 << 10),
+            error: None,
+        }],
+        ..DiffOptions::default()
+    };
+    let out = replay(&p, Some("counter-fetch-extra"), fork_lsn, &stubbed, 1);
+    let body = serde_json::to_string(&out.diff.responses.items[0].body).unwrap();
+    assert!(body.contains("error FetchError::TooLarge"), "{body}");
+    assert!(!body.contains("TURN_TOO_LARGE"), "{body}");
+    assert_eq!(out.diff.summary.synthetic, 1);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
 /// A new schema version: `migrate(from)` runs in each isolated overlay
 /// before the root input's turn, once per actor in continuous replay, and
 /// the migration turns show in the diff.
@@ -1175,4 +1238,195 @@ fn isolated_timer_sees_state_from_later_roots() {
         String::from_utf8_lossy(&out.bytes)
     );
     assert_eq!(out.diff.summary.divergent_turns, 0);
+}
+
+/// A call whose reply is over what the caller may take: production
+/// withholds it, records HOST_REDACTION_FAILURE with the callee's committed
+/// status and its source, fails the caller's turn and delivers the call's
+/// compensation. The fork names its own callee turn as the source and
+/// decides the same, where it used to fail the whole replay as a missing
+/// prerequisite (UNAVAILABLE): identity replay is empty.
+#[test]
+fn identity_replay_over_a_withheld_call_reply_is_empty() {
+    use kronik_proto::log::v1 as pb;
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    // No reply fits in one byte: every reply is withheld.
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "counter".into(),
+            effect_response_bytes: Some(1),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    let fork_lsn = p.settle();
+    let r = p.send("counter/a", "call", "counter/b increment increment");
+    assert_eq!(
+        r.outcome.error_code, "HOST_REDACTION_FAILURE",
+        "{:?}",
+        r.outcome
+    );
+    // The call and its compensation both incremented counter/b.
+    let to = p.settle();
+    let n = p.node.store().db().kv_get("counter", "b", "n").unwrap();
+    assert_eq!(n.as_deref(), Some(b"2".as_slice()));
+    let call_of = |t: &pb::TurnRecord| {
+        t.effects
+            .iter()
+            .find(|e| e.kind == "actor.call")
+            .cloned()
+            .unwrap()
+    };
+    let is = |t: &pb::TurnRecord, actor: &str| {
+        t.actor
+            .as_ref()
+            .is_some_and(|a| format!("{}/{}", a.kind, a.key) == actor)
+    };
+    let prod = (fork_lsn + 1..=to)
+        .filter_map(|l| p.rt.block_on(p.node.read_record(l)).unwrap())
+        .find_map(|c| match c.record {
+            kronik_proto::Record::TurnRecord(t) if is(&t, "counter/a") => Some(t),
+            _ => None,
+        })
+        .unwrap();
+    let recorded = call_of(&prod);
+    assert_eq!(
+        recorded.status,
+        pb::EffectStatus::HostRedactionFailure as i32
+    );
+    assert_eq!(
+        recorded.observed_callee_status,
+        Some(pb::EffectStatus::Ok as i32)
+    );
+    assert_eq!(recorded.callee_source.unwrap().branch, "main");
+    for mode in [Mode::Both, Mode::Isolated] {
+        let out = replay(&p, None, fork_lsn, &opts(mode), 2);
+        let s = &out.diff.summary;
+        assert!(
+            !s.changed,
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&out.bytes)
+        );
+        assert_eq!(
+            (s.turns_prod, s.divergent_turns),
+            (s.turns_fork, 0),
+            "{mode:?}"
+        );
+    }
+    // The fork's record names the fork's callee turn, and the fork delivers
+    // the compensation as production did.
+    let out = replay(&p, None, fork_lsn, &opts(Mode::Continuous), 1);
+    let turns = out.continuous.unwrap().turns();
+    let caller = turns.iter().find(|t| is(&t.record, "counter/a")).unwrap();
+    assert_eq!(
+        caller.record.outcome.as_ref().unwrap().error_code,
+        "HOST_REDACTION_FAILURE"
+    );
+    let call = call_of(&caller.record);
+    assert_eq!(call.status, pb::EffectStatus::HostRedactionFailure as i32);
+    assert_eq!(
+        call.observed_callee_status,
+        Some(pb::EffectStatus::Ok as i32)
+    );
+    let source = call.callee_source.unwrap();
+    source.validate().unwrap();
+    assert_eq!(source.branch, "f-test");
+    let callee = turns.iter().find(|t| t.lsn == source.lsn).unwrap();
+    assert!(is(&callee.record, "counter/b"), "{:?}", callee.record);
+    assert_eq!(caller.record.compensations.len(), 1);
+    let sources: Vec<i32> = turns
+        .iter()
+        .filter(|t| is(&t.record, "counter/b"))
+        .filter_map(|t| match t.record.input.as_ref()?.kind.as_ref()? {
+            pb::input::Kind::Message(m) => Some(m.source),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sources,
+        [
+            pb::MessageSource::Call as i32,
+            pb::MessageSource::Compensation as i32
+        ]
+    );
+}
+
+/// ADR 0134 (#39): turns recorded before and after an actor type's
+/// fingerprint rules change replay exactly, each under the rules of its own
+/// epoch that its recording holds, and the replay sends nothing.
+#[test]
+fn identity_replay_across_a_fingerprint_rules_change_is_exact() {
+    use kronik_proto::log::v1 as pb;
+    let (addr, hits) = server();
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    p.grant("http:127.0.0.1");
+    let fork_lsn = p.settle();
+    let spec = |n: &str| format!("GET http://{addr}/ok?ts={n}&a=b\nH x-api-key key-{n}");
+    let r = p.send("counter/a", "fetch-ok", &spec("1"));
+    assert!(r.committed(), "{:?}", r.outcome);
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "counter".into(),
+            fingerprint_exclude_headers: Some(pb::NameList {
+                names: vec!["x-api-key".into()],
+            }),
+            fingerprint_exclude_query: Some(pb::NameList {
+                names: vec!["ts".into()],
+            }),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    let r = p.send("counter/b", "fetch-ok", &spec("2"));
+    assert!(r.committed(), "{:?}", r.outcome);
+    let sent = hits.load(Ordering::SeqCst);
+    assert_eq!(sent, 2);
+    for mode in [Mode::Both, Mode::Isolated] {
+        let out = replay(&p, None, fork_lsn, &opts(mode), 2);
+        let s = &out.diff.summary;
+        assert!(
+            !s.changed,
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&out.bytes)
+        );
+        assert_eq!(s.divergent_turns, 0, "{mode:?}");
+        assert_eq!(
+            (s.exact >= 2, s.approximate),
+            (true, 0),
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&out.bytes)
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), sent, "the replay sent nothing");
+    // The fork records each turn's request under its turn's rules, as
+    // production did: version 2 before the change, 3 with the names after.
+    let out = replay(&p, None, fork_lsn, &opts(Mode::Continuous), 1);
+    let turns = out.continuous.unwrap().turns();
+    let request_of = |key: &str| {
+        let turn = turns
+            .iter()
+            .find(|t| t.record.actor.as_ref().is_some_and(|a| a.key == key))
+            .unwrap();
+        let Some(pb::sealable::Value::Plain(bytes)) = turn.record.effects[0]
+            .request
+            .as_ref()
+            .and_then(|r| r.value.as_ref())
+        else {
+            panic!("a plain request");
+        };
+        <pb::HttpEffectRequest as prost::Message>::decode(bytes.as_slice()).unwrap()
+    };
+    assert_eq!(request_of("a").fingerprint_version, 2);
+    let after = request_of("b");
+    assert_eq!(after.fingerprint_version, 3);
+    assert_eq!(after.fingerprint_excluded_headers, ["x-api-key"]);
+    assert_eq!(after.fingerprint_excluded_query, ["ts"]);
 }

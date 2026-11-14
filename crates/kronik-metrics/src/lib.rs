@@ -58,6 +58,11 @@ pub const METRICS: &[Def] = &[
         kind: Type::Gauge,
     },
     Def {
+        name: "kronik_retention_open_turn_segments",
+        help: "Closed log segments that the last retention pass kept only for an open turn, by source (live: open in the running state; snapshot: held open by a kept snapshot).",
+        kind: Type::Gauge,
+    },
+    Def {
         name: "kronik_secret_fetch_total",
         help: "Requests to external secret backends, by backend and result (ok, unavailable, denied, not_found, version_gone, invalid, cancelled).",
         kind: Type::Counter,

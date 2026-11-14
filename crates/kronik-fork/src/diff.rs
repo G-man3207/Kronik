@@ -1470,6 +1470,9 @@ fn path_prefix(key: &pb::CausalKey, n: usize) -> Vec<u8> {
     })
 }
 
+/// Whether the turn with a causal key committed, on one side of a diff.
+type CommittedAt<'a> = &'a dyn Fn(&pb::CausalKey) -> bool;
+
 impl Acc {
     fn new(opts: &DiffOptions, sealer: Arc<Sealer>) -> Acc {
         Acc {
@@ -1592,14 +1595,29 @@ impl Acc {
         });
     }
 
-    /// Orphans a failed turn leaves: OK calls without a compensation.
-    fn orphans(t: &pb::TurnRecord) -> BTreeSet<u32> {
+    /// Orphans a failed turn leaves: calls whose callee committed, without a
+    /// compensation. A successful call (status OK, or a withheld reply whose
+    /// callee committed), or one that timed out while its callee's turn
+    /// still committed (#30), which `callee_committed` tells by that turn's
+    /// causal key, as the store's `orphans` table does.
+    fn orphans(
+        t: &pb::TurnRecord,
+        callee_committed: &dyn Fn(&pb::CausalKey) -> bool,
+    ) -> BTreeSet<u32> {
         if !failed(t) {
             return BTreeSet::new();
         }
+        let callee_key = |ordinal: u32| {
+            let caller = ActorRef::from_pb(t.actor.as_ref()?);
+            Some(causal::child(t.causal_key.as_ref()?, &caller, ordinal))
+        };
         t.effects
             .iter()
-            .filter(|e| e.kind == "actor.call" && e.status == pb::EffectStatus::Ok as i32)
+            .filter(|e| {
+                e.successful_call()
+                    || (e.timed_out_call()
+                        && callee_key(e.ordinal).is_some_and(|k| callee_committed(&k)))
+            })
             .filter(|e| {
                 sealable_bytes(e.request.as_ref())
                     .and_then(|b| pb::CallEffectRequest::decode(b).ok())
@@ -1610,8 +1628,15 @@ impl Acc {
     }
 
     /// Errors of one fork turn against its production counterpart (both
-    /// modes, deduplicated by causal key).
-    fn turn_errors(&mut self, prod: Option<(Lsn, &pb::TurnRecord)>, fork: &ForkTurn) {
+    /// modes, deduplicated by causal key). `committed` tells whether the
+    /// production and the fork turn with a causal key committed.
+    fn turn_errors(
+        &mut self,
+        prod: Option<(Lsn, &pb::TurnRecord)>,
+        fork: &ForkTurn,
+        committed: (CommittedAt<'_>, CommittedAt<'_>),
+    ) {
+        let (prod_committed, fork_committed) = committed;
         let key = fork
             .record
             .causal_key
@@ -1631,7 +1656,7 @@ impl Acc {
                 } else if !failed(f) && failed(p) {
                     self.error("fixed", key.clone(), p, Some(lsn), Some(&fork.id));
                 }
-                if !Self::orphans(f).is_subset(&Self::orphans(p)) {
+                if !Self::orphans(f, fork_committed).is_subset(&Self::orphans(p, prod_committed)) {
                     self.error("new_orphan", key.clone(), f, Some(lsn), Some(&fork.id));
                 }
             }
@@ -1639,7 +1664,7 @@ impl Acc {
                 if failed(f) {
                     self.error("introduced", key.clone(), f, None, Some(&fork.id));
                 }
-                if !Self::orphans(f).is_empty() {
+                if !Self::orphans(f, fork_committed).is_empty() {
                     self.error("new_orphan", key.clone(), f, None, Some(&fork.id));
                 }
             }
@@ -1934,6 +1959,16 @@ impl Acc {
         let below = |set: &BTreeSet<Vec<u8>>, ck: Option<&pb::CausalKey>| {
             ck.is_some_and(|ck| (0..ck.path.len()).any(|n| set.contains(&path_prefix(ck, n))))
         };
+        // Whether the turn with a causal key committed, on each side: the
+        // callee's turn of a call that timed out (#30).
+        let prod_committed = |k: &pb::CausalKey| {
+            pmap.get(&causal::encode(k))
+                .is_some_and(|(_, t)| committed(t))
+        };
+        let fork_committed = |k: &pb::CausalKey| {
+            fmap.get(&causal::encode(k))
+                .is_some_and(|f| committed(&f.record))
+        };
         let mut changes: BTreeMap<Vec<u8>, Change<'a>> = BTreeMap::new();
         for f in fork {
             let Some(key) = f.record.causal_key.as_ref().map(causal::encode) else {
@@ -1946,7 +1981,7 @@ impl Acc {
             if f.erased {
                 self.erased_seen.insert(key.clone());
             }
-            self.turn_errors(p, f);
+            self.turn_errors(p, f, (&prod_committed, &fork_committed));
             match p {
                 Some(p) => {
                     if full && !unverified_input(f) {
@@ -2933,6 +2968,74 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The diff's orphans are the store's (#30): a failed turn's call whose
+    /// callee committed and that has no compensation. That is a successful
+    /// call, one whose reply was withheld after its callee committed, or one
+    /// that timed out while its callee's turn still committed.
+    #[test]
+    fn orphans_are_calls_whose_callee_committed() {
+        let call = |ordinal: u32, status: pb::EffectStatus, compensate: bool| {
+            let request = pb::CallEffectRequest {
+                compensate: compensate.then(pb::Message::default),
+                ..Default::default()
+            };
+            pb::EffectRecord {
+                ordinal,
+                kind: "actor.call".into(),
+                target: "actor:counter/b".into(),
+                status: status as i32,
+                request: Some(pb::Sealable {
+                    subject: None,
+                    value: Some(pb::sealable::Value::Plain(request.encode_to_vec())),
+                }),
+                ..Default::default()
+            }
+        };
+        let mut withheld = call(4, pb::EffectStatus::HostRedactionFailure, false);
+        withheld.callee_source = Some(pb::ActorSource {
+            shard: None,
+            lsn: 9,
+            branch: "main".into(),
+        });
+        withheld.observed_callee_status = Some(pb::EffectStatus::Ok as i32);
+        let caller = pb::ActorRef {
+            kind: "counter".into(),
+            key: "a".into(),
+        };
+        let key = pb::CausalKey {
+            root: "r".into(),
+            path: vec![],
+        };
+        let mut turn = pb::TurnRecord {
+            actor: Some(caller.clone()),
+            causal_key: Some(key.clone()),
+            effects: vec![
+                call(1, pb::EffectStatus::Ok, false),
+                call(2, pb::EffectStatus::Ok, true),
+                call(3, pb::EffectStatus::Failed, false),
+                withheld,
+                call(5, pb::EffectStatus::Timeout, false),
+                call(6, pb::EffectStatus::Timeout, false),
+                call(7, pb::EffectStatus::Timeout, true),
+            ],
+            outcome: Some(pb::Outcome {
+                kind: pb::OutcomeKind::Failed as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // The callee of ordinal 5 committed, the one of 6 did not.
+        let committed_callee = causal::child(&key, &ActorRef::from_pb(&caller), 5);
+        let committed = |k: &pb::CausalKey| *k == committed_callee;
+        assert_eq!(Acc::orphans(&turn, &committed), BTreeSet::from([1, 4, 5]));
+        // A committed turn leaves none.
+        turn.outcome = Some(pb::Outcome {
+            kind: pb::OutcomeKind::Committed as i32,
+            ..Default::default()
+        });
+        assert!(Acc::orphans(&turn, &committed).is_empty());
+    }
 
     #[test]
     fn json_paths() {

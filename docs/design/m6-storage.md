@@ -68,8 +68,8 @@ snapshots/main/<L>/manifest.json     written last: the snapshot exists iff it do
   newest snapshot but its own marker, so an idle node writes no copy of
   the state and appends no marker.
 - **Kept.** The newest `retention.snapshots_kept` (48); the window's
-  **base**, the newest snapshot whose state is no newer than the start of
-  the history window (§5: its `logical_time_ms` is at or before the
+  **base**, the newest snapshot whose state is older than the start of
+  the history window (§5: its `logical_time_ms` is strictly before the
   cutoff), from which every fork point in the window can start; and,
   between the base and the newest `snapshots_kept`, one snapshot per seventh
   of `history` (a day with the defaults; at least `snapshot_interval`

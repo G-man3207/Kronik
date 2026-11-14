@@ -116,6 +116,17 @@ hint:  Start the daemon with `kronik serve --api-socket /run/kronik/api.sock`, o
 docs:  kronik explain UNAVAILABLE
 ```
 
+An answer that is not the API's, such as a proxy's error page, is the same
+`UNAVAILABLE` error in both forms, with the start of the page in the
+message:
+
+```text
+$ kronik --url https://kronik.example.com actors list
+error: UNAVAILABLE: the API answered HTTP 502 without a Kronik error: <html><body>Bad Gateway</body></html>
+hint:  Something between the CLI and the daemon (a proxy or a load balancer) answered; check that the URL is the daemon's server.api_listen.
+docs:  kronik explain UNAVAILABLE
+```
+
 ## kronik serve
 
 Runs the daemon: it recovers from the log in the data directory, serves the
@@ -181,6 +192,7 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_disk_below_reserve` | gauge | 1 while the log's file system is below [log] disk_reserve: new inputs and changes are refused. |
 | `kronik_key_source_up` | gauge | 1 when the daemon loaded its master key through its key source ([keys] source); 0 without a secret store. |
 | `kronik_secret_recovery_stalled` | gauge | Re-runs of open turns waiting for a recorded secret value or for an unavailable prerequisite. |
+| `kronik_retention_open_turn_segments` | gauge | Closed log segments that the last retention pass kept only for an open turn, by source (live: open in the running state; snapshot: held open by a kept snapshot). |
 | `kronik_secret_fetch_total` | counter | Requests to external secret backends, by backend and result (ok, unavailable, denied, not_found, version_gone, invalid, cancelled). |
 | `kronik_secret_fetch_seconds` | histogram | Time an external secret backend took to answer, or until the request gave up, by backend. |
 | `kronik_secret_stale` | gauge | 1 while effects use a secret's cached value past [secrets] refresh because its backend does not answer, by secret name. |
@@ -245,7 +257,10 @@ Checks what this host can run (M6): the configuration file, the kernel,
 gVisor's `runsc`, KVM, cgroups, whether it runs as root, and for foreign
 actors `runc`, network namespaces, the run directory and a sandbox; then
 free disk for the data directory, clock synchronization, the TLS
-certificate and shipping. Each check passes, warns or fails. A failure
+certificate, shipping and the master key's source; and, from a daemon that
+answers on the API socket, its export streams, its secret backends and
+whether an open turn keeps the log past `[retention] history` (`retention`).
+Each check passes, warns or fails. A failure
 includes a catalog code and a hint; a pass or a warning may omit a hint.
 The checks of what only foreign actors need warn rather than fail, unless
 the configuration asks for what is missing (`platform = "kvm"`); the
@@ -872,6 +887,8 @@ is granted again. Re-granting without `--in-forks compute` writes
 `recorded`. Under `compute`, a name linked to an external backend at the
 fork point is computed with the value the node holds for that link, and is
 denied with `SECRET_UNAVAILABLE` when it holds none: a fork never fetches.
+Either way the effect is graded synthetic (ADR 0132), as what the node
+holds is not part of the log.
 
 For `http:` capabilities, `--delivery` says how the target tolerates
 retries after a crash: `replay-safe` and `idempotency-keyed` requests are
@@ -929,7 +946,7 @@ Next     kronik revoke counter http:api.example.com --reason "..."
 
 ## kronik limits set
 
-`kronik limits set <KIND> [--fuel <N>] [--memory <SIZE>] [--message-size <SIZE>] [--state-value-size <SIZE>] [--sql-size <SIZE>] [--effect-timeout <DURATION>] [--effect-response-size <SIZE>] --reason <REASON> [--dry-run]`
+`kronik limits set <KIND> [--fuel <N>] [--memory <SIZE>] [--message-size <SIZE>] [--state-value-size <SIZE>] [--sql-size <SIZE>] [--effect-timeout <DURATION>] [--effect-response-size <SIZE>] [--fingerprint-exclude-header <NAMES>] [--fingerprint-exclude-query <NAMES>] --reason <REASON> [--dry-run]`
 
 Changes an actor type's limits (M2); limits that are not named keep their
 value, and at least one must be named. Turns use the limits of their
@@ -950,6 +967,23 @@ configuration epoch. The output shows every limit in force afterwards.
 | `--sql-size` | Largest SQL database per actor | 1 GiB |
 | `--effect-timeout` | How long an effect may take | 10s |
 | `--effect-response-size` | Largest effect response | 10 MiB |
+| `--fingerprint-exclude-header` | Header names left out of HTTP fingerprints | none (the six defaults always) |
+| `--fingerprint-exclude-query` | Query-parameter names left out of HTTP fingerprints | none |
+
+`--fingerprint-exclude-header` and `--fingerprint-exclude-query` take
+comma-separated names (ADR 0134). They leave a header or query parameter
+that changes on every request, such as a rotating `x-api-key` or a `ts`
+timestamp, out of the fingerprint of the type's `http.fetch` and
+`foreign.http` requests, so that a re-run or a fork still matches the
+recording exactly. `authorization`, `cookie`, `date`, `idempotency-key`,
+`user-agent` and `x-request-id` are always left out. A list replaces the
+type's list, `''` clears it, and the request itself is still recorded
+whole. Header names are matched without case; query names as the URL
+writes them.
+
+```text
+$ kronik limits set billing --fingerprint-exclude-header x-api-key --fingerprint-exclude-query ts,nonce --reason "rotating key and timestamp"
+```
 
 ```text
 $ kronik limits set counter --fuel 100M --memory 128Mi --effect-timeout 2s --reason "invoices with many lines"
@@ -961,6 +995,7 @@ Set the limits of counter at lsn 5, epoch 4
   SQL size          1 GiB
   Effect timeout    2s
   Effect response   10 MiB
+  Not fingerprinted -
 Next     kronik limits show --kind counter
 ```
 
@@ -973,8 +1008,8 @@ deployed or not.
 
 ```text
 $ kronik limits show
-KIND     FUEL       MEMORY   MESSAGE  STATE VALUE  SQL    EFFECT TIMEOUT  EFFECT RESPONSE
-counter  100000000  128 MiB  1 MiB    1 MiB        1 GiB  2s              10 MiB
+KIND     FUEL       MEMORY   MESSAGE  STATE VALUE  SQL    EFFECT TIMEOUT  EFFECT RESPONSE  NOT FINGERPRINTED
+counter  100000000  128 MiB  1 MiB    1 MiB        1 GiB  2s              10 MiB           -
 Next     kronik limits set counter --fuel <n> --reason "..."
 ```
 
@@ -2767,15 +2802,19 @@ Historical native scenario receipts do not establish this newer source cohort.
 
 Serves the Model Context Protocol on stdin and stdout for an agent's MCP
 client, and forwards each request to the daemon's MCP endpoint, `/mcp` on
-the API socket (`--socket` and `$KRONIK_API_SOCKET` apply; `--json` does
-not). With `--token` or `$KRONIK_TOKEN`, the agent acts as that token,
-with its scopes; an agent's token has `read`, `fork` and `propose`.
-Without a token, it acts as the socket's caller, with every scope. The same
-endpoint answers over TCP with `--api-listen` and a bearer token, so
-`kronik mcp --url` is refused (`BAD_REQUEST`, exit 1), as is a set
-`$KRONIK_URL` unless `--socket` is given, with the hint to
-point the agent's MCP client at `https://<host>:<port>/mcp` (Streamable
-HTTP) with `Authorization: Bearer <token>`. See
+the API socket (`--socket` and `$KRONIK_API_SOCKET` apply). With `--token`
+or `$KRONIK_TOKEN`, the agent acts as that token, with its scopes; an
+agent's token has `read`, `fork` and `propose`. Without a token, it acts as
+the socket's caller, with every scope. The same endpoint answers over TCP
+with `--api-listen` and a bearer token, so `kronik mcp --url` is refused
+(`BAD_REQUEST`, exit 1), as is a set `$KRONIK_URL` unless `--socket` is
+given, with the hint to point the agent's MCP client at
+`https://<host>:<port>/mcp` (Streamable HTTP) with `Authorization: Bearer
+<token>`. A failure to start is an error like any other command's, exit 1:
+`UNAVAILABLE` when no daemon answers on the socket, `UNAUTHENTICATED` when
+it refuses the token, with code, message, hint and `docs:` on stderr, or,
+with `--json`, the error JSON on stdout. Once the session runs, stdout
+belongs to the protocol and a failure goes to stderr. See
 [ADR 0008](../adr/0008-mcp-server.md) and the
 [agent guide](../guides/agent.md).
 

@@ -117,7 +117,12 @@ the root id).
   serialized in that order. So matched turns run in production order and
   new turns run right after their causal parent.
 - **Calls** run the callee's turn in the fork (re-executed, not taken from
-  the recording); its result is internal.
+  the recording); its result is internal. The call's record names that
+  fork turn as its callee source (`callee_source`: the fork's name and the
+  turn's LSN in the fork's store), as production names the callee's turn
+  in its log, so a reply over what the caller may take is withheld and
+  recorded as `HOST_REDACTION_FAILURE` with the callee's status, as in
+  production.
 - **Fork-only timers** (continuous): a timer due at `d` fires at the first
   production position whose logical time is ≥ `d`, before that root input:
   its order key is `[that root input's LSN - 1, u64::MAX, seq]`, which sorts
@@ -149,8 +154,9 @@ the root id).
   `compute`. Under `compute`, a name that is linked to an external backend
   at the fork point is recomputed with the value the node already holds for
   that link (m23 §6); when it holds none the effect is denied with
-  `SECRET_UNAVAILABLE` and graded synthetic like any answer the fork cannot
-  give, as a fork never fetches. `secret.reveal` in a fork never
+  `SECRET_UNAVAILABLE`, as a fork never fetches. Both are graded synthetic
+  (ADR 0132): what the node holds is not in the log, so the grade does not
+  depend on it. `secret.reveal` in a fork never
   gets the value: it answers the placeholder `[secret:<name>]` (exact when
   production revealed at that point, else synthetic). Production records
   HTTP and call requests, and fingerprints them, with the same placeholder
@@ -290,7 +296,7 @@ whose drift grows: `{"actors_changed": N, "items": [{"actor", "keys": [...], "sq
 | --- | --- |
 | `introduced` | fork turns that fail where production committed, plus new turns that fail |
 | `fixed` | turns that committed in the fork but failed in production |
-| `new_orphans` | orphans created in the fork that production did not create |
+| `new_orphans` | orphans created in the fork that production did not create: calls without a compensation, in a failed turn, whose callee committed (a successful call, one whose reply was withheld, or one that timed out while its callee's turn still committed, as in the `orphans` table) |
 | `outcome_unknown` | fork effects matched to a production effect whose recorded status was outcome-unknown |
 | `items` | `[{"kind": "introduced" | "fixed" | "new_orphan" | "outcome_unknown", "error_code", "message", "turn_prod", "turn_fork", "input"}]`, at most 20 per kind |
 

@@ -822,3 +822,101 @@ fn native_origin_message_is_data_only_and_field10_is_not_an_old_reader_write_fen
     assert!(kronik_proto::control::validate_native_authority_origin(&origin).is_err());
     // This fixture performs no Log append, metadata apply or activation.
 }
+
+/// `Limits.fingerprint_exclude_headers` and `fingerprint_exclude_query`
+/// (fields 11 and 12, ADR 0134). A record without them decodes with both
+/// unset, which keeps a kind's lists.
+#[test]
+fn limits_fingerprint_rules_v1() {
+    let names = |n: &[&str]| {
+        Some(pb::NameList {
+            names: n.iter().map(|s| (*s).to_owned()).collect(),
+        })
+    };
+    let record = Record::Limits(pb::Limits {
+        epoch: 9,
+        kind: "billing".into(),
+        fuel: Some(100_000_000),
+        fingerprint_exclude_headers: names(&["x-api-key", "x-request-nonce"]),
+        fingerprint_exclude_query: names(&[]),
+        audit: Some(pb::Audit {
+            token_id: "admin".into(),
+            reason: "volatile headers".into(),
+            wall_time_ms: 1_794_000_000_000,
+        }),
+        ..Default::default()
+    });
+    let bytes = fixture("limits-fingerprint-v1", &record);
+    let decoded = Record::decode(kronik_proto::kind::LIMITS, &bytes).unwrap();
+    assert_eq!(decoded, record);
+    // An empty list is a list (it clears), not an unset field.
+    let Record::Limits(limits) = decoded else {
+        unreachable!("a Limits record")
+    };
+    assert_eq!(limits.fingerprint_exclude_query, names(&[]));
+    let older = Record::Limits(pb::Limits {
+        epoch: 9,
+        kind: "billing".into(),
+        fuel: Some(100_000_000),
+        ..Default::default()
+    });
+    let Record::Limits(older) =
+        Record::decode(kronik_proto::kind::LIMITS, &older.encode()).unwrap()
+    else {
+        unreachable!("a Limits record")
+    };
+    assert!(older.fingerprint_exclude_headers.is_none());
+    assert!(older.fingerprint_exclude_query.is_none());
+}
+
+/// An `http.fetch` effect whose request is fingerprint version 3 with the
+/// names its actor type's rules left out (`HttpEffectRequest` fields 6 and
+/// 7, ADR 0134), inside a `TurnRecord`.
+#[test]
+fn effect_record_http_v3_v1() {
+    use prost::Message as _;
+    let request = pb::HttpEffectRequest {
+        method: "GET".into(),
+        url: "https://payments.internal/v1/charges?ts=1&a=b".into(),
+        headers: vec![pb::HttpEffectHeader {
+            name: "x-api-key".into(),
+            value: Some(pb::http_effect_header::Value::Text("k1".into())),
+        }],
+        body: Vec::new(),
+        fingerprint_version: 3,
+        fingerprint_excluded_headers: vec!["x-api-key".into()],
+        fingerprint_excluded_query: vec!["nonce".into(), "ts".into()],
+    };
+    let mut turn = turn();
+    turn.effects = vec![pb::EffectRecord {
+        ordinal: 1,
+        kind: "http.fetch".into(),
+        status: pb::EffectStatus::Ok as i32,
+        target: "http:payments.internal".into(),
+        fingerprint: vec![7; 32],
+        grounding: pb::Grounding::Live as i32,
+        request: Some(pb::Sealable {
+            subject: None,
+            value: Some(pb::sealable::Value::Plain(request.encode_to_vec())),
+        }),
+        ..Default::default()
+    }];
+    let record = Record::TurnRecord(turn);
+    let bytes = fixture("effect-record-http-v3-v1", &record);
+    let decoded = Record::decode(kronik_proto::kind::TURN_RECORD, &bytes).unwrap();
+    assert_eq!(decoded, record);
+    let Record::TurnRecord(turn) = decoded else {
+        unreachable!("a TurnRecord")
+    };
+    let Some(pb::sealable::Value::Plain(inner)) = turn.effects[0]
+        .request
+        .as_ref()
+        .and_then(|request| request.value.as_ref())
+    else {
+        unreachable!("a plain request")
+    };
+    assert_eq!(
+        pb::HttpEffectRequest::decode(inner.as_slice()).unwrap(),
+        request
+    );
+}

@@ -2172,10 +2172,12 @@ fn fork_hmac(d: &Daemon, fork: &str, secret: &str) -> (u16, Value) {
 /// from) under a `compute` grant computes on the host. For a name linked at
 /// the fork point it uses the value this process holds for that link (here
 /// VALUE_2, the backend's), never the built-in store's older value (VALUE_1)
-/// and never a fetch; when the process holds none (after a restart) the
-/// effect is denied with SECRET_UNAVAILABLE and graded synthetic. A fork from
-/// before the link or from after the unlink computes with the built-in value
-/// as it always did, and a name that was never linked is unaffected.
+/// and never a fetch, and grades it synthetic: it rests on what this process
+/// holds, so a diff grades it the same as the denial that a process holding
+/// nothing (after a restart) gives, SECRET_UNAVAILABLE and synthetic. A fork
+/// from before the link or from after the unlink computes with the built-in
+/// value as it always did (exact), and a name that was never linked is
+/// unaffected.
 #[test]
 fn a_fork_computes_a_linked_name_with_the_value_held_for_its_link_and_never_fetches() {
     let bao = Bao::start();
@@ -2237,14 +2239,24 @@ fn a_fork_computes_a_linked_name_with_the_value_held_for_its_link_and_never_fetc
 
     // After the link: the held value of the link; the other name is the
     // built-in store's.
+    let grounding = |answer: &Value| {
+        answer["effects"]
+            .as_array()
+            .and_then(|effects| effects.first())
+            .and_then(|effect| effect["grounding"].as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
     let (status, answer) = fork_hmac(&d, &linked, "stripe");
     println!("linked fork, stripe: {status} {answer}");
     assert_eq!(status, 200, "{answer}");
     assert!(answer.to_string().contains(&backend), "{answer}");
     assert!(!answer.to_string().contains(&built_in), "{answer}");
+    assert_eq!(grounding(&answer), "synthetic", "{answer}");
     let (status, answer) = fork_hmac(&d, &linked, "plain");
     assert_eq!(status, 200, "{answer}");
     assert!(answer.to_string().contains(&built_in), "{answer}");
+    assert_eq!(grounding(&answer), "exact", "{answer}");
 
     // Before the link and after the unlink: the built-in store's, as before.
     for (fork, when) in [
@@ -2280,7 +2292,7 @@ fn a_fork_computes_a_linked_name_with_the_value_held_for_its_link_and_never_fetc
         text.contains("SECRET_UNAVAILABLE: stripe is linked"),
         "{text}"
     );
-    assert!(text.contains("synthetic"), "{text}");
+    assert_eq!(grounding(&answer), "synthetic", "{answer}");
     for value in [&built_in, &backend] {
         assert!(!text.contains(value.as_str()), "{text}");
     }

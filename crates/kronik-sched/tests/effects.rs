@@ -19,6 +19,7 @@ use kronik_effects::{Delivery, Rate};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Node, NodeConfig, TurnResult, start_local};
+use prost::Message as _;
 use tokio::runtime::Runtime;
 
 const COUNTER: &str = concat!(
@@ -1625,4 +1626,349 @@ fn a_snapshot_with_an_open_turn_stays_a_start_point_through_retention() {
     p.wait_until("no open turn", |p| {
         p.node.store().db().open_turns().unwrap().is_empty()
     });
+}
+
+/// Makes `actor` busy for about 0.75 s (a bounded spin) before anything
+/// queued after this returns, so a call to it times out (#30).
+fn keep_busy(p: &Proc, actor: &str) {
+    let started = p
+        .node
+        .probe
+        .turns_run
+        .load(std::sync::atomic::Ordering::SeqCst);
+    p.send_detached(actor, msg("spin", "250000000"));
+    p.wait_until("the spin to start", |p| {
+        p.node
+            .probe
+            .turns_run
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > started
+    });
+}
+
+/// The turns of `actor` whose input came by `source`.
+fn turns_from(p: &Proc, actor: &str, source: pb::MessageSource) -> usize {
+    turn_records(&p.records())
+        .iter()
+        .filter(|t| {
+            t.actor
+                .as_ref()
+                .is_some_and(|a| format!("{}/{}", a.kind, a.key) == actor)
+                && matches!(
+                    t.input.as_ref().and_then(|i| i.kind.as_ref()),
+                    Some(pb::input::Kind::Message(m)) if m.source == source as i32
+                )
+        })
+        .count()
+}
+
+/// #30: a call that times out while its callee is busy still commits at the
+/// callee. When the caller then fails, the callee's change is an orphan and
+/// the call's compensation is delivered, once, as soon as the callee's turn
+/// commits; a callee turn that fails leaves neither. Until then the
+/// compensation is held, also across a restart that loses the queued call.
+#[test]
+fn a_call_that_times_out_is_an_orphan_once_its_callee_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy();
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "counter".into(),
+            effect_timeout_ms: Some(100),
+            fuel: Some(5_000_000_000),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    let orphan_of = |p: &Proc, key: &str| {
+        p.node
+            .store()
+            .db()
+            .orphans(true)
+            .unwrap()
+            .into_iter()
+            .find(|o| o.callee.key == key)
+    };
+
+    // With a compensation.
+    keep_busy(&p, "counter/b");
+    let r = p.send(
+        "counter/a",
+        msg("call-fail", "counter/b increment increment"),
+    );
+    assert!(!r.committed());
+    assert!(r.outcome.message.contains("Timeout"), "{:?}", r.outcome);
+    // The callee has not run the call yet: nothing is known.
+    assert!(orphan_of(&p, "b").is_none());
+    assert_eq!(p.kv("counter/b", "n"), None);
+    p.wait_until("the call and its compensation", |p| {
+        p.kv("counter/b", "n").as_deref() == Some("2")
+    });
+    p.wait_until("the orphan to resolve", |p| {
+        orphan_of(p, "b").is_some_and(|o| o.resolved_lsn.is_some())
+    });
+    assert!(orphan_of(&p, "b").unwrap().compensation_id.is_some());
+    assert_eq!(
+        turns_from(&p, "counter/b", pb::MessageSource::Compensation),
+        1
+    );
+
+    // Without one: the change stays an orphan.
+    keep_busy(&p, "counter/c");
+    let r = p.send("counter/a", msg("call-fail", "counter/c increment"));
+    assert!(!r.committed());
+    p.wait_until("the orphan", |p| orphan_of(p, "c").is_some());
+    let o = orphan_of(&p, "c").unwrap();
+    assert!(
+        o.compensation_id.is_none() && o.resolved_lsn.is_none(),
+        "{o:?}"
+    );
+    assert_eq!(p.kv("counter/c", "n").as_deref(), Some("1"));
+
+    // A callee turn that fails changed nothing: no orphan, no compensation.
+    keep_busy(&p, "counter/d");
+    let r = p.send("counter/a", msg("call-fail", "counter/d fail increment"));
+    assert!(!r.committed());
+    p.wait_until("the callee's failed turn", |p| {
+        turns_from(p, "counter/d", pb::MessageSource::Call) == 1
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(orphan_of(&p, "d").is_none());
+    assert_eq!(p.kv("counter/d", "n"), None);
+    assert_eq!(
+        turns_from(&p, "counter/d", pb::MessageSource::Compensation),
+        0
+    );
+
+    // A restart loses the queued call: the held compensation never goes out.
+    keep_busy(&p, "counter/e");
+    let r = p.send(
+        "counter/a",
+        msg("call-fail", "counter/e increment increment"),
+    );
+    assert!(!r.committed());
+    drop(p);
+    let p = start(dir.path());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(orphan_of(&p, "e").is_none());
+    assert_eq!(p.kv("counter/e", "n"), None);
+    assert!(p.node.store().db().mailbox().unwrap().is_empty());
+    // The rest stands after the restart.
+    assert!(orphan_of(&p, "c").is_some_and(|o| o.resolved_lsn.is_none()));
+    assert_eq!(p.kv("counter/b", "n").as_deref(), Some("2"));
+}
+
+/// The real clock with a wall clock the test steps, as NTP or an operator
+/// would.
+struct SteppedClock {
+    real: Arc<dyn kronik_core::env::Clock>,
+    offset_ms: std::sync::atomic::AtomicI64,
+}
+
+impl kronik_core::env::Clock for SteppedClock {
+    fn wall_ms(&self) -> u64 {
+        let offset = self.offset_ms.load(std::sync::atomic::Ordering::SeqCst);
+        u64::try_from(i64::try_from(self.real.wall_ms()).unwrap() + offset).unwrap()
+    }
+
+    fn monotonic(&self) -> Duration {
+        self.real.monotonic()
+    }
+
+    fn sleep(&self, d: Duration) -> kronik_core::env::BoxFuture<'static, ()> {
+        self.real.sleep(d)
+    }
+}
+
+/// #40 (ADR 0006): after the host clock steps back 5 minutes, logical time
+/// holds still at its high-water mark, but a 1 s timer set before the step
+/// and one set after it both fire after about 1 s, not 5 minutes later.
+/// Logical time never goes back, and each timer turn's time is at least its
+/// due time.
+#[test]
+fn a_clock_step_back_delays_no_timer() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut clock = None;
+    let node = rt.block_on(async {
+        let mut env = Env::real(tokio::runtime::Handle::current());
+        let stepped = Arc::new(SteppedClock {
+            real: env.clock.clone(),
+            offset_ms: std::sync::atomic::AtomicI64::new(0),
+        });
+        env.clock = stepped.clone();
+        clock = Some(stepped);
+        start_local(
+            env,
+            dir.path(),
+            NodeConfig {
+                concurrency: 8,
+                ..NodeConfig::default()
+            },
+        )
+        .await
+        .unwrap()
+    });
+    let clock = clock.unwrap();
+    let p = Proc { rt, node };
+    p.deploy();
+    let started = Instant::now();
+    p.send("counter/before", msg("schedule", "1000 increment"));
+    clock
+        .offset_ms
+        .fetch_sub(300_000, std::sync::atomic::Ordering::SeqCst);
+    let after = Instant::now();
+    p.send("counter/after", msg("schedule", "1000 increment"));
+    // wait_until gives up after about 10 s.
+    p.wait_until("the timer set before the step", |p| {
+        p.kv("counter/before", "n").as_deref() == Some("1")
+    });
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    p.wait_until("the timer set after the step", |p| {
+        p.kv("counter/after", "n").as_deref() == Some("1")
+    });
+    assert!(after.elapsed() >= Duration::from_secs(1));
+    p.wait_until("both timer turns in the log", |p| {
+        turn_records(&p.records())
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.input.as_ref().and_then(|i| i.kind.as_ref()),
+                    Some(pb::input::Kind::Timer(_))
+                )
+            })
+            .count()
+            == 2
+    });
+    // Per actor, as ADR 0006 promises (concurrent turns of two actors may
+    // commit in the other order of their times).
+    let mut last: BTreeMap<String, u64> = BTreeMap::new();
+    for t in turn_records(&p.records()) {
+        let actor = t.actor.as_ref().map(|a| a.key.clone()).unwrap_or_default();
+        let previous = last.insert(actor, t.logical_time_ms).unwrap_or(0);
+        assert!(
+            t.logical_time_ms >= previous,
+            "logical time went back: {t:?}"
+        );
+        if let Some(pb::input::Kind::Timer(input)) = t.input.and_then(|i| i.kind) {
+            assert!(t.logical_time_ms >= input.due_ms);
+        }
+    }
+}
+
+/// #39 (ADR 0134): an actor type's fingerprint rules leave out the header
+/// and query-parameter names they list, for that type only. A request is
+/// recorded with the rules of its turn's epoch (version 3 and the names) and
+/// its fingerprint is recomputed from the recording alone.
+#[test]
+fn fingerprint_rules_apply_to_their_kind_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start();
+    let p = start(dir.path());
+    p.deploy();
+    p.grant("http:127.0.0.1", None, None);
+    let set = |kind: &str, headers: &[&str], query: &[&str]| {
+        let list = |names: &[&str]| {
+            Some(pb::NameList {
+                names: names.iter().map(|n| (*n).to_owned()).collect(),
+            })
+        };
+        p.rt.block_on(p.node.set_limits(
+            pb::Limits {
+                kind: kind.into(),
+                fingerprint_exclude_headers: list(headers),
+                fingerprint_exclude_query: list(query),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            p.owner(),
+        ))
+        .unwrap()
+    };
+    // The recorded request and fingerprint of one fetch.
+    let fetch = |key: &str, ts: &str, tenant: &str| {
+        let spec = format!(
+            "GET http://{}/ok?ts={ts}&a=b\nH X-Api-Key key-{key}\nH x-tenant {tenant}",
+            server.addr
+        );
+        let r = p.send(&format!("counter/{key}"), msg("fetch-ok", &spec));
+        assert!(reply(&r).starts_with("200"), "{}", reply(&r));
+        let turns = turn_records(&p.records());
+        let effect = turns.last().unwrap().effects[0].clone();
+        let Some(pb::sealable::Value::Plain(bytes)) =
+            effect.request.as_ref().and_then(|r| r.value.as_ref())
+        else {
+            panic!("a plain request");
+        };
+        let request = pb::HttpEffectRequest::decode(bytes.as_slice()).unwrap();
+        // The recording's fingerprint follows from the recording alone.
+        let target = kronik_effects::http::prepared_target(&request).unwrap();
+        assert_eq!(
+            kronik_effects::http::fingerprint_v2(&request, &target).unwrap(),
+            effect.fingerprint
+        );
+        (request, effect.fingerprint)
+    };
+    // Rules for another kind leave counter's fingerprints alone.
+    let (_, _, _, rules) = set("billing", &["x-api-key"], &["ts"]);
+    assert_eq!(rules.headers(), ["x-api-key"]);
+    let (a, fa) = fetch("a", "1", "t1");
+    let (_, fb) = fetch("b", "2", "t1");
+    assert_eq!(a.fingerprint_version, 2);
+    assert!(a.fingerprint_excluded_headers.is_empty());
+    assert_ne!(fa, fb);
+    // Counter's own rules: the names are canonical (lowercase, sorted, the
+    // default user-agent dropped) and recorded in its requests.
+    let (_, _, _, rules) = set("counter", &["X-Api-Key", "user-agent"], &["ts", "nonce"]);
+    assert_eq!(rules.headers(), ["x-api-key"]);
+    assert_eq!(rules.query(), ["nonce", "ts"]);
+    let (c, fc) = fetch("c", "3", "t1");
+    let (_, fd) = fetch("d", "4", "t1");
+    assert_eq!(c.fingerprint_version, 3);
+    assert_eq!(c.fingerprint_excluded_headers, ["x-api-key"]);
+    assert_eq!(c.fingerprint_excluded_query, ["nonce", "ts"]);
+    assert_eq!(fc, fd, "the key and ts differ only");
+    // A header the rules do not name still counts.
+    let (_, fe) = fetch("e", "5", "t2");
+    assert_ne!(fc, fe);
+    // An empty list clears; the other list stays.
+    let (_, _, _, rules) =
+        p.rt.block_on(p.node.set_limits(
+            pb::Limits {
+                kind: "counter".into(),
+                fingerprint_exclude_headers: Some(pb::NameList { names: vec![] }),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            p.owner(),
+        ))
+        .unwrap();
+    assert!(rules.headers().is_empty());
+    assert_eq!(rules.query(), ["nonce", "ts"]);
+    // An invalid name is refused before anything is written.
+    let error =
+        p.rt.block_on(p.node.set_limits(
+            pb::Limits {
+                kind: "counter".into(),
+                fingerprint_exclude_headers: Some(pb::NameList {
+                    names: vec!["bad header".into()],
+                }),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            p.owner(),
+        ))
+        .unwrap_err();
+    assert_eq!(error.code, kronik_core::error::ErrorCode::BadRequest);
 }

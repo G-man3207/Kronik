@@ -279,6 +279,8 @@ pub struct Config {
     pub epoch: u64,
     grants: BTreeMap<(String, String), Grant>,
     limits: BTreeMap<String, KindLimits>,
+    /// HTTP fingerprint rules by kind (ADR 0134), set by `Limits` records.
+    fingerprint: BTreeMap<String, crate::http::FingerprintRules>,
     /// `ForeignActor` add records by name (docs/design/m7-foreign.md §2).
     foreign: BTreeMap<String, pb::ForeignActor>,
     /// The latest `PrivacyMode` record's epoch and mode
@@ -331,6 +333,7 @@ impl Config {
                 self.epoch = self.epoch.max(l.epoch);
                 let base = self.installation_limits();
                 self.limits.entry(l.kind.clone()).or_insert(base).apply(l);
+                self.apply_fingerprint_rules(l);
             }
             Record::Deployment(d) => self.epoch = self.epoch.max(d.epoch),
             Record::PrivacyMode(p) => {
@@ -406,6 +409,31 @@ impl Config {
             Some((epoch, pb::PrivacyState::On)) => (pb::PrivacyState::On, Some(epoch)),
             Some((epoch, _)) => (pb::PrivacyState::Off, Some(epoch)),
             None => (pb::PrivacyState::Off, None),
+        }
+    }
+
+    /// The kind's HTTP fingerprint rules (ADR 0134): none until a `Limits`
+    /// record sets some.
+    pub fn fingerprint_rules(&self, kind: &str) -> crate::http::FingerprintRules {
+        self.fingerprint.get(kind).cloned().unwrap_or_default()
+    }
+
+    /// A `Limits` record's lists replace the kind's, each one it sets. The
+    /// node checked them before writing the record; a name that does not
+    /// check out leaves that list as it was.
+    fn apply_fingerprint_rules(&mut self, l: &pb::Limits) {
+        if l.fingerprint_exclude_headers.is_none() && l.fingerprint_exclude_query.is_none() {
+            return;
+        }
+        let rules = self.fingerprint.entry(l.kind.clone()).or_default();
+        if let Some(list) = &l.fingerprint_exclude_headers {
+            let _ = rules.set_headers(&list.names);
+        }
+        if let Some(list) = &l.fingerprint_exclude_query {
+            let _ = rules.set_query(&list.names);
+        }
+        if rules.is_empty() {
+            self.fingerprint.remove(&l.kind);
         }
     }
 
@@ -526,6 +554,48 @@ mod tests {
             audit: None,
             in_forks: String::new(),
         })
+    }
+
+    /// ADR 0134: a `Limits` record's lists replace a kind's, each one it
+    /// sets; an unset list keeps, an empty one clears, and other kinds and
+    /// the other limits are untouched.
+    #[test]
+    fn limits_records_set_a_kinds_fingerprint_rules() {
+        let names = |n: &[&str]| {
+            Some(pb::NameList {
+                names: n.iter().map(|s| (*s).to_owned()).collect(),
+            })
+        };
+        let limits = |epoch, headers, query, fuel| {
+            Record::Limits(pb::Limits {
+                epoch,
+                kind: "billing".into(),
+                fuel,
+                fingerprint_exclude_headers: headers,
+                fingerprint_exclude_query: query,
+                ..Default::default()
+            })
+        };
+        let mut c = Config::default();
+        assert!(c.fingerprint_rules("billing").is_empty());
+        c.apply(&limits(1, names(&["X-Api-Key"]), names(&["ts"]), None));
+        let r = c.fingerprint_rules("billing");
+        assert_eq!(
+            (r.headers(), r.query()),
+            (&["x-api-key".to_owned()][..], &["ts".to_owned()][..])
+        );
+        assert!(c.fingerprint_rules("other").is_empty());
+        // Another limit alone keeps the lists.
+        c.apply(&limits(2, None, None, Some(7)));
+        assert_eq!(c.fingerprint_rules("billing"), r);
+        assert_eq!(c.limits("billing").fuel, 7);
+        // One list replaced, the other kept; then cleared.
+        c.apply(&limits(3, None, names(&["nonce"]), None));
+        assert_eq!(c.fingerprint_rules("billing").headers(), ["x-api-key"]);
+        assert_eq!(c.fingerprint_rules("billing").query(), ["nonce"]);
+        c.apply(&limits(4, names(&[]), names(&[]), None));
+        assert!(c.fingerprint_rules("billing").is_empty());
+        assert_eq!(c.limits("billing").fuel, 7);
     }
 
     #[test]

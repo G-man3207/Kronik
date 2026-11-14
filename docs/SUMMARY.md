@@ -134,3 +134,4 @@
 - [ADR 0130: A turn's record fits in one log record](adr/0130-one-log-record-per-turn.md)
 - [ADR 0131: Retention keeps a base for the whole history window](adr/0131-retention-keeps-a-base-for-the-window.md)
 - [ADR 0133: The isolation proofs run on GitHub-hosted runners](adr/0133-isolation-proofs-on-hosted-runners.md)
+- [ADR 0134: Per-kind HTTP fingerprint rules](adr/0134-per-kind-http-fingerprint-rules.md)

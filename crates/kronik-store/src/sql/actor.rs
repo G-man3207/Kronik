@@ -232,7 +232,32 @@ const DENIED_FUNCTIONS: &[&str] = &[
     "total_changes",
     "sqlite_offset",
     "fts3_tokenizer",
+    SCRUB_REPLACE,
 ];
+
+/// The host's byte replace for the secret scrub of blob cells; a guest may
+/// not call it ([`DENIED_FUNCTIONS`]).
+const SCRUB_REPLACE: &str = "kronik_scrub_replace";
+
+/// `haystack` with every occurrence of `needle` replaced by `with`, left to
+/// right, byte for byte. An empty needle replaces nothing.
+fn replace_bytes(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return haystack.to_vec();
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut rest = haystack;
+    while !rest.is_empty() {
+        if rest.starts_with(needle) {
+            out.extend_from_slice(with);
+            rest = &rest[needle.len()..];
+        } else {
+            out.push(rest[0]);
+            rest = &rest[1..];
+        }
+    }
+    out
+}
 
 /// Eponymous virtual tables that expose physical state.
 const DENIED_TABLES: &[&str] = &["dbstat", "sqlite_dbpage", "sqlite_stmt"];
@@ -526,6 +551,25 @@ impl SqlActor {
             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS,
             move |_| Ok(lock(&s).subject.clone()),
         )?;
+        // The secret scrub's replace for blob cells (`scrub`): byte for byte.
+        // SQLite's replace() takes a pattern whose first byte is NUL for an
+        // empty one and leaves the value as it is. Host only (`authorize`).
+        conn.create_scalar_function(
+            SCRUB_REPLACE,
+            3,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let bytes = |i: usize| -> rusqlite::Result<Vec<u8>> {
+                    Ok(match ctx.get_raw(i) {
+                        rusqlite::types::ValueRef::Blob(b) | rusqlite::types::ValueRef::Text(b) => {
+                            b.to_vec()
+                        }
+                        _ => Vec::new(),
+                    })
+                };
+                Ok(replace_bytes(&bytes(0)?, &bytes(1)?, &bytes(2)?))
+            },
+        )?;
         let s = shared.clone();
         conn.authorizer(Some(move |ctx: AuthContext<'_>| {
             authorize(&mut lock(&s), &ctx)
@@ -808,10 +852,11 @@ impl SqlActor {
         Ok(t)
     }
 
-    /// Replaces every exact occurrence of each secret value in the text
-    /// columns of every user table with `[secret:<name>]`, inside the turn,
-    /// so the turn's changeset never holds the value. Returns the number of
-    /// changed cells.
+    /// Replaces every exact occurrence of each secret value in the text and
+    /// blob cells of every user table with `[secret:<name>]`, inside the
+    /// turn, so neither the turn's changeset (the log) nor the actor database
+    /// holds the value (#37). A blob cell stays a blob; a value that is not
+    /// UTF-8 can only be in a blob. Returns the number of changed cells.
     pub fn scrub<N: AsRef<str>, V: AsRef<[u8]>>(
         &mut self,
         secrets: &[(N, V)],
@@ -836,24 +881,34 @@ impl SqlActor {
                 .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
                 .and_then(|mut st| st.query_map([t], |r| r.get(0))?.collect())
                 .map_err(|e| e.to_string())?;
+            let table = t.replace('"', "\"\"");
             for c in &cols {
+                let col = c.replace('"', "\"\"");
                 for (name, value) in secrets {
-                    let name = name.as_ref();
-                    let Ok(v) = std::str::from_utf8(value.as_ref()) else {
-                        continue;
-                    };
-                    if v.len() < 4 {
+                    let marker = format!("[secret:{}]", name.as_ref());
+                    let bytes = value.as_ref();
+                    if bytes.len() < 4 {
                         continue;
                     }
+                    if let Ok(v) = std::str::from_utf8(bytes) {
+                        let q = format!(
+                            "UPDATE \"{table}\" SET \"{col}\" = replace(\"{col}\", ?1, ?2) \
+                             WHERE typeof(\"{col}\") = 'text' AND instr(\"{col}\", ?1) > 0"
+                        );
+                        changed += self
+                            .conn
+                            .execute(&q, rusqlite::params![v, marker])
+                            .map_err(|e| e.to_string())? as u64;
+                    }
+                    // With a blob needle instr() compares bytes; the replace
+                    // is the host's, byte for byte, and answers a blob.
                     let q = format!(
-                        "UPDATE \"{t}\" SET \"{c}\" = replace(\"{c}\", ?1, ?2) \
-                         WHERE typeof(\"{c}\") = 'text' AND instr(\"{c}\", ?1) > 0",
-                        t = t.replace('"', "\"\""),
-                        c = c.replace('"', "\"\"")
+                        "UPDATE \"{table}\" SET \"{col}\" = {SCRUB_REPLACE}(\"{col}\", ?1, ?2) \
+                         WHERE typeof(\"{col}\") = 'blob' AND instr(\"{col}\", ?1) > 0"
                     );
                     changed += self
                         .conn
-                        .execute(&q, rusqlite::params![v, format!("[secret:{name}]")])
+                        .execute(&q, rusqlite::params![bytes, marker])
                         .map_err(|e| e.to_string())? as u64;
                 }
             }

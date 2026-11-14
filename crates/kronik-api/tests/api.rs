@@ -1082,6 +1082,12 @@ async fn incomplete_secret_inventory_blocks_disclosure_not_unrelated_turns() {
             "/v1/actors/counter/a/messages",
             json!({"name": "increment", "reason": "before failure"}),
         ),
+        // A pending timer whose message name holds the value before it is
+        // a secret (#44).
+        (
+            "/v1/actors/counter/a/messages",
+            json!({"name": "schedule", "text": format!("3600000 run-{SECRET}"), "reason": "timer"}),
+        ),
     ] {
         let (status, response) = call(&api, "POST", path, body).await;
         assert_eq!(status, 200, "{response}");
@@ -1094,6 +1100,13 @@ async fn incomplete_secret_inventory_blocks_disclosure_not_unrelated_turns() {
     )
     .await;
     assert_eq!(status, 200, "{response}");
+    // The timers view scrubs the name, as a turn's `timers[].name` is.
+    let (status, response) = call(&api, "GET", "/v1/actors/counter/a/timers", Value::Null).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(
+        response["timers"][0]["name"], "run-[secret:api-key]",
+        "{response}"
+    );
     // Warm certified bytes survive ciphertext damage, so the read path's
     // store-identity probe is what catches a damaged store: every active
     // ledger row's physical row must still carry the ledger's version hash,
@@ -1111,6 +1124,7 @@ async fn incomplete_secret_inventory_blocks_disclosure_not_unrelated_turns() {
         "/v1/audit",
         "/v1/actors/counter/a",
         "/v1/actors/counter/a/history",
+        "/v1/actors/counter/a/timers",
     ] {
         let (status, response) = call(&api, "GET", path, Value::Null).await;
         assert_eq!(status, 503, "{path}: {response}");
@@ -1167,4 +1181,49 @@ async fn an_orphan_of_a_sealed_call_keeps_the_callee_turn() {
     let (_, v) = call(&api, "GET", "/v1/orphans", Value::Null).await;
     let turn = v["orphans"][0]["turn_id"].as_str().unwrap_or_default();
     assert!(turn.starts_with("main:"), "{v}");
+}
+
+/// `+` is a literal character in a path (RFC 3986 §3.3), as the gateway reads
+/// it: an actor `counter/a+b` is read at `/v1/actors/counter/a+b`, not as
+/// `a b`, which is no valid key (#47).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plus_in_a_path_segment_is_a_plus() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::real(tokio::runtime::Handle::current());
+    let node = start_local(env, dir.path(), NodeConfig::default())
+        .await
+        .unwrap();
+    let api = Arc::new(Api::new(node));
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/deployments",
+        json!({"wasm_base64": wasm(COUNTER), "reason": "deploy"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    // Encoded `+` worked before and after.
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/actors/counter/a%2Bb/messages",
+        json!({"name": "increment", "reason": "test"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = call(&api, "GET", "/v1/actors/counter/a+b", Value::Null).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["actor"]["key"], "a+b", "{v}");
+    let (s, v) = call(&api, "GET", "/v1/actors/counter/a+b/history", Value::Null).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["turns"].as_array().map(Vec::len), Some(1), "{v}");
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/actors/counter/a+b/messages",
+        json!({"name": "increment", "reason": "test"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["reply"]["text"], "2", "{v}");
 }

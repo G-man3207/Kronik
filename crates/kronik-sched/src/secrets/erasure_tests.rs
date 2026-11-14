@@ -76,6 +76,7 @@ fn fetch(subject: Option<&str>, cites: Option<(&str, u64, &[u8])>) -> pb::Effect
             headers,
             body: b"the body of the request".to_vec(),
             fingerprint_version: 2,
+            ..Default::default()
         }
         .encode_to_vec(),
     )

@@ -421,8 +421,9 @@ fn decode_secret_references(
                 request
                     .merge(bytes)
                     .map_err(|_| ScrubError::SourceScopeUnavailable)?;
-                if !matches!(request.fingerprint_version, 0 | 2)
-                    || (prepared_http && request.fingerprint_version != 2)
+                if !matches!(request.fingerprint_version, 0 | 2 | 3)
+                    || (prepared_http
+                        && !kronik_effects::http::prepared_version(request.fingerprint_version))
                 {
                     return Err(ScrubError::SourceScopeUnavailable);
                 }

@@ -126,6 +126,7 @@ mod tests {
             headers,
             body: b"payload".to_vec(),
             fingerprint_version: 2,
+            ..Default::default()
         }
         .encode_to_vec()
     }

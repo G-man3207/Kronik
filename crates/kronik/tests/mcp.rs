@@ -839,10 +839,63 @@ fn the_stdio_bridge_without_a_daemon_says_how_to_start_one() {
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
     let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(stderr.contains("UNAVAILABLE"), "{stderr}");
-    assert!(stderr.contains("kronik serve"), "{stderr}");
+    assert!(
+        stderr.starts_with("error: UNAVAILABLE: cannot reach the Kronik daemon's MCP endpoint"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("hint:") && stderr.contains("kronik serve"),
+        "{stderr}"
+    );
+    // The documentation command, as every other error has it (#42).
+    assert!(
+        stderr.contains("docs:  kronik explain UNAVAILABLE"),
+        "{stderr}"
+    );
+}
+
+/// #42: a failure to start the bridge honors --json: the error JSON on
+/// stdout, exit 1, for an unreachable daemon and for a refused --url.
+#[test]
+fn the_stdio_bridge_reports_startup_errors_as_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let error_of = |out: &std::process::Output| -> Value {
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("stdout is no error JSON ({e}): {out:?}"))
+    };
+    let out = Command::new(KRONIK)
+        .arg("--json")
+        .arg("--socket")
+        .arg(dir.path().join("none.sock"))
+        .arg("mcp")
+        .env_remove("KRONIK_API_SOCKET")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let v = error_of(&out);
+    assert_eq!(v["error"]["code"], "UNAVAILABLE", "{v}");
+    assert_eq!(v["error"]["docs"], "kronik explain UNAVAILABLE", "{v}");
+    assert!(
+        v["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("kronik serve"),
+        "{v}"
+    );
+    let out = Command::new(KRONIK)
+        .args(["--json", "mcp", "--url", "http://127.0.0.1:1"])
+        .env_remove("KRONIK_API_SOCKET")
+        .env_remove("KRONIK_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let v = error_of(&out);
+    assert_eq!(v["error"]["code"], "BAD_REQUEST", "{v}");
+    assert!(v["error"]["hint"].as_str().unwrap().contains("/mcp"), "{v}");
 }
 
 /// H2: `kronik mcp --token` acts as that token, not as the socket's caller
@@ -934,4 +987,35 @@ fn the_stdio_bridge_takes_the_token_flag_and_refuses_a_url() {
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("--token is empty"), "{stderr}");
+
+    // #42: a token the daemon does not know is UNAUTHENTICATED, not an
+    // unreachable daemon, in both forms.
+    for json in [false, true] {
+        let mut command = Command::new(KRONIK);
+        if json {
+            command.arg("--json");
+        }
+        let out = command
+            .arg("--socket")
+            .arg(&daemon.socket)
+            .args(["mcp", "--token", "kronik_not_a_live_token"])
+            .env_remove("KRONIK_API_SOCKET")
+            .env_remove("KRONIK_TOKEN")
+            .env_remove("KRONIK_URL")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        if json {
+            let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(v["error"]["code"], "UNAUTHENTICATED", "{v}");
+        } else {
+            let stderr = String::from_utf8(out.stderr).unwrap();
+            assert!(
+                stderr.starts_with("error: UNAUTHENTICATED:")
+                    && stderr.contains("docs:  kronik explain UNAUTHENTICATED"),
+                "{stderr}"
+            );
+        }
+    }
 }

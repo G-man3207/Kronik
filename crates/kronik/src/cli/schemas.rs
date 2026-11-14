@@ -292,7 +292,10 @@ const COMMANDS: &[(&str, Output)] = &[
         "events webhooks replay",
         Output::Api(&[("", "POST", "/v1/events/webhooks/{name}/replay")]),
     ),
-    ("mcp", Output::None("MCP's JSON-RPC on stdout instead")),
+    (
+        "mcp",
+        Output::None("MCP's JSON-RPC on stdout instead; a failure to start is the error JSON"),
+    ),
     ("explain", Output::Local(explain_schema)),
 ];
 

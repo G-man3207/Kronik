@@ -94,6 +94,11 @@ pub struct ScenarioConfig {
     pub fail_fsyncs: Vec<u64>,
     /// Chance per fault tick that the wall clock jumps backwards.
     pub clock_jump_p: f64,
+    /// Once, at this fault tick (counted from 1), the wall clock steps back
+    /// this far, as an operator or NTP fixing a clock that ran ahead would:
+    /// the webhook workload, whose retries wait on timers that must still
+    /// fire within the drain (ADR 0006, #40).
+    pub clock_step_back: Option<(u32, Duration)>,
     /// Chance that `state.db` and the actor databases survive a crash.
     pub keep_store_p: f64,
     pub segment_max_bytes: u64,
@@ -147,6 +152,7 @@ impl ScenarioConfig {
             fsync_error: if r.chance(0.3) { 0.01 } else { 0.0 },
             fail_fsyncs: Vec::new(),
             clock_jump_p: 0.2,
+            clock_step_back: None,
             keep_store_p: [0.0, 0.5, 1.0][r.below(3) as usize],
             segment_max_bytes: [2 << 10, 64 << 10, 64 << 20][r.below(3) as usize],
             mutation_ack_before_fsync: false,
@@ -210,6 +216,12 @@ impl ScenarioConfig {
         if let Some(fx) = cfg.effects.as_mut() {
             fx.webhook = true;
         }
+        // Retries set before and after a step back of 5 to 10 minutes.
+        let r = SimRng::new(seed, b"clock-step");
+        cfg.clock_step_back = Some((
+            1 + r.below(8) as u32,
+            Duration::from_secs(300 + r.below(300)),
+        ));
         cfg
     }
 
@@ -949,10 +961,12 @@ impl World {
 
     async fn supervisor(self: Arc<Self>, mut fatal_rx: mpsc::UnboundedReceiver<NodeId>) {
         self.start_node();
+        let mut tick = 0u32;
         loop {
             if self.st().clients_done == self.cfg.clients {
                 break;
             }
+            tick = tick.saturating_add(1);
             let crash_in = Duration::from_micros(
                 1 + self
                     .faults
@@ -969,6 +983,14 @@ impl World {
                 self.wall_offset
                     .fetch_sub(back, std::sync::atomic::Ordering::Relaxed);
                 self.event(format!("wall clock jumps back {back} ms"));
+            }
+            if let Some((at, back)) = self.cfg.clock_step_back
+                && at == tick
+            {
+                let back = i64::try_from(back.as_millis()).unwrap_or(i64::MAX);
+                self.wall_offset
+                    .fetch_sub(back, std::sync::atomic::Ordering::Relaxed);
+                self.event(format!("wall clock steps back {back} ms"));
             }
             let current = self.st().node_id;
             let crash = match fatal {
@@ -995,18 +1017,11 @@ impl World {
 
     /// Waits for the mailbox to drain, then checks the end-state invariants.
     async fn finish(self: &Arc<Self>, fatal_rx: &mut mpsc::UnboundedReceiver<NodeId>) {
-        // Timers are due in logical time, which holds still while the wall
-        // clock is behind its high-water mark (ADR 0006). The workload's
-        // backward jumps can add up to many minutes, so the clock is
-        // corrected before waiting for the webhook retries.
-        if self.cfg.effects.is_some_and(|fx| fx.webhook) {
-            let off = self
-                .wall_offset
-                .swap(0, std::sync::atomic::Ordering::Relaxed);
-            if off < 0 {
-                self.event(format!("wall clock corrected forward {} ms", -off));
-            }
-        }
+        // The wall clock is not corrected: logical time holds still while it
+        // is behind its high-water mark (ADR 0006), but the webhook retries'
+        // timers fire after their delay on the monotonic clock (#40), within
+        // the drain below, after the workload's jumps and its step back of
+        // 5 to 10 minutes.
         let mut node = None;
         // 100 s of virtual time, or 10 000 s after a long run.
         let rounds = if self.cfg.long.is_some() {
@@ -1427,6 +1442,14 @@ impl World {
                     self.violation(format!(
                         "{actor}: message at lsn {} runs at {} before it was sent at {}",
                         c.lsn, t.logical_time_ms, m.sent_logical_time_ms
+                    ));
+                }
+                // A timer that fires on its monotonic deadline while the
+                // wall clock is behind still runs at its due time (#40).
+                Some(pb::input::Kind::Timer(tm)) if t.logical_time_ms < tm.due_ms => {
+                    self.violation(format!(
+                        "{actor}: timer at lsn {} runs at {} before it was due at {}",
+                        c.lsn, t.logical_time_ms, tm.due_ms
                     ));
                 }
                 _ => {}

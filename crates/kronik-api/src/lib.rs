@@ -173,7 +173,19 @@ fn ok<T: Serialize>(v: &T) -> Result<ApiResponse> {
     })
 }
 
-fn decode(s: &str) -> Option<String> {
+/// Percent-decodes a path segment. `+` is a literal character in a path
+/// (RFC 3986 §3.3): an actor key `a+b` arrives as `a+b`, as at the gateway.
+fn decode_path(s: &str) -> Option<String> {
+    percent_decode(s, false)
+}
+
+/// Percent-decodes a query name or value, where `+` stands for a space
+/// (`application/x-www-form-urlencoded`).
+fn decode_query(s: &str) -> Option<String> {
+    percent_decode(s, true)
+}
+
+fn percent_decode(s: &str, plus_is_space: bool) -> Option<String> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -184,7 +196,7 @@ fn decode(s: &str) -> Option<String> {
                 out.push(u8::from_str_radix(hex, 16).ok()?);
                 i += 3;
             }
-            b'+' => {
+            b'+' if plus_is_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -204,8 +216,8 @@ impl Query {
         let mut out = Vec::new();
         for part in q.split('&').filter(|p| !p.is_empty()) {
             let (k, v) = part.split_once('=').unwrap_or((part, ""));
-            let k = decode(k).ok_or_else(|| bad(format!("invalid query {part:?}")))?;
-            let v = decode(v).ok_or_else(|| bad(format!("invalid query {part:?}")))?;
+            let k = decode_query(k).ok_or_else(|| bad(format!("invalid query {part:?}")))?;
+            let v = decode_query(v).ok_or_else(|| bad(format!("invalid query {part:?}")))?;
             out.push((k, v));
         }
         Ok(Query(out))
@@ -795,7 +807,7 @@ impl Api {
             .path
             .split('/')
             .skip(1)
-            .map(|segment| decode(segment).ok_or_else(|| bad("invalid API path")))
+            .map(|segment| decode_path(segment).ok_or_else(|| bad("invalid API path")))
             .collect::<Result<Vec<_>>>()?;
         let segments = segments.iter().map(String::as_str).collect::<Vec<_>>();
         Ok(auth::required_scope(&req.method, &segments))
@@ -1177,7 +1189,7 @@ impl Api {
             .path
             .split('/')
             .skip(1)
-            .map(|s| decode(s).ok_or_else(|| bad(format!("invalid path segment {s:?}"))))
+            .map(|s| decode_path(s).ok_or_else(|| bad(format!("invalid path segment {s:?}"))))
             .collect::<Result<_>>()?;
         let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
         caller.require(auth::required_scope(&req.method, &segs))?;
@@ -1292,6 +1304,22 @@ impl Api {
             http_listen: self.http_listen.clone(),
             disk_free_bytes: self.node.disk_free(),
             low_disk: self.node.disk_below_reserve().is_some(),
+            retention_pin: self.node.retention_pin().map(|held| RetentionPinView {
+                source: if held.pin.snapshot.is_some() {
+                    "snapshot"
+                } else {
+                    "live"
+                }
+                .into(),
+                execution_id: held.pin.execution_id,
+                actor: held.pin.actor,
+                begin_lsn: held.pin.lsn,
+                snapshot: held.pin.snapshot,
+                segment: held.pin.segment,
+                held_segments: held.held_segments,
+                held_bytes: held.held_bytes,
+                since_ms: held.since_ms,
+            }),
         })
     }
 
@@ -1681,8 +1709,14 @@ impl Api {
         out
     }
 
-    fn limits_view(kind: &str, l: &kronik_effects::KindLimits) -> LimitsView {
+    fn limits_view(
+        kind: &str,
+        l: &kronik_effects::KindLimits,
+        rules: &kronik_effects::http::FingerprintRules,
+    ) -> LimitsView {
         LimitsView {
+            fingerprint_exclude_headers: rules.headers().to_vec(),
+            fingerprint_exclude_query: rules.query().to_vec(),
             kind: kind.to_owned(),
             fuel: l.fuel,
             memory_bytes: l.memory_bytes,
@@ -1710,8 +1744,16 @@ impl Api {
             effect_timeout_ms: r.effect_timeout_ms,
             effect_response_bytes: r.effect_response_bytes,
             audit: None,
+            fingerprint_exclude_headers: r
+                .fingerprint_exclude_headers
+                .clone()
+                .map(|names| pb::NameList { names }),
+            fingerprint_exclude_query: r
+                .fingerprint_exclude_query
+                .clone()
+                .map(|names| pb::NameList { names }),
         };
-        let (epoch, lsn, effective) = self
+        let (epoch, lsn, effective, rules) = self
             .node
             .set_limits(
                 limits,
@@ -1720,7 +1762,7 @@ impl Api {
                 req.authority.clone(),
             )
             .await?;
-        let mut view = Self::limits_view(&r.kind, &effective);
+        let mut view = Self::limits_view(&r.kind, &effective, &rules);
         view.epoch = Some(epoch);
         view.lsn = Some(lsn);
         ok(&LimitsResponse {
@@ -1746,7 +1788,7 @@ impl Api {
         ok(&LimitsListResponse {
             limits: kinds
                 .iter()
-                .map(|k| Self::limits_view(k, &config.limits(k)))
+                .map(|k| Self::limits_view(k, &config.limits(k), &config.fingerprint_rules(k)))
                 .collect(),
         })
     }
@@ -2138,7 +2180,9 @@ impl Api {
             .db()
             .timers(Some((&actor.kind, &actor.key)))
             .map_err(internal)?;
-        ok(&TimersResponse {
+        // A name is the guest's text: scrubbed like the turn views, and
+        // 503 rather than unscrubbed while the inventory is not held (#44).
+        self.ok_scrubbed(TimersResponse {
             timers: rows
                 .into_iter()
                 .map(|t| Timer {
@@ -2339,6 +2383,18 @@ mod tests {
     use prost::Message as _;
 
     use super::*;
+
+    /// `+` is literal in a path segment (#47) and a space in a query.
+    #[test]
+    fn a_plus_is_literal_in_a_path_and_a_space_in_a_query() {
+        assert_eq!(decode_path("a+b").as_deref(), Some("a+b"));
+        assert_eq!(decode_path("a%2Bb").as_deref(), Some("a+b"));
+        assert_eq!(decode_path("a%20b").as_deref(), Some("a b"));
+        assert_eq!(decode_path("a%2").as_deref(), None);
+        let q = Query::parse("cursor=a+b&n=a%2Bb").unwrap();
+        assert_eq!(q.get("cursor"), Some("a b"));
+        assert_eq!(q.get("n"), Some("a+b"));
+    }
 
     #[test]
     fn request_lines_show_method_host_and_path_only() {

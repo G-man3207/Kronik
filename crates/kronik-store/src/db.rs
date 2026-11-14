@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS orphans (
   call_message_id TEXT PRIMARY KEY, callee_kind TEXT NOT NULL, callee_key TEXT NOT NULL,
   callee_turn TEXT NOT NULL, caller_kind TEXT NOT NULL, caller_key TEXT NOT NULL,
   caller_lsn INTEGER NOT NULL, compensation_id TEXT, resolved_lsn INTEGER) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS timed_out_calls (
+  call_message_id TEXT PRIMARY KEY, caller_kind TEXT NOT NULL, caller_key TEXT NOT NULL,
+  caller_lsn INTEGER NOT NULL, compensation_id TEXT, released_lsn INTEGER) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS kinds (
   kind TEXT PRIMARY KEY, code_hash BLOB NOT NULL, schema_version INTEGER NOT NULL,
   epoch INTEGER NOT NULL, lsn INTEGER NOT NULL, version BLOB NOT NULL);
@@ -999,7 +1002,9 @@ impl StateDb {
                 )?;
             }
         }
-        for table in ["mailbox", "dead_letters", "orphans"] {
+        // The held compensations of timed-out calls (#30) go with the
+        // mailbox they are held in.
+        for table in ["mailbox", "dead_letters", "orphans", "timed_out_calls"] {
             tx.execute(&format!("DELETE FROM {table}"), [])?;
             copy_rows(&shadow.conn, &tx, table, "1", [])?;
         }
@@ -1395,34 +1400,43 @@ impl StateDb {
             .optional()?)
     }
 
-    /// Every pending message, in commit order.
+    /// Every pending message, in commit order. A compensation held for a
+    /// timed-out call whose callee's turn is not applied yet (#30) is not
+    /// pending: it waits in the mailbox until that turn commits.
     pub fn mailbox(&self) -> Result<Vec<MailboxRow>, StoreError> {
         let mut st = self.conn.prepare_cached(
             "SELECT message_id, to_kind, to_key, input, causal, lsn FROM mailbox \
+             WHERE message_id NOT IN (SELECT compensation_id FROM timed_out_calls \
+             WHERE released_lsn IS NULL AND compensation_id IS NOT NULL) \
              ORDER BY lsn, ordinal",
         )?;
-        let rows = st.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Vec<u8>>(3)?,
-                r.get::<_, Vec<u8>>(4)?,
-                r.get::<_, i64>(5)?,
-            ))
-        })?;
+        let rows = st.query_map([], mailbox_columns)?;
         let mut out = Vec::new();
         for row in rows {
-            let (message_id, kind, key, input, causal, lsn) = row?;
-            out.push(MailboxRow {
-                message_id,
-                to: kronik_core::ids::ActorRef { kind, key },
-                input: decode(&input, "mailbox input")?,
-                causal_key: decode(&causal, "mailbox causal key")?,
-                lsn: lsn as Lsn,
-            });
+            out.push(mailbox_row(row?)?);
         }
         Ok(out)
+    }
+
+    /// The compensation of the timed-out call `call_message_id` that the
+    /// record at `lsn` released for delivery (#30): the caller's failed turn
+    /// when the callee's had committed before it, else the callee's turn.
+    /// The node that applied `lsn` delivers it, once.
+    pub fn released_compensation(
+        &self,
+        call_message_id: &str,
+        lsn: Lsn,
+    ) -> Result<Option<MailboxRow>, StoreError> {
+        let row = self
+            .conn
+            .prepare_cached(
+                "SELECT m.message_id, m.to_kind, m.to_key, m.input, m.causal, m.lsn \
+                 FROM timed_out_calls t JOIN mailbox m ON m.message_id = t.compensation_id \
+                 WHERE t.call_message_id = ?1 AND t.released_lsn = ?2",
+            )?
+            .query_row(params![call_message_id, i(lsn)], mailbox_columns)
+            .optional()?;
+        row.map(mailbox_row).transpose()
     }
 
     /// The turn that consumed `message_id`, if any.
@@ -2096,31 +2110,25 @@ fn apply_turn(
             }
         }
     } else {
-        // A failed turn: compensations are delivered, and every successful
-        // call becomes an orphan until its compensation succeeds.
+        // A failed turn: every call whose callee committed becomes an orphan
+        // until its compensation succeeds, and that compensation is
+        // delivered. A call that timed out (#30) is such a call once its
+        // callee's turn commits, which the callee may do before this record
+        // or after it: before, it is decided here from `deliveries`; after,
+        // the call waits in `timed_out_calls`, its compensation held in the
+        // mailbox, until the callee's turn is applied
+        // ([`resolve_timed_out_call`]).
         let parent_key = t
             .causal_key
             .as_ref()
             .ok_or_else(|| corrupt("turn record without causal key"))?;
         let caller = kronik_core::ids::ActorRef::from_pb(actor);
-        for m in &t.compensations {
-            let to =
-                m.to.as_ref()
-                    .ok_or_else(|| corrupt("compensation without target"))?;
-            let callee = kronik_core::ids::ActorRef::from_pb(to);
-            let compensates = kronik_core::causal::message_id(parent_key, m.ordinal);
-            let input = message_input(
-                pb::MessageSource::Compensation,
-                actor,
-                m,
-                t.logical_time_ms,
-                &compensates,
-            );
-            let causal = kronik_core::causal::compensation(parent_key, &caller, m.ordinal, &callee);
-            mailbox_insert(tx, m, lsn, &input, &causal)?;
-        }
+        // The compensations of timed-out calls whose callee's turn failed:
+        // nothing changed, so there is nothing to compensate.
+        let mut dropped = std::collections::BTreeSet::new();
         for e in &t.effects {
-            if e.kind != "actor.call" || e.status != pb::EffectStatus::Ok as i32 {
+            let timed_out = e.timed_out_call();
+            if !timed_out && !e.successful_call() {
                 continue;
             }
             // Routing never reads user data: the callee is the plain target
@@ -2136,29 +2144,80 @@ fn apply_turn(
                 continue;
             };
             let call_message_id = kronik_core::causal::message_id(parent_key, e.ordinal);
-            let callee_turn =
-                pb::CallEffectResponse::decode(sealable_plain(e.response.as_ref()).as_slice())
-                    .map(|r| r.turn_id)
-                    .unwrap_or_default();
             let compensation = t
                 .compensations
                 .iter()
                 .find(|m| m.ordinal == e.ordinal)
                 .map(|m| m.message_id.clone());
-            tx.prepare_cached(
-                "INSERT OR IGNORE INTO orphans (call_message_id, callee_kind, callee_key, callee_turn, \
-                 caller_kind, caller_key, caller_lsn, compensation_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?
-            .execute(params![
-                call_message_id,
-                to.kind,
-                to.key,
-                callee_turn,
+            let callee_turn = if timed_out {
+                match call_committed(tx, &call_message_id)? {
+                    // Decided now: an orphan; its compensation is delivered by
+                    // whoever wrote this record (`released_lsn`).
+                    Some(true) => {
+                        if compensation.is_some() {
+                            timed_out_call_insert(
+                                tx,
+                                &call_message_id,
+                                kind,
+                                key,
+                                lsn,
+                                compensation.as_deref(),
+                                Some(lsn),
+                            )?;
+                        }
+                        String::new()
+                    }
+                    Some(false) => {
+                        dropped.insert(e.ordinal);
+                        continue;
+                    }
+                    None => {
+                        timed_out_call_insert(
+                            tx,
+                            &call_message_id,
+                            kind,
+                            key,
+                            lsn,
+                            compensation.as_deref(),
+                            None,
+                        )?;
+                        continue;
+                    }
+                }
+            } else {
+                pb::CallEffectResponse::decode(sealable_plain(e.response.as_ref()).as_slice())
+                    .map(|r| r.turn_id)
+                    .unwrap_or_default()
+            };
+            orphan_insert(
+                tx,
+                &call_message_id,
+                &to,
+                &callee_turn,
                 kind,
                 key,
                 lsn,
-                compensation
-            ])?;
+                compensation.as_deref(),
+            )?;
+        }
+        for m in &t.compensations {
+            if dropped.contains(&m.ordinal) {
+                continue;
+            }
+            let to =
+                m.to.as_ref()
+                    .ok_or_else(|| corrupt("compensation without target"))?;
+            let callee = kronik_core::ids::ActorRef::from_pb(to);
+            let compensates = kronik_core::causal::message_id(parent_key, m.ordinal);
+            let input = message_input(
+                pb::MessageSource::Compensation,
+                actor,
+                m,
+                t.logical_time_ms,
+                &compensates,
+            );
+            let causal = kronik_core::causal::compensation(parent_key, &caller, m.ordinal, &callee);
+            mailbox_insert(tx, m, lsn, &input, &causal)?;
         }
     }
 
@@ -2191,6 +2250,15 @@ fn apply_turn(
                      VALUES (?1, ?2, ?3, ?4)",
                 )?
                 .execute(params![m.message_id, lsn, saved, subject])?;
+                if call {
+                    resolve_timed_out_call(tx, &m.message_id, kind, key, lsn, committed)?;
+                }
+            }
+            // A compensation that ran, committed or not, has been delivered:
+            // nothing of its timed-out call is left to wait for.
+            if source == pb::MessageSource::Compensation && !m.compensates.is_empty() {
+                tx.prepare_cached("DELETE FROM timed_out_calls WHERE call_message_id = ?1")?
+                    .execute([&m.compensates])?;
             }
             if source == pb::MessageSource::DeadLetterResend
                 && let Some(of) = kronik_core::ids::TurnId::parse(&m.resend_of)
@@ -2296,6 +2364,160 @@ fn mailbox_insert(
         input.encode_to_vec(),
         causal.encode_to_vec()
     ])?;
+    Ok(())
+}
+
+/// The columns `message_id, to_kind, to_key, input, causal, lsn` of a
+/// mailbox row.
+type MailboxColumns = (String, String, String, Vec<u8>, Vec<u8>, i64);
+
+fn mailbox_columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<MailboxColumns> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+    ))
+}
+
+fn mailbox_row(
+    (message_id, kind, key, input, causal, lsn): MailboxColumns,
+) -> Result<MailboxRow, StoreError> {
+    Ok(MailboxRow {
+        message_id,
+        to: kronik_core::ids::ActorRef { kind, key },
+        input: decode(&input, "mailbox input")?,
+        causal_key: decode(&causal, "mailbox causal key")?,
+        lsn: lsn as Lsn,
+    })
+}
+
+/// Whether the callee's turn of the call `call_message_id` committed: `None`
+/// while no turn of it is applied.
+fn call_committed(tx: &Connection, call_message_id: &str) -> Result<Option<bool>, StoreError> {
+    let saved: Option<Option<Vec<u8>>> = tx
+        .prepare_cached("SELECT outcome FROM deliveries WHERE message_id = ?1")?
+        .query_row([call_message_id], |r| r.get(0))
+        .optional()?;
+    Ok(saved.map(|outcome| {
+        outcome.is_none_or(|bytes| {
+            pb::Outcome::decode(bytes.as_slice())
+                .is_ok_and(|o| o.kind == pb::OutcomeKind::Committed as i32)
+        })
+    }))
+}
+
+// One orphans row's columns, in their order: naming them would only repeat
+// the table's schema.
+#[allow(clippy::too_many_arguments)]
+fn orphan_insert(
+    tx: &Connection,
+    call_message_id: &str,
+    callee: &kronik_core::ids::ActorRef,
+    callee_turn: &str,
+    caller_kind: &str,
+    caller_key: &str,
+    caller_lsn: i64,
+    compensation: Option<&str>,
+) -> Result<(), StoreError> {
+    tx.prepare_cached(
+        "INSERT OR IGNORE INTO orphans (call_message_id, callee_kind, callee_key, callee_turn, \
+         caller_kind, caller_key, caller_lsn, compensation_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?
+    .execute(params![
+        call_message_id,
+        callee.kind,
+        callee.key,
+        callee_turn,
+        caller_kind,
+        caller_key,
+        caller_lsn,
+        compensation
+    ])?;
+    Ok(())
+}
+
+/// A failed caller's timed-out call (#30): waiting for its callee's turn
+/// (`released_lsn` NULL; its compensation is held in the mailbox), or with
+/// its compensation released at `released_lsn` for the node to deliver.
+fn timed_out_call_insert(
+    tx: &Connection,
+    call_message_id: &str,
+    caller_kind: &str,
+    caller_key: &str,
+    caller_lsn: i64,
+    compensation: Option<&str>,
+    released_lsn: Option<i64>,
+) -> Result<(), StoreError> {
+    tx.prepare_cached(
+        "INSERT OR REPLACE INTO timed_out_calls (call_message_id, caller_kind, caller_key, \
+         caller_lsn, compensation_id, released_lsn) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?
+    .execute(params![
+        call_message_id,
+        caller_kind,
+        caller_key,
+        caller_lsn,
+        compensation,
+        released_lsn
+    ])?;
+    Ok(())
+}
+
+/// The callee's turn of a call whose caller failed after the call timed out
+/// (#30). A committed turn makes the call an orphan and releases its
+/// compensation for delivery; a failed one changed nothing, so its held
+/// compensation is dropped.
+fn resolve_timed_out_call(
+    tx: &Connection,
+    call_message_id: &str,
+    callee_kind: &str,
+    callee_key: &str,
+    lsn: i64,
+    committed: bool,
+) -> Result<(), StoreError> {
+    let waiting: Option<(String, String, i64, Option<String>)> = tx
+        .prepare_cached(
+            "SELECT caller_kind, caller_key, caller_lsn, compensation_id FROM timed_out_calls \
+             WHERE call_message_id = ?1 AND released_lsn IS NULL",
+        )?
+        .query_row([call_message_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .optional()?;
+    let Some((caller_kind, caller_key, caller_lsn, compensation)) = waiting else {
+        return Ok(());
+    };
+    if committed {
+        let callee = kronik_core::ids::ActorRef {
+            kind: callee_kind.to_owned(),
+            key: callee_key.to_owned(),
+        };
+        orphan_insert(
+            tx,
+            call_message_id,
+            &callee,
+            "",
+            &caller_kind,
+            &caller_key,
+            caller_lsn,
+            compensation.as_deref(),
+        )?;
+        if compensation.is_some() {
+            tx.prepare_cached(
+                "UPDATE timed_out_calls SET released_lsn = ?2 WHERE call_message_id = ?1",
+            )?
+            .execute(params![call_message_id, lsn])?;
+            return Ok(());
+        }
+    } else if let Some(compensation) = &compensation {
+        tx.prepare_cached("DELETE FROM mailbox WHERE message_id = ?1")?
+            .execute([compensation])?;
+    }
+    tx.prepare_cached("DELETE FROM timed_out_calls WHERE call_message_id = ?1")?
+        .execute([call_message_id])?;
     Ok(())
 }
 
@@ -3749,6 +3971,183 @@ mod tests {
                 kronik_core::causal::message_id(&parent, ordinal)
             );
             assert_eq!(o.callee_turn, "");
+        }
+    }
+
+    /// The failed caller turn of a call that timed out, with a compensation
+    /// when `compensate`, and the callee's turn of that call (#30).
+    fn timed_out_caller(root: &str, compensate: bool) -> (Record, String, Record) {
+        let parent = causal(root).unwrap();
+        let call_id = kronik_core::causal::message_id(&parent, 1);
+        let callee = pb::ActorRef {
+            kind: "counter".into(),
+            key: "b".into(),
+        };
+        let compensations = if compensate {
+            let key = kronik_core::causal::compensation(
+                &parent,
+                &kronik_core::ids::ActorRef::from_pb(&callee),
+                1,
+                &kronik_core::ids::ActorRef::from_pb(&callee),
+            );
+            vec![pb::OutboundMessage {
+                to: Some(callee.clone()),
+                msg: Some(pb::Message {
+                    name: "undo".into(),
+                    body: Some(pb::Sealable {
+                        subject: None,
+                        value: Some(pb::sealable::Value::Plain(Vec::new())),
+                    }),
+                    ..Default::default()
+                }),
+                ordinal: 1,
+                message_id: kronik_core::causal::causal_id(&key),
+            }]
+        } else {
+            Vec::new()
+        };
+        let caller = Record::TurnRecord(pb::TurnRecord {
+            execution_id: format!("{root}-caller"),
+            actor: actor(),
+            causal_key: Some(parent.clone()),
+            input: message_input(),
+            effects: vec![pb::EffectRecord {
+                ordinal: 1,
+                kind: "actor.call".into(),
+                target: "actor:counter/b".into(),
+                status: pb::EffectStatus::Timeout as i32,
+                error: "CALL_TIMEOUT".into(),
+                ..Default::default()
+            }],
+            compensations,
+            outcome: Some(pb::Outcome {
+                kind: pb::OutcomeKind::Failed as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let callee_turn = |committed: bool| {
+            Record::TurnRecord(pb::TurnRecord {
+                execution_id: format!("{root}-callee"),
+                actor: Some(callee.clone()),
+                causal_key: Some(kronik_core::causal::child(
+                    &parent,
+                    &kronik_core::ids::ActorRef::from_pb(&actor().unwrap()),
+                    1,
+                )),
+                input: Some(pb::Input {
+                    kind: Some(pb::input::Kind::Message(pb::MessageInput {
+                        source: pb::MessageSource::Call as i32,
+                        sender: actor(),
+                        message_id: call_id.clone(),
+                        msg: Some(pb::Message {
+                            name: "increment".into(),
+                            body: Some(pb::Sealable {
+                                subject: None,
+                                value: Some(pb::sealable::Value::Plain(Vec::new())),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })),
+                }),
+                outcome: Some(pb::Outcome {
+                    kind: if committed {
+                        pb::OutcomeKind::Committed
+                    } else {
+                        pb::OutcomeKind::Failed
+                    } as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        let callee = callee_turn(root.ends_with("ok"));
+        (caller, call_id, callee)
+    }
+
+    /// #30: a call that timed out is an orphan, and its compensation is
+    /// delivered, exactly when its callee's turn commits: whether that turn
+    /// is applied before the failed caller's record or after it. A callee
+    /// turn that failed changed nothing: no orphan, no compensation. While
+    /// the callee's turn is not applied, the compensation is held.
+    #[test]
+    fn a_timed_out_call_is_an_orphan_once_its_callee_commits() {
+        for (callee_first, root, compensate) in [
+            (false, "after-ok", true),
+            (true, "before-ok", true),
+            (false, "after-failed", true),
+            (true, "before-failed", true),
+            (false, "plain-ok", false),
+        ] {
+            let mut db = StateDb::open(Connection::open_in_memory().unwrap()).unwrap();
+            let (caller, call_id, callee) = timed_out_caller(root, compensate);
+            let ok = root.ends_with("ok");
+            let (first, second) = if callee_first {
+                (callee.clone(), caller.clone())
+            } else {
+                (caller.clone(), callee.clone())
+            };
+            db.apply(&[committed(1, first)]).unwrap();
+            if !callee_first {
+                // The caller came first: nothing is known yet, nothing goes out.
+                assert!(db.orphans(true).unwrap().is_empty(), "{root}");
+                assert!(db.mailbox().unwrap().is_empty(), "{root}: held");
+                assert!(db.released_compensation(&call_id, 1).unwrap().is_none());
+            }
+            db.apply(&[committed(2, second)]).unwrap();
+            let orphans = db.orphans(true).unwrap();
+            let mailbox = db.mailbox().unwrap();
+            if !ok {
+                assert!(orphans.is_empty(), "{root}: {orphans:?}");
+                assert!(mailbox.is_empty(), "{root}: {mailbox:?}");
+                let left: i64 = db
+                    .conn
+                    .query_row("SELECT count(*) FROM timed_out_calls", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(left, 0, "{root}");
+                continue;
+            }
+            assert_eq!(orphans.len(), 1, "{root}");
+            let o = &orphans[0];
+            assert_eq!(o.call_message_id, call_id, "{root}");
+            assert_eq!(o.callee.to_string(), "counter/b", "{root}");
+            // The caller's record is at 1 or 2.
+            assert_eq!(o.caller_lsn, if callee_first { 2 } else { 1 }, "{root}");
+            assert_eq!(o.compensation_id.is_some(), compensate, "{root}");
+            if !compensate {
+                assert!(mailbox.is_empty(), "{root}");
+                continue;
+            }
+            assert_eq!(mailbox.len(), 1, "{root}: released");
+            // The record that released it delivers it: the later one, 2.
+            let released = db.released_compensation(&call_id, 2).unwrap();
+            assert_eq!(
+                released.map(|r| r.message_id),
+                o.compensation_id.clone(),
+                "{root}"
+            );
+            assert!(db.released_compensation(&call_id, 1).unwrap().is_none());
+            // The compensation's turn resolves the orphan and the wait.
+            let Some(pb::input::Kind::Message(m)) = &mailbox[0].input.kind else {
+                panic!("{root}: a compensation is a message");
+            };
+            assert_eq!(m.compensates, call_id, "{root}");
+            let mut done = turn(
+                &format!("{root}-comp"),
+                root,
+                mailbox[0].input.clone().into(),
+            );
+            if let Record::TurnRecord(t) = &mut done {
+                t.actor = Some(pb::ActorRef {
+                    kind: "counter".into(),
+                    key: "b".into(),
+                });
+            }
+            db.apply(&[committed(3, done)]).unwrap();
+            assert!(db.mailbox().unwrap().is_empty(), "{root}");
+            assert_eq!(db.orphans(false).unwrap().len(), 0, "{root}: resolved");
+            assert!(db.released_compensation(&call_id, 2).unwrap().is_none());
         }
     }
 

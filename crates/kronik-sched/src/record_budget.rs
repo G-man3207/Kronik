@@ -172,9 +172,15 @@ pub enum Fit {
     /// Even the failed turn was too large, which only effects recorded
     /// before this budget existed can cause (the re-run of a turn an earlier
     /// release began): their requests and responses were left out of the
-    /// turn record. The log's `EffectResult` records of the execution still
-    /// hold them.
+    /// turn record, and when that was not enough the effects themselves. The
+    /// log's `EffectResult` records of the execution still hold them. The
+    /// record fits.
     Stripped,
+    /// Even without its effects the record is over the limit: its input or
+    /// its compensations, which an earlier release recorded past this
+    /// budget, are. Nothing more is left out; the caller can only try to
+    /// append it, as the log's own limit is [`TURN_RESERVE`] larger.
+    Over,
 }
 
 /// Makes a finished turn's record fit `limit` ([`turn_limit`]). A record
@@ -184,6 +190,10 @@ pub enum Fit {
 /// `compensations` are the turn's compensation messages, which a committed
 /// turn did not record; `input_cost` is [`input_cost`] of its plaintext
 /// input.
+///
+/// A record that does not commit after an effect whose outcome is unknown
+/// ends with `EFFECT_OUTCOME_UNKNOWN`, also when it failed for its size
+/// ([`mark_unknown_outcome`]).
 pub fn fit(
     record: &mut pb::TurnRecord,
     compensations: &[pb::OutboundMessage],
@@ -191,9 +201,31 @@ pub fn fit(
     input_cost: usize,
 ) -> Fit {
     if turn_cost(record, input_cost) <= limit {
+        mark_unknown_outcome(record);
         return Fit::Fits;
     }
     fail(record, compensations, limit, input_cost)
+}
+
+/// A turn that did not commit after an effect whose outcome is unknown
+/// (I17: an `unsafe` effect a re-run did not perform again) ends with
+/// `EFFECT_OUTCOME_UNKNOWN`, whatever else ended it: a guest error, a trap,
+/// or a record too large for the log. The outcome's message keeps saying
+/// what ended it; the code is what a client acts on, and it must learn that
+/// an effect may have happened. Production and its replays decide this on
+/// the final record, from the effects it holds, so they decide the same.
+pub fn mark_unknown_outcome(record: &mut pb::TurnRecord) {
+    let unknown = record
+        .effects
+        .iter()
+        .any(|e| e.status == pb::EffectStatus::OutcomeUnknown as i32);
+    if let Some(outcome) = record.outcome.as_mut()
+        && unknown
+        && outcome.kind != pb::OutcomeKind::Committed as i32
+    {
+        outcome.kind = pb::OutcomeKind::EffectOutcomeUnknown as i32;
+        outcome.error_code = ErrorCode::EffectOutcomeUnknown.as_str().into();
+    }
 }
 
 /// [`fit`] for a turn already known not to fit, for instance because its
@@ -213,35 +245,62 @@ pub fn fail(
     record.compensations = compensations.to_vec();
     record.schema_version = 0;
     record.outcome = Some(too_large_outcome(limit));
+    // The unknown outcome's code is longer than TURN_TOO_LARGE: it is set
+    // before the size is checked, so the check sees the record as written.
+    mark_unknown_outcome(record);
     if turn_cost(record, input_cost) <= limit {
         return Fit::Failed;
     }
+    strip(record, limit, input_cost)
+}
+
+/// Leaves out of a failed record what effects an earlier release recorded
+/// past this budget take, checking after each step: first their requests
+/// and responses, then the effects themselves. The outcome says which; the
+/// log's `EffectResult` records keep them.
+fn strip(record: &mut pb::TurnRecord, limit: usize, input_cost: usize) -> Fit {
     for e in &mut record.effects {
         e.request = None;
         e.response = None;
     }
-    if let Some(outcome) = &mut record.outcome {
-        outcome
-            .message
-            .push_str("; the requests and responses of its effects are only in its effect results");
+    let note = |record: &mut pb::TurnRecord, text: &str| {
+        if let Some(outcome) = &mut record.outcome {
+            outcome.message.push_str(text);
+        }
+    };
+    note(
+        record,
+        "; the requests and responses of its effects are only in its effect results",
+    );
+    if turn_cost(record, input_cost) <= limit {
+        return Fit::Stripped;
     }
-    Fit::Stripped
+    let effects = record.effects.len();
+    record.effects.clear();
+    note(
+        record,
+        &format!("; its {effects} effects are only in its effect results"),
+    );
+    if turn_cost(record, input_cost) <= limit {
+        Fit::Stripped
+    } else {
+        Fit::Over
+    }
 }
 
 /// Makes a failed record that closes an open turn without running its guest
-/// (a re-run whose recorded secret version is gone) fit `limit`, keeping
-/// its outcome. Only effects an earlier release recorded past the budget can
-/// make it too large: then their requests and responses are left out of the
-/// turn record; the log's `EffectResult` records of the execution keep them.
+/// (a re-run whose recorded secret version is gone, or whose input does not
+/// fit in a turn's record) fit `limit`, keeping its outcome. Only what an
+/// earlier release recorded past the budget can make it too large: then
+/// the requests and responses of its effects are left out of the turn
+/// record, and if that is not enough the effects themselves; the log's
+/// `EffectResult` records of the execution keep them. [`Fit::Over`] when
+/// even that is over the limit.
 pub fn fit_closing(record: &mut pb::TurnRecord, limit: usize, input_cost: usize) -> Fit {
     if turn_cost(record, input_cost) <= limit {
         return Fit::Fits;
     }
-    for e in &mut record.effects {
-        e.request = None;
-        e.response = None;
-    }
-    Fit::Stripped
+    strip(record, limit, input_cost)
 }
 
 /// What a turn's record may still take, charged as the turn records
