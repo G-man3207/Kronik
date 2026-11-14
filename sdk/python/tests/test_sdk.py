@@ -16,7 +16,7 @@ from kronik._export import connection_closed, connection_frame, handle, open_con
 from kronik.connections import IncomingFrame, OpenRequest, closed_of, send_now_failure, to_wit_frame  # noqa: E402
 from kronik.ctx import actor_ref, wit_message  # noqa: E402
 from kronik.errors import explain_topic, host_error, variant_tag  # noqa: E402
-from kronik.http import Request, encode_body, parse_json, to_json  # noqa: E402
+from kronik.http import Message, Request, encode_body, parse_json, to_json  # noqa: E402
 from kronik.sql import SqlRows, from_sql, has_order_by, to_sql  # noqa: E402
 
 
@@ -61,6 +61,7 @@ def fake_host(writes):
 
 BlobError_NotHeld = _variant("BlobError_NotHeld")
 BlobError_Invalid = _variant("BlobError_Invalid", "value")
+BlobError_QuotaExceeded = _variant("BlobError_QuotaExceeded")
 MIB = 1 << 20
 
 
@@ -70,6 +71,12 @@ class FakeBlobs:
     def __init__(self):
         self.store = {}
         self.calls = []
+        # M26: the actor's holds, the default subject at each put, and an
+        # error the next put raises.
+        self.held = set()
+        self.subjects = []
+        self.privacy = None
+        self.fail = None
 
     def add(self, data):
         ref = types.BlobRef("b3:" + format(len(self.store), "064x"), len(data))
@@ -83,6 +90,29 @@ class FakeBlobs:
         if ref.hash not in self.store:
             raise Err(BlobError_NotHeld())
         return self.store[ref.hash][offset : offset + n]
+
+    def put(self, data):
+        self.calls.append(("put", len(data)))
+        self.subjects.append(self.privacy.current_subject() if self.privacy else None)
+        if self.fail is not None:
+            raise Err(self.fail)
+        if len(data) > MIB:
+            raise Err(BlobError_Invalid("more than 1 MiB in one call"))
+        ref = self.add(bytes(data))
+        self.held.add(ref.hash)
+        return ref
+
+    def retain(self, ref):
+        self.calls.append(("retain", ref.hash))
+        if ref.hash not in self.store:
+            raise Err(BlobError_NotHeld())
+        self.held.add(ref.hash)
+
+    def release(self, ref):
+        self.calls.append(("release", ref.hash))
+        if ref.hash not in self.held:
+            raise Err(BlobError_NotHeld())
+        self.held.discard(ref.hash)
 
     def Writer(self):  # noqa: N802 (the WIT resource's class)
         blobs = self
@@ -110,7 +140,20 @@ def blob_host(blobs, fetch=None):
         HeaderValue_Text=_variant("HeaderValue_Text", "value"),
         fetch=fetch,
     )
-    return SimpleNamespace(types=types, Err=Err, blobs=blobs, http_client=hc)
+    return SimpleNamespace(types=types, Err=Err, blobs=blobs, http_client=hc, privacy=FakePrivacy())
+
+
+class FakePrivacy:
+    """The host's default subject."""
+
+    def __init__(self):
+        self.subject = None
+
+    def set_subject(self, subject):
+        self.subject = subject
+
+    def current_subject(self):
+        return self.subject
 
 
 def http_input(method="POST", query="", body=b""):
@@ -530,3 +573,60 @@ class BlobTests(unittest.TestCase):
         with self.assertRaises(KronikError) as e:
             req.body
         self.assertIn("is a blob", str(e.exception))
+
+
+class HoldTests(unittest.TestCase):
+    """M26: holding blobs and carrying them in messages."""
+
+    def test_put_holds_and_a_large_put_goes_through_a_writer(self):
+        blobs = FakeBlobs()
+        b = Ctx(blob_host(blobs)).blobs
+        small = b.put("hello")
+        self.assertEqual(blobs.store[small.hash], b"hello")
+        self.assertIn(small.hash, blobs.held)
+        big = b.put(bytes(MIB + 1))
+        self.assertEqual(big.size, MIB + 1)
+        self.assertIn(big.hash, blobs.held)
+        self.assertEqual([c[0] for c in blobs.calls], ["put", "write", "write", "retain"])
+
+    def test_put_for_restores_the_default_subject(self):
+        blobs = FakeBlobs()
+        host = blob_host(blobs)
+        blobs.privacy = host.privacy
+        ctx = Ctx(host)
+        ctx.subject("user:1")
+        ctx.blobs.put_for("user:2", b"x")
+        self.assertEqual(blobs.subjects, ["user:2"])
+        self.assertEqual(ctx.current_subject(), "user:1")
+        blobs.fail = BlobError_QuotaExceeded()
+        with self.assertRaises(KronikError) as e:
+            ctx.blobs.put_for(None, b"y")
+        self.assertEqual(e.exception.kind, "blob.quota-exceeded")
+        self.assertEqual(blobs.subjects, ["user:2", None])
+        self.assertEqual(ctx.current_subject(), "user:1")
+
+    def test_retain_and_release_map_host_errors(self):
+        blobs = FakeBlobs()
+        b = Ctx(blob_host(blobs)).blobs
+        ref = blobs.add(b"x")
+        blob = BlobRef(ref.hash, ref.size)
+        b.retain(blob)
+        self.assertIn(ref.hash, blobs.held)
+        b.release(blob)
+        self.assertNotIn(ref.hash, blobs.held)
+        with self.assertRaises(KronikError) as e:
+            b.release(blob)
+        self.assertEqual(e.exception.topic, "BLOB_NOT_HELD")
+        with self.assertRaises(KronikError):
+            b.retain(BlobRef("b3:" + "ee" * 32, 1))
+
+    def test_messages_carry_blobs(self):
+        a = BlobRef("b3:" + "aa" * 32, 5)
+        self.assertEqual(
+            wit_message({"name": "shared", "body": "img-1", "blobs": [a]}, types),
+            types.Message("shared", "text/plain; charset=utf-8", b"img-1", [types.BlobRef(a.hash, 5)]),
+        )
+        self.assertEqual(wit_message({"name": "tick"}, types).blobs, [])
+        m = Message(types.Message("shared", "", b"", [types.BlobRef(a.hash, 5)]))
+        self.assertEqual(m.blobs, [a])
+        self.assertEqual(Message(types.Message("tick", "", b"", [])).blobs, [])

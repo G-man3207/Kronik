@@ -57,11 +57,13 @@ charged for every frame it touches, so readers fetch whole frames."""
 @dataclass(frozen=True)
 class BlobRef:
     """A blob: a large body kept outside the log and named by its hash (see
-    `kronik explain blob`). A handler gets one as `req.blob` or `res.blob`, or
-    from `ctx.blobs.writer().finish()`, and may use it in the turn that got
-    it: read it (`ctx.blobs`), answer with it (`ctx.blob`), or send it
-    (`ctx.http.fetch(url, body=blob)`). `hash` is `b3:<hex>`, or `b3s:<hex>`
-    for a data subject's blob; `size` its size in bytes."""
+    `kronik explain blob`). A handler gets one as `req.blob` or `res.blob`, in
+    a message's `blobs`, from `ctx.blobs.writer().finish()` or
+    `ctx.blobs.put`, and may use it in the turn that got it: read it
+    (`ctx.blobs`), answer with it (`ctx.blob`), send it
+    (`ctx.http.fetch(url, body=blob)`, a message's "blobs"), or hold it for
+    later turns (`ctx.blobs.retain`). `hash` is `b3:<hex>`, or `b3s:<hex>` for
+    a data subject's blob; `size` its size in bytes."""
 
     hash: str
     size: int
@@ -135,13 +137,16 @@ class Request:
 
 
 class Message:
-    """A message from another actor or the operator; `sender` is the sending actor, if an actor sent it."""
+    """A message from another actor or the operator; `sender` is the sending
+    actor, if an actor sent it. `blobs` are the BlobRefs it carries (M26): the
+    turn may read them, and holds one only if it retains it."""
 
     def __init__(self, msg, sender=None):
         self.name = msg.name
         self.content_type = msg.content_type
         self.body = msg.body
         self.sender = sender
+        self.blobs = [BlobRef(blob.hash, blob.size) for blob in (getattr(msg, "blobs", None) or ())]
 
     def text(self):
         """The body as UTF-8 text."""

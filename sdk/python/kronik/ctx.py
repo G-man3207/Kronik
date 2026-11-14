@@ -39,9 +39,11 @@ def actor_ref(actor, types):
 
 
 def wit_message(msg, types):
-    """An outgoing message dict as a WIT message."""
+    """An outgoing message dict as a WIT message: `name`, and optionally
+    `body`, `content_type` and `blobs` (BlobRefs that travel with it, M26)."""
     body, content_type = encode_body(msg["body"]) if "body" in msg else (b"", "")
-    return types.Message(msg["name"], msg.get("content_type", content_type), body, [])
+    blobs = [types.BlobRef(blob.hash, blob.size) for blob in msg.get("blobs", ())]
+    return types.Message(msg["name"], msg.get("content_type", content_type), body, blobs)
 
 
 class State:
@@ -170,10 +172,11 @@ class Http:
 
 
 class Blobs:
-    """The turn's blobs (see `kronik explain blob`): read the ones the turn got
-    (its request's or a fetch response's body) and the ones it wrote, in ranges
-    or with a reader, and write new ones. The host checks every call
-    (`BLOB_NOT_HELD`)."""
+    """The turn's blobs (see `kronik explain blob`): read the ones the turn may
+    use (its request's or a fetch response's body, a message's blobs, the ones
+    it wrote and the ones its actor holds), in ranges or with a reader, write
+    new ones, and hold them across turns (`put`, `retain`, `release`, M26).
+    The host checks every call (`BLOB_NOT_HELD`)."""
 
     def __init__(self, h):
         self._h = h
@@ -215,6 +218,53 @@ class Blobs:
         `write()` its bytes, then `finish()` to get the BlobRef, which the turn
         may use as a response or fetch body."""
         return BlobWriter(self._h, self._h.blobs.Writer())
+
+    def put(self, data):
+        """Stores `data` (bytes, or a str as UTF-8) as a blob tagged with the
+        turn's default subject; the actor holds it once the turn commits. One
+        host call takes at most 1 MiB: a larger value is written in parts and
+        then retained, which is the same. Returns its BlobRef."""
+        data = data.encode() if isinstance(data, str) else bytes(data)
+        if len(data) > BLOB_CALL_BYTES:
+            writer = self.writer()
+            writer.write(data)
+            blob = writer.finish()
+            self.retain(blob)
+            return blob
+        try:
+            blob = self._h.blobs.put(data)
+        except self._h.Err as e:
+            raise host_error("blob", e.value) from None
+        return BlobRef(blob.hash, blob.size)
+
+    def put_for(self, subject, data):
+        """`put` tagged with `subject` (None: none), whatever the turn's default
+        subject is; the default is restored afterwards, also when the put
+        fails."""
+        before = self._h.privacy.current_subject()
+        self._h.privacy.set_subject(subject)
+        try:
+            return self.put(data)
+        finally:
+            self._h.privacy.set_subject(before)
+
+    def retain(self, blob):
+        """Holds `blob` from the turn's commit on: one the turn may use, such as
+        a request body, a fetch response or one that a message brought. A blob
+        the actor already holds stays held."""
+        try:
+            self._h.blobs.retain(self._h.types.BlobRef(blob.hash, blob.size))
+        except self._h.Err as e:
+            raise host_error("blob", e.value) from None
+
+    def release(self, blob):
+        """Ends the actor's hold on `blob` at the turn's commit; the turn can
+        still read it. Only a hold of this actor's own ends; a blob nothing
+        holds any more is deleted later by collection."""
+        try:
+            self._h.blobs.release(self._h.types.BlobRef(blob.hash, blob.size))
+        except self._h.Err as e:
+            raise host_error("blob", e.value) from None
 
 
 class BlobReader(io.RawIOBase):
