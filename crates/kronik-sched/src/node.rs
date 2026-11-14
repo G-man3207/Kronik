@@ -1074,9 +1074,7 @@ impl Node {
             }
         }
         // The files of erased blobs that a stop left behind (M26 §9.3).
-        if let Err(e) = node.delete_erased_blobs().await {
-            tracing::error!(error = %e.message, "deleting the files of erased blobs failed");
-        }
+        node.delete_erased_blobs_logged().await;
         node.initialize_secret_versions(last == 0, node.native_recovery.clone())
             .await?;
         node.start_secret_refresh(node.native_recovery.clone());
@@ -2548,6 +2546,13 @@ impl Node {
             blobs.lease_input(&input);
         }
         if let Some(blobs) = &turn_blobs {
+            // A subject erased while the turn runs: its blobs are neither read
+            // nor written any more (m8-privacy §6.8, M26 §9.3).
+            let node = self.me.clone();
+            blobs.guard_erasures(Arc::new(move |subject: &str| {
+                node.upgrade()
+                    .is_some_and(|n| lock(&n.erasure_marks).predates(subject, born).is_some())
+            }));
             fx.attach_blobs(blobs.clone());
         }
         let run = program
@@ -3248,6 +3253,7 @@ impl Node {
     pub(crate) async fn commit(&self, mut record: Record) -> Result<Lsn, ApiError> {
         self.seal(&mut record)?;
         self.decodable(&record)?;
+        let erased_blobs = self.refs_erased_blobs(&record);
         if let Record::TurnRecord(turn) = &record {
             Self::observe_turn(
                 turn.actor
@@ -3267,9 +3273,34 @@ impl Node {
         };
         tokio::select! {
             biased;
-            () = self.store.applied.wait(lsn) => Ok(lsn),
-            msg = self.fatal.wait() => Err(ApiError::new(ErrorCode::Unavailable, msg)),
+            () = self.store.applied.wait(lsn) => {}
+            msg = self.fatal.wait() => return Err(ApiError::new(ErrorCode::Unavailable, msg)),
         }
+        if erased_blobs {
+            self.delete_erased_blobs_logged().await;
+        }
+        Ok(lsn)
+    }
+
+    /// Whether `record` references a blob whose subject's keys are gone
+    /// through its key version: a turn that ran across the erasure, or an
+    /// input refused for it. Applying it marks the blob erased, and its file
+    /// must go then, not at the collector's next passes (M26 §9.3).
+    fn refs_erased_blobs(&self, record: &Record) -> bool {
+        if self.blobs.is_none() {
+            return false;
+        }
+        let refs = kronik_proto::blobs::refs(record);
+        if refs.iter().all(|r| r.subject.is_none()) {
+            return false;
+        }
+        let marks = lock(&self.erasure_marks);
+        refs.iter().any(|r| {
+            r.subject
+                .as_deref()
+                .and_then(|subject| marks.erased_through(subject))
+                .is_some_and(|through| r.key_version <= through)
+        })
     }
 
     /// The largest record body this node's log appends: `MAX_RECORD`,
@@ -3290,6 +3321,7 @@ impl Node {
         authority: AuthLease,
     ) -> Result<Lsn, ApiError> {
         let record = self.seal_authorized(record, authority.clone()).await?;
+        let erased_blobs = self.refs_erased_blobs(&record);
         let lsn = match self.log.append_authorized(record, authority).await {
             Ok(lsn) => lsn,
             Err(kronik_log::AuthorizedAppendError::Authority(error)) => return Err(error),
@@ -3303,9 +3335,13 @@ impl Node {
         };
         tokio::select! {
             biased;
-            () = self.store.applied.wait(lsn) => Ok(lsn),
-            message = self.fatal.wait() => Err(ApiError::new(ErrorCode::Unavailable, message)),
+            () = self.store.applied.wait(lsn) => {}
+            message = self.fatal.wait() => return Err(ApiError::new(ErrorCode::Unavailable, message)),
         }
+        if erased_blobs {
+            self.delete_erased_blobs_logged().await;
+        }
+        Ok(lsn)
     }
 
     async fn seal_authorized(

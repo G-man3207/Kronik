@@ -162,6 +162,15 @@ impl Marks {
         before.then_some(mark.key_version)
     }
 
+    /// The last key version of `subject` whose keys are gone, if any: its
+    /// blobs keyed with it or an older one are erased (M26 §9.3).
+    pub(crate) fn erased_through(&self, subject: &str) -> Option<u32> {
+        self.subjects
+            .get(subject)
+            .map(|m| m.key_version)
+            .filter(|v| *v > 0)
+    }
+
     /// The subjects erased after `born`: what a turn born then may still
     /// hold in memory.
     pub(crate) fn erased_after(&self, born: Born) -> impl Iterator<Item = &String> {

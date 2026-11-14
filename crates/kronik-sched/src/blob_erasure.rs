@@ -72,6 +72,19 @@ impl Node {
         Ok(deleted)
     }
 
+    /// [`Node::delete_erased_blobs`], whose failure is logged: the erasure or
+    /// record that asked for it is done, and the next start and the
+    /// collector try again.
+    pub(crate) async fn delete_erased_blobs_logged(&self) -> u64 {
+        match self.delete_erased_blobs().await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(error = %e.message, "deleting the files of erased blobs failed");
+                0
+            }
+        }
+    }
+
     /// Per erased subject, its blobs that are not gone yet: how many still
     /// have a file on this node (main's store or a fork space) and how many
     /// an object in the bucket (the shipper's record; its step 6 deletes

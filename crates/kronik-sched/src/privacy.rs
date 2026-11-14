@@ -181,13 +181,7 @@ impl Node {
         tracing::info!(epoch, lsn, key_version, "subject erased");
         // Its blobs' files go now (M26 §9.3). A failure leaves them to the
         // next start's pass and to the collector: the erasure itself is done.
-        let blobs = match self.delete_erased_blobs().await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(error = %e.message, "deleting the files of erased blobs failed");
-                0
-            }
-        };
+        let blobs = self.delete_erased_blobs_logged().await;
         // What the shipper still has in the bucket goes in its next round.
         let pending_blob_objects = self
             .erased_blobs_left()?

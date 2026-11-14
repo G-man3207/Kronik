@@ -16,7 +16,9 @@ until the v1.0 compatibility promise takes effect.
   marks them for the shipper to replace in the bucket (`reseal.blobs_sealed`
   and `reseal.pending_blobs` in `GET /v1/privacy`). A restore refuses with
   `KEYSTORE_INCOMPLETE` a blob reference whose subject key is neither in the
-  keystore backup nor erased.
+  keystore backup nor erased. A turn that runs across its subject's erasure
+  can no longer read or write that subject's blobs (`erased`), so none
+  outlives the erasure under a new key version.
 - `kronik serve`'s default `--concurrency` follows the CPUs the daemon may
   use: 8 turns at once per CPU, at least 8 and at most 64 (ADR 0140). Its
   CPU affinity and a cgroup's CPU quota count, so a 2-vCPU machine runs 16

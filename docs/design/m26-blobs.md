@@ -533,6 +533,15 @@ until the collector forgets them, which it does only once the shipper no
 longer holds their objects. The shipper deletes the remote objects in its
 next round (ADR 0122 §3, step 6).
 
+A turn that runs across the erasure (m8-privacy §6.8) neither reads nor
+writes a blob of the subject from then on: `get` and a `wasi:http` body
+answer `erased`, as does a writer of the subject, which stores nothing. A
+new blob would need a key version newer than the erased ones and could hold
+what the turn read before. A blob of the subject stored before the erasure
+but first referenced by a record applied after it (an upload whose turn came
+later, a turn across the erasure) is erased when that record is applied, and
+its file goes then.
+
 - A guest read returns `erased`; the API answers `SUBJECT_ERASED`; a replay
   marks the turn unverifiable (ADR 0109); holds, pins and log references
   remain and point at an erased blob.

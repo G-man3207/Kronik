@@ -108,7 +108,14 @@ struct Inner {
     holds: Option<Holds>,
     /// Test hook: where a writer's finish waits ([`crate::HoldPoint::BlobFinished`]).
     after_finish: std::sync::OnceLock<(crate::TestHold, Arc<dyn kronik_core::env::Fs>)>,
+    /// Whether a subject was erased since the turn began
+    /// ([`TurnBlobs::guard_erasures`]).
+    erased_since: std::sync::OnceLock<ErasedSince>,
 }
+
+/// Whether a subject was erased since a turn began: what the turn holds of
+/// it predates the erasure (docs/design/m8-privacy.md §6.8).
+pub type ErasedSince = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// What the turn's actor holds (M26 §2): the store whose `blob_refs`
 /// answer, main's or a fork's, and the actor. The actor's turns run one at
@@ -123,6 +130,9 @@ struct Slot {
     writer: Option<BlobWriter>,
     /// The scrubber, and how many secret values it matches.
     scrub: Option<(StreamScrubber<'static>, usize)>,
+    /// A writer of a subject erased since the turn began: it stores nothing,
+    /// and every write and its finish answer `erased`.
+    refused: bool,
 }
 
 impl TurnBlobs {
@@ -161,6 +171,7 @@ impl TurnBlobs {
             budget: std::sync::OnceLock::new(),
             holds,
             after_finish: std::sync::OnceLock::new(),
+            erased_since: std::sync::OnceLock::new(),
         });
         // The lease lives as long as the host, renewed while the turn runs,
         // however long it waits (ADR 0120 §4); the loop ends with the host.
@@ -185,6 +196,16 @@ impl TurnBlobs {
     pub fn with_budget(self, budget: Arc<kronik_blob::SpaceBudget>) -> TurnBlobs {
         let _ = self.0.budget.set(budget);
         self
+    }
+
+    /// The erasures this turn runs across (docs/design/m8-privacy.md §6.8):
+    /// a blob of a subject erased since the turn began is neither read nor
+    /// written. A read would hand the guest plaintext from before the
+    /// erasure through a reader the turn opened before it. A new blob of the
+    /// subject would need a key version newer than the erased ones, and may
+    /// hold what the turn read before. Both answer `erased`.
+    pub(crate) fn guard_erasures(&self, check: ErasedSince) {
+        let _ = self.0.erased_since.set(check);
     }
 
     /// The secret values of a turn's effect state, for its blob host. It
@@ -305,6 +326,9 @@ impl TurnBlobs {
         &self,
         blob: &pb::BlobRef,
     ) -> Result<Box<dyn BodySource>, BlobHostError> {
+        if self.0.erased_since(blob.subject.as_deref()) {
+            return Err(BlobHostError::Erased);
+        }
         let reader = self.0.reader(blob).await?;
         Ok(Box::new(FrameSource { reader, next: 0 }))
     }
@@ -492,6 +516,14 @@ impl Inner {
         Ok(emitted)
     }
 
+    /// Whether `subject` was erased since the turn began.
+    fn erased_since(&self, subject: Option<&str>) -> bool {
+        match (subject, self.erased_since.get()) {
+            (Some(subject), Some(check)) => check(subject),
+            _ => false,
+        }
+    }
+
     async fn reader(&self, blob: &pb::BlobRef) -> Result<Arc<BlobReader>, BlobHostError> {
         if let Some((_, reader)) = lock(&self.readers).iter().find(|(h, _)| *h == blob.hash) {
             return Ok(reader.clone());
@@ -523,6 +555,10 @@ impl BlobHost for TurnBlobs {
         let inner = self.0.clone();
         let blob = blob.clone();
         Box::pin(async move {
+            if inner.erased_since(blob.subject.as_deref()) {
+                inner.read_erased.store(true, Ordering::Relaxed);
+                return Err(BlobHostError::Erased);
+            }
             // A `--no-pii` fork reads a subject's blob as its pseudonym:
             // 16 bytes, then nothing (M25 §9).
             if inner.options.pseudonymize
@@ -567,6 +603,18 @@ impl BlobHost for TurnBlobs {
     fn create(&self, subject: Option<String>) -> BoxFuture<'static, Result<u64, BlobHostError>> {
         let inner = self.0.clone();
         Box::pin(async move {
+            if inner.erased_since(subject.as_deref()) {
+                let id = inner.next.fetch_add(1, Ordering::Relaxed);
+                lock(&inner.writers).insert(
+                    id,
+                    Slot {
+                        writer: None,
+                        scrub: None,
+                        refused: true,
+                    },
+                );
+                return Ok(id);
+            }
             let keys = match &subject {
                 None => None,
                 Some(subject) => Some(inner.keys(subject)?),
@@ -584,6 +632,7 @@ impl BlobHost for TurnBlobs {
             let mut slot = Slot {
                 writer: Some(writer),
                 scrub: None,
+                refused: false,
             };
             // A turn that used secrets before the writer starts scrubs from
             // its first byte.
@@ -602,6 +651,9 @@ impl BlobHost for TurnBlobs {
                 let slot = writers
                     .get_mut(&writer)
                     .ok_or_else(|| BlobHostError::Host(format!("no blob writer {writer}")))?;
+                if slot.refused {
+                    return Err(BlobHostError::Erased);
+                }
                 let mut bytes = inner.rescrub(slot)?;
                 match &mut slot.scrub {
                     Some((scrubber, _)) => {
@@ -630,6 +682,9 @@ impl BlobHost for TurnBlobs {
             let slot = lock(&inner.writers)
                 .remove(&writer)
                 .ok_or_else(|| BlobHostError::Host(format!("no blob writer {writer}")))?;
+            if slot.refused {
+                return Err(BlobHostError::Erased);
+            }
             let mut w = slot
                 .writer
                 .ok_or_else(|| BlobHostError::Host(format!("blob writer {writer} is busy")))?;
