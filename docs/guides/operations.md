@@ -1857,6 +1857,23 @@ daemon started on the directory with the log's hash and the state hash of
 v0.4.1 unchanged, isolated and continuous replays of the same root inputs
 showed no change, and a key-backed effect gave its recorded result.
 
+- **With privacy mode on.** The upgrade changes nothing of privacy: sealed
+  values stay sealed under the same keys, an erased subject stays unreadable
+  in the log, `state.db`, the snapshots, the bucket and a restore from it
+  with the new binary, `privacy status` reads the same, and `kronik privacy
+  reseal` works on the new binary. Turns that met an erased subject's data
+  are not verified: the check passes and counts them (`Unverifiable N
+  turns`), and the identity replays of the runbook count them the same way
+  (`Unverifiable` in their summary, `summary.unverifiable` in the diff),
+  however the replay is authorized. Those are expected; read the count, and
+  look at the diff when it is larger than the turns of erased subjects in
+  the window. A pending timer that an erased subject's turn scheduled fires
+  after the upgrade as a `SUBJECT_ERASED` dead letter, and another subject's
+  fires as scheduled. This was drilled with the v0.4.1 release binary and
+  privacy mode on: subjects' state, SQL rows, saved responses, operator
+  messages, pending timers and dead letters, an erasure, a reseal and
+  shipping, then the check (14 turns, 9 of them unverifiable), the restart,
+  and a restore of the bucket with the new binary.
 - **The configuration.** A `kronik.toml` of v0.4.1 stays valid. The new
   `[connections]` section and the `[foreign]` keys `microvm_dir` and
   `start_timeout` are optional, with the defaults this guide gives.
@@ -1891,6 +1908,19 @@ showed no change, and a key-backed effect gave its recorded result.
   This was drilled on a test host from the v0.4.1 release to a `0.5.0-dev`
   build and back: the restored node's log hash and state hash through the
   copy's last LSN were the ones recorded before the upgrade.
+- **The copy is a privacy liability.** It is personal data like the
+  bucket, and the shipper does not look after it. It holds the keystore
+  backups of its time: a subject erased after the copy was made keeps its
+  key there, so its sealed values in the copy stay readable with the master
+  key, and the erasure is not complete while the copy exists
+  (`complete_after_ms` does not cover it). Going back restores the copy as
+  it was: every subject erased after it comes back. So record every subject
+  you erase while the copy exists (no command lists them by name: the
+  audit's `privacy.erase` lines carry a keyed hash), erase each of them
+  again after going back, before the restored node serves requests, and
+  delete the copy as soon as you stay on v0.5.0. The privacy drill of this
+  upgrade showed it: a subject erased on v0.5.0 was readable again on the
+  restored v0.4.1 node until it was erased once more.
 
 ### Upgrading from v0.3.0 or older
 

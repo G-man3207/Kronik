@@ -14,6 +14,10 @@ engine-compatibility exemption.
    ships to the same `[ship] url`, and a record the old binary cannot read
    makes that bucket unrestorable for the old binary too
    ([going back from v0.5.0](../guides/operations.md#upgrading-from-v041)).
+   With privacy mode on, that copy holds the keystore backups of its time:
+   a subject erased after it stays readable there, and comes back when you
+   go back to it. Record every subject you erase while the copy exists,
+   erase them again after going back, and delete the copy once you stay.
 2. With the **candidate binary**, check the actual data and configured keys:
 
    ```sh
@@ -67,10 +71,13 @@ engine-compatibility exemption.
    ```
 
    Every root input replayed, no changed response, effect or state, no error
-   introduced. A rollback is an engine transition in the opposite direction and
-   needs its own passing check; restoring the old binary over new data without
-   a check is unsafe. When the old binary cannot read the new records (v0.4.1
-   after a connection's turn), going back is a restore of step 1's copy.
+   introduced. Turns that met an erased subject's data are counted as
+   `Unverifiable` in the replay's summary: they are the check's unverifiable
+   turns, not a change, and no token makes them verifiable. A rollback is an
+   engine transition in the opposite direction and needs its own passing check;
+   restoring the old binary over new data without a check is unsafe. When the
+   old binary cannot read the new records (v0.4.1 after a connection's turn),
+   going back is a restore of step 1's copy.
 
 For data written by v0.3.0 or older, two things differ from the procedure
 above: an older binary could not start on data that a newer one had served,

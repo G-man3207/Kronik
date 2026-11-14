@@ -286,7 +286,12 @@ records hold in `state.db` are sealed the same way. The
 segment still being written is left until the next roll. A dry run reports
 how many closed segments would change and writes nothing. Run it after
 turning the mode on, before the first erasure. The command is `kronik
-privacy reseal --reason "..."`; `--dry-run` writes nothing.
+privacy reseal --reason "..."`; `--dry-run` writes nothing. Reseal takes a
+snapshot afterwards but keeps the older ones: a snapshot taken before the
+reseal still holds the plain values in its copy of `state.db`, locally and
+in the bucket, until retention thins it out (`[retention] snapshots_kept`
+and `history`). An erasure, unlike a reseal, deletes the snapshots older
+than it.
 
 **When erasure is complete.** Inside the data directory, the keys are gone
 at once. The shipper uploads an encrypted backup of the keystore (not the
