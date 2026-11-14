@@ -687,3 +687,176 @@ fn a_turn_that_fills_the_store_itself_stops_waiting() {
     let record = p.record(&next);
     assert!(record.effects.is_empty());
 }
+
+/// Real files; records the blob store's renames into `objects/` and its
+/// directory syncs, in order, with the events of the test's peer.
+struct OrderFs {
+    inner: Arc<dyn kronik_core::env::Fs>,
+    events: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl kronik_core::env::Fs for OrderFs {
+    fn create_dir_all(
+        &self,
+        path: std::path::PathBuf,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
+        self.inner.create_dir_all(path)
+    }
+    fn open(
+        &self,
+        path: std::path::PathBuf,
+        mode: kronik_core::env::OpenMode,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<Arc<dyn kronik_core::env::File>>>
+    {
+        self.inner.open(path, mode)
+    }
+    fn exists(
+        &self,
+        path: std::path::PathBuf,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<bool>> {
+        self.inner.exists(path)
+    }
+    fn read_dir(
+        &self,
+        dir: std::path::PathBuf,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<Vec<String>>> {
+        self.inner.read_dir(dir)
+    }
+    fn rename(
+        &self,
+        from: std::path::PathBuf,
+        to: std::path::PathBuf,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
+        if to.components().any(|c| c.as_os_str() == "objects") {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("named {}", to.display()));
+        }
+        self.inner.rename(from, to)
+    }
+    fn remove_file(
+        &self,
+        path: std::path::PathBuf,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
+        self.inner.remove_file(path)
+    }
+    fn sync_dir(
+        &self,
+        dir: std::path::PathBuf,
+    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
+        if dir.components().any(|c| c.as_os_str() == "objects") {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("synced {}", dir.display()));
+        }
+        self.inner.sync_dir(dir)
+    }
+}
+
+/// ADR 0117 §4: an effect's record never precedes its blobs. A turn that
+/// writes a blob and POSTs it in the same turn has the blob's name synced
+/// before the request leaves (so before its effect is recorded), not only
+/// at the turn's commit.
+#[allow(clippy::disallowed_methods)]
+#[test]
+fn a_blob_the_turn_wrote_is_durable_before_it_is_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let node = rt.block_on(async {
+        let mut env = Env::real(tokio::runtime::Handle::current());
+        env.fs = Arc::new(OrderFs {
+            inner: env.fs.clone(),
+            events: events.clone(),
+        });
+        let config = NodeConfig {
+            concurrency: 8,
+            blobs: Some(BlobsConfig::default()),
+            ..NodeConfig::default()
+        };
+        start_local(env, dir.path(), config).await.unwrap()
+    });
+    let p = Proc { rt, node };
+    let owner = p.node.local_operator_authority().unwrap();
+    p.rt.block_on(p.node.deploy(
+        &std::fs::read(MEDIA).unwrap(),
+        audit(),
+        false,
+        owner.clone(),
+    ))
+    .unwrap();
+    p.rt.block_on(p.node.grant(
+        "media",
+        "http:127.0.0.1",
+        None,
+        None,
+        kronik_effects::InForks::Recorded,
+        audit(),
+        false,
+        owner,
+    ))
+    .unwrap();
+    // A peer that notes when the request arrives.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let seen = events.clone();
+    std::thread::spawn(move || {
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut head = String::new();
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                head.push_str(&line);
+                line.clear();
+            }
+            seen.lock().unwrap().push("request".into());
+            let len: usize = head
+                .lines()
+                .find_map(|l| {
+                    let (n, v) = l.split_once(':')?;
+                    n.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse().unwrap())
+                })
+                .unwrap_or(0);
+            let mut body = vec![0; len];
+            let _ = reader.read_exact(&mut body);
+            let mut stream = stream;
+            let _ = stream.write_all(
+                b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    events.lock().unwrap().clear();
+    let r = p.ingress(http(
+        "write-post",
+        &format!("size=200000&url=http://{addr}/sink"),
+        inline(b""),
+    ));
+    assert_eq!(answer(&r), "status 201");
+    let events = events.lock().unwrap().clone();
+    let named = events
+        .iter()
+        .position(|e| e.starts_with("named "))
+        .expect("the blob was named");
+    let shard = std::path::Path::new(events[named].trim_start_matches("named "))
+        .parent()
+        .unwrap()
+        .display()
+        .to_string();
+    let synced = events
+        .iter()
+        .position(|e| *e == format!("synced {shard}"))
+        .expect("its directory was synced");
+    let request = events
+        .iter()
+        .position(|e| e == "request")
+        .expect("the peer got the request");
+    assert!(named < synced && synced < request, "{events:#?}");
+}

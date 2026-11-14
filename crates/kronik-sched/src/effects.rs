@@ -1597,6 +1597,16 @@ impl TurnFx {
         let mut rec = self.base(ordinal, kind, recorded_cap, fp);
         rec.request = tagged(&subject, recorded.encode_to_vec());
         rec.blobs = blob_body.iter().cloned().collect();
+        // The record must not precede its blob (ADR 0117 §4): a body the
+        // turn wrote itself is named durably only at its commit otherwise.
+        if blob_body.is_some()
+            && let Some(blobs) = self.blobs.get()
+        {
+            blobs.ensure_durable().await.map_err(|e| match e {
+                kronik_blob::BlobError::StoreFull { .. } => GateError::BlobStoreFull(e.to_string()),
+                other => GateError::Host(format!("naming a request body blob: {other}")),
+            })?;
+        }
         rec.idempotency_key = idem.clone();
         rec.delivery = delivery.as_str().into();
         if let Some((status, error)) = failure {

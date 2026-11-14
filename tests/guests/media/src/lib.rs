@@ -21,6 +21,8 @@
 //! - `fetch-write` (`size=`; the body is a URL): GETs it, then writes `size`
 //!   bytes as `write` does and answers with the blob. Its turn has a
 //!   `TurnBegin` before it writes.
+//! - `write-post` (`size=`, `url=`): writes a blob as `write` does and
+//!   POSTs it, in the same turn; answers the status or the fetch error.
 //! - `post` (`url=`): POSTs the body (a blob stays a blob) and answers the
 //!   status, or the fetch error.
 //! - `remember`: stores the body's reference in state (`ref` = `<hash>
@@ -271,6 +273,15 @@ fn run(op: &str, query: &str, body: HttpBody) -> Result<Output, HandlerError> {
             let blob = write_pattern(query_u64(query, "size", 0), MIB)
                 .map_err(|e| failed("write", &e))?;
             respond(HttpBody::Blob(blob))
+        }
+        "write-post" => {
+            let url = query_value(query, "url").unwrap_or("").to_string();
+            let blob = write_pattern(query_u64(query, "size", 0), MIB)
+                .map_err(|e| failed("write", &e))?;
+            match fetch("POST", &url, HttpBody::Blob(blob)) {
+                Ok(response) => text(format!("status {}", response.status)),
+                Err(e) => text(fetch_error(&e)),
+            }
         }
         "post" => {
             let url = query_value(query, "url").unwrap_or("").to_string();

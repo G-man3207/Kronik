@@ -1263,6 +1263,16 @@ impl Runner {
         let (blob_erased, blob_masked) = blob_host.as_ref().map_or((false, false), |host| {
             (host.read_erased(), host.read_masked())
         });
+        // The fork turn's blobs are named durably before its record exists
+        // (ADR 0117 §4), as production's are.
+        if let Some(host) = &blob_host
+            && let Err(e) = host.ensure_durable().await
+        {
+            let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
+            return Err(ReplayError::Host(format!(
+                "naming the fork turn's blobs: {e}"
+            )));
+        }
         let mut out = match run {
             Ok(o) => o,
             Err(e) => {
