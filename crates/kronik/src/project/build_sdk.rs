@@ -244,12 +244,17 @@ pub fn python(dir: &Path, force: bool, entry: Option<&str>) -> Result<Built, Fai
         .hint("set [tool.kronik] entry in pyproject.toml, or pass --entry"));
     }
     let name = variant(&name, &entry, &default_entry)?;
-    let world = sdk_world(&sdk.join("wit/kronik-actor.wit"))?;
     let bin = tools_bin();
     let versions = vec![
         version(&bin, "componentize-py", &["--version"], &[COMPONENTIZE_PY])?,
         wasi_virt(&bin)?,
     ];
+    // After the toolchain checks, as for TypeScript.
+    let world = sdk_world(&sdk.join("wit/kronik-actor.wit")).map_err(|f| {
+        f.hint(format!(
+            "vendor the Python SDK again into {sdk_rel} (`kronik init` writes one), or set [tool.kronik] sdk"
+        ))
+    })?;
     let job = Job {
         dir,
         bin: &bin,

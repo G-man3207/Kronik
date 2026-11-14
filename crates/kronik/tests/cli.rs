@@ -529,6 +529,33 @@ fn build_checks_node_before_the_typescript_toolchain() {
         build(&bin).starts_with("Node.js is not installed: "),
         "no node on PATH"
     );
+    // With a recent `node` the build reads the SDK's WIT next. This SDK has
+    // none: the error says to install it again, not which file was missing.
+    std::fs::write(&node, "#!/bin/sh\necho v22.20.0\n").unwrap();
+    std::fs::set_permissions(&node, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let o = Command::new(KRONIK)
+        .args(["--json", "build", "--dir"])
+        .arg(&project)
+        .env("PATH", &bin)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    let error: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "BAD_REQUEST", "{error}");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("the SDK has no WIT file ")
+            && message.ends_with("kronik-actor.wit: it is incomplete, or older than this kronik"),
+        "{error}"
+    );
+    assert!(
+        error["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .ends_with("&& npm install)"),
+        "{error}"
+    );
 }
 
 #[test]

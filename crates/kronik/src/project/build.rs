@@ -39,8 +39,16 @@ const DISABLED_FEATURES: [&str; 2] = ["fetch-event", "stdio"];
 /// components also export `kronik:actor/connection-handler` (ADR 0113), or
 /// `actor` for an SDK that an older `kronik init` vendored.
 pub(super) fn sdk_world(wit: &Path) -> Result<&'static str, Failure> {
-    let text = std::fs::read_to_string(wit)
-        .map_err(|e| Failure::new(format!("the SDK's WIT {}: {e}", wit.display())))?;
+    let text = std::fs::read_to_string(wit).map_err(|e| {
+        Failure::new(if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "the SDK has no WIT file {}: it is incomplete, or older than this kronik",
+                wit.display()
+            )
+        } else {
+            format!("cannot read the SDK's WIT {}: {e}", wit.display())
+        })
+    })?;
     Ok(
         if text
             .lines()
@@ -236,8 +244,12 @@ fn typescript(dir: &Path, force: bool, entry: Option<&str>) -> Result<Built, Fai
             Failure::new("@kronik/sdk is not installed")
                 .hint(format!("run: (cd {} && npm install)", dir.display()))
         })?;
+    // The SDK's WIT decides the world. Its bytes, not the world read from
+    // them, go into the inputs, so that a build with unchanged inputs needs
+    // neither the file's world nor Node.js; a missing file is reported after
+    // the toolchain checks, when the build needs it.
     let wit = sdk.join("wit/kronik-actor.wit");
-    let world = sdk_world(&wit)?;
+    let wit_hash = blake3::hash(&std::fs::read(&wit).unwrap_or_default()).to_hex();
     let mut versions = Vec::new();
     for package in [
         "@bytecodealliance/jco",
@@ -260,7 +272,7 @@ fn typescript(dir: &Path, force: bool, entry: Option<&str>) -> Result<Built, Fai
     let mut hasher = blake3::Hasher::new();
     hasher.update(
         format!(
-            "kronik build ts\0{KRONIK_VERSION}\0{world}\0{}\0{}\0{entry}\0",
+            "kronik build ts\0{KRONIK_VERSION}\0{wit_hash}\0{}\0{}\0{entry}\0",
             versions.join(","),
             DISABLED_FEATURES.join(",")
         )
@@ -290,6 +302,12 @@ fn typescript(dir: &Path, force: bool, entry: Option<&str>) -> Result<Built, Fai
     }
 
     check_node()?;
+    let world = sdk_world(&wit).map_err(|f| {
+        f.hint(format!(
+            "install it again: (cd {} && npm install)",
+            dir.display()
+        ))
+    })?;
     step("tsc --noEmit", || {
         tool(
             Command::new(modules.join(".bin/tsc"))
