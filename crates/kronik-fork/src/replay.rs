@@ -1161,6 +1161,7 @@ impl Runner {
             message_bytes: size(kl.message_bytes),
             state_value_bytes: size(kl.state_value_bytes),
             blob_bytes: kl.blob_bytes_per_actor,
+            blob_threshold: kl.blob_threshold(),
         };
         let call_chain = match &p.input.kind {
             Some(pb::input::Kind::Message(m)) => {

@@ -2307,6 +2307,7 @@ dependencies = [
  "bytes",
  "chacha20",
  "http",
+ "http-body",
  "http-body-util",
  "kronik-core",
  "kronik-proto",

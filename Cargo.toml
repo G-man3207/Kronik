@@ -65,6 +65,7 @@ ed25519-dalek = { version = "3.0", default-features = false, features = ["fast",
 getrandom = "0.4"
 hmac = "0.13"
 http = "1"
+http-body = "1.1"
 http-body-util = "0.1.3"
 hyper = { version = "1.7", features = ["server", "http1"] }
 hyper-util = { version = "0.1.17", features = ["tokio"] }

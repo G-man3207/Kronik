@@ -11,6 +11,7 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 chacha20 = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
 http-body-util = { workspace = true }
 kronik-core = { workspace = true }
 kronik-proto = { workspace = true }

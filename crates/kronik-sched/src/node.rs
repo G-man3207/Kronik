@@ -5598,6 +5598,7 @@ fn turn_limits(l: &KindLimits) -> TurnLimits {
         message_bytes: size(l.message_bytes),
         state_value_bytes: size(l.state_value_bytes),
         blob_bytes: l.blob_bytes_per_actor,
+        blob_threshold: l.blob_threshold(),
     }
 }
 

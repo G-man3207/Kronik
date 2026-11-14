@@ -723,6 +723,19 @@ fork matching and simulators.
   responses are read whole within the effect limits. Trailers are not
   supported, and `request-options` timeouts are ignored (the effect timeout
   applies). A turn may have 32 requests that it has not waited for.
+- For a component that imports `kronik:actor/blobs` (M25), on a node with
+  a blob store, bodies above the kind's blob threshold
+  (`blob_threshold_bytes`, 1 MiB by default) are blobs. A request body that
+  passes it is stored as a blob of the turn's subject while the guest writes
+  it and sent from the store; it counts against the bytes a turn may write
+  into blobs (`blob_bytes_per_actor`), past which the request is not sent
+  and the guest gets `HTTP-request-body-size`. A response above it, up to
+  `effect_response_bytes`, is a blob that the guest reads through the
+  body's stream: the host reads it one 64 KiB frame at a time, only when the
+  guest waits after the stream ran out, so what a read returns never
+  depends on timing. A secret value the turn revealed and wrote into a body
+  above the threshold is stored, and sent, as its placeholder, and the
+  turn's log gets a warning: send secrets in `{{secret:NAME}}` headers.
 - Errors arrive as `wasi:http` error codes: denied (a missing capability
   or secret) is `HTTP-request-denied`, a timeout
   `HTTP-response-timeout`, an answer over the limit

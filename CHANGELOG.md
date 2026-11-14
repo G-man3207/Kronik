@@ -567,6 +567,16 @@ M23, key and secret backends:
   through a synced temporary file: a crash while it was written could leave
   a shorter number, and the shipper would then delete keystore backups
   before `privacy.keystore_backup_retention` had passed.
+- Standard `fetch` through `wasi:http` handles bodies above the blob
+  threshold (M25 §7.6) for a component that imports `kronik:actor/blobs`:
+  a request body that passes `blob_threshold_bytes` is stored as a blob of
+  the turn's subject while the guest writes it, within the bytes a turn may
+  write into blobs, and sent from the store; a response above it is a blob
+  the guest reads through the body's stream, one 64 KiB frame at a time and
+  only when it waits after the stream ran out, so what a read returns
+  never depends on disk or network timing. A secret value the turn
+  revealed and wrote into such a request body is stored and sent as its
+  placeholder, with a warning in the turn's log.
 
 <!--
 Draft of the v0.5.0 section, to finish at the release. Then rename

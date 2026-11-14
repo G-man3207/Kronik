@@ -99,6 +99,10 @@ pub struct TurnLimits {
     /// The bytes one turn may write into blobs (`blob_bytes_per_actor`,
     /// M25/M26): a `write` past it is `quota-exceeded`.
     pub blob_bytes: u64,
+    /// The kind's blob threshold (`KindLimits::blob_threshold`, M25): in a
+    /// turn with a blob host whose component reads blobs, a `wasi:http`
+    /// request body above it is spooled into a blob (§7.6).
+    pub blob_threshold: u64,
 }
 
 impl Default for TurnLimits {
@@ -109,6 +113,7 @@ impl Default for TurnLimits {
             message_bytes: 1 << 20,
             state_value_bytes: 1 << 20,
             blob_bytes: 1 << 30,
+            blob_threshold: 1 << 20,
         }
     }
 }

@@ -49,6 +49,9 @@ sql-call = []
 untagged = []
 # Standard fetch (M22): `wfetch*` operations through wasi:http directly.
 wasi-http = ["dep:wasip2"]
+# Blob bodies through wasi:http (M25 §7.6): `wbig`, and `bprobe`, which
+# makes the component import kronik:actor/blobs (it reads blobs).
+wasi-http-blobs = ["wasi-http"]
 
 [profile.release]
 opt-level = "s"

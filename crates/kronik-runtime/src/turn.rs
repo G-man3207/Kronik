@@ -250,6 +250,11 @@ impl Program {
             }
             _ => None,
         };
+        if with_blobs && self.reads_blobs {
+            // A wasi:http request body above the kind's threshold becomes a
+            // blob, as the gate makes a response above it one (M25 §7.6).
+            host.spool_request_bodies_above(req.limits.blob_threshold);
+        }
         if with_blobs {
             // The input's references are the turn's to read (ADR 0119 §2).
             let mut refs = Vec::new();

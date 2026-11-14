@@ -576,19 +576,49 @@ blob's identity and size are those of the scrubbed bytes.
 ### 7.6 Standard `fetch` (`wasi:http`)
 
 As [ADR 0121](../adr/0121-blob-interface-and-wasi-0-3.md) §6, in
-`kronik-runtime/src/host/wasi_http.rs`:
+`kronik-runtime/src/host/wasi_http.rs`, for a turn with a blob host whose
+component reads blobs:
 
-- `answer()` maps a `FetchBody::Blob` response to an incoming body backed by
-  a reader. Its frames are filled only by `drive`: at each guest wait, every
-  blob-backed body with an empty buffer gets exactly the next frame (at most
-  64 KiB). A non-blocking read returns what is buffered. What a read returns
-  depends only on the guest's waits.
-- `drive` spools a request body that passes the threshold into a writer (the
-  turn's subject; the turn's created-bytes quota as its limit, else
-  `HTTP-request-body-size`) instead of growing `Pending.bytes`; the effect's
-  request is then `FetchBody::Blob`.
+- `answer()` maps a `FetchResponseBody::Blob` response to an incoming body
+  backed by the store and adds the reference to `T`, as `http-client.fetch`
+  does. Its frames are read only at the guest's waits, and only on demand:
+  when the body's stream finds nothing to take (a non-blocking read, a
+  `ready`, a wait), the body wants a frame, and the next wait reads exactly
+  its next frame (at most 64 KiB, charged to the blob budget like a `get`).
+  A wait that is not ready because it found such a body empty reads that
+  frame and looks again; only `poll`, `block` and the blocking reads, skips
+  and splices do, as they change nothing before they are ready. A
+  non-blocking read returns only what an earlier wait read. What a read
+  returns therefore depends only on the guest's calls; the host holds at
+  most one frame of a body (`wasmtime-wasi-http`'s stream holds the frame
+  it took, and the body is read again only once that is used up), reads
+  nothing of a body the guest does not read, and waiting for the trailers
+  of a body read in part reads the rest within that wait. This relies on
+  `wasmtime-wasi-http` 50 polling an incoming body only from the guest's
+  calls, with no worker task.
+- `drive` spools a request body that passes the threshold
+  (`TurnLimits::blob_threshold`, the kind's `KindLimits::blob_threshold`)
+  into a writer of the turn's subject instead of growing `Pending.bytes`; a
+  body of exactly the threshold stays inline. The spooled bytes are the
+  turn's created bytes, against `TurnLimits::blob_bytes` (past it the
+  request is not sent and the guest gets `HTTP-request-body-size` with the
+  quota), and count against its blob budget; the writer is one of the
+  turn's open writers and is discarded when the request is not sent. The
+  effect's request is then `FetchBody::Blob`, whose reference is not added
+  to `T`: the guest never received it. The blob is scrubbed like any
+  writer's (§5.2), so a secret value the turn revealed goes out as its
+  placeholder, and the turn's log gets a warning with the count
+  (`BlobHost::replaced`); secrets belong in `{{secret:NAME}}` headers.
+  Without a blob host, or for a component that does not read blobs, a body
+  stays inline up to `message_bytes`. (`wasi:http` reaches only `http` and
+  `https` URLs, so never a foreign actor, whose bodies stay inline.)
 - The determinism test of ADR 0070 (100 runs, jittered latency) runs again
-  with a 3 MiB response and a 3 MiB streamed request body.
+  with a 3 MiB request body, streamed through `check-write`, `write` and
+  `poll`, and its echo, a 3 MiB response read with non-blocking reads of
+  mixed lengths, blocking reads and polls, while the blob store's reads and
+  writes are jittered too (`crates/kronik-runtime/tests/wasi_http.rs`, guest
+  `counter-wasi-http-blobs`). Every run has the same transcript and the same
+  store operations: each response frame is read once, in order.
 
 ## 8. Log format
 
@@ -701,7 +731,7 @@ blobs is released without them (§18.2).
 | fetch request from a blob | one frame |
 | response to a client | one frame (hyper's write buffer aside) |
 | `blobs.get`, `write` | 1 MiB per call (the guest's own memory aside) |
-| `wasi:http` body | one frame per body |
+| `wasi:http` body | one frame per response body, read on demand; a request body up to `threshold` before it is spooled |
 | shipping a blob | one 8 MiB part |
 
 Concurrency is bounded by what already bounds it: gateway connections and the
@@ -886,7 +916,7 @@ when all its criteria pass.
 
 | Risk | Mitigation |
 | --- | --- |
-| A blob-backed `wasi:http` body makes `poll` results depend on disk timing | Frames are filled only during drive, one per body per wait (§7.6); the 100-run transcript test |
+| A blob-backed `wasi:http` body makes `poll` results depend on disk timing | Frames are read only at waits, one per body that asked for it (§7.6); the 100-run transcript test, with the store's latency jittered too |
 | Memory grows with body size somewhere unexpected (hyper buffers, the scrubber, `object_store` parts) | Measured by criteria 1, 2 and 4 at two sizes; bounds in §11 |
 | Anyone can fill the disk with uploads that retention keeps for 7 days | `upload_bytes` defaults to 64 MiB; the blob reserve stops blobs before the log; docs recommend an authenticating proxy in front of upload routes |
 | The stream scrubber differs from whole-buffer scrubbing at chunk borders | Property test over random splits (§7.4) |

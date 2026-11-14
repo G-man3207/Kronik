@@ -85,6 +85,13 @@ pub trait BlobHost: Send + Sync {
     fn finish(&self, writer: u64) -> BoxFuture<'static, Result<pb::BlobRef, BlobHostError>>;
     /// Drops an unfinished writer and its bytes.
     fn discard(&self, writer: u64);
+    /// How many secret values the turn revealed were replaced by their
+    /// placeholders in writer `writer`'s bytes (§5.2); after `finish`, the
+    /// final count, readable until the turn ends. A `wasi:http` request body
+    /// spooled into a blob warns the guest with it (§7.6).
+    fn replaced(&self, _writer: u64) -> u64 {
+        0
+    }
 }
 
 /// The host's state of a guest's `writer` resource.
@@ -97,12 +104,13 @@ pub struct GuestWriter {
 pub(crate) struct TurnBlobs {
     /// `T`: every reference the turn may use, complete, by (hash, size).
     refs: BTreeMap<(String, u64), pb::BlobRef>,
-    /// Ids of writers not yet finished or dropped.
-    open: Vec<u64>,
+    /// Ids of writers not yet finished or dropped, a `wasi:http` request
+    /// body's spool writer included.
+    pub(super) open: Vec<u64>,
     /// Bytes `get` and `write` moved, against fuel × 64.
     moved: u64,
     /// Bytes the turn wrote into blobs, against `TurnLimits::blob_bytes`.
-    created: u64,
+    pub(super) created: u64,
 }
 
 impl TurnBlobs {
@@ -152,7 +160,7 @@ impl TurnHost {
 
     /// Counts `bytes` against the turn's blob I/O budget; past it the turn
     /// runs out of fuel.
-    fn charge_blob_bytes(&mut self, bytes: u64) -> wasmtime::Result<()> {
+    pub(super) fn charge_blob_bytes(&mut self, bytes: u64) -> wasmtime::Result<()> {
         let budget = self.limits.fuel.saturating_mul(BLOB_BYTES_PER_FUEL);
         self.blob_state.moved = self.blob_state.moved.saturating_add(bytes);
         if self.blob_state.moved > budget {
@@ -162,7 +170,7 @@ impl TurnHost {
     }
 
     /// A storage failure that is not guest-visible.
-    fn blob_failure(&mut self, error: BlobHostError) -> wasmtime::Error {
+    pub(super) fn blob_failure(&mut self, error: BlobHostError) -> wasmtime::Error {
         match error {
             BlobHostError::Erased => {
                 self.host_failure("an erased blob where nothing was read".into())

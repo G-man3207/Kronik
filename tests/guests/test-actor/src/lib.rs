@@ -75,6 +75,20 @@
 //!   waiting (a `fetch` nobody awaits)
 //! - `wdrop`: starts a request and drops its future, then sends the next
 //!   one (after `---`)
+//!
+//! Blob bodies (M25 §7.6): feature `wasi-http-blobs` adds `bprobe`, which
+//! makes the component import `kronik:actor/blobs`, and `wbig`. Its body
+//! is `METHOD URL`, then `key=value` lines: `size` (request body bytes, a
+//! fixed pattern, default 0), `chunk` (the most one write takes, default
+//! 65536), `reads` (comma-separated read lengths used in turn, default
+//! `1,4096,70000,65536,777,100000`), `stop` (after that many body bytes,
+//! drop the stream) and `trailers=no` (do not wait for the trailers once the
+//! stream is dropped). It writes the body
+//! through `check-write`, `write` and `poll`, then reads the response with
+//! non-blocking reads (every fifth a blocking one) and a `poll` whenever a
+//! read returns nothing. It replies the status, the byte counts and FNV-1a
+//! digests of the bytes sent, the bytes read and the transcript of every
+//! write permit, read length and ready list.
 
 // The notes build does not use the counter helpers.
 #![cfg_attr(feature = "notes", allow(unused_imports, dead_code))]
@@ -455,6 +469,22 @@ fn run(op: &str, body: &[u8]) -> Result<String, HandlerError> {
         }
         #[cfg(feature = "wasi-http")]
         "wfetch" | "wfetch2" | "wfetch3" | "wleave" | "wstream" | "wstall" | "wdrop" => Ok(wasi_http_ops::run(op, &text)),
+        #[cfg(feature = "wasi-http-blobs")]
+        "wbig" => Ok(wasi_http_ops::big(&text)),
+        #[cfg(feature = "wasi-http-blobs")]
+        "bprobe" => Ok(
+            match kronik::actor::blobs::get(
+                &kronik::actor::types::BlobRef {
+                    hash: text.clone(),
+                    size: 1,
+                },
+                0,
+                1,
+            ) {
+                Ok(bytes) => format!("read {}", bytes.len()),
+                Err(e) => format!("{e:?}"),
+            },
+        ),
         other => Err(HandlerError::Rejected(format!("unknown operation {other}"))),
     }
 }
@@ -873,5 +903,173 @@ mod wasi_http_ops {
             }
         })();
         r.unwrap_or_else(|e| format!("guest error {e}"))
+    }
+
+    /// Byte `i` of a `wbig` request body.
+    #[cfg(feature = "wasi-http-blobs")]
+    fn pattern(i: u64) -> u8 {
+        ((i % 251) as u8) ^ ((i / 251) as u8)
+    }
+
+    /// FNV-1a, 64 bits.
+    #[cfg(feature = "wasi-http-blobs")]
+    struct Fnv(u64);
+
+    #[cfg(feature = "wasi-http-blobs")]
+    impl Fnv {
+        fn new() -> Fnv {
+            Fnv(0xcbf2_9ce4_8422_2325)
+        }
+        fn add(&mut self, bytes: &[u8]) {
+            for b in bytes {
+                self.0 ^= u64::from(*b);
+                self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+    }
+
+    /// `wbig` (the crate's docs).
+    #[cfg(feature = "wasi-http-blobs")]
+    pub fn big(text: &str) -> String {
+        use std::fmt::Write as _;
+        use wasip2::http::types::IncomingBody;
+        use wasip2::io::streams::StreamError;
+
+        let mut lines = text.lines();
+        let request = lines.next().unwrap_or("GET http://invalid/");
+        let (mut size, mut chunk, mut stop) = (0u64, 65536u64, None::<u64>);
+        let mut wait_trailers = true;
+        let mut reads: Vec<u64> = vec![1, 4096, 70000, 65536, 777, 100000];
+        for line in lines {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key {
+                "size" => size = value.parse().unwrap_or(0),
+                "chunk" => chunk = value.parse().unwrap_or(65536).max(1),
+                "reads" => reads = value.split(',').filter_map(|n| n.parse().ok()).collect(),
+                "stop" => stop = value.parse().ok(),
+                "trailers" => wait_trailers = value != "no",
+                _ => {}
+            }
+        }
+        if reads.is_empty() {
+            reads.push(65536);
+        }
+        let mut transcript = String::new();
+        let mut sent = Fnv::new();
+        let s = match start(request) {
+            Ok(s) => s,
+            Err(e) => return format!("guest error {e}"),
+        };
+        // The body: as much as each write permit allows, a poll when none.
+        {
+            let Ok(stream) = s.body.write() else {
+                return "guest error body stream".into();
+            };
+            let (mut at, mut buf) = (0u64, Vec::new());
+            // A body the host refused closes the stream: the response says
+            // why.
+            while at < size {
+                let permit = match stream.check_write() {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        let _ = write!(transcript, "x{e:?} ");
+                        break;
+                    }
+                };
+                let _ = write!(transcript, "w{permit} ");
+                if permit == 0 {
+                    let p = stream.subscribe();
+                    let ready = poll::poll(&[&p]);
+                    let _ = write!(transcript, "p{ready:?} ");
+                    continue;
+                }
+                let n = permit.min(size - at).min(chunk);
+                buf.clear();
+                buf.extend((at..at + n).map(pattern));
+                sent.add(&buf);
+                if let Err(e) = stream.write(&buf) {
+                    let _ = write!(transcript, "x{e:?} ");
+                    break;
+                }
+                at += n;
+            }
+        }
+        if let Err(e) = OutgoingBody::finish(s.body, None) {
+            let _ = write!(transcript, "finish-error {} ", code(&e));
+        }
+        s.future.subscribe().block();
+        let resp = match s.future.get() {
+            Some(Ok(Ok(resp))) => resp,
+            Some(Ok(Err(e))) => return format!("error {} | {transcript}", code(&e)),
+            _ => return "guest error no response".into(),
+        };
+        let status = resp.status();
+        let Ok(body) = resp.consume() else {
+            return "guest error consume".into();
+        };
+        let mut got = Fnv::new();
+        let (mut total, mut n_reads, mut waits) = (0u64, 0u64, 0u64);
+        let mut end = String::from("eof");
+        {
+            let Ok(stream) = body.stream() else {
+                return "guest error response stream".into();
+            };
+            let mut k = 0;
+            loop {
+                if stop.is_some_and(|stop| total >= stop) {
+                    end = "stopped".into();
+                    break;
+                }
+                let len = reads[k % reads.len()];
+                let blocking = k % 5 == 4;
+                k += 1;
+                n_reads += 1;
+                let read = if blocking {
+                    stream.blocking_read(len)
+                } else {
+                    stream.read(len)
+                };
+                match read {
+                    Ok(bytes) => {
+                        let tag = if blocking { "B" } else { "r" };
+                        let _ = write!(transcript, "{tag}{} ", bytes.len());
+                        got.add(&bytes);
+                        total += bytes.len() as u64;
+                        if bytes.is_empty() {
+                            let p = stream.subscribe();
+                            let ready = poll::poll(&[&p]);
+                            waits += 1;
+                            let _ = write!(transcript, "p{ready:?} ");
+                        }
+                    }
+                    Err(StreamError::Closed) => break,
+                    Err(StreamError::LastOperationFailed(e)) => {
+                        end = format!("failed({})", e.to_debug_string());
+                        break;
+                    }
+                }
+            }
+        }
+        // The trailers: after a stop, the rest of the body is read for them.
+        let trailers = if wait_trailers {
+            let trailers = IncomingBody::finish(body);
+            trailers.subscribe().block();
+            match trailers.get() {
+                Some(Ok(Ok(None))) => "none".to_string(),
+                Some(Ok(Ok(Some(_)))) => "some".to_string(),
+                Some(Ok(Err(e))) => format!("error {}", code(&e)),
+                _ => "unexpected".to_string(),
+            }
+        } else {
+            drop(body);
+            "skipped".to_string()
+        };
+        format!(
+            "{status} sent={size}:{:016x} got={total}:{:016x} reads={n_reads} waits={waits} \
+             end={end} trailers={trailers} | {transcript}",
+            sent.0, got.0
+        )
     }
 }
