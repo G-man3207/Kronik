@@ -505,6 +505,23 @@ response, streamed and hashed by the client. `cargo test` runs CI's sizes;
 
 The four tests took 17 s together.
 
+### Results (VPS sizes, 2026-11-14)
+
+The test VPS's sizes (`KRONIK_M25_FULL=1`), on the development machine
+(debug build) and on the test machine (4 vCPU, 7 GiB; release build for
+glibc 2.35, the daemon confined to two CPUs and 4 GiB as on the 2-vCPU VPS,
+the client on the other two):
+
+| What | Sizes | Development machine | Test machine |
+| --- | --- | --- | --- |
+| Upload | 30 MB, 300 MB | +1.5 MiB, +4.2 MiB | +1.4 MiB, +2.9 MiB |
+| Fetch | 4 MB, 40 MB | +3.9 MiB, +6.4 MiB | +1.2 MiB, +1.5 MiB |
+| Response | 100 MB, 1 GB | +1.5 MiB, +5.3 MiB | +0.0 MiB, +0.0 MiB |
+
+All four tests passed, in 34 s and 17 s. A growth of 0 means the peak of
+the warm-up request (a 2 MiB response) was not exceeded: a gigabyte
+streamed through one frame at a time.
+
 ## Nightly checks (Definition of done)
 
 The Definition of done asks for a crash test of 1 000 `kill -9` cycles and
