@@ -83,9 +83,9 @@ nonroot service instead (M21, opt-in; see
 [ADR 0060](../adr/0060-non-root-daemon-user-namespace.md) and
 [ADR 0062](../adr/0062-non-root-systemd-units.md)). It needs systemd 255 or
 newer, cgroup v2 and user namespaces. Its installed proofs passed on Ubuntu
-24.04 (GitHub-hosted runners, virtual machines on AMD hosts, 2026-11-14), with
-AppArmor's restriction on
-unprivileged user namespaces active and with it lifted; Kronik does nothing
+24.04 (GitHub-hosted runners, virtual machines on AMD and Intel hosts,
+2026-11-14), with AppArmor's restriction on unprivileged user namespaces
+active and with it lifted; Kronik does nothing
 about that restriction. It has not run on other distributions. Missing prerequisites never select the root service: the command
 stops and names `--init --root`. Its steps check before they act, like the
 root service's:

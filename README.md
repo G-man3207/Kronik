@@ -61,9 +61,10 @@ since `v0.4.1`. On `main` today:
   support in the four SDKs.
 - **The nonroot daemon (M21, opt-in):** the nonroot service of `kronik serve
   --init --rootless` passed its installed proofs (ADR 0064) on 2026-11-14 on
-  GitHub-hosted Ubuntu 24.04 runners (virtual machines on AMD hosts), once
-  with AppArmor's restriction on unprivileged user namespaces (R1) active and
-  once with it lifted; it has not run on other distributions. The root
+  GitHub-hosted Ubuntu 24.04 runners (virtual machines on AMD and Intel
+  hosts), once with AppArmor's restriction on unprivileged user namespaces
+  (R1) active and once with it lifted; it has not run on other
+  distributions. The root
   service stays the default. Its decisions, ADRs 0060–0065, were accepted on
   2026-11-13.
 - **The microVM level (M20, opt-in; gVisor stays the default):**
