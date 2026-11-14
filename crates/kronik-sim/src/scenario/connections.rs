@@ -433,6 +433,24 @@ fn frame_bytes(f: &pb::Frame) -> usize {
     data + f.event.len() + f.id.len()
 }
 
+/// Whether a frame sent is the one its record holds. A record keeps a
+/// subject's data sealed when privacy mode is on, and the client gets it
+/// plain: then the frame's kind, SSE fields and subject must match. A
+/// tombstone (an erasure that began during the turn) is sealed in both.
+fn same_frame(recorded: &pb::Frame, sent: &pb::Frame) -> bool {
+    let sealed = matches!(
+        recorded.data.as_ref().and_then(|d| d.value.as_ref()),
+        Some(pb::sealable::Value::Sealed(_))
+    );
+    if !sealed {
+        return recorded == sent;
+    }
+    recorded.kind == sent.kind
+        && recorded.event == sent.event
+        && recorded.id == sent.id
+        && recorded.data.as_ref().map(|d| &d.subject) == sent.data.as_ref().map(|d| &d.subject)
+}
+
 /// Standard base64 with padding: a WebSocket key.
 fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -817,7 +835,7 @@ impl World {
                 socket.id, socket.owner, first.actor
             ));
         }
-        if first.frame != *frame {
+        if !same_frame(&first.frame, frame) {
             self.violation(format!(
                 "C3: {} seq {seq} is not the frame its record holds",
                 socket.id
