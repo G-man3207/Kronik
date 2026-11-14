@@ -97,25 +97,29 @@ impl KeyAccess for NoKeys {
 /// One shard directory's name generations: `renamed` counts names created
 /// in it, `synced` is the count a completed `sync_dir` covers.
 #[derive(Default)]
-struct Gens {
+pub(crate) struct Gens {
     renamed: u64,
     synced: u64,
     /// Objects named in this process and not yet covered by a sync.
     pending: BTreeMap<String, u64>,
+    /// The store's touch sequence number of the last naming or claim of
+    /// each object, until the collector's next pass has started after it
+    /// ([`crate::sweep`]).
+    pub(crate) touched: BTreeMap<String, u64>,
 }
 
 #[derive(Default)]
-struct Dir {
+pub(crate) struct Dir {
     /// Serializes naming and deleting objects in this directory (claims).
-    claim: tokio::sync::Mutex<()>,
+    pub(crate) claim: tokio::sync::Mutex<()>,
     /// Serializes syncs of this directory, so concurrent callers share one.
     sync: tokio::sync::Mutex<()>,
-    gens: Mutex<Gens>,
+    pub(crate) gens: Mutex<Gens>,
 }
 
 /// The blob store of one data directory.
 pub struct BlobStore {
-    env: Env,
+    pub(crate) env: Env,
     data_dir: PathBuf,
     /// `[blobs] disk_reserve`; a test can change it ([`BlobStore::set_reserve`]).
     reserve: AtomicU64,
@@ -126,6 +130,11 @@ pub struct BlobStore {
     /// Space roots prepared by this process.
     prepared: tokio::sync::Mutex<BTreeSet<PathBuf>>,
     dirs: Mutex<HashMap<PathBuf, Arc<Dir>>>,
+    /// Counts the namings and claims of objects, for the collector: a pass
+    /// skips a name touched after it began ([`crate::sweep`]).
+    pub(crate) touch_seq: AtomicU64,
+    /// The collector's state between passes.
+    pub(crate) sweep: crate::sweep::SweepState,
 }
 
 fn shard_dirs(root: &Path) -> impl Iterator<Item = PathBuf> + '_ {
@@ -151,6 +160,8 @@ impl BlobStore {
             free: AtomicU64::new(u64::MAX),
             prepared: tokio::sync::Mutex::new(BTreeSet::new()),
             dirs: Mutex::new(HashMap::new()),
+            touch_seq: AtomicU64::new(0),
+            sweep: crate::sweep::SweepState::default(),
         });
         store.prepare(&Space::Main).await?;
         Ok(store)
@@ -240,7 +251,7 @@ impl BlobStore {
         Ok(())
     }
 
-    fn dir(&self, path: &Path) -> Arc<Dir> {
+    pub(crate) fn dir(&self, path: &Path) -> Arc<Dir> {
         lock(&self.dirs)
             .entry(path.to_path_buf())
             .or_default()
@@ -393,6 +404,10 @@ impl BlobStore {
             let generation = gens.renamed;
             gens.pending.insert(meta.id.file_name(), generation);
         }
+        // Named or claimed now, under the claim lock: a collector pass that
+        // began before does not delete it (ADR 0120 §5).
+        let touched = self.touch_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        lock(&dir.gens).touched.insert(meta.id.file_name(), touched);
         lease.add(meta.id);
         Ok(())
     }

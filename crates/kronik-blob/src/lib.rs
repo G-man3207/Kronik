@@ -27,12 +27,14 @@ pub mod format;
 mod id;
 mod lease;
 mod store;
+mod sweep;
 
 pub use id::{BlobId, BlobMeta};
 pub use lease::{Lease, Leases};
 pub use store::{
     BlobKeys, BlobReader, BlobStore, BlobWriter, KeyAccess, KeyAnswer, NoKeys, Space, StoreConfig,
 };
+pub use sweep::{Roots, SweepOptions, SweepReport, Unrooted};
 
 /// Why a blob operation failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
