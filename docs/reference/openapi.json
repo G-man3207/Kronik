@@ -4098,6 +4098,13 @@
               "null"
             ]
           },
+          "pending_blob_objects": {
+            "default": 0,
+            "description": "Its blobs' objects still in the bucket, which the shipper deletes in\nits next round; `privacy status` counts the erasure as pending until\nthen. 0 for a dry run.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "plain_values": {
             "description": "The subject's values written in `off` mode that are still plain in\nthe log, until a reseal (§8).",
             "format": "uint64",

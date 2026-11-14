@@ -71,4 +71,60 @@ impl Node {
         }
         Ok(deleted)
     }
+
+    /// Per erased subject, its blobs that are not gone yet: how many still
+    /// have a file on this node (main's store or a fork space) and how many
+    /// an object in the bucket (the shipper's record; its step 6 deletes
+    /// them, and the collector keeps their rows until it has). `privacy
+    /// status` counts such an erasure as pending (M26 §9.3).
+    pub(crate) fn erased_blobs_left(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, BlobsLeft>, ApiError> {
+        let internal =
+            |what: &str, e: String| ApiError::new(ErrorCode::Internal, format!("{what}: {e}"));
+        let rows = self
+            .store()
+            .db()
+            .erased_subject_blobs()
+            .map_err(|e| internal("reading the erased blobs", e.to_string()))?;
+        let mut left: std::collections::BTreeMap<String, BlobsLeft> = Default::default();
+        if rows.is_empty() {
+            return Ok(left);
+        }
+        let data = self.storage_config().map(|s| s.data_dir.clone());
+        let shipped = match &data {
+            Some(data) => kronik_store::ship_blobs::shipped_names(data)
+                .map_err(|e| internal("reading the shipper's blob record", e.to_string()))?,
+            None => Default::default(),
+        };
+        let mut spaces = vec![Space::Main];
+        if let Some(data) = &data {
+            spaces.extend(fork_spaces(data, self.branch()));
+        }
+        for (hash, subject) in rows {
+            let Ok(id) = BlobId::parse(&hash) else {
+                continue;
+            };
+            let entry = left.entry(subject).or_default();
+            if shipped.contains(&id.file_name()) {
+                entry.objects += 1;
+            }
+            if let Some(store) = self.blob_store()
+                && spaces.iter().any(|s| store.object_path(s, &id).exists())
+            {
+                entry.files += 1;
+            }
+        }
+        left.retain(|_, l| l.files + l.objects > 0);
+        Ok(left)
+    }
+}
+
+/// An erased subject's blobs that are not gone yet ([`Node::erased_blobs_left`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BlobsLeft {
+    /// With a file on this node.
+    pub files: u64,
+    /// With an object in the bucket.
+    pub objects: u64,
 }

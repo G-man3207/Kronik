@@ -248,6 +248,14 @@ fn render_erase(r: &ErasureResponse, rerun: &str) -> String {
     if r.blobs > 0 {
         let _ = writeln!(out, "Deleted {} files of its blobs.", r.blobs);
     }
+    if r.pending_blob_objects > 0 {
+        let _ = writeln!(
+            out,
+            "{} of its blobs' objects are still in the bucket: the shipper deletes them in its \
+             next round, and `kronik privacy status` counts the erasure as pending until then.",
+            r.pending_blob_objects
+        );
+    }
     complete_after(&mut out, r.complete_after_ms);
     out.push_str(&next(&["kronik privacy status".to_owned()]));
     out

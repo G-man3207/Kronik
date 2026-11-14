@@ -2,6 +2,7 @@
 //! §9.3, criterion 12). Applying the `Erasure` record marks the subject's
 //! rows of the blob index erased, and the node deletes their files at once,
 //! in main's store and in every fork space; another subject's blob stays.
+//! The erasure is pending while the shipper still has one of its objects.
 
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -141,6 +142,21 @@ fn erasing_a_subject_deletes_its_blobs_files_everywhere() {
     std::fs::create_dir_all(fork_one.parent().unwrap()).unwrap();
     std::fs::copy(&main_one, &fork_one).unwrap();
 
+    // The shipper's record: both blobs are in the bucket.
+    let shipped = rusqlite::Connection::open(dir.path().join("ship-blobs.db")).unwrap();
+    shipped
+        .execute_batch("CREATE TABLE shipped (name TEXT PRIMARY KEY, body_digest BLOB);")
+        .unwrap();
+    let name = |b: &pb::BlobRef| BlobId::parse(&b.hash).unwrap().file_name();
+    for b in [&one, &two] {
+        shipped
+            .execute(
+                "INSERT INTO shipped (name, body_digest) VALUES (?1, x'00')",
+                [name(b)],
+            )
+            .unwrap();
+    }
+
     let row = |hash: &str| p.node.store().db().blob(hash).unwrap().unwrap();
     assert!(!row(&one.hash).erased);
     let owner = p.node.local_operator_authority().unwrap();
@@ -153,4 +169,14 @@ fn erasing_a_subject_deletes_its_blobs_files_everywhere() {
     assert!(!fork_one.exists(), "the fork's file is gone");
     assert!(!row(&two.hash).erased);
     assert!(main_two.exists(), "another subject's blob stays");
+
+    // Its object is still in the bucket: the erasure is pending until the
+    // shipper's next round deletes it (only user:2's object is left then).
+    assert_eq!(done.pending_blob_objects, 1);
+    let pending = || p.rt.block_on(p.node.pending_erasures()).unwrap();
+    assert_eq!(pending(), 1);
+    shipped
+        .execute("DELETE FROM shipped WHERE name = ?1", [name(&one)])
+        .unwrap();
+    assert_eq!(pending(), 0);
 }

@@ -41,6 +41,9 @@ pub struct ErasureDone {
     /// The files of the subject's erased blobs deleted, in main's store and
     /// in the fork spaces (M26 §9.3); 0 for a dry run.
     pub blobs: u64,
+    /// Its blobs' objects still in the bucket: the shipper deletes them in
+    /// its next round (M26 §9.3); 0 for a dry run.
+    pub pending_blob_objects: u64,
 }
 
 impl Node {
@@ -145,11 +148,13 @@ impl Node {
                 plain_values,
                 complete_after_ms,
                 blobs: 0,
+                pending_blob_objects: 0,
             });
         }
         let node = self
             .arc()
             .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let erased = subject.to_owned();
         let subject = subject.to_owned();
         let (key_version, lsn) = self
             .authorized_effect(authority, move || async move {
@@ -183,6 +188,11 @@ impl Node {
                 0
             }
         };
+        // What the shipper still has in the bucket goes in its next round.
+        let pending_blob_objects = self
+            .erased_blobs_left()?
+            .get(&erased)
+            .map_or(0, |left| left.objects);
         Ok(ErasureDone {
             key_version,
             epoch,
@@ -190,6 +200,7 @@ impl Node {
             plain_values,
             complete_after_ms,
             blobs,
+            pending_blob_objects,
         })
     }
 
@@ -275,7 +286,9 @@ impl Node {
     /// `state.db` (state values, queued timer and message bodies, saved
     /// responses, dead letters, open turns' effects; issue #31), or in this
     /// process from before the erasure: an input still queued, or a turn that
-    /// runs across it (§6.8). The count names no subject.
+    /// runs across it (§6.8); or while one of its blobs has a file on this
+    /// node or an object in the bucket (M26 §9.3). The count names no
+    /// subject.
     pub async fn pending_erasures(&self) -> Result<u64, ApiError> {
         let erased: std::collections::HashSet<String> = self
             .store()
@@ -303,6 +316,9 @@ impl Node {
         if self.reseal_fix_pending().await {
             pending.extend(erased.iter().cloned());
         }
+        // A blob of the subject with a file on this node or an object in the
+        // bucket (M26 §9.3).
+        pending.extend(self.erased_blobs_left()?.into_keys());
         let upto = self.applied_lsn();
         if upto < 1 {
             return Ok(pending.len() as u64);

@@ -135,6 +135,11 @@ pub struct ErasureResponse {
     /// main's and the forks' (M26 §9.3); 0 for a dry run.
     #[serde(default)]
     pub blobs: u64,
+    /// Its blobs' objects still in the bucket, which the shipper deletes in
+    /// its next round; `privacy status` counts the erasure as pending until
+    /// then. 0 for a dry run.
+    #[serde(default)]
+    pub pending_blob_objects: u64,
 }
 
 /// `POST /v1/privacy/reseal` (§8).
@@ -217,6 +222,7 @@ impl Api {
             plain_values: done.plain_values,
             complete_after_ms: done.complete_after_ms,
             blobs: done.blobs,
+            pending_blob_objects: done.pending_blob_objects,
         })
     }
 

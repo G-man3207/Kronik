@@ -1254,6 +1254,19 @@ impl StateDb {
         let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+
+    /// The erased rows of the index that have a subject, as (hash,
+    /// subject), sorted: for `privacy status`, an erasure is pending while
+    /// one of its blobs has a file on this node or an object in the bucket
+    /// (M26 §9.3). The collector keeps an erased row while the shipper
+    /// still has its object.
+    pub fn erased_subject_blobs(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT hash, subject FROM blobs WHERE erased = 1 AND subject IS NOT NULL ORDER BY hash",
+        )?;
+        let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 }
 
 #[cfg(test)]
