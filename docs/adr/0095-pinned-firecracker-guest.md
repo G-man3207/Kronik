@@ -1,6 +1,6 @@
 # 0095. Pinned Firecracker guest and finite persistent drive
 
-- **Status:** Proposed. Implemented; its KVM proofs passed on 2026-11-14 on a GitHub-hosted Ubuntu 24.04 runner (a virtual machine on an AMD host, with nested KVM), with the pinned tool bundle built there; awaits maintainer ratification.
+- **Status:** Accepted (2026-11-14) by the maintainers, for v0.5.0 as an opt-in level beside gVisor, the default. Implemented; its KVM proofs passed on 2026-11-14 on a GitHub-hosted Ubuntu 24.04 runner (a virtual machine on an AMD host, with nested KVM), with the pinned tool bundle built there.
 - **Date:** 2026-11-07
 
 ## Decision

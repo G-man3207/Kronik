@@ -4052,7 +4052,7 @@
           },
           "fork_mode": {
             "default": null,
-            "description": "What forks do with calls to it: `recorded` (default) or `sandbox`\n(a copy from the nearest checkpoint answers, M14; gvisor or the\nexperimental microvm).",
+            "description": "What forks do with calls to it: `recorded` (default) or `sandbox`\n(a copy from the nearest checkpoint answers, M14; gvisor or\nmicrovm).",
             "type": [
               "string",
               "null"
@@ -4063,7 +4063,7 @@
           },
           "isolation": {
             "default": null,
-            "description": "`gvisor` (default), `trusted` (plain runc, with a warning) or\n`microvm` (Firecracker, M20; experimental, with a warning, and\n`KVM_UNAVAILABLE` without a usable `/dev/kvm`).",
+            "description": "`gvisor` (default), `trusted` (plain runc, with a warning) or\n`microvm` (a Firecracker VM, M20; `KVM_UNAVAILABLE` without a usable\n`/dev/kvm`).",
             "type": [
               "string",
               "null"

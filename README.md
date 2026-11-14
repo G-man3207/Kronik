@@ -56,11 +56,11 @@ cluster (M16–M19), the WASI 0.3 remainder (M22), connections, streaming bodies
 and blobs (M24–M26), and the UI, fleet and hardening tracks (M27 and M29–M34).
 The nonroot service of `kronik serve --init --rootless` (M21, opt-in) passed
 its installed proofs (ADR 0064) on 2026-11-14 on GitHub-hosted Ubuntu 24.04
-runners, once with AppArmor's restriction on unprivileged user namespaces (R1)
+runners (virtual machines on AMD hosts), once with AppArmor's restriction on unprivileged user namespaces (R1)
 active and once with it lifted; it has not run on other distributions. The
-microVM level (M20, `isolation = "microvm"`) is experimental; its proofs passed
-on the same runners, which are virtual machines on AMD hosts with nested KVM,
-and nowhere else. The manual `isolation` workflow runs them on disposable hosted runners and
+microVM level (M20, `isolation = "microvm"`, opt-in; gVisor stays the default)
+passed its proofs on the same runners, which are virtual machines on AMD hosts
+with nested KVM; neither has run on bare metal. The manual `isolation` workflow runs them on disposable hosted runners and
 keeps their evidence. The nonroot
 daemon's decisions, ADRs 0060–0065, were accepted on 2026-11-13; the microVM
 level's, ADRs 0095 and 0096, await the maintainers.

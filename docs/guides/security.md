@@ -405,7 +405,8 @@ and installs the nonroot `kronik` service. Its design is accepted
 [ADR 0062](../adr/0062-non-root-systemd-units.md) and
 [ADR 0065](../adr/0065-api-peer-identity-acceptor.md)), and the installed
 proofs of [ADR 0064](../adr/0064-foreign-isolation-conformance.md) passed on
-2026-11-14 on GitHub-hosted Ubuntu 24.04 runners, once with that
+2026-11-14 on GitHub-hosted Ubuntu 24.04 runners (virtual machines on AMD
+hosts), once with that
 distribution's AppArmor restriction on unprivileged user namespaces active and
 once with it lifted. Kronik checks `user.max_user_namespaces` and
 `kernel.unprivileged_userns_clone` and does nothing about the AppArmor
@@ -451,7 +452,7 @@ private trees private and never copy their modes into a public or executable
 location. A microVM's guest inode modes stay inside its opaque drive; they
 are not host setid files.
 
-A microVM's VMM (M20, experimental) that escaped its guest can change three
+A microVM's VMM (M20) that escaped its guest can change three
 files of the host's data file system and nothing else there: its data drive
 and the two files of a snapshot, which the daemon makes before the VMM starts.
 Its output directory is read-only, so it creates, renames and removes nothing

@@ -83,7 +83,8 @@ nonroot service instead (M21, opt-in; see
 [ADR 0060](../adr/0060-non-root-daemon-user-namespace.md) and
 [ADR 0062](../adr/0062-non-root-systemd-units.md)). It needs systemd 255 or
 newer, cgroup v2 and user namespaces. Its installed proofs passed on Ubuntu
-24.04 (GitHub-hosted runners, 2026-11-14), with AppArmor's restriction on
+24.04 (GitHub-hosted runners, virtual machines on AMD hosts, 2026-11-14), with
+AppArmor's restriction on
 unprivileged user namespaces active and with it lifted; Kronik does nothing
 about that restriction. It has not run on other distributions. Missing prerequisites never select the root service: the command
 stops and names `--init --root`. Its steps check before they act, like the
@@ -566,7 +567,7 @@ stays the same when it is replayed again.
 | Key | Default | Meaning |
 |---|---|---|
 | `runsc_path` | `"/usr/local/bin/runsc"` | gVisor's `runsc` |
-| `microvm_dir` | `"/usr/local/lib/kronik/microvm"` | The protected, offline bundle for `isolation = "microvm"` (experimental): the pinned Firecracker, guest kernel, guest init and filesystem tools, with a digest manifest (ADR 0095). The daemon never downloads or builds it; `scripts/build-microvm-tools.sh` makes one. The files, the directory and every directory above it must be real directories (no symbolic link) owned by root or by the daemon's user, with no write access for group or others, because the files are checked and then executed; a bundle that someone else could replace is refused. Some distributions make `/usr/local` and `/usr/local/lib` group-writable (`root:staff`, mode 2775), and the default path is then refused with the directory it objects to named: put the bundle where only root writes, such as `/opt/kronik/microvm`, and set `microvm_dir` to it |
+| `microvm_dir` | `"/usr/local/lib/kronik/microvm"` | The protected, offline bundle for `isolation = "microvm"`: the pinned Firecracker, guest kernel, guest init and filesystem tools, with a digest manifest (ADR 0095). The daemon never downloads or builds it; `scripts/build-microvm-tools.sh` makes one. The files, the directory and every directory above it must be real directories (no symbolic link) owned by root or by the daemon's user, with no write access for group or others, because the files are checked and then executed; a bundle that someone else could replace is refused. Some distributions make `/usr/local` and `/usr/local/lib` group-writable (`root:staff`, mode 2775), and the default path is then refused with the directory it objects to named: put the bundle where only root writes, such as `/opt/kronik/microvm`, and set `microvm_dir` to it |
 | `platform` | `"auto"` | `"auto"`, `"systrap"` or `"kvm"`: gVisor's platform. `auto` is systrap; `kvm` needs a `/dev/kvm` the daemon can open |
 | `run_dir` | `"/run/kronik"` | Runtime state of the sandboxes: runsc's root, network namespaces and bridge sockets. Best on a tmpfs; nothing in it survives a reboot. One daemon per directory: a second daemon runs without foreign actors |
 | `layout_dirs` | `[]` | Absolute directories whose `oci-layout:` images an `operate` token may add; any other directory needs `admin` |
@@ -2027,7 +2028,7 @@ Other values of `snapshots_kept`, deleting snapshot directories by hand, v0.2.0
 ## Foreign actors
 
 Foreign actors are ordinary programs (OCI images) that run in gVisor
-sandboxes next to the daemon, or, with the experimental `--isolation microvm`
+sandboxes next to the daemon, or, with the opt-in `--isolation microvm`
 (M20), in a Firecracker microVM. Kronik reaches them only through its bridge (vsock for a
 microVM), and they record their calls like other effects
 ([M7 design](../design/m7-foreign.md), [ADR 0003](../adr/0003-gvisor-bridge.md),
@@ -2048,12 +2049,10 @@ microVM), and they record their calls like other effects
   in `[foreign] microvm_dir` (`scripts/build-microvm-tools.sh` builds one, and
   takes `--command-timeout` and `--kernel-jobs` for a slow machine;
   the daemon never downloads or builds it). Without KVM the add is refused
-  with `KVM_UNAVAILABLE`, which suggests `gvisor`. The microVM level is
-  experimental: its proofs passed on 2026-11-14 on GitHub-hosted Ubuntu 24.04
-  runners, which are virtual machines on AMD hosts with nested KVM, and nowhere
-  else (no bare metal, no Intel, no aarch64), and every add answers with a
-  warning that says so.
-  Use `gvisor` for actors you rely on.
+  with `KVM_UNAVAILABLE`, which suggests `gvisor`. gVisor stays the default.
+  The microVM level's proofs passed on 2026-11-14 on GitHub-hosted Ubuntu
+  24.04 runners, which are virtual machines on AMD hosts with nested KVM; they
+  have not run on bare metal, on Intel or on aarch64.
 
 Know two things before you enable `--isolation microvm`
 ([ADR 0095](../adr/0095-pinned-firecracker-guest.md),

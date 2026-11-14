@@ -22,8 +22,8 @@ pub enum Isolation {
     Gvisor,
     /// Plain runc on the host kernel: only for images you trust.
     Trusted,
-    /// Firecracker microVM (M20), experimental: proven only on hosted virtual
-    /// machines with nested KVM. Needs a usable /dev/kvm and the pinned tool bundle; without
+    /// A Firecracker microVM per actor (M20). Needs a usable /dev/kvm and the
+    /// pinned tool bundle; without
     /// KVM the add is refused with KVM_UNAVAILABLE (use gvisor).
     Microvm,
 }
@@ -70,8 +70,8 @@ pub enum ForeignCommand {
         secrets: Vec<String>,
         /// What forks do with calls to it: `recorded` (default) matches
         /// them against recordings; `sandbox` answers changed calls from a
-        /// copy restored from the nearest checkpoint (M14; gvisor, or the
-        /// experimental microvm).
+        /// copy restored from the nearest checkpoint (M14; gvisor or
+        /// microvm).
         #[arg(long, value_enum)]
         fork_mode: Option<ForkMode>,
         #[command(flatten)]

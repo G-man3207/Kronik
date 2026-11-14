@@ -267,7 +267,7 @@ the configuration asks for what is missing (`platform = "kvm"`); the
 [operations guide](../guides/operations.md#kronik-doctor) lists them all.
 Where a microVM tool bundle is installed and the root service runs, `microvm`
 warns when the daemon has no delegated cgroup leaf and prints the drop-in
-that adds it (the microVM level is experimental).
+that adds it.
 With `--rootless` (M21) it also checks what the nonroot service needs
 (`userns`, `uid_view`, `subid`, `pin` and `delegate`) and runs the network
 namespace and sandbox checks under the service's identity: as root it first
@@ -285,7 +285,7 @@ $ kronik doctor
   pass  kernel  Linux 6.12.111+deb13-cloud-amd64
   pass  runsc   /usr/local/bin/runsc release-20261019.0
   warn  kvm     /dev/kvm: No such file or directory (os error 2); gVisor's platform systrap only, and no isolation microvm (KVM_UNAVAILABLE)
-                hint: fine for most hosts: foreign actors use gVisor with systrap without KVM; only the experimental isolation microvm needs it
+                hint: fine for most hosts: foreign actors use gVisor with systrap without KVM; only isolation microvm needs it
   pass  cgroup  cgroup v2 with cpu, memory and pids
   pass  root    running as root, as the daemon does in v0.1
   pass  runc    /usr/bin/runc: isolation trusted is available
@@ -2114,9 +2114,8 @@ node's cache or the backend (`SECRET_UNAVAILABLE` while the backend does not
 answer and nothing is cached; the next start retries). A link made later is
 seen by the next start. `trusted` runs plain runc with a warning, a
 seccomp filter and no user namespace: it is not a security boundary.
-`microvm` (M20) is **experimental**: its proofs have run only on hosted virtual
-machines with nested KVM (GitHub's Ubuntu 24.04 runners, 2026-11-14),
-and every add answers with a warning that says so. Its VMM runs as the
+`microvm` (M20) is an opt-in that gives the actor a VM of its own; its proofs
+passed on GitHub-hosted Ubuntu 24.04 runners, virtual machines on AMD hosts with nested KVM, on 2026-11-14. Its VMM runs as the
 daemon's own user under a launcher of Kronik's (not Firecracker's jailer),
 and its sandbox forks all resume one snapshot, so values a program holds in
 memory repeat across forks (the
@@ -2126,8 +2125,8 @@ Firecracker VM with a pinned guest kernel and no network device; it needs a
 usable `/dev/kvm` and the pinned tool bundle in `[foreign] microvm_dir`, and
 without KVM the add is `KVM_UNAVAILABLE` (use `gvisor`) and nothing is
 written. `--fork-mode` (M14) says how forks answer calls to it: `recorded`
-(the default) matches production's recordings; `sandbox` (gVisor, or the
-experimental microVM) checkpoints the actor
+(the default) matches production's recordings; `sandbox` (gVisor or microVM)
+checkpoints the actor
 with every snapshot, and each continuous fork gets a copy from the nearest
 checkpoint, with no network and its own disk, deleted with the fork; its
 answers are graded `forked`.

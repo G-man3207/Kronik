@@ -6,6 +6,26 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- `isolation = "microvm"` runs a foreign actor in a Firecracker microVM of
+  its own (M20; ADRs 0095 and 0096, accepted on 2026-11-14), an opt-in
+  level beside gVisor, which stays the default. It needs a usable `/dev/kvm`
+  (`KVM_UNAVAILABLE` otherwise, with a hint to use gVisor) and the pinned tool
+  bundle that `scripts/build-microvm-tools.sh` builds: Firecracker 1.17.0, a
+  Linux 6.18.25 guest kernel, a Rust guest init and e2fsprogs 1.47.2. Calls go
+  over vsock, the VM has no network device, its data drive is a fixed 1 GiB,
+  sandbox forks restore from a full snapshot, and a stop ends the VM within a
+  second. Its VMM runs as the daemon's own user under Kronik's own jail, and
+  every fork of a microVM actor resumes the same snapshot. Its proofs passed
+  on 2026-11-14 on GitHub-hosted Ubuntu 24.04 runners, virtual machines on AMD
+  hosts with nested KVM, through the manual `isolation` workflow (ADR 0133).
+- `kronik serve --init --rootless` installs a nonroot service (M21; ADRs
+  0060-0065): the daemon runs as the `kronik` user, foreign sandboxes run as
+  root of a user namespace that `kronik userns pin` makes, and an API
+  acceptor keeps the callers' real uids. Its installed proofs (the hostile
+  actor, the v0.1 demos, the Postgres fork, ship and restore) passed on the
+  same runners, once with Ubuntu's AppArmor restriction on unprivileged user
+  namespaces active and once with it lifted. `serve --init` without the flag
+  keeps the root service.
 - `kronik promote` warns when the new code of a kind that holds open
   WebSocket or SSE connections does not handle connections: their frames
   and closes would fail (M24). The API's promote response carries it in

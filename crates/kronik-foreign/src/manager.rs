@@ -86,10 +86,6 @@ impl Isolation {
 /// The warning every `trusted` add carries.
 pub const TRUSTED_WARNING: &str = "isolation trusted runs the image with plain runc and the host kernel: only use it for images you trust";
 
-/// The warning of every `isolation microvm` add (M20): the level ships as
-/// an experimental opt-in until a real KVM host has run its proofs (ADR 0095).
-pub const MICROVM_WARNING: &str = "isolation microvm is experimental: its proofs have run only on hosted virtual machines with nested KVM, its VMM runs as the daemon's own user, and its sandbox forks repeat the memory of one snapshot; use gvisor for actors you rely on";
-
 /// The foreign boundary established before the daemon starts any threads.
 #[derive(Debug, Clone)]
 pub enum Privilege {
@@ -537,7 +533,7 @@ impl Foreign {
                 crate::microvm_sys::kvm().map_err(|e| {
                     ApiError::new(
                         ErrorCode::KvmUnavailable,
-                        format!("isolation microvm (experimental) needs a usable /dev/kvm: {e}"),
+                        format!("isolation microvm needs a usable /dev/kvm: {e}"),
                     )
                     .with_hint("Use isolation gvisor, the default, on hosts without /dev/kvm.")
                 })?;
@@ -550,7 +546,6 @@ impl Foreign {
                         ApiError::new(ErrorCode::ForeignUnavailable, e)
                             .with_hint(crate::microvm::root_leaf_advice())
                     })?;
-                warnings.push(MICROVM_WARNING.to_owned());
                 "firecracker".to_owned()
             }
             Isolation::Trusted => {
