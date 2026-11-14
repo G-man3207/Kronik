@@ -2217,14 +2217,24 @@ pub struct SocketDirectory {
     pub fd: OwnedFd,
     /// Its owner.
     pub owner: u32,
-    /// Whether only root controls it: root's, and not writable by group or
-    /// others unless sticky. Then only root can have put an entry there.
+    /// Whether only root can put an entry there: root's, and not writable
+    /// by group or others. A sticky directory such as `/tmp` is not: anyone
+    /// may create a socket or a link in it.
     pub root_controlled: bool,
 }
 
-/// Whether only root can change the entries of a directory with this `stat`.
-fn root_controlled(stat: &libc::stat) -> bool {
+/// Whether root may pass through a directory with this `stat` on its way to
+/// a socket: root's, and closed to others or sticky (in a sticky directory
+/// only an entry's owner can rename or remove it, and the next directory on
+/// the way must again be root's).
+fn passable(stat: &libc::stat) -> bool {
     stat.st_uid == 0 && (stat.st_mode & 0o022 == 0 || stat.st_mode & 0o1000 != 0)
+}
+
+/// Whether only root can make an entry in a directory with this `stat`:
+/// root's and closed to others, sticky or not.
+fn root_only(stat: &libc::stat) -> bool {
+    stat.st_uid == 0 && stat.st_mode & 0o022 == 0
 }
 
 fn stat_of(fd: &impl AsRawFd) -> io::Result<libc::stat> {
@@ -2324,7 +2334,7 @@ pub fn open_socket_directory(dir: &Path) -> io::Result<SocketDirectory> {
     let mut links = 0;
     while let Some(name) = pending.pop_front() {
         let here = stat_of(&current)?;
-        if !root_controlled(&here) {
+        if !passable(&here) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
@@ -2386,7 +2396,7 @@ pub fn open_socket_directory(dir: &Path) -> io::Result<SocketDirectory> {
     Ok(SocketDirectory {
         fd: current,
         owner: stat.st_uid,
-        root_controlled: root_controlled(&stat),
+        root_controlled: root_only(&stat),
     })
 }
 
@@ -2931,6 +2941,10 @@ mod tests {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
         let run = open_socket_directory(Path::new("/run")).unwrap();
         assert!(run.owner == 0 && run.root_controlled);
+        // A sticky directory open to everyone may be passed through, but anyone
+        // can make an entry in it: it is not root's alone.
+        let sticky = open_socket_directory(Path::new("/var/tmp")).unwrap();
+        assert!(sticky.owner == 0 && !sticky.root_controlled);
         // `/proc/self` is root's link in a directory only root controls: it is
         // followed, and the last directory, this process's, may be anyone's.
         let me = open_socket_directory(Path::new("/proc/self")).unwrap();
