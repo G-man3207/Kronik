@@ -882,9 +882,12 @@ fn create(args: &[String]) -> Result<()> {
         root.join("etc/nsswitch.conf"),
         "passwd: files\ngroup: files\nshadow: files\nhosts: files dns\n",
     )?;
-    fs::write(root.join("data/.kronik-proof-owner"), &token)?;
-    fs::write(root.join("data/.kronik-check-rootless"), &token)?;
-    fs::create_dir(root.join("data/layouts"))?;
+    // The first `serve --init` must find the data directory as a new
+    // installation does, empty: `--rootless` refuses a root-owned one that
+    // holds anything (ADR 0063), and its hand-over of a new one is part of
+    // what the proof shows. The fixture's own files reach it after that
+    // init (`seed_data`); the layouts wait in `seed` meanwhile.
+    fs::create_dir_all(root.join("seed/layouts"))?;
     for (arg, name) in [
         (&args[2], "probe"),
         (&args[3], "pg"),
@@ -896,7 +899,7 @@ fn create(args: &[String]) -> Result<()> {
             "prebuilt OCI layout missing: {}",
             source.display()
         );
-        copy_tree(&source, &root.join(format!("data/layouts/{name}.oci")))?;
+        copy_tree(&source, &root.join(format!("seed/layouts/{name}.oci")))?;
     }
     for path in [root.join("run/kronik"), root.join("ship")] {
         chown(path, Some(uid), Some(gid))?;
@@ -1326,6 +1329,56 @@ fn setup(root: &Path, cfg: &Value, mode: &str) -> Result<()> {
         &root.join(format!("init-{mode}.json")),
         &serde_json::to_value(output?)?,
     )?;
+    if mode != "dry-run" {
+        seed_data(root, cfg, mode == "rootless")?;
+    }
+    Ok(())
+}
+
+/// After the first `serve --init`, the fixture's own files in the data
+/// directory: its two markers (the legacy canary the conformance audit must
+/// find unchanged) and the OCI layouts under `[foreign] layout_dirs`, owned
+/// by the service user for the nonroot service. Nothing that exists is
+/// replaced, and no link is followed: a later init (after `reset` or
+/// `restore`, which bring their own) leaves them as they are.
+fn seed_data(root: &Path, cfg: &Value, rootless: bool) -> Result<()> {
+    let data = root.join("data");
+    let owner = if rootless {
+        (number(cfg, "uid")?, number(cfg, "gid")?)
+    } else {
+        (0, 0)
+    };
+    for name in [".kronik-proof-owner", ".kronik-check-rootless"] {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(data.join(name))
+        {
+            Ok(mut file) => {
+                file.write_all(text(cfg, "token")?.as_bytes())?;
+                file.sync_all()?;
+                chown(data.join(name), Some(owner.0), Some(owner.1))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                ensure!(
+                    fs::read(data.join(name))? == text(cfg, "token")?.as_bytes(),
+                    "existing fixture marker {name} changed"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let layouts = data.join("layouts");
+    if layouts.symlink_metadata().is_err() {
+        copy_tree(&root.join("seed/layouts"), &layouts)?;
+        chown_tree(&layouts, owner.0, owner.1)?;
+    }
+    ensure!(
+        layouts.symlink_metadata()?.is_dir(),
+        "the fixture's layouts are not a directory"
+    );
     Ok(())
 }
 
