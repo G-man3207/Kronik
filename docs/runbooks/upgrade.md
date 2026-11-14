@@ -9,7 +9,11 @@ engine-compatibility exemption.
 1. Record old and candidate `kronik --version` output and binary SHA-256.
    Obtain the candidate through the release verification process; do not
    weaken signature verification for an upgrade. Make a recoverable backup
-   using the [backup runbook](backup.md), including its independent key source.
+   using the [backup runbook](backup.md), including its independent key source,
+   and keep a copy of it that the candidate will not write into: the candidate
+   ships to the same `[ship] url`, and a record the old binary cannot read
+   makes that bucket unrestorable for the old binary too
+   ([going back from v0.5.0](../guides/operations.md#upgrading-from-v041)).
 2. With the **candidate binary**, check the actual data and configured keys:
 
    ```sh
@@ -50,9 +54,23 @@ engine-compatibility exemption.
    the old recorded LSN. Read the fixture's known SQL/key-value state and
    repeat a key-backed effect. Restart the owned candidate once and ensure it
    does not append a second upgrade event for the same completed transition.
-6. Identity replay in both modes must remain complete and unchanged. A rollback
-   is an engine transition in the opposite direction and needs its own passing
-   check; restoring the old binary over new data without a check is unsafe.
+6. Identity replay in both modes must remain complete and unchanged. A fork
+   keeps the code of its fork point, so fork after the last deployment
+   (`kronik deployments list`); an earlier fork point diverges on the later
+   deployments, not on the engine:
+
+   ```sh
+   kronik fork create --at <lsn after the last deployment> --name identity-isolated --reason 'upgrade identity replay'
+   kronik replay identity-isolated --mode isolated --reason 'upgrade identity replay'
+   kronik fork create --at <the same lsn> --name identity-continuous --reason 'upgrade identity replay'
+   kronik replay identity-continuous --mode continuous --reason 'upgrade identity replay'
+   ```
+
+   Every root input replayed, no changed response, effect or state, no error
+   introduced. A rollback is an engine transition in the opposite direction and
+   needs its own passing check; restoring the old binary over new data without
+   a check is unsafe. When the old binary cannot read the new records (v0.4.1
+   after a connection's turn), going back is a restore of step 1's copy.
 
 For data written by v0.3.0 or older, two things differ from the procedure
 above: an older binary could not start on data that a newer one had served,

@@ -1863,9 +1863,24 @@ showed no change, and a key-backed effect gave its recorded result.
 - **Going back.** v0.4.1 takes the data back only through its own `kronik
   upgrade check`, and only while the log holds nothing it cannot read. It
   cannot read the turns of WebSocket and SSE connections: on a log with one
-  it stops with `STORAGE_CORRUPT` ("no input case set"), and going back means
-  restoring the backup that [the upgrade runbook](../runbooks/upgrade.md)
-  asks for. Keep it until you are sure.
+  it stops with `STORAGE_CORRUPT` ("no input case set": the records are
+  newer, not damaged), and going back means restoring the backup that [the
+  upgrade runbook](../runbooks/upgrade.md) asks for. Keep it until you are
+  sure.
+- **The backup for going back** must be one that v0.5.0 does not write
+  into. v0.5.0 ships to the same `[ship] url`, and the log segment that was
+  active at the restart goes up again with v0.5.0's records in it: once one
+  of them is a connection's turn, v0.4.1's `kronik restore` stops on that
+  bucket with the same error. So, right before the restart, create a
+  snapshot, wait until `kronik --json snapshot list` shows it `shipped`, and
+  copy the bucket's prefix to another prefix (or give v0.5.0 a new `[ship]
+  url`). Going back is then: stop the service, put the v0.4.1 binary back,
+  `kronik restore --from <the copy> --force`, point `[ship] url` at a prefix
+  that v0.5.0 has not written (that one holds another history under the
+  same LSNs), and start the service. Everything after the copy is lost.
+  This was drilled on a test host from the v0.4.1 release to a `0.5.0-dev`
+  build and back: the restored node's log hash and state hash through the
+  copy's last LSN were the ones recorded before the upgrade.
 
 ### Upgrading from v0.3.0 or older
 
