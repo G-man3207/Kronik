@@ -86,8 +86,10 @@ pub(super) struct Served {
     expires_ms: u64,
     routes: Vec<RouteEntry>,
     /// How the gateway reads bodies for each kind of the preview's code
-    /// (M25 §6.4); a kind not here is read inline.
-    policies: BTreeMap<String, kronik_sched::BodyPolicy>,
+    /// (M25 §6.4); a kind not here is read inline. Exact once the
+    /// preview's fork state is built; after a restart, until its first
+    /// request rebuilds it, from the programs and the current limits.
+    policies: std::sync::Mutex<BTreeMap<String, kronik_sched::BodyPolicy>>,
     state: tokio::sync::Mutex<Entry>,
 }
 
@@ -112,10 +114,58 @@ impl Served {
         Arc::new(Served {
             expires_ms,
             routes,
-            policies,
+            policies: std::sync::Mutex::new(policies),
             state: tokio::sync::Mutex::new(Entry { meta, live }),
         })
     }
+}
+
+/// The body policies of a preview reopened after a restart, before its
+/// fork state is rebuilt: its routes' kinds that read blobs, the
+/// proposal's code for the kinds it changes and production's for the
+/// others, with the current limits. The first request's rebuild
+/// replaces them with the exact ones (`Proposals::body_policies`).
+pub(super) fn reopened_policies(
+    node: &kronik_sched::Node,
+    meta: &Proposal,
+) -> BTreeMap<String, kronik_sched::BodyPolicy> {
+    if node.blob_store().is_none() {
+        return BTreeMap::new();
+    }
+    let changed: BTreeMap<String, Vec<u8>> = meta
+        .kind_versions()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| (v.kind, v.code_hash))
+        .collect();
+    let kinds: std::collections::BTreeSet<String> = meta
+        .preview
+        .as_ref()
+        .map(|p| p.routes.iter().map(|r| r.kind.clone()).collect())
+        .unwrap_or_default();
+    let config = node.config_now();
+    kinds
+        .into_iter()
+        .filter(|kind| match changed.get(kind) {
+            Some(hash) => kronik_core::ids::CodeHash::from_slice(hash)
+                .and_then(|h| node.code().get(&h).ok())
+                .is_some_and(|program| program.reads_blobs()),
+            None => matches!(
+                node.body_policy(kind),
+                kronik_sched::BodyPolicy::Blobs { .. }
+            ),
+        })
+        .map(|kind| {
+            let limits = config.limits(&kind);
+            (
+                kind,
+                kronik_sched::BodyPolicy::Blobs {
+                    threshold: limits.blob_threshold(),
+                    upload_bytes: limits.upload_bytes,
+                },
+            )
+        })
+        .collect()
 }
 
 fn not_found(id: &str) -> ApiError {
@@ -677,6 +727,8 @@ impl Proposals {
         let live = self
             .continuous_for(id, &mut entry, &actor.kind, authority.clone())
             .await?;
+        // The fork state is built: its policies are exact from now on.
+        *lock(&served.policies) = self.body_policies(live);
         if live.preview_requests >= max {
             return Err(ApiError::new(
                 ErrorCode::PreviewFull,
@@ -751,7 +803,7 @@ impl kronik_gateway::PreviewRouter for Proposals {
     fn body_policy(&self, id: &str, kind: &str) -> kronik_sched::BodyPolicy {
         self.served(id)
             .ok()
-            .and_then(|s| s.policies.get(kind).copied())
+            .and_then(|s| lock(&s.policies).get(kind).copied())
             .unwrap_or(kronik_sched::BodyPolicy::Inline)
     }
 

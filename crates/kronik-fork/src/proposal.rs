@@ -445,7 +445,11 @@ impl Proposals {
             .map(|e| {
                 (
                     e.meta.id.clone(),
-                    preview::Served::new(e.meta.clone(), None, BTreeMap::new()),
+                    preview::Served::new(
+                        e.meta.clone(),
+                        None,
+                        preview::reopened_policies(&node, &e.meta),
+                    ),
                 )
             })
             .collect();

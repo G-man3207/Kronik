@@ -835,3 +835,86 @@ fn a_previews_blob_space_is_capped_and_goes_with_the_preview() {
         "the expired preview's blob space is gone"
     );
 }
+
+/// Review (ci-green, erasure): a preview reopened after a restart read
+/// every request body inline until it was created again, as its body
+/// policies were computed only by create_preview. They are computed again
+/// at open, and made exact by the first request's rebuild.
+#[test]
+fn a_preview_takes_uploads_as_blobs_after_a_restart() {
+    use kronik_gateway::{Gateway, GatewayConfig, HttpRequest, PREVIEW_PREFIX};
+    let dir = tempdir();
+    let preview = {
+        let p = blob_node(dir.path());
+        p.rt.block_on(p.node.set_limits(
+            pb::Limits {
+                kind: "media".into(),
+                fuel: Some(2_000_000_000),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            p.owner(),
+        ))
+        .unwrap();
+        ingress(&p, http("info", "", inline(b"x")));
+        p.settle();
+        let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+        let (proposal, _) =
+            p.rt.block_on(props.propose(
+                kronik_fork::proposal::ProposeRequest {
+                    wasm: vec![{
+                        let mut v2 = std::fs::read(guest("media")).unwrap();
+                        v2.extend_from_slice(&[
+                            0x00, 0x07, 0x04, b't', b'e', b's', b't', b'v', b'2',
+                        ]);
+                        v2
+                    }],
+                    names: Vec::new(),
+                    window_ms: None,
+                    at: None,
+                    options: DiffOptions::default(),
+                    workers: Some(2),
+                    audit: audit(),
+                    dry_run: false,
+                },
+                p.owner(),
+            ))
+            .unwrap();
+        let (preview, _) = p
+            .rt
+            .block_on(props.create_preview(&proposal.id, None, false, audit(), false, p.owner()))
+            .unwrap();
+        p.settle();
+        preview
+    };
+    // The daemon restarts: the node and the proposals open from disk.
+    let p = Proc::start_with(
+        dir.path(),
+        NodeConfig {
+            concurrency: 8,
+            blobs: Some(BlobsConfig::default()),
+            ..NodeConfig::default()
+        },
+    );
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    let gw = Gateway::new(p.node.clone(), GatewayConfig::default()).with_preview(props.clone());
+    let upload: Vec<u8> = (0..2_000_000u64).map(|i| (i % 247) as u8).collect();
+    let digest = blake3::hash(&upload).to_hex().to_string();
+    for _ in 0..2 {
+        let r = p.rt.block_on(gw.handle(HttpRequest {
+            method: "POST".into(),
+            path: format!("{PREVIEW_PREFIX}{}/media/a/info", preview.id),
+            query: String::new(),
+            headers: Vec::new(),
+            body: upload.clone(),
+            peer: None,
+        }));
+        assert_eq!(
+            String::from_utf8_lossy(&r.body),
+            format!("blob b3:{digest} {}", upload.len()),
+            "status {}",
+            r.status
+        );
+    }
+}
