@@ -102,6 +102,7 @@ fn a_simulated_node_writes_nothing_on_the_host() {
         sealer: None,
         key_source: None,
         ownership: None,
+        blobs: None,
     };
     let done = Arc::new(AtomicBool::new(false));
     let finished = done.clone();
