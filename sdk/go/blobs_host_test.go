@@ -9,6 +9,7 @@ package kronik_test
 import (
 	"bytes"
 	"net/url"
+	"strings"
 	"testing"
 
 	"kronik.dev/sdk/testkit"
@@ -104,5 +105,90 @@ func TestBlobsInAnActor(t *testing.T) {
 	host.HTTP("GET", "/files/a/forged", nil).JSON(&forged)
 	if forged.Error != "BLOB_NOT_HELD" {
 		t.Fatalf("forged: %+v", forged)
+	}
+}
+
+// M26: an actor holds blobs across turns (Put, Retain, Release, PutFor) and
+// sends one in a message to another key, which retains it.
+func TestBlobHoldsAndMessages(t *testing.T) {
+	host := testkit.Start(t, testkit.Options{Dir: "testdata/files"})
+	kept := func(key string) ([]byte, string) {
+		res := host.HTTP("GET", "/files/"+key+"/kept", nil)
+		if res.Status == 200 {
+			return res.Body, ""
+		}
+		var e struct{ Error string }
+		res.JSON(&e)
+		return nil, e.Error
+	}
+	type ref struct {
+		Hash string `json:"hash"`
+		Size int    `json:"size"`
+	}
+	type released struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+
+	// An inline body, stored with Put and held: a later turn reads it.
+	small := pattern(3, 5000)
+	var a ref
+	host.HTTP("POST", "/files/a/keep", small).JSON(&a)
+	if !strings.HasPrefix(a.Hash, "b3:") || a.Size != len(small) {
+		t.Fatalf("keep: %+v", a)
+	}
+	if got, e := kept("a"); !bytes.Equal(got, small) {
+		t.Fatalf("a: %q", e)
+	}
+
+	// A blob sent in a message: the receiving key retains it.
+	if res := host.HTTP("POST", "/files/a/share?to=b", nil); res.Status != 202 {
+		t.Fatalf("share: %d", res.Status)
+	}
+	if got, e := kept("b"); !bytes.Equal(got, small) {
+		t.Fatalf("b: %q", e)
+	}
+
+	// A release ends a's hold only; a second one is BLOB_NOT_HELD.
+	var r released
+	host.HTTP("POST", "/files/a/release", nil).JSON(&r)
+	if !r.OK {
+		t.Fatalf("release: %+v", r)
+	}
+	if _, e := kept("a"); e != "BLOB_NOT_HELD" {
+		t.Fatalf("a after its release: %q", e)
+	}
+	if got, e := kept("b"); !bytes.Equal(got, small) {
+		t.Fatalf("b after a's release: %q", e)
+	}
+	r = released{}
+	host.HTTP("POST", "/files/a/release", nil).JSON(&r)
+	if r.Error != "BLOB_NOT_HELD" {
+		t.Fatalf("second release: %+v", r)
+	}
+
+	// A body above the threshold arrives as a blob and is retained.
+	big := pattern(0, mib+mib/2)
+	var c ref
+	host.HTTP("POST", "/files/c/keep", big).JSON(&c)
+	if got, e := kept("c"); c.Size != len(big) || !bytes.Equal(got, big) {
+		t.Fatalf("c: %+v %q", c, e)
+	}
+
+	// Put takes more than one host call's 1 MiB: written in parts, retained.
+	var d ref
+	host.HTTP("POST", "/files/d/put-big?size=1300000", nil).JSON(&d)
+	if got, e := kept("d"); d.Size != 1300000 || !bytes.Equal(got, pattern(0, 1300000)) {
+		t.Fatalf("d: %+v %q", d, e)
+	}
+
+	// PutFor tags the blob with a subject: a subject's blob has a b3s: hash.
+	var e ref
+	host.HTTP("POST", "/files/e/put-for?subject="+url.QueryEscape("user:1"), small).JSON(&e)
+	if !strings.HasPrefix(e.Hash, "b3s:") {
+		t.Fatalf("put-for: %+v", e)
+	}
+	if got, msg := kept("e"); !bytes.Equal(got, small) {
+		t.Fatalf("e: %q", msg)
 	}
 }

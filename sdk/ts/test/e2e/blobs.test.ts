@@ -82,3 +82,47 @@ test('an actor reads, answers, writes and sends blobs', async (t) => {
   // A reference the turn never got.
   assert.deepEqual((await host.http('GET', '/files/a/forged')).json(), { error: 'BLOB_NOT_HELD' });
 });
+
+test('an actor holds blobs across turns and sends them in messages (M26)', async (t) => {
+  const host = await TestHost.start({ dir: fixture });
+  t.after(() => host.close());
+  const kept = async (key: string) => {
+    const r = await host.http('GET', `/files/${key}/kept`);
+    return r.status === 200 ? bytes(r.body) : r.json();
+  };
+
+  // An inline body, stored with put and held: a later turn reads it.
+  const small = pattern(3, 5000);
+  const a = (await host.http('POST', '/files/a/keep', { body: small })).json() as { hash: string; size: number };
+  assert.match(a.hash, /^b3:[0-9a-f]{64}$/);
+  assert.equal(a.size, small.length);
+  assert.deepEqual(await kept('a'), small);
+
+  // A blob sent in a message: the receiving key retains it and reads it in
+  // its own later turns.
+  assert.equal((await host.http('POST', '/files/a/share?to=b')).status, 202);
+  assert.deepEqual(await kept('b'), small);
+
+  // A release ends a's hold only: b's own hold keeps the blob readable, and
+  // a second release is BLOB_NOT_HELD.
+  assert.deepEqual((await host.http('POST', '/files/a/release')).json(), { ok: true });
+  assert.deepEqual(await kept('a'), { error: 'BLOB_NOT_HELD' });
+  assert.deepEqual(await kept('b'), small);
+  assert.deepEqual((await host.http('POST', '/files/a/release')).json(), { error: 'BLOB_NOT_HELD' });
+
+  // A body above the threshold arrives as a blob and is retained as it is.
+  const big = pattern(0, 1.5 * MIB);
+  const c = (await host.http('POST', '/files/c/keep', { body: big })).json() as { size: number };
+  assert.equal(c.size, big.length);
+  assert.deepEqual(await kept('c'), big);
+
+  // put takes more than one host call's 1 MiB: written in parts, retained.
+  const d = (await host.http('POST', '/files/d/put-big?size=1300000')).json() as { size: number };
+  assert.equal(d.size, 1300000);
+  assert.deepEqual(await kept('d'), pattern(0, 1300000));
+
+  // putFor tags the blob with a subject: a subject's blob has a b3s: hash.
+  const e = (await host.http('POST', '/files/e/put-for?subject=user:1', { body: small })).json() as { hash: string };
+  assert.match(e.hash, /^b3s:[0-9a-f]{64}$/);
+  assert.deepEqual(await kept('e'), small);
+});

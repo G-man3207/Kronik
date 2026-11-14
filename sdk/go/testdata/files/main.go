@@ -5,6 +5,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"strconv"
@@ -85,8 +86,128 @@ func info(req *kronik.Request, ctx *kronik.Ctx) (kronik.Output, error) {
 		"streamed": streamed, "whole": probe(body, 0, 0)})
 }
 
+// keptRef is the blob a key keeps, as state holds it (M26).
+type keptRef struct {
+	Hash string `json:"hash"`
+	Size uint64 `json:"size"`
+}
+
+// kept is the blob this key keeps, rebuilt from its hash and size.
+func kept(ctx *kronik.Ctx) (kronik.BlobRef, bool) {
+	raw, ok := ctx.State.Get("kept")
+	var k keptRef
+	if !ok || json.Unmarshal(raw, &k) != nil {
+		return kronik.BlobRef{}, false
+	}
+	return kronik.BlobRef{Hash: k.Hash, Size: k.Size}, true
+}
+
+func keep(ctx *kronik.Ctx, b kronik.BlobRef, err error) (kronik.Output, error) {
+	if err != nil {
+		return kronik.Output{}, err
+	}
+	if err := ctx.State.SetJSON("kept", keptRef{b.Hash, b.Size}); err != nil {
+		return kronik.Output{}, err
+	}
+	return ctx.JSON(200, keptRef{b.Hash, b.Size})
+}
+
+func topic(err error) string {
+	var e *kronik.Error
+	if errors.As(err, &e) {
+		return e.Topic
+	}
+	return err.Error()
+}
+
+// holds runs the M26 hold operations; handled is false for any other op.
+func holds(op string, req *kronik.Request, ctx *kronik.Ctx) (out kronik.Output, handled bool, err error) {
+	switch op {
+	case "keep":
+		if blob, ok := req.Blob(); ok {
+			if err := ctx.Blobs.Retain(blob); err != nil {
+				return kronik.Output{}, true, err
+			}
+			out, err = keep(ctx, blob, nil)
+			return out, true, err
+		}
+		body, err := req.Body()
+		if err != nil {
+			return kronik.Output{}, true, err
+		}
+		b, err := ctx.Blobs.Put(body)
+		out, err = keep(ctx, b, err)
+		return out, true, err
+	case "put-big":
+		q, _ := req.QueryParam("size")
+		size, _ := strconv.Atoi(q)
+		b, err := ctx.Blobs.Put(pattern(0, size))
+		out, err = keep(ctx, b, err)
+		return out, true, err
+	case "put-for":
+		subject, _ := req.QueryParam("subject")
+		body, err := req.Body()
+		if err != nil {
+			return kronik.Output{}, true, err
+		}
+		b, err := ctx.Blobs.PutFor(subject, body)
+		out, err = keep(ctx, b, err)
+		return out, true, err
+	case "kept", "release", "share":
+	default:
+		return kronik.Output{}, false, nil
+	}
+	blob, ok := kept(ctx)
+	if !ok {
+		out, err = ctx.Status(404)
+		return out, true, err
+	}
+	switch op {
+	case "kept":
+		// A read first: a blob the actor no longer holds gives its error here.
+		if _, err := ctx.Blobs.Get(blob, 0, 1); err != nil {
+			out, err = ctx.JSON(409, map[string]any{"error": topic(err)})
+			return out, true, err
+		}
+		return kronik.BlobResponse(200, blob, ""), true, nil
+	case "release":
+		if err := ctx.Blobs.Release(blob); err != nil {
+			out, err = ctx.JSON(200, map[string]any{"error": topic(err)})
+			return out, true, err
+		}
+		out, err = ctx.JSON(200, map[string]any{"ok": true})
+		return out, true, err
+	default:
+		to, _ := req.QueryParam("to")
+		key, _ := req.Param("key")
+		msg := kronik.OutgoingMessage{Name: "shared", Body: "from " + key, Blobs: []kronik.BlobRef{blob}}
+		if err := ctx.Send("files/"+to, msg); err != nil {
+			return kronik.Output{}, true, err
+		}
+		out, err = ctx.Status(202)
+		return out, true, err
+	}
+}
+
+// message retains a shared blob that arrives with the message (M26).
+func message(msg *kronik.Message, ctx *kronik.Ctx) (kronik.Output, error) {
+	if msg.Name != "shared" || len(msg.Blobs) != 1 {
+		return ctx.None()
+	}
+	if err := ctx.Blobs.Retain(msg.Blobs[0]); err != nil {
+		return kronik.Output{}, err
+	}
+	if err := ctx.State.SetJSON("kept", keptRef{msg.Blobs[0].Hash, msg.Blobs[0].Size}); err != nil {
+		return kronik.Output{}, err
+	}
+	return ctx.None()
+}
+
 func http(req *kronik.Request, ctx *kronik.Ctx) (kronik.Output, error) {
 	op, _ := req.Param("op")
+	if out, handled, err := holds(op, req, ctx); handled {
+		return out, err
+	}
 	switch op {
 	case "info":
 		return info(req, ctx)
@@ -157,6 +278,7 @@ func init() {
 		},
 		Capabilities: []string{"http:store.test"},
 		HTTP:         http,
+		Message:      message,
 	})
 }
 

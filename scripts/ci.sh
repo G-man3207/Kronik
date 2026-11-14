@@ -292,7 +292,7 @@ step_sdks() {
     # TypeScript testkit's run as chat-ts's tests in the ts step), and the
     # SDKs' blobs (M25) in actors the test kits build and run.
     KRONIK_BIN="$kronik" python3 -m unittest discover -s sdk/python/host_tests
-    (cd sdk/go && KRONIK_BIN="$kronik" PATH="$tools/bin:$PATH" GOTOOLCHAIN=local go test -tags kronikhost -run 'TestATestPlaysTheClient|TestBlobsInAnActor' .)
+    (cd sdk/go && KRONIK_BIN="$kronik" PATH="$tools/bin:$PATH" GOTOOLCHAIN=local go test -tags kronikhost -run 'TestATestPlaysTheClient|TestBlobsInAnActor|TestBlobHoldsAndMessages' .)
     KRONIK_BIN="$kronik" cargo test --manifest-path examples/Cargo.toml --locked -p kronik-sdk --test testkit_connections -- --ignored
     KRONIK_BIN="$kronik" scripts/build-examples-py.sh
     KRONIK_BIN="$kronik" scripts/build-examples-go.sh
