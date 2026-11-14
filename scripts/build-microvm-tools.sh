@@ -306,7 +306,15 @@ for name, executable in [('cc',cc),('ld','ld'),('as','as'),('make','make'),('fle
     kernel_tools[name] = {'resolved_path':str(path),'sha256':sha(path)}
 header_libraries = run('kernel-header-libraries',
     [env.get('PKG_CONFIG','pkg-config'),'--modversion','uuid','blkid','libelf','openssl','zlib'],cwd=repo)
-kernel_inputs = {'recipe':'kronik.microvm-kernel/v1','architecture':arch,
+# The one change to Firecracker's guest configuration. Its 6.18 configuration turns on
+# Amazon Linux's loader of an external FIPS 140 crypto module, which this recipe does not
+# build (it builds the kernel image alone, and no modules): at boot the loader cannot link
+# the module and panics ("FIPS140 loader: module loading error"), as the first boot on KVM
+# showed. The guest has no use for FIPS 140 mode; CRYPTO_FIPS, which the loader selects,
+# goes too (its own dependencies are not met without it).
+config_overrides = {'CRYPTO_FIPS140_EXTMOD': 'n', 'CRYPTO_FIPS': 'n'}
+kernel_inputs = {'recipe':'kronik.microvm-kernel/v2','architecture':arch,
+    'config_overrides':config_overrides,
     'kernel_commit':commit,'kernel_version':'6.18.25','firecracker_commit':fc_commit,
     'guest_config_git_blob':config_blob,'source_date_epoch':epoch,'tools':kernel_tools,
     'header_libraries':header_libraries,
@@ -356,7 +364,13 @@ else:
                        for key in ['VERSION','PATCHLEVEL','SUBLEVEL'])
     if version != '6.18.25': raise RuntimeError('pinned Amazon source does not have kernel version 6.18.25')
     kbuild = work / 'kernel-build'; kbuild.mkdir()
-    shutil.copyfile(config, kbuild / '.config')
+    text = config.read_text()
+    for option, value in config_overrides.items():
+        line = 'CONFIG_' + option + '=y\n'
+        if value != 'n' or text.count(line) != 1:
+            raise RuntimeError('the guest configuration does not have CONFIG_' + option + '=y to turn off')
+        text = text.replace(line, '# CONFIG_' + option + ' is not set\n')
+    (kbuild / '.config').write_text(text)
     kargs = ['make', '-j' + str(a.kernel_jobs), '-C', kernel, 'O=' + str(kbuild), 'ARCH=' + kernel_arch,
              'CC=' + cc, 'KCFLAGS=' + remap, 'HOSTCFLAGS=' + remap]
     run('kernel-olddefconfig', kargs + ['olddefconfig'])
@@ -377,6 +391,9 @@ resolved_config = (sources / 'kernel-resolved.config').read_text()
 for feature in required:
     if '\nCONFIG_' + feature + '=y\n' not in '\n' + resolved_config:
         raise RuntimeError('upstream resolved config lacks built-in CONFIG_' + feature)
+for option in config_overrides:
+    if '\n# CONFIG_' + option + ' is not set\n' not in '\n' + resolved_config:
+        raise RuntimeError('the resolved config did not keep CONFIG_' + option + ' off')
 if a.kernel_from is None:
     run('kernel-' + kernel_target, kargs + [kernel_target])
     kernel_binary = kbuild / ('vmlinux' if arch == 'x86_64' else 'arch/arm64/boot/Image')
