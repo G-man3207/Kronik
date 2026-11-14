@@ -474,8 +474,8 @@ Groups, in this order:
    backends, the cache and outage handling, the PKCS#11 helper, the
    scrub-only copies (ADR 0142: external secret values are now at rest,
    encrypted, in the data directory), and their fixes.
-4. Isolation, opt-in: the nonroot daemon (M21) and the microVM level (M20,
-   experimental), with the state of their proofs at the release.
+4. Isolation, opt-in: the nonroot daemon (M21) and the microVM level (M20),
+   with where their proofs ran.
 5. Replay, forks and the upgrade check: every point of the log, erased
    inputs as unverifiable (ADR 0109), calls and timers in forks.
 6. Privacy and erasure.
