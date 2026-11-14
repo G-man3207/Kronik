@@ -226,6 +226,12 @@ impl Guest for Room {
                         connections::close(body.trim(), 4000, "kicked");
                         "kicked".to_string()
                     }
+                    "spray" => {
+                        let n: u64 = body.trim().parse().unwrap_or(1);
+                        let ids: Vec<String> = (0..n).map(|i| format!("c-{i:032x}")).collect();
+                        connections::broadcast(&ids, &Frame::Text("x".to_string()));
+                        "sprayed".to_string()
+                    }
                     other => query(other, &body)?,
                 };
                 Ok(Output::Reply(message("reply", &reply)))
@@ -331,6 +337,13 @@ impl ConnectionGuest for Room {
             }
             "kick" => connections::close(arg.trim(), 4000, "kicked"),
             "bye" => connections::close(&conn, 1000, "bye"),
+            "burst" => {
+                let (n, size) = arg.split_once(' ').unwrap_or((arg, "1"));
+                let size: usize = size.trim().parse().unwrap_or(1);
+                for i in 0..n.trim().parse::<u64>().unwrap_or(1) {
+                    connections::send(&conn, &Frame::Text(format!("{i:0>size$}")));
+                }
+            }
             "send-to" => {
                 let (to, rest) = arg.split_once(' ').unwrap_or((arg, ""));
                 connections::send(to, &Frame::Text(rest.to_string()));

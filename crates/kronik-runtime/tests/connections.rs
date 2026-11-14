@@ -420,3 +420,66 @@ async fn released_components_link_and_run_under_the_new_bindings() {
     let (_, notes) = code.add(NOTES).unwrap();
     assert!(!notes.handles_connections());
 }
+
+/// Counts the connection rows a turn looks up.
+struct Counting(std::sync::atomic::AtomicUsize);
+
+impl StateView for Counting {
+    fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
+    fn keys(&self, _prefix: &str) -> Result<Vec<String>, String> {
+        Ok(vec![])
+    }
+    fn timer_pending(&self, _id: u64) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn connection(&self, _id: &str) -> Result<Option<kronik_runtime::ConnectionView>, String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(None)
+    }
+}
+
+/// Review M7: a broadcast past the per-turn target limit traps before it
+/// looks up a single id, so a list of a hundred thousand made-up ids costs
+/// no state reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broadcast_past_the_target_limit_traps_before_any_lookup() {
+    let code = store();
+    let (_, room) = code.add(ROOM).unwrap();
+    let view = Arc::new(Counting(std::sync::atomic::AtomicUsize::new(0)));
+    let out = room
+        .run(
+            TurnRequest {
+                actor: ActorRef::parse("room/a").unwrap(),
+                causal_key: kronik_core::causal::root("r".into()),
+                logical_time_ms: 1_761_300_000_000,
+                seed: [7; 32],
+                input: message("spray", b"100001"),
+                limits: TurnLimits {
+                    fuel: 5_000_000_000,
+                    ..TurnLimits::default()
+                },
+                subject: None,
+            },
+            view.clone(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out.outcome.kind,
+        pb::OutcomeKind::Trap as i32,
+        "{:?}",
+        out.outcome
+    );
+    assert!(
+        out.outcome
+            .message
+            .contains("more than 100000 frame targets"),
+        "{:?}",
+        out.outcome
+    );
+    assert_eq!(view.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+}

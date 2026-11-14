@@ -278,3 +278,61 @@ async fn the_caps_answer_connection_limit() {
         .await;
     assert_eq!(third.response.status, 101);
 }
+
+/// Review M1: `max_per_client` counts the client behind a trusted proxy
+/// (the rightmost `X-Forwarded-For` address that is no trusted proxy), not
+/// the proxy; an untrusted peer's header counts for nothing; IPv6 clients
+/// count per /64; a trusted proxy that forwards nothing is exempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_per_client_cap_counts_the_forwarded_client() {
+    let (_dir, node) = node(ConnectionsConfig {
+        max_per_client: 1,
+        ..ConnectionsConfig::default()
+    })
+    .await;
+    let gw = Gateway::new(
+        node.clone(),
+        GatewayConfig {
+            trusted_proxies: vec![kronik_gateway::IpNet::parse("127.0.0.1").unwrap()],
+            ..GatewayConfig::default()
+        },
+    );
+    let from = |peer: &str, forwarded: Option<&str>| {
+        let mut req = upgrade("/room/lobby/ws?user=u", &[]);
+        req.peer = Some(peer.parse().unwrap());
+        if let Some(f) = forwarded {
+            req.headers.push(("x-forwarded-for".into(), f.into()));
+        }
+        req
+    };
+    let mut transports = Vec::new();
+    let mut open = async |req: HttpRequest| {
+        let answer = gw.open_connection(req).await;
+        if let Some(conn) = &answer.connection {
+            transports.push(RecordingTransport::attach(node.hub(), conn).unwrap());
+        }
+        answer.response.status
+    };
+    // Behind the proxy: one connection per forwarded client.
+    assert_eq!(open(from("127.0.0.1", Some("203.0.113.5"))).await, 101);
+    assert_eq!(open(from("127.0.0.1", Some("203.0.113.5"))).await, 503);
+    assert_eq!(
+        open(from("127.0.0.1", Some("198.51.100.1, 203.0.113.6"))).await,
+        101
+    );
+    // A proxy chain: trusted hops on the right are skipped.
+    assert_eq!(
+        open(from("127.0.0.1", Some("203.0.113.6, 127.0.0.1"))).await,
+        503
+    );
+    // A peer that is no proxy cannot claim another address.
+    assert_eq!(open(from("198.51.100.7", Some("203.0.113.9"))).await, 101);
+    assert_eq!(open(from("198.51.100.7", Some("203.0.113.10"))).await, 503);
+    // IPv6 clients count per /64.
+    assert_eq!(open(from("2001:db8::1", None)).await, 101);
+    assert_eq!(open(from("2001:db8::2", None)).await, 503);
+    assert_eq!(open(from("2001:db8:0:1::1", None)).await, 101);
+    // A trusted proxy that forwards nobody is exempt.
+    assert_eq!(open(from("127.0.0.1", None)).await, 101);
+    assert_eq!(open(from("127.0.0.1", None)).await, 101);
+}

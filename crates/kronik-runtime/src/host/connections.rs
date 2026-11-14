@@ -241,6 +241,11 @@ impl wit::Host for TurnHost {
 
     async fn broadcast(&mut self, conns: Vec<String>, frame: wit::Frame) -> wasmtime::Result<()> {
         self.deny_in_describe("connections")?;
+        // The target limit before any id is looked up, counting the list as
+        // given: a list past it costs no lookups (review M7).
+        if self.conns.targets.saturating_add(conns.len()) > MAX_TARGETS {
+            bail!("connections: more than {MAX_TARGETS} frame targets in one turn");
+        }
         // The first occurrence of an id keeps its place.
         let mut seen = HashSet::new();
         let mut live = Vec::new();

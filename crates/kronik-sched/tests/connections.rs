@@ -33,6 +33,10 @@ struct Proc {
 }
 
 fn start(dir: &Path) -> Proc {
+    start_with(dir, kronik_sched::connections::ConnectionsConfig::default())
+}
+
+fn start_with(dir: &Path, connections: kronik_sched::connections::ConnectionsConfig) -> Proc {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -42,6 +46,7 @@ fn start(dir: &Path) -> Proc {
         let env = Env::real(tokio::runtime::Handle::current());
         let config = NodeConfig {
             concurrency: 8,
+            connections,
             ..NodeConfig::default()
         };
         start_local(env, dir, config).await.unwrap()
@@ -627,6 +632,12 @@ fn a_closed_connection_is_dropped_whether_or_not_compaction_ran() {
         p.row(&a).is_some_and(|r| r.closed_lsn.is_some())
     });
     assert!(!p.live(&a), "the closed row left the live table");
+    // Ada's close turn tells bob she left, after its record is applied.
+    p.until("bob hears ada left", || {
+        frames(&tb.recording())
+            .iter()
+            .any(|(_, f)| f.contains("\"left\""))
+    });
     let frames = tb.recording().frames.len();
     p.frame(&b, &format!("send-to {a} late"));
     p.until("bob's frame turn", || p.row(&b).unwrap().frames_in == 1);
@@ -682,4 +693,53 @@ fn a_closed_connection_is_dropped_whether_or_not_compaction_ran() {
     assert_eq!(again.connection_ops, recorded.connection_ops);
     assert_eq!(again.writes, recorded.writes);
     assert_eq!(again.fuel_used, recorded.fuel_used);
+}
+
+/// Review M6: all outgoing queues together hold at most
+/// `total_queue_bytes`. The frame that would pass it closes its connection
+/// as a slow consumer, though that connection's own queue is far below
+/// `outbound_queue_bytes`.
+#[test]
+fn the_queues_share_a_node_wide_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start_with(
+        dir.path(),
+        kronik_sched::connections::ConnectionsConfig {
+            total_queue_bytes: 2000,
+            ..Default::default()
+        },
+    );
+    p.deploy(ROOM, false).unwrap();
+    let (a, ta) = p.join("lobby", "ada");
+    let (b, tb) = p.join("lobby", "bob");
+    p.until("the welcomes", || {
+        ta.recording().frames.len() == 2 && tb.recording().frames.len() == 1
+    });
+    // Neither client reads any more.
+    ta.stall(true);
+    tb.stall(true);
+    for i in 0..40 {
+        p.send("room/lobby", "say", &format!("message {i}"));
+        if [&a, &b]
+            .iter()
+            .any(|c| p.row(c).is_some_and(|r| r.closed_lsn.is_some()))
+        {
+            break;
+        }
+    }
+    p.until("a slow-consumer close", || {
+        [&a, &b]
+            .iter()
+            .any(|c| p.row(c).is_some_and(|r| r.closed_lsn.is_some()))
+    });
+    for c in [&a, &b] {
+        let row = p.row(c).unwrap();
+        if row.closed_lsn.is_some() {
+            assert_eq!(
+                row.cause,
+                Some(pb::CloseCause::SlowConsumer as i32),
+                "{row:?}"
+            );
+        }
+    }
 }

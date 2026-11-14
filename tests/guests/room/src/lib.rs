@@ -26,13 +26,16 @@
 //! - `kick <conn>`: closes that connection (4000 `kicked`), `bye`: closes
 //!   the sender's (1000 `bye`), `send-to <conn> <text>`: a frame to any id
 //!   (ownership tests);
+//! - `burst <n> <size>`: `n` buffered frames of `size` characters to the
+//!   sender, in one turn;
 //! - `fail`: the turn fails; `trap`: the guest panics.
 //!
 //! The close handler records the close and broadcasts `left`. HTTP
 //! `GET /room/{key}/{op}` and operator messages of the same names answer
 //! `members`, `closes`, `unknown`, `seq` and `messages` (`after=<seq>`);
 //! `POST /room/{key}/say` and the message `say` post as `http` and `op`; the
-//! message `kick` closes the connection in its body; `ping` answers `pong`.
+//! message `kick` closes the connection in its body, `spray <n>` broadcasts
+//! to `n` well-formed ids that nobody holds; `ping` answers `pong`.
 //!
 //! Feature `fmt2` (room-fmt2.wasm) changes only the message format: `body`
 //! instead of `text`.

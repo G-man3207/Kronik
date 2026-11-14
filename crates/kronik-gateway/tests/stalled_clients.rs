@@ -472,3 +472,139 @@ async fn a_client_over_tcp_that_leaves_mid_open_is_freed() {
     assert!(closes.contains("host 1001 abandoned"), "{closes}");
     assert_eq!(ask(&node, "members", b"").await, "");
 }
+
+/// Review M3: while Kronik pauses reading (here the inbound rate, 1/s),
+/// the client's pongs wait unread: that is no ping timeout. The client
+/// reads all the while, and gets every echo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_kronik_paused_is_no_ping_timeout() {
+    let cfg = ConnectionsConfig {
+        ping_interval: Duration::from_millis(150),
+        ping_timeout: Duration::from_millis(250),
+        close_timeout: SHORT,
+        inbound_rate: 1,
+        ..ConnectionsConfig::default()
+    };
+    let (_dir, node) = node(cfg.clone()).await;
+    let gw = Gateway::new(node.clone(), GatewayConfig::default());
+    let answer = gw
+        .open_connection(request("/room/lobby/ws?user=ada", true))
+        .await;
+    let conn = answer.connection.unwrap();
+    let (client, server) = tokio::io::duplex(64 << 10);
+    let driver = tokio::spawn(kronik_gateway::connections::drive(
+        node.hub().clone(),
+        conn.clone(),
+        TokioIo::new(server),
+        limits(&cfg),
+    ));
+    let mut ws = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+    let mut texts = Vec::new();
+    for t in ["echo a", "echo b", "echo c"] {
+        ws.send(Message::text(t)).await.unwrap();
+    }
+    // The welcome, then the three echoes about a second apart.
+    while texts.len() < 4 {
+        match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => texts.push(t.as_str().to_owned()),
+            Ok(Some(Ok(_))) => {}
+            other => panic!("the connection ended: {other:?} after {texts:?}"),
+        }
+    }
+    assert_eq!(texts[1..], ["a", "b", "c"]);
+    assert!(
+        node.store().db().connection(&conn).unwrap().is_some(),
+        "still open"
+    );
+    drop(ws);
+    let row = closed(&node, &conn).await;
+    assert_eq!(row.cause, Some(pb::CloseCause::Client as i32), "{row:?}");
+    driver.await.unwrap();
+}
+
+/// Review M4: a long burst does not keep the driver from reading. The
+/// client reads slowly and closes early; the driver sees the close while
+/// the burst is still being written, not after all of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_burst_does_not_starve_the_reader() {
+    let cfg = ConnectionsConfig {
+        ping_timeout: Duration::from_secs(5),
+        ..quick()
+    };
+    let (_dir, node) = node(cfg.clone()).await;
+    let gw = Gateway::new(node.clone(), GatewayConfig::default());
+    let answer = gw
+        .open_connection(request("/room/lobby/ws?user=ada", true))
+        .await;
+    let conn = answer.connection.unwrap();
+    let (client, server) = tokio::io::duplex(1024);
+    let driver = tokio::spawn(kronik_gateway::connections::drive(
+        node.hub().clone(),
+        conn.clone(),
+        TokioIo::new(server),
+        limits(&cfg),
+    ));
+    let mut ws = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+    ws.send(Message::text("burst 2000 64")).await.unwrap();
+    let mut read = 0;
+    while read < 20 {
+        if let Some(Ok(Message::Text(_))) = ws.next().await {
+            read += 1;
+        }
+    }
+    ws.send(Message::Close(None)).await.unwrap();
+    // Go on reading, slowly, until the driver ends the connection.
+    while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let row = closed(&node, &conn).await;
+    assert_eq!(row.cause, Some(pb::CloseCause::Client as i32), "{row:?}");
+    let written = row.frames_written.unwrap();
+    assert!(
+        written < 1000,
+        "the close waited for {written} of 2001 frames"
+    );
+    driver.await.unwrap();
+}
+
+/// Review M2: an SSE stream gives its [gateway] HTTP slot back once it
+/// streams (it counts in [connections] instead), and its TCP connection
+/// ends with it. Four streams on a gateway of four slots leave room for
+/// HTTP requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sse_streams_do_not_hold_http_slots() {
+    let (_dir, node) = node(ConnectionsConfig::default()).await;
+    let gw = Arc::new(Gateway::new(node.clone(), GatewayConfig::default()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(kronik_gateway::server::serve(listener, gw, 4));
+    let mut streams = Vec::new();
+    for i in 0..4 {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(
+            format!(
+                "GET /room/lobby/events?user=u{i} HTTP/1.1\r\nHost: t\r\nAccept: text/event-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut head = [0u8; 512];
+        let n = s.read(&mut head).await.unwrap();
+        let head = String::from_utf8_lossy(&head[..n]).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert!(head.contains("connection: close"), "{head}");
+        streams.push(s);
+    }
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"GET /room/lobby/seq HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut answer = String::new();
+    tokio::time::timeout(Duration::from_secs(10), s.read_to_string(&mut answer))
+        .await
+        .expect("an HTTP request is served next to four streams")
+        .unwrap();
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert_eq!(node.hub().live(), 4);
+}

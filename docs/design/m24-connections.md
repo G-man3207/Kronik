@@ -522,6 +522,11 @@ connection. It comes after the connection's admitted frames:
 - A resent close runs the close handler again (to clean up after a bug was
   fixed). It changes nothing in the `connections` table.
 - A failed `open` is not a dead letter (§4.2).
+- Any client can make its connection's owner fail, so state.db keeps only
+  the newest 10,000 dead letters of frame and close turns, node-wide
+  (`MAX_CONNECTION_DEAD_LETTERS`); the applier deletes the oldest past it,
+  in log order, so a rebuild gives the same rows (review M5). The turns
+  stay in the log and in history; other dead letters are not counted.
 - A connection input whose kind has no deployment, or whose code lacks the
   export, gets a failed record without running (as m1-core §7 does for
   messages). It becomes a dead letter for frames and closes.
@@ -661,7 +666,9 @@ simulated clients.
 
 The HTTP connection slot (`[gateway]`'s connection cap, `server.rs`
 `Slots`) is released when hyper hands over the upgraded I/O. From then on
-the connection counts against `[connections]`.
+the connection counts against `[connections]`. An SSE stream releases its
+slot when it starts streaming (review M2), and its response carries
+`connection: close`, so the TCP connection ends with the stream.
 
 ### 5.4 Opening an SSE stream
 
@@ -693,13 +700,19 @@ The reader task, per connection, for each message:
   - While `inflight_frames` frames wait or run, and while the rate is
     exceeded, the reader stops reading. TCP then pushes back on the client.
     Slow actors and fast clients cost bounded memory: at most
-    `inflight_frames` × `max_frame_bytes` per connection.
+    `inflight_frames` × `max_frame_bytes` per connection, and
+    `total_inflight_bytes` for all connections together (review M6).
+  - While Kronik itself paused reading, the client's pongs wait unread,
+    so the ping timeout does not run (review M3).
   - If admission fails (the node stopped, or `[log] disk_reserve` was
     reached), the host closes the connection with the reason `unavailable`
     (1013). Nothing is lost silently: `frames_received` shows how many
     frames were read.
 - **Ping:** tungstenite answers with a pong. **Pong:** marks the peer
   alive.
+- **Writing and reading take turns:** the writer sends at most 64 frames
+  per wakeup before the reader, the timer and the closes get theirs
+  (review M4).
 - **Close frame:** answered, then a client close.
 - **A frame over the size limit:** a `too-large` close (1009). **Invalid
   UTF-8 or a protocol error:** a `protocol` close (1007 or 1002).
@@ -801,11 +814,13 @@ settings: replay never reads them, because it reads the recorded inputs.
 [connections]
 max_open = 4096              # live connections in total, besides [gateway]'s HTTP connections
 max_per_actor = 2048         # per owner
-max_per_client = 256         # per client address; [gateway] trusted_proxies are exempt
+max_per_client = 256         # per client address (an IPv6 /64); see below
 max_frame_bytes = 65536      # largest incoming message; never above the kind's message_bytes
 inflight_frames = 16         # incoming frames per connection admitted and not yet finished
 inbound_rate = "50/s"        # reads per connection are paced to this (a token bucket of that size)
 outbound_queue_bytes = 1048576   # queued outgoing bytes per connection before a slow-consumer close
+total_queue_bytes = 268435456    # queued outgoing bytes of all connections together
+total_inflight_bytes = 67108864  # incoming frame bytes in flight on all connections
 ping_interval = "30s"
 ping_timeout = "30s"
 sse_heartbeat = "15s"
@@ -813,6 +828,16 @@ close_timeout = "5s"
 shutdown_grace = "2s"
 ```
 
+- **The client address** that `max_per_client` counts is the peer's, or,
+  from a `[gateway] trusted_proxies` peer, the address it forwards: the
+  rightmost `X-Forwarded-For` entry that is no trusted proxy. A trusted
+  proxy that forwards none is exempt. IPv6 addresses count per /64, and
+  an IPv4-mapped one as its IPv4 address (review M1).
+- **Aggregate budgets** (review M6): a committed frame that would take the
+  queues of all connections past `total_queue_bytes` closes its connection
+  as a slow consumer; past `total_inflight_bytes` of incoming frames in
+  flight, every reader waits. A broadcast's targets share one copy of the
+  frame.
 - The cap that applies is the smaller of `max_open` and what the open-file
   limit leaves after `serve.rs`'s `connection_caps` reserves (node, HTTP
   gateway, TCP API). The shipped unit has `LimitNOFILE=65536`, which leaves
@@ -1408,11 +1433,14 @@ diffs with 1, 4 and 16 workers.
 | --- | --- | --- | --- |
 | Live connections | 4,096 | `[connections] max_open` and the open-file limit | 503 `CONNECTION_LIMIT` |
 | Per owner | 2,048 | `max_per_actor` | 503 `CONNECTION_LIMIT` |
-| Per client address | 256 | `max_per_client` (trusted proxies exempt) | 503 `CONNECTION_LIMIT` |
+| Per client address | 256 | `max_per_client` (the forwarded client behind a trusted proxy; IPv6 per /64) | 503 `CONNECTION_LIMIT` |
 | Incoming message | 64 KiB, and the kind's `message_bytes` | `max_frame_bytes` | close `too-large` (1009) |
 | Incoming frames admitted per connection | 16 | `inflight_frames` | reading pauses |
 | Incoming pace per connection | 50/s | `inbound_rate` | reading pauses |
 | Outgoing queue per connection | 1 MiB | `outbound_queue_bytes` | close `slow-consumer`; a `send-now` waits up to the effect timeout |
+| Outgoing queues, all connections | 256 MiB | `total_queue_bytes` | close `slow-consumer` |
+| Incoming frames in flight, all connections | 64 MiB | `total_inflight_bytes` | reading pauses |
+| Dead letters of frame and close turns | 10,000, node-wide | constant | the oldest are deleted |
 | Outgoing frame | the kind's `message_bytes` (1 MiB) | `kronik limits set --message-size` | trap |
 | Per turn: operations, targets, bytes | 10,000; 100,000; 16 MiB | constants (§4.11) | trap |
 | Open turn | 30 s | `[gateway] timeout` | 504, then `abandoned` |

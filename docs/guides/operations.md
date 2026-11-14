@@ -424,16 +424,24 @@ transport settings: replay never reads them.
 |---|---|---|
 | `max_open` | `4096` | Live connections in total, besides the gateway's HTTP connections. The open-file limit lowers it: `kronik serve` keeps descriptors for the node, the gateway and the TCP API first (with the shipped unit's `LimitNOFILE=65536`, about 63,000 remain), and `kronik doctor` warns when the limit leaves fewer than `max_open` |
 | `max_per_actor` | `2048` | Live connections per owner |
-| `max_per_client` | `256` | Live connections per client address; `[gateway] trusted_proxies` are exempt. Over any of the three caps an open gets `503 CONNECTION_LIMIT` with `retry-after: 5`, before any turn |
+| `max_per_client` | `256` | Live connections per client address: the peer's, or behind a `[gateway] trusted_proxies` peer the rightmost `X-Forwarded-For` address that is no trusted proxy (a proxy that forwards none is exempt); IPv6 addresses count per /64. Over any of the three caps an open gets `503 CONNECTION_LIMIT` with `retry-after: 5`, before any turn |
 | `max_frame_bytes` | `65536` | The largest incoming message, never above the owner kind's message limit. A larger one closes the connection with `too-large` (1009) |
 | `inflight_frames` | `16` | Incoming frames per connection admitted and not finished. While they are in flight the gateway stops reading the socket, so a fast client cannot outrun its actor |
 | `inbound_rate` | `"50/s"` | Reads per connection are paced to this |
 | `outbound_queue_bytes` | `1048576` | Outgoing bytes a connection may queue. A client that does not read is closed as a slow consumer (1008) instead of holding memory |
+| `total_queue_bytes` | `268435456` | Outgoing bytes all connections may queue together (256 MiB); a frame that would pass it closes its connection as a slow consumer |
+| `total_inflight_bytes` | `67108864` | Incoming frame bytes in flight on all connections together (64 MiB); past it, the gateway stops reading until frames finish |
 | `ping_interval` | `"30s"` | An idle WebSocket gets a ping this often |
 | `ping_timeout` | `"30s"` | A WebSocket that answers nothing within this after a ping is closed with `ping-timeout` (1001). A WebSocket or SSE client that takes no frame for this long is closed as a slow consumer (1008), and any gateway connection whose client takes no bytes for this long is dropped |
 | `sse_heartbeat` | `"15s"` | An SSE stream gets a `: keep-alive` comment this often |
 | `close_timeout` | `"5s"` | How long a close waits for the client's close frame |
 | `shutdown_grace` | `"2s"` | On SIGTERM every WebSocket gets the close code 1012 `kronik: restart`; the daemon waits this long for the writers |
+
+An SSE stream does not hold one of `[gateway]`'s HTTP connections: it
+counts against these caps, and its TCP connection ends with it. A failed
+frame or close turn is a dead letter, like a failed message; state.db
+keeps the newest 10,000 of them, node-wide, since any client can make its
+actor fail (the turns stay in history).
 
 After any restart, graceful or not, every connection the last process held
 gets a close input with the reason `restart` (1012) before the gateway takes

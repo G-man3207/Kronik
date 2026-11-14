@@ -436,3 +436,43 @@ fn another_actors_record_does_not_move_a_row() {
         .unwrap();
     assert_eq!(store.db().connection(C1).unwrap().unwrap(), before);
 }
+
+/// Review M5: any client can make its connection's owner fail, so the dead
+/// letters of failed frame and close turns are capped node-wide, the oldest
+/// going first; other dead letters stay. A rebuild gives the same rows.
+#[test]
+fn connection_dead_letters_are_capped() {
+    let store = Store::memory().unwrap();
+    let cap = kronik_store::db::MAX_CONNECTION_DEAD_LETTERS as u64;
+    let mut records = Vec::new();
+    // A message dead letter first: not a connection's.
+    let mut message = turn(
+        pb::Input {
+            kind: Some(pb::input::Kind::Message(pb::MessageInput {
+                message_id: "m1".into(),
+                ..Default::default()
+            })),
+        },
+        pb::OutcomeKind::Trap,
+    );
+    message.execution_id = format!("{:032x}", 0);
+    records.push(committed(1, Record::TurnRecord(message)));
+    for i in 0..cap + 3 {
+        let mut t = turn(frame(C1, i, ""), pb::OutcomeKind::Trap);
+        t.execution_id = format!("{:032x}", i + 1);
+        records.push(committed(i + 2, Record::TurnRecord(t)));
+    }
+    for chunk in records.chunks(500) {
+        store.apply(chunk).unwrap();
+    }
+    let letters = store.db().dead_letters(0, usize::MAX).unwrap();
+    assert_eq!(letters.len() as u64, cap + 1);
+    // The message's stays; the three oldest frames' went.
+    assert_eq!(letters[0].lsn, 1);
+    assert_eq!(letters[1].lsn, 2 + 3);
+    let rebuilt = Store::memory().unwrap();
+    for chunk in records.chunks(500) {
+        rebuilt.apply(chunk).unwrap();
+    }
+    assert_eq!(rebuilt.state_hash().unwrap(), store.state_hash().unwrap());
+}

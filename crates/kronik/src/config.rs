@@ -85,6 +85,10 @@ pub struct Connections {
     pub inbound_rate: Rate,
     /// Queued outgoing bytes per connection before a slow-consumer close.
     pub outbound_queue_bytes: usize,
+    /// Queued outgoing bytes of all connections together.
+    pub total_queue_bytes: usize,
+    /// Incoming frame bytes in flight on all connections together.
+    pub total_inflight_bytes: usize,
     pub ping_interval: Dur,
     pub ping_timeout: Dur,
     pub sse_heartbeat: Dur,
@@ -103,6 +107,8 @@ impl Default for Connections {
             inflight_frames: d.inflight_frames,
             inbound_rate: Rate(d.inbound_rate),
             outbound_queue_bytes: d.outbound_queue_bytes,
+            total_queue_bytes: d.total_queue_bytes,
+            total_inflight_bytes: d.total_inflight_bytes,
             ping_interval: Dur(d.ping_interval),
             ping_timeout: Dur(d.ping_timeout),
             sse_heartbeat: Dur(d.sse_heartbeat),
@@ -124,6 +130,8 @@ impl Connections {
             inflight_frames: self.inflight_frames,
             inbound_rate: self.inbound_rate.0,
             outbound_queue_bytes: self.outbound_queue_bytes,
+            total_queue_bytes: self.total_queue_bytes,
+            total_inflight_bytes: self.total_inflight_bytes,
             ping_interval: self.ping_interval.0,
             ping_timeout: self.ping_timeout.0,
             sse_heartbeat: self.sse_heartbeat.0,
@@ -141,6 +149,8 @@ impl Connections {
             ("max_frame_bytes", self.max_frame_bytes),
             ("inflight_frames", self.inflight_frames),
             ("outbound_queue_bytes", self.outbound_queue_bytes),
+            ("total_queue_bytes", self.total_queue_bytes),
+            ("total_inflight_bytes", self.total_inflight_bytes),
         ] {
             if value == 0 {
                 return Err(format!("[connections] {name} must be at least 1"));

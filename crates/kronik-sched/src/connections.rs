@@ -23,6 +23,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
@@ -72,6 +73,12 @@ pub struct ConnectionsConfig {
     /// WebSocket upgrade, the SSE body) before it closes as `abandoned`
     /// (§5.3). Not a kronik.toml key.
     pub attach_timeout: Duration,
+    /// Outgoing bytes all connections' queues may hold together: a frame
+    /// that would pass it closes its connection as a slow consumer.
+    pub total_queue_bytes: usize,
+    /// Incoming frame bytes admitted and not yet finished, on all
+    /// connections together: past it, readers wait.
+    pub total_inflight_bytes: usize,
 }
 
 impl Default for ConnectionsConfig {
@@ -90,6 +97,8 @@ impl Default for ConnectionsConfig {
             close_timeout: Duration::from_secs(5),
             shutdown_grace: Duration::from_secs(2),
             attach_timeout: Duration::from_secs(10),
+            total_queue_bytes: 256 << 20,
+            total_inflight_bytes: 64 << 20,
         }
     }
 }
@@ -141,8 +150,8 @@ impl Drop for FinishGuard {
 /// What a connection's writer sends next.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outgoing {
-    /// A frame, with its outgoing seq.
-    Frame { seq: u64, frame: pb::Frame },
+    /// A frame, with its outgoing seq; a broadcast's targets share it.
+    Frame { seq: u64, frame: Arc<pb::Frame> },
     /// The actor's close, after the frames before it: send it, wait at most
     /// `close_timeout` for the client's, end, and report [`Hub::finished`].
     Close { code: u16, reason: String },
@@ -206,8 +215,55 @@ struct Inner {
     /// The log's last LSN when the node started: a restart close's
     /// `restart_after_lsn`.
     restart_after_lsn: u64,
-    /// The (kind, protocol) pairs `kronik_connections_open` reported.
-    gauged: Vec<(String, &'static str)>,
+    /// Connections past their open turn, by kind and protocol: the gauge
+    /// `kronik_connections_open`, kept as counters (review M8).
+    open: HashMap<(String, &'static str), usize>,
+    /// The counters that changed since they were last published.
+    changed: Vec<(String, &'static str)>,
+}
+
+impl Inner {
+    /// A connection past its open turn starts (`delta` 1) or stops (-1)
+    /// counting in `kronik_connections_open`.
+    fn count_open(&mut self, kind: &str, protocol: pb::ConnectionProtocol, up: bool) {
+        let key = (kind.to_owned(), conn::protocol_name(protocol as i32));
+        let n = self.open.entry(key.clone()).or_default();
+        *n = if up { *n + 1 } else { n.saturating_sub(1) };
+        if !self.changed.contains(&key) {
+            self.changed.push(key);
+        }
+    }
+
+    /// The changed counters, to publish once the lock is released.
+    fn take_gauges(&mut self) -> Vec<(String, &'static str, usize)> {
+        let changed = std::mem::take(&mut self.changed);
+        changed
+            .into_iter()
+            .map(|key| {
+                let n = self.open.get(&key).copied().unwrap_or(0);
+                if n == 0 {
+                    self.open.remove(&key);
+                }
+                (key.0, key.1, n)
+            })
+            .collect()
+    }
+}
+
+/// The key a client address counts under for `max_per_client` (review
+/// M1): an IPv4 address, or an IPv6 address's /64, since one client
+/// usually holds a whole /64; an IPv4-mapped IPv6 address is its IPv4.
+pub fn client_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let prefix = u128::from(v6) & !((1u128 << 64) - 1);
+                IpAddr::V6(std::net::Ipv6Addr::from(prefix))
+            }
+        },
+    }
 }
 
 /// A close the host decided while delivering: the connection, its
@@ -224,6 +280,11 @@ pub struct Hub {
     inner: Mutex<Inner>,
     /// Signals a finished connection (for [`Hub::shutdown`]).
     gone: Notify,
+    /// The bytes all outgoing queues hold (`total_queue_bytes`).
+    queued: AtomicUsize,
+    /// Incoming frame bytes admitted and not finished
+    /// (`total_inflight_bytes`), one permit per byte.
+    inflight_bytes: Arc<Semaphore>,
 }
 
 /// A host cause's close code (§5.8).
@@ -241,6 +302,9 @@ pub fn host_code(cause: pb::CloseCause) -> u16 {
 
 impl Hub {
     pub fn new(env: Env, cfg: ConnectionsConfig) -> Arc<Hub> {
+        let inflight_bytes = Arc::new(Semaphore::new(
+            cfg.total_inflight_bytes.clamp(1, Semaphore::MAX_PERMITS),
+        ));
         Arc::new_cyclic(|me| Hub {
             me: me.clone(),
             env,
@@ -248,6 +312,8 @@ impl Hub {
             node: Mutex::new(Weak::new()),
             inner: Mutex::new(Inner::default()),
             gone: Notify::new(),
+            queued: AtomicUsize::new(0),
+            inflight_bytes,
         })
     }
 
@@ -326,6 +392,7 @@ impl Hub {
                 self.cfg.max_per_actor
             ));
         }
+        let client = client.map(client_key);
         let counted_client = client.is_some() && !exempt;
         if let Some(ip) = client.filter(|_| counted_client)
             && inner.per_client.get(&ip).copied().unwrap_or(0) >= self.cfg.max_per_client
@@ -365,13 +432,16 @@ impl Hub {
                 counted_client,
             },
         );
-        self.gauge(&mut inner);
         Ok(())
     }
 
     /// Removes `id` and gives its cap slots back.
-    fn remove(inner: &mut Inner, id: &str) -> Option<Live> {
+    fn remove(&self, inner: &mut Inner, id: &str) -> Option<Live> {
         let live = inner.live.remove(id)?;
+        if live.state != State::Opening {
+            inner.count_open(&live.owner.kind, live.protocol, false);
+        }
+        self.queued.fetch_sub(live.queued_bytes, Ordering::Relaxed);
         if let Some(n) = inner.per_actor.get_mut(&live.owner) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -389,32 +459,21 @@ impl Hub {
         Some(live)
     }
 
-    /// `kronik_connections_open` by kind and protocol, and the bytes all
-    /// outgoing queues hold.
-    fn gauge(&self, inner: &mut Inner) {
-        let mut open: std::collections::BTreeMap<(String, &'static str), usize> =
-            inner.gauged.iter().map(|k| (k.clone(), 0)).collect();
-        let mut queued = 0;
-        for live in inner.live.values() {
-            queued += live.queued_bytes;
-            if live.state != State::Opening {
-                *open
-                    .entry((
-                        live.owner.kind.clone(),
-                        conn::protocol_name(live.protocol as i32),
-                    ))
-                    .or_default() += 1;
-            }
-        }
-        for ((kind, protocol), n) in &open {
+    /// Publishes the changed `kronik_connections_open` counters and the
+    /// bytes all outgoing queues hold; called with no hub lock held.
+    fn publish(&self, gauges: Vec<(String, &'static str, usize)>) {
+        for (kind, protocol, n) in gauges {
             kronik_metrics::set(
                 "kronik_connections_open",
-                &[("kind", kind), ("protocol", protocol)],
-                *n as f64,
+                &[("kind", &kind), ("protocol", protocol)],
+                n as f64,
             );
         }
-        inner.gauged = open.into_keys().collect();
-        kronik_metrics::set("kronik_connection_queued_bytes", &[], queued as f64);
+        kronik_metrics::set(
+            "kronik_connection_queued_bytes",
+            &[],
+            self.queued.load(Ordering::Relaxed) as f64,
+        );
     }
 
     /// The open turn of `input` committed (§4.2): an accept opens the
@@ -452,26 +511,32 @@ impl Hub {
         );
         let mut abandoned = false;
         let mut unattached = false;
-        let restart = {
+        let (restart, gauges) = {
             let mut inner = lock(&self.inner);
-            match inner.live.get_mut(&input.connection) {
+            let mut opened = None;
+            let restart = match inner.live.get_mut(&input.connection) {
                 Some(live) if live.state == State::Opening => {
                     if accept.is_some() {
                         live.state = State::Open;
                         live.subject = subject.clone();
                         abandoned = live.abandoned;
                         unattached = live.transport.is_none();
+                        opened = Some(live.protocol);
                         tracing::debug!(connection = %input.connection, owner = %owner, "connection open");
                     } else {
-                        Self::remove(&mut inner, &input.connection);
-                        self.gauge(&mut inner);
+                        self.remove(&mut inner, &input.connection);
                     }
                     None
                 }
                 Some(_) => None,
                 None => accept.map(|_| inner.restart_after_lsn),
+            };
+            if let Some(protocol) = opened {
+                inner.count_open(&owner.kind, protocol, true);
             }
+            (restart, inner.take_gauges())
         };
+        self.publish(gauges);
         if abandoned {
             self.close_host(&input.connection, pb::CloseCause::Abandoned);
         } else if unattached {
@@ -534,8 +599,7 @@ impl Hub {
             .get(conn)
             .is_some_and(|l| l.state == State::Opening)
         {
-            Self::remove(&mut inner, conn);
-            self.gauge(&mut inner);
+            self.remove(&mut inner, conn);
         }
     }
 
@@ -561,44 +625,44 @@ impl Hub {
         }
         let mut wake: Vec<Arc<dyn Transport>> = Vec::new();
         let mut close: Vec<HostClose> = Vec::new();
-        {
+        // Counted under the lock, reported after it (review M8).
+        let mut out: HashMap<(String, &'static str), (u64, u64)> = HashMap::new();
+        let mut dropped_live: HashMap<(String, &'static str), u64> = HashMap::new();
+        let gauges = {
             let mut inner = lock(&self.inner);
             for op in ops {
                 match &op.op {
                     Some(pb::connection_op::Op::Send(frame)) => {
                         let bytes = conn::frame_bytes(frame);
+                        // One copy for every target (review M6).
+                        let frame = Arc::new(frame.clone());
                         for (id, seq) in op.connections.iter().zip(&op.seqs) {
                             let Some(live) = inner.live.get_mut(id) else {
                                 continue;
                             };
-                            let labels = [
-                                ("kind", live.owner.kind.as_str()),
-                                ("protocol", conn::protocol_name(live.protocol as i32)),
-                            ];
+                            let key = (
+                                live.owner.kind.clone(),
+                                conn::protocol_name(live.protocol as i32),
+                            );
                             if live.state == State::Closing {
-                                kronik_metrics::inc(
-                                    "kronik_connection_frames_dropped_total",
-                                    &labels,
-                                );
+                                *dropped_live.entry(key).or_default() += 1;
                                 continue;
                             }
-                            kronik_metrics::inc(
-                                "kronik_connection_frames_total",
-                                &[labels[0], labels[1], ("direction", "out")],
-                            );
-                            kronik_metrics::add(
-                                "kronik_connection_frame_bytes_total",
-                                &[labels[0], labels[1], ("direction", "out")],
-                                bytes as u64,
-                            );
+                            let counts = out.entry(key).or_default();
+                            counts.0 += 1;
+                            counts.1 += bytes as u64;
                             live.queue.push_back(Outgoing::Frame {
                                 seq: *seq,
                                 frame: frame.clone(),
                             });
                             live.queued_bytes += bytes;
-                            if live.queued_bytes > self.cfg.outbound_queue_bytes {
+                            let total = self.queued.fetch_add(bytes, Ordering::Relaxed) + bytes;
+                            if live.queued_bytes > self.cfg.outbound_queue_bytes
+                                || total > self.cfg.total_queue_bytes
+                            {
                                 // A committed frame never waits: the client
-                                // that cannot keep up is closed (§5.6).
+                                // that cannot keep up is closed (§5.6), also
+                                // when all queues together are full.
                                 live.state = State::Closing;
                                 live.close.get_or_insert(CloseFacts {
                                     cause: pb::CloseCause::SlowConsumer,
@@ -606,6 +670,7 @@ impl Hub {
                                     reason: String::new(),
                                 });
                                 live.queue.clear();
+                                self.queued.fetch_sub(live.queued_bytes, Ordering::Relaxed);
                                 live.queued_bytes = 0;
                                 tracing::info!(connection = %id, owner = %live.owner, "closing a slow consumer");
                                 close.push((
@@ -651,7 +716,9 @@ impl Hub {
                                     wake.push(t.clone());
                                 }
                             }
-                            // Accepted, but never attached: nobody to write to.
+                            // Accepted, but never attached: nobody to write
+                            // to. One still waiting for its transport keeps
+                            // the close queued; the attach watchdog frees it.
                             None if live.abandoned => close.push((id.clone(), None, code, "")),
                             None => {}
                         }
@@ -659,8 +726,25 @@ impl Hub {
                     None => {}
                 }
             }
-            self.gauge(&mut inner);
+            inner.take_gauges()
+        };
+        for ((kind, protocol), (frames, bytes)) in out {
+            let labels = [
+                ("kind", kind.as_str()),
+                ("protocol", protocol),
+                ("direction", "out"),
+            ];
+            kronik_metrics::add("kronik_connection_frames_total", &labels, frames);
+            kronik_metrics::add("kronik_connection_frame_bytes_total", &labels, bytes);
         }
+        for ((kind, protocol), n) in dropped_live {
+            kronik_metrics::add(
+                "kronik_connection_frames_dropped_total",
+                &[("kind", kind.as_str()), ("protocol", protocol)],
+                n,
+            );
+        }
+        self.publish(gauges);
         for t in wake {
             t.wake();
         }
@@ -722,7 +806,12 @@ impl Hub {
     /// dropped, and its transport is told to send the cause's code. The
     /// first cause decided wins.
     pub fn close_host(&self, conn: &str, cause: pb::CloseCause) {
-        let code = host_code(cause);
+        self.close_host_with(conn, cause, host_code(cause));
+    }
+
+    /// [`Hub::close_host`] with a code other than the cause's own: invalid
+    /// UTF-8 is a `protocol` close with 1007 (§5.5).
+    pub fn close_host_with(&self, conn: &str, cause: pb::CloseCause, code: u16) {
         let (transport, finish) = {
             let mut inner = lock(&self.inner);
             let Some(live) = inner.live.get_mut(conn) else {
@@ -739,6 +828,7 @@ impl Hub {
             });
             live.state = State::Closing;
             live.queue.clear();
+            self.queued.fetch_sub(live.queued_bytes, Ordering::Relaxed);
             live.queued_bytes = 0;
             (live.transport.clone(), live.transport.is_none())
         };
@@ -762,7 +852,9 @@ impl Hub {
         let live = inner.live.get_mut(conn)?;
         let item = live.queue.pop_front()?;
         if let Outgoing::Frame { frame, .. } = &item {
-            live.queued_bytes = live.queued_bytes.saturating_sub(conn::frame_bytes(frame));
+            let bytes = conn::frame_bytes(frame).min(live.queued_bytes);
+            live.queued_bytes -= bytes;
+            self.queued.fetch_sub(bytes, Ordering::Relaxed);
         }
         Some(item)
     }
@@ -786,7 +878,7 @@ impl Hub {
     /// closing connection is counted and discarded; one the node cannot
     /// admit closes the connection with the reason `unavailable` (§5.5).
     pub async fn incoming(&self, conn: &str, frame: pb::Frame) {
-        let (inflight, owner) = {
+        let (inflight, owner, protocol) = {
             let mut inner = lock(&self.inner);
             if inner.stopping {
                 return;
@@ -798,20 +890,27 @@ impl Hub {
             if live.state != State::Open {
                 return;
             }
-            let labels = [
-                ("kind", live.owner.kind.as_str()),
-                ("protocol", conn::protocol_name(live.protocol as i32)),
-                ("direction", "in"),
-            ];
-            kronik_metrics::inc("kronik_connection_frames_total", &labels);
-            kronik_metrics::add(
-                "kronik_connection_frame_bytes_total",
-                &labels,
-                conn::frame_bytes(&frame) as u64,
-            );
-            (live.inflight.clone(), live.owner.clone())
+            (
+                live.inflight.clone(),
+                live.owner.clone(),
+                conn::protocol_name(live.protocol as i32),
+            )
         };
+        let bytes = conn::frame_bytes(&frame);
+        let labels = [
+            ("kind", owner.kind.as_str()),
+            ("protocol", protocol),
+            ("direction", "in"),
+        ];
+        kronik_metrics::inc("kronik_connection_frames_total", &labels);
+        kronik_metrics::add("kronik_connection_frame_bytes_total", &labels, bytes as u64);
         let Ok(permit) = inflight.acquire_owned().await else {
+            return;
+        };
+        // The node-wide budget of incoming bytes in flight (review M6).
+        let total = self.cfg.total_inflight_bytes.max(1);
+        let share = u32::try_from(bytes.max(1).min(total)).unwrap_or(u32::MAX);
+        let Ok(bytes_permit) = self.inflight_bytes.clone().acquire_many_owned(share).await else {
             return;
         };
         self.pace(conn).await;
@@ -854,10 +953,11 @@ impl Hub {
         };
         match admission {
             Ok(rx) => {
-                // The permit comes back when the frame's turn finished.
+                // The permits come back when the frame's turn finished.
                 self.env.spawn("connection-frame", async move {
                     let _ = rx.await;
                     drop(permit);
+                    drop(bytes_permit);
                 });
             }
             Err(e) => {
@@ -901,14 +1001,14 @@ impl Hub {
     /// frames were written; during a graceful stop the node's next start
     /// admits it instead (§5.9).
     pub fn finished(&self, conn: &str, client: Option<(u16, String)>) {
-        let (live, stopping) = {
+        let (live, stopping, gauges) = {
             let mut inner = lock(&self.inner);
-            let Some(live) = Self::remove(&mut inner, conn) else {
+            let Some(live) = self.remove(&mut inner, conn) else {
                 return;
             };
-            self.gauge(&mut inner);
-            (live, inner.stopping)
+            (live, inner.stopping, inner.take_gauges())
         };
+        self.publish(gauges);
         self.gone.notify_waiters();
         if stopping || live.state == State::Opening {
             return;
@@ -993,6 +1093,7 @@ impl Hub {
                 .filter_map(|l| {
                     l.state = State::Closing;
                     l.queue.clear();
+                    self.queued.fetch_sub(l.queued_bytes, Ordering::Relaxed);
                     l.queued_bytes = 0;
                     l.transport.clone()
                 })
@@ -1098,7 +1199,7 @@ impl Transport for RecordingTransport {
             }
             match hub.next(&conn) {
                 Some(Outgoing::Frame { seq, frame }) => {
-                    lock(&self.record).frames.push((seq, frame));
+                    lock(&self.record).frames.push((seq, (*frame).clone()));
                     hub.written(&conn, seq);
                 }
                 Some(Outgoing::Close { code, reason }) => {
