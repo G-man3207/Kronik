@@ -109,12 +109,12 @@ class Node:
 
     def proc_status(self):
         """VmRSS, VmHWM, RssAnon (heap) and RssFile (mapped files) in KiB,
-        and user+system CPU seconds."""
+        the number of threads, and user+system CPU seconds."""
         pid = self.daemon.proc.pid
         fields = {}
         for line in Path(f"/proc/{pid}/status").read_text().splitlines():
             key, _, value = line.partition(":")
-            if key in ("VmRSS", "VmHWM", "RssAnon", "RssFile"):
+            if key in ("VmRSS", "VmHWM", "RssAnon", "RssFile", "Threads"):
                 fields[key] = int(value.split()[0])
         stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
         ticks = os.sysconf("SC_CLK_TCK")
