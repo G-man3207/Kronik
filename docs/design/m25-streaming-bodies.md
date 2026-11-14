@@ -636,7 +636,13 @@ effect results and the API's turn JSON show the reference, never the bytes.
   threshold is spooled into the fork's space. Stub rules stay inline.
 - **New blobs** go to the fork's space or an isolated tree's scratch space
   (§4.5). Identities are computed as in production, so equal bytes give equal
-  references and no difference.
+  references and no difference. The first B10 commit writes an isolated
+  tree's blobs to the fork's space too: a tree can only use the references it
+  received, so sharing the space changes no result, only when the bytes are
+  deleted (with the fork rather than with the tree).
+- **Request bodies.** A blob request body is recorded as its reference, as in
+  production, so the fingerprints agree; a reference the turn may not use is
+  matched to production's recorded denial, or denied in production's words.
 - **Prepared bodies.** The disclosure guards that check prepared inline
   bodies for secret values (`prepared_outcome_safe`,
   `disclose_neighbor`) treat `Body.blob` and `body_blob` as prepared when

@@ -200,6 +200,15 @@ pub fn prepare_inline_fetch_response(
     }))
 }
 
+/// The recorded error of a fetch whose body is a blob reference the turn
+/// may not use (M25 §7.2); a fork's replay records the same words.
+pub fn not_held_error(hash: &str, size: u64) -> String {
+    format!(
+        "BLOB_NOT_HELD: the request body is the blob {hash} ({size} bytes), which the turn \
+         neither holds nor received"
+    )
+}
+
 /// What an HTTP exchange gave the gate.
 enum Exchanged {
     /// A response: its body inline, or a blob of the turn's (M25 §7.3).
@@ -1443,13 +1452,7 @@ impl TurnFx {
         let wire_body = match &req.body {
             FetchBody::Inline(bytes) => bytes.clone(),
             FetchBody::NotHeld { hash, size } => {
-                failure = Some((
-                    pb::EffectStatus::Denied,
-                    format!(
-                        "BLOB_NOT_HELD: the request body is the blob {hash} ({size} bytes), \
-                         which the turn neither holds nor received"
-                    ),
-                ));
+                failure = Some((pb::EffectStatus::Denied, not_held_error(hash, *size)));
                 Vec::new()
             }
             // M25 §7.2: recorded as the reference, streamed from the store.

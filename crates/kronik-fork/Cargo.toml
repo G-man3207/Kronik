@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 base64 = { workspace = true }
 blake3 = { workspace = true }
+kronik-blob = { workspace = true }
 kronik-core = { workspace = true }
 kronik-metrics = { workspace = true }
 kronik-effects = { workspace = true }

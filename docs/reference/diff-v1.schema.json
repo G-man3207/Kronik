@@ -195,7 +195,7 @@
       "pattern": "^[^:]+:(r[0-9]+\\.)?[0-9]+$"
     },
     "DiffValue": {
-      "description": "A value on one side: a state value, a header, a body or part of one, an SQL row; null when that side has none. A value with a subject is never shown, nor is the subject id: a state value, body or header value is `{\"redacted\": true, \"subject\": \"s:<12 hex>\", \"hash\": \"k:<16 hex>\"}`, a value in an SQL row `\"[redacted:s:<12 hex>:k:<16 hex>]\"`. `s:` is a keyed hash of the subject id (equal subjects give equal ones), `k:` a keyed hash of the subject and the value; both are `-` when the diff was built without the master key (`kronik upgrade check`). In a `--no-pii` fork, what a turn that used SQL produced is redacted under the subject `[sql]`, shown as is."
+      "description": "A value on one side: a state value, a header, a body or part of one, an SQL row; null when that side has none. A blob body (M25) is `{\"blob\": \"b3:…\", \"size\": N}`: its identity and size, never its bytes or its subject. A value with a subject is never shown, nor is the subject id: a state value, body or header value is `{\"redacted\": true, \"subject\": \"s:<12 hex>\", \"hash\": \"k:<16 hex>\"}`, a value in an SQL row `\"[redacted:s:<12 hex>:k:<16 hex>]\"`. `s:` is a keyed hash of the subject id (equal subjects give equal ones), `k:` a keyed hash of the subject and the value; both are `-` when the diff was built without the master key (`kronik upgrade check`). In a `--no-pii` fork, what a turn that used SQL produced is redacted under the subject `[sql]`, shown as is."
     },
     "DiffBase": {
       "description": "Where the fork starts and which root inputs ran.",
@@ -987,7 +987,7 @@
           }
         },
         "body": {
-          "description": "When both bodies are JSON, the operations from production's body to the fork's, by JSON Pointer; otherwise one `replace` at the path `\"\"` with each body as text (or base64).",
+          "description": "When both bodies are JSON, the operations from production's body to the fork's, by JSON Pointer; otherwise one `replace` at the path `\"\"` with each body as text (or base64). A blob body (M25) is compared by reference and shown as `{\"blob\": \"b3:…\", \"size\": N}`.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/DiffBodyOp"

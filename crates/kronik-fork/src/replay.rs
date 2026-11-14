@@ -119,6 +119,9 @@ pub struct ReplaySetup {
     /// The budget of one turn's record (`kronik_sched::record_budget`):
     /// production's, so a replay makes the decisions production made.
     pub record_limit: usize,
+    /// The node's blob store (M25 §9): fork turns read blobs from it and
+    /// write new ones to the fork's space. None: blobs are off.
+    pub blobs: Option<Arc<kronik_blob::BlobStore>>,
     dispatch: ReplayDispatch,
 }
 
@@ -206,6 +209,7 @@ impl ReplaySetup {
             rebase: false,
             preview: false,
             record_limit: kronik_sched::record_budget::turn_limit(kronik_log::MAX_RECORD as usize),
+            blobs: None,
             dispatch,
         }
     }
@@ -1233,13 +1237,16 @@ impl Runner {
             limits,
             subject: p.subject.clone(),
         };
+        let blob_bytes = req.limits.blob_bytes;
         let run = kind
             .program
-            .run(
+            .run_with_blobs(
                 req,
                 state.clone(),
                 Some(Box::new(SqlHandle(sql.clone()))),
                 Some(Arc::new(GateHandle(gate.clone()))),
+                fork_blob_host(&self.setup, &gate, blob_bytes)
+                    .map(|host| Arc::new(host) as Arc<dyn kronik_runtime::BlobHost>),
             )
             .await;
         let mut out = match run {
@@ -1667,6 +1674,38 @@ fn inline_request_body(body: &FetchBody) -> Result<&[u8], GateError> {
             "NOT_IMPLEMENTED: blob request bodies are not supported in forks yet".into(),
         )),
     }
+}
+
+/// A fork turn's blob host (M25 §9): new blobs go to the fork's space,
+/// and reads find main's blobs too. Writes are scrubbed of the secret
+/// values the fork turn used, as its outputs are.
+fn fork_blob_host(
+    setup: &ReplaySetup,
+    gate: &Arc<ReplayGate>,
+    limit: u64,
+) -> Option<kronik_sched::blobs::TurnBlobs> {
+    let store = setup.blobs.clone()?;
+    let gate = gate.clone();
+    let secrets: kronik_sched::blobs::SecretSource = Arc::new(move || {
+        lock(&gate.state)
+            .secrets
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    Arc::new(zeroize::Zeroizing::new(value.clone())),
+                )
+            })
+            .collect()
+    });
+    Some(kronik_sched::blobs::TurnBlobs::new(
+        store.clone(),
+        kronik_blob::Space::Fork(setup.fork.clone()),
+        store.env().clone(),
+        setup.privacy.sealer.clone(),
+        secrets,
+        limit,
+    ))
 }
 
 /// The replay effect gate of one fork turn.
@@ -2475,8 +2514,17 @@ impl ReplayGate {
             method: req.method.clone(),
             url: req.url.clone(),
             headers,
-            body: inline_request_body(&req.body)?.to_vec(),
+            body: match &req.body {
+                FetchBody::Inline(bytes) => bytes.clone(),
+                FetchBody::Blob(_) | FetchBody::NotHeld { .. } => Vec::new(),
+            },
             fingerprint_version: 2,
+            // A blob body is recorded as its reference, as production does
+            // (M25 §7.2), so the fingerprints agree.
+            body_blob: match &req.body {
+                FetchBody::Blob(blob) => Some(blob.clone()),
+                _ => None,
+            },
             ..Default::default()
         };
         // Keyed for a subject's request, as production records it.
@@ -2596,6 +2644,14 @@ impl ReplayGate {
                 self.push(rec)?;
                 return out;
             }
+        }
+        // A body the turn may not use is a denial (M25 §7.2): production's
+        // recording of it was matched above; without one, the fork denies
+        // in production's words.
+        if let FetchBody::NotHeld { hash, size } = &req.body {
+            let error = kronik_sched::effects::not_held_error(hash, *size);
+            self.push(self.denied(ordinal, kind, cap, error.clone()))?;
+            return Ok(FetchOutcome::Denied(error));
         }
         let setup = &self.runner.setup;
         let sims = setup.simulators.target(&original_cap);

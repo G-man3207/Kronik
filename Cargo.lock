@@ -2108,6 +2108,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "boon",
+ "kronik-blob",
  "kronik-core",
  "kronik-effects",
  "kronik-gateway",

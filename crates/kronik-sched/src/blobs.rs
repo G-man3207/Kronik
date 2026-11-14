@@ -27,17 +27,18 @@ use crate::effects::{FxState, secret_patterns};
 const SCRUB_BUFFER_BYTES: usize = 16 << 20;
 
 /// The secret values a turn has used or revealed, by name.
-pub(crate) type SecretValues = Vec<(String, Arc<zeroize::Zeroizing<Vec<u8>>>)>;
+pub type SecretValues = Vec<(String, Arc<zeroize::Zeroizing<Vec<u8>>>)>;
 /// Where a turn's blob host reads them, at each write.
-pub(crate) type SecretSource = Arc<dyn Fn() -> SecretValues + Send + Sync>;
+pub type SecretSource = Arc<dyn Fn() -> SecretValues + Send + Sync>;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// One turn's blob host. Cloning shares it.
+/// One turn's blob host. Cloning shares it. The scheduler gives one to
+/// every turn; the fork engine to every fork turn, in the fork's space.
 #[derive(Clone)]
-pub(crate) struct TurnBlobs(Arc<Inner>);
+pub struct TurnBlobs(Arc<Inner>);
 
 struct Inner {
     store: Arc<BlobStore>,
@@ -64,7 +65,10 @@ struct Slot {
 }
 
 impl TurnBlobs {
-    pub(crate) fn new(
+    /// A host writing to `space` of `store` under a new lease, reading
+    /// subjects' keys from `sealer`, scrubbing writes of what `secrets`
+    /// gives, at most `limit` bytes per blob.
+    pub fn new(
         store: Arc<BlobStore>,
         space: Space,
         env: Env,
@@ -206,7 +210,7 @@ impl TurnBlobs {
 
     /// Names every blob the turn finished durably (ADR 0117 §4); called
     /// before the turn's record is appended.
-    pub(crate) async fn ensure_durable(&self) -> Result<(), BlobError> {
+    pub async fn ensure_durable(&self) -> Result<(), BlobError> {
         let ids = lock(&self.0.created).clone();
         if ids.is_empty() {
             return Ok(());

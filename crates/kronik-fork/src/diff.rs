@@ -1139,6 +1139,55 @@ fn http_body(r: &pb::HttpResponse) -> Option<&pb::Sealable> {
     }
 }
 
+/// A response's blob body (M25): compared and shown by reference.
+fn http_blob(r: &pb::HttpResponse) -> Option<&pb::BlobRef> {
+    match r.body.as_ref().and_then(|b| b.value.as_ref()) {
+        Some(pb::body::Value::Blob(blob)) => Some(blob),
+        _ => None,
+    }
+}
+
+/// A blob as the diff shows it (M25 §9): its identity and size, never its
+/// bytes or its subject.
+fn blob_json(blob: &pb::BlobRef) -> Value {
+    json!({ "blob": blob.hash, "size": blob.size })
+}
+
+fn same_blob(a: &pb::BlobRef, b: &pb::BlobRef) -> bool {
+    a.hash == b.hash && a.size == b.size
+}
+
+/// The body operations of two HTTP responses: a blob body is compared by
+/// reference (equal identity and size is unchanged), else as `body_ops`.
+fn response_body_ops(
+    n: &Norm,
+    p: Option<&pb::HttpResponse>,
+    f: Option<&pb::HttpResponse>,
+) -> Vec<BodyOp> {
+    let (pb_, fb) = (p.and_then(http_blob), f.and_then(http_blob));
+    if pb_.is_none() && fb.is_none() {
+        return body_ops(n, p.and_then(http_body), f.and_then(http_body));
+    }
+    if let (Some(a), Some(b)) = (pb_, fb)
+        && same_blob(a, b)
+    {
+        return Vec::new();
+    }
+    let side = |r: Option<&pb::HttpResponse>| match r {
+        Some(r) => match http_blob(r) {
+            Some(blob) => blob_json(blob),
+            None => sealable_json(&n.sealer, http_body(r)),
+        },
+        None => Value::Null,
+    };
+    vec![BodyOp {
+        op: "replace".into(),
+        path: String::new(),
+        prod: side(p),
+        fork: side(f),
+    }]
+}
+
 /// Everything §4 compares, normalized.
 #[derive(PartialEq)]
 struct TurnView {
@@ -1174,7 +1223,18 @@ fn view(t: &pb::TurnRecord, n: &Norm) -> TurnView {
                 }
                 v.push(0);
             }
-            v.extend(n.body_key(http_body(r)));
+            // A blob body is its reference; the tag keeps the two apart.
+            match http_blob(r) {
+                Some(blob) => {
+                    v.push(1);
+                    v.extend_from_slice(blob.hash.as_bytes());
+                    v.extend_from_slice(&blob.size.to_le_bytes());
+                }
+                None => {
+                    v.push(0);
+                    v.extend(n.body_key(http_body(r)));
+                }
+            }
             v
         }
         // M24 (ADR 0116): an open turn's accept, against a refusal's
@@ -1696,9 +1756,33 @@ fn effect_fields(
                 });
             }
         }
+        // A blob request body (M25 §7.2) is compared by reference.
+        let (pblob, fblob) = (
+            pr.as_ref().and_then(|r| r.body_blob.as_ref()),
+            fr.as_ref().and_then(|r| r.body_blob.as_ref()),
+        );
+        let blobs_differ = match (pblob, fblob) {
+            (Some(a), Some(b)) => !same_blob(a, b),
+            (None, None) => false,
+            _ => true,
+        };
+        if blobs_differ {
+            let side = |r: &Option<pb::HttpEffectRequest>| match r {
+                Some(r) => match &r.body_blob {
+                    Some(blob) => blob_json(blob),
+                    None => bytes_json(&r.body),
+                },
+                None => Value::Null,
+            };
+            out.push(FieldDiff {
+                field: "body".into(),
+                prod: shown(&ps, side(&pr)),
+                fork: shown(&fs, side(&fr)),
+            });
+        }
         let pb_ = pr.as_ref().map(|r| r.body.clone());
         let fb = fr.as_ref().map(|r| r.body.clone());
-        if pb_ != fb {
+        if !blobs_differ && pb_ != fb {
             out.push(FieldDiff {
                 field: "body".into(),
                 prod: shown(&ps, pb_.map_or(Value::Null, |b| bytes_json(&b))),
@@ -2344,11 +2428,7 @@ impl Acc {
                 fork: hv(fh.get(n), fsub.get(n)),
             })
             .collect();
-        let body = body_ops(
-            &self.norm,
-            pr.as_ref().and_then(http_body),
-            fr.as_ref().and_then(http_body),
-        );
+        let body = response_body_ops(&self.norm, pr.as_ref(), fr.as_ref());
         let kind = kind_of(prod.1);
         if status.prod == status.fork && headers.is_empty() && body.is_empty() {
             self.kind(kind).responses.unchanged += 1;
@@ -3640,6 +3720,52 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M25 §9: blob bodies compare by reference. Equal identity and size is
+    /// unchanged; another blob, or a blob against inline bytes, is one
+    /// `replace` showing `{"blob", "size"}`, never bytes or a subject.
+    #[test]
+    fn blob_bodies_compare_by_reference() {
+        let norm = Norm::new(&DiffOptions::default(), Arc::new(Sealer::plain()));
+        let blob = |byte: u8, size: u64, subject: Option<&str>| pb::HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(pb::Body {
+                value: Some(pb::body::Value::Blob(pb::BlobRef {
+                    hash: format!("b3:{}", format!("{byte:02x}").repeat(32)),
+                    size,
+                    subject: subject.map(str::to_owned),
+                    key_version: u32::from(subject.is_some()),
+                })),
+            }),
+        };
+        let inline = pb::HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(pb::Body {
+                value: Some(pb::body::Value::Inline(pb::Sealable {
+                    subject: None,
+                    value: Some(pb::sealable::Value::Plain(b"text".to_vec())),
+                })),
+            }),
+        };
+        let a = blob(0xaa, 10, None);
+        assert!(response_body_ops(&norm, Some(&a), Some(&blob(0xaa, 10, None))).is_empty());
+        let other = response_body_ops(&norm, Some(&a), Some(&blob(0xbb, 10, Some("user:1"))));
+        assert_eq!(other.len(), 1);
+        assert_eq!(
+            (other[0].op.as_ref(), other[0].path.as_str()),
+            ("replace", "")
+        );
+        assert_eq!(
+            other[0].prod,
+            json!({"blob": format!("b3:{}", "aa".repeat(32)), "size": 10})
+        );
+        assert!(!other[0].fork.to_string().contains("user:1"));
+        let mixed = response_body_ops(&norm, Some(&a), Some(&inline));
+        assert_eq!(mixed[0].fork, json!("text"));
+        assert!(response_body_ops(&norm, Some(&inline), Some(&inline)).is_empty());
+    }
 
     /// The diff's orphans are the store's (#30): a failed turn's call whose
     /// callee committed and that has no compensation. That is a successful

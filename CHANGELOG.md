@@ -233,6 +233,11 @@ until the v1.0 compatibility promise takes effect.
   as it arrives, scrubbed of the turn's secrets and named durably before
   its result is recorded, and a blob request body is streamed from the store
   with its length. The effect's record holds only the references.
+- Forks replay turns with blobs (M25): a fork's turns read production's
+  blobs and write new ones to the fork's own space, recorded blob responses
+  and blob request bodies replay as production recorded them, and `kronik
+  diff` compares blob bodies by reference, showing `{"blob", "size"}` when
+  they differ.
 - Three new per-kind limits (M25, M26): `blob_threshold_bytes` (bodies above
   it become blobs for code that imports `blobs`, 1 MiB, never above
   `message_bytes`), `upload_bytes` (the largest upload for such code,
