@@ -161,17 +161,19 @@ fn the_index_follows_references_pins_and_the_floor() {
     assert!(db.unrooted_blobs(3).unwrap().is_empty());
     let shard_of = |r: &pb::BlobRef| r.hash[3..5].to_owned();
     assert_eq!(
-        db.rooted_blobs_in_shard(&shard_of(&upload), 3).unwrap(),
+        db.rooted_blobs_in_shard(&shard_of(&upload), 3, None)
+            .unwrap(),
         std::slice::from_ref(&upload.hash)
     );
     // Past the floor only the saved response keeps its blob.
     assert!(
-        db.rooted_blobs_in_shard(&shard_of(&upload), 4)
+        db.rooted_blobs_in_shard(&shard_of(&upload), 4, None)
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        db.rooted_blobs_in_shard(&shard_of(&answer), 4).unwrap(),
+        db.rooted_blobs_in_shard(&shard_of(&answer), 4, None)
+            .unwrap(),
         std::slice::from_ref(&answer.hash)
     );
     assert_eq!(
@@ -247,7 +249,7 @@ fn a_blob_of_an_erased_subject_is_marked_and_kept_by_nothing() {
     db.apply(&[at(2, begin("e1", http(Some(&theirs), "")))])
         .unwrap();
     assert!(db.blob(&theirs.hash).unwrap().unwrap().erased);
-    assert!(db.rooted_blobs_in_shard("ab", 1).unwrap().is_empty());
+    assert!(db.rooted_blobs_in_shard("ab", 1, None).unwrap().is_empty());
     assert!(db.state_blob_roots().unwrap().is_empty());
 }
 
@@ -362,7 +364,7 @@ fn holds_follow_retain_and_release() {
     assert_ne!(crate::snapshot::hash_for_test(&db, &["blob_refs"]), none);
     // Held, so kept far below the floor.
     assert_eq!(
-        db.rooted_blobs_in_shard("11", 1000).unwrap(),
+        db.rooted_blobs_in_shard("11", 1000, None).unwrap(),
         std::slice::from_ref(&a.hash)
     );
     assert_eq!(db.state_blob_roots().unwrap().len(), 2);
@@ -384,7 +386,11 @@ fn holds_follow_retain_and_release() {
         db.released_by(&a.hash).unwrap(),
         Some(("media".into(), "a".into(), 2))
     );
-    assert!(db.rooted_blobs_in_shard("11", 1000).unwrap().is_empty());
+    assert!(
+        db.rooted_blobs_in_shard("11", 1000, None)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(crate::snapshot::hash_for_test(&db, &["blob_refs"]), none);
 
     let err = db
@@ -412,6 +418,51 @@ fn holds_follow_retain_and_release() {
         )])
         .unwrap_err();
     assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
+}
+
+/// Below the floor, a blob that only a pending timer keeps is rooted; the
+/// simulator's mutation "a sweep that ignores timers" leaves exactly the
+/// timers' pins out (a queued message's blob stays rooted).
+#[test]
+fn a_timer_keeps_its_blob_unless_the_roots_leave_timers_out() {
+    let mut db = db();
+    // Two blobs of shard 31.
+    let in_31 = |n: u8, size| pb::BlobRef {
+        hash: format!("b3:31{}", format!("{n:02x}").repeat(31)),
+        size,
+        subject: None,
+        key_version: 0,
+    };
+    let (m, t) = (in_31(0x01, 10), in_31(0x02, 20));
+    let out = pb::OutboundMessage {
+        to: Some(pb::ActorRef {
+            kind: "media".into(),
+            key: "b".into(),
+        }),
+        msg: Some(msg_with(vec![m.clone()])),
+        ordinal: 1,
+        message_id: "m1".into(),
+    };
+    let schedule = pb::TimerOp {
+        kind: pb::TimerOpKind::Schedule as i32,
+        timer_id: 7,
+        due_ms: 99,
+        msg: Some(msg_with(vec![t.clone()])),
+        ordinal: 2,
+    };
+    db.apply(&[at(
+        1,
+        turn("e1", operator(), true, vec![], vec![out], vec![schedule]),
+    )])
+    .unwrap();
+    let mut both = vec![m.hash.clone(), t.hash.clone()];
+    both.sort();
+    assert_eq!(db.rooted_blobs_in_shard("31", 1000, None).unwrap(), both);
+    assert_eq!(
+        db.rooted_blobs_in_shard("31", 1000, Some(source::TIMER))
+            .unwrap(),
+        std::slice::from_ref(&m.hash)
+    );
 }
 
 /// A queued message, a scheduled timer, a dead letter and a saved call

@@ -174,6 +174,7 @@ impl BlobStore {
                     continue;
                 }
                 let erased = options.erased_now
+                    && !self.mutation_sweep_ignores_erasures
                     && !options.dry_run
                     && header_subject(&*file)
                         .await

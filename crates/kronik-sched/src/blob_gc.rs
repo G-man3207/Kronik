@@ -232,6 +232,9 @@ fn forks(data: &Path, branch: &str) -> Vec<ForkRoots> {
 struct NodeRoots {
     node: Arc<Node>,
     floor: Lsn,
+    /// A pin source left out of the roots: only the simulator's mutation
+    /// "a sweep that ignores timers" sets it.
+    ignored: Option<i64>,
     /// Snapshots' and forks' roots, read when the pass began.
     other: BTreeSet<BlobId>,
     /// Every erased subject and the last key version erased, when the pass
@@ -256,7 +259,7 @@ impl Roots for NodeRoots {
             .node
             .store()
             .db()
-            .rooted_blobs_in_shard(&hex, self.floor)
+            .rooted_blobs_in_shard(&hex, self.floor, self.ignored)
             .map_err(|e| BlobError::Io(e.to_string()))?;
         let mut out: BTreeSet<BlobId> = rooted
             .iter()
@@ -289,6 +292,11 @@ impl Node {
             ApiError::new(ErrorCode::Unavailable, "the node has no data directory")
         })?;
         let mut floor = self.log_first(storage)?;
+        // Tests and the simulator only: retention as if compaction had kept
+        // the last `lag` records (a lag over the log changes nothing).
+        if let Some(lag) = self.cfg.blobs.as_ref().and_then(|b| b.gc_floor_lag) {
+            floor = floor.max(self.applied_lsn().saturating_add(1).saturating_sub(lag));
+        }
         for fork in forks(&storage.data_dir, self.branch()) {
             // A fork whose point cannot be read keeps every record the log
             // holds: the floor goes to the start.
@@ -360,9 +368,16 @@ impl Node {
             erased_now: options.erased_now || !loose.is_empty(),
             ..options
         };
+        let ignored = self
+            .cfg
+            .blobs
+            .as_ref()
+            .is_some_and(|b| b.mutation_sweep_ignores_timers)
+            .then_some(kronik_store::db::blob_source::TIMER);
         let mut roots = NodeRoots {
             node,
             floor,
+            ignored,
             other: self.other_blob_roots()?,
             erased: erased.clone(),
         };

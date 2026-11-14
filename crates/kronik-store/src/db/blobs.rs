@@ -120,9 +120,20 @@ pub mod source {
 }
 
 /// The SQL condition that a `blobs` row (aliased `blobs`) is kept by the
-/// state: a pin or a hold.
-const KEPT_BY_STATE: &str = "(EXISTS (SELECT 1 FROM blob_pins p WHERE p.hash = blobs.hash) \
-     OR EXISTS (SELECT 1 FROM blob_refs h WHERE h.hash = blobs.hash))";
+/// state: a pin or a hold. `$pins` is added to the condition on its pins
+/// (the simulator's mutation "a sweep that ignores timers" only).
+macro_rules! kept_by_state {
+    ($pins:literal) => {
+        concat!(
+            "(EXISTS (SELECT 1 FROM blob_pins p WHERE p.hash = blobs.hash",
+            $pins,
+            ") OR EXISTS (SELECT 1 FROM blob_refs h WHERE h.hash = blobs.hash))"
+        )
+    };
+}
+
+/// [`kept_by_state!`] for every pin.
+const KEPT_BY_STATE: &str = kept_by_state!("");
 
 /// The owner of the pins of a saved idempotent response: the ingress key's
 /// row, its fields separated by the unit separator, which none of them
@@ -817,20 +828,26 @@ impl StateDb {
 
     /// The hashes in shard `shard` (two hex characters) that the index
     /// keeps: every row that is not erased and that the state keeps or
-    /// whose last reference is at or above `floor` (ADR 0120 §3).
+    /// whose last reference is at or above `floor` (ADR 0120 §3). `ignored`
+    /// is always `None` but in the simulator's mutation "a sweep that
+    /// ignores timers": the pins of that source then keep nothing.
     pub fn rooted_blobs_in_shard(
         &self,
         shard: &str,
         floor: Lsn,
+        ignored: Option<i64>,
     ) -> Result<Vec<String>, StoreError> {
         let mut out = Vec::new();
-        let mut statement = self.conn.prepare_cached(&format!(
+        let mut statement = self.conn.prepare_cached(concat!(
             "SELECT hash FROM blobs WHERE hash >= ?1 AND hash < ?2 AND erased = 0 \
-             AND (last_ref_lsn >= ?3 OR {KEPT_BY_STATE}) ORDER BY hash"
+             AND (last_ref_lsn >= ?3 OR ",
+            kept_by_state!(" AND p.source IS NOT ?4"),
+            ") ORDER BY hash"
         ))?;
         for (low, high) in shard_ranges(shard) {
-            let rows =
-                statement.query_map(params![low, high, i(floor)], |r| r.get::<_, String>(0))?;
+            let rows = statement.query_map(params![low, high, i(floor), ignored], |r| {
+                r.get::<_, String>(0)
+            })?;
             for hash in rows {
                 out.push(hash?);
             }

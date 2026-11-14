@@ -711,6 +711,7 @@ async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<
             disk_reserve: config.blobs.disk_reserve_bytes(config.log.disk_reserve.0),
             lease_ttl: config.blobs.lease_ttl.0,
             gc_interval: config.blobs.gc_interval.0,
+            ..kronik_sched::BlobsConfig::default()
         }),
         ..NodeConfig::default()
     };

@@ -231,6 +231,7 @@ impl BlobWorkload {
             disk_reserve: RESERVE,
             lease_ttl: Duration::from_secs(30),
             gc_interval: Duration::from_secs(1),
+            ..BlobsConfig::default()
         }
     }
 }

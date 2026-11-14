@@ -44,6 +44,18 @@ fn start(dir: &Path) -> Proc {
 
 /// [`start`] with leases that live `lease_ttl` without renewal.
 fn start_with(dir: &Path, lease_ttl: Duration) -> Proc {
+    start_blobs(
+        dir,
+        BlobsConfig {
+            gc_interval: Duration::ZERO,
+            lease_ttl,
+            ..BlobsConfig::default()
+        },
+    )
+}
+
+/// [`start`] with `blobs` as the node's `[blobs]` settings.
+fn start_blobs(dir: &Path, blobs: BlobsConfig) -> Proc {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -59,11 +71,7 @@ fn start_with(dir: &Path, lease_ttl: Duration) -> Proc {
             storage: Some(storage),
             segment_max_bytes: Some(4096),
             ingress_ttl: Duration::from_secs(3600),
-            blobs: Some(BlobsConfig {
-                gc_interval: Duration::ZERO,
-                lease_ttl,
-                ..BlobsConfig::default()
-            }),
+            blobs: Some(blobs),
             ..NodeConfig::default()
         };
         start_local(env, dir, config).await.unwrap()
@@ -537,4 +545,33 @@ fn an_erased_row_stays_while_its_object_is_shipped() {
     let after = p.gc(SweepOptions::default());
     assert_eq!(after.forgotten, 1, "{after:?}");
     assert!(p.node.store().db().blob(&blob.hash).unwrap().is_none());
+}
+
+/// The simulator's retention (`gc_floor_lag`): records more than `lag` LSNs
+/// behind the applied one are below the collector's floor, as if compaction
+/// had deleted them; a lag over the log, or none, leaves the floor at the
+/// log's first record.
+#[test]
+fn a_floor_lag_moves_the_floor_behind_the_applied_record() {
+    let lagged = |lag| BlobsConfig {
+        gc_interval: Duration::ZERO,
+        gc_floor_lag: lag,
+        ..BlobsConfig::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let p = start_blobs(dir.path(), lagged(Some(3)));
+    for key in ["k1", "k2", "k3", "k4"] {
+        p.blob_turn(1000, key);
+    }
+    let applied = p.node.applied_lsn();
+    assert!(applied > 4, "{applied}");
+    assert_eq!(p.node.blob_floor().unwrap(), applied + 1 - 3);
+    drop(p);
+
+    for lag in [None, Some(1_000_000)] {
+        let dir = tempfile::tempdir().unwrap();
+        let p = start_blobs(dir.path(), lagged(lag));
+        p.blob_turn(1000, "k1");
+        assert_eq!(p.node.blob_floor().unwrap(), 1, "lag {lag:?}");
+    }
 }

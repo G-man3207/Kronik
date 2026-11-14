@@ -230,6 +230,16 @@ pub struct BlobsConfig {
     /// `[blobs] gc_interval`: the collector's pass, besides the one after
     /// every retention pass; zero runs it only on demand.
     pub gc_interval: Duration,
+    /// Tests and the simulator: records more than `lag` LSNs behind the
+    /// applied one count as out of retention for the collector, as if
+    /// compaction had deleted them ([`Node::blob_floor`]). Always `None`
+    /// outside them; never set by `kronik serve`.
+    #[doc(hidden)]
+    pub gc_floor_lag: Option<u64>,
+    /// Deliberate bug (mutation testing of the harness); never set outside
+    /// the simulator: the collector's roots leave out what timers keep.
+    #[doc(hidden)]
+    pub mutation_sweep_ignores_timers: bool,
 }
 
 impl Default for BlobsConfig {
@@ -238,6 +248,8 @@ impl Default for BlobsConfig {
             disk_reserve: 0,
             lease_ttl: Duration::from_secs(300),
             gc_interval: Duration::from_secs(3600),
+            gc_floor_lag: None,
+            mutation_sweep_ignores_timers: false,
         }
     }
 }
