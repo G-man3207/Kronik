@@ -84,7 +84,9 @@ const TOOLS: &[Spec] = &[
             with its error code, state writes, messages sent, SQL changes, effects and fuel. \
             An effect that used a secret lists it in `secrets` (name, version and the first 8 \
             hex characters of the version hash, never a value), so a rotation shows as a new \
-            version. To page, pass the previous result's `next` as `before`.",
+            version. A connection turn's `connection_ops` are its sends and closes on WebSocket \
+            and SSE connections, with the frames' fates; `connection` limits the history to one \
+            connection's turns. To page, pass the previous result's `next` as `before`.",
         mutates: false,
         dry_run: false,
         destructive: false,
@@ -93,6 +95,7 @@ const TOOLS: &[Spec] = &[
                 json!({
                     "actor": actor_property(),
                     "before": {"type": "integer", "minimum": 0, "description": "Only turns before this LSN: the previous result's `next`."},
+                    "connection": {"type": "string", "description": "Only this connection's inputs and the turns that sent to it or closed it."},
                     "limit": {"type": "integer", "minimum": 1, "description": "At most this many turns."}
                 }),
                 &["actor"],
@@ -154,6 +157,40 @@ const TOOLS: &[Spec] = &[
         output: || {
             result(json!({
                 "dead_letters": {"type": "array", "items": {"type": "object", "description": "{id, actor, input, error_code, message, resent_as}"}}
+            }))
+        },
+    },
+    Spec {
+        name: "list_connections",
+        title: "List connections",
+        scope: "read",
+        description: "Long-lived WebSocket and SSE connections (M24), in id order: their \
+            owner, protocol, route, state, open turn, close (initiator, cause, code) and frame \
+            counts by fate (written, queued, dropped, unknown); the subject only with pii:read. \
+            Open ones by default. With `id`, the one connection. To page, pass the previous \
+            result's `next` as `after`. Closing a connection is an operator's command \
+            (`kronik connections close`), not a tool.",
+        mutates: false,
+        dry_run: false,
+        destructive: false,
+        input: || {
+            object(
+                json!({
+                    "id": {"type": "string", "description": "One connection: `c-` and 32 hex characters."},
+                    "actor": {"type": "string", "description": "Only the connections this actor (`kind/key`) accepted."},
+                    "kind": {"type": "string", "description": "Only the connections of actors of this kind."},
+                    "state": {"type": "string", "enum": ["open", "closed", "all"], "description": "`open` (the default; also closing), `closed` or `all`."},
+                    "after": {"type": "string", "description": "Start after this connection id: the previous result's `next`."},
+                    "limit": {"type": "integer", "minimum": 1, "description": "At most this many connections."}
+                }),
+                &[],
+            )
+        },
+        output: || {
+            result(json!({
+                "connections": {"type": "array", "items": {"type": "object", "description": "{id, actor, protocol, route, state, opened, closed, frames, live, subject}"}},
+                "next": {"type": ["string", "null"], "description": "Pass as `after` for the next page; null at the end."},
+                "id": {"type": "string", "description": "With `id`: the connection itself, not a list."}
             }))
         },
     },
@@ -504,7 +541,7 @@ pub(crate) async fn call(
             .actor()
             .map(|(kind, key)| Request::get(format!("/v1/actors/{kind}/{key}"), String::new())),
         "query_history" => args.actor().and_then(|(kind, key)| {
-            let q = args.query(&["before", "limit"])?;
+            let q = args.query(&["before", "connection", "limit"])?;
             Ok(Request::get(format!("/v1/actors/{kind}/{key}/history"), q))
         }),
         "trace_turn" => args
@@ -513,6 +550,14 @@ pub(crate) async fn call(
         "list_dead_letters" => args
             .query(&["after", "limit"])
             .map(|q| Request::get("/v1/dead-letters".into(), q)),
+        "list_connections" => match args.0.get("id") {
+            Some(_) => args
+                .segment("id")
+                .map(|id| Request::get(format!("/v1/connections/{id}"), String::new())),
+            None => args
+                .query(&["actor", "kind", "state", "after", "limit"])
+                .map(|q| Request::get("/v1/connections".into(), q)),
+        },
         "create_fork" => Ok(args.post("/v1/forks".into(), &["at", "name", "no_pii"])),
         "send_to_fork" => args.segment("fork").and_then(|fork| {
             let (kind, key) = args.actor()?;

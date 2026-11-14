@@ -2924,6 +2924,7 @@ route needs:
 | `list_actors`, `inspect_actor` | `read` | Actors and their state |
 | `query_history`, `trace_turn` | `read` | History and causal trees |
 | `list_dead_letters` | `read` | Failed inputs and uncertain effects |
+| `list_connections` | `read` | WebSocket and SSE connections, or one by `id`; closing one is an operator's command |
 | `create_fork`, `send_to_fork` | `fork` | Forks, without personal data for a token without `pii:read`, and messages into them |
 | `propose_change` | `propose` | Replays recent traffic through new code; the proposal, its diff summary and the next commands |
 | `get_diff` | `read` | The whole behavior diff of a proposal or a fork |

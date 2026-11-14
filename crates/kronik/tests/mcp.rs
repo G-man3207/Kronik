@@ -156,12 +156,13 @@ async fn call(
     }
 }
 
-const TOOLS: [&str; 13] = [
+const TOOLS: [&str; 14] = [
     "create_fork",
     "explain",
     "get_diff",
     "inspect_actor",
     "list_actors",
+    "list_connections",
     "list_dead_letters",
     "promote",
     "propose_change",
@@ -254,6 +255,22 @@ async fn over_streamable_http(daemon: &Daemon) {
     );
     let dead = call(&client, "list_dead_letters", json!({})).await.unwrap();
     assert_eq!(dead["dead_letters"], json!([]));
+    // M24: the counter holds no connections; an unknown one is an error.
+    let conns = call(&client, "list_connections", json!({"state": "all"}))
+        .await
+        .unwrap();
+    assert_eq!(conns["connections"], json!([]), "{conns}");
+    let missing = call(
+        &client,
+        "list_connections",
+        json!({"id": "c-00000000000000000000000000000000"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        missing.to_string().contains("CONNECTION_NOT_FOUND"),
+        "{missing}"
+    );
     let turn_id = history["turns"][0]["turn_id"].as_str().unwrap();
     let trace = call(&client, "trace_turn", json!({"turn_id": turn_id}))
         .await

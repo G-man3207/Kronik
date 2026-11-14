@@ -69,6 +69,10 @@ personal data unless your token has `pii:read`.
   to it, and every turn it caused. Use it to see why something happened.
 - `list_dead_letters` lists inputs that failed and effects with an uncertain
   outcome, with their error codes.
+- `list_connections` lists an app's WebSocket and SSE connections: owner,
+  route, state, close and frame counts. `query_history` with `connection`
+  gives one connection's turns, with what each sent and whether the frames
+  were written.
 
 ### 3. Make the change
 
@@ -217,6 +221,7 @@ the effects that cannot be undone; it needs a human's approval, then
 | `list_actors`, `inspect_actor` | `read` | Actors and their state |
 | `query_history`, `trace_turn` | `read` | History and causal trees |
 | `list_dead_letters` | `read` | Failed inputs and uncertain effects |
+| `list_connections` | `read` | WebSocket and SSE connections, or one by `id`; closing one is an operator's command |
 | `create_fork`, `send_to_fork` | `fork` | Forks and messages into them; never live effects |
 | `propose_change` | `propose` | Replays recent traffic through new code; returns the proposal and its diff summary |
 | `get_diff` | `read` | The whole behavior diff of a proposal or a fork |
