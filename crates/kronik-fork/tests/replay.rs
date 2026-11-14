@@ -1430,3 +1430,156 @@ fn identity_replay_across_a_fingerprint_rules_change_is_exact() {
     assert_eq!(after.fingerprint_excluded_headers, ["x-api-key"]);
     assert_eq!(after.fingerprint_excluded_query, ["ts"]);
 }
+
+/// Calls that timed out in production: the fork serves the recorded timeout
+/// to the caller, as it serves other recorded effects, and runs the callee's
+/// turn where production ran it, so identity replay over them is empty. One
+/// caller gave up on its call and committed; one failed, and its call's
+/// compensation went out once the callee committed (#30).
+#[test]
+fn identity_replay_over_timed_out_calls_is_empty() {
+    use kronik_proto::log::v1 as pb;
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "counter".into(),
+            effect_timeout_ms: Some(100),
+            fuel: Some(5_000_000_000),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    let fork_lsn = p.settle();
+    // Keeps `key` busy for about 0.75 s, so a call to it times out.
+    let busy = |key: &str| {
+        let started = p.node.probe.turns_run.load(Ordering::SeqCst);
+        p.http_detached(key, "spin", "250000000");
+        while p.node.probe.turns_run.load(Ordering::SeqCst) == started {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    busy("b");
+    let r = p.send("counter/a", "call", "counter/b increment");
+    assert!(r.committed(), "{:?}", r.outcome);
+    busy("d");
+    let r = p.send("counter/c", "call-fail", "counter/d increment increment");
+    assert!(!r.committed(), "{:?}", r.outcome);
+    // The callees run the calls after their spins (d also the compensation);
+    // settling alone may return while they still spin.
+    let n = |key: &str| p.node.store().db().kv_get("counter", key, "n").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while (n("b").as_deref(), n("d").as_deref()) != (Some(b"1".as_slice()), Some(b"2".as_slice())) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the callees did not run: b {:?}, d {:?}",
+            n("b"),
+            n("d")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let to = p.settle();
+    // Both calls timed out in production.
+    let timed_out = (fork_lsn + 1..=to)
+        .filter_map(|l| p.rt.block_on(p.node.read_record(l)).unwrap())
+        .filter_map(|c| match c.record {
+            kronik_proto::Record::TurnRecord(t) => Some(t),
+            _ => None,
+        })
+        .flat_map(|t| t.effects)
+        .filter(|e| e.timed_out_call())
+        .count();
+    assert_eq!(timed_out, 2);
+    for mode in [Mode::Both, Mode::Isolated] {
+        let out = replay(&p, None, fork_lsn, &opts(mode), 2);
+        let s = &out.diff.summary;
+        assert!(
+            !s.changed,
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&out.bytes)
+        );
+        assert_eq!(
+            (s.turns_prod, s.divergent_turns),
+            (s.turns_fork, 0),
+            "{mode:?}"
+        );
+    }
+}
+
+/// A call that timed out and was then lost with its process: the next start
+/// closed it as a callee turn that never ran (`UNAVAILABLE`), and the
+/// failed caller's compensation was dropped (#30). The fork serves the
+/// caller its recorded timeout and records the callee's turn as production
+/// did, without running it, so identity replay is empty.
+#[test]
+fn identity_replay_over_a_call_lost_to_a_restart_is_empty() {
+    use kronik_proto::log::v1 as pb;
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "counter".into(),
+            effect_timeout_ms: Some(100),
+            fuel: Some(5_000_000_000),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    let fork_lsn = p.settle();
+    let started = p.node.probe.turns_run.load(Ordering::SeqCst);
+    p.http_detached("e", "spin", "250000000");
+    while p.node.probe.turns_run.load(Ordering::SeqCst) == started {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let r = p.send("counter/c", "call-fail", "counter/e increment increment");
+    assert!(!r.committed(), "{:?}", r.outcome);
+    // The queued call goes with the process.
+    drop(p);
+    let p = Proc::open(
+        dir.path(),
+        kronik_sched::NodeConfig {
+            concurrency: 8,
+            ..kronik_sched::NodeConfig::default()
+        },
+    );
+    let to = p.settle();
+    let closed: Vec<pb::TurnRecord> = (fork_lsn + 1..=to)
+        .filter_map(|l| p.rt.block_on(p.node.read_record(l)).unwrap())
+        .filter_map(|c| match c.record {
+            kronik_proto::Record::TurnRecord(t)
+                if t.actor.as_ref().is_some_and(|a| a.key == "e") =>
+            {
+                Some(t)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(
+        closed[0].outcome.as_ref().unwrap().error_code,
+        "UNAVAILABLE"
+    );
+    assert!(closed[0].random_seed.is_empty(), "it never ran");
+    let n = p.node.store().db().kv_get("counter", "e", "n").unwrap();
+    assert_eq!(n, None, "neither the call nor its compensation ran");
+    for mode in [Mode::Both, Mode::Isolated] {
+        let out = replay(&p, None, fork_lsn, &opts(mode), 2);
+        let s = &out.diff.summary;
+        assert!(
+            !s.changed,
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&out.bytes)
+        );
+        assert_eq!(
+            (s.turns_prod, s.divergent_turns),
+            (s.turns_fork, 0),
+            "{mode:?}"
+        );
+    }
+}

@@ -3,7 +3,7 @@
 //! store, the deterministic scheduler, and the replay effect gate (exact,
 //! approximate and synthetic matching; no live effects, I7).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -411,6 +411,27 @@ struct Runner {
     base: Lsn,
     /// The production turns the fork has run (their LSNs).
     ran: Mutex<std::collections::BTreeSet<Lsn>>,
+    /// Calls served their recorded timeout, by call message id: where
+    /// their compensation runs if the callee's turn releases it (#30).
+    timed_out: Mutex<HashMap<String, TimedOutCall>>,
+    /// Callee turns production closed without running them (a call lost to
+    /// a restart, closed at the next start): by causal key, the error code
+    /// and message the fork records instead of running the guest.
+    unrun: Mutex<HashMap<Vec<u8>, (String, String)>>,
+}
+
+/// A call the fork served its recorded timeout (the fork gate's `call`).
+/// Its callee's turn runs as a consequence where production ran it, and its
+/// compensation, if the caller failed, goes out once that turn committed:
+/// the store decides it as production's does (`released_compensation`).
+struct TimedOutCall {
+    /// The compensation's order key.
+    order: Vec<u64>,
+    /// The calling turn's taint when it made the call, which the
+    /// compensation it carries inherits.
+    sql: bool,
+    personal: bool,
+    unverified: bool,
 }
 
 impl Runner {
@@ -436,6 +457,8 @@ impl Runner {
             caught_up: Mutex::new(0),
             leaves: Mutex::new(Vec::new()),
             taint: Arc::new(Mutex::new(Taint::default())),
+            timed_out: Mutex::new(HashMap::new()),
+            unrun: Mutex::new(HashMap::new()),
         })
     }
 
@@ -452,6 +475,43 @@ impl Runner {
 
     fn push(&self, order: Vec<u64>, p: Pending) {
         lock(&self.queue).insert(order, Queued::Turn(Box::new(p)));
+    }
+
+    /// After the callee's turn of a call served its recorded timeout is
+    /// applied at `lsn`: the compensation that turn released, if the caller
+    /// failed first, runs where production ran it, with the caller's taint
+    /// at the call ([`TimedOutCall`]).
+    fn release_compensation(&self, input: &pb::Input, lsn: Lsn) -> Result<(), ReplayError> {
+        let Some(pb::input::Kind::Message(m)) = input.kind.as_ref() else {
+            return Ok(());
+        };
+        let Some(call) = lock(&self.timed_out).remove(&m.message_id) else {
+            return Ok(());
+        };
+        let Some(row) = self.store.db().released_compensation(&m.message_id, lsn)? else {
+            return Ok(());
+        };
+        if self.deferred(&row.causal_key) {
+            return Ok(());
+        }
+        let time = match row.input.kind.as_ref() {
+            Some(pb::input::Kind::Message(sent)) => sent.sent_logical_time_ms,
+            _ => 0,
+        };
+        self.push(
+            call.order,
+            Pending {
+                actor: row.to,
+                input: row.input,
+                key: row.causal_key,
+                time,
+                subject: None,
+                sql: call.sql,
+                personal: call.personal,
+                unverified: call.unverified,
+            },
+        );
+        Ok(())
     }
 
     /// The order key of a child turn: its production LSN when matched,
@@ -916,6 +976,12 @@ impl Runner {
     ) -> BoxFuture<'static, Result<ForkTurn, ReplayError>> {
         Box::pin(async move {
             self.flush_leaves()?;
+            // A callee turn production closed without running it (#30) is
+            // recorded as production recorded it, without running the guest.
+            if let Some((code, message)) = lock(&self.unrun).remove(&causal::encode(&p.key)) {
+                let hash = self.setup.kinds.get(&p.actor.kind).map(|k| k.hash);
+                return self.record_unrun(&p, &order, hash, &code, message);
+            }
             let kind = match self
                 .setup
                 .upgrade_config
@@ -1252,7 +1318,16 @@ impl Runner {
             .outcome
             .as_ref()
             .is_some_and(|o| o.kind == pb::OutcomeKind::Committed as i32);
+        // The callee's turn of a call served its recorded timeout: applying it
+        // decides whether the call's compensation goes out (#30).
+        let resolves_timed_out = match p.input.kind.as_ref() {
+            Some(pb::input::Kind::Message(m)) if m.source == pb::MessageSource::Call as i32 => {
+                lock(&self.timed_out).contains_key(&m.message_id)
+            }
+            _ => false,
+        };
         let leaf = self.isolated
+            && !resolves_timed_out
             && record.messages.is_empty()
             && record.timers.is_empty()
             && compensations.is_empty()
@@ -1271,6 +1346,9 @@ impl Runner {
             self.apply(record.clone())?
         };
         let id = self.next_id(lsn);
+        if resolves_timed_out {
+            self.release_compensation(&p.input, lsn)?;
+        }
         if committed {
             for m in &record.messages {
                 let Some(to) = m.to.as_ref().map(ActorRef::from_pb) else {
@@ -1318,6 +1396,21 @@ impl Runner {
                     continue;
                 }
                 let compensates = causal::message_id(&p.key, m.ordinal);
+                // A timed-out call's compensation goes out with this record
+                // only if its callee's turn committed first; else that turn
+                // releases it (`release_compensation`), or drops it (#30).
+                if record
+                    .effects
+                    .iter()
+                    .any(|e| e.ordinal == m.ordinal && e.timed_out_call())
+                    && self
+                        .store
+                        .db()
+                        .released_compensation(&compensates, lsn)?
+                        .is_none()
+                {
+                    continue;
+                }
                 let order = self.child_order(&order, &key, m.ordinal);
                 self.push(
                     order,
@@ -2867,14 +2960,22 @@ impl ReplayGate {
             .ok_or_else(|| GateError::Host("The call message is missing".into()))?;
         // The request holds the message: it is the message's subject's data.
         let msg_subject = msg.body.as_ref().and_then(|b| b.subject.clone());
+        let plain = blake3::hash(&encoded).as_bytes().to_vec();
+        let sealer = &self.runner.setup.privacy.sealer;
+        // The same request that timed out in production: the fork's own call
+        // never times out, so it serves the recorded outcome instead.
+        let recorded_timeout = self
+            .prod_at(ordinal)
+            .filter(|p| {
+                p.timed_out_call()
+                    && sealer.fingerprint_matches(msg_subject.as_deref(), &p.fingerprint, &plain)
+            })
+            .cloned();
         let mut rec = pb::EffectRecord {
             ordinal,
             kind: "actor.call".into(),
             target: format!("actor:{to}"),
-            fingerprint: self.runner.setup.privacy.sealer.effect_fingerprint(
-                msg_subject.as_deref(),
-                blake3::hash(&encoded).as_bytes().to_vec(),
-            ),
+            fingerprint: sealer.effect_fingerprint(msg_subject.as_deref(), plain),
             request: tagged(&msg_subject, encoded),
             grounding: pb::Grounding::Live as i32,
             ..Default::default()
@@ -2894,12 +2995,25 @@ impl ReplayGate {
                     source: pb::MessageSource::Call as i32,
                     sender: Some(self.actor.to_pb()),
                     msg: Some(msg),
-                    message_id,
+                    message_id: message_id.clone(),
                     sent_logical_time_ms: self.time,
                     call_chain: chain.iter().map(ActorRef::to_pb).collect(),
                     ..Default::default()
                 })),
             };
+            if let Some(recorded) = recorded_timeout {
+                let callee = Pending {
+                    actor: to.clone(),
+                    input,
+                    key,
+                    time: self.time,
+                    subject,
+                    sql: false,
+                    personal: self.saw_personal(),
+                    unverified: self.unverified_so_far(),
+                };
+                return self.served_timeout(recorded, &message_id, callee, order, compensate);
+            }
             let mut turn = self
                 .runner
                 .clone()
@@ -2986,6 +3100,67 @@ impl ReplayGate {
         }
         self.push(rec)?;
         out
+    }
+
+    /// A call that timed out in production, met with the same request: the
+    /// caller gets the recorded timeout, as a recorded effect is served
+    /// (M3), since the fork's own call never times out. The callee's turn
+    /// still runs as a consequence where production ran it (`order`), and
+    /// only if production ran it: a queued call lost to a restart never ran.
+    /// The compensation is recorded as production records it, and goes out
+    /// once the callee's turn committed in the fork (#30, `Runner`).
+    fn served_timeout(
+        &self,
+        mut recorded: pb::EffectRecord,
+        message_id: &str,
+        callee: Pending,
+        order: Vec<u64>,
+        compensate: Option<pb::Message>,
+    ) -> Result<CallOutcome, GateError> {
+        let ordinal = recorded.ordinal;
+        let to = callee.actor.clone();
+        if let Some((_, ran)) = self.runner.setup.index.turn(&callee.key) {
+            // A call lost to a restart: the next start closed it as a turn
+            // that never ran (no seed; m2-effects §5), and so does the fork.
+            let outcome = ran.outcome.clone().unwrap_or_default();
+            if ran.random_seed.is_empty() && outcome.kind != pb::OutcomeKind::Committed as i32 {
+                lock(&self.runner.unrun).insert(
+                    causal::encode(&callee.key),
+                    (outcome.error_code, outcome.message),
+                );
+            }
+            let compensation_key = causal::compensation(&self.key, &self.actor, ordinal, &to);
+            // One lock at a time: the taint helpers lock the state too.
+            let sql = lock(&self.state).sql;
+            let personal = self.saw_personal();
+            let unverified = self.unverified_so_far();
+            let timed_out = TimedOutCall {
+                order: self
+                    .runner
+                    .child_order(&self.order, &compensation_key, ordinal),
+                sql,
+                personal,
+                unverified,
+            };
+            lock(&self.runner.timed_out).insert(message_id.to_owned(), timed_out);
+            self.runner.push(order, callee);
+        }
+        if let Some(c) = compensate {
+            let key = causal::compensation(&self.key, &self.actor, ordinal, &to);
+            let mut compensation = pb::OutboundMessage {
+                to: Some(to.to_pb()),
+                msg: Some(c),
+                ordinal,
+                message_id: causal::causal_id(&key),
+            };
+            let cost = kronik_sched::record_budget::message_cost(&mut compensation);
+            let mut state = lock(&self.state);
+            state.budget.charge(cost);
+            state.compensations.push(compensation);
+        }
+        recorded.grounding = pb::Grounding::Exact as i32;
+        self.push(recorded)?;
+        Ok(CallOutcome::Timeout)
     }
 
     fn crypto(

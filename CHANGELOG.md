@@ -271,6 +271,13 @@ M23, key and secret backends:
   matched under its own rules. Requests without rules stay version 2, byte
   for byte; a binary from before this release refuses a log with version 3
   requests.
+- A fork replayed a call that had timed out in production by running its
+  callee at once (a fork's calls never time out), so the caller got an answer
+  where production's got `timeout`, and an identity replay of that turn
+  showed a change. The fork now serves the recorded timeout to the caller, as
+  it serves other recorded effects, and runs the callee's turn where
+  production ran it; a compensation the call carried goes out once that turn
+  committed, as in production.
 - A timed-out call whose callee had not run it when the daemon stopped was
   lost with the process, and its held compensation and bookkeeping row stayed
   in `state.db` for good. The next start now closes such a call as a failed

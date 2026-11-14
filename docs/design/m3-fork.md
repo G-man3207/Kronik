@@ -123,6 +123,22 @@ the root id).
   in its log, so a reply over what the caller may take is withheld and
   recorded as `HOST_REDACTION_FAILURE` with the callee's status, as in
   production.
+- **Calls that timed out.** The fork's own calls never time out, so a call
+  that timed out in production and makes the same request again (same
+  ordinal and fingerprint) is served its recorded `timeout`, as recorded
+  effects are matched; re-running it would answer the caller where
+  production's caller got `timeout`. The callee's turn still runs, as a
+  consequence at production's position, if production has it. A queued call
+  lost to a restart never ran: the next start closed it as a failed turn
+  without a seed (m2-effects §5), and the fork records that turn the same
+  way, with production's error, without running the guest. If the caller
+  failed, the call's compensation goes out
+  once the callee's turn committed in the fork, as the fork's store decides
+  it for production's rules (#30): with the caller's record when the callee
+  committed first, else when the callee's turn is applied; a callee turn
+  that failed drops it. In isolated replay that callee turn is always
+  applied, not buffered as a leaf, because applying it decides the
+  compensation.
 - **Fork-only timers** (continuous): a timer due at `d` fires at the first
   production position whose logical time is ≥ `d`, before that root input:
   its order key is `[that root input's LSN - 1, u64::MAX, seq]`, which sorts
