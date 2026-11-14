@@ -1161,6 +1161,7 @@ impl StateDb {
             "lsn BETWEEN ?1 AND ?2",
             params![i(sw.first_turn_lsn), i(sw.last_turn_lsn)],
         )?;
+        blobs::apply_switch(&shadow.conn, &tx, actors, base)?;
         apply_deployment(&tx, c.lsn, deployment)?;
         {
             let mut st = tx.prepare_cached("INSERT OR REPLACE INTO meta (k, v) VALUES (?1, ?2)")?;
@@ -2382,8 +2383,10 @@ fn apply_turn(
                     causal.encode_to_vec(),
                     lsn
                 ])?;
+                blobs::pin_timer(tx, kind, key, op.timer_id as i64, msg, lsn)?;
             } else {
                 cancel.execute(params![kind, key, op.timer_id as i64])?;
+                blobs::unpin_timer(tx, kind, key, op.timer_id as i64)?;
             }
         }
     } else {
@@ -2513,6 +2516,7 @@ fn apply_turn(
             ) {
                 tx.prepare_cached("DELETE FROM mailbox WHERE message_id = ?1")?
                     .execute([&m.message_id])?;
+                blobs::unpin(tx, blob_source::MAILBOX, &m.message_id)?;
             }
             if matches!(
                 source,
@@ -2528,6 +2532,9 @@ fn apply_turn(
                      VALUES (?1, ?2, ?3, ?4)",
                 )?
                 .execute(params![m.message_id, lsn, saved, subject])?;
+                if call {
+                    blobs::pin_delivery(tx, &m.message_id, outcome, lsn)?;
+                }
                 if call {
                     resolve_timed_out_call(tx, &m.message_id, kind, key, lsn, committed)?;
                 }
@@ -2545,6 +2552,8 @@ fn apply_turn(
                     "UPDATE dead_letters SET resent_as = ?2 WHERE lsn = ?1 AND resent_as IS NULL",
                 )?
                 .execute(params![i(of.lsn), lsn])?;
+                // The resend's record references the same blobs.
+                blobs::unpin(tx, blob_source::DEAD_LETTER, &i(of.lsn).to_string())?;
             }
             if committed && !m.compensates.is_empty() {
                 tx.prepare_cached(
@@ -2560,6 +2569,7 @@ fn apply_turn(
         Some(pb::input::Kind::Timer(tm)) => {
             tx.prepare_cached("DELETE FROM timers WHERE kind = ?1 AND key = ?2 AND timer_id = ?3")?
                 .execute(params![kind, key, tm.timer_id as i64])?;
+            blobs::unpin_timer(tx, kind, key, tm.timer_id as i64)?;
             if !committed {
                 dead_letter_insert(tx, lsn, kind, key, input, outcome)?;
             }
@@ -2741,6 +2751,7 @@ fn apply_connections(
             "UPDATE dead_letters SET resent_as = ?2 WHERE lsn = ?1 AND resent_as IS NULL",
         )?
         .execute(params![i(of.lsn), lsn])?;
+        blobs::unpin(tx, blob_source::DEAD_LETTER, &i(of.lsn).to_string())?;
     }
     // A failed frame or close turn is a dead letter; a failed open is not
     // (its client got the error). Any client can make its owner fail, so
@@ -2765,6 +2776,7 @@ fn apply_connections(
                  (SELECT lsn FROM connection_dead_letters ORDER BY lsn LIMIT ?1)",
             )?
             .execute([over])?;
+            blobs::prune_orphan_pins(tx, blob_source::DEAD_LETTER)?;
         }
     }
     Ok(())
@@ -2824,6 +2836,7 @@ fn mailbox_insert(
         input.encode_to_vec(),
         causal.encode_to_vec()
     ])?;
+    blobs::pin_message(tx, &m.message_id, input, lsn)?;
     Ok(())
 }
 
@@ -2975,6 +2988,7 @@ fn resolve_timed_out_call(
     } else if let Some(compensation) = &compensation {
         tx.prepare_cached("DELETE FROM mailbox WHERE message_id = ?1")?
             .execute([compensation])?;
+        blobs::unpin(tx, blob_source::MAILBOX, compensation)?;
     }
     tx.prepare_cached("DELETE FROM timed_out_calls WHERE call_message_id = ?1")?
         .execute([call_message_id])?;
@@ -3002,6 +3016,7 @@ fn dead_letter_insert(
         outcome.message,
         input_subject(input)
     ])?;
+    blobs::pin_dead_letter(tx, lsn, input)?;
     Ok(())
 }
 
@@ -3111,6 +3126,9 @@ fn erase_rows(tx: &Connection, subject: &str, key_version: u32) -> Result<(), St
         "DELETE FROM dead_letters WHERE subject = ?1",
     ] {
         tx.prepare_cached(sql)?.execute([subject])?;
+    }
+    for source in [blob_source::INGRESS_KEY, blob_source::DEAD_LETTER] {
+        blobs::prune_orphan_pins(tx, source)?;
     }
     tx.prepare_cached(
         "DELETE FROM connection_dead_letters WHERE lsn NOT IN (SELECT lsn FROM dead_letters)",

@@ -37,6 +37,9 @@ const HASHED_TABLES: &[&str] = &[
     "secret_link_history",
     // M24: derived from the log like every table above.
     "connections",
+    // M26: what actors hold. Rows only, so a state without blobs hashes as
+    // before.
+    "blob_refs",
 ];
 
 /// What `Store::snapshot_to` wrote.
@@ -53,6 +56,21 @@ fn sqlite(e: rusqlite::Error) -> StoreError {
 }
 
 /// Rows of `tables` in key order, type-tagged, into `h`.
+/// The hash of `tables` of `db` (all hashed ones when empty), for tests of
+/// what the state hash covers.
+#[cfg(test)]
+pub(crate) fn hash_for_test(db: &crate::db::StateDb, tables: &[&str]) -> String {
+    assert!(tables.iter().all(|t| HASHED_TABLES.contains(t)));
+    let mut h = blake3::Hasher::new();
+    let tables = if tables.is_empty() {
+        HASHED_TABLES
+    } else {
+        tables
+    };
+    hash_tables(db.conn(), tables, &mut h).unwrap();
+    h.finalize().to_hex().to_string()
+}
+
 fn hash_tables(conn: &Connection, tables: &[&str], h: &mut blake3::Hasher) -> rusqlite::Result<()> {
     for t in tables {
         let cols: Vec<String> = conn

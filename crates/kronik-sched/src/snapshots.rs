@@ -1441,7 +1441,12 @@ impl Node {
             .compact(first, hwm.saturating_sub(ingress_ttl))
             .map_err(store_err)?;
         // The pins of the saved responses compaction deleted (M26 §5.4).
-        self.store().db().prune_blob_pins().map_err(store_err)?;
+        // ... and of saved call outcomes below the blob floor.
+        let floor = self.blob_floor().unwrap_or(first);
+        self.store()
+            .db()
+            .prune_blob_pins(floor)
+            .map_err(store_err)?;
         Ok(first)
     }
 }
