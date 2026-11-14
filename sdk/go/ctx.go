@@ -277,7 +277,10 @@ func (bs Blobs) Put(data []byte) (BlobRef, error) {
 		if err != nil {
 			return BlobRef{}, err
 		}
-		return b, bs.Retain(b)
+		if err := bs.Retain(b); err != nil {
+			return BlobRef{}, err
+		}
+		return b, nil
 	}
 	res := blobs.Put(cm.ToList(data))
 	if res.IsErr() {
