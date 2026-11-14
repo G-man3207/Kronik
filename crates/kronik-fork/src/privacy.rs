@@ -588,11 +588,13 @@ mod tests {
         assert_eq!(v.value, Some(pb::sealable::Value::Plain(b"alice".to_vec())));
     }
 
-    /// A `--no-pii` replay's actor database must not hold production plaintext
-    /// from a subject-tagged SQL row. The database itself is inspected, not
-    /// only a redacted reply.
+    /// A `--no-pii` replay's actor database must not hold production text or
+    /// blob values from a subject-tagged SQL row. The database itself is
+    /// inspected, not only a redacted reply. Integer and real cells are left
+    /// as production recorded them (m8-privacy §9, #70): this test proves
+    /// text and blob cells only.
     #[test]
-    fn no_pii_replay_actor_database_has_no_subject_plaintext() {
+    fn no_pii_replay_actor_database_has_no_subject_text_or_blob_plaintext() {
         use std::collections::BTreeSet;
         use std::sync::Arc;
 

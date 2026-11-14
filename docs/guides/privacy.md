@@ -362,6 +362,13 @@ the row. A snapshot the fork continues is rewritten the same way before
 later changesets are applied. Changesets with no subject are not
 rewritten. Erased subjects stay skipped and unreadable.
 
+Integer and real cells are not pseudonymized, key columns or not: a
+`--no-pii` fork's actors read a subject's numbers (an age, an amount, an
+account number stored as `INTEGER` or `REAL`) as production stored them.
+Store numeric personal data as `TEXT` (or a `BLOB`) when a `--no-pii` fork
+must not see it, for example an account number as `'4711'` rather than
+`4711`. Pseudonymizing numeric cells is left to a later decision.
+
 A `--no-pii` fork still treats a turn that used SQL, called a turn that
 did, or was sent a message or timer by one as personal data: its values
 (reply, writes, messages, effects, outcome message) read `[sql]` in the

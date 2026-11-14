@@ -339,6 +339,14 @@ starts a background compaction that requires the mode to be `on`:
   the fork continues is rewritten the same way before later changesets are
   applied. Changesets with no subject are not rewritten. Erased subjects
   stay skipped and unreadable.
+- **Carve-out: numeric cells (#70).** Integer and real cells are applied as
+  production recorded them, key columns or not: a `--no-pii` guest that
+  selects a subject's age, amount or account number stored as `INTEGER` or
+  `REAL` reads production's number. So "a `--no-pii` guest cannot `SELECT`
+  plaintext that production stored for a subject" holds for text and blob
+  cells only. Store numeric personal data as `TEXT` (or a `BLOB`) where a
+  `--no-pii` fork must not see it. Pseudonymizing non-key numeric cells (a
+  deterministic per-subject value, keys left real) is left to a later ADR.
 - The replay runner marks a turn that read at least one pseudonym. If such a
   turn's result differs from production, the diff calls it `pii-masked`
   instead of `diverged`.

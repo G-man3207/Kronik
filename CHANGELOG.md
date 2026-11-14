@@ -87,6 +87,11 @@ until the v1.0 compatibility promise takes effect.
   unverifiable ([ADR 0109](docs/adr/0109-erased-input-is-unverifiable.md)
   points 7 and 9, now accepted). The check shows the count of unverifiable
   turns right under its verdict, also when it is 0.
+- The privacy guide and the design now state a limit of `--no-pii` forks:
+  they pseudonymize the text and blob cells of a subject's SQL rows only;
+  integer and real cells reach their actors as production stored them.
+  Store numeric personal data as `TEXT` where a `--no-pii` fork must not see
+  it (#70).
 - A fork (a proposal, a preview, a rebase) never creates a key version for
   an erased subject: what it writes of one - its log, and the turns a rebase
   stages into main's log - is the erasure's tombstone. A replay that
