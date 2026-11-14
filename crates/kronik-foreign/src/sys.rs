@@ -3051,11 +3051,12 @@ int main(void) {
 
     /// Descriptors really close, in a process of their own so that no other
     /// test loses a descriptor: with `close_range`, and by hand where the
-    /// kernel has none or refuses it.
+    /// kernel has none or refuses it. The child is this test binary itself:
+    /// it enters no namespace, so it needs no copy (see [`rehearsal_exe`]).
     #[test]
     fn descriptors_above_the_standard_three_are_closed_with_and_without_close_range() {
         for mode in ["quick", "fallback"] {
-            let out = std::process::Command::new(rehearsal_exe())
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "sys::tests::close_descriptors_child",
@@ -3417,7 +3418,19 @@ int main(void) {
             assert_eq!(unsafe { libc::atexit(remove_rehearsal_dir) }, 0);
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
             let copy = dir.join("kronik-foreign");
-            std::fs::copy(&exe, &copy).unwrap();
+            // Copied by `cp`, never written by this process: a test that forks
+            // while this process holds the new file open for writing passes
+            // the descriptor to its child (a helper that never execs keeps
+            // it), and every exec of the copy fails with ETXTBSY ("text file
+            // busy") until that child lets go. This suite's tests fork in
+            // parallel threads, and a busy hosted runner hits that race.
+            let copied = std::process::Command::new("cp")
+                .arg("--")
+                .arg(&exe)
+                .arg(&copy)
+                .status()
+                .unwrap();
+            assert!(copied.success(), "copying the test binary: {copied}");
             std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
             copy
         })
