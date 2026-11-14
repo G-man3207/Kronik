@@ -18,6 +18,11 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use crate::microvm_assets::Assets;
 
 pub(crate) const DATA_BYTES: u64 = 1 << 30;
+/// The two files of a full snapshot in the VMM's `out` directory. The daemon
+/// makes them, empty, before the VMM starts; they are the only files there
+/// that the VMM can write (see `sys::jail_mounts`).
+pub(crate) const SNAPSHOT_MEMORY: &str = "checkpoint.mem";
+pub(crate) const SNAPSHOT_STATE: &str = "checkpoint.state";
 /// Guest RAM is separate from VMM threads, device state and mapped metadata.
 /// Calibration is a required real-KVM conformance result, not a guest quota.
 pub(crate) const VMM_OVERHEAD: u64 = 128 << 20;
@@ -312,6 +317,35 @@ fn private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Opens the snapshot file `name` of the VMM's `output` directory for the
+/// daemon, to read it or to empty it: without following a link or blocking on
+/// a FIFO, and only if it is a regular file with one link. The VMM cannot
+/// replace it (its `out` is read-only and the file a mount of its own); the
+/// daemon does not rely on that.
+pub(crate) fn snapshot_file(output: &Path, name: &str, write: bool) -> io::Result<File> {
+    use std::os::unix::fs::MetadataExt as _;
+    let file = OpenOptions::new()
+        .read(!write)
+        .write(write)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(output.join(name))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(io::Error::other(format!(
+            "the VMM's {name} is not a regular file with one link"
+        )));
+    }
+    Ok(file)
+}
+
+/// Empties both snapshot files of `output`, which frees their space.
+pub(crate) fn empty_snapshot(output: &Path) -> io::Result<()> {
+    for name in [SNAPSHOT_MEMORY, SNAPSHOT_STATE] {
+        snapshot_file(output, name, true)?.set_len(0)?;
+    }
+    Ok(())
+}
+
 /// The guest kernel's command line. Every word is the kernel's own parameter
 /// (`Documentation/admin-guide/kernel-parameters.txt`): `console=ttyS0` is the
 /// serial console, `reboot=k` and `panic=1` end the VM on a reboot request or
@@ -513,6 +547,9 @@ impl Vm {
         private_dir(&start.root.join("dev")).map_err(|e| e.to_string())?;
         private_dir(&start.root.join("out")).map_err(|e| e.to_string())?;
         private_dir(start.output).map_err(|e| e.to_string())?;
+        for name in [SNAPSHOT_MEMORY, SNAPSHOT_STATE] {
+            private_file(&start.output.join(name), &[]).map_err(|e| e.to_string())?;
+        }
         for name in [
             "firecracker",
             "vmlinux",
@@ -748,8 +785,8 @@ impl Vm {
         self.put(
             env,
             "/snapshot/create",
-            json!({"snapshot_type":"Full","snapshot_path":"/out/checkpoint.state",
-            "mem_file_path":"/out/checkpoint.mem","sync_snapshot_files":true}),
+            json!({"snapshot_type":"Full","snapshot_path":format!("/out/{SNAPSHOT_STATE}"),
+            "mem_file_path":format!("/out/{SNAPSHOT_MEMORY}"),"sync_snapshot_files":true}),
         )
         .await
     }
@@ -820,15 +857,9 @@ impl Vm {
         }
     }
 
+    /// Empties the snapshot files: they stay, as the VMM's jail binds them.
     pub fn discard_snapshot(&self) -> io::Result<()> {
-        for name in ["checkpoint.mem", "checkpoint.state"] {
-            match fs::remove_file(self.output.join(name)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
+        empty_snapshot(&self.output)
     }
 
     /// Called only after reap: namespace mounts and guest writes have ended.

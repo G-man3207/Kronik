@@ -445,6 +445,21 @@ private trees private and never copy their modes into a public or executable
 location. A microVM's guest inode modes stay inside its opaque drive; they
 are not host setid files.
 
+A microVM's VMM (M20, experimental) that escaped its guest can change three
+files of the host's data file system and nothing else there: its data drive
+and the two files of a snapshot, which the daemon makes before the VMM starts.
+Its output directory is read-only, so it creates, renames and removes nothing
+in it. Each file it writes is limited to the larger of the data drive (1 GiB)
+and the VM's memory (`RLIMIT_FSIZE`; a write past it ends the VMM), and a data
+drive that grew past its size is refused at the next start or checkpoint.
+`/dev/kvm` is bound read-only: the VMM opens and uses the device, but on a root
+installation, where the VMM is uid 0 and owns the device node, it cannot
+change the node's mode, owner or ACLs. Its jail directory is under
+`[foreign] run_dir`, by default on the `/run` tmpfs, where what it writes
+counts against the VM's memory limit: keep `run_dir` there, as on a disk it
+would not be bounded. Its disk I/O bandwidth is not limited
+([ADR 0095](../adr/0095-pinned-firecracker-guest.md)).
+
 `/run/kronik` is mode 0750 with group `kronik`: whoever may use the API socket
 can list it. The runtime state of the sandboxes beneath it (`runsc/`, `runc/`)
 is mode 0700, because a runtime's state file holds the container's

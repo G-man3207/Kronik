@@ -51,13 +51,18 @@ pub(crate) fn allocate(file: &File, bytes: u64) -> io::Result<()> {
 /// Copy an immutable checkpoint backing file without copying its pages when
 /// the filesystem supports reflinks. The destination must not already exist.
 pub(crate) fn copy(source: &Path, destination: &Path) -> io::Result<u64> {
-    let mut input = OpenOptions::new()
+    let input = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(source)?;
     if !input.metadata()?.is_file() {
         return Err(io::Error::other("checkpoint backing is not a regular file"));
     }
+    copy_from(input, destination)
+}
+
+/// [`copy`] from a regular file the caller opened and checked.
+pub(crate) fn copy_from(mut input: File, destination: &Path) -> io::Result<u64> {
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)

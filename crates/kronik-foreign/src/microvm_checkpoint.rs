@@ -78,39 +78,31 @@ fn host_identity() -> Result<String, String> {
     Ok(crate::blobs::hex(&hash.finalize()))
 }
 
-/// Moves the snapshot Firecracker wrote into `output` to `image/memory` and
-/// `image/state`, and returns the memory file's length. The files are the
-/// guest's memory and state, written with the VMM's umask: they are made
-/// private to the daemon's user whatever that was and wherever they are
-/// published.
+/// Copies the snapshot Firecracker wrote into `output` to `image/memory` and
+/// `image/state`, empties the VMM's files and returns the memory file's
+/// length. The copies are new files private to the daemon's user (0600),
+/// whatever mode the VMM wrote with.
 ///
-/// `output` is the VMM's directory, so what is named `checkpoint.mem` there is
-/// whatever the VMM left: a rename moves a symbolic link as a link, and a
-/// `chmod` by path would follow it and change the mode of its target. So the
-/// moved entry is opened where it landed, in the daemon's private image
-/// directory, without following a link, and must be a regular file with one
-/// link; only then is its mode set, on the descriptor. A snapshot that is
-/// anything else fails the checkpoint, which is discarded.
-fn move_snapshot(output: &Path, image: &Path) -> io::Result<u64> {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+/// The files stay where they are: the VMM's jail binds each of them, and a
+/// rename or an unlink would leave the jail writing to a file the daemon no
+/// longer sees. `output` is the VMM's directory, so each file is opened
+/// without following a link or blocking on a FIFO and must be a regular file
+/// with one link (see `microvm::snapshot_file`); a snapshot that is anything
+/// else, or empty, fails the checkpoint, which is discarded.
+fn copy_snapshot(output: &Path, image: &Path) -> io::Result<u64> {
+    use crate::microvm::{SNAPSHOT_MEMORY, SNAPSHOT_STATE, snapshot_file};
     let mut memory = 0;
-    for (from, to) in [("checkpoint.mem", "memory"), ("checkpoint.state", "state")] {
-        fs::rename(output.join(from), image.join(to))?;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(image.join(to))?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.nlink() != 1 {
-            return Err(io::Error::other(format!(
-                "the VMM's {from} is not a regular file with one link"
-            )));
+    for (from, to) in [(SNAPSHOT_MEMORY, "memory"), (SNAPSHOT_STATE, "state")] {
+        let file = snapshot_file(output, from, false)?;
+        let bytes = crate::microvm_sys::copy_from(file, &image.join(to))?;
+        if bytes == 0 {
+            return Err(io::Error::other(format!("the VMM wrote no {from}")));
         }
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         if to == "memory" {
-            memory = metadata.len();
+            memory = bytes;
         }
     }
+    crate::microvm::empty_snapshot(output)?;
     Ok(memory)
 }
 
@@ -173,8 +165,10 @@ impl Foreign {
             .await
             .ok_or("microVM identity task dropped")??;
         let resources = Resources::new(actor.decl.cpu_millis, actor.decl.memory_bytes)?;
+        // The snapshot's memory is on the disk twice until the VMM's file is
+        // emptied: as the VMM wrote it and as the checkpoint's copy.
         let required = DATA_BYTES
-            .saturating_add(u64::from(resources.guest_mib) << 20)
+            .saturating_add(u64::from(resources.guest_mib) << 21)
             .saturating_add(root_bytes)
             .saturating_add(1 << 20)
             .saturating_add(self.ctx.disk_reserve);
@@ -196,14 +190,7 @@ impl Foreign {
                     fs::remove_dir_all(&temporary)?;
                 }
                 private_dir(&temporary.join("image"))?;
-                for name in ["checkpoint.mem", "checkpoint.state"] {
-                    match fs::remove_file(output.join(name)) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e),
-                    }
-                }
-                Ok(())
+                crate::microvm::empty_snapshot(&output)
             },
         )
         .await
@@ -231,7 +218,7 @@ impl Foreign {
                     let root =
                         crate::microvm_sys::copy(&rootfs, &temporary.join("image/root.ext4"))
                             .map_err(|e| e.to_string())?;
-                    let memory = move_snapshot(&output, &temporary.join("image"))
+                    let memory = copy_snapshot(&output, &temporary.join("image"))
                         .map_err(|e| e.to_string())?;
                     Ok(data.saturating_add(root).saturating_add(memory))
                 },
@@ -518,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_is_moved_into_the_image_and_made_private_to_the_daemon() {
+    fn a_snapshot_is_copied_into_the_image_private_to_the_daemon_and_the_vmms_files_emptied() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let (output, image) = (dir.path().join("out"), dir.path().join("image"));
@@ -530,21 +517,30 @@ mod tests {
         for name in ["checkpoint.mem", "checkpoint.state"] {
             fs::set_permissions(output.join(name), fs::Permissions::from_mode(0o666)).unwrap();
         }
-        assert_eq!(move_snapshot(&output, &image).unwrap(), 4096);
+        assert_eq!(copy_snapshot(&output, &image).unwrap(), 4096);
         for name in ["memory", "state"] {
             let mode = fs::metadata(image.join(name)).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "{name}");
         }
-        assert!(
-            !output.join("checkpoint.mem").exists() && !output.join("checkpoint.state").exists()
-        );
-        // A snapshot that is incomplete moves nothing it cannot and says so.
-        assert!(move_snapshot(&output, &image).is_err());
+        assert_eq!(fs::read(image.join("memory")).unwrap(), vec![7u8; 4096]);
+        assert_eq!(fs::read(image.join("state")).unwrap(), b"state");
+        // The VMM's files stay, empty, for the jail's binds of them.
+        for name in ["checkpoint.mem", "checkpoint.state"] {
+            assert_eq!(fs::metadata(output.join(name)).unwrap().len(), 0, "{name}");
+        }
+        // An empty snapshot, one the VMM did not write, is no checkpoint.
+        let again = dir.path().join("again");
+        fs::create_dir_all(&again).unwrap();
+        assert!(copy_snapshot(&output, &again).is_err());
+        // Nor is one whose files are missing.
+        fs::remove_file(output.join("checkpoint.state")).unwrap();
+        assert!(crate::microvm::empty_snapshot(&output).is_err());
     }
 
-    /// What the VMM leaves as `checkpoint.mem` is its own to choose: a
-    /// link, a second name for a file of the host, a FIFO. None of them is
-    /// followed or changed, and the checkpoint fails.
+    /// Were the VMM able to leave something else as `checkpoint.mem` (its
+    /// `out` is read-only, so it is not): a link, a second name for a file of
+    /// the host, a FIFO. None of them is followed, read, emptied or changed,
+    /// and the checkpoint fails.
     #[test]
     fn a_snapshot_that_is_not_a_plain_file_is_refused_and_nothing_it_names_is_changed() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
@@ -576,8 +572,10 @@ mod tests {
                 }
                 _ => fs::create_dir(&mem).unwrap(),
             }
-            let error = move_snapshot(&output, &image).unwrap_err();
+            let error = copy_snapshot(&output, &image).unwrap_err();
             assert!(!error.to_string().is_empty(), "{case}");
+            // Emptying (a discarded checkpoint) refuses it too.
+            assert!(crate::microvm::empty_snapshot(&output).is_err(), "{case}");
             let after = fs::metadata(&victim).unwrap();
             assert_eq!(
                 after.mode() & 0o7777,

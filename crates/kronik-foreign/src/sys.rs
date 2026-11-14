@@ -1623,7 +1623,34 @@ pub(crate) fn isolate(jail: &MicrovmJail<'_>, kvm: &Path) -> io::Result<()> {
         Forked::Child => {}
     }
     jail_mounts(jail, kvm)?;
+    limit_file_size(file_size_limit(jail.memory_bytes))?;
     seal_capabilities()
+}
+
+/// The largest file the VMM may make or extend: its data disk is `DATA_BYTES`
+/// long and a full snapshot's memory file is as large as the guest's memory,
+/// which is below the VM's `memory_bytes`; the snapshot's state is small.
+/// Writable on the data file system are only those three files (the jail's
+/// `out` is read-only, see [`jail_mounts`]), so this also bounds what a VMM
+/// that escaped its guest can take of that file system.
+pub(crate) fn file_size_limit(memory_bytes: u64) -> u64 {
+    crate::microvm::DATA_BYTES.max(memory_bytes)
+}
+
+/// Sets `RLIMIT_FSIZE`, soft and hard, to `bytes`: a write past it fails with
+/// `EFBIG` and raises `SIGXFSZ`, which ends the VMM. A process without
+/// `CAP_SYS_RESOURCE`, as the VMM is once its capabilities are sealed, cannot
+/// raise a hard limit again. It is inherited through `exec`.
+fn limit_file_size(bytes: u64) -> io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: bytes as libc::rlim_t,
+        rlim_max: bytes as libc::rlim_t,
+    };
+    // SAFETY: setrlimit reads one rlimit.
+    check(
+        unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &raw const limit) },
+        "limiting the size of the VMM's files",
+    )
 }
 
 /// What no process of the jail may gain back through `exec`. The bounding set
@@ -1831,7 +1858,16 @@ pub(crate) fn mount_flags(file: &File) -> io::Result<libc::c_ulong> {
 /// the mounts private, binds the fixed inputs into the jail root (the
 /// read-only ones read-only, nosuid and nodev, with the source mount's other
 /// flags), pivots into the root and detaches the old one. `kvm` is the device
-/// to bind; a test passes a regular file.
+/// to bind; a test passes another character device.
+///
+/// What the VMM can change of the host's files is the data disk and the two
+/// files of a snapshot, which the daemon makes in `out` beforehand: `out`
+/// itself is read-only, so the VMM creates, renames and removes nothing on
+/// the data file system, and each file it can write is bounded by
+/// [`file_size_limit`]. `/dev/kvm` is read-only and nosuid but not nodev: the
+/// VMM still opens it for writing (a read-only mount does not refuse that for
+/// a device) and makes its ioctls, while a root VMM, which owns the host's
+/// device node, can no longer change its mode, owner, times or ACLs.
 pub(crate) fn jail_mounts(jail: &MicrovmJail<'_>, kvm: &Path) -> io::Result<()> {
     // SAFETY: only this process's mount namespace is affected.
     check(
@@ -1860,16 +1896,23 @@ pub(crate) fn jail_mounts(jail: &MicrovmJail<'_>, kvm: &Path) -> io::Result<()> 
         },
         "binding microVM root",
     )?;
-    for (source, target, readonly, directory) in [
-        (jail.firecracker, "firecracker", true, false),
-        (jail.kernel, "vmlinux", true, false),
-        (jail.initrd, "initrd", true, false),
-        (jail.rootfs, "root.ext4", true, false),
-        (jail.data, "data.ext4", false, false),
-        (jail.output, "out", false, true),
-        (kvm, "dev/kvm", false, false),
+    let memory = jail.output.join(crate::microvm::SNAPSHOT_MEMORY);
+    let state = jail.output.join(crate::microvm::SNAPSHOT_STATE);
+    let memory_target = format!("out/{}", crate::microvm::SNAPSHOT_MEMORY);
+    let state_target = format!("out/{}", crate::microvm::SNAPSHOT_STATE);
+    for (source, target, input, directory) in [
+        (jail.firecracker, "firecracker", Input::ReadOnly, false),
+        (jail.kernel, "vmlinux", Input::ReadOnly, false),
+        (jail.initrd, "initrd", Input::ReadOnly, false),
+        (jail.rootfs, "root.ext4", Input::ReadOnly, false),
+        (jail.data, "data.ext4", Input::Writable, false),
+        // Read-only first, then the two files of a snapshot on top of it.
+        (jail.output, "out", Input::ReadOnly, true),
+        (&memory, &memory_target, Input::Writable, false),
+        (&state, &state_target, Input::Writable, false),
+        (kvm, "dev/kvm", Input::Device, false),
     ] {
-        bind_input(jail.root, source, target, readonly, directory)?;
+        bind_input(jail.root, source, target, input, directory)?;
     }
     // Nothing the daemon left open may follow the VMM into its jail: a
     // descriptor on a host directory is a way out of any root. The launcher
@@ -2030,8 +2073,20 @@ fn close_range_by_hand(from: u32, to: u32) {
     }
 }
 
+/// How [`bind_input`] makes an input of the jail.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Input {
+    /// Read-only, nosuid and nodev, with the source mount's noexec.
+    ReadOnly,
+    /// As the source mount is.
+    Writable,
+    /// A character device: read-only and nosuid, with the source mount's
+    /// noexec, but not nodev, so that it can still be opened.
+    Device,
+}
+
 /// Binds `source` onto the placeholder `root/target`. A read-only input is
-/// then remounted read-only, nosuid and nodev.
+/// then remounted read-only, nosuid and nodev, a device read-only and nosuid.
 ///
 /// The remount goes through a descriptor opened after the bind. A descriptor
 /// opened on the placeholder before it keeps naming the placeholder under the
@@ -2043,9 +2098,10 @@ fn bind_input(
     root: &Path,
     source: &Path,
     target: &str,
-    readonly: bool,
+    input: Input,
     directory: bool,
 ) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let open = |path: &Path| {
         OpenOptions::new()
@@ -2060,9 +2116,15 @@ fn bind_input(
     let src = open(source)?;
     let placeholder = open(&root.join(target))?;
     let metadata = src.metadata()?;
-    if metadata.is_dir() != directory || (!directory && target != "dev/kvm" && !metadata.is_file())
-    {
-        return Err(io::Error::other("invalid microVM mount source type"));
+    let kind_ok = match input {
+        Input::Device => metadata.file_type().is_char_device(),
+        _ if directory => metadata.is_dir(),
+        _ => metadata.is_file(),
+    };
+    if !kind_ok {
+        return Err(io::Error::other(format!(
+            "invalid microVM mount source type for {target}"
+        )));
     }
     let from = descriptor_path(&src)?;
     let onto = descriptor_path(&placeholder)?;
@@ -2079,11 +2141,17 @@ fn bind_input(
         },
         "binding microVM input",
     )?;
-    if !readonly {
-        return Ok(());
-    }
+    let nodev = match input {
+        Input::Writable => return Ok(()),
+        Input::ReadOnly => libc::MS_NODEV,
+        Input::Device => 0,
+    };
     let carried = carried_mount_flags(mount_flags(&src)?);
-    let mounted = open(&root.join(target))?;
+    // A device is not opened for the check: opening one can have effects.
+    let mounted = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_PATH)
+        .open(root.join(target))?;
     let onto = descriptor_path(&mounted)?;
     // SAFETY: the descriptor stays open throughout the remount.
     check(
@@ -2096,20 +2164,31 @@ fn bind_input(
                     | libc::MS_REMOUNT
                     | libc::MS_RDONLY
                     | libc::MS_NOSUID
-                    | libc::MS_NODEV
+                    | nodev
                     | carried,
                 std::ptr::null(),
             )
         },
         "making microVM input read-only",
     )?;
-    // Read-only, nosuid and nodev are always asked for, and noexec when the
-    // source mount has it.
-    let wanted = ST_RDONLY | ST_NOSUID | ST_NODEV | (mount_flags(&src)? & ST_NOEXEC);
-    if mount_flags(&mounted)? & wanted != wanted {
-        return Err(io::Error::other(
-            "a microVM input is not read-only, nosuid and nodev (with the source's noexec) after its remount",
-        ));
+    // Read-only and nosuid are always asked for, nodev for all but the
+    // device, and noexec when the source mount has it.
+    let flags = mount_flags(&mounted)?;
+    let wanted = ST_RDONLY | ST_NOSUID | (mount_flags(&src)? & ST_NOEXEC);
+    let wanted = if input == Input::Device {
+        wanted
+    } else {
+        wanted | ST_NODEV
+    };
+    if flags & wanted != wanted || (input == Input::Device && flags & ST_NODEV != 0) {
+        return Err(io::Error::other(format!(
+            "the microVM input {target} has mount flags {flags:#x} after its remount, not {wanted:#x}{}",
+            if input == Input::Device {
+                " without nodev"
+            } else {
+                ""
+            }
+        )));
     }
     Ok(())
 }
@@ -2337,10 +2416,12 @@ mod tests {
     // runs before it execs the VMM, and it needs neither KVM nor Firecracker.
     // The cgroup half cannot be rehearsed without a delegated cgroup.
 
+    const PIN_REHEARSAL_DIR: &str = "KRONIK_PIN_REHEARSAL_DIR";
     const REHEARSAL_DIR: &str = "KRONIK_JAIL_REHEARSAL_DIR";
     const REHEARSAL_CASE: &str = "KRONIK_JAIL_REHEARSAL_CASE";
-    /// Set: after its checks the VMM of the rehearsal writes `/out/ready` and
-    /// waits for `/out/go`, so that a test can look at the processes from outside
+    /// Set: after its checks the VMM of the rehearsal writes `ready` into
+    /// `/out/checkpoint.state` (`/out` itself is read-only) and waits for
+    /// `/out/go`, so that a test can look at the processes from outside
     /// while the launcher waits for it.
     const REHEARSAL_HOLD: &str = "KRONIK_JAIL_REHEARSAL_HOLD";
 
@@ -2514,16 +2595,22 @@ mod tests {
             ))
             .spawn()
             .unwrap();
-        let ready = dir.path().join("src/out/ready");
+        // The jail's /out is read-only: the VMM says it is ready in the one
+        // file there it can write, and reads `go` through the read-only bind.
+        let state = dir
+            .path()
+            .join("src/out")
+            .join(crate::microvm::SNAPSHOT_STATE);
+        let ready = || fs::read(&state).is_ok_and(|bytes| bytes == b"ready");
         let go = dir.path().join("src/out/go");
         let mut looked_at = Ok(());
         for _ in 0..1500 {
-            if ready.exists() || launcher.try_wait().unwrap().is_some() {
+            if ready() || launcher.try_wait().unwrap().is_some() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        if ready.exists() {
+        if ready() {
             looked_at = (|| {
                 let parent = launcher.id();
                 // The VMM: a child of the launcher that is pid 1 in its namespace.
@@ -2594,7 +2681,7 @@ mod tests {
         };
         let log = fs::read_to_string(dir.path().join("log")).unwrap_or_default()
             + &fs::read_to_string(dir.path().join("log-err")).unwrap_or_default();
-        assert!(ready.exists(), "the VMM never got ready: {log}");
+        assert!(ready(), "the VMM never got ready: {log}");
         assert_eq!(looked_at, Ok(()), "{log}");
         assert!(
             status.success() && log.contains("jail rehearsal ok"),
@@ -3103,17 +3190,17 @@ int main(void) {
         let fail = |what: String| Err(io::Error::other(what));
         let src = dir.join("src");
         let root = dir.join("root");
-        for name in [
-            "firecracker",
-            "vmlinux",
-            "initrd",
-            "root.ext4",
-            "data.ext4",
-            "kvm",
-        ] {
+        for name in ["firecracker", "vmlinux", "initrd", "root.ext4", "data.ext4"] {
             fs::write(src.join(name), b"input")?;
         }
         fs::create_dir(src.join("out"))?;
+        // The daemon makes the snapshot's two files before the VMM starts.
+        for name in [
+            crate::microvm::SNAPSHOT_MEMORY,
+            crate::microvm::SNAPSHOT_STATE,
+        ] {
+            fs::write(src.join("out").join(name), b"")?;
+        }
         fs::create_dir(&root)?;
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
         fs::create_dir(root.join("dev"))?;
@@ -3175,7 +3262,9 @@ int main(void) {
                 output: &src.join("out"),
                 parent_pid: 0,
             },
-            &src.join("kvm"),
+            // A character device of the host stands for /dev/kvm. Nothing
+            // below changes it: the mode check sets the mode it has.
+            Path::new("/dev/null"),
         )?;
 
         // From here on this process is inside the jail, and it is init of a
@@ -3249,8 +3338,75 @@ int main(void) {
             .append(true)
             .open("/data.ext4")?
             .write_all(b"more")?;
-        fs::write("/out/probe", b"output")?;
-        fs::metadata("/dev/kvm")?;
+        // `out` is read-only: nothing is created, removed or renamed there.
+        // The snapshot's two files are writable, as Firecracker writes them.
+        match fs::write("/out/probe", b"output") {
+            Err(e) if e.raw_os_error() == Some(libc::EROFS) => {}
+            other => return fail(format!("/out/probe could be created: {other:?}")),
+        }
+        for name in [
+            crate::microvm::SNAPSHOT_MEMORY,
+            crate::microvm::SNAPSHOT_STATE,
+        ] {
+            let path = Path::new("/out").join(name);
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)?
+                .write_all(b"snapshot")?;
+            if fs::read(&path)? != b"snapshot" {
+                return fail(format!("{name} did not keep what was written"));
+            }
+            if fs::remove_file(&path).is_ok() || fs::rename(&path, "/out/moved").is_ok() {
+                return fail(format!("{name} could be removed or renamed"));
+            }
+        }
+        // Each file is bounded: a write past the limit fails (`SIGXFSZ`, which
+        // would end the VMM, is ignored here to see the error).
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one rlimit; signal takes scalars.
+        unsafe {
+            check(
+                libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut limit),
+                "getrlimit",
+            )?;
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        }
+        let bound = file_size_limit(1);
+        if (limit.rlim_cur, limit.rlim_max) != (bound, bound) {
+            return fail(format!(
+                "the file size limit is {}/{}, not {bound}",
+                limit.rlim_cur, limit.rlim_max
+            ));
+        }
+        {
+            use std::os::unix::fs::FileExt as _;
+            let data = OpenOptions::new().write(true).open("/data.ext4")?;
+            match data.write_at(b"x", bound) {
+                Err(e) if e.raw_os_error() == Some(libc::EFBIG) => {}
+                other => return fail(format!("a write past the limit gave {other:?}")),
+            }
+        }
+        // /dev/kvm is read-only and nosuid but not nodev: it opens for
+        // writing and takes writes, and its mode, which a root VMM owns,
+        // cannot be set (EROFS before any permission check).
+        let kvm = OpenOptions::new().read(true).write(true).open("/dev/kvm")?;
+        (&kvm).write_all(b"x")?;
+        let flags = mount_flags(&kvm)?;
+        if flags & (ST_RDONLY | ST_NOSUID) != ST_RDONLY | ST_NOSUID || flags & ST_NODEV != 0 {
+            return fail(format!(
+                "/dev/kvm has mount flags {flags:#x}: not read-only and nosuid without nodev"
+            ));
+        }
+        let mode = fs::metadata("/dev/kvm")?.permissions();
+        match fs::set_permissions("/dev/kvm", mode) {
+            Err(e) if e.raw_os_error() == Some(libc::EROFS) => {}
+            other => return fail(format!("the mode of /dev/kvm could be set: {other:?}")),
+        }
         // The old root is gone and `..` does not lead out of the jail.
         for gone in ["/.old", "/proc", "/etc/passwd"] {
             if fs::symlink_metadata(gone).is_ok() {
@@ -3312,7 +3468,10 @@ int main(void) {
             }
         }
         if std::env::var_os(REHEARSAL_HOLD).is_some() {
-            fs::write("/out/ready", b"")?;
+            fs::write(
+                Path::new("/out").join(crate::microvm::SNAPSHOT_STATE),
+                b"ready",
+            )?;
             for _ in 0..1500 {
                 if Path::new("/out/go").exists() {
                     return Ok(());
