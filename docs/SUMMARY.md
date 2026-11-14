@@ -138,4 +138,5 @@
 - [ADR 0132: A fork's computation with a held linked secret is synthetic](adr/0132-fork-crypto-with-a-held-secret.md)
 - [ADR 0133: The isolation proofs run on GitHub-hosted runners](adr/0133-isolation-proofs-on-hosted-runners.md)
 - [ADR 0134: Per-kind HTTP fingerprint rules](adr/0134-per-kind-http-fingerprint-rules.md)
+- [ADR 0140: The default turn concurrency follows the CPUs](adr/0140-default-concurrency-follows-the-cpus.md)
 - [ADR 0142: Encrypted scrub-only copies of recorded external secret versions](adr/0142-scrub-only-copies-of-external-secret-versions.md)
