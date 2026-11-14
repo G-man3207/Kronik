@@ -240,8 +240,14 @@ def consumed_service(root, cfg, pid):
     require(loaded["source"] == "file" and loaded["check_ok"], "actual loaded file source failed")
     initial = os.readlink(f"/proc/{cfg['manager']['pid']}/ns/cgroup")
     actual = os.readlink(f"/proc/{pid}/ns/cgroup")
-    require((actual != initial) == (version >= 257),
-            f"systemd {version} did not consume the version-specific cgroup protection")
+    # A private view of the delegated cgroup either way (ADR 0061): systemd 257
+    # gives the unit one (ProtectControlGroups=private), and on 255 the daemon
+    # makes its own after it enters the Kronik namespace. Seen from the
+    # manager, the daemon is in the delegated cgroup's `daemon` leaf.
+    require(actual != initial, f"the service on systemd {version} has no private cgroup view")
+    seen = next((line[3:] for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+                 if line.startswith("0::")), "")
+    require(seen.endswith("/daemon"), f"the daemon is not in its delegated cgroup's leaf: {seen}")
     view = (Path(f"/proc/{pid}") / "root" / "sys/fs/cgroup/cgroup.controllers").read_text().split()
     require({"cpu", "memory", "pids"} <= set(view), "consumed cgroup mount lacks required controllers")
     (root / "consumed-service.json").write_text(json.dumps({
