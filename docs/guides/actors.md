@@ -271,6 +271,91 @@ offset, len)` reads a range (at most 1 MiB); `Request::post(url)
 `res.read_body()` read a blob response. A turn holds at most 64 open
 writers; a writer dropped or left open when the turn ends is discarded.
 
+In TypeScript, Python and Go, a request's and a fetch response's body is
+read on first use: `req.body` (Go: `req.Body()`) gives the bytes of an
+inline body and reads a blob body whole into memory, as `text()` and
+`json()` do, within the guest's memory limit (64 MiB by default). `req.blob`
+(Go: `req.Blob()`) says whether the body is a blob. To keep memory flat,
+read a large blob in parts:
+
+```ts
+http: async (req, ctx) => {
+  if (!req.blob) return ctx.text(200, `${req.body.length} bytes inline`);
+  // Read it in chunks of whole frames, and write a new blob.
+  const chunks = ctx.blobs.stream(req.blob).getReader();
+  const writer = ctx.blobs.writer();
+  for (let next = await chunks.read(); !next.done; next = await chunks.read()) {
+    const chunk = next.value;
+    for (let i = 0; i < chunk.length; i++) if (chunk[i] >= 97 && chunk[i] <= 122) chunk[i] -= 32;
+    writer.write(chunk);
+  }
+  return ctx.blob(200, writer.finish(), 'text/plain');
+},
+```
+
+```python
+def http(req, ctx):
+    if req.blob is None:
+        return ctx.text(200, f"{len(req.body)} bytes inline")
+    # A file object that reads whole frames, and a new blob.
+    reader = ctx.blobs.reader(req.blob)
+    writer = ctx.blobs.writer()
+    while chunk := reader.read(64 << 10):
+        writer.write(chunk.upper())
+    return ctx.blob(200, writer.finish(), "text/plain")
+```
+
+```go
+func upper(req *kronik.Request, ctx *kronik.Ctx) (kronik.Output, error) {
+	upload, ok := req.Blob()
+	if !ok {
+		body, err := req.Body()
+		if err != nil {
+			return kronik.Output{}, err
+		}
+		return ctx.Text(200, fmt.Sprintf("%d bytes inline", len(body)))
+	}
+	// An io.Reader, io.ReaderAt and io.Seeker that reads whole frames, and a new blob.
+	reader := ctx.Blobs.Reader(upload)
+	writer := ctx.Blobs.Writer()
+	buf := make([]byte, 64<<10)
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			if _, err := writer.Write(bytes.ToUpper(buf[:n])); err != nil {
+				return kronik.Output{}, err
+			}
+		}
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return kronik.Output{}, err
+		}
+	}
+	copied, err := writer.Finish()
+	if err != nil {
+		return kronik.Output{}, err
+	}
+	return kronik.BlobResponse(200, copied, "text/plain"), nil
+}
+```
+
+`ctx.blobs.get(b, offset, length)` (Go: `ctx.Blobs.Get`) reads a range,
+as many host calls of at most 1 MiB as it needs. A writer sends whole 64 KiB
+frames and keeps the rest until the next write or `finish()`. A fetch sends
+a blob as its body with `body: b` (Python: `body=b`, Go:
+`FetchRequest{BodyBlob: &b}`), and its response's `body` and `blob` work as
+a request's. Blob errors are `KronikError`s (Go: `*kronik.Error`) whose
+topic is `BLOB_NOT_HELD`, `SUBJECT_ERASED` or `blob`. A TypeScript project
+type-checks the SDK's blob writer with `esnext.disposable` in its
+tsconfig's `lib`, as `kronik init` writes it.
+
+Fuel bounds a guest's own work: a loop over every byte of a large body
+costs fuel per byte, and the default limit does not cover one over even a
+few MiB. Process large blobs in host calls (read ranges, stream them
+through, write them on), and raise the type's fuel with `kronik limits set
+<type> --fuel <n> --reason '...'` for heavy work.
+
 ## Building
 
 `kronik build` (in the project, or `--dir`) writes `dist/<name>.wasm` and

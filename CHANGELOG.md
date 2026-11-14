@@ -233,6 +233,18 @@ until the v1.0 compatibility promise takes effect.
   as it arrives, scrubbed of the turn's secrets and named durably before
   its result is recorded, and a blob request body is streamed from the store
   with its length. The effect's record holds only the references.
+- The TypeScript, Python and Go SDKs read and write blobs (M25): a
+  request's and a fetch response's `body` reads a blob body when first
+  used, and `blob` gives the blob; `ctx.blobs` reads ranges (`get`), a
+  stream (TypeScript, a `ReadableStream`) or a reader (Python
+  `io.RawIOBase`, Go `io.Reader`, `io.ReaderAt`, `io.Seeker`) that fetches
+  whole 64 KiB frames, and writes blobs (`writer()`); `ctx.blob(...)`
+  (Go `kronik.BlobResponse`) answers with a blob, and a fetch sends one
+  (`body`, Go `FetchRequest.BodyBlob`). **Go: `Request.Body` and
+  `FetchResponse.Body` are now methods, `Body()`, which may fail.**
+  TypeScript projects add `esnext.disposable` to their tsconfig's `lib`
+  (`kronik init` and the examples do). A test kit's stub sees the bytes of
+  a blob a fetch sent.
 - The Rust SDK reads and writes blobs (M25): `ctx.blobs()` (`get`,
   `read_all`, a `reader` that is `Read + Seek` and reads whole 64 KiB
   frames, a `writer` that is `Write`), `HttpRequest::body_blob` and

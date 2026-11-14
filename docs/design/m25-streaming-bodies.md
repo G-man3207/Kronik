@@ -816,9 +816,9 @@ bodies.
 | --- | --- | --- | --- | --- |
 | whole body, inline or blob | `req.read_body()?` | `req.body` (lazy) | `req.body` (lazy) | `req.Body()` |
 | is it a blob | `req.body_blob()` | `req.blob` | `req.blob` | `req.Blob()` |
-| read a range | `ctx.blobs().get(&b, off, len)` | `ctx.blobs.get(b, off, len)` | `ctx.blobs.get(b, off, n)` | `ctx.Blobs().Get(b, off, n)` |
-| read in chunks | `ctx.blobs().reader(&b)` (`Read + Seek`) | `ctx.blobs.stream(b)` (`ReadableStream`) | `ctx.blobs.reader(b)` (`io.RawIOBase`) | `ctx.Blobs().Reader(b)` (`io.ReaderAt`, `io.Reader`) |
-| write a large body | `ctx.blobs().writer()` (`Write`), `.finish()` | `ctx.blobs.writer()`, `.write()`, `.finish()` | `ctx.blobs.writer()` | `ctx.Blobs().Writer()` (`io.Writer`), `.Finish()` |
+| read a range | `ctx.blobs().get(&b, off, len)` | `ctx.blobs.get(b, off, len)` | `ctx.blobs.get(b, off, n)` | `ctx.Blobs.Get(b, off, n)` |
+| read in chunks | `ctx.blobs().reader(&b)` (`Read + Seek`) | `ctx.blobs.stream(b)` (`ReadableStream`) | `ctx.blobs.reader(b)` (`io.RawIOBase`) | `ctx.Blobs.Reader(b)` (`io.ReaderAt`, `io.Reader`, `io.Seeker`) |
+| write a large body | `ctx.blobs().writer()` (`Write`), `.finish()` | `ctx.blobs.writer()`, `.write()`, `.finish()` | `ctx.blobs.writer()` | `ctx.Blobs.Writer()` (`io.Writer`), `.Finish()` |
 | respond with a blob | `HttpResponse::blob(200, &b, "application/pdf")` | `ctx.blob(200, b, 'application/pdf')` | `ctx.blob(200, b, ...)` | `kronik.BlobResponse(200, b, ...)` |
 | fetch with a blob body | `Request::post(url).body_blob(&b)` | `ctx.http.fetch({ url, method: 'POST', body: b })` | `ctx.http.fetch(url, method="POST", body=b)` | `kronik.FetchRequest{Body: …, BodyBlob: &b}` |
 | fetch response | `res.read_body()?`, `res.blob()` | `res.body` (lazy), `res.blob` | `res.body`, `res.blob` | `res.Body()`, `res.Blob()` |
