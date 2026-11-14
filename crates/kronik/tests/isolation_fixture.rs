@@ -864,9 +864,30 @@ fn create(args: &[String]) -> Result<()> {
             "root:x:0:0:root:/root:/bin/false\nkronik:x:{uid}:{gid}:proof:/var/lib/kronik:/bin/false\n"
         ),
     )?;
+    // The microVM level's drop-in grants /dev/kvm's group by number, and
+    // systemd looks that number up when it starts the unit (exit 216, GROUP,
+    // when the group database lacks it): the private view has the host's
+    // group of the device, under the host's name for it.
+    let kvm_group = if args.len() > 9 && !directory_only {
+        let kvm = fs::metadata("/dev/kvm")?.gid();
+        let name = fs::read_to_string("/etc/group")?
+            .lines()
+            .find_map(|line| {
+                let fields: Vec<&str> = line.split(':').collect();
+                (fields.len() >= 3 && fields[2] == kvm.to_string()).then(|| fields[0].to_owned())
+            })
+            .unwrap_or_else(|| "kvm".into());
+        ensure!(
+            kvm != 0 && kvm != gid,
+            "/dev/kvm's group {kvm} cannot be granted"
+        );
+        format!("{name}:x:{kvm}:\n")
+    } else {
+        String::new()
+    };
     fs::write(
         root.join("etc/group"),
-        format!("root:x:0:\nkronik:x:{gid}:\n"),
+        format!("root:x:0:\nkronik:x:{gid}:\n{kvm_group}"),
     )?;
     fs::write(root.join("etc/subuid"), "")?;
     fs::write(root.join("etc/subgid"), "")?;
