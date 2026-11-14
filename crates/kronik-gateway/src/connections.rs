@@ -155,6 +155,25 @@ where
 
 type Admit = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+/// What woke the connection's task.
+enum Event {
+    /// A frame's admission finished: reading goes on.
+    Admitted,
+    /// The client sent something, or the stream ended.
+    Read(Option<Result<Message, WsError>>),
+    /// The hub queued frames or decided a close.
+    Write,
+    /// The ping or close timer.
+    Tick,
+}
+
+/// Waits for the pending admission, if there is one.
+async fn admitted(admitting: &mut Option<Admit>) {
+    if let Some(admit) = admitting.as_mut() {
+        admit.await;
+    }
+}
+
 /// Drives one upgraded WebSocket connection until it ends, then reports the
 /// end to the hub. `io` is the upgraded connection.
 pub async fn drive<I>(hub: Arc<Hub>, conn: String, io: I, limits: Limits)
@@ -181,63 +200,42 @@ where
     let mut closing: Option<Duration> = None;
     let mut last_heard = now();
     let mut ping_sent: Option<Duration> = None;
+    // Reading and writing take turns: each wait is one of two `biased`
+    // selects (ADR 0004 §3) whose order flips every round, and the writer
+    // sends at most a batch per round (review M4). The close deadline is
+    // checked before every wait, so a client that floods cannot outrun it.
+    let mut read_first = true;
     'run: loop {
+        if closing.is_some_and(|deadline| now() >= deadline) {
+            // The client did not answer the close in time.
+            break 'run;
+        }
         let wait = match (closing, ping_sent) {
             (Some(deadline), _) => deadline.saturating_sub(now()),
             (None, Some(sent)) => (sent + limits.ping_timeout).saturating_sub(now()),
             (None, None) => (last_heard + limits.ping_interval).saturating_sub(now()),
         };
-        // Unbiased: reading, writing and the timer take turns (review M4).
-        tokio::select! {
-            () = transport.notify.notified(), if closing.is_none() => {
-                if let Some((code, reason)) = transport.take_host_close() {
-                    if send(&mut sink, close_message(code, &reason), limits.close_timeout).await.is_err() {
-                        break 'run;
-                    }
-                    closing = Some(now() + limits.close_timeout);
-                    continue;
-                }
-                let mut batch = 0;
-                while let Some(item) = hub.next(&conn) {
-                    batch += 1;
-                    match item {
-                        Outgoing::Frame { seq, frame } => {
-                            match send(&mut sink, to_message(&frame), limits.ping_timeout).await {
-                                Ok(()) => hub.written(&conn, seq),
-                                // A client that takes no frame for the ping
-                                // timeout cannot keep up: no close frame
-                                // could reach it either (review S1).
-                                Err(WriteError::Stalled) => {
-                                    hub.close_host(&conn, pb::CloseCause::SlowConsumer);
-                                    break 'run;
-                                }
-                                Err(WriteError::Gone) => break 'run,
-                            }
-                        }
-                        Outgoing::Close { code, reason } => {
-                            if send(&mut sink, close_message(code, &reason), limits.close_timeout).await.is_err() {
-                                break 'run;
-                            }
-                            closing = Some(now() + limits.close_timeout);
-                            break;
-                        }
-                    }
-                    // A host close decided meanwhile (it dropped the queue),
-                    // or a full batch: the rest after the other branches.
-                    if transport.host_close_pending() || batch >= WRITE_BATCH {
-                        transport.notify.notify_one();
-                        break;
-                    }
-                }
+        let event = if read_first {
+            tokio::select! {
+                biased;
+                () = admitted(&mut admitting), if admitting.is_some() => Event::Admitted,
+                message = stream.next(), if admitting.is_none() => Event::Read(message),
+                () = transport.notify.notified(), if closing.is_none() => Event::Write,
+                () = tokio::time::sleep(wait) => Event::Tick,
             }
-            () = async {
-                if let Some(admit) = admitting.as_mut() {
-                    admit.await;
-                }
-            }, if admitting.is_some() => {
-                admitting = None;
+        } else {
+            tokio::select! {
+                biased;
+                () = transport.notify.notified(), if closing.is_none() => Event::Write,
+                () = admitted(&mut admitting), if admitting.is_some() => Event::Admitted,
+                message = stream.next(), if admitting.is_none() => Event::Read(message),
+                () = tokio::time::sleep(wait) => Event::Tick,
             }
-            message = stream.next(), if admitting.is_none() => {
+        };
+        read_first = !read_first;
+        match event {
+            Event::Admitted => admitting = None,
+            Event::Read(message) => {
                 last_heard = now();
                 ping_sent = None;
                 match message {
@@ -277,7 +275,9 @@ where
                     }
                     Some(Err(WsError::Capacity(_))) => {
                         hub.close_host(&conn, pb::CloseCause::TooLarge);
-                        if !closing_after_error(&transport, &mut sink, &mut closing, now(), &limits).await {
+                        if !closing_after_error(&transport, &mut sink, &mut closing, now(), &limits)
+                            .await
+                        {
                             break 'run;
                         }
                     }
@@ -289,13 +289,17 @@ where
                     // other protocol errors with 1002 (§5.5).
                     Some(Err(WsError::Utf8(_))) => {
                         hub.close_host_with(&conn, pb::CloseCause::Protocol, 1007);
-                        if !closing_after_error(&transport, &mut sink, &mut closing, now(), &limits).await {
+                        if !closing_after_error(&transport, &mut sink, &mut closing, now(), &limits)
+                            .await
+                        {
                             break 'run;
                         }
                     }
                     Some(Err(WsError::Protocol(_) | WsError::AttackAttempt)) => {
                         hub.close_host(&conn, pb::CloseCause::Protocol);
-                        if !closing_after_error(&transport, &mut sink, &mut closing, now(), &limits).await {
+                        if !closing_after_error(&transport, &mut sink, &mut closing, now(), &limits)
+                            .await
+                        {
                             break 'run;
                         }
                     }
@@ -304,7 +308,62 @@ where
                     Some(Err(_)) | None => break 'run,
                 }
             }
-            () = tokio::time::sleep(wait) => {
+            Event::Write => {
+                if let Some((code, reason)) = transport.take_host_close() {
+                    if send(
+                        &mut sink,
+                        close_message(code, &reason),
+                        limits.close_timeout,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break 'run;
+                    }
+                    closing = Some(now() + limits.close_timeout);
+                    continue;
+                }
+                let mut batch = 0;
+                while let Some(item) = hub.next(&conn) {
+                    batch += 1;
+                    match item {
+                        Outgoing::Frame { seq, frame } => {
+                            match send(&mut sink, to_message(&frame), limits.ping_timeout).await {
+                                Ok(()) => hub.written(&conn, seq),
+                                // A client that takes no frame for the ping
+                                // timeout cannot keep up: no close frame
+                                // could reach it either (review S1).
+                                Err(WriteError::Stalled) => {
+                                    hub.close_host(&conn, pb::CloseCause::SlowConsumer);
+                                    break 'run;
+                                }
+                                Err(WriteError::Gone) => break 'run,
+                            }
+                        }
+                        Outgoing::Close { code, reason } => {
+                            if send(
+                                &mut sink,
+                                close_message(code, &reason),
+                                limits.close_timeout,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break 'run;
+                            }
+                            closing = Some(now() + limits.close_timeout);
+                            break;
+                        }
+                    }
+                    // A host close decided meanwhile (it dropped the queue),
+                    // or a full batch: the rest after the other branches.
+                    if transport.host_close_pending() || batch >= WRITE_BATCH {
+                        transport.notify.notify_one();
+                        break;
+                    }
+                }
+            }
+            Event::Tick => {
                 if closing.is_some() {
                     // The client did not answer the close in time.
                     break 'run;
@@ -319,7 +378,9 @@ where
                 }
                 match ping_sent {
                     Some(_) => hub.close_host(&conn, pb::CloseCause::PingTimeout),
-                    None => match send(&mut sink, Message::Ping(Bytes::new()), limits.ping_timeout).await {
+                    None => match send(&mut sink, Message::Ping(Bytes::new()), limits.ping_timeout)
+                        .await
+                    {
                         Ok(()) => ping_sent = Some(now()),
                         Err(WriteError::Stalled) => {
                             hub.close_host(&conn, pb::CloseCause::PingTimeout);
