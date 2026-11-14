@@ -198,8 +198,10 @@ The pool has `2 × concurrency` linear memory slots per engine (one engine
 per daemon; forks and replays share it, `kronik upgrade check` builds its
 own of `2 × workers`). Each reused slot now keeps up to 2 MiB resident
 instead of 64 KiB, so the worst case on top of running instances is
-128 × 2 MiB = 256 MiB at the default `--concurrency 64` (512 MiB at 128),
-248 MiB more than before.
+128 × 2 MiB = 256 MiB at `--concurrency 64` (512 MiB at 128), 248 MiB more
+than before. 64 was then the default everywhere; since
+[ADR 0140](adr/0140-default-concurrency-follows-the-cpus.md) it is the
+default from eight CPUs, and less below them.
 
 Measured on the test VPS (4 GB): `kronik serve` from the same tree with
 64 KiB (before) and 2 MiB (after), the guest deployed, 20 s of 64 clients
@@ -698,17 +700,17 @@ letter, and used about 1.3 of the daemon's two CPUs.
 
 | Start (UTC) | `--concurrency` | Steady phase | Deliveries | p50 / p99 / max | `VmHWM` | `VmRSS` growth (heap) | Result |
 | --- | ---: | ---: | ---: | --- | ---: | --- | --- |
-| 13:48 | 64 (default) | 10 min | 1,200,260 | 29.4 / 247 / 2,850 ms | 557 MiB | +25.6 % (+95 MiB) | fails the growth condition |
+| 13:48 | 64 (then the default) | 10 min | 1,200,260 | 29.4 / 247 / 2,850 ms | 557 MiB | +25.6 % (+95 MiB) | fails the growth condition |
 | 14:18 | 8 | 10 min | 1,200,500 | 29.9 / 168 / 536 ms | 492 MiB | +4.3 % (+7 MiB) | passes |
-| 14:29 | 64 (default) | 30 min | 3,601,520 | 28.3 / 319 / 2,818 ms | 575 MiB | +34.1 % (+119 MiB) | fails growth and p99 |
+| 14:29 | 64 (then the default) | 30 min | 3,601,520 | 28.3 / 319 / 2,818 ms | 575 MiB | +34.1 % (+119 MiB) | fails growth and p99 |
 | 15:22 | 8 | 30 min | 3,600,300 | 27.8 / 172 / 1,242 ms | 490 MiB | +6.8 % (+26 MiB) | passes |
 
 Opening the 1,000 connections (the 20-s ramp and 5-s settle, including the
 rooms' first turns) raised the daemon's `VmRSS` by 16 to 23 MiB in these
 four runs: 16 to 24 KiB per connection.
 
-The heap (`RssAnon`) is where the growth is; mapped files stay flat. At the
-default concurrency it grows in steps (+34 MiB and +74 MiB in the first ten
+The heap (`RssAnon`) is where the growth is; mapped files stay flat. At
+concurrency 64 it grows in steps (+34 MiB and +74 MiB in the first ten
 minutes) and then slowly: 278, 311, 367, 401, 416 and 425 MiB at 12, 300,
 500, 1,000, 1,500 and 1,827 s of the 30-minute run. The steps fit the Wasm
 instance pool's warm slots: two linear-memory slots per unit of
@@ -751,6 +753,50 @@ The run directories (the driver's log, `report.json` with every sample, the
 daemon's log and configuration, `vmstat` and `iostat`, and metric scrapes
 every 30 s) are kept with the project's release evidence, outside the
 repository.
+
+## The default turn concurrency (ADR 0140)
+
+[ADR 0140](adr/0140-default-concurrency-follows-the-cpus.md) makes the
+default `--concurrency` follow the CPUs the daemon may use: 8 per CPU, from
+8 to 64 (16 on two CPUs, 32 on four, 64 from eight); an explicit
+`--concurrency` is unchanged, and `kronik is serving` logs the value. It
+follows from M24's criterion 1 above, which passes at a concurrency of 8
+and fails its memory condition at 64. These runs check that the lower
+default costs no throughput and that M24 passes at it.
+
+Method: `scripts/perf-m1.sh` as in [Method](#method), 10 s per row, on the
+test machine (2026-11-14, 17:05 to 17:45 UTC, with no other workload), both
+confined (the daemon on two CPUs, the load generator on the other two) and
+on all four CPUs shared with the load generator, each at the new default
+and at `--concurrency 64`. The build: the ADR 0140 change on `main` at
+`f725254a`, static musl as the release builds it (SHA-256
+`06b6583a41b86c7837bc6228ee1e9511f6b5debc7d82000c77dadd1403429f84`).
+
+Committed turns/s (p50 / p99 in ms); no row had an error:
+
+| Workload | 2 CPUs, default 16 | 2 CPUs, 64 | 4 CPUs, default 32 | 4 CPUs, 64 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 actor, 1 client | 140 (6.9 / 14.7) | 142 (6.9 / 12.6) | 139 (7.1 / 12.8) | 139 (7.1 / 12.1) |
+| 1 actor, 16 clients | 158 (101 / 126) | 160 (99 / 128) | 158 (101 / 126) | 159 (99 / 124) |
+| 64 actors, 64 clients | 2 656 (22.5 / 50.3) | 2 612 (22.5 / 53.5) | 3 016 (18.9 / 48.2) | 3 022 (18.9 / 49.3) |
+| 256 actors, 256 clients | 2 644 (96.5 / 172.0) | 2 624 (96.5 / 167.8) | 2 782 (90.2 / 192.9) | 2 797 (90.2 / 201.3) |
+| 256 actors, open loop 200 req/s | 200 (7.3 / 28.8) | 200 (7.6 / 31.5) | 200 (7.7 / 31.5) | 200 (7.7 / 30.4) |
+
+- The lower default costs no throughput: every row is within 2 % of the
+  same row at 64, and the across-actor rate stays far above the brief's
+  1 000 turns/s.
+- The open-loop p99 at 200 req/s, 28.8 to 31.5 ms, is above the brief's
+  25 ms at every concurrency, and one actor's turn takes about 7 ms (p50)
+  against about 5 ms on the earlier machines (the M1 results above), though
+  this machine's fsync costs the same. The cause is not investigated: the
+  machine, the build (static musl here, glibc in the earlier measurements)
+  or both.
+
+M24 at the new default (16 on the confined two CPUs), with the same build:
+criterion 1 passed every condition (1,199,600 of 1,199,600 deliveries,
+p50 27.8 ms, p99 151 ms, max 1.0 s, `VmHWM` 487 MiB, `VmRSS` +6.1 % over the
+10-minute steady phase, the heap +12.4 MiB), and criterion 4 passed every
+check (400 reconnects, the slowest after 3.1 s).
 
 ## M32 benchmark and regression contract
 
