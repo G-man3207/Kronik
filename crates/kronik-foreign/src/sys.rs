@@ -2044,17 +2044,23 @@ const SYS_OPENAT2: libc::c_long = 437;
 /// (`RESOLVE_NO_SYMLINKS`), and none that the kernel makes up (`/proc` links).
 pub fn open_socket_entry(dir: &Path, name: &str, owner: u32) -> io::Result<OwnedFd> {
     use std::os::unix::fs::OpenOptionsExt as _;
+    // The directory is the daemon's own path to the jail: by path, as a path.
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(dir)?;
+    open_socket_entry_at(&dir, name, owner)
+}
+
+/// [`open_socket_entry`] in a directory the caller has open, for one that it
+/// reached without following links (see [`open_socket_directory`]).
+pub fn open_socket_entry_at(dir: &impl AsRawFd, name: &str, owner: u32) -> io::Result<OwnedFd> {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{name:?} is not the plain name of a socket"),
         ));
     }
-    // The directory is the daemon's own path to the jail: by path, as a path.
-    let dir = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
-        .open(dir)?;
     let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     // SAFETY: open_how is a plain C struct; zero is a valid value for every field.
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
@@ -2117,6 +2123,208 @@ fn explain_openat2(error: io::Error) -> io::Error {
 /// stands for, as long as `fd` is open.
 pub fn fd_path(fd: &OwnedFd) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+}
+
+/// The directory that holds a socket, as root reaches it (see
+/// [`open_socket_directory`]).
+#[derive(Debug)]
+pub struct SocketDirectory {
+    /// The directory, open with `O_PATH`.
+    pub fd: OwnedFd,
+    /// Its owner.
+    pub owner: u32,
+    /// Whether only root controls it: root's, and not writable by group or
+    /// others unless sticky. Then only root can have put an entry there.
+    pub root_controlled: bool,
+}
+
+/// Whether only root can change the entries of a directory with this `stat`.
+fn root_controlled(stat: &libc::stat) -> bool {
+    stat.st_uid == 0 && (stat.st_mode & 0o022 == 0 || stat.st_mode & 0o1000 != 0)
+}
+
+fn stat_of(fd: &impl AsRawFd) -> io::Result<libc::stat> {
+    // SAFETY: stat is a plain C struct that fstat fills in for a live descriptor.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    check(
+        unsafe { libc::fstat(fd.as_raw_fd(), &raw mut stat) },
+        "fstat",
+    )?;
+    Ok(stat)
+}
+
+/// `openat(dir, name, O_PATH | O_NOFOLLOW)`: the entry itself, a link as a link.
+fn open_entry(dir: &impl AsRawFd, name: &std::ffi::OsStr) -> io::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let name =
+        CString::new(name.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: a NUL-terminated name; the kernel only reads it.
+    let raw = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// The target of the link that `link` (opened with `O_PATH | O_NOFOLLOW`) is.
+fn link_target(link: &impl AsRawFd) -> io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: an empty path makes readlinkat read the link `link` stands for;
+    // it writes at most `buffer.len()` bytes into the buffer.
+    let read = unsafe {
+        libc::readlinkat(
+            link.as_raw_fd(),
+            c"".as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if read < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let read = read as usize;
+    if read >= buffer.len() {
+        return Err(io::Error::other("a symbolic link's target is too long"));
+    }
+    buffer.truncate(read);
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+}
+
+/// Opens `dir` the way root reaches a socket that a user it does not trust
+/// may control (a nonroot installation's `/run/kronik` belongs to the
+/// service user): from `/`, one component at a time, through directories
+/// that root controls only, and following a symbolic link only if root made
+/// it (in such a directory). The last directory, the one that holds the
+/// socket, may be anyone's: the caller decides what it then requires.
+///
+/// A link or a directory that another user controls on the way could send
+/// root's connection to any socket of the host, which `connect(2)` by path
+/// would follow. A relative `dir` is taken from the current directory.
+pub fn open_socket_directory(dir: &Path) -> io::Result<SocketDirectory> {
+    use std::collections::VecDeque;
+    use std::path::Component;
+    let names = |path: &Path| -> Vec<std::ffi::OsString> {
+        path.components()
+            .filter_map(|c| match c {
+                Component::Normal(name) => Some(name.to_owned()),
+                Component::ParentDir => Some("..".into()),
+                _ => None,
+            })
+            .collect()
+    };
+    let top = || -> io::Result<OwnedFd> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        Ok(OwnedFd::from(
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open("/")?,
+        ))
+    };
+    let dir = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
+    let mut pending: VecDeque<std::ffi::OsString> = names(&dir).into();
+    let mut current = top()?;
+    let mut shown = PathBuf::from("/");
+    let mut links = 0;
+    while let Some(name) = pending.pop_front() {
+        let here = stat_of(&current)?;
+        if !root_controlled(&here) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "the path passes through {}, which uid {} owns{}: root goes to a socket only through directories that root owns and others cannot write",
+                    shown.display(),
+                    here.st_uid,
+                    if here.st_mode & 0o022 != 0 {
+                        " and others can write"
+                    } else {
+                        ""
+                    }
+                ),
+            ));
+        }
+        let entry = open_entry(&current, &name)?;
+        let stat = stat_of(&entry)?;
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => {
+                current = entry;
+                if name == ".." {
+                    shown.pop();
+                } else {
+                    shown.push(&name);
+                }
+            }
+            libc::S_IFLNK => {
+                links += 1;
+                if links > 40 {
+                    return Err(io::Error::from_raw_os_error(libc::ELOOP));
+                }
+                if stat.st_uid != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "{} is a symbolic link of uid {}: root follows only its own links to a socket",
+                            shown.join(&name).display(),
+                            stat.st_uid
+                        ),
+                    ));
+                }
+                let target = link_target(&entry)?;
+                if target.is_absolute() {
+                    current = top()?;
+                    shown = PathBuf::from("/");
+                }
+                for (at, part) in names(&target).into_iter().enumerate() {
+                    pending.insert(at, part);
+                }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is not a directory", shown.join(&name).display()),
+                ));
+            }
+        }
+    }
+    let stat = stat_of(&current)?;
+    Ok(SocketDirectory {
+        fd: current,
+        owner: stat.st_uid,
+        root_controlled: root_controlled(&stat),
+    })
+}
+
+/// The uid of the process at the other end of a connected Unix socket, as
+/// the kernel recorded it when that end connected or listened (`SO_PEERCRED`).
+pub fn peer_uid(socket: &impl AsRawFd) -> io::Result<u32> {
+    // SAFETY: ucred is a plain C struct; getsockopt writes at most `len` bytes.
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    check(
+        unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &raw mut len,
+            )
+        },
+        "SO_PEERCRED",
+    )?;
+    Ok(cred.uid)
 }
 
 /// The effective user id of this process.
@@ -2630,6 +2838,51 @@ mod tests {
         assert!(unpin_userns(&old).unwrap());
         assert!(unpin_userns(&pin).unwrap());
         println!("pin rehearsal ok");
+    }
+
+    /// Root reaches a socket's directory only through directories that root
+    /// controls and links that root made; the last directory may be anyone's.
+    #[test]
+    fn root_reaches_a_socket_directory_only_through_what_root_controls() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let run = open_socket_directory(Path::new("/run")).unwrap();
+        assert!(run.owner == 0 && run.root_controlled);
+        // `/proc/self` is root's link in a directory only root controls: it is
+        // followed, and the last directory, this process's, may be anyone's.
+        let me = open_socket_directory(Path::new("/proc/self")).unwrap();
+        assert_eq!(me.owner, euid());
+        let base = tempfile::Builder::new()
+            .prefix("kronik-socket-dir-")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        fs::create_dir_all(base.path().join("service/inner")).unwrap();
+        if !is_root() {
+            // The test's own directory is not root's: nothing is reached through it.
+            let why = open_socket_directory(&base.path().join("service")).unwrap_err();
+            assert_eq!(why.kind(), io::ErrorKind::PermissionDenied, "{why}");
+            return;
+        }
+        fs::set_permissions(base.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let service = base.path().join("service");
+        std::os::unix::fs::chown(&service, Some(65_534), Some(65_534)).unwrap();
+        let held = open_socket_directory(&service).unwrap();
+        assert_eq!((held.owner, held.root_controlled), (65_534, false));
+        // Through another user's directory: refused, whatever lies beyond.
+        let why = open_socket_directory(&service.join("inner")).unwrap_err();
+        assert!(why.to_string().contains("passes through"), "{why}");
+        // Root's link is followed; another user's link is not.
+        let link = base.path().join("link");
+        symlink("service", &link).unwrap();
+        assert_eq!(open_socket_directory(&link).unwrap().owner, 65_534);
+        std::os::unix::fs::lchown(&link, Some(65_534), Some(65_534)).unwrap();
+        let why = open_socket_directory(&link).unwrap_err();
+        assert!(
+            why.to_string().contains("symbolic link of uid 65534"),
+            "{why}"
+        );
+        // A directory that others can write is not root's to pass through.
+        fs::set_permissions(base.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(open_socket_directory(&service).is_err());
     }
 
     #[test]

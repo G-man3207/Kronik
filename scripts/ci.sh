@@ -370,6 +370,9 @@ step_foreign() {
     # leaving them absent from every run.
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik-foreign --lib sys::tests
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --bin kronik data_directory_tests
+    # A root client's refusal of a swapped API socket in a directory that
+    # another user owns: it needs root and a second uid.
+    KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --bin kronik cli::http::tests::root_
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik-privacy --lib key_source::tests
     # `kronik restore` as root into the nonroot service's directory, with the
     # real drop of privileges: it needs root, a second uid and a private

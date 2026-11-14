@@ -464,6 +464,20 @@ counts against the VM's memory limit: keep `run_dir` there, as on a disk it
 would not be bounded. Its disk I/O bandwidth is not limited
 ([ADR 0095](../adr/0095-pinned-firecracker-guest.md)).
 
+A command that root runs against a nonroot installation (`sudo kronik ...`,
+`sudo kronik doctor`, the readiness check of `serve --init`) does not connect
+to the API socket by path: `/run/kronik` belongs to the service user, who could
+put a link to another of the host's sockets, a FIFO or a listener of its own in
+place of the daemon's socket, and root would connect with its own authority
+and send its token. Root reaches the socket's directory from `/` through
+directories that root controls and links that root made only, opens the socket
+without following a link, requires a socket that the directory's owner made,
+connects to exactly that inode and requires the same owner at the other end
+(`SO_PEERCRED`); anything else is refused with the reason. The service user can
+still answer root's requests, as the daemon does; it cannot redirect them. A
+socket in a directory that only root controls (the root service's) is used as
+before.
+
 `/run/kronik` is mode 0750 with group `kronik`: whoever may use the API socket
 can list it. The runtime state of the sandboxes beneath it (`runsc/`, `runc/`)
 is mode 0700, because a runtime's state file holds the container's

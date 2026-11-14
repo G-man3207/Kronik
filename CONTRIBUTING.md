@@ -66,7 +66,8 @@ needs root and `runsc` and is skipped with a message otherwise; without
 libfaketime, `identity` skips `todo-ts` the same way. Run as root, the
 `foreign` step also runs, under `KRONIK_FOREIGN_TESTS=require`, the
 rehearsals of the microVM launcher (`sys::tests` of `kronik-foreign`), the
-installer's hand-over of a data directory to another user, the key
+installer's hand-over of a data directory to another user, a root
+client's refusal of an API socket that another user swapped, the key
 source's work in a tree that another user owns and `kronik restore` as root
 into the nonroot service's directory (`--test restore_drop`, which really
 gives up root), so that a host that cannot run them fails the step instead

@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs as _};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -150,6 +150,72 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Connects to the first address that answers within `timeout` (at most
 /// [`CONNECT_TIMEOUT`]). Plain HTTP only ever dials loopback addresses.
+/// Connects to the API socket at `path`.
+///
+/// As root, a socket in a directory that another user controls is not
+/// connected to by path: a nonroot installation's `/run/kronik` belongs to
+/// its service user, who could put a link to another of the host's sockets,
+/// a FIFO or a listener of its own in place of the daemon's socket, and root
+/// would connect with its own authority (and send its token). So root
+/// reaches the directory from `/` without following a link that root did not
+/// make and only through directories that root controls, opens the entry
+/// without following a link, requires a socket that the directory's owner
+/// made, connects to exactly that inode, and requires that owner at the
+/// other end (`SO_PEERCRED`); anything else is refused, with the reason. The
+/// daemon's own socket passes: its user owns the directory, made the socket
+/// and serves it. A socket in a directory that only root controls, and every
+/// connection of another user, is made by path as before.
+pub(crate) fn connect_unix(path: &Path) -> io::Result<UnixStream> {
+    if kronik_foreign::sys::is_root() {
+        connect_unix_as_root(path)
+    } else {
+        UnixStream::connect(path)
+    }
+}
+
+fn connect_unix_as_root(path: &Path) -> io::Result<UnixStream> {
+    use kronik_foreign::sys;
+    let refused = |why: String| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing, as root, to connect to the API socket {}: {why}",
+                path.display()
+            ),
+        )
+    };
+    // A missing socket stays "not found": no daemon there is an answer.
+    let refuse = |e: io::Error| {
+        if e.kind() == io::ErrorKind::NotFound {
+            e
+        } else {
+            refused(e.to_string())
+        }
+    };
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| refused("it has no plain file name".into()))?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let dir = sys::open_socket_directory(parent).map_err(refuse)?;
+    if dir.root_controlled {
+        return UnixStream::connect(path);
+    }
+    let entry = sys::open_socket_entry_at(&dir.fd, name, dir.owner).map_err(refuse)?;
+    let stream = UnixStream::connect(sys::fd_path(&entry))?;
+    let peer = sys::peer_uid(&stream)?;
+    if peer != dir.owner {
+        return Err(refused(format!(
+            "it is served by uid {peer}, not by uid {}, who owns its directory",
+            dir.owner
+        )));
+    }
+    Ok(stream)
+}
+
 fn connect(host: &str, port: u16, tls: bool, timeout: Duration) -> io::Result<TcpStream> {
     let timeout = timeout.min(CONNECT_TIMEOUT);
     let addrs = match fixed_addrs(host, port) {
@@ -269,7 +335,7 @@ pub fn request(
     head.push_str("\r\n");
     match endpoint {
         Endpoint::Unix(path) => {
-            let stream = UnixStream::connect(path).map_err(Failure::Connect)?;
+            let stream = connect_unix(path).map_err(Failure::Connect)?;
             stream
                 .set_read_timeout(Some(timeout))
                 .and_then(|()| stream.set_write_timeout(Some(timeout)))
@@ -486,7 +552,7 @@ pub(super) fn stream(
     let opening_deadline = Instant::now() + CONNECT_TIMEOUT;
     let transport: Box<dyn ReadWrite> = match endpoint {
         Endpoint::Unix(path) => {
-            let socket = UnixStream::connect(path).map_err(Failure::Connect)?;
+            let socket = connect_unix(path).map_err(Failure::Connect)?;
             socket
                 .set_read_timeout(Some(timeout))
                 .and_then(|()| socket.set_write_timeout(Some(timeout)))
@@ -842,6 +908,107 @@ mod tests {
     // The remote-mode fixtures drive real sockets, threads and wall-clock
     // deadlines: the direct std/tokio calls are the harness, not daemon paths.
     #![allow(clippy::disallowed_methods)]
+
+    /// F3: as root, the API socket in a directory that another user owns is
+    /// reached only as that user's own socket, made and served by that user:
+    /// a link, a FIFO, root's own socket and one handed to the user but served
+    /// by root are refused, and nothing hangs. Needs root; elsewhere it says so,
+    /// or fails under `KRONIK_FOREIGN_TESTS=require`.
+    #[test]
+    fn root_refuses_a_swapped_api_socket_and_reaches_its_owners() {
+        use std::io::{BufRead as _, Read as _};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::UnixListener;
+        if !kronik_foreign::sys::is_root() {
+            assert!(
+                std::env::var("KRONIK_FOREIGN_TESTS").as_deref() != Ok("require"),
+                "KRONIK_FOREIGN_TESTS=require, but the root client test needs root"
+            );
+            eprintln!("skipped: the root client test needs root");
+            return;
+        }
+        let base = tempfile::Builder::new()
+            .prefix("kronik-api-socket-")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The service user's runtime directory, as the nonroot unit makes it.
+        let run = base.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::os::unix::fs::chown(&run, Some(65_534), Some(65_534)).unwrap();
+        let socket = run.join("api.sock");
+        // Root's own socket elsewhere, which a link would lead to.
+        let elsewhere = base.path().join("root.sock");
+        let _root_listener = UnixListener::bind(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &socket).unwrap();
+        let why = connect_unix_as_root(&socket).unwrap_err().to_string();
+        assert!(why.contains("refusing, as root"), "link: {why}");
+        std::fs::remove_file(&socket).unwrap();
+        // A FIFO: refused before anything could block on it.
+        let made = std::process::Command::new("mkfifo")
+            .arg(&socket)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let why = connect_unix_as_root(&socket).unwrap_err().to_string();
+        assert!(why.contains("not a socket"), "fifo: {why}");
+        std::fs::remove_file(&socket).unwrap();
+        // Root's socket in the user's directory: not the user's.
+        let listener = UnixListener::bind(&socket).unwrap();
+        let why = connect_unix_as_root(&socket).unwrap_err().to_string();
+        assert!(
+            why.contains("belongs to user 0, not 65534"),
+            "root's socket: {why}"
+        );
+        // Handed to the user, but served by root: the peer gives it away.
+        std::os::unix::fs::lchown(&socket, Some(65_534), Some(65_534)).unwrap();
+        let why = connect_unix_as_root(&socket).unwrap_err().to_string();
+        assert!(
+            why.contains("served by uid 0, not by uid 65534"),
+            "root's listener: {why}"
+        );
+        drop(listener);
+        std::fs::remove_file(&socket).unwrap();
+        // The user's own socket, served by the user: reached.
+        let mut server = std::process::Command::new("setpriv")
+            .args([
+                "--reuid=65534",
+                "--regid=65534",
+                "--clear-groups",
+                "python3",
+                "-c",
+            ])
+            .arg(
+                "import socket, sys\n\
+                 s = socket.socket(socket.AF_UNIX)\n\
+                 s.bind(sys.argv[1])\n\
+                 s.listen(1)\n\
+                 print('ready', flush=True)\n\
+                 c, _ = s.accept()\n\
+                 c.sendall(b'ok')\n\
+                 c.close()\n",
+            )
+            .arg(&socket)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(server.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+        let mut stream = connect_unix_as_root(&socket).unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).unwrap();
+        assert_eq!(answer, "ok");
+        assert!(server.wait().unwrap().success());
+        // A missing socket stays "not found": no daemon is an answer, not a refusal.
+        std::fs::remove_file(&socket).unwrap();
+        assert_eq!(
+            connect_unix_as_root(&socket).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
 
     use super::*;
 
