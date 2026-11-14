@@ -103,6 +103,19 @@ class ExplicitFixture(unittest.TestCase):
 
 
 class Evidence(unittest.TestCase):
+    def test_a_path_an_artifact_refuses_is_renamed_and_others_kept(self):
+        self.assertEqual(CI["artifact_path"](Path("logs/library-package-libblkid1:amd64.log")),
+                         Path("logs/library-package-libblkid1_amd64.log"))
+        self.assertEqual(CI["artifact_path"](Path('a"b/c<d>e|f*g?h')), Path("a_b/c_d_e_f_g_h"))
+        self.assertEqual(CI["artifact_path"](Path("run/build.log")), Path("run/build.log"))
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination = Path(directory) / "tree", Path(directory) / "evidence"
+            (source / "logs").mkdir(parents=True)
+            (source / "logs" / "package-libelf1:amd64.log").write_text("built\n")
+            copied, _, _ = CI["copy_evidence"](source, destination, CI["MAX_TOTAL"])
+            self.assertEqual(copied, 1)
+            self.assertEqual((destination / "logs" / "package-libelf1_amd64.log").read_text(), "built\n")
+
     def test_only_text_leaves_and_no_key_image_disk_or_database(self):
         with tempfile.TemporaryDirectory() as directory:
             source, destination = Path(directory) / "proof", Path(directory) / "evidence"

@@ -10,7 +10,7 @@
 set -euo pipefail
 exec python3 - "$@" <<'PY'
 import argparse, contextlib, ctypes, hashlib, json, os, pathlib, platform
-import re, runpy, shutil, signal, subprocess, sys, tarfile, tempfile, time, tomllib, urllib.request
+import re, runpy, shutil, signal, subprocess, sys, tarfile, tempfile, time, tomllib, urllib.error, urllib.request
 
 _spawning = False
 _cancel_signal = None
@@ -114,6 +114,26 @@ def run(name, args, cwd=work, timeout=None, extra=None, capture=None):
             _spawning = False
     return (logs / (name + '.log')).read_text(errors='replace')
 def fetch(name, url, limit, expected=None):
+    # Hosted runners share their addresses, and GitHub's archive host answers
+    # 429 to too many downloads from one: such an answer, a server error or a
+    # dropped connection is retried, after Retry-After (at most five minutes)
+    # or a doubling wait, five times. The partial file goes first; the digest
+    # check below stays the same.
+    for attempt in range(6):
+        try:
+            return fetch_once(name, url, limit, expected)
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503, 504) or attempt == 5: raise
+            after = (e.headers.get('Retry-After') or '').strip()
+            wait = min(int(after), 300) if after.isdigit() else 15 * 2 ** attempt
+            why = 'HTTP ' + str(e.code)
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if attempt == 5: raise
+            wait, why = 15 * 2 ** attempt, str(e)
+        (sources / name).unlink(missing_ok=True)
+        print(name + ': ' + why + ', retrying in ' + str(wait) + ' s', file=sys.stderr, flush=True)
+        time.sleep(wait)
+def fetch_once(name, url, limit, expected=None):
     path = sources / name
     start = time.monotonic()
     h = hashlib.sha256()

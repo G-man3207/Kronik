@@ -58,6 +58,8 @@ SKIPPED_NAMES = {"master.key", "vmlinux", "firecracker", "guest-init", "mke2fs",
                  "initrd", "initrd.cpio"}
 MAX_FILE = 16 << 20
 MAX_TOTAL = 400 << 20
+# The characters an artifact's file paths may not contain (actions/upload-artifact).
+ARTIFACT_FORBIDDEN = '"' + ':<>|*?\r\n'
 
 
 class Refused(Exception):
@@ -443,6 +445,13 @@ def text_file(path):
         return False
 
 
+def artifact_path(relative):
+    """`relative` with every character an artifact path may not contain replaced by `_`
+    (a build log is named after a package such as `libblkid1:amd64`)."""
+    return Path(*["".join("_" if c in ARTIFACT_FORBIDDEN else c for c in part)
+                  for part in Path(relative).parts])
+
+
 def copy_evidence(source, destination, budget):
     """Copies the evidence files of `source` below `destination`; returns (copied, skipped, bytes)."""
     copied = skipped = total = 0
@@ -458,7 +467,7 @@ def copy_evidence(source, destination, budget):
             if total + size > budget:
                 skipped += 1
                 continue
-            target = destination / relative / name
+            target = destination / artifact_path(relative / name)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, target, follow_symlinks=False)
             copied, total = copied + 1, total + size
