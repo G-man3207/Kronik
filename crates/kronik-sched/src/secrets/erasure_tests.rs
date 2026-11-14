@@ -228,9 +228,24 @@ fn a_secret_only_erased_requests_cited_stays_a_scrub_value() {
         // cannot write a manifest again behind the one removed here.
         quiesce(&node).await;
         std::fs::remove_file(data.path().join(MANIFEST)).unwrap();
+        let (records_before, _) = stats(&node);
         certify(&node).await;
-        let (_, erased) = stats(&node);
-        assert!(erased >= 1, "the erased request was read");
+        let (records_after, erased) = stats(&node);
+        // It failed once under heavy load, not since in 50 runs: what the
+        // builds read says whether the certification started at the first
+        // record or at a watermark that came back.
+        assert!(
+            erased >= 1,
+            "the erased request was read: builds since the removal read {} records, \
+             the log is applied through {}, a watermark is {}",
+            records_after - records_before,
+            node.applied_lsn(),
+            if data.path().join(MANIFEST).exists() {
+                "there now"
+            } else {
+                "absent"
+            }
+        );
         let cold = node.native_secret_snapshot().unwrap();
         assert!(retained(&cold), "{:?}", values(&cold));
         assert!(cold.references.is_some());
