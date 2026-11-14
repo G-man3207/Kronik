@@ -2489,6 +2489,9 @@ impl Node {
             )
         });
         if let Some(blobs) = &turn_blobs {
+            blobs.lease_input(&input);
+        }
+        if let Some(blobs) = &turn_blobs {
             fx.attach_blobs(blobs.clone());
         }
         let run = program

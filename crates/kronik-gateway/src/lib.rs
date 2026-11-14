@@ -1171,7 +1171,10 @@ impl Gateway {
                 )
             }
         };
+        // Renewed until the turn's result arrives, however long the upload
+        // and the turn's wait take.
         let lease = store.leases().take("upload");
+        lease.keep_alive(self.node.env());
         let stored = |e: kronik_blob::BlobError| match e {
             kronik_blob::BlobError::TooLarge { .. } => {
                 too_large(format!("over {upload_bytes} bytes"))
@@ -1259,8 +1262,10 @@ impl Gateway {
             missing("the response is a blob and the node has no blob store".into())
         })?;
         let meta = kronik_blob::BlobMeta::from_pb(blob).map_err(|e| missing(e.to_string()))?;
+        // Renewed while the answer streams, however slow the client.
         let lease = store.leases().take("stream");
         lease.add(meta.id);
+        lease.keep_alive(self.node.env());
         let access = self.node.sealer().blob_key_access();
         let reader = store
             .reader(space, &meta, &access)

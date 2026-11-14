@@ -265,6 +265,11 @@ until the v1.0 compatibility promise takes effect.
   node from starting (found in review). Every record is also checked as the
   log's readers will decode it before it is appended: a turn whose record
   would not decode fails instead of being written.
+- Uploads, streamed blob answers and replays keep their blobs however long
+  they take (M25): their leases are renewed while held, and a running turn
+  holds the blobs of its input; an upload that waited for its turn longer
+  than `[blobs] lease_ttl` could be collected before the turn read it
+  (found in review).
 - Blob limits found in review (M25): a turn holds at most 64 blob writers
   open at once (constructing another traps); a writer creates its part file
   with its first full frame and holds at most one frame; a blob read is

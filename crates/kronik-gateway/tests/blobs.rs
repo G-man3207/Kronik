@@ -379,3 +379,93 @@ async fn the_server_streams_uploads_and_blob_responses() {
     );
     assert!(response[split + 4..] == upload[..], "the echo differs");
 }
+
+/// Review R-2 (erasure): the upload's lease was never renewed, so an
+/// upload whose turn waited longer than the lease TTL (here behind a slow
+/// turn of the same actor) could be collected before its turn ran. It is
+/// renewed until the turn's result arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upload_lease_outlives_its_ttl_while_its_turn_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::real(tokio::runtime::Handle::current());
+    let config = NodeConfig {
+        blobs: Some(BlobsConfig {
+            lease_ttl: Duration::from_millis(200),
+            ..BlobsConfig::default()
+        }),
+        ..NodeConfig::default()
+    };
+    let node = start_local(env, dir.path(), config).await.unwrap();
+    let owner = node.local_operator_authority().unwrap();
+    node.deploy(
+        &std::fs::read(MEDIA).unwrap(),
+        audit(),
+        false,
+        owner.clone(),
+    )
+    .await
+    .unwrap();
+    node.grant(
+        "media",
+        "http:127.0.0.1",
+        None,
+        None,
+        kronik_effects::InForks::Recorded,
+        audit(),
+        false,
+        owner,
+    )
+    .await
+    .unwrap();
+    // A server that answers after 1.5 s keeps media/a busy.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        use std::io::{BufRead as _, Write as _};
+        for stream in listener.incoming().flatten() {
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                line.clear();
+            }
+            std::thread::sleep(Duration::from_millis(1500));
+            let mut stream = stream;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        }
+    });
+    let gw = Arc::new(Gateway::new(node.clone(), GatewayConfig::default()));
+    let slow = {
+        let gw = gw.clone();
+        let url = format!("http://{addr}/slow");
+        tokio::spawn(async move {
+            send(
+                &gw,
+                request("fetch", &[]),
+                RequestBody::Inline(url.into_bytes()),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let body = data(2 * MIB);
+    let id = kronik_blob::BlobId::parse(&format!("b3:{}", blake3::hash(&body).to_hex())).unwrap();
+    let upload = {
+        let gw = gw.clone();
+        let body = body.clone();
+        tokio::spawn(async move { send(&gw, request("info", &[]), chunks(body, 64 << 10)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let store = node.blob_store().unwrap().clone();
+    assert!(
+        store.leases().is_leased(&id),
+        "the queued upload is held past the lease TTL: {:?}",
+        store.leases().holders()
+    );
+    let r = upload.await.unwrap();
+    assert_eq!(
+        text(&r),
+        format!("blob b3:{} {}", blake3::hash(&body).to_hex(), body.len())
+    );
+    assert_eq!(slow.await.unwrap().status, 200);
+}

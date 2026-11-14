@@ -791,3 +791,36 @@ async fn an_erased_subjects_plain_blob_reads_as_erased() {
     let shared = put(&store, None, &content(6, 500), 100).await;
     store.reader(&Space::Main, &shared, &keys).await.unwrap();
 }
+
+/// Review R-2 (erasure): a lease held longer than its TTL expired, so an
+/// upload waiting for its turn lost its blob to the collector. A kept-alive
+/// lease stays in force while held and ends when dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_alive_lease_outlives_its_ttl_while_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::real(tokio::runtime::Handle::current());
+    let store = BlobStore::open(
+        env.clone(),
+        dir.path(),
+        StoreConfig {
+            lease_ttl: Duration::from_millis(80),
+            ..StoreConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let meta = put(&store, None, &content(8, 1000), 100).await;
+    let plain = store.leases().take("plain");
+    plain.add(meta.id);
+    let kept = store.leases().take("kept");
+    kept.add(meta.id);
+    kept.keep_alive(&env);
+    env.clock.sleep(Duration::from_millis(400)).await;
+    assert!(!plain.is_live(), "an unrenewed lease expires");
+    assert!(kept.is_live(), "a kept-alive lease does not");
+    assert!(store.leases().is_leased(&meta.id));
+    drop(kept);
+    drop(plain);
+    env.clock.sleep(Duration::from_millis(50)).await;
+    assert!(store.leases().holders().is_empty(), "it ends when dropped");
+}

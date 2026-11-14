@@ -134,6 +134,28 @@ impl Lease {
         }
     }
 
+    /// Renews the lease every quarter of its TTL (at most every 30 s)
+    /// while any clone of it exists, so that a lease held longer than the
+    /// TTL (a slow upload, a long streamed answer, a replay) stays in force
+    /// until it is dropped (ADR 0120 §4).
+    pub fn keep_alive(&self, env: &kronik_core::env::Env) {
+        let weak = Arc::downgrade(&self.0);
+        let every = (self.0.leases.ttl / 4).clamp(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(30),
+        );
+        let clock = env.clock.clone();
+        drop(env.spawn("blob lease renewal", async move {
+            loop {
+                clock.sleep(every).await;
+                match weak.upgrade() {
+                    Some(handle) => Lease(handle).renew(),
+                    None => return,
+                }
+            }
+        }));
+    }
+
     /// Extends the lease by the TTL from now.
     pub fn renew(&self) {
         let expires = self.0.leases.clock.monotonic() + self.0.leases.ttl;

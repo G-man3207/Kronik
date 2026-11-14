@@ -765,10 +765,11 @@ impl Proposals {
         // Blobs (M25 §9): fork turns read main's and write the fork's, and
         // the run holds a floor lease at its fork point (ADR 0120 §4).
         setup.blobs = self.node.blob_store().cloned();
-        setup.blob_floor = setup
-            .blobs
-            .as_ref()
-            .map(|store| store.leases().floor("replay", setup.index.fork_lsn));
+        setup.blob_floor = setup.blobs.as_ref().map(|store| {
+            let floor = store.leases().floor("replay", setup.index.fork_lsn);
+            floor.keep_alive(self.node.env());
+            floor
+        });
         // Values of linked secrets this process holds; a preview computes nothing.
         if !preview {
             setup.held_secrets = self

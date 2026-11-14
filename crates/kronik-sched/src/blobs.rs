@@ -274,6 +274,19 @@ impl TurnBlobs {
         Ok(Box::new(FrameSource { reader, next: 0 }))
     }
 
+    /// Adds the blobs `input` references to the turn's lease, which is
+    /// renewed while the turn runs: its input stays while the turn reads it
+    /// (ADR 0120 §4), however long it waits before its record.
+    pub(crate) fn lease_input(&self, input: &pb::Input) {
+        let mut refs = Vec::new();
+        kronik_proto::blobs::input(Some(input), &mut refs);
+        for blob in refs {
+            if let Ok(id) = BlobId::parse(&blob.hash) {
+                self.0.lease.add(id);
+            }
+        }
+    }
+
     /// Whether the turn read an erased subject's blob.
     pub fn read_erased(&self) -> bool {
         self.0.read_erased.load(Ordering::Relaxed)

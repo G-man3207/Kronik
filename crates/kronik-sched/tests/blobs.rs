@@ -1223,3 +1223,74 @@ fn a_reply_cannot_carry_blobs() {
         "inline 2"
     );
 }
+
+/// Serves one request after reading its body, `delay` later.
+#[allow(clippy::disallowed_methods)]
+fn slow_server(delay: std::time::Duration) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                .unwrap();
+            let mut buf = vec![0u8; 64 << 10];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+            std::thread::sleep(delay);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    addr
+}
+
+/// Review R-2 (erasure): a turn's lease held only the blobs it wrote, so
+/// its input could be collected while it ran. The turn's lease, renewed
+/// while it runs, now holds its input too.
+#[allow(clippy::disallowed_methods)]
+#[test]
+fn a_running_turn_leases_its_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(
+        dir.path(),
+        Some(BlobsConfig {
+            lease_ttl: std::time::Duration::from_millis(200),
+            ..BlobsConfig::default()
+        }),
+    );
+    p.effect_setup(1 << 20, None);
+    let addr = slow_server(std::time::Duration::from_millis(1500));
+    let blob = p.upload(dir.path(), &vec![5u8; 300_000]);
+    let id = kronik_blob::BlobId::parse(&blob.hash).unwrap();
+    let store = p.node.blob_store().unwrap().clone();
+    assert!(!store.leases().is_leased(&id));
+    let node = p.node.clone();
+    let input = http(
+        "post",
+        &format!("url=http://{addr}/sink"),
+        pb::body::Value::Blob(blob),
+    );
+    let turn = p.rt.spawn(async move {
+        match node
+            .ingress(ActorRef::parse("media/a").unwrap(), input, None)
+            .unwrap()
+        {
+            Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
+            Ingress::Done(r) => *r,
+        }
+    });
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    assert!(
+        store.leases().is_leased(&id),
+        "the running turn holds its input past the lease TTL: {:?}",
+        store.leases().holders()
+    );
+    let r = p.rt.block_on(turn).unwrap();
+    assert_eq!(answer(&r), "status 200");
+}
