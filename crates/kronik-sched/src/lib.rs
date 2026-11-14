@@ -17,6 +17,7 @@
 //! interval/shutdown and irreversible recovery continuations are separate host paths;
 //! audit metadata never chooses operation authority.
 
+mod blob_erasure;
 pub mod blob_gc;
 pub mod blobs;
 pub mod connections;

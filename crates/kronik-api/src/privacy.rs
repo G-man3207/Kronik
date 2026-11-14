@@ -131,6 +131,10 @@ pub struct ErasureResponse {
     /// run, the would-be time.
     #[serde(default)]
     pub complete_after_ms: u64,
+    /// The files of the subject's blobs deleted from this node's stores,
+    /// main's and the forks' (M26 §9.3); 0 for a dry run.
+    #[serde(default)]
+    pub blobs: u64,
 }
 
 /// `POST /v1/privacy/reseal` (§8).
@@ -212,6 +216,7 @@ impl Api {
             lsn: done.lsn,
             plain_values: done.plain_values,
             complete_after_ms: done.complete_after_ms,
+            blobs: done.blobs,
         })
     }
 

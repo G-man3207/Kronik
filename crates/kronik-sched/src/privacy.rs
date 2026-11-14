@@ -38,6 +38,9 @@ pub struct ErasureDone {
     /// When shipped keystore backups of this erasure expire
     /// (`erased_at + privacy.keystore_backup_retention`).
     pub complete_after_ms: u64,
+    /// The files of the subject's erased blobs deleted, in main's store and
+    /// in the fork spaces (M26 §9.3); 0 for a dry run.
+    pub blobs: u64,
 }
 
 impl Node {
@@ -141,6 +144,7 @@ impl Node {
                 lsn: None,
                 plain_values,
                 complete_after_ms,
+                blobs: 0,
             });
         }
         let node = self
@@ -170,12 +174,22 @@ impl Node {
             })
             .await?;
         tracing::info!(epoch, lsn, key_version, "subject erased");
+        // Its blobs' files go now (M26 §9.3). A failure leaves them to the
+        // next start's pass and to the collector: the erasure itself is done.
+        let blobs = match self.delete_erased_blobs().await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(error = %e.message, "deleting the files of erased blobs failed");
+                0
+            }
+        };
         Ok(ErasureDone {
             key_version,
             epoch,
             lsn: Some(lsn),
             plain_values,
             complete_after_ms,
+            blobs,
         })
     }
 

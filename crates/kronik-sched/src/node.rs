@@ -1073,6 +1073,10 @@ impl Node {
                 );
             }
         }
+        // The files of erased blobs that a stop left behind (M26 §9.3).
+        if let Err(e) = node.delete_erased_blobs().await {
+            tracing::error!(error = %e.message, "deleting the files of erased blobs failed");
+        }
         node.initialize_secret_versions(last == 0, node.native_recovery.clone())
             .await?;
         node.start_secret_refresh(node.native_recovery.clone());

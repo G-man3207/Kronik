@@ -24,6 +24,7 @@
 //! subject's blob ([`BlobKeys`], [`KeyAccess`]).
 
 mod budget;
+mod erase;
 pub mod format;
 mod id;
 mod lease;

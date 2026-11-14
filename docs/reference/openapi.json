@@ -4060,6 +4060,13 @@
       "ErasureResponse": {
         "description": "The answer to `POST /v1/privacy/erase`.",
         "properties": {
+          "blobs": {
+            "default": 0,
+            "description": "The files of the subject's blobs deleted from this node's stores,\nmain's and the forks' (M26 §9.3); 0 for a dry run.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "complete_after_ms": {
             "default": 0,
             "description": "When shipped keystore backups of this erasure expire\n(`erased_at + privacy.keystore_backup_retention`, §6.7). For a dry\nrun, the would-be time.",

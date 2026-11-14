@@ -245,6 +245,9 @@ fn render_erase(r: &ErasureResponse, rerun: &str) -> String {
             r.plain_values
         );
     }
+    if r.blobs > 0 {
+        let _ = writeln!(out, "Deleted {} files of its blobs.", r.blobs);
+    }
     complete_after(&mut out, r.complete_after_ms);
     out.push_str(&next(&["kronik privacy status".to_owned()]));
     out

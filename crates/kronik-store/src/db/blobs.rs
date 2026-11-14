@@ -1226,6 +1226,36 @@ pub(super) fn references_blobs(record: &Record) -> bool {
     !kronik_proto::blobs::refs(record).is_empty()
 }
 
+/// Applying an `Erasure` of `subject` through `key_version` (M26 §9.3): its
+/// blobs keyed with that version or an older one are erased (as `index_ref`
+/// decides for a blob first referenced after the erasure). Their files go
+/// in the node's after-erasure step; pins, holds and log references stay
+/// and point at an erased blob. Returns how many rows it marked.
+pub(super) fn erase_blobs(
+    tx: &Connection,
+    subject: &str,
+    key_version: u32,
+) -> Result<u64, StoreError> {
+    Ok(tx
+        .prepare_cached(
+            "UPDATE blobs SET erased = 1 WHERE subject = ?1 AND key_version <= ?2 AND erased = 0",
+        )?
+        .execute(params![subject, i64::from(key_version)])? as u64)
+}
+
+impl StateDb {
+    /// The erased rows of the index, sorted (M26 §9.3): their files go from
+    /// main's store and from every fork space, until the collector, which
+    /// deletes main's, forgets the rows.
+    pub fn erased_blobs(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT hash FROM blobs WHERE erased = 1 ORDER BY hash")?;
+        let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+}
+
 #[cfg(test)]
 #[path = "blobs_tests.rs"]
 mod tests;
