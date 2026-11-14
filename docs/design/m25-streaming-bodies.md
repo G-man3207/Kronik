@@ -508,9 +508,10 @@ read past `max_response_bytes` fails with `response_too_large()`
 implementation (`env/real/authorized.rs`) shares its admission and dispatch
 with `http_authorized`, sends a streamed body chunk by chunk with its
 `content-length`, and returns hyper's `Incoming` as a `BodySource` that owns
-the request's original authority until the body ends. The simulated network
-and `ForeignHost` keep the buffering default for now; seeded chunk sizes in
-the simulator come with the M26 simulation slice, and foreign responses stay
+the request's original authority until the body ends. The simulator's
+service (`kronik-sim/src/service.rs`, the M26 simulation slice) streams both
+ways in chunks of seeded sizes and delays and can cut a response in its
+body; `ForeignHost` keeps the buffering default, and foreign responses stay
 inline.
 
 ### 7.2 A blob request body

@@ -16,7 +16,10 @@
 //! from the log. `--scenario allocator` and `--scenario secret-outage` (not
 //! part of `all`) are M23's secret workloads against a simulated OpenBao:
 //! one allocator of version numbers under concurrent first uses, refreshes
-//! and crashes, and turns while the backend hangs.
+//! and crashes, and turns while the backend hangs. `--scenario blobs` (not part
+//! of `all`) is the blob workload (M25, M26 §14): the `media` guest writes,
+//! fetches, posts and discards blobs under the collector, full-store windows
+//! and targeted crashes.
 //! `--long STEPS` runs the counter workload, with connection clients in the
 //! mix, as one long run per seed (default seed 0) of at least STEPS executor
 //! steps, with crashes throughout; the
@@ -31,6 +34,8 @@
 //! `--expect-violation C3` makes it pass only when some seed reports a
 //! violation that starts with `C3`. `--identity-replay` replays the log of
 //! every connections run (C8), not only every 10th seed's.
+//! The blob workload's mutations are `blob-skip-ensure-durable`,
+//! `blob-sweep-ignores-leases` and `blob-sweep-ignores-touches`.
 //! A run line shows `start-failures=N` after its wall time when a node's
 //! start failed on an injected fsync error and the node was restarted; the
 //! lines under it say what failed.
@@ -41,7 +46,7 @@
 
 use std::process::ExitCode;
 
-use kronik_sim::scenario::{ScenarioConfig, run};
+use kronik_sim::scenario::{BlobMutation, ScenarioConfig, run};
 
 fn parse_range(s: &str) -> Option<std::ops::Range<u64>> {
     let (a, b) = s.split_once("..")?;
@@ -56,6 +61,7 @@ fn main() -> ExitCode {
     let mut deliver_before_fsync = false;
     let mut identity_replay = false;
     let mut expect: Option<String> = None;
+    let mut blob_mutation = None;
     let mut scenarios = vec!["counter", "effects", "webhook", "connections"];
     let mut long = None;
     let mut seeds_given = false;
@@ -125,11 +131,15 @@ fn main() -> ExitCode {
                     scenarios = vec!["connections"];
                     i += 1;
                 }
+                Some("blobs") => {
+                    scenarios = vec!["blobs"];
+                    i += 1;
+                }
                 Some("all") => i += 1,
                 _ => {
                     eprintln!(
                         "--scenario needs counter, effects, webhook, connections, rebuild, \
-                         allocator, secret-outage or all"
+                         allocator, secret-outage, blobs or all"
                     );
                     return ExitCode::FAILURE;
                 }
@@ -143,8 +153,16 @@ fn main() -> ExitCode {
                     deliver_before_fsync = true;
                     i += 1;
                 }
+                Some(name) if BlobMutation::parse(name).is_some() => {
+                    blob_mutation = BlobMutation::parse(name);
+                    i += 1;
+                }
                 _ => {
-                    eprintln!("--mutation needs ack-before-fsync or deliver-before-fsync");
+                    eprintln!(
+                        "--mutation needs ack-before-fsync, deliver-before-fsync, \
+                         blob-skip-ensure-durable, blob-sweep-ignores-leases or \
+                         blob-sweep-ignores-touches"
+                    );
                     return ExitCode::FAILURE;
                 }
             },
@@ -182,6 +200,8 @@ fn main() -> ExitCode {
             ScenarioConfig::outage_for_seed(seed)
         } else if scenario == "connections" {
             ScenarioConfig::connections_for_seed(seed)
+        } else if scenario == "blobs" {
+            ScenarioConfig::blobs_for_seed(seed)
         } else if let Some(steps) = long {
             ScenarioConfig::long(seed, steps)
         } else {
@@ -191,6 +211,9 @@ fn main() -> ExitCode {
         cfg.mutation_deliver_before_fsync = deliver_before_fsync;
         if let Some(w) = cfg.connections.as_mut() {
             w.identity_replay |= identity_replay;
+        }
+        if let Some(blobs) = cfg.blobs.as_mut() {
+            blobs.mutation = blob_mutation;
         }
         cfg
     };

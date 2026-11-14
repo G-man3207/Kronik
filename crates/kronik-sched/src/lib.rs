@@ -345,6 +345,7 @@ pub async fn start_local_locked(
                 kronik_blob::StoreConfig {
                     reserve: b.disk_reserve,
                     lease_ttl: b.lease_ttl,
+                    ..kronik_blob::StoreConfig::default()
                 },
             )
             .await

@@ -102,7 +102,11 @@ impl BlobStore {
         // first is skipped as touched, one named before is leased at the
         // second or referenced by a record the roots read later.
         let start = self.touch_seq.load(Ordering::Acquire);
-        let leased_at_start = self.leases().leased();
+        let leased_at_start = if self.mutation_sweep_ignores_leases {
+            BTreeSet::new()
+        } else {
+            self.leases().leased()
+        };
         let root = self.root(space);
         let previous = lock(&self.sweep.candidates)
             .get(&root)
@@ -140,11 +144,13 @@ impl BlobStore {
                     continue;
                 }
                 let _claim = dir.claim.lock().await;
-                let touched = lock(&dir.gens)
-                    .touched
-                    .get(&name)
-                    .is_some_and(|seq| *seq > start);
-                if touched || self.leases().is_leased(&id) {
+                let touched = !self.mutation_sweep_ignores_touches
+                    && lock(&dir.gens)
+                        .touched
+                        .get(&name)
+                        .is_some_and(|seq| *seq > start);
+                let leased = !self.mutation_sweep_ignores_leases && self.leases().is_leased(&id);
+                if touched || leased {
                     continue;
                 }
                 let candidate = previous.contains(&id);

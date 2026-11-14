@@ -40,6 +40,16 @@ pub struct StoreConfig {
     pub reserve: u64,
     /// `[blobs] lease_ttl`.
     pub lease_ttl: Duration,
+    /// Deliberate bug (mutation testing of the harness); never set outside
+    /// the simulator: [`BlobStore::ensure_durable`] returns without syncing.
+    pub mutation_skip_ensure_durable: bool,
+    /// Deliberate bug (mutation testing of the harness); never set outside
+    /// the simulator: a sweep deletes what a lease keeps.
+    pub mutation_sweep_ignores_leases: bool,
+    /// Deliberate bug (mutation testing of the harness); never set outside
+    /// the simulator: a sweep deletes what was named or claimed after it
+    /// began.
+    pub mutation_sweep_ignores_touches: bool,
 }
 
 impl Default for StoreConfig {
@@ -47,6 +57,9 @@ impl Default for StoreConfig {
         StoreConfig {
             reserve: 0,
             lease_ttl: Duration::from_secs(300),
+            mutation_skip_ensure_durable: false,
+            mutation_sweep_ignores_leases: false,
+            mutation_sweep_ignores_touches: false,
         }
     }
 }
@@ -135,6 +148,10 @@ pub struct BlobStore {
     pub(crate) touch_seq: AtomicU64,
     /// The collector's state between passes.
     pub(crate) sweep: crate::sweep::SweepState,
+    /// The harness's mutations ([`StoreConfig`]).
+    pub(crate) mutation_skip_ensure_durable: bool,
+    pub(crate) mutation_sweep_ignores_leases: bool,
+    pub(crate) mutation_sweep_ignores_touches: bool,
 }
 
 fn shard_dirs(root: &Path) -> impl Iterator<Item = PathBuf> + '_ {
@@ -162,6 +179,9 @@ impl BlobStore {
             dirs: Mutex::new(HashMap::new()),
             touch_seq: AtomicU64::new(0),
             sweep: crate::sweep::SweepState::default(),
+            mutation_skip_ensure_durable: cfg.mutation_skip_ensure_durable,
+            mutation_sweep_ignores_leases: cfg.mutation_sweep_ignores_leases,
+            mutation_sweep_ignores_touches: cfg.mutation_sweep_ignores_touches,
         });
         store.prepare(&Space::Main).await?;
         Ok(store)
@@ -539,6 +559,9 @@ impl BlobStore {
     /// synced yet, shared between concurrent callers (ADR 0117 §4.3). Call it
     /// before appending a record that references the blobs.
     pub async fn ensure_durable(&self, space: &Space, ids: &[BlobId]) -> Result<(), BlobError> {
+        if self.mutation_skip_ensure_durable {
+            return Ok(());
+        }
         let mut need: BTreeMap<PathBuf, u64> = BTreeMap::new();
         for id in ids {
             let object = self.object_path(space, id);

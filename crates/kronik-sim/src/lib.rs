@@ -265,8 +265,16 @@ impl Default for Trace {
 }
 
 impl Trace {
+    /// `KRONIK_DST_TRACE=1` also prints every line as it is traced, for a
+    /// seed whose last lines do not tell enough.
+    // The harness reports on its standard streams.
+    #[allow(clippy::print_stderr)]
     pub fn push(&mut self, at: Duration, line: String) {
+        static PRINT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let entry = format!("{:>12} {line}", at.as_micros());
+        if *PRINT.get_or_init(|| std::env::var_os("KRONIK_DST_TRACE").is_some_and(|v| v == "1")) {
+            eprintln!("trace {entry}");
+        }
         self.hasher.update(entry.as_bytes());
         self.hasher.update(b"\n");
         self.events += 1;

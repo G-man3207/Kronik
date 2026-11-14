@@ -71,6 +71,21 @@ jobs:
       # start's recovered state against a rebuild from the log.
       - name: DST, rebuild workload
         run: TMPDIR="$RUNNER_TEMP" scripts/dst.sh 0..10000 "$(nproc)" --scenario rebuild --twice
+      # Blobs (M25, M26 §14): writers, streamed effects, the collector,
+      # full-store windows and targeted crashes.
+      - name: DST, blob workload
+        run: TMPDIR="$RUNNER_TEMP" scripts/dst.sh 0..10000 "$(nproc)" --scenario blobs --twice
+      # Each deliberate bug in the blob store must make some seed fail: a
+      # mutation the workload no longer catches is a workload that lost its
+      # teeth.
+      - name: DST, blob mutations are caught
+        run: |
+          for mutation in blob-skip-ensure-durable blob-sweep-ignores-leases; do
+            if TMPDIR="$RUNNER_TEMP" scripts/dst.sh 0..1000 "$(nproc)" --scenario blobs --mutation "$mutation"; then
+              echo "::error::no seed failed with the blob mutation $mutation"
+              exit 1
+            fi
+          done
       - name: Keep the shards' output
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

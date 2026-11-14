@@ -64,6 +64,30 @@ fn apply(buf: &mut Vec<u8>, op: &Op, keep: Option<usize>) {
 /// and the scenarios restart that node.
 pub const INJECTED_FSYNC_EIO: &str = "injected fsync EIO";
 
+/// An operation a crash point watches ([`Disk::crash_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CrashOp {
+    /// A rename, by its destination.
+    Rename,
+    RemoveFile,
+    /// A file's `sync_data`, by the file's current name.
+    SyncData,
+    SyncDir,
+}
+
+/// A targeted crash: the `nth` operation `op` (counted from 1) on a path
+/// under `under` takes effect, and then never returns; the process is
+/// crashed instead ([`SimFs::with_crash_hook`]). It is how a scenario
+/// crashes between two steps of the code under test without a hook in it:
+/// between a blob's rename into place and the record that references it,
+/// between a record's fsync and its apply, between two deletions of a sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrashPoint {
+    pub op: CrashOp,
+    pub under: PathBuf,
+    pub nth: u64,
+}
+
 /// Fault and latency knobs for one disk.
 #[derive(Debug, Clone, Copy)]
 pub struct DiskFaults {
@@ -88,6 +112,17 @@ pub struct Disk {
     /// The `sync_data` calls (counted from 1) that fail whatever the random
     /// draws say; see [`Disk::fail_syncs`].
     fail_sync_calls: BTreeSet<u64>,
+    /// The free space `available` reports; `None`: no limit.
+    pub free: Option<u64>,
+    /// Opening a file under this directory takes up to this much longer: a
+    /// slow disk under the blob store widens the windows between a
+    /// collector's steps.
+    pub slow_open: Option<(PathBuf, Duration)>,
+    /// Crash points not reached yet, and the operations counted for them.
+    crash_points: Vec<CrashPoint>,
+    crash_counts: BTreeMap<(CrashOp, PathBuf), u64>,
+    /// The crash points reached, in order.
+    pub crashed_at: Vec<CrashPoint>,
 }
 
 fn parent(p: &Path) -> PathBuf {
@@ -123,6 +158,66 @@ impl Disk {
     /// whatever the seed.
     pub fn fail_syncs(&mut self, calls: impl IntoIterator<Item = u64>) {
         self.fail_sync_calls.extend(calls);
+    }
+
+    /// Arms a crash point ([`CrashPoint`]); points on the same operation
+    /// and directory count the same operations.
+    pub fn crash_at(&mut self, point: CrashPoint) {
+        self.crash_points.push(point);
+    }
+
+    /// Disarms the crash points not reached yet: the run's checks at the
+    /// end need a node that stays up.
+    pub fn disarm_crash_points(&mut self) {
+        self.crash_points.clear();
+    }
+
+    /// Counts `op` on `path` for the armed crash points; `true` when one of
+    /// them is reached now (it is then disarmed).
+    fn reached(&mut self, op: CrashOp, path: &Path) -> bool {
+        let mut hit = None;
+        let mut counted = BTreeSet::new();
+        for (i, point) in self.crash_points.iter().enumerate() {
+            if point.op != op || !path.starts_with(&point.under) {
+                continue;
+            }
+            let key = (op, point.under.clone());
+            if counted.insert(key.clone()) {
+                *self.crash_counts.entry(key.clone()).or_default() += 1;
+            }
+            if hit.is_none() && self.crash_counts[&key] == point.nth {
+                hit = Some(i);
+            }
+        }
+        match hit {
+            Some(i) => {
+                let point = self.crash_points.remove(i);
+                self.crashed_at.push(point);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The files whose names are under `dir` now.
+    pub fn files_under(&self, dir: &Path) -> Vec<PathBuf> {
+        self.names
+            .keys()
+            .filter(|p| p.starts_with(dir))
+            .cloned()
+            .collect()
+    }
+
+    fn watches(&self, op: CrashOp) -> bool {
+        self.crash_points.iter().any(|point| point.op == op)
+    }
+
+    /// The current name of inode `ino`, if it has one.
+    fn name_of(&self, ino: u64) -> Option<PathBuf> {
+        self.names
+            .iter()
+            .find(|(_, i)| **i == ino)
+            .map(|(p, _)| p.clone())
     }
 
     /// A durable regular file that was on the disk before the run, with its
@@ -349,6 +444,8 @@ pub struct SimFs {
     clock: Arc<dyn Clock>,
     rng: SimRng,
     faults: DiskFaults,
+    /// Called when an operation reaches a crash point.
+    crash_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl SimFs {
@@ -363,7 +460,39 @@ impl SimFs {
             clock,
             rng,
             faults,
+            crash_hook: None,
         }
+    }
+
+    /// Calls `hook` when an operation reaches a crash point; the operation
+    /// then never returns, so nothing after it runs before the crash.
+    pub fn with_crash_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.crash_hook = Some(hook);
+        self
+    }
+
+    /// The end of an operation that reached a crash point: it has taken
+    /// effect, and the process crashes before it returns.
+    async fn crash_here<T>(&self) -> io::Result<T> {
+        if let Some(hook) = &self.crash_hook {
+            hook();
+        }
+        std::future::pending().await
+    }
+
+    fn op_or_crash(
+        &self,
+        lat: Duration,
+        f: impl FnOnce(&mut Disk) -> io::Result<bool> + Send + 'static,
+    ) -> BoxFuture<'static, io::Result<()>> {
+        let fs = self.clone();
+        let op = self.op(lat, f);
+        Box::pin(async move {
+            if op.await? {
+                return fs.crash_here().await;
+            }
+            Ok(())
+        })
     }
 
     fn latency(&self, min_us: u64, max_us: u64, slow_p: f64, slow_us: u64) -> Duration {
@@ -482,7 +611,16 @@ impl Fs for SimFs {
 
     fn open(&self, path: PathBuf, mode: OpenMode) -> BoxFuture<'static, io::Result<Arc<dyn File>>> {
         let me = self.clone();
-        self.op(self.latency(5, 30, 0.0, 0), move |d| {
+        let slow = lock(&self.disk)
+            .slow_open
+            .as_ref()
+            .filter(|(under, _)| path.starts_with(under))
+            .map(|(_, max)| *max);
+        let mut lat = self.latency(5, 30, 0.0, 0);
+        if let Some(max) = slow {
+            lat += self.rng.duration(Duration::ZERO, max);
+        }
+        self.op(lat, move |d| {
             let ino = match (d.names.get(&path), mode) {
                 (Some(i), _) => *i,
                 (None, OpenMode::Read) => {
@@ -526,24 +664,31 @@ impl Fs for SimFs {
     }
 
     fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.op(self.latency(10, 50, 0.0, 0), move |d| {
+        self.op_or_crash(self.latency(10, 50, 0.0, 0), move |d| {
             let ino = d.inode_of(&from)?;
             d.names.remove(&from);
-            d.names.insert(to, ino);
-            Ok(())
+            d.names.insert(to.clone(), ino);
+            Ok(d.reached(CrashOp::Rename, &to))
         })
     }
 
     fn remove_file(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.op(self.latency(10, 50, 0.0, 0), move |d| {
+        self.op_or_crash(self.latency(10, 50, 0.0, 0), move |d| {
             d.inode_of(&path)?;
             d.names.remove(&path);
-            Ok(())
+            Ok(d.reached(CrashOp::RemoveFile, &path))
         })
     }
 
+    /// At once and without a random draw, as `Fs::available`'s default: the
+    /// node asks every second, and a draw would move every seed's faults.
+    fn available(&self, _path: PathBuf) -> BoxFuture<'static, io::Result<u64>> {
+        let free = lock(&self.disk).free.unwrap_or(u64::MAX);
+        Box::pin(async move { Ok(free) })
+    }
+
     fn sync_dir(&self, dir: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.op(self.latency(100, 1000, 0.01, 10_000), move |d| {
+        self.op_or_crash(self.latency(100, 1000, 0.01, 10_000), move |d| {
             let stale: Vec<PathBuf> = d
                 .durable_names
                 .keys()
@@ -560,7 +705,7 @@ impl Fs for SimFs {
                 .map(|(p, i)| (p.clone(), *i))
                 .collect();
             d.durable_names.extend(cur);
-            Ok(())
+            Ok(d.reached(CrashOp::SyncDir, &dir))
         })
     }
 
@@ -669,7 +814,8 @@ impl File for SimFile {
     fn sync_data(&self) -> BoxFuture<'static, io::Result<()>> {
         let lat = self.fs.latency(200, 3000, 0.01, 20_000);
         let fail = self.fs.rng.chance(self.fs.faults.fsync_error);
-        self.with(lat, move |i, d| {
+        let ino = self.ino;
+        let synced = self.with(lat, move |i, d| {
             d.sync_calls += 1;
             if fail || d.fail_sync_calls.contains(&d.sync_calls) {
                 // The kernel may have dropped the dirty pages: model the worst
@@ -681,6 +827,16 @@ impl File for SimFile {
             i.durable = i.current.clone();
             i.pending.clear();
             d.fsyncs += 1;
+            // Only a watched fsync looks its file's name up.
+            Ok(d.watches(CrashOp::SyncData)
+                && d.name_of(ino)
+                    .is_some_and(|path| d.reached(CrashOp::SyncData, &path)))
+        });
+        let fs = self.fs.clone();
+        Box::pin(async move {
+            if synced.await? {
+                return fs.crash_here().await;
+            }
             Ok(())
         })
     }

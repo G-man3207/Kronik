@@ -24,6 +24,11 @@
 //! The secret workloads (M23, [`SecretWorkload`], `secrets.rs`) link secret
 //! names to a simulated OpenBao (`bao.rs`) and check the secret invariants
 //! instead of the counters.
+//!
+//! The blob workload (M25, M26 §14, [`BlobWorkload`], `blobs.rs`) writes,
+//! fetches, posts and discards blobs with the `media` guest under the
+//! collector, full-store windows and targeted crashes, and checks the blob
+//! invariants.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -49,9 +54,11 @@ use crate::exec::{Executor, Handle, NodeId, RunEnd, SUPERVISOR};
 use crate::fs::{CrashModel, Disk, DiskFaults, INJECTED_FSYNC_EIO, SimFs};
 use crate::service::{ServiceFaults, SimService};
 
+mod blobs;
 mod connections;
 mod secrets;
 use crate::{SimClock, SimEntropy, SimNoNet, SimProcs, SimRng, SimSpawner, Trace};
+pub use blobs::{BlobMutation, BlobWorkload};
 pub use connections::ConnWorkload;
 use kronik_effects::{Delivery, Rate};
 use secrets::SecretState;
@@ -128,6 +135,8 @@ pub struct ScenarioConfig {
     /// Deliberate bug (mutation testing of the harness, M24 §14): the node
     /// gives a turn's frames to the hub before its record is appended.
     pub mutation_deliver_before_fsync: bool,
+    /// The blob workload instead of the counter workload.
+    pub blobs: Option<BlobWorkload>,
 }
 
 /// The effects workload's knobs.
@@ -171,6 +180,7 @@ impl ScenarioConfig {
             secrets: None,
             connections: None,
             mutation_deliver_before_fsync: false,
+            blobs: None,
         }
     }
 
@@ -218,6 +228,7 @@ impl ScenarioConfig {
             faults: ServiceFaults {
                 connect_fail: [0.0, 0.05][r.below(2) as usize],
                 lose_response: [0.0, 0.05][r.below(2) as usize],
+                cut_body: 0.0,
             },
             webhook: false,
         });
@@ -282,6 +293,24 @@ impl ScenarioConfig {
             baseline: Duration::from_millis(200 + r.below(800)),
             outage: fetch_timeout * 4 + Duration::from_millis(r.below(3_000)),
         });
+        cfg
+    }
+
+    /// The blob workload for `seed` (`--scenario blobs`, M25, M26 §14): the
+    /// `media` guest writes, fetches, posts and discards blobs while the node
+    /// crashes (at random and at targeted points), the collector runs every
+    /// virtual second and the disk fills now and then. Every start's
+    /// recovered state, the blob index included, is checked against a
+    /// rebuild from the log.
+    pub fn blobs_for_seed(seed: u64) -> ScenarioConfig {
+        let r = SimRng::new(seed, b"blobs-workload");
+        let mut cfg = ScenarioConfig::for_seed(seed);
+        cfg.forward_p = 0.0;
+        cfg.clients = 2 + r.below(4) as usize;
+        cfg.requests_per_client = 10 + r.below(30) as usize;
+        cfg.actors = 2 + r.below(3) as usize;
+        cfg.check_recovery = true;
+        cfg.blobs = Some(BlobWorkload::for_seed(seed));
         cfg
     }
 
@@ -381,6 +410,7 @@ fn code() -> Result<Arc<CodeStore>, String> {
         code.add(COUNTER).map_err(|e| e.to_string())?;
         code.add(webhook_relay()?).map_err(|e| e.to_string())?;
         code.add(connections::ROOM).map_err(|e| e.to_string())?;
+        code.add(blobs::MEDIA).map_err(|e| e.to_string())?;
         Ok(Arc::new(code))
     })
     .clone()
@@ -407,6 +437,7 @@ struct State {
     notes: String,
     secrets: SecretState,
     conns: connections::ConnState,
+    blobs: blobs::BlobState,
 }
 
 struct World {
@@ -448,8 +479,21 @@ fn injected_start_failure(error: &StartError) -> Option<String> {
     cause.contains(INJECTED_FSYNC_EIO).then_some(cause)
 }
 
+/// The simulated node's data directory, on the simulated disk. Snapshots,
+/// retention and the collector's snapshot and fork roots work through
+/// `std::fs`, outside the simulated disk: this is a path no host has, so they
+/// find nothing of the host there, and the node takes no snapshot (see
+/// `node_main`), which would write onto the host. One write still reaches
+/// the host: every start publishes `privacy/keystore_retention_ms` under it
+/// (`reseal::publish_keystore_retention`), harmless, and refused without
+/// root.
+pub(crate) const DATA_DIR: &str = "/kronik-sim/data";
+
 fn log_dir() -> PathBuf {
-    PathBuf::from("/data/branches/main/log")
+    PathBuf::from(DATA_DIR)
+        .join("branches")
+        .join("main")
+        .join("log")
 }
 
 impl World {
@@ -480,15 +524,22 @@ impl World {
                 node,
             }),
             entropy: Arc::new(SimEntropy(self.entropy.clone())),
-            fs: Arc::new(SimFs::new(
-                self.disk.clone(),
-                self.clock.clone(),
-                self.faults.clone(),
-                DiskFaults {
-                    crash_model: self.cfg.crash_model,
-                    fsync_error: self.cfg.fsync_error,
-                },
-            )),
+            fs: Arc::new({
+                // A crash point the node's I/O reaches crashes the node.
+                let fatal = self.fatal_tx.clone();
+                SimFs::new(
+                    self.disk.clone(),
+                    self.clock.clone(),
+                    self.faults.clone(),
+                    DiskFaults {
+                        crash_model: self.cfg.crash_model,
+                        fsync_error: self.cfg.fsync_error,
+                    },
+                )
+                .with_crash_hook(Arc::new(move || {
+                    let _ = fatal.send(node);
+                }))
+            }),
             net: match (&self.service, &self.bao) {
                 (service, Some(bao)) => Arc::new(SimNet {
                     bao: Some(bao.clone()),
@@ -593,6 +644,10 @@ impl World {
     }
 
     async fn node_main(self: Arc<Self>, env: Env, node_id: NodeId, store: Arc<Store>) {
+        let blob_store = match self.open_blob_store(&env).await {
+            Ok(store) => store,
+            Err(e) => return self.violation(format!("node {node_id} blob store: {e}")),
+        };
         let parts = NodeParts {
             env: env.clone(),
             config: NodeConfig {
@@ -604,11 +659,13 @@ impl World {
                 // 4, what the hosted CI runners' cores gave.
                 startup_decode_width: Some(4),
                 // Production nodes always have a storage root; the simulated
-                // node's virtual /data backs the coverage watermark (and its
-                // cold-start scan frontier) the same way, across restarts.
-                storage: Some(kronik_sched::snapshots::StorageConfig::new(PathBuf::from(
-                    "/data",
-                ))),
+                // node's virtual data directory backs the coverage watermark
+                // (and its cold-start scan frontier) the same way, across
+                // restarts. No snapshot: they write through `std::fs`.
+                storage: Some(kronik_sched::snapshots::StorageConfig {
+                    snapshot_interval: Duration::from_secs(100 * 365 * 86_400),
+                    ..kronik_sched::snapshots::StorageConfig::new(PathBuf::from(DATA_DIR))
+                }),
                 secret_settings: self.cfg.secrets.map(|w| w.settings()).unwrap_or_default(),
                 connections: self
                     .cfg
@@ -627,6 +684,7 @@ impl World {
                     })
                     .unwrap_or_default(),
                 mutation_deliver_before_fsync: self.cfg.mutation_deliver_before_fsync,
+                blobs: self.cfg.blobs.as_ref().map(BlobWorkload::blobs_config),
                 ..NodeConfig::default()
             },
             log: self.log_config(),
@@ -636,7 +694,7 @@ impl World {
             sealer: None,
             key_source: None,
             ownership: None,
-            blobs: None,
+            blobs: blob_store,
         };
         let (parts, _store_guard) = match self.open_secrets(node_id, parts) {
             Ok(opened) => opened,
@@ -671,6 +729,10 @@ impl World {
                 }
                 Err(e) => return self.violation(format!("node {node_id}: recovered state: {e}")),
             }
+        }
+        if self.cfg.blobs.is_some() {
+            self.check_blob_refs(&node, &format!("node {node_id}'s start"))
+                .await;
         }
         // The counter, unless every client opens connections; the room
         // with the connections workload.
@@ -767,6 +829,13 @@ impl World {
             && let Err(e) = self.setup_secrets(&node, &authority).await
         {
             self.event(format!("secret setup failed: {e}"));
+            let _ = self.fatal_tx.send(node_id);
+            return;
+        }
+        if self.cfg.blobs.is_some()
+            && let Err(e) = self.setup_blobs(&node, &authority).await
+        {
+            self.event(format!("blob setup failed: {e}"));
             let _ = self.fatal_tx.send(node_id);
             return;
         }
@@ -935,6 +1004,9 @@ impl World {
             .is_some_and(|w| client >= w.first_client)
         {
             return self.conn_client(client).await;
+        }
+        if self.cfg.blobs.is_some() {
+            return self.blob_client(client).await;
         }
         for r in 0..self.cfg.requests_per_client {
             if self
@@ -1149,6 +1221,14 @@ impl World {
 
     /// Waits for the mailbox to drain, then checks the end-state invariants.
     async fn finish(self: &Arc<Self>, fatal_rx: &mut mpsc::UnboundedReceiver<NodeId>) {
+        // No targeted crash after the workload: the drain below handles a
+        // crash point reached before (its request is in `fatal_rx`), and the
+        // checks after it need the node up (a collector pass that reached
+        // one would hold the pass lock forever).
+        self.disk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .disarm_crash_points();
         // The wall clock is not corrected: logical time holds still while it
         // is behind its high-water mark (ADR 0006), but the webhook retries'
         // timers fire after their delay on the monotonic clock (#40), within
@@ -1213,6 +1293,7 @@ impl World {
         self.check_effects(&node).await;
         self.check_secrets(&node).await;
         self.check_connections(&node).await;
+        self.check_blobs_end(&node).await;
         let turns = node
             .probe
             .turns_run
@@ -1538,7 +1619,7 @@ impl World {
         {
             return self.violation(format!("reading the log: {e}"));
         }
-        let mut keys: BTreeMap<(String, String), Lsn> = BTreeMap::new();
+        let mut keys: BTreeMap<(String, String), (Lsn, String, u64)> = BTreeMap::new();
         let mut times: BTreeMap<ActorRef, u64> = BTreeMap::new();
         let mut prev = 0;
         for c in &records {
@@ -1555,6 +1636,7 @@ impl World {
             if t.outcome.as_ref().map(|o| o.kind) != Some(pb::OutcomeKind::Committed as i32)
                 && !self.expected_failure(t)
                 && !self.expected_connection_failure(t)
+                && !self.expected_blob_failure(t)
             {
                 self.violation(format!("failed turn at lsn {}: {:?}", c.lsn, t.outcome));
             }
@@ -1568,12 +1650,14 @@ impl World {
             *last = t.logical_time_ms;
             match t.input.as_ref().and_then(|i| i.kind.as_ref()) {
                 Some(pb::input::Kind::Http(h)) if !h.idempotency_key.is_empty() => {
-                    if let Some(first) =
-                        keys.insert((actor.to_string(), h.idempotency_key.clone()), c.lsn)
+                    let turn = (c.lsn, t.execution_id.clone(), t.logical_time_ms);
+                    if let Some((first, execution, time)) =
+                        keys.insert((actor.to_string(), h.idempotency_key.clone()), turn)
                     {
                         self.violation(format!(
-                            "{actor} key {} has turns at lsn {first} and {}",
-                            h.idempotency_key, c.lsn
+                            "{actor} key {} has turns at lsn {first} (execution {execution}, \
+                             time {time}) and {} (execution {}, time {})",
+                            h.idempotency_key, c.lsn, t.execution_id, t.logical_time_ms
                         ));
                     }
                 }
@@ -1646,6 +1730,12 @@ fn derived_state(store: &Store) -> Result<String, String> {
             "id, kind, key, protocol, route, subject, opened_lsn, closing_lsn, closed_lsn, \
              cause, code, frames_in, next_seq, frames_written, restart_after_lsn",
         ),
+        // The blob index (M26 §5), outside the state hash.
+        (
+            "blobs",
+            "hash, size, subject, key_version, first_lsn, last_ref_lsn, erased",
+        ),
+        ("blob_pins", "hash, source, owner, lsn"),
     ] {
         let mut st = db
             .conn()
@@ -1704,7 +1794,9 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
     let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
     let service = cfg
         .effects
-        .map(|fx| SimService::new(clock.clone(), SimRng::new(seed, b"service"), fx.faults));
+        .map(|fx| fx.faults)
+        .or(cfg.blobs.as_ref().map(|b| b.faults))
+        .map(|faults| SimService::new(clock.clone(), SimRng::new(seed, b"service"), faults));
     let secrets_root = match (cfg.effects.is_some_and(|fx| fx.webhook) || cfg.secrets.is_some())
         .then(|| tempfile::tempdir().map_err(|e| e.to_string()))
         .transpose()
@@ -1732,6 +1824,14 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
 
     let mut disk = Disk::default();
     disk.fail_syncs(cfg.fail_fsyncs.iter().copied());
+    for point in cfg.blobs.iter().flat_map(|b| b.crash_points.clone()) {
+        disk.crash_at(point);
+    }
+    disk.slow_open = cfg
+        .blobs
+        .as_ref()
+        .filter(|b| !b.slow_open.is_zero())
+        .map(|b| (BlobWorkload::objects(), b.slow_open));
     let bao = cfg.secrets.map(|workload| {
         disk.install(
             std::path::Path::new(secrets::TOKEN_FILE),
@@ -1778,6 +1878,20 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
             SUPERVISOR,
             "secret-director",
             Box::pin(async move { w.secret_director().await }),
+        );
+    }
+    if world.cfg.blobs.is_some() {
+        let w = world.clone();
+        handle.spawn(
+            SUPERVISOR,
+            "blob-director",
+            Box::pin(async move { w.blob_director().await }),
+        );
+        let w = world.clone();
+        handle.spawn(
+            SUPERVISOR,
+            "blob-disk",
+            Box::pin(async move { w.blob_disk().await }),
         );
     }
     let w = world.clone();

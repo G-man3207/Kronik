@@ -560,6 +560,31 @@ blobs`), run by `scripts/dst.sh` with the others (200 seeds per change,
   that ignores timers, and a store that skips `ensure_durable`; each must
   make some seed fail.
 
+What runs today (`crates/kronik-sim/src/scenario/blobs.rs`), before the holds
+of B14 and B16: the M25 operations of `media` (`write`, `fetch-sum`,
+`write-post`, `fetch-write`, and loose bytes from `write-discard`,
+`fail-after-write` and `open-writer`), threshold 256 bytes to 4 KiB, a few
+sizes per seed so that writes deduplicate onto each other's files, the node's
+pass every virtual second and passes of the workload every 5 to 205 ms
+(`immediate` on half the seeds), full-store windows below `[blobs]
+disk_reserve` (`SimFs::available`), slow opens under `blobs/objects` on some
+seeds, and the simulated service streaming both ways in seeded chunks with
+responses cut in their body. The targeted crashes are `SimFs` crash points
+(`fs::CrashPoint`: an operation that takes effect and never returns, then
+the node crashes): a blob's rename into place, a log fsync, a blob
+directory's sync, a sweep's deletion. Checked: B1 and B2 (with the index's
+pins) after every start, every workload pass and at the end; B3 (the
+recovered `blobs` and `blob_pins` rows against a rebuild); B5 (every blob
+a guest answered or the service received has the bytes written); B6; and
+the counter workload's exactly-once and logical-time checks. The mutations
+are `blob-skip-ensure-durable`, `blob-sweep-ignores-leases` and
+`blob-sweep-ignores-touches` (`kronik_blob::StoreConfig`). Not simulated:
+snapshots, retention and forks, which write through `std::fs` (the floor
+stays at the log's first LSN; their roots are covered by
+`kronik-sched/tests/blobs.rs` and the B11 tests). Holds, edges and timers
+(B14, B16), erasure (B15) and the mutation "a sweep that ignores timers"
+come with those slices.
+
 ## 15. The `media-ts` example
 
 `examples/media-ts`, a TypeScript actor built by `kronik build`, kind

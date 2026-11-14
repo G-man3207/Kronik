@@ -320,12 +320,15 @@ step_sdks() {
 # state against a rebuild from the log). The default scenarios include the
 # M24 connections workload (properties C1 to C9, identity replay of every
 # 10th seed); its deliberate bug, frames delivered before their record is
-# durable, must make C3 fail for some seed.
+# durable, must make C3 fail for some seed. Then 200 seeds of the blob
+# workload (M25, M26 §14: writers, streamed effects, the collector,
+# full-store windows and targeted crashes).
 step_dst() {
     cargo test --locked --release -p kronik-sim --test dst -- --seeds 0..200 --twice
     cargo test --locked --release -p kronik-sim --test dst -- --seeds 0..200 --scenario rebuild --twice
     cargo test --locked --release -p kronik-sim --test dst -- --seeds 0..20 --scenario connections \
         --mutation deliver-before-fsync --expect-violation C3
+    cargo test --locked --release -p kronik-sim --test dst -- --seeds 0..200 --scenario blobs --twice
 }
 
 step_deny() {

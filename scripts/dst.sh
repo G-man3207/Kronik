@@ -8,7 +8,10 @@
 #   SEEDS   A..B, default 0..10000
 #   JOBS    processes, default the number of CPUs
 #   harness options such as `--scenario webhook` or `--twice`; the secret
-#   workloads (M23) are `--scenario allocator` and `--scenario secret-outage`;
+#   workloads (M23) are `--scenario allocator` and `--scenario secret-outage`,
+#   the blob workload (M25, M26) `--scenario blobs`, whose mutations
+#   (`--mutation blob-skip-ensure-durable`, `blob-sweep-ignores-leases`,
+#   `blob-sweep-ignores-touches`) must make some seed fail;
 #   KRONIK_DST_RELAY=<component> runs the webhook workload with another
 #   relay, as in the harness. For the long run, call the harness directly:
 #   cargo test --release -p kronik-sim --test dst -- --long 1000000

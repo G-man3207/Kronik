@@ -580,6 +580,10 @@ and runs these with the commands below. It does not run on a schedule.
   - With `--scenario webhook` and
     `KRONIK_DST_RELAY=examples/dist/webhook-relay-ts.wasm`, the webhook
     workload uses the TypeScript relay.
+  - `--scenario blobs` is the blob workload (M26 §14). Its mutations
+    (`--mutation blob-skip-ensure-durable`, `blob-sweep-ignores-leases`,
+    `blob-sweep-ignores-touches`) must each make some seed fail.
+  - `KRONIK_DST_TRACE=1` prints every line of a seed's trace as it happens.
 - **DST long run:**
   `cargo test --release -p kronik-sim --test dst -- --long 1000000 --twice`.
   This runs the counter workload as one run of at least 1 000 000 executor
