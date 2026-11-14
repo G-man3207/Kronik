@@ -187,13 +187,28 @@ fn fork_of(dir: &Path) -> ForkRoots {
     }
 }
 
-/// The forks of `<data>/branches` (every branch but `branch`).
+/// The forks of `<data>/branches` (every branch but `branch`). A directory
+/// with neither `blobs.roots` nor `proposal.json` is no fork: a creation
+/// that stopped before its first record, with no state to keep. It is
+/// skipped with a warning, rather than keeping every record the log holds
+/// for as long as it lies there.
 fn forks(data: &Path, branch: &str) -> Vec<ForkRoots> {
     let Ok(dir) = std::fs::read_dir(data.join("branches")) else {
         return Vec::new();
     };
     dir.flatten()
         .filter(|e| e.file_name() != branch && e.path().is_dir())
+        .filter(|e| {
+            let dir = e.path();
+            let fork = dir.join(FORK_ROOTS).exists() || dir.join("proposal.json").exists();
+            if !fork {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    "a branch directory without blobs.roots or proposal.json is not a fork; its blobs are not kept"
+                );
+            }
+            fork
+        })
         .map(|e| fork_of(&e.path()))
         .collect()
 }
@@ -811,7 +826,8 @@ mod tests {
             .map(|f| f.fork_lsn)
             .collect();
         points.sort();
-        assert_eq!(points, [None, Some(17), Some(41)]);
+        // `broken`, with neither file, is no fork (review L-4).
+        assert_eq!(points, [Some(17), Some(41)]);
         let snapshot = dir.path().join("idx");
         write_roots_file(&snapshot, None, std::slice::from_ref(&a)).unwrap();
         assert_eq!(

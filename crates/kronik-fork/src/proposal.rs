@@ -501,6 +501,12 @@ impl Proposals {
     fn save(&self, meta: &Proposal, diff: Option<&[u8]>) -> Result<(), ApiError> {
         let dir = self.dir(&meta.id);
         std::fs::create_dir_all(&dir).map_err(internal)?;
+        // Every fork, a proposal's and a preview's too, keeps the blobs its
+        // base state roots in main's store while it exists (ADR 0120 §4):
+        // written at its first save, before its proposal.json.
+        if !dir.join(kronik_sched::blob_gc::FORK_ROOTS).exists() {
+            self.node.write_fork_roots(&dir, meta.fork_lsn)?;
+        }
         if let Some(d) = diff {
             write_atomic(&dir.join("diff.json"), d)?;
         }
@@ -2154,11 +2160,8 @@ impl Proposals {
             if dry_run {
                 return Ok((meta, true));
             }
+            // `save` writes its blobs.roots (ADR 0120 §4) with its first record.
             this.save(&meta, None)?;
-            // The blobs its base state roots (ADR 0120 §4), after the fork
-            // exists: a crash in between leaves a fork whose base the floor
-            // and main's snapshot indexes keep while it is in retention.
-            this.node.write_fork_roots(&this.dir(&name), fork_lsn)?;
             entries.insert(
                 name,
                 Entry {

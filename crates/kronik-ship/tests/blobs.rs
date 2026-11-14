@@ -507,3 +507,78 @@ fn a_deletion_cut_short_never_skips_an_upload() {
     assert!(bucket_blobs(&p.rt, &remote).contains(&blob.hash));
     assert_references_complete(&p.rt, &remote);
 }
+
+/// A node restored from `remote` into a new directory, started; the
+/// source's master key in place.
+fn restored(remote: &Remote, key: &[u8]) -> (tempfile::TempDir, Proc) {
+    let dst = tempdir("blob-restored-");
+    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
+    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
+    {
+        let rt = rt();
+        rt.block_on(restore_with_options(
+            remote,
+            dst.path(),
+            "main",
+            false,
+            &Env::real(rt.handle().clone()),
+            &Default::default(),
+            KeystoreMode::Require,
+            RestoreOptions::default(),
+        ))
+        .unwrap();
+    }
+    let q = start(dst.path());
+    (dst, q)
+}
+
+/// A source node with a saved response's blob shipped in plain bytes;
+/// its bucket, the blob and the master key.
+fn shipped_plain_blob() -> (tempfile::TempDir, Remote, pb::BlobRef, Vec<u8>) {
+    let src = tempdir("blob-plain-src-");
+    let bucket = tempdir("blob-plain-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let p = start(src.path());
+    p.deploy();
+    let blob = p.blob(70_000, "k1");
+    p.snapshot();
+    p.ship(&remote, src.path()).unwrap();
+    let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
+    drop(p);
+    (bucket, remote, blob, key)
+}
+
+/// A stand-in for a local file whose bytes changed since its object was
+/// shipped (M26's `privacy reseal` seals a file in place): its header's
+/// body digest differs; the frames are kept, which the shipper does not
+/// read. Returns the file's new bytes.
+fn changed_stand_in(file: &Path) -> Vec<u8> {
+    use kronik_blob::format::{HEADER_LEN, Header};
+    let mut bytes = std::fs::read(file).unwrap();
+    let mut header = Header::decode(&bytes[..HEADER_LEN]).unwrap();
+    header.body_digest = *blake3::hash(&header.body_digest).as_bytes();
+    bytes[..HEADER_LEN].copy_from_slice(&header.encode());
+    std::fs::write(file, &bytes).unwrap();
+    bytes
+}
+
+/// Review H-1: a restored node starts without ship-blobs.db, while its
+/// bucket holds the source's objects. It takes a bucket's object as its own
+/// only when the object's header has the local file's body digest; an
+/// object of a file that changed since is replaced when a record references
+/// it.
+#[test]
+fn a_restored_node_adopts_only_an_object_with_its_digest() {
+    let (_bucket, remote, blob, key) = shipped_plain_blob();
+    let (dst, q) = restored(&remote, &key);
+    let id = BlobId::parse(&blob.hash).unwrap();
+    let file = q.node.blob_store().unwrap().object_path(&Space::Main, &id);
+    let sealed = changed_stand_in(&file);
+    q.snapshot();
+    q.ship(&remote, dst.path()).unwrap();
+    let object = q.rt.block_on(remote.get(&object(&blob.hash))).unwrap();
+    assert!(
+        object == sealed,
+        "the bucket does not have the changed object"
+    );
+}

@@ -307,8 +307,15 @@ pub(crate) async fn ship_blob(
         return Ok(BlobShipped::Nothing);
     }
     let rel = remote_name(id);
-    // A lost ship-blobs.db: the bucket may hold it already.
-    if shipped.digest(&name)?.is_none() && remote.exists(&rel).await? {
+    // Without a record (a lost ship-blobs.db, a restored node) the bucket may
+    // hold it already: taken as it is only when its header has this file's
+    // body digest. An object of a file that changed since is replaced.
+    if shipped.digest(&name)?.is_none()
+        && remote
+            .header(&rel)
+            .await?
+            .is_some_and(|remote| remote.body_digest == digest)
+    {
         shipped.put(&name, &digest)?;
         return Ok(BlobShipped::Nothing);
     }
@@ -699,15 +706,6 @@ pub(crate) fn check_file(
 }
 
 impl Remote {
-    /// Whether an object exists under `rel`.
-    pub(crate) async fn exists(&self, rel: &str) -> Result<bool, ShipError> {
-        match self.store.head(&self.key(rel)).await {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(self.store_error(e)),
-        }
-    }
-
     /// Deletes the object under `rel`; one that is gone already is fine.
     pub async fn delete_object(&self, rel: &str) -> Result<(), ShipError> {
         match self.store.delete(&self.key(rel)).await {
@@ -761,6 +759,17 @@ impl Remote {
         }
         upload.complete().await.map_err(|e| self.store_error(e))?;
         Ok(())
+    }
+
+    /// The header of the blob object under `rel`; `None` when there is no
+    /// such object, or none that starts with a blob header.
+    pub(crate) async fn header(&self, rel: &str) -> Result<Option<Header>, ShipError> {
+        let key = self.key(rel);
+        match self.store.get_range(&key, 0..HEADER_LEN as u64).await {
+            Ok(bytes) => Ok(Header::decode(&bytes).ok()),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(self.store_error(e)),
+        }
     }
 
     /// Downloads the object under `rel` into a new file at `path`, in

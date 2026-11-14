@@ -436,6 +436,20 @@ fn a_preview_takes_uploads_and_streams_blob_answers_in_its_space() {
     let (preview, _) =
         p.rt.block_on(props.create_preview(&proposal.id, None, false, audit(), false, p.owner()))
             .unwrap();
+    // A proposal and a preview keep their base state's blobs in main's
+    // store as a plain fork does (review L-5): each has its blobs.roots.
+    for (id, fork_lsn) in [
+        (&proposal.id, proposal.fork_lsn),
+        (&preview.id, preview.fork_lsn),
+    ] {
+        let roots =
+            std::fs::read_to_string(dir.path().join("branches").join(id).join("blobs.roots"))
+                .unwrap();
+        assert_eq!(
+            roots.lines().next(),
+            Some(format!("fork_lsn {fork_lsn}").as_str())
+        );
+    }
     let gw = Gateway::new(p.node.clone(), GatewayConfig::default()).with_preview(props.clone());
     let request = |op: &str, query: &str, body: Vec<u8>| HttpRequest {
         method: "POST".into(),
