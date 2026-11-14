@@ -2142,3 +2142,165 @@ fn rebase_staging_keeps_to_the_disk_reserve() {
         "no snapshot at or after the switch"
     );
 }
+
+/// Opens a WebSocket connection to room `key` and attaches a recording
+/// transport, as the gateway would.
+fn join_room(
+    p: &Proc,
+    key: &str,
+    user: &str,
+) -> (String, Arc<kronik_sched::connections::RecordingTransport>) {
+    let request = pb::HttpInput {
+        method: "GET".into(),
+        path: format!("/room/{key}/ws"),
+        query: format!("user={user}"),
+        params: vec![pb::Param {
+            name: "key".into(),
+            value: key.into(),
+            sealed_value: None,
+        }],
+        route: "/room/{key}/ws".into(),
+        ..Default::default()
+    };
+    let (id, waiter) = p
+        .node
+        .connection_open(
+            ActorRef::parse(&format!("room/{key}")).unwrap(),
+            request,
+            pb::ConnectionProtocol::Websocket,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+    let r = p.rt.block_on(waiter.wait()).unwrap();
+    assert!(r.committed(), "{r:?}");
+    let t = kronik_sched::connections::RecordingTransport::attach(p.node.hub(), &id).unwrap();
+    (id, t)
+}
+
+fn room_frame(p: &Proc, conn: &str, text: &str) {
+    p.rt.block_on(p.node.hub().incoming(
+        conn,
+        pb::Frame {
+            kind: pb::frame::Kind::Text as i32,
+            data: plain(text),
+            ..Default::default()
+        },
+    ));
+}
+
+/// M24 §7.7: a rollback via replay of a kind with live connections closes
+/// them at the switch, on the wire with 1012 and `rebase`, and each
+/// connection the rebased state holds open gets exactly one close input
+/// with the reason `rebase`; new connections then open under the old code.
+#[test]
+fn a_rebase_switch_closes_the_connections_of_the_rebased_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = Proc::start_with(
+        dir.path(),
+        NodeConfig {
+            concurrency: 8,
+            ..NodeConfig::default()
+        },
+    );
+    p.deploy("room");
+    p.rt.block_on(p.node.set_policy(QUIET, audit(), false, p.owner()))
+        .unwrap();
+    let (a, ta) = join_room(&p, "lobby", "ada");
+    room_frame(&p, &a, "say before");
+    p.settle();
+    p.rt.block_on(p.node.snapshot("before the deployment", p.owner()))
+        .unwrap();
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_rebase(Duration::from_secs(30)),
+    );
+    let bytes = std::fs::read(guest("room-fmt2")).unwrap();
+    let (prop, _) =
+        p.rt.block_on(props.propose(
+            ProposeRequest {
+                wasm: vec![bytes],
+                names: Vec::new(),
+                window_ms: None,
+                at: None,
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
+        .unwrap();
+    let promoted =
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
+            .unwrap();
+    let (b, tb) = join_room(&p, "lobby", "bob");
+    room_frame(&p, &b, "say after");
+    p.settle();
+
+    let (rebase, _) =
+        p.rt.block_on(props.rebase(
+            RebaseRequest {
+                epoch: promoted.epoch,
+                options: DiffOptions {
+                    mode: Mode::Continuous,
+                    ..DiffOptions::default()
+                },
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
+        .unwrap();
+    p.rt.block_on(props.approve(&rebase.id, audit(), false, None, p.owner()))
+        .unwrap();
+    p.rt.block_on(props.promote(&rebase.id, audit(), false, p.owner()))
+        .unwrap();
+
+    // On the wire: both closed with 1012 `rebase`.
+    for t in [&ta, &tb] {
+        assert_eq!(
+            t.recording().closed,
+            Some((1012, "rebase".to_owned())),
+            "{:?}",
+            t.recording()
+        );
+    }
+    // In the log: one close input each, with the reason `rebase`.
+    wait_until("the rebase closes", || {
+        p.node.store().db().open_connections().unwrap().is_empty()
+    });
+    p.settle();
+    for id in [&a, &b] {
+        let row = p.node.store().db().connection_any(id).unwrap().unwrap();
+        assert_eq!(row.cause, Some(pb::CloseCause::Rebase as i32), "{row:?}");
+        assert_eq!(row.code, Some(1012));
+        // The store's guard must be gone before `read_record` takes it.
+        let turns = p
+            .node
+            .store()
+            .db()
+            .history("room", "lobby", None, 100)
+            .unwrap();
+        let closes = turns
+            .into_iter()
+            .map(|t| p.rt.block_on(p.node.read_record(t.lsn)).unwrap().unwrap())
+            .filter(|c| match &c.record {
+                Record::TurnRecord(t) => matches!(
+                    t.input.as_ref().and_then(|i| i.kind.as_ref()),
+                    Some(pb::input::Kind::Connection(c)) if c.connection == *id
+                        && matches!(c.event, Some(pb::connection_input::Event::Close(_)))
+                ),
+                _ => false,
+            })
+            .count();
+        assert_eq!(closes, 1, "{id}: exactly one close input");
+    }
+    // New connections open as usual.
+    let (_c, tc) = join_room(&p, "lobby", "cid");
+    wait_until("the welcome", || tc.recording().frames.len() == 1);
+    assert!(p.node.hub().live() >= 1);
+}

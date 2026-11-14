@@ -1191,6 +1191,47 @@ impl Hub {
         }
     }
 
+    /// A rebase switch (§7.7): every connection of `kinds` past its open
+    /// turn closes on the wire with 1012 and `rebase`, and leaves the hub
+    /// without a close input; the node then admits one from the rebased
+    /// state for each connection that state holds open. Returns how many
+    /// frames each removed connection's writer wrote. Opens still running
+    /// stay: their turn runs on the rebased state.
+    pub fn close_for_rebase(
+        &self,
+        kinds: &std::collections::BTreeSet<String>,
+    ) -> BTreeMap<String, u64> {
+        let (closed, gauges) = {
+            let mut inner = lock(&self.inner);
+            let ids: Vec<String> = inner
+                .live
+                .iter()
+                .filter(|(_, l)| l.state != State::Opening && kinds.contains(&l.owner.kind))
+                .map(|(id, _)| id.clone())
+                .collect();
+            let mut closed = Vec::new();
+            for id in ids {
+                if let Some(live) = self.remove(&mut inner, &id) {
+                    closed.push((id, live.frames_written, live.transport));
+                }
+            }
+            (closed, inner.take_gauges())
+        };
+        self.publish(gauges);
+        self.gone.notify_waiters();
+        let code = host_code(pb::CloseCause::Rebase);
+        let reason = conn::cause_name(pb::CloseCause::Rebase as i32);
+        closed
+            .into_iter()
+            .map(|(id, written, transport)| {
+                if let Some(t) = transport {
+                    t.close(code, reason);
+                }
+                (id, written)
+            })
+            .collect()
+    }
+
     /// A graceful stop (§5.9): no more opens or frames are admitted, every
     /// WebSocket gets a close frame with 1012 and `kronik: restart`, every
     /// SSE stream a `retry:` hint and its end, and the writers get at most

@@ -1372,6 +1372,17 @@ diffs with 1, 4 and 16 workers.
   reason `rebase`, through the restart path of §4.8. A live connection
   that the rebased history never accepted is closed on the wire without
   any input, because in that history it never existed.
+  - The rebased kinds are the kinds the switch installs (those the
+    rolled-back deployment changed). The hub removes their connections
+    past their open turn without a close input (`Hub::close_for_rebase`);
+    opens still running stay and run on the rebased state.
+  - The close inputs are admitted with the switch's drain still held. A
+    connection with a close input already queued gets none: one close
+    input per connection. A connection the hub held records how many
+    frames its writer wrote; one that only the rebased history accepted
+    records 0, since none of its frames reached a client. A crash before
+    they run leaves the rows open, and the next start closes them with
+    `restart`.
 - **`kronik watch` guards** count failed connection turns in the error
   rate like other turns.
 

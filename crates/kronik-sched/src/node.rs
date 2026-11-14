@@ -1581,6 +1581,9 @@ impl Node {
             .me()
             .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
         let rebase = matches!(record, Record::StateRebase(_));
+        // The rebased kinds, whose connections a rebase switch closes.
+        let kinds: std::collections::BTreeSet<String> =
+            installs.iter().map(|(v, _, _)| v.kind.clone()).collect();
         let task = self.env.spawn("switch", async move {
             let _held = held;
             let _gate = gate;
@@ -1608,6 +1611,7 @@ impl Node {
                     return Err(e);
                 }
                 node.rebase.clear_live();
+                node.close_after_rebase(&kinds);
             }
             drop(_held);
             drop(_gate);
@@ -3459,6 +3463,66 @@ impl Node {
     /// The close input of a connection the last process held (M24 §4.8):
     /// the host's cause `restart`, code 1012, the frames written unknown,
     /// and the log's last LSN at the start.
+    /// After a rebase switch (§7.7): the connections of the rebased `kinds`
+    /// close on the wire (`Hub::close_for_rebase`), and every connection
+    /// the rebased state holds open gets a host close input with the
+    /// reason `rebase` (1012), unless a close input of it is queued
+    /// already. A connection the hub held records how many frames its
+    /// writer wrote; one that only the rebased history accepted, none. A
+    /// connection the rebased history never accepted gets no input: in
+    /// that history it never existed. Called with the switch's drain held,
+    /// so no turn runs meanwhile.
+    pub(crate) fn close_after_rebase(&self, kinds: &std::collections::BTreeSet<String>) {
+        let written = self.hub.close_for_rebase(kinds);
+        let queued: std::collections::BTreeSet<String> = lock(&self.actors)
+            .iter()
+            .filter(|(actor, _)| kinds.contains(&actor.kind))
+            .flat_map(|(_, slot)| slot.queue.iter())
+            .filter_map(|job| match job.input.kind.as_ref() {
+                Some(pb::input::Kind::Connection(c))
+                    if matches!(c.event, Some(pb::connection_input::Event::Close(_))) =>
+                {
+                    Some(c.connection.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let rows = match self.store().db().open_connections() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read the rebased connections; the next start closes them");
+                return;
+            }
+        };
+        for row in rows {
+            if !kinds.contains(&row.actor.kind) || queued.contains(&row.id) {
+                continue;
+            }
+            let input = pb::ConnectionInput {
+                connection: row.id.clone(),
+                protocol: row.protocol,
+                route: row.route.clone(),
+                event: Some(pb::connection_input::Event::Close(pb::ConnectionClose {
+                    cause: pb::CloseCause::Rebase as i32,
+                    code: u32::from(crate::connections::RESTART_CODE),
+                    // Empty, tagged with the connection's subject (§4.10).
+                    reason: Some(pb::Sealable {
+                        subject: row.subject.clone(),
+                        value: Some(pb::sealable::Value::Plain(Vec::new())),
+                    }),
+                    frames_written: written.get(&row.id).copied().unwrap_or(0),
+                    frames_written_known: true,
+                    frames_received: 0,
+                    restart_after_lsn: 0,
+                })),
+                ..Default::default()
+            };
+            if let Err(e) = self.admit_connection(row.actor, input, row.subject, true) {
+                tracing::warn!(connection = %row.id, error = %e, "cannot admit a rebase close; the next start closes it");
+            }
+        }
+    }
+
     fn admit_restart_close(&self, row: kronik_store::db::ConnectionRow, last: Lsn) {
         let input = pb::ConnectionInput {
             connection: row.id.clone(),

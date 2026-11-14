@@ -1080,3 +1080,28 @@ fn a_crash_after_send_now_gives_outcome_unknown_and_never_resends() {
         assert!(closes.contains("host 1012 restart"), "{closes}");
     }
 }
+
+/// M24 §7.7: at a rebase switch the hub closes the connections of the
+/// rebased kinds on the wire with 1012 `rebase` and admits no close input
+/// for them (the node admits one from the rebased state); the connections
+/// of other kinds stay open.
+#[test]
+fn a_rebase_closes_its_kinds_on_the_wire_without_an_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy(ROOM, false).unwrap();
+    let (a, ta) = p.join("lobby", "ada");
+    p.until("the welcome", || ta.recording().frames.len() == 1);
+    let other = std::collections::BTreeSet::from(["chat".to_owned()]);
+    assert!(p.node.hub().close_for_rebase(&other).is_empty());
+    assert!(ta.recording().closed.is_none(), "another kind's rebase");
+    let before = p.node.applied_lsn();
+    let room = std::collections::BTreeSet::from(["room".to_owned()]);
+    let written = p.node.hub().close_for_rebase(&room);
+    assert_eq!(written.get(&a), Some(&1), "the welcome was written");
+    assert_eq!(ta.recording().closed, Some((1012, "rebase".to_owned())));
+    assert_eq!(p.node.hub().live(), 0);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(p.node.applied_lsn(), before, "no close input from the hub");
+    assert!(p.live(&a), "the rebased state's row is the node's to close");
+}
