@@ -322,10 +322,79 @@ async fn reseal_seals_dead_letters_in_state_db() {
     }
 }
 
+/// The real clock, moved forward by a test: `wall_ms` and `monotonic` gain
+/// `offset` (ms), and a sleep that a move ends returns within 20 ms. A timer
+/// set an hour ahead then fires when the test says so, not when a loaded
+/// machine happens to get there.
+struct SteppedClock {
+    inner: Arc<dyn kronik_core::env::Clock>,
+    offset: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl kronik_core::env::Clock for SteppedClock {
+    fn wall_ms(&self) -> u64 {
+        self.inner.wall_ms() + self.offset.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn monotonic(&self) -> std::time::Duration {
+        self.inner.monotonic()
+            + std::time::Duration::from_millis(
+                self.offset.load(std::sync::atomic::Ordering::SeqCst),
+            )
+    }
+
+    fn sleep(&self, d: std::time::Duration) -> kronik_core::env::BoxFuture<'static, ()> {
+        let inner = self.inner.clone();
+        let offset = self.offset.clone();
+        let now = move || {
+            inner.monotonic()
+                + std::time::Duration::from_millis(offset.load(std::sync::atomic::Ordering::SeqCst))
+        };
+        let target = now() + d;
+        let real = self.inner.clone();
+        Box::pin(async move {
+            loop {
+                let left = target.saturating_sub(now());
+                if left.is_zero() {
+                    return;
+                }
+                real.sleep(left.min(std::time::Duration::from_millis(20)))
+                    .await;
+            }
+        })
+    }
+}
+
 /// A node with closed segments after every record, snapshots and a
-/// deployed counter, behind the API.
-async fn counter_node(dir: &std::path::Path) -> (Arc<kronik_sched::Node>, Api) {
-    let env = Env::real(tokio::runtime::Handle::current());
+/// deployed counter, behind the API, on a [`SteppedClock`]: the offset
+/// moves it forward.
+async fn stepped_counter_node(
+    dir: &std::path::Path,
+) -> (
+    Arc<kronik_sched::Node>,
+    Api,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
+    let mut env = Env::real(tokio::runtime::Handle::current());
+    let offset = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    env.clock = Arc::new(SteppedClock {
+        inner: env.clock.clone(),
+        offset: offset.clone(),
+    });
+    let (node, api) = counter_node_with(dir, env).await;
+    (node, api, offset)
+}
+
+/// An hour: the delay of the tests' timers, which only a step of the clock
+/// reaches.
+const TIMER_DELAY_MS: u64 = 3_600_000;
+
+/// Moves the clock past the tests' timers.
+fn fire_timers(offset: &std::sync::atomic::AtomicU64) {
+    offset.fetch_add(TIMER_DELAY_MS + 1_000, std::sync::atomic::Ordering::SeqCst);
+}
+
+async fn counter_node_with(dir: &std::path::Path, env: Env) -> (Arc<kronik_sched::Node>, Api) {
     let mut storage = kronik_sched::snapshots::StorageConfig::new(dir.to_path_buf());
     storage.history = std::time::Duration::from_millis(u64::MAX);
     let node = start_local(
@@ -397,13 +466,15 @@ fn state_db_holds(dir: &std::path::Path, mark: &str) -> bool {
 async fn reseal_seals_a_pending_timer_and_after_erasure_it_fires_as_a_dead_letter() {
     const MARK: &str = "NEEDLE-TIMER-9c1";
     let dir = tempfile::tempdir().unwrap();
-    let (node, api) = counter_node(dir.path()).await;
-    // In `off` mode: `store` the mark in 8 s, for user:1.
+    let (node, api, clock) = stepped_counter_node(dir.path()).await;
+    // In `off` mode: `store` the mark in an hour, for user:1. Only the
+    // test's step of the clock fires it, after the erasure, however slow the
+    // steps before are.
     let (s, v) = call(
         &api,
         "POST",
         "/v1/actors/counter/t/messages",
-        json!({"name": "schedule", "text": format!("8000 store\n{MARK}"), "subject": "user:1", "reason": "r"}),
+        json!({"name": "schedule", "text": format!("{TIMER_DELAY_MS} store\n{MARK}"), "subject": "user:1", "reason": "r"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -433,7 +504,7 @@ async fn reseal_seals_a_pending_timer_and_after_erasure_it_fires_as_a_dead_lette
         let (s, v) = call(&api, "POST", path, req).await;
         assert_eq!(s, 200, "{v}");
     }
-    let body = timer_body(&node, id).expect("the timer fired before the erasure: raise its delay");
+    let body = timer_body(&node, id).expect("the timer fired before the clock moved");
     assert!(
         matches!(
             body.value,
@@ -456,10 +527,11 @@ async fn reseal_seals_a_pending_timer_and_after_erasure_it_fires_as_a_dead_lette
     assert_eq!(v["plain_values"], 0, "{v}");
     assert!(
         timer_body(&node, id).is_some(),
-        "the timer fired before the erasure: raise its delay"
+        "the timer fired before the clock moved"
     );
     let status = call(&api, "GET", "/v1/privacy", Value::Null).await.1;
     assert_eq!(status["pending_erasures"], 0, "{status}");
+    fire_timers(&clock);
     let dead = timer_dead_letter(&node).await;
     assert_eq!(dead.error_code, "SUBJECT_ERASED", "{dead:?}");
     assert!(
@@ -482,12 +554,12 @@ async fn reseal_seals_a_pending_timer_and_after_erasure_it_fires_as_a_dead_lette
 async fn an_erasure_before_any_reseal_stops_a_pending_timer_too() {
     const MARK: &str = "NEEDLE-TIMER-41d";
     let dir = tempfile::tempdir().unwrap();
-    let (node, api) = counter_node(dir.path()).await;
+    let (node, api, clock) = stepped_counter_node(dir.path()).await;
     let (s, v) = call(
         &api,
         "POST",
         "/v1/actors/counter/t/messages",
-        json!({"name": "schedule", "text": format!("5000 store\n{MARK}"), "subject": "user:1", "reason": "r"}),
+        json!({"name": "schedule", "text": format!("{TIMER_DELAY_MS} store\n{MARK}"), "subject": "user:1", "reason": "r"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -501,7 +573,7 @@ async fn an_erasure_before_any_reseal_stops_a_pending_timer_too() {
     .await;
     assert_eq!(s, 200, "{v}");
     assert!(v["plain_values"].as_u64().unwrap() > 0, "{v}");
-    let body = timer_body(&node, id).expect("the timer fired before the erasure: raise its delay");
+    let body = timer_body(&node, id).expect("the timer fired before the clock moved");
     assert!(
         matches!(
             body.value,
@@ -511,6 +583,7 @@ async fn an_erasure_before_any_reseal_stops_a_pending_timer_too() {
     );
     let status = call(&api, "GET", "/v1/privacy", Value::Null).await.1;
     assert_eq!(status["pending_erasures"], 1, "{status}");
+    fire_timers(&clock);
     let dead = timer_dead_letter(&node).await;
     assert_eq!(dead.error_code, "SUBJECT_ERASED", "{dead:?}");
     assert!(
