@@ -162,12 +162,19 @@ pub async fn check(
     if let Some(p) = privacy {
         setup.privacy = p;
     }
+    // Blobs (M25, M26): the replayed turns read production's blobs, and
+    // those they write go to a space of the check's own, removed after it.
+    // Its name (`upgrade-` and the engine version, with `.` and `+`) is never
+    // a fork's (`[a-z][a-z0-9-]*`).
+    setup.blobs = open_blobs(env, data).await?;
+    let blob_space = data.join("branches").join(&setup.fork);
     let setup = Arc::new(setup);
     let options = DiffOptions {
         mode: Mode::Both,
         fuel_threshold: NO_FUEL_THRESHOLD,
         ..DiffOptions::default()
     };
+    let blobs = setup.blobs.is_some();
     let out = crate::run(
         env,
         setup,
@@ -178,8 +185,21 @@ pub async fn check(
         fc.after,
         &[],
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await;
+    // The check leaves the data directory as it found it.
+    if blobs {
+        match std::fs::remove_dir_all(&blob_space) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "removing the upgrade check's blobs {}: {e}",
+                    blob_space.display()
+                ));
+            }
+        }
+    }
+    let out = out.map_err(|e| e.to_string())?;
     let report = UpgradeReport {
         schema: REPORT_SCHEMA.into(),
         from_engine,
@@ -199,4 +219,16 @@ pub async fn check(
         diff: out.diff,
         diff_bytes: out.bytes,
     })
+}
+
+/// The data directory's blob store, when it has one (M25 on): read-mostly,
+/// as a fork uses main's.
+async fn open_blobs(env: &Env, data: &Path) -> Result<Option<Arc<kronik_blob::BlobStore>>, String> {
+    if !data.join("blobs").is_dir() {
+        return Ok(None);
+    }
+    kronik_blob::BlobStore::open(env.clone(), data, kronik_blob::StoreConfig::default())
+        .await
+        .map(Some)
+        .map_err(|e| format!("opening the blob store: {e}"))
 }

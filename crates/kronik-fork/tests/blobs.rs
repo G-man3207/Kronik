@@ -1065,3 +1065,87 @@ fn a_preview_seals_a_new_subjects_blobs_and_refuses_an_erased_ones() {
     assert!(String::from_utf8_lossy(&r.body).contains("SUBJECT_ERASED"));
     assert!(files_with(dir.path(), MARK).is_empty());
 }
+
+/// `kronik upgrade check` (and the start of a daemon whose engine changed)
+/// replays the window offline. It replayed blob turns without the blob
+/// store, so a recorded blob response failed the check ("a blob response in
+/// a turn without blobs"; found by the v0.5.0 compatibility corpus). It
+/// reads production's blobs, writes the replayed turns' own to a space of
+/// its own, and removes that space after.
+#[test]
+fn the_upgrade_check_replays_blob_turns_and_leaves_no_space_behind() {
+    let dir = tempdir();
+    {
+        let p = blob_node(dir.path());
+        let owner = p.owner();
+        p.rt.block_on(p.node.set_limits(
+            pb::Limits {
+                kind: "media".into(),
+                blob_threshold_bytes: Some(65_536),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            owner.clone(),
+        ))
+        .unwrap();
+        p.rt.block_on(p.node.grant(
+            "media",
+            "http:127.0.0.1",
+            None,
+            None,
+            kronik_effects::InForks::Recorded,
+            audit(),
+            false,
+            owner,
+        ))
+        .unwrap();
+        let (addr, _) = document_server();
+        let fetched = ingress(
+            &p,
+            http(
+                "fetch",
+                "",
+                inline(format!("http://{addr}/doc/300000").as_bytes()),
+            ),
+        );
+        assert!(
+            answer(&fetched).starts_with("status 200 blob b3:"),
+            "{}",
+            answer(&fetched)
+        );
+        let upload = upload(&p, dir.path(), &document(200_000));
+        assert_eq!(
+            answer(&ingress(&p, http("sum", "", pb::body::Value::Blob(upload))))
+                .split(' ')
+                .next(),
+            Some("200000")
+        );
+        let written = ingress(&p, http("write", "size=150000", inline(b"")));
+        assert!(written.committed());
+        p.settle();
+    }
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let checked = rt
+        .block_on(async {
+            let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+            kronik_fork::upgrade::check(
+                &env,
+                dir.path(),
+                std::time::Duration::from_secs(6 * 3600),
+                2,
+                None,
+            )
+            .await
+        })
+        .unwrap();
+    assert!(checked.report.passed, "{:?}", checked.report);
+    assert!(checked.report.root_inputs >= 3, "{:?}", checked.report);
+    let spaces: Vec<String> = std::fs::read_dir(dir.path().join("branches"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("upgrade-"))
+        .collect();
+    assert!(spaces.is_empty(), "the check left {spaces:?}");
+}

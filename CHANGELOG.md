@@ -6,6 +6,11 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- `kronik upgrade check`, and the start of a daemon whose engine changed,
+  replay blob turns (M25, M26): they replayed without the blob store, so a
+  turn with a recorded blob response failed the check, and a node with one
+  in its window could not start after an upgrade. The check reads
+  production's blobs and removes what its replayed turns wrote.
 - Blobs are on in every daemon (M25, M26): a kind whose code imports
   `kronik:actor/blobs` gets request bodies and `fetch` responses above its
   blob threshold as blobs, and can write, hold and send blobs. The
