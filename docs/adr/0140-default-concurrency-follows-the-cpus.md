@@ -1,6 +1,6 @@
 # 0140. The default turn concurrency follows the CPUs
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-14)
 - **Date:** 2026-11-14
 
 ## Context
