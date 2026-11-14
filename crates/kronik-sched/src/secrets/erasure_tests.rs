@@ -878,7 +878,7 @@ async fn reseal_stopped_after_its_rename(node: &Node, data: &Path) {
     assert!(stopped.is_err(), "{stopped:?}");
     assert!(!secret_row(node).0, "the row was fixed before the stop");
     assert!(!crate::reseal::pending_fix_segments(data).is_empty());
-    assert!(node.reseal_progress().pending_segments >= 1);
+    assert!(node.reseal_progress().await.pending_segments >= 1);
     assert_eq!(node.pending_erasures().await.unwrap(), 1);
 }
 

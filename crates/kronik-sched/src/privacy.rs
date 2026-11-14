@@ -184,7 +184,8 @@ impl Node {
         let blobs = self.delete_erased_blobs_logged().await;
         // What the shipper still has in the bucket goes in its next round.
         let pending_blob_objects = self
-            .erased_blobs_left()?
+            .erased_blobs_left()
+            .await?
             .get(&erased)
             .map_or(0, |left| left.objects);
         Ok(ErasureDone {
@@ -312,7 +313,7 @@ impl Node {
         }
         // A blob of the subject with a file on this node or an object in the
         // bucket (M26 §9.3).
-        pending.extend(self.erased_blobs_left()?.into_keys());
+        pending.extend(self.erased_blobs_left().await?.into_keys());
         let upto = self.applied_lsn();
         if upto < 1 {
             return Ok(pending.len() as u64);
@@ -335,9 +336,13 @@ impl Node {
     }
 
     /// Reseal progress for `GET /v1/privacy`.
-    pub fn reseal_progress(&self) -> crate::ResealProgress {
+    pub async fn reseal_progress(&self) -> crate::ResealProgress {
         match self.cfg.storage.as_ref() {
-            Some(s) => crate::reseal::reseal_progress(&s.data_dir),
+            Some(s) => {
+                let mut progress = crate::reseal::reseal_progress(&s.data_dir);
+                progress.pending_blobs = self.pending_blob_reuploads().await;
+                progress
+            }
             None => crate::ResealProgress::default(),
         }
     }

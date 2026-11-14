@@ -159,10 +159,11 @@ async fn a_plain_subject_file_is_sealed_in_place() {
                 .unwrap(),
             Some(true)
         );
-        let marks = AtomicUsize::new(0);
-        let mark = || {
-            marks.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+        let marks = Arc::new(AtomicUsize::new(0));
+        let counted = marks.clone();
+        let mark = move || -> kronik_core::env::BoxFuture<'static, Result<(), BlobError>> {
+            counted.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
         };
         let r = store
             .seal_in_place(&Space::Main, &meta.id, &keys, &mark)
@@ -204,7 +205,9 @@ async fn a_damaged_or_erased_file_is_not_sealed() {
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[HEADER_LEN + FRAME_SIZE + 10] ^= 1;
     std::fs::write(&path, &bytes).unwrap();
-    let mark = || panic!("a damaged file is never marked");
+    let mark = || -> kronik_core::env::BoxFuture<'static, Result<(), BlobError>> {
+        panic!("a damaged file is never marked")
+    };
     let err = store
         .seal_in_place(&Space::Main, &meta.id, &keys, &mark)
         .await

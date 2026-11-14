@@ -193,7 +193,7 @@ impl Api {
             keys: s.keys,
             erased: s.erased,
         });
-        let progress = self.node.reseal_progress();
+        let progress = self.node.reseal_progress().await;
         ok(&PrivacyStatus {
             mode: mode.into(),
             epoch,

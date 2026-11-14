@@ -266,7 +266,9 @@ pub fn reseal_progress(data: &Path) -> ResealProgress {
         tombstones: p.tombstones,
         pending_segments: pending.len() as u64,
         blobs_sealed: p.blobs_sealed,
-        pending_blobs: crate::blob_reseal::pending_blob_reuploads(data),
+        // The node counts them through its file system
+        // ([`Node::reseal_progress`]).
+        pending_blobs: 0,
     }
 }
 

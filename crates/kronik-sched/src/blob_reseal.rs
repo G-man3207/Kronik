@@ -8,43 +8,41 @@
 //! not resealed: a fork's blobs go with the fork.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use kronik_blob::{BlobError, BlobId, Resealed, Space};
+use kronik_core::env::{BoxFuture, Fs, OpenMode};
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_store::ship_blobs::reupload_dir;
 
 use crate::Node;
 
-/// Marks `id` for the shipper to upload again, durably: the shipper then
-/// replaces the bucket's plain object with the sealed file.
-fn mark_reupload(data: &Path, id: &BlobId) -> Result<(), BlobError> {
+/// Marks `id` for the shipper to upload again, durably, through the node's
+/// file system: the shipper then replaces the bucket's plain object with
+/// the sealed file.
+fn mark_reupload(
+    fs: Arc<dyn Fs>,
+    data: &Path,
+    id: &BlobId,
+) -> BoxFuture<'static, Result<(), BlobError>> {
     let dir = reupload_dir(data);
-    let failed = |what: &str, e: std::io::Error| BlobError::Io(format!("{what}: {e}"));
-    std::fs::create_dir_all(&dir).map_err(|e| failed("creating the reupload directory", e))?;
     let path = dir.join(id.file_name());
-    std::fs::File::create(&path)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| failed("marking a blob for reupload", e))?;
-    std::fs::File::open(&dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| failed("syncing the reupload directory", e))
-}
-
-/// Blobs a reseal sealed whose shipped object the shipper has not replaced
-/// yet (`reseal.pending_blobs`).
-pub fn pending_blob_reuploads(data: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(reupload_dir(data)) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| BlobId::from_file_name(n).is_some())
-        })
-        .count() as u64
+    Box::pin(async move {
+        let failed = |what: &str, e: std::io::Error| BlobError::Io(format!("{what}: {e}"));
+        fs.create_dir_all(dir.clone())
+            .await
+            .map_err(|e| failed("creating the reupload directory", e))?;
+        let file = fs
+            .open(path, OpenMode::ReadWriteCreate)
+            .await
+            .map_err(|e| failed("marking a blob for reupload", e))?;
+        file.sync_data()
+            .await
+            .map_err(|e| failed("marking a blob for reupload", e))?;
+        fs.sync_dir(dir)
+            .await
+            .map_err(|e| failed("syncing the reupload directory", e))
+    })
 }
 
 impl Node {
@@ -78,13 +76,14 @@ impl Node {
         let (Some(store), Some(data)) = (self.blob_store(), self.data_dir()) else {
             return Ok(0);
         };
+        let fs = self.env.fs.clone();
         let keys = self.sealer.blob_key_access();
         let mut sealed = 0;
         for hash in self.subject_blob_rows()? {
             let Ok(id) = BlobId::parse(&hash) else {
                 continue;
             };
-            let mark = || mark_reupload(data, &id);
+            let mark = || mark_reupload(fs.clone(), data, &id);
             match store
                 .seal_in_place(&Space::Main, &id, &keys, &mark)
                 .await
@@ -98,6 +97,22 @@ impl Node {
             tracing::info!(blobs = sealed, "resealed plain blob files");
         }
         Ok(sealed)
+    }
+
+    /// Blobs a reseal sealed whose shipped object the shipper has not
+    /// replaced yet (`reseal.pending_blobs`): the marks in
+    /// `<data>/blobs/reupload`.
+    pub(crate) async fn pending_blob_reuploads(&self) -> u64 {
+        let Some(data) = self.data_dir() else {
+            return 0;
+        };
+        match self.env.fs.read_dir(reupload_dir(data)).await {
+            Ok(names) => names
+                .iter()
+                .filter(|n| BlobId::from_file_name(n).is_some())
+                .count() as u64,
+            Err(_) => 0,
+        }
     }
 
     fn subject_blob_rows(&self) -> Result<Vec<String>, ApiError> {

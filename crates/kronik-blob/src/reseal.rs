@@ -8,7 +8,7 @@
 use std::io;
 
 use bytes::Bytes;
-use kronik_core::env::OpenMode;
+use kronik_core::env::{BoxFuture, OpenMode};
 
 use crate::format::{
     FrameKey, HEADER_LEN, Header, PLAIN_OVERHEAD, frame_count, open_plain_frame, seal_frame,
@@ -63,7 +63,7 @@ impl BlobStore {
         space: &Space,
         id: &BlobId,
         keys: &dyn KeyAccess,
-        before_rename: &(dyn Fn() -> Result<(), BlobError> + Send + Sync),
+        before_rename: &(dyn Fn() -> BoxFuture<'static, Result<(), BlobError>> + Send + Sync),
     ) -> Result<Resealed, BlobError> {
         let object = self.object_path(space, id);
         let Some(dir_path) = object.parent().map(std::path::Path::to_path_buf) else {
@@ -176,7 +176,11 @@ impl BlobStore {
             Ok(())
         }
         .await;
-        if let Err(e) = written.and_then(|()| before_rename()) {
+        let written = match written {
+            Ok(()) => before_rename().await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
             let _ = fs.remove_file(part).await;
             return Err(e);
         }

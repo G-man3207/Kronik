@@ -230,7 +230,7 @@ fn reseal_seals_a_subjects_plain_blob_in_place() {
         .join("blobs/reupload")
         .join(BlobId::parse(&blob.hash).unwrap().file_name());
     assert!(mark.exists(), "marked for the shipper");
-    let progress = p.node.reseal_progress();
+    let progress = p.rt.block_on(p.node.reseal_progress());
     assert_eq!((progress.blobs_sealed, progress.pending_blobs), (1, 1));
     let again = p.rt.block_on(p.node.reseal(audit(), false, owner)).unwrap();
     assert_eq!(again.blobs_sealed, 0);

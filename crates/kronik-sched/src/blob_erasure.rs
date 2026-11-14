@@ -10,24 +10,41 @@
 use std::path::Path;
 
 use kronik_blob::{BlobId, Space};
+use kronik_core::env::Fs;
 use kronik_core::error::{ApiError, ErrorCode};
 
 use crate::Node;
 
 /// The fork spaces of the data directory: every branch but `branch` that
-/// has a blob space.
-fn fork_spaces(data: &Path, branch: &str) -> Vec<Space> {
-    let Ok(dir) = std::fs::read_dir(data.join("branches")) else {
-        return Vec::new();
+/// has a blob space. Through the node's file system, so a simulation sees
+/// the same directories as the rest of the node.
+async fn fork_spaces(fs: &dyn Fs, data: &Path, branch: &str) -> Result<Vec<Space>, ApiError> {
+    let branches = data.join("branches");
+    let names = match fs.read_dir(branches.clone()).await {
+        Ok(names) => names,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(ApiError::new(
+                ErrorCode::Internal,
+                format!("listing the branches: {e}"),
+            ));
+        }
     };
-    let mut forks: Vec<Space> = dir
-        .flatten()
-        .filter(|e| e.file_name() != branch && e.path().join("blobs").is_dir())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .map(Space::Fork)
-        .collect();
+    let mut forks = Vec::new();
+    for name in names {
+        if name == branch {
+            continue;
+        }
+        let has_space = fs
+            .exists(branches.join(&name).join("blobs"))
+            .await
+            .map_err(|e| ApiError::new(ErrorCode::Internal, format!("a fork's blob space: {e}")))?;
+        if has_space {
+            forks.push(Space::Fork(name));
+        }
+    }
     forks.sort();
-    forks
+    Ok(forks)
 }
 
 impl Node {
@@ -56,7 +73,7 @@ impl Node {
             .collect();
         let mut spaces = vec![Space::Main];
         if let Some(storage) = self.storage_config() {
-            spaces.extend(fork_spaces(&storage.data_dir, self.branch()));
+            spaces.extend(fork_spaces(&*self.env.fs, &storage.data_dir, self.branch()).await?);
         }
         let mut deleted = 0;
         for space in spaces {
@@ -90,7 +107,7 @@ impl Node {
     /// an object in the bucket (the shipper's record; its step 6 deletes
     /// them, and the collector keeps their rows until it has). `privacy
     /// status` counts such an erasure as pending (M26 §9.3).
-    pub(crate) fn erased_blobs_left(
+    pub(crate) async fn erased_blobs_left(
         &self,
     ) -> Result<std::collections::BTreeMap<String, BlobsLeft>, ApiError> {
         let internal =
@@ -112,7 +129,7 @@ impl Node {
         };
         let mut spaces = vec![Space::Main];
         if let Some(data) = &data {
-            spaces.extend(fork_spaces(data, self.branch()));
+            spaces.extend(fork_spaces(&*self.env.fs, data, self.branch()).await?);
         }
         for (hash, subject) in rows {
             let Ok(id) = BlobId::parse(&hash) else {
@@ -122,10 +139,17 @@ impl Node {
             if shipped.contains(&id.file_name()) {
                 entry.objects += 1;
             }
-            if let Some(store) = self.blob_store()
-                && spaces.iter().any(|s| store.object_path(s, &id).exists())
-            {
-                entry.files += 1;
+            if let Some(store) = self.blob_store() {
+                for space in &spaces {
+                    if store
+                        .contains(space, &id)
+                        .await
+                        .map_err(|e| internal("looking for an erased blob", e.to_string()))?
+                    {
+                        entry.files += 1;
+                        break;
+                    }
+                }
             }
         }
         left.retain(|_, l| l.files + l.objects > 0);
