@@ -1219,7 +1219,8 @@ impl World {
         self.st().finished = true;
     }
 
-    /// Waits for the mailbox to drain, then checks the end-state invariants.
+    /// Waits for the mailbox to drain and the last start's re-runs and
+    /// restart closes to commit, then checks the end-state invariants.
     async fn finish(self: &Arc<Self>, fatal_rx: &mut mpsc::UnboundedReceiver<NodeId>) {
         // No targeted crash after the workload: the drain below handles a
         // crash point reached before (its request is in `fatal_rx`), and the
@@ -1263,6 +1264,14 @@ impl World {
                     .unwrap_or(false)
                 // Webhook retries wait on timers.
                 && (!webhook || n.store().db().timers(None).is_ok_and(|t| t.is_empty()))
+                // The last start's own work is in no mailbox: its re-runs,
+                // and the restart closes of the connections it found open.
+                // An fsync that fails under one stops the node, which must
+                // then restart as above (the next start does that work
+                // again), so the drain waits for it too.
+                && n.store().db().open_turns().is_ok_and(|t| t.is_empty())
+                && (self.cfg.connections.is_none()
+                    || n.store().db().open_connections().is_ok_and(|c| c.is_empty()))
             {
                 node = Some(n);
                 break;
@@ -1273,10 +1282,14 @@ impl World {
             let detail = self.st().node.clone().map(|n| {
                 let db = n.store().db();
                 format!(
-                    " (mailbox {:?}, timers {:?}, fatal {:?})",
+                    " (mailbox {:?}, timers {:?}, open turns {:?}, open connections {:?}, fatal {:?})",
                     db.mailbox().map(|m| m.len()),
                     db.timers(None)
                         .map(|t| t.iter().map(|t| t.due_ms).collect::<Vec<_>>()),
+                    db.open_turns()
+                        .map(|t| t.into_iter().map(|t| t.execution_id).collect::<Vec<_>>()),
+                    db.open_connections()
+                        .map(|c| c.into_iter().map(|c| c.id).collect::<Vec<_>>()),
                     n.fatal()
                 )
             });
