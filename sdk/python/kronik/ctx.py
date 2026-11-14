@@ -205,10 +205,11 @@ class Timers:
 class ConnectionOps:
     """The WebSocket and SSE connections this actor accepted: `ctx.connections`
     (see `kronik explain connections`). Only the actor whose open accepted a
-    connection may send on it or close it while it is live: another actor's
-    use traps with CONNECTION_NOT_HELD. A frame to a connection that is not
-    live (closed, or never accepted) is dropped and shows in the history,
-    closing it does nothing, and send_now returns False. A frame is a Frame,
+    connection sends on it or closes it. A frame to an id that is not a live
+    connection of this actor (it closed, was never accepted, or another actor
+    holds it) is recorded as dropped and never delivered, and shows in the
+    history; closing it does nothing, and send_now returns False. To reach
+    another actor's clients, send that actor a message. A frame is a Frame,
     a str (text) or bytes (binary)."""
 
     def __init__(self, h):

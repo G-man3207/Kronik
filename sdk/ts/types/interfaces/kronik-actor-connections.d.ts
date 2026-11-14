@@ -2,25 +2,30 @@
 declare module 'kronik:actor/connections@0.1.1' {
   /**
    * Buffered: sent after this turn commits, in call order; nothing if the
-   * turn fails. Traps on another actor's live connection; to a connection
-   * that is not live (closed, or never accepted) the frame is recorded as
-   * dropped.
+   * turn fails. To an id that is not a live connection of this actor (it
+   * closed, was never accepted, or another actor holds it) the frame is
+   * recorded as dropped and never delivered. Traps on a malformed id.
    */
   export function send(conn: ConnectionId, frame: Frame): void;
   /**
-   * `send` to each of `conns`, recorded once.
+   * `send` to each of `conns`, recorded once; ids that are not this
+   * actor's live connections are recorded as dropped.
    */
   export function broadcast(conns: Array<ConnectionId>, frame: Frame): void;
   /**
    * Buffered like `send`: after the frames before it, the connection
    * closes with `code` and `reason` (WebSocket) or its stream ends (SSE).
+   * On an id that is not a live connection of this actor the close is
+   * recorded as dropped and does nothing.
    */
   export function close(conn: ConnectionId, code: number, reason: string): void;
   /**
    * Sends now, before the turn commits: an effect with delivery class
    * unsafe that needs the capability connection:send-now. `ok` means
    * handed to the connection in order, not received. Never sent again
-   * after a crash: the re-run gets `outcome-unknown`.
+   * after a crash: the re-run gets `outcome-unknown`. An id that is not a
+   * live connection of this actor answers `closed` (recorded, no frame
+   * sent).
    */
   export function sendNow(conn: ConnectionId, frame: Frame): void;
   export type Header = import('kronik:actor/types@0.1.1').Header;
@@ -145,8 +150,9 @@ declare module 'kronik:actor/connections@0.1.1' {
   }
   export type SendError = SendErrorClosed | SendErrorOutcomeUnknown | SendErrorDenied;
   /**
-   * the connection is closed or closing, or the client could not keep
-   * up: the frame was not sent
+   * not a live connection of this actor (closed or closing, never
+   * accepted, or another actor's), or the client could not keep up: the
+   * frame was not sent
    */
   export interface SendErrorClosed {
     tag: 'closed',
