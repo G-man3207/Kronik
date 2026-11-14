@@ -2051,8 +2051,8 @@ microVM), and they record their calls like other effects
   the daemon never downloads or builds it). Without KVM the add is refused
   with `KVM_UNAVAILABLE`, which suggests `gvisor`. gVisor stays the default.
   The microVM level's proofs passed on 2026-11-14 on GitHub-hosted Ubuntu
-  24.04 runners, which are virtual machines on AMD hosts with nested KVM; they
-  have not run on bare metal, on Intel or on aarch64.
+  24.04 runners, which are virtual machines with nested KVM, on an AMD host and
+  on an Intel host; they have not run on bare metal or on aarch64.
 
 Know two things before you enable `--isolation microvm`
 ([ADR 0095](../adr/0095-pinned-firecracker-guest.md),

@@ -16,8 +16,9 @@ until the v1.0 compatibility promise takes effect.
   sandbox forks restore from a full snapshot, and a stop ends the VM within a
   second. Its VMM runs as the daemon's own user under Kronik's own jail, and
   every fork of a microVM actor resumes the same snapshot. Its proofs passed
-  on 2026-11-14 on GitHub-hosted Ubuntu 24.04 runners, virtual machines on AMD
-  hosts with nested KVM, through the manual `isolation` workflow (ADR 0133).
+  on 2026-11-14 on GitHub-hosted Ubuntu 24.04 runners, virtual machines with
+  nested KVM on an AMD host and on an Intel host, through the manual
+  `isolation` workflow (ADR 0133).
 - `kronik serve --init --rootless` installs a nonroot service (M21; ADRs
   0060-0065): the daemon runs as the `kronik` user, foreign sandboxes run as
   root of a user namespace that `kronik userns pin` makes, and an API

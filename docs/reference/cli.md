@@ -2115,7 +2115,7 @@ answer and nothing is cached; the next start retries). A link made later is
 seen by the next start. `trusted` runs plain runc with a warning, a
 seccomp filter and no user namespace: it is not a security boundary.
 `microvm` (M20) is an opt-in that gives the actor a VM of its own; its proofs
-passed on GitHub-hosted Ubuntu 24.04 runners, virtual machines on AMD hosts with nested KVM, on 2026-11-14. Its VMM runs as the
+passed on GitHub-hosted Ubuntu 24.04 runners, virtual machines with nested KVM on an AMD host and on an Intel host, on 2026-11-14. Its VMM runs as the
 daemon's own user under a launcher of Kronik's (not Firecracker's jailer),
 and its sandbox forks all resume one snapshot, so values a program holds in
 memory repeat across forks (the

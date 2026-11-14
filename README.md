@@ -59,8 +59,8 @@ its installed proofs (ADR 0064) on 2026-11-14 on GitHub-hosted Ubuntu 24.04
 runners (virtual machines on AMD hosts), once with AppArmor's restriction on unprivileged user namespaces (R1)
 active and once with it lifted; it has not run on other distributions. The
 microVM level (M20, `isolation = "microvm"`, opt-in; gVisor stays the default)
-passed its proofs on the same runners, which are virtual machines on AMD hosts
-with nested KVM; neither has run on bare metal. The manual `isolation` workflow runs them on disposable hosted runners and
+passed its proofs on the same kind of runner, with nested KVM, on an AMD host
+and on an Intel host; neither has run on bare metal. The manual `isolation` workflow runs them on disposable hosted runners and
 keeps their evidence. The nonroot
 daemon's decisions, ADRs 0060–0065, were accepted on 2026-11-13; the microVM
 level's, ADRs 0095 and 0096, await the maintainers.
