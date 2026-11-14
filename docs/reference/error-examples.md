@@ -84,6 +84,16 @@ its input carried, or to retain the blob (M26) in the turn that received it.
 kronik history media/fixture --limit 5
 ```
 
+## BLOB_QUOTA_EXCEEDED
+
+A fixture `media` actor retains every upload it receives and reaches its
+kind's `blob_bytes_per_actor`. Look at what it holds, then release what it
+no longer needs in its code, or raise the quota for the kind.
+
+```sh
+kronik limits set media --blob-size-per-actor 4GiB --reason "media keeps originals"
+```
+
 ## BLOB_STORE_FULL
 
 An owned fixture's disk is filled until the blob store is below

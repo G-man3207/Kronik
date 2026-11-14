@@ -119,6 +119,9 @@ codes! {
     BlobNotHeld = "BLOB_NOT_HELD", 403, "M25",
         "The turn used a blob reference it neither holds nor received",
         "Use the reference the turn received in its input, from a fetch or a writer, or one the actor holds; a hash stored as data is not a reference.";
+    BlobQuotaExceeded = "BLOB_QUOTA_EXCEEDED", 409, "M26",
+        "The actor would hold more blob bytes than its quota",
+        "Release blobs the actor no longer needs (blobs.release), or raise the quota with `kronik limits set <kind> --blob-size-per-actor <size> --reason '...'`.";
     BlobStoreFull = "BLOB_STORE_FULL", 503, "M25",
         "The blob store's disk is below its reserve",
         "Free disk space on the data directory's file system, or lower [blobs] disk_reserve, then retry; turns that write blobs wait and run again.";
@@ -583,9 +586,9 @@ mod tests {
 
     #[test]
     fn every_code_has_a_status_milestone_title_hint_and_explanation() {
-        const MILESTONES: [&str; 16] = [
+        const MILESTONES: [&str; 17] = [
             "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M21", "M23",
-            "M24", "M25", "M28",
+            "M24", "M25", "M26", "M28",
         ];
         for &code in ErrorCode::ALL {
             assert!((400..600).contains(&code.http_status()), "{code}");

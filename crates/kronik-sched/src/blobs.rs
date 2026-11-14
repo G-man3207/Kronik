@@ -104,6 +104,16 @@ struct Inner {
     /// The byte budget of the space it writes to: a preview's
     /// ([`TurnBlobs::with_budget`]).
     budget: std::sync::OnceLock<Arc<kronik_blob::SpaceBudget>>,
+    /// What the actor holds; none: it holds nothing (a scratch turn).
+    holds: Option<Holds>,
+}
+
+/// What the turn's actor holds (M26 §2): the store whose `blob_refs`
+/// answer, main's or a fork's, and the actor. The actor's turns run one at
+/// a time, so its holds there are those of the turn's start.
+pub struct Holds {
+    pub store: Arc<kronik_store::Store>,
+    pub actor: kronik_core::ids::ActorRef,
 }
 
 struct Slot {
@@ -117,6 +127,8 @@ impl TurnBlobs {
     /// A host writing to `space` of `store` under a new lease, reading
     /// subjects' keys from `sealer`, scrubbing writes of what `secrets`
     /// gives, at most `limit` bytes per blob.
+    // Each argument is a different part of the turn's context.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<BlobStore>,
         space: Space,
@@ -125,6 +137,7 @@ impl TurnBlobs {
         fx_state: SecretSource,
         limit: u64,
         options: HostOptions,
+        holds: Option<Holds>,
     ) -> TurnBlobs {
         let lease = store.leases().take("turn");
         let inner = Arc::new(Inner {
@@ -144,6 +157,7 @@ impl TurnBlobs {
             read_erased: std::sync::atomic::AtomicBool::new(false),
             read_masked: std::sync::atomic::AtomicBool::new(false),
             budget: std::sync::OnceLock::new(),
+            holds,
         });
         // The lease lives as long as the host, renewed while the turn runs,
         // however long it waits (ADR 0120 §4); the loop ends with the host.
@@ -627,6 +641,28 @@ impl BlobHost for TurnBlobs {
         })
     }
 
+    fn held(&self, hash: &str) -> Result<Option<pb::BlobRef>, BlobHostError> {
+        let Some(holds) = &self.0.holds else {
+            return Ok(None);
+        };
+        holds
+            .store
+            .db()
+            .held(&holds.actor.kind, &holds.actor.key, hash)
+            .map_err(|e| BlobHostError::Host(format!("reading the actor's holds: {e}")))
+    }
+
+    fn held_bytes(&self) -> Result<u64, BlobHostError> {
+        let Some(holds) = &self.0.holds else {
+            return Ok(0);
+        };
+        holds
+            .store
+            .db()
+            .held_bytes(&holds.actor.kind, &holds.actor.key)
+            .map_err(|e| BlobHostError::Host(format!("reading the actor's holds: {e}")))
+    }
+
     fn replaced(&self, writer: u64) -> u64 {
         if let Some(slot) = lock(&self.0.writers).get(&writer) {
             return slot.scrub.as_ref().map_or(0, |(s, _)| s.replaced());
@@ -668,6 +704,7 @@ mod tests {
             Arc::new(move || lock(&seen).clone()),
             1 << 30,
             HostOptions::production(),
+            None,
         );
         (blobs, store)
     }

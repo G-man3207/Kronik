@@ -250,6 +250,21 @@ pub fn validate_call_reply(reply: Option<&pb::Message>) -> Result<(), GateError>
 /// A genuine strict source scope proves the unchanged result; otherwise a
 /// matching field cannot be safely disclosed. A qualified callee MUST have
 /// its withheld FX11 fsynced before the runtime receives the typed failure.
+/// The references an `actor.call` carries, for its `EffectRecord.blobs`
+/// (M26 §4): its message's and its compensation's, sorted by identity, each
+/// once.
+pub fn call_blobs(msg: &pb::Message, compensate: Option<&pb::Message>) -> Vec<pb::BlobRef> {
+    let mut blobs: Vec<pb::BlobRef> = msg
+        .blobs
+        .iter()
+        .chain(compensate.into_iter().flat_map(|c| &c.blobs))
+        .cloned()
+        .collect();
+    blobs.sort_by(|a, b| a.hash.cmp(&b.hash));
+    blobs.dedup_by(|a, b| a.hash == b.hash);
+    blobs
+}
+
 pub fn prepare_call_outcome(
     record: &mut pb::EffectRecord,
     outcome: CallOutcome,
@@ -280,7 +295,14 @@ pub fn prepare_call_outcome(
             let prepared =
                 crate::scrub::prepared_fields_safe(current_scope, prepared_scope, matcher, fields)
                     .and_then(|()| {
-                        if value.encoded_len() <= output_bytes.min(kronik_log::MAX_RECORD as usize)
+                        // The reply's references are listed again in
+                        // `EffectRecord.blobs` (M26 §4).
+                        let listed = value
+                            .reply
+                            .as_ref()
+                            .map_or(0, |reply| crate::record_budget::blobs_need(&reply.blobs));
+                        if value.encoded_len() + listed
+                            <= output_bytes.min(kronik_log::MAX_RECORD as usize)
                         {
                             Ok(())
                         } else {
@@ -397,6 +419,14 @@ pub fn prepare_call_outcome(
                 .and_then(|reply| reply.body.as_ref())
                 .and_then(|body| body.subject.clone());
             record.response = tagged(&subject, response.encode_to_vec());
+            // The reply's references join the call's (M26 §4).
+            if let Some(reply) = &response.reply
+                && !reply.blobs.is_empty()
+            {
+                record.blobs.extend(reply.blobs.iter().cloned());
+                record.blobs.sort_by(|a, b| a.hash.cmp(&b.hash));
+                record.blobs.dedup_by(|a, b| a.hash == b.hash);
+            }
             Ok(CallOutcome::Ok(response.reply.take()))
         }
         CallOutcome::Rejected(error) => {
@@ -2158,6 +2188,9 @@ impl TurnFx {
             .msg
             .take()
             .ok_or_else(|| GateError::Host("The call message is missing".into()))?;
+        // The references the call carries (M26 §4); the reply's join them
+        // in prepare_call_outcome.
+        let blobs = call_blobs(&msg, cleanup.as_ref());
         let plain = blake3::hash(&encoded).as_bytes().to_vec();
         let fingerprint = self
             .node
@@ -2181,11 +2214,13 @@ impl TurnFx {
         // A new call: its request, its compensation's copy and a result
         // without a body must fit in what is left of the turn's record, or
         // it does not happen (#26).
-        let need = crate::record_budget::call_need(encoded.len(), cleanup.as_ref(), &to.to_pb());
+        let need = crate::record_budget::call_need(encoded.len(), cleanup.as_ref(), &to.to_pb())
+            + crate::record_budget::blobs_need(&blobs);
         self.admit(ordinal, kind, need)?;
         self.begin().await?;
         let mut record = self.base(ordinal, kind, target, fingerprint);
         record.request = tagged(&subject, encoded);
+        record.blobs = blobs;
         let (outcome, source, prepared_scope) =
             self.perform_call(ordinal, &to, msg, &message_id).await?;
         if self.node.hold_after_call() {

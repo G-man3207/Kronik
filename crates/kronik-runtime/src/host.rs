@@ -640,10 +640,38 @@ impl TurnHost {
                 self.limits.message_bytes
             );
         }
-        if !msg.blobs.is_empty() {
-            bail!("NOT_IMPLEMENTED: blobs in messages arrive in a later version");
+        if msg.blobs.len() > blobs::MAX_MESSAGE_BLOBS {
+            bail!(
+                "message {:?} carries {} blobs, the limit is {}",
+                msg.name,
+                msg.blobs.len(),
+                blobs::MAX_MESSAGE_BLOBS
+            );
         }
         Ok(())
+    }
+
+    /// The complete references of a message's blobs (M26 §3): each must be
+    /// in the turn's `T`, else the turn traps with `BLOB_NOT_HELD`. Without
+    /// a blob host a message carries none.
+    fn complete_message_blobs(
+        &mut self,
+        msg: &types::Message,
+    ) -> wasmtime::Result<Vec<pb::BlobRef>> {
+        if msg.blobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.blobs.is_none() {
+            bail!("NOT_IMPLEMENTED: blobs in messages are not available in this turn");
+        }
+        let mut out = Vec::with_capacity(msg.blobs.len());
+        for blob in &msg.blobs {
+            match self.complete_ref(blob)? {
+                Some(full) => out.push(full),
+                None => bail!("{}", blobs::not_held(blob)),
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -757,8 +785,13 @@ impl context::Host for TurnHost {
     }
 }
 
-/// Converts a guest message to the log form, tagging the body with `subject`.
-pub(crate) fn message_to_pb(m: types::Message, subject: Option<String>) -> pb::Message {
+/// Converts a guest message to the log form, tagging the body with
+/// `subject`; `blobs` are its references, completed from the turn's `T`.
+pub(crate) fn message_to_pb(
+    m: types::Message,
+    subject: Option<String>,
+    blobs: Vec<pb::BlobRef>,
+) -> pb::Message {
     pb::Message {
         name: m.name,
         content_type: m.content_type,
@@ -766,18 +799,7 @@ pub(crate) fn message_to_pb(m: types::Message, subject: Option<String>) -> pb::M
             subject,
             value: Some(pb::sealable::Value::Plain(m.body)),
         }),
-        // `check_message` refuses message blobs until M26, whose turns
-        // complete each reference from the turn's references instead.
-        blobs: m
-            .blobs
-            .into_iter()
-            .map(|b| pb::BlobRef {
-                hash: b.hash,
-                size: b.size,
-                subject: None,
-                key_version: 0,
-            })
-            .collect(),
+        blobs,
         retained_compensation_source: None,
     }
 }
@@ -812,10 +834,11 @@ impl messaging::Host for TurnHost {
             Err(e) => bail!("messaging.send: {e}"),
         };
         self.check_message(&msg)?;
+        let blobs = self.complete_message_blobs(&msg)?;
         let ordinal = self.ordinal();
         self.messages.push(pb::OutboundMessage {
             to: Some(to.to_pb()),
-            msg: Some(message_to_pb(msg, self.subject.clone())),
+            msg: Some(message_to_pb(msg, self.subject.clone(), blobs)),
             ordinal,
             message_id: causal::message_id(&self.causal_key, ordinal),
         });
@@ -837,18 +860,33 @@ impl messaging::Host for TurnHost {
         if let Some(c) = &compensate {
             self.check_message(c)?;
         }
+        let msg_blobs = self.complete_message_blobs(&msg)?;
+        let compensate_blobs = match &compensate {
+            Some(c) => self.complete_message_blobs(c)?,
+            None => Vec::new(),
+        };
         let gate = self.gate("messaging.call")?;
         let ordinal = self.ordinal();
         let subject = self.subject.clone();
-        let msg = message_to_pb(msg, subject.clone());
-        let compensate = compensate.map(|c| message_to_pb(c, subject));
+        let msg = message_to_pb(msg, subject.clone(), msg_blobs);
+        let compensate = compensate.map(|c| message_to_pb(c, subject, compensate_blobs));
         let res = gate.call(ordinal, to, msg, compensate).await;
         let out = res.map_err(|e| self.gate_failure(e))?;
         Ok(match out {
-            CallOutcome::Ok(reply) => Ok(reply
-                .map(guest_call_reply)
-                .transpose()
-                .map_err(|error| self.gate_failure(error))?),
+            CallOutcome::Ok(reply) => {
+                // The reply's references are the caller's to use (M26 §2).
+                if self.blobs.is_some()
+                    && let Some(reply) = &reply
+                {
+                    for blob in &reply.blobs {
+                        self.blob_state.admit(blob.clone());
+                    }
+                }
+                Ok(reply
+                    .map(guest_call_reply)
+                    .transpose()
+                    .map_err(|error| self.gate_failure(error))?)
+            }
             CallOutcome::NotFound => Err(messaging::CallError::NotFound),
             CallOutcome::Rejected(m) => Err(messaging::CallError::Rejected(m)),
             CallOutcome::Failed(m) => Err(messaging::CallError::Failed(m)),
@@ -862,13 +900,14 @@ impl timers::Host for TurnHost {
     async fn schedule(&mut self, delay_ms: u64, msg: types::Message) -> wasmtime::Result<u64> {
         self.deny_in_describe("timers")?;
         self.check_message(&msg)?;
+        let blobs = self.complete_message_blobs(&msg)?;
         let ordinal = self.ordinal();
         let id = timer_id(&self.causal_key, ordinal);
         self.timers.push(pb::TimerOp {
             kind: pb::TimerOpKind::Schedule as i32,
             timer_id: id,
             due_ms: self.now_ms.saturating_add(delay_ms),
-            msg: Some(message_to_pb(msg, self.subject.clone())),
+            msg: Some(message_to_pb(msg, self.subject.clone(), blobs)),
             ordinal,
         });
         Ok(id)
@@ -917,14 +956,19 @@ impl http_client::Host for TurnHost {
             }
             // A blob body needs blobs on; one the turn may not use is the
             // gate's to deny (recorded, BLOB_NOT_HELD).
-            types::HttpBody::Blob(blob) => match (&self.blobs, self.blob_state.complete(&blob)) {
-                (None, _) => bail!("NOT_IMPLEMENTED: blob bodies are not available in this turn"),
-                (Some(_), Some(full)) => FetchBody::Blob(full),
-                (Some(_), None) => FetchBody::NotHeld {
-                    hash: blob.hash,
-                    size: blob.size,
-                },
-            },
+            types::HttpBody::Blob(blob) => {
+                if self.blobs.is_none() {
+                    bail!("NOT_IMPLEMENTED: blob bodies are not available in this turn");
+                }
+                // In `T`: received, created, or held (M26 §2).
+                match self.complete_ref(&blob)? {
+                    Some(full) => FetchBody::Blob(full),
+                    None => FetchBody::NotHeld {
+                        hash: blob.hash,
+                        size: blob.size,
+                    },
+                }
+            }
         };
         let headers = req
             .headers

@@ -3,9 +3,10 @@
 //! `kronik:actor/blobs` (docs/design/m25-streaming-bodies.md §17).
 //!
 //! Every input is an operation named by the last path segment of an HTTP
-//! request (`POST|GET /media/{key}/{op}`, options in the query string) or by
-//! the name of an operator message. The request's body is the operation's
-//! body: inline bytes or a blob. Answers are text.
+//! request (`POST|GET /media/{key}/{op}`, options in the query string), or by
+//! the name of a message or a timer's message (`op` or `op?query`). The
+//! operation's body is the request's body, inline bytes or a blob; a
+//! message's is its first blob, else its bytes. Answers are text.
 //!
 //! - `info`: `blob <hash> <size>` or `inline <size>` of the body.
 //! - `sum` (`chunk=`, default 1 MiB): reads the whole body in chunks of
@@ -43,6 +44,35 @@
 //!   does, finishes it, and answers `discarded` without it.
 //! - `open-writer`: writes into a writer it never finishes.
 //! - `fail-after-write` writes a blob, then fails the turn.
+//!
+//! M26, what an actor holds. Several operations use the reference stored in
+//! state as `ref` (`<hash> <size>`, as bytes: it keeps nothing).
+//!
+//! - `put` (`size=`, at most 1 MiB): puts `size` bytes of the `write`
+//!   pattern, which the actor then holds; stores the reference and answers
+//!   `blob <hash> <size>`, or the error.
+//! - `retain`: retains the body's blob and stores its reference; answers
+//!   `retained` or the error. `forged-retain` retains the stored reference.
+//! - `release`: releases the body's blob, else the stored reference; answers
+//!   `released` or the error.
+//! - `remember-text`: stores the body's bytes as the reference (a hash
+//!   learned as text).
+//! - `held-sum`: reads the whole stored reference (`<size> <fnv1a-64 hex>`);
+//!   the error fails the turn.
+//! - `send` (`to=<key>`, `op=`, `with=ref|text`): sends `media/<to>` a
+//!   message named `op` whose body is the stored reference's text, with the
+//!   body's blob, else the stored reference, in its blobs unless
+//!   `with=text`. A blob it does not hold or receive fails the turn with
+//!   `BLOB_NOT_HELD`.
+//! - `schedule` (`delay=` ms, `op=`): schedules a timer whose message, named
+//!   `op`, carries the body's blob, else the stored reference; answers
+//!   `scheduled`.
+//! - `call` (`to=<key>`, `op=`, `keep=1`): calls `media/<to>` with a message
+//!   named `op` carrying the body's blob, else the stored reference, if any;
+//!   answers `reply <blob <hash> <size> | none>`, and with `keep=1` retains
+//!   the reply's blob and stores its reference.
+//! - `reply`: answers a call with a reply carrying the body's blob, else the
+//!   stored reference.
 
 use std::fmt::Write as _;
 
@@ -54,10 +84,11 @@ wit_bindgen::generate!({
 use exports::kronik::actor::handler::Guest;
 use kronik::actor::blobs::{self, BlobError, Writer};
 use kronik::actor::http_client::{self, FetchError, Request, Response};
-use kronik::actor::state;
 use kronik::actor::types::{
-    BlobRef, HandlerError, HttpBody, HttpResponse, Input, Manifest, Message, Output, Route,
+    ActorRef, BlobRef, HandlerError, HttpBody, HttpResponse, Input, Manifest, Message, Output,
+    Route,
 };
+use kronik::actor::{messaging, state, timers};
 
 struct Media;
 
@@ -201,6 +232,44 @@ fn forged() -> Result<BlobRef, HandlerError> {
     Ok(BlobRef {
         hash: hash.to_string(),
         size: size.parse().map_err(|_| HandlerError::Failed("bad size".into()))?,
+    })
+}
+
+/// Stores `blob` as the reference later operations use.
+fn store_ref(blob: &BlobRef) {
+    state::set("ref", format!("{} {}", blob.hash, blob.size).as_bytes());
+}
+
+/// The body's blob, else the stored reference.
+fn body_or_stored(body: &HttpBody) -> Result<BlobRef, HandlerError> {
+    match body {
+        HttpBody::Blob(blob) => Ok(blob.clone()),
+        HttpBody::Inline(_) => forged(),
+    }
+}
+
+/// A message named `name` carrying `blobs`, its body the text of the stored
+/// reference.
+fn message(name: &str, blobs: Vec<BlobRef>) -> Message {
+    Message {
+        name: name.to_string(),
+        content_type: "text/plain".to_string(),
+        body: state::get("ref").unwrap_or_default(),
+        blobs,
+    }
+}
+
+fn media(key: &str) -> ActorRef {
+    ActorRef {
+        kind: "media".to_string(),
+        key: key.to_string(),
+    }
+}
+
+fn answer<T>(r: Result<T, BlobError>, ok: &str) -> Output {
+    text(match r {
+        Ok(_) => ok.to_string(),
+        Err(e) => error_name(&e),
     })
 }
 
@@ -412,8 +481,95 @@ fn run(op: &str, query: &str, body: HttpBody) -> Result<Output, HandlerError> {
             write_pattern(1000, 1000).map_err(|e| failed("write", &e))?;
             return Err(HandlerError::Failed("failed after a write".into()));
         }
+        "put" => {
+            let size = query_u64(query, "size", 1000);
+            let bytes: Vec<u8> = (0..size).map(pattern).collect();
+            match blobs::put(&bytes) {
+                Ok(blob) => {
+                    store_ref(&blob);
+                    text(format!("blob {} {}", blob.hash, blob.size))
+                }
+                Err(e) => text(error_name(&e)),
+            }
+        }
+        "retain" => {
+            let HttpBody::Blob(blob) = &body else {
+                return Err(HandlerError::Rejected("retain needs a blob body".into()));
+            };
+            let r = blobs::retain(blob);
+            if r.is_ok() {
+                store_ref(blob);
+            }
+            answer(r, "retained")
+        }
+        "forged-retain" => answer(blobs::retain(&forged()?), "retained"),
+        "release" => answer(blobs::release(&body_or_stored(&body)?), "released"),
+        "remember-text" => {
+            let HttpBody::Inline(bytes) = &body else {
+                return Err(HandlerError::Rejected("remember-text needs bytes".into()));
+            };
+            state::set("ref", bytes);
+            text("remembered".into())
+        }
+        "held-sum" => {
+            let (size, fnv) = sum(&HttpBody::Blob(forged()?), MIB)?;
+            text(format!("{size} {fnv}"))
+        }
+        "send" => {
+            let to = query_value(query, "to").unwrap_or("b");
+            let op = query_value(query, "op").unwrap_or("info");
+            let blobs = match query_value(query, "with") {
+                Some("text") => Vec::new(),
+                _ => vec![body_or_stored(&body)?],
+            };
+            messaging::send(&media(to), &message(op, blobs));
+            text("sent".into())
+        }
+        "schedule" => {
+            let op = query_value(query, "op").unwrap_or("held-sum");
+            let delay = query_u64(query, "delay", 0);
+            timers::schedule(delay, &message(op, vec![body_or_stored(&body)?]));
+            text("scheduled".into())
+        }
+        "call" => {
+            let to = query_value(query, "to").unwrap_or("b");
+            let op = query_value(query, "op").unwrap_or("reply");
+            let blobs = match (&body, state::get("ref")) {
+                (HttpBody::Blob(blob), _) => vec![blob.clone()],
+                (HttpBody::Inline(_), Some(_)) => vec![forged()?],
+                (HttpBody::Inline(_), None) => Vec::new(),
+            };
+            match messaging::call(&media(to), &message(op, blobs), None) {
+                Ok(Some(reply)) => match reply.blobs.first() {
+                    Some(blob) => {
+                        let mut kept = String::new();
+                        if query_value(query, "keep") == Some("1") {
+                            blobs::retain(blob).map_err(|e| failed("retain", &e))?;
+                            store_ref(blob);
+                            kept.push_str(" retained");
+                        }
+                        text(format!("reply blob {} {}{kept}", blob.hash, blob.size))
+                    }
+                    None => text("reply none".into()),
+                },
+                Ok(None) => text("reply none".into()),
+                Err(e) => text(format!("call error {e:?}")),
+            }
+        }
+        "reply" => Output::Reply(message("reply", vec![body_or_stored(&body)?])),
         other => return Err(HandlerError::Rejected(format!("unknown op {other}"))),
     })
+}
+
+/// A message's or timer's operation: `op` or `op?query`; its body is its
+/// first blob, else its bytes.
+fn run_message(msg: Message) -> Result<Output, HandlerError> {
+    let (op, query) = msg.name.split_once('?').unwrap_or((&msg.name, ""));
+    let body = match msg.blobs.first() {
+        Some(blob) => HttpBody::Blob(blob.clone()),
+        None => HttpBody::Inline(msg.body.clone()),
+    };
+    run(op, query, body)
 }
 
 impl Guest for Media {
@@ -435,11 +591,9 @@ impl Guest for Media {
                 let op = request.path.rsplit('/').next().unwrap_or("").to_string();
                 run(&op, &request.query, request.body)
             }
-            Input::Message(incoming) => {
-                let Message { name, body, .. } = incoming.msg;
-                run(&name, "", HttpBody::Inline(body))
-            }
-            Input::Timer(_) | Input::Migrate(_) => Ok(Output::None),
+            Input::Message(incoming) => run_message(incoming.msg),
+            Input::Timer(fired) => run_message(fired.msg),
+            Input::Migrate(_) => Ok(Output::None),
         }
     }
 }

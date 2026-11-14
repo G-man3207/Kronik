@@ -4170,6 +4170,7 @@ against both.
             "BLOB_MISSING",
             "BLOB_NOT_FOUND",
             "BLOB_NOT_HELD",
+            "BLOB_QUOTA_EXCEEDED",
             "BLOB_STORE_FULL",
             "CAPABILITY_NOT_GRANTED",
             "CERTIFICATE_INVALID",

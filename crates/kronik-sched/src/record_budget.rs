@@ -420,6 +420,13 @@ pub fn call_need(
     field(recorded_request_len) + compensation + 2 * SEAL_ALLOWANCE + EFFECT_RESERVE
 }
 
+/// What listing `blobs` in `EffectRecord.blobs` costs (M26 §4): an
+/// `actor.call` lists the references of its message, compensation and reply
+/// there again, outside its payloads, which may be sealed.
+pub fn blobs_need(blobs: &[pb::BlobRef]) -> usize {
+    blobs.iter().map(|b| field(b.encoded_len())).sum()
+}
+
 /// What a new effect without a request body (crypto, a secret reveal) or a
 /// denial needs before it is recorded.
 pub const SMALL_NEED: usize = EFFECT_RESERVE;

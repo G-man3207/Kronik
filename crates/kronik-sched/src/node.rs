@@ -2523,6 +2523,11 @@ impl Node {
                 crate::blobs::TurnBlobs::secrets_of(fx.clone()),
                 kind_limits.blob_bytes_per_actor,
                 crate::blobs::HostOptions::production(),
+                // What the actor holds (M26 §2), from main's state.
+                Some(crate::blobs::Holds {
+                    store: self.store.clone(),
+                    actor: actor.clone(),
+                }),
             )
         });
         if let Some(blobs) = &turn_blobs {
@@ -2771,7 +2776,12 @@ impl Node {
                 fxs.compensations.clone()
             },
             sql_schema,
-            blob_refs: Vec::new(),
+            // The net hold changes of a committed turn (M26 §3).
+            blob_refs: if committed {
+                std::mem::take(&mut out.blob_refs)
+            } else {
+                Vec::new()
+            },
             config_epoch: epoch,
             memory_peak_bytes: out.memory_peak_bytes,
             schema_version: if committed { schema_version } else { 0 },
@@ -4118,6 +4128,14 @@ impl Node {
         }
         self.check_running()?;
         self.check_message(&actor.kind, &msg)?;
+        // A reference is an authorization (M26 §2): an operator's message
+        // names none; only actors pass references on.
+        if !msg.blobs.is_empty() {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "an operator message carries no blobs",
+            ));
+        }
         if dry_run {
             return Ok(None);
         }

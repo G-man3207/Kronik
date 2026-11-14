@@ -44,6 +44,9 @@ pub struct TurnOutput {
     pub timers: Vec<pb::TimerOp>,
     /// The buffered connection operations, with their outgoing seqs (M24).
     pub connection_ops: Vec<pb::ConnectionOp>,
+    /// The net hold changes of a committed turn (M26 §3), sorted by
+    /// identity; empty for a failed one.
+    pub blob_refs: Vec<pb::BlobRefOp>,
     pub fuel_used: u64,
     pub memory_peak_bytes: u64,
     pub logs: Vec<LogEvent>,
@@ -316,6 +319,14 @@ impl Program {
                 blobs.discard(writer);
             }
         }
+        // A blob the actor held when the turn started is in `T` too: the
+        // answer may use it (M26 §2). A lookup that fails is the turn's
+        // failure below.
+        if with_blobs {
+            for blob in answer_refs(&result) {
+                let _ = host.complete_ref(&blob);
+            }
+        }
         if let Some(fatal) = host.fatal.take() {
             return Err(fatal);
         }
@@ -373,6 +384,11 @@ impl Program {
             },
             timers: if ok {
                 std::mem::take(&mut host.timers)
+            } else {
+                Vec::new()
+            },
+            blob_refs: if ok {
+                host.blob_state.ops()
             } else {
                 Vec::new()
             },
@@ -537,18 +553,39 @@ fn committed(
                     format!("reply is {} bytes, the limit is {limit}", m.body.len()),
                 );
             }
-            // As for sent messages (`check_message`): blobs travel in
-            // messages from M26 on, when each is completed from the
-            // references the turn holds. Until then nothing a guest names
-            // reaches the record unchecked.
-            if !m.blobs.is_empty() {
+            if m.blobs.len() > crate::host::blobs::MAX_MESSAGE_BLOBS {
                 return failed(
                     pb::OutcomeKind::Trap,
-                    "NOT_IMPLEMENTED",
-                    "NOT_IMPLEMENTED: blobs in replies arrive in a later version".into(),
+                    "TURN_FAILED",
+                    format!(
+                        "the reply carries {} blobs, the limit is {}",
+                        m.blobs.len(),
+                        crate::host::blobs::MAX_MESSAGE_BLOBS
+                    ),
                 );
             }
-            Some(pb::outcome::Output::Reply(message_to_pb(m, subject)))
+            let mut blobs = Vec::with_capacity(m.blobs.len());
+            for blob in &m.blobs {
+                match refs.map(|refs| refs.complete(blob)) {
+                    None => {
+                        return failed(
+                            pb::OutcomeKind::Trap,
+                            "NOT_IMPLEMENTED",
+                            "NOT_IMPLEMENTED: blobs in messages are not available in this turn"
+                                .into(),
+                        );
+                    }
+                    Some(None) => {
+                        return failed(
+                            pb::OutcomeKind::Trap,
+                            ErrorCode::BlobNotHeld.as_str(),
+                            not_held(blob),
+                        );
+                    }
+                    Some(Some(full)) => blobs.push(full),
+                }
+            }
+            Some(pb::outcome::Output::Reply(message_to_pb(m, subject, blobs)))
         }
         types::Output::Http(r) => {
             let body = match r.body {
@@ -599,6 +636,23 @@ fn committed(
         error_code: String::new(),
         message: String::new(),
         output,
+    }
+}
+
+/// The guest references an answer names: a reply's blobs, or an HTTP
+/// response body (also an open's refusal).
+fn answer_refs(
+    result: &wasmtime::Result<Result<Answer, types::HandlerError>>,
+) -> Vec<crate::host::bindings::kronik::actor::types::BlobRef> {
+    let http = |r: &types::HttpResponse| match &r.body {
+        types::HttpBody::Blob(blob) => vec![blob.clone()],
+        types::HttpBody::Inline(_) => Vec::new(),
+    };
+    match result {
+        Ok(Ok(Answer::Output(types::Output::Reply(m)))) => m.blobs.clone(),
+        Ok(Ok(Answer::Output(types::Output::Http(r)))) => http(r),
+        Ok(Ok(Answer::Open(conn_wit::OpenReply::Refuse(r)))) => http(r),
+        _ => Vec::new(),
     }
 }
 

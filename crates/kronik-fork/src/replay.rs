@@ -1250,7 +1250,16 @@ impl Runner {
         if let Some(floor) = &self.setup.blob_floor {
             floor.renew();
         }
-        let blob_host = fork_blob_host(&self.setup, &gate, req.limits.blob_bytes);
+        // What the actor holds in the fork's state (M26 §2).
+        let blob_host = fork_blob_host(
+            &self.setup,
+            &gate,
+            req.limits.blob_bytes,
+            kronik_sched::blobs::Holds {
+                store: self.store.clone(),
+                actor: p.actor.clone(),
+            },
+        );
         let run = kind
             .program
             .run_with_blobs(
@@ -1387,7 +1396,12 @@ impl Runner {
                 compensations.clone()
             },
             sql_schema,
-            blob_refs: Vec::new(),
+            // The net hold changes of a committed turn (M26 §3).
+            blob_refs: if committed {
+                std::mem::take(&mut out.blob_refs)
+            } else {
+                Vec::new()
+            },
             config_epoch: epoch,
             memory_peak_bytes: out.memory_peak_bytes,
             schema_version: if committed { schema_version } else { 0 },
@@ -1714,6 +1728,7 @@ fn fork_blob_host(
     setup: &ReplaySetup,
     gate: &Arc<ReplayGate>,
     limit: u64,
+    holds: kronik_sched::blobs::Holds,
 ) -> Option<kronik_sched::blobs::TurnBlobs> {
     let store = setup.blobs.clone()?;
     // Weak: the host must not keep the turn's gate (and its secrets) alive.
@@ -1739,6 +1754,7 @@ fn fork_blob_host(
         secrets,
         limit,
         kronik_sched::blobs::HostOptions::fork(setup.privacy.no_pii),
+        Some(holds),
     );
     // A preview's blob space has a byte budget (`[fork] preview_blob_bytes`).
     Some(match &setup.blob_budget {
@@ -3129,10 +3145,17 @@ impl ReplayGate {
         }
         let encoded = request.encode_to_vec();
         let compensate = request.compensate.take();
+        // The references the call carries, as production lists them (M26 §4).
+        let blobs = request
+            .msg
+            .as_ref()
+            .map(|msg| kronik_sched::effects::call_blobs(msg, compensate.as_ref()))
+            .unwrap_or_default();
         // Production admits a new call with room for its request, its
-        // compensation's copy and a result without a body.
+        // compensation's copy, its references and a result without a body.
         let need =
-            kronik_sched::record_budget::call_need(encoded.len(), compensate.as_ref(), &to.to_pb());
+            kronik_sched::record_budget::call_need(encoded.len(), compensate.as_ref(), &to.to_pb())
+                + kronik_sched::record_budget::blobs_need(&blobs);
         self.admit(ordinal, "actor.call", need)?;
         let msg = request
             .msg
@@ -3158,6 +3181,7 @@ impl ReplayGate {
             fingerprint: sealer.effect_fingerprint(msg_subject.as_deref(), plain),
             request: tagged(&msg_subject, encoded),
             grounding: pb::Grounding::Live as i32,
+            blobs,
             ..Default::default()
         };
         let (outcome, turn_id, callee_lsn) = if to == self.actor || self.call_chain.contains(&to) {

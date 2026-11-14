@@ -40,6 +40,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`BLOB_MISSING`](#blob_missing) | 500 | M25 | A committed blob reference's bytes are not in the blob store |
 | [`BLOB_NOT_FOUND`](#blob_not_found) | 404 | M25 | This node knows no such blob |
 | [`BLOB_NOT_HELD`](#blob_not_held) | 403 | M25 | The turn used a blob reference it neither holds nor received |
+| [`BLOB_QUOTA_EXCEEDED`](#blob_quota_exceeded) | 409 | M26 | The actor would hold more blob bytes than its quota |
 | [`BLOB_STORE_FULL`](#blob_store_full) | 503 | M25 | The blob store's disk is below its reserve |
 | [`CAPABILITY_NOT_GRANTED`](#capability_not_granted) | 403 | M2 | The actor type lacks a capability for this effect |
 | [`CERTIFICATE_INVALID`](#certificate_invalid) | 400 | M6 | The TLS certificate cannot be used |
@@ -238,6 +239,28 @@ same in production and in replay.
 To keep a blob across turns, retain it (`blobs.retain`, M26) in the turn that
 received it, and send it to another actor in the message's `blobs`, never in
 its body.
+
+See also: [`blob`](concepts/glossary.md#blob).
+
+## BLOB_QUOTA_EXCEEDED
+
+HTTP status 409, milestone M26. The actor would hold more blob bytes than its quota.
+
+Default hint: Release blobs the actor no longer needs (blobs.release), or raise the quota with `kronik limits set <kind> --blob-size-per-actor <size> --reason '...'`.
+
+An actor would hold more blob bytes than `blob_bytes_per_actor` allows for
+its kind (1 GiB by default), or a turn would write more bytes into blobs
+than that. The quota counts the distinct blobs the actor holds after the
+call: those it held when the turn started plus what the turn retained and
+put, minus what it released. A blob several actors hold counts for each.
+
+`blobs.put`, `blobs.retain` and a writer's `write` answer `quota-exceeded`
+to the guest; nothing was held or written by that call, and the turn goes on.
+The SDKs turn the answer into an error with this code; a turn that does not
+handle it fails with it.
+
+Release the blobs the actor no longer needs, or raise the quota with
+`kronik limits set <kind> --blob-size-per-actor <size> --reason "..."`.
 
 See also: [`blob`](concepts/glossary.md#blob).
 

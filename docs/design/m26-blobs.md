@@ -124,6 +124,29 @@ The interface is the one [ADR 0121](../adr/0121-blob-interface-and-wasi-0-3.md)
   call (§16); there is no `put-for` in the WIT.
 - `kronik send` (operator messages) carries no blobs.
 
+As built (M26 slice B14):
+
+- A reference is in `T` when the turn received or created it, or when the
+  actor held it at the turn's start; the blob host answers the latter per
+  blob from `blob_refs` (`BlobHost::held`, `held_bytes`), and the answer
+  joins `T`. `get`, `retain`, `release`, message blobs, a reply's blobs, a
+  response body and a `fetch` request body all complete the guest's
+  `(hash, size)` this way.
+- `put` writes the bytes through a writer of its own (it counts among the
+  turn's open writers while it writes), then holds the blob. The quota is
+  checked with the blob's identity, so a `put` of bytes the actor holds
+  already adds nothing; over the quota the blob is neither held nor in `T`,
+  and the collector takes it.
+- A turn that would change more than 1 024 holds gets `invalid` from the
+  call that would; a message with more than 256 references traps the turn
+  (`TURN_FAILED`), as an oversized body does.
+- A call's `EffectRecord.blobs` lists its message's, its compensation's and
+  its reply's references, sorted by identity, each once. The record budget
+  counts them when it admits the call and in the reply's room, in
+  production and in a fork's replay alike.
+- `kronik send` with blobs is `BAD_REQUEST`. A dead letter's resend carries
+  the dead letter's blobs: its input is the dead letter's.
+
 ## 4. The log
 
 All additive in log format v1; the field numbers are M25 §8.1.
@@ -197,6 +220,11 @@ table marker only when it has rows, so a state without blobs hashes exactly
 as before and v0.4 snapshots and restores keep their hashes. `blob_pins` and
 `blobs` are bookkeeping, like positions, and are not hashed.
 
+As built (M26 slice B14): the state hash marks each row, not the table, so a
+table without rows adds nothing; `blob_refs` is hashed on its `kind`, `key`
+and `hash` columns only (`HASHED_COLUMNS`), not on the LSN that made the
+hold.
+
 ### 5.4 Compaction
 
 `Db::compact` (the retention pass, m6-storage §5) gains, with the floor of
@@ -218,6 +246,13 @@ show it.
 
 The rows a rebuild produces can differ from the live ones only in rows the
 next pass deletes.
+
+As built (M26 slice B14): `prune_blob_pins(floor)` also deletes the pins of
+rows that paths other than the applier's usual ones removed (an erasure's
+dead letters and saved responses, the cap on connection dead letters), by
+checking each pin's row; step 2 runs there too. An erased blob's row stays
+while `ship-blobs.db` still lists its object, so that privacy status can
+name the subject of every object left in the bucket.
 
 ## 6. Collection
 

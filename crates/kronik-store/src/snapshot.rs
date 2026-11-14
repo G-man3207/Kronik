@@ -38,9 +38,13 @@ const HASHED_TABLES: &[&str] = &[
     // M24: derived from the log like every table above.
     "connections",
     // M26: what actors hold. Rows only, so a state without blobs hashes as
-    // before.
+    // before; and only who holds what ([`HASHED_COLUMNS`]).
     "blob_refs",
 ];
+
+/// Tables hashed with some of their columns, in this order: a hold is the
+/// state, not the LSN of the record that made it (M26 §5.3).
+const HASHED_COLUMNS: &[(&str, &[&str])] = &[("blob_refs", &["kind", "key", "hash"])];
 
 /// What `Store::snapshot_to` wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,18 +77,26 @@ pub(crate) fn hash_for_test(db: &crate::db::StateDb, tables: &[&str]) -> String 
 
 fn hash_tables(conn: &Connection, tables: &[&str], h: &mut blake3::Hasher) -> rusqlite::Result<()> {
     for t in tables {
-        let cols: Vec<String> = conn
+        let mut cols: Vec<String> = conn
             .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?
             .query_map([t], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         if cols.is_empty() {
             continue;
         }
+        if let Some((_, some)) = HASHED_COLUMNS.iter().find(|(name, _)| name == t) {
+            cols = some.iter().map(|c| (*c).to_owned()).collect();
+        }
         let order = (1..=cols.len())
             .map(|i| i.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        let mut st = conn.prepare(&format!("SELECT * FROM \"{t}\" ORDER BY {order}"))?;
+        let select = cols
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut st = conn.prepare(&format!("SELECT {select} FROM \"{t}\" ORDER BY {order}"))?;
         let n = st.column_count();
         let mut rows = st.query([])?;
         while let Some(row) = rows.next()? {

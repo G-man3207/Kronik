@@ -263,9 +263,9 @@ mod tests {
 
     #[test]
     fn names_are_unique_and_texts_are_complete() {
-        const MILESTONES: [&str; 16] = [
+        const MILESTONES: [&str; 17] = [
             "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M21", "M23",
-            "M24", "M25", "M28",
+            "M24", "M25", "M26", "M28",
         ];
         let mut seen = HashSet::new();
         for t in list() {

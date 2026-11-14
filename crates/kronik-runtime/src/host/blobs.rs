@@ -7,7 +7,9 @@
 //! move (fuel × [`BLOB_BYTES_PER_FUEL`]). Storage is behind [`BlobHost`],
 //! which the scheduler and the fork engine implement. Without a blob host
 //! (a node with blobs off, `describe`), every function traps with
-//! `NOT_IMPLEMENTED`. `put`, `retain` and `release` arrive with M26.
+//! `NOT_IMPLEMENTED`. M26 adds what an actor holds: `put`, `retain` and
+//! `release` buffer net hold changes that the turn's record carries
+//! (`TurnRecord.blob_refs`), within `blob_bytes_per_actor`.
 
 use std::collections::BTreeMap;
 
@@ -34,6 +36,11 @@ pub const BLOB_FRAME_BYTES: u64 = 65_536;
 /// up to a frame of data. Constructing another traps; finished and dropped
 /// writers do not count.
 pub const MAX_OPEN_WRITERS: usize = 64;
+/// The hold changes one turn may make (M26 §3): its record carries one
+/// operation for each.
+pub const MAX_HOLD_CHANGES: usize = 1024;
+/// The references one message may carry (M26 §3).
+pub const MAX_MESSAGE_BLOBS: usize = 256;
 
 /// The bytes a read of `blob_size` bytes at `offset`, `len` bytes long,
 /// is charged: every frame it touches, whole.
@@ -96,6 +103,16 @@ pub trait BlobHost: Send + Sync {
     fn replaced(&self, _writer: u64) -> u64 {
         0
     }
+    /// The complete reference of `hash` when the turn's actor held it when
+    /// the turn started (M26 §2): held references are in `T`.
+    fn held(&self, _hash: &str) -> Result<Option<pb::BlobRef>, BlobHostError> {
+        Ok(None)
+    }
+    /// The bytes of the distinct blobs the actor held when the turn
+    /// started, for its quota (ADR 0117 §8).
+    fn held_bytes(&self) -> Result<u64, BlobHostError> {
+        Ok(0)
+    }
 }
 
 /// The host's state of a guest's `writer` resource.
@@ -115,6 +132,14 @@ pub(crate) struct TurnBlobs {
     moved: u64,
     /// Bytes the turn wrote into blobs, against `TurnLimits::blob_bytes`.
     pub(super) created: u64,
+    /// Whether the actor held a blob when the turn started, by hash, as
+    /// the blob host answered (looked up when first needed).
+    held_start: BTreeMap<String, Option<pb::BlobRef>>,
+    /// The bytes the actor held when the turn started, once asked.
+    held_bytes_start: Option<u64>,
+    /// The blobs whose hold this turn changed: their reference, and
+    /// whether the actor holds them now.
+    holds: BTreeMap<String, (pb::BlobRef, bool)>,
 }
 
 impl TurnBlobs {
@@ -133,6 +158,43 @@ impl TurnBlobs {
     /// The writers still open, which the turn's end discards.
     pub(crate) fn take_open(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.open)
+    }
+
+    /// Whether the actor holds `hash` now, after this turn's operations so
+    /// far; `None` when the turn did not change it (its start decides).
+    fn held_now(&self, hash: &str) -> Option<bool> {
+        self.holds.get(hash).map(|(_, now)| *now)
+    }
+
+    /// The hold changes that differ from the turn's start.
+    fn changes(&self) -> usize {
+        self.holds
+            .iter()
+            .filter(|(hash, (_, now))| {
+                let start = self.held_start.get(*hash).is_some_and(Option::is_some);
+                *now != start
+            })
+            .count()
+    }
+
+    /// The net hold operations of the turn (M26 §3): `RETAIN` for what it
+    /// holds now and did not at its start, `RELEASE` for the reverse,
+    /// sorted by identity.
+    pub(crate) fn ops(&self) -> Vec<pb::BlobRefOp> {
+        self.holds
+            .iter()
+            .filter_map(|(hash, (blob, now))| {
+                let start = self.held_start.get(hash).is_some_and(Option::is_some);
+                (*now != start).then(|| pb::BlobRefOp {
+                    kind: if *now {
+                        pb::blob_ref_op::Kind::Retain as i32
+                    } else {
+                        pb::blob_ref_op::Kind::Release as i32
+                    },
+                    blob: Some(blob.clone()),
+                })
+            })
+            .collect()
     }
 }
 
@@ -205,6 +267,105 @@ impl TurnHost {
     fn writer_id(&self, writer: &Resource<GuestWriter>) -> wasmtime::Result<u64> {
         Ok(self.table.get(writer)?.id)
     }
+
+    /// Whether the actor held `hash` when the turn started, and its
+    /// complete reference then; asked of the blob host once per blob.
+    fn held_at_start(&mut self, hash: &str) -> wasmtime::Result<Option<pb::BlobRef>> {
+        if let Some(known) = self.blob_state.held_start.get(hash) {
+            return Ok(known.clone());
+        }
+        let answer = match &self.blobs {
+            Some(host) => host.held(hash),
+            None => Ok(None),
+        };
+        let held = answer.map_err(|error| self.blob_failure(error))?;
+        self.blob_state
+            .held_start
+            .insert(hash.to_owned(), held.clone());
+        Ok(held)
+    }
+
+    /// The complete reference of a guest's `blob-ref` when it is in `T`:
+    /// it entered the turn, or the actor held it when the turn started
+    /// (then it joins `T`).
+    pub(crate) fn complete_ref(&mut self, blob: &BlobRef) -> wasmtime::Result<Option<pb::BlobRef>> {
+        if let Some(full) = self.blob_state.complete(blob) {
+            return Ok(Some(full));
+        }
+        if self.blobs.is_none() {
+            return Ok(None);
+        }
+        Ok(match self.held_at_start(&blob.hash)? {
+            Some(full) if full.size == blob.size => {
+                self.blob_state.admit(full.clone());
+                Some(full)
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether the actor holds `hash` now.
+    fn holds_now(&mut self, hash: &str) -> wasmtime::Result<bool> {
+        if let Some(now) = self.blob_state.held_now(hash) {
+            return Ok(now);
+        }
+        Ok(self.held_at_start(hash)?.is_some())
+    }
+
+    /// The bytes the actor would hold with `extra` more, after the turn's
+    /// changes so far: its holds at the turn's start, plus what it retained
+    /// and minus what it released since.
+    fn would_hold(&mut self, extra: u64) -> wasmtime::Result<u64> {
+        let start = match self.blob_state.held_bytes_start {
+            Some(bytes) => bytes,
+            None => {
+                let answer = match &self.blobs {
+                    Some(host) => host.held_bytes(),
+                    None => Ok(0),
+                };
+                let bytes = answer.map_err(|error| self.blob_failure(error))?;
+                self.blob_state.held_bytes_start = Some(bytes);
+                bytes
+            }
+        };
+        let mut total = start;
+        let changed: Vec<(String, u64, bool)> = self
+            .blob_state
+            .holds
+            .iter()
+            .map(|(hash, (blob, now))| (hash.clone(), blob.size, *now))
+            .collect();
+        for (hash, size, now) in changed {
+            let was = self.held_at_start(&hash)?.is_some();
+            match (was, now) {
+                (false, true) => total = total.saturating_add(size),
+                (true, false) => total = total.saturating_sub(size),
+                _ => {}
+            }
+        }
+        Ok(total.saturating_add(extra))
+    }
+
+    /// Holds `blob`, which is in `T`: `quota-exceeded` past
+    /// `blob_bytes_per_actor`, and an error past [`MAX_HOLD_CHANGES`].
+    fn hold(&mut self, blob: pb::BlobRef) -> wasmtime::Result<Result<(), wit::BlobError>> {
+        if self.holds_now(&blob.hash)? {
+            return Ok(Ok(()));
+        }
+        let was = self.held_at_start(&blob.hash)?.is_some();
+        if !was && self.would_hold(blob.size)? > self.limits.blob_bytes {
+            return Ok(Err(wit::BlobError::QuotaExceeded));
+        }
+        if !was && self.blob_state.changes() >= MAX_HOLD_CHANGES {
+            return Ok(Err(invalid(format!(
+                "a turn changes at most {MAX_HOLD_CHANGES} holds"
+            ))));
+        }
+        self.blob_state
+            .holds
+            .insert(blob.hash.clone(), (blob, true));
+        Ok(Ok(()))
+    }
 }
 
 fn invalid(message: String) -> wit::BlobError {
@@ -224,7 +385,7 @@ impl wit::Host for TurnHost {
                 "get reads 1 to {MAX_BLOB_CALL_BYTES} bytes, not {len}"
             ))));
         }
-        let Some(full) = self.blob_state.complete(&blob) else {
+        let Some(full) = self.complete_ref(&blob)? else {
             return Ok(Err(wit::BlobError::NotHeld));
         };
         self.charge_blob_bytes(read_charge(full.size, offset, len))?;
@@ -238,19 +399,91 @@ impl wit::Host for TurnHost {
         }
     }
 
-    async fn put(&mut self, _bytes: Vec<u8>) -> wasmtime::Result<Result<BlobRef, wit::BlobError>> {
-        self.deny_in_describe("blobs")?;
-        bail!("NOT_IMPLEMENTED: blobs.put is not available yet")
+    async fn put(&mut self, bytes: Vec<u8>) -> wasmtime::Result<Result<BlobRef, wit::BlobError>> {
+        let host = self.blob_host("blobs.put")?;
+        if bytes.len() > MAX_BLOB_CALL_BYTES {
+            return Ok(Err(invalid(format!(
+                "put stores at most {MAX_BLOB_CALL_BYTES} bytes, not {}",
+                bytes.len()
+            ))));
+        }
+        let created = self.blob_state.created.saturating_add(bytes.len() as u64);
+        if created > self.limits.blob_bytes {
+            return Ok(Err(wit::BlobError::QuotaExceeded));
+        }
+        // The holds' quota is checked with the blob's identity once it is
+        // written (`hold`): a blob the actor holds already adds nothing.
+        if self.blob_state.open.len() >= MAX_OPEN_WRITERS {
+            bail!(
+                "too many open blob writers: a turn holds at most {MAX_OPEN_WRITERS} at once \
+                 (finish or drop one first)"
+            );
+        }
+        self.charge_blob_bytes(bytes.len() as u64)?;
+        self.blob_state.created = created;
+        let id = match host.create(self.subject.clone()).await {
+            Ok(id) => id,
+            Err(error) => return Err(self.blob_failure(error)),
+        };
+        self.blob_state.open.push(id);
+        let written = host.write(id, bytes).await;
+        let blob = match written {
+            Ok(()) => {
+                self.blob_state.open.retain(|open| *open != id);
+                host.finish(id).await
+            }
+            Err(error) => {
+                self.blob_state.open.retain(|open| *open != id);
+                host.discard(id);
+                Err(error)
+            }
+        };
+        let blob = match blob {
+            Ok(blob) => blob,
+            Err(BlobHostError::Erased) => return Ok(Err(wit::BlobError::Erased)),
+            Err(BlobHostError::TooLarge) => return Ok(Err(wit::BlobError::QuotaExceeded)),
+            Err(error) => return Err(self.blob_failure(error)),
+        };
+        // `put` holds what it stored (M26 §3). Over the quota, the blob is
+        // neither held nor in `T`: the collector takes it.
+        let wit_ref = to_wit(&blob);
+        match self.hold(blob.clone())? {
+            Ok(()) => {
+                self.blob_state.admit(blob);
+                Ok(Ok(wit_ref))
+            }
+            Err(error) => Ok(Err(error)),
+        }
     }
 
-    async fn retain(&mut self, _blob: BlobRef) -> wasmtime::Result<Result<(), wit::BlobError>> {
-        self.deny_in_describe("blobs")?;
-        bail!("NOT_IMPLEMENTED: blobs.retain is not available yet")
+    async fn retain(&mut self, blob: BlobRef) -> wasmtime::Result<Result<(), wit::BlobError>> {
+        self.blob_host("blobs.retain")?;
+        let Some(full) = self.complete_ref(&blob)? else {
+            return Ok(Err(wit::BlobError::NotHeld));
+        };
+        self.hold(full)
     }
 
-    async fn release(&mut self, _blob: BlobRef) -> wasmtime::Result<Result<(), wit::BlobError>> {
-        self.deny_in_describe("blobs")?;
-        bail!("NOT_IMPLEMENTED: blobs.release is not available yet")
+    async fn release(&mut self, blob: BlobRef) -> wasmtime::Result<Result<(), wit::BlobError>> {
+        self.blob_host("blobs.release")?;
+        // Only the actor's own hold: at the turn's start, or retained since.
+        let Some(full) = self.complete_ref(&blob)? else {
+            return Ok(Err(wit::BlobError::NotHeld));
+        };
+        if !self.holds_now(&full.hash)? {
+            return Ok(Err(wit::BlobError::NotHeld));
+        }
+        let was = self.held_at_start(&full.hash)?.is_some();
+        if was && self.blob_state.changes() >= MAX_HOLD_CHANGES {
+            return Ok(Err(invalid(format!(
+                "a turn changes at most {MAX_HOLD_CHANGES} holds"
+            ))));
+        }
+        // `T` only grows: a released blob stays readable in this turn.
+        self.blob_state
+            .holds
+            .insert(full.hash.clone(), (full, false));
+        Ok(Ok(()))
     }
 }
 
@@ -332,5 +565,53 @@ impl wit::HostWriter for TurnHost {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blob(n: u8) -> pb::BlobRef {
+        pb::BlobRef {
+            hash: format!("b3:{}", format!("{n:02x}").repeat(32)),
+            size: u64::from(n),
+            subject: None,
+            key_version: 0,
+        }
+    }
+
+    /// The record gets the net change of each hold against the turn's
+    /// start, sorted by identity: a hold taken and let go in the turn, or
+    /// let go and taken again, is no operation.
+    #[test]
+    fn the_record_gets_the_net_hold_changes() {
+        let mut state = TurnBlobs::default();
+        // Held at the start: 1 and 2; not: 3, 4 and 5.
+        for n in [1, 2] {
+            state.held_start.insert(blob(n).hash, Some(blob(n)));
+        }
+        for n in [3, 4, 5] {
+            state.held_start.insert(blob(n).hash, None);
+        }
+        // 1 released; 2 released and retained again; 3 retained; 4
+        // retained and released; 5 untouched.
+        state.holds.insert(blob(1).hash, (blob(1), false));
+        state.holds.insert(blob(2).hash, (blob(2), true));
+        state.holds.insert(blob(3).hash, (blob(3), true));
+        state.holds.insert(blob(4).hash, (blob(4), false));
+        assert_eq!(state.changes(), 2);
+        let ops: Vec<(i32, String)> = state
+            .ops()
+            .into_iter()
+            .map(|op| (op.kind, op.blob.unwrap().hash))
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                (pb::blob_ref_op::Kind::Release as i32, blob(1).hash),
+                (pb::blob_ref_op::Kind::Retain as i32, blob(3).hash),
+            ]
+        );
     }
 }
