@@ -12,10 +12,12 @@ pub mod key_source;
 pub mod keystore;
 pub mod owned_tree;
 mod publication;
+mod scrub_copies;
 pub mod sealer;
 pub mod secret_backend;
 pub mod secret_selection;
 pub use publication::PublicationError;
+pub use scrub_copies::ScrubCopy;
 
 #[cfg(test)]
 mod file_custody_tests;
@@ -873,6 +875,8 @@ pub struct SecretStore {
     fresh_at_open: bool,
     // A pinned legacy read-only snapshot may predate the derived floor table.
     has_floor_table: bool,
+    // ... and the table of external scrub copies (ADR 0142).
+    has_copy_table: bool,
     // Declared after the connection so SQLite closes before private staging is removed.
     _snapshot: Option<EncryptedSecretSnapshot>,
     custody: SecretStoreCustody,
@@ -970,6 +974,7 @@ impl SecretStore {
             hash_key: self.hash_key.clone(),
             fresh_at_open: false,
             has_floor_table: self.has_floor_table,
+            has_copy_table: self.has_copy_table,
             _snapshot: None,
             custody: SecretStoreCustody::Owned(owned.clone()),
         }))
@@ -1517,10 +1522,11 @@ impl SecretStore {
         if let Some(version) = invalid {
             return Err(PrivacyError::InvalidStoredVersion(version));
         }
-        let (has_check, has_floor_table): (bool, bool) = conn.query_row(
+        let (has_check, has_floor_table, has_copy_table): (bool, bool, bool) = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='key_check'), \
-             EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='secret_deletion_floors')",
-            [], |row| Ok((row.get(0)?, row.get(1)?)),
+             EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='secret_deletion_floors'), \
+             EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='external_scrub_copies')",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         if has_check {
             let want = master.check_value();
@@ -1543,6 +1549,7 @@ impl SecretStore {
             hash_key: master.derive("kronik secret version v1")?,
             fresh_at_open: false,
             has_floor_table,
+            has_copy_table,
             _snapshot: None,
             custody: SecretStoreCustody::ReadOnly,
         })
@@ -1570,12 +1577,14 @@ impl SecretStore {
         let hash_key = master.derive("kronik secret version v1")?;
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(scrub_copies::SCHEMA)?;
         let store = SecretStore {
             conn: Mutex::new(conn),
             cipher,
             hash_key,
             fresh_at_open,
             has_floor_table: true,
+            has_copy_table: true,
             _snapshot: None,
             custody,
         };
@@ -2031,7 +2040,8 @@ impl SecretStore {
 
     /// Every stored secret value, every version of it (a rotated value can
     /// still be in logs and outputs written before the rotation), for
-    /// scanning outputs (scrubbing), including deleted encrypted versions.
+    /// scanning outputs (scrubbing), including deleted encrypted versions and
+    /// the scrub-only copies of recorded external versions (ADR 0142).
     /// Legacy erased rows fail rather than claiming complete scrub coverage.
     pub fn values(&self) -> Result<Vec<(String, Vec<u8>)>, PrivacyError> {
         let rows: Vec<(String, i64, Vec<u8>, Vec<u8>)> = {
@@ -2056,6 +2066,15 @@ impl SecretStore {
                 }
             };
             out.push((name, value));
+        }
+        match self.scrub_copy_values() {
+            Ok(copies) => out.extend(copies),
+            Err(error) => {
+                for (_, value) in &mut out {
+                    value.zeroize();
+                }
+                return Err(error);
+            }
         }
         Ok(out)
     }
