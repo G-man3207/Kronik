@@ -1541,6 +1541,20 @@ fn a_snapshot_with_an_open_turn_stays_a_start_point_through_retention() {
     let p = start_with(dir.path(), config());
     p.deploy();
     p.grant("http:127.0.0.1", None, None);
+    // The /hang fetch keeps the turn open until the server is released: the
+    // default effect timeout (10 s) would close it in the middle of the
+    // rounds below on a loaded machine, and then no snapshot holds it open.
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "counter".into(),
+            effect_timeout_ms: Some(600_000),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
     // Segments before the one the open turn begins in, for retention to take.
     for _ in 0..20 {
         p.send("counter/w", msg("increment", ""));
@@ -1564,6 +1578,11 @@ fn a_snapshot_with_an_open_turn_stays_a_start_point_through_retention() {
         for i in 0..30 {
             p.send(&format!("counter/x{}", i % 3), msg("increment", ""));
         }
+        assert_eq!(
+            p.node.store().db().open_turns().unwrap().len(),
+            1,
+            "round {round}: the /hang turn is still open"
+        );
         let m = p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
         assert!(m.lsn > open[0].lsn, "round {round}");
         assert!(
