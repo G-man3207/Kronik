@@ -1364,7 +1364,14 @@ fn a_revealed_value_in_a_fetch_is_not_written_anywhere() {
     const SECRET: &str = "VALUE-fetch-2b7c41";
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start();
-    let p = start(dir.path());
+    // A secret mutation waits for its inventory publication for up to the
+    // fetch timeout (2 s by default), which a loaded machine can exceed.
+    let mut config = NodeConfig {
+        concurrency: 8,
+        ..NodeConfig::default()
+    };
+    config.secret_settings.fetch_timeout = Duration::from_secs(30);
+    let p = start_with(dir.path(), config);
     p.deploy();
     p.rt.block_on(
         p.node

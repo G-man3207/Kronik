@@ -407,6 +407,9 @@ async fn provider_node_with(
     environment.net = bao.clone();
     let mut config = config();
     config.foreign = foreign;
+    // `link_token`'s link waits for its inventory publication for up to the
+    // fetch timeout, which a loaded machine can exceed at the default 2 s.
+    config.secret_settings.fetch_timeout = Duration::from_secs(30);
     config.secret_settings.backends.insert(
         "bao".into(),
         Definition::Openbao {
