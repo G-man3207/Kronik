@@ -30,12 +30,18 @@ helps.
 
 ## Machines
 
-| | development machine | test VPS |
-| --- | --- | --- |
-| CPU | AMD EPYC 9354P, 8 vCPU | Intel Xeon Skylake, 2 vCPU |
-| Memory | 31 GB | 4 GB |
-| OS | Debian 13 | Debian 13, no `/dev/kvm` |
-| 4 KiB `O_DSYNC` write | 1.08 ms | 0.85 ms |
+| | development machine | test VPS | test machine (v0.5.0) |
+| --- | --- | --- | --- |
+| CPU | AMD EPYC 9354P, 8 vCPU | Intel Xeon Skylake, 2 vCPU | Intel Xeon Skylake, 4 vCPU (a KVM guest) |
+| Memory | 31 GB | 4 GB | 7.6 GiB |
+| OS | Debian 13 | Debian 13, no `/dev/kvm` | Ubuntu 22.04, Linux 5.15, no `/dev/kvm` |
+| 4 KiB `O_DSYNC` write | 1.08 ms | 0.85 ms | 1.07 to 1.23 ms |
+
+The v0.5.0 runs on the test machine stand in for the 2-vCPU test VPS: the
+daemon runs in a systemd scope confined to two of its CPUs and 4 GiB
+(`systemd-run --scope -p AllowedCPUs=0-1 -p MemoryMax=4G kronik serve ...`),
+and the load generator in a scope on the other two
+(`-p AllowedCPUs=2-3`), so the two do not share CPUs as they did on the VPS.
 
 ## Results (M1, 2026-10-25)
 
@@ -645,6 +651,106 @@ less. `scripts/chaos.py` now fails a restart that takes more than
 that answers 503 after a restart. Every certification logs `secret inventory
 certified` with the LSN range, the number of records read and the time it
 took.
+
+## Long-lived connections (M24)
+
+The build brief's criterion: the chat app `chat-ts` handles 1,000 concurrent
+WebSocket clients on the test VPS. The acceptance plan
+([M24 design](design/m24-connections.md) §18) passes a run when all 1,000
+connections are accepted with no refusal and no unexpected close; every
+delivery arrives once, in order (no gap, duplicate or loss); the end-to-end
+latency has p50 ≤ 50 ms and p99 ≤ 250 ms; the daemon's `VmHWM` stays at or
+below 1.5 GiB and its `VmRSS` grows less than 10 % over the steady phase;
+`kronik connections list` counts 1,000 open connections during it and none
+after; there is no dead letter; and a sample room's history has one open
+and one close per member.
+
+### Method
+
+- `scripts/acceptance-m24.sh load` builds the release `kronik`,
+  `tools/loadgen` and `chat-ts`, then runs `scripts/acceptance_m24.py load`:
+  a fresh `kronik serve` with `[connections] max_open = 4096` and
+  `max_per_client = 2048`, `chat-ts` deployed, and `kronik-loadgen chat`
+  with 1,000 clients in 50 rooms of 20, connecting over 20 s, then every
+  client sending a message every 10 s (±20 % jitter) for the steady phase
+  (`SECONDS`, 600 by default), about 100 incoming and 2,000 outgoing frames
+  per second, then every client closing.
+- The driver samples the daemon's `VmRSS`, `RssAnon`, `RssFile`, `VmHWM`
+  and CPU time from `/proc` every 10 s. The growth is from the first sample
+  60 s into the steady phase to the last.
+- `scripts/acceptance_m24.py restart` (criterion 4) runs 200 clients in 10
+  rooms for 90 s, with a graceful restart after a third of it and a
+  `SIGKILL` after two thirds; the clients reconnect.
+- The runs below used the test machine, confined as above, and each run's
+  daemon flags came from the driver's defaults plus, where the table says
+  so, `--concurrency 8`.
+
+### Results with the release build (2026-11-14)
+
+`kronik` from `main` at `3c29fa42` (every M24 slice), the static musl build
+the release makes (`cargo zigbuild --locked --release -p kronik --target
+x86_64-unknown-linux-musl` with the pins of `scripts/install-zig.sh`,
+stripped; SHA-256 `04454936d6d236dd6369b1bce14633b17f45e527d3d34467f966b04844684d4c`).
+`tools/loadgen` and `chat-ts` built from the same sources. Every run
+delivered every message (no gap, duplicate or loss, no unexpected close), had
+1,000 connections open in the steady phase and none after the close, no dead
+letter, and used about 1.3 of the daemon's two CPUs.
+
+| Start (UTC) | `--concurrency` | Steady phase | Deliveries | p50 / p99 / max | `VmHWM` | `VmRSS` growth (heap) | Result |
+| --- | ---: | ---: | ---: | --- | ---: | --- | --- |
+| 13:48 | 64 (default) | 10 min | 1,200,260 | 29.4 / 247 / 2,850 ms | 557 MiB | +25.6 % (+95 MiB) | fails the growth condition |
+| 14:18 | 8 | 10 min | 1,200,500 | 29.9 / 168 / 536 ms | 492 MiB | +4.3 % (+7 MiB) | passes |
+| 14:29 | 64 (default) | 30 min | 3,601,520 | 28.3 / 319 / 2,818 ms | 575 MiB | +34.1 % (+119 MiB) | fails growth and p99 |
+| 15:22 | 8 | 30 min | 3,600,300 | 27.8 / 172 / 1,242 ms | 490 MiB | +6.8 % (+26 MiB) | passes |
+
+Opening the 1,000 connections (the 20-s ramp and 5-s settle, including the
+rooms' first turns) raised the daemon's `VmRSS` by 16 to 23 MiB in these
+four runs: 16 to 24 KiB per connection.
+
+The heap (`RssAnon`) is where the growth is; mapped files stay flat. At the
+default concurrency it grows in steps (+34 MiB and +74 MiB in the first ten
+minutes) and then slowly: 278, 311, 367, 401, 416 and 425 MiB at 12, 300,
+500, 1,000, 1,500 and 1,827 s of the 30-minute run. The steps fit the Wasm
+instance pool's warm slots: two linear-memory slots per unit of
+concurrency, each keeping up to 2 MiB resident once used
+([Memory cost of the resident Wasm memories](#memory-cost-of-the-resident-wasm-memories)),
+up to 256 MiB at 64 and 32 MiB at 8. At concurrency 8 the heap was flat
+from 256 s to 976 s and then grew about 1.6 MiB per minute to the end, the
+same slope as the end of the run at 64; that slower growth is not explained
+yet (no log segment was removed during that run, so it is not compaction).
+The leading explanation is the room actors' SQLite page caches: each actor
+database is opened with a 512 KiB cache and kept open in a pool
+(`crates/kronik-store/src/sql/actor.rs`), so the growth would stop at about
+25 MiB for 50 rooms. It has not been tested: a run with 10 rooms of 100
+saturated the two CPUs instead.
+In the first run the daemon recorded no turn over 0.5 s and no fsync over
+0.1 s: the latency maxima come from the delivery path.
+
+Criterion 4 on the same build passed every check: 200 clients, a graceful
+restart (the daemon down 0.97 s) and a `SIGKILL` (0.48 s), 400 reconnects,
+the slowest after 5.8 s, every client closed with 1012 `kronik: restart` by
+the graceful restart, and 290,800 of 290,800 deliveries after resync.
+
+### Earlier runs with glibc builds (2026-11-14)
+
+Before the release's static musl link worked again, the same runs used
+builds of the M24 work before it landed, linked against glibc 2.35 (`cargo
+zigbuild --target x86_64-unknown-linux-gnu.2.35`). Every delivery arrived in
+each of them. Two 10-minute runs at the default concurrency grew `VmRSS` by
+23 % and 20 % (p99 128 and 155 ms); with the hub's drained-queue shrink
+added, 28.6 %. With `MALLOC_ARENA_MAX=2` the growth fell to 9.2 %, and with
+it and `--concurrency 8` to 7.7 % (p99 134 and 147 ms): with glibc, most of
+the growth was malloc's per-thread arenas, sized for the machine's four
+CPUs, not the scope's two. The release build uses musl's allocator, hence
+the reruns above. A criterion 4 run passed every check with a slowest
+reconnect of 3.2 s. Two checks that failed in the first runs (a room's
+history read and the count after the close) were the driver's and were fixed
+in it.
+
+The run directories (the driver's log, `report.json` with every sample, the
+daemon's log and configuration, `vmstat` and `iostat`, and metric scrapes
+every 30 s) are kept with the project's release evidence, outside the
+repository.
 
 ## M32 benchmark and regression contract
 
