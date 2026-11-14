@@ -356,6 +356,60 @@ few MiB. Process large blobs in host calls (read ranges, stream them
 through, write them on), and raise the type's fuel with `kronik limits set
 <type> --fuel <n> --reason '...'` for heavy work.
 
+### Holding blobs
+
+A blob that a turn got (a body, a fetch response, a message's blobs, one it
+wrote) is the turn's only until it ends. To use a blob in later turns, the
+actor holds it (M26): `put` stores bytes and holds the new blob, `retain`
+holds a blob the turn may use, and `release` ends the actor's own hold. They
+take effect when the turn commits: a turn that fails holds nothing new and
+releases nothing. A turn may use every blob its actor holds; the SDKs' `put`
+takes any size (above 1 MiB it writes the blob in parts and retains it), and
+a release leaves the blob readable until the turn ends.
+
+A reference is only a hash and a size. Keeping them in state or SQL keeps
+nothing alive, and gives nobody access: the host checks every use against
+what the actor holds, so keep the hold and rebuild the reference from the
+two values. A blob that nothing holds, carries or keeps any more (no hold,
+queued message, timer, dead letter, snapshot or fork) is deleted by
+collection once retention passes its last record.
+
+Messages carry blobs: `send`, `call`, timers and replies take `blobs`, and
+an incoming message (a timer's and a call's reply too) has them as `blobs`.
+The receiving turn may read them, and holds one only if it retains it. An
+actor holds at most the type's quota (`kronik limits set <type>
+--blob-size-per-actor`) in the blobs' total size.
+
+```ts
+http: (req, ctx) => {
+  if (req.method === 'POST') {
+    // Hold the upload: a blob body as it is, an inline one through put.
+    const photo = req.blob ?? ctx.blobs.put(req.body);
+    if (req.blob) ctx.blobs.retain(photo);
+    ctx.state.setJson('photo', { hash: photo.hash, size: Number(photo.size) });
+    // Another actor gets it with a message; it holds it if it retains it.
+    ctx.send('gallery/main', { name: 'added', blobs: [photo] });
+    return ctx.json(201, { hash: photo.hash });
+  }
+  const kept = ctx.state.getJson<{ hash: string; size: number }>('photo');
+  if (!kept) return ctx.status(404);
+  return ctx.blob(200, new BlobRef(kept.hash, BigInt(kept.size)), 'image/png');
+},
+```
+
+| Need | Rust | TypeScript | Python | Go |
+| --- | --- | --- | --- | --- |
+| store bytes and hold them | `ctx.blobs().put(&bytes)?` | `ctx.blobs.put(bytes)` | `ctx.blobs.put(data)` | `ctx.Blobs.Put(data)` |
+| for another subject | `ctx.blobs().put_for(subject, &bytes)?` | `ctx.blobs.putFor(subject, bytes)` | `ctx.blobs.put_for(subject, data)` | `ctx.Blobs.PutFor(subject, data)` |
+| hold, let go | `retain(&b)?`, `release(&b)?` | `retain(b)`, `release(b)` | `retain(b)`, `release(b)` | `Retain(b)`, `Release(b)` |
+| send with blobs | `Message::text(name, body).blob(&b)` | `{ name, body, blobs: [b] }` | `{"name": ..., "blobs": [b]}` | `OutgoingMessage{Blobs: []kronik.BlobRef{b}}` |
+| the blobs of an input | `msg.blobs()` | `msg.blobs` | `msg.blobs` | `msg.Blobs` |
+
+`putFor` sets the default subject around the put and restores it, also when
+the put fails. The errors are those above: `BLOB_NOT_HELD` for a blob the
+turn may not use, `SUBJECT_ERASED`, and `blob` for the quota and the call
+limits.
+
 ## Building
 
 `kronik build` (in the project, or `--dir`) writes `dist/<name>.wasm` and

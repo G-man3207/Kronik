@@ -296,6 +296,12 @@ until the v1.0 compatibility promise takes effect.
   TypeScript projects add `esnext.disposable` to their tsconfig's `lib`
   (`kronik init` and the examples do). A test kit's stub sees the bytes of
   a blob a fetch sent.
+- The four SDKs hold blobs and carry them in messages (M26): `ctx.blobs`
+  gains `put` (store bytes and hold them, any size), `putFor` (with
+  another subject; Rust `put_for`, Python `put_for`, Go `PutFor`), `retain`
+  and `release`. Outgoing messages take `blobs` (Rust `Message::blob`, Go
+  `OutgoingMessage.Blobs`) for `send`, `call`, timers and replies, and an
+  incoming message has them as `blobs` (Rust `blobs()`, Go `Blobs`).
 - The Rust SDK reads and writes blobs (M25): `ctx.blobs()` (`get`,
   `read_all`, a `reader` that is `Read + Seek` and reads whole 64 KiB
   frames, a `writer` that is `Write`), `HttpRequest::body_blob` and
