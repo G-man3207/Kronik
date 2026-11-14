@@ -124,10 +124,15 @@ pub(crate) fn publish(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     let source = CString::new(source.as_os_str().as_bytes())?;
     let destination = CString::new(destination.as_os_str().as_bytes())?;
+    // The system call itself, not libc's `renameat2` wrapper: the static
+    // release binary links against zig's musl, which has none (an undefined
+    // symbol at link time), while the system call exists on every kernel the
+    // daemon supports (Linux 3.15 and later).
     // SAFETY: both terminated paths live through the call; NOREPLACE protects
     // an existing actor drive even when another creator wins the race.
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             source.as_ptr(),
             libc::AT_FDCWD,
