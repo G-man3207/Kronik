@@ -559,6 +559,52 @@ pub const OPERATIONS: &[Operation] = &[
         answer: Answer::Json(schema::<TurnResponse>),
     },
     Operation {
+        method: "GET",
+        path: "/v1/connections",
+        summary: "Long-lived WebSocket and SSE connections, in id order",
+        query: &[
+            Param {
+                name: "actor",
+                kind: "string",
+                description: "Only the connections this actor (`kind/key`) accepted.",
+            },
+            Param {
+                name: "kind",
+                kind: "string",
+                description: "Only the connections of actors of this kind.",
+            },
+            Param {
+                name: "state",
+                kind: "string",
+                description: "`open` (the default: open or closing), `closed` or `all`.",
+            },
+            Param {
+                name: "after",
+                kind: "string",
+                description: "Start after this connection id: the previous page's `next`.",
+            },
+            LIMIT,
+        ],
+        request: None,
+        answer: Answer::Json(schema::<ConnectionsResponse>),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/connections/{id}",
+        summary: "One connection, open or closed",
+        query: &[],
+        request: None,
+        answer: Answer::Json(schema::<Connection>),
+    },
+    Operation {
+        method: "POST",
+        path: "/v1/connections/{id}/close",
+        summary: "Close an open connection as the operator",
+        query: &[],
+        request: Some(schema::<ConnectionCloseRequest>),
+        answer: Answer::Json(schema::<ConnectionCloseResponse>),
+    },
+    Operation {
         method: "POST",
         path: "/v1/grants",
         summary: "Grant an actor type a capability",

@@ -99,6 +99,14 @@ fn cases() -> Vec<Case> {
             writes: &["resend"],
             extra: json!({}),
         },
+        // M24: the AuditEvent, before the close; the close input that it
+        // causes is the connection's own turn.
+        Case {
+            method: "POST",
+            path: "/v1/connections/{id}/close",
+            writes: &["connection.close"],
+            extra: json!({}),
+        },
         Case {
             method: "POST",
             path: "/v1/grants",
@@ -844,6 +852,8 @@ const UNDRIVEN: &[(&str, &str)] = &[
     ("POST", "/v1/fleet/enroll"),
     ("POST", "/v1/fleet/revoke"),
     ("POST", "/v1/events/webhooks/{name}/replay"),
+    // No connection is open here: tests/connections.rs closes a real one.
+    ("POST", "/v1/connections/{id}/close"),
 ];
 
 /// Every mutating route, run once for real, writes exactly the audited
@@ -922,6 +932,12 @@ async fn every_mutation_writes_its_audited_record() {
             "POST",
             "/v1/dead-letters/{id}/resend",
             "/v1/dead-letters/{id}/resend",
+            json!({}),
+        ),
+        (
+            "POST",
+            "/v1/connections/{id}/close",
+            "/v1/connections/c-00000000000000000000000000000000/close",
             json!({}),
         ),
         (

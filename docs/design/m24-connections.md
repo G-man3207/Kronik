@@ -1516,18 +1516,27 @@ them until the retention base passes their close, and after that answers
   "protocol": "websocket",
   "route": "/chat/{key}/ws",
   "state": "open|closing|closed",
-  "opened": {"turn_id": "main:…", "logical_time_ms": 0},
+  "opened": {"turn_id": "main:…", "logical_time_ms": 0 | null},
   "closed": {"turn_id": "main:…", "initiator": "client|actor|host", "cause": "client|actor|restart|…", "code": 1000} | null,
-  "frames": {"in": 0, "out": 0, "written": 0, "dropped": 0, "queued": 0, "unknown": 0},
-  "live": {"queued_bytes": 0, "last_pong_ms_ago": 0} | null,
+  "frames": {"in": 0, "out": 0, "written": 0, "queued": 0, "dropped": 0, "unknown": 0},
+  "live": {"queued_bytes": 0} | null,
   "subject": "user:1" | null
 }
 ```
 
 - `subject` is shown only with `pii:read`.
+- `state` is `closing` once its owner, the host or the operator closed it
+  and until its close input is recorded, and for a live row that this node
+  does not hold (its restart close is not recorded yet).
+- `opened.logical_time_ms` is null once retention removed the open turn.
+- `frames` counts outgoing frames by their fate (§4.7). After a restart all
+  of them are `unknown`: the count of frames written died with the
+  process. `live` is present while this node holds the connection.
 - The operator's close is a mutation: `reason` is the operator's reason
   (I12), recorded in the close input's `audit`, and `message` is the
-  close frame's reason.
+  close frame's reason. `code` is one that an actor may send (§2.4),
+  1008 by default. It closes only a connection that this node holds
+  open (`Hub::close_operator`), else `CONNECTION_NOT_FOUND`.
 - `dry_run` answers what would be closed.
 
 Changes to existing endpoints:

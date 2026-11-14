@@ -792,6 +792,253 @@
         ],
         "type": "object"
       },
+      "Connection": {
+        "description": "A long-lived WebSocket or SSE connection (M24,\ndocs/design/m24-connections.md §12).",
+        "properties": {
+          "actor": {
+            "description": "Its owner, as `kind/key`: the actor whose open turn accepted it.",
+            "type": "string"
+          },
+          "closed": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConnectionClosed"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Its close input, once recorded."
+          },
+          "frames": {
+            "$ref": "#/components/schemas/ConnectionFrames"
+          },
+          "id": {
+            "description": "`c-` and 32 lowercase hex characters.",
+            "type": "string"
+          },
+          "live": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConnectionLive"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "While this node holds it."
+          },
+          "opened": {
+            "$ref": "#/components/schemas/ConnectionOpened"
+          },
+          "protocol": {
+            "description": "`websocket` or `sse`.",
+            "type": "string"
+          },
+          "route": {
+            "description": "The route pattern that it opened on.",
+            "type": "string"
+          },
+          "state": {
+            "description": "`open`; `closing` (its owner, the host or the operator closed it, and\nits close input is not recorded yet); or `closed`.",
+            "type": "string"
+          },
+          "subject": {
+            "description": "The connection's subject; only with `pii:read`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "actor",
+          "protocol",
+          "route",
+          "state",
+          "opened",
+          "frames"
+        ],
+        "type": "object"
+      },
+      "ConnectionCloseRequest": {
+        "properties": {
+          "code": {
+            "default": null,
+            "description": "The close code: 1000, 1001, 1003, 1007, 1008, 1009, 1011, or 3000 to\n4999. Default 1008.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "message": {
+            "default": "",
+            "description": "The close frame's reason, which the client gets: at most 123 bytes.",
+            "type": "string"
+          },
+          "reason": {
+            "default": "",
+            "description": "Required: missing or blank answers REASON_REQUIRED. Recorded in the\nclose input's audit.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ConnectionCloseResponse": {
+        "properties": {
+          "connection": {
+            "$ref": "#/components/schemas/Connection",
+            "description": "The connection: `closing` after a close, unchanged after a dry run."
+          },
+          "dry_run": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dry_run",
+          "connection"
+        ],
+        "type": "object"
+      },
+      "ConnectionClosed": {
+        "properties": {
+          "cause": {
+            "description": "`client`, `actor`, `restart`, `ping-timeout`, `too-large`,\n`slow-consumer`, `protocol`, `operator`, `rebase`, `abandoned` or\n`unavailable`.",
+            "type": "string"
+          },
+          "code": {
+            "description": "The WebSocket close code received or sent.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "initiator": {
+            "description": "`client`, `actor` or `host`.",
+            "type": "string"
+          },
+          "turn_id": {
+            "description": "The close input's turn.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "turn_id",
+          "initiator",
+          "cause",
+          "code"
+        ],
+        "type": "object"
+      },
+      "ConnectionFrames": {
+        "description": "Counts of a connection's frames. Outgoing frames are `written`,\n`queued`, `dropped` or `unknown` (docs/design/m24-connections.md §4.7):\nafter a restart nobody knows which of the frames before it were\nwritten.",
+        "properties": {
+          "dropped": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "in": {
+            "description": "Frames from the client, recorded as inputs.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "out": {
+            "description": "Frames to the client, recorded by its owner's turns.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queued": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unknown": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "written": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "in",
+          "out",
+          "written",
+          "queued",
+          "dropped",
+          "unknown"
+        ],
+        "type": "object"
+      },
+      "ConnectionLive": {
+        "properties": {
+          "queued_bytes": {
+            "description": "Outgoing bytes waiting for the client.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "queued_bytes"
+        ],
+        "type": "object"
+      },
+      "ConnectionOpened": {
+        "properties": {
+          "logical_time_ms": {
+            "description": "The open turn's logical time; null once retention removed it.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "turn_id": {
+            "description": "The open turn that accepted it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "turn_id"
+        ],
+        "type": "object"
+      },
+      "ConnectionsResponse": {
+        "properties": {
+          "connections": {
+            "items": {
+              "$ref": "#/components/schemas/Connection"
+            },
+            "type": "array"
+          },
+          "next": {
+            "description": "Pass as `after` for the next page; null at the end.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "connections"
+        ],
+        "type": "object"
+      },
       "ContractView": {
         "description": "The contract of a target.",
         "properties": {
@@ -3217,6 +3464,7 @@
                   "CAPABILITY_NOT_GRANTED",
                   "CERTIFICATE_INVALID",
                   "CONNECTION_LIMIT",
+                  "CONNECTION_NOT_FOUND",
                   "CONNECTION_NOT_HELD",
                   "DEAD_LETTER_ALREADY_RESENT",
                   "DEAD_LETTER_NOT_FOUND",
@@ -10869,6 +11117,217 @@
         ],
         "summary": "Ordinary cluster observations, or the actual native non-member response",
         "x-kronik-scope": "read"
+      }
+    },
+    "/v1/connections": {
+      "get": {
+        "operationId": "get_v1_connections",
+        "parameters": [
+          {
+            "description": "Only the connections this actor (`kind/key`) accepted.",
+            "in": "query",
+            "name": "actor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only the connections of actors of this kind.",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`open` (the default: open or closing), `closed` or `all`.",
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Start after this connection id: the previous page's `next`.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "At most this many; 1 to 1000, 100 when absent.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionsResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Long-lived WebSocket and SSE connections, in id order",
+        "x-kronik-scope": "read"
+      }
+    },
+    "/v1/connections/{id}": {
+      "get": {
+        "operationId": "get_v1_connections_id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Connection"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "One connection, open or closed",
+        "x-kronik-scope": "read"
+      }
+    },
+    "/v1/connections/{id}/close": {
+      "post": {
+        "operationId": "post_v1_connections_id_close",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required only for browser-session authentication: exact configured admin origin.",
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          },
+          {
+            "description": "Required only for browser-session authentication: the current CSRF token from /v1/auth/session.",
+            "in": "header",
+            "name": "X-Kronik-CSRF",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "x-kronik-required-for": "browserSession"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionCloseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionCloseResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error: the stable error JSON."
+          }
+        },
+        "security": [
+          {},
+          {
+            "bearer": []
+          },
+          {
+            "browserSession": []
+          }
+        ],
+        "summary": "Close an open connection as the operator",
+        "x-kronik-scope": "operate"
       }
     },
     "/v1/dead-letters": {

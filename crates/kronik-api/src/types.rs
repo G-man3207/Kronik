@@ -1735,3 +1735,104 @@ pub struct ExportRewindResponse {
     pub from: u64,
     pub to: u64,
 }
+
+/// A long-lived WebSocket or SSE connection (M24,
+/// docs/design/m24-connections.md §12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Connection {
+    /// `c-` and 32 lowercase hex characters.
+    pub id: String,
+    /// Its owner, as `kind/key`: the actor whose open turn accepted it.
+    pub actor: String,
+    /// `websocket` or `sse`.
+    pub protocol: String,
+    /// The route pattern that it opened on.
+    pub route: String,
+    /// `open`; `closing` (its owner, the host or the operator closed it, and
+    /// its close input is not recorded yet); or `closed`.
+    pub state: String,
+    pub opened: ConnectionOpened,
+    /// Its close input, once recorded.
+    pub closed: Option<ConnectionClosed>,
+    pub frames: ConnectionFrames,
+    /// While this node holds it.
+    pub live: Option<ConnectionLive>,
+    /// The connection's subject; only with `pii:read`.
+    pub subject: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConnectionOpened {
+    /// The open turn that accepted it.
+    pub turn_id: String,
+    /// The open turn's logical time; null once retention removed it.
+    pub logical_time_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConnectionClosed {
+    /// The close input's turn.
+    pub turn_id: String,
+    /// `client`, `actor` or `host`.
+    pub initiator: String,
+    /// `client`, `actor`, `restart`, `ping-timeout`, `too-large`,
+    /// `slow-consumer`, `protocol`, `operator`, `rebase`, `abandoned` or
+    /// `unavailable`.
+    pub cause: String,
+    /// The WebSocket close code received or sent.
+    pub code: u32,
+}
+
+/// Counts of a connection's frames. Outgoing frames are `written`,
+/// `queued`, `dropped` or `unknown` (docs/design/m24-connections.md §4.7):
+/// after a restart nobody knows which of the frames before it were
+/// written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConnectionFrames {
+    /// Frames from the client, recorded as inputs.
+    #[serde(rename = "in")]
+    pub incoming: u64,
+    /// Frames to the client, recorded by its owner's turns.
+    pub out: u64,
+    pub written: u64,
+    pub queued: u64,
+    pub dropped: u64,
+    pub unknown: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConnectionLive {
+    /// Outgoing bytes waiting for the client.
+    pub queued_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConnectionsResponse {
+    pub connections: Vec<Connection>,
+    /// Pass as `after` for the next page; null at the end.
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConnectionCloseRequest {
+    /// The close code: 1000, 1001, 1003, 1007, 1008, 1009, 1011, or 3000 to
+    /// 4999. Default 1008.
+    #[serde(default)]
+    pub code: Option<u16>,
+    /// The close frame's reason, which the client gets: at most 123 bytes.
+    #[serde(default)]
+    pub message: String,
+    /// Required: missing or blank answers REASON_REQUIRED. Recorded in the
+    /// close input's audit.
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConnectionCloseResponse {
+    pub dry_run: bool,
+    /// The connection: `closing` after a close, unchanged after a dry run.
+    pub connection: Connection,
+}

@@ -7,6 +7,7 @@ mod audit;
 pub mod auth;
 pub mod auth_config;
 mod cluster_status;
+mod connections;
 mod effect_secrets;
 #[cfg(feature = "server")]
 pub mod event_stream;
@@ -1440,6 +1441,16 @@ impl Api {
                 self.dead_letters(&q, caller.has(auth::Scope::PiiRead))
             }
             ("POST", ["v1", "dead-letters", id, "resend"]) => self.resend(req, id).await,
+            ("GET", ["v1", "connections"]) => {
+                self.connections(&q, caller.has(auth::Scope::PiiRead)).await
+            }
+            ("GET", ["v1", "connections", id]) => {
+                self.connection(id, caller.has(auth::Scope::PiiRead)).await
+            }
+            ("POST", ["v1", "connections", id, "close"]) => {
+                self.close_connection(req, id, caller.has(auth::Scope::PiiRead))
+                    .await
+            }
             ("POST", ["v1", "grants"]) => self.grant(req).await,
             ("POST", ["v1", "grants", "revoke"]) => self.revoke(req).await,
             ("GET", ["v1", "grants"]) => self.grants(&q),
