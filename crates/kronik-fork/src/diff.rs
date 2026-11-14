@@ -1306,7 +1306,7 @@ fn failed(t: &pb::TurnRecord) -> bool {
 /// The kind of the `connection.send-now` effect (M24 §6.2). It is not
 /// [`external`]: its answer says nothing about a system outside, so it
 /// counts in no grounding and no confidence (§7.3).
-const SEND_NOW: &str = "connection.send-now";
+const SEND_NOW: &str = kronik_proto::connection::SEND_NOW_KIND;
 
 /// Changed operations listed per item of `frames.items`.
 const MAX_FRAME_CHANGES: usize = 20;

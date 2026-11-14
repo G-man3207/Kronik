@@ -2,7 +2,8 @@
 //! docs/design/m24-connections.md §7, ADR 0116; the `cargo test` part of
 //! criterion 2 in §18). A session of the room guest is recorded through the
 //! hub with recording transports: three WebSocket clients and an SSE
-//! follower, 30 `say` frames, a client that vanishes, one that is kicked
+//! follower, 30 `say` frames, a `stream 3` whose frames go out with
+//! `send-now`, a client that vanishes, one that is kicked
 //! (an actor close), one that says `bye`, an HTTP `say`, and a restart,
 //! which closes the follower. Then:
 //!
@@ -14,7 +15,8 @@
 //!   open answers, and continuous replay skips the frames and closes of the
 //!   connections it never accepted (§7.2).
 //!
-//! The session has no `send-now` yet (slice 8): `frames.send_now` is 0.
+//! The session's `stream 3` sends three frames with `send-now`: identity
+//! replay answers them from the recording.
 
 // Test helpers may unwrap; the shared harness's HTTP servers use std threads.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
@@ -193,8 +195,19 @@ fn session(dir: &Path) -> (Proc, Lsn, Vec<String>) {
     let (fork_lsn, ids) = {
         let p = Proc::open(dir, config());
         p.deploy("room");
+        p.rt.block_on(p.node.grant(
+            "room",
+            "connection:send-now",
+            None,
+            None,
+            kronik_effects::InForks::default(),
+            audit(),
+            false,
+            p.owner(),
+        ))
+        .unwrap();
         let fork_lsn = p.settle();
-        let (ada, _ta) = join(&p, "ada", Websocket);
+        let (ada, ta) = join(&p, "ada", Websocket);
         let (bob, _tb) = join(&p, "bob", Websocket);
         let (cid, tc) = join(&p, "cid", Websocket);
         let clients = [&ada, &bob, &cid];
@@ -209,6 +222,14 @@ fn session(dir: &Path) -> (Proc, Lsn, Vec<String>) {
             }
         }
         let (dee, _td) = follower.unwrap();
+        // Three frames with send-now, then a buffered one (criterion 2).
+        frame(&p, &ada, "stream 3");
+        until("the stream", || {
+            ta.recording().frames.iter().any(|(_, f)| {
+                f.data.as_ref().and_then(|d| d.value.as_ref())
+                    == Some(&pb::sealable::Value::Plain(b"done 3".to_vec()))
+            })
+        });
         http_say(&p, "lemur");
         // cid vanishes, ada kicks bob, then says bye.
         tc.client_close(None);
@@ -399,12 +420,12 @@ fn identity_replay_of_a_recorded_session_is_empty() {
         );
         subjects += 1;
     }
-    assert_eq!(subjects, 36);
-    // 4 opens; 30 says, the kick and the bye; 4 closes (client, actor twice,
-    // restart). The HTTP say sent frames, so it is compared too.
+    assert_eq!(subjects, 37);
+    // 4 opens; 30 says, the stream, the kick and the bye; 4 closes (client,
+    // actor twice, restart). The HTTP say sent frames, so it is compared too.
     let inputs = FrameInputs {
         open: 4,
-        frame: 32,
+        frame: 33,
         close: 4,
     };
     for mode in [Mode::Isolated, Mode::Continuous, Mode::Both] {
@@ -418,16 +439,20 @@ fn identity_replay_of_a_recorded_session_is_empty() {
         assert_eq!(f.inputs, inputs, "{mode:?}");
         assert_eq!(
             (f.changed, f.unchanged, f.skipped),
-            (0, 41, 0),
+            (0, 42, 0),
             "{mode:?}: {text}"
         );
         assert!(f.items.is_empty());
-        assert_eq!(f.send_now.modeled, 0);
+        assert_eq!(
+            (f.send_now.recorded, f.send_now.modeled),
+            (3, 0),
+            "{mode:?}"
+        );
         assert!(f.sent.prod > 0);
         assert_eq!(f.sent.prod, f.sent.fork, "{mode:?}");
         let room = d.kinds.iter().find(|k| k.kind == "room").unwrap();
         let k = room.frames.expect("the room's frames");
-        assert_eq!((k.unchanged, k.changed), (41, 0));
+        assert_eq!((k.unchanged, k.changed), (42, 0));
         assert!(d.samples.frames_changed.is_empty() && d.samples.frames_skipped.is_empty());
         check_schema(&format!("identity {mode:?}"), &json(&out));
     }
@@ -456,7 +481,7 @@ fn a_changed_message_format_shows_as_changed_outgoing_frames() {
         let text = String::from_utf8_lossy(&out.bytes);
         let f = d.frames.as_ref().expect("a frames section");
         assert_eq!(f.changed, expected.len() as u64, "{mode:?}: {text}");
-        assert_eq!(f.unchanged + f.changed, 41, "{mode:?}");
+        assert_eq!(f.unchanged + f.changed, 42, "{mode:?}");
         assert_eq!(f.skipped, 0);
         assert_eq!(d.summary.frames_changed, f.changed);
         assert!(d.summary.changed);
@@ -519,7 +544,7 @@ fn a_changed_message_format_shows_as_changed_outgoing_frames() {
         assert!(md.contains("`/body`") && md.contains("`/text`"), "{md}");
         let summary = kronik_fork::markdown::summary(d, None, &[]);
         assert!(
-            summary.contains("| Frames | 32 changed, 9 unchanged, 0 skipped"),
+            summary.contains("| Frames | 32 changed, 10 unchanged, 0 skipped"),
             "{summary}"
         );
         for secret in ids
@@ -562,7 +587,7 @@ fn a_fork_that_refuses_the_opens_skips_their_connections() {
     let text = String::from_utf8_lossy(&out.bytes);
     let f = d.frames.as_ref().expect("a frames section");
     // Every frame and close input of the window: their opens are in it.
-    assert_eq!(f.skipped, 36, "{text}");
+    assert_eq!(f.skipped, 37, "{text}");
     assert_eq!(d.samples.frames_skipped.len(), 20);
     assert!(
         d.samples
@@ -571,7 +596,7 @@ fn a_fork_that_refuses_the_opens_skips_their_connections() {
             .all(|t| t.starts_with("main:"))
     );
     assert!(d.summary.changed);
-    assert!(d.summary.divergent_turns >= 36, "{text}");
+    assert!(d.summary.divergent_turns >= 37, "{text}");
     let opens: Vec<_> = f.items.iter().filter_map(|i| i.open.as_ref()).collect();
     assert_eq!(opens.len(), 4, "{text}");
     for o in opens {
