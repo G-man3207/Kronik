@@ -1022,6 +1022,10 @@ impl Node {
                 node.cfg.apply_batch,
                 fatal,
                 node.secret_runtime.clone(),
+                node.cfg
+                    .test_hold
+                    .clone()
+                    .map(|hold| (hold, node.env.fs.clone())),
             ),
         );
         if let Some(u) = upgrade {
@@ -2530,6 +2534,12 @@ impl Node {
                 }),
             )
         });
+        // Test hook: stop after a guest's writer finished its blob.
+        if let (Some(blobs), Some(hold)) = (&turn_blobs, &self.cfg.test_hold)
+            && hold.point == crate::HoldPoint::BlobFinished
+        {
+            blobs.after_finish(hold.clone(), self.env.fs.clone());
+        }
         if let Some(blobs) = &turn_blobs {
             blobs.lease_input(&input);
         }
@@ -2884,6 +2894,13 @@ impl Node {
                 other => internal(other),
             });
         }
+        // Test hook: the record is built and its blobs are durable.
+        crate::test_hold(
+            self.cfg.test_hold.as_ref(),
+            &self.env.fs,
+            crate::HoldPoint::BeforeCommit,
+        )
+        .await;
         // An erasure that began while the turn ran: its values of the subject
         // become tombstones, in the record and in what it sends (§6.8): its
         // messages and compensations, the frames and closes the hub writes
@@ -5960,6 +5977,7 @@ async fn applier(
     max: usize,
     fatal: Arc<Fatal>,
     runtime: Option<Arc<crate::secrets::SecretRuntime>>,
+    hold: Option<(crate::TestHold, Arc<dyn kronik_core::env::Fs>)>,
 ) {
     while let Some(first) = rx.recv().await {
         let mut batch = vec![first];
@@ -5968,6 +5986,14 @@ async fn applier(
                 Ok(c) => batch.push(c),
                 Err(_) => break,
             }
+        }
+        // Test hook: a turn's record is in the log and not applied.
+        if let Some((hold, fs)) = &hold
+            && batch
+                .iter()
+                .any(|c| matches!(c.record, Record::TurnRecord(_)))
+        {
+            crate::test_hold(Some(hold), fs, crate::HoldPoint::RecordAppended).await;
         }
         let current = match &runtime {
             Some(runtime) => match runtime

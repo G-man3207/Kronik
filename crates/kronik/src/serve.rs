@@ -83,6 +83,11 @@ pub struct ServeArgs {
     /// the connection and before its result is recorded (M24).
     #[arg(long, hide = true)]
     test_hold_after_send_now: bool,
+    /// Test hook (M26): while `<data_dir>/test-hold-armed` exists, a turn
+    /// that reaches the point writes `<data_dir>/test-hold-reached` and
+    /// waits, so a crash test can kill the daemon there.
+    #[arg(long, hide = true, value_enum, value_name = "POINT")]
+    test_hold: Option<TestHoldPoint>,
     /// Test hook: each isolated root input of a proposal job's replay waits
     /// for a permit; the file holds how many have been given so far.
     #[arg(long, hide = true, value_name = "FILE")]
@@ -203,6 +208,17 @@ impl ServeArgs {
     }
 }
 
+/// Where `--test-hold` stops a turn (M26 §17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum TestHoldPoint {
+    /// After a guest's writer finished its blob.
+    BlobFinished,
+    /// After the turn's record is in the log, before it is applied.
+    RecordAppended,
+    /// Before the turn's record is appended.
+    BeforeCommit,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum LogFormat {
     Text,
@@ -280,6 +296,7 @@ impl ServeArgs {
         let set = [
             (self.test_hold_after_call, "--test-hold-after-call"),
             (self.test_hold_after_send_now, "--test-hold-after-send-now"),
+            (self.test_hold.is_some(), "--test-hold"),
             (self.test_replay_permits.is_some(), "--test-replay-permits"),
             (
                 !self.test_insecure_registry.is_empty(),
@@ -677,6 +694,15 @@ async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<
         group_commit_window: Some(Duration::from_millis(config.log.group_commit_ms)),
         test_hold_after_call: args.test_hold_after_call,
         test_hold_after_send_now: args.test_hold_after_send_now,
+        test_hold: args.test_hold.map(|point| kronik_sched::TestHold {
+            point: match point {
+                TestHoldPoint::BlobFinished => kronik_sched::HoldPoint::BlobFinished,
+                TestHoldPoint::RecordAppended => kronik_sched::HoldPoint::RecordAppended,
+                TestHoldPoint::BeforeCommit => kronik_sched::HoldPoint::BeforeCommit,
+            },
+            armed: data_dir.join("test-hold-armed"),
+            reached: data_dir.join("test-hold-reached"),
+        }),
         keystore_backup_retention: config.privacy.keystore_backup_retention.0,
         sql_bytes_per_actor: config.sql.max_size_per_actor.0,
         disk_reserve: config.log.disk_reserve.0,

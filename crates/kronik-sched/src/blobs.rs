@@ -106,6 +106,8 @@ struct Inner {
     budget: std::sync::OnceLock<Arc<kronik_blob::SpaceBudget>>,
     /// What the actor holds; none: it holds nothing (a scratch turn).
     holds: Option<Holds>,
+    /// Test hook: where a writer's finish waits ([`crate::HoldPoint::BlobFinished`]).
+    after_finish: std::sync::OnceLock<(crate::TestHold, Arc<dyn kronik_core::env::Fs>)>,
 }
 
 /// What the turn's actor holds (M26 §2): the store whose `blob_refs`
@@ -158,6 +160,7 @@ impl TurnBlobs {
             read_masked: std::sync::atomic::AtomicBool::new(false),
             budget: std::sync::OnceLock::new(),
             holds,
+            after_finish: std::sync::OnceLock::new(),
         });
         // The lease lives as long as the host, renewed while the turn runs,
         // however long it waits (ADR 0120 §4); the loop ends with the host.
@@ -317,6 +320,11 @@ impl TurnBlobs {
                 self.0.lease.add(id);
             }
         }
+    }
+
+    /// Test hook: a writer's finish waits at [`crate::HoldPoint::BlobFinished`].
+    pub(crate) fn after_finish(&self, hold: crate::TestHold, fs: Arc<dyn kronik_core::env::Fs>) {
+        let _ = self.0.after_finish.set((hold, fs));
     }
 
     /// Whether the turn read an erased subject's blob.
@@ -637,6 +645,9 @@ impl BlobHost for TurnBlobs {
                 meta.size,
             );
             lock(&inner.created).push(meta.id);
+            if let Some((hold, fs)) = inner.after_finish.get() {
+                crate::test_hold(Some(hold), fs, crate::HoldPoint::BlobFinished).await;
+            }
             Ok(meta.to_pb())
         })
     }

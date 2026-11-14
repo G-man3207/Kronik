@@ -107,6 +107,9 @@ pub struct NodeConfig {
     /// the connection and before its result is recorded (M24 criterion 3).
     #[doc(hidden)]
     pub test_hold_after_send_now: bool,
+    /// Test hook (M26 §17): crash tests stop a turn at a point of its
+    /// commit and kill the daemon there.
+    pub test_hold: Option<TestHold>,
     /// Test hook: every code switch (promote, rollback, the rebase switch)
     /// parks after its record is applied and before the code is installed,
     /// until the hold releases it (ADR 0013, 0018).
@@ -158,6 +161,63 @@ pub struct NodeConfig {
     pub blobs: Option<BlobsConfig>,
 }
 
+/// A crash test's hold (docs/design/m26-blobs.md §17): while the file
+/// `armed` exists, a turn that reaches `point` writes `reached` and waits
+/// forever, for the test to kill the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestHold {
+    pub point: HoldPoint,
+    /// The hold applies only while this file exists.
+    pub armed: std::path::PathBuf,
+    /// Written when a turn waits at the point.
+    pub reached: std::path::PathBuf,
+}
+
+/// Where a [`TestHold`] stops a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldPoint {
+    /// A guest's writer finished its blob (named, durable or not); the
+    /// turn's record is not written.
+    BlobFinished,
+    /// The turn's record is in the log (synced) and not applied.
+    RecordAppended,
+    /// The turn's record is built and its blobs are durable; it is not
+    /// appended.
+    BeforeCommit,
+}
+
+/// Waits forever at `point` when `hold` is set for it and armed, after
+/// writing its `reached` file.
+pub(crate) async fn test_hold(
+    hold: Option<&TestHold>,
+    fs: &Arc<dyn kronik_core::env::Fs>,
+    point: HoldPoint,
+) {
+    let Some(hold) = hold.filter(|h| h.point == point) else {
+        return;
+    };
+    if !fs.exists(hold.armed.clone()).await.unwrap_or(false) {
+        return;
+    }
+    tracing::warn!(
+        ?point,
+        "test hold: the turn waits here for the test to kill the daemon"
+    );
+    if let Ok(file) = fs
+        .open(
+            hold.reached.clone(),
+            kronik_core::env::OpenMode::ReadWriteCreate,
+        )
+        .await
+    {
+        let _ = file
+            .write_at(0, bytes::Bytes::from_static(b"reached\n"))
+            .await;
+        let _ = file.sync_data().await;
+    }
+    std::future::pending::<()>().await;
+}
+
 /// `[blobs]` (docs/design/m25-streaming-bodies.md §12).
 #[derive(Debug, Clone)]
 pub struct BlobsConfig {
@@ -196,6 +256,7 @@ impl Default for NodeConfig {
             group_commit_window: None,
             test_hold_after_call: false,
             test_hold_after_send_now: false,
+            test_hold: None,
             test_hold_switch: None,
             keystore_backup_retention: Duration::from_secs(30 * 86_400),
             sql_bytes_per_actor: 1 << 30,
