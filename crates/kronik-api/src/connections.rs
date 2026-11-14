@@ -304,11 +304,18 @@ impl Api {
         let out = row.next_seq;
         let (written, queued, dropped, unknown) = match (row.closed_lsn, stats, row.frames_written)
         {
-            // Held here: written by its writer, waiting in its queue, or
-            // dropped by a close.
+            // Held here: written by its writer; on an open connection the
+            // rest is queued (in the queue, or taken by the writer and not
+            // confirmed yet: an SSE stream confirms a frame when the next
+            // chunk goes out); on a closing one, what its queue still holds
+            // is queued and the rest was dropped by the close.
             (None, Some(s), _) => {
                 let written = s.frames_written.min(out);
-                let queued = s.queued_frames.min(out - written);
+                let queued = if s.open {
+                    out - written
+                } else {
+                    s.queued_frames.min(out - written)
+                };
                 (written, queued, out - written - queued, 0)
             }
             // Closed with the count of frames written.

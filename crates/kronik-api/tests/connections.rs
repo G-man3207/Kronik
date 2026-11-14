@@ -537,4 +537,12 @@ async fn a_frame_the_writer_has_not_confirmed_is_queued() {
         json!({"written": 0, "queued": 1, "dropped": 0, "unknown": 0}),
         "{open}"
     );
+    // The connection's own counts say the same (`kronik connections
+    // inspect`).
+    let v = get(&r.api, &format!("/v1/connections/{ada}")).await;
+    assert_eq!(
+        v["frames"],
+        json!({"in": 0, "out": 1, "written": 0, "queued": 1, "dropped": 0, "unknown": 0}),
+        "{v}"
+    );
 }
