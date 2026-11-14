@@ -38,7 +38,10 @@ done
 # the blobs import.
 (cd ../media &&
     cargo build --locked --release --target wasm32-wasip2 --target-dir target &&
-    cp target/wasm32-wasip2/release/kronik_test_media.wasm ../media.wasm)
+    cp target/wasm32-wasip2/release/kronik_test_media.wasm ../media.wasm &&
+    cargo build --locked --release --target wasm32-wasip2 --target-dir target/alt \
+        --features alternate &&
+    cp target/alt/wasm32-wasip2/release/kronik_test_media.wasm ../media-alt.wasm)
 # Rollback via replay (M13): a schema-1 build that migrates and also makes
 # the extra GET, so the rolled-back code had a migration and effects the old
 # code would not make.

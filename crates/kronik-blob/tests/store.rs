@@ -824,3 +824,100 @@ async fn a_kept_alive_lease_outlives_its_ttl_while_held() {
     env.clock.sleep(Duration::from_millis(50)).await;
     assert!(store.leases().holders().is_empty(), "it ends when dropped");
 }
+
+/// Review R-4 (erasure): a rebase's blobs move from its fork's space into
+/// main's as they are: the same file, so the same reference, plain or
+/// sealed; one main has already is claimed; one neither has is NotFound.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_copies_a_fork_blob_into_main_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path()).await;
+    let keys = TestKeys::default();
+    let fork = Space::Fork("r-1".into());
+    let put_in = |space: Space, k: Option<BlobKeys>, data: Vec<u8>| {
+        let store = store.clone();
+        async move {
+            let mut w = store
+                .writer(space.clone(), k, u64::MAX, store.leases().take("t"))
+                .await
+                .unwrap();
+            w.write(&data).await.unwrap();
+            let meta = w.finish().await.unwrap();
+            store.ensure_durable(&space, &[meta.id]).await.unwrap();
+            meta
+        }
+    };
+    let plain_data = content(21, 3 * FRAME_SIZE + 9);
+    let sealed_data = content(22, FRAME_SIZE + 1);
+    let plain = put_in(fork.clone(), None, plain_data.clone()).await;
+    let sealed = put_in(
+        fork.clone(),
+        Some(keys.keys("user:4", 1, true)),
+        sealed_data.clone(),
+    )
+    .await;
+    for (meta, data) in [(&plain, &plain_data), (&sealed, &sealed_data)] {
+        assert!(!store.contains(&Space::Main, &meta.id).await.unwrap());
+        let lease = store.leases().take("rebase");
+        store
+            .import(&fork, &Space::Main, meta, &lease)
+            .await
+            .unwrap();
+        store
+            .ensure_durable(&Space::Main, &[meta.id])
+            .await
+            .unwrap();
+        assert!(store.leases().is_leased(&meta.id));
+        let main_file = std::fs::read(object(dir.path(), meta)).unwrap();
+        let fork_file = std::fs::read(
+            dir.path()
+                .join("branches/r-1/blobs/objects")
+                .join(meta.id.shard())
+                .join(meta.id.file_name()),
+        )
+        .unwrap();
+        assert!(main_file == fork_file, "the same file");
+        // Readable from main alone, once the fork is gone.
+        std::fs::remove_dir_all(
+            dir.path()
+                .join("branches/r-1/blobs/objects")
+                .join(meta.id.shard()),
+        )
+        .unwrap();
+        let r = store.reader(&Space::Main, meta, &keys).await.unwrap();
+        assert_eq!(r.read_at(0, data.len()).await.unwrap(), data[..]);
+        std::fs::create_dir_all(
+            dir.path()
+                .join("branches/r-1/blobs/objects")
+                .join(meta.id.shard()),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("branches/r-1/blobs/objects")
+                .join(meta.id.shard())
+                .join(meta.id.file_name()),
+            fork_file,
+        )
+        .unwrap();
+    }
+    // Main has it already (and the fork does not): claimed.
+    let only_main = put_in(Space::Main, None, content(23, 500)).await;
+    let lease = store.leases().take("rebase");
+    store
+        .import(&fork, &Space::Main, &only_main, &lease)
+        .await
+        .unwrap();
+    assert!(store.leases().is_leased(&only_main.id));
+    // Neither has it.
+    let mut missing = only_main.clone();
+    missing.size += 1;
+    let made_up = BlobMeta {
+        id: kronik_blob::BlobId::parse(&format!("b3:{}", "09".repeat(32))).unwrap(),
+        ..missing
+    };
+    assert!(matches!(
+        store.import(&fork, &Space::Main, &made_up, &lease).await,
+        Err(BlobError::NotFound(_))
+    ));
+}

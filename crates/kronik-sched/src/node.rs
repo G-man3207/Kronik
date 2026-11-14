@@ -1241,6 +1241,11 @@ impl Node {
         self.fatal.get()
     }
 
+    /// Stops the node: it is fatal with `message` from now on.
+    pub(crate) fn stop(&self, message: String) {
+        self.fatal.set(message);
+    }
+
     /// Resolves when a fatal storage failure happens.
     pub async fn wait_fatal(&self) -> String {
         self.fatal.wait().await

@@ -102,8 +102,15 @@ impl Fnv {
 }
 
 /// Byte `i` of the `write` pattern.
+#[cfg(not(feature = "alternate"))]
 fn pattern(i: u64) -> u8 {
     ((i.wrapping_mul(31) + 7) % 251) as u8
+}
+
+/// Byte `i` of the `write` pattern of the `alternate` build.
+#[cfg(feature = "alternate")]
+fn pattern(i: u64) -> u8 {
+    ((i.wrapping_mul(17) + 3) % 241) as u8
 }
 
 fn error_name(e: &BlobError) -> String {

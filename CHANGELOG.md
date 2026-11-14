@@ -265,6 +265,9 @@ until the v1.0 compatibility promise takes effect.
   node from starting (found in review). Every record is also checked as the
   log's readers will decode it before it is appended: a turn whose record
   would not decode fails instead of being written.
+- A rollback by replay brings the blobs its re-run turns wrote into main's
+  blob store before it switches (M25): they were left in the rebase's fork,
+  so main's records referenced blobs main did not have (found in review).
 - Uploads, streamed blob answers and replays keep their blobs however long
   they take (M25): their leases are renewed while held, and a running turn
   holds the blobs of its input; an upload that waited for its turn longer

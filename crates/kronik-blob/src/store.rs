@@ -397,6 +397,124 @@ impl BlobStore {
         Ok(())
     }
 
+    /// Makes blob `meta` present in `to` and joins it to `lease`: its file
+    /// is copied byte for byte from `from` (its identity, sealing and key
+    /// version unchanged), or, when `to` has it already, claimed there as a
+    /// writer's finish claims an equal object. A rebase's turns become
+    /// main's this way (M25 §4.3). Named durably only after
+    /// [`BlobStore::ensure_durable`].
+    pub async fn import(
+        self: &Arc<Self>,
+        from: &Space,
+        to: &Space,
+        meta: &BlobMeta,
+        lease: &Lease,
+    ) -> Result<(), BlobError> {
+        self.check_reserve()?;
+        self.prepare(to).await?;
+        let fs = &self.env.fs;
+        let source = match fs
+            .open(self.object_path(from, &meta.id), OpenMode::Read)
+            .await
+        {
+            Ok(file) => file,
+            // Not in `from`: a blob of `to` the turns received there.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return if self.claim_existing(to, meta, lease).await? {
+                    Ok(())
+                } else {
+                    Err(BlobError::NotFound(meta.id))
+                };
+            }
+            Err(e) => return Err(BlobError::io("opening a blob", e)),
+        };
+        // The source must be the blob its name says.
+        let corrupt = |why: String| BlobError::Corrupt { id: meta.id, why };
+        let head = source
+            .read_at(0, HEADER_LEN)
+            .await
+            .map_err(|e| BlobError::io("reading a blob header", e))?;
+        let header = Header::decode(&head).map_err(corrupt)?;
+        let len = source
+            .len()
+            .await
+            .map_err(|e| BlobError::io("reading a blob's length", e))?;
+        if header.identity != *meta.id.digest()
+            || header.size != meta.size
+            || header.subject != meta.subject
+            || header.key_version != meta.key_version
+            || len != header.file_len()
+        {
+            return Err(corrupt("the file is not the blob its name says".into()));
+        }
+        let part = self
+            .root(to)
+            .join("tmp")
+            .join(format!("{}.part", hex(&self.env.random_bytes::<8>())));
+        let target = fs
+            .open(part.clone(), OpenMode::ReadWriteCreate)
+            .await
+            .map_err(|e| BlobError::io("creating a blob part file", e))?;
+        let copied = async {
+            let mut at = 0u64;
+            while at < len {
+                self.check_reserve()?;
+                let n = (len - at).min(1 << 20) as usize;
+                let bytes = source
+                    .read_at(at, n)
+                    .await
+                    .map_err(|e| BlobError::io("reading a blob", e))?;
+                if bytes.is_empty() {
+                    return Err(corrupt(format!("the blob ends at {at} of {len} bytes")));
+                }
+                let got = bytes.len() as u64;
+                target
+                    .write_at(at, Bytes::from(bytes))
+                    .await
+                    .map_err(|e| BlobError::io("copying a blob", e))?;
+                self.charge(got);
+                at += got;
+            }
+            target
+                .sync_data()
+                .await
+                .map_err(|e| BlobError::io("syncing a blob", e))?;
+            self.install(to, &part, meta, header.sealed, lease).await
+        }
+        .await;
+        if copied.is_err() {
+            let _ = fs.remove_file(part).await;
+        }
+        copied
+    }
+
+    /// Claims an object of `space` equal to `meta` for `lease`, under its
+    /// directory's claim lock, as [`BlobStore::install`] does; false when
+    /// there is none.
+    async fn claim_existing(
+        &self,
+        space: &Space,
+        meta: &BlobMeta,
+        lease: &Lease,
+    ) -> Result<bool, BlobError> {
+        let object = self.object_path(space, &meta.id);
+        let dir_path = object
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| BlobError::Invalid("an object path without a directory".into()))?;
+        let dir = self.dir(&dir_path);
+        let _claim = dir.claim.lock().await;
+        let claimable = match self.env.fs.open(object, OpenMode::Read).await {
+            Ok(file) => existing_matches(&*file, meta, false).await,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(BlobError::io("opening a blob", e)),
+        };
+        if claimable {
+            lease.add(meta.id);
+        }
+        Ok(claimable)
+    }
+
     /// Makes the names of `ids` in `space` durable: one `sync_dir` per
     /// shard directory that holds a name this process created and has not
     /// synced yet, shared between concurrent callers (ADR 0117 §4.3). Call it

@@ -578,3 +578,118 @@ fn a_preview_upload_creates_no_subject_key() {
         );
     }
 }
+
+/// Review R-4 (erasure): a rollback by replay re-runs turns with the old
+/// code, whose blobs differ from production's and are written to the
+/// rebase's fork space. Staging copies them into main's store before the
+/// records that reference them are appended: after the switch the rebased
+/// turn's blob reads from main, also once the fork's space is gone.
+#[test]
+fn a_rollback_by_replay_brings_its_blobs_into_main() {
+    use kronik_fork::proposal::RebaseRequest;
+    let dir = tempdir();
+    let p = blob_node(dir.path());
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "media".into(),
+            fuel: Some(2_000_000_000),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    ingress(&p, http("info", "", inline(b"x")));
+    p.settle();
+    p.rt.block_on(p.node.snapshot("before the deployment", p.owner()))
+        .unwrap();
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_rebase(std::time::Duration::from_secs(5)),
+    );
+    let alt = std::fs::read(guest("media-alt")).unwrap();
+    let (prop, _) =
+        p.rt.block_on(props.propose(
+            kronik_fork::proposal::ProposeRequest {
+                wasm: vec![alt],
+                names: Vec::new(),
+                window_ms: None,
+                at: None,
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
+        .unwrap();
+    let promoted =
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
+            .unwrap();
+    // Under the new code: the alternate pattern.
+    let size = 200_000u64;
+    let production = blob_answer_of(&ingress(
+        &p,
+        http("write", &format!("size={size}"), inline(b"")),
+    ));
+    p.settle();
+    // Roll the code back by replaying with the old code.
+    let (rebase, _) =
+        p.rt.block_on(props.rebase(
+            RebaseRequest {
+                epoch: promoted.epoch,
+                options: DiffOptions {
+                    mode: Mode::Continuous,
+                    ..DiffOptions::default()
+                },
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
+        .unwrap();
+    p.rt.block_on(props.approve(&rebase.id, audit(), false, None, p.owner()))
+        .unwrap();
+    p.rt.block_on(props.promote(&rebase.id, audit(), false, p.owner()))
+        .unwrap();
+    // The rebased turn wrote the old pattern: a blob production never had.
+    let old: Vec<u8> = (0..size).map(pattern).collect();
+    let rebased = format!("b3:{}", blake3::hash(&old).to_hex());
+    assert_ne!(rebased, production.hash);
+    let store = p.node.blob_store().unwrap().clone();
+    let meta = kronik_blob::BlobMeta {
+        id: kronik_blob::BlobId::parse(&rebased).unwrap(),
+        size,
+        subject: None,
+        key_version: 0,
+    };
+    let fork_space = dir.path().join("branches").join(&rebase.id).join("blobs");
+    let read_main = || {
+        p.rt.block_on(async {
+            let r = store
+                .reader(&kronik_blob::Space::Main, &meta, &kronik_blob::NoKeys)
+                .await?;
+            r.read_at(0, size as usize).await
+        })
+    };
+    assert!(read_main().unwrap() == old, "main has the rebased blob");
+    if fork_space.exists() {
+        std::fs::remove_dir_all(&fork_space).unwrap();
+    }
+    assert!(read_main().unwrap() == old, "without the fork's space too");
+}
+
+fn blob_answer_of(r: &TurnResult) -> pb::BlobRef {
+    match &r.outcome.output {
+        Some(pb::outcome::Output::Http(h)) => {
+            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
+                Some(pb::body::Value::Blob(b)) => b.clone(),
+                other => panic!("not a blob: {other:?}"),
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+}

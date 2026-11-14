@@ -15,6 +15,11 @@ crate-type = ["cdylib"]
 [dependencies]
 wit-bindgen = "=0.63.0"
 
+[features]
+# Another `write` pattern (tests/guests/media-alt.wasm): code that writes
+# other blobs for the same input, as a rolled-back version would.
+alternate = []
+
 [profile.release]
 opt-level = "s"
 lto = true

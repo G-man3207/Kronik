@@ -297,6 +297,79 @@ impl Node {
         Ok(())
     }
 
+    /// M25 §4.3: the blobs the rebased `turns` reference, which the
+    /// rebase's runs wrote to its fork's space, become main's before any
+    /// record that references them is appended: copied (or claimed when
+    /// main has them) and named durably, under a lease the caller holds
+    /// until the records are applied. None: no blob store, or no blobs.
+    async fn import_rebase_blobs(
+        &self,
+        id: &str,
+        turns: &[(Lsn, pb::TurnRecord)],
+    ) -> Result<Option<kronik_blob::Lease>, ApiError> {
+        let Some(store) = self.blob_store().cloned() else {
+            return Ok(None);
+        };
+        let mut refs = Vec::new();
+        for (_, turn) in turns {
+            kronik_proto::blobs::turn(turn, &mut refs);
+        }
+        if refs.is_empty() {
+            return Ok(None);
+        }
+        let lease = store.leases().take("rebase");
+        lease.keep_alive(self.env());
+        let from = kronik_blob::Space::Fork(id.to_owned());
+        let mut seen = std::collections::BTreeSet::new();
+        let mut ids = Vec::new();
+        for blob in refs {
+            if !seen.insert(blob.hash.clone()) {
+                continue;
+            }
+            let meta = kronik_blob::BlobMeta::from_pb(blob)
+                .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+            store
+                .import(&from, &kronik_blob::Space::Main, &meta, &lease)
+                .await
+                .map_err(|e| self.rebase_blob_error(e))?;
+            ids.push(meta.id);
+        }
+        store
+            .ensure_durable(&kronik_blob::Space::Main, &ids)
+            .await
+            .map_err(|e| self.rebase_blob_error(e))?;
+        Ok(Some(lease))
+    }
+
+    /// A blob error while staging a rebase: nothing was switched.
+    fn rebase_blob_error(&self, error: kronik_blob::BlobError) -> ApiError {
+        match error {
+            kronik_blob::BlobError::StoreFull { .. } => ApiError::new(
+                ErrorCode::BlobStoreFull,
+                format!("{error}; nothing was switched"),
+            ),
+            kronik_blob::BlobError::NotFound(id) => ApiError::new(
+                ErrorCode::BlobMissing,
+                format!(
+                    "a rebased turn references blob {id}, which neither the rebase's fork nor \
+                     main has; nothing was switched"
+                ),
+            ),
+            // The blob store's disk failed: the node stops, as for a
+            // failure of its log (M25 §4.7).
+            kronik_blob::BlobError::Io(message) => {
+                let message = format!("the blob store failed: {message}");
+                tracing::error!("{message}");
+                self.stop(message.clone());
+                ApiError::new(ErrorCode::Unavailable, message)
+            }
+            other => ApiError::new(
+                ErrorCode::Internal,
+                format!("copying a rebased turn's blob into main's store: {other}"),
+            ),
+        }
+    }
+
     /// Writes fork turns of rebase `id` (fork LSN, record; in fork order)
     /// into main's log and feeds them to the shadow.
     pub async fn rebase_stage(
@@ -342,6 +415,10 @@ impl Node {
                  back the code only: kronik rollback <epoch> --reason \"...\"",
             ));
         }
+        // The rebased turns' blobs become main's before any record that
+        // references them is appended (M25 §4.3), and stay leased until the
+        // records are applied, which the appends below wait for.
+        let _blobs = self.import_rebase_blobs(id, &turns).await?;
         let records = turns.into_iter().map(|(fork_lsn, record)| {
             Record::StateRebase(pb::StateRebase {
                 rebase_id: id.to_owned(),
