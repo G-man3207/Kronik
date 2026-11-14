@@ -1388,6 +1388,90 @@ pub fn cgroup_delegated(cgroup: &str) -> bool {
         .all(|f| OpenOptions::new().write(true).open(dir.join(f)).is_ok())
 }
 
+/// Gives this process, which is in its delegated cgroup `delegated` with no
+/// controller enabled below it yet, in the Kronik user namespace and its
+/// private mount namespace, the view of the cgroup tree that systemd 257's
+/// `ProtectControlGroups=private` gives a unit and systemd 255 cannot: a
+/// cgroup namespace of its own, rooted at `delegated` (where it is), a
+/// `daemon` leaf that it and `others` (the API acceptor) move into, and a
+/// cgroup2 file system mounted on `/sys/fs/cgroup`, rooted there too.
+///
+/// runsc configures every directory from the cgroup mount's root down to an
+/// actor's cgroup (`cgroup.subtree_control`), and in the host's view that
+/// root is a directory that only host root may write. The inherited mount is
+/// locked in this mount namespace (it came from a more privileged one) and
+/// the kernel refuses the same file system on top of it at the same place, so
+/// a small tmpfs goes between them.
+pub fn private_cgroup_view(delegated: &str, others: &[u32]) -> io::Result<()> {
+    let own = own_cgroup()?;
+    if own != delegated {
+        return Err(io::Error::other(format!(
+            "a private cgroup view is made from the delegated cgroup {delegated}, not from {own}"
+        )));
+    }
+    // SAFETY: unshare without shared state; allowed with CAP_SYS_ADMIN in the
+    // Kronik namespace, which owns the new cgroup namespace.
+    check(
+        unsafe { libc::unshare(libc::CLONE_NEWCGROUP) },
+        "unshare(CLONE_NEWCGROUP)",
+    )?;
+    // Through the inherited mount, the host's view, which still shows it.
+    let leaf = cgroup_dir(delegated).join("daemon");
+    match fs::create_dir(&leaf) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("creating {}: {e}", leaf.display()),
+            ));
+        }
+        _ => {}
+    }
+    for pid in std::iter::once(std::process::id()).chain(others.iter().copied()) {
+        fs::write(leaf.join("cgroup.procs"), pid.to_string()).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("moving process {pid} into {}: {e}", leaf.display()),
+            )
+        })?;
+    }
+    let target = c"/sys/fs/cgroup";
+    let flags = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+    // SAFETY: mounts in this process's own mount namespace, with fixed
+    // NUL-terminated strings.
+    check(
+        unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                target.as_ptr(),
+                c"tmpfs".as_ptr(),
+                flags,
+                c"size=4k,mode=0755".as_ptr().cast(),
+            )
+        },
+        "mounting a tmpfs over the inherited cgroup view",
+    )?;
+    // SAFETY: as above.
+    check(
+        unsafe {
+            libc::mount(
+                c"cgroup2".as_ptr(),
+                target.as_ptr(),
+                c"cgroup2".as_ptr(),
+                flags,
+                std::ptr::null(),
+            )
+        },
+        "mounting the private cgroup view",
+    )?;
+    let now = own_cgroup()?;
+    if now != "/daemon" {
+        return Err(io::Error::other(format!(
+            "the private cgroup view shows this process in {now}, not /daemon"
+        )));
+    }
+    Ok(())
+}
+
 /// When this process's cgroup C is delegated to it, moves the process into
 /// `C/daemon` and returns C, under which the sandboxes' cgroups then go
 /// (ADR 0061): a cgroup whose children get controllers may hold no process

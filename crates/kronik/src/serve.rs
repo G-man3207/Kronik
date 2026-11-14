@@ -415,7 +415,9 @@ fn refusal(why: kronik_foreign::sys::AcceptorRefusal) -> anyhow::Error {
 
 /// The non-root daemon's start (ADR 0060): the API
 /// socket and its acceptor, which keeps reading the callers' host uids in
-/// the initial namespace; the cgroup leaf; then the Kronik user namespace.
+/// the initial namespace; the cgroup leaf; then the Kronik user namespace
+/// (and, where the unit sees the host's cgroup tree, a private view of its
+/// delegated cgroup, with the leaf; ADR 0061).
 /// Without the namespace or a delegated cgroup the daemon still serves,
 /// and foreign actors answer FOREIGN_UNAVAILABLE with the reason.
 fn nonroot_boundary(
@@ -428,9 +430,17 @@ fn nonroot_boundary(
     let unix = kronik_api::server::bind_std(api_socket)
         .with_context(|| format!("binding the API on {}", api_socket.display()))?;
     sys::clear_capabilities().context("dropping all host capabilities after listener binding")?;
-    // Before the acceptor forks, so that it starts in the leaf too: the
-    // delegated cgroup may hold no process once it has controllers on.
-    let leaf = sys::cgroup_leaf();
+    // The cgroup the service manager gave the unit, and whether it is
+    // delegated. Under systemd 257's ProtectControlGroups=private the unit's
+    // view is already rooted there ("/"); under 255 it is the host's, and the
+    // daemon makes the private view itself once it is in the namespace
+    // (`sys::private_cgroup_view`), with the acceptor, which then has to
+    // start in the delegated cgroup.
+    let delegated = sys::own_cgroup().ok().filter(|c| sys::cgroup_delegated(c));
+    let host_view = delegated.as_deref().is_some_and(|c| c != "/");
+    // Otherwise before the acceptor forks, so that it starts in the leaf too:
+    // the delegated cgroup may hold no process once it has controllers on.
+    let leaf = (!host_view).then(sys::cgroup_leaf);
     let acceptor = sys::Acceptor::spawn(std::os::fd::OwnedFd::from(unix))
         .context("starting the API socket's acceptor")?;
     let pin = Path::new(USERNS_PIN);
@@ -443,20 +453,33 @@ fn nonroot_boundary(
         let uid = rustix::process::geteuid().as_raw();
         let entered = crate::cli::userns::kronik_user("", Some(uid))
             .and_then(|user| sys::enter_userns(pin, &user.maps()).map_err(|e| e.to_string()));
-        match (entered, leaf) {
-            (Err(why), _) => Unavailable(format!(
+        match (entered, leaf, delegated) {
+            (Err(why), _, _) => Unavailable(format!(
                 "the daemon is not root, and it cannot enter the Kronik user namespace: {why}"
             )),
-            (Ok(()), Ok(Some(cgroup))) if sys::cgroup_delegated(&cgroup) => Userns { cgroup },
-            (Ok(()), Ok(Some(cgroup))) => Unavailable(format!(
+            (Ok(()), None, Some(cgroup)) => {
+                match sys::private_cgroup_view(&cgroup, &[acceptor.pid()]) {
+                    Ok(()) if sys::cgroup_delegated("/") => Userns { cgroup: "/".into() },
+                    Ok(()) => Unavailable(format!(
+                        "the delegated cgroup {cgroup} is not writable inside the Kronik user namespace"
+                    )),
+                    Err(e) => Unavailable(format!(
+                        "no private view of the delegated cgroup {cgroup}: {e}"
+                    )),
+                }
+            }
+            (Ok(()), Some(Ok(Some(cgroup))), _) if sys::cgroup_delegated(&cgroup) => {
+                Userns { cgroup }
+            }
+            (Ok(()), Some(Ok(Some(cgroup))), _) => Unavailable(format!(
                 "the cgroup {cgroup} is not writable inside the Kronik user namespace"
             )),
-            (Ok(()), Ok(None)) => Unavailable(format!(
+            (Ok(()), Some(Err(e)), _) => Unavailable(format!("no cgroup leaf: {e}")),
+            (Ok(()), _, _) => Unavailable(format!(
                 "no delegated cgroup: the daemon's cgroup {:?} is not writable for it; run it \
                  in kronik.service (Delegate=yes)",
                 sys::own_cgroup().unwrap_or_default()
             )),
-            (Ok(()), Err(e)) => Unavailable(format!("no cgroup leaf: {e}")),
         }
     };
     Ok((acceptor, privilege))
