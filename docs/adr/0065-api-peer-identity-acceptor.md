@@ -1,6 +1,6 @@
 # 0065. Initial-namespace Unix API attribution
 
-- **Status:** Accepted (2026-11-13). Implemented; the boundary driver has not been run on this revision.
+- **Status:** Accepted (2026-11-13). Implemented; the boundary driver passed on 2026-11-14 on hosted Ubuntu 24.04 runners.
 - **Date:** 2026-11-07
 
 ## Context

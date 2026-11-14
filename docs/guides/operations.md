@@ -79,13 +79,13 @@ contradicts it stops with the file's value rather than being silently lost.
 ### The nonroot service
 
 `kronik serve --init --rootless` uses root for the setup and installs the
-nonroot service instead (M21; the design is proposed, see
+nonroot service instead (M21, opt-in; see
 [ADR 0060](../adr/0060-non-root-daemon-user-namespace.md) and
-[ADR 0062](../adr/0062-non-root-systemd-units.md)). It is opt-in until the
-maintainers have ruled on it: it has not been run on a systemd host. It needs
-systemd 255 or newer, cgroup v2 and user namespaces, and it has not been run on
-Ubuntu 24.04 or checked against its AppArmor restriction on unprivileged user
-namespaces. Missing prerequisites never select the root service: the command
+[ADR 0062](../adr/0062-non-root-systemd-units.md)). It needs systemd 255 or
+newer, cgroup v2 and user namespaces. Its installed proofs passed on Ubuntu
+24.04 (GitHub-hosted runners, 2026-11-14), with AppArmor's restriction on
+unprivileged user namespaces active and with it lifted; Kronik does nothing
+about that restriction. It has not run on other distributions. Missing prerequisites never select the root service: the command
 stops and names `--init --root`. Its steps check before they act, like the
 root service's:
 
@@ -237,8 +237,8 @@ There is no uninstall command, and `--init` is not a journal: a run that stops
 half way leaves what it made, and the next run continues from there. On a
 machine you care about, `kronik serve --init --rootless --dry-run` is the only
 safe preview. On a throwaway machine, undo `--init --rootless` by hand, in this
-order (it follows what the installer creates, and has not been run on a systemd
-host):
+order (it follows what the installer creates; the installed proofs clean up
+their own fixture instead, so these steps themselves have not been run):
 
 1. `systemctl disable --now kronik.service kronik-userns.service`
 2. `kronik userns unpin`, while the `kronik` user still exists: it removes the

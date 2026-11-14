@@ -54,13 +54,13 @@ streaming bodies (M25) and blob storage (M26) are accepted, and their
 implementation has not landed. Major areas remain absent or partial: the
 cluster (M16–M19), the WASI 0.3 remainder (M22), connections, streaming bodies
 and blobs (M24–M26), and the UI, fleet and hardening tracks (M27 and M29–M34).
-The microVM level (M20) and the nonroot daemon (M21) are in the tree as opt-in
-work whose installed proofs have not been run on this revision:
-`isolation = "microvm"` is experimental and has not booted a VM on a KVM host,
-and the nonroot service of `kronik serve --init --rootless` has not passed its
-installed proofs (ADR 0064), on Ubuntu 24.04 with AppArmor's restriction on
-user namespaces (R1) or elsewhere. The manual `isolation` workflow runs those
-proofs on disposable hosted runners and keeps their evidence. The nonroot
+The nonroot service of `kronik serve --init --rootless` (M21, opt-in) passed
+its installed proofs (ADR 0064) on 2026-11-14 on GitHub-hosted Ubuntu 24.04
+runners, once with AppArmor's restriction on unprivileged user namespaces (R1)
+active and once with it lifted; it has not run on other distributions. The
+microVM level (M20, `isolation = "microvm"`) is experimental and has not passed
+its proofs. The manual `isolation` workflow runs them on disposable hosted
+runners and keeps their evidence. The nonroot
 daemon's decisions, ADRs 0060–0065, were accepted on 2026-11-13; the microVM
 level's, ADRs 0095 and 0096, await the maintainers.
 See the [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)

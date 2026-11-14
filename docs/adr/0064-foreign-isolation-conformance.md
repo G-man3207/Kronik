@@ -143,7 +143,7 @@ The microVM oracle runs on hosts that may themselves be virtual and have slow di
 
 ## Evidence boundary
 
-Parser/socket/filesystem regressions and static review support implementation but cannot close these runtime criteria. The installed program proof (real malicious-actor controls, the demos, Postgres checkpoint and fork, the UID audit, source-unavailable loaded-key ship/restore), the pinned tool build and the KVM boot, call, resource calibration, ENOSPC, full snapshot, fork and stop checks have not been run on this revision. They remain unexercised criteria, never optional skips. No independent security audit, Ubuntu 24.04 result or cross-version snapshot compatibility is claimed.
+Parser/socket/filesystem regressions and static review support implementation but cannot close these runtime criteria. The boundary driver and the installed program proof for the gVisor level (real malicious-actor controls, the demos, Postgres checkpoint and fork, the UID audit, the acceptor restart, source-unavailable loaded-key ship/restore) passed on 2026-11-14 on GitHub-hosted Ubuntu 24.04 runners (Linux 7.0, systemd 255), through the manual `isolation` workflow, once with Ubuntu's AppArmor restriction on unprivileged user namespaces active (the image's default) and once with it lifted (ADR 0133). The pinned tool build passed there too. The KVM boot, call, resource calibration, ENOSPC, full snapshot, fork and stop checks have not passed yet; they remain unexercised criteria, never optional skips. No external security audit, result on another distribution or cross-version snapshot compatibility is claimed.
 
 ### The fixture's start timeout
 

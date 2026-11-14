@@ -1,6 +1,6 @@
 # 0061. Foreign runtime namespaces and delegated cgroup leaves
 
-- **Status:** Accepted (2026-11-13). Implemented; the runtime acceptance under Consequences and proof has not been run on this revision.
+- **Status:** Accepted (2026-11-13). Implemented; the gVisor part of the runtime acceptance under Consequences and proof passed on 2026-11-14.
 - **Date:** 2026-11-07
 
 ## Deviation from the build brief
@@ -27,4 +27,4 @@ Do not add a runc `--rootless` override merely because the daemon lacks host aut
 
 ## Consequences and proof
 
-Rootless is a host-authority property, not a promise that every child uses a similarly named runtime flag. Real runsc/runc start, resource limits, Postgres persistence, checkpoint/fork copies, malicious actors and actual KVM boot remain required behavioral acceptance. Namespace/cgroup path and escape regressions supplement, not replace, that execution. No such acceptance was run during source integration.
+Rootless is a host-authority property, not a promise that every child uses a similarly named runtime flag. Real runsc/runc start, resource limits, Postgres persistence, checkpoint/fork copies, malicious actors and actual KVM boot remain required behavioral acceptance. Namespace/cgroup path and escape regressions supplement, not replace, that execution. The gVisor part of it (real runsc start under the nonroot service, limits, Postgres persistence, checkpoint and fork copies, the malicious actor) passed on 2026-11-14 on GitHub-hosted Ubuntu 24.04 runners (Linux 7.0, systemd 255), through the manual `isolation` workflow, once with Ubuntu's AppArmor restriction on unprivileged user namespaces active (the image's default) and once with it lifted; that first run is what found the private cgroup view systemd 255 needs. The microVM part is ADR 0095's.

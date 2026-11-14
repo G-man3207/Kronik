@@ -1,6 +1,6 @@
 # 0060. Stable-user namespace setup and irreversible startup boundary
 
-- **Status:** Accepted (2026-11-13). Implemented; the proofs that need root, systemd 255 or newer and free numeric ids have not been run on this revision (see Consequences and proof).
+- **Status:** Accepted (2026-11-13). Implemented; its installed proofs passed on 2026-11-14 on GitHub-hosted Ubuntu 24.04 runners (Linux 7.0, systemd 255), through the manual `isolation` workflow, once with Ubuntu's AppArmor restriction on unprivileged user namespaces active (the image's default) and once with it lifted (see Consequences and proof).
 - **Date:** 2026-11-07
 - **Relates to:** ADR 0003 (gVisor bridge), ADR 0027 (unit hardening) and the data-directory descriptor lock of the key-source boundary (ADR 0092).
 
@@ -32,4 +32,4 @@ The root setup command is trusted, bounded setup authority, not a privileged dae
 
 Behavioral regressions cover strict map parsing, symlink/FD identity, owned unpin refusal, startup capabilities on successful and degraded paths, and real peer UIDs. The explicit `rootless_boundary` driver requires allocated numeric identities and real namespace authority; it fails on missing prerequisites and retains diagnostics.
 
-Nothing in this ADR has been run on this revision: the unit tests run anywhere, but the `rootless_boundary` driver, the installed fixture and the program proof need root, systemd 255 or newer and free numeric ids, and have not been run. The design is untested on Ubuntu 24.04: it checks `user.max_user_namespaces` and `kernel.unprivileged_userns_clone` only and does not handle Ubuntu's AppArmor restriction on unprivileged user namespaces. It has had no independent security review.
+The `rootless_boundary` driver, the installed fixture and the program proof need root, systemd 255 or newer and free numeric ids; they passed on 2026-11-14 on GitHub-hosted Ubuntu 24.04 runners (Linux 7.0, systemd 255), through the manual `isolation` workflow, once with Ubuntu's AppArmor restriction on unprivileged user namespaces active (the image's default) and once with it lifted. Kronik does nothing about that restriction: the pin is made by root, and the proofs passed with it active. They have not run on other distributions or on hardware. A security review of the series (2026-11-14) found no path to host root; its findings were fixed (the security guide says what they changed). It was not an external audit.

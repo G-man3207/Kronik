@@ -403,12 +403,14 @@ and installs the nonroot `kronik` service. Its design is accepted
 ([ADR 0060](../adr/0060-non-root-daemon-user-namespace.md),
 [ADR 0061](../adr/0061-runsc-in-the-kronik-user-namespace.md),
 [ADR 0062](../adr/0062-non-root-systemd-units.md) and
-[ADR 0065](../adr/0065-api-peer-identity-acceptor.md)), but the installed
-proofs of [ADR 0064](../adr/0064-foreign-isolation-conformance.md) have not
-been run on this revision, and the service is untested on Ubuntu 24.04:
-Kronik checks `user.max_user_namespaces` and
-`kernel.unprivileged_userns_clone` and does not handle that distribution's
-AppArmor restriction on unprivileged user namespaces.
+[ADR 0065](../adr/0065-api-peer-identity-acceptor.md)), and the installed
+proofs of [ADR 0064](../adr/0064-foreign-isolation-conformance.md) passed on
+2026-11-14 on GitHub-hosted Ubuntu 24.04 runners, once with that
+distribution's AppArmor restriction on unprivileged user namespaces active and
+once with it lifted. Kronik checks `user.max_user_namespaces` and
+`kernel.unprivileged_userns_clone` and does nothing about the AppArmor
+restriction: the namespace is made by root, and the proofs passed with it on.
+They have not run on other distributions.
 
 The daemon runs as `kronik` with the group `kronik` and the umask 0007. Its
 API acceptor stays in the initial user namespace with that host uid and no
