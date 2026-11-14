@@ -20,5 +20,8 @@
     "@bytecodealliance/jco": "1.39.0",
     "@types/node": "24.19.2",
     "typescript": "7.0.2"
+  },
+  "overrides": {
+    "minimatch": "11.0.8"
   }
 }
