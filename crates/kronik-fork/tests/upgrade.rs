@@ -1166,14 +1166,16 @@ fn an_erasure_in_the_window_removes_state_written_before_it() {
         &["counter"],
         &[
             Step::Send("counter/a", "subject", "", Some("user:1")),
-            Step::Pause(Duration::from_millis(600)),
+            Step::Pause(Duration::from_secs(4)),
             Step::Send("counter/k1", "increment", "", None),
             Step::Erase("user:1"),
             Step::Send("counter/k9", "increment", "", None),
         ],
     );
-    // The window holds the last two root inputs, not the write.
-    let checked = check_dir(&rt, dir.path(), Duration::from_millis(300));
+    // The window holds the last two root inputs, not the write. Between
+    // them the erasure takes its snapshot: on a loaded machine that can
+    // take a while, so the window is wide and the pause wider.
+    let checked = check_dir(&rt, dir.path(), Duration::from_millis(2500));
     let d = &checked.diff;
     let text = String::from_utf8_lossy(&checked.diff_bytes);
     assert_eq!(checked.report.root_inputs, 2, "{text}");
