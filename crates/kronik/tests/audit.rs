@@ -11,6 +11,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{Read as _, Write as _};
+use std::net::TcpStream;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use kronik_otel::audit::Line;
 use serde_json::{Value, json};
+use tokio_tungstenite::tungstenite::{self, Message, WebSocket};
 
 #[path = "../../kronik-api/tests/common/oidc_provider.rs"]
 mod oidc_provider;
@@ -32,6 +34,8 @@ const STEP2: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/guests/counter-step2.wasm"
 );
+/// A chat room with WebSocket routes (M24).
+const ROOM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/room.wasm");
 
 /// The needles: none may appear in any exported line.
 const SECRET: &str = "s3cr3t-needle-91ab";
@@ -214,6 +218,55 @@ impl Daemon {
                 "not exported: {s}\n{}",
                 self.log()
             );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Opens a WebSocket to `path` on the gateway; the connection's id, the
+    /// one connection that `actor` holds.
+    fn open_websocket(&self, path: &str, actor: &str) -> (WebSocket<TcpStream>, String) {
+        let (_, health) = self.try_api("GET", "/v1/health", None, None).unwrap();
+        let http = health["http_listen"].as_str().unwrap().to_owned();
+        let stream = TcpStream::connect(&http).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let ws = match tungstenite::client(format!("ws://{http}{path}"), stream) {
+            Ok((ws, _)) => ws,
+            Err(e) => panic!("WebSocket {path}: {e}\n{}", self.log()),
+        };
+        let (_, list) = self
+            .try_api("GET", &format!("/v1/connections?actor={actor}"), None, None)
+            .unwrap();
+        let id = list["connections"][0]["id"].as_str().unwrap().to_owned();
+        (ws, id)
+    }
+
+    /// Reads `ws` until the operator's close with `code` arrives, completes
+    /// the close handshake, and waits until `conn`'s close input is
+    /// recorded, so that no later dry run sees it land.
+    fn closed_by_operator(&self, ws: &mut WebSocket<TcpStream>, conn: &str, code: u16) {
+        loop {
+            match ws.read() {
+                Ok(Message::Close(Some(f))) => {
+                    assert_eq!(u16::from(f.code), code, "{f:?}");
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("no close frame: {e}"),
+            }
+        }
+        while ws.read().is_ok() {}
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (_, v) = self
+                .try_api("GET", &format!("/v1/connections/{conn}"), None, None)
+                .unwrap();
+            if v["state"] == "closed" {
+                assert_eq!(v["closed"]["cause"], "operator", "{v}");
+                return;
+            }
+            assert!(Instant::now() < deadline, "{v}");
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -609,11 +662,37 @@ fn every_mutation_reaches_the_file_sink_and_verify_reports_it_complete() {
                 json!({"kind": "counter", "capability": "secret-reveal:db"}),
                 Some("revoke"),
             ),
+            step(
+                "POST",
+                "/v1/deployments",
+                "/v1/deployments",
+                json!({"wasm_base64": b64(ROOM)}),
+                Some("deploy"),
+            ),
         ],
         me,
         &mut want,
         &mut seen,
     );
+    // M24: the operator closes a live WebSocket connection. The mutation's
+    // record is its `connection.close` AuditEvent, written before the close;
+    // the connection's close input carries the same audit and exports no
+    // line of its own.
+    let (mut ws, conn) = d.open_websocket("/room/audit/ws?user=ada", "room/audit");
+    drive(
+        &d,
+        vec![step(
+            "POST",
+            "/v1/connections/{id}/close",
+            &format!("/v1/connections/{conn}/close"),
+            json!({"code": 4001, "message": "closed by the audit test"}),
+            Some("connection.close"),
+        )],
+        me,
+        &mut want,
+        &mut seen,
+    );
+    d.closed_by_operator(&mut ws, &conn, 4001);
     // A token acts as itself: its id, never its secret, is in the line.
     let created = drive(
         &d,
