@@ -22,6 +22,9 @@ fmt2 = []
 # The room's manifest for the world `actor`, without the connection export
 # (room-bare.wasm): deploy must refuse it.
 bare = []
+# Every open refused with 403, nothing else changed (room-refuse.wasm): a
+# fork that holds none of production's connections (M24 replay tests).
+refuse = []
 
 [profile.release]
 opt-level = "s"

@@ -403,4 +403,43 @@ impl ConnectionGuest for Room {
     }
 }
 
+#[cfg(not(feature = "refuse"))]
 export!(Room);
+
+/// Feature `refuse`: the room, but every open is refused with 403. Kept
+/// after the room so that the room's panic locations do not move.
+#[cfg(feature = "refuse")]
+struct Refusing;
+
+#[cfg(feature = "refuse")]
+impl Guest for Refusing {
+    fn describe() -> Manifest {
+        <Room as Guest>::describe()
+    }
+
+    fn handle(input: Input) -> Result<Output, HandlerError> {
+        <Room as Guest>::handle(input)
+    }
+}
+
+#[cfg(feature = "refuse")]
+impl ConnectionGuest for Refusing {
+    fn open(_req: OpenRequest) -> Result<OpenReply, HandlerError> {
+        Ok(OpenReply::Refuse(HttpResponse {
+            status: 403,
+            headers: Vec::new(),
+            body: HttpBody::Inline(b"closed".to_vec()),
+        }))
+    }
+
+    fn frame(event: IncomingFrame) -> Result<(), HandlerError> {
+        <Room as ConnectionGuest>::frame(event)
+    }
+
+    fn close(event: Closed) -> Result<(), HandlerError> {
+        <Room as ConnectionGuest>::close(event)
+    }
+}
+
+#[cfg(feature = "refuse")]
+export!(Refusing);

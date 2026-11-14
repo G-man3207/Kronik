@@ -44,6 +44,10 @@
 //! Feature `fmt2` (room-fmt2.wasm) changes only the message format: `body`
 //! instead of `text`.
 //!
+//! Feature `refuse` (room-refuse.wasm) refuses every open with 403 and
+//! changes nothing else: a fork with it holds none of production's
+//! connections (the replay tests of M24 §7.2).
+//!
 //! Feature `bare` (room-bare.wasm) builds the same manifest for the world
 //! `actor`, without the `connection-handler` export: deploy must refuse it
 //! (ADR 0113).

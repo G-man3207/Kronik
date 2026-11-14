@@ -22,14 +22,17 @@ done
 (cd ../leaky && cargo build --locked --release --target wasm32-wasip2 --target-dir target &&
     cp target/wasm32-wasip2/release/kronik_test_leaky.wasm ../leaky.wasm)
 # room (M24 connections): its own crate, kind `room`, the world
-# actor-connections; fmt2 changes only the message format (replay tests),
-# bare declares the same routes without the connection export (deploy check).
+# actor-connections; fmt2 changes only the message format and refuse refuses
+# every open (replay tests), bare declares the same routes without the
+# connection export (deploy check).
 (cd ../room &&
     cargo build --locked --release --target wasm32-wasip2 --target-dir target/room &&
     cargo build --locked --release --target wasm32-wasip2 --target-dir target/fmt2 --features fmt2 &&
+    cargo build --locked --release --target wasm32-wasip2 --target-dir target/refuse --features refuse &&
     cargo build --locked --release --target wasm32-wasip2 --target-dir target/bare --features bare &&
     cp target/room/wasm32-wasip2/release/kronik_test_room.wasm ../room.wasm &&
     cp target/fmt2/wasm32-wasip2/release/kronik_test_room.wasm ../room-fmt2.wasm &&
+    cp target/refuse/wasm32-wasip2/release/kronik_test_room.wasm ../room-refuse.wasm &&
     cp target/bare/wasm32-wasip2/release/kronik_test_room.wasm ../room-bare.wasm)
 # Rollback via replay (M13): a schema-1 build that migrates and also makes
 # the extra GET, so the rolled-back code had a migration and effects the old
