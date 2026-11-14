@@ -2428,6 +2428,7 @@ dependencies = [
  "blake3",
  "bytes",
  "kronik-api",
+ "kronik-blob",
  "kronik-core",
  "kronik-gateway",
  "kronik-log",

@@ -27,12 +27,14 @@ use kronik_api::{Api, ApiRequest, ApiResponse};
 use kronik_core::env::{
     BoxFuture, Clock, EntropySource, Env, Process, ProcessRunner, ProcessSpec, Spawner,
 };
-use kronik_gateway::{Gateway, GatewayConfig, HttpRequest, HttpResponse};
+use kronik_gateway::{
+    Gateway, GatewayConfig, HttpRequest, HttpResponse, RequestBody, ResponseBody,
+};
 use kronik_log::LogConfig;
 use kronik_privacy::{MasterKey, SecretStore};
 use kronik_runtime::{CodeStore, PoolSize, build_engine};
 use kronik_sched::connections::ConnectionsConfig;
-use kronik_sched::{Node, NodeConfig, NodeParts};
+use kronik_sched::{BlobsConfig, Node, NodeConfig, NodeParts};
 use kronik_store::Store;
 use kronik_store::sql::{Limits, MemOpener, SqlPool};
 
@@ -136,6 +138,15 @@ impl TestHost {
             .unwrap_or_else(|| kronik_sched::secrets::SecretCacheData::new());
         let secrets = SecretStore::open_owned(&ownership, &master, secrets_data)
             .map_err(|e| Error::new("secrets", e))?;
+        // Blobs (M25) on the same in-memory file system: actors that import
+        // `blobs` get blob bodies above their threshold, as in production.
+        let blobs = kronik_blob::BlobStore::open(
+            env.clone(),
+            std::path::Path::new("/data"),
+            kronik_blob::StoreConfig::default(),
+        )
+        .await
+        .map_err(|e| Error::new("blob store", e))?;
         let node = Node::start(NodeParts {
             env,
             config: NodeConfig {
@@ -146,6 +157,7 @@ impl TestHost {
                     inbound_rate: 0,
                     ..ConnectionsConfig::default()
                 },
+                blobs: Some(BlobsConfig::default()),
                 ..NodeConfig::default()
             },
             log,
@@ -155,7 +167,7 @@ impl TestHost {
             sealer: None,
             key_source: None,
             ownership: Some(ownership),
-            blobs: None,
+            blobs: Some(blobs),
         })
         .await
         .map_err(|e| Error::new("starting the node", e))?;
@@ -173,6 +185,21 @@ impl TestHost {
     /// An HTTP request through the gateway, as a client would send it.
     pub async fn http(&self, req: HttpRequest) -> HttpResponse {
         self.gateway.handle(req).await
+    }
+
+    /// [`TestHost::http`], with the reference of the answer's body when it
+    /// is a blob (M25); the body is read whole either way.
+    pub async fn http_with_blob(
+        &self,
+        mut req: HttpRequest,
+    ) -> (HttpResponse, Option<kronik_proto::log::v1::BlobRef>) {
+        let body = RequestBody::Inline(std::mem::take(&mut req.body));
+        let answer = self.gateway.respond(req, body).await;
+        let blob = match &answer.body {
+            ResponseBody::Blob(b) => Some(b.reference()),
+            _ => None,
+        };
+        (answer.into_response().await, blob)
     }
 
     /// A request to the API, as `kronik` would send it over the socket.

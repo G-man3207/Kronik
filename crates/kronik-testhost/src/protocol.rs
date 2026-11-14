@@ -5,7 +5,11 @@
 //!
 //! - `{"op": "http", "method", "path", "headers": [[name, value]], "body" |
 //!   "body_base64"}`: through the gateway. Answer: `status`, `headers`,
-//!   `body` (if UTF-8) or `body_base64`, and `turn`, the turn's id.
+//!   `body` (if UTF-8) or `body_base64`, and `turn`, the turn's id. A body
+//!   of any size is taken: for an actor that imports `blobs` one above its
+//!   threshold becomes a blob (M25). When the answer's body is a blob, the
+//!   answer also has `blob`: `{"hash": "b3:...", "size": N}`, next to the
+//!   body's bytes.
 //! - `{"op": "api", "method", "path", "query", "body": <JSON>}`: the daemon's
 //!   API (crates/kronik-api), as `kronik` uses it over the socket. Answer:
 //!   `status` and `body`.
@@ -258,8 +262,8 @@ impl TestHost {
                 .to_bytes()
                 .map_err(Error)?;
                 let (path, query) = path.split_once('?').unwrap_or((&path, ""));
-                let res = self
-                    .http(HttpRequest {
+                let (res, blob) = self
+                    .http_with_blob(HttpRequest {
                         method,
                         path: path.to_string(),
                         query: query.to_string(),
@@ -269,7 +273,11 @@ impl TestHost {
                     })
                     .await;
                 self.settle().await?;
-                response_json(&res)
+                let mut out = response_json(&res)?;
+                if let Some(blob) = blob {
+                    out["blob"] = json!({"hash": blob.hash, "size": blob.size});
+                }
+                Ok(out)
             }
             Request::Api {
                 method,

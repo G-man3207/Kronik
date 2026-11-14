@@ -12,6 +12,7 @@ base64 = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 kronik-api = { workspace = true }
+kronik-blob = { workspace = true }
 kronik-core = { workspace = true }
 kronik-gateway = { workspace = true }
 kronik-log = { workspace = true }
@@ -30,7 +31,7 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 kronik-core = { workspace = true, features = ["real"] }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

@@ -77,6 +77,11 @@ impl BlobBody {
         }
     }
 
+    /// The blob's reference.
+    pub fn reference(&self) -> kronik_proto::log::v1::BlobRef {
+        self.reader.meta().to_pb()
+    }
+
     /// The blob's size: the response's length.
     pub fn size(&self) -> u64 {
         self.size
