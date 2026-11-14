@@ -346,6 +346,10 @@ struct Inflight {
     waiter: Arc<Waiter>,
 }
 
+/// How long a start waits to fix state.db for a resealed segment
+/// ([`Node::finish_reseal_fixes`]) before it goes on without.
+const RESEAL_FIX_AT_START: Duration = Duration::from_secs(60);
+
 /// Set once when the log writer or the applier fails; the daemon must exit
 /// and recover on restart.
 struct Fatal {
@@ -1040,12 +1044,30 @@ impl Node {
         // into place and fixing state.db for it (docs/design/m8-privacy.md
         // §8). A failure leaves its journal entry: `privacy status` reports
         // the reseal pending, and the next pass tries again.
-        if let Err(e) = node.finish_reseal_fixes().await {
-            tracing::error!(
-                error = %e.message,
-                "fixing state.db for a resealed segment failed: the reseal, and every erasure, \
-                 stay pending in privacy status until a reseal pass fixes it"
-            );
+        // Only a node with a privacy keystore can have resealed (sealing needs
+        // its keys); its mode may be off again since, so it is not asked. A
+        // simulated node has none, and does no file system operation here.
+        // Bounded: the closed segments are applied already at this point, and
+        // a start must never hang on the fix (an applier that died without a
+        // fatal state would never get there).
+        if node.sealer.keystore().is_some() {
+            let fixed = match node
+                .env
+                .timeout(RESEAL_FIX_AT_START, node.finish_reseal_fixes())
+                .await
+            {
+                Ok(fixed) => fixed.map_err(|e| e.message),
+                Err(_) => Err(format!(
+                    "the closed segments were not applied within {RESEAL_FIX_AT_START:?}"
+                )),
+            };
+            if let Err(error) = fixed {
+                tracing::error!(
+                    %error,
+                    "fixing state.db for a resealed segment failed: the reseal, and every \
+                     erasure, stay pending in privacy status until a reseal pass fixes it"
+                );
+            }
         }
         node.initialize_secret_versions(last == 0, node.native_recovery.clone())
             .await?;
