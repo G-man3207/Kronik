@@ -111,8 +111,23 @@ CREATE TABLE IF NOT EXISTS connections (
   next_seq INTEGER NOT NULL DEFAULT 0,
   frames_written INTEGER,
   restart_after_lsn INTEGER);
-CREATE INDEX IF NOT EXISTS connections_owner ON connections (kind, key, closed_lsn);
-CREATE INDEX IF NOT EXISTS connections_open ON connections (id) WHERE closed_lsn IS NULL;
+CREATE INDEX IF NOT EXISTS connections_owner ON connections (kind, key);
+CREATE TABLE IF NOT EXISTS connection_history (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL, key TEXT NOT NULL,
+  protocol INTEGER NOT NULL,
+  route TEXT NOT NULL,
+  subject TEXT,
+  opened_lsn INTEGER NOT NULL,
+  closing_lsn INTEGER,
+  closed_lsn INTEGER,
+  cause INTEGER, code INTEGER,
+  frames_in INTEGER NOT NULL DEFAULT 0,
+  next_seq INTEGER NOT NULL DEFAULT 0,
+  frames_written INTEGER,
+  restart_after_lsn INTEGER);
+CREATE INDEX IF NOT EXISTS connection_history_owner ON connection_history (kind, key, closed_lsn);
+CREATE INDEX IF NOT EXISTS connection_history_closed ON connection_history (closed_lsn);
 ";
 
 /// One row of `actors`.
@@ -238,9 +253,9 @@ pub struct OrphanRow {
 }
 
 /// A long-lived connection that its owner accepted (M24,
-/// docs/design/m24-connections.md §6.5): one row from the accepting open
-/// turn on, closed by its close input. Rows stay after the close, so the
-/// ownership check of a turn never depends on when a row went away.
+/// docs/design/m24-connections.md §6.5): a row of `connections` from the
+/// accepting open turn on, while it is live, and of `connection_history`
+/// once its close input is applied (ADR 0114, amended 2026-11-13).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionRow {
     pub id: String,
@@ -1080,8 +1095,15 @@ impl StateDb {
         let base = i(sw.base_lsn);
         let tx = self.conn.savepoint()?;
         for (kind, key) in actors {
-            // M24: the connections the rebased actors hold are the shadow's.
-            for table in ["actors", "kv", "timers", "connections"] {
+            // M24: the connections the rebased actors hold, and held, are
+            // the shadow's.
+            for table in [
+                "actors",
+                "kv",
+                "timers",
+                "connections",
+                "connection_history",
+            ] {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE kind = ?1 AND key = ?2"),
                     params![kind, key],
@@ -1688,6 +1710,13 @@ impl StateDb {
             params![i(first_lsn)],
         )?;
         tx.execute("DELETE FROM trees WHERE lsn < ?1", params![i(first_lsn)])?;
+        // M24: closed connections whose close is below the retention base
+        // (ADR 0114, amended); turns never read them, so this changes no
+        // turn's outcome, and the live `connections` stay.
+        tx.execute(
+            "DELETE FROM connection_history WHERE closed_lsn < ?1",
+            params![i(first_lsn)],
+        )?;
         tx.execute(
             "DELETE FROM segments WHERE last_lsn < ?1",
             params![i(first_lsn)],
@@ -1965,7 +1994,8 @@ impl StateDb {
         }
     }
 
-    /// A connection's row (M24).
+    /// A live connection's row (M24): what a turn reads (ADR 0114,
+    /// amended). `None` when no live connection has the id.
     pub fn connection(&self, id: &str) -> Result<Option<ConnectionRow>, StoreError> {
         Ok(self
             .conn
@@ -1976,19 +2006,35 @@ impl StateDb {
             .optional()?)
     }
 
-    /// The connections without a close input, in id order: the ones a
-    /// restart closes (M24 §4.8).
+    /// A connection's row, live or closed, for the API and history; a
+    /// closed one until retention's base passes its close.
+    pub fn connection_any(&self, id: &str) -> Result<Option<ConnectionRow>, StoreError> {
+        if let Some(row) = self.connection(id)? {
+            return Ok(Some(row));
+        }
+        Ok(self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT {CONNECTION_COLUMNS} FROM connection_history WHERE id = ?1"
+            ))?
+            .query_row([id], connection_row)
+            .optional()?)
+    }
+
+    /// The live connections, in id order: the ones a restart closes (M24
+    /// §4.8).
     pub fn open_connections(&self) -> Result<Vec<ConnectionRow>, StoreError> {
         let mut st = self.conn.prepare_cached(&format!(
-            "SELECT {CONNECTION_COLUMNS} FROM connections WHERE closed_lsn IS NULL ORDER BY id"
+            "SELECT {CONNECTION_COLUMNS} FROM connections ORDER BY id"
         ))?;
         let rows = st.query_map([], connection_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Connections in id order after `after` (empty: from the start), at
-    /// most `limit`: those of one owner or one kind when given, and open
-    /// ones (no close input), closed ones or all.
+    /// most `limit`: those of one owner or one kind when given, and live
+    /// ones, closed ones (until retention's base passes their close) or
+    /// all.
     pub fn connections(
         &self,
         owner: Option<(&str, Option<&str>)>,
@@ -1996,16 +2042,23 @@ impl StateDb {
         after: &str,
         limit: usize,
     ) -> Result<Vec<ConnectionRow>, StoreError> {
-        let state = match state {
-            ConnectionState::Open => " AND closed_lsn IS NULL",
-            ConnectionState::Closed => " AND closed_lsn IS NOT NULL",
-            ConnectionState::All => "",
+        let filter = "WHERE id > ?1 AND (?2 = '' OR kind = ?2) AND (?3 IS NULL OR key = ?3)";
+        let from = match state {
+            ConnectionState::Open => {
+                format!("SELECT {CONNECTION_COLUMNS} FROM connections {filter}")
+            }
+            ConnectionState::Closed => {
+                format!("SELECT {CONNECTION_COLUMNS} FROM connection_history {filter}")
+            }
+            ConnectionState::All => format!(
+                "SELECT {CONNECTION_COLUMNS} FROM connections {filter} UNION ALL \
+                 SELECT {CONNECTION_COLUMNS} FROM connection_history {filter}"
+            ),
         };
         let (kind, key) = owner.unwrap_or(("", None));
-        let mut st = self.conn.prepare_cached(&format!(
-            "SELECT {CONNECTION_COLUMNS} FROM connections WHERE id > ?1 \
-             AND (?2 = '' OR kind = ?2) AND (?3 IS NULL OR key = ?3){state} ORDER BY id LIMIT ?4"
-        ))?;
+        let mut st = self
+            .conn
+            .prepare_cached(&format!("{from} ORDER BY id LIMIT ?4"))?;
         let rows = st.query_map(
             params![after, kind, key, i64::try_from(limit).unwrap_or(i64::MAX)],
             connection_row,
@@ -2013,14 +2066,12 @@ impl StateDb {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// How many connections of `kind` have no close input (deploy's
-    /// warning, M24 §2.6).
+    /// How many live connections `kind` holds (deploy's warning, M24
+    /// §2.6).
     pub fn open_connection_count(&self, kind: &str) -> Result<u64, StoreError> {
         let n: i64 = self
             .conn
-            .prepare_cached(
-                "SELECT count(*) FROM connections WHERE kind = ?1 AND closed_lsn IS NULL",
-            )?
+            .prepare_cached("SELECT count(*) FROM connections WHERE kind = ?1")?
             .query_row([kind], |r| r.get(0))?;
         Ok(n as u64)
     }
@@ -2494,13 +2545,14 @@ fn apply_turn(
 /// A turn record's effect on the `connections` table (M24 §6.5), in this
 /// order: an accepted open inserts the row; every OK `connection.send-now`
 /// advances its target's `next_seq` by one, also in failed turns; a
-/// committed record's SEND targets advance it and its CLOSE sets
+/// committed record's live SEND targets advance it and its CLOSE sets
 /// `closing_lsn`; a frame input (not a resend) counts in `frames_in`; a
-/// close input closes the row whatever its turn's outcome. Every update
-/// names the turn's actor as the owner: a record cannot move another
-/// actor's row (ADR 0114), and an id without such a row is ignored. A
-/// failed frame or close turn is a dead letter, and a resend marks the dead
-/// letter it resends.
+/// close input closes the row whatever its turn's outcome and moves it to
+/// `connection_history`. Every update names the turn's actor as the owner:
+/// a record cannot move another actor's row (ADR 0114), and an id without
+/// such a live row (an operation's `dropped` targets) is ignored. A failed
+/// frame or close turn is a dead letter, and a resend marks the dead letter
+/// it resends.
 ///
 /// A send-now advances by one, never to its recorded seq: its request may
 /// be sealed, and production applies sealed records while a fork applies
@@ -2594,25 +2646,38 @@ fn apply_connections(
                 .execute(params![c.connection, kind, key])?;
             }
         }
-        // 5. The close, whatever the turn's outcome.
+        // 5. The close, whatever the turn's outcome: the live row gets the
+        // close's facts and moves to `connection_history`, in this
+        // transaction (ADR 0114, amended). A resent close finds no live
+        // row and changes nothing.
         Some(Event::Close(close)) => {
-            tx.prepare_cached(
-                "UPDATE connections SET closed_lsn = ?4, cause = ?5, code = ?6, \
-                 frames_written = ?7, restart_after_lsn = ?8 \
-                 WHERE id = ?1 AND kind = ?2 AND key = ?3 AND closed_lsn IS NULL",
-            )?
-            .execute(params![
-                c.connection,
-                kind,
-                key,
-                lsn,
-                close.cause,
-                close.code,
-                close
-                    .frames_written_known
-                    .then_some(i(close.frames_written)),
-                (close.restart_after_lsn > 0).then_some(i(close.restart_after_lsn)),
-            ])?;
+            let moved = tx
+                .prepare_cached(
+                    "UPDATE connections SET closed_lsn = ?4, cause = ?5, code = ?6, \
+                     frames_written = ?7, restart_after_lsn = ?8 \
+                     WHERE id = ?1 AND kind = ?2 AND key = ?3",
+                )?
+                .execute(params![
+                    c.connection,
+                    kind,
+                    key,
+                    lsn,
+                    close.cause,
+                    close.code,
+                    close
+                        .frames_written_known
+                        .then_some(i(close.frames_written)),
+                    (close.restart_after_lsn > 0).then_some(i(close.restart_after_lsn)),
+                ])?;
+            if moved > 0 {
+                tx.prepare_cached(
+                    "INSERT OR REPLACE INTO connection_history SELECT * FROM connections \
+                     WHERE id = ?1",
+                )?
+                .execute([&c.connection])?;
+                tx.prepare_cached("DELETE FROM connections WHERE id = ?1")?
+                    .execute([&c.connection])?;
+            }
         }
         Some(Event::Open(_)) | None => {}
     }

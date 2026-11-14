@@ -129,6 +129,7 @@ fn send(targets: &[(&str, u64)], frame: pb::Frame) -> pb::ConnectionOp {
         connections: targets.iter().map(|(c, _)| (*c).into()).collect(),
         seqs: targets.iter().map(|(_, s)| *s).collect(),
         op: Some(pb::connection_op::Op::Send(frame)),
+        dropped: Vec::new(),
     }
 }
 
@@ -140,6 +141,7 @@ fn close_op(id: &str) -> pb::ConnectionOp {
             code: 4000,
             reason: plain(None, b"kicked"),
         })),
+        dropped: Vec::new(),
     }
 }
 
@@ -260,7 +262,10 @@ fn the_applier_follows_a_connection_from_open_to_close() {
     );
 
     store.apply(&records[4..]).unwrap();
-    let row = store.db().connection(C1).unwrap().unwrap();
+    // The close input moved the row out of the live table (ADR 0114,
+    // amended): turns no longer see it; the API and history still do.
+    assert!(store.db().connection(C1).unwrap().is_none());
+    let row = store.db().connection_any(C1).unwrap().unwrap();
     // The resend does not count again; the closing lsn is the first close's.
     assert_eq!(row.frames_in, 4);
     assert_eq!(row.next_seq, 5);
@@ -338,8 +343,12 @@ fn snapshots_and_rebuilds_keep_the_connections_table() {
     rebuilt.db().end_bulk_replay().unwrap();
     assert_eq!(rebuilt.state_hash().unwrap(), store.state_hash().unwrap());
     assert_eq!(
-        rebuilt.db().connection(C1).unwrap(),
-        store.db().connection(C1).unwrap()
+        rebuilt.db().connection_any(C1).unwrap(),
+        store.db().connection_any(C1).unwrap()
+    );
+    assert_eq!(
+        rebuilt.db().open_connections().unwrap(),
+        store.db().open_connections().unwrap()
     );
 }
 
@@ -370,18 +379,33 @@ fn the_startup_fast_path_does_not_skip_frames_of_http_turns() {
     );
 }
 
-/// Retention's index compaction keeps closed connection rows: a turn's
-/// ownership check reads them (a send to a connection its actor accepted
-/// long ago is recorded and dropped, one to another actor's traps), so
-/// deleting them at a time the log does not record would make a turn's
-/// outcome depend on when compaction ran, in production and in replay.
+/// Retention's index compaction deletes closed connections whose close is
+/// below the retention base, and nothing else: the live table, which turns
+/// read, and the state hash stay as they were (ADR 0114, amended).
 #[test]
-fn compaction_keeps_closed_connections() {
+fn compaction_deletes_only_history_below_the_base() {
     let store = Store::memory().unwrap();
-    store.apply(&records()).unwrap();
-    store.db().compact(1_000, u64::MAX).unwrap();
-    let row = store.db().connection(C1).unwrap().unwrap();
-    assert_eq!(row.closed_lsn, Some(8));
+    let mut records = records();
+    // A second connection that stays open.
+    let mut other = turn(open(C2), pb::OutcomeKind::Committed);
+    if let Some(o) = other.outcome.as_mut() {
+        o.output = Some(pb::outcome::Output::Accept(pb::ConnectionAccept::default()));
+    }
+    records.push(committed(
+        records.len() as u64 + 1,
+        Record::TurnRecord(other),
+    ));
+    store.apply(&records).unwrap();
+    let hash = store.state_hash().unwrap();
+    let live = store.db().open_connections().unwrap();
+    assert_eq!(live.len(), 1);
+    // C1 closed at lsn 8: a base at 8 keeps it, one above deletes it.
+    store.db().compact(8, u64::MAX).unwrap();
+    assert!(store.db().connection_any(C1).unwrap().is_some());
+    store.db().compact(9, u64::MAX).unwrap();
+    assert!(store.db().connection_any(C1).unwrap().is_none());
+    assert_eq!(store.db().open_connections().unwrap(), live);
+    assert_eq!(store.state_hash().unwrap(), hash, "history is not hashed");
 }
 
 /// Every row update names the turn's actor as the owner (ADR 0114): a

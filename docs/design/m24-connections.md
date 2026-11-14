@@ -231,16 +231,17 @@ instantiate a 0.1.0 component (ADR 0113, Consequences).
 
 | Function | Rules (a broken rule traps, and the turn fails) |
 | --- | --- |
-| `send(conn, frame)` | `conn` is held: it is the connection this turn opens, or a `connections` row whose owner is this actor; otherwise `CONNECTION_NOT_HELD`. The frame's payload (text bytes, binary bytes, or event data + event + id) is at most the kind's `message_bytes`. `binary` to an SSE connection traps. `event.event` and `event.id` must not contain CR, LF or NUL. The per-turn caps of §4.11 apply. Recorded in `TurnRecord.connection_ops` with the payload tagged with the turn's default subject. Not allowed in `describe`. |
-| `broadcast(conns, frame)` | `send`'s rules for every id. Duplicate ids are ignored (the first occurrence keeps its place). An empty list does nothing. One recorded operation with all targets. |
-| `close(conn, code, reason)` | `conn` is held. `code` is 1000, 1001, 1003, 1007, 1008, 1009 or 1011, or 3000 to 4999. `reason` is at most 123 bytes of UTF-8. On SSE, the code and reason are recorded, and the stream ends. |
-| `send-now(conn, frame)` | `send`'s rules. `conn` must not be the connection that the current turn opens (it opens at commit). Without a grant of `connection:send-now`: `denied("CAPABILITY_NOT_GRANTED: connection:send-now")`, recorded as status `DENIED`. Otherwise: `TurnBegin` (I14), the frame goes to the hub (§5.2), and the `EffectResult` is fsynced before the guest sees the result (§4.4). |
+| `send(conn, frame)` | `conn` is a well-formed id (`c-` and 32 lowercase hex characters), else the turn traps. If it names a live connection (§6.5), the turn's actor owns it, or it is the connection this turn opens; else `CONNECTION_NOT_HELD`. If no live connection has it (it closed, or none was ever accepted), the frame is recorded as dropped and never delivered (§4.7; ADR 0114, amended). The frame's payload (text bytes, binary bytes, or event data + event + id) is at most the kind's `message_bytes`. `binary` to an SSE connection traps. `event.event` and `event.id` must not contain CR, LF or NUL. The per-turn caps of §4.11 apply. Recorded in `TurnRecord.connection_ops` with the payload tagged with the turn's default subject. Not allowed in `describe`. |
+| `broadcast(conns, frame)` | `send`'s rules for every id: dropped ids are recorded as such. Duplicate ids are ignored (the first occurrence keeps its place). An empty list does nothing. One recorded operation with all targets. |
+| `close(conn, code, reason)` | `send`'s rules for `conn`: a close of an id without a live connection is recorded as dropped and does nothing. `code` is 1000, 1001, 1003, 1007, 1008, 1009 or 1011, or 3000 to 4999. `reason` is at most 123 bytes of UTF-8. On SSE, the code and reason are recorded, and the stream ends. |
+| `send-now(conn, frame)` | `send`'s rules. `conn` must not be the connection that the current turn opens (it opens at commit). An id without a live connection answers `closed`, recorded with the status `CLOSED` without a `TurnBegin`: the answer follows from the state. Without a grant of `connection:send-now`: `denied("CAPABILITY_NOT_GRANTED: connection:send-now")`, recorded as status `DENIED`. Otherwise: `TurnBegin` (I14), the frame goes to the hub (§5.2), and the `EffectResult` is fsynced before the guest sees the result (§4.4). |
 
 Each turn has a set of held connections: the connection that its `open`
-input names, plus every `connections` row whose owner is the turn's actor,
-as of the turn's start. The rows come from the state view, which gets
-`connection(id) -> Option<ConnectionView { owner_is_self, protocol,
-next_seq }>`.
+input names, plus every live connection (a `connections` row, §6.5) whose
+owner is the turn's actor, as of the turn's start. The rows come from the
+state view, which gets `connection(id) -> Option<ConnectionView {
+owner_is_self, protocol, next_seq, closing }>` over live rows only: `None`
+means no live connection has the id.
 
 ### 2.5 Routes in the manifest
 
@@ -283,7 +284,13 @@ ADR 0114 has the reasoning:
 - The owner is the actor whose open turn accepted the connection, which is
   the actor the route named. It never changes.
 - Only the owner's turns may `send`, `broadcast`, `close` or `send-now` on
-  the connection. Any other use traps with `CONNECTION_NOT_HELD`.
+  a live connection. Another actor's use traps with `CONNECTION_NOT_HELD`.
+  An operation on an id without a live connection (it closed, or none was
+  ever accepted) is recorded as dropped, as the brief says of frames to a
+  closed connection (ADR 0114, amended 2026-11-13).
+- Connection ids are the open's root id: 128 random bits from the node's
+  entropy source. So an actor cannot find another actor's live connection
+  by guessing ids and telling a trap from a dropped frame.
 - The gateway delivers a connection's frames and its close only to the
   owner.
 - Fan-out goes through ownership (a room actor owns its members'
@@ -454,7 +461,17 @@ The chat example uses a room sequence, and clients resynchronize with
 ### 4.7 Frames to closed connections
 
 Frames to a connection that is closed, closing or not live are recorded
-and never written. Every close input carries `frames_written` (§6.1):
+and never written.
+
+- **An id without a live connection** (its close input was applied, or no
+  connection was ever accepted with it): the turn records the target in
+  `ConnectionOp.dropped` (§6.1), with no seq, and nothing reaches the hub.
+  `send-now` answers `closed`.
+- **A closing connection** (its owner's close committed, its close input
+  not yet applied): it is still live, so its frames get seqs like any
+  other and the hub drops them.
+
+Every close input carries `frames_written` (§6.1):
 frames with a lower `seq` were written, and the rest were dropped. `history`
 shows every outgoing frame's **fate**:
 
@@ -462,7 +479,7 @@ shows every outgoing frame's **fate**:
 | --- | --- |
 | `written` | `seq < frames_written`, or the connection is live and its writer has written it. |
 | `queued` | The connection is live and the frame waits in its queue. |
-| `dropped` | `seq >= frames_written`. Or the connection was closed by a restart and the frame's record has an LSN above that close's `restart_after_lsn`. |
+| `dropped` | `seq >= frames_written`. Or the connection was closed by a restart and the frame's record has an LSN above that close's `restart_after_lsn`. Or the target is in its operation's `dropped` list: no live connection had the id. |
 | `unknown` | The connection was closed by a restart (the count died with the process) and the frame's record has an LSN at or below `restart_after_lsn`. |
 
 `kronik_connection_frames_dropped_total` counts dropped frames (§11).
@@ -945,14 +962,18 @@ comment on `EffectRecord.kind`, and:
 ```proto
 // A buffered connection operation of a turn (M24), in call order.
 message ConnectionOp {
-  // SEND: one or more connections (`broadcast`), each with its seq at the
-  // same index. CLOSE: exactly one connection, no seqs.
+  // SEND: the live targets (`broadcast` has several), each with its seq at
+  // the same index. CLOSE: at most one, no seqs.
   repeated string connections = 1;
   repeated uint64 seqs = 2;
   oneof op {
     Frame send = 3;
     ConnectionCloseRequest close = 4;
   }
+  // The targets no live connection had (ADR 0114, amended): recorded,
+  // never delivered. A SEND's targets are `connections` and `dropped`; a
+  // CLOSE has exactly one target in either list.
+  repeated string dropped = 5;
 }
 
 message ConnectionCloseRequest {
@@ -1014,8 +1035,12 @@ message ConnectionSendRequest {
   - `close.cause` is valid.
 - `ConnectionOp`:
   - `op` is set;
-  - for SEND, `connections` is non-empty and `seqs` has the same length;
-  - for CLOSE, there is one connection and no seqs;
+  - every id in `connections` and `dropped` is well formed, and no id is in
+    both or twice;
+  - for SEND, `connections` and `dropped` together are non-empty, and
+    `seqs` has the length of `connections`;
+  - for CLOSE, there is exactly one id in the two lists together, and no
+    seqs;
   - `Frame.kind` is valid.
 - `EffectRecord` of kind `connection.send-now`: the target starts with
   `connection:`.
@@ -1038,7 +1063,12 @@ reseal, erasure, `--no-pii`). It gains:
 
 `send-now` requests are already covered as `EffectRecord.request`.
 
-### 6.5 Materialized state: `connections` in `state.db`
+### 6.5 Materialized state: `connections` and `connection_history` in `state.db`
+
+Two tables with the same columns. `connections` holds the live
+connections, the only rows a turn reads. `connection_history` holds the
+closed ones, for the API and `kronik history` (ADR 0114, amended
+2026-11-13).
 
 ```sql
 CREATE TABLE IF NOT EXISTS connections (
@@ -1056,8 +1086,15 @@ CREATE TABLE IF NOT EXISTS connections (
   frames_written INTEGER,          -- from the close input, when known
   restart_after_lsn INTEGER
 );
-CREATE INDEX IF NOT EXISTS connections_owner ON connections(kind, key, closed_lsn);
+CREATE INDEX IF NOT EXISTS connections_owner ON connections(kind, key);
+-- The same columns; rows move here when their close input is applied.
+CREATE TABLE IF NOT EXISTS connection_history ( ... );
+CREATE INDEX IF NOT EXISTS connection_history_owner ON connection_history(kind, key, closed_lsn);
+CREATE INDEX IF NOT EXISTS connection_history_closed ON connection_history(closed_lsn);
 ```
+
+In `connections`, `closed_lsn`, `cause`, `code`, `frames_written` and
+`restart_after_lsn` are always null.
 
 The applier applies, per turn record, in this order:
 
@@ -1068,21 +1105,32 @@ The applier applies, per turn record, in this order:
    committed CLOSE sets `closing_lsn` if it is still unset.
 4. A frame input increments `frames_in`, unless it is a resend.
 5. A close input sets `closed_lsn`, `cause`, `code`, `frames_written` and
-   `restart_after_lsn`, if `closed_lsn` is still unset. This does not
-   depend on the turn's outcome.
+   `restart_after_lsn` on the live row and moves it, in the same
+   transaction, to `connection_history`. This does not depend on the
+   turn's outcome.
 
-Operations on ids without a row are ignored (a refused open's own frames).
+Operations on ids without a live row are ignored: a refused open's own
+frames, and the targets in `ConnectionOp.dropped`. Every row change
+names the owner as well as the id, so a record that names another actor's
+connection changes nothing.
 
-- **Other uses of the table.** It is in `snapshot.rs`'s `HASHED_TABLES`, so
-  recovery and rebuild checks cover it. It is rebuilt from the log like
-  every table (I4). It travels in snapshots and restores. Retention's index
-  compaction keeps closed rows, like `kv` rows: a turn's ownership check
-  reads them (a frame to a connection the actor closed long ago is
-  recorded and dropped, one to another actor's traps), so deleting them at
-  a time the log does not record would make a turn's outcome depend on
-  when compaction ran, in production and in replay (I1). A row is about
-  200 bytes; a deterministic compaction (one the log records) is a later
-  option.
+- **Other uses of the tables.**
+  - `connections` is in `snapshot.rs`'s `HASHED_TABLES`, so recovery and
+    rebuild checks cover it. `connection_history` is not, like
+    `turn_index`.
+  - Both are rebuilt from the log like every table (I4), and travel in
+    snapshots and restores.
+  - Retention's index compaction deletes the history rows with `closed_lsn`
+    below the first retained LSN, in the same pass that deletes
+    `turn_index` and `trees` rows below it. It works at the retention
+    base, never by wall time, and never touches `connections`.
+  - What a turn reads therefore changes only when a record of the log is
+    applied (I1). A turn that sends to a connection closed long ago gets
+    the same dropped frame whether or not compaction ran.
+  - Every frame record of a connection precedes its close, so compaction
+    never removes a history row that a retained record's fate needs.
+  - The M13 switch copies both tables' rows of the rebased actors from the
+    shadow.
 - **Replay.** Isolated replay's production cursor holds the table as of
   each root input's LSN, and the overlay applies the fork's turns to it.
   Continuous replay's fork store evolves its own table.
@@ -1143,8 +1191,8 @@ ADR 0116 has the reasoning.
   state at its LSN, including the `connections` table. A frame input's
   connection is therefore held, and its seqs equal production's.
 - **Continuous replay** evolves the fork's table under the fork's code. A
-  frame or close input whose connection the fork's actor does not hold
-  (the fork refused the open) is **not run**. It counts in
+  frame or close input whose connection is not a live connection of the
+  fork's actor (the fork refused the open) is **not run**. It counts in
   `frames.skipped`, and its production turn is missing in the fork.
 - An open that production refused and the fork accepts stays open in the
   fork. No frames ever arrive for it, and the diff shows the changed open.
@@ -1161,9 +1209,11 @@ answers `connection.send-now` as follows:
    `CLOSED`.
 2. **The same, but a different frame:** the recorded result
    (`GROUNDING_APPROXIMATE`). The frame difference goes to `frames`.
-3. **Otherwise, the connection model:** `OK` when the connection is held
-   and not closing in the fork's state at that turn, and `CLOSED`
-   otherwise (`GROUNDING_SYNTHETIC`, simulator `connection`).
+3. **Otherwise, the connection model:** `OK` when the connection is a
+   live connection of the turn's actor and not closing in the fork's state
+   at that turn, and `CLOSED` otherwise (`GROUNDING_SYNTHETIC`, simulator
+   `connection`). As in production, an id without a live connection
+   answers `CLOSED`, and another actor's live connection traps (§2.4).
 
 These effects are excluded from `grounding` and `summary.confidence`
 (`kronik-fork` `diff.rs` `external()` does not list the kind).
@@ -1388,6 +1438,10 @@ The JSON API (`/v1`, m1-core §4 conventions; OpenAPI regenerated):
 | `GET /v1/connections?actor=&kind=&state=open\|closed\|all&after=&limit=` | `read` | | `{"connections": [Connection], "next": "<id>"\|null}`, open ones by default |
 | `GET /v1/connections/{id}` | `read` | | `Connection` with `opened` and `closed` turn ids and counts; `CONNECTION_NOT_FOUND` |
 | `POST /v1/connections/{id}/close` | `operate` | `{"code": 1008, "message": "...", "reason": "...", "dry_run": false}` | `{"dry_run", "connection": Connection}`; `CONNECTION_NOT_FOUND` when not live |
+
+Closed connections come from `connection_history` (§6.5): the API lists
+them until the retention base passes their close, and after that answers
+`CONNECTION_NOT_FOUND` for them, as for their turns.
 
 `Connection`:
 

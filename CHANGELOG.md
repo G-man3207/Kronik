@@ -25,9 +25,16 @@ until the v1.0 compatibility promise takes effect.
   subprotocol, headers and the connection's subject) or refuses with an
   HTTP response. `connections.send`, `broadcast` and `close` are buffered
   in the turn record with per-connection outgoing seqs and handed to the
-  connection after the turn commits; a failed turn sends nothing. Only the
-  actor that accepted a connection may use it (`CONNECTION_NOT_HELD`,
-  new). Every accepted connection gets exactly one close input; after a
+  connection after the turn commits; a failed turn sends nothing. A turn
+  may use the live connections its actor accepted: another actor's live
+  connection traps with `CONNECTION_NOT_HELD` (new), and an operation on an
+  id without a live connection (closed, or never accepted) is recorded as
+  dropped (ADR 0114, amended). Closed connections move from state.db's
+  `connections` to `connection_history`, which retention trims at its base
+  and turns never read; offered WebSocket subprotocols are recorded only as
+  the sealable `Sec-WebSocket-Protocol` header, which the API redacts like
+  `Authorization`, and an accept records the selected one's position.
+  Every accepted connection gets exactly one close input; after a
   restart, every connection the last process held gets a host close with
   the reason `restart` (code 1012). Failed frame and close turns are dead
   letters and can be resent. New: the error code `CONNECTION_LIMIT`, the

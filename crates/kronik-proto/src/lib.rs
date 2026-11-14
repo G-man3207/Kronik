@@ -753,28 +753,31 @@ fn connection_input(c: &pb::ConnectionInput) -> Result<(), DecodeError> {
     }
 }
 
-/// A turn's buffered connection operation (M24).
+/// A turn's buffered connection operation (M24, §6.3): every target id is
+/// well formed and appears once across the live `connections` and the
+/// `dropped` ids (ADR 0114, amended); a send has a seq per live target, a
+/// close exactly one target and no seqs.
 fn connection_op(op: &pb::ConnectionOp) -> Result<(), DecodeError> {
-    for id in &op.connections {
+    let mut seen = std::collections::HashSet::new();
+    for id in op.connections.iter().chain(&op.dropped) {
         connection_id(id, "ConnectionOp.connections")?;
+        if !seen.insert(id.as_str()) {
+            return Err(invalid("ConnectionOp.connections", "a connection twice"));
+        }
     }
+    let targets = op.connections.len() + op.dropped.len();
     match &op.op {
         Some(pb::connection_op::Op::Send(f)) => {
-            if op.connections.is_empty() || op.seqs.len() != op.connections.len() {
+            if targets == 0 || op.seqs.len() != op.connections.len() {
                 return Err(invalid(
                     "ConnectionOp",
-                    "a send needs connections and one seq per connection",
+                    "a send needs targets and one seq per live connection",
                 ));
-            }
-            // The host records each target once (`broadcast` drops repeats).
-            let mut seen = std::collections::HashSet::new();
-            if !op.connections.iter().all(|c| seen.insert(c.as_str())) {
-                return Err(invalid("ConnectionOp.connections", "a connection twice"));
             }
             frame(Some(f), "ConnectionOp.send")
         }
         Some(pb::connection_op::Op::Close(close)) => {
-            if op.connections.len() != 1 || !op.seqs.is_empty() {
+            if targets != 1 || !op.seqs.is_empty() {
                 return Err(invalid(
                     "ConnectionOp",
                     "a close needs exactly one connection and no seqs",
@@ -1398,6 +1401,7 @@ mod connection_tests {
                 connections: vec![CONN.into(), "c-ffffffffffffffffffffffffffffffff".into()],
                 seqs: vec![3, 0],
                 op: Some(pb::connection_op::Op::Send(text("msg"))),
+                dropped: Vec::new(),
             },
             pb::ConnectionOp {
                 connections: vec![CONN.into()],
@@ -1406,6 +1410,7 @@ mod connection_tests {
                     code: 1000,
                     reason: plain(b"bye"),
                 })),
+                dropped: Vec::new(),
             },
         ];
         let record = Record::TurnRecord(t);
@@ -1598,43 +1603,67 @@ mod connection_tests {
 
     #[test]
     fn invalid_connection_ops() {
+        const OTHER: &str = "c-ffffffffffffffffffffffffffffffff";
         let base = turn(frame_input(pb::ConnectionProtocol::Websocket));
         let with = |op: pb::ConnectionOp| pb::TurnRecord {
             connection_ops: vec![op],
             ..base.clone()
         };
-        let send = |connections: Vec<&str>, seqs: Vec<u64>| pb::ConnectionOp {
-            connections: connections.into_iter().map(String::from).collect(),
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let send = |connections: &[&str], seqs: Vec<u64>, dropped: &[&str]| pb::ConnectionOp {
+            connections: ids(connections),
             seqs,
             op: Some(pb::connection_op::Op::Send(text("x"))),
+            dropped: ids(dropped),
         };
-        let close = |connections: Vec<&str>, seqs: Vec<u64>| pb::ConnectionOp {
-            connections: connections.into_iter().map(String::from).collect(),
+        let close = |connections: &[&str], seqs: Vec<u64>, dropped: &[&str]| pb::ConnectionOp {
+            connections: ids(connections),
             seqs,
             op: Some(pb::connection_op::Op::Close(pb::ConnectionCloseRequest {
                 code: 1000,
                 reason: None,
             })),
+            dropped: ids(dropped),
         };
-        assert!(check(with(send(vec![CONN], vec![0]))).is_ok());
-        assert!(check(with(close(vec![CONN], vec![]))).is_ok());
+        // ADR 0114 (amended): live targets with seqs, dropped ones without.
+        for op in [
+            send(&[CONN], vec![0], &[]),
+            send(&[CONN], vec![0], &[OTHER]),
+            send(&[], vec![], &[OTHER]),
+            close(&[CONN], vec![], &[]),
+            close(&[], vec![], &[OTHER]),
+        ] {
+            assert!(check(with(op.clone())).is_ok(), "{op:?}");
+        }
         for (what, op) in [
             (
                 "no op",
                 pb::ConnectionOp {
                     op: None,
-                    ..send(vec![CONN], vec![0])
+                    ..send(&[CONN], vec![0], &[])
                 },
             ),
-            ("send without targets", send(vec![], vec![])),
-            ("send with a seq missing", send(vec![CONN, CONN], vec![0])),
-            ("send to a bad id", send(vec!["x"], vec![0])),
-            ("close with seqs", close(vec![CONN], vec![1])),
+            ("send without targets", send(&[], vec![], &[])),
+            (
+                "send with a seq missing",
+                send(&[CONN, OTHER], vec![0], &[]),
+            ),
+            ("a seq for a dropped target", send(&[], vec![0], &[OTHER])),
+            ("send to a bad id", send(&["x"], vec![0], &[])),
+            ("a bad dropped id", send(&[CONN], vec![0], &["c-x"])),
+            ("close with seqs", close(&[CONN], vec![1], &[])),
             (
                 "send to one connection twice",
-                send(vec![CONN, CONN], vec![0, 1]),
+                send(&[CONN, CONN], vec![0, 1], &[]),
             ),
-            ("close of two", close(vec![CONN, CONN], vec![])),
+            ("live and dropped at once", send(&[CONN], vec![0], &[CONN])),
+            ("dropped twice", send(&[], vec![], &[OTHER, OTHER])),
+            ("close of two", close(&[CONN, OTHER], vec![], &[])),
+            (
+                "close of a live and a dropped",
+                close(&[CONN], vec![], &[OTHER]),
+            ),
+            ("close of nothing", close(&[], vec![], &[])),
             (
                 "send kind 0",
                 pb::ConnectionOp {
@@ -1642,7 +1671,7 @@ mod connection_tests {
                         kind: 0,
                         ..text("x")
                     })),
-                    ..send(vec![CONN], vec![0])
+                    ..send(&[CONN], vec![0], &[])
                 },
             ),
         ] {

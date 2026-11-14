@@ -194,17 +194,108 @@ async fn run_full(program: &Program, actor: &str, input: pb::Input) -> kronik_ru
         .unwrap()
 }
 
-/// M24 §2.4: a turn may use only the connections it holds; anything else
-/// traps with CONNECTION_NOT_HELD. An empty broadcast does nothing.
+/// A state view with live connections: id -> (owned by the turn's actor,
+/// next seq).
+struct Live(BTreeMap<String, (bool, u64)>);
+
+impl StateView for Live {
+    fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
+    fn keys(&self, _prefix: &str) -> Result<Vec<String>, String> {
+        Ok(vec![])
+    }
+    fn timer_pending(&self, _id: u64) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn connection(&self, id: &str) -> Result<Option<kronik_runtime::ConnectionView>, String> {
+        Ok(self
+            .0
+            .get(id)
+            .map(|(own, next_seq)| kronik_runtime::ConnectionView {
+                owner_is_self: *own,
+                protocol: pb::ConnectionProtocol::Websocket,
+                next_seq: *next_seq,
+                closing: false,
+            }))
+    }
+}
+
+async fn run_with(program: &Program, input: pb::Input, live: &Live) -> kronik_runtime::TurnOutput {
+    program
+        .run(
+            TurnRequest {
+                actor: ActorRef::parse("room/a").unwrap(),
+                causal_key: kronik_core::causal::root("r".into()),
+                logical_time_ms: 1_761_300_000_000,
+                seed: [7; 32],
+                input,
+                limits: TurnLimits::default(),
+                subject: None,
+            },
+            Arc::new(Live(live.0.clone())),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+}
+
+/// ADR 0114 (amended 2026-11-13): the turn's own live connection takes the
+/// next seq; another actor's live connection traps with
+/// CONNECTION_NOT_HELD; an id that no live connection has is recorded as
+/// dropped, without a seq, and the turn commits; a malformed id traps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn connection_operations_need_held_connections() {
+async fn live_connections_are_held_dead_ids_are_dropped() {
+    const MINE: &str = "c-11111111111111111111111111111111";
+    const THEIRS: &str = "c-22222222222222222222222222222222";
+    const GONE: &str = "c-33333333333333333333333333333333";
     let code = store();
     let (_, room) = code.add(ROOM).unwrap();
-    let outcome = run(&room, "room/a", message("kick", CONN.as_bytes())).await;
-    assert_eq!(outcome.kind, pb::OutcomeKind::Trap as i32, "{outcome:?}");
-    assert_eq!(outcome.error_code, "CONNECTION_NOT_HELD", "{outcome:?}");
-    assert!(outcome.message.contains(CONN), "{outcome:?}");
-    let out = run_full(&room, "room/a", message("say", b"hi")).await;
+    let live = Live(BTreeMap::from([
+        (MINE.to_owned(), (true, 7)),
+        (THEIRS.to_owned(), (false, 0)),
+    ]));
+    // A message `kick <conn>` closes `conn` (buffered).
+    let out = run_with(&room, message("kick", MINE.as_bytes()), &live).await;
+    assert!(out.committed(), "{:?}", out.outcome);
+    assert_eq!(out.connection_ops.len(), 1);
+    assert_eq!(out.connection_ops[0].connections, [MINE]);
+    assert!(out.connection_ops[0].dropped.is_empty());
+
+    let out = run_with(&room, message("kick", GONE.as_bytes()), &live).await;
+    assert!(out.committed(), "{:?}", out.outcome);
+    assert!(out.connection_ops[0].connections.is_empty());
+    assert_eq!(out.connection_ops[0].dropped, [GONE]);
+    assert!(out.connection_ops[0].seqs.is_empty());
+
+    let out = run_with(&room, message("kick", THEIRS.as_bytes()), &live).await;
+    assert_eq!(
+        out.outcome.error_code, "CONNECTION_NOT_HELD",
+        "{:?}",
+        out.outcome
+    );
+    assert!(out.outcome.message.contains(THEIRS), "{:?}", out.outcome);
+    assert!(out.connection_ops.is_empty());
+
+    let out = run_with(&room, message("kick", b"c-not-an-id"), &live).await;
+    assert_eq!(
+        out.outcome.kind,
+        pb::OutcomeKind::Trap as i32,
+        "{:?}",
+        out.outcome
+    );
+    assert_eq!(out.outcome.error_code, "TURN_FAILED", "{:?}", out.outcome);
+    assert!(
+        out.outcome.message.contains("is not a connection id"),
+        "{:?}",
+        out.outcome
+    );
+
+    // A broadcast splits its targets: live ones with seqs from next_seq,
+    // dead ones dropped; the operator's `say` broadcasts to the members in
+    // state, here none, which records nothing.
+    let out = run_with(&room, message("say", b"hi"), &live).await;
     assert!(out.committed(), "{:?}", out.outcome);
     assert!(out.connection_ops.is_empty());
 }
@@ -240,9 +331,9 @@ async fn connection_inputs_call_the_connection_handler() {
     assert_eq!(out.outcome.kind, pb::OutcomeKind::Failed as i32);
     assert!(out.connection_ops.is_empty() && out.writes.is_empty());
 
-    // A frame and a close of a connection the actor does not hold (the
-    // state view here has no rows): the frame's `echo` traps, the close
-    // handler runs.
+    // A frame and a close of a connection without a live row (the state
+    // view here has none): the frame's `echo` is recorded as dropped, the
+    // close handler runs.
     let frame = connection(pb::connection_input::Event::Frame(pb::ConnectionFrame {
         seq: 0,
         frame: Some(pb::Frame {
@@ -255,10 +346,12 @@ async fn connection_inputs_call_the_connection_handler() {
         }),
     }));
     let out = run_full(&room, "room/a", frame.clone()).await;
+    assert!(out.committed(), "{:?}", out.outcome);
+    assert_eq!(out.connection_ops.len(), 1);
     assert_eq!(
-        out.outcome.error_code, "CONNECTION_NOT_HELD",
-        "{:?}",
-        out.outcome
+        out.connection_ops[0].dropped,
+        [CONN],
+        "no live row: dropped"
     );
     let close = connection(pb::connection_input::Event::Close(pb::ConnectionClose {
         cause: pb::CloseCause::Restart as i32,

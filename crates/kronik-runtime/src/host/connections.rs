@@ -5,12 +5,15 @@
 //! `send`, `broadcast` and `close` are buffered in call order, like
 //! `messaging.send`, and leave the turn through
 //! [`crate::turn::TurnOutput::connection_ops`] only when it commits. A
-//! turn may use the connection its open input names and every connection
-//! its actor accepted (ADR 0114); any other id traps with
-//! `CONNECTION_NOT_HELD`. At the end of the turn the buffered frames take
-//! their outgoing seqs (§4.5): after the connection's `next_seq` as of the
-//! turn's start (0 for the connection the turn opens) and after the frames
-//! the turn sent with `send-now`.
+//! turn may use the connection its open input names and the live
+//! connections its actor accepted (ADR 0114, amended 2026-11-13). Another
+//! actor's live connection traps with `CONNECTION_NOT_HELD`, and so does a
+//! malformed id; an id that no live connection has (it closed, or none was
+//! ever accepted) is recorded as dropped and never delivered. At the end of
+//! the turn the buffered frames to live connections take their outgoing
+//! seqs (§4.5): after the connection's `next_seq` as of the turn's start (0
+//! for the connection the turn opens) and after the frames the turn sent
+//! with `send-now`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -32,6 +35,15 @@ pub const MAX_REASON_BYTES: usize = 123;
 /// The trap message prefix of an id the turn does not hold; the turn's
 /// error code is then `CONNECTION_NOT_HELD`.
 pub const NOT_HELD: &str = "CONNECTION_NOT_HELD";
+
+/// What a turn may do with a connection id (ADR 0114, amended).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// The connection this turn opens, or a live connection of its actor.
+    Held(pb::ConnectionProtocol),
+    /// No live connection has the id: recorded as dropped, never delivered.
+    Dropped,
+}
 
 /// The connection state of one turn.
 #[derive(Default)]
@@ -95,38 +107,41 @@ pub fn valid_close_code(code: u16) -> bool {
 }
 
 impl TurnHost {
-    /// The protocol of `conn` when this turn holds it; otherwise the turn
-    /// traps with `CONNECTION_NOT_HELD` (ADR 0114).
-    fn held(&mut self, conn: &str) -> wasmtime::Result<pb::ConnectionProtocol> {
+    /// What this turn may do with `conn` (ADR 0114, amended): a held
+    /// connection, or a dropped target. Another actor's live connection
+    /// traps with `CONNECTION_NOT_HELD`, and a malformed id traps.
+    pub(crate) fn target(&mut self, conn: &str) -> wasmtime::Result<Target> {
         if let Some((id, protocol)) = &self.conns.opening
             && id == conn
         {
-            return Ok(*protocol);
+            return Ok(Target::Held(*protocol));
+        }
+        if !kronik_proto::connection::valid_id(conn) {
+            bail!(
+                "connections: {conn:?} is not a connection id: c- and 32 lowercase hex \
+                 characters"
+            );
         }
         let view = match self.conns.views.get(conn) {
             Some(view) => *view,
             None => {
-                // An id that is not one never has a row: no lookup.
-                let view = if kronik_proto::connection::valid_id(conn) {
-                    let state = self.state_view()?.clone();
-                    match state.connection(conn) {
-                        Ok(view) => view,
-                        Err(e) => return Err(self.host_failure(e)),
-                    }
-                } else {
-                    None
+                let state = self.state_view()?.clone();
+                let view = match state.connection(conn) {
+                    Ok(view) => view,
+                    Err(e) => return Err(self.host_failure(e)),
                 };
                 self.conns.views.insert(conn.to_owned(), view);
                 view
             }
         };
         match view {
-            Some(v) if v.owner_is_self => Ok(v.protocol),
-            _ => bail!(
-                "{NOT_HELD}: {} did not accept connection {conn:?}; only the actor that \
-                 accepted a connection sends on it or closes it",
+            Some(v) if v.owner_is_self => Ok(Target::Held(v.protocol)),
+            Some(_) => bail!(
+                "{NOT_HELD}: connection {conn:?} is another actor's; only the actor that \
+                 accepted a connection sends on it or closes it ({} did not)",
                 self.actor
             ),
+            None => Ok(Target::Dropped),
         }
     }
 
@@ -204,13 +219,22 @@ impl TurnHost {
 impl wit::Host for TurnHost {
     async fn send(&mut self, conn: String, frame: wit::Frame) -> wasmtime::Result<()> {
         self.deny_in_describe("connections")?;
-        let protocol = self.held(&conn)?;
-        let (frame, bytes) = self.frame_to_pb(frame, &[protocol])?;
+        let target = self.target(&conn)?;
+        let protocols: &[pb::ConnectionProtocol] = match &target {
+            Target::Held(p) => std::slice::from_ref(p),
+            Target::Dropped => &[],
+        };
+        let (frame, bytes) = self.frame_to_pb(frame, protocols)?;
         self.charge_operation(1, bytes)?;
+        let (connections, dropped) = match target {
+            Target::Held(_) => (vec![conn], Vec::new()),
+            Target::Dropped => (Vec::new(), vec![conn]),
+        };
         self.conns.ops.push(pb::ConnectionOp {
-            connections: vec![conn],
+            connections,
             seqs: Vec::new(),
             op: Some(pb::connection_op::Op::Send(frame)),
+            dropped,
         });
         Ok(())
     }
@@ -219,33 +243,41 @@ impl wit::Host for TurnHost {
         self.deny_in_describe("connections")?;
         // The first occurrence of an id keeps its place.
         let mut seen = HashSet::new();
-        let mut targets = Vec::new();
+        let mut live = Vec::new();
+        let mut dropped = Vec::new();
         let mut protocols = Vec::new();
         for conn in conns {
             if seen.contains(&conn) {
                 continue;
             }
-            protocols.push(self.held(&conn)?);
-            seen.insert(conn.clone());
-            targets.push(conn);
+            match self.target(&conn)? {
+                Target::Held(p) => {
+                    protocols.push(p);
+                    live.push(conn.clone());
+                }
+                Target::Dropped => dropped.push(conn.clone()),
+            }
+            seen.insert(conn);
         }
         let (frame, bytes) = self.frame_to_pb(frame, &protocols)?;
-        if targets.is_empty() {
+        let targets = live.len() + dropped.len();
+        if targets == 0 {
             self.charge_operation(0, 0)?;
             return Ok(());
         }
-        self.charge_operation(targets.len(), bytes)?;
+        self.charge_operation(targets, bytes)?;
         self.conns.ops.push(pb::ConnectionOp {
-            connections: targets,
+            connections: live,
             seqs: Vec::new(),
             op: Some(pb::connection_op::Op::Send(frame)),
+            dropped,
         });
         Ok(())
     }
 
     async fn close(&mut self, conn: String, code: u16, reason: String) -> wasmtime::Result<()> {
         self.deny_in_describe("connections")?;
-        self.held(&conn)?;
+        let target = self.target(&conn)?;
         if !valid_close_code(code) {
             bail!(
                 "connections: close code {code} is not allowed; use 1000, 1001, 1003, 1007, \
@@ -259,8 +291,12 @@ impl wit::Host for TurnHost {
             );
         }
         self.charge_operation(1, reason.len())?;
+        let (connections, dropped) = match target {
+            Target::Held(_) => (vec![conn], Vec::new()),
+            Target::Dropped => (Vec::new(), vec![conn]),
+        };
         self.conns.ops.push(pb::ConnectionOp {
-            connections: vec![conn],
+            connections,
             seqs: Vec::new(),
             op: Some(pb::connection_op::Op::Close(pb::ConnectionCloseRequest {
                 code: u32::from(code),
@@ -269,6 +305,7 @@ impl wit::Host for TurnHost {
                     value: Some(pb::sealable::Value::Plain(reason.into_bytes())),
                 }),
             })),
+            dropped,
         });
         Ok(())
     }
@@ -317,6 +354,7 @@ mod tests {
             connections: conns.iter().map(|s| (*s).into()).collect(),
             seqs: vec![],
             op: Some(pb::connection_op::Op::Send(pb::Frame::default())),
+            dropped: Vec::new(),
         };
         c.ops = vec![
             send(&["c-new"]),
@@ -327,6 +365,7 @@ mod tests {
                 op: Some(pb::connection_op::Op::Close(
                     pb::ConnectionCloseRequest::default(),
                 )),
+                dropped: Vec::new(),
             },
             send(&["c-old"]),
         ];

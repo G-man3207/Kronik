@@ -199,7 +199,9 @@ interface connections {
   }
 
   /// Buffered: sent after this turn commits, in call order; nothing if the
-  /// turn fails. Traps on a connection this actor does not hold.
+  /// turn fails. Traps on another actor's live connection; to a connection
+  /// that is not live (closed, or never accepted) the frame is recorded as
+  /// dropped.
   send: func(conn: connection-id, frame: frame);
   /// `send` to each of `conns`, recorded once.
   broadcast: func(conns: list<connection-id>, frame: frame);

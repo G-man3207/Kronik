@@ -2361,7 +2361,7 @@ impl Node {
             self.hub.settle_open(actor, c, &outcome);
         }
         if !connection_ops.is_empty() {
-            self.hub.deliver(&connection_ops);
+            self.hub.deliver(actor, &connection_ops);
         }
         for m in messages {
             self.deliver(actor, &key, time, m, pb::MessageSource::Actor, "", born);
