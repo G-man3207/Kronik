@@ -1566,7 +1566,8 @@ impl World {
         // OK sends, both ways, and outcome-unknown ones.
         let mut performed: BTreeMap<(String, u32), BTreeSet<(String, u64)>> = BTreeMap::new();
         let mut sent_now: BTreeMap<(String, u64), BTreeMap<String, Content>> = BTreeMap::new();
-        let mut unknowns: BTreeMap<(String, u32), (String, Content)> = BTreeMap::new();
+        // Outcome-unknown sends: the seq each may have been sent with.
+        let mut unknowns: BTreeMap<(String, u32), (String, u64, Content)> = BTreeMap::new();
         let mut note = |exec: &str, e: &pb::EffectRecord| {
             let Some(req) = decode(e) else {
                 return;
@@ -1587,7 +1588,10 @@ impl World {
                     .or_default()
                     .insert(exec.to_owned(), content);
             } else if e.status == unknown {
-                unknowns.insert((exec.to_owned(), e.ordinal), (req.connection, content));
+                unknowns.insert(
+                    (exec.to_owned(), e.ordinal),
+                    (req.connection, req.seq, content),
+                );
             }
         };
         for (lsn, record) in records {
@@ -1649,6 +1653,17 @@ impl World {
                 ));
             }
         }
+        // An outcome-unknown send keeps the seq it may have used: no later
+        // frame of its connection takes it.
+        for ((exec, ordinal), (conn, seq, _)) in &unknowns {
+            if f.sent.contains_key(&(conn.clone(), *seq))
+                || sent_now.contains_key(&(conn.clone(), *seq))
+            {
+                self.violation(format!(
+                    "C5: {conn} seq {seq} of the outcome-unknown send-now {ordinal} of {exec} is also another frame"
+                ));
+            }
+        }
         let unresolved = std::mem::take(&mut self.st().conns.unresolved);
         let mut claimed: BTreeSet<(String, u32)> = BTreeSet::new();
         for u in unresolved {
@@ -1674,13 +1689,13 @@ impl World {
                 continue;
             }
             // A send whose turn crashed before its result was durable: the
-            // re-run recorded it outcome-unknown without a seq (I17), and
-            // may have given the seq to a buffered frame that the restart's
-            // close dropped (C4 sees one written twice).
+            // re-run recorded it outcome-unknown, with the seq it may have
+            // been sent with (I17).
             let explained = unknowns
                 .iter()
-                .find(|(k, (conn, sent))| {
+                .find(|(k, (conn, seq, sent))| {
                     *conn == u.conn
+                        && *seq == u.seq
                         && u.begins.contains(&k.0)
                         && !claimed.contains(*k)
                         && *sent == got
