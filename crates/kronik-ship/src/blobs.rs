@@ -307,7 +307,7 @@ pub(crate) async fn ship_blob(
     let rel = remote_name(id);
     // Without a record (a lost ship-blobs.db, a restored node) the bucket may
     // hold it already: taken as it is only when its header has this file's
-    // body digest. An object of a file that changed since is replaced.
+    // body digest. A plain object of a file resealed since is replaced.
     if shipped.digest(&name)?.is_none()
         && remote
             .header(&rel)
@@ -380,9 +380,13 @@ pub(crate) async fn reupload_marked(
                         .map_err(|why| ShipError::Restore(format!("blob {id}: {why}")))?;
                     if !header.sealed {
                         false
-                    } else if shipped.digest(&name)?.is_none() {
-                        // Never in the bucket: step 1 uploads the sealed file
-                        // when what references it ships.
+                    } else if shipped.digest(&name)?.is_none()
+                        && !remote.exists(&remote_name(&id)).await?
+                    {
+                        // Not in the bucket: step 1 uploads the sealed file
+                        // when what references it ships. (Without a record
+                        // the bucket is asked: a restored node starts with
+                        // none, and its bucket holds the plain object.)
                         true
                     } else {
                         let len = file.metadata()?.len();
@@ -826,6 +830,15 @@ impl Remote {
         }
         upload.complete().await.map_err(|e| self.store_error(e))?;
         Ok(())
+    }
+
+    /// Whether an object exists under `rel`.
+    pub(crate) async fn exists(&self, rel: &str) -> Result<bool, ShipError> {
+        match self.store.head(&self.key(rel)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(self.store_error(e)),
+        }
     }
 
     /// The header of the blob object under `rel`; `None` when there is no

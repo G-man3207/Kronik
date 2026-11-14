@@ -622,9 +622,10 @@ fn a_resealed_blob_replaces_its_plain_object() {
     std::fs::write(mark(&local_id.file_name()), b"").unwrap();
     let report = p.ship(&remote, src.path()).unwrap();
     assert!(report.objects >= 2, "{report:?}");
-    assert_eq!(
-        p.rt.block_on(remote.get(&object(&shipped.hash))).unwrap(),
-        bytes
+    let object = p.rt.block_on(remote.get(&object(&shipped.hash))).unwrap();
+    assert!(
+        object == bytes,
+        "the bucket does not have the sealed object"
     );
     assert_eq!(std::fs::read_dir(&marks).unwrap().count(), 0);
     // Recorded with their new digests: nothing to upload again.
@@ -632,8 +633,8 @@ fn a_resealed_blob_replaces_its_plain_object() {
 }
 
 /// A stand-in for `privacy reseal` sealing a file in place: its header says
-/// sealed, of subject `user:1` at key version 1; the frames are kept, which
-/// the shipper does not read. Returns the file's new bytes.
+/// sealed, of subject `user:1` at key version 1, with another body digest;
+/// the frames are kept, which the shipper does not read. Returns the file's new bytes.
 fn seal_stand_in(file: &Path) -> Vec<u8> {
     use kronik_blob::format::{HEADER_LEN, Header};
     let mut bytes = std::fs::read(file).unwrap();
@@ -641,7 +642,31 @@ fn seal_stand_in(file: &Path) -> Vec<u8> {
     header.sealed = true;
     header.subject = Some("user:1".into());
     header.key_version = 1;
+    // Sealed frames have another body digest.
+    header.body_digest = *blake3::hash(&header.body_digest).as_bytes();
     bytes[..HEADER_LEN].copy_from_slice(&header.encode());
     std::fs::write(file, &bytes).unwrap();
     bytes
+}
+
+/// Review H-1: a restored node starts without ship-blobs.db while its
+/// bucket holds the plain objects. A blob it reseals (marked) is uploaded
+/// over its plain object, although nothing records it as shipped.
+#[test]
+fn a_restored_node_replaces_a_plain_object_it_resealed() {
+    let (_bucket, remote, blob, key) = shipped_plain_blob();
+    let (dst, q) = restored(&remote, &key);
+    let id = BlobId::parse(&blob.hash).unwrap();
+    let file = q.node.blob_store().unwrap().object_path(&Space::Main, &id);
+    let sealed = seal_stand_in(&file);
+    let marks = kronik_store::ship_blobs::reupload_dir(dst.path());
+    std::fs::create_dir_all(&marks).unwrap();
+    std::fs::write(marks.join(id.file_name()), b"").unwrap();
+    q.ship(&remote, dst.path()).unwrap();
+    let object = q.rt.block_on(remote.get(&object(&blob.hash))).unwrap();
+    assert!(
+        object == sealed,
+        "the bucket does not have the sealed object"
+    );
+    assert_eq!(std::fs::read_dir(&marks).unwrap().count(), 0);
 }
