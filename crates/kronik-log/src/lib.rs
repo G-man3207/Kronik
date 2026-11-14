@@ -1219,20 +1219,24 @@ async fn writer(
     committed: mpsc::UnboundedSender<Committed>,
     fatal: oneshot::Sender<String>,
 ) {
+    // One batch for every group commit, emptied by each: a fresh one grew
+    // by doubling every time, and above 32 KiB the release build's allocator
+    // maps and unmaps each step (docs/perf.md).
+    let mut batch = Vec::new();
     while let Some(first) = rx.recv().await {
         if !cfg.group_commit_window.is_zero() {
             env.clock.sleep(cfg.group_commit_window).await;
         }
-        let mut batch = vec![first];
+        batch.push(first);
         while let Ok(a) = rx.try_recv() {
             batch.push(a);
         }
-        let result = write_batch(&env, &cfg, &mut seg, &mut next_lsn, batch, &committed).await;
+        let result = write_batch(&env, &cfg, &mut seg, &mut next_lsn, &mut batch, &committed).await;
         committed_head.store(next_lsn.saturating_sub(1), Ordering::Release);
-        if let Err((msg, batch)) = result {
+        if let Err(msg) = result {
             rx.close();
             // Never retry a failed write or fsync: fail every waiter and stop.
-            for a in batch {
+            for a in batch.drain(..) {
                 let _ = a.done.send(Err(msg.clone()));
             }
             while let Ok(a) = rx.try_recv() {
@@ -1243,8 +1247,6 @@ async fn writer(
         }
     }
 }
-
-type BatchError = (String, Vec<Append>);
 
 /// Appends the footer at the segment's current end and fsyncs it. The caller
 /// then switches to a new segment; nothing is appended after the footer.
@@ -1257,23 +1259,25 @@ async fn write_footer(seg: &Segment) -> Result<(), LogError> {
     Ok(())
 }
 
+/// Writes and fsyncs `batch` and hands every append its LSN, which leaves
+/// `batch` empty. On an error the appends not yet handed over stay in it.
 async fn write_batch(
     env: &Env,
     cfg: &LogConfig,
     seg: &mut Segment,
     next_lsn: &mut Lsn,
-    batch: Vec<Append>,
+    batch: &mut Vec<Append>,
     committed: &mpsc::UnboundedSender<Committed>,
-) -> Result<(), BatchError> {
+) -> Result<(), String> {
     let has_entries = *next_lsn > seg.start_lsn;
     let age = env.clock.monotonic().saturating_sub(seg.opened_at);
     if has_entries && (seg.offset >= cfg.segment_max_bytes || age >= cfg.segment_max_age) {
         if let Err(e) = write_footer(seg).await {
-            return Err((format!("segment footer failed: {e}"), batch));
+            return Err(format!("segment footer failed: {e}"));
         }
         match create_segment(env, cfg, *next_lsn).await {
             Ok(new) => *seg = new,
-            Err(e) => return Err((format!("segment roll failed: {e}"), batch)),
+            Err(e) => return Err(format!("segment roll failed: {e}")),
         }
     }
     let mut buf = Vec::new();
@@ -1287,7 +1291,6 @@ async fn write_batch(
     let len = buf.len() as u64;
     let first_lsn = *next_lsn;
     let mut res = seg.file.write_at(seg.offset, Bytes::from(buf)).await;
-    let mut batch = batch;
     if cfg.mutation_ack_before_fsync && res.is_ok() {
         deliver(
             seg.start_lsn,
@@ -1307,7 +1310,7 @@ async fn write_batch(
         );
     }
     if let Err(e) = res {
-        return Err((format!("log write/fsync failed: {e}"), batch));
+        return Err(format!("log write/fsync failed: {e}"));
     }
     seg.offset += len;
     *next_lsn += offsets.len() as u64;
@@ -1320,7 +1323,7 @@ async fn write_batch(
         seg.start_lsn,
         first_lsn,
         &offsets,
-        batch.into_iter(),
+        batch.drain(..),
         committed,
     );
     Ok(())
