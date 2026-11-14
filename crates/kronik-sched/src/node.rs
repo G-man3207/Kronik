@@ -492,18 +492,12 @@ async fn replay_unapplied(
     } else {
         config.apply_batch
     };
-    let width = decode_ahead(config);
-    let result = replay_segments(
-        env,
-        rebase,
-        store,
-        applied + 1,
-        upto,
+    let shape = ReplayShape {
         bulk,
         batch_cap,
-        width,
-    )
-    .await;
+        width: decode_ahead(config),
+    };
+    let result = replay_segments(env, rebase, store, applied + 1, upto, shape).await;
     match result {
         // Journaling was off: the file may hold part of a failed batch. Its
         // marker stays, so the next start rebuilds it.
@@ -519,16 +513,28 @@ async fn replay_unapplied(
     }
 }
 
+/// How a startup replay applies and decodes: in bulk or not, the records per
+/// transaction, and the segments decoded ahead.
+#[derive(Clone, Copy)]
+struct ReplayShape {
+    bulk: bool,
+    batch_cap: usize,
+    width: usize,
+}
+
 async fn replay_segments(
     env: &Env,
     rebase: &crate::rebase::RebaseCtx,
     store: &Store,
     from: Lsn,
     upto: Lsn,
-    bulk: bool,
-    batch_cap: usize,
-    width: usize,
+    shape: ReplayShape,
 ) -> Result<(), StartError> {
+    let ReplayShape {
+        bulk,
+        batch_cap,
+        width,
+    } = shape;
     let reader = &rebase.reader;
     let starts = reader.starts().await?;
     let mut segs = Vec::new();
