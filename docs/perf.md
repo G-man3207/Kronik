@@ -916,6 +916,53 @@ keeps resident per reused slot ([Memory cost of the resident Wasm
 memories](#memory-cost-of-the-resident-wasm-memories)), a trade-off measured
 with glibc's faster `memset`.
 
+## Allocations on the turn path (2026-11-14)
+
+The profile above traced the release build's `mmap` and `munmap` calls to
+one block per turn: the boxed task of an actor's worker, spawned whenever a
+job reaches an idle actor. An async block in the task spawner kept that
+future twice (rust-lang/rust#62958), and the worker's future had grown to
+37 KiB on its own, so the box was about 74 KiB, well above the 32 KiB from
+which zig's allocator maps and unmaps every block. Three changes: the
+spawner boxes a task at the size of its future; five awaits of rare
+branches on the turn path (a full blob store, an open turn that cannot run
+again, a recorded secret version that is gone) await boxed futures, which
+leaves the worker's future under the line (28 400 bytes in the build
+measured below, 29 808 with M26;
+`crates/kronik-sched/tests/worker_size.rs` keeps it under 31 KiB); and the
+log writer reuses one batch for every group commit instead of growing a new
+one.
+
+Measured on the test machine, confined as above (2026-11-14, 20:49 to 21:22
+UTC), with static musl builds as the release builds them of `main` at
+`f6048eb0` (SHA-256
+`b29077683a9ccd3790474b622ef5e9cbb6357cc065ce846d5678d75ff83ef277`) and of
+the same commit with the three changes
+(`7e26b5232c68b7d443702ef359a6e50d0863212456478965d009eba09e989741`), at the
+default concurrency of [ADR 0140](adr/0140-default-concurrency-follows-the-cpus.md)
+(16 on two CPUs). `scripts/perf-m1.sh`, medians of three interleaved
+rounds, committed turns/s (p50 / p99 in ms), no errors:
+
+| Workload | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 1 actor, 1 client | 129 (7.6 / 15.2) | 133 (7.3 / 13.4) | +4 % |
+| 1 actor, 16 clients | 145 (109 / 138) | 145 (109 / 138) | 0 % |
+| 64 actors, 64 clients | 2 450 (24.1 / 52.4) | 2 968 (18.9 / 50.3) | +21 % |
+| 256 actors, 256 clients | 2 596 (98.6 / 155.2) | 3 021 (83.9 / 146.8) | +16 % |
+| 256 actors, open loop 200 req/s | 200 (8.1 / 29.4) | 200 (8.1 / 31.5) | |
+
+- The open-loop p99 is noisy on this machine (28.3 to 39.8 ms over the six
+  runs above). Six more interleaved runs of that row alone, each on a fresh
+  daemon, gave a median p99 of 19.7 ms before and 16.5 ms after.
+- Over 10 s at the 64-actor row (`strace -c`), the release build made
+  4 932 `mmap` and 4 949 `munmap` calls before and 160 and 161 after.
+- M24's criterion 1 for 10 minutes at the default concurrency passed every
+  condition with both builds: before, p99 172 ms, `VmHWM` 481 MiB and
+  `VmRSS` +0.9 % (the heap +4.5 MiB); after, p99 124 ms, `VmHWM` 487 MiB and
+  `VmRSS` +3.2 % (the heap +10.7 MiB). The worker's boxes now come from the
+  allocator's size classes and are kept for reuse instead of returned, a few
+  MiB.
+
 ## M32 benchmark and regression contract
 
 The M32 targets are unchanged:
