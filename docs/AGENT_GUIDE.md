@@ -56,7 +56,8 @@ personal data unless your token has `pii:read`.
 ### 2. Read the history
 
 - `query_history` with `{"actor": "kind/key", "limit": 20}` gives turns,
-  newest first. Each turn has its input (HTTP request, message or timer),
+  newest first. Each turn has its input (HTTP request, message, timer, or a
+  connection's open, incoming frame or close),
   its outcome (`committed` or `failed`, with an error code), the state it
   wrote, the messages it sent, and its effects: kind, target, status and
   delivery. An effect that used a secret also lists it in `secrets`, with
@@ -78,6 +79,8 @@ personal data unless your token has `pii:read`.
 
 Write the new code and build it into a component. In a Kronik project,
 `kronik build` writes `dist/<name>.wasm`. Keep the actor kind and its routes.
+If its routes include `WEBSOCKET` or `SSE`, the component must still export
+`kronik:actor/connection-handler`, or propose refuses it with `BAD_REQUEST`.
 Pass the component's bytes as base64. A request may be up to 64 MiB, over
 stdio as over HTTP: a TypeScript component, about 17.5 MB in base64, fits.
 
@@ -254,6 +257,8 @@ never “fix” missing key material by making a new seed over existing data.
 | `NOTHING_TO_PROPOSE` | Main already runs every component you passed. Nothing changed: stop proposing, or change the code and build it again. |
 | `VERIFY_REQUIRED` | A kind with history only changes through `propose_change`. |
 | `CAPABILITY_NOT_GRANTED` | The code calls a target it has no grant for. In a fork that call is denied; in production a human grants it. |
+| `CONNECTION_NOT_HELD` | The code sends on, or closes, a WebSocket or SSE connection that another actor accepted. Only the accepting actor may; pass the message to it instead. |
+| `SECRET_UNAVAILABLE` | A secret's value cannot be read now, often a linked secret whose backend is down. A fork never fetches one: it uses only a value the node already holds for the fork point. Ask the operator; do not retry in a loop. |
 | `ACTOR_NOT_FOUND`, `FORK_NOT_FOUND`, `PROPOSAL_NOT_FOUND`, `TURN_NOT_FOUND` | Check the id: list again. |
 | `UNAUTHENTICATED` | Your token is missing, unknown or revoked. |
 | `KEY_SOURCE_UNAVAILABLE` | A KMS operation could not complete within its total budget. Ask the operator to check provider reachability, credentials and key versions; the running node may still have its loaded key. |

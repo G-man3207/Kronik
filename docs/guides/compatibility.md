@@ -63,6 +63,12 @@ patch updates. Follow `kronik upgrade check` and
 identity and code hash. Do not rewrite historical engine names to make a check
 pass.
 
+Each release is a new engine, so a data directory that another release wrote
+starts only after a passing `kronik upgrade check` with the new binary; the
+operations guide has the procedure ([Upgrading to a new
+release](operations.md#upgrading-to-a-new-release)) and what changes for the
+data of v0.4.1 ([Upgrading from v0.4.1](operations.md#upgrading-from-v041)).
+
 ## At least twelve months before removal
 
 A frozen supported interface is not removed until **at least twelve calendar

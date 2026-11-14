@@ -56,8 +56,8 @@ What the code does today, on one node:
   recorded traffic through new code and writes a behavior diff. `approve`,
   `promote` and `rollback` are the rest of that path. Policy rules decide
   whether a proposal may go through.
-- **TypeScript (M4).** `kronik init` and `kronik build` produce a component.
-  The Rust SDK is there too.
+- **SDKs (M4, M15).** `kronik init` and `kronik build` produce a component
+  in TypeScript, Rust, Python or Go.
 - **Policy, tokens and MCP (M5).** Tokens carry scopes. The JSON API is
   described by OpenAPI. `kronik mcp` serves the agent tools. Every mutation
   takes `--reason` and `--dry-run`, except `replay` and `send --fork`, which
@@ -68,11 +68,12 @@ What the code does today, on one node:
   and `/metrics` exist. There is no cluster.
 - **Foreign actors (M7, M20, M21).** Linux programs from OCI images run in
   gVisor. With `isolation = "microvm"` they run in a Firecracker VM on a host
-  with KVM; that level is experimental: implemented, but not yet run on a KVM
-  host. `kronik serve --init` installs the root service as before, and
-  `--init --rootless` the nonroot service (M21), an opt-in whose design is
-  accepted (ADRs 0060–0065) but whose installed proofs have not been run on
-  this revision, and which is untested on Ubuntu 24.04.
+  with KVM; that level is experimental: implemented, but it has not yet
+  booted a VM on a KVM host. `kronik serve --init` installs the root service
+  as before, and `--init --rootless` the nonroot service (M21), an opt-in
+  whose design is accepted (ADRs 0060–0065) but whose installed proofs have
+  not passed yet, also not on Ubuntu 24.04 with AppArmor's restriction on
+  user namespaces; the root service stays the default.
 - **Privacy (M8).** Values with a subject can be sealed. `erase` deletes a
   subject's keys and SQL rows that have a `_subject` value. A turn with a
   subject cannot write a table without a `_subject` column. Old rows in
@@ -80,6 +81,27 @@ What the code does today, on one node:
   and survive erasure. `reseal` rewrites closed segments. A
   `--no-pii` fork replays with pseudonyms, including text and blob values
   of subject-tagged SQL rows.
+- **More of the change path (M9–M14).** Proposals that span several actor
+  kinds (M9), the CLI against a remote API (M10), `watch` after a promote and
+  preview forks that take new requests on unproposed code (M11), effect
+  simulators that answer a fork's unrecorded effects (M12), rollback via
+  replay of history under the old code (M13), and foreign actors copied into
+  forks (M14).
+- **Standard `fetch` (M22).** Guest code may use `wasi:http`; its requests
+  are recorded and replayed like `http.fetch`.
+- **Keys and secrets (M23).** The master key can be wrapped by OpenBao, AWS,
+  GCP or Azure KMS, and secret names can be linked to OpenBao or Vault, AWS
+  Secrets Manager, GCP Secret Manager or Azure Key Vault, read through a
+  cache that rides out a backend's outage for a while. Both are checked
+  against emulators and pinned services, not against real clouds.
+- **Long-lived connections (M24).** `WEBSOCKET` and `SSE` routes: the actor
+  that accepts a connection owns it, its incoming frames and its close are
+  turns of that actor, and the frames it sends are recorded with the turn
+  and go out after the turn commits. A restart closes every open connection
+  with a dedicated reason, and clients reconnect.
+- **Observability (M28).** OpenTelemetry traces built from the turn records,
+  metrics for Prometheus and over OTLP, and an audit export that `kronik
+  audit verify` checks against the log.
 
 The CLI, the JSON API and MCP are the supported surface. An embedded admin web
 interface (M27) is partial and unreleased: with TLS, the `server.admin_listen`

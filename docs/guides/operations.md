@@ -1834,6 +1834,39 @@ v0.3.0 or older](#upgrading-from-v030-or-older)). A restore from a bucket that
 an older binary shipped also needs the check before the restored directory's
 first start.
 
+### Upgrading from v0.4.1
+
+v0.5.0 changes the engine from `kronik-0.4.1+wasmtime-50.0.1` to
+`kronik-0.5.0+wasmtime-50.0.1`; Wasmtime is the same. So the data of v0.4.1
+needs the procedure above: `kronik upgrade check` with the new binary, then the
+restart. It was checked with a `0.5.0-dev` build on the v0.4.1 data directory of
+the compatibility corpus (`tests/compatibility/v0.4.1`), with the verification
+that `scripts/ci.sh ts` runs on every released corpus: the check passed with 9
+root inputs and 10 turns, none of them unverifiable, and wrote its report; the
+daemon started on the directory with the log's hash and the state hash of
+v0.4.1 unchanged, isolated and continuous replays of the same root inputs
+showed no change, and a key-backed effect gave its recorded result.
+
+- **The configuration.** A `kronik.toml` of v0.4.1 stays valid. The new
+  `[connections]` section and the `[foreign]` keys `microvm_dir` and
+  `start_timeout` are optional, with the defaults this guide gives.
+- **The components.** The actor WIT is now `kronik:actor@0.1.1`. It only adds
+  interfaces, so components built against `0.1.0` run unchanged and replay
+  the same; rebuild a component with this release's SDK only to use
+  connections ([ADR 0113](../adr/0113-v05-actor-abi.md)).
+- **The service.** The root service stays the default. The nonroot service
+  of `kronik serve --init --rootless` is an opt-in whose installed proofs
+  have not passed; do not convert an existing installation to it.
+- **`kronik doctor`** gains the checks `secrets`, `retention` and
+  `connections` (the open-file limit against `[connections] max_open`), and
+  with `--rootless` the checks of the nonroot service.
+- **Going back.** v0.4.1 takes the data back only through its own `kronik
+  upgrade check`, and only while the log holds nothing it cannot read. It
+  cannot read the turns of WebSocket and SSE connections: on a log with one
+  it stops with `STORAGE_CORRUPT` ("no input case set"), and going back means
+  restoring the backup that [the upgrade runbook](../runbooks/upgrade.md)
+  asks for. Keep it until you are sure.
+
 ### Upgrading from v0.3.0 or older
 
 This is a known defect, not intended behavior. A code change for it is being

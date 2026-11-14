@@ -45,25 +45,36 @@ and the defects found since `v0.4.0` in restart, retention, secret handling and
 the audit export; the engine is `kronik-0.4.1+wasmtime-50.0.1`. `v0.3.0` and
 `v0.1.0` are the historical unsigned releases.
 
-`main` is an unreleased `0.5.0-dev` work in progress; the
-[changelog](CHANGELOG.md) lists what changed since `v0.4.1`. The external
-secret backends (M23 B2–B6) are in the code and have run against pinned
-services, emulators and SoftHSM2, not against a real cloud or a physical HSM;
-they are not accepted yet. The designs of long-lived connections (M24),
-streaming bodies (M25) and blob storage (M26) are accepted, and their
-implementation has not landed. Major areas remain absent or partial: the
-cluster (M16–M19), the WASI 0.3 remainder (M22), connections, streaming bodies
-and blobs (M24–M26), and the UI, fleet and hardening tracks (M27 and M29–M34).
-The nonroot service of `kronik serve --init --rootless` (M21, opt-in) passed
-its installed proofs (ADR 0064) on 2026-11-14 on GitHub-hosted Ubuntu 24.04
-runners (virtual machines on AMD hosts), once with AppArmor's restriction on unprivileged user namespaces (R1)
-active and once with it lifted; it has not run on other distributions. The
-microVM level (M20, `isolation = "microvm"`, opt-in; gVisor stays the default)
-passed its proofs on the same kind of runner, with nested KVM, on an AMD host
-and on an Intel host; neither has run on bare metal. The manual `isolation` workflow runs them on disposable hosted runners and
-keeps their evidence. The nonroot
-daemon's decisions, ADRs 0060–0065, were accepted on 2026-11-13; the microVM
-level's, ADRs 0095 and 0096, await the maintainers.
+`main` is the unreleased `0.5.0-dev` line, the brief's "Isolation, standards
+and web" release (M20–M26); the [changelog](CHANGELOG.md) lists what changed
+since `v0.4.1`. On `main` today:
+
+- **External secret backends (M23 B2–B6):** secret names linked to OpenBao or
+  Vault, AWS Secrets Manager, GCP Secret Manager or Azure Key Vault, read
+  through a cache with outage handling, and a PKCS#11 helper. They ran against
+  pinned services, emulators and SoftHSM2, not against a real cloud or a
+  physical HSM.
+- **Long-lived connections (M24):** `WEBSOCKET` and `SSE` routes, whose
+  owner actor accepts, sends and closes in recorded turns, with the
+  `kronik:actor@0.1.1` WIT that keeps `0.1.0` components running; `send-now`,
+  the replay and diff of connections, their API, CLI and MCP surface, and
+  support in the four SDKs.
+- **The nonroot daemon (M21, opt-in):** the nonroot service of `kronik serve
+  --init --rootless` passed its installed proofs (ADR 0064) on 2026-11-14 on
+  GitHub-hosted Ubuntu 24.04 runners (virtual machines on AMD hosts), once
+  with AppArmor's restriction on unprivileged user namespaces (R1) active and
+  once with it lifted; it has not run on other distributions. The root
+  service stays the default. Its decisions, ADRs 0060–0065, were accepted on
+  2026-11-13.
+- **The microVM level (M20, opt-in; gVisor stays the default):**
+  `isolation = "microvm"` passed its proofs on the same kind of runner, with
+  nested KVM, on an AMD host and on an Intel host; neither has run on bare
+  metal. Its decisions, ADRs 0095 and 0096, were accepted on 2026-11-14.
+
+The manual `isolation` workflow runs those proofs on disposable hosted runners
+and keeps their evidence. Streaming bodies and blob storage (M25–M26) are on a
+branch and have not landed. Absent or partial: the cluster (M16–M19), the WASI
+0.3 remainder (M22), and the UI, fleet and hardening tracks (M27 and M29–M34).
 See the [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
 for the state of each milestone, the open questions and the known gaps, and the
 [compliance audit](https://github.com/G-man3207/Kronik/wiki/Compliance-audit)
@@ -93,9 +104,15 @@ for how the brief maps to the tree.
 - **Operations.** TLS from certificate files or ACME, a systemd unit,
   snapshots, shipping to object storage, `kronik restore`, `kronik upgrade
   check`, `kronik doctor`, `keys status|wrap|rewrap` and `/metrics`.
-  Master-key custody supports file/env or OpenBao/AWS/GCP/Azure KMS,
-  checked against free emulators, not production cloud IAM. ACME is tested
-  against Pebble, not a public certificate authority.
+  Master-key custody supports file/env or OpenBao/AWS/GCP/Azure KMS, and
+  secrets can live in OpenBao or Vault, AWS Secrets Manager, GCP Secret
+  Manager or Azure Key Vault; both are checked against free emulators, not
+  production cloud IAM. ACME is tested against Pebble, not a public
+  certificate authority.
+- **Long-lived connections.** WebSocket and server-sent-events routes: the
+  actor that accepts a connection owns it, its frames are recorded with the
+  turns that send them and go out after those commit, and a restart closes
+  every open connection with a dedicated reason so that clients reconnect.
 - **Privacy mode.** Values with a subject can be sealed, erased and resealed,
   and forks replay without personal data unless a token carries `pii:read`.
 - **Foreign actors.** Linux programs from OCI images run in gVisor behind the
