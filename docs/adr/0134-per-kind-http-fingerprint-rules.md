@@ -1,6 +1,6 @@
 # 0134. Per-kind HTTP fingerprint rules
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-13)
 - **Date:** 2026-11-13
 
 ## Context
