@@ -8,6 +8,7 @@ use kronik_core::authority::AuthLease;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+use kronik_core::env::{Env, OpenMode};
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::Lsn;
 use kronik_privacy::sealer::{ResealOp, Sealer};
@@ -69,15 +70,28 @@ fn retention_path(data: &Path) -> PathBuf {
     privacy_dir(data).join("keystore_retention_ms")
 }
 
-/// Writes the retention the shipper uses for keystore backups. A missing
+/// Writes the retention the shipper uses for keystore backups
+/// ([`keystore_retention_ms`]), through the node's file system, so that a
+/// simulated node writes it on its simulated disk, never on the host's. The
+/// file is replaced whole (a synced temporary file, renamed): a crash in the
+/// middle never leaves a shorter number, which the shipper would read as a
+/// shorter retention. Best effort: a failure is a warning, and a missing
 /// file means the default (30 days).
-pub fn publish_keystore_retention(data: &Path, retention_ms: u64) {
+pub(crate) async fn publish_keystore_retention(env: &Env, data: &Path, retention_ms: u64) {
     let dir = privacy_dir(data);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(error = %e, "could not create the privacy directory");
-        return;
-    }
-    if let Err(e) = std::fs::write(retention_path(data), retention_ms.to_string()) {
+    let path = retention_path(data);
+    let temp = path.with_extension("tmp");
+    let write = async {
+        env.fs.create_dir_all(dir.clone()).await?;
+        let file = env.fs.open(temp.clone(), OpenMode::ReadWriteCreate).await?;
+        file.set_len(0).await?;
+        file.write_at(0, bytes::Bytes::from(retention_ms.to_string().into_bytes()))
+            .await?;
+        file.sync_data().await?;
+        env.fs.rename(temp, path).await?;
+        env.fs.sync_dir(dir).await
+    };
+    if let Err(e) = write.await {
         tracing::warn!(error = %e, "could not record keystore backup retention");
     }
 }

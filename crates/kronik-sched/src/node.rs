@@ -946,12 +946,6 @@ impl Node {
         native::observe_startup(&node);
         node.sealer
             .set_on(node.privacy_mode().0 == pb::PrivacyState::On);
-        if let Some(storage) = &node.cfg.storage {
-            crate::reseal::publish_keystore_retention(
-                &storage.data_dir,
-                node.cfg.keystore_backup_retention.as_millis() as u64,
-            );
-        }
         let f = fatal.clone();
         env.spawn("log-fatal", async move {
             if let Ok(msg) = fatal_rx.await {
@@ -988,6 +982,17 @@ impl Node {
         node.initialize_secret_versions(last == 0, node.native_recovery.clone())
             .await?;
         node.start_secret_refresh(node.native_recovery.clone());
+        // For the shipper, after the records the start appends itself: a
+        // file of the data directory, written through the node's file
+        // system.
+        if let Some(storage) = &node.cfg.storage {
+            crate::reseal::publish_keystore_retention(
+                &node.env,
+                &storage.data_dir,
+                node.cfg.keystore_backup_retention.as_millis() as u64,
+            )
+            .await;
+        }
         // Physical ACTIVE precedes Foreign recovery; public readiness is still the final Ok(node).
         native_execution
             .activate()

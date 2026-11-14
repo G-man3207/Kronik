@@ -462,6 +462,11 @@ M23, key and secret backends:
   turn of its callee with `UNAVAILABLE` ("the call never ran"): its
   compensation is dropped and nothing is orphaned, in a rebuild of the log
   too.
+- The keystore backup retention the daemon publishes for the shipper
+  (`<data>/privacy/keystore_retention_ms`) is replaced whole at each start,
+  through a synced temporary file: a crash while it was written could leave
+  a shorter number, and the shipper would then delete keystore backups
+  before `privacy.keystore_backup_retention` had passed.
 
 <!--
 Draft of the v0.5.0 section, to finish at the release. Then rename
