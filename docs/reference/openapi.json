@@ -8261,6 +8261,14 @@
             "description": "`close` only."
           },
           "connections": {
+            "description": "The live connections it went to.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "dropped": {
+            "description": "The targets no live connection had (closed, or never accepted): recorded, never delivered.",
             "items": {
               "type": "string"
             },
@@ -8306,6 +8314,7 @@
           "op",
           "connections",
           "seqs",
+          "dropped",
           "frame",
           "code",
           "reason"

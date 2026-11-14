@@ -474,9 +474,23 @@ impl Hub {
     /// A committed turn's buffered operations (§4.3), in order: frames are
     /// queued for their connection's writer in seq order, a close after
     /// the frames before it. A connection that is not live here, or is
-    /// closing, drops them: they are recorded and never written (§4.7). A
-    /// queue past `outbound_queue_bytes` closes as a slow consumer (§5.6).
-    pub(crate) fn deliver(&self, ops: &[pb::ConnectionOp]) {
+    /// closing, drops them: they are recorded and never written (§4.7), as
+    /// are the targets that no live connection had (`dropped`, ADR 0114,
+    /// amended). A queue past `outbound_queue_bytes` closes as a slow
+    /// consumer (§5.6). `owner` is the turn's actor.
+    pub(crate) fn deliver(&self, owner: &ActorRef, ops: &[pb::ConnectionOp]) {
+        let dropped: usize = ops
+            .iter()
+            .filter(|op| matches!(op.op, Some(pb::connection_op::Op::Send(_))))
+            .map(|op| op.dropped.len())
+            .sum();
+        if dropped > 0 {
+            kronik_metrics::add(
+                "kronik_connection_frames_dropped_total",
+                &[("kind", owner.kind.as_str()), ("protocol", "none")],
+                dropped as u64,
+            );
+        }
         let mut wake: Vec<Arc<dyn Transport>> = Vec::new();
         let mut close: Vec<HostClose> = Vec::new();
         {

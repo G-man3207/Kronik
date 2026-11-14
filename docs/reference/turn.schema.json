@@ -1140,6 +1140,7 @@
         "op",
         "connections",
         "seqs",
+        "dropped",
         "frame",
         "code",
         "reason"
@@ -1156,13 +1157,21 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "description": "The live connections it went to."
         },
         "seqs": {
           "description": "`send`: each connection's outgoing seq, at the same index; `close`: empty.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/TurnCount"
+          }
+        },
+        "dropped": {
+          "description": "The targets no live connection had (closed, or never accepted): recorded, never delivered.",
+          "type": "array",
+          "items": {
+            "type": "string"
           }
         },
         "frame": {

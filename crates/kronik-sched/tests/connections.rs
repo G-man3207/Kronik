@@ -296,8 +296,14 @@ impl Proc {
         panic!("timed out waiting for {what}");
     }
 
+    /// A connection's row, live or closed.
     fn row(&self, conn: &str) -> Option<kronik_store::db::ConnectionRow> {
-        self.node.store().db().connection(conn).unwrap()
+        self.node.store().db().connection_any(conn).unwrap()
+    }
+
+    /// Whether `conn` is live in state.db (the rows turns read).
+    fn live(&self, conn: &str) -> bool {
+        self.node.store().db().connection(conn).unwrap().is_some()
     }
 
     fn record(&self, lsn: u64) -> pb::TurnRecord {
@@ -416,11 +422,14 @@ fn only_the_owner_uses_a_connection_and_failed_frames_are_dead_letters() {
     // no operations.
     let t = p.record(dl.lsn);
     assert!(t.connection_ops.is_empty());
-    // A made-up id traps the same way.
+    // An id that no live connection has is recorded as dropped, and the
+    // turn commits (ADR 0114, amended).
+    let before = p.row(&a).unwrap().frames_in;
     p.frame(&a, "send-to c-00000000000000000000000000000000 x");
-    p.until("the second dead letter", || {
-        p.node.store().db().dead_letters(0, 10).unwrap().len() == 2
+    p.until("the frame turn", || {
+        p.row(&a).unwrap().frames_in == before + 1
     });
+    assert_eq!(p.node.store().db().dead_letters(0, 10).unwrap().len(), 1);
     // Resend: a new root input of the same connection and frame.
     let r =
         p.rt.block_on(p.node.resend(
@@ -600,4 +609,77 @@ fn a_restart_closes_every_connection_the_last_process_held() {
         }
     });
     assert_eq!(reply(&r), "1");
+}
+
+/// ADR 0114 (amended 2026-11-13): a frame to a connection whose close input
+/// was applied is recorded as dropped, and retention's compaction, which
+/// deletes the closed row from `connection_history`, changes nothing a
+/// turn sees: the same input gives the same turn with or without it (I1).
+#[test]
+fn a_closed_connection_is_dropped_whether_or_not_compaction_ran() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy(ROOM, false).unwrap();
+    let (a, ta) = p.join("lobby", "ada");
+    let (b, tb) = p.join("lobby", "bob");
+    ta.client_close(Some((1000, "bye".into())));
+    p.until("ada's close", || {
+        p.row(&a).is_some_and(|r| r.closed_lsn.is_some())
+    });
+    assert!(!p.live(&a), "the closed row left the live table");
+    let frames = tb.recording().frames.len();
+    p.frame(&b, &format!("send-to {a} late"));
+    p.until("bob's frame turn", || p.row(&b).unwrap().frames_in == 1);
+    let lsn = p
+        .node
+        .store()
+        .db()
+        .history("room", "lobby", None, 1)
+        .unwrap()[0]
+        .lsn;
+    let recorded = p.record(lsn);
+    assert_eq!(
+        recorded.outcome.as_ref().unwrap().kind,
+        pb::OutcomeKind::Committed as i32
+    );
+    assert_eq!(recorded.connection_ops.len(), 1);
+    assert_eq!(recorded.connection_ops[0].dropped, std::slice::from_ref(&a));
+    assert!(recorded.connection_ops[0].connections.is_empty());
+    assert_eq!(tb.recording().frames.len(), frames, "nothing was delivered");
+
+    // Compaction past the close deletes ada's history row.
+    let applied = p.node.applied_lsn();
+    p.node.store().db().compact(applied + 1, 0).unwrap();
+    assert!(p.row(&a).is_none());
+    // The same turn again, on a fresh instance, after the compaction: the
+    // same outcome and operations.
+    let hash = kronik_core::ids::CodeHash::from_slice(&recorded.code_hash).unwrap();
+    let program = p.node.code().get(&hash).unwrap();
+    let view = Arc::new(kronik_sched::host::KvView {
+        store: p.node.store().clone(),
+        actor: ActorRef::parse("room/lobby").unwrap(),
+        sealer: p.node.sealer().clone(),
+    });
+    let again =
+        p.rt.block_on(program.run(
+            kronik_runtime::TurnRequest {
+                actor: ActorRef::parse("room/lobby").unwrap(),
+                causal_key: recorded.causal_key.clone().unwrap(),
+                logical_time_ms: recorded.logical_time_ms,
+                seed: recorded.random_seed.as_slice().try_into().unwrap(),
+                input: recorded.input.clone().unwrap(),
+                limits: kronik_runtime::TurnLimits::default(),
+                subject: kronik_proto::connection::input_subject(
+                    kronik_proto::connection::input(recorded.input.as_ref()).unwrap(),
+                ),
+            },
+            view,
+            None,
+            None,
+        ))
+        .unwrap();
+    assert_eq!(&again.outcome, recorded.outcome.as_ref().unwrap());
+    assert_eq!(again.connection_ops, recorded.connection_ops);
+    assert_eq!(again.writes, recorded.writes);
+    assert_eq!(again.fuel_used, recorded.fuel_used);
 }

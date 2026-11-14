@@ -1042,6 +1042,7 @@ mod tests {
                     connections: vec![conn.clone()],
                     seqs: vec![0],
                     op: Some(pb::connection_op::Op::Send(frame(b"outgoing"))),
+                    dropped: Vec::new(),
                 },
                 pb::ConnectionOp {
                     connections: vec![conn],
@@ -1050,6 +1051,7 @@ mod tests {
                         code: 1000,
                         reason: Some(val(Some("user:1"), b"bye")),
                     })),
+                    dropped: Vec::new(),
                 },
             ],
             ..Default::default()

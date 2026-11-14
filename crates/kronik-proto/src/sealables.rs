@@ -334,6 +334,7 @@ mod tests {
                     connections: vec!["c-0123456789abcdef0123456789abcdef".into()],
                     seqs: vec![0],
                     op: Some(pb::connection_op::Op::Send(frame(b"welcome"))),
+                    dropped: Vec::new(),
                 },
                 pb::ConnectionOp {
                     connections: vec!["c-0123456789abcdef0123456789abcdef".into()],
@@ -342,6 +343,7 @@ mod tests {
                         code: 1000,
                         reason: s("u", b"bye"),
                     })),
+                    dropped: Vec::new(),
                 },
             ],
             ..Default::default()

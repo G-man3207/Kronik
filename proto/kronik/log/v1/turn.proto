@@ -224,14 +224,18 @@ message BlobRefOp {
 
 // A buffered connection operation of a turn (M24), in call order.
 message ConnectionOp {
-  // SEND: one or more connections (`broadcast`), each with its seq at the
-  // same index. CLOSE: exactly one connection, no seqs.
+  // SEND: the live targets (`broadcast` has several), each with its seq at
+  // the same index. CLOSE: at most one, no seqs.
   repeated string connections = 1;
   repeated uint64 seqs = 2;
   oneof op {
     Frame send = 3;
     ConnectionCloseRequest close = 4;
   }
+  // The targets no live connection had (ADR 0114, amended): recorded,
+  // never delivered. A SEND's targets are `connections` and `dropped`; a
+  // CLOSE has exactly one target in either list.
+  repeated string dropped = 5;
 }
 
 message ConnectionCloseRequest {

@@ -804,15 +804,18 @@ fn connection_ops_json(t: &pb::TurnRecord) -> Vec<serde_json::Value> {
         .map(|op| match &op.op {
             Some(pb::connection_op::Op::Send(f)) => serde_json::json!({
                 "op": "send", "connections": op.connections, "seqs": op.seqs,
+                "dropped": op.dropped,
                 "frame": frame_json(Some(f)), "code": null, "reason": null,
             }),
             Some(pb::connection_op::Op::Close(c)) => serde_json::json!({
                 "op": "close", "connections": op.connections, "seqs": op.seqs,
+                "dropped": op.dropped,
                 "frame": null, "code": c.code,
                 "reason": c.reason.as_ref().map(|r| sealable_json(Some(r))),
             }),
             None => serde_json::json!({
                 "op": "unspecified", "connections": op.connections, "seqs": op.seqs,
+                "dropped": op.dropped,
                 "frame": null, "code": null, "reason": null,
             }),
         })
@@ -2815,6 +2818,7 @@ mod connection_turn_json_tests {
                     event: "message".into(),
                     id: "1".into(),
                 })),
+                dropped: Vec::new(),
             },
             pb::ConnectionOp {
                 connections: vec![CONN.into()],
@@ -2823,6 +2827,7 @@ mod connection_turn_json_tests {
                     code: 1000,
                     reason: plain(None, b"bye"),
                 })),
+                dropped: Vec::new(),
             },
         ];
         let original = open.clone();

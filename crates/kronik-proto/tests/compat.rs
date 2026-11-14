@@ -1019,6 +1019,7 @@ fn connection_open_v1() {
                 event: "welcome".into(),
                 id: "0".into(),
             })),
+            dropped: Vec::new(),
         },
         pb::ConnectionOp {
             connections: vec![CONN.into()],
@@ -1027,6 +1028,7 @@ fn connection_open_v1() {
                 code: 4000,
                 reason: sealed_plain(Some("user:ada"), b"kicked"),
             })),
+            dropped: Vec::new(),
         },
     ];
     let record = Record::TurnRecord(t);
@@ -1090,6 +1092,8 @@ fn connection_frame_v1() {
             data: sealed_plain(Some("user:ada"), &[0, 1, 2]),
             ..Default::default()
         })),
+        // A target no live connection had (ADR 0114, amended).
+        dropped: vec!["c-00000000000000000000000000000001".into()],
     }];
     let record = Record::TurnRecord(t);
     let bytes = fixture("connection-frame-v1", &record);

@@ -2,6 +2,8 @@
 
 - **Status:** Accepted (2026-11-13)
 - **Date:** 2026-11-13
+- **Amended:** 2026-11-13: live connections and a retention bound (see
+  [the amendment](#amended-2026-11-13-live-connections-and-a-retention-bound))
 
 ## Context
 
@@ -47,7 +49,9 @@ What bears on the answer:
    `connections.send`, `broadcast`, `close` and `send-now`. Any other actor
    using the id, and the owner using an id it never accepted, traps with
    `CONNECTION_NOT_HELD`, which fails the turn. The check reads only
-   recorded, immutable facts, so it is deterministic.
+   recorded, immutable facts, so it is deterministic. (Amended 2026-11-13:
+   this holds for live connections; an id without a live connection is
+   recorded as dropped. See the amendment below.)
 3. **Handles are data, not capabilities.** Storing an id, logging it or
    sending it in a message grants nothing.
 4. **Inputs go to the owner only.** The gateway delivers a connection's
@@ -98,3 +102,91 @@ What bears on the answer:
   owner.
 - Revisit if a production app needs cross-actor fan-out that the hop cannot
   carry. Shared edges are the planned extension.
+
+## Amended 2026-11-13: live connections and a retention bound
+
+### Context
+
+Decision 2's check also covers ids that no live connection has: a
+connection the actor closed long ago, or an id it never accepted. To answer
+it, the state kept every connection's row forever, closed ones included.
+Deleting a closed row at a time the log does not record would make a turn's
+outcome depend on when the deletion ran, in production and in replay (I1).
+So the `connections` table grew without bound, and it is hashed into every
+state hash and copied into every snapshot. A reconnect-heavy app (1,000
+mobile users reconnecting 20 times a day) would add about 20,000 rows a
+day, roughly 2 GB a year.
+
+The brief already answers the case that needs the old rows: "frames to a
+closed connection are dropped and show up in history". It does not ask for
+a trap.
+
+### Decision
+
+1. **Ownership is checked against live connections.** A connection is live
+   from the open turn that accepts it until its close input is applied. The
+   rows that turns read hold live connections only.
+2. **What a turn's `send`, `broadcast`, `close` or `send-now` does depends
+   on its id:**
+   - **A live connection of the turn's actor**, or the one the turn's own
+     open accepts: as before.
+   - **A live connection of another actor:** it traps with
+     `CONNECTION_NOT_HELD`, as before. Owner-only sending holds for every
+     live connection.
+   - **No live connection has the id** (it closed, or none was ever
+     accepted): the operation is recorded as dropped and never handed to a
+     connection, and the turn goes on. `send-now` answers `closed`.
+     History shows the frame as dropped.
+   - **A malformed id** (not `c-` and 32 lowercase hex characters): it
+     traps, as a guest bug.
+3. **Connection ids are unguessable.** A connection's id is `c-` and its
+   open input's root id: 16 bytes (128 bits) that the node draws from the
+   operating system's random source when it admits the open. Nothing about
+   an id is sequential or derived from other data. So an actor cannot tell
+   another actor's live connection from a dead id by guessing ids and
+   watching for the trap. It learns a live id only when one is handed to
+   it, and handles are data (decision 3). This must stay so: a change to
+   how ids are drawn needs a new decision.
+4. **Closed rows leave the table that turns read, at a logged point.**
+   Applying a connection's close input moves its row, in the same
+   transaction, to a history table that turns never read. Only the API and
+   `kronik history` read it, and it is not part of the state hash. History
+   rows are deleted only by retention's index compaction, at the retention
+   base: the pass that deletes `turn_index` rows below the first retained
+   LSN also deletes the history rows that closed below it. Never by wall
+   time. Every change to what a turn can read is applied from a record of
+   the log, so I1 and I4 hold.
+
+### Consequences
+
+- **Bounded tables.** The live table is bounded by the connection caps.
+  After a restart, every live connection gets its host close, which moves
+  its row. History is bounded by the retention window. A frame record that
+  could ask for a connection's fate is never older than its close, so no
+  history row is deleted while a retained record still needs it.
+- **What is lost.** Before, an id the actor never accepted trapped; now it
+  is a dropped frame unless another actor's live connection has it. A typo
+  in an id therefore shows up as dropped frames in history and in
+  `kronik_connection_frames_dropped_total`, not as a failed turn.
+- **The API.** `GET /v1/connections` lists closed connections until the
+  retention base passes their close. After that they answer
+  `CONNECTION_NOT_FOUND`, like their turns.
+- **Replay.** Isolated replay reads production's live rows at each input.
+  Continuous replay evolves its own. Both drop and trap on the same
+  conditions as production, and history rows play no part.
+- **The format.** `ConnectionOp` gains `repeated string dropped = 5`, the
+  ids of the operation's targets that no live connection had. `connections`
+  and `seqs` keep only the live targets, so a send's or close's targets are
+  the union of the two lists. A `send-now` that finds no live connection is
+  recorded with the status `CLOSED`. Like a denied effect, it needs no
+  `TurnBegin`: its answer follows from the recorded state.
+- **Verification:**
+  - runtime tests: an id without a live connection is recorded as dropped
+    and the turn commits; another actor's live connection traps; a
+    malformed id traps;
+  - store tests: the close input moves the row; compaction removes only
+    history rows below the first retained LSN and changes neither the live
+    table nor the state hash; a rebuild from a snapshot and the log gives
+    the same live table;
+  - an I1 test: one input sequence gives byte-identical turn records
+    whether or not compaction ran in between.
