@@ -23,11 +23,17 @@ async function start(t: { after(f: () => Promise<void>): void }) {
     host.http("POST", `/media/${album}/images`, { body: bytes, headers });
   const list = async (album: string) => (await host.http("GET", `/media/${album}/images`)).json<{ images: Image[] }>().images;
   const read = async (album: string, id: string) => host.http("GET", `/media/${album}/images/${id}`);
-  return { host, upload, list, read };
+  /** The hashes of the blobs the album holds, from the API: holds, not rows. */
+  const held = async (album: string) => {
+    const answer = await host.api("GET", `/v1/actors/media/${album}/blobs`);
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    return (answer.body as { blobs: Array<{ hash: string }> }).blobs.map((b) => b.hash);
+  };
+  return { host, upload, list, read, held };
 }
 
 test("images are uploaded, listed, read and deleted; a blob goes with its last row", async (t) => {
-  const { host, upload, list, read } = await start(t);
+  const { host, upload, list, read, held } = await start(t);
 
   // A small image is stored with put and held; it reads back as it was.
   const small = picture(20_000);
@@ -59,11 +65,15 @@ test("images are uploaded, listed, read and deleted; a blob goes with its last r
   );
 
   // Deleting one of two rows of a blob keeps the album's hold for the other.
+  assert.ok((await held("trip")).includes(one.hash));
   assert.equal((await host.http("DELETE", "/media/trip/images/img-1")).status, 204);
   assert.equal((await read("trip", "img-1")).status, 404);
   assert.deepEqual(new Uint8Array((await read("trip", "img-2")).body), small);
+  assert.ok((await held("trip")).includes(one.hash), "the other row keeps the hold");
+  // Deleting the last row lets the blob go.
   assert.equal((await host.http("DELETE", "/media/trip/images/img-2")).status, 204);
   assert.deepEqual((await list("trip")).map((i) => i.id), ["img-3"]);
+  assert.ok(!(await held("trip")).includes(one.hash), "the last row's delete releases the blob");
 
   // What is not an image, or empty, is refused.
   assert.equal((await upload("trip", small, { "content-type": "text/plain" })).status, 415);
@@ -72,7 +82,7 @@ test("images are uploaded, listed, read and deleted; a blob goes with its last r
 });
 
 test("an album shares an image by message, and the receiver holds its own", async (t) => {
-  const { host, upload, list, read } = await start(t);
+  const { host, upload, list, read, held } = await start(t);
   const bytes = picture(30_000);
   const { hash } = (await upload("alice", bytes)).json<{ hash: string }>();
 
@@ -83,7 +93,9 @@ test("an album shares an image by message, and the receiver holds its own", asyn
   assert.deepEqual(new Uint8Array((await read("bob", "img-1")).body), bytes);
 
   // alice's delete ends alice's hold only.
+  assert.deepEqual([(await held("alice")).includes(hash), (await held("bob")).includes(hash)], [true, true]);
   assert.equal((await host.http("DELETE", "/media/alice/images/img-1")).status, 204);
+  assert.deepEqual([(await held("alice")).includes(hash), (await held("bob")).includes(hash)], [false, true]);
   assert.deepEqual(new Uint8Array((await read("bob", "img-1")).body), bytes);
 
   assert.equal((await host.http("POST", "/media/bob/images/img-1/share/bob")).status, 400);
