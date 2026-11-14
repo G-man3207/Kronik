@@ -1,6 +1,6 @@
 # 0065. Initial-namespace Unix API attribution
 
-- **Status:** Accepted (2026-11-13). Implemented; the boundary driver passed on 2026-11-14 on GitHub-hosted Ubuntu 24.04 runners (virtual machines on AMD hosts).
+- **Status:** Accepted (2026-11-13). Implemented; the boundary driver passed on 2026-11-14 on GitHub-hosted Ubuntu 24.04 runners (virtual machines on AMD and Intel hosts).
 - **Date:** 2026-11-07
 
 ## Context

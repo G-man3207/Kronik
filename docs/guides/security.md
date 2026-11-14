@@ -406,7 +406,7 @@ and installs the nonroot `kronik` service. Its design is accepted
 [ADR 0065](../adr/0065-api-peer-identity-acceptor.md)), and the installed
 proofs of [ADR 0064](../adr/0064-foreign-isolation-conformance.md) passed on
 2026-11-14 on GitHub-hosted Ubuntu 24.04 runners (virtual machines on AMD
-hosts), once with that
+and Intel hosts), once with that
 distribution's AppArmor restriction on unprivileged user namespaces active and
 once with it lifted. Kronik checks `user.max_user_namespaces` and
 `kernel.unprivileged_userns_clone` and does nothing about the AppArmor
