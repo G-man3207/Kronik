@@ -362,7 +362,7 @@ pub struct StateDb {
 }
 
 mod blobs;
-pub use blobs::{BlobPin, BlobRow, source as blob_source};
+pub use blobs::{BlobPin, BlobRow, PinDrift, source as blob_source};
 
 fn corrupt(msg: impl Into<String>) -> StoreError {
     StoreError::Corrupt(msg.into())

@@ -317,6 +317,37 @@ pub struct InspectResponse {
     pub actor: Actor,
     pub state: Vec<StateEntry>,
     pub sql: Option<SqlSummary>,
+    /// The blobs the actor holds (M26), when the node has blobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blobs: Option<ActorBlobsSummary>,
+}
+
+/// What an actor holds (M26 §12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ActorBlobsSummary {
+    /// Distinct blobs it holds, and their bytes (what its quota counts).
+    pub held: u64,
+    pub bytes: u64,
+}
+
+/// One blob an actor holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ActorBlobEntry {
+    pub hash: String,
+    pub size: u64,
+    /// Null without `pii:read`, and for a blob without a subject.
+    pub subject: Option<String>,
+    /// The record that made the actor hold it.
+    pub lsn: u64,
+}
+
+/// `GET /v1/actors/{kind}/{key}/blobs` (`kronik blobs list --actor`): the
+/// blobs the actor holds, by hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ActorBlobsResponse {
+    pub blobs: Vec<ActorBlobEntry>,
+    /// Pass as `after` for the next page; null on the last.
+    pub next: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1941,11 +1972,15 @@ pub struct BlobGcSummary {
 /// What keeps a blob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BlobRootEntry {
-    /// `log` (a record at or after the floor), `pin` (a row of the state),
-    /// `snapshot`, `fork` or `lease`.
+    /// `log` (a record at or after the floor), `held` (an actor holds it),
+    /// `pin` (a row of the state), `snapshot`, `fork` or `lease`.
     pub kind: String,
-    /// `log`: the last record that references it; `pin`: the record that
-    /// set the pin; `snapshot`: the snapshot's LSN.
+    /// `held`: the actor, `kind/key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// `log`: the last record that references it; `held`: the record that
+    /// made the actor hold it; `pin`: the record that set the pin;
+    /// `snapshot`: the snapshot's LSN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsn: Option<u64>,
     /// `log`: the floor.
@@ -1996,9 +2031,13 @@ pub struct BlobInspectResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BlobGcEntry {
     pub hash: String,
-    /// `loose` (no record ever referenced it), `out-of-retention` (its
-    /// last reference is below the floor) or `erased`.
+    /// `loose` (no record ever referenced it), `released` (its last holder
+    /// released it, and that record is below the floor), `out-of-retention`
+    /// (its last reference is below the floor) or `erased`.
     pub reason: String,
+    /// The actor (`kind/key`) that released it last, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_by: Option<String>,
     /// From the index, when a record referenced it.
     pub size: Option<u64>,
     /// The file's bytes on disk.
@@ -2023,6 +2062,26 @@ pub struct BlobGcPlanResponse {
     pub floor: Option<u64>,
     /// Files with a root.
     pub kept: u64,
+    /// With `verify=true`: the differences between the index's pins and the
+    /// rows they mirror, recomputed from those rows. Always empty unless
+    /// the index is wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift: Option<Vec<BlobPinDriftEntry>>,
+}
+
+/// A difference between the index's pins and the rows they mirror.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BlobPinDriftEntry {
+    pub hash: String,
+    /// The row's kind: `message`, `timer`, `dead-letter`, `saved-response`,
+    /// `saved-call`, `open-turn` or `open-effect`.
+    pub source: String,
+    /// The row, as `kronik blobs inspect` shows a pin's owner.
+    pub owner: String,
+    /// `missing`: the row references the blob and no pin keeps it, so the
+    /// collector could delete it under the row; `extra`: a pin no row
+    /// accounts for, which keeps the blob too long.
+    pub problem: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -156,7 +156,8 @@ async fn call(
     }
 }
 
-const TOOLS: [&str; 15] = [
+const TOOLS: [&str; 16] = [
+    "blob_gc_plan",
     "create_fork",
     "explain",
     "get_diff",
@@ -294,6 +295,12 @@ async fn over_streamable_http(daemon: &Daemon) {
     .await
     .unwrap_err();
     assert_eq!(no_blob["error"]["code"], "BLOB_NOT_FOUND", "{no_blob}");
+    // blob_gc_plan is `GET /v1/blobs/gc`: what the collector would delete.
+    let plan = call(&client, "blob_gc_plan", json!({"verify": true}))
+        .await
+        .unwrap();
+    assert!(plan["blobs"].is_array(), "{plan}");
+    assert_eq!(plan["count"], 0, "{plan}");
 
     // explain is `kronik explain`.
     let fork = call(&client, "explain", json!({"topic": "fork"}))

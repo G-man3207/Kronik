@@ -1,7 +1,7 @@
-//! `kronik blobs status`, `inspect`, `get` and `gc` (M25 §15, M26 §12):
-//! the blob store and its collector. All talk to the daemon: status,
-//! inspect, get and the dry run need `read` (and `get` of a subject's blob
-//! `pii:read`), a pass needs `operate`.
+//! `kronik blobs status`, `inspect`, `get`, `list` and `gc` (M25 §15, M26
+//! §12): the blob store, what actors hold, and the collector. All talk to
+//! the daemon: status, inspect, get, list and the dry run need `read` (and
+//! `get` of a subject's blob `pii:read`), a pass needs `operate`.
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use kronik_api::types::{
-    BlobGcPlanResponse, BlobGcRequest, BlobGcResponse, BlobInspectResponse, BlobsStatusResponse,
+    ActorBlobsResponse, BlobGcPlanResponse, BlobGcRequest, BlobGcResponse, BlobInspectResponse,
+    BlobsStatusResponse,
 };
 use kronik_core::error::{ApiError, ErrorCode};
 
@@ -27,9 +28,24 @@ pub enum BlobsCommand {
     /// Write a blob's bytes, through the secret output matcher, to a file
     /// or standard output.
     Get(GetArgs),
+    /// The blobs an actor holds, by hash.
+    List(ListArgs),
     /// The collector: with --dry-run alone, list the blob files nothing
     /// keeps and why; with --reason, run a pass now.
     Gc(GcArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ListArgs {
+    /// The actor, as kind/key.
+    #[arg(long, value_name = "KIND/KEY")]
+    actor: String,
+    /// Start after this hash (the `next` of the previous page).
+    #[arg(long)]
+    after: Option<String>,
+    /// At most this many (1 to 1000; default 100).
+    #[arg(long)]
+    limit: Option<u32>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -55,6 +71,10 @@ pub struct GcArgs {
     /// Delete every file without a root now, without waiting a pass.
     #[arg(long)]
     immediate: bool,
+    /// With --dry-run alone: also check the index's pins against the rows
+    /// they mirror; any difference (drift) exits with 1.
+    #[arg(long)]
+    verify: bool,
     #[command(flatten)]
     mutation: Mutation,
 }
@@ -64,6 +84,7 @@ pub(super) fn blobs(ctx: &Ctx, command: BlobsCommand) -> Result<ExitCode, Error>
         BlobsCommand::Status => status(ctx),
         BlobsCommand::Inspect(a) => inspect(ctx, a),
         BlobsCommand::Get(a) => get(ctx, a),
+        BlobsCommand::List(a) => list(ctx, a),
         BlobsCommand::Gc(a) => gc(ctx, a),
     }
 }
@@ -195,6 +216,11 @@ fn render_inspect(r: &BlobInspectResponse) -> String {
                         root.lsn.unwrap_or(0),
                         root.floor.unwrap_or(0)
                     ),
+                    "held" => format!(
+                        "held by {} (lsn {})",
+                        root.actor.as_deref().unwrap_or(""),
+                        root.lsn.unwrap_or(0)
+                    ),
                     "pin" => format!(
                         "{} {} (lsn {})",
                         root.source.as_deref().unwrap_or(""),
@@ -276,17 +302,97 @@ fn get(ctx: &Ctx, a: GetArgs) -> Result<ExitCode, Error> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn list(ctx: &Ctx, a: ListArgs) -> Result<ExitCode, Error> {
+    let Some((kind, key)) = a.actor.split_once('/') else {
+        return Err(local(format!("--actor {:?} is not kind/key", a.actor)));
+    };
+    let mut query = Vec::new();
+    if let Some(after) = &a.after {
+        query.push(format!("after={}", http::encode(after)));
+    }
+    if let Some(limit) = a.limit {
+        query.push(format!("limit={limit}"));
+    }
+    let mut path = format!(
+        "/v1/actors/{}/{}/blobs",
+        http::encode(kind),
+        http::encode(key)
+    );
+    if !query.is_empty() {
+        path.push('?');
+        path.push_str(&query.join("&"));
+    }
+    let body = ctx.get(&path)?;
+    if ctx.json {
+        ctx.print_raw(&body);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let r: ActorBlobsResponse = ctx.decode(&body)?;
+    ctx.print(&render_list(&a.actor, &r));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn render_list(actor: &str, r: &ActorBlobsResponse) -> String {
+    let mut out = String::new();
+    if r.blobs.is_empty() {
+        let _ = writeln!(out, "{actor} holds no blob.");
+        return out;
+    }
+    let rows = r
+        .blobs
+        .iter()
+        .map(|b| {
+            vec![
+                b.hash.clone(),
+                units::size(b.size),
+                b.subject.clone().unwrap_or_else(|| "-".to_owned()),
+                b.lsn.to_string(),
+            ]
+        })
+        .collect();
+    out.push_str(&table(&["blob", "size", "subject", "held since lsn"], rows));
+    let mut steps = Vec::new();
+    if let Some(after) = &r.next {
+        steps.push(format!(
+            "kronik blobs list --actor {} --after {}",
+            shell_quote(actor),
+            shell_quote(after)
+        ));
+    }
+    if let Some(first) = r.blobs.first() {
+        steps.push(format!("kronik blobs inspect {}", shell_quote(&first.hash)));
+    }
+    out.push_str(&next(&steps));
+    out
+}
+
 fn gc(ctx: &Ctx, a: GcArgs) -> Result<ExitCode, Error> {
     // `--dry-run` alone reads the plan with `read`; a pass needs a reason.
     if a.mutation.dry_run && a.mutation.reason.is_none() {
-        let body = ctx.get("/v1/blobs/gc")?;
+        let path = if a.verify {
+            "/v1/blobs/gc?verify=true"
+        } else {
+            "/v1/blobs/gc"
+        };
+        let body = ctx.get(path)?;
+        let r: BlobGcPlanResponse = ctx.decode(&body)?;
+        // Drift is a failed check, not a detail.
+        let status = if r.drift.as_ref().is_some_and(|d| !d.is_empty()) {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
         if ctx.json {
             ctx.print_raw(&body);
-            return Ok(ExitCode::SUCCESS);
+            return Ok(status);
         }
-        let r: BlobGcPlanResponse = ctx.decode(&body)?;
         ctx.print(&render_plan(&r));
-        return Ok(ExitCode::SUCCESS);
+        return Ok(status);
+    }
+    if a.verify {
+        return Err(local(
+            "--verify goes with --dry-run alone: kronik blobs gc --dry-run --verify".to_owned(),
+        ));
     }
     let why = super::reason(&a.mutation)?;
     let body = ctx.post(
@@ -328,6 +434,32 @@ fn gc(ctx: &Ctx, a: GcArgs) -> Result<ExitCode, Error> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn render_drift(r: &BlobGcPlanResponse, out: &mut String) {
+    match &r.drift {
+        None => {}
+        Some(d) if d.is_empty() => out.push_str("Pins         match the rows they mirror\n"),
+        Some(d) => {
+            let _ = writeln!(
+                out,
+                "Pins         DRIFT: {} differences from the rows they mirror",
+                d.len()
+            );
+            let rows = d
+                .iter()
+                .map(|e| {
+                    vec![
+                        e.hash.clone(),
+                        e.source.clone(),
+                        e.owner.clone(),
+                        e.problem.clone(),
+                    ]
+                })
+                .collect();
+            out.push_str(&table(&["blob", "row", "owner", "problem"], rows));
+        }
+    }
+}
+
 fn render_plan(r: &BlobGcPlanResponse) -> String {
     let mut out = String::new();
     if !r.enabled {
@@ -336,6 +468,7 @@ fn render_plan(r: &BlobGcPlanResponse) -> String {
     }
     if r.blobs.is_empty() {
         let _ = writeln!(out, "Nothing to collect: all {} files have a root.", r.kept);
+        render_drift(r, &mut out);
         return out;
     }
     let rows = r
@@ -344,7 +477,10 @@ fn render_plan(r: &BlobGcPlanResponse) -> String {
         .map(|b| {
             vec![
                 b.hash.clone(),
-                b.reason.clone(),
+                match &b.released_by {
+                    Some(actor) if b.reason == "released" => format!("released by {actor}"),
+                    _ => b.reason.clone(),
+                },
                 units::size(b.bytes),
                 b.last_ref_lsn.map_or("-".to_owned(), |l| l.to_string()),
                 if b.candidate {
@@ -368,6 +504,7 @@ fn render_plan(r: &BlobGcPlanResponse) -> String {
         r.kept,
         r.floor.unwrap_or(0)
     );
+    render_drift(r, &mut out);
     out.push_str(&next(&[
         "kronik blobs gc --reason \"...\"".to_owned(),
         "kronik blobs gc --immediate --reason \"...\"".to_owned(),

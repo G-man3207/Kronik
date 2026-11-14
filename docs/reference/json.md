@@ -124,6 +124,7 @@ against both.
 | `kronik integrity` | [`IntegrityResponse`](#integrityresponse) (`GET /v1/integrity`) |
 | `kronik blobs status` | [`BlobsStatusResponse`](#blobsstatusresponse) (`GET /v1/blobs`) |
 | `kronik blobs inspect` | [`BlobInspectResponse`](#blobinspectresponse) (`GET /v1/blobs/{hash}`) |
+| `kronik blobs list` | [`ActorBlobsResponse`](#actorblobsresponse) (`GET /v1/actors/{kind}/{key}/blobs`) |
 | `kronik blobs get` | no JSON: writes the blob's bytes; with -o, --json prints the hash, path and bytes |
 | `kronik blobs gc` | [`BlobGcResponse`](#blobgcresponse) (`POST /v1/blobs/gc`); with --dry-run without --reason: [`BlobGcPlanResponse`](#blobgcplanresponse) (`GET /v1/blobs/gc`) |
 | `kronik export status` | [`ExportStatusResponse`](#exportstatusresponse) (`GET /v1/export`) |
@@ -246,6 +247,96 @@ against both.
     "turns",
     "last_turn_id",
     "sql"
+  ],
+  "type": "object"
+}
+```
+
+### ActorBlobEntry
+
+```json
+{
+  "description": "One blob an actor holds.",
+  "properties": {
+    "hash": {
+      "type": "string"
+    },
+    "lsn": {
+      "description": "The record that made the actor hold it.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "size": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "subject": {
+      "description": "Null without `pii:read`, and for a blob without a subject.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "hash",
+    "size",
+    "lsn"
+  ],
+  "type": "object"
+}
+```
+
+### ActorBlobsResponse
+
+```json
+{
+  "description": "`GET /v1/actors/{kind}/{key}/blobs` (`kronik blobs list --actor`): the\nblobs the actor holds, by hash.",
+  "properties": {
+    "blobs": {
+      "items": {
+        "$ref": "#/components/schemas/ActorBlobEntry"
+      },
+      "type": "array"
+    },
+    "next": {
+      "description": "Pass as `after` for the next page; null on the last.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "blobs"
+  ],
+  "type": "object"
+}
+```
+
+### ActorBlobsSummary
+
+```json
+{
+  "description": "What an actor holds (M26 §12).",
+  "properties": {
+    "bytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "held": {
+      "description": "Distinct blobs it holds, and their bytes (what its quota counts).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "held",
+    "bytes"
   ],
   "type": "object"
 }
@@ -471,8 +562,15 @@ against both.
       ]
     },
     "reason": {
-      "description": "`loose` (no record ever referenced it), `out-of-retention` (its\nlast reference is below the floor) or `erased`.",
+      "description": "`loose` (no record ever referenced it), `released` (its last holder\nreleased it, and that record is below the floor), `out-of-retention`\n(its last reference is below the floor) or `erased`.",
       "type": "string"
+    },
+    "released_by": {
+      "description": "The actor (`kind/key`) that released it last, when one did.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "size": {
       "description": "From the index, when a record referenced it.",
@@ -523,6 +621,16 @@ against both.
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
+    },
+    "drift": {
+      "description": "With `verify=true`: the differences between the index's pins and the\nrows they mirror, recomputed from those rows. Always empty unless\nthe index is wrong.",
+      "items": {
+        "$ref": "#/components/schemas/BlobPinDriftEntry"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
     },
     "enabled": {
       "type": "boolean"
@@ -762,6 +870,38 @@ against both.
 }
 ```
 
+### BlobPinDriftEntry
+
+```json
+{
+  "description": "A difference between the index's pins and the rows they mirror.",
+  "properties": {
+    "hash": {
+      "type": "string"
+    },
+    "owner": {
+      "description": "The row, as `kronik blobs inspect` shows a pin's owner.",
+      "type": "string"
+    },
+    "problem": {
+      "description": "`missing`: the row references the blob and no pin keeps it, so the\ncollector could delete it under the row; `extra`: a pin no row\naccounts for, which keeps the blob too long.",
+      "type": "string"
+    },
+    "source": {
+      "description": "The row's kind: `message`, `timer`, `dead-letter`, `saved-response`,\n`saved-call`, `open-turn` or `open-effect`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "hash",
+    "source",
+    "owner",
+    "problem"
+  ],
+  "type": "object"
+}
+```
+
 ### BlobReference
 
 ```json
@@ -791,6 +931,13 @@ against both.
 {
   "description": "What keeps a blob.",
   "properties": {
+    "actor": {
+      "description": "`held`: the actor, `kind/key`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "floor": {
       "description": "`log`: the floor.",
       "format": "uint64",
@@ -808,11 +955,11 @@ against both.
       ]
     },
     "kind": {
-      "description": "`log` (a record at or after the floor), `pin` (a row of the state),\n`snapshot`, `fork` or `lease`.",
+      "description": "`log` (a record at or after the floor), `held` (an actor holds it),\n`pin` (a row of the state), `snapshot`, `fork` or `lease`.",
       "type": "string"
     },
     "lsn": {
-      "description": "`log`: the last record that references it; `pin`: the record that\nset the pin; `snapshot`: the snapshot's LSN.",
+      "description": "`log`: the last record that references it; `held`: the record that\nmade the actor hold it; `pin`: the record that set the pin;\n`snapshot`: the snapshot's LSN.",
       "format": "uint64",
       "minimum": 0,
       "type": [
@@ -5421,6 +5568,17 @@ against both.
   "properties": {
     "actor": {
       "$ref": "#/components/schemas/Actor"
+    },
+    "blobs": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/ActorBlobsSummary"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The blobs the actor holds (M26), when the node has blobs."
     },
     "sql": {
       "anyOf": [

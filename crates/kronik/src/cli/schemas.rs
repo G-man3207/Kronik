@@ -280,6 +280,10 @@ const COMMANDS: &[(&str, Output)] = &[
         Output::Api(&[("", "GET", "/v1/blobs/{hash}")]),
     ),
     (
+        "blobs list",
+        Output::Api(&[("", "GET", "/v1/actors/{kind}/{key}/blobs")]),
+    ),
+    (
         "blobs get",
         Output::None("writes the blob's bytes; with -o, --json prints the hash, path and bytes"),
     ),

@@ -127,6 +127,17 @@ until the v1.0 compatibility promise takes effect.
   `TurnBegin`, and the connection a turn opens cannot take one. Forks
   answer from the recording or from a connection model (simulator
   `connection`). New metric `kronik_connection_send_now_total`.
+- What keeps a blob, and why one has nothing (M26 slice B16): the
+  collector's dry run gives the reason `released` (its last holder let it
+  go, named in `released_by`, and that record left retention) besides
+  `loose`, `out-of-retention` and `erased`, and `kronik blobs gc --dry-run
+  --verify` (`GET /v1/blobs/gc?verify=true`) checks the index's pins
+  against the rows they mirror and lists any `drift` (exit 1).
+  `kronik blobs inspect` names the actors that hold a blob (`held` roots);
+  `kronik actors inspect` (`GET /v1/actors/{kind}/{key}`) counts the blobs
+  an actor holds and their bytes; `kronik blobs list --actor KIND/KEY`
+  (`GET /v1/actors/{kind}/{key}/blobs`) lists them; the MCP tool
+  `blob_gc_plan` is the dry run.
 - After a restart, the views that remove secret values (`history`,
   `actors inspect`, turns, traces, dead letters, the audit log and others)
   answered 503 `SECRET_UNAVAILABLE` for good once the external backend of a

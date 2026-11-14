@@ -1470,6 +1470,9 @@ impl Api {
             ("GET", ["v1", "secrets", name, "history"]) => self.secret_history(name).await,
             ("GET", ["v1", "orphans"]) => self.orphans(&q),
             ("GET", ["v1", "actors", kind, key, "timers"]) => self.timers(kind, key),
+            ("GET", ["v1", "actors", kind, key, "blobs"]) => {
+                self.actor_blobs(kind, key, &q, caller.has(auth::Scope::PiiRead))
+            }
             ("POST", ["v1", "tokens"]) => self.token_create(req).await,
             ("GET", ["v1", "tokens"]) => self.tokens(),
             ("POST", ["v1", "tokens", name, "revoke"]) => self.token_revoke(req, name).await,
@@ -1729,6 +1732,18 @@ impl Api {
                 .ok_or_else(|| Self::not_found(kind, key))?;
             (row, db.kv_list(&actor.kind, &actor.key).map_err(internal)?)
         };
+        let blobs = match self.node.blob_store() {
+            Some(_) => {
+                let (held, bytes) = self
+                    .node
+                    .store()
+                    .db()
+                    .held_summary(&actor.kind, &actor.key)
+                    .map_err(internal)?;
+                Some(ActorBlobsSummary { held, bytes })
+            }
+            None => None,
+        };
         let sql = if row.sql {
             let db = self
                 .node
@@ -1769,6 +1784,7 @@ impl Api {
                 })
                 .collect(),
             sql,
+            blobs,
         })
     }
 

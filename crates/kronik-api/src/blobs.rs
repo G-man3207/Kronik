@@ -7,6 +7,7 @@
 
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_sched::blob_gc::{BlobRoot, GcOutcome, SweepOptions, Unrooted};
+use kronik_store::db::PinDrift;
 
 use crate::auth::{Caller, Scope};
 use crate::types::*;
@@ -28,11 +29,40 @@ fn entry(u: &Unrooted, pii: bool) -> BlobGcEntry {
     BlobGcEntry {
         hash: u.hash.clone(),
         reason: u.reason.as_str().to_owned(),
+        released_by: u.released_by.as_ref().map(|(actor, _)| actor.clone()),
         size: u.size,
         bytes: u.bytes,
         subject: u.subject.clone().filter(|_| pii),
         last_ref_lsn: u.last_ref_lsn,
         candidate: u.candidate,
+    }
+}
+
+/// A pin's owner as the API shows it: the store separates the fields of a
+/// row's key (an ingress key, a timer) with the unit separator; show them as
+/// a path.
+fn owner_path(owner: &str) -> String {
+    owner.replace('\u{1f}', "/")
+}
+
+fn drift_entry(d: PinDrift) -> BlobPinDriftEntry {
+    BlobPinDriftEntry {
+        hash: d.hash,
+        source: kronik_store::db::blob_source::name(d.source).to_owned(),
+        owner: owner_path(&d.owner),
+        problem: if d.missing { "missing" } else { "extra" }.to_owned(),
+    }
+}
+
+/// `verify=true|false` of a query.
+fn verify_flag(q: &Query) -> Result<bool> {
+    match q.get("verify") {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(other) => Err(ApiError::new(
+            ErrorCode::BadRequest,
+            format!("verify is true or false, not {other:?}"),
+        )),
     }
 }
 
@@ -50,6 +80,7 @@ fn summary(o: &GcOutcome) -> BlobGcSummary {
 fn root(r: BlobRoot) -> BlobRootEntry {
     let mut e = BlobRootEntry {
         kind: String::new(),
+        actor: None,
         lsn: None,
         floor: None,
         source: None,
@@ -65,12 +96,15 @@ fn root(r: BlobRoot) -> BlobRootEntry {
             e.lsn = Some(last_ref_lsn);
             e.floor = Some(floor);
         }
+        BlobRoot::Held { actor, lsn } => {
+            e.kind = "held".into();
+            e.actor = Some(actor);
+            e.lsn = Some(lsn);
+        }
         BlobRoot::Pin { source, owner, lsn } => {
             e.kind = "pin".into();
             e.source = Some(source.to_owned());
-            // The store separates the fields of an ingress row's key with
-            // the unit separator; show them as a path.
-            e.owner = Some(owner.replace('\u{1f}', "/"));
+            e.owner = Some(owner_path(&owner));
             e.lsn = Some(lsn);
         }
         BlobRoot::Snapshot { lsn } => {
@@ -97,7 +131,7 @@ impl Api {
         let pii = caller.has(Scope::PiiRead);
         Some(match (req.method.as_str(), segs) {
             ("GET", ["v1", "blobs"]) => self.blobs_status(),
-            ("GET", ["v1", "blobs", "gc"]) => self.blob_gc_plan(pii).await,
+            ("GET", ["v1", "blobs", "gc"]) => self.blob_gc_plan(q, pii).await,
             ("POST", ["v1", "blobs", "gc"]) => self.blob_gc_run(req).await,
             ("GET", ["v1", "blobs", hash]) => self.blob_inspect(hash, q, pii).await,
             // Streamed by the server; reached only through a path that
@@ -126,7 +160,7 @@ impl Api {
         })
     }
 
-    async fn blob_plan(&self, pii: bool) -> Result<BlobGcPlanResponse> {
+    async fn blob_plan(&self, pii: bool, verify: bool) -> Result<BlobGcPlanResponse> {
         let Some(o) = self
             .node
             .blob_gc(SweepOptions {
@@ -139,6 +173,18 @@ impl Api {
         };
         let blobs: Vec<BlobGcEntry> = o.unrooted.iter().map(|u| entry(u, pii)).collect();
         let bytes = blobs.iter().map(|b| b.bytes).sum();
+        let drift = if verify {
+            Some(
+                self.node
+                    .blob_pin_drift()
+                    .await?
+                    .into_iter()
+                    .map(drift_entry)
+                    .collect(),
+            )
+        } else {
+            None
+        };
         Ok(BlobGcPlanResponse {
             enabled: true,
             count: blobs.len() as u64,
@@ -146,11 +192,51 @@ impl Api {
             floor: Some(o.floor),
             kept: o.report.objects.saturating_sub(blobs.len() as u64),
             blobs,
+            drift,
         })
     }
 
-    async fn blob_gc_plan(&self, pii: bool) -> Result<ApiResponse> {
-        ok(&self.blob_plan(pii).await?)
+    async fn blob_gc_plan(&self, q: &Query, pii: bool) -> Result<ApiResponse> {
+        self.ok_scrubbed(self.blob_plan(pii, verify_flag(q)?).await?)
+    }
+
+    /// `GET /v1/actors/{kind}/{key}/blobs` (M26 §12): what the actor holds,
+    /// by hash, a page at a time.
+    pub(crate) fn actor_blobs(
+        &self,
+        kind: &str,
+        key: &str,
+        q: &Query,
+        pii: bool,
+    ) -> Result<ApiResponse> {
+        let actor = Self::actor_ref(kind, key)?;
+        let limit = q.limit()?;
+        let after = q.get("after").unwrap_or("");
+        let mut holds = self
+            .node
+            .store()
+            .db()
+            .holds(&actor.kind, &actor.key, after, limit + 1)
+            .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+        let next = (holds.len() > limit).then(|| {
+            holds.truncate(limit);
+            holds
+                .last()
+                .map(|(r, _)| r.hash.clone())
+                .unwrap_or_default()
+        });
+        ok(&ActorBlobsResponse {
+            blobs: holds
+                .into_iter()
+                .map(|(r, lsn)| ActorBlobEntry {
+                    hash: r.hash,
+                    size: r.size,
+                    subject: r.subject.filter(|_| pii),
+                    lsn,
+                })
+                .collect(),
+            next,
+        })
     }
 
     async fn blob_gc_run(&self, req: &AuthorizedRequest) -> Result<ApiResponse> {
@@ -159,7 +245,7 @@ impl Api {
         if r.dry_run {
             // What a pass now would do: with `immediate` it deletes every
             // file without a root, otherwise the candidates of the last one.
-            let plan = self.blob_plan(false).await?;
+            let plan = self.blob_plan(false, false).await?;
             let (now, later): (Vec<&BlobGcEntry>, Vec<&BlobGcEntry>) =
                 plan.blobs.iter().partition(|b| r.immediate || b.candidate);
             return ok(&BlobGcResponse {
@@ -203,17 +289,7 @@ impl Api {
     }
 
     async fn blob_inspect(&self, hash: &str, q: &Query, pii: bool) -> Result<ApiResponse> {
-        let verify = match q.get("verify") {
-            None | Some("false") => false,
-            Some("true") => true,
-            Some(other) => {
-                return Err(ApiError::new(
-                    ErrorCode::BadRequest,
-                    format!("verify is true or false, not {other:?}"),
-                ));
-            }
-        };
-        let i = self.node.blob_inspect(hash, verify).await?;
+        let i = self.node.blob_inspect(hash, verify_flag(q)?).await?;
         let row = i.row.as_ref();
         let (verified, verify_error) = match &i.verified {
             None => (None, None),

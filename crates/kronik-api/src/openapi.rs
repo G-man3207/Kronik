@@ -529,6 +529,21 @@ pub const OPERATIONS: &[Operation] = &[
     },
     Operation {
         method: "GET",
+        path: "/v1/actors/{kind}/{key}/blobs",
+        summary: "The blobs an actor holds, by hash (M26); a subject with pii:read",
+        query: &[
+            Param {
+                name: "after",
+                kind: "string",
+                description: "Start after this hash: the previous page's `next`.",
+            },
+            LIMIT,
+        ],
+        request: None,
+        answer: Answer::Json(schema::<ActorBlobsResponse>),
+    },
+    Operation {
+        method: "GET",
         path: "/v1/turns/{id}",
         summary: "A turn record as JSON, on main or in a fork",
         query: &[],
@@ -1032,7 +1047,11 @@ pub const OPERATIONS: &[Operation] = &[
         method: "GET",
         path: "/v1/blobs/gc",
         summary: "The blob files of main's store that nothing keeps now, each with why (a dry run of the collector)",
-        query: &[],
+        query: &[Param {
+            name: "verify",
+            kind: "boolean",
+            description: "Also check the index's pins against the rows they mirror, and list any difference in `drift`.",
+        }],
         request: None,
         answer: Answer::Json(schema::<BlobGcPlanResponse>),
     },

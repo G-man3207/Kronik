@@ -401,20 +401,37 @@ blob of main's store without a root, now, ignoring the two-phase grace:
 
 `reason`: `loose` (no committed record ever referenced it), `released` (its
 last holder released it), `out-of-retention` (its last reference is below the
-floor), `fork-deleted` (only a deleted fork referenced it). As built in M25
-(slice B11) the reasons are `loose`, `out-of-retention` and `erased` (its
-subject was erased through its key version, a file §9.3 missed); `released`
-comes with the holds (B16), and `fork-deleted` cannot occur in main's store:
-a fork writes its blobs into its own space, which is deleted with it. `subject` is
-null without `pii:read`. `--verify` also recomputes the pins by decoding the
-rows they mirror (mailbox, timers, dead letters, ingress keys, deliveries,
-open turns and effects) and reports any difference from `blob_pins` as
-`"drift"`; it should always be empty. `kronik blobs gc --reason R [--immediate]` (`POST
-/v1/blobs/gc`, scope `operate`, `dry_run` supported) runs a pass now and
-records an `AuditEvent` `blobs.gc`. `kronik blobs inspect <hash>` lists the
-roots that keep a blob (`{"roots": [{"kind": "held", "actor": "media/alice"},
-{"kind": "timer", "actor": …, "timer_id": …}, {"kind": "log", "lsn": …},
-{"kind": "snapshot", "lsn": …}, …]}`).
+floor), `fork-deleted` (only a deleted fork referenced it). As built, the
+reasons are `loose`, `released`, `out-of-retention` and `erased` (its subject
+was erased through its key version, a file §9.3 missed); `fork-deleted`
+cannot occur in main's store: a fork writes its blobs into its own space,
+which is deleted with it. `released` (slice B16) is a blob whose last
+reference is the `RELEASE` that `blob_releases` remembers (a release is a
+reference, so a record that referenced the blob after it makes the reason
+`out-of-retention`); `released_by` names that actor whenever the table has a
+row. `subject` is null without `pii:read`.
+
+`--verify` (`GET /v1/blobs/gc?verify=true`, MCP `blob_gc_plan` with
+`verify`) also recomputes the pins by decoding the rows they mirror, as the
+applier does (mailbox, timers, dead letters not resent, ingress keys,
+deliveries, open turns, whose references it reads from their `TurnBegin`,
+and open effects), and reports any difference from `blob_pins` as `"drift"`:
+`missing` (a row references a blob that no pin keeps) or `extra` (a pin that
+no row accounts for). It should always be empty. Not drift: the pins of a
+row of sources 1 to 5 that is gone, which the next retention pass deletes; a
+saved `call` outcome below the floor that no older open turn may repeat,
+whose pins that pass deletes too; erased blobs, which nothing roots. An open
+turn or effect's pin without its row is drift: only its turn record deletes
+it. `kronik blobs gc --dry-run --verify` exits 1 on drift.
+
+`kronik blobs gc --reason R [--immediate]` (`POST /v1/blobs/gc`, scope
+`operate`, `dry_run` supported) runs a pass now and records an `AuditEvent`
+`blobs.gc`. `kronik blobs inspect <hash>` lists the roots that keep a blob,
+as built: `{"roots": [{"kind": "log", "lsn": …, "floor": …}, {"kind": "held",
+"actor": "media/alice", "lsn": …}, {"kind": "pin", "source": "timer", "owner":
+"media/alice/7", "lsn": …}, {"kind": "snapshot", "lsn": …}, {"kind": "fork",
+"fork": …}, {"kind": "lease"}]}`; a pin's `source` is `message`, `timer`,
+`dead-letter`, `saved-response`, `saved-call`, `open-turn` or `open-effect`.
 
 ## 7. Snapshots
 
@@ -583,12 +600,12 @@ M25 §15's surfaces, plus:
 | --- | --- | --- |
 | `GET /v1/actors/{kind}/{key}` / `kronik actors inspect` | `read` | adds `"blobs": {"held": N, "bytes": B}` |
 | `GET /v1/actors/{kind}/{key}/blobs?after=&limit=` / `kronik blobs list --actor KIND/KEY` | `read` | `{"blobs": [{"hash", "size", "subject", "lsn"}], "next"}` |
-| `GET /v1/blobs/gc` / `kronik blobs gc --dry-run` | `read` | §6.6 |
+| `GET /v1/blobs/gc?verify=` / `kronik blobs gc --dry-run [--verify]` | `read` | §6.6 |
 | `POST /v1/blobs/gc` / `kronik blobs gc --reason R [--immediate] [--dry-run]` | `operate` | `{"dry_run", "deleted", "bytes", "candidates"}`; an `AuditEvent` `blobs.gc` |
 | `GET /v1/blobs/{hash}` / `kronik blobs inspect` | `read` | adds `roots` (§6.6) |
 | `POST /v1/limits` / `kronik limits set --blob-size-per-actor` | `operate` | the quota |
 | `GET /v1/privacy`, `POST /v1/privacy/erase` | as today | the fields of §9 |
-| MCP `blob_gc_plan` | `read` | as `GET /v1/blobs/gc` |
+| MCP `blob_gc_plan` (`verify`) | `read` | as `GET /v1/blobs/gc` |
 
 The OpenAPI document, the CLI's JSON schemas, `docs/reference/cli.md`,
 `api-examples.md` and `json.md` are regenerated with each route.

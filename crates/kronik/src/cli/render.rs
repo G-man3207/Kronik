@@ -290,6 +290,19 @@ pub fn inspect(r: &InspectResponse) -> String {
         }
         field8(&mut out, "SQL", &tables);
     }
+    // What it holds (M26), when it holds anything.
+    if let Some(blobs) = r.blobs.filter(|b| b.held > 0) {
+        let noun = if blobs.held == 1 { "blob" } else { "blobs" };
+        field8(
+            &mut out,
+            "Blobs",
+            &[format!(
+                "{} {noun} held, {}; kronik blobs list --actor {actor}",
+                blobs.held,
+                units::size(blobs.bytes)
+            )],
+        );
+    }
     out.push_str(&next(&[
         format!("kronik history {actor}"),
         format!("kronik actors timers {actor}"),

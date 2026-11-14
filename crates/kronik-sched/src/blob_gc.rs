@@ -52,12 +52,15 @@ pub struct GcOutcome {
     pub unrooted: Vec<Unrooted>,
 }
 
-/// Why a blob file has no root (ADR 0120 §6). M26 adds `released`.
+/// Why a blob file has no root (ADR 0120 §6, M26 §6.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnrootedReason {
     /// No committed record ever referenced it: a turn that failed or never
     /// returned or kept what it wrote, a crash before the commit.
     Loose,
+    /// Its last holder released it, no record referenced it after that, and
+    /// that record is below the floor now (M26).
+    Released,
     /// Its last reference is below the floor, and nothing in the state
     /// keeps it.
     OutOfRetention,
@@ -69,6 +72,7 @@ impl UnrootedReason {
     pub fn as_str(self) -> &'static str {
         match self {
             UnrootedReason::Loose => "loose",
+            UnrootedReason::Released => "released",
             UnrootedReason::OutOfRetention => "out-of-retention",
             UnrootedReason::Erased => "erased",
         }
@@ -89,6 +93,8 @@ pub struct Unrooted {
     pub size: Option<u64>,
     pub subject: Option<String>,
     pub last_ref_lsn: Option<Lsn>,
+    /// The actor (`kind/key`) that released it last, and that record's LSN.
+    pub released_by: Option<(String, Lsn)>,
 }
 
 /// The collector's state on the node.
@@ -319,9 +325,18 @@ impl Node {
         for file in &report.unrooted {
             let hash = file.id.to_string();
             let row = self.store().db().blob(&hash).map_err(store_error)?;
+            let released = self.store().db().released_by(&hash).map_err(store_error)?;
             let reason = match &row {
                 None => UnrootedReason::Loose,
                 Some(row) if row.erased => UnrootedReason::Erased,
+                // The release was its last reference (a RELEASE is one).
+                Some(row)
+                    if released
+                        .as_ref()
+                        .is_some_and(|(_, _, lsn)| *lsn >= row.last_ref_lsn) =>
+                {
+                    UnrootedReason::Released
+                }
                 Some(_) => UnrootedReason::OutOfRetention,
             };
             unrooted.push(Unrooted {
@@ -332,6 +347,7 @@ impl Node {
                 size: row.as_ref().map(|r| r.size),
                 subject: row.as_ref().and_then(|r| r.subject.clone()),
                 last_ref_lsn: row.as_ref().map(|r| r.last_ref_lsn),
+                released_by: released.map(|(kind, key, lsn)| (format!("{kind}/{key}"), lsn)),
             });
         }
         kronik_metrics::set(
@@ -447,6 +463,33 @@ impl Node {
             .map(|store| store.leases().floor(holder, lsn))
     }
 
+    /// `kronik blobs gc --dry-run --verify` (M26 §6.6): the differences
+    /// between the index's pins and the rows they mirror, which should
+    /// always be empty. An open turn's references come from its
+    /// `TurnBegin`, read from the log. Empty when blobs are off.
+    pub async fn blob_pin_drift(&self) -> Result<Vec<kronik_store::db::PinDrift>, ApiError> {
+        if self.blobs.is_none() {
+            return Ok(Vec::new());
+        }
+        let floor = self.blob_floor()?;
+        let open = self.store().db().open_turns().map_err(store_error)?;
+        let mut refs = std::collections::BTreeMap::new();
+        for turn in open {
+            let c = self.reader().read_at(turn.pos).await.map_err(|e| {
+                store_error(format!("reading the open turn at lsn {}: {e}", turn.lsn))
+            })?;
+            let hashes: Vec<String> = kronik_proto::blobs::refs(&c.record)
+                .into_iter()
+                .map(|r| r.hash.clone())
+                .collect();
+            refs.insert(turn.execution_id, hashes);
+        }
+        self.store()
+            .db()
+            .blob_pin_drift(floor, &refs)
+            .map_err(store_error)
+    }
+
     /// The last pass that deleted, for `kronik blobs status`.
     pub fn blob_gc_last(&self) -> Option<GcOutcome> {
         lock(&self.blob_gc.last).clone()
@@ -485,6 +528,8 @@ pub struct BlobStatus {
 pub enum BlobRoot {
     /// A record at or after the floor references it.
     Log { last_ref_lsn: Lsn, floor: Lsn },
+    /// An actor (`kind/key`) holds it, since the record at `lsn` (M26).
+    Held { actor: String, lsn: Lsn },
     /// A row of the state pins it.
     Pin {
         source: &'static str,
@@ -646,6 +691,12 @@ impl Node {
                 roots.push(BlobRoot::Log {
                     last_ref_lsn: r.last_ref_lsn,
                     floor,
+                });
+            }
+            for (kind, key, lsn) in self.store().db().holders(&hash).map_err(store_error)? {
+                roots.push(BlobRoot::Held {
+                    actor: format!("{kind}/{key}"),
+                    lsn,
                 });
             }
             for pin in self.store().db().blob_pins(&hash).map_err(store_error)? {

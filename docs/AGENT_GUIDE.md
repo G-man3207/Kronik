@@ -229,6 +229,7 @@ the effects that cannot be undone; it needs a human's approval, then
 | `list_dead_letters` | `read` | Failed inputs and uncertain effects |
 | `inspect_blob` | `read` | A blob's state, size and what keeps it, by the hash a history shows; never its bytes |
 | `list_connections` | `read` | WebSocket and SSE connections, or one by `id`; closing one is an operator's command |
+| `blob_gc_plan` | `read` | The blob files nothing keeps, with why (`loose`, `released`, `out-of-retention`, `erased`); deletes nothing |
 | `create_fork`, `send_to_fork` | `fork` | Forks and messages into them; never live effects |
 | `propose_change` | `propose` | Replays recent traffic through new code; returns the proposal and its diff summary |
 | `get_diff` | `read` | The whole behavior diff of a proposal or a fork |

@@ -198,6 +198,41 @@ const TOOLS: &[Spec] = &[
         },
     },
     Spec {
+        name: "blob_gc_plan",
+        title: "Plan the blob collection",
+        scope: "read",
+        description: "The blob files of main's store that nothing keeps now and that the \
+            collector would delete, each with why: `loose` (no committed record ever \
+            referenced it), `released` (its last holder released it, and that record left \
+            retention; `released_by` names the actor), `out-of-retention` (its last \
+            reference left retention) or `erased` (its subject was erased). `candidate`: a \
+            pass already found it without a root, so the next pass deletes it. Deletes \
+            nothing. With `verify`, also recomputes the index's pins from the rows they \
+            mirror and lists any difference in `drift`, which should be empty.",
+        mutates: false,
+        dry_run: false,
+        destructive: false,
+        input: || {
+            object(
+                json!({
+                    "verify": {"type": "boolean", "description": "Also check the index's pins against the rows they mirror (drift)."}
+                }),
+                &[],
+            )
+        },
+        output: || {
+            result(json!({
+                "enabled": {"type": "boolean", "description": "Whether the node has a blob store."},
+                "blobs": {"type": "array", "items": {"type": "object", "description": "{hash, reason (loose, released, out-of-retention or erased), released_by, size, bytes, subject (null without pii:read), last_ref_lsn, candidate}"}},
+                "count": {"type": "integer"},
+                "bytes": {"type": "integer"},
+                "floor": {"type": ["integer", "null"], "description": "Records at or after this LSN keep their blobs."},
+                "kept": {"type": "integer", "description": "Files with a root."},
+                "drift": {"type": "array", "items": {"type": "object", "description": "{hash, source, owner, problem (missing or extra)}"}}
+            }))
+        },
+    },
+    Spec {
         name: "list_connections",
         title: "List connections",
         scope: "read",
@@ -587,6 +622,9 @@ pub(crate) async fn call(
         "list_dead_letters" => args
             .query(&["after", "limit"])
             .map(|q| Request::get("/v1/dead-letters".into(), q)),
+        "blob_gc_plan" => args
+            .query(&["verify"])
+            .map(|q| Request::get("/v1/blobs/gc".to_owned(), q)),
         "inspect_blob" => args.segment("hash").and_then(|hash| {
             let q = args.query(&["verify"])?;
             Ok(Request::get(format!("/v1/blobs/{hash}"), q))

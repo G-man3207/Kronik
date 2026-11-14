@@ -399,6 +399,20 @@ pub struct BlobRow {
     pub erased: bool,
 }
 
+/// A difference between `blob_pins` and the rows they mirror
+/// ([`StateDb::blob_pin_drift`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PinDrift {
+    pub hash: String,
+    /// The pin source ([`source`]) and owner of the row.
+    pub source: i64,
+    pub owner: String,
+    /// `true`: the row references the blob and no pin keeps it (the
+    /// collector could delete it under the row); `false`: a pin that no row
+    /// accounts for (it keeps the blob too long).
+    pub missing: bool,
+}
+
 /// One pin of a blob: its source, its owner and the LSN that set it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobPin {
@@ -825,11 +839,13 @@ impl StateDb {
         Ok(out)
     }
 
-    /// Whether the state keeps `hash` (a pin; M26: a hold).
+    /// Whether the state keeps `hash`: a pin or a hold.
     pub fn blob_kept_by_state(&self, hash: &str) -> Result<bool, StoreError> {
         Ok(self
             .conn
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM blob_pins WHERE hash = ?1)")?
+            .prepare_cached(&format!(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE hash = ?1 AND {KEPT_BY_STATE})"
+            ))?
             .query_row([hash], |r| r.get(0))?)
     }
 
@@ -961,6 +977,214 @@ impl StateDb {
             ))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The actors that hold `hash`, with the LSN of each hold (`kronik blobs
+    /// inspect`, M26 §6.6).
+    pub fn holders(&self, hash: &str) -> Result<Vec<(String, String, Lsn)>, StoreError> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT kind, key, lsn FROM blob_refs WHERE hash = ?1 ORDER BY kind, key",
+        )?;
+        let rows = st.query_map([hash], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as Lsn))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// How many distinct blobs the actor `kind`/`key` holds, and their bytes
+    /// (`kronik actors inspect`, M26 §12).
+    pub fn held_summary(&self, kind: &str, key: &str) -> Result<(u64, u64), StoreError> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT count(*), coalesce(sum(b.size), 0) FROM blob_refs h JOIN blobs b \
+             ON b.hash = h.hash WHERE h.kind = ?1 AND h.key = ?2",
+            )?
+            .query_row(params![kind, key], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+            })?)
+    }
+
+    /// The differences between `blob_pins` and the rows the pins mirror
+    /// (`kronik blobs gc --dry-run --verify`, M26 §6.6), recomputed by
+    /// decoding those rows as the applier does: the mailbox (1), timers (2),
+    /// dead letters not resent (3), saved responses (4), saved `call`
+    /// outcomes (5), open turns (6: `open_turns` holds only a position, so
+    /// the caller passes each one's references from its `TurnBegin`) and
+    /// their recorded effects (7). It should always be empty. The open
+    /// turns are checked as `open_turns` has them now: one that opened after
+    /// the caller read the others is not checked, one that closed since is
+    /// not looked at.
+    ///
+    /// Not drift: the pins of a row of sources 1 to 5 that is gone, which
+    /// the next retention pass deletes ([`StateDb::prune_blob_pins`]); a
+    /// saved `call` outcome below `floor` that no older open turn may
+    /// repeat, whose pins that pass deletes too; and erased blobs, which
+    /// nothing roots.
+    pub fn blob_pin_drift(
+        &self,
+        floor: Lsn,
+        open_turn_refs: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<Vec<PinDrift>, StoreError> {
+        use std::collections::{BTreeMap, BTreeSet};
+        // Each row's (source, owner) -> the blobs it references, and
+        // whether they must be pinned.
+        let mut rows: BTreeMap<(i64, String), (BTreeSet<String>, bool)> = BTreeMap::new();
+        let mut add = |source: i64, owner: String, refs: Vec<&pb::BlobRef>, required: bool| {
+            rows.insert(
+                (source, owner),
+                (refs.iter().map(|r| r.hash.clone()).collect(), required),
+            );
+        };
+        let conn = &self.conn;
+        {
+            let mut st = conn.prepare("SELECT message_id, input FROM mailbox")?;
+            let mut q = st.query([])?;
+            while let Some(r) = q.next()? {
+                let input: pb::Input = super::decode(&r.get::<_, Vec<u8>>(1)?, "a mailbox input")?;
+                let mut refs = Vec::new();
+                kronik_proto::blobs::input(Some(&input), &mut refs);
+                add(source::MAILBOX, r.get(0)?, refs, true);
+            }
+        }
+        {
+            let mut st = conn.prepare("SELECT kind, key, timer_id, msg FROM timers")?;
+            let mut q = st.query([])?;
+            while let Some(r) = q.next()? {
+                let msg: pb::Message = super::decode(&r.get::<_, Vec<u8>>(3)?, "a timer message")?;
+                let owner =
+                    timer_owner(&r.get::<_, String>(0)?, &r.get::<_, String>(1)?, r.get(2)?);
+                add(source::TIMER, owner, msg.blobs.iter().collect(), true);
+            }
+        }
+        {
+            let mut st =
+                conn.prepare("SELECT lsn, input FROM dead_letters WHERE resent_as IS NULL")?;
+            let mut q = st.query([])?;
+            while let Some(r) = q.next()? {
+                let input: pb::Input =
+                    super::decode(&r.get::<_, Vec<u8>>(1)?, "a dead letter's input")?;
+                let mut refs = Vec::new();
+                kronik_proto::blobs::input(Some(&input), &mut refs);
+                add(
+                    source::DEAD_LETTER,
+                    r.get::<_, i64>(0)?.to_string(),
+                    refs,
+                    true,
+                );
+            }
+        }
+        {
+            let mut st = conn.prepare("SELECT kind, key, idem_key, outcome FROM ingress_keys")?;
+            let mut q = st.query([])?;
+            while let Some(r) = q.next()? {
+                let outcome: pb::Outcome =
+                    super::decode(&r.get::<_, Vec<u8>>(3)?, "a saved response")?;
+                let mut refs = Vec::new();
+                kronik_proto::blobs::outcome(Some(&outcome), &mut refs);
+                let owner = ingress_owner(
+                    &r.get::<_, String>(0)?,
+                    &r.get::<_, String>(1)?,
+                    &r.get::<_, String>(2)?,
+                );
+                add(source::INGRESS_KEY, owner, refs, true);
+            }
+        }
+        {
+            let mut st = conn.prepare(
+                "SELECT d.message_id, d.outcome, d.lsn >= ?1 \
+                 OR EXISTS (SELECT 1 FROM open_turns o WHERE o.lsn < d.lsn) \
+                 FROM deliveries d WHERE d.outcome IS NOT NULL",
+            )?;
+            let mut q = st.query([i(floor)])?;
+            while let Some(r) = q.next()? {
+                let outcome: pb::Outcome =
+                    super::decode(&r.get::<_, Vec<u8>>(1)?, "a saved call outcome")?;
+                let mut refs = Vec::new();
+                kronik_proto::blobs::outcome(Some(&outcome), &mut refs);
+                add(source::DELIVERY, r.get(0)?, refs, r.get(2)?);
+            }
+        }
+        {
+            let mut st = conn.prepare("SELECT execution_id, ordinal, record FROM open_effects")?;
+            let mut q = st.query([])?;
+            while let Some(r) = q.next()? {
+                let effect: pb::EffectRecord =
+                    super::decode(&r.get::<_, Vec<u8>>(2)?, "an open effect")?;
+                let owner = effect_owner(&r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32);
+                add(
+                    source::OPEN_EFFECT,
+                    owner,
+                    effect.blobs.iter().collect(),
+                    true,
+                );
+            }
+        }
+        let mut unchecked = BTreeSet::new();
+        {
+            let mut st = conn.prepare("SELECT execution_id FROM open_turns")?;
+            let mut q = st.query([])?;
+            while let Some(r) = q.next()? {
+                let execution_id: String = r.get(0)?;
+                match open_turn_refs.get(&execution_id) {
+                    Some(hashes) => {
+                        rows.insert(
+                            (source::OPEN_TURN, execution_id),
+                            (hashes.iter().cloned().collect(), true),
+                        );
+                    }
+                    None => {
+                        unchecked.insert(execution_id);
+                    }
+                }
+            }
+        }
+        let erased: BTreeSet<String> = conn
+            .prepare("SELECT hash FROM blobs WHERE erased = 1")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?;
+        let pins: BTreeSet<(i64, String, String)> = conn
+            .prepare("SELECT source, owner, hash FROM blob_pins")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut drift = BTreeSet::new();
+        for ((source, owner), (hashes, required)) in &rows {
+            for hash in hashes {
+                if *required
+                    && !erased.contains(hash)
+                    && !pins.contains(&(*source, owner.clone(), hash.clone()))
+                {
+                    drift.insert(PinDrift {
+                        hash: hash.clone(),
+                        source: *source,
+                        owner: owner.clone(),
+                        missing: true,
+                    });
+                }
+            }
+        }
+        for (source, owner, hash) in pins {
+            if erased.contains(&hash) || (source == source::OPEN_TURN && unchecked.contains(&owner))
+            {
+                continue;
+            }
+            let extra = match rows.get(&(source, owner.clone())) {
+                Some((hashes, _)) => !hashes.contains(&hash),
+                // A row of sources 1 to 5 that is gone waits for the next
+                // retention pass; an open turn or effect's pins go with its
+                // turn record, so one without its row is drift.
+                None => matches!(source, source::OPEN_TURN | source::OPEN_EFFECT),
+            };
+            if extra {
+                drift.insert(PinDrift {
+                    hash,
+                    source,
+                    owner,
+                    missing: false,
+                });
+            }
+        }
+        Ok(drift.into_iter().collect())
     }
 
     /// Every blob first referenced at or before `lsn`, not erased, sorted:

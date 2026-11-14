@@ -485,6 +485,8 @@ impl ScrubbedOutput for InspectResponse {
             actor: _,
             state,
             sql,
+            // Counts only.
+            blobs: _,
         } = self;
         if let Some(sql) = sql {
             for table in &mut sql.tables {
@@ -745,8 +747,23 @@ impl ScrubbedOutput for BlobInspectResponse {
     fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
         for root in &mut self.roots {
             optional_text(&mut root.owner, secrets);
+            optional_text(&mut root.actor, secrets);
         }
         optional_text(&mut self.verify_error, secrets);
+        Ok(())
+    }
+}
+
+/// The collector's plan names actors that released blobs and the rows of
+/// pins that drifted: keys a client chose, which may hold a secret value.
+impl ScrubbedOutput for BlobGcPlanResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for blob in &mut self.blobs {
+            optional_text(&mut blob.released_by, secrets);
+        }
+        for drift in self.drift.iter_mut().flatten() {
+            text(&mut drift.owner, secrets);
+        }
         Ok(())
     }
 }
@@ -975,6 +992,7 @@ mod tests {
                 subject: Some("subject7".into()),
                 lsn: 7,
             }],
+            blobs: None,
             sql: Some(SqlSummary {
                 tables: vec![SqlTable {
                     name: "7".into(),

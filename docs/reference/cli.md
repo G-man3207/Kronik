@@ -687,7 +687,10 @@ Next     kronik actors inspect counter/a
 `kronik actors inspect <KIND/KEY>`
 
 Shows an actor's key-value state, with the LSN and subject of each value,
-and the row counts of its SQL tables.
+and the row counts of its SQL tables. On a node with blobs, `--json` adds
+`blobs`: how many distinct blobs the actor holds and their bytes, which is
+what its quota counts (M26); the text shows a `Blobs` line when it holds
+any (`kronik blobs list --actor` lists them).
 
 ```text
 $ kronik actors inspect notes/n
@@ -2570,8 +2573,10 @@ Next     kronik blobs gc --dry-run
 One blob (`GET /v1/blobs/{hash}`, scope `read`): its size, its subject (only
 with `pii:read`), whether its frames are sealed, the first and last records
 that referenced it, its state and what keeps it: `log` (a record at or
-after the floor), `pin` (a saved idempotent response, an open turn or one of
-its effects), `snapshot`, `fork` or `lease`. The state is `live`, `erased`
+after the floor), `held` (an actor holds it, named as `kind/key`), `pin` (a
+row of the state that carries it: a queued message, a timer, a dead letter,
+a saved idempotent response or `call` outcome, an open turn or one of its
+effects), `snapshot`, `fork` or `lease`. The state is `live`, `erased`
 (its subject was erased), `missing` (referenced, but not in the store:
 `BLOB_MISSING`) or `loose` (in the store, never referenced: the collector
 deletes it). `--verify` also reads the whole file and checks every frame
@@ -2612,17 +2617,43 @@ $ kronik blobs get b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2
 Wrote b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9 (30.0 MiB) to report.pdf
 ```
 
+## kronik blobs list
+
+`kronik blobs list --actor <KIND/KEY> [--after <HASH>] [--limit <N>]`
+
+The blobs an actor holds (`GET /v1/actors/{kind}/{key}/blobs`, scope
+`read`), by hash, 100 at a time (`--limit` up to 1000): each one's size, its
+subject (only with `pii:read`) and the record that made the actor hold it.
+`--after` takes the `next` of the previous page.
+
+```text
+$ kronik blobs list --actor media/alice
+blob                                                                     size     subject  held since lsn
+b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9  30.0 MiB  -        1203
+Next     kronik blobs inspect b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9
+```
+
 ## kronik blobs gc
 
-`kronik blobs gc --dry-run`
+`kronik blobs gc --dry-run [--verify]`
 `kronik blobs gc --reason <REASON> [--immediate] [--dry-run]`
 
 The collector (M26 §6). With `--dry-run` alone (`GET /v1/blobs/gc`, scope
 `read`) it lists every blob file of main's store that nothing keeps now,
 and why: `loose` (no record ever referenced it: a turn that failed, or
 wrote a blob and did not answer with it or keep it, a crash before the
-commit), `out-of-retention` (its last reference is below the floor) or
-`erased`. A pass deletes a file without a root when the previous pass found
+commit), `released` (its last holder released it, named in `released_by`,
+and that record is below the floor), `out-of-retention` (its last reference
+is below the floor) or `erased`. `--verify` also recomputes the pins of the
+index from the rows they mirror (queued messages, timers, dead letters,
+saved responses and `call` outcomes, open turns and their effects) and
+lists any difference as `drift`, which should always be empty: `missing`
+(a row carries a blob that no pin keeps, so the collector could delete it
+under the row) or `extra` (a pin that no row accounts for). Drift exits 1.
+The pins of a row that is gone are not drift: the next retention pass
+deletes them. The check reads every such row at once, and the daemon applies
+no record meanwhile: on a node with a long mailbox, run it when traffic is
+low. A pass deletes a file without a root when the previous pass found
 it without one too, so a file goes within two passes; the daemon runs a pass
 after every retention pass and every `[blobs] gc_interval`. With `--reason`
 (`POST /v1/blobs/gc`, scope `operate`) it runs a pass now; `--immediate`
@@ -2631,10 +2662,11 @@ says what such a pass would delete. A pass records an `AuditEvent`
 `blobs.gc`.
 
 ```text
-$ kronik blobs gc --dry-run
+$ kronik blobs gc --dry-run --verify
 blob                                                                     reason            bytes     last lsn  deleted by
 b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9  out-of-retention  30.0 MiB  1203      next pass
 1 files (30.0 MiB) without a root; 12 kept; floor lsn 1290.
+Pins         match the rows they mirror
 Next     kronik blobs gc --reason "..."
          kronik blobs gc --immediate --reason "..."
 
@@ -3062,6 +3094,7 @@ route needs:
 | `list_dead_letters` | `read` | Failed inputs and uncertain effects |
 | `inspect_blob` | `read` | `kronik blobs inspect`: a blob's state, size and roots; `verify` checks its file |
 | `list_connections` | `read` | WebSocket and SSE connections, or one by `id`; closing one is an operator's command |
+| `blob_gc_plan` | `read` | `kronik blobs gc --dry-run`: the blob files without a root, each with why; `verify` checks the pins (`drift`) |
 | `create_fork`, `send_to_fork` | `fork` | Forks, without personal data for a token without `pii:read`, and messages into them |
 | `propose_change` | `propose` | Replays recent traffic through new code; the proposal, its diff summary and the next commands |
 | `get_diff` | `read` | The whole behavior diff of a proposal or a fork |
