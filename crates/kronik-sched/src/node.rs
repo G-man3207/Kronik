@@ -1179,6 +1179,15 @@ impl Node {
         self.me.upgrade()
     }
 
+    /// Whether no actor has a turn queued or running: a worker removes its
+    /// actor's slot only once the queue is empty. Root inputs that wait in
+    /// memory, such as a connection's frames and close (M24), count, and a
+    /// turn hands its frames to the connections before it ends. So a test
+    /// host that also sees no mailbox row and no due timer has settled.
+    pub fn actors_idle(&self) -> bool {
+        lock(&self.actors).is_empty()
+    }
+
     fn enqueue(&self, actor: ActorRef, job: Job) {
         let Some(me) = self.me() else { return };
         let mut actors = lock(&self.actors);
