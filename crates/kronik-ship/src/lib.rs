@@ -1649,6 +1649,10 @@ struct KeystoreStep {
     /// Subjects' blobs staged, to check with their keys (identity, sealed
     /// frames) once the backup is imported.
     blobs: Vec<(kronik_blob::BlobMeta, PathBuf)>,
+    /// Every (subject, key version) that a restored blob reference names,
+    /// staged or not (M26 §9.6): its key must be in the backup, or the
+    /// subject erased through that version.
+    blob_keys: BTreeSet<(String, u32)>,
 }
 
 /// What the keystore step decided.
@@ -1811,6 +1815,17 @@ async fn stage_after_keys(
     //    subject's blob also with its keys in the keystore step.
     let (mut blob_report, keyed) =
         blobs::stage(remote, stage, &snap, &blob_refs, &erasures).await?;
+    // The keys every subject's blob reference names (M26 §9.6): the log's
+    // and the staged ones (the snapshot's index among them).
+    let blob_keys: BTreeSet<(String, u32)> = blob_refs
+        .values()
+        .filter_map(|r| Some((r.subject.clone()?, r.key_version)))
+        .chain(
+            keyed
+                .iter()
+                .filter_map(|(meta, _)| Some((meta.subject.clone()?, meta.key_version))),
+        )
+        .collect();
     // 3. The keystore: the backup, with the log's erasures applied again,
     //    must hold every key a sealed value needs.
     let step = KeystoreStep {
@@ -1819,6 +1834,7 @@ async fn stage_after_keys(
         erasures,
         allow: mode == KeystoreMode::AllowMissingKeys,
         blobs: keyed,
+        blob_keys,
     };
     let KeystoreStaged {
         status: keystore,
@@ -1918,6 +1934,7 @@ fn stage_keystore(
         erasures,
         allow,
         blobs: keyed,
+        blob_keys,
     } = step;
     let mut blobs_erased = Vec::new();
     let mut blobs_failed = Vec::new();
@@ -1968,6 +1985,29 @@ fn stage_keystore(
                     missing.push((subject.clone(), *version));
                 }
             }
+            // A subject's blob is readable with its key, or gone with its
+            // erasure: a reference to one without either would be unreadable
+            // (M26 §9.6).
+            {
+                let sealer = kronik_privacy::sealer::Sealer::new(ks.clone());
+                let access = sealer.blob_key_access();
+                for (subject, version) in &blob_keys {
+                    match kronik_blob::KeyAccess::identity_key(&access, subject, *version) {
+                        kronik_blob::KeyAnswer::Found(_) | kronik_blob::KeyAnswer::Erased => {}
+                        kronik_blob::KeyAnswer::Missing => {
+                            if !missing.contains(&(subject.clone(), *version)) {
+                                missing.push((subject.clone(), *version));
+                            }
+                        }
+                        kronik_blob::KeyAnswer::Unavailable(why) => {
+                            return Err(ShipError::Restore(format!(
+                                "the restored keystore cannot answer for {subject} (key \
+                                 {version}): {why}"
+                            )));
+                        }
+                    }
+                }
+            }
             if !missing.is_empty() && !allow {
                 let shown: Vec<String> = missing
                     .iter()
@@ -1975,7 +2015,7 @@ fn stage_keystore(
                     .collect();
                 return Err(ShipError::KeystoreIncomplete(format!(
                     "the bucket's newest keystore backup ({}) lacks the keys of {}: their sealed \
-                     values would be unreadable",
+                     values and blobs would be unreadable",
                     k.wall,
                     list_some(&shown)
                 )));
@@ -1983,16 +2023,39 @@ fn stage_keystore(
             restore.close_stage(ks).map_err(ShipError::Key)?;
             ("installed", Some(k.wall), subjects_of(&missing))
         }
-        Err("none_in_bucket") if !needed.is_empty() => {
-            let pairs: Vec<(String, u32)> = needed.keys().cloned().collect();
+        Err("none_in_bucket") if !needed.is_empty() || !blob_keys.is_empty() => {
+            // A blob reference of a subject that the log erased through its
+            // version needs no key (M26 §9.6).
+            let erased = |subject: &str, version: u32| {
+                erasures
+                    .iter()
+                    .any(|(s, v, _)| s == subject && *v >= version)
+            };
+            let mut pairs: Vec<(String, u32)> = needed.keys().cloned().collect();
+            for (subject, version) in &blob_keys {
+                if !erased(subject, *version) && !pairs.contains(&(subject.clone(), *version)) {
+                    pairs.push((subject.clone(), *version));
+                }
+            }
+            pairs.sort();
+            if pairs.is_empty() {
+                return Ok(KeystoreStaged {
+                    status: "none_in_bucket",
+                    backup_ms: None,
+                    missing: Vec::new(),
+                    master,
+                    blobs_erased,
+                    blobs_failed,
+                });
+            }
             if !allow {
                 let shown: Vec<String> = pairs
                     .iter()
                     .map(|(s, v)| format!("{s} (key {v})"))
                     .collect();
                 return Err(ShipError::KeystoreIncomplete(format!(
-                    "the restored data holds sealed values of {}, and the bucket has no keystore \
-                     backup",
+                    "the restored data holds sealed values or blobs of {}, and the bucket has no \
+                     keystore backup",
                     list_some(&shown)
                 )));
             }
