@@ -712,8 +712,9 @@ pub async fn ship_once(
 }
 
 /// [`ship_once`], stopping with `fault`'s error where it names a step:
-/// `blob` after each blob upload, `blob-deleted` after a blob's object is
-/// deleted and before its record goes, `segment` after each segment upload,
+/// `reupload` after each resealed blob's upload, `blob` after each blob
+/// upload, `blob-deleted` after a blob's object is deleted and before its
+/// record goes, `segment` after each segment upload,
 /// `snapshot` after each snapshot upload, `snapshot-delete` and
 /// `segment-delete` after each remote deletion, `blob-delete` before the
 /// remote blobs gone locally are deleted. Tests stop a round anywhere with
@@ -732,6 +733,15 @@ pub async fn ship_once_with_fault(
         index: None,
         branch,
     };
+    // Blobs resealed in place replace their plain objects first (M26 §9.4).
+    if kronik_store::ship_blobs::reupload_dir(data).exists() {
+        round.shipped()?;
+        if let Some(shipped) = &round.shipped {
+            let (objects, bytes) = blobs::reupload_marked(remote, data, shipped, fault).await?;
+            report.objects += objects;
+            report.bytes += bytes;
+        }
+    }
     let log_dir = data.join("branches").join(branch).join("log");
     let starts = kronik_log::segment_starts(&log_dir)?;
     let seg_rel = |s: Lsn| format!("{branch}/segments/{}.zst", kronik_log::segment_name(s));

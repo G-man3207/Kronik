@@ -341,6 +341,75 @@ pub fn missing_blob_names(data: &Path) -> Result<BTreeSet<String>, ShipError> {
     rows.collect::<Result<_, _>>().map_err(sqlite)
 }
 
+/// The first step of a round: blobs that `privacy reseal` sealed in place
+/// (M26 §9.4) replace the plain objects the bucket holds. For each mark in
+/// `<data>/blobs/reupload`: a sealed file whose object was shipped is
+/// uploaded over it and recorded with its new body digest; a file still
+/// plain keeps its mark for a later round (the reseal has not renamed it in
+/// yet); a file that is gone, or one never shipped, needs nothing. The mark
+/// goes once nothing is left to do. Returns the objects and bytes uploaded.
+pub(crate) async fn reupload_marked(
+    remote: &Remote,
+    data: &Path,
+    shipped: &Shipped,
+    fault: &(dyn Fn(&str) -> std::io::Result<()> + Sync),
+) -> Result<(u64, u64), ShipError> {
+    let dir = kronik_store::ship_blobs::reupload_dir(data);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(e.into()),
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        names.push(entry?.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    let (mut objects, mut bytes) = (0, 0);
+    let mut removed = false;
+    for name in names {
+        let mark = dir.join(&name);
+        let done = match BlobId::from_file_name(&name) {
+            // Not a blob's name: nothing to upload.
+            None => true,
+            Some(id) => match std::fs::File::open(local_path(data, &id)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(e) => return Err(e.into()),
+                Ok(file) => {
+                    let header = read_header(&file)
+                        .map_err(|why| ShipError::Restore(format!("blob {id}: {why}")))?;
+                    if !header.sealed {
+                        false
+                    } else if shipped.digest(&name)?.is_none() {
+                        // Never in the bucket: step 1 uploads the sealed file
+                        // when what references it ships.
+                        true
+                    } else {
+                        let len = file.metadata()?.len();
+                        remote.put_file(&remote_name(&id), &file, len).await?;
+                        shipped.put(&name, &header.body_digest)?;
+                        objects += 1;
+                        bytes += len;
+                        fault("reupload")?;
+                        true
+                    }
+                }
+            },
+        };
+        if done {
+            match std::fs::remove_file(&mark) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    if removed {
+        std::fs::File::open(&dir)?.sync_all()?;
+    }
+    Ok((objects, bytes))
+}
+
 /// Step 6 of a round (ADR 0122 §3): deletes the remote objects of blobs
 /// whose local file is gone, that have no live index row, and that no local
 /// snapshot's `blobs.idx` lists. A shipped blob whose file is gone while its

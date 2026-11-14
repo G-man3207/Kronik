@@ -13,6 +13,17 @@ pub fn path(data: &Path) -> PathBuf {
     data.join("ship-blobs.db")
 }
 
+/// Where `privacy reseal` marks a blob it sealed in place (M26 §9.4), below
+/// the data directory: one empty file per blob, named as the blob's file.
+/// The shipper uploads the sealed file over the bucket's plain object and
+/// removes the mark.
+pub const REUPLOAD_DIR: &str = "blobs/reupload";
+
+/// `<data>/blobs/reupload`.
+pub fn reupload_dir(data: &Path) -> PathBuf {
+    data.join(REUPLOAD_DIR)
+}
+
 /// The file names (`b3-<hex>`, `b3s-<hex>`) of the blobs the shipper has
 /// uploaded and not yet deleted from the bucket; none when it never shipped
 /// a blob.

@@ -582,3 +582,66 @@ fn a_restored_node_adopts_only_an_object_with_its_digest() {
         "the bucket does not have the changed object"
     );
 }
+
+/// A blob `privacy reseal` sealed in place (M26 §9.4) is marked in
+/// `<data>/blobs/reupload`: the next round uploads the sealed file over the
+/// bucket's plain object and removes the mark. A file still plain keeps its
+/// mark; a mark whose file is gone, or whose blob was never shipped, goes
+/// without an upload.
+#[test]
+fn a_resealed_blob_replaces_its_plain_object() {
+    let src = tempdir("blob-reseal-src-");
+    let bucket = tempdir("blob-reseal-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let p = start(src.path());
+    p.deploy();
+    let shipped = p.blob(70_000, "k1");
+    p.ship(&remote, src.path()).unwrap();
+    let id = BlobId::parse(&shipped.hash).unwrap();
+    let file = p.node.blob_store().unwrap().object_path(&Space::Main, &id);
+    let marks = kronik_store::ship_blobs::reupload_dir(src.path());
+    std::fs::create_dir_all(&marks).unwrap();
+    let mark = |name: &str| marks.join(name);
+    // Still plain: the mark stays, nothing is uploaded.
+    std::fs::write(mark(&id.file_name()), b"").unwrap();
+    assert_eq!(p.ship(&remote, src.path()).unwrap().objects, 0);
+    assert!(mark(&id.file_name()).exists());
+    // Sealed in place.
+    let bytes = seal_stand_in(&file);
+    // A mark whose file is gone, and one of a blob never shipped.
+    let gone = "b3-".to_owned() + &"0".repeat(64);
+    std::fs::write(mark(&gone), b"").unwrap();
+    let local_only = p.upload(1000);
+    let local_id = BlobId::parse(&local_only.hash).unwrap();
+    seal_stand_in(
+        &p.node
+            .blob_store()
+            .unwrap()
+            .object_path(&Space::Main, &local_id),
+    );
+    std::fs::write(mark(&local_id.file_name()), b"").unwrap();
+    let report = p.ship(&remote, src.path()).unwrap();
+    assert!(report.objects >= 2, "{report:?}");
+    assert_eq!(
+        p.rt.block_on(remote.get(&object(&shipped.hash))).unwrap(),
+        bytes
+    );
+    assert_eq!(std::fs::read_dir(&marks).unwrap().count(), 0);
+    // Recorded with their new digests: nothing to upload again.
+    assert_eq!(p.ship(&remote, src.path()).unwrap().objects, 0);
+}
+
+/// A stand-in for `privacy reseal` sealing a file in place: its header says
+/// sealed, of subject `user:1` at key version 1; the frames are kept, which
+/// the shipper does not read. Returns the file's new bytes.
+fn seal_stand_in(file: &Path) -> Vec<u8> {
+    use kronik_blob::format::{HEADER_LEN, Header};
+    let mut bytes = std::fs::read(file).unwrap();
+    let mut header = Header::decode(&bytes[..HEADER_LEN]).unwrap();
+    header.sealed = true;
+    header.subject = Some("user:1".into());
+    header.key_version = 1;
+    bytes[..HEADER_LEN].copy_from_slice(&header.encode());
+    std::fs::write(file, &bytes).unwrap();
+    bytes
+}
