@@ -287,6 +287,19 @@ impl Message {
     pub fn body_json<T: DeserializeOwned>(&self) -> Result<T, Error> {
         from_json(&self.body, "the message body", "message")
     }
+
+    /// The message with `blob` added to the blobs it carries (M26), at most
+    /// 256, each one the turn may use (see `kronik explain blob`).
+    pub fn blob(mut self, blob: &BlobRef) -> Self {
+        self.blobs.push(blob.clone());
+        self
+    }
+
+    /// The blobs the message carries (M26): the receiving turn may read
+    /// them, and holds one only if it retains it.
+    pub fn blobs(&self) -> &[BlobRef] {
+        &self.blobs
+    }
 }
 
 impl ActorRef {
@@ -446,6 +459,30 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn messages_carry_blobs() {
+        let a = BlobRef {
+            hash: format!("b3:{}", "aa".repeat(32)),
+            size: 5,
+        };
+        let b = BlobRef {
+            hash: format!("b3s:{}", "bb".repeat(32)),
+            size: 1 << 21,
+        };
+        let m = Message::text("shared", "img-1").blob(&a).blob(&b);
+        let pairs = |m: &Message| {
+            m.blobs()
+                .iter()
+                .map(|b| (b.hash.clone(), b.size))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pairs(&m), [(a.hash, 5), (b.hash, 1 << 21)]);
+        assert_eq!(m.body_text().unwrap(), "img-1");
+        assert!(Message::text("tick", "").blobs().is_empty());
+        // The accessor is the record's field.
+        assert_eq!(m.blobs.len(), 2);
+    }
 
     #[test]
     fn manifest_builder() {

@@ -5,12 +5,15 @@
 //! reference instead of bytes: [`HttpRequest::body_blob`](crate::HttpRequest::body_blob)
 //! and [`Response::blob`](crate::http::Response::blob) say so, and
 //! [`Blobs::reader`] reads it a frame at a time. A turn may read the blobs it
-//! received (its request's body, a fetch's response) and the ones it wrote;
-//! any other reference fails with `not-held`.
+//! received (its request's body, a fetch's response, a message's blobs), the
+//! ones it wrote and the ones its actor holds; any other reference fails with
+//! `not-held`. [`Blobs::put`], [`Blobs::retain`] and [`Blobs::release`] hold
+//! blobs across turns (M26), and [`Message::blob`](crate::Message::blob)
+//! sends one with a message.
 
 use std::io;
 
-use crate::bindings::kronik::actor::blobs;
+use crate::bindings::kronik::actor::{blobs, privacy};
 use crate::{BlobRef, Error};
 
 pub use crate::bindings::kronik::actor::blobs::BlobError;
@@ -74,6 +77,52 @@ impl Blobs {
             inner: blobs::Writer::new(),
             pending: Vec::new(),
         }
+    }
+
+    /// Stores `bytes` as a blob tagged with the turn's default subject; the
+    /// actor holds it once the turn commits (M26). One host call takes at
+    /// most 1 MiB: a larger value is written in parts and then retained,
+    /// which is the same.
+    pub fn put(&self, bytes: &[u8]) -> Result<BlobRef, Error> {
+        if bytes.len() <= MAX_CHUNK {
+            return blobs::put(bytes).map_err(Error::Blob);
+        }
+        let writer = blobs::Writer::new();
+        for chunk in bytes.chunks(MAX_CHUNK) {
+            writer.write(chunk).map_err(Error::Blob)?;
+        }
+        let blob = writer.finish().map_err(Error::Blob)?;
+        self.retain(&blob)?;
+        Ok(blob)
+    }
+
+    /// [`Blobs::put`] tagged with `subject` (`None`: none), whatever the
+    /// turn's default subject is; the default is restored afterwards, also
+    /// when the put fails.
+    pub fn put_for<'a>(
+        &self,
+        subject: impl Into<Option<&'a str>>,
+        bytes: &[u8],
+    ) -> Result<BlobRef, Error> {
+        let before = privacy::current_subject();
+        privacy::set_subject(subject.into());
+        let put = self.put(bytes);
+        privacy::set_subject(before.as_deref());
+        put
+    }
+
+    /// Holds `blob` from the turn's commit on: one the turn may use, such as
+    /// a request body, a fetch response or one that a message brought. A
+    /// blob the actor already holds stays held.
+    pub fn retain(&self, blob: &BlobRef) -> Result<(), Error> {
+        blobs::retain(blob).map_err(Error::Blob)
+    }
+
+    /// Ends the actor's hold on `blob` at the turn's commit; the turn can
+    /// still read it. Only a hold of this actor's own ends; a blob nothing
+    /// holds any more is deleted later by collection.
+    pub fn release(&self, blob: &BlobRef) -> Result<(), Error> {
+        blobs::release(blob).map_err(Error::Blob)
     }
 }
 
