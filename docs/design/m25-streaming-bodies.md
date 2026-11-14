@@ -395,7 +395,11 @@ implementation. The order of `Gateway::serve`:
 1. Route match (404 without reading the body).
 2. M24's classification: a WebSocket upgrade or an SSE route takes the
    connection path, which never reads a body.
-3. `node.check_running()` (the log's reserve), before reading a byte.
+3. `node.check_running()` (the log's reserve) and the blob reserve, before
+   the body is spooled: before anything is stored. (The first B8 commit
+   checks them there rather than before the first byte is read, so that a
+   retry that joins its turn or gets its saved answer, which store nothing,
+   keep working on a full disk, as they did before M25.)
 4. The body phase (§6.2).
 5. Admission (`Node::ingress`), the wait, the response (§6.5).
 

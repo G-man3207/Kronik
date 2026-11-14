@@ -233,6 +233,15 @@ until the v1.0 compatibility promise takes effect.
   as it arrives, scrubbed of the turn's secrets and named durably before
   its result is recorded, and a blob request body is streamed from the store
   with its length. The effect's record holds only the references.
+- The gateway reads request bodies as they arrive (M25): for a kind whose
+  code imports `blobs`, on a node with blobs, a body above the kind's
+  threshold is written to a blob as it arrives, up to its upload size (413
+  above it, at once for a `Content-Length`), with about a frame of it in
+  memory; an upload that sends nothing for 30 s is 400; a retry of a
+  request still running or answered is only hashed. A blob response is
+  streamed from the store with its length, one frame at a time; an erased
+  subject's is 410 `SUBJECT_ERASED`, a missing one 500 `BLOB_MISSING`.
+  Other kinds read bodies as before.
 - Idempotency-Key request hashes are version 4 (M25): the body counts as
   its BLAKE3 digest, so a large body read as a stream and a small one held
   in memory hash alike. Responses saved under version 3 are still replayed

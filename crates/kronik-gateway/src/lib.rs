@@ -14,6 +14,8 @@
 //! transport to the node's hub.
 
 pub mod body;
+
+pub use body::{BlobBody, RequestBody, ResponseBody};
 #[cfg(feature = "server")]
 pub mod connections;
 #[cfg(feature = "server")]
@@ -28,11 +30,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kronik_core::env::BoxFuture;
+use kronik_core::env::{BodySource, BytesSource};
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, valid_key};
 use kronik_privacy::sealer::is_erased;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{Ingress, IngressExtras, Node, RouteEntry, TurnResult};
+use kronik_sched::{BodyPolicy, Ingress, IngressExtras, Node, RouteEntry, TurnResult};
 
 /// The path prefix of preview requests: `/__preview/<id>/...`.
 pub const PREVIEW_PREFIX: &str = "/__preview/";
@@ -73,6 +76,10 @@ pub struct GatewayConfig {
     /// Requests for the host `<id>.<preview_domain>` go to preview `<id>`
     /// (`gateway.preview_domain`, M11).
     pub preview_domain: Option<String>,
+    /// How long an upload that becomes a blob may send nothing (M25 §6.2):
+    /// it has no whole-body timeout, so a slow large upload is not cut off
+    /// while bytes keep arriving.
+    pub body_idle_timeout: Duration,
 }
 
 impl Default for GatewayConfig {
@@ -84,8 +91,28 @@ impl Default for GatewayConfig {
             idempotency_header: "Idempotency-Key".into(),
             preview_domain: None,
             trusted_proxies: Vec::new(),
+            body_idle_timeout: Duration::from_secs(30),
         }
     }
+}
+
+/// How long a client may take to send a body held in memory.
+pub const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A request whose body could not be read (the client went away).
+fn unreadable(e: std::io::Error) -> ApiError {
+    ApiError::new(
+        ErrorCode::BadRequest,
+        format!("the request body could not be read: {e}"),
+    )
+}
+
+/// The request's `Content-Length`, when it has a valid one.
+fn content_length(req: &HttpRequest) -> Option<u64> {
+    req.headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.trim().parse().ok())
 }
 
 /// An address or a CIDR block, such as `192.0.2.7`, `10.0.0.0/8` or
@@ -488,6 +515,78 @@ fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
     }
 }
 
+/// Who a request is for and from ([`Gateway::identify`]).
+struct Identity {
+    actor: ActorRef,
+    idempotency_key: String,
+    subject: Option<String>,
+}
+
+/// How a root input's body was read (M25 §6.2).
+enum InputBody {
+    /// Held: the request's `body`.
+    Inline,
+    /// Spooled into a blob: its reference and the body's BLAKE3 digest.
+    Blob { blob: pb::BlobRef, digest: [u8; 32] },
+    /// Only hashed (a retry of a request running or answered): the body's
+    /// BLAKE3 digest. Never recorded.
+    Hashed { digest: [u8; 32] },
+}
+
+/// What the body phase read (M25 §6.2).
+enum ReadBody {
+    Inline(Vec<u8>),
+    Spooled {
+        blob: pb::BlobRef,
+        digest: [u8; 32],
+        lease: kronik_blob::Lease,
+    },
+    Hashed([u8; 32]),
+}
+
+/// A gateway answer whose body may stream (M25 §6.1).
+#[derive(Debug)]
+pub struct Answer {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: ResponseBody,
+}
+
+impl From<HttpResponse> for Answer {
+    fn from(r: HttpResponse) -> Answer {
+        Answer {
+            status: r.status,
+            headers: r.headers,
+            body: ResponseBody::Inline(r.body),
+        }
+    }
+}
+
+impl Answer {
+    /// The answer with its body read whole, for tests and the simulator.
+    /// A blob that cannot be read becomes BLOB_MISSING.
+    pub async fn into_response(self) -> HttpResponse {
+        let body = match self.body {
+            ResponseBody::Inline(b) => b,
+            ResponseBody::Blob(blob) => match blob.collect().await {
+                Ok(b) => b,
+                Err(e) => {
+                    return error(&ApiError::new(
+                        ErrorCode::BlobMissing,
+                        format!("the response blob could not be read: {e}"),
+                    ));
+                }
+            },
+            ResponseBody::Events(_) => Vec::new(),
+        };
+        HttpResponse {
+            status: self.status,
+            headers: self.headers,
+            body,
+        }
+    }
+}
+
 /// A request as a root input ([`Gateway::input`]).
 struct Admitted {
     actor: ActorRef,
@@ -826,28 +925,33 @@ impl Gateway {
         trusted.is_empty() || peer.is_some_and(|ip| trusted.iter().any(|n| n.contains(ip)))
     }
 
-    pub async fn handle(&self, req: HttpRequest) -> HttpResponse {
-        match self.serve(req).await {
-            Ok(r) => r,
-            Err(e) => error(&e),
+    /// Serves one request whose body is `req.body`, and reads the answer
+    /// whole: the simulator and tests ([`Gateway::respond`] streams).
+    pub async fn handle(&self, mut req: HttpRequest) -> HttpResponse {
+        let body = RequestBody::Inline(std::mem::take(&mut req.body));
+        self.respond(req, body).await.into_response().await
+    }
+
+    /// Serves one HTTP request whose body is `body` (`req.body` is not
+    /// read): route it, read its body (M25 §6.2), admit the root input, wait
+    /// for the turn (at most the gateway timeout) and answer, a blob body
+    /// streamed from the store (§6.5).
+    pub async fn respond(&self, req: HttpRequest, body: RequestBody) -> Answer {
+        match self.serve(req, body).await {
+            Ok(a) => a,
+            Err(e) => error(&e).into(),
         }
     }
 
-    async fn serve(&self, req: HttpRequest) -> Result<HttpResponse, ApiError> {
-        if req.body.len() > self.cfg.max_body {
-            return Err(ApiError::new(
-                ErrorCode::PayloadTooLarge,
-                format!(
-                    "the request body is {} bytes, the limit is {}",
-                    req.body.len(),
-                    self.cfg.max_body
-                ),
-            ));
-        }
+    async fn serve(&self, mut req: HttpRequest, body: RequestBody) -> Result<Answer, ApiError> {
         if let Some(router) = &self.preview
             && let Some((id, path)) = preview_target(&req, self.cfg.preview_domain.as_deref())
         {
-            return self.serve_preview(router.clone(), id, path, req).await;
+            req.body = self.read_inline(body).await?;
+            return Ok(self
+                .serve_preview(router.clone(), id, path, req)
+                .await?
+                .into());
         }
         if is_websocket_upgrade(&req) {
             return Err(ApiError::new(
@@ -855,6 +959,7 @@ impl Gateway {
                 "a WebSocket upgrade needs the gateway's connection path (open_connection)",
             ));
         }
+        // The route before a byte of the body is read (M25 §6.1).
         let m = self.matched(&req.method, &req.path)?;
         if m.method == "SSE" {
             return Err(ApiError::new(
@@ -862,18 +967,47 @@ impl Gateway {
                 "an SSE route needs the gateway's connection path (open_connection)",
             ));
         }
+        strip_admin_cookies(&mut req.headers);
+        let (input_body, upload, body_withheld) = match self.node.body_policy(&m.kind) {
+            BodyPolicy::Inline => {
+                req.body = self.read_inline(body).await?;
+                (InputBody::Inline, None, false)
+            }
+            BodyPolicy::Blobs {
+                threshold,
+                upload_bytes,
+            } => {
+                let who = self.identify(&req, &m)?;
+                match self
+                    .read_for_blobs(&req, &who, body, threshold, upload_bytes)
+                    .await?
+                {
+                    ReadBody::Inline(bytes) => {
+                        req.body = bytes;
+                        (InputBody::Inline, None, false)
+                    }
+                    ReadBody::Spooled {
+                        blob,
+                        digest,
+                        lease,
+                    } => (InputBody::Blob { blob, digest }, Some(lease), false),
+                    ReadBody::Hashed(digest) => (InputBody::Hashed { digest }, None, true),
+                }
+            }
+        };
         let Admitted {
             actor,
             http,
             subject,
             legacy_hash,
-        } = self.input(req, m)?;
+        } = self.input(req, m, input_body)?;
         let extras = IngressExtras {
             legacy_hash,
-            ..IngressExtras::default()
+            upload,
+            body_withheld,
         };
         let (waiter, joined) = match self.node.ingress_with(actor, http, subject, extras)? {
-            Ingress::Done(r) => return Ok(turn_response(&r)),
+            Ingress::Done(r) => return Ok(self.turn_answer(&r).await),
             Ingress::Started(w) => (w, false),
             Ingress::Joined(w) => (w, true),
         };
@@ -883,13 +1017,251 @@ impl Gateway {
             .timeout(self.cfg.timeout, waiter.wait())
             .await
         {
-            Ok(r) => Ok(turn_response(&r?)),
+            Ok(r) => Ok(self.turn_answer(&r?).await),
             Err(_) if joined => Err(ApiError::new(
                 ErrorCode::IdempotencyInFlight,
                 "the original request with this Idempotency-Key is still running",
             )),
             Err(_) => Err(self.timed_out()),
         }
+    }
+
+    /// Reads a body into memory, up to `[gateway] max_body`, within
+    /// [`BODY_TIMEOUT`].
+    async fn read_inline(&self, body: RequestBody) -> Result<Vec<u8>, ApiError> {
+        let max = self.cfg.max_body;
+        let mut source = match body {
+            RequestBody::Inline(b) if b.len() > max => {
+                return Err(ApiError::new(
+                    ErrorCode::PayloadTooLarge,
+                    format!("the request body is {} bytes, the limit is {max}", b.len()),
+                ));
+            }
+            RequestBody::Inline(b) => return Ok(b),
+            RequestBody::Stream(source) => source,
+        };
+        let read = async {
+            let mut out = Vec::new();
+            while let Some(chunk) = source.next().await.map_err(unreadable)? {
+                if out.len() + chunk.len() > max {
+                    return Err(ApiError::new(
+                        ErrorCode::PayloadTooLarge,
+                        format!("the request body exceeds {max} bytes"),
+                    ));
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Ok(out)
+        };
+        match self.node.env().timeout(BODY_TIMEOUT, read).await {
+            Ok(read) => read,
+            Err(_) => Err(ApiError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "the request body did not arrive within {} s",
+                    BODY_TIMEOUT.as_secs()
+                ),
+            )),
+        }
+    }
+
+    /// The next chunk of an upload, which must come within
+    /// `[gateway] body_idle_timeout`.
+    async fn next_chunk(
+        &self,
+        source: &mut Box<dyn BodySource>,
+    ) -> Result<Option<bytes::Bytes>, ApiError> {
+        let idle = self.cfg.body_idle_timeout;
+        match self.node.env().timeout(idle, source.next()).await {
+            Ok(chunk) => chunk.map_err(unreadable),
+            Err(_) => Err(ApiError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "the request body stopped arriving: nothing for {} s",
+                    idle.as_secs()
+                ),
+            )),
+        }
+    }
+
+    /// The body phase of a kind whose code reads blobs (M25 §6.2): a body
+    /// up to `threshold` bytes is held; a larger one is written to a blob
+    /// as it arrives, up to `upload_bytes`, with no more than a frame of it
+    /// in memory; the retry of a request running or answered is only
+    /// hashed. Each chunk must arrive within `[gateway] body_idle_timeout`.
+    async fn read_for_blobs(
+        &self,
+        req: &HttpRequest,
+        who: &Identity,
+        body: RequestBody,
+        threshold: u64,
+        upload_bytes: u64,
+    ) -> Result<ReadBody, ApiError> {
+        let kind = who.actor.kind.as_str();
+        let too_large = |size: String| {
+            ApiError::new(
+                ErrorCode::PayloadTooLarge,
+                format!("the request body is {size}, the limit of {kind} is {upload_bytes} bytes"),
+            )
+            .with_hint(format!(
+                "kronik limits set {kind} --upload-size <size> --reason '...'"
+            ))
+        };
+        if let Some(len) = content_length(req)
+            && len > upload_bytes
+        {
+            return Err(too_large(format!("{len} bytes")));
+        }
+        let mut source: Box<dyn BodySource> = match body {
+            RequestBody::Inline(b) => Box::new(BytesSource::new(bytes::Bytes::from(b))),
+            RequestBody::Stream(source) => source,
+        };
+        // A retry of a request running or answered: only its hash matters.
+        if self.node.ingress_peek(&who.actor, &who.idempotency_key)? {
+            let mut hasher = blake3::Hasher::new();
+            let mut size = 0u64;
+            while let Some(chunk) = self.next_chunk(&mut source).await? {
+                size += chunk.len() as u64;
+                if size > upload_bytes {
+                    return Err(too_large(format!("over {upload_bytes} bytes")));
+                }
+                hasher.update(&chunk);
+            }
+            return Ok(ReadBody::Hashed(*hasher.finalize().as_bytes()));
+        }
+        // Up to the threshold, held.
+        let mut held = Vec::new();
+        while held.len() as u64 <= threshold {
+            match self.next_chunk(&mut source).await? {
+                Some(chunk) => held.extend_from_slice(&chunk),
+                None => return Ok(ReadBody::Inline(held)),
+            }
+        }
+        // Larger: a blob, written as the body arrives. Only now is there
+        // something to store, so only now do the log's and the blob
+        // store's reserves count.
+        self.node.check_running()?;
+        if let Some(free) = self.node.blobs_below_reserve() {
+            return Err(ApiError::new(
+                ErrorCode::BlobStoreFull,
+                format!("the blob store has {free} bytes free, below [blobs] disk_reserve"),
+            ));
+        }
+        let store = self
+            .node
+            .blob_store()
+            .ok_or_else(|| ApiError::new(ErrorCode::Internal, "the node has no blob store"))?
+            .clone();
+        let keys = match &who.subject {
+            None => None,
+            Some(subject) => {
+                let entropy = self.node.env().entropy.clone();
+                let fill = move |bytes: &mut [u8]| entropy.fill(bytes);
+                Some(
+                    self.node
+                        .sealer()
+                        .blob_keys(subject, &fill, self.node.env().clock.wall_ms())
+                        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?,
+                )
+            }
+        };
+        let lease = store.leases().take("upload");
+        let stored = |e: kronik_blob::BlobError| match e {
+            kronik_blob::BlobError::TooLarge { .. } => {
+                too_large(format!("over {upload_bytes} bytes"))
+            }
+            kronik_blob::BlobError::StoreFull { .. } => {
+                ApiError::new(ErrorCode::BlobStoreFull, e.to_string())
+            }
+            other => ApiError::new(
+                ErrorCode::Internal,
+                format!("storing the request body: {other}"),
+            ),
+        };
+        let mut writer = store
+            .writer(kronik_blob::Space::Main, keys, upload_bytes, lease.clone())
+            .await
+            .map_err(stored)?;
+        let mut digest = blake3::Hasher::new();
+        digest.update(&held);
+        writer.write(&held).await.map_err(stored)?;
+        drop(held);
+        while let Some(chunk) = self.next_chunk(&mut source).await? {
+            digest.update(&chunk);
+            writer.write(&chunk).await.map_err(stored)?;
+        }
+        let meta = writer.finish().await.map_err(stored)?;
+        // Durable before the input that references it exists.
+        store
+            .ensure_durable(&kronik_blob::Space::Main, &[meta.id])
+            .await
+            .map_err(stored)?;
+        kronik_metrics::add(
+            "kronik_blob_written_bytes_total",
+            &[("source", "upload")],
+            meta.size,
+        );
+        Ok(ReadBody::Spooled {
+            blob: meta.to_pb(),
+            digest: *digest.finalize().as_bytes(),
+            lease,
+        })
+    }
+
+    /// The answer for a finished turn: [`turn_response`], with a blob body
+    /// streamed from the store (M25 §6.5). An erased blob is 410
+    /// SUBJECT_ERASED, a missing one 500 BLOB_MISSING, both with the turn
+    /// id.
+    async fn turn_answer(&self, r: &TurnResult) -> Answer {
+        let resp = turn_response(r);
+        let blob = match &r.outcome.output {
+            Some(pb::outcome::Output::Http(h)) if r.committed() => {
+                match h.body.as_ref().and_then(|b| b.value.as_ref()) {
+                    Some(pb::body::Value::Blob(blob)) => Some(blob),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(blob) = blob.filter(|_| (200..=599).contains(&resp.status)) else {
+            return resp.into();
+        };
+        match self.open_blob(blob).await {
+            Ok(body) => Answer {
+                status: resp.status,
+                headers: resp.headers,
+                body: ResponseBody::Blob(body),
+            },
+            Err(e) => {
+                let mut resp = error(&e);
+                resp.headers
+                    .push((TURN_ID_HEADER.to_owned(), r.turn_id.to_string()));
+                resp.into()
+            }
+        }
+    }
+
+    /// Opens a response blob in main's space under a streaming lease.
+    async fn open_blob(&self, blob: &pb::BlobRef) -> Result<BlobBody, ApiError> {
+        let missing = |why: String| ApiError::new(ErrorCode::BlobMissing, why);
+        let store = self.node.blob_store().ok_or_else(|| {
+            missing("the response is a blob and the node has no blob store".into())
+        })?;
+        let meta = kronik_blob::BlobMeta::from_pb(blob).map_err(|e| missing(e.to_string()))?;
+        let lease = store.leases().take("stream");
+        lease.add(meta.id);
+        let access = self.node.sealer().blob_key_access();
+        let reader = store
+            .reader(&kronik_blob::Space::Main, &meta, &access)
+            .await
+            .map_err(|e| match e {
+                kronik_blob::BlobError::Erased => ApiError::new(
+                    ErrorCode::SubjectErased,
+                    "the response is a blob of a subject that was erased",
+                ),
+                other => missing(format!("the response blob {}: {other}", meta.id)),
+            })?;
+        Ok(BlobBody::new(reader, lease))
     }
 
     /// What a request is (M24 §5.1): a WebSocket upgrade, a GET that an
@@ -1045,7 +1417,7 @@ impl Gateway {
             http,
             subject,
             ..
-        } = self.input(req, m)?;
+        } = self.input(req, m, InputBody::Inline)?;
         let (conn, waiter) = self
             .node
             .connection_open(actor, http, protocol, subject, client, exempt)?;
@@ -1182,7 +1554,7 @@ impl Gateway {
             mut http,
             subject,
             ..
-        } = self.input(req, m)?;
+        } = self.input(req, m, InputBody::Inline)?;
         http.idempotency_key.clear();
         http.request_hash.clear();
         // On main's origin the browser sends main's credentials (N2): the
@@ -1207,8 +1579,9 @@ impl Gateway {
 
     /// The root input of a matched request: its actor, the HTTP input and
     /// its subject.
-    fn input(&self, mut req: HttpRequest, m: Matched) -> Result<Admitted, ApiError> {
-        strip_admin_cookies(&mut req.headers);
+    /// Who a request is for and from (M25 §6.2: known before its body is
+    /// read): its actor, its idempotency key and its subject.
+    fn identify(&self, req: &HttpRequest, m: &Matched) -> Result<Identity, ApiError> {
         let key = m
             .params
             .iter()
@@ -1221,7 +1594,7 @@ impl Gateway {
             ));
         }
         let actor = ActorRef {
-            kind: m.kind,
+            kind: m.kind.clone(),
             key: key.to_owned(),
         };
         let header = self.cfg.idempotency_header.as_str();
@@ -1259,19 +1632,39 @@ impl Gateway {
                 subject.map_err(|e| ApiError::new(ErrorCode::BadRequest, e))?
             }
         };
-        // With a key: the version-4 hash, recorded, and the version-3 one of
-        // rows saved before it (M25 §6.3), never recorded.
-        let (request_hash, legacy_hash) = if idempotency_key.is_empty() {
-            (Vec::new(), None)
-        } else {
-            (
-                request_hash(&req, subject.as_deref(), self.node.sealer()),
-                Some(legacy_request_hash(
-                    &req,
-                    subject.as_deref(),
-                    self.node.sealer(),
-                )),
-            )
+        Ok(Identity {
+            actor,
+            idempotency_key,
+            subject,
+        })
+    }
+
+    fn input(
+        &self,
+        mut req: HttpRequest,
+        m: Matched,
+        body: InputBody,
+    ) -> Result<Admitted, ApiError> {
+        strip_admin_cookies(&mut req.headers);
+        let Identity {
+            actor,
+            idempotency_key,
+            subject,
+        } = self.identify(&req, &m)?;
+        // With a key: the version-4 hash, recorded, and for a body the
+        // gateway holds the version-3 one of rows saved before it (M25
+        // §6.3), never recorded.
+        let sealer = self.node.sealer();
+        let (request_hash, legacy_hash) = match (&body, idempotency_key.is_empty()) {
+            (_, true) => (Vec::new(), None),
+            (InputBody::Inline, false) => (
+                request_hash(&req, subject.as_deref(), sealer),
+                Some(legacy_request_hash(&req, subject.as_deref(), sealer)),
+            ),
+            (InputBody::Blob { digest, .. } | InputBody::Hashed { digest }, false) => (
+                request_hash_of_body(&req, digest, subject.as_deref(), sealer),
+                None,
+            ),
         };
         // The request is the subject's data: every value carries the tag
         // (I9). With a subject, path, query and parameter values go into
@@ -1320,8 +1713,15 @@ impl Gateway {
                     value: Some(tagged(value.into_bytes())),
                 })
                 .collect(),
+            // A spooled body is its blob, whose reference carries the
+            // subject (I9); a hashed one is never recorded.
             body: Some(pb::Body {
-                value: Some(pb::body::Value::Inline(tagged(req.body))),
+                value: Some(match body {
+                    InputBody::Blob { blob, .. } => pb::body::Value::Blob(blob),
+                    InputBody::Inline | InputBody::Hashed { .. } => {
+                        pb::body::Value::Inline(tagged(req.body))
+                    }
+                }),
             }),
             route: m.pattern,
             idempotency_key,

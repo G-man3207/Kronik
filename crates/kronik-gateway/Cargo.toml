@@ -10,7 +10,7 @@ publish.workspace = true
 # The hyper TCP server (production), with TLS from files or ACME; the
 # service function needs only Env.
 server = [
-    "dep:bytes", "dep:futures-util", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "tokio/net", "tokio/process", "tokio/rt", "tokio/time",
+    "dep:futures-util", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "tokio/net", "tokio/process", "tokio/rt", "tokio/time",
     "dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:instant-acme", "dep:rcgen",
     "dep:x509-parser", "dep:rustix",
 ]
@@ -18,12 +18,13 @@ server = [
 [dependencies]
 base64 = { workspace = true }
 blake3 = { workspace = true }
-bytes = { workspace = true, optional = true }
+bytes = { workspace = true }
 futures-util = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 instant-acme = { workspace = true, optional = true }
+kronik-blob = { workspace = true }
 kronik-core = { workspace = true }
 kronik-effects = { workspace = true }
 kronik-metrics = { workspace = true }

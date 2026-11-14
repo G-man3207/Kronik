@@ -24,13 +24,15 @@ use std::future::Future as _;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::body::ResponseBody;
+use crate::body::{RequestBody, ResponseBody};
 use crate::tls::ACME_TLS_ALPN;
 use crate::{Gateway, HttpRequest, HttpResponse, IpNet, RequestKind};
+use kronik_core::env::{BodySource, BoxFuture};
 
-/// How long a client may take to send a request head, then its body.
+/// How long a client may take to send a request head; a body held in
+/// memory has [`crate::BODY_TIMEOUT`].
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
-const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::BODY_TIMEOUT;
 
 fn error(status: u16, code: kronik_core::error::ErrorCode, message: String) -> HttpResponse {
     let e = kronik_core::error::ApiError::new(code, message);
@@ -41,13 +43,59 @@ fn error(status: u16, code: kronik_core::error::ErrorCode, message: String) -> H
     }
 }
 
-async fn to_request(
-    req: hyper::Request<Incoming>,
+/// A request's head, its body still to read.
+fn head_of(parts: &hyper::http::request::Parts, peer: std::net::IpAddr) -> HttpRequest {
+    HttpRequest {
+        method: parts.method.as_str().to_owned(),
+        path: parts.uri.path().to_owned(),
+        query: parts.uri.query().unwrap_or("").to_owned(),
+        headers: parts
+            .headers
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_owned(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect(),
+        body: Vec::new(),
+        peer: Some(peer),
+    }
+}
+
+/// hyper's request body as a [`BodySource`] (M25 §6.1): its data frames as
+/// they arrive; trailers are ignored.
+struct IncomingSource(Incoming);
+
+impl BodySource for IncomingSource {
+    fn next(&mut self) -> BoxFuture<'_, std::io::Result<Option<Bytes>>> {
+        Box::pin(async move {
+            loop {
+                match self.0.frame().await {
+                    None => return Ok(None),
+                    Some(Ok(frame)) => {
+                        if let Ok(data) = frame.into_data()
+                            && !data.is_empty()
+                        {
+                            return Ok(Some(data));
+                        }
+                    }
+                    Some(Err(e)) => return Err(std::io::Error::other(e)),
+                }
+            }
+        })
+    }
+}
+
+/// A connection path's request with its body read into memory, up to
+/// `max_body` (an upgrade or an SSE GET has none).
+async fn collect_request(
+    mut head: HttpRequest,
+    body: Incoming,
     max_body: usize,
-    peer: std::net::IpAddr,
 ) -> Result<HttpRequest, HttpResponse> {
-    let (parts, body) = req.into_parts();
-    let body =
+    head.body =
         match tokio::time::timeout(BODY_TIMEOUT, Limited::new(body, max_body).collect()).await {
             Ok(Ok(b)) => b.to_bytes().to_vec(),
             Ok(Err(_)) => {
@@ -68,37 +116,26 @@ async fn to_request(
                 ));
             }
         };
-    Ok(HttpRequest {
-        method: parts.method.as_str().to_owned(),
-        path: parts.uri.path().to_owned(),
-        query: parts.uri.query().unwrap_or("").to_owned(),
-        headers: parts
-            .headers
-            .iter()
-            .map(|(n, v)| {
-                (
-                    n.as_str().to_owned(),
-                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
-                )
-            })
-            .collect(),
-        body,
-        peer: Some(peer),
-    })
+    Ok(head)
 }
 
-/// The one body type of every gateway response: inline bytes, or an SSE
-/// stream's chunks (M24). The client's disconnect drops it, which ends an
-/// SSE stream's driver.
+/// The one body type of every gateway response: inline bytes, a blob read
+/// from the store a frame at a time (M25), or an SSE stream's chunks (M24).
+/// The client's disconnect drops it, which ends an SSE stream's driver and
+/// a blob's streaming lease. A blob frame that fails its check is an error,
+/// which ends the response early.
 impl hyper::body::Body for ResponseBody {
     type Data = Bytes;
-    type Error = Infallible;
+    type Error = kronik_blob::BlobError;
 
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, kronik_blob::BlobError>>> {
         match self.get_mut() {
+            ResponseBody::Blob(blob) => blob
+                .poll_frame(cx)
+                .map(|frame| frame.map(|f| f.map(hyper::body::Frame::data))),
             ResponseBody::Inline(bytes) => {
                 if bytes.is_empty() {
                     return Poll::Ready(None);
@@ -113,12 +150,17 @@ impl hyper::body::Body for ResponseBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        matches!(self, ResponseBody::Inline(bytes) if bytes.is_empty())
+        match self {
+            ResponseBody::Inline(bytes) => bytes.is_empty(),
+            ResponseBody::Blob(blob) => blob.remaining() == 0,
+            ResponseBody::Events(_) => false,
+        }
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
         match self {
             ResponseBody::Inline(bytes) => hyper::body::SizeHint::with_exact(bytes.len() as u64),
+            ResponseBody::Blob(blob) => hyper::body::SizeHint::with_exact(blob.remaining()),
             ResponseBody::Events(_) => hyper::body::SizeHint::default(),
         }
     }
@@ -342,12 +384,19 @@ where
                 .headers()
                 .contains_key(hyper::header::UPGRADE)
                 .then(|| hyper::upgrade::on(&mut req));
-            let resp = match to_request(req, gw.cfg.max_body, peer).await {
-                Ok(r) => match gw.classify(&r) {
-                    RequestKind::Http => to_hyper(gw.handle(r).await),
-                    kind => open_connection(&gw, r, kind, upgrade, &slot).await,
+            let (parts, body) = req.into_parts();
+            let head = head_of(&parts, peer);
+            let resp = match gw.classify(&head) {
+                // The body phase reads the body as it arrives (M25 §6.2).
+                RequestKind::Http => {
+                    let body = RequestBody::Stream(Box::new(IncomingSource(body)));
+                    let answer = gw.respond(head, body).await;
+                    with_body(answer.status, &answer.headers, answer.body)
+                }
+                kind => match collect_request(head, body, gw.cfg.max_body).await {
+                    Ok(r) => open_connection(&gw, r, kind, upgrade, &slot).await,
+                    Err(resp) => to_hyper(resp),
                 },
-                Err(resp) => to_hyper(resp),
             };
             let status = resp.status().as_u16().to_string();
             kronik_metrics::inc("kronik_gateway_requests_total", &[("status", &status)]);
