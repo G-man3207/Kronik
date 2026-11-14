@@ -33,6 +33,8 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
+pub mod sse;
+
 /// How long the upgrade of an accepted connection may take before it is
 /// abandoned.
 pub const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);

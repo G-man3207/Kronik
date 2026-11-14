@@ -13,6 +13,7 @@
 //! turn and answers the handshake; the caller attaches the connection's
 //! transport to the node's hub.
 
+pub mod body;
 #[cfg(feature = "server")]
 pub mod connections;
 #[cfg(feature = "server")]
