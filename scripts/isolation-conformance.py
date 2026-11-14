@@ -380,14 +380,22 @@ def check_errno(value, allowed):
 
 
 def owner_tree(roots, cfg):
-    """Explicit roots cover supported separate actor filesystems without find -xdev."""
+    """Explicit roots cover supported separate actor filesystems without find -xdev.
+
+    The tree is the running daemon's: an entry listed in a directory can be gone when it is
+    looked at (the shipper writes `.ship-state-*.tmp` and renames it into place). What no
+    longer exists has no owner to check, so it is skipped; a root itself must exist."""
     allowed = {Path(p).resolve(strict=True) for p in roots}
     seen = set()
     for root in allowed:
         stack = [root]
         while stack:
             path = stack.pop()
-            md = path.lstat()
+            try:
+                md = path.lstat()
+            except FileNotFoundError:
+                require(path not in allowed, f"data root vanished: {path}")
+                continue
             require(md.st_uid != 0 and md.st_gid != 0, f"root-owned data: {path}")
             require(md.st_uid == cfg["uid"] or cfg["subid"] <= md.st_uid < cfg["subid"] + 65536,
                     f"unexpected data uid {md.st_uid}: {path}")
@@ -406,7 +414,10 @@ def owner_tree(roots, cfg):
                 if identity in seen:
                     continue
                 seen.add(identity)
-                stack.extend(path.iterdir())
+                try:
+                    stack.extend(path.iterdir())
+                except FileNotFoundError:
+                    continue
 
 
 # Executed only after nsenter enters the target and unshare creates a CHILD mount namespace.

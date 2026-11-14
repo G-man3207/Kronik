@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 SOURCE = Path(__file__).with_name("isolation-conformance.py")
 spec = importlib.util.spec_from_file_location("isolation_conformance", SOURCE)
@@ -99,6 +100,37 @@ class VmProcesses(unittest.TestCase):
         self.assertEqual(ids[0], os.getpid())
         args = proof.process_args(os.getpid())
         self.assertTrue(args and all(isinstance(a, bytes) for a in args) and args[0])
+
+
+class OwnerTree(unittest.TestCase):
+    """The owner audit of the running daemon's data tree."""
+
+    def tree(self, directory):
+        root = Path(directory)
+        (root / "kept").write_text("x")
+        (root / ".ship-state-1-1.tmp").write_text("x")
+        owner = 65534 if os.geteuid() == 0 else os.getuid()
+        group = 65534 if os.geteuid() == 0 else os.getgid()
+        if os.geteuid() == 0:
+            for path in [root, root / "kept", root / ".ship-state-1-1.tmp"]:
+                os.chown(path, owner, group)
+        return root, {"uid": owner, "gid": group, "subid": 2_000_000_000, "data": str(root)}
+
+    def test_an_entry_that_vanishes_during_the_walk_is_skipped(self):
+        real = Path.lstat
+        def vanishing(path, *args, **kwargs):
+            if path.name.startswith(".ship-state-"):
+                raise FileNotFoundError(path)
+            return real(path, *args, **kwargs)
+        with tempfile.TemporaryDirectory() as directory:
+            root, cfg = self.tree(directory)
+            with mock.patch.object(Path, "lstat", vanishing):
+                proof.owner_tree([str(root)], cfg)
+            # A file of another owner is still refused.
+            if os.geteuid() == 0:
+                os.chown(root / "kept", 0, 0)
+                with self.assertRaises(proof.Violation):
+                    proof.owner_tree([str(root)], cfg)
 
 
 class MicrovmStop(unittest.TestCase):
