@@ -525,6 +525,10 @@ impl BlobStore {
             Err(e) => return Err(BlobError::io("opening a blob", e)),
         };
         if claimable {
+            // Claimed under the claim lock, as install's claim: a collector
+            // pass that began before does not delete it (ADR 0120 §5).
+            let touched = self.touch_seq.fetch_add(1, Ordering::AcqRel) + 1;
+            lock(&dir.gens).touched.insert(meta.id.file_name(), touched);
             lease.add(meta.id);
         }
         Ok(claimable)

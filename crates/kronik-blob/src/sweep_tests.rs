@@ -251,3 +251,47 @@ async fn other_files_are_left_alone() {
     assert_eq!((report.objects, report.deleted), (0, 0));
     assert!(stray.exists());
 }
+
+/// A rebase's import of a blob that main has already claims main's file
+/// (review R-4): claimed while a pass runs, the file stays even when the
+/// claim's lease ends before the pass reaches it, as a writer's claim does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_that_claims_a_file_during_a_pass_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path()).await;
+    let meta = put(&store, b"main has it already", store.leases().take("t")).await;
+    let claimer = store.clone();
+    let claimed = meta.clone();
+    let rt = tokio::runtime::Handle::current();
+    let mut during = During(
+        BTreeSet::new(),
+        Some(move || {
+            let store = claimer.clone();
+            std::thread::spawn(move || {
+                rt.block_on(async {
+                    let lease = store.leases().take("rebase");
+                    // Not in the fork's space: claimed in main.
+                    store
+                        .import(&Space::Fork("f".into()), &Space::Main, &claimed, &lease)
+                        .await
+                        .unwrap();
+                })
+            })
+            .join()
+            .unwrap();
+        }),
+    );
+    let report = store
+        .sweep(
+            &Space::Main,
+            &mut during,
+            SweepOptions {
+                immediate: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.deleted, 0, "{report:?}");
+    assert!(exists(&store, &meta.id));
+}
