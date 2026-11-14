@@ -80,7 +80,7 @@ type OpenRequest struct {
 
 func newOpenRequest(req *connections.OpenRequest) *OpenRequest {
 	return &OpenRequest{
-		Request:      newRequest(&req.Request),
+		Request:      newRequest(&req.Request, readBlob),
 		Connection:   string(req.Connection),
 		Protocol:     req.Protocol.String(),
 		Subprotocols: append([]string(nil), req.Subprotocols.Slice()...),

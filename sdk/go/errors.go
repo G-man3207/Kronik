@@ -89,6 +89,12 @@ var hostMessages = map[string]map[string][2]string{
 		"denied":      {"crypto denied", "secret-handle"},
 		"unsupported": {"crypto not supported", "NOT_IMPLEMENTED"},
 	},
+	"blob": {
+		"not-held":       {"the turn neither holds nor borrows this blob", "BLOB_NOT_HELD"},
+		"quota-exceeded": {"over the actor's blob quota", "blob"},
+		"erased":         {"the blob belonged to an erased subject", "SUBJECT_ERASED"},
+		"invalid":        {"blob call outside its limits", "blob"},
+	},
 }
 
 // hostError turns a WIT error variant of area (its case name tag and its

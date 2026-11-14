@@ -5,11 +5,13 @@ package kronik
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
 
 	"go.bytecodealliance.org/cm"
+	"kronik.dev/sdk/internal/wit/kronik/actor/blobs"
 	"kronik.dev/sdk/internal/wit/kronik/actor/context"
 	"kronik.dev/sdk/internal/wit/kronik/actor/crypto"
 	httpclient "kronik.dev/sdk/internal/wit/kronik/actor/http-client"
@@ -192,7 +194,213 @@ func (HTTP) Fetch(req FetchRequest) (*FetchResponse, error) {
 		return nil, hostError("fetch", e.String(), detail, *e)
 	}
 	r := res.OK()
-	return &FetchResponse{Status: int(r.Status), Headers: r.Headers.Slice(), Body: inline(r.Body)}, nil
+	return newFetchResponse(int(r.Status), r.Headers.Slice(), r.Body, readBlob), nil
+}
+
+// Blobs is the turn's blobs (see `kronik explain blob`): read the ones the
+// turn got (its request's or a fetch response's body) and the ones it
+// wrote, in ranges or with a reader, and write new ones. The host checks
+// every call (BLOB_NOT_HELD).
+type Blobs struct{}
+
+func blobError(e *blobs.BlobError) *Error {
+	detail := ""
+	if s := e.Invalid(); s != nil {
+		detail = *s
+	}
+	return hostError("blob", e.String(), detail, *e)
+}
+
+// getOnce is up to n (at most 1 MiB) bytes of b from off: one host call.
+func getOnce(b BlobRef, off uint64, n int) ([]byte, error) {
+	res := blobs.Get(b.wit(), off, uint32(n))
+	if res.IsErr() {
+		return nil, blobError(res.Err())
+	}
+	return res.OK().Slice(), nil
+}
+
+// Get returns up to n bytes of b from off: fewer only at its end, none at
+// or past it. One host call moves at most 1 MiB; Get makes as many as n
+// needs.
+func (Blobs) Get(b BlobRef, off uint64, n int) ([]byte, error) {
+	if n < 0 {
+		return nil, newError("blob.range", fmt.Sprintf("no such range of a blob: offset %d, length %d", off, n), "", "blob", nil)
+	}
+	if off >= b.Size {
+		return []byte{}, nil
+	}
+	end := b.Size
+	if uint64(n) < b.Size-off {
+		end = off + uint64(n)
+	}
+	out := make([]byte, 0, end-off)
+	for at := off; at < end; {
+		chunk, err := getOnce(b, at, int(min(end-at, BlobCallBytes)))
+		if err != nil {
+			return nil, err
+		}
+		if len(chunk) == 0 {
+			break
+		}
+		out = append(out, chunk...)
+		at += uint64(len(chunk))
+	}
+	return out, nil
+}
+
+// readBlob reads a whole blob: a lazy body. It must fit in the guest's
+// memory (64 MiB by default).
+func readBlob(b BlobRef) ([]byte, error) { return Blobs{}.Get(b, 0, int(b.Size)) }
+
+// Reader returns a reader of b: an [io.Reader], [io.ReaderAt] and
+// [io.Seeker].
+func (Blobs) Reader(b BlobRef) *BlobReader { return &BlobReader{blob: b} }
+
+// Writer returns a writer of a new blob, tagged with the turn's default
+// subject: Write its bytes, then Finish to get the blob, which the turn may
+// use as a response or fetch body.
+func (Blobs) Writer() *BlobWriter { return &BlobWriter{w: blobs.NewWriter()} }
+
+// BlobReader reads one blob; see [Blobs.Reader]. It fetches whole 64 KiB
+// frames (a read is charged for every frame it touches) and serves small
+// reads from the last ones it fetched.
+type BlobReader struct {
+	blob    BlobRef
+	pos     int64
+	blockAt int64
+	block   []byte
+}
+
+// Size is the blob's size in bytes.
+func (r *BlobReader) Size() int64 { return int64(r.blob.Size) }
+
+// Read reads up to len(p) bytes.
+func (r *BlobReader) Read(p []byte) (int, error) {
+	if r.pos >= int64(r.blob.Size) {
+		return 0, io.EOF
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	rel := r.pos - r.blockAt
+	if rel < 0 || rel >= int64(len(r.block)) {
+		r.blockAt = r.pos - r.pos%BlobFrameBytes
+		want := int(r.pos-r.blockAt) + len(p)
+		want = min(BlobCallBytes, (want+BlobFrameBytes-1)/BlobFrameBytes*BlobFrameBytes)
+		chunk, err := getOnce(r.blob, uint64(r.blockAt), want)
+		if err != nil {
+			return 0, err
+		}
+		r.block = chunk
+		rel = r.pos - r.blockAt
+		if rel >= int64(len(r.block)) {
+			return 0, io.EOF
+		}
+	}
+	n := copy(p, r.block[rel:])
+	r.pos += int64(n)
+	return n, nil
+}
+
+// ReadAt reads len(p) bytes from off; fewer only at the blob's end, with
+// [io.EOF].
+func (r *BlobReader) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, newError("blob.range", fmt.Sprintf("no such range of a blob: offset %d", off), "", "blob", nil)
+	}
+	data, err := Blobs{}.Get(r.blob, uint64(off), len(p))
+	if err != nil {
+		return 0, err
+	}
+	n := copy(p, data)
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// Seek sets where the next Read starts.
+func (r *BlobReader) Seek(offset int64, whence int) (int64, error) {
+	base := int64(0)
+	switch whence {
+	case io.SeekCurrent:
+		base = r.pos
+	case io.SeekEnd:
+		base = int64(r.blob.Size)
+	}
+	if base+offset < 0 {
+		return 0, newError("blob.range", "a seek before the start of a blob", "", "blob", nil)
+	}
+	r.pos = base + offset
+	return r.pos, nil
+}
+
+// BlobWriter writes one blob in parts; [BlobWriter.Finish] ends it. Bytes
+// go to the host as whole 64 KiB frames (calls of at most 1 MiB); what is
+// short of a frame waits for the next Write or Finish.
+type BlobWriter struct {
+	w       blobs.Writer
+	pending []byte
+	done    bool
+}
+
+func (w *BlobWriter) send(p []byte) error {
+	for at := 0; at < len(p); at += BlobCallBytes {
+		res := w.w.Write(cm.ToList(p[at:min(len(p), at+BlobCallBytes)]))
+		if res.IsErr() {
+			return blobError(res.Err())
+		}
+	}
+	return nil
+}
+
+// Write appends p, of any length.
+func (w *BlobWriter) Write(p []byte) (int, error) {
+	if w.done {
+		return 0, newError("blob.finished", "a finished blob writer takes no more bytes", "", "blob", nil)
+	}
+	data := p
+	if len(w.pending) > 0 {
+		data = append(w.pending, p...)
+	}
+	whole := len(data) - len(data)%BlobFrameBytes
+	if err := w.send(data[:whole]); err != nil {
+		return 0, err
+	}
+	// A copy: the caller may reuse p.
+	w.pending = append([]byte(nil), data[whole:]...)
+	return len(p), nil
+}
+
+// Finish ends the blob and returns it; the writer takes no more bytes.
+func (w *BlobWriter) Finish() (BlobRef, error) {
+	if w.done {
+		return BlobRef{}, newError("blob.finished", "the blob writer is already finished", "", "blob", nil)
+	}
+	w.done = true
+	if err := w.send(w.pending); err != nil {
+		w.w.ResourceDrop()
+		return BlobRef{}, err
+	}
+	w.pending = nil
+	res := w.w.Finish()
+	w.w.ResourceDrop()
+	if res.IsErr() {
+		return BlobRef{}, blobError(res.Err())
+	}
+	b := res.OK()
+	return BlobRef{Hash: b.Hash, Size: b.Size}, nil
+}
+
+// BlobResponse is an HTTP response whose body is b (a blob the turn got or
+// wrote): the gateway streams it from the blob store.
+func BlobResponse(status int, b BlobRef, contentType string) Output {
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	headers := []types.Header{{Name: "content-type", Value: contentType}}
+	return Output{types.OutputHTTP(types.HTTPResponse{Status: uint16(status), Headers: list(headers), Body: types.HTTPBodyBlob(b.wit())})}
 }
 
 // Crypto is crypto computed by the host with a secret's value; it needs the
@@ -317,7 +525,7 @@ func (l Log) Error(message string, fields ...any) { l.Emit(LevelError, message, 
 
 // Ctx is a turn's access to the host: the names Kronik's SDKs share
 // (State, SQL, Send, Call, HTTP.Fetch, Crypto, Timers, Now, Random,
-// CausalID, Secret, Subject, Log, Connections) and helpers for outputs.
+// CausalID, Secret, Subject, Log, Connections, Blobs) and helpers for outputs.
 type Ctx struct {
 	State       State
 	SQL         SQL
@@ -328,6 +536,7 @@ type Ctx struct {
 	Random      Random
 	Log         Log
 	Connections ConnectionOps
+	Blobs       Blobs
 }
 
 // Send sends msg to the actor to ("kind/key"): buffered, delivered exactly

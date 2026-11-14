@@ -113,7 +113,7 @@ func TestBodiesAndRequests(t *testing.T) {
 		Params:  cm.ToList([][2]string{{"key", "alice"}}),
 		Headers: cm.ToList([]types.Header{{Name: "Content-Type", Value: "application/json"}}),
 		Body:    types.HTTPBodyInline(cm.ToList([]byte(`{"x":1}`))),
-	})
+	}, nil)
 	if k, _ := req.Param("key"); k != "alice" {
 		t.Error("param")
 	}
@@ -197,5 +197,81 @@ func TestUnhandledInputIsRejected(t *testing.T) {
 	res := (&Actor{Kind: "x"}).handle(types.InputHTTP(types.HTTPRequest{}))
 	if e := res.Err(); e == nil || e.Rejected() == nil || *e.Rejected() != "actor type x does not handle HTTP requests: give the kronik.Actor an HTTP func (see `kronik explain actor`)" {
 		t.Errorf("unhandled: %v", res)
+	}
+}
+
+func TestBlobBodiesAreReadLazilyAndOnce(t *testing.T) {
+	ref := types.BlobRef{Hash: "b3:" + strings.Repeat("ab", 32), Size: 7}
+	reads := 0
+	read := func(b BlobRef) ([]byte, error) {
+		reads++
+		if b.Hash != ref.Hash || b.Size != 7 {
+			t.Errorf("read %+v", b)
+		}
+		return []byte(`{"x":2}`), nil
+	}
+	req := newRequest(&types.HTTPRequest{Method: "POST", Path: "/p", Body: types.HTTPBodyBlob(ref)}, read)
+	b, ok := req.Blob()
+	if !ok || b.Size != 7 || reads != 0 {
+		t.Fatalf("blob %+v %v, %d reads", b, ok, reads)
+	}
+	var x struct{ X int }
+	if err := req.JSON(&x); err != nil || x.X != 2 {
+		t.Fatal("json", err)
+	}
+	if body, err := req.Body(); err != nil || string(body) != `{"x":2}` || reads != 1 {
+		t.Fatalf("body %q %v, %d reads", body, err, reads)
+	}
+	inline := newRequest(&types.HTTPRequest{Body: types.HTTPBodyInline(cm.ToList([]byte("hi")))}, read)
+	if _, ok := inline.Blob(); ok {
+		t.Error("an inline body is not a blob")
+	}
+	if body, _ := inline.Body(); string(body) != "hi" || reads != 1 {
+		t.Error("inline body", string(body))
+	}
+	if _, err := newRequest(&types.HTTPRequest{Body: types.HTTPBodyBlob(ref)}, nil).Body(); err == nil || !strings.Contains(err.Error(), "is a blob") {
+		t.Error("no reader", err)
+	}
+	res := newFetchResponse(200, nil, types.HTTPBodyBlob(ref), func(BlobRef) ([]byte, error) { return []byte("ok"), nil })
+	if text, err := res.Text(); err != nil || text != "ok" {
+		t.Error("response", text, err)
+	}
+	if b, ok := res.Blob(); !ok || b.Hash != ref.Hash {
+		t.Error("response blob")
+	}
+}
+
+func TestBlobFetchBodiesAndResponses(t *testing.T) {
+	blob := BlobRef{Hash: "b3:" + strings.Repeat("cd", 32), Size: 9}
+	w, err := (&FetchRequest{Method: "PUT", URL: "https://x.example/up", BodyBlob: &blob}).wit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := w.Body.Blob(); b == nil || b.Hash != blob.Hash || b.Size != 9 {
+		t.Fatalf("body %+v", w.Body)
+	}
+	headers := w.Headers.Slice()
+	if len(headers) != 1 || headers[0].Name != "content-type" || *headers[0].Value.Text() != "application/octet-stream" {
+		t.Errorf("headers %+v", headers)
+	}
+	typed, _ := (&FetchRequest{URL: "https://x.example/up", Headers: []FetchHeader{{Name: "Content-Type", Value: "application/pdf"}}, BodyBlob: &blob}).wit()
+	if len(typed.Headers.Slice()) != 1 {
+		t.Error("an explicit content-type stays alone")
+	}
+	if _, err := (&FetchRequest{URL: "https://x.example/", Body: "x", BodyBlob: &blob}).wit(); err == nil {
+		t.Error("Body and BodyBlob together")
+	}
+	out := BlobResponse(200, blob, "")
+	resp := out.wit.HTTP()
+	if resp == nil || resp.Status != 200 || resp.Body.Blob() == nil || resp.Headers.Slice()[0].Value != "application/octet-stream" {
+		t.Errorf("blob response %+v", out.wit)
+	}
+}
+
+func TestBlobErrorsNameTheirCodes(t *testing.T) {
+	for tag, topic := range map[string]string{"not-held": "BLOB_NOT_HELD", "quota-exceeded": "blob", "erased": "SUBJECT_ERASED", "invalid": "blob"} {
+		if e := hostError("blob", tag, "", nil); e.Topic != topic || e.Kind != "blob."+tag {
+			t.Errorf("%s: %+v", tag, e)
+		}
 	}
 }

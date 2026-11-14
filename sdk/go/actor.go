@@ -128,7 +128,7 @@ func (a *Actor) dispatch(input *types.Input, ctx *Ctx) (Output, error) {
 		if a.HTTP == nil {
 			return Output{}, unhandled(ctx, "HTTP requests", "an HTTP", "actor")
 		}
-		return a.HTTP(newRequest(input.HTTP()), ctx)
+		return a.HTTP(newRequest(input.HTTP(), readBlob), ctx)
 	case input.Message() != nil:
 		if a.Message == nil {
 			return Output{}, unhandled(ctx, "messages", "a Message", "message")

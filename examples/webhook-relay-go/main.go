@@ -103,16 +103,27 @@ func loadConfig(ctx *kronik.Ctx) (config, error) {
 }
 
 func accept(req *kronik.Request, ctx *kronik.Ctx) (kronik.Output, error) {
-	if len(req.Body) > maxPayloadBytes {
+	tooLarge := func() (kronik.Output, error) {
 		return ctx.JSON(413, map[string]string{"error": fmt.Sprintf("the webhook body is over %d bytes", maxPayloadBytes)})
+	}
+	// A large body arrives as a blob: its size is known before it is read.
+	if b, ok := req.Blob(); ok && b.Size > maxPayloadBytes {
+		return tooLarge()
+	}
+	raw, err := req.Body()
+	if err != nil {
+		return kronik.Output{}, err
+	}
+	if len(raw) > maxPayloadBytes {
+		return tooLarge()
 	}
 	// The payload as JSON (compacted, keys in their order), else as text.
 	var payload json.RawMessage
 	var compact bytes.Buffer
-	if json.Valid(req.Body) && json.Compact(&compact, req.Body) == nil {
+	if json.Valid(raw) && json.Compact(&compact, raw) == nil {
 		payload = compact.Bytes()
-	} else if utf8.Valid(req.Body) {
-		text, err := toJSON(string(req.Body))
+	} else if utf8.Valid(raw) {
+		text, err := toJSON(string(raw))
 		if err != nil {
 			return kronik.Output{}, err
 		}

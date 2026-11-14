@@ -73,11 +73,75 @@ func decodeJSON(b []byte, v any, what, topic string) error {
 	return nil
 }
 
-func inline(body types.HTTPBody) []byte {
-	if b := body.Inline(); b != nil {
-		return b.Slice()
+// BlobCallBytes is the most bytes one blob call moves: 1 MiB.
+const BlobCallBytes = 1 << 20
+
+// BlobFrameBytes is a blob's frame: the store reads and checks whole frames,
+// and a read is charged for every frame it touches, so readers fetch whole
+// frames.
+const BlobFrameBytes = 1 << 16
+
+// BlobRef is a blob: a large body kept outside the log and named by its
+// hash (see `kronik explain blob`). A handler gets one from req.Blob() or
+// res.Blob(), or from ctx.Blobs.Writer().Finish(), and may use it in the
+// turn that got it: read it (ctx.Blobs), answer with it (BlobResponse), or
+// send it (FetchRequest.BodyBlob).
+type BlobRef struct {
+	// Hash is "b3:<hex>", or "b3s:<hex>" for a data subject's blob.
+	Hash string
+	// Size is the blob's size in bytes.
+	Size uint64
+}
+
+func (b BlobRef) wit() types.BlobRef { return types.BlobRef{Hash: b.Hash, Size: b.Size} }
+
+// blobReader reads a whole blob: a lazy body.
+type blobReader func(BlobRef) ([]byte, error)
+
+// splitBody is an HTTP body's inline bytes, or its blob.
+func splitBody(body types.HTTPBody) ([]byte, *BlobRef) {
+	if b := body.Blob(); b != nil {
+		return nil, &BlobRef{Hash: b.Hash, Size: b.Size}
 	}
-	return nil
+	if b := body.Inline(); b != nil {
+		return b.Slice(), nil
+	}
+	return nil, nil
+}
+
+// lazyBody is a body that may be a blob, read on first use.
+type lazyBody struct {
+	bytes []byte
+	blob  *BlobRef
+	read  blobReader
+	done  bool
+}
+
+func newLazyBody(body types.HTTPBody, read blobReader) lazyBody {
+	bytes, blob := splitBody(body)
+	return lazyBody{bytes: bytes, blob: blob, read: read, done: blob == nil}
+}
+
+func (b *lazyBody) get(what string) ([]byte, error) {
+	if b.done {
+		return b.bytes, nil
+	}
+	if b.read == nil {
+		return nil, newError("blob", what+" is a blob that this value cannot read", "", "blob", nil)
+	}
+	bytes, err := b.read(*b.blob)
+	if err != nil {
+		return nil, err
+	}
+	b.bytes, b.done = bytes, true
+	return bytes, nil
+}
+
+func (b *lazyBody) blobRef() (BlobRef, bool) {
+	if b.blob == nil {
+		return BlobRef{}, false
+	}
+	return *b.blob, true
 }
 
 // Header is an HTTP header.
@@ -95,12 +159,11 @@ type Request struct {
 	// Params are the route parameters, such as "key" for /notes/{key}.
 	Params  map[string]string
 	Headers []Header
-	// Body is the body's bytes (inline; a blob body, from M25, is empty here).
-	Body []byte
+	body    lazyBody
 }
 
-func newRequest(req *types.HTTPRequest) *Request {
-	r := &Request{Method: req.Method, Path: req.Path, Query: req.Query, Params: map[string]string{}, Body: inline(req.Body)}
+func newRequest(req *types.HTTPRequest, read blobReader) *Request {
+	r := &Request{Method: req.Method, Path: req.Path, Query: req.Query, Params: map[string]string{}, body: newLazyBody(req.Body, read)}
 	for _, p := range req.Params.Slice() {
 		r.Params[p[0]] = p[1]
 	}
@@ -140,10 +203,30 @@ func (r *Request) Header(name string) (string, bool) {
 }
 
 // Text returns the body as UTF-8 text.
-func (r *Request) Text() (string, error) { return decodeText(r.Body, "the request body", "message") }
+func (r *Request) Text() (string, error) {
+	body, err := r.Body()
+	if err != nil {
+		return "", err
+	}
+	return decodeText(body, "the request body", "message")
+}
 
 // JSON parses the body as JSON into v.
-func (r *Request) JSON(v any) error { return decodeJSON(r.Body, v, "the request body", "message") }
+func (r *Request) JSON(v any) error {
+	body, err := r.Body()
+	if err != nil {
+		return err
+	}
+	return decodeJSON(body, v, "the request body", "message")
+}
+
+// Body returns the body's bytes. A blob body is read on first use, whole,
+// within the guest's memory limit (64 MiB by default); read a larger one in
+// parts with ctx.Blobs.Reader.
+func (r *Request) Body() ([]byte, error) { return r.body.get("the request body") }
+
+// Blob returns the body's blob, when the gateway stored a large body as one.
+func (r *Request) Blob() (BlobRef, bool) { return r.body.blobRef() }
 
 // Message is a message from another actor or the operator.
 type Message struct {
@@ -225,6 +308,9 @@ type FetchRequest struct {
 	// Body is nil, []byte, a string as text, or a value sent as JSON (which
 	// also sets content-type).
 	Body any
+	// BodyBlob, instead of Body, sends a blob, streamed from the blob store
+	// (content-type application/octet-stream unless Headers set one).
+	BodyBlob *BlobRef
 }
 
 func (req *FetchRequest) wit() (httpclient.Request, error) {
@@ -238,16 +324,25 @@ func (req *FetchRequest) wit() (httpclient.Request, error) {
 		}
 		headers = append(headers, httpclient.RequestHeader{Name: h.Name, Value: value})
 	}
+	method := req.Method
+	if method == "" {
+		method = "GET"
+	}
+	if req.BodyBlob != nil {
+		if req.Body != nil {
+			return httpclient.Request{}, newError("fetch.body", "a request has a Body or a BodyBlob, not both", "", "blob", nil)
+		}
+		if !hasContentType {
+			headers = append(headers, httpclient.RequestHeader{Name: "content-type", Value: httpclient.HeaderValueText("application/octet-stream")})
+		}
+		return httpclient.Request{Method: method, URL: req.URL, Headers: list(headers), Body: types.HTTPBodyBlob(req.BodyBlob.wit())}, nil
+	}
 	body, contentType, err := encodeBody(req.Body)
 	if err != nil {
 		return httpclient.Request{}, err
 	}
 	if req.Body != nil && !hasContentType {
 		headers = append(headers, httpclient.RequestHeader{Name: "content-type", Value: httpclient.HeaderValueText(contentType)})
-	}
-	method := req.Method
-	if method == "" {
-		method = "GET"
 	}
 	return httpclient.Request{Method: method, URL: req.URL, Headers: list(headers), Body: types.HTTPBodyInline(cm.ToList(body))}, nil
 }
@@ -256,8 +351,19 @@ func (req *FetchRequest) wit() (httpclient.Request, error) {
 type FetchResponse struct {
 	Status  int
 	Headers [][2]string
-	Body    []byte
+	body    lazyBody
 }
+
+func newFetchResponse(status int, headers [][2]string, body types.HTTPBody, read blobReader) *FetchResponse {
+	return &FetchResponse{Status: status, Headers: headers, body: newLazyBody(body, read)}
+}
+
+// Body returns the body's bytes. A blob body is read on first use, whole,
+// within the guest's memory limit; read a larger one with ctx.Blobs.Reader.
+func (r *FetchResponse) Body() ([]byte, error) { return r.body.get("the response body") }
+
+// Blob returns the body's blob, when the host stored a large response as one.
+func (r *FetchResponse) Blob() (BlobRef, bool) { return r.body.blobRef() }
 
 // OK reports whether the status is 2xx.
 func (r *FetchResponse) OK() bool { return r.Status >= 200 && r.Status < 300 }
@@ -274,10 +380,18 @@ func (r *FetchResponse) Header(name string) (string, bool) {
 
 // Text returns the body as UTF-8 text.
 func (r *FetchResponse) Text() (string, error) {
-	return decodeText(r.Body, "the response body", "effect")
+	body, err := r.Body()
+	if err != nil {
+		return "", err
+	}
+	return decodeText(body, "the response body", "effect")
 }
 
 // JSON parses the body as JSON into v.
 func (r *FetchResponse) JSON(v any) error {
-	return decodeJSON(r.Body, v, "the response body", "effect")
+	body, err := r.Body()
+	if err != nil {
+		return err
+	}
+	return decodeJSON(body, v, "the response body", "effect")
 }
