@@ -6,10 +6,12 @@
 //! `messaging.send`, and leave the turn through
 //! [`crate::turn::TurnOutput::connection_ops`] only when it commits. A
 //! turn may use the connection its open input names and the live
-//! connections its actor accepted (ADR 0114, amended 2026-11-13). Another
-//! actor's live connection traps with `CONNECTION_NOT_HELD`, and so does a
-//! malformed id; an id that no live connection has (it closed, or none was
-//! ever accepted) is recorded as dropped and never delivered. At the end of
+//! connections its actor accepted (ADR 0114, amended 2026-11-13 and
+//! 2026-11-14). Any other well-formed id (a connection that closed, that
+//! was never accepted, or that another actor holds) is recorded as dropped
+//! and never delivered: a turn decides only from its own actor's rows,
+//! which change only through that actor's own turns, so a replay decides
+//! the same. A malformed id traps. At the end of
 //! the turn the buffered frames to live connections take their outgoing
 //! seqs (§4.5): after the connection's `next_seq` as of the turn's start (0
 //! for the connection the turn opens) and after the frames the turn sent
@@ -36,16 +38,13 @@ pub const MAX_PAYLOAD_BYTES: usize = 16 << 20;
 /// The longest close reason, in bytes (RFC 6455: 123 in a close frame).
 pub const MAX_REASON_BYTES: usize = 123;
 
-/// The trap message prefix of an id the turn does not hold; the turn's
-/// error code is then `CONNECTION_NOT_HELD`.
-pub const NOT_HELD: &str = "CONNECTION_NOT_HELD";
-
 /// What a turn may do with a connection id (ADR 0114, amended).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Target {
     /// The connection this turn opens, or a live connection of its actor.
     Held(pb::ConnectionProtocol),
-    /// No live connection has the id: recorded as dropped, never delivered.
+    /// Not a live connection of this actor: recorded as dropped, never
+    /// delivered.
     Dropped,
 }
 
@@ -113,8 +112,11 @@ pub fn valid_close_code(code: u16) -> bool {
 
 impl TurnHost {
     /// What this turn may do with `conn` (ADR 0114, amended): a held
-    /// connection, or a dropped target. Another actor's live connection
-    /// traps with `CONNECTION_NOT_HELD`, and a malformed id traps.
+    /// connection, or a dropped target. The decision reads only whether
+    /// `conn` is a live connection of this turn's actor: whether another
+    /// actor's connection is live depends on when that actor's turns were
+    /// applied, which the log does not order against this turn (I1). A
+    /// malformed id traps.
     pub(crate) fn target(&mut self, conn: &str) -> wasmtime::Result<Target> {
         if let Some((id, protocol)) = &self.conns.opening
             && id == conn
@@ -141,11 +143,16 @@ impl TurnHost {
         };
         match view {
             Some(v) if v.owner_is_self => Ok(Target::Held(v.protocol)),
-            Some(_) => bail!(
-                "{NOT_HELD}: connection {conn:?} is another actor's; only the actor that \
-                 accepted a connection sends on it or closes it ({} did not)",
-                self.actor
-            ),
+            Some(_) => {
+                // A debugging aid, not recorded: the turn drops it either way.
+                tracing::warn!(
+                    actor = %self.actor,
+                    connection = %conn,
+                    "a turn used another actor's live connection; only the actor that \
+                     accepted a connection sends on it or closes it, so it is dropped"
+                );
+                Ok(Target::Dropped)
+            }
             None => Ok(Target::Dropped),
         }
     }

@@ -25,13 +25,14 @@ connection then gives its actor three kinds of input, each its own turn:
 | frame | A WebSocket client sent a text or binary message. SSE has no frames. | Handles it. |
 | close | The connection ended: the client left, the actor closed it, or the host did (a restart, a limit, an operator). | Cleans up. Every accepted connection gets exactly one close, also after a crash. |
 
-Only the actor that accepted a connection may send on it or close it while
-it is live: another actor's use fails the turn with `CONNECTION_NOT_HELD`.
-A frame to a connection that is not live (closed, or never accepted) is
-dropped and shows in `kronik history`: a connection can close between the
-turn that learned its id and the turn that sends to it, and that is no
-error. Connection ids are 128 random bits, so they cannot be guessed. To
-reach clients connected to other actors, send those actors a message.
+Only the actor that accepted a connection sends on it or closes it. A frame
+to any other id, a connection that closed, one that was never accepted or
+one that another actor holds, is dropped and shows in `kronik history`. That
+is no error: a connection can close between the turn that learned its id
+and the turn that sends to it, and a turn decides only from its own actor's
+connections, so it replays the same. Connection ids are 128 random bits, so
+they cannot be guessed. To reach clients connected to other actors, send
+those actors a message.
 
 ## The API
 

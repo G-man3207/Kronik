@@ -3713,7 +3713,6 @@ against both.
             "CERTIFICATE_INVALID",
             "CONNECTION_LIMIT",
             "CONNECTION_NOT_FOUND",
-            "CONNECTION_NOT_HELD",
             "DEAD_LETTER_ALREADY_RESENT",
             "DEAD_LETTER_NOT_FOUND",
             "DEPLOYMENT_NOT_FOUND",

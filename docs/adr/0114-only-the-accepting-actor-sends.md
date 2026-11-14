@@ -51,7 +51,9 @@ What bears on the answer:
    `CONNECTION_NOT_HELD`, which fails the turn. The check reads only
    recorded, immutable facts, so it is deterministic. (Amended 2026-11-13:
    this holds for live connections; an id without a live connection is
-   recorded as dropped. See the amendment below.)
+   recorded as dropped. Amended 2026-11-14: any id that is not a live
+   connection of the turn's own actor is recorded as dropped; nothing traps
+   but a malformed id. See the amendments below.)
 3. **Handles are data, not capabilities.** Storing an id, logging it or
    sending it in a message grants nothing.
 4. **Inputs go to the owner only.** The gateway delivers a connection's
@@ -132,7 +134,8 @@ a trap.
      open accepts: as before.
    - **A live connection of another actor:** it traps with
      `CONNECTION_NOT_HELD`, as before. Owner-only sending holds for every
-     live connection.
+     live connection. (Superseded on 2026-11-14: it is recorded as dropped,
+     see below.)
    - **No live connection has the id** (it closed, or none was ever
      accepted): the operation is recorded as dropped and never handed to a
      connection, and the turn goes on. `send-now` answers `closed`.
@@ -190,3 +193,58 @@ a trap.
     the same live table;
   - an I1 test: one input sequence gives byte-identical turn records
     whether or not compaction ran in between.
+
+## Amended 2026-11-14: a turn decides from its own actor's rows
+
+### Context
+
+The deterministic simulation's identity replay (C8) found that the trap
+for another actor's live connection broke I1. Whether another actor's
+connection is live depends on when that actor's close input was applied,
+and the log does not order that against a turn of a different actor: in
+production a frame turn of `room/r0` read the state before `room/r2`'s
+close (LSN 46) was applied and trapped at LSN 47, while identity replay
+applied LSN 46 first, found no live row, and dropped instead. The diff
+showed a fixed error that production never fixed. About one connections
+seed in 500 hit it.
+
+A turn's own actor's rows have no such race: they change only through
+that actor's own turns, which run one at a time, so a turn reads them as
+its earlier turns left them, in production and in replay.
+
+### Decision
+
+1. **A turn decides only from its own actor's rows.** A `send`,
+   `broadcast` target, `close` or `send-now` to the connection the turn's
+   open accepts, or to a live connection of the turn's actor, works as
+   before. Any other well-formed id, whether it closed, was never accepted
+   or is another actor's live connection, is recorded as dropped and never
+   handed to a connection; the turn goes on, and `send-now` answers
+   `closed`. A malformed id still traps.
+2. **The security property is unchanged.** Only the owner's turns ever put
+   a frame on a connection or close it: a frame to another actor's
+   connection is recorded, with its fate `dropped`, and never delivered.
+   The trap only made such a mistake loud.
+3. **Connection ids stay unguessable** (decision 3 of the first amendment:
+   128 random bits). With no trap, a turn cannot even tell another actor's
+   live connection from a dead id, so ids cannot be probed.
+4. **`CONNECTION_NOT_HELD` goes.** No path raises it any more, and M24 is
+   not released, so the error code leaves the catalog rather than staying
+   reserved.
+
+### Consequences
+
+- **Determinism.** The outcome of every connection operation follows from
+  the turn's own actor's rows and the log: identity replay of the race above
+  gives an empty diff.
+- **What is lost.** Passing the wrong actor a connection id no longer fails
+  its turn. The mistake shows up as dropped frames in history (`kronik
+  history --connection`), in `kronik_connection_frames_dropped_total`, and
+  as a warning in the daemon's log that names the actor and the connection
+  (not recorded, so replay is not affected).
+- **Verification:** a runtime test (another actor's live connection is
+  dropped and the turn commits), a scheduler test (a frame turn's send,
+  close and `send-now` to another room's live connection: dropped, `closed`,
+  nothing reaches that connection's client), an identity replay of such a
+  session with an empty diff, and the deterministic simulation's C8 on the
+  seeds that found it.

@@ -406,35 +406,100 @@ fn opens_frames_and_broadcasts_go_through_the_turn_and_the_hub() {
     assert_eq!(p.node.hub().live(), 2);
 }
 
-/// ADR 0114: only the owner may use a connection; another actor's id traps
-/// with CONNECTION_NOT_HELD. The failed frame turn is a dead letter, and
-/// its resend runs the same frame again as a new root input (§4.9).
+/// ADR 0114 (amended 2026-11-14): only the owner's turns reach a
+/// connection. A turn's `send`, `close` and `send-now` to another room's
+/// live connection are recorded as dropped (`send-now`: `closed`, without a
+/// `TurnBegin`), the turn commits, and nothing reaches that connection:
+/// the turn decides only from its own actor's connections.
 #[test]
-fn only_the_owner_uses_a_connection_and_failed_frames_are_dead_letters() {
+fn another_actors_connection_is_dropped_and_its_client_gets_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy(ROOM, false).unwrap();
+    grant_send_now(&p);
+    let (a, ta) = p.join("lobby", "ada");
+    let (other, to) = p.join("kitchen", "bob");
+    p.until("the welcomes", || {
+        ta.recording().frames.len() == 1 && to.recording().frames.len() == 1
+    });
+    let before = p.row(&a).unwrap().frames_in;
+    for cmd in [
+        format!("send-to {other} sneaky"),
+        format!("kick {other}"),
+        format!("now-to {other} sneaky"),
+    ] {
+        p.frame(&a, &cmd);
+    }
+    p.until("ada's three frame turns", || {
+        p.row(&a).unwrap().frames_in == before + 3
+    });
+    // Every one committed, and none is a dead letter.
+    assert!(p.node.store().db().dead_letters(0, 10).unwrap().is_empty());
+    let turns: Vec<pb::TurnRecord> = log(&p)
+        .into_iter()
+        .filter_map(|(_, r)| match r {
+            Record::TurnRecord(t) => Some(t),
+            _ => None,
+        })
+        .filter(|t| {
+            matches!(
+                t.input.as_ref().and_then(|i| i.kind.as_ref()),
+                Some(pb::input::Kind::Connection(c)) if c.connection == a
+                    && matches!(c.event, Some(pb::connection_input::Event::Frame(_)))
+            )
+        })
+        .collect();
+    assert_eq!(turns.len(), 3);
+    for t in &turns {
+        assert_eq!(
+            t.outcome.as_ref().unwrap().kind,
+            pb::OutcomeKind::Committed as i32,
+            "{t:?}"
+        );
+    }
+    // send-to and kick: dropped, with no live target and no seq.
+    for t in &turns[..2] {
+        assert_eq!(t.connection_ops.len(), 1, "{t:?}");
+        let op = &t.connection_ops[0];
+        assert!(op.connections.is_empty() && op.seqs.is_empty(), "{op:?}");
+        assert_eq!(op.dropped, std::slice::from_ref(&other));
+    }
+    // send-now: `closed`, without a TurnBegin.
+    let e = &turns[2].effects[0];
+    assert_eq!(e.kind, "connection.send-now");
+    assert_eq!(e.status, pb::EffectStatus::Closed as i32, "{e:?}");
+    assert!(!log(&p).iter().any(
+        |(_, r)| matches!(r, Record::TurnBegin(b) if b.execution_id == turns[2].execution_id)
+    ));
+    // Bob's connection got nothing but its welcome, and is still open.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(to.recording().frames.len(), 1, "{:?}", to.recording());
+    assert!(to.recording().closed.is_none());
+    assert!(p.live(&other));
+}
+
+/// A frame turn that fails is a dead letter, and its resend runs the same
+/// frame again as a new root input (§4.9); resends are not counted as
+/// frames.
+#[test]
+fn failed_frames_are_dead_letters_and_their_resend_runs_again() {
     let dir = tempfile::tempdir().unwrap();
     let p = start(dir.path());
     p.deploy(ROOM, false).unwrap();
     let (a, ta) = p.join("lobby", "ada");
-    let (other, _to) = p.join("kitchen", "bob");
-    p.frame(&a, &format!("send-to {other} sneaky"));
+    p.frame(&a, "fail");
     p.until("the dead letter", || {
         !p.node.store().db().dead_letters(0, 10).unwrap().is_empty()
     });
     let dl = p.node.store().db().dead_letters(0, 10).unwrap().remove(0);
-    assert_eq!(dl.error_code, "CONNECTION_NOT_HELD");
-    assert!(dl.message.contains(&other), "{}", dl.message);
-    // Nothing reached the other connection, and the failed turn recorded
-    // no operations.
+    assert!(
+        dl.message.contains("the frame failed on request"),
+        "{}",
+        dl.message
+    );
+    // The failed turn recorded no operations.
     let t = p.record(dl.lsn);
     assert!(t.connection_ops.is_empty());
-    // An id that no live connection has is recorded as dropped, and the
-    // turn commits (ADR 0114, amended).
-    let before = p.row(&a).unwrap().frames_in;
-    p.frame(&a, "send-to c-00000000000000000000000000000000 x");
-    p.until("the frame turn", || {
-        p.row(&a).unwrap().frames_in == before + 1
-    });
-    assert_eq!(p.node.store().db().dead_letters(0, 10).unwrap().len(), 1);
     // Resend: a new root input of the same connection and frame.
     let r =
         p.rt.block_on(p.node.resend(
@@ -445,7 +510,7 @@ fn only_the_owner_uses_a_connection_and_failed_frames_are_dead_letters() {
         ))
         .unwrap()
         .unwrap();
-    assert_eq!(r.outcome.error_code, "CONNECTION_NOT_HELD");
+    assert!(!r.committed(), "the resent frame fails again: {r:?}");
     let resent = p.record(r.turn_id.lsn);
     let Some(pb::input::Kind::Connection(c)) = resent.input.and_then(|i| i.kind) else {
         panic!("not a connection input")
@@ -455,7 +520,7 @@ fn only_the_owner_uses_a_connection_and_failed_frames_are_dead_letters() {
     let dls = p.node.store().db().dead_letters(0, 10).unwrap();
     assert_eq!(dls[0].resent_as, Some(r.turn_id.lsn));
     // Resends are not counted as frames.
-    assert_eq!(p.row(&a).unwrap().frames_in, 2);
+    assert_eq!(p.row(&a).unwrap().frames_in, 1);
     assert_eq!(ta.recording().frames.len(), 1, "only the welcome");
 }
 

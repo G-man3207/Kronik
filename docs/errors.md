@@ -41,7 +41,6 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`CERTIFICATE_INVALID`](#certificate_invalid) | 400 | M6 | The TLS certificate cannot be used |
 | [`CONNECTION_LIMIT`](#connection_limit) | 503 | M24 | The gateway holds as many connections as it may |
 | [`CONNECTION_NOT_FOUND`](#connection_not_found) | 404 | M24 | No such connection, or it is not open |
-| [`CONNECTION_NOT_HELD`](#connection_not_held) | 403 | M24 | The actor used a connection it did not accept |
 | [`DEAD_LETTER_ALREADY_RESENT`](#dead_letter_already_resent) | 409 | M1 | The dead letter was already resent |
 | [`DEAD_LETTER_NOT_FOUND`](#dead_letter_not_found) | 404 | M1 | No such dead letter |
 | [`DEPLOYMENT_NOT_FOUND`](#deployment_not_found) | 404 | M3 | No such deployment |
@@ -240,20 +239,6 @@ List the connections, open ones by default, and look one up by its id:
     kronik connections inspect c-0123456789abcdef0123456789abcdef
 
 See also: [`connections`](concepts/glossary.md#connections).
-
-## CONNECTION_NOT_HELD
-
-HTTP status 403, milestone M24. The actor used a connection it did not accept.
-
-Default hint: Only the actor that accepted a connection can send on it or close it; send that actor a message instead (`kronik explain connections`).
-
-A turn used a connection that its actor does not hold: `connections.send`, `broadcast`, `close` or `send-now` named a connection id that another actor accepted, or one that no actor accepted. Only the actor whose open turn accepted a connection (its owner) may send on it or close it, and an id is data, not a capability: storing it or sending it in a message grants nothing (ADR 0114). The turn failed with this code; an HTTP client gets `TURN_FAILED`, and a failed message, timer or frame input is a dead letter.
-
-To reach clients whose connections another actor holds, send that actor a message and let it forward the frame on its own connection, or let one actor (such as a room) accept all the connections it broadcasts to.
-
-    kronik history chat/lobby --limit 10
-
-See also: [`connections`](concepts/glossary.md#connections), [`dead-letters`](concepts/glossary.md#dead-letters), [`TURN_FAILED`](#turn_failed).
 
 ## DEAD_LETTER_ALREADY_RESENT
 

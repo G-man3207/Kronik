@@ -127,11 +127,22 @@ fn join(
     user: &str,
     protocol: pb::ConnectionProtocol,
 ) -> (String, Arc<RecordingTransport>) {
+    join_room(p, "lobby", user, protocol)
+}
+
+/// Opens a connection of `user` to room `key` and attaches a recording
+/// transport.
+fn join_room(
+    p: &Proc,
+    key: &str,
+    user: &str,
+    protocol: pb::ConnectionProtocol,
+) -> (String, Arc<RecordingTransport>) {
     let (id, waiter) = p
         .node
         .connection_open(
-            ActorRef::parse("room/lobby").unwrap(),
-            open_request("lobby", &format!("user={user}"), protocol),
+            ActorRef::parse(&format!("room/{key}")).unwrap(),
+            open_request(key, &format!("user={user}"), protocol),
             protocol,
             None,
             None,
@@ -614,4 +625,86 @@ fn a_fork_that_refuses_the_opens_skips_their_connections() {
     assert_eq!(f.changed, 4, "{}", String::from_utf8_lossy(&out.bytes));
     assert!(f.items.iter().all(|i| i.open.is_some()));
     check_schema("refuse isolated", &json(&out));
+}
+
+/// ADR 0114 (amended 2026-11-14): `room/lobby`'s frame turns send to,
+/// `send-now` and kick `room/kitchen`'s connection, while it is live and
+/// after the kitchen closed it. A turn decides only from its own actor's
+/// connections, so each is recorded the same way either way (dropped,
+/// `closed`), nothing reaches the kitchen's client, and identity replay is
+/// empty in every mode, whenever the replay applies the kitchen's close.
+#[test]
+fn another_rooms_connection_is_dropped_the_same_way_in_replay() {
+    use pb::ConnectionProtocol::Websocket;
+    let dir = tempdir();
+    let p = Proc::open(dir.path(), config());
+    p.deploy("room");
+    p.rt.block_on(p.node.grant(
+        "room",
+        "connection:send-now",
+        None,
+        None,
+        kronik_effects::InForks::default(),
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    let fork_lsn = p.settle();
+    let (ada, _ta) = join(&p, "ada", Websocket);
+    let (bob, tb) = join_room(&p, "kitchen", "bob", Websocket);
+    p.settle();
+    let welcome = tb.recording().frames.len();
+    // While bob's connection is live:
+    for cmd in [
+        format!("send-to {bob} sneaky"),
+        format!("now-to {bob} sneaky"),
+    ] {
+        frame(&p, &ada, &cmd);
+        p.settle();
+    }
+    // The kitchen closes it, then the lobby tries again.
+    frame(&p, &bob, "bye");
+    until("bob's close", || closed(&p, &bob));
+    for cmd in [format!("kick {bob}"), format!("send-to {bob} late")] {
+        frame(&p, &ada, &cmd);
+        p.settle();
+    }
+    assert!(p.node.store().db().dead_letters(0, 10).unwrap().is_empty());
+    assert_eq!(tb.recording().frames.len(), welcome, "{:?}", tb.recording());
+    let turns = window(&p, fork_lsn);
+    let mut dropped = 0;
+    for t in turns.values() {
+        let Some(pb::input::Kind::Connection(c)) = t.input.as_ref().and_then(|i| i.kind.as_ref())
+        else {
+            continue;
+        };
+        if c.connection != ada || !matches!(c.event, Some(pb::connection_input::Event::Frame(_))) {
+            continue;
+        }
+        assert_eq!(
+            t.outcome.as_ref().unwrap().kind,
+            pb::OutcomeKind::Committed as i32,
+            "{t:?}"
+        );
+        // (A `now-to` also tells ada's own connection what send-now
+        // answered: that one is hers and goes out.)
+        for op in &t.connection_ops {
+            assert!(!op.connections.contains(&bob), "{op:?}");
+            if op.dropped.contains(&bob) {
+                dropped += 1;
+            }
+        }
+        for e in &t.effects {
+            assert_eq!(e.status, pb::EffectStatus::Closed as i32, "{e:?}");
+        }
+    }
+    assert_eq!(dropped, 3, "send-to twice and the kick");
+
+    for mode in [Mode::Isolated, Mode::Continuous, Mode::Both] {
+        let out = replay(&p, None, fork_lsn, &opts(mode), 1);
+        let text = String::from_utf8_lossy(&out.bytes);
+        assert!(!out.diff.summary.changed, "{mode:?}: {text}");
+        assert_eq!(out.diff.summary.divergent_turns, 0, "{mode:?}: {text}");
+    }
 }

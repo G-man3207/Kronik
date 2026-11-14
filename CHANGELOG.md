@@ -159,10 +159,11 @@ until the v1.0 compatibility promise takes effect.
   HTTP response. `connections.send`, `broadcast` and `close` are buffered
   in the turn record with per-connection outgoing seqs and handed to the
   connection after the turn commits; a failed turn sends nothing. A turn
-  may use the live connections its actor accepted: another actor's live
-  connection traps with `CONNECTION_NOT_HELD` (new), and an operation on an
-  id without a live connection (closed, or never accepted) is recorded as
-  dropped (ADR 0114, amended). Closed connections move from state.db's
+  may use the live connections its actor accepted; an operation on any
+  other id (closed, never accepted, or another actor's) is recorded as
+  dropped and never delivered (ADR 0114, amended 2026-11-13 and
+  2026-11-14: a turn decides from its own actor's connections only, so it
+  replays the same). Closed connections move from state.db's
   `connections` to `connection_history`, which retention trims at its base
   and turns never read; offered WebSocket subprotocols are recorded only as
   the sealable `Sec-WebSocket-Protocol` header, which the API redacts like

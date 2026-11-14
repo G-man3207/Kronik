@@ -257,7 +257,6 @@ never “fix” missing key material by making a new seed over existing data.
 | `NOTHING_TO_PROPOSE` | Main already runs every component you passed. Nothing changed: stop proposing, or change the code and build it again. |
 | `VERIFY_REQUIRED` | A kind with history only changes through `propose_change`. |
 | `CAPABILITY_NOT_GRANTED` | The code calls a target it has no grant for. In a fork that call is denied; in production a human grants it. |
-| `CONNECTION_NOT_HELD` | The code sends on, or closes, a WebSocket or SSE connection that another actor accepted. Only the accepting actor may; pass the message to it instead. |
 | `SECRET_UNAVAILABLE` | A secret's value cannot be read now, often a linked secret whose backend is down. A fork never fetches one: it uses only a value the node already holds for the fork point. Ask the operator; do not retry in a loop. |
 | `ACTOR_NOT_FOUND`, `FORK_NOT_FOUND`, `PROPOSAL_NOT_FOUND`, `TURN_NOT_FOUND` | Check the id: list again. |
 | `UNAUTHENTICATED` | Your token is missing, unknown or revoked. |

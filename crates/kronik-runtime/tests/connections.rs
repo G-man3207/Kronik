@@ -241,10 +241,10 @@ async fn run_with(program: &Program, input: pb::Input, live: &Live) -> kronik_ru
         .unwrap()
 }
 
-/// ADR 0114 (amended 2026-11-13): the turn's own live connection takes the
-/// next seq; another actor's live connection traps with
-/// CONNECTION_NOT_HELD; an id that no live connection has is recorded as
-/// dropped, without a seq, and the turn commits; a malformed id traps.
+/// ADR 0114 (amended 2026-11-13 and 2026-11-14): the turn's own live
+/// connection takes the next seq; any other id, one that no live connection
+/// has or another actor's live connection, is recorded as dropped, without
+/// a seq, and the turn commits; a malformed id traps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_connections_are_held_dead_ids_are_dropped() {
     const MINE: &str = "c-11111111111111111111111111111111";
@@ -269,14 +269,13 @@ async fn live_connections_are_held_dead_ids_are_dropped() {
     assert_eq!(out.connection_ops[0].dropped, [GONE]);
     assert!(out.connection_ops[0].seqs.is_empty());
 
+    // Another actor's live connection: the turn reads only its own actor's
+    // rows, so it is dropped like a dead id.
     let out = run_with(&room, message("kick", THEIRS.as_bytes()), &live).await;
-    assert_eq!(
-        out.outcome.error_code, "CONNECTION_NOT_HELD",
-        "{:?}",
-        out.outcome
-    );
-    assert!(out.outcome.message.contains(THEIRS), "{:?}", out.outcome);
-    assert!(out.connection_ops.is_empty());
+    assert!(out.committed(), "{:?}", out.outcome);
+    assert!(out.connection_ops[0].connections.is_empty());
+    assert_eq!(out.connection_ops[0].dropped, [THEIRS]);
+    assert!(out.connection_ops[0].seqs.is_empty());
 
     let out = run_with(&room, message("kick", b"c-not-an-id"), &live).await;
     assert_eq!(

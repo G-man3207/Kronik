@@ -479,11 +479,12 @@ every incoming frame and the close are inputs of the owner, delivered to
   must not contain CR, LF or NUL; they are recorded in plain text, so keep
   personal data out of them.
 - **Ownership.** A turn may use the connection its `open` input names and
-  the live connections its actor accepted earlier. Another actor's live
-  connection traps with `CONNECTION_NOT_HELD`, and a malformed id traps.
-  An id that no live connection has (it closed, or none was ever accepted)
-  is recorded as dropped: its frames are never delivered, `close` does
-  nothing and `send-now` answers `closed`. Ids are 128 random bits, so
+  the live connections its actor accepted earlier. Any other id, one that
+  closed, one that was never accepted or one that another actor holds, is
+  recorded as dropped: its frames are never delivered, `close` does nothing
+  and `send-now` answers `closed`. A turn decides from its own actor's
+  connections only, so it replays the same (ADR 0114, amended 2026-11-14).
+  A malformed id traps. Ids are 128 random bits, so
   they cannot be guessed.
 - **`send`, `broadcast` and `close` are buffered**, like `messaging.send`:
   they are recorded in the turn record in call order and handed to the

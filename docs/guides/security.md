@@ -358,9 +358,9 @@ Prefer a preview domain wherever previews take traffic from browsers.
 
 Long-lived connections ([Connections](connections.md), M24):
 
-- **Owner-only sending.** Only the actor that accepted a connection may
-  send on it or close it while it is live. Another actor's use fails its
-  turn with `CONNECTION_NOT_HELD`
+- **Owner-only sending.** Only the actor that accepted a connection sends
+  on it or closes it: another actor's frames to it are recorded as dropped
+  and never delivered
   ([ADR 0114](../adr/0114-only-the-accepting-actor-sends.md)). A
   connection's id is 128 random bits, so an actor cannot find another
   actor's connections by guessing ids; a frame to an id that no live

@@ -122,9 +122,6 @@ codes! {
     ConnectionNotFound = "CONNECTION_NOT_FOUND", 404, "M24",
         "No such connection, or it is not open",
         "List connections with `kronik connections list`.";
-    ConnectionNotHeld = "CONNECTION_NOT_HELD", 403, "M24",
-        "The actor used a connection it did not accept",
-        "Only the actor that accepted a connection can send on it or close it; send that actor a message instead (`kronik explain connections`).";
     DeadLetterAlreadyResent = "DEAD_LETTER_ALREADY_RESENT", 409, "M1",
         "The dead letter was already resent",
         "See its `resent_as` turn in `kronik dead-letters list`.";

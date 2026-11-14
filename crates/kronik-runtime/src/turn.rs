@@ -567,8 +567,6 @@ fn classify_error(e: &wasmtime::Error, memory_limit_hit: bool) -> pb::Outcome {
         "NOT_IMPLEMENTED"
     } else if msg.starts_with("REPLAY_DIVERGED") {
         "REPLAY_DIVERGED"
-    } else if msg.starts_with(crate::host::connections::NOT_HELD) {
-        crate::host::connections::NOT_HELD
     } else {
         "TURN_FAILED"
     };

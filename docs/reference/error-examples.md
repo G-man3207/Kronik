@@ -90,16 +90,6 @@ the right id; a closed connection can be inspected but not closed.
 kronik connections inspect c-0123456789abcdef0123456789abcdef
 ```
 
-## CONNECTION_NOT_HELD
-
-A fixture room actor's frame turn sends to a connection id that another
-actor accepted. The turn fails with this code and its frame input is a dead
-letter. Find the failed turn, then send the owning actor a message instead.
-
-```sh
-kronik history room/lobby --limit 10
-```
-
 ## DEAD_LETTER_ALREADY_RESENT
 
 Attempt a second resend of a dead letter that already names its `resent_as`

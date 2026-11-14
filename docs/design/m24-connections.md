@@ -231,7 +231,7 @@ instantiate a 0.1.0 component (ADR 0113, Consequences).
 
 | Function | Rules (a broken rule traps, and the turn fails) |
 | --- | --- |
-| `send(conn, frame)` | `conn` is a well-formed id (`c-` and 32 lowercase hex characters), else the turn traps. If it names a live connection (§6.5), the turn's actor owns it, or it is the connection this turn opens; else `CONNECTION_NOT_HELD`. If no live connection has it (it closed, or none was ever accepted), the frame is recorded as dropped and never delivered (§4.7; ADR 0114, amended). The frame's payload (text bytes, binary bytes, or event data + event + id) is at most the kind's `message_bytes`. `binary` to an SSE connection traps. `event.event` and `event.id` must not contain CR, LF or NUL. The per-turn caps of §4.11 apply. Recorded in `TurnRecord.connection_ops` with the payload tagged with the turn's default subject. Not allowed in `describe`. |
+| `send(conn, frame)` | `conn` is a well-formed id (`c-` and 32 lowercase hex characters), else the turn traps. If it is the connection this turn opens or a live connection (§6.5) of the turn's actor, the frame goes to it. Any other id (it closed, it was never accepted, or another actor holds it) is recorded as dropped and never delivered (§4.7; ADR 0114, amended 2026-11-13 and 2026-11-14): the turn reads only its own actor's rows, so its outcome does not depend on when another actor's turns were applied. The frame's payload (text bytes, binary bytes, or event data + event + id) is at most the kind's `message_bytes`. `binary` to an SSE connection traps. `event.event` and `event.id` must not contain CR, LF or NUL. The per-turn caps of §4.11 apply. Recorded in `TurnRecord.connection_ops` with the payload tagged with the turn's default subject. Not allowed in `describe`. |
 | `broadcast(conns, frame)` | `send`'s rules for every id: dropped ids are recorded as such. Duplicate ids are ignored (the first occurrence keeps its place). An empty list does nothing. One recorded operation with all targets. |
 | `close(conn, code, reason)` | `send`'s rules for `conn`: a close of an id without a live connection is recorded as dropped and does nothing. `code` is 1000, 1001, 1003, 1007, 1008, 1009 or 1011, or 3000 to 4999. `reason` is at most 123 bytes of UTF-8. On SSE, the code and reason are recorded, and the stream ends. |
 | `send-now(conn, frame)` | `send`'s rules. `conn` must not be the connection that the current turn opens (it opens at commit). An id without a live connection answers `closed`, recorded with the status `CLOSED` without a `TurnBegin`: the answer follows from the state. Without a grant of `connection:send-now`: `denied("CAPABILITY_NOT_GRANTED: connection:send-now")`, recorded as status `DENIED`. Otherwise: `TurnBegin` (I14), the frame goes to the hub (§5.2), and the `EffectResult` is fsynced before the guest sees the result (§4.4). |
@@ -283,14 +283,19 @@ ADR 0114 has the reasoning:
 
 - The owner is the actor whose open turn accepted the connection, which is
   the actor the route named. It never changes.
-- Only the owner's turns may `send`, `broadcast`, `close` or `send-now` on
-  a live connection. Another actor's use traps with `CONNECTION_NOT_HELD`.
-  An operation on an id without a live connection (it closed, or none was
-  ever accepted) is recorded as dropped, as the brief says of frames to a
-  closed connection (ADR 0114, amended 2026-11-13).
+- Only the owner's turns `send`, `broadcast`, `close` or `send-now` on a
+  connection. An operation on any other id, one that closed, one that was
+  never accepted or one that another actor holds, is recorded as dropped
+  and never delivered, as the brief says of frames to a closed connection
+  (ADR 0114, amended 2026-11-13 and 2026-11-14). A turn decides from its
+  own actor's rows only, which change only through that actor's own turns:
+  whether another actor's connection is live depends on when that actor's
+  turns were applied, which the log does not order against this turn (I1).
+  The host logs a warning (not recorded) when a dropped id is another
+  actor's live connection, as a debugging aid.
 - Connection ids are the open's root id: 128 random bits from the node's
-  entropy source. So an actor cannot find another actor's live connection
-  by guessing ids and telling a trap from a dropped frame.
+  entropy source. A turn cannot tell another actor's live connection from a
+  dead id, and cannot guess one.
 - The gateway delivers a connection's frames and its close only to the
   owner.
 - Fan-out goes through ownership (a room actor owns its members'
@@ -1260,8 +1265,8 @@ answers `connection.send-now` as follows:
 3. **Otherwise, the connection model:** `OK` when the connection is a
    live connection of the turn's actor and not closing in the fork's state
    at that turn, and `CLOSED` otherwise (`GROUNDING_SYNTHETIC`, simulator
-   `connection`). As in production, an id without a live connection
-   answers `CLOSED`, and another actor's live connection traps (§2.4).
+   `connection`). As in production, an id that is not a live connection
+   of the turn's actor answers `CLOSED` (§2.4).
 
 These effects are excluded from `grounding` and `summary.confidence`
 (`kronik-fork` `diff.rs` `external()` does not list the kind).
@@ -1581,13 +1586,11 @@ New in `kronik-core::error`, and from there in `docs/errors.md` (generated):
 | Code | HTTP | Title | Hint |
 | --- | --- | --- | --- |
 | `CONNECTION_NOT_FOUND` | 404 | No such connection, or it is not open | List connections with `kronik connections list`. |
-| `CONNECTION_NOT_HELD` | 403 | The actor used a connection it did not accept | Only the actor that accepted a connection can send on it or close it; send that actor a message instead (`kronik explain connections`). |
 | `CONNECTION_LIMIT` | 503 | The gateway holds as many connections as it may | Try again later; operators raise `[connections] max_open`, `max_per_actor` or `max_per_client`. |
 
-- A trap whose message starts with `CONNECTION_NOT_HELD:` gets that code as
-  the turn's error code, as `NOT_IMPLEMENTED` and `REPLAY_DIVERGED` do in
-  `turn.rs` `classify_error`. An HTTP client still sees `TURN_FAILED`, as
-  for every failed turn.
+- (A first version had `CONNECTION_NOT_HELD` for another actor's live
+  connection; ADR 0114's amendment of 2026-11-14 removed it before the
+  release: such operations are dropped.)
 - These codes are used as they are: `ROUTE_NOT_FOUND`, `ROUTE_CONFLICT`,
   `BAD_REQUEST`, `GATEWAY_TIMEOUT`, `UNAVAILABLE`, `NOT_IMPLEMENTED`,
   `TURN_FAILED`, `EFFECT_OUTCOME_UNKNOWN`, `CAPABILITY_NOT_GRANTED`,
@@ -2030,7 +2033,7 @@ unchanged. "M25" below means the M25/M26 work (ADRs 0117 to 0122).
 | 1 | **WIT 0.1.1 and the export.** The whole `connections` interface and `connection-handler` (every function traps `NOT_IMPLEMENTED`); the package bump; `actor-connections`; the second `bindgen!` with `with:`; `Program` detects the export; the allowlist; `WEBSOCKET`/`SSE` in `METHODS` and conflicts; the deploy check; `docs/reference/wit.md`; the SDK WIT copies regenerated. | `wit/`, `kronik-runtime` (`host.rs`, `turn.rs`, `allowlist.rs`), `kronik-sched` (`validate_manifest`, `check_routes_of`), `docs/reference/wit.md`, `sdk/python/wit`, `sdk/go/wit` | Corpus components (`tests/compatibility`) link and replay under 0.1.1; a guest with the export links; allowlist tests; route conflict and deploy-check tests | **Conflicts** with M25's WIT slice (same files). Land one, rebase the other; the first bumps the version. |
 | 2 | **The log format.** The messages of §6.1 and §6.2 in `common.proto`, `input.proto`, `turn.proto` and `effects.proto`; `Input` 5; `TurnRecord` 30; `Outcome` 6; `EffectStatus` 12; validation; `sealables`; turn JSON and `turn.schema.json`; golden tests. | `proto/`, `kronik-proto`, `kronik-api` (turn JSON), `docs/reference/turn.schema.json` | Round-trip and validation tests; sealables visit every new field (seal/unseal test); old fixtures read | **Textual conflicts only** (`common.proto`, `turn.proto`, `effects.proto`, schemas). Parallel with care. |
 | 3 | **The `connections` table.** The applier rules of §6.5; `HASHED_TABLES`; queries; retention compaction; `StateView::connection`. | `kronik-store`, `kronik-sched` (`KvView`) | Apply against rebuild equality; state hash; retention test | Parallel (M26's `blob_refs` table is a textual neighbor in `db.rs`). |
-| 4 | **Turn path for buffered operations.** The host's `send`, `broadcast` and `close` (ownership, limits, seqs); the `connection-handler` calls; checking the open reply; `TurnOutput.connection_ops`; `run_turn` records field 30 and `accept`; failed turns drop them; dead-letter resend of connection inputs; the test guest `room` (Rust). | `kronik-runtime` (new `host/connections.rs`), `kronik-sched` (`node.rs`), `tests/guests/room` (its own crate), `scripts/build-test-guests.sh` | `kronik-sched` tests through `Node::connection_*` with fake transports: accept, refuse, failure; order; `CONNECTION_NOT_HELD`; broadcast; close; dead letters and resend | Parallel. Textual conflicts in `run_turn` with M26's blob-ref buffering. |
+| 4 | **Turn path for buffered operations.** The host's `send`, `broadcast` and `close` (ownership, limits, seqs); the `connection-handler` calls; checking the open reply; `TurnOutput.connection_ops`; `run_turn` records field 30 and `accept`; failed turns drop them; dead-letter resend of connection inputs; the test guest `room` (Rust). | `kronik-runtime` (new `host/connections.rs`), `kronik-sched` (`node.rs`), `tests/guests/room` (its own crate), `scripts/build-test-guests.sh` | `kronik-sched` tests through `Node::connection_*` with fake transports: accept, refuse, failure; order; ownership (only the turn's own actor's connections); broadcast; close; dead letters and resend | Parallel. Textual conflicts in `run_turn` with M26's blob-ref buffering. |
 | 5 | **The hub.** Registry, queues, in-flight window, `deliver`, exactly one close, abandoned opens, restart closes in `Node::start`, `shutdown`, metrics. | `kronik-sched` (new `connections.rs`), `NodeParts` | Hub tests: seq order, `frames_written`, slow consumer, restart closes after a store reopen, an actor that sleeps (§5.10) | Parallel. |
 | 6 | **Gateway WebSocket.** Classification; the handshake; caps and the `[connections]` config; 101 after commit; tungstenite tasks; ping and pong; close codes; the graceful 1012; `server.rs` `.with_upgrades()`; `serve.rs` wiring and caps; `kronik doctor`. | `kronik-gateway` (new `connections/`), `kronik/src/serve.rs`, `config` | `kronik-gateway` tests; `crates/kronik/tests/connections.rs` (a real daemon and client): open, frames, every close cause, limits | **Conflicts** with M25's gateway body slice in `server.rs` and `lib.rs`. Serialize these two. |
 | 7 | **Gateway SSE.** The SSE route path; `ResponseBody::Events`; the encoder; heartbeat; disconnect detection; `Last-Event-ID`. | `kronik-gateway` (`connections/sse.rs`, `body.rs`) | Encoder unit tests (multi-line data, CR/LF refusal); a real EventSource-style client test; resume test | **Conflicts** with M25's `body.rs` (the agreed either-order rebase). |
