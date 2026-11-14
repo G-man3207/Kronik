@@ -342,6 +342,11 @@ fn replay_error(e: replay::ReplayError) -> ApiError {
                  the subjects. Restore it from a keystore backup that holds the key.",
             )
         }
+        e @ replay::ReplayError::Erased => ApiError::new(ErrorCode::SubjectErased, e.to_string())
+            .with_hint(
+                "The subject was erased with `kronik privacy erase`: its values cannot be read \
+                 again, by any replay.",
+            ),
         e => internal(e),
     }
 }
@@ -519,7 +524,7 @@ impl Proposals {
                 // Sealed like production's log: the fork's turns hold the
                 // values it revealed (m8-privacy §5).
                 let mut record = Record::TurnRecord(shown_record(t));
-                self.node.seal(&mut record)?;
+                self.node.seal_fork_record(&mut record)?;
                 let line = serde_json::json!({
                     "id": t.id,
                     "root_lsn": tree.root_lsn,
@@ -1035,9 +1040,10 @@ impl Proposals {
                 .filter(|t| t.lsn > live.logged_to)
                 .map(|t| Record::TurnRecord(shown_record(t))),
         );
-        // Sealed like production's log: the fork holds revealed values.
+        // Sealed like production's log: the fork holds revealed values. An
+        // erased subject's values become tombstones, never a new key version.
         for r in &mut records {
-            self.node.seal(r)?;
+            self.node.seal_fork_record(r)?;
         }
         if records.is_empty() {
             return Ok(());

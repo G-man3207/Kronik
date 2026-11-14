@@ -935,6 +935,20 @@ impl Keystore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// The newest key version the subject has, without creating one; `None`
+    /// when it has none (never sealed, or erased with no newer key since).
+    pub fn newest_version(&self, subject: &str) -> Result<Option<u32>, PrivacyError> {
+        let conn = self.checked_conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT max(version) FROM subject_keys WHERE subject = ?1",
+                [subject],
+                |r| r.get::<_, Option<u32>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub fn stats(&self) -> Result<KeystoreStats, PrivacyError> {
         let conn = self.checked_conn()?;
         let (subjects, keys): (i64, i64) = conn.query_row(

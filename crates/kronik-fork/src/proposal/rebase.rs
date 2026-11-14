@@ -38,6 +38,21 @@ pub struct RebaseDone {
     pub irreversible_effects: u64,
 }
 
+/// The hash a fork turn is compared by when a rebase resumes (H3): its
+/// record as the fork's log holds it in plaintext, with an erased subject's
+/// values as the tombstones the log holds (`Sealer::keep_erasures`), so a
+/// fresh replay and the log agree on them.
+fn logged_hash(sealer: &kronik_privacy::sealer::Sealer, t: pb::TurnRecord) -> blake3::Hash {
+    let mut record = Record::TurnRecord(t);
+    // A keystore that cannot be read leaves the values as they are, and the
+    // comparison then refuses a resume rather than accepting one.
+    let _ = sealer.keep_erasures(&mut record);
+    match &record {
+        Record::TurnRecord(t) => blake3::hash(&t.encode_to_vec()),
+        _ => blake3::hash(&[]),
+    }
+}
+
 fn bad(msg: impl Into<String>) -> ApiError {
     ApiError::new(ErrorCode::BadRequest, msg)
 }
@@ -303,8 +318,8 @@ impl Proposals {
                 // is (N13-1).
                 let mut record = c.record;
                 self.node.sealer().unseal_record(&mut record);
-                if let Record::TurnRecord(t) = &record {
-                    out.push((c.lsn, blake3::hash(&t.encode_to_vec())));
+                if let Record::TurnRecord(t) = record {
+                    out.push((c.lsn, logged_hash(self.node.sealer(), t)));
                 }
                 Ok(())
             })
@@ -467,8 +482,14 @@ impl Proposals {
                 .unwrap_or_default()
                 .iter()
                 .filter(|t| t.lsn <= staged)
-                // As the fork log holds it (`write_log`), before sealing.
-                .map(|t| (t.lsn, blake3::hash(&super::shown_record(t).encode_to_vec())))
+                // As the fork log holds it (`write_log`), before sealing; an
+                // erased subject's values as their tombstones, as there.
+                .map(|t| {
+                    (
+                        t.lsn,
+                        logged_hash(self.node.sealer(), super::shown_record(t)),
+                    )
+                })
                 .collect();
             let before: Vec<_> = logged.into_iter().filter(|(l, _)| *l <= staged).collect();
             if fresh != before {

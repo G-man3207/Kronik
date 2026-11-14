@@ -351,7 +351,11 @@ impl Node {
                 })),
             })
         });
-        for record in records {
+        for mut record in records {
+            // A rebased turn is a fork's: what it holds of an erased subject
+            // is the erasure's tombstone, never a value under a new key
+            // version (docs/design/m8-privacy.md §6.8).
+            self.seal_fork_record(&mut record)?;
             if let Some(pause) = pause {
                 if pause.expired() {
                     return Err(stale(

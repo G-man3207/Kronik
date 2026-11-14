@@ -378,6 +378,11 @@ fn check_error(msg: String) -> ApiError {
         ApiError::new(ErrorCode::BadRequest, msg).with_hint(
             "Point --data-dir at a data directory that has served, or start one with `kronik serve --data-dir <dir>`.",
         )
+    } else if let Some(i) = msg.find("SUBJECT_ERASED: ") {
+        ApiError::new(ErrorCode::SubjectErased, msg[i..].to_owned()).with_hint(
+            "A sealed value of an erased subject reached a replayed turn; erased values cannot \
+             be read again.",
+        )
     } else if let Some(i) = msg.find("KEYSTORE_INCOMPLETE: ") {
         ApiError::new(ErrorCode::KeystoreIncomplete, msg[i..].to_owned()).with_hint(
             "The privacy keystore lacks a subject's key; `kronik integrity` lists the subjects.",
@@ -393,7 +398,27 @@ fn check_error(msg: String) -> ApiError {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::unverifiable_line;
+    use super::{check_error, unverifiable_line};
+    use kronik_core::error::ErrorCode;
+
+    /// A replay that meets a sealed value of an erased subject says so: the
+    /// key is not missing from the keystore, the subject was erased.
+    #[test]
+    fn a_replays_erased_value_is_subject_erased_not_a_missing_key() {
+        let erased = check_error(
+            "replay failed: SUBJECT_ERASED: a sealed value of an erased subject reached a fork \
+             turn"
+                .into(),
+        );
+        assert_eq!(erased.code, ErrorCode::SubjectErased);
+        assert!(!erased.message.contains("keystore"), "{}", erased.message);
+        let missing = check_error(
+            "replay failed: KEYSTORE_INCOMPLETE: a sealed value of subject user:1 cannot be \
+             opened: its key is not in this node's privacy keystore"
+                .into(),
+        );
+        assert_eq!(missing.code, ErrorCode::KeystoreIncomplete);
+    }
 
     #[test]
     fn the_unverifiable_line_is_silent_at_zero_and_counts_above() {

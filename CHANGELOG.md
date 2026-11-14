@@ -62,6 +62,12 @@ until the v1.0 compatibility promise takes effect.
   inside the savepoint, the turn's end rolled them back, and a rebuild
   from the log deleted them. The deletes now run right after the turn
   ends.
+- A fork (a proposal, a preview, a rebase) never creates a key version for
+  an erased subject: what it writes of one - its log, and the turns a rebase
+  stages into main's log - is the erasure's tombstone. A replay that
+  meets a sealed value of an erased subject fails with `SUBJECT_ERASED`
+  instead of `KEYSTORE_INCOMPLETE` ("its key is not in this node's privacy
+  keystore").
 - An open turn whose re-run after a restart met an input of an erased
   subject, or a kind that is no longer deployed, is closed once: its failed
   record now carries the turn's own execution id and its recorded effects.

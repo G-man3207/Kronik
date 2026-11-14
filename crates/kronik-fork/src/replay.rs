@@ -50,6 +50,13 @@ pub enum ReplayError {
     /// keystore lacks.
     #[error("replay failed: {0}")]
     KeyMissing(kronik_runtime::RunError),
+    /// A sealed value of a subject this node's keystore erased reached a
+    /// fork turn unopened. Not a missing key: the value is gone for good.
+    /// The message does not name the subject (as `Unreadable::Erased`).
+    #[error(
+        "replay failed: SUBJECT_ERASED: a sealed value of an erased subject reached a fork turn"
+    )]
+    Erased,
 }
 
 /// One kind's code in the fork.
@@ -1120,11 +1127,7 @@ impl Runner {
             Ok(o) => o,
             Err(e) => {
                 let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
-                return Err(match e {
-                    kronik_runtime::RunError::Prerequisite(code) => ReplayError::Prerequisite(code),
-                    e @ kronik_runtime::RunError::KeyMissing(_) => ReplayError::KeyMissing(e),
-                    e => ReplayError::Host(e.to_string()),
-                });
+                return Err(run_error(e, &self.setup.privacy.sealer));
             }
         };
         drop(out.sql.take());
@@ -1393,6 +1396,56 @@ fn used_a_secret(records: &[pb::EffectRecord]) -> bool {
     records
         .iter()
         .any(|r| r.kind.starts_with("crypto.") || r.kind == "secret.reveal")
+}
+
+/// A replayed turn's runtime failure. A sealed value that reached the guest
+/// unopened is `SUBJECT_ERASED` when the keystore erased its subject (its
+/// key is not missing, it is gone on purpose), `KEYSTORE_INCOMPLETE`
+/// otherwise.
+fn run_error(e: kronik_runtime::RunError, sealer: &kronik_privacy::sealer::Sealer) -> ReplayError {
+    match e {
+        kronik_runtime::RunError::Prerequisite(code) => ReplayError::Prerequisite(code),
+        kronik_runtime::RunError::KeyMissing(subject)
+            if sealer
+                .erasure_floor(&subject)
+                .is_ok_and(|floor| floor.is_some()) =>
+        {
+            ReplayError::Erased
+        }
+        e @ kronik_runtime::RunError::KeyMissing(_) => ReplayError::KeyMissing(e),
+        e => ReplayError::Host(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[test]
+fn a_sealed_value_of_an_erased_subject_is_subject_erased_not_a_missing_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = kronik_privacy::key_source::lock_data(dir.path()).unwrap();
+    let (master, _) =
+        kronik_privacy::MasterKey::open(&dir.path().join("master.key"), dir.path(), Some([7; 32]))
+            .unwrap();
+    let sealer = kronik_privacy::sealer::Sealer::new(
+        kronik_privacy::keystore::Keystore::open_owned(&owner, &master).unwrap(),
+    );
+    sealer.set_on(true);
+    let mut value = pb::Sealable {
+        subject: Some("user:1".into()),
+        value: Some(pb::sealable::Value::Plain(b"x".to_vec())),
+    };
+    sealer
+        .seal_value(&mut value, &|b: &mut [u8]| b.fill(3), 1)
+        .unwrap();
+    sealer.erase("user:1", 2).unwrap();
+    let missing = |subject: &str| kronik_runtime::RunError::KeyMissing(subject.into());
+    let erased = run_error(missing("user:1"), &sealer);
+    assert!(matches!(erased, ReplayError::Erased), "{erased:?}");
+    assert!(erased.to_string().contains("SUBJECT_ERASED"), "{erased}");
+    assert!(!erased.to_string().contains("user:1"), "{erased}");
+    let other = run_error(missing("user:2"), &sealer);
+    assert!(matches!(other, ReplayError::KeyMissing(_)), "{other:?}");
+    assert!(other.to_string().contains("KEYSTORE_INCOMPLETE"), "{other}");
 }
 
 #[cfg(test)]

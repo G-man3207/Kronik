@@ -68,6 +68,26 @@ impl Node {
             .map_err(|e| ApiError::new(ErrorCode::Internal, format!("sealing: {e}")))
     }
 
+    /// Seals a record a fork writes to disk (its log, its samples): like
+    /// [`Node::seal`], except that a value of an erased subject becomes the
+    /// erasure's tombstone instead of being sealed under a new key version.
+    /// A fork's turns hold what it revealed or computed; none of it may bring
+    /// an erased subject back (docs/design/m8-privacy.md §6.8).
+    pub fn seal_fork_record(&self, record: &mut Record) -> Result<(), ApiError> {
+        if !self.sealer.is_on() {
+            return Ok(());
+        }
+        let entropy = self.env.entropy.clone();
+        self.sealer
+            .seal_record_keeping_erasures(
+                record,
+                &|b: &mut [u8]| entropy.fill(b),
+                self.env.clock.wall_ms(),
+            )
+            .map(|_| ())
+            .map_err(|e| ApiError::new(ErrorCode::Internal, format!("sealing: {e}")))
+    }
+
     /// The error of a turn whose input cannot be unsealed.
     pub(crate) fn unreadable_input(e: &Unreadable) -> (ErrorCode, String) {
         match e {
