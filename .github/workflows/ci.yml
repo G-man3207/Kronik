@@ -200,6 +200,31 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" target examples "$HOME/.cargo" "$HOME/.rustup"
           exit "$status"
 
+  # The S3 variants of the shipping, restore, blob and audit-sink tests,
+  # against moto's S3 server in docker (scripts/s3.sh). The runner has docker;
+  # KRONIK_TEST_S3=require makes any skip a failure.
+  s3:
+    name: s3
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: s3
+
+      # The same command as scripts/ci.sh runs locally.
+      - name: s3
+        env:
+          KRONIK_TEST_S3: require
+        run: scripts/ci.sh s3
+
   sdk-chain:
     name: examples, ts, sdks, identity
     runs-on: ubuntu-24.04

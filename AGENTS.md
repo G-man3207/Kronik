@@ -92,7 +92,7 @@ The full list is in `CONTRIBUTING.md`. In short:
 ## Running CI locally
 
 ```sh
-scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, identity and action, as in CI
+scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, s3, identity and action, as in CI
 scripts/ci.sh clippy test    # selected steps
 ```
 
@@ -117,6 +117,9 @@ and `cargo-deny`. Some steps need more:
   is skipped with a message without them, unless
   `KRONIK_FOREIGN_TESTS=require`. When it runs, it also needs Docker for the
   pinned Postgres image, and skopeo for the registry test.
+- `s3` runs the S3 variants of the shipping, restore, blob and audit-sink
+  tests against moto's S3 server (`scripts/s3.sh`). It needs Docker and is
+  skipped with a message without it, unless `KRONIK_TEST_S3=require`.
 - `identity` needs libfaketime for `todo-ts`, which it skips with a message
   otherwise.
 

@@ -38,12 +38,33 @@ class CheckCiSteps(unittest.TestCase):
             CHECK["check"](SCRIPT, workflow(lint=["clippy fmt"], test=["test"], musl=["musl"],
                                             action=["action"]))
 
+    def test_a_step_that_skips_needs_its_require_variable(self):
+        script = 'if [ "$#" -eq 0 ]; then\n    set -- test s3 foreign\nfi\n'
+        def text(s3_env, foreign_cmd):
+            return ("name: CI\njobs:\n"
+                    "  test:\n    steps:\n      - run: scripts/ci.sh test\n"
+                    f"  s3:\n    steps:\n      - env:\n{s3_env}        run: scripts/ci.sh s3\n"
+                    f"  foreign:\n    steps:\n      - run: {foreign_cmd}\n")
+        CHECK["check"](script, text("          KRONIK_TEST_S3: require\n",
+                                    "sudo -E env KRONIK_FOREIGN_TESTS=require scripts/ci.sh foreign"))
+        for case, (s3_env, foreign_cmd) in {
+            "s3 without require": ("          OTHER: 1\n",
+                                   "KRONIK_FOREIGN_TESTS=require scripts/ci.sh foreign"),
+            "s3 with another value": ("          KRONIK_TEST_S3: skip\n",
+                                      "KRONIK_FOREIGN_TESTS=require scripts/ci.sh foreign"),
+            "foreign without require": ("          KRONIK_TEST_S3: require\n",
+                                        "scripts/ci.sh foreign"),
+        }.items():
+            with self.assertRaises(ValueError, msg=case):
+                CHECK["check"](script, text(s3_env, foreign_cmd))
+
     def test_the_repository_runs_every_step_and_musl_in_a_job_of_its_own(self):
         script = (ROOT / "scripts/ci.sh").read_text()
         text = (ROOT / ".github/workflows/ci.yml").read_text()
         CHECK["check"](script, text)
         jobs = CHECK["jobs"](text)
         self.assertEqual(CHECK["calls"](jobs["musl"], []), ["musl"])
+        self.assertEqual(CHECK["calls"](jobs["s3"], []), ["s3"])
 
 
 if __name__ == "__main__":

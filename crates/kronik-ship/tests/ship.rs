@@ -322,10 +322,27 @@ fn an_interrupted_restore_leaves_a_consistent_directory() {
     assert_eq!(q.send("counter/a", "increment", ""), "2");
 }
 
+/// The S3 URL of this run (`scripts/s3.sh` exports it), or `None` to skip.
+/// With `KRONIK_TEST_S3=require` (the `s3` step of `scripts/ci.sh`) a
+/// missing URL fails the test, so that a run never passes by skipping.
+fn s3_url() -> Option<String> {
+    match std::env::var("KRONIK_TEST_S3_URL") {
+        Ok(url) => Some(url),
+        Err(_) => {
+            assert_ne!(
+                std::env::var("KRONIK_TEST_S3").as_deref(),
+                Ok("require"),
+                "KRONIK_TEST_S3=require, but KRONIK_TEST_S3_URL is not set: run this test under scripts/s3.sh"
+            );
+            eprintln!("KRONIK_TEST_S3_URL is not set; run scripts/s3.sh for this test");
+            None
+        }
+    }
+}
+
 #[test]
 fn ship_destroy_and_restore_from_s3() {
-    let Ok(url) = std::env::var("KRONIK_TEST_S3_URL") else {
-        eprintln!("KRONIK_TEST_S3_URL is not set; run scripts/s3.sh for this test");
+    let Some(url) = s3_url() else {
         return;
     };
     let endpoint = std::env::var("KRONIK_TEST_S3_ENDPOINT").ok();

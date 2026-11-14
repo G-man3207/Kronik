@@ -716,11 +716,15 @@ class CiInventoryTest(unittest.TestCase):
 
     def test_required_hyphenated_steps_keep_inventory_boundaries(self):
         script = "set -- foreign foreign-extra other-job\n"
-        self.check("run: scripts/ci.sh foreign foreign-extra other-job\n", script)
+        # foreign runs with its require variable, as check-ci-steps asks.
+        run = "run: KRONIK_FOREIGN_TESTS=require scripts/ci.sh "
+        self.check(run + "foreign foreign-extra other-job\n", script)
         with self.assertRaisesRegex(ValueError, "missing"):
-            self.check("run: scripts/ci.sh foreign other-job\n", script)
+            self.check(run + "foreign other-job\n", script)
         with self.assertRaisesRegex(ValueError, "unknown"):
-            self.check("run: scripts/ci.sh foreign foreign-extr other-job\n", script)
+            self.check(run + "foreign foreign-extr other-job\n", script)
+        with self.assertRaisesRegex(ValueError, "KRONIK_FOREIGN_TESTS=require"):
+            self.check("run: scripts/ci.sh foreign foreign-extra other-job\n", script)
 
     def test_missing_step_and_no_calls_fail(self):
         for workflow in ("run: scripts/ci.sh fmt test", "# no CI calls"):

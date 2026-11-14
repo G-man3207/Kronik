@@ -740,6 +740,24 @@ fn read_back(sink: &Sink, got: &Mutex<Vec<String>>) -> Vec<Line> {
             .iter()
             .map(|f| std::fs::read_to_string(f).unwrap())
             .collect(),
+        Sink::S3 { url, endpoint } if url.starts_with("s3://") => {
+            let remote = kronik_ship::Remote::open(url, endpoint.as_deref()).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (mut names, _) = rt
+                .block_on(remote.list(kronik_otel::sink::OBJECT_PREFIX))
+                .unwrap();
+            names.sort();
+            names
+                .iter()
+                .map(|name| {
+                    let rel = format!("{}/{name}", kronik_otel::sink::OBJECT_PREFIX);
+                    String::from_utf8(rt.block_on(remote.get(&rel)).unwrap()).unwrap()
+                })
+                .collect()
+        }
         Sink::S3 { url, .. } => {
             let dir = Path::new(url.strip_prefix("file://").unwrap())
                 .join(kronik_otel::sink::OBJECT_PREFIX);
@@ -875,62 +893,92 @@ fn a_restore_that_reuses_lsns_loses_no_exported_line() {
         },
         Sink::Webhook(hook),
     ] {
-        let (old, restored) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        // The restore point: in both directories.
-        let (rt, node) = node_at(old.path());
-        grant(&rt, &node, "example.com", "before");
-        let through = node.applied_lsn();
-        drop(node);
-        drop(rt);
-        copy_dir(old.path(), restored.path());
-        let (rt, node) = node_at(old.path());
-        for host in ["example.org", "example.net", "example.edu"] {
-            grant(&rt, &node, host, "lost tail");
-        }
-        export(&rt, &node, old.path(), sink.clone());
-        drop(node);
-        drop(rt);
-        let (rt, node) = node_at(restored.path());
-        let restore = pb::Audit {
-            token_id: "system".into(),
-            reason: "kronik restore".into(),
-            wall_time_ms: 2,
-        };
-        let details = [("through_lsn".to_owned(), through.to_string())].into();
-        rt.block_on(node.record_system_audit_event(
-            kronik_sched::SystemAudit::Restore,
-            "",
-            details,
-            restore,
-            node.local_operator_authority().unwrap(),
-        ))
-        .unwrap();
-        for host in ["example.io", "example.dev", "example.app"] {
-            grant(&rt, &node, host, "after restore");
-        }
-        export(&rt, &node, restored.path(), sink.clone());
-        let lines = read_back(&sink, &got);
-        let lost: Vec<&Line> = lines.iter().filter(|l| l.reason == "lost tail").collect();
-        assert_eq!(lost.len(), 3, "{sink:?}: {lines:?}");
-        assert!(
-            lost.iter()
-                .all(|o| lines.iter().any(|l| l.lsn == o.lsn && l.reason != o.reason)),
-            "{sink:?}: {lines:?}"
-        );
-        let mut expected = Vec::new();
-        let m = mapper(&node);
-        rt.block_on(node.reader().read(1, node.applied_lsn(), |c| {
-            expected.extend(
-                m.expected(c.lsn, &c.record)
-                    .map_err(|error| kronik_log::LogError::Corrupt(error.message))?,
-            );
-            Ok(())
-        }))
-        .unwrap();
-        let r = verify(&expected, &lines, 0, node.applied_lsn());
-        assert!(r.complete, "{sink:?}: {r:?}");
-        assert_eq!(r.superseded, 3, "{sink:?}: {r:?}");
+        restore_reusing_lsns(&sink, &got);
     }
+}
+
+/// The scenario of [`a_restore_that_reuses_lsns_loses_no_exported_line`]
+/// against one sink: a tail exported and then lost to a restore, and the
+/// restored node's other records at the same LSNs, both kept.
+fn restore_reusing_lsns(sink: &Sink, got: &Mutex<Vec<String>>) {
+    let (old, restored) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    // The restore point: in both directories.
+    let (rt, node) = node_at(old.path());
+    grant(&rt, &node, "example.com", "before");
+    let through = node.applied_lsn();
+    drop(node);
+    drop(rt);
+    copy_dir(old.path(), restored.path());
+    let (rt, node) = node_at(old.path());
+    for host in ["example.org", "example.net", "example.edu"] {
+        grant(&rt, &node, host, "lost tail");
+    }
+    export(&rt, &node, old.path(), sink.clone());
+    drop(node);
+    drop(rt);
+    let (rt, node) = node_at(restored.path());
+    let restore = pb::Audit {
+        token_id: "system".into(),
+        reason: "kronik restore".into(),
+        wall_time_ms: 2,
+    };
+    let details = [("through_lsn".to_owned(), through.to_string())].into();
+    rt.block_on(node.record_system_audit_event(
+        kronik_sched::SystemAudit::Restore,
+        "",
+        details,
+        restore,
+        node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
+    for host in ["example.io", "example.dev", "example.app"] {
+        grant(&rt, &node, host, "after restore");
+    }
+    export(&rt, &node, restored.path(), sink.clone());
+    let lines = read_back(sink, got);
+    let lost: Vec<&Line> = lines.iter().filter(|l| l.reason == "lost tail").collect();
+    assert_eq!(lost.len(), 3, "{sink:?}: {lines:?}");
+    assert!(
+        lost.iter()
+            .all(|o| lines.iter().any(|l| l.lsn == o.lsn && l.reason != o.reason)),
+        "{sink:?}: {lines:?}"
+    );
+    let mut expected = Vec::new();
+    let m = mapper(&node);
+    rt.block_on(node.reader().read(1, node.applied_lsn(), |c| {
+        expected.extend(
+            m.expected(c.lsn, &c.record)
+                .map_err(|error| kronik_log::LogError::Corrupt(error.message))?,
+        );
+        Ok(())
+    }))
+    .unwrap();
+    let r = verify(&expected, &lines, 0, node.applied_lsn());
+    assert!(r.complete, "{sink:?}: {r:?}");
+    assert_eq!(r.superseded, 3, "{sink:?}: {r:?}");
+}
+
+/// The same against S3 (`scripts/s3.sh`: the `s3` step of
+/// `scripts/ci.sh`): the sink's conditional creates (`If-None-Match: *`)
+/// meet the names the lost tail took, and both versions stay.
+#[test]
+fn a_restore_that_reuses_lsns_loses_no_exported_line_on_s3() {
+    let Ok(url) = std::env::var("KRONIK_TEST_S3_URL") else {
+        assert_ne!(
+            std::env::var("KRONIK_TEST_S3").as_deref(),
+            Ok("require"),
+            "KRONIK_TEST_S3=require, but KRONIK_TEST_S3_URL is not set: run this test under scripts/s3.sh"
+        );
+        eprintln!("KRONIK_TEST_S3_URL is not set; run scripts/s3.sh for this test");
+        return;
+    };
+    // A prefix of its own: other tests share the bucket.
+    let url = format!("{}/audit-{}", url.trim_end_matches('/'), std::process::id());
+    let sink = Sink::S3 {
+        url,
+        endpoint: std::env::var("KRONIK_TEST_S3_ENDPOINT").ok(),
+    };
+    restore_reusing_lsns(&sink, &Mutex::new(Vec::new()));
 }
 
 #[test]

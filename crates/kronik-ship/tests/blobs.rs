@@ -1,6 +1,6 @@
 //! Shipping and restoring blobs (ADR 0122, M25 slice B12) against a local
 //! directory bucket, and against S3 when `KRONIK_TEST_S3_URL` is set
-//! (scripts/s3.sh runs an S3 server for it): blobs go up before what
+//! (scripts/s3.sh runs moto's S3 server in docker for it): blobs go up before what
 //! references them, a multipart upload for a blob above 8 MiB; a round
 //! stopped at any step never leaves a segment or snapshot in the bucket whose
 //! blobs are not there; blobs the collector deleted leave the bucket after the
@@ -572,8 +572,7 @@ fn restore_keeps_a_timer_only_blob_from_a_directory_bucket() {
 
 #[test]
 fn restore_keeps_a_timer_only_blob_from_s3() {
-    let Ok(url) = std::env::var("KRONIK_TEST_S3_URL") else {
-        eprintln!("KRONIK_TEST_S3_URL is not set; run scripts/s3.sh for this test");
+    let Some(url) = s3_url() else {
         return;
     };
     // A prefix of its own: other tests share the bucket and its prefix.
@@ -594,10 +593,27 @@ fn ship_and_restore_blobs_from_a_directory_bucket() {
     ship_and_restore_blobs(&remote);
 }
 
+/// The S3 URL of this run (`scripts/s3.sh` exports it), or `None` to skip.
+/// With `KRONIK_TEST_S3=require` (the `s3` step of `scripts/ci.sh`) a
+/// missing URL fails the test, so that a run never passes by skipping.
+fn s3_url() -> Option<String> {
+    match std::env::var("KRONIK_TEST_S3_URL") {
+        Ok(url) => Some(url),
+        Err(_) => {
+            assert_ne!(
+                std::env::var("KRONIK_TEST_S3").as_deref(),
+                Ok("require"),
+                "KRONIK_TEST_S3=require, but KRONIK_TEST_S3_URL is not set: run this test under scripts/s3.sh"
+            );
+            eprintln!("KRONIK_TEST_S3_URL is not set; run scripts/s3.sh for this test");
+            None
+        }
+    }
+}
+
 #[test]
 fn ship_and_restore_blobs_from_s3() {
-    let Ok(url) = std::env::var("KRONIK_TEST_S3_URL") else {
-        eprintln!("KRONIK_TEST_S3_URL is not set; run scripts/s3.sh for this test");
+    let Some(url) = s3_url() else {
         return;
     };
     // A prefix of its own: other tests share the bucket and its prefix.

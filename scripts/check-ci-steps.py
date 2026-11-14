@@ -3,7 +3,10 @@
 
 The steps may be spread over parallel jobs. Each job runs its steps in the
 order ci.sh lists them, since a later step of a job can use what an earlier
-one built. The workflow is read as text, so the check needs no YAML library.
+one built. A step that skips with a message where its environment is missing
+(foreign without root and runsc, s3 without docker) must run with its
+variable set to `require` in the job that runs it, so that CI never passes
+by skipping. The workflow is read as text, so the check needs no YAML library.
 """
 
 import pathlib
@@ -63,8 +66,19 @@ def calls(text, steps):
     return runs
 
 
+# The steps that skip without their environment, and the variable that makes
+# a skip a failure.
+REQUIRED = {"foreign": "KRONIK_FOREIGN_TESTS", "s3": "KRONIK_TEST_S3"}
+
+
+def requires(text, variable):
+    """Whether a job's text sets `variable` to `require`, as a step's `env:`
+    entry or in a command."""
+    return re.search(rf"\b{variable}(?:=|:[ \t]*)[\"']?require\b", text) is not None
+
+
 def check(script, workflow):
-    match = re.search(r"^\s*set -- ([a-z -]+)$", script, re.M)
+    match = re.search(r"^\s*set -- ([a-z0-9 -]+)$", script, re.M)
     if match is None:
         raise ValueError("scripts/ci.sh has no default step inventory")
     steps = match.group(1).split()
@@ -78,6 +92,9 @@ def check(script, workflow):
             raise ValueError(f"job {job} runs {runs}, not in the order of ci.sh's {steps}")
         for step in runs:
             where.setdefault(step, []).append(job)
+            variable = REQUIRED.get(step)
+            if variable and not requires(text, variable):
+                raise ValueError(f"job {job} runs {step} without {variable}=require")
     twice = {step: names for step, names in where.items() if len(names) > 1}
     if twice:
         raise ValueError(f"workflow runs ci.sh steps more than once: {twice}")

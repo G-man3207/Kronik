@@ -42,7 +42,7 @@ step. These are development dependencies, not daemon/runtime requirements.
 Run the same checks as CI before you push:
 
 ```sh
-scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, identity and action
+scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, s3, identity and action
 scripts/ci.sh clippy test    # selected steps
 ```
 
@@ -63,7 +63,15 @@ conformance harness and the escape probe. The two explicit drivers,
 (`cargo test -p kronik --no-run --test isolation_fixture`; ADR 0064 gives
 their arguments) and are never run by `cargo test`. The `foreign` step
 needs root and `runsc` and is skipped with a message otherwise; without
-libfaketime, `identity` skips `todo-ts` the same way. Run as root, the
+libfaketime, `identity` skips `todo-ts` the same way. The `s3` step runs the
+S3 variants of the shipping, restore, blob and audit-sink tests (every test
+with `s3` in its name in `kronik-ship`'s `ship` and `blobs` and
+`kronik-otel`'s `audit_export`) against moto's S3 server in Docker
+(`scripts/s3.sh`). That covers multipart uploads, ranged reads, conditional
+creates and listing by prefix, which the directory buckets of the `test`
+step do not reach. Without Docker it is skipped with a message; under
+`KRONIK_TEST_S3=require`, as in CI, a skip in the step or in a test fails, and
+so does a binary in which no S3 test ran. Run as root, the
 `foreign` step also runs, under `KRONIK_FOREIGN_TESTS=require`, the
 rehearsals of the microVM launcher (`sys::tests` of `kronik-foreign`), the
 installer's hand-over of a data directory to another user, a root
@@ -145,7 +153,7 @@ The Release workflow was already manual. See
 [ADR 0110](docs/adr/0110-manual-github-workflows.md).
 
 CI runs the steps of `scripts/ci.sh` in parallel jobs, each step once: fmt,
-clippy, hygiene, docs, book and deny; test; dst; musl; foreign; examples, ts,
+clippy, hygiene, docs, book and deny; test; dst; musl; foreign; s3; examples, ts,
 sdks and identity, in one job because identity replays the examples the others
 build; and action. The musl step links `kronik` for the static release target
 (`x86_64-unknown-linux-musl`) with the release's pinned zig and cargo-zigbuild
@@ -153,7 +161,9 @@ build; and action. The musl step links `kronik` for the static release target
 build: a libc function that zig's musl does not have, which compiles and works
 on glibc, is an undefined symbol there and not first in the release. A job runs its steps in the script's order. The hygiene
 step checks both with `scripts/check-ci-steps.py`, so a new default step in
-`scripts/ci.sh` must also go into one of the jobs.
+`scripts/ci.sh` must also go into one of the jobs. It also checks that the
+job running `foreign` or `s3` sets `KRONIK_FOREIGN_TESTS` or `KRONIK_TEST_S3`
+to `require`, so that CI never passes by skipping them.
 
 The synthetic M10 workflow (`.github/workflows/kronik.yml`) is not a general
 build. It still starts only when `examples/github-flow/proof/change.json`

@@ -7,6 +7,8 @@
 # musl (the release target, linked against the release's zig and musl),
 # foreign (needs root and runsc; skipped with a message otherwise, a failure
 # with KRONIK_FOREIGN_TESTS=require),
+# s3 (needs docker; skipped with a message otherwise, a failure with
+# KRONIK_TEST_S3=require),
 # identity (without libfaketime, todo-ts is skipped with a message too),
 # action.
 # Without arguments, all steps run in order.
@@ -388,6 +390,52 @@ step_foreign() {
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --test restore_drop
 }
 
+# The S3 variants of the shipping, restore, blob and audit-sink tests, against
+# moto's S3 server in docker (scripts/s3.sh): the release's backup path to a
+# real bucket, which the directory-bucket variants in the test step do not
+# reach (multipart uploads, ranged GETs, conditional creates, listing by
+# prefix). Every test whose name has `s3` in these binaries runs, and each
+# binary must have run one at least. Without docker the step says why and
+# skips, unless KRONIK_TEST_S3=require (as in CI), which makes every skip,
+# here and in the tests, a failure.
+S3_TESTS=(
+    "kronik-ship ship"
+    "kronik-ship blobs"
+    "kronik-otel audit_export"
+)
+
+step_s3() {
+    if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+        local why="the s3 step needs docker for scripts/s3.sh"
+        if [ "${KRONIK_TEST_S3:-}" = require ]; then
+            echo "error: KRONIK_TEST_S3=require, but $why" >&2
+            return 1
+        fi
+        echo "skipped: $why"
+        return 0
+    fi
+    local entry package test log
+    for entry in "${S3_TESTS[@]}"; do
+        read -r package test <<<"$entry"
+        cargo test --locked -p "$package" --test "$test" --no-run
+    done
+    for entry in "${S3_TESTS[@]}"; do
+        read -r package test <<<"$entry"
+        log="$(mktemp)"
+        if ! KRONIK_TEST_S3=require scripts/s3.sh \
+            cargo test --locked -p "$package" --test "$test" -- s3 --test-threads=1 2>&1 | tee "$log"; then
+            rm -f "$log"
+            return 1
+        fi
+        if ! grep -Eq '^test [a-z0-9_:]*s3[a-z0-9_:]* \.\.\. ok$' "$log"; then
+            rm -f "$log"
+            echo "error: no S3 test of $package --test $test ran" >&2
+            return 1
+        fi
+        rm -f "$log"
+    done
+}
+
 # Identity replay of every example app (the Definition of done: "Identity
 # replay empty for all example apps"): each example runs on a fresh daemon,
 # is driven, forked and replayed in both modes (scripts/identity-examples.sh),
@@ -450,14 +498,14 @@ step_action() {
 }
 
 if [ "$#" -eq 0 ]; then
-    set -- fmt clippy hygiene test docs book examples ts sdks dst deny musl foreign identity action
+    set -- fmt clippy hygiene test docs book examples ts sdks dst deny musl foreign s3 identity action
 fi
 
 for step in "$@"; do
     case "$step" in
-        fmt | clippy | hygiene | test | docs | book | examples | ts | sdks | dst | deny | musl | foreign | identity | action) ;;
+        fmt | clippy | hygiene | test | docs | book | examples | ts | sdks | dst | deny | musl | foreign | s3 | identity | action) ;;
         *)
-            echo "error: unknown step '$step'; expected fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, identity or action" >&2
+            echo "error: unknown step '$step'; expected fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, s3, identity or action" >&2
             exit 2
             ;;
     esac
