@@ -498,3 +498,83 @@ fn a_preview_takes_uploads_and_streams_blob_answers_in_its_space() {
         r.headers
     );
 }
+
+/// Review L-1 (erasure): a subject's upload to a preview created the
+/// subject's key in main's keystore, although forks never change it. A
+/// preview uses the subject's existing key, else a fork-local one; main's
+/// upload still creates it.
+#[test]
+fn a_preview_upload_creates_no_subject_key() {
+    use kronik_gateway::subject::SubjectFrom;
+    use kronik_gateway::{Gateway, GatewayConfig, HttpRequest, PREVIEW_PREFIX};
+    let dir = tempdir();
+    let p = blob_node(dir.path());
+    ingress(&p, http("info", "", inline(b"x")));
+    p.settle();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    let (proposal, _) =
+        p.rt.block_on(props.propose(
+            kronik_fork::proposal::ProposeRequest {
+                wasm: vec![{
+                    let mut v2 = std::fs::read(guest("media")).unwrap();
+                    v2.extend_from_slice(&[0x00, 0x07, 0x04, b't', b'e', b's', b't', b'v', b'2']);
+                    v2
+                }],
+                names: Vec::new(),
+                window_ms: None,
+                at: None,
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
+        .unwrap();
+    let (preview, _) =
+        p.rt.block_on(props.create_preview(&proposal.id, None, false, audit(), false, p.owner()))
+            .unwrap();
+    let gw = Gateway::new(
+        p.node.clone(),
+        GatewayConfig {
+            subject_from: SubjectFrom::parse("header:x-user-id"),
+            ..GatewayConfig::default()
+        },
+    )
+    .with_preview(props.clone());
+    let request = |path: String, user: &str| HttpRequest {
+        method: "POST".into(),
+        path,
+        query: String::new(),
+        headers: vec![("x-user-id".into(), user.into())],
+        body: vec![3u8; 2_000_000],
+        peer: None,
+    };
+    let keys = || {
+        p.node
+            .sealer()
+            .keystore()
+            .map_or(0, |k| k.stats().unwrap().keys)
+    };
+    let before = keys();
+    let r = p.rt.block_on(gw.handle(request(
+        format!("{PREVIEW_PREFIX}{}/media/a/info", preview.id),
+        "user:9",
+    )));
+    assert!(
+        String::from_utf8_lossy(&r.body).starts_with("blob b3s:"),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(keys(), before, "the preview created no key");
+    let r =
+        p.rt.block_on(gw.handle(request("/media/a/info".into(), "user:9")));
+    assert!(String::from_utf8_lossy(&r.body).starts_with("blob b3s:"));
+    if p.node.sealer().keystore().is_some() {
+        assert_eq!(
+            keys(),
+            before + 1,
+            "main's upload created the subject's key"
+        );
+    }
+}

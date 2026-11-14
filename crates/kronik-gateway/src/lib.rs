@@ -1160,16 +1160,7 @@ impl Gateway {
             .clone();
         let keys = match &who.subject {
             None => None,
-            Some(subject) => {
-                let entropy = self.node.env().entropy.clone();
-                let fill = move |bytes: &mut [u8]| entropy.fill(bytes);
-                Some(
-                    self.node
-                        .sealer()
-                        .blob_keys(subject, &fill, self.node.env().clock.wall_ms())
-                        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?,
-                )
-            }
+            Some(subject) => Some(self.upload_keys(subject, space)?),
         };
         // Renewed until the turn's result arrives, however long the upload
         // and the turn's wait take.
@@ -1215,6 +1206,33 @@ impl Gateway {
             digest: *digest.finalize().as_bytes(),
             lease,
         })
+    }
+
+    /// The keys of a subject's upload: main's creates the subject's key when
+    /// it has none, as a value of the subject's does; a preview (a fork)
+    /// never changes the keystore (M25 §9), so it uses the subject's
+    /// existing key, else a fork-local test key, never sealed.
+    fn upload_keys(
+        &self,
+        subject: &str,
+        space: &kronik_blob::Space,
+    ) -> Result<kronik_blob::BlobKeys, ApiError> {
+        let sealer = self.node.sealer();
+        let internal =
+            |e: kronik_privacy::PrivacyError| ApiError::new(ErrorCode::Internal, e.to_string());
+        if *space == kronik_blob::Space::Main {
+            let entropy = self.node.env().entropy.clone();
+            let fill = move |bytes: &mut [u8]| entropy.fill(bytes);
+            return sealer
+                .blob_keys(subject, &fill, self.node.env().clock.wall_ms())
+                .map_err(internal);
+        }
+        match sealer.existing_blob_keys(subject).map_err(internal)? {
+            Some(keys) => Ok(keys),
+            None => kronik_privacy::sealer::Sealer::plain()
+                .blob_keys(subject, &|bytes: &mut [u8]| bytes.fill(0), 0)
+                .map_err(internal),
+        }
     }
 
     /// The answer for a finished turn: [`turn_response`], with a blob body
