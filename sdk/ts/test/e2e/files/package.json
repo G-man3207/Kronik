@@ -1,0 +1,9 @@
+{
+  "name": "files",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "kronik": {
+    "entry": "src/actor.ts"
+  }
+}

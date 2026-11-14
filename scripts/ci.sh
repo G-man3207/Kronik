@@ -243,6 +243,8 @@ step_ts() {
     cargo build --locked --release -p kronik
     # Where cargo put it, also with CARGO_TARGET_DIR set.
     kronik="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/kronik"
+    # The SDK's blobs (M25) in an actor the test kit builds and runs.
+    (cd sdk/ts && KRONIK_BIN="$kronik" node --test test/e2e/*.test.ts)
     KRONIK_BIN="$kronik" scripts/build-examples-ts.sh
     python3 -B scripts/check-doc-surface.py --binary "$kronik"
     compatibility_root="$(mktemp -d)"
@@ -286,10 +288,11 @@ step_sdks() {
     # Where cargo put it, also with CARGO_TARGET_DIR set.
     kronik="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/kronik"
     # The testkits' WebSocket and SSE connections (M24) against a test host
-    # and the room guest (tests/guests/room), in Python, Go and Rust; the
-    # TypeScript testkit's run as chat-ts's tests in the ts step.
+    # and the room guest (tests/guests/room), in Python, Go and Rust (the
+    # TypeScript testkit's run as chat-ts's tests in the ts step), and the
+    # SDKs' blobs (M25) in actors the test kits build and run.
     KRONIK_BIN="$kronik" python3 -m unittest discover -s sdk/python/host_tests
-    (cd sdk/go && KRONIK_BIN="$kronik" PATH="$tools/bin:$PATH" GOTOOLCHAIN=local go test -tags kronikhost -run TestATestPlaysTheClient .)
+    (cd sdk/go && KRONIK_BIN="$kronik" PATH="$tools/bin:$PATH" GOTOOLCHAIN=local go test -tags kronikhost -run 'TestATestPlaysTheClient|TestBlobsInAnActor' .)
     KRONIK_BIN="$kronik" cargo test --manifest-path examples/Cargo.toml --locked -p kronik-sdk --test testkit_connections -- --ignored
     KRONIK_BIN="$kronik" scripts/build-examples-py.sh
     KRONIK_BIN="$kronik" scripts/build-examples-go.sh
