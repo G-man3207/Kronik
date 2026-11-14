@@ -6,6 +6,13 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- `kronik serve`'s default `--concurrency` follows the CPUs the daemon may
+  use: 8 turns at once per CPU, at least 8 and at most 64 (ADR 0140). Its
+  CPU affinity and a cgroup's CPU quota count, so a 2-vCPU machine runs 16
+  turns at once instead of 64, and the Wasm instance pool keeps fewer slots
+  warm (64 MiB instead of 256 MiB at most). From 8 CPUs nothing changes.
+  An explicit `--concurrency` is used as given. The `kronik is serving` log
+  line shows the value.
 - `isolation = "microvm"` runs a foreign actor in a Firecracker microVM of
   its own (M20; ADRs 0095 and 0096, accepted on 2026-11-14), an opt-in
   level beside gVisor, which stays the default. It needs a usable `/dev/kvm`

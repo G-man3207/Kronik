@@ -607,7 +607,7 @@ stays the same when it is replayed again.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--concurrency` | `64` | Turns that run at the same time |
+| `--concurrency` | 8 per CPU, 8 to 64 | Turns that run at the same time; the default follows the CPUs the daemon may use (its CPU affinity and a cgroup's CPU quota count), and `kronik is serving` logs it |
 | `--log-format` (`KRONIK_LOG_FORMAT`) | `text` | `text` or `json`; see [logs](#logs) |
 | `KRONIK_LOG` | `info` | The log filter: a level, or per target like `info,kronik::guest=debug` |
 | `--disk-reserve` (`KRONIK_DISK_RESERVE`) | `[log] disk_reserve` | Overrides `[log] disk_reserve`, e.g. `0B` for a test machine with little free space |
@@ -623,7 +623,9 @@ back in. That bounds what the pool holds on top of running instances:
 
 | `--concurrency` | Memory slots | Kept resident, worst case |
 |---|---|---|
-| 64 (default) | 128 | 256 MiB |
+| 16 (default on 2 CPUs) | 32 | 64 MiB |
+| 32 (default on 4 CPUs) | 64 | 128 MiB |
+| 64 (default from 8 CPUs) | 128 | 256 MiB |
 | 128 | 256 | 512 MiB |
 
 A slot keeps only what its instances used, so a small Rust guest (about
@@ -631,8 +633,12 @@ A slot keeps only what its instances used, so a small Rust guest (about
 reach the 2 MiB per slot. Measured on a 2 vCPU, 4 GB VPS after 30 s of 256
 clients on 256 actors (`docs/perf.md`): the daemon used 66 MiB with the Rust
 counter and 563 MiB with the TypeScript counter, which needs about 330 MiB
-for its compiled code alone. On a 4 GB machine the default leaves room;
-raise `--concurrency` only with the worst case above in mind.
+for its compiled code alone. The default grows with the CPUs because more
+turns at once than the CPUs can run only add warm slots and waiting: on 2
+CPUs, 1,000 WebSocket clients ran with about 90 MiB less memory and a p99
+latency of 170 ms instead of 250 to 320 ms at a concurrency of 8 than at
+64 ([ADR 0140](../adr/0140-default-concurrency-follows-the-cpus.md)).
+Raise `--concurrency` only with the worst case above in mind.
 
 ### Record size
 

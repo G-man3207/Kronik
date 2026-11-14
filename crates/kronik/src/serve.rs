@@ -45,9 +45,10 @@ pub struct ServeArgs {
     /// completes [file: gateway.timeout].
     #[arg(long)]
     gateway_timeout_ms: Option<u64>,
-    /// Turns running at once.
-    #[arg(long, default_value_t = 64)]
-    concurrency: usize,
+    /// Turns running at once [default: 8 per CPU the daemon may use, at
+    /// least 8 and at most 64].
+    #[arg(long)]
+    concurrency: Option<usize>,
     /// Master key of the secret store, created with mode 0600 if missing
     /// [file: keys.master_key_file]. `KRONIK_MASTER_KEY`, when set, holds
     /// the key itself (64 hex characters) and no file is read or created;
@@ -655,12 +656,13 @@ async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<
         foreign_config.privilege = privilege;
     }
     let foreign = kronik_foreign::Foreign::new(env.clone(), foreign_config);
+    let concurrency = args.concurrency.unwrap_or_else(default_concurrency).max(1);
     let node_config = NodeConfig {
         connections: config.connections.hub(connections_cap),
         foreign: kronik_effects::foreign::ForeignSlot(Some(Arc::new(kronik_foreign::Host(
             foreign.clone(),
         )))),
-        concurrency: args.concurrency.max(1),
+        concurrency,
         keys: config.keys.clone(),
         secret_settings: config.secrets.clone(),
         storage: Some(kronik_sched::snapshots::StorageConfig {
@@ -967,6 +969,7 @@ async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<
         data = %data_dir.display(),
         engine = kronik_runtime::ENGINE_VERSION,
         applied_lsn = node.applied_lsn(),
+        concurrency,
         open_files,
         gateway_connections,
         api_connections,
@@ -1296,6 +1299,20 @@ async fn record_key_source(
     Ok(())
 }
 
+/// The default number of turns that run at once (ADR 0140): 8 per CPU this
+/// process may use, at least 8 and at most 64. Rust's `available_parallelism`
+/// honours the CPU affinity and a cgroup v2 CPU quota, so a daemon confined
+/// to 2 CPUs runs 16 turns at once, and the Wasm instance pool, which is
+/// sized by the concurrency, keeps fewer slots warm on a small machine.
+fn default_concurrency() -> usize {
+    concurrency_for(std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// [`default_concurrency`] for `cpus` CPUs.
+fn concurrency_for(cpus: usize) -> usize {
+    cpus.saturating_mul(8).clamp(8, 64)
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
@@ -1305,6 +1322,23 @@ mod tests {
     struct Serve {
         #[command(flatten)]
         args: super::ServeArgs,
+    }
+
+    /// ADR 0140: 8 turns per CPU, from 8 to 64; an explicit flag as given.
+    #[test]
+    fn the_default_concurrency_follows_the_cpus() {
+        assert_eq!(
+            [0, 1, 2, 3, 4, 8, 9, 128].map(super::concurrency_for),
+            [8, 8, 16, 24, 32, 64, 64, 64]
+        );
+        assert!((8..=64).contains(&super::default_concurrency()));
+        assert_eq!(Serve::parse_from(["serve"]).args.concurrency, None);
+        assert_eq!(
+            Serve::parse_from(["serve", "--concurrency", "128"])
+                .args
+                .concurrency,
+            Some(128)
+        );
     }
 
     #[test]
