@@ -14,6 +14,9 @@ use super::{Failure, Lang};
 pub const JCO: &str = "1.39.0";
 pub const COMPONENTIZE_JS: &str = "0.23.0";
 pub const TYPESCRIPT: &str = "7.0.2";
+/// jco's standard library pins minimatch 10.2.6, which GHSA-g3hv-75wg-m249
+/// covers: a new project overrides it, as the SDK's own package.json does.
+pub const MINIMATCH: &str = "11.0.8";
 /// The Rust toolchain the SDK is built and tested with.
 pub const RUST: &str = "1.99.1";
 /// The checksums of the Go SDK's one dependency, for a new project's go.sum.
@@ -38,6 +41,9 @@ const TS_PACKAGE: &str = r#"{
     "@bytecodealliance/componentize-js": "{componentize_js}",
     "@bytecodealliance/jco": "{jco}",
     "typescript": "{typescript}"
+  },
+  "overrides": {
+    "minimatch": "{minimatch}"
   }
 }
 "#;
@@ -441,6 +447,7 @@ fn templates(
             .replace("{jco}", JCO)
             .replace("{componentize_js}", COMPONENTIZE_JS)
             .replace("{typescript}", TYPESCRIPT)
+            .replace("{minimatch}", MINIMATCH)
             .replace("{rust}", RUST)
     };
     match lang {
@@ -495,6 +502,27 @@ fn write(path: &Path, contents: &str) -> Result<(), Failure> {
 
 #[cfg(test)]
 mod tests {
+    /// A new TypeScript project overrides minimatch like the SDK, whose
+    /// package-lock.json the CI installs and audits.
+    #[test]
+    fn the_typescript_template_overrides_minimatch_like_the_sdk() {
+        let (files, sdk) = super::templates("shop-ts", super::Lang::Ts);
+        let package = &files
+            .iter()
+            .find(|(path, _)| *path == "package.json")
+            .unwrap()
+            .1;
+        let package: serde_json::Value = serde_json::from_str(package).unwrap();
+        let sdk_package = sdk.iter().find(|f| f.path == "package.json").unwrap();
+        let sdk_package: serde_json::Value = serde_json::from_str(sdk_package.contents).unwrap();
+        assert_eq!(package["overrides"]["minimatch"], super::MINIMATCH);
+        assert_eq!(sdk_package["overrides"], package["overrides"]);
+        assert_eq!(
+            package["devDependencies"]["@bytecodealliance/jco"],
+            super::JCO
+        );
+    }
+
     /// examples/github-flow holds `kronik init --lang rust counter`'s files
     /// (without vendor/), for a repository that runs the GitHub Action.
     #[test]
