@@ -652,6 +652,16 @@ impl BlobStore {
                 Err(e) => return Err(BlobError::io("opening a blob", e)),
             }
         }
+        // A subject's blob whose file its erasure deleted is erased, not
+        // missing (M26 §9.3).
+        if let Some(subject) = &meta.subject
+            && matches!(
+                keys.identity_key(subject, meta.key_version),
+                KeyAnswer::Erased
+            )
+        {
+            return Err(BlobError::Erased);
+        }
         Err(BlobError::NotFound(meta.id))
     }
 
