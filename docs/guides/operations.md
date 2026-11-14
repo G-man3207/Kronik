@@ -430,7 +430,7 @@ transport settings: replay never reads them.
 | `inbound_rate` | `"50/s"` | Reads per connection are paced to this |
 | `outbound_queue_bytes` | `1048576` | Outgoing bytes a connection may queue. A client that does not read is closed as a slow consumer (1008) instead of holding memory |
 | `ping_interval` | `"30s"` | An idle WebSocket gets a ping this often |
-| `ping_timeout` | `"30s"` | A WebSocket that answers nothing within this after a ping is closed with `ping-timeout` (1001) |
+| `ping_timeout` | `"30s"` | A WebSocket that answers nothing within this after a ping is closed with `ping-timeout` (1001). A WebSocket or SSE client that takes no frame for this long is closed as a slow consumer (1008), and any gateway connection whose client takes no bytes for this long is dropped |
 | `sse_heartbeat` | `"15s"` | An SSE stream gets a `: keep-alive` comment this often |
 | `close_timeout` | `"5s"` | How long a close waits for the client's close frame |
 | `shutdown_grace` | `"2s"` | On SIGTERM every WebSocket gets the close code 1012 `kronik: restart`; the daemon waits this long for the writers |

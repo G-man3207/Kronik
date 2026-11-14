@@ -2130,6 +2130,7 @@ dependencies = [
  "kronik-privacy",
  "kronik-proto",
  "kronik-sched",
+ "kronik-store",
  "rcgen",
  "rustix",
  "rustls",
