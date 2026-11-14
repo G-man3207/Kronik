@@ -39,6 +39,11 @@ fn audit() -> pb::Audit {
 /// A node with blobs, no history window, small segments and no collector
 /// loop of its own (`gc_interval` 0: the test drives the passes).
 fn start(dir: &Path) -> Proc {
+    start_with(dir, BlobsConfig::default().lease_ttl)
+}
+
+/// [`start`] with leases that live `lease_ttl` without renewal.
+fn start_with(dir: &Path, lease_ttl: Duration) -> Proc {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -56,6 +61,7 @@ fn start(dir: &Path) -> Proc {
             ingress_ttl: Duration::from_secs(3600),
             blobs: Some(BlobsConfig {
                 gc_interval: Duration::ZERO,
+                lease_ttl,
                 ..BlobsConfig::default()
             }),
             ..NodeConfig::default()
@@ -358,4 +364,134 @@ fn a_fork_keeps_its_base_and_the_records_after_its_point() {
     });
     assert_eq!(gone.report.deleted, 2, "{gone:?}");
     assert!(!p.exists(&base) && !p.exists(&after));
+}
+
+/// Answers each request `delay` after it read the request.
+#[allow(clippy::disallowed_methods)]
+fn slow_server(delay: Duration) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+        for mut stream in listener.incoming().flatten() {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            let mut buf = vec![0u8; 64 << 10];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+            std::thread::sleep(delay);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    addr
+}
+
+/// Review R-2 (erasure), the collector's side: an upload whose turn waits
+/// longer than `[blobs] lease_ttl` for its actor, before any record names
+/// it, is kept only by the upload's lease. The gateway keeps that lease
+/// alive until the turn's result (Lease::keep_alive), so two immediate
+/// passes after the TTL leave it, and the turn reads all of it. A lease
+/// nobody renews ends with its TTL, and its blob goes.
+#[allow(clippy::disallowed_methods)]
+#[test]
+fn an_upload_waiting_past_the_lease_ttl_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start_with(dir.path(), Duration::from_secs(1));
+    let owner = p.node.local_operator_authority().unwrap();
+    p.rt.block_on(p.node.grant(
+        "media",
+        "http:127.0.0.1",
+        None,
+        None,
+        kronik_effects::InForks::Recorded,
+        audit(),
+        false,
+        owner,
+    ))
+    .unwrap();
+    let store = p.node.blob_store().unwrap().clone();
+    let write = |lease: kronik_blob::Lease, byte: u8| -> pb::BlobRef {
+        let store = store.clone();
+        p.rt.block_on(async move {
+            let mut w = store
+                .writer(Space::Main, None, u64::MAX, lease)
+                .await
+                .unwrap();
+            w.write(&vec![byte; 200_000]).await.unwrap();
+            let meta = w.finish().await.unwrap();
+            store
+                .ensure_durable(&Space::Main, &[meta.id])
+                .await
+                .unwrap();
+            meta.to_pb()
+        })
+    };
+    // media/a is busy for 3 s with a turn that waits for a slow server.
+    let addr = slow_server(Duration::from_secs(3));
+    let node = p.node.clone();
+    let busy = http("post", &format!("url=http://{addr}/sink"), "");
+    let first = p.rt.spawn(async move {
+        match node
+            .ingress(ActorRef::parse("media/a").unwrap(), busy, None)
+            .unwrap()
+        {
+            Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
+            Ingress::Done(r) => *r,
+        }
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    // An upload as the gateway takes it, and a lease nobody renews.
+    let upload = store.leases().take("upload");
+    upload.keep_alive(p.node.env());
+    let kept = write(upload.clone(), 3);
+    let stale = store.leases().take("stale");
+    let gone = write(stale.clone(), 4);
+    // Its turn waits behind the busy one.
+    let mut input = http("sum", "", "");
+    input.body = Some(pb::Body {
+        value: Some(pb::body::Value::Blob(kept.clone())),
+    });
+    let node = p.node.clone();
+    let second = p.rt.spawn(async move {
+        match node
+            .ingress(ActorRef::parse("media/a").unwrap(), input, None)
+            .unwrap()
+        {
+            Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
+            Ingress::Done(r) => *r,
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    for _ in 0..2 {
+        p.gc(SweepOptions {
+            immediate: true,
+            ..Default::default()
+        });
+    }
+    assert!(p.exists(&kept), "the kept-alive upload was collected");
+    assert!(!p.exists(&gone), "a lease past its TTL kept its blob");
+    drop(stale);
+    assert!(p.rt.block_on(first).unwrap().committed());
+    let r = p.rt.block_on(second).unwrap();
+    assert!(r.committed(), "{r:?}");
+    match &r.outcome.output {
+        Some(pb::outcome::Output::Http(h)) => {
+            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
+                Some(pb::body::Value::Inline(s)) => match &s.value {
+                    Some(pb::sealable::Value::Plain(b)) => {
+                        assert!(String::from_utf8_lossy(b).starts_with("200000 "), "{b:?}");
+                    }
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+    drop(upload);
 }
