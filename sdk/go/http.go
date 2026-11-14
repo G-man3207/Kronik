@@ -83,9 +83,11 @@ const BlobFrameBytes = 1 << 16
 
 // BlobRef is a blob: a large body kept outside the log and named by its
 // hash (see `kronik explain blob`). A handler gets one from req.Blob() or
-// res.Blob(), or from ctx.Blobs.Writer().Finish(), and may use it in the
-// turn that got it: read it (ctx.Blobs), answer with it (BlobResponse), or
-// send it (FetchRequest.BodyBlob).
+// res.Blob(), in a message's Blobs, or from ctx.Blobs.Writer().Finish() or
+// ctx.Blobs.Put, and may use it in the turn that got it: read it
+// (ctx.Blobs), answer with it (BlobResponse), send it
+// (FetchRequest.BodyBlob, OutgoingMessage.Blobs), or hold it for later turns
+// (ctx.Blobs.Retain).
 type BlobRef struct {
 	// Hash is "b3:<hex>", or "b3s:<hex>" for a data subject's blob.
 	Hash string
@@ -235,12 +237,18 @@ type Message struct {
 	Body        []byte
 	// Sender is the sending actor, if an actor sent it.
 	Sender *ActorRef
+	// Blobs are the blobs the message carries (M26): the turn may read
+	// them, and holds one only if it retains it ([Blobs.Retain]).
+	Blobs []BlobRef
 }
 
 func newMessage(msg *types.Message, sender *types.ActorRef) *Message {
 	m := &Message{Name: msg.Name, ContentType: msg.ContentType, Body: msg.Body.Slice()}
 	if sender != nil {
 		m.Sender = &ActorRef{Kind: sender.Kind, Key: sender.Key}
+	}
+	for _, b := range msg.Blobs.Slice() {
+		m.Blobs = append(m.Blobs, BlobRef{Hash: b.Hash, Size: b.Size})
 	}
 	return m
 }
@@ -251,13 +259,18 @@ func (m *Message) Text() (string, error) { return decodeText(m.Body, "the messag
 // JSON parses the body as JSON into v.
 func (m *Message) JSON(v any) error { return decodeJSON(m.Body, v, "the message body", "message") }
 
-// OutgoingMessage is a message to send: a name and a body (nil, []byte,
-// a string as text, or any other value as JSON).
+// OutgoingMessage is a message to send, schedule or reply with: a name and
+// a body (nil, []byte, a string as text, or any other value as JSON), and
+// the blobs it carries.
 type OutgoingMessage struct {
 	Name string
 	Body any
 	// ContentType overrides the content type that follows from the body.
 	ContentType string
+	// Blobs travel with the message (M26), at most 256, each one the turn
+	// may use. The receiving turn may read them, and holds one only if it
+	// retains it.
+	Blobs []BlobRef
 }
 
 func (m OutgoingMessage) wit() (types.Message, error) {
@@ -268,7 +281,11 @@ func (m OutgoingMessage) wit() (types.Message, error) {
 	if m.ContentType != "" {
 		contentType = m.ContentType
 	}
-	return types.Message{Name: m.Name, ContentType: contentType, Body: cm.ToList(body)}, nil
+	blobs := make([]types.BlobRef, 0, len(m.Blobs))
+	for _, b := range m.Blobs {
+		blobs = append(blobs, b.wit())
+	}
+	return types.Message{Name: m.Name, ContentType: contentType, Body: cm.ToList(body), Blobs: cm.ToList(blobs)}, nil
 }
 
 // Secret is a handle to a secret: its name, never its value (see `kronik

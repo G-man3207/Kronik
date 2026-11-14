@@ -198,9 +198,10 @@ func (HTTP) Fetch(req FetchRequest) (*FetchResponse, error) {
 }
 
 // Blobs is the turn's blobs (see `kronik explain blob`): read the ones the
-// turn got (its request's or a fetch response's body) and the ones it
-// wrote, in ranges or with a reader, and write new ones. The host checks
-// every call (BLOB_NOT_HELD).
+// turn may use (its request's or a fetch response's body, a message's
+// blobs, the ones it wrote and the ones its actor holds), in ranges or with
+// a reader, write new ones, and hold them across turns (Put, Retain,
+// Release; M26). The host checks every call (BLOB_NOT_HELD).
 type Blobs struct{}
 
 func blobError(e *blobs.BlobError) *Error {
@@ -261,6 +262,60 @@ func (Blobs) Reader(b BlobRef) *BlobReader { return &BlobReader{blob: b} }
 // subject: Write its bytes, then Finish to get the blob, which the turn may
 // use as a response or fetch body.
 func (Blobs) Writer() *BlobWriter { return &BlobWriter{w: blobs.NewWriter()} }
+
+// Put stores data as a blob tagged with the turn's default subject; the
+// actor holds it once the turn commits (M26). One host call takes at most
+// 1 MiB: a larger value is written in parts and then retained, which is the
+// same.
+func (bs Blobs) Put(data []byte) (BlobRef, error) {
+	if len(data) > BlobCallBytes {
+		w := bs.Writer()
+		if _, err := w.Write(data); err != nil {
+			return BlobRef{}, err
+		}
+		b, err := w.Finish()
+		if err != nil {
+			return BlobRef{}, err
+		}
+		return b, bs.Retain(b)
+	}
+	res := blobs.Put(cm.ToList(data))
+	if res.IsErr() {
+		return BlobRef{}, blobError(res.Err())
+	}
+	b := res.OK()
+	return BlobRef{Hash: b.Hash, Size: b.Size}, nil
+}
+
+// PutFor is [Blobs.Put] tagged with subject ("" for none), whatever the
+// turn's default subject is; the default is restored afterwards, also when
+// the put fails.
+func (bs Blobs) PutFor(subject string, data []byte) (BlobRef, error) {
+	before := privacy.CurrentSubject()
+	privacy.SetSubject(optional(subject))
+	defer privacy.SetSubject(before)
+	return bs.Put(data)
+}
+
+// Retain holds b from the turn's commit on: a blob the turn may use, such
+// as a request body, a fetch response or one that a message brought. A blob
+// the actor already holds stays held.
+func (Blobs) Retain(b BlobRef) error {
+	if res := blobs.Retain(b.wit()); res.IsErr() {
+		return blobError(res.Err())
+	}
+	return nil
+}
+
+// Release ends the actor's hold on b at the turn's commit; the turn can
+// still read it. Only a hold of this actor's own ends; a blob nothing holds
+// any more is deleted later by collection.
+func (Blobs) Release(b BlobRef) error {
+	if res := blobs.Release(b.wit()); res.IsErr() {
+		return blobError(res.Err())
+	}
+	return nil
+}
 
 // BlobReader reads one blob; see [Blobs.Reader]. It fetches whole 64 KiB
 // frames (a read is charged for every frame it touches) and serves small

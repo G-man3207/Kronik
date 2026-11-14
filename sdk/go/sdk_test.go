@@ -275,3 +275,30 @@ func TestBlobErrorsNameTheirCodes(t *testing.T) {
 		}
 	}
 }
+
+// M26: messages carry blobs both ways.
+func TestMessagesCarryBlobs(t *testing.T) {
+	a := BlobRef{Hash: "b3:" + strings.Repeat("aa", 32), Size: 5}
+	b := BlobRef{Hash: "b3s:" + strings.Repeat("bb", 32), Size: 1 << 21}
+	w, err := OutgoingMessage{Name: "shared", Body: "img-1", Blobs: []BlobRef{a, b}}.wit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := w.Blobs.Slice(); len(got) != 2 || got[0] != a.wit() || got[1] != b.wit() {
+		t.Fatalf("blobs %+v", got)
+	}
+	if string(w.Body.Slice()) != "img-1" || w.ContentType != "text/plain; charset=utf-8" {
+		t.Errorf("body %q %q", w.Body.Slice(), w.ContentType)
+	}
+	if none, _ := (OutgoingMessage{Name: "tick"}).wit(); len(none.Blobs.Slice()) != 0 {
+		t.Error("no blobs")
+	}
+	m := newMessage(&w, nil)
+	if !reflect.DeepEqual(m.Blobs, []BlobRef{a, b}) {
+		t.Errorf("incoming %+v", m.Blobs)
+	}
+	plain := types.Message{Name: "tick"}
+	if newMessage(&plain, nil).Blobs != nil {
+		t.Error("a message without blobs has none")
+	}
+}
