@@ -356,10 +356,21 @@ Prefer a preview domain wherever previews take traffic from browsers.
 
 ## WebSocket and SSE connections
 
+Long-lived connections ([Connections](connections.md), M24):
+
+- **Owner-only sending.** Only the actor that accepted a connection may
+  send on it or close it while it is live. Another actor's use fails its
+  turn with `CONNECTION_NOT_HELD`
+  ([ADR 0114](../adr/0114-only-the-accepting-actor-sends.md)). A
+  connection's id is 128 random bits, so an actor cannot find another
+  actor's connections by guessing ids; a frame to an id that no live
+  connection has is recorded as dropped.
 - **Check `Origin` in `open`.** Browsers send cookies and an `Origin`
   header with a WebSocket handshake, and the gateway does not check
   `Origin` (cross-site WebSocket hijacking). An actor that authenticates
   by cookie must check it in its open handler, as the chat example does.
+  The gateway strips Kronik's own admin cookies from every upgrade, as it
+  does from HTTP requests.
 - **Tokens in `Sec-WebSocket-Protocol`.** Browsers cannot set
   `Authorization` on a WebSocket, so apps pass bearer tokens in this
   header. Kronik records it like `Authorization`: as a header of the open's
@@ -369,6 +380,10 @@ Prefer a preview domain wherever previews take traffic from browsers.
   snapshots, backups and forks hold the token: prefer short-lived tokens,
   or set a subject for the request. The accept records only the selected
   subprotocol's position, never its value.
+- **Subjects.** As for HTTP, only `[gateway] trusted_proxies` may set the
+  subject of an open. An actor that learns its user from a token sets the
+  connection's subject in its accept; the API shows a connection's subject
+  only with `pii:read`.
 - **Caps and memory.** Connections are capped in total, per actor and per
   client (the forwarded client behind a trusted proxy, an IPv6 /64), and
   their buffers per connection and node-wide (`[connections]`). A client
@@ -376,6 +391,9 @@ Prefer a preview domain wherever previews take traffic from browsers.
 - **`connection:send-now`** sends during a turn, before it commits, and
   needs its grant (always delivery class `unsafe`); buffered `send`,
   `broadcast` and `close` on the actor's own connections need none.
+- **Closing a client.** An operator closes any open connection, such as an
+  abusive client's, with `kronik connections close` (scope `operate`); the
+  reason is audited.
 
 ## Root
 
