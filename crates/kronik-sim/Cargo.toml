@@ -13,6 +13,7 @@ bytes = { workspace = true }
 chacha20 = { workspace = true }
 kronik-core = { workspace = true }
 kronik-effects = { workspace = true }
+kronik-fork = { workspace = true }
 kronik-gateway = { workspace = true }
 kronik-log = { workspace = true }
 kronik-privacy = { workspace = true }

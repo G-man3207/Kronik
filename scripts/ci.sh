@@ -306,10 +306,15 @@ step_sdks() {
 # of the effects workload against a simulated external service (M2), with
 # crashes, each run twice to check determinism; then 200 seeds of the
 # rebuild workload (tiny bulk-replay thresholds; every start's recovered
-# state against a rebuild from the log).
+# state against a rebuild from the log). The default scenarios include the
+# M24 connections workload (properties C1 to C9, identity replay of every
+# 10th seed); its deliberate bug, frames delivered before their record is
+# durable, must make C3 fail for some seed.
 step_dst() {
     cargo test --locked --release -p kronik-sim --test dst -- --seeds 0..200 --twice
     cargo test --locked --release -p kronik-sim --test dst -- --seeds 0..200 --scenario rebuild --twice
+    cargo test --locked --release -p kronik-sim --test dst -- --seeds 0..20 --scenario connections \
+        --mutation deliver-before-fsync --expect-violation C3
 }
 
 step_deny() {

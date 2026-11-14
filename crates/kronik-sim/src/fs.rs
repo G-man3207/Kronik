@@ -159,6 +159,16 @@ impl Disk {
         Some(self.inodes.get(ino)?.durable.clone())
     }
 
+    /// The durably named files directly in `dir`, in name order: the files
+    /// a crash right now would leave there.
+    pub fn durable_files_in(&self, dir: &Path) -> Vec<PathBuf> {
+        self.durable_names
+            .keys()
+            .filter(|p| p.parent() == Some(dir))
+            .cloned()
+            .collect()
+    }
+
     /// Like `durable_contents`, but only the bytes from `from` on, plus the
     /// total durable length (for incremental checks on long runs).
     pub fn durable_suffix(&self, path: &Path, from: usize) -> Option<(usize, Vec<u8>)> {

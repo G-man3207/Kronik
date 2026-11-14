@@ -5,24 +5,32 @@
 //!   cargo test -p kronik-sim --release --test dst -- --seeds 0..200
 //!   cargo test -p kronik-sim --test dst          (default: seeds 0..4)
 //!
-//! `--scenario counter|effects|webhook|all` (default all) picks the
-//! workload: the M1 counter workload, the M2 effects workload against a
+//! `--scenario counter|effects|webhook|connections|all` (default all) picks
+//! the workload: the M1 counter workload, the M2 effects workload against a
 //! simulated external service, webhook-relay-rs against the same service,
-//! or all three for every seed. `--scenario rebuild` (not part of `all`)
+//! the M24 connections workload (WebSocket and SSE clients of the room
+//! guest, properties C1 to C9 of docs/design/m24-connections.md §14), or
+//! all four for every seed. `--scenario rebuild` (not part of `all`)
 //! runs the effects workload with tiny startup-replay thresholds and
 //! segments, and checks every start's recovered state against a rebuild
 //! from the log. `--scenario allocator` and `--scenario secret-outage` (not
 //! part of `all`) are M23's secret workloads against a simulated OpenBao:
 //! one allocator of version numbers under concurrent first uses, refreshes
 //! and crashes, and turns while the backend hangs.
-//! `--long STEPS` runs the counter workload as one long run per seed (default
-//! seed 0) of at least STEPS executor steps, with crashes throughout; the
+//! `--long STEPS` runs the counter workload, with connection clients in the
+//! mix, as one long run per seed (default seed 0) of at least STEPS executor
+//! steps, with crashes throughout; the
 //! Definition of done asks for at least 1 000 000 (`--long 1000000`).
 //! `KRONIK_DST_RELAY=<component>` runs the webhook workload with another
 //! relay (e.g. webhook-relay-ts) instead of webhook-relay-rs.
 //! `--twice` runs every seed twice and fails if the traces differ
 //! (determinism check). `--mutation ack-before-fsync` seeds a deliberate
-//! log bug; the run is then expected to report violations for some seeds.
+//! log bug, `--mutation deliver-before-fsync` one in the scheduler (a
+//! turn's frames go to the hub before its record is appended); the run is
+//! then expected to report violations for some seeds, and
+//! `--expect-violation C3` makes it pass only when some seed reports a
+//! violation that starts with `C3`. `--identity-replay` replays the log of
+//! every connections run (C8), not only every 10th seed's.
 //! A run line shows `start-failures=N` after its wall time when a node's
 //! start failed on an injected fsync error and the node was restarted; the
 //! lines under it say what failed.
@@ -44,8 +52,11 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let mut seeds = 0..4u64;
     let mut twice = false;
-    let mut mutation = false;
-    let mut scenarios = vec!["counter", "effects", "webhook"];
+    let mut ack_before_fsync = false;
+    let mut deliver_before_fsync = false;
+    let mut identity_replay = false;
+    let mut expect: Option<String> = None;
+    let mut scenarios = vec!["counter", "effects", "webhook", "connections"];
     let mut long = None;
     let mut seeds_given = false;
     let mut i = 1;
@@ -110,22 +121,41 @@ fn main() -> ExitCode {
                     scenarios = vec!["secret-outage"];
                     i += 1;
                 }
+                Some("connections") => {
+                    scenarios = vec!["connections"];
+                    i += 1;
+                }
                 Some("all") => i += 1,
                 _ => {
                     eprintln!(
-                        "--scenario needs counter, effects, webhook, rebuild, allocator, \
-                         secret-outage or all"
+                        "--scenario needs counter, effects, webhook, connections, rebuild, \
+                         allocator, secret-outage or all"
                     );
                     return ExitCode::FAILURE;
                 }
             },
             "--mutation" => match args.get(i + 1).map(String::as_str) {
                 Some("ack-before-fsync") => {
-                    mutation = true;
+                    ack_before_fsync = true;
+                    i += 1;
+                }
+                Some("deliver-before-fsync") => {
+                    deliver_before_fsync = true;
                     i += 1;
                 }
                 _ => {
-                    eprintln!("--mutation needs ack-before-fsync");
+                    eprintln!("--mutation needs ack-before-fsync or deliver-before-fsync");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--identity-replay" => identity_replay = true,
+            "--expect-violation" => match args.get(i + 1) {
+                Some(prefix) => {
+                    expect = Some(prefix.clone());
+                    i += 1;
+                }
+                None => {
+                    eprintln!("--expect-violation needs a prefix, such as C3");
                     return ExitCode::FAILURE;
                 }
             },
@@ -138,9 +168,9 @@ fn main() -> ExitCode {
         seeds = 0..1;
     }
     let mut failed = Vec::new();
-    let config = |seed, scenario: &str| ScenarioConfig {
-        mutation_ack_before_fsync: mutation,
-        ..if scenario == "effects" {
+    let mut expected_seen = Vec::new();
+    let config = |seed, scenario: &str| {
+        let mut cfg = if scenario == "effects" {
             ScenarioConfig::effects_for_seed(seed)
         } else if scenario == "webhook" {
             ScenarioConfig::webhook_for_seed(seed)
@@ -150,11 +180,19 @@ fn main() -> ExitCode {
             ScenarioConfig::allocator_for_seed(seed)
         } else if scenario == "secret-outage" {
             ScenarioConfig::outage_for_seed(seed)
+        } else if scenario == "connections" {
+            ScenarioConfig::connections_for_seed(seed)
         } else if let Some(steps) = long {
             ScenarioConfig::long(seed, steps)
         } else {
             ScenarioConfig::for_seed(seed)
+        };
+        cfg.mutation_ack_before_fsync = ack_before_fsync;
+        cfg.mutation_deliver_before_fsync = deliver_before_fsync;
+        if let Some(w) = cfg.connections.as_mut() {
+            w.identity_replay |= identity_replay;
         }
+        cfg
     };
     let runs: Vec<(u64, &str)> = seeds
         .clone()
@@ -163,6 +201,17 @@ fn main() -> ExitCode {
     for (seed, scenario) in runs {
         let r = run(seed, config(seed, scenario));
         println!("{scenario:<8} {}", r.line());
+        if let Some(prefix) = &expect {
+            // A mutation run: the seeds that catch it are what it is for.
+            if r.violations.iter().any(|v| v.starts_with(prefix.as_str())) {
+                println!(
+                    "  caught: {}",
+                    r.violations.first().map_or("", String::as_str)
+                );
+                expected_seen.push(seed);
+            }
+            continue;
+        }
         for cause in &r.start_failures {
             println!("  start failed on an injected fsync, node restarted: {cause}");
         }
@@ -204,6 +253,19 @@ fn main() -> ExitCode {
             );
             failed.push(seed);
         }
+    }
+    if let Some(prefix) = &expect {
+        println!(
+            "dst: {} seeds x {:?}, a violation starting with {prefix} in {} {expected_seen:?}",
+            seeds.end - seeds.start,
+            scenarios,
+            expected_seen.len()
+        );
+        return if expected_seen.is_empty() {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
     }
     println!(
         "dst: {} seeds x {:?}, {} failed {failed:?}",

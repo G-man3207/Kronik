@@ -61,11 +61,12 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # Every scenario (counter, effects, webhook with webhook-relay-rs), each
-      # seed twice to check determinism. dst.sh keeps the shards' output in
-      # $TMPDIR.
+      # Every scenario (counter, effects, webhook with webhook-relay-rs,
+      # connections), each seed twice to check determinism, and identity
+      # replay of every connections run (M24 C8). dst.sh keeps the shards'
+      # output in $TMPDIR.
       - name: DST
-        run: TMPDIR="$RUNNER_TEMP" scripts/dst.sh 0..10000 "$(nproc)" --twice
+        run: TMPDIR="$RUNNER_TEMP" scripts/dst.sh 0..10000 "$(nproc)" --twice --identity-replay
       # Startup bulk replays cut into tiny batches and segments; every
       # start's recovered state against a rebuild from the log.
       - name: DST, rebuild workload

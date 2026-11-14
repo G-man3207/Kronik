@@ -54,6 +54,19 @@ until the v1.0 compatibility promise takes effect.
   earlier release get their copy at the first start while the backend still
   serves them. **External secret values are now at rest, encrypted, in the
   data directory, its snapshots and the bucket.**
+- DST scenario `--scenario connections` (M24): WebSocket and SSE clients of
+  the room guest through the gateway's connection path and the hub, with
+  crashes, graceful stops and lost `state.db`. It checks that every
+  accepted connection gets exactly one close input, that incoming seqs
+  have no gaps, that no client gets a frame before its record is durable
+  or from another actor, that `frames_written` matches what the client
+  got, that recovery and identity replay agree with the log, and that a
+  run is a function of its seed. It is part of `--scenario all` and of
+  the long run; `--mutation deliver-before-fsync` must make it fail.
+  Found with it: a graceful stop closed connections in an order that
+  differed per process, and a replay ran a connection's frame and close
+  turns without the connection's subject, so its state writes differed
+  from production's.
 - Long-lived connections never wait for ever on a client (M24 review): a
   WebSocket or SSE client that takes no frame for `[connections]
   ping_timeout` is closed as a slow consumer, every close gets

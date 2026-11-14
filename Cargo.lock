@@ -2361,6 +2361,7 @@ dependencies = [
  "chacha20",
  "kronik-core",
  "kronik-effects",
+ "kronik-fork",
  "kronik-gateway",
  "kronik-log",
  "kronik-privacy",

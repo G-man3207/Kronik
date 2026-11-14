@@ -49,8 +49,10 @@ use crate::exec::{Executor, Handle, NodeId, RunEnd, SUPERVISOR};
 use crate::fs::{CrashModel, Disk, DiskFaults, INJECTED_FSYNC_EIO, SimFs};
 use crate::service::{ServiceFaults, SimService};
 
+mod connections;
 mod secrets;
 use crate::{SimClock, SimEntropy, SimNoNet, SimProcs, SimRng, SimSpawner, Trace};
+pub use connections::ConnWorkload;
 use kronik_effects::{Delivery, Rate};
 use secrets::SecretState;
 pub use secrets::SecretWorkload;
@@ -121,6 +123,11 @@ pub struct ScenarioConfig {
     pub check_recovery: bool,
     /// A secret workload instead of the counter workload.
     pub secrets: Option<SecretWorkload>,
+    /// The M24 connections workload instead of the counter workload.
+    pub connections: Option<ConnWorkload>,
+    /// Deliberate bug (mutation testing of the harness, M24 §14): the node
+    /// gives a turn's frames to the hub before its record is appended.
+    pub mutation_deliver_before_fsync: bool,
 }
 
 /// The effects workload's knobs.
@@ -162,6 +169,8 @@ impl ScenarioConfig {
             startup_apply_batch: kronik_sched::NodeConfig::default().startup_apply_batch,
             check_recovery: false,
             secrets: None,
+            connections: None,
+            mutation_deliver_before_fsync: false,
         }
     }
 
@@ -174,12 +183,18 @@ impl ScenarioConfig {
         let r = SimRng::new(seed, b"long-config");
         let base = ScenarioConfig::for_seed(seed);
         ScenarioConfig {
-            clients: 4,
+            // Four counter clients and three connection clients (M24 §14).
+            clients: 7,
             requests_per_client: usize::MAX,
             crash_mean: Duration::from_millis(300 + r.below(700)),
             max_crashes: u32::MAX,
             segment_max_bytes: base.segment_max_bytes.max(64 << 10),
             long: Some(steps),
+            connections: Some(ConnWorkload {
+                first_client: 4,
+                identity_replay: false,
+                ..ConnWorkload::for_seed(seed)
+            }),
             ..base
         }
     }
@@ -287,6 +302,22 @@ impl ScenarioConfig {
         cfg.check_recovery = true;
         cfg
     }
+
+    /// The connections workload for `seed` (`--scenario connections`, M24
+    /// §14): K = 2 to 6 clients on R = 1 to 3 rooms of the room guest,
+    /// crashes and graceful stops spread over the run, and every start's
+    /// recovered state (the connections tables included, C7) checked
+    /// against a rebuild from the log.
+    pub fn connections_for_seed(seed: u64) -> ScenarioConfig {
+        let r = SimRng::new(seed, b"connections-scenario");
+        let mut cfg = ScenarioConfig::for_seed(seed);
+        cfg.clients = 2 + r.below(5) as usize;
+        cfg.crash_mean = Duration::from_millis(50 + r.below(1500));
+        cfg.max_crashes = r.below(6) as u32;
+        cfg.check_recovery = true;
+        cfg.connections = Some(ConnWorkload::for_seed(seed));
+        cfg
+    }
 }
 
 /// The result of one run.
@@ -349,6 +380,7 @@ fn code() -> Result<Arc<CodeStore>, String> {
         let code = CodeStore::new(engine, None).map_err(|e| e.to_string())?;
         code.add(COUNTER).map_err(|e| e.to_string())?;
         code.add(webhook_relay()?).map_err(|e| e.to_string())?;
+        code.add(connections::ROOM).map_err(|e| e.to_string())?;
         Ok(Arc::new(code))
     })
     .clone()
@@ -374,6 +406,7 @@ struct State {
     finished: bool,
     notes: String,
     secrets: SecretState,
+    conns: connections::ConnState,
 }
 
 struct World {
@@ -574,6 +607,23 @@ impl World {
                     "/data",
                 ))),
                 secret_settings: self.cfg.secrets.map(|w| w.settings()).unwrap_or_default(),
+                connections: self
+                    .cfg
+                    .connections
+                    .map(|w| {
+                        let d = kronik_sched::connections::ConnectionsConfig::default();
+                        kronik_sched::connections::ConnectionsConfig {
+                            outbound_queue_bytes: w.queue_bytes,
+                            total_queue_bytes: w.total_queue_bytes.unwrap_or(d.total_queue_bytes),
+                            total_inflight_bytes: w
+                                .total_inflight_bytes
+                                .unwrap_or(d.total_inflight_bytes),
+                            shutdown_grace: Duration::from_millis(500),
+                            ..d
+                        }
+                    })
+                    .unwrap_or_default(),
+                mutation_deliver_before_fsync: self.cfg.mutation_deliver_before_fsync,
                 ..NodeConfig::default()
             },
             log: self.log_config(),
@@ -596,6 +646,7 @@ impl World {
             "node {node_id} recovered at lsn {}",
             node.applied_lsn()
         ));
+        self.conn_note_start(node.applied_lsn());
         // The operator's original lease: the same authority the scheduler
         // tests use for deploy/grant/send/secret mutations, retained for the
         // node process's lifetime like the daemon's configured operator does.
@@ -617,18 +668,28 @@ impl World {
                 Err(e) => return self.violation(format!("node {node_id}: recovered state: {e}")),
             }
         }
-        if !node.kind_exists("counter") {
+        // The counter, unless every client opens connections; the room
+        // with the connections workload.
+        let counter = self.cfg.connections.is_none_or(|w| w.first_client > 0);
+        let guests = [
+            ("counter", COUNTER, counter),
+            ("room", connections::ROOM, self.cfg.connections.is_some()),
+        ];
+        for (kind, guest, wanted) in guests {
+            if !wanted || node.kind_exists(kind) {
+                continue;
+            }
             let audit = pb::Audit {
                 token_id: "sim".into(),
                 reason: "dst".into(),
                 wall_time_ms: 0,
             };
-            if let Err(e) = node.deploy(COUNTER, audit, false, authority.clone()).await {
+            if let Err(e) = node.deploy(guest, audit, false, authority.clone()).await {
                 self.event(format!("deploy failed: {}", e.code));
                 let _ = self.fatal_tx.send(node_id);
                 return;
             }
-            self.event("deployed counter");
+            self.event(format!("deployed {kind}"));
         }
         if let Some(fx) = self.cfg.effects
             && node
@@ -675,6 +736,9 @@ impl World {
             return;
         }
         let gateway = Arc::new(Gateway::new(node.clone(), GatewayConfig::default()));
+        if self.cfg.connections.is_some() {
+            self.listen_for_opens(&env, &node, &gateway);
+        }
         let (tx, mut rx) =
             mpsc::unbounded_channel::<(HttpRequest, oneshot::Sender<HttpResponse>)>();
         {
@@ -804,6 +868,7 @@ impl World {
             let mut st = self.st();
             st.crashes += 1;
             st.conn = None;
+            st.conns.listener = None;
             if let Some(n) = st.node.take() {
                 st.turns += n.probe.turns_run.load(std::sync::atomic::Ordering::Relaxed);
             }
@@ -828,6 +893,13 @@ impl World {
     async fn client(self: Arc<Self>, client: usize) {
         if self.cfg.secrets.is_some() {
             return self.secret_client(client).await;
+        }
+        if self
+            .cfg
+            .connections
+            .is_some_and(|w| client >= w.first_client)
+        {
+            return self.conn_client(client).await;
         }
         for r in 0..self.cfg.requests_per_client {
             if self
@@ -999,7 +1071,17 @@ impl World {
                 None => self.st().crashes < self.cfg.max_crashes,
             };
             if crash && self.st().clients_done < self.cfg.clients {
-                self.crash();
+                // The connections workload also stops the node gracefully.
+                if fatal.is_none()
+                    && self
+                        .cfg
+                        .connections
+                        .is_some_and(|w| self.faults.chance(w.graceful_p))
+                {
+                    self.stop_gracefully().await;
+                } else {
+                    self.crash();
+                }
                 let d = self
                     .faults
                     .duration(Duration::from_millis(1), Duration::from_millis(100));
@@ -1010,6 +1092,21 @@ impl World {
                 self.crash();
                 self.start_node();
             }
+        }
+        if self.cfg.connections.is_some() {
+            // C1: every client has left, so the hub empties; then the node
+            // restarts, and the start closes what is still open.
+            self.conn_settle().await;
+            if self
+                .cfg
+                .connections
+                .is_some_and(|w| self.faults.chance(w.graceful_p))
+            {
+                self.stop_gracefully().await;
+            } else {
+                self.crash();
+            }
+            self.start_node();
         }
         self.finish(&mut fatal_rx).await;
         self.st().finished = true;
@@ -1080,6 +1177,7 @@ impl World {
         self.check_no_open_turns(&node).await;
         self.check_effects(&node).await;
         self.check_secrets(&node).await;
+        self.check_connections(&node).await;
         let turns = node
             .probe
             .turns_run
@@ -1143,6 +1241,11 @@ impl World {
                 drop(db);
                 return self.violation(line);
             }
+        }
+        // The connections workload makes frame turns fail on purpose; it
+        // checks its dead letters itself (check_connections).
+        if self.cfg.connections.is_some() {
+            return;
         }
         match db.dead_letters(0, 10) {
             Ok(d) if d.is_empty() => {}
@@ -1416,6 +1519,7 @@ impl World {
             };
             if t.outcome.as_ref().map(|o| o.kind) != Some(pb::OutcomeKind::Committed as i32)
                 && !self.expected_failure(t)
+                && !self.expected_connection_failure(t)
             {
                 self.violation(format!("failed turn at lsn {}: {:?}", c.lsn, t.outcome));
             }
@@ -1500,6 +1604,13 @@ fn derived_state(store: &Store) -> Result<String, String> {
     for (table, cols) in [
         ("open_turns", "execution_id, lsn, kind, key"),
         ("open_effects", "execution_id, ordinal"),
+        // M24: closed connections, derived from the log like `connections`
+        // (in the state hash), but outside the hash (C7).
+        (
+            "connection_history",
+            "id, kind, key, protocol, route, subject, opened_lsn, closing_lsn, closed_lsn, \
+             cause, code, frames_in, next_seq, frames_written, restart_after_lsn",
+        ),
     ] {
         let mut st = db
             .conn()

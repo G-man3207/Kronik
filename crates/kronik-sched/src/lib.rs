@@ -131,6 +131,13 @@ pub struct NodeConfig {
     pub test_max_record_bytes: Option<u32>,
     /// `[connections]` (M24): the hub's caps and transport settings.
     pub connections: connections::ConnectionsConfig,
+    /// Deliberate bug, for mutation testing of the DST harness (M24 §14,
+    /// `--mutation deliver-before-fsync`): a turn's buffered connection
+    /// operations go to the hub before its record is appended, so a client
+    /// can get a frame whose record is not durable, or never will be. The
+    /// DST property C3 must catch it.
+    #[doc(hidden)]
+    pub mutation_deliver_before_fsync: bool,
 }
 
 impl Default for NodeConfig {
@@ -157,6 +164,7 @@ impl Default for NodeConfig {
             startup_apply_batch: 131_072,
             test_max_record_bytes: None,
             connections: connections::ConnectionsConfig::default(),
+            mutation_deliver_before_fsync: false,
         }
     }
 }

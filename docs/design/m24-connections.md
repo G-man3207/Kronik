@@ -1634,6 +1634,27 @@ part of `--scenario all`:
 (`--mutation deliver-before-fsync`) must make C3 fail for some seeds, as
 `ack-before-fsync` does for the counter.
 
+**Implementation** (`crates/kronik-sim/src/scenario/connections.rs`). A
+task of the node serves each open with `Gateway::open_connection`; a client
+that gives up during the open makes it drop the open, as hyper drops the
+service future. An accepted connection gets a `SimTransport`: a writer task
+moves the hub's frames into a bounded simulated socket buffer (256 bytes to
+64 KiB) and reports them written, a reader task hands the client's frames
+to `Hub::incoming` one at a time, and the client reads the buffer at its
+own pace or stops. A crash drops both tasks, and the client sees a reset;
+the executor starts no task of a killed node, so no destructor of a dead
+node reaches the log. C3 and C6 are checked as each frame enters the
+socket, against the durable bytes of the log's segments on the simulated
+disk; C1, C2, C4 and C5 at the end, from the log, after a final restart;
+C7 by every start's recovery check (`connection_history` included); C8 on
+every 10th seed (`--identity-replay`: every seed, as nightly). Until slice
+8 lands, the clients ask for no `send-now` frames (`SEND_NOW` in the
+workload); C5 already checks the log's `connection.send-now` effects and
+resolves the frames that no durable record held. `scripts/ci.sh dst` also
+runs `--seeds 0..20 --scenario connections --mutation deliver-before-fsync
+--expect-violation C3`, which passes only when C3 catches the mutation;
+the long run mixes three connection clients with its counter clients.
+
 ## 15. SDKs
 
 The same API in four languages, in the style of the M15 table

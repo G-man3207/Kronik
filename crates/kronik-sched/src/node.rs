@@ -2496,6 +2496,12 @@ impl Node {
                 kronik_proto::sealables::outcome_mut(Some(&mut outcome), f);
             });
         }
+        // Mutation testing of the DST harness only (M24 §14): the frames go
+        // out before the record is even appended. DST's C3 must catch it.
+        let delivered_early = self.cfg.mutation_deliver_before_fsync && !connection_ops.is_empty();
+        if delivered_early {
+            self.hub.deliver(actor, &connection_ops);
+        }
         let lsn = self.commit_origin(record, completion).await;
         drop(fence);
         let lsn = lsn?;
@@ -2510,7 +2516,7 @@ impl Node {
         {
             self.hub.settle_open(actor, c, &outcome);
         }
-        if !connection_ops.is_empty() {
+        if !connection_ops.is_empty() && !delivered_early {
             self.hub.deliver(actor, &connection_ops);
         }
         for m in messages {
