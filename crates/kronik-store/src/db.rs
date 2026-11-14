@@ -1647,6 +1647,19 @@ impl StateDb {
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+    /// Every subject with an applied `Erasure` record: the last key version
+    /// it erased and the record's LSN. A value of the subject recorded at a
+    /// lower LSN predates the erasure (docs/design/m8-privacy.md §6.8).
+    pub fn erasure_records(&self) -> Result<Vec<(String, u32, Lsn)>, StoreError> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT subject, key_version, lsn FROM erasures")?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as Lsn))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// The earliest applied erasure's LSN, if any. `pick_base` will not go
     /// back past it (docs/design/m8-privacy.md §6.6).
     pub fn erasure_floor(&self) -> Result<Option<Lsn>, StoreError> {
@@ -1663,13 +1676,23 @@ impl StateDb {
     /// (`timers`, `mailbox`), saved ingress and call responses, dead-letter
     /// inputs. A row is updated only when its `lsn` is still the turn's, so
     /// a later write is left; rows an erasure deleted or tombstoned stay so.
+    /// `effects`: the rewritten effect results (execution id, effect), whose
+    /// copies in `open_effects` a turn still open would hand to its guest
+    /// on a re-run.
     pub fn fix_reseal(
         &mut self,
         segment: Lsn,
         offsets: &[(Lsn, u64)],
         turns: &[(Lsn, pb::TurnRecord)],
+        effects: &[(String, pb::EffectRecord)],
     ) -> Result<(), StoreError> {
         let tx = self.conn.transaction()?;
+        for (execution_id, effect) in effects {
+            tx.execute(
+                "UPDATE open_effects SET record = ?3 WHERE execution_id = ?1 AND ordinal = ?2",
+                params![execution_id, effect.ordinal as i64, effect.encode_to_vec()],
+            )?;
+        }
         for (lsn, offset) in offsets {
             tx.execute(
                 "UPDATE turn_index SET offset = ?1 WHERE lsn = ?2 AND segment = ?3",
@@ -2593,14 +2616,10 @@ fn erased_call_outcome() -> Vec<u8> {
 }
 
 /// What a queued value of an erased subject becomes: a tombstone of its
-/// erased key version that opens as erased whatever the keystore holds (an
-/// empty nonce and ciphertext; reseal keeps it as its own tombstone).
+/// erased key version that opens as erased whatever the keystore holds
+/// ([`kronik_privacy::sealer::erased_value`]; reseal keeps it as it is).
 fn erased_value(key_version: u32) -> pb::sealable::Value {
-    pb::sealable::Value::Sealed(pb::Sealed {
-        key_version,
-        nonce: Vec::new(),
-        ciphertext: Vec::new(),
-    })
+    pb::sealable::Value::Sealed(kronik_privacy::sealer::erased_value(key_version))
 }
 
 /// Replaces every value of `subject` with [`erased_value`]; whether any was.
@@ -2624,7 +2643,9 @@ fn tombstone(subject: &str, key_version: u32) -> impl FnMut(&mut pb::Sealable) -
 /// plain, and nothing else would stop them) become tombstones: the row
 /// stays, so its turn still runs, meets an erased input and becomes a
 /// `SUBJECT_ERASED` dead letter instead of handing the value to the guest
-/// and sealing it again under a new key version (issue #31).
+/// and sealing it again under a new key version (issue #31). So do the
+/// subject's values in the recorded effects of turns still open, which a
+/// re-run would hand to its guest.
 fn erase_rows(tx: &Connection, subject: &str, key_version: u32) -> Result<(), StoreError> {
     for sql in [
         "DELETE FROM kv WHERE subject = ?1",
@@ -2662,6 +2683,21 @@ fn erase_rows(tx: &Connection, subject: &str, key_version: u32) -> Result<(), St
         if hit {
             tx.prepare_cached("UPDATE mailbox SET input = ?2 WHERE message_id = ?1")?
                 .execute(params![id, input.encode_to_vec()])?;
+        }
+    }
+    let recorded: Vec<(String, i64, Vec<u8>)> = tx
+        .prepare_cached("SELECT execution_id, ordinal, record FROM open_effects")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    for (id, ordinal, bytes) in recorded {
+        let mut effect: pb::EffectRecord = decode(&bytes, "open effect")?;
+        let mut hit = false;
+        kronik_proto::sealables::effect_mut(&mut effect, &mut |s| hit |= f(s));
+        if hit {
+            tx.prepare_cached(
+                "UPDATE open_effects SET record = ?3 WHERE execution_id = ?1 AND ordinal = ?2",
+            )?
+            .execute(params![id, ordinal, effect.encode_to_vec()])?;
         }
     }
     Ok(())
@@ -4573,7 +4609,7 @@ mod tests {
                 s.value = Some(pb::sealable::Value::Sealed(sealed.clone()));
             }
         });
-        db.fix_reseal(0, &[], &[(1, resealed)]).unwrap();
+        db.fix_reseal(0, &[], &[(1, resealed)], &[]).unwrap();
         let (timer, mail) = queued(&db);
         for v in [&timer, &mail] {
             assert_eq!(
@@ -4626,6 +4662,67 @@ mod tests {
             matches!(opened, kronik_privacy::sealer::Opened::Erased { .. }),
             "{opened:?}"
         );
+    }
+
+    /// Issue #72: the recorded effects of a turn still open hold a plain
+    /// value of a subject (privacy mode off). An erasure tombstones it in
+    /// `open_effects`, so a re-run cannot hand it to the guest, and a reseal
+    /// that rewrites the effect result rewrites the row too.
+    #[test]
+    fn open_effects_are_erased_and_resealed() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut db = StateDb::open(conn).unwrap();
+        let effect = |subject: &str, ordinal: u32| pb::EffectRecord {
+            ordinal,
+            kind: "http.fetch".into(),
+            response: tagged(subject, "NEEDLE"),
+            ..Default::default()
+        };
+        let result = |exec: &str, e: pb::EffectRecord| {
+            Record::EffectResult(pb::EffectResult {
+                execution_id: exec.into(),
+                effect: Some(e),
+            })
+        };
+        db.apply(&[
+            committed(1, begin("e1", "r1", message_input())),
+            committed(2, result("e1", effect("user:1", 1))),
+            committed(3, result("e1", effect("user:2", 2))),
+        ])
+        .unwrap();
+        assert_eq!(
+            plain_subjects(&db.conn).unwrap(),
+            ["user:1".to_owned(), "user:2".to_owned()].into()
+        );
+        // Reseal rewrites user:2's effect result.
+        let mut resealed = effect("user:2", 2);
+        let sealed = pb::Sealed {
+            key_version: 1,
+            nonce: vec![1; 24],
+            ciphertext: vec![2; 8],
+        };
+        resealed.response.as_mut().unwrap().value =
+            Some(pb::sealable::Value::Sealed(sealed.clone()));
+        db.fix_reseal(0, &[], &[], &[("e1".to_owned(), resealed)])
+            .unwrap();
+        // Erasing user:1 tombstones its recorded value.
+        db.apply(&[committed(
+            4,
+            Record::Erasure(pb::Erasure {
+                subject: "user:1".into(),
+                key_version: 0,
+                ..Default::default()
+            }),
+        )])
+        .unwrap();
+        let rows = db.open_effects("e1").unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|e| e.response.as_ref().unwrap().value.clone().unwrap())
+                .collect::<Vec<_>>(),
+            [erased_value(0), pb::sealable::Value::Sealed(sealed)]
+        );
+        assert!(plain_subjects(&db.conn).unwrap().is_empty());
     }
 
     fn timer_or(sealed: &pb::Sealed) -> pb::Sealable {

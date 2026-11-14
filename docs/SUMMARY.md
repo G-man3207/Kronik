@@ -123,6 +123,7 @@
 - [ADR 0120: Collecting blobs: roots, leases and a two-phase sweep](adr/0120-blob-gc-roots-and-leases.md)
 - [ADR 0121: Reading and writing blobs on WASI 0.2, and the path to WASI 0.3](adr/0121-blob-interface-and-wasi-0-3.md)
 - [ADR 0122: Shipping and restoring blobs](adr/0122-shipping-and-restoring-blobs.md)
+- [ADR 0123: An erasure stops the plaintext already in flight](adr/0123-erasure-stops-plaintext-in-flight.md)
 - [ADR 0130: A turn's record fits in one log record](adr/0130-one-log-record-per-turn.md)
 - [ADR 0131: Retention keeps a base for the whole history window](adr/0131-retention-keeps-a-base-for-the-window.md)
 - [ADR 0134: Per-kind HTTP fingerprint rules](adr/0134-per-kind-http-fingerprint-rules.md)

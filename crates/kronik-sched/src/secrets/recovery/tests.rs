@@ -654,7 +654,12 @@ async fn terminal_failure_preserves_original_identity_and_effects_without_runnin
     let positions = persist(&node, &begin, &effects).await;
     let source_before = record(&node, positions[0]).await.encode();
     let result = node
-        .fail_recorded_secret(begin.clone(), effects.clone(), ErrorCode::SecretVersionGone)
+        .fail_recorded_secret(
+            begin.clone(),
+            effects.clone(),
+            ErrorCode::SecretVersionGone,
+            crate::erasure::Born::Gen(0),
+        )
         .await
         .unwrap();
     let Record::TurnRecord(terminal) = record(&node, result.turn_id.lsn).await else {
@@ -696,10 +701,15 @@ async fn transient_failure_cannot_be_committed_as_a_new_terminal_guest_outcome()
     persist(&node, &begin, &[]).await;
     let before = node.applied_lsn();
     assert_eq!(
-        node.fail_recorded_secret(begin, Vec::new(), ErrorCode::SecretUnavailable)
-            .await
-            .unwrap_err()
-            .code,
+        node.fail_recorded_secret(
+            begin,
+            Vec::new(),
+            ErrorCode::SecretUnavailable,
+            crate::erasure::Born::Gen(0)
+        )
+        .await
+        .unwrap_err()
+        .code,
         ErrorCode::Internal
     );
     assert_eq!(node.applied_lsn(), before);
@@ -719,7 +729,8 @@ async fn unreadable_or_malformed_successful_call_never_silently_drops_compensati
         node.fail_recorded_secret(
             begin.clone(),
             vec![effect.clone()],
-            ErrorCode::SecretVersionGone
+            ErrorCode::SecretVersionGone,
+            crate::erasure::Born::Gen(0),
         )
         .await
         .unwrap_err()
@@ -735,10 +746,15 @@ async fn unreadable_or_malformed_successful_call_never_silently_drops_compensati
         })),
     });
     assert_eq!(
-        node.fail_recorded_secret(begin, vec![effect], ErrorCode::SecretVersionGone)
-            .await
-            .unwrap_err()
-            .code,
+        node.fail_recorded_secret(
+            begin,
+            vec![effect],
+            ErrorCode::SecretVersionGone,
+            crate::erasure::Born::Gen(0)
+        )
+        .await
+        .unwrap_err()
+        .code,
         ErrorCode::SecretUnavailable
     );
     assert_eq!(node.applied_lsn(), before);
@@ -793,6 +809,7 @@ fn terminal_compensation_is_durable_before_dispatch_and_survives_restart_exactly
                     begin.clone(),
                     vec![effect.clone()],
                     ErrorCode::SecretVersionGone,
+                    crate::erasure::Born::Gen(0),
                 )
                 .await
                 .unwrap();
@@ -883,7 +900,12 @@ async fn current_privacy_seals_only_the_new_copy_without_rewriting_recorded_logi
     .await
     .unwrap();
     let result = node
-        .fail_recorded_secret(begin, vec![effect.clone()], ErrorCode::SecretVersionGone)
+        .fail_recorded_secret(
+            begin,
+            vec![effect.clone()],
+            ErrorCode::SecretVersionGone,
+            crate::erasure::Born::Gen(0),
+        )
         .await
         .unwrap();
     let Record::TurnRecord(terminal) = record(&node, result.turn_id.lsn).await else {
@@ -923,7 +945,12 @@ async fn only_successful_calls_with_a_recorded_compensation_generate_a_message()
     let effects = vec![successful, failed];
     persist(&node, &begin, &effects).await;
     let result = node
-        .fail_recorded_secret(begin, effects.clone(), ErrorCode::SecretVersionGone)
+        .fail_recorded_secret(
+            begin,
+            effects.clone(),
+            ErrorCode::SecretVersionGone,
+            crate::erasure::Born::Gen(0),
+        )
         .await
         .unwrap();
     let Record::TurnRecord(terminal) = record(&node, result.turn_id.lsn).await else {

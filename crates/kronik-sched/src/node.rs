@@ -25,6 +25,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::effects::{Gate, TurnFx, TurnSpec};
+use crate::erasure::Born;
 use crate::host::{KvView, SqlHandle, SqlTurn};
 use crate::timers::Wheel;
 use crate::{NodeConfig, TurnResult};
@@ -188,6 +189,21 @@ struct Kind {
 
 type Reply = oneshot::Sender<Result<TurnResult, ApiError>>;
 
+/// The erasure fence held by an erasure (crate::erasure).
+pub(crate) struct ErasureFence(#[allow(dead_code)] tokio::sync::OwnedRwLockWriteGuard<()>);
+
+/// A turn that runs, registered with its provenance (crate::erasure).
+struct RunningTurn<'a> {
+    node: &'a Node,
+    id: u64,
+}
+
+impl Drop for RunningTurn<'_> {
+    fn drop(&mut self) {
+        lock(&self.node.running_born).remove(&self.id);
+    }
+}
+
 struct Job {
     input: pb::Input,
     causal_key: pb::CausalKey,
@@ -196,6 +212,9 @@ struct Job {
     reply: Option<Reply>,
     rerun: Option<Rerun>,
     origin: OperationOrigin,
+    /// Where the input's values came from: a value of a subject erased
+    /// since then never reaches the guest (crate::erasure).
+    born: Born,
 }
 
 impl Job {
@@ -393,6 +412,16 @@ pub struct Node {
     /// Follows the latest `PrivacyMode` record (set at start and by
     /// `set_privacy_mode`).
     pub(crate) sealer: Arc<Sealer>,
+    /// The erasures queued work may predate (crate::erasure).
+    pub(crate) erasure_marks: Mutex<crate::erasure::Marks>,
+    /// The erasure fence (crate::erasure): sealing a turn's record and
+    /// appending it take it shared; an erasure takes it exclusively from
+    /// before its keys go until its record is applied.
+    pub(crate) erase_lock: Arc<tokio::sync::RwLock<()>>,
+    /// The provenance of every turn that runs (crate::erasure): an erasure
+    /// stays pending while a turn that may hold its subject's values runs.
+    running_born: Mutex<HashMap<u64, Born>>,
+    next_running: AtomicU64,
     /// The sandboxes behind `foreign://` (docs/design/m7-foreign.md).
     pub(crate) foreign: Option<Arc<dyn kronik_effects::foreign::ForeignHost>>,
     pub(crate) rates: RateLimiter,
@@ -736,7 +765,7 @@ impl Node {
             None => None,
         };
 
-        let (hwm, epoch, kind_rows, mailbox, config_records, open_turns, timers) = {
+        let (hwm, epoch, kind_rows, mailbox, config_records, open_turns, timers, erasures) = {
             let db = store.db();
             (
                 db.time_hwm()?,
@@ -746,8 +775,25 @@ impl Node {
                 db.config_records()?,
                 db.open_turns()?,
                 db.timers(None)?,
+                db.erasure_records()?,
             )
         };
+        // Erasures the keystore made but the log has no record of yet (a stop
+        // between the two steps; recover_erasures commits the record below):
+        // until then, every value of the subject that was read back predates
+        // its erasure (crate::erasure).
+        let unrecorded: Vec<(String, u32)> = sealer
+            .erasures()
+            .map_err(|e| StartError::Erasure(format!("keystore: {e}")))?
+            .into_iter()
+            .filter(|k| {
+                !erasures.iter().any(|(subject, version, _)| {
+                    *subject == k.subject && *version >= k.last_version
+                })
+            })
+            .map(|k| (k.subject, k.last_version))
+            .collect();
+        let erasure_marks = crate::erasure::Marks::load(erasures, unrecorded);
         let mut history = ConfigHistory::default().with_sql_default(config.sql_bytes_per_actor);
         for r in config_records {
             history.push(r);
@@ -775,7 +821,7 @@ impl Node {
                 )));
             };
             let recorded = store.db().open_effects(&t.execution_id)?;
-            reruns.push((t.actor, begin, recorded));
+            reruns.push((t.actor, begin, recorded, t.lsn));
         }
         let mut kinds = BTreeMap::new();
         for row in kind_rows {
@@ -832,6 +878,10 @@ impl Node {
             publication,
             lifecycle,
             sealer: sealer.clone(),
+            erasure_marks: Mutex::new(erasure_marks),
+            erase_lock: Arc::new(tokio::sync::RwLock::new(())),
+            running_born: Mutex::new(HashMap::new()),
+            next_running: AtomicU64::new(0),
             rates: RateLimiter::starting_full(env.clock.monotonic()),
             wheel: Mutex::new(Wheel::default()),
             wheel_notify: Arc::new(Notify::new()),
@@ -920,7 +970,7 @@ impl Node {
         // entry is skipped and its ingress key joins the re-run.
         let mut rerun_messages = HashSet::new();
         let rerun_count = reruns.len();
-        for (actor, begin, recorded) in reruns {
+        for (actor, begin, recorded, begun_at) in reruns {
             let input = begin.input.clone().unwrap_or_default();
             let mut reply = None;
             let mut subject = None;
@@ -956,6 +1006,7 @@ impl Node {
                     reply,
                     rerun: Some(Rerun { begin, recorded }),
                     origin: OperationOrigin::Internal,
+                    born: Born::Lsn(begun_at),
                 },
             );
         }
@@ -1144,6 +1195,7 @@ impl Node {
             };
             let retry_begin = job.rerun.as_ref().map(|rerun| rerun.begin.clone());
             let retry_subject = job.subject.clone();
+            let born = job.born;
             let mut result = self
                 .run_job(
                     &actor,
@@ -1153,6 +1205,7 @@ impl Node {
                     job.subject,
                     job.rerun,
                     job.origin,
+                    born,
                 )
                 .await;
             if let Some(begin) = retry_begin {
@@ -1212,6 +1265,7 @@ impl Node {
                                 recorded,
                             }),
                             OperationOrigin::Internal,
+                            born,
                         )
                         .await;
                 }
@@ -1280,6 +1334,7 @@ impl Node {
                 reply: None,
                 rerun: None,
                 origin: OperationOrigin::Internal,
+                born: Born::Lsn(row.lsn),
             },
         );
     }
@@ -1464,12 +1519,13 @@ impl Node {
     async fn run_job(
         &self,
         actor: &ActorRef,
-        input: pb::Input,
+        mut input: pb::Input,
         key: pb::CausalKey,
         parent_time: u64,
         subject: Option<String>,
-        rerun: Option<Rerun>,
+        mut rerun: Option<Rerun>,
         origin: OperationOrigin,
+        born: Born,
     ) -> Result<TurnResult, ApiError> {
         origin.check()?;
         if let Some(f) = self.fatal() {
@@ -1541,6 +1597,9 @@ impl Node {
         let (kind, mut epoch) = self.start_code(&actor.kind, &origin).await?;
         let Some(mut kind) = kind else {
             let message = format!("no deployed kind {:?}", actor.kind);
+            // What the failed record holds of an erased subject is its
+            // tombstone, never plaintext sealed again (crate::erasure).
+            self.tombstone_predating(&mut input, rerun.as_mut(), born);
             // An open turn is closed under its own execution id, or its
             // open_turns row would outlive the failure and the next start
             // would run it again (and it would keep the log from compaction).
@@ -1552,6 +1611,7 @@ impl Node {
                         ErrorCode::ActorNotFound,
                         message,
                         true,
+                        born,
                     )
                     .await
                 }
@@ -1566,18 +1626,35 @@ impl Node {
                         ErrorCode::ActorNotFound,
                         message,
                         origin.clone(),
+                        born,
                     )
                     .await
                 }
             };
         };
+        // The turn's own provenance, taken before its input is checked: an
+        // erasure that begins after the check finds everything the turn holds
+        // predating it (crate::erasure). The turn counts for `privacy status`
+        // while it runs.
+        let turn_born = self.born_now();
+        let _running = self.running_turn(turn_born);
         // The guest gets plaintext; an input of an erased subject can't run
-        // (docs/design/m8-privacy.md §5).
-        if let Err(e) = self.check_input(&input) {
-            let (code, message) = Node::unreadable_input(&e);
+        // (docs/design/m8-privacy.md §5), and neither can one holding a value,
+        // plain or sealed, of a subject erased since the input came in (§6.8):
+        // a re-run's recorded effects count as its input.
+        let refused = match self.check_input(&input) {
+            Err(e) => Some(Node::unreadable_input(&e)),
+            Ok(()) if self.predates_erasure(&mut input, rerun.as_mut(), born) => Some((
+                ErrorCode::SubjectErased,
+                "the input belongs to an erased subject".to_owned(),
+            )),
+            Ok(()) => None,
+        };
+        if let Some((code, message)) = refused {
+            self.tombstone_predating(&mut input, rerun.as_mut(), born);
             return match rerun {
                 Some(r) => {
-                    self.close_open_turn(r.begin, r.recorded, code, message, true)
+                    self.close_open_turn(r.begin, r.recorded, code, message, true, born)
                         .await
                 }
                 None => {
@@ -1591,11 +1668,15 @@ impl Node {
                         code,
                         message,
                         origin.clone(),
+                        born,
                     )
                     .await
                 }
             };
         }
+        // What the turn records, sends and calls with is sealed against its
+        // own provenance from here on (crate::erasure).
+        let born = turn_born;
         let actor_version = || -> Result<u32, ApiError> {
             Ok(self
                 .store
@@ -1629,6 +1710,7 @@ impl Node {
                     epoch,
                     Some(r),
                     origin.clone(),
+                    born,
                 )
                 .await;
         }
@@ -1661,6 +1743,7 @@ impl Node {
                     epoch,
                     None,
                     origin.clone(),
+                    born,
                 )
                 .await?;
             if !r.committed() {
@@ -1678,6 +1761,7 @@ impl Node {
                             r.turn_id
                         ),
                         origin.clone(),
+                        born,
                     )
                     .await;
             }
@@ -1703,6 +1787,7 @@ impl Node {
             epoch,
             None,
             origin,
+            born,
         )
         .await
     }
@@ -1758,6 +1843,7 @@ impl Node {
         epoch: u64,
         rerun: Option<Rerun>,
         origin: OperationOrigin,
+        born: Born,
     ) -> Result<TurnResult, ApiError> {
         origin.check()?;
         let original_execution = match &origin {
@@ -1792,7 +1878,7 @@ impl Node {
                     {
                         if error.code == ErrorCode::SecretVersionGone {
                             return self
-                                .fail_recorded_secret(r.begin, r.recorded, error.code)
+                                .fail_recorded_secret(r.begin, r.recorded, error.code, born)
                                 .await;
                         }
                         return Err(error);
@@ -1897,6 +1983,7 @@ impl Node {
                          run again"
                     ),
                     false,
+                    born,
                 )
                 .await;
         }
@@ -1925,6 +2012,7 @@ impl Node {
                 }),
                 recorded,
                 origin: origin.clone(),
+                born,
             },
             original_execution,
         );
@@ -2011,6 +2099,7 @@ impl Node {
                         fx.admitted_begin().clone(),
                         canonical,
                         ErrorCode::SecretVersionGone,
+                        born,
                     )
                     .await;
             }
@@ -2192,7 +2281,7 @@ impl Node {
         }
         let outcome = record.outcome.clone().unwrap_or_default();
         let committed = outcome.kind == pb::OutcomeKind::Committed as i32;
-        let messages = if committed {
+        let mut messages = if committed {
             record.messages.clone()
         } else {
             Vec::new()
@@ -2208,17 +2297,24 @@ impl Node {
         } else {
             origin
         };
-        let lsn = self
-            .commit_origin(Record::TurnRecord(record), completion)
-            .await?;
+        // An erasure that began while the turn ran: its values of the subject
+        // become tombstones, in the record and in what it sends (§6.8).
+        let mut record = Record::TurnRecord(record);
+        let fence = self.seal_born(&mut record, born).await?;
+        self.tombstone_outbound(&mut messages, born);
+        let mut compensations = fxs.compensations;
+        self.tombstone_outbound(&mut compensations, born);
+        let lsn = self.commit_origin(record, completion).await;
+        drop(fence);
+        let lsn = lsn?;
         if authorized {
             Self::observe_turn(&actor.kind, Some(&outcome));
         }
         for m in messages {
-            self.deliver(actor, &key, time, m, pb::MessageSource::Actor, "");
+            self.deliver(actor, &key, time, m, pb::MessageSource::Actor, "", born);
         }
         if !committed {
-            for m in fxs.compensations {
+            for m in compensations {
                 let compensates = causal::message_id(&key, m.ordinal);
                 // A timed-out call's compensation goes out only once its
                 // callee's turn commits (#30): now if that turn came first,
@@ -2235,6 +2331,7 @@ impl Node {
                     m,
                     pb::MessageSource::Compensation,
                     &compensates,
+                    born,
                 );
             }
         }
@@ -2268,6 +2365,179 @@ impl Node {
         })
     }
 
+    /// How many jobs wait in `actor`'s queue (tests).
+    #[cfg(test)]
+    pub(crate) fn queued_jobs(&self, actor: &ActorRef) -> usize {
+        lock(&self.actors)
+            .get(actor)
+            .map_or(0, |slot| slot.queue.len())
+    }
+
+    /// What a value the node takes in now is born at (crate::erasure).
+    pub(crate) fn born_now(&self) -> Born {
+        lock(&self.erasure_marks).now()
+    }
+
+    /// Deletes `subject`'s keys with `erase` (the keystore's erasure) behind
+    /// the erasure fence: what the node holds from before is marked as
+    /// predating the erasure, and the mark goes again when the keystore
+    /// refuses. The fence returned is held until the `Erasure` record is
+    /// applied ([`Node::commit_erasure`]).
+    pub(crate) async fn erase_keys(
+        &self,
+        subject: &str,
+        erase: impl FnOnce() -> Result<u32, ApiError>,
+    ) -> Result<(u32, ErasureFence), ApiError> {
+        let fence = ErasureFence(self.erase_lock.clone().write_owned().await);
+        let undo = lock(&self.erasure_marks).begin(subject);
+        match erase() {
+            Ok(key_version) => {
+                lock(&self.erasure_marks).keys_erased(subject, key_version);
+                Ok((key_version, fence))
+            }
+            Err(error) => {
+                lock(&self.erasure_marks).undo(undo);
+                Err(error)
+            }
+        }
+    }
+
+    /// Seals a record a turn writes, whose values came from `born`: a value
+    /// of a subject erased since then becomes that erasure's tombstone
+    /// instead of being sealed under a key version newer than the erased
+    /// ones; the rest is sealed as [`Node::seal`] does (crate::erasure).
+    /// Hold the guard until the record is appended: no erasure begins in
+    /// between, so the record lands before the `Erasure` record or knows of
+    /// it.
+    pub(crate) async fn seal_born(
+        &self,
+        record: &mut Record,
+        born: Born,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, ApiError> {
+        let fence = self.erase_lock.read().await;
+        lock(&self.erasure_marks).tombstone(born, |f| {
+            kronik_proto::sealables::record_mut(record, &mut *f);
+        });
+        self.seal(record)?;
+        Ok(fence)
+    }
+
+    /// Registers a turn that runs with values born at `born` until the guard
+    /// drops (crate::erasure).
+    fn running_turn(&self, born: Born) -> RunningTurn<'_> {
+        let id = self.next_running.fetch_add(1, Ordering::Relaxed);
+        lock(&self.running_born).insert(id, born);
+        RunningTurn { node: self, id }
+    }
+
+    /// The erased subjects a running turn may still hold values of: it began
+    /// before their erasure was applied.
+    pub(crate) fn running_predating(&self) -> std::collections::BTreeSet<String> {
+        let born: Vec<Born> = lock(&self.running_born).values().copied().collect();
+        let marks = lock(&self.erasure_marks);
+        born.into_iter()
+            .flat_map(|b| marks.erased_after(b).cloned().collect::<Vec<_>>())
+            .collect()
+    }
+
+    /// Tombstones the values of messages a turn sends that predate an
+    /// erasure, before they are queued in memory.
+    pub(crate) fn tombstone_outbound(&self, messages: &mut [pb::OutboundMessage], born: Born) {
+        lock(&self.erasure_marks).tombstone(born, |f| {
+            for m in messages.iter_mut() {
+                kronik_proto::sealables::message_mut(m.msg.as_mut(), &mut *f);
+            }
+        });
+    }
+
+    /// The `Erasure` record of `subject` is applied at `lsn`: queued inputs
+    /// lose their values of the subject from before it to its tombstones,
+    /// so no plaintext of it stays in this process's queues.
+    pub(crate) fn erasure_applied(&self, subject: &str, key_version: u32, lsn: Lsn) {
+        let marks = {
+            let mut marks = lock(&self.erasure_marks);
+            marks.recorded(subject, key_version, lsn);
+            marks.clone()
+        };
+        let mut actors = lock(&self.actors);
+        for slot in actors.values_mut() {
+            for job in slot.queue.iter_mut() {
+                let born = job.born;
+                marks.tombstone(born, |f| {
+                    kronik_proto::sealables::input_mut(Some(&mut job.input), &mut *f);
+                    if let Some(r) = job.rerun.as_mut() {
+                        kronik_proto::sealables::input_mut(r.begin.input.as_mut(), &mut *f);
+                        for e in &mut r.recorded {
+                            kronik_proto::sealables::effect_mut(e, &mut *f);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    /// Whether `input`, or a re-run's begin and recorded effects, hold a
+    /// value of a subject erased since `born` (crate::erasure).
+    fn predates_erasure(
+        &self,
+        input: &mut pb::Input,
+        rerun: Option<&mut Rerun>,
+        born: Born,
+    ) -> bool {
+        lock(&self.erasure_marks).any_predating(born, |f| {
+            kronik_proto::sealables::input_mut(Some(input), &mut *f);
+            if let Some(r) = rerun {
+                kronik_proto::sealables::input_mut(r.begin.input.as_mut(), &mut *f);
+                for e in &mut r.recorded {
+                    kronik_proto::sealables::effect_mut(e, &mut *f);
+                }
+            }
+        })
+    }
+
+    /// Replaces what [`Node::predates_erasure`] finds with the erasures'
+    /// tombstones: a failed record keeps them, never the plaintext sealed
+    /// again under a key version newer than the erasure.
+    fn tombstone_predating(&self, input: &mut pb::Input, rerun: Option<&mut Rerun>, born: Born) {
+        lock(&self.erasure_marks).tombstone(born, |f| {
+            kronik_proto::sealables::input_mut(Some(input), &mut *f);
+            if let Some(r) = rerun {
+                kronik_proto::sealables::input_mut(r.begin.input.as_mut(), &mut *f);
+                for e in &mut r.recorded {
+                    kronik_proto::sealables::effect_mut(e, &mut *f);
+                }
+            }
+        });
+    }
+
+    /// The erased subjects with plain values waiting in a queue from before
+    /// their erasure. Their turns fail with `SUBJECT_ERASED` before guest
+    /// code runs, but until then the plaintext is in this process's memory,
+    /// so the erasure is still pending (crate::erasure).
+    pub(crate) fn queued_predating(&self) -> std::collections::BTreeSet<String> {
+        let marks = lock(&self.erasure_marks).clone();
+        let mut out = std::collections::BTreeSet::new();
+        let mut actors = lock(&self.actors);
+        for slot in actors.values_mut() {
+            for job in slot.queue.iter_mut() {
+                let born = job.born;
+                marks.predating_subjects(
+                    born,
+                    |f| {
+                        kronik_proto::sealables::input_mut(Some(&mut job.input), &mut *f);
+                        if let Some(r) = job.rerun.as_mut() {
+                            for e in &mut r.recorded {
+                                kronik_proto::sealables::effect_mut(e, &mut *f);
+                            }
+                        }
+                    },
+                    &mut out,
+                );
+            }
+        }
+        out
+    }
+
     /// Records a failed turn for an input that could not run (no deployed
     /// kind, failed migration), so messages leave the mailbox and appear in
     /// the dead letters and the history. A new input only: an open turn is
@@ -2284,6 +2554,7 @@ impl Node {
         code: ErrorCode,
         message: String,
         origin: OperationOrigin,
+        born: Born,
     ) -> Result<TurnResult, ApiError> {
         origin.check()?;
         let time = self.clock.next(self.env.clock.as_ref(), parent_time);
@@ -2306,9 +2577,11 @@ impl Node {
             ..Default::default()
         };
         let authorized = matches!(&origin, OperationOrigin::Request(_));
-        let lsn = self
-            .commit_origin(Record::TurnRecord(record), origin)
-            .await?;
+        let mut record = Record::TurnRecord(record);
+        let fence = self.seal_born(&mut record, born).await?;
+        let lsn = self.commit_origin(record, origin).await;
+        drop(fence);
+        let lsn = lsn?;
         if authorized {
             Self::observe_turn(&actor.kind, Some(&outcome));
         }
@@ -2524,6 +2797,9 @@ impl Node {
             .map_err(|_| ApiError::new(ErrorCode::Unavailable, "Side-effect worker stopped"))?
     }
 
+    /// Queues a message a turn sent; `born`: where the turn's values came
+    /// from (crate::erasure).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn deliver(
         &self,
         from: &ActorRef,
@@ -2532,6 +2808,7 @@ impl Node {
         m: pb::OutboundMessage,
         source: pb::MessageSource,
         compensates: &str,
+        born: Born,
     ) {
         let Some(to) = m.to.as_ref().map(ActorRef::from_pb) else {
             return;
@@ -2563,6 +2840,7 @@ impl Node {
                 reply: None,
                 rerun: None,
                 origin: OperationOrigin::Internal,
+                born,
             },
         );
     }
@@ -2574,6 +2852,7 @@ impl Node {
         input: pb::Input,
         key: pb::CausalKey,
         time: u64,
+        born: Born,
     ) -> oneshot::Receiver<Result<TurnResult, ApiError>> {
         let subject = match &input.kind {
             Some(pb::input::Kind::Message(m)) => body_subject(m.msg.as_ref()),
@@ -2590,6 +2869,7 @@ impl Node {
                 reply: Some(tx),
                 rerun: None,
                 origin: OperationOrigin::Internal,
+                born,
             },
         );
         rx
@@ -2657,6 +2937,7 @@ impl Node {
                 reply: Some(tx),
                 rerun: None,
                 origin,
+                born: self.born_now(),
             },
         );
         rx
@@ -3831,6 +4112,7 @@ impl Node {
                 reply: None,
                 rerun: None,
                 origin: OperationOrigin::Internal,
+                born: Born::Lsn(row.lsn),
             },
         );
     }
@@ -3867,7 +4149,22 @@ impl Node {
         epoch: u64,
         record: Record,
     ) -> Result<Lsn, ApiError> {
-        self.commit_config_origin(guard, epoch, record, OperationOrigin::Internal)
+        self.commit_config_origin(guard, epoch, record, OperationOrigin::Internal, None)
+            .await
+    }
+
+    /// [`Node::commit_config`] of an `Erasure` record whose keys
+    /// [`Node::erase_keys`] deleted behind `fence`: the fence holds until the
+    /// record is applied, and goes before the snapshot that follows an
+    /// erasure (crate::erasure).
+    pub(crate) async fn commit_erasure(
+        &self,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+        epoch: u64,
+        record: Record,
+        fence: ErasureFence,
+    ) -> Result<Lsn, ApiError> {
+        self.commit_config_origin(guard, epoch, record, OperationOrigin::Internal, Some(fence))
             .await
     }
 
@@ -3878,8 +4175,14 @@ impl Node {
         record: Record,
         authority: AuthLease,
     ) -> Result<Lsn, ApiError> {
-        self.commit_config_origin(guard, epoch, record, OperationOrigin::Request(authority))
-            .await
+        self.commit_config_origin(
+            guard,
+            epoch,
+            record,
+            OperationOrigin::Request(authority),
+            None,
+        )
+        .await
     }
 
     async fn commit_config_origin(
@@ -3888,12 +4191,13 @@ impl Node {
         epoch: u64,
         record: Record,
         origin: OperationOrigin,
+        fence: Option<ErasureFence>,
     ) -> Result<Lsn, ApiError> {
         let node = self
             .me()
             .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
         let task = self.env.spawn("config", async move {
-            node.commit_config_locked(&guard, epoch, record, origin)
+            node.commit_config_locked(&guard, epoch, record, origin, fence)
                 .await
         });
         task.await.unwrap_or_else(|| {
@@ -3906,14 +4210,20 @@ impl Node {
 
     /// Applies one immutable configuration command while its caller retains
     /// the deploy lock, including an already-admitted reseal continuation.
+    /// `fence`: an erasure's (crate::erasure), released once its record is
+    /// applied.
     pub(crate) async fn commit_config_locked(
         &self,
         _guard: &tokio::sync::OwnedMutexGuard<()>,
         epoch: u64,
         record: Record,
         origin: OperationOrigin,
+        fence: Option<ErasureFence>,
     ) -> Result<Lsn, ApiError> {
-        let erasure = matches!(record, Record::Erasure(_));
+        let erasure = match &record {
+            Record::Erasure(e) => Some((e.subject.clone(), e.key_version)),
+            _ => None,
+        };
         let privacy = matches!(record, Record::PrivacyMode(_));
         let mode_changed = matches!(
             &record,
@@ -3949,7 +4259,11 @@ impl Node {
                 .set_on(self.privacy_mode().0 == pb::PrivacyState::On);
         }
         let lsn = committed?;
-        if erasure {
+        if let Some((subject, key_version)) = &erasure {
+            self.erasure_applied(subject, *key_version, lsn);
+        }
+        drop(fence);
+        if erasure.is_some() {
             self.after_erasure(lsn).await?;
         }
         drop(_privacy_gate);

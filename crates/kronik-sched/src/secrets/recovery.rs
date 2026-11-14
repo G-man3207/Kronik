@@ -14,6 +14,7 @@ use kronik_proto::{Record, log::v1 as pb};
 use prost::Message;
 use zeroize::Zeroizing;
 
+use crate::erasure::Born;
 use crate::{Node, TurnResult};
 
 pub(crate) const RETRY_INITIAL: Duration = Duration::from_millis(100);
@@ -237,6 +238,7 @@ impl Node {
         begin: pb::TurnBegin,
         effects: Vec<pb::EffectRecord>,
         code: ErrorCode,
+        born: Born,
     ) -> Result<TurnResult, ApiError> {
         if code != ErrorCode::SecretVersionGone {
             return Err(ApiError::new(
@@ -250,6 +252,7 @@ impl Node {
             code,
             "A secret version that the turn recorded is no longer recoverable".into(),
             false,
+            born,
         )
         .await
     }
@@ -262,7 +265,8 @@ impl Node {
     /// `erased_calls`: a call request of an erased subject cannot be opened,
     /// so whether it had a compensation is gone with it; the call is skipped
     /// instead of refusing the close (the turn's input or kind is gone for
-    /// good, so waiting would keep it open forever).
+    /// good, so waiting would keep it open forever). `born`: where the
+    /// turn's values came from; its compensations carry it (crate::erasure).
     pub(crate) async fn close_open_turn(
         &self,
         begin: pb::TurnBegin,
@@ -270,6 +274,7 @@ impl Node {
         code: ErrorCode,
         message: String,
         erased_calls: bool,
+        born: Born,
     ) -> Result<TurnResult, ApiError> {
         let actor_pb = begin.actor.as_ref().ok_or_else(corrupt)?;
         let actor =
@@ -367,7 +372,12 @@ impl Node {
                  record; the effect results in the log keep them"
             ),
         }
-        let lsn = self.commit(Record::TurnRecord(record)).await?;
+        let mut closing = Record::TurnRecord(record);
+        let fence = self.seal_born(&mut closing, born).await?;
+        self.tombstone_outbound(&mut compensations, born);
+        let lsn = self.commit(closing).await;
+        drop(fence);
+        let lsn = lsn?;
         for message in compensations {
             let compensates = causal::message_id(&key, message.ordinal);
             if timed_out.contains(&message.ordinal)
@@ -382,6 +392,7 @@ impl Node {
                 message,
                 pb::MessageSource::Compensation,
                 &compensates,
+                born,
             );
         }
         Ok(TurnResult {

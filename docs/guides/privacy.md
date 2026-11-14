@@ -227,9 +227,10 @@ The erasure itself:
    request runs anew) and its dead letters. A saved response of a call to
    an actor becomes an erased marker: a repeated call fails with
    `SUBJECT_ERASED` instead of running again. So does the body of each of
-   its pending timers and undelivered messages, also one written in `off`
-   mode: its turn still runs, and fails with `SUBJECT_ERASED` (step 3)
-   instead of handing the value to the actor. The same happens when the
+   its pending timers and undelivered messages, and its values in the
+   recorded effects of a turn still open, also those written in `off` mode:
+   the turn still runs, and fails with `SUBJECT_ERASED` (step 3) instead of
+   handing the value to the actor. The same happens when the
    state is rebuilt from the log, so a rebuild equals the live databases.
    The databases zero deleted rows (`secure_delete`) and their write-ahead
    logs are emptied right after (the keystore's before the record is
@@ -237,9 +238,15 @@ The erasure itself:
    directory's files.
 3. From then on, the subject's sealed values in the log are unreadable for
    everyone, the API shows them as `[erased]`, and its state values read as
-   absent in turns. A queued input of the subject fails its turn with
-   `SUBJECT_ERASED` (a dead letter): the turn can't run on data that no
-   longer exists.
+   absent in turns. An input that held a value of the subject before the
+   erasure - queued, sent by a turn, or waiting in a restart's re-run, plain
+   or sealed - fails its turn with `SUBJECT_ERASED` (a dead letter) before
+   the actor sees it: the turn can't run on data that no longer exists. A
+   turn that was already running finishes, but what it records and sends
+   holds the erased marker in place of the subject's values: nothing from
+   before the erasure is sealed again under a new key. A value of the
+   subject that arrives after the erasure began is new data, sealed under a
+   new key ([ADR 0123](../adr/0123-erasure-stops-plaintext-in-flight.md)).
 
 Other subjects are unaffected, also their values written in the same turn:
 each has its own key, its own changesets and its own rows.
@@ -289,7 +296,9 @@ by default; `kronik serve` applies the file's value), always keeping the newest.
 response is the erase's wall time plus that window. Count the erasure as
 complete when that time has passed and reseal and the snapshot replacement
 are done: `privacy status` counts an erasure as pending while its subject
-still has a plain value in the log or in `state.db`.
+still has a plain value in the log, in `state.db` or in an input still queued
+from before the erasure, and while a turn that began before the erasure
+still runs.
 
 ## Forks without personal data
 

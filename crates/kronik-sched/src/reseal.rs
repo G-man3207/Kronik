@@ -352,7 +352,7 @@ impl Node {
             .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
         self.authorized_effect(authority, move || async move {
             // The exact request and segment set were admitted together.
-            node.commit_config_locked(&held, epoch, request, OperationOrigin::Internal)
+            node.commit_config_locked(&held, epoch, request, OperationOrigin::Internal, None)
                 .await?;
             if todo.is_empty() {
                 return Ok(ResealDone {
@@ -405,6 +405,9 @@ impl Node {
             // responses, dead letters), so nothing a turn left queued
             // reaches a guest plain after its subject's erasure (#31).
             let mut turns: Vec<(Lsn, pb::TurnRecord)> = Vec::new();
+            // The changed effect results: an open turn's copies of them in
+            // open_effects are what its re-run hands to the guest.
+            let mut effects: Vec<(String, pb::EffectRecord)> = Vec::new();
             let rewritten = kronik_log::rewrite_segment(&path, |lsn, record| {
                 reseal_record(self.sealer(), record, &erased, &fill, wall).map(|(s, t)| {
                     counts.0 += s;
@@ -415,6 +418,12 @@ impl Node {
                         && let Some(turn) = record.turn()
                     {
                         turns.push((lsn, turn.clone()));
+                    }
+                    if s + t > 0
+                        && let Record::EffectResult(r) = &*record
+                        && let Some(effect) = &r.effect
+                    {
+                        effects.push((r.execution_id.clone(), effect.clone()));
                     }
                     s + t > 0
                 })
@@ -439,7 +448,7 @@ impl Node {
             }
             self.store()
                 .db()
-                .fix_reseal(start, &rewritten.offsets, &turns)
+                .fix_reseal(start, &rewritten.offsets, &turns, &effects)
                 .map_err(|e| ApiError::new(ErrorCode::Internal, format!("reseal: {e}")))?;
             values_sealed += counts.0;
             tombstones += counts.1;

@@ -161,7 +161,7 @@ fn status(ctx: &Ctx) -> Result<ExitCode, Error> {
         &mut out,
         "Erasures",
         &[format!(
-            "{} still have a plain value in the log or state.db",
+            "{} still have a plain value in the log, state.db or in flight",
             s.pending_erasures
         )],
         "",

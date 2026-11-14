@@ -719,6 +719,9 @@ pub(crate) struct TurnSpec {
     /// What the turn's record may take, with what it holds before any
     /// effect already taken (crate::record_budget).
     pub budget: crate::record_budget::Budget,
+    /// Where the turn's values came from: the callee input of a call carries
+    /// it (crate::erasure).
+    pub born: crate::erasure::Born,
 }
 
 #[derive(Default)]
@@ -1027,13 +1030,19 @@ impl TurnFx {
         if lock(&self.state).begun {
             return Ok(());
         }
-        self.node
-            .append_origin(
-                Record::TurnBegin(self.spec.begin.clone()),
-                self.spec.origin.clone(),
-            )
+        // Sealed against the turn's provenance: an erasure that began while
+        // the turn ran leaves tombstones, never a newer key (crate::erasure).
+        let mut begin = Record::TurnBegin(self.spec.begin.clone());
+        let fence = self
+            .node
+            .seal_born(&mut begin, self.spec.born)
             .await
             .map_err(|e| GateError::Host(e.to_string()))?;
+        self.node
+            .append_origin(begin, self.spec.origin.clone())
+            .await
+            .map_err(|e| GateError::Host(e.to_string()))?;
+        drop(fence);
         lock(&self.state).begun = true;
         Ok(())
     }
@@ -1079,14 +1088,21 @@ impl TurnFx {
             }
             state.budget.charge(cost);
         }
-        let lsn = self
+        let mut result = Record::EffectResult(pb::EffectResult {
+            execution_id: self.spec.execution_id.clone(),
+            effect: Some(rec.clone()),
+        });
+        let fence = self
             .node
-            .append(Record::EffectResult(pb::EffectResult {
-                execution_id: self.spec.execution_id.clone(),
-                effect: Some(rec.clone()),
-            }))
+            .seal_born(&mut result, self.spec.born)
             .await
             .map_err(|e| GateError::Host(e.to_string()))?;
+        let lsn = self
+            .node
+            .append(result)
+            .await
+            .map_err(|e| GateError::Host(e.to_string()))?;
+        drop(fence);
         let mut state = lock(&self.state);
         state.last_result_lsn = state.last_result_lsn.max(lsn);
         state.records.push(rec);
@@ -2092,7 +2108,7 @@ impl TurnFx {
         let key = causal::child(&self.spec.causal_key, &self.spec.actor, ordinal);
         let rx = self
             .node
-            .enqueue_call(to.clone(), input, key, self.spec.time);
+            .enqueue_call(to.clone(), input, key, self.spec.time, self.spec.born);
         match self
             .node
             .env

@@ -55,7 +55,13 @@ fn call(
         })),
     };
     let key = kronik_core::causal::root(format!("r{n}"));
-    node.enqueue_call(ActorRef::parse("counter/c").unwrap(), input, key, 0)
+    node.enqueue_call(
+        ActorRef::parse("counter/c").unwrap(),
+        input,
+        key,
+        0,
+        node.born_now(),
+    )
 }
 
 async fn settle() {
@@ -158,6 +164,7 @@ async fn a_turn_running_in_the_drain_is_not_quiet() {
         input,
         kronik_core::causal::root("spin".to_string()),
         0,
+        node.born_now(),
     );
     // While the callee turn runs, the pause is not quiet. The turn running is
     // what ends the wait; the attempts only bound a turn that never starts,

@@ -187,7 +187,9 @@ Concretely:
 1. `keystore.erase(subject, wall)` deletes the keys (durable: WAL with
    `synchronous = FULL`) and returns `last_version`. Doing this first means a
    crash before step 2 already leaves the data unreadable, and recovery sees
-   an erasure row without a record and commits the record.
+   an erasure row without a record and commits the record. From the
+   deletion until the record is applied, no turn seals and appends a record
+   (§6.8).
 2. Commit `Erasure { epoch, subject, key_version: last_version, audit }`.
 3. **The erasure operation** runs when the record is applied, once in
    production and again on every rebuild. It is recorded as this record, not
@@ -195,10 +197,11 @@ Concretely:
    (ADR 0005 §6). For every actor with SQL state it runs `DELETE FROM t WHERE
    _subject = ?` on each table with a `_subject` column, and it deletes the
    subject's KV rows from `state.db`. The bodies of the subject's pending
-   timers and undelivered messages become tombstones of its erased key
-   version: the rows stay, so their turns still run and fail with
-   `SUBJECT_ERASED` instead of handing the value to a guest, which would
-   seal it again under a new key version. On rebuild the subject's
+   timers and undelivered messages, and its values in the recorded effects
+   of turns still open, become tombstones of its erased key version: the
+   rows stay, so their turns still run and fail with `SUBJECT_ERASED`
+   instead of handing the value to a guest, which would seal it again under
+   a new key version. On rebuild the subject's
    changesets can't be unsealed and are skipped; the operation is then
    replayed, and the result equals the live database.
 4. **Other subjects are unaffected:** their values in the same turns are
@@ -219,6 +222,47 @@ Concretely:
    <erased_at + privacy.keystore_backup_retention>` (30 days by default),
    provided steps 5 and 6 are done by then; `privacy status` lists pending
    erasures without naming subjects unless the caller has `pii:read`.
+8. **What was in flight** (ADR 0123). Plaintext of the subject that the node
+   already held is never handed to a guest after the erasure, nor sealed
+   again under a key version newer than the erased ones:
+   - Every queued input and every running turn carries where its values
+     came from: the node's erasure generation for what it holds in memory (a
+     request, a message or a call a turn sent, a compensation), the LSN that
+     recorded it for what it read back (a re-run, a mailbox row, a timer). A
+     value of a subject erased after that point predates the erasure.
+   - An input with such a value fails its turn with `SUBJECT_ERASED` before
+     guest code runs, a re-run's recorded effects included, and its record
+     holds the erasure's tombstone in place of the value (an open turn is
+     closed under its own execution id). Applying the record also tombstones
+     such values in the inputs still queued.
+   - A turn that runs across the erasure finishes, but every record it
+     writes (`TurnBegin`, effect results, `TurnRecord`) is sealed against its
+     provenance: a value that predates the erasure becomes the tombstone, and
+     so do the values of the messages it sends. A turn takes its provenance
+     before its input is checked; until the record is applied, what the node
+     takes in counts as born before the erasure (the subject's rows are still
+     there to read). Sealing and appending a turn's record take a fence
+     shared, the erasure takes it from before the key deletion until its
+     record is applied: a record lands before the `Erasure` record, sealed
+     under the erased version, or is sealed knowing of it, never under a
+     newer key.
+   - The deletes in an actor database wait for a turn of the actor that has
+     its savepoint open, and run right after the turn's end rolls it back:
+     run inside it, they were rolled back with it (and recorded by its
+     session as the turn's own changes). The database's applied LSN stays
+     below the erasure's until then, so a stop in between replays it.
+   - In `state.db` the bodies of pending timers and undelivered messages, and
+     the recorded effects of turns still open (`open_effects`, which a re-run
+     hands to its guest), become tombstones (step 3); reseal rewrites
+     `open_effects` with the effect results it rewrites (§8).
+   - `privacy status` counts an erasure as pending while the log, `state.db`,
+     or an input still queued in this process holds a plain value of it, and
+     while a turn that began before its record was applied still runs.
+   - A fork never creates a key version for an erased subject: what it
+     writes of one (its log, its samples, the turns a rebase stages into
+     main's log) is the erasure's tombstone.
+   A subject can come back after its erasure: a value that arrives after the
+   erasure began is new data, sealed under a new key version (§2).
 
 Erasing a subject that has no key still records the erasure and runs the SQL
 deletion, and it works in `off` mode too (there are no keys, version 0).

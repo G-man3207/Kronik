@@ -18,6 +18,7 @@
 //! audit metadata never chooses operation authority.
 
 pub mod effects;
+mod erasure;
 mod gate;
 pub mod host;
 mod native_execution;

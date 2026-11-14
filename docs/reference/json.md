@@ -5267,7 +5267,7 @@ against both.
     },
     "pending_erasures": {
       "default": 0,
-      "description": "Erasures whose subject still has a plain value in the log or in\n`state.db` (§6.5, §8: a state value, a queued timer or message body,\na saved response, a dead letter, an open turn's effect). The count\nnames no subject.",
+      "description": "Erasures whose subject still has a plain value in the log, in\n`state.db` (§6.5, §8: a state value, a queued timer or message body,\na saved response, a dead letter, an open turn's effect), or in this\nprocess from before the erasure: an input still queued, or a turn\nthat runs across it (§6.8). The count names no subject.",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"

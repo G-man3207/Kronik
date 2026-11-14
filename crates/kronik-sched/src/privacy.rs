@@ -96,13 +96,15 @@ impl Node {
 
     /// `kronik privacy erase <subject>` (docs/design/m8-privacy.md §6):
     ///
-    /// 1. the subject's keys are deleted first, durably, so its sealed
-    ///    values are unreadable even if the daemon stops before step 2
-    ///    (the next start commits the record: [`Node::recover_erasures`]);
+    /// 1. the subject's keys are deleted, durably, so its sealed values are
+    ///    unreadable even if the daemon stops before step 2 (the next start
+    ///    commits the record: [`Node::recover_erasures`]); from then on, a
+    ///    value of the subject the node held before is never handed to a
+    ///    guest nor sealed under a newer key (§6.8, crate::erasure);
     /// 2. an `Erasure` record is committed with the next epoch;
     /// 3. applying it deletes the subject's state values and its rows in
     ///    every actor database's tables with a `_subject` column (replayed
-    ///    on every rebuild).
+    ///    on every rebuild), and tombstones its queued values.
     ///
     /// Values of other subjects, also those written in the same turns, are
     /// separate and stay. Plain values the subject wrote in `off` mode stay
@@ -148,19 +150,22 @@ impl Node {
         let (key_version, lsn) = self
             .authorized_effect(authority, move || async move {
                 // Key deletion is irreversible: this admitted private continuation must finish its record or durable recovery.
-                let key_version = node
-                    .sealer
-                    .erase(&subject, node.env.clock.wall_ms())
-                    .map_err(|error| {
-                        ApiError::new(ErrorCode::Internal, format!("keystore: {error}"))
-                    })?;
+                let (key_version, fence) = node
+                    .erase_keys(&subject, || {
+                        node.sealer
+                            .erase(&subject, node.env.clock.wall_ms())
+                            .map_err(|error| {
+                                ApiError::new(ErrorCode::Internal, format!("keystore: {error}"))
+                            })
+                    })
+                    .await?;
                 let record = Record::Erasure(pb::Erasure {
                     epoch,
                     subject,
                     key_version,
                     audit: Some(audit),
                 });
-                let lsn = node.commit_config(guard, epoch, record).await?;
+                let lsn = node.commit_erasure(guard, epoch, record, fence).await?;
                 Ok((key_version, lsn))
             })
             .await?;
@@ -254,8 +259,9 @@ impl Node {
     /// (§6.5, §8): a value written in `off` mode that no reseal has sealed
     /// or tombstoned yet, there or in a row the log's records left in
     /// `state.db` (state values, queued timer and message bodies, saved
-    /// responses, dead letters, open turns' effects; issue #31). The count
-    /// names no subject.
+    /// responses, dead letters, open turns' effects; issue #31), or in this
+    /// process from before the erasure: an input still queued, or a turn that
+    /// runs across it (§6.8). The count names no subject.
     pub async fn pending_erasures(&self) -> Result<u64, ApiError> {
         let erased: std::collections::HashSet<String> = self
             .store()
@@ -274,6 +280,10 @@ impl Node {
                 .into_iter()
                 .filter(|s| erased.contains(s))
                 .collect();
+        // Plaintext from before an erasure still waiting in a queue, or held
+        // by a turn that runs across it (§6.8).
+        pending.extend(self.queued_predating());
+        pending.extend(self.running_predating());
         let upto = self.applied_lsn();
         if upto < 1 {
             return Ok(pending.len() as u64);

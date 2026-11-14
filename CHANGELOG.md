@@ -57,6 +57,20 @@ until the v1.0 compatibility promise takes effect.
   the turn (a warning for a turn open in the running state), the gauge
   `kronik_retention_open_turn_segments`, `retention_pin` in `/v1/health`,
   and the new `kronik doctor` check `retention`.
+- `kronik privacy erase` no longer lets the subject's plaintext that was
+  already in flight reach an actor or be sealed again under a new key
+  version: a message or call a turn had sent, a request waiting in a queue,
+  a turn running across the erasure, or (privacy mode `off`) the recorded
+  effects of a turn still open. Before, such a value reached the actor after
+  the erasure, the turn's record was sealed under a new key version of the
+  erased subject, and `privacy status` reported the erasure complete. Now
+  an input that held a value of the subject from before the erasure fails
+  with `SUBJECT_ERASED` before the actor sees it, a turn running across the
+  erasure records and sends the erased marker in place of the subject's
+  values, the erasure tombstones the subject's values in open turns'
+  recorded effects (reseal seals them), and `privacy status` counts inputs
+  still queued and turns still running from before the erasure
+  ([ADR 0123](docs/adr/0123-erasure-stops-plaintext-in-flight.md)).
 - An erasure applied while a turn of an actor had its SQL savepoint open
   left the subject's rows in that actor's live database: the deletes ran
   inside the savepoint, the turn's end rolled them back, and a rebuild

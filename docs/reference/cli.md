@@ -2152,16 +2152,17 @@ Next     kronik privacy status
 
 Shows privacy mode, the configuration epoch it was last set in (`none yet`
 before the first change), the keystore's counts, how many erasures still
-have a plain value in the log or in `state.db` (a state value, a queued
-timer or message body, a saved response, a dead letter), and reseal
-progress. If a rewritten segment has not been replaced in object storage
+have a plain value in the log, in `state.db` (a state value, a queued
+timer or message body, a saved response, a dead letter, an open turn's
+recorded effect) or in flight from before the erasure (an input still
+queued, a turn that runs across it), and reseal progress. If a rewritten segment has not been replaced in object storage
 yet, it says the shipped copy still holds the old bytes. Needs `read`.
 
 ```text
 $ kronik privacy status
   Mode          on (epoch 1)
   Keystore      0 subjects, 0 keys, 0 erased
-  Erasures      0 still have a plain value in the log or state.db
+  Erasures      0 still have a plain value in the log, state.db or in flight
   Reseal        0 of 0 segments, 0 values sealed, 0 tombstones
 Next     kronik privacy mode off --reason "..."
 ```
@@ -2173,8 +2174,11 @@ Next     kronik privacy mode off --reason "..."
 Erases a subject (M8), such as `user:42`, for a request under GDPR article
 17. It deletes the subject's keys, so its sealed values can't be read again
 anywhere: in the log, in the state, in replays and in forks. It also
-deletes the subject's SQL rows. An `Erasure` record keeps the reason and
-the caller. `key version 0` means the subject had no key: none of its
+deletes the subject's SQL rows. An input that held a value of the subject
+before the erasure fails its turn with `SUBJECT_ERASED` instead of
+reaching the actor, and a turn that runs across the erasure records the
+erased marker in place of the subject's values. An `Erasure` record keeps
+the reason and the caller. `key version 0` means the subject had no key: none of its
 values was sealed. Values that were written with privacy mode off are
 still plain in the log until they are resealed, and the command warns with
 their count. When `complete_after_ms` is set, the command prints that wall

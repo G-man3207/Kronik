@@ -77,10 +77,11 @@ pub struct PrivacyStatus {
     pub epoch: Option<u64>,
     /// `null` when the daemon runs without a keystore.
     pub keystore: Option<KeystoreCounts>,
-    /// Erasures whose subject still has a plain value in the log or in
+    /// Erasures whose subject still has a plain value in the log, in
     /// `state.db` (§6.5, §8: a state value, a queued timer or message body,
-    /// a saved response, a dead letter, an open turn's effect). The count
-    /// names no subject.
+    /// a saved response, a dead letter, an open turn's effect), or in this
+    /// process from before the erasure: an input still queued, or a turn
+    /// that runs across it (§6.8). The count names no subject.
     #[serde(default)]
     pub pending_erasures: u64,
     /// Reseal progress (§8). Zero until the first reseal.
