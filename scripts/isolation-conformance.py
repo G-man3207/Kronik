@@ -905,9 +905,12 @@ def vm_calibration(root, cfg, name, cpu, memory, candidates):
     require(machine["mem_size_mib"] == guest_mib and machine["vcpu_count"] == vcpus,
             f"actual VMM resource rounding mismatch: {machine}")
     limits = {key:(cg/key).read_text().strip() for key in
-              ["cpu.max","memory.max","memory.swap.max","pids.max","memory.current","memory.peak"]}
+              ["cpu.max","memory.max","memory.high","memory.swap.max","pids.max","memory.current",
+               "memory.peak","cgroup.controllers"]}
     require(limits["cpu.max"] == f"{cpu*100} 100000", f"wrong exact CPU quota: {limits}")
     require(int(limits["memory.max"]) == (guest_mib+128)*(1<<20), f"wrong fixed VMM overhead cap: {limits}")
+    # Reclaim and throttling start half the overhead below the cap (ADR 0095).
+    require(int(limits["memory.high"]) == (guest_mib+64)*(1<<20), f"wrong VMM reclaim threshold: {limits}")
     require(limits["memory.swap.max"] == "0" and limits["pids.max"] == "1024", f"missing VMM hard cap: {limits}")
     require(0 < int(limits["memory.current"]) <= int(limits["memory.max"]) and
             0 < int(limits["memory.peak"]) <= int(limits["memory.max"]), "VMM calibration exceeds its cap")

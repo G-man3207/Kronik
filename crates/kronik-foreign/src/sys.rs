@@ -1737,6 +1737,19 @@ pub(crate) fn vm_controllers(available: &str) -> &'static str {
     }
 }
 
+/// The VM cgroup's `memory.high`, below its `memory.max` by half the fixed
+/// VMM overhead: the guest's memory and the VMM's own stay below it, and the
+/// host page cache of the VMM's buffered writes to its data drive goes above
+/// it. There the kernel reclaims (waking the flusher threads for the dirty
+/// pages) and slows the VMM, before `memory.max` would end it. The per-cgroup
+/// dirty throttling does not cover those writes: the drive was made by the
+/// daemon, whose cgroup owns its writeback. On the first KVM proof a guest
+/// that filled its drive got its VMM killed by the OOM killer with 120 MB of
+/// dirty page cache in its cgroup.
+pub(crate) fn vm_memory_high(memory_bytes: u64) -> u64 {
+    memory_bytes.saturating_sub(crate::microvm::VMM_OVERHEAD / 2)
+}
+
 /// Installs the VMM's fixed jail in its single-threaded launcher process.
 /// Every resource write is mandatory: delegation errors never remove limits.
 pub fn jail_microvm(jail: &MicrovmJail<'_>) -> io::Result<()> {
@@ -1773,6 +1786,10 @@ pub fn jail_microvm(jail: &MicrovmJail<'_>) -> io::Result<()> {
         format!("{} 100000", u64::from(jail.cpu_millis) * 100),
     )?;
     fs::write(group.join("memory.max"), jail.memory_bytes.to_string())?;
+    fs::write(
+        group.join("memory.high"),
+        vm_memory_high(jail.memory_bytes).to_string(),
+    )?;
     fs::write(group.join("memory.swap.max"), "0")?;
     fs::write(group.join("pids.max"), "1024")?;
     fs::write(group.join("cgroup.procs"), std::process::id().to_string())?;
@@ -2800,6 +2817,16 @@ mod tests {
             assert_eq!(field(set), ["0000000000000000"], "{set}");
         }
         assert_eq!(field("NoNewPrivs:"), ["1"]);
+    }
+
+    #[test]
+    fn a_vms_memory_high_leaves_its_guest_below_and_the_drives_cache_above() {
+        let overhead = crate::microvm::VMM_OVERHEAD;
+        let guest = 128u64 << 20;
+        let max = guest + overhead;
+        let high = vm_memory_high(max);
+        assert_eq!(high, guest + overhead / 2);
+        assert!(guest < high && high < max);
     }
 
     #[test]
