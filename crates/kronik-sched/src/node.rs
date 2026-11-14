@@ -2460,6 +2460,7 @@ impl Node {
                 self.sealer.clone(),
                 crate::blobs::TurnBlobs::secrets_of(fx.clone()),
                 kind_limits.blob_bytes_per_actor,
+                crate::blobs::HostOptions::production(),
             )
         });
         if let Some(blobs) = &turn_blobs {

@@ -482,6 +482,25 @@ impl Sealer {
         })
     }
 
+    /// [`Sealer::blob_keys`] without creating a key: `None` when the
+    /// subject has no live key (a fork, which must not change the keystore,
+    /// then names the blob otherwise). Without a keystore, the test key.
+    pub fn existing_blob_keys(&self, subject: &str) -> Result<Option<BlobKeys>, PrivacyError> {
+        if !crate::keystore::valid_subject(subject) {
+            return Err(PrivacyError::InvalidSubject(subject.to_owned()));
+        }
+        let key = match &self.keystore {
+            None => Some(crate::keystore::test_subject_key(subject)),
+            Some(ks) => ks.existing_identity_key(subject)?,
+        };
+        Ok(key.map(|key| BlobKeys {
+            subject: subject.to_owned(),
+            key_version: key.version,
+            identity: key.derive(BLOB_IDENTITY_LABEL),
+            seal: (self.keystore.is_some() && self.is_on()).then(|| key.derive(BLOB_SEAL_LABEL)),
+        }))
+    }
+
     fn blob_identity_key(
         &self,
         ks: &Keystore,
@@ -1612,6 +1631,23 @@ mod blob_key_tests {
         let after = s.blob_keys("user:1", &fill(7), 6).unwrap();
         assert_eq!(after.key_version, 3);
         assert_ne!(*after.identity, *first.identity);
+    }
+
+    /// Forks look keys up without creating them.
+    #[test]
+    fn existing_blob_keys_never_create_a_key() {
+        let s = sealer();
+        assert!(s.existing_blob_keys("user:3").unwrap().is_none());
+        assert_eq!(s.keystore().unwrap().stats().unwrap().keys, 0);
+        let made = s.blob_keys("user:3", &fill(4), 1).unwrap();
+        let found = s.existing_blob_keys("user:3").unwrap().unwrap();
+        assert_eq!(
+            (found.key_version, *found.identity),
+            (made.key_version, *made.identity)
+        );
+        assert_eq!(s.keystore().unwrap().stats().unwrap().keys, 1);
+        s.erase("user:3", 2).unwrap();
+        assert!(s.existing_blob_keys("user:3").unwrap().is_none());
     }
 
     #[test]

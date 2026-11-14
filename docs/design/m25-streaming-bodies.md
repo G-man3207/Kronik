@@ -656,6 +656,9 @@ effect results and the API's turn JSON show the reference, never the bytes.
 - **Request bodies.** A blob request body is recorded as its reference, as in
   production, so the fingerprints agree; a reference the turn may not use is
   matched to production's recorded denial, or denied in production's words.
+- **Keys.** A fork never changes the keystore: a subject's new blob in a fork
+  is named with the subject's existing key (`Sealer::existing_blob_keys`),
+  else with a fork-local test key, never sealed.
 - **Prepared bodies.** The disclosure guards that check prepared inline
   bodies for secret values (`prepared_outcome_safe`,
   `disclose_neighbor`) treat `Body.blob` and `body_blob` as prepared when

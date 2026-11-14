@@ -762,8 +762,13 @@ impl Proposals {
         setup.preview = preview;
         // Production's turn record budget, so the replay decides as it did.
         setup.record_limit = self.node.turn_record_limit();
-        // Blobs (M25 §9): fork turns read main's and write the fork's.
+        // Blobs (M25 §9): fork turns read main's and write the fork's, and
+        // the run holds a floor lease at its fork point (ADR 0120 §4).
         setup.blobs = self.node.blob_store().cloned();
+        setup.blob_floor = setup
+            .blobs
+            .as_ref()
+            .map(|store| store.leases().floor("replay", setup.index.fork_lsn));
         // Values of linked secrets this process holds; a preview computes nothing.
         if !preview {
             setup.held_secrets = self

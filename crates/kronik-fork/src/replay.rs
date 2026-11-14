@@ -122,6 +122,10 @@ pub struct ReplaySetup {
     /// The node's blob store (M25 §9): fork turns read blobs from it and
     /// write new ones to the fork's space. None: blobs are off.
     pub blobs: Option<Arc<kronik_blob::BlobStore>>,
+    /// A floor lease at the fork point (ADR 0120 §4): while the run lives,
+    /// main's collector keeps every blob a record from there on references.
+    /// Renewed with every turn the run replays.
+    pub blob_floor: Option<kronik_blob::Lease>,
     dispatch: ReplayDispatch,
 }
 
@@ -210,6 +214,7 @@ impl ReplaySetup {
             preview: false,
             record_limit: kronik_sched::record_budget::turn_limit(kronik_log::MAX_RECORD as usize),
             blobs: None,
+            blob_floor: None,
             dispatch,
         }
     }
@@ -1237,7 +1242,10 @@ impl Runner {
             limits,
             subject: p.subject.clone(),
         };
-        let blob_bytes = req.limits.blob_bytes;
+        if let Some(floor) = &self.setup.blob_floor {
+            floor.renew();
+        }
+        let blob_host = fork_blob_host(&self.setup, &gate, req.limits.blob_bytes);
         let run = kind
             .program
             .run_with_blobs(
@@ -1245,10 +1253,16 @@ impl Runner {
                 state.clone(),
                 Some(Box::new(SqlHandle(sql.clone()))),
                 Some(Arc::new(GateHandle(gate.clone()))),
-                fork_blob_host(&self.setup, &gate, blob_bytes)
+                blob_host
+                    .clone()
                     .map(|host| Arc::new(host) as Arc<dyn kronik_runtime::BlobHost>),
             )
             .await;
+        // What the turn's blob reads met (M25 §9): an erased subject's blob
+        // makes it unverifiable, a pseudonym in a `--no-pii` fork masked.
+        let (blob_erased, blob_masked) = blob_host.as_ref().map_or((false, false), |host| {
+            (host.read_erased(), host.read_masked())
+        });
         let mut out = match run {
             Ok(o) => o,
             Err(e) => {
@@ -1329,7 +1343,8 @@ impl Runner {
         let erased = gate.unverified
             || state.erased()
             || (sql_unverified && used_sql)
-            || gs.unverified_callee;
+            || gs.unverified_callee
+            || blob_erased;
         // As in production: a turn that does not commit after an effect
         // whose outcome is unknown ends with EFFECT_OUTCOME_UNKNOWN, decided by
         // `fit` and `fail` below on the final record.
@@ -1504,6 +1519,7 @@ impl Runner {
         self.settle(&p.key, &record, prod, &order, erased);
         let pseudonyms = self.setup.privacy.no_pii
             && (state.masked()
+                || blob_masked
                 || crate::privacy::tagged_input(record.input.as_ref())
                 || record.effects.iter().any(|e| {
                     e.grounding != pb::Grounding::Live as i32
@@ -1685,9 +1701,10 @@ fn fork_blob_host(
     limit: u64,
 ) -> Option<kronik_sched::blobs::TurnBlobs> {
     let store = setup.blobs.clone()?;
-    let gate = gate.clone();
-    let secrets: kronik_sched::blobs::SecretSource = Arc::new(move || {
-        lock(&gate.state)
+    // Weak: the host must not keep the turn's gate (and its secrets) alive.
+    let gate = Arc::downgrade(gate);
+    let secrets: kronik_sched::blobs::SecretSource = Arc::new(move || match gate.upgrade() {
+        Some(gate) => lock(&gate.state)
             .secrets
             .iter()
             .map(|(name, value)| {
@@ -1696,7 +1713,8 @@ fn fork_blob_host(
                     Arc::new(zeroize::Zeroizing::new(value.clone())),
                 )
             })
-            .collect()
+            .collect(),
+        None => Vec::new(),
     });
     Some(kronik_sched::blobs::TurnBlobs::new(
         store.clone(),
@@ -1705,6 +1723,7 @@ fn fork_blob_host(
         setup.privacy.sealer.clone(),
         secrets,
         limit,
+        kronik_sched::blobs::HostOptions::fork(setup.privacy.no_pii),
     ))
 }
 
@@ -1781,10 +1800,10 @@ pub(crate) fn prepared_outcome_safe(
             }
             match response.body.as_ref().and_then(|body| body.value.as_ref()) {
                 Some(pb::body::Value::Inline(value)) => fields.push(prepared_plain(value)?),
-                Some(pb::body::Value::Blob(_)) => {
-                    return Err(GateError::Prerequisite(ErrorCode::Unavailable));
-                }
-                None => {}
+                // A blob body was prepared when it was written: a writer's
+                // bytes and a response's are scrubbed of the turn's secrets
+                // (M25 §5.2, §7.3), and it is never read here (§9).
+                Some(pb::body::Value::Blob(_)) | None => {}
             }
         }
         Some(pb::outcome::Output::Accept(accept)) => {

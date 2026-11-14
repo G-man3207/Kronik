@@ -248,7 +248,10 @@ until the v1.0 compatibility promise takes effect.
   blobs and write new ones to the fork's own space, recorded blob responses
   and blob request bodies replay as production recorded them, and `kronik
   diff` compares blob bodies by reference, showing `{"blob", "size"}` when
-  they differ.
+  they differ. A `--no-pii` fork reads a subject's blob as its pseudonym and
+  counts the turn as `pii-masked`; a read of an erased subject's blob makes
+  the turn unverifiable; a fork never creates a subject key; a replay holds
+  a floor lease at its fork point so the collector keeps what it reads.
 - Three new per-kind limits (M25, M26): `blob_threshold_bytes` (bodies above
   it become blobs for code that imports `blobs`, 1 MiB, never above
   `message_bytes`), `upload_bytes` (the largest upload for such code,

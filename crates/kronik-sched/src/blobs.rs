@@ -41,6 +41,36 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// How a blob host treats keys and subjects' blobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostOptions {
+    /// Whether a subject's first blob may create its key. Production turns
+    /// may; forks must not change the keystore, so they use the subject's
+    /// existing key, else a fork-local test key.
+    pub create_keys: bool,
+    /// A `--no-pii` fork: a read of a subject's blob gives its pseudonym
+    /// (M25 §9), never its bytes.
+    pub pseudonymize: bool,
+}
+
+impl HostOptions {
+    /// A production turn's host.
+    pub fn production() -> HostOptions {
+        HostOptions {
+            create_keys: true,
+            pseudonymize: false,
+        }
+    }
+
+    /// A fork turn's host; `no_pii` for a `--no-pii` fork.
+    pub fn fork(no_pii: bool) -> HostOptions {
+        HostOptions {
+            create_keys: false,
+            pseudonymize: no_pii,
+        }
+    }
+}
+
 /// One turn's blob host. Cloning shares it. The scheduler gives one to
 /// every turn; the fork engine to every fork turn, in the fork's space.
 #[derive(Clone)]
@@ -62,6 +92,11 @@ struct Inner {
     readers: Mutex<Vec<(String, Arc<BlobReader>)>>,
     /// Blobs the turn finished, to make durable before its record.
     created: Mutex<Vec<BlobId>>,
+    options: HostOptions,
+    /// The turn read an erased subject's blob (a fork marks it unverifiable).
+    read_erased: std::sync::atomic::AtomicBool,
+    /// The turn got a pseudonym for a subject's blob (`--no-pii`).
+    read_masked: std::sync::atomic::AtomicBool,
 }
 
 struct Slot {
@@ -82,6 +117,7 @@ impl TurnBlobs {
         sealer: Arc<Sealer>,
         fx_state: SecretSource,
         limit: u64,
+        options: HostOptions,
     ) -> TurnBlobs {
         let lease = store.leases().take("turn");
         let inner = Arc::new(Inner {
@@ -96,6 +132,9 @@ impl TurnBlobs {
             writers: Mutex::new(HashMap::new()),
             readers: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
+            options,
+            read_erased: std::sync::atomic::AtomicBool::new(false),
+            read_masked: std::sync::atomic::AtomicBool::new(false),
         });
         // The lease lives as long as the host, renewed while the turn runs,
         // however long it waits (ADR 0120 §4); the loop ends with the host.
@@ -144,16 +183,11 @@ impl TurnBlobs {
         let inner = &self.0;
         let keys = match subject {
             None => None,
-            Some(subject) => {
-                let entropy = inner.env.entropy.clone();
-                let fill = move |bytes: &mut [u8]| entropy.fill(bytes);
-                Some(
-                    inner
-                        .sealer
-                        .blob_keys(subject, &fill, inner.env.clock.wall_ms())
-                        .map_err(|e| StreamError::Store(e.to_string()))?,
-                )
-            }
+            Some(subject) => Some(
+                inner
+                    .keys(subject)
+                    .map_err(|e| StreamError::Store(format!("{e:?}")))?,
+            ),
         };
         let mut writer = inner
             .store
@@ -235,6 +269,16 @@ impl TurnBlobs {
     ) -> Result<Box<dyn BodySource>, BlobHostError> {
         let reader = self.0.reader(blob).await?;
         Ok(Box::new(FrameSource { reader, next: 0 }))
+    }
+
+    /// Whether the turn read an erased subject's blob.
+    pub fn read_erased(&self) -> bool {
+        self.0.read_erased.load(Ordering::Relaxed)
+    }
+
+    /// Whether the turn got a pseudonym for a subject's blob.
+    pub fn read_masked(&self) -> bool {
+        self.0.read_masked.load(Ordering::Relaxed)
     }
 
     /// Names every blob the turn finished durably (ADR 0117 §4); called
@@ -324,6 +368,30 @@ fn scrub_error(error: ScrubError) -> BlobHostError {
 }
 
 impl Inner {
+    /// The keys of a subject's new blob: created when the host may, else
+    /// the subject's existing key, else a fork-local test key (never
+    /// sealed), so a fork never changes the keystore.
+    fn keys(&self, subject: &str) -> Result<kronik_blob::BlobKeys, BlobHostError> {
+        let privacy = |e: kronik_privacy::PrivacyError| match e {
+            kronik_privacy::PrivacyError::KeyMissing(s) => BlobHostError::KeyMissing(s),
+            other => BlobHostError::Host(other.to_string()),
+        };
+        if self.options.create_keys {
+            let entropy = self.env.entropy.clone();
+            let fill = move |bytes: &mut [u8]| entropy.fill(bytes);
+            return self
+                .sealer
+                .blob_keys(subject, &fill, self.env.clock.wall_ms())
+                .map_err(privacy);
+        }
+        match self.sealer.existing_blob_keys(subject).map_err(privacy)? {
+            Some(keys) => Ok(keys),
+            None => Sealer::plain()
+                .blob_keys(subject, &|bytes: &mut [u8]| bytes.fill(0), 0)
+                .map_err(privacy),
+        }
+    }
+
     /// Brings the writer's scrubber up to the turn's secrets: none while
     /// the turn has used no secret, a new matcher when it has more.
     /// Returns bytes the switch emitted.
@@ -381,7 +449,32 @@ impl BlobHost for TurnBlobs {
         let inner = self.0.clone();
         let blob = blob.clone();
         Box::pin(async move {
-            let reader = inner.reader(&blob).await?;
+            // A `--no-pii` fork reads a subject's blob as its pseudonym:
+            // 16 bytes, then nothing (M25 §9).
+            if inner.options.pseudonymize
+                && let Some(subject) = &blob.subject
+            {
+                inner.read_masked.store(true, Ordering::Relaxed);
+                let digest = kronik_proto::blobs::parse_hash(&blob.hash)
+                    .map(|(_, digest)| digest)
+                    .map_err(BlobHostError::Host)?;
+                let pseudonym = inner
+                    .sealer
+                    .pseudonym(subject, &digest)
+                    .unwrap_or_default()
+                    .into_bytes();
+                let start = (offset as usize).min(pseudonym.len());
+                let end = start.saturating_add(len as usize).min(pseudonym.len());
+                return Ok(pseudonym[start..end].to_vec());
+            }
+            let reader = match inner.reader(&blob).await {
+                Ok(reader) => reader,
+                Err(BlobHostError::Erased) => {
+                    inner.read_erased.store(true, Ordering::Relaxed);
+                    return Err(BlobHostError::Erased);
+                }
+                Err(e) => return Err(e),
+            };
             let len = (len as usize)
                 .min(usize::try_from(blob.size.saturating_sub(offset)).unwrap_or(usize::MAX));
             if len == 0 {
@@ -402,21 +495,7 @@ impl BlobHost for TurnBlobs {
         Box::pin(async move {
             let keys = match &subject {
                 None => None,
-                Some(subject) => {
-                    let entropy = inner.env.entropy.clone();
-                    let fill = move |bytes: &mut [u8]| entropy.fill(bytes);
-                    Some(
-                        inner
-                            .sealer
-                            .blob_keys(subject, &fill, inner.env.clock.wall_ms())
-                            .map_err(|e| match e {
-                                kronik_privacy::PrivacyError::KeyMissing(s) => {
-                                    BlobHostError::KeyMissing(s)
-                                }
-                                other => BlobHostError::Host(other.to_string()),
-                            })?,
-                    )
-                }
+                Some(subject) => Some(inner.keys(subject)?),
             };
             let writer = inner
                 .store
@@ -524,6 +603,7 @@ mod tests {
             Arc::new(Sealer::plain()),
             Arc::new(move || lock(&seen).clone()),
             1 << 30,
+            HostOptions::production(),
         );
         (blobs, store)
     }

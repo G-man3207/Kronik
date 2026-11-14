@@ -267,3 +267,125 @@ fn a_fork_replays_blob_turns_without_divergence() {
     assert_eq!(summary["unverifiable"], 0, "{diff:#}");
     assert!(summary["replayed"].as_u64().unwrap() >= 6, "{diff:#}");
 }
+
+/// A subject's blob written into the node's store, as the gateway writes
+/// a subject's upload: keyed with the subject's key.
+fn subject_upload(p: &Proc, dir: &std::path::Path, subject: &str, bytes: &[u8]) -> pb::BlobRef {
+    let keys = p
+        .node
+        .sealer()
+        .blob_keys(subject, &|b: &mut [u8]| b.fill(9), 1)
+        .unwrap();
+    p.rt.block_on(async {
+        let store = kronik_blob::BlobStore::open(
+            kronik_core::env::Env::real(tokio::runtime::Handle::current()),
+            dir,
+            kronik_blob::StoreConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut w = store
+            .writer(
+                kronik_blob::Space::Main,
+                Some(keys),
+                u64::MAX,
+                store.leases().take("upload"),
+            )
+            .await
+            .unwrap();
+        w.write(bytes).await.unwrap();
+        let meta = w.finish().await.unwrap();
+        store
+            .ensure_durable(&kronik_blob::Space::Main, &[meta.id])
+            .await
+            .unwrap();
+        meta.to_pb()
+    })
+}
+
+fn blob_node(dir: &std::path::Path) -> Proc {
+    let p = Proc::start_with(
+        dir,
+        NodeConfig {
+            concurrency: 8,
+            blobs: Some(BlobsConfig::default()),
+            ..NodeConfig::default()
+        },
+    );
+    p.deploy("media");
+    p
+}
+
+fn replay(
+    p: &Proc,
+    props: &Arc<Proposals>,
+    name: &str,
+    fork_at: u64,
+    no_pii: bool,
+) -> serde_json::Value {
+    p.rt.block_on(props.create_fork(
+        Some(name.into()),
+        fork_at,
+        no_pii,
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    p.rt.block_on(props.fork_replay(
+        name,
+        None,
+        DiffOptions {
+            mode: Mode::Both,
+            no_pii,
+            ..DiffOptions::default()
+        },
+        None,
+        p.owner(),
+    ))
+    .unwrap();
+    serde_json::from_slice(&p.rt.block_on(props.diff(name, false, false)).unwrap()).unwrap()
+}
+
+/// M25 §9: a `--no-pii` fork reads a subject's blob as its pseudonym, never
+/// its bytes; the turn is pii-masked, not divergent. The fork also holds a
+/// floor lease at its fork point.
+#[test]
+fn a_no_pii_fork_reads_a_subjects_blob_as_its_pseudonym() {
+    let dir = tempdir();
+    let p = blob_node(dir.path());
+    let fork_at = p.settle();
+    let secret = b"SUBJECT-PLAINTEXT-".repeat(4000);
+    let upload = subject_upload(&p, dir.path(), "user:1", &secret);
+    let read = ingress(&p, http("ranges", "at=0:16", pb::body::Value::Blob(upload)));
+    assert!(answer(&read).starts_with("0:16=16 "), "{}", answer(&read));
+    p.settle();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    let diff = replay(&p, &props, "nopii", fork_at, true);
+    let summary = &diff["summary"];
+    assert_eq!(summary["divergent_turns"], 0, "{diff:#}");
+    assert!(summary["pii_masked"].as_u64().unwrap() >= 1, "{diff:#}");
+    assert!(!diff.to_string().contains("SUBJECT-PLAINTEXT"));
+    let store = p.node.blob_store().unwrap();
+    assert_eq!(store.leases().lowest_floor(), Some(fork_at));
+}
+
+/// M25 §9 and ADR 0109: a fork's read of an erased subject's blob gives
+/// the guest `erased` and makes the turn unverifiable, not divergent.
+#[test]
+fn a_forks_read_of_an_erased_blob_is_unverifiable() {
+    let dir = tempdir();
+    let p = blob_node(dir.path());
+    let fork_at = p.settle();
+    let upload = subject_upload(&p, dir.path(), "user:2", &b"to be erased ".repeat(3000));
+    let read = ingress(&p, http("ranges", "at=0:12", pb::body::Value::Blob(upload)));
+    assert!(answer(&read).starts_with("0:12=12 "), "{}", answer(&read));
+    p.rt.block_on(p.node.erase_subject("user:2", audit(), false, p.owner()))
+        .unwrap();
+    p.settle();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    let diff = replay(&p, &props, "erased", fork_at, false);
+    let summary = &diff["summary"];
+    assert_eq!(summary["divergent_turns"], 0, "{diff:#}");
+    assert!(summary["unverifiable"].as_u64().unwrap() >= 1, "{diff:#}");
+}

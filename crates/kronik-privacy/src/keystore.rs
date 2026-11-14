@@ -843,6 +843,34 @@ impl Keystore {
         Ok((revision, key))
     }
 
+    /// The subject's oldest key version that is not erased, as
+    /// [`Keystore::identity_key`] picks it, but never created: `None` when
+    /// the subject has no live key. For readers and forks, which must not
+    /// change the keystore.
+    pub fn existing_identity_key(&self, subject: &str) -> Result<Option<SubjectKey>, PrivacyError> {
+        if !valid_subject(subject) {
+            return Err(PrivacyError::InvalidSubject(subject.to_owned()));
+        }
+        let mut conn = self.checked_conn()?;
+        let tx = conn.transaction()?;
+        self.check_master(&tx)?;
+        let oldest: Option<(u32, Vec<u8>, Vec<u8>)> = tx
+            .query_row(
+                "SELECT version, nonce, wrapped FROM subject_keys WHERE subject = ?1 ORDER BY version ASC LIMIT 1",
+                [subject],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let key = match oldest {
+            Some((version, nonce, wrapped)) => {
+                Some(self.unwrap_key(subject, version, &nonce, &wrapped)?)
+            }
+            None => None,
+        };
+        tx.commit()?;
+        Ok(key)
+    }
+
     /// Adds a new version of the subject's key, which seals from now on;
     /// older versions still unseal. Returns the new version.
     pub fn rotate(
