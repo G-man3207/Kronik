@@ -584,3 +584,73 @@ fn a_rebase_switch_takes_the_shadows_holds_and_pins() {
     assert_eq!(sources(&main, &new.hash), [(source::MAILBOX, "s1".into())]);
     assert_eq!(main.blob(&new.hash).unwrap().unwrap().last_ref_lsn, 5);
 }
+
+/// An erased blob's row stays while a pin or a hold names it, so that the
+/// hold still resolves and a read answers `erased` (M26 §9.3); once nothing
+/// keeps it, the collector's forget step deletes it.
+#[test]
+fn an_erased_row_stays_while_a_pin_or_a_hold_keeps_it() {
+    use pb::blob_ref_op::Kind;
+    let mut db = db();
+    let theirs = pb::BlobRef {
+        hash: format!("b3s:{}", "cd".repeat(32)),
+        size: 5,
+        subject: Some("user:1".into()),
+        key_version: 2,
+    };
+    // Held by media/a, and the input of a turn that is still open.
+    db.apply(&[at(
+        1,
+        turn(
+            "e0",
+            operator(),
+            true,
+            vec![op(Kind::Retain, &theirs)],
+            vec![],
+            vec![],
+        ),
+    )])
+    .unwrap();
+    db.apply(&[at(2, begin("e1", http(Some(&theirs), "")))])
+        .unwrap();
+    db.apply(&[at(
+        3,
+        Record::Erasure(pb::Erasure {
+            subject: "user:1".into(),
+            key_version: 2,
+            ..Default::default()
+        }),
+    )])
+    .unwrap();
+    db.conn
+        .execute(
+            "UPDATE blobs SET erased = 1 WHERE hash = ?1",
+            [&theirs.hash],
+        )
+        .unwrap();
+    let forget = |db: &mut StateDb| {
+        db.forget_blobs(std::slice::from_ref(&theirs.hash), 100)
+            .unwrap()
+    };
+    assert_eq!(forget(&mut db), 0);
+    assert!(db.held("media", "a", &theirs.hash).unwrap().is_some());
+    // The open turn ends: the hold still keeps the row.
+    db.apply(&[at(4, record("e1", http(Some(&theirs), ""), None))])
+        .unwrap();
+    assert_eq!(forget(&mut db), 0);
+    // Released: nothing keeps it.
+    db.apply(&[at(
+        5,
+        turn(
+            "e2",
+            operator(),
+            true,
+            vec![op(Kind::Release, &theirs)],
+            vec![],
+            vec![],
+        ),
+    )])
+    .unwrap();
+    assert_eq!(forget(&mut db), 1);
+    assert!(db.blob(&theirs.hash).unwrap().is_none());
+}

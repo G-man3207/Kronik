@@ -568,14 +568,17 @@ impl StateDb {
     }
 
     /// Deletes the rows of `hashes` that are still unrooted at `floor` (a
-    /// record applied meanwhile keeps its row). Returns how many it deleted.
+    /// record applied meanwhile keeps its row). An erased blob's row stays
+    /// while a hold or a pin keeps it: they still name it, and a read of it
+    /// must answer `erased`, not that the actor does not hold it (M26 §9.3).
+    /// Returns how many it deleted.
     pub fn forget_blobs(&mut self, hashes: &[String], floor: Lsn) -> Result<u64, StoreError> {
         let tx = self.conn.savepoint()?;
         let mut deleted = 0;
         {
             let mut statement = tx.prepare_cached(&format!(
-                "DELETE FROM blobs WHERE hash = ?1 AND (erased = 1 OR (last_ref_lsn < ?2 \
-                 AND NOT {KEPT_BY_STATE}))"
+                "DELETE FROM blobs WHERE hash = ?1 AND NOT {KEPT_BY_STATE} \
+                 AND (erased = 1 OR last_ref_lsn < ?2)"
             ))?;
             for hash in hashes {
                 deleted += statement.execute(params![hash, i(floor)])? as u64;
