@@ -37,8 +37,10 @@ on:
 permissions:
   contents: read
 
+# One run per branch and choice of proofs at a time: an M21 run does not wait
+# hours for an M20 run's kernel build on the same branch.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.proofs }}
   cancel-in-progress: false
 
 env:
