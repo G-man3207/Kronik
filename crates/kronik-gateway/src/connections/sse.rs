@@ -9,12 +9,19 @@
 //! graceful stop sends `retry: 5000` first, so browsers reconnect in 5 s);
 //! a client that goes away drops the body, which the driver notices and
 //! reports as the client's close. SSE has no incoming frames.
+//!
+//! No wait is unbounded: a client that takes no chunk (a frame or a
+//! heartbeat) within `ping_timeout` closes as a slow consumer, the last
+//! chunks get `close_timeout`, and a host close is noticed while waiting.
+//! The server's connection then drops the socket when its own write stalls
+//! (`server.rs`). The hub hears of the end exactly once, through a
+//! [`FinishGuard`].
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kronik_proto::log::v1 as pb;
-use kronik_sched::connections::{Hub, Outgoing, RESTART_CODE, Transport};
+use kronik_sched::connections::{FinishGuard, Hub, Outgoing, RESTART_CODE, Transport};
 use tokio::sync::{Notify, mpsc};
 
 /// The comment an idle stream gets every `sse_heartbeat`.
@@ -76,9 +83,58 @@ impl Transport for SseTransport {
     }
 }
 
+impl SseTransport {
+    fn host_close(&self) -> Option<u16> {
+        *self.host_close.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// What waiting for room in the body gave.
+enum Room<'a> {
+    Permit(mpsc::Permit<'a, Vec<u8>>),
+    /// The host closed the connection meanwhile.
+    HostClose,
+    /// The body is gone: the client left.
+    Gone,
+    /// The client took nothing for the wait's deadline.
+    Stalled,
+}
+
+/// Waits at most `limit` for room for the next chunk, noticing a host
+/// close meanwhile (other wakes, for new frames, wait on).
+async fn room<'a>(
+    out: &'a mpsc::Sender<Vec<u8>>,
+    transport: &SseTransport,
+    limit: Duration,
+) -> Room<'a> {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        tokio::select! {
+            biased;
+            reserved = tokio::time::timeout_at(deadline, out.reserve()) => {
+                return match reserved {
+                    Ok(Ok(permit)) => Room::Permit(permit),
+                    Ok(Err(_)) => Room::Gone,
+                    Err(_) => Room::Stalled,
+                };
+            }
+            () = transport.notify.notified() => {
+                if transport.host_close().is_some() {
+                    return Room::HostClose;
+                }
+            }
+        }
+    }
+}
+
 /// Streams connection `conn` into `out` until it ends, then reports the
 /// end to the hub.
-pub async fn drive(hub: Arc<Hub>, conn: String, out: mpsc::Sender<Vec<u8>>, heartbeat: Duration) {
+pub async fn drive(hub: Arc<Hub>, conn: String, out: mpsc::Sender<Vec<u8>>) {
+    // Reports the end however this task ends: the hub has the actor's or
+    // the host's cause, else the client left (1006, as SSE always records
+    // a client's end, §4.8).
+    let _finish = FinishGuard::new(hub.clone(), conn.clone());
+    let cfg = hub.config().clone();
     let transport = Arc::new(SseTransport::default());
     if hub.attach(&conn, transport.clone()).is_err() {
         return;
@@ -86,34 +142,37 @@ pub async fn drive(hub: Arc<Hub>, conn: String, out: mpsc::Sender<Vec<u8>>, hear
     // The frame hyper may not have taken yet.
     let mut unconfirmed: Option<u64> = None;
     'run: loop {
-        let host_close = transport
-            .host_close
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(code) = host_close {
+        if let Some(code) = transport.host_close() {
             if code == RESTART_CODE {
-                let _ = out.send(RETRY_AFTER_RESTART.to_vec()).await;
+                let _ =
+                    tokio::time::timeout(cfg.close_timeout, out.send(RETRY_AFTER_RESTART.to_vec()))
+                        .await;
             }
             break 'run;
         }
         match hub.next(&conn) {
             Some(Outgoing::Frame { seq, frame }) => {
-                let Ok(permit) = out.reserve().await else {
-                    break 'run;
-                };
-                if let Some(prev) = unconfirmed.take() {
-                    hub.written(&conn, prev);
+                match room(&out, &transport, cfg.ping_timeout).await {
+                    Room::Permit(permit) => {
+                        if let Some(prev) = unconfirmed.take() {
+                            hub.written(&conn, prev);
+                        }
+                        permit.send(encode(&frame));
+                        unconfirmed = Some(seq);
+                    }
+                    Room::HostClose => continue 'run,
+                    Room::Gone => break 'run,
+                    Room::Stalled => {
+                        hub.close_host(&conn, pb::CloseCause::SlowConsumer);
+                        break 'run;
+                    }
                 }
-                permit.send(encode(&frame));
-                unconfirmed = Some(seq);
             }
             Some(Outgoing::Close { .. }) => {
                 // The actor's close: the stream ends after its frames.
-                if out.reserve().await.is_err() {
-                    break 'run;
-                }
-                if let Some(prev) = unconfirmed.take() {
+                if let Ok(Ok(_)) = tokio::time::timeout(cfg.close_timeout, out.reserve()).await
+                    && let Some(prev) = unconfirmed.take()
+                {
                     hub.written(&conn, prev);
                 }
                 break 'run;
@@ -123,13 +182,21 @@ pub async fn drive(hub: Arc<Hub>, conn: String, out: mpsc::Sender<Vec<u8>>, hear
                     biased;
                     () = out.closed() => break 'run,
                     () = transport.notify.notified() => {}
-                    () = tokio::time::sleep(heartbeat) => {
-                        if out.send(HEARTBEAT.to_vec()).await.is_err() {
-                            break 'run;
-                        }
-                        // Hyper took the chunk before the heartbeat.
-                        if let Some(prev) = unconfirmed.take() {
-                            hub.written(&conn, prev);
+                    () = tokio::time::sleep(cfg.sse_heartbeat) => {
+                        match room(&out, &transport, cfg.ping_timeout).await {
+                            Room::Permit(permit) => {
+                                // Hyper took the chunk before the heartbeat.
+                                if let Some(prev) = unconfirmed.take() {
+                                    hub.written(&conn, prev);
+                                }
+                                permit.send(HEARTBEAT.to_vec());
+                            }
+                            Room::HostClose => {}
+                            Room::Gone => break 'run,
+                            Room::Stalled => {
+                                hub.close_host(&conn, pb::CloseCause::SlowConsumer);
+                                break 'run;
+                            }
                         }
                     }
                 }
@@ -137,9 +204,6 @@ pub async fn drive(hub: Arc<Hub>, conn: String, out: mpsc::Sender<Vec<u8>>, hear
         }
     }
     drop(out);
-    // The hub has the actor's or the host's cause; without one the client
-    // left: 1006, as SSE always records a client's end (§4.8).
-    hub.finished(&conn, None);
 }
 
 #[cfg(test)]

@@ -9,9 +9,15 @@
 //! back while the connection's in-flight window is full or its inbound
 //! rate is spent, so TCP pushes back on a client that sends faster than
 //! its owner works; writing goes on meanwhile. Pings keep an idle
-//! connection alive. Whoever ends the connection, the hub gets exactly one
-//! report of it ([`Hub::finished`]), with the client's close when there was
-//! one.
+//! connection alive.
+//!
+//! No write waits for ever on a client that stops reading: a frame or a
+//! ping it does not take within `ping_timeout` closes the connection as a
+//! slow consumer (or a ping timeout), and a close frame, the flush after
+//! the client's close and the final close get `close_timeout`. Then the
+//! socket is dropped. Whoever ends the connection, and however the task
+//! ends, the hub gets exactly one report of it ([`Hub::finished`], through
+//! a [`FinishGuard`]), with the client's close when there was one.
 //
 // The connection task runs on tokio directly, like the hyper server
 // (ADR 0004 §3).
@@ -26,7 +32,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use hyper_util::rt::TokioIo;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::connections::{Hub, Outgoing, Transport};
+use kronik_sched::connections::{FinishGuard, Hub, Outgoing, Transport};
 use tokio::sync::Notify;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -66,6 +72,13 @@ impl WsTransport {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+    }
+
+    fn host_close_pending(&self) -> bool {
+        self.host_close
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 }
 
@@ -115,14 +128,24 @@ fn close_message(code: u16, reason: &str) -> Message {
     }))
 }
 
-/// How a connection's task ended, for the hub.
-enum End {
-    /// The client closed (with its close frame's code and reason; 1005 for
-    /// a close frame without one), or went away (`None`: 1006).
-    Client(Option<(u16, String)>),
-    /// Kronik sent a close frame (the actor's or the host's): the hub has
-    /// its cause.
-    Kronik,
+/// Why a write did not complete.
+enum WriteError {
+    /// The socket failed: the client is gone.
+    Gone,
+    /// The client took nothing for the write's deadline.
+    Stalled,
+}
+
+/// Sends `m`, waiting at most `limit` for the client to take it.
+async fn send<S>(sink: &mut S, m: Message, limit: Duration) -> Result<(), WriteError>
+where
+    S: futures_util::Sink<Message, Error = WsError> + Unpin,
+{
+    match tokio::time::timeout(limit, sink.send(m)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(WriteError::Gone),
+        Err(_) => Err(WriteError::Stalled),
+    }
 }
 
 type Admit = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -133,6 +156,8 @@ pub async fn drive<I>(hub: Arc<Hub>, conn: String, io: I, limits: Limits)
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
+    // Reports the end however this task ends (a dropped task included).
+    let mut finish = FinishGuard::new(hub.clone(), conn.clone());
     let socket =
         WebSocketStream::from_raw_socket(TokioIo::new(io), Role::Server, Some(limits.config()))
             .await;
@@ -140,7 +165,7 @@ where
     let transport = Arc::new(WsTransport::default());
     if hub.attach(&conn, transport.clone()).is_err() {
         // Closed while the client upgraded (a restart, an operator).
-        let _ = sink.send(close_message(1001, "")).await;
+        let _ = send(&mut sink, close_message(1001, ""), limits.close_timeout).await;
         return;
     }
     let start = tokio::time::Instant::now();
@@ -151,7 +176,7 @@ where
     let mut closing: Option<Duration> = None;
     let mut last_heard = now();
     let mut ping_sent: Option<Duration> = None;
-    let end = 'run: loop {
+    'run: loop {
         let wait = match (closing, ping_sent) {
             (Some(deadline), _) => deadline.saturating_sub(now()),
             (None, Some(sent)) => (sent + limits.ping_timeout).saturating_sub(now()),
@@ -161,8 +186,8 @@ where
             biased;
             () = transport.notify.notified(), if closing.is_none() => {
                 if let Some((code, reason)) = transport.take_host_close() {
-                    if sink.send(close_message(code, &reason)).await.is_err() {
-                        break 'run End::Kronik;
+                    if send(&mut sink, close_message(code, &reason), limits.close_timeout).await.is_err() {
+                        break 'run;
                     }
                     closing = Some(now() + limits.close_timeout);
                     continue;
@@ -170,18 +195,30 @@ where
                 while let Some(item) = hub.next(&conn) {
                     match item {
                         Outgoing::Frame { seq, frame } => {
-                            if sink.send(to_message(frame)).await.is_err() {
-                                break 'run End::Client(None);
+                            match send(&mut sink, to_message(frame), limits.ping_timeout).await {
+                                Ok(()) => hub.written(&conn, seq),
+                                // A client that takes no frame for the ping
+                                // timeout cannot keep up: no close frame
+                                // could reach it either (review S1).
+                                Err(WriteError::Stalled) => {
+                                    hub.close_host(&conn, pb::CloseCause::SlowConsumer);
+                                    break 'run;
+                                }
+                                Err(WriteError::Gone) => break 'run,
                             }
-                            hub.written(&conn, seq);
                         }
                         Outgoing::Close { code, reason } => {
-                            if sink.send(close_message(code, &reason)).await.is_err() {
-                                break 'run End::Kronik;
+                            if send(&mut sink, close_message(code, &reason), limits.close_timeout).await.is_err() {
+                                break 'run;
                             }
                             closing = Some(now() + limits.close_timeout);
                             break;
                         }
+                    }
+                    // A host close decided meanwhile (it dropped the queue).
+                    if transport.host_close_pending() {
+                        transport.notify.notify_one();
+                        break;
                     }
                 }
             }
@@ -222,58 +259,55 @@ where
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
                     Some(Ok(Message::Close(frame))) => {
                         // tungstenite queued the answering close: send it.
-                        let _ = sink.flush().await;
-                        if closing.is_some() {
-                            break 'run End::Kronik;
+                        let _ = tokio::time::timeout(limits.close_timeout, sink.flush()).await;
+                        if closing.is_none() {
+                            finish.client_closed(Some(frame.map_or((1005, String::new()), |f| {
+                                (u16::from(f.code), f.reason.as_str().to_owned())
+                            })));
                         }
-                        let close = frame.map_or((1005, String::new()), |f| {
-                            (u16::from(f.code), f.reason.as_str().to_owned())
-                        });
-                        break 'run End::Client(Some(close));
+                        break 'run;
                     }
                     Some(Err(WsError::Capacity(_))) => {
                         hub.close_host(&conn, pb::CloseCause::TooLarge);
                         if !closing_after_error(&transport, &mut sink, &mut closing, now(), &limits).await {
-                            break 'run End::Kronik;
+                            break 'run;
                         }
                     }
                     Some(Err(WsError::Protocol(_) | WsError::Utf8(_) | WsError::AttackAttempt)) => {
                         hub.close_host(&conn, pb::CloseCause::Protocol);
                         if !closing_after_error(&transport, &mut sink, &mut closing, now(), &limits).await {
-                            break 'run End::Kronik;
+                            break 'run;
                         }
                     }
-                    Some(Err(_)) | None => {
-                        if closing.is_some() {
-                            break 'run End::Kronik;
-                        }
-                        break 'run End::Client(None);
-                    }
+                    // Gone without a close frame (1006), unless Kronik
+                    // closed first.
+                    Some(Err(_)) | None => break 'run,
                 }
             }
             () = tokio::time::sleep(wait) => {
                 if closing.is_some() {
                     // The client did not answer the close in time.
-                    break 'run End::Kronik;
+                    break 'run;
                 }
                 match ping_sent {
                     Some(_) => hub.close_host(&conn, pb::CloseCause::PingTimeout),
-                    None => {
-                        if sink.send(Message::Ping(Bytes::new())).await.is_err() {
-                            break 'run End::Client(None);
+                    None => match send(&mut sink, Message::Ping(Bytes::new()), limits.ping_timeout).await {
+                        Ok(()) => ping_sent = Some(now()),
+                        Err(WriteError::Stalled) => {
+                            hub.close_host(&conn, pb::CloseCause::PingTimeout);
+                            break 'run;
                         }
-                        ping_sent = Some(now());
-                    }
+                        Err(WriteError::Gone) => break 'run,
+                    },
                 }
             }
         }
-    };
-    drop(admitting);
-    let _ = sink.close().await;
-    match end {
-        End::Client(close) => hub.finished(&conn, close),
-        End::Kronik => hub.finished(&conn, None),
     }
+    drop(admitting);
+    let _ = tokio::time::timeout(limits.close_timeout, sink.close()).await;
+    // `finish` reports the end now: the hub has the actor's or the host's
+    // cause if one was decided, else the client's close (1006 without one).
+    drop(finish);
 }
 
 /// The frame input of an incoming message, admitted through the hub (which
@@ -283,7 +317,8 @@ fn admit(hub: Arc<Hub>, conn: String, frame: pb::Frame) -> Admit {
 }
 
 /// After a read error the hub decided a host close: send its close frame
-/// now. `false` when that is impossible (the socket is unusable).
+/// now, within `close_timeout`. `false` when that is impossible (the
+/// socket is unusable, or the client takes nothing).
 async fn closing_after_error<S>(
     transport: &WsTransport,
     sink: &mut S,
@@ -292,12 +327,15 @@ async fn closing_after_error<S>(
     limits: &Limits,
 ) -> bool
 where
-    S: futures_util::Sink<Message> + Unpin,
+    S: futures_util::Sink<Message, Error = WsError> + Unpin,
 {
     let Some((code, reason)) = transport.take_host_close() else {
         return false;
     };
-    if sink.send(close_message(code, &reason)).await.is_err() {
+    if send(sink, close_message(code, &reason), limits.close_timeout)
+        .await
+        .is_err()
+    {
         return false;
     }
     *closing = Some(now + limits.close_timeout);

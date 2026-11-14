@@ -20,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use std::future::Future as _;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -165,10 +166,9 @@ async fn open_connection(
             return to_hyper(answer.response);
         };
         let hub = gw.node.hub().clone();
-        let heartbeat = hub.config().sse_heartbeat;
         // One chunk in flight: the driver learns when hyper took the last.
         let (chunks, body) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(crate::connections::sse::drive(hub, conn, chunks, heartbeat));
+        tokio::spawn(crate::connections::sse::drive(hub, conn, chunks));
         return with_body(
             answer.response.status,
             &answer.response.headers,
@@ -203,11 +203,115 @@ async fn open_connection(
     to_hyper(answer.response)
 }
 
+/// A client connection whose writes may stall at most `limit`: a client
+/// that takes no bytes for that long is gone, and the write fails, which
+/// ends whatever writes to it (a response, an SSE stream, a WebSocket) and
+/// frees its socket (M24 review S1, S2). Any progress restarts the clock.
+struct StallGuard<I> {
+    inner: I,
+    limit: Duration,
+    stalled: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<I> StallGuard<I> {
+    fn new(inner: I, limit: Duration) -> StallGuard<I> {
+        StallGuard {
+            inner,
+            limit,
+            stalled: None,
+        }
+    }
+
+    /// A write is pending: an error once it has been pending for `limit`.
+    fn stall(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Error> {
+        let limit = self.limit;
+        let sleep = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+        sleep.as_mut().poll(cx).map(|()| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the client took no bytes for too long",
+            )
+        })
+    }
+}
+
+impl<I: AsyncRead + Unpin> AsyncRead for StallGuard<I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<I: AsyncWrite + Unpin> AsyncWrite for StallGuard<I> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Ready(r) => {
+                this.stalled = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => this.stall(cx).map(Err),
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_write_vectored(cx, bufs) {
+            Poll::Ready(r) => {
+                this.stalled = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => this.stall(cx).map(Err),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Ready(r) => {
+                this.stalled = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => this.stall(cx).map(Err),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_shutdown(cx) {
+            Poll::Ready(r) => {
+                this.stalled = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => this.stall(cx).map(Err),
+        }
+    }
+}
+
 /// Serves HTTP/1.1 on one connection, with upgrades for WebSockets (M24).
+/// Its writes may stall at most `[connections] ping_timeout`.
 async fn serve_connection<I>(io: I, gw: Arc<Gateway>, peer: std::net::IpAddr)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let io = StallGuard::new(io, gw.node.hub().config().ping_timeout);
     let svc = service_fn(move |mut req: hyper::Request<Incoming>| {
         let gw = gw.clone();
         async move {
@@ -472,5 +576,41 @@ pub async fn serve_tls(
             }
             drop(slot);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Test code: unwraps are fine.
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// A peer that takes no bytes: once the buffer is full, a write fails
+    /// after the stall limit instead of waiting for ever; a peer that
+    /// reads keeps the connection alive.
+    #[tokio::test]
+    async fn a_write_that_stalls_past_the_limit_fails() {
+        let (a, _peer) = tokio::io::duplex(64);
+        let mut stalled = StallGuard::new(a, Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        let err = stalled.write_all(&[7; 4096]).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        // Progress restarts the clock: a slow reader is not a stall.
+        let (a, mut b2) = tokio::io::duplex(64);
+        let mut guarded = StallGuard::new(a, Duration::from_millis(200));
+        let reader = tokio::spawn(async move {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 16];
+            while got.len() < 4096 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let n = b2.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+            }
+            got.len()
+        });
+        guarded.write_all(&[7; 4096]).await.unwrap();
+        assert_eq!(reader.await.unwrap(), 4096);
     }
 }

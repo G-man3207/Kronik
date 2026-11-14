@@ -68,6 +68,10 @@ pub struct ConnectionsConfig {
     pub close_timeout: Duration,
     /// How long a graceful stop waits for the writers.
     pub shutdown_grace: Duration,
+    /// How long an accepted connection waits for its transport (the
+    /// WebSocket upgrade, the SSE body) before it closes as `abandoned`
+    /// (§5.3). Not a kronik.toml key.
+    pub attach_timeout: Duration,
 }
 
 impl Default for ConnectionsConfig {
@@ -85,6 +89,7 @@ impl Default for ConnectionsConfig {
             sse_heartbeat: Duration::from_secs(15),
             close_timeout: Duration::from_secs(5),
             shutdown_grace: Duration::from_secs(2),
+            attach_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -100,6 +105,37 @@ pub trait Transport: Send + Sync {
     /// protocol can (a WebSocket close frame), drop what is still queued,
     /// end, and report [`Hub::finished`].
     fn close(&self, code: u16, reason: &str);
+}
+
+/// Reports the end of a connection's transport to the hub when dropped
+/// ([`Hub::finished`], which ignores a connection that is gone already).
+/// A transport's task holds one, so that the end is reported however the
+/// task ends: a write that timed out, an error, or the task being dropped.
+pub struct FinishGuard {
+    hub: Arc<Hub>,
+    conn: String,
+    client: Option<(u16, String)>,
+}
+
+impl FinishGuard {
+    pub fn new(hub: Arc<Hub>, conn: String) -> FinishGuard {
+        FinishGuard {
+            hub,
+            conn,
+            client: None,
+        }
+    }
+
+    /// The client's close (its code and reason), reported with the end.
+    pub fn client_closed(&mut self, close: Option<(u16, String)>) {
+        self.client = close;
+    }
+}
+
+impl Drop for FinishGuard {
+    fn drop(&mut self) {
+        self.hub.finished(&self.conn, self.client.take());
+    }
 }
 
 /// What a connection's writer sends next.
@@ -180,6 +216,8 @@ type HostClose = (String, Option<Arc<dyn Transport>>, u16, &'static str);
 
 /// The live connections of a node.
 pub struct Hub {
+    /// For the tasks the hub starts (the attach watchdog).
+    me: Weak<Hub>,
     env: Env,
     cfg: ConnectionsConfig,
     node: Mutex<Weak<Node>>,
@@ -203,7 +241,8 @@ pub fn host_code(cause: pb::CloseCause) -> u16 {
 
 impl Hub {
     pub fn new(env: Env, cfg: ConnectionsConfig) -> Arc<Hub> {
-        Arc::new(Hub {
+        Arc::new_cyclic(|me| Hub {
+            me: me.clone(),
             env,
             cfg,
             node: Mutex::new(Weak::new()),
@@ -412,6 +451,7 @@ impl Hub {
             &[("kind", kind), ("protocol", protocol), ("result", result)],
         );
         let mut abandoned = false;
+        let mut unattached = false;
         let restart = {
             let mut inner = lock(&self.inner);
             match inner.live.get_mut(&input.connection) {
@@ -420,6 +460,7 @@ impl Hub {
                         live.state = State::Open;
                         live.subject = subject.clone();
                         abandoned = live.abandoned;
+                        unattached = live.transport.is_none();
                         tracing::debug!(connection = %input.connection, owner = %owner, "connection open");
                     } else {
                         Self::remove(&mut inner, &input.connection);
@@ -433,6 +474,8 @@ impl Hub {
         };
         if abandoned {
             self.close_host(&input.connection, pb::CloseCause::Abandoned);
+        } else if unattached {
+            self.watch_attach(&input.connection);
         }
         if let Some(restart_after_lsn) = restart {
             tracing::debug!(connection = %input.connection, owner = %owner, "a re-run accepted a connection after a restart: closing it");
@@ -454,6 +497,31 @@ impl Hub {
                 close,
             );
         }
+    }
+
+    /// An accepted connection that gets no transport within
+    /// `attach_timeout` is abandoned, whoever forgot it: the client left
+    /// before the upgrade, or its handshake never completed. Until then a
+    /// close the actor buffers waits in its queue for the transport; after
+    /// it, the connection is freed with the close decided first (review
+    /// S3).
+    fn watch_attach(&self, conn: &str) {
+        let Some(hub) = self.me.upgrade() else {
+            return;
+        };
+        let conn = conn.to_owned();
+        let wait = self.cfg.attach_timeout;
+        drop(self.env.spawn("connection-attach", async move {
+            hub.env.clock.sleep(wait).await;
+            let unattached = lock(&hub.inner)
+                .live
+                .get(&conn)
+                .is_some_and(|l| l.state != State::Opening && l.transport.is_none());
+            if unattached {
+                tracing::info!(connection = %conn, "no transport attached in time: abandoned");
+                hub.abandon(&conn);
+            }
+        }));
     }
 
     /// The open turn of `conn` finished. One that did not settle the open

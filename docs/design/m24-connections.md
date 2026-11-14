@@ -720,6 +720,22 @@ numbering.
   frame 1008 (`slow-consumer`) is attempted within `close_timeout`. Then
   TCP is closed, and the close input records `frames_written`.
 - A `send-now` instead waits up to the effect timeout for room (§4.4).
+- **No write waits for ever** (review S1, S2). A frame or a ping that the
+  client does not take within `ping_timeout` closes the connection: as a
+  slow consumer for a frame, with `ping-timeout` for a ping. A close frame,
+  the flush after the client's close and the final close each get
+  `close_timeout`. The SSE driver's wait for room in the response body is
+  bounded the same way and notices a host close meanwhile. Under all of
+  them, the server fails any write to a client socket that makes no
+  progress for `ping_timeout` (`server.rs` `StallGuard`), which also frees
+  the socket of an SSE stream or an HTTP response that hyper is writing.
+  However a driver ends, it reports the end to the hub exactly once
+  (`FinishGuard`).
+- **No accepted connection without a transport** (review S3). An open
+  whose client leaves while its turn runs is abandoned when the gateway's
+  answering future is dropped. An accept that gets no transport within
+  `attach_timeout` (10 s, the upgrade's limit, not a `kronik.toml` key) is
+  abandoned by the hub; a close its actor buffered meanwhile is recorded.
 
 ### 5.7 Keepalive
 

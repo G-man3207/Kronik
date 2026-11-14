@@ -418,6 +418,27 @@ pub struct OpenAnswer {
     pub protocol: Option<pb::ConnectionProtocol>,
 }
 
+/// Abandons a connection whose open is being answered unless disarmed
+/// (`Hub::abandon` is harmless for one that is gone).
+struct AbandonGuard {
+    hub: Arc<kronik_sched::connections::Hub>,
+    conn: Option<String>,
+}
+
+impl AbandonGuard {
+    fn disarm(mut self) {
+        self.conn = None;
+    }
+}
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.hub.abandon(&conn);
+        }
+    }
+}
+
 /// How long a client waits before it reconnects after `CONNECTION_LIMIT`.
 const CONNECTION_LIMIT_RETRY_SECS: &str = "5";
 
@@ -871,6 +892,13 @@ impl Gateway {
         let (conn, waiter) = self
             .node
             .connection_open(actor, http, protocol, subject, peer, exempt)?;
+        // Every way out of here but an accept handed to the caller
+        // abandons the connection, including this future being dropped
+        // because the client left while the open turn ran (review S3).
+        let guard = AbandonGuard {
+            hub: self.node.hub().clone(),
+            conn: Some(conn.clone()),
+        };
         let r = match self
             .node
             .env()
@@ -878,10 +906,7 @@ impl Gateway {
             .await
         {
             Ok(r) => r?,
-            Err(_) => {
-                self.node.hub().abandon(&conn);
-                return Err(self.timed_out());
-            }
+            Err(_) => return Err(self.timed_out()),
         };
         let accept = match (&r.outcome.output, r.committed()) {
             (Some(pb::outcome::Output::Accept(a)), true) => a,
@@ -943,6 +968,9 @@ impl Gateway {
                 }),
         );
         headers.push((TURN_ID_HEADER.into(), r.turn_id.to_string()));
+        // From here the caller attaches the connection's transport or
+        // abandons it; the hub abandons it if neither happens in time.
+        guard.disarm();
         Ok(OpenAnswer {
             response: HttpResponse {
                 status,

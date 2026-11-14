@@ -20,6 +20,13 @@ until the v1.0 compatibility promise takes effect.
   earlier release get their copy at the first start while the backend still
   serves them. **External secret values are now at rest, encrypted, in the
   data directory, its snapshots and the bucket.**
+- Long-lived connections never wait for ever on a client (M24 review): a
+  WebSocket or SSE client that takes no frame for `[connections]
+  ping_timeout` is closed as a slow consumer, every close gets
+  `close_timeout`, and the gateway drops any connection whose client takes
+  no bytes for `ping_timeout`, HTTP responses included. An open whose
+  client leaves while its turn runs, or whose transport never attaches
+  (10 s), is closed as `abandoned`, so it holds no slot.
 - The gateway serves WebSocket routes (M24): an upgrade to a `WEBSOCKET`
   route opens a connection whose owner's open turn accepts it, and the
   client gets `101 Switching Protocols` (with the selected subprotocol and

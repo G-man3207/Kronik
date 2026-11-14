@@ -129,6 +129,7 @@ impl Connections {
             sse_heartbeat: self.sse_heartbeat.0,
             close_timeout: self.close_timeout.0,
             shutdown_grace: self.shutdown_grace.0,
+            ..kronik_sched::connections::ConnectionsConfig::default()
         }
     }
 
