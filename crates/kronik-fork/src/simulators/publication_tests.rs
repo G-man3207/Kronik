@@ -1003,6 +1003,8 @@ async fn actual_multi_answer_cache_crosses_the_old_aggregate_bound_without_losin
     assert_eq!(provider.connections.load(Ordering::SeqCst), 0);
     model.offline = false;
     model.secret_snapshot = live;
+    // The live half reads under certificates of its own (`recertify`).
+    let mut certified = recertify(&node, &original).await;
     let (request, target, scope, fingerprint) = prepared(&model);
     assert!(
         model
@@ -1024,6 +1026,7 @@ async fn actual_multi_answer_cache_crosses_the_old_aggregate_bound_without_losin
     drop(model);
     let reopened = access(&node, &provider.url, &path);
     for ordinal in 0..count {
+        keep_certified(&node, &original, &mut certified).await;
         assert_eq!(
             reopened
                 .cached_answer("http:h.invalid", &legacy_key(ordinal as u32).1)
@@ -1033,6 +1036,7 @@ async fn actual_multi_answer_cache_crosses_the_old_aggregate_bound_without_losin
             answer
         );
     }
+    keep_certified(&node, &original, &mut certified).await;
     assert!(
         reopened
             .cached_answer("http:h.invalid", &fingerprint)
@@ -1125,6 +1129,41 @@ async fn settle_secret_inventory(node: &kronik_sched::Node) {
             tokio::time::Instant::now() < deadline,
             "the initial secret refresh did not settle"
         );
+    }
+}
+
+/// Certifies the node's secret inventory again and waits until the cycle has
+/// settled on it. Returns an instant no later than the new certificate's
+/// capture.
+///
+/// A live publication is current only for `[secrets] refresh` after its
+/// certificate was captured. The node's own secret cycle certifies again on
+/// this test's single-threaded runtime, so not while a test works without
+/// yielding: on a loaded machine, reading ~130 MiB of cached answers twice
+/// outlasts the certificate `native()` settled on.
+async fn recertify(node: &kronik_sched::Node, original: &AuthLease) -> std::time::Instant {
+    let at = std::time::Instant::now();
+    node.refresh_secret_inventory(original.clone())
+        .await
+        .unwrap();
+    settle_secret_inventory(node).await;
+    at
+}
+
+/// Certifies again when `certified`, an instant no later than the current
+/// certificate's capture, is more than half a certificate's window ago, so a
+/// live read that starts now ends while its certificate is current. Nothing
+/// is retried: every read still has to succeed on its first attempt. The
+/// window is the `[secrets] refresh` of the config `native()` starts the
+/// node with.
+async fn keep_certified(
+    node: &kronik_sched::Node,
+    original: &AuthLease,
+    certified: &mut std::time::Instant,
+) {
+    let window = kronik_sched::NodeConfig::default().secret_settings.refresh;
+    if certified.elapsed() > window / 2 {
+        *certified = recertify(node, original).await;
     }
 }
 
