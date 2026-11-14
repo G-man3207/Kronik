@@ -483,9 +483,9 @@ it reads the key source and checks the newest keystore backup, then it gives up
 root and reads the rest of the bucket as the data directory's owner. A
 `file://` bucket may belong to the service user (the daemon ships to
 `/var/lib/kronik-ship`), so in the root phase it is read by descriptor: reached
-from `/` without following a link and through directories that only root
-controls, never created, and below it only real directories on its file system
-and regular files with one link. A link to a file that only root may read, a
+from `/` without following a link anywhere, never created, and below it only
+real directories on its file system and regular files with one link, the
+wrapped key at most 1 MiB. A link to a file that only root may read, a
 FIFO that would hang the restore, or a linked directory in the bucket fails
 the restore instead.
 

@@ -392,11 +392,9 @@ fn restore_dropping(
         // owner's phase below reads the rest of it as the owner).
         let remote;
         let bucket = match job.from.strip_prefix("file://") {
-            Some(directory) => kronik_ship::Bucket::local(
-                Path::new(directory),
-                rustix::process::geteuid().as_raw(),
-            )
-            .map_err(ship_error)?,
+            Some(directory) => {
+                kronik_ship::Bucket::local(Path::new(directory)).map_err(ship_error)?
+            }
             None => {
                 remote =
                     Remote::open_with(job.from, job.endpoint, &credentials).map_err(ship_error)?;

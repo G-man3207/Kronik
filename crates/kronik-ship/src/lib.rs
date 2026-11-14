@@ -1019,24 +1019,32 @@ pub enum Bucket<'a> {
     Local(kronik_privacy::owned_tree::Dir),
 }
 
-/// The largest object the root phase reads from a local bucket (a keystore
-/// backup; the wrapped key is a small JSON document).
-const ROOT_PHASE_MAX_BYTES: u64 = 4 << 30;
+/// The largest objects the root phase reads from a local bucket into root's
+/// memory: a keystore backup, and a wrapped key (a small JSON document).
+const KEYSTORE_MAX_BYTES: u64 = 4 << 30;
+const WRAPPED_MAX_BYTES: u64 = 1 << 20;
 
 impl Bucket<'static> {
     /// The `file://` bucket at `path`, as a process with root's authority
     /// reads a bucket that another user may own (a nonroot installation's
-    /// `/var/lib/kronik-ship` is the service user's): reached from `/` without
-    /// following a symbolic link, through directories that only root or
-    /// `trusted` can change, and never created. Below it, a directory is never
-    /// a link nor on another file system, and an object is read only as a
-    /// regular file with one link, never a FIFO, a socket or a device: by path,
-    /// object_store's local store follows links, which could stand for a file
-    /// that only root may read, and opens a FIFO, which hangs the restore.
-    pub fn local(path: &Path, trusted: u32) -> Result<Bucket<'static>, ShipError> {
-        kronik_privacy::owned_tree::Dir::open_controlled(path, trusted, None)
-            .map(Bucket::Local)
-            .map_err(|e| ShipError::Restore(format!("the bucket {}: {e}", path.display())))
+    /// `/var/lib/kronik-ship` is the service user's): reached from `/` by
+    /// descriptor without following a symbolic link anywhere, and never
+    /// created. Below it, a directory is never a link nor on another file
+    /// system, and an object is read only as a regular file with one link,
+    /// never a FIFO, a socket or a device: by path, object_store's local store
+    /// follows links, which could stand for a file that only root may read,
+    /// and opens a FIFO, which hangs the restore. The directories on the way
+    /// may be anyone's: with no link followed, a directory of the bucket's
+    /// owner leads only to more of that owner's files, which is what a bucket
+    /// is.
+    pub fn local(path: &Path) -> Result<Bucket<'static>, ShipError> {
+        kronik_privacy::owned_tree::Dir::open_absolute(
+            path,
+            kronik_privacy::owned_tree::Ancestors::Any,
+            None,
+        )
+        .map(Bucket::Local)
+        .map_err(|e| ShipError::Restore(format!("the bucket {}: {e}", path.display())))
     }
 }
 
@@ -1062,8 +1070,9 @@ impl Bucket<'_> {
         Ok(Some((dir, name)))
     }
 
-    /// The object `rel`, or `None` when there is none.
-    async fn get(&self, rel: &str) -> Result<Option<Vec<u8>>, ShipError> {
+    /// The object `rel`, or `None` when there is none; from a local bucket at
+    /// most `max` bytes.
+    async fn get(&self, rel: &str, max: u64) -> Result<Option<Vec<u8>>, ShipError> {
         match self {
             Bucket::Remote(remote) => match remote.get(rel).await {
                 Ok(bytes) => Ok(Some(bytes)),
@@ -1074,7 +1083,7 @@ impl Bucket<'_> {
                 let Some((dir, name)) = Self::local_parent(root, rel)? else {
                     return Ok(None);
                 };
-                match dir.read_regular(std::ffi::OsStr::new(name), ROOT_PHASE_MAX_BYTES) {
+                match dir.read_regular(std::ffi::OsStr::new(name), max) {
                     Ok(bytes) => Ok(Some(bytes)),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                     Err(e) => Err(ShipError::Restore(format!("the bucket's {rel}: {e}"))),
@@ -1134,7 +1143,10 @@ pub async fn root_phase_from(
     let mut wrapped = None;
     let mut check_stores_first = false;
     let master = if keys.source.is_kms() {
-        let bytes = match bucket.get("wrapped/current.wrapped").await? {
+        let bytes = match bucket
+            .get("wrapped/current.wrapped", WRAPPED_MAX_BYTES)
+            .await?
+        {
             Some(bytes) => bytes,
             None => {
                 let backups = bucket.list("keystore").await?;
@@ -1146,7 +1158,7 @@ pub async fn root_phase_from(
                         ShipError::Restore("no wrapped master key in the bucket".into())
                     })?;
                 bucket
-                    .get(&format!("keystore/{wall}.wrapped"))
+                    .get(&format!("keystore/{wall}.wrapped"), WRAPPED_MAX_BYTES)
                     .await?
                     .ok_or_else(|| {
                         ShipError::Restore(format!(
@@ -1933,7 +1945,7 @@ async fn check_keystore_backup(
         ))
     })?;
     let blob = bucket
-        .get(&format!("keystore/{wall}.bin"))
+        .get(&format!("keystore/{wall}.bin"), KEYSTORE_MAX_BYTES)
         .await?
         .ok_or_else(|| ShipError::Restore(format!("keystore backup {wall} vanished")))?;
     match kronik_privacy::keystore::Keystore::read_backup(master, &blob) {
