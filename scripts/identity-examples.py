@@ -32,6 +32,9 @@ The traffic:
   a day later: libfaketime moves its wall clock 25 h ahead, so the sweep
   timer fires and removes the done items. Also a message, which todo does
   not handle: a dead letter, resent.
+- chat-ts (M24): messages posted over HTTP, read back by page, a room's
+  members and its page, invalid posts and pages, and a message, which
+  chat does not handle: a dead letter, resent.
 - billing-ts with its ledger: invoices finalized through calls to the
   ledger actor and charges to fake-payments, run as a plain local HTTP
   service (the gVisor path is demo/billing.sh's). A declined charge fails
@@ -211,6 +214,25 @@ def notes_traffic(ex):
     ex.expect("POST", "/notes/alice", 400, {"title": "x" * 201, "body": ""})
     ex.check("four notes left", len(ex.expect("GET", "/notes/alice", 200)["notes"]) == 4)
     ex.dead_letter_resent("notes/alice", "archive")
+
+
+# -------------------------------------------------------------------- chat
+
+
+def chat_traffic(ex):
+    for i, (user, text) in enumerate([("ada", "hello"), ("bob", "hi ada"), ("ada", "how are you?")]):
+        m = ex.expect("POST", "/chat/lobby/messages", 201, {"user": user, "text": text, "id": f"m{i}"})
+        ex.check("the room's next seq", m["seq"] == i + 1, m)
+    ex.expect("POST", "/chat/other/messages", 201, {"user": "cy", "text": "elsewhere"})
+    page = ex.expect("GET", "/chat/lobby/messages?after=1&limit=10", 200)
+    ex.check("the page after seq 1", [m["seq"] for m in page["messages"]] == [2, 3] and page["last"] == 3, page)
+    ex.check("no members", ex.expect("GET", "/chat/lobby/members", 200) == {"members": [], "followers": 0})
+    status, body, _ = ex.http("GET", "/chat/lobby")
+    ex.check("the room's page", status == 200 and "new WebSocket(" in str(body), status)
+    ex.expect("POST", "/chat/lobby/messages", 400, b"not json")
+    ex.expect("POST", "/chat/lobby/messages", 400, {"user": "Ada!", "text": "x"})
+    ex.expect("GET", "/chat/lobby/messages?after=x", 400)
+    ex.dead_letter_resent("chat/lobby", "archive")
 
 
 # ----------------------------------------------------------- webhook-relay
@@ -476,6 +498,7 @@ EXAMPLES = {
     "webhook-relay-go": (["webhook-relay-go.wasm"], relay_setup, relay_traffic),
     "uptime-ts": (["uptime-ts.wasm"], uptime_setup, uptime_traffic),
     "todo-ts": (["todo-ts.wasm"], None, todo_traffic),
+    "chat-ts": (["chat-ts.wasm"], None, chat_traffic),
     "billing-ts": (["billing-ts.wasm", "billing-ts-ledger.wasm"], billing_setup, billing_traffic),
 }
 
