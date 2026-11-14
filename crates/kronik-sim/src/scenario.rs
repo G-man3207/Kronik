@@ -1961,6 +1961,8 @@ mod tests {
             StartError::Corrupt(format!(
                 "recording the engine upgrade: log writer stopped: {writer}"
             )),
+            // A step that failed after the injected fsync stopped the node.
+            StartError::Fatal(writer.clone()),
         ] {
             assert!(injected_start_failure(&error).is_some(), "{error}");
         }
@@ -1978,6 +1980,7 @@ mod tests {
                 ErrorCode::Unavailable,
                 "the secret store is unavailable",
             )),
+            StartError::Fatal("applying the log failed: no such table".into()),
         ] {
             assert!(injected_start_failure(&error).is_none(), "{error}");
         }

@@ -50,12 +50,15 @@ fn the_log_open_and_the_first_record_of_a_start_can_fail_their_fsync() {
         assert_eq!(opened.start_failures, [INJECTED_FSYNC_EIO], "seed {seed}");
 
         // The second is the first record the start appends, the secret
-        // format fence: the start fails with a secret error that reports the
-        // stopped log writer (the failure of the nightly run).
+        // format fence: its failure stops the node, and the start fails with
+        // that storage failure (it used to fail with a secret error naming
+        // the stopped log writer, the failure of the nightly run).
         let fenced = failing_fsync(seed, 2);
         assert!(fenced.ok(), "seed {seed}, fsync 2: {}", why(&fenced));
         assert!(
-            matches!(&fenced.start_failures[..], [e] if e.contains("log writer stopped")),
+            matches!(&fenced.start_failures[..], [e]
+                if e.contains("a storage failure stopped the node while it started")
+                    && e.contains(INJECTED_FSYNC_EIO)),
             "seed {seed}: {:?}",
             fenced.start_failures
         );

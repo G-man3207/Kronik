@@ -144,6 +144,12 @@ pub enum StartError {
     /// ([`Node::recover_erasures`]).
     #[error("erasure recovery: {0}")]
     Erasure(String),
+    /// A storage failure stopped the node while it started (the log writer
+    /// or the applier failed, or the blob store's disk): a step that then
+    /// failed failed because of it. The daemon exits and is started again,
+    /// as for any I/O error of a start.
+    #[error("UNAVAILABLE: a storage failure stopped the node while it started: {0}")]
+    Fatal(String),
 }
 
 /// A route served by a deployed kind.
@@ -999,7 +1005,7 @@ impl Node {
                     node.epoch(),
                 )
                 .await
-                .map_err(|error| StartError::Corrupt(error.to_string()))?;
+                .map_err(|error| node.start_failure(StartError::Corrupt(error.to_string())))?;
             let _publication = lock(&node.publication);
             runtime.publish_native_current_config_under_publication(node.epoch());
         }
@@ -1036,14 +1042,17 @@ impl Node {
                 "engine upgrade"
             );
             node.commit(Record::EngineUpgrade(u)).await.map_err(|e| {
-                StartError::Corrupt(format!("recording the engine upgrade: {}", e.message))
+                node.start_failure(StartError::Corrupt(format!(
+                    "recording the engine upgrade: {}",
+                    e.message
+                )))
             })?;
         }
         // A subject whose keys were erased by a run that stopped before the
         // Erasure record (docs/design/m8-privacy.md §6.1).
         node.recover_erasures()
             .await
-            .map_err(|e| StartError::Erasure(e.message))?;
+            .map_err(|e| node.start_failure(StartError::Erasure(e.message)))?;
         // A reseal that stopped between renaming a segment's resealed image
         // into place and fixing state.db for it (docs/design/m8-privacy.md
         // §8). A failure leaves its journal entry: `privacy status` reports
@@ -1079,7 +1088,8 @@ impl Node {
         // a stop may have left: the collector's first pass (M26 §9.3).
         node.wake_for_loose_erasures().await;
         node.initialize_secret_versions(last == 0, node.native_recovery.clone())
-            .await?;
+            .await
+            .map_err(|e| node.start_failure(e.into()))?;
         node.start_secret_refresh(node.native_recovery.clone());
         // For the shipper, after the records the start appends itself: a
         // file of the data directory, written through the node's file
@@ -1095,12 +1105,12 @@ impl Node {
         // Physical ACTIVE precedes Foreign recovery; public readiness is still the final Ok(node).
         native_execution
             .activate()
-            .map_err(|error| StartError::Corrupt(error.to_string()))?;
+            .map_err(|error| node.start_failure(StartError::Corrupt(error.to_string())))?;
         // Foreign actors run before open turns are re-run: a re-run may redo
         // a foreign call (docs/design/m7-foreign.md §5).
         node.reconcile_foreign().await;
         kronik_core::authority::Authority::check(native_execution.as_ref())
-            .map_err(|error| StartError::Corrupt(error.to_string()))?;
+            .map_err(|error| node.start_failure(StartError::Corrupt(error.to_string())))?;
         // Timed-out calls still waiting for a callee turn that no process
         // will run are closed before any turn runs; a re-run callee turn
         // resolves its call itself (#30).
@@ -1113,7 +1123,9 @@ impl Node {
                 }
             })
             .collect();
-        node.close_lost_calls(&rerun_calls).await?;
+        node.close_lost_calls(&rerun_calls)
+            .await
+            .map_err(|e| node.start_failure(e))?;
         // Open turns first: each is the delivery of its input, so its mailbox
         // entry is skipped and its ingress key joins the re-run.
         let mut rerun_messages = HashSet::new();
@@ -1179,7 +1191,11 @@ impl Node {
         // after the re-runs and the mailbox and before the gateway takes
         // traffic, so in each actor the old connections close before new
         // ones open.
-        let open_connections = node.store.db().open_connections()?;
+        let open_connections = node
+            .store
+            .db()
+            .open_connections()
+            .map_err(|e| node.start_failure(e.into()))?;
         let restart_closes = open_connections.len();
         for row in open_connections {
             if rerun_closes.contains(&row.id) {
@@ -1290,6 +1306,20 @@ impl Node {
     /// Resolves when a fatal storage failure happens.
     pub async fn wait_fatal(&self) -> String {
         self.fatal.wait().await
+    }
+
+    /// The error of a start step, or the storage failure that stopped the
+    /// node meanwhile: the step then failed because of it (the node's
+    /// native lifecycle ends with a fatal failure), and its own error would
+    /// hide the cause from an operator and from a supervisor.
+    fn start_failure(&self, error: StartError) -> StartError {
+        match self.fatal() {
+            Some(fatal) => {
+                tracing::error!(%error, %fatal, "a start step failed after a storage failure");
+                StartError::Fatal(fatal)
+            }
+            None => error,
+        }
     }
 
     /// Stops the node as a failed log fsync does: a storage step whose

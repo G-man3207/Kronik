@@ -783,6 +783,14 @@ check the engine name against `kronik --version` of the release build):
   pointed into the old image. `privacy status` counts such a segment in
   `reseal.pending_segments`, and every erasure as pending, until the fix is
   done. v0.4.1 has the same gap.
+- A start that a storage failure stops (the log writer, the applier or the
+  blob store's disk failed) fails with that failure, `UNAVAILABLE: a
+  storage failure stopped the node while it started: ...`, so that the
+  daemon is started again as for any I/O error of a start. Before, a later
+  step failed with its own error, such as "the original native execution
+  lifetime ended", which hid the cause (found by the DST: an erasure whose
+  record a start recovered, then the snapshot the erasure takes failed its
+  log fsync). v0.4.1 has the same gap.
 
 ## v0.4.1 — 2026-11-07
 
