@@ -92,7 +92,7 @@ waiting messages carry, then release or cancel what it no longer needs in
 its code, or raise the quota for the kind.
 
 ```sh
-kronik limits set media --blob-size-per-actor 4GiB --reason "media keeps originals"
+kronik limits set media --blob-size-per-actor 4Gi --reason "media keeps originals"
 ```
 
 ## BLOB_STORE_FULL
