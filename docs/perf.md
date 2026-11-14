@@ -474,6 +474,37 @@ runs, niceness -10, on a loaded development machine:
   within the noise; CPU per record rose by up to 42 %, for notes (1 374 ±
   334 µs against 971 ± 84).
 
+## Streaming bodies and blobs (M25)
+
+The build brief: a 300 MB upload, a 40 MB fetched document and a 1 GB
+response pass through a node with constant memory
+(docs/design/m25-streaming-bodies.md §17).
+
+### Method
+
+`crates/kronik/tests/blobs_streaming.rs` runs a real `kronik serve` with
+`[blobs] enabled = true` and the test guest `media`. Memory is the daemon's
+peak RSS (`VmHWM` in `/proc/<pid>/status`) after a warm-up request of 2 MiB:
+for two sizes a factor of ten apart, each must grow it by at most the blob
+threshold (1 MiB) + 48 MiB, and both by the same amount within 16 MiB. The
+upload is streamed by the client and answered with its blob's identity,
+checked against the client's BLAKE3; the fetch is a generated PDF served by
+a local server, replayed by a fork in both modes with no difference and no
+second request; the response is a fetched document answered as the
+response, streamed and hashed by the client. `cargo test` runs CI's sizes;
+`scripts/acceptance-m25.sh` runs the VPS's (`--confine`: two CPUs and
+4 GiB, as the VPS).
+
+### Results (development machine, 2026-11-14, CI sizes, debug build)
+
+| What | Sizes | Peak RSS growth |
+| --- | --- | --- |
+| Upload | 8 MB, 80 MB | +1.6 MiB, +7.5 MiB |
+| Fetch | 4 MB, 40 MB | +4.7 MiB, +7.4 MiB |
+| Response | 12 MB, 120 MB | +3.1 MiB, +5.2 MiB |
+
+The four tests took 17 s together.
+
 ## Nightly checks (Definition of done)
 
 The Definition of done asks for a crash test of 1 000 `kill -9` cycles and
