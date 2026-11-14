@@ -256,6 +256,32 @@ pub fn fail(
     strip(record, limit, input_cost)
 }
 
+/// A turn whose record a reader of the log could not decode (only a host
+/// bug produces one): it fails, as [`fail`] makes a record too large fail,
+/// keeping its input, effects and compensations and dropping what it
+/// wrote, sent and answered.
+pub fn invalid(record: &mut pb::TurnRecord, compensations: &[pb::OutboundMessage], why: String) {
+    record.writes.clear();
+    record.messages.clear();
+    record.timers.clear();
+    record.connection_ops.clear();
+    record.sql_changes.clear();
+    record.sql_schema.clear();
+    record.blob_refs.clear();
+    record.compensations = compensations.to_vec();
+    record.schema_version = 0;
+    record.outcome = Some(pb::Outcome {
+        kind: pb::OutcomeKind::Trap as i32,
+        error_code: ErrorCode::Internal.as_str().into(),
+        message: format!(
+            "the turn's record could not be written as it would not decode (a host bug; \
+             see the daemon log): {why}"
+        ),
+        output: None,
+    });
+    mark_unknown_outcome(record);
+}
+
 /// Leaves out of a failed record what effects an earlier release recorded
 /// past this budget take, checking after each step: first their requests
 /// and responses, then the effects themselves. The outcome says which; the

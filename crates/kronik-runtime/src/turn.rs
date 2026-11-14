@@ -537,6 +537,17 @@ fn committed(
                     format!("reply is {} bytes, the limit is {limit}", m.body.len()),
                 );
             }
+            // As for sent messages (`check_message`): blobs travel in
+            // messages from M26 on, when each is completed from the
+            // references the turn holds. Until then nothing a guest names
+            // reaches the record unchecked.
+            if !m.blobs.is_empty() {
+                return failed(
+                    pb::OutcomeKind::Trap,
+                    "NOT_IMPLEMENTED",
+                    "NOT_IMPLEMENTED: blobs in replies arrive in a later version".into(),
+                );
+            }
             Some(pb::outcome::Output::Reply(message_to_pb(m, subject)))
         }
         types::Output::Http(r) => {

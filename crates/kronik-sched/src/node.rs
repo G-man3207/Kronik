@@ -2771,6 +2771,19 @@ impl Node {
                 "the turn's record did not fit in one log record: it fails with TURN_TOO_LARGE"
             ),
         }
+        // Defense in depth (review R-1): a record a reader of the log could
+        // not decode is never written. Only a host bug produces one; the
+        // turn fails instead, keeping its effects. (Sealing changes no
+        // reference; `commit` checks the sealed record again.)
+        if let Some(why) = undecodable(&mut record) {
+            tracing::error!(
+                actor = %actor,
+                execution_id = %record.execution_id,
+                error = %why,
+                "the turn's record would not decode (a host bug): the turn fails"
+            );
+            crate::record_budget::invalid(&mut record, &fxs.compensations, why);
+        }
         let mut outcome = record.outcome.clone().unwrap_or_default();
         let committed = outcome.kind == pb::OutcomeKind::Committed as i32;
         let mut messages = if committed {
@@ -3163,6 +3176,7 @@ impl Node {
 
     pub(crate) async fn commit(&self, mut record: Record) -> Result<Lsn, ApiError> {
         self.seal(&mut record)?;
+        self.decodable(&record)?;
         if let Record::TurnRecord(turn) = &record {
             Self::observe_turn(
                 turn.actor
@@ -3438,6 +3452,7 @@ impl Node {
         let mut sealed = Vec::with_capacity(records.len());
         for mut r in records {
             self.seal(&mut r)?;
+            self.decodable(&r)?;
             sealed.push(r);
         }
         let last = match self.log.append_all(sealed).await {
@@ -3459,9 +3474,26 @@ impl Node {
         self.me()
     }
 
+    /// Checks a sealed record as a reader of the log will (Record::validate)
+    /// before it is appended: one that failed would stop every later start,
+    /// shipping and replay at its LSN. Only a bug produces one; it is
+    /// refused with INTERNAL and not written, so the log stays readable.
+    fn decodable(&self, record: &Record) -> Result<(), ApiError> {
+        record.validate().map_err(|e| {
+            let message = format!(
+                "a record of kind {} failed validation before it was appended (a bug; it was \
+                 not written): {e}",
+                record.kind()
+            );
+            tracing::error!("{message}");
+            ApiError::new(ErrorCode::Internal, message)
+        })
+    }
+
     /// Appends a record and resolves after its fsync (not its apply).
     pub(crate) async fn append(&self, mut record: Record) -> Result<Lsn, ApiError> {
         self.seal(&mut record)?;
+        self.decodable(&record)?;
         self.log.append(record).await.map_err(|e| {
             if e.is_refusal() {
                 return refused(&e);
@@ -5851,6 +5883,16 @@ fn check_connection_export(m: &pb::Manifest, handles_connections: bool) -> Resul
             m.kind
         ),
     ))
+}
+
+/// Why a turn's record would not decode, as `Record::validate` sees it.
+fn undecodable(record: &mut pb::TurnRecord) -> Option<String> {
+    let wrapped = Record::TurnRecord(std::mem::take(record));
+    let checked = wrapped.validate();
+    if let Record::TurnRecord(back) = wrapped {
+        *record = back;
+    }
+    checked.err().map(|e| e.to_string())
 }
 
 async fn applier(

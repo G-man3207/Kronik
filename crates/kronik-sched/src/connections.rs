@@ -1175,14 +1175,24 @@ impl Hub {
             ],
         );
         tracing::debug!(connection = %conn, owner = %live.owner, cause = conn::cause_name(facts.cause as i32), "connection closed");
+        // A close for a restart is recorded as a restart's close at the next
+        // start is (`admit_restart_close`): the frames written unknown, and
+        // the turns after this point's frames dropped. Only the test host
+        // closes a live connection for a restart; a log reader refuses a
+        // restart close that claims to know them.
+        let restart = facts.cause == pb::CloseCause::Restart;
         let close = pb::ConnectionClose {
             cause: facts.cause as i32,
             code: u32::from(facts.code),
             reason: Some(tagged(live.subject.clone(), facts.reason.into_bytes())),
-            frames_written: live.frames_written,
-            frames_written_known: true,
+            frames_written: if restart { 0 } else { live.frames_written },
+            frames_written_known: !restart,
             frames_received: live.frames_received,
-            restart_after_lsn: 0,
+            restart_after_lsn: if restart {
+                self.node().map_or(0, |n| n.applied_lsn())
+            } else {
+                0
+            },
         };
         self.admit_close(
             &live.owner,

@@ -974,6 +974,7 @@ async fn unavailable_recorded_reference_itself_waits_and_cancellation_drops_its_
         kind: "secret.reveal".into(),
         status: pb::EffectStatus::Ok as i32,
         target: "secret-reveal:token".into(),
+        grounding: pb::Grounding::Live as i32,
         request: Some(pb::Sealable {
             subject: Some("missing".into()),
             value: Some(pb::sealable::Value::Sealed(pb::Sealed {

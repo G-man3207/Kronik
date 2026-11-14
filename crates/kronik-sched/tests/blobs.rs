@@ -1182,3 +1182,44 @@ fn a_blob_store_io_failure_stops_the_node_and_the_turn_runs_again() {
     assert_eq!(blob.size, 300_000);
     assert!(requests.load(std::sync::atomic::Ordering::SeqCst) >= 1);
 }
+
+/// Review R-1 (erasure): a reply's blobs reached the turn's record
+/// unchecked, so a made-up `b3s:` reference made the log undecodable at
+/// the next start, and a known one with another size made the node fatal.
+/// In M25 a reply cannot carry blobs (as a sent message cannot): the turn
+/// traps, the node stays up, and it starts again from its log.
+#[test]
+fn a_reply_cannot_carry_blobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), Some(BlobsConfig::default()));
+    let made_up = p.ingress(http("reply-forged", "", inline(b"")));
+    assert!(!made_up.committed());
+    assert_eq!(
+        made_up.outcome.error_code, "NOT_IMPLEMENTED",
+        "{:?}",
+        made_up.outcome
+    );
+    let written = blob_answer(&p.ingress(http("write", "size=100000", inline(b""))));
+    let resized = p.ingress(http(
+        "reply-forged",
+        "kind=resized",
+        pb::body::Value::Blob(written),
+    ));
+    assert!(!resized.committed());
+    assert_eq!(
+        resized.outcome.error_code, "NOT_IMPLEMENTED",
+        "{:?}",
+        resized.outcome
+    );
+    assert!(p.node.fatal().is_none());
+    assert_eq!(
+        answer(&p.ingress(http("info", "", inline(b"x")))),
+        "inline 1"
+    );
+    drop(p);
+    let p = start(dir.path(), Some(BlobsConfig::default()));
+    assert_eq!(
+        answer(&p.ingress(http("info", "", inline(b"yz")))),
+        "inline 2"
+    );
+}

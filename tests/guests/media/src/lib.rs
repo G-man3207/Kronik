@@ -21,6 +21,9 @@
 //! - `fetch-write` (`size=`; the body is a URL): GETs it, then writes `size`
 //!   bytes as `write` does and answers with the blob. Its turn has a
 //!   `TurnBegin` before it writes.
+//! - `reply-forged` (`kind=resized`): replies with a message naming a
+//!   blob the turn does not hold: a made-up `b3s:` reference, or the body's
+//!   blob with its size plus one.
 //! - `write-post` (`size=`, `url=`): writes a blob as `write` does and
 //!   POSTs it, in the same turn; answers the status or the fetch error.
 //! - `post` (`url=`): POSTs the body (a blob stays a blob) and answers the
@@ -273,6 +276,24 @@ fn run(op: &str, query: &str, body: HttpBody) -> Result<Output, HandlerError> {
             let blob = write_pattern(query_u64(query, "size", 0), MIB)
                 .map_err(|e| failed("write", &e))?;
             respond(HttpBody::Blob(blob))
+        }
+        "reply-forged" => {
+            let blob = match (&body, query_value(query, "kind")) {
+                (HttpBody::Blob(b), Some("resized")) => BlobRef {
+                    hash: b.hash.clone(),
+                    size: b.size + 1,
+                },
+                _ => BlobRef {
+                    hash: format!("b3s:{}", "ab".repeat(32)),
+                    size: 10,
+                },
+            };
+            Output::Reply(Message {
+                name: "forged".into(),
+                content_type: String::new(),
+                body: Vec::new(),
+                blobs: vec![blob],
+            })
         }
         "write-post" => {
             let url = query_value(query, "url").unwrap_or("").to_string();

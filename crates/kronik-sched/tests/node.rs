@@ -589,6 +589,8 @@ fn below_the_disk_reserve_new_work_waits_and_the_node_stays_up() {
     // A watch's guard record is an incident record too (W-M1).
     p.rt.block_on(p.node.record_guard(pb::GuardTriggered {
         audit: Some(audit()),
+        action: pb::GuardAction::Alert as i32,
+        outcome: pb::GuardOutcome::Alerted as i32,
         ..Default::default()
     }))
     .unwrap();

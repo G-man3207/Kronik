@@ -1489,6 +1489,12 @@ async fn begin(node: &Node) {
             kind: Some(pb::input::Kind::Http(pb::HttpInput {
                 method: "GET".into(),
                 path: "/".into(),
+                body: Some(pb::Body {
+                    value: Some(pb::body::Value::Inline(pb::Sealable {
+                        subject: None,
+                        value: Some(pb::sealable::Value::Plain(Vec::new())),
+                    })),
+                }),
                 ..Default::default()
             })),
         }),

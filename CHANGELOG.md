@@ -259,6 +259,12 @@ until the v1.0 compatibility promise takes effect.
   would be stored as a blob runs anew. A retry of a request still running or
   answered no longer needs its large body stored again (the gateway can ask
   `Node::ingress_peek` first).
+- A call's reply cannot carry blobs before M26 (M25): its turn traps with
+  `NOT_IMPLEMENTED`, as a sent message's does; a reply naming a reference
+  reached the record unchecked, and one the log could not decode stopped the
+  node from starting (found in review). Every record is also checked as the
+  log's readers will decode it before it is appended: a turn whose record
+  would not decode fails instead of being written.
 - Blob limits found in review (M25): a turn holds at most 64 blob writers
   open at once (constructing another traps); a writer creates its part file
   with its first full frame and holds at most one frame; a blob read is

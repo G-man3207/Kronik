@@ -48,6 +48,10 @@ fn call(
             source: pb::MessageSource::Call as i32,
             msg: Some(pb::Message {
                 name: "increment".into(),
+                body: Some(pb::Sealable {
+                    subject: None,
+                    value: Some(pb::sealable::Value::Plain(Vec::new())),
+                }),
                 ..Default::default()
             }),
             message_id: format!("m{n}"),

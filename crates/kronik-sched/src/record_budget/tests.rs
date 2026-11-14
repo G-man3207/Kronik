@@ -425,3 +425,48 @@ fn a_response_may_take_what_is_left_after_its_need() {
     assert_eq!(response_room(&budget, need, 10), 10);
     assert_eq!(response_room(&budget, 200_000, u64::MAX), 0);
 }
+
+/// Review R-1: a turn whose record would not decode (here a reply naming a
+/// `b3s:` reference without its subject) fails instead: what it wrote,
+/// sent and answered goes, its effects stay, and the record decodes.
+#[test]
+fn an_undecodable_turn_record_fails_and_decodes() {
+    use kronik_proto::Record;
+    let mut t = turn(2, 10);
+    if let Some(pb::input::Kind::Message(m)) = t.input.as_mut().and_then(|i| i.kind.as_mut()) {
+        m.source = pb::MessageSource::Operator as i32;
+    }
+    t.effects = vec![effect(0, 10)];
+    t.compensations.clear();
+    Record::TurnRecord(t.clone())
+        .validate()
+        .expect("a valid record before the forged reply");
+    let effects = t.effects.len();
+    t.outcome = Some(pb::Outcome {
+        kind: pb::OutcomeKind::Committed as i32,
+        output: Some(pb::outcome::Output::Reply(pb::Message {
+            name: "forged".into(),
+            blobs: vec![pb::BlobRef {
+                hash: format!("b3s:{}", "ab".repeat(32)),
+                size: 10,
+                subject: None,
+                key_version: 0,
+            }],
+            ..message(b"")
+        })),
+        ..Default::default()
+    });
+    let wrapped = Record::TurnRecord(t);
+    let why = wrapped.validate().expect_err("the forged reference");
+    let Record::TurnRecord(mut t) = wrapped else {
+        panic!("a turn record")
+    };
+    invalid(&mut t, &[compensation()], why.to_string());
+    assert!(t.writes.is_empty() && t.messages.is_empty());
+    assert_eq!(t.effects.len(), effects, "the effects stay");
+    assert_eq!(t.compensations.len(), 1);
+    let outcome = t.outcome.clone().unwrap();
+    assert_eq!(outcome.error_code, "INTERNAL");
+    assert!(outcome.output.is_none());
+    Record::TurnRecord(t).validate().unwrap();
+}
