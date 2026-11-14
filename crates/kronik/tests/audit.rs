@@ -662,6 +662,14 @@ fn every_mutation_reaches_the_file_sink_and_verify_reports_it_complete() {
                 json!({"kind": "counter", "capability": "secret-reveal:db"}),
                 Some("revoke"),
             ),
+            // M25: a pass of the blob collector, recorded as its AuditEvent.
+            step(
+                "POST",
+                "/v1/blobs/gc",
+                "/v1/blobs/gc",
+                json!({}),
+                Some("blobs.gc"),
+            ),
             step(
                 "POST",
                 "/v1/deployments",

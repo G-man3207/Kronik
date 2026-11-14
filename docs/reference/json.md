@@ -122,6 +122,10 @@ against both.
 | `kronik snapshot list` | [`SnapshotsResponse`](#snapshotsresponse) (`GET /v1/snapshots`) |
 | `kronik snapshot create` | [`SnapshotCreateResponse`](#snapshotcreateresponse) (`POST /v1/snapshots`) |
 | `kronik integrity` | [`IntegrityResponse`](#integrityresponse) (`GET /v1/integrity`) |
+| `kronik blobs status` | [`BlobsStatusResponse`](#blobsstatusresponse) (`GET /v1/blobs`) |
+| `kronik blobs inspect` | [`BlobInspectResponse`](#blobinspectresponse) (`GET /v1/blobs/{hash}`) |
+| `kronik blobs get` | no JSON: writes the blob's bytes; with -o, --json prints the hash, path and bytes |
+| `kronik blobs gc` | [`BlobGcResponse`](#blobgcresponse) (`POST /v1/blobs/gc`); with --dry-run without --reason: [`BlobGcPlanResponse`](#blobgcplanresponse) (`GET /v1/blobs/gc`) |
 | `kronik export status` | [`ExportStatusResponse`](#exportstatusresponse) (`GET /v1/export`) |
 | `kronik export rewind` | [`ExportRewindResponse`](#exportrewindresponse) (`POST /v1/export/{stream}/rewind`) |
 | `kronik audit show` | [`AuditResponse`](#auditresponse) (`GET /v1/audit`) |
@@ -439,6 +443,325 @@ against both.
 }
 ```
 
+### BlobGcEntry
+
+```json
+{
+  "description": "One blob file without a root.",
+  "properties": {
+    "bytes": {
+      "description": "The file's bytes on disk.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "candidate": {
+      "description": "The previous pass found it without a root too: the next pass\ndeletes it.",
+      "type": "boolean"
+    },
+    "hash": {
+      "type": "string"
+    },
+    "last_ref_lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "reason": {
+      "description": "`loose` (no record ever referenced it), `out-of-retention` (its\nlast reference is below the floor) or `erased`.",
+      "type": "string"
+    },
+    "size": {
+      "description": "From the index, when a record referenced it.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "subject": {
+      "description": "Null without `pii:read`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "hash",
+    "reason",
+    "bytes",
+    "candidate"
+  ],
+  "type": "object"
+}
+```
+
+### BlobGcPlanResponse
+
+```json
+{
+  "description": "`GET /v1/blobs/gc` (`kronik blobs gc --dry-run`): every blob file of\nmain's store without a root now, ignoring the two-pass grace.",
+  "properties": {
+    "blobs": {
+      "items": {
+        "$ref": "#/components/schemas/BlobGcEntry"
+      },
+      "type": "array"
+    },
+    "bytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "count": {
+      "description": "How many, and their bytes.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "floor": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "kept": {
+      "description": "Files with a root.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "enabled",
+    "blobs",
+    "count",
+    "bytes",
+    "kept"
+  ],
+  "type": "object"
+}
+```
+
+### BlobGcResponse
+
+```json
+{
+  "description": "`POST /v1/blobs/gc` (`kronik blobs gc`).",
+  "properties": {
+    "bytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "candidates": {
+      "description": "Files without a root kept for the next pass.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "deleted": {
+      "description": "Files deleted (a dry run: that a pass now would delete), and their\nbytes.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "floor": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "objects": {
+      "description": "Blob files left in main's store.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "dry_run",
+    "enabled",
+    "deleted",
+    "bytes",
+    "candidates",
+    "objects"
+  ],
+  "type": "object"
+}
+```
+
+### BlobGcSummary
+
+```json
+{
+  "description": "One pass of the blob collector.",
+  "properties": {
+    "bytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "candidates": {
+      "description": "Files without a root that the next pass deletes if they still have\nnone.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "deleted": {
+      "description": "Files it deleted, and their bytes.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "deleted_bytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "floor": {
+      "description": "The floor of the pass.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "objects": {
+      "description": "Blob files in main's store after the pass, and their bytes.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "objects",
+    "bytes",
+    "deleted",
+    "deleted_bytes",
+    "candidates",
+    "floor"
+  ],
+  "type": "object"
+}
+```
+
+### BlobInspectResponse
+
+```json
+{
+  "description": "`GET /v1/blobs/{hash}` (`kronik blobs inspect`).",
+  "properties": {
+    "file_bytes": {
+      "description": "The file's bytes on disk.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "first_ref_lsn": {
+      "description": "The first and last records that referenced it.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "hash": {
+      "type": "string"
+    },
+    "key_version": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "last_ref_lsn": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "roots": {
+      "description": "What keeps it; empty for a blob the collector deletes.",
+      "items": {
+        "$ref": "#/components/schemas/BlobRootEntry"
+      },
+      "type": "array"
+    },
+    "sealed": {
+      "description": "Its frames are encrypted (privacy mode), when the file was opened.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "size": {
+      "description": "From the index, when a record referenced it.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "state": {
+      "description": "`live`, `erased` (its subject was erased), `missing` (referenced,\nnot in the store: BLOB_MISSING) or `loose` (in the store, never\nreferenced: the collector deletes it).",
+      "type": "string"
+    },
+    "subject": {
+      "description": "Its subject: null without `pii:read`, and for a blob without one.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "verified": {
+      "description": "With `verify=true`: whether the whole file checked out.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "verify_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "hash",
+    "state",
+    "roots"
+  ],
+  "type": "object"
+}
+```
+
 ### BlobReference
 
 ```json
@@ -457,6 +780,141 @@ against both.
   "required": [
     "hash",
     "size"
+  ],
+  "type": "object"
+}
+```
+
+### BlobRootEntry
+
+```json
+{
+  "description": "What keeps a blob.",
+  "properties": {
+    "floor": {
+      "description": "`log`: the floor.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "fork": {
+      "description": "`fork`: its name.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "description": "`log` (a record at or after the floor), `pin` (a row of the state),\n`snapshot`, `fork` or `lease`.",
+      "type": "string"
+    },
+    "lsn": {
+      "description": "`log`: the last record that references it; `pin`: the record that\nset the pin; `snapshot`: the snapshot's LSN.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "owner": {
+      "description": "`pin`: the row: `kind/key/idempotency key`, an execution id, or\n`execution id/ordinal`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source": {
+      "description": "`pin`: `saved-response`, `open-turn` or `open-effect` (M26 adds\nothers).",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "kind"
+  ],
+  "type": "object"
+}
+```
+
+### BlobsStatusResponse
+
+```json
+{
+  "description": "`GET /v1/blobs` (`kronik blobs status`, M25 §15).",
+  "properties": {
+    "below_reserve": {
+      "type": "boolean"
+    },
+    "enabled": {
+      "description": "`[blobs]` is on. When it is off every count is 0.",
+      "type": "boolean"
+    },
+    "floor": {
+      "description": "Records at or after this LSN keep their blobs (the lowest of the\nlog's first LSN, each fork's point + 1 and each replay's floor).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "free_bytes": {
+      "description": "Free bytes of the data directory's file system.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "indexed": {
+      "description": "Blobs that a record within retention or the state references (not\nerased), and their bytes.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "indexed_bytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "last_gc": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/BlobGcSummary"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The collector's last pass that deleted, since the daemon started."
+    },
+    "leases": {
+      "description": "Leases held in the daemon's memory: turns, uploads, streams, replays.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "reserve_bytes": {
+      "description": "`[blobs] disk_reserve` in bytes; below it new blobs are refused.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "enabled",
+    "indexed",
+    "indexed_bytes",
+    "leases",
+    "reserve_bytes",
+    "below_reserve"
   ],
   "type": "object"
 }
@@ -2802,7 +3260,7 @@ against both.
   "additionalProperties": false,
   "properties": {
     "body": {
-      "description": "When both bodies are JSON, the operations from production's body to the fork's, by JSON Pointer; otherwise one `replace` at the path `\"\"` with each body as text (or base64).",
+      "description": "When both bodies are JSON, the operations from production's body to the fork's, by JSON Pointer; otherwise one `replace` at the path `\"\"` with each body as text (or base64). A blob body (M25) is compared by reference and shown as `{\"blob\": \"b3:…\", \"size\": N}`.",
       "items": {
         "$ref": "#/components/schemas/DiffBodyOp"
       },
@@ -3387,7 +3845,7 @@ against both.
 
 ```json
 {
-  "description": "A value on one side: a state value, a header, a body or part of one, an SQL row; null when that side has none. A value with a subject is never shown, nor is the subject id: a state value, body or header value is `{\"redacted\": true, \"subject\": \"s:<12 hex>\", \"hash\": \"k:<16 hex>\"}`, a value in an SQL row `\"[redacted:s:<12 hex>:k:<16 hex>]\"`. `s:` is a keyed hash of the subject id (equal subjects give equal ones), `k:` a keyed hash of the subject and the value; both are `-` when the diff was built without the master key (`kronik upgrade check`). In a `--no-pii` fork, what a turn that used SQL produced is redacted under the subject `[sql]`, shown as is."
+  "description": "A value on one side: a state value, a header, a body or part of one, an SQL row; null when that side has none. A blob body (M25) is `{\"blob\": \"b3:…\", \"size\": N}`: its identity and size, never its bytes or its subject. A value with a subject is never shown, nor is the subject id: a state value, body or header value is `{\"redacted\": true, \"subject\": \"s:<12 hex>\", \"hash\": \"k:<16 hex>\"}`, a value in an SQL row `\"[redacted:s:<12 hex>:k:<16 hex>]\"`. `s:` is a keyed hash of the subject id (equal subjects give equal ones), `k:` a keyed hash of the subject and the value; both are `-` when the diff was built without the master key (`kronik upgrade check`). In a `--no-pii` fork, what a turn that used SQL produced is redacted under the subject `[sql]`, shown as is."
 }
 ```
 
@@ -3710,6 +4168,7 @@ against both.
             "AUDIT_RANGE_GONE",
             "BAD_REQUEST",
             "BLOB_MISSING",
+            "BLOB_NOT_FOUND",
             "BLOB_NOT_HELD",
             "BLOB_STORE_FULL",
             "CAPABILITY_NOT_GRANTED",

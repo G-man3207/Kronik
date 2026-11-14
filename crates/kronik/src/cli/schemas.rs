@@ -274,6 +274,22 @@ const COMMANDS: &[(&str, Output)] = &[
         Output::Api(&[("", "POST", "/v1/snapshots")]),
     ),
     ("integrity", Output::Api(&[("", "GET", "/v1/integrity")])),
+    ("blobs status", Output::Api(&[("", "GET", "/v1/blobs")])),
+    (
+        "blobs inspect",
+        Output::Api(&[("", "GET", "/v1/blobs/{hash}")]),
+    ),
+    (
+        "blobs get",
+        Output::None("writes the blob's bytes; with -o, --json prints the hash, path and bytes"),
+    ),
+    (
+        "blobs gc",
+        Output::Api(&[
+            ("", "POST", "/v1/blobs/gc"),
+            ("--dry-run without --reason", "GET", "/v1/blobs/gc"),
+        ]),
+    ),
     ("export status", Output::Api(&[("", "GET", "/v1/export")])),
     (
         "export rewind",
@@ -361,7 +377,7 @@ fn api_schema(g: &mut SchemaGenerator, method: &str, path: &str) -> Option<Schem
         Answer::EventsSse | Answer::EventsWebSocket => {
             g.subschema_for::<kronik_fleet::events::Event>()
         }
-        Answer::Redirect | Answer::Asset(_) => return None,
+        Answer::Redirect | Answer::Asset(_) | Answer::Bytes => return None,
     })
 }
 

@@ -34,6 +34,21 @@ GET /v1/health HTTP/1.1
 Host: kronik
 ```
 
+## GET /v1/blobs/{hash}/content
+
+A blob's bytes, streamed through the secret output matcher (`kronik blobs
+get`), with their exact `Content-Length`; `X-Kronik-Blob-Size` is the blob's
+own size. `offset` and `len` select a part of that output, which is the
+blob's own bytes when it holds no secret value. A subject's blob needs
+`pii:read`. The answer starts once the daemon has read the blob once, to
+count and check it; a transfer that stops before `Content-Length` is a
+failure.
+
+```http
+GET /v1/blobs/b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9/content HTTP/1.1
+Host: kronik
+```
+
 ## GET /v1/openapi.json
 
 Retrieve the schemas served by the running binary before constructing a client

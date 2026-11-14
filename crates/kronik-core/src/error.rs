@@ -113,6 +113,9 @@ codes! {
     BlobMissing = "BLOB_MISSING", 500, "M25",
         "A committed blob reference's bytes are not in the blob store",
         "Restore the blob store from the backup the data directory came from; never expected otherwise.";
+    BlobNotFound = "BLOB_NOT_FOUND", 404, "M25",
+        "This node knows no such blob",
+        "Check the hash: `kronik history` shows the blobs of turns, and `kronik blobs gc --dry-run` the files nothing keeps; a blob nothing kept may have been collected.";
     BlobNotHeld = "BLOB_NOT_HELD", 403, "M25",
         "The turn used a blob reference it neither holds nor received",
         "Use the reference the turn received in its input, from a fetch or a writer, or one the actor holds; a hash stored as data is not a reference.";

@@ -48,6 +48,8 @@ pub enum Answer {
     Redirect,
     /// Embedded static asset, on the admin listener only.
     Asset(&'static str),
+    /// Bytes (a blob's), streamed with their exact `Content-Length`.
+    Bytes,
 }
 
 /// One `/v1` operation.
@@ -1020,6 +1022,61 @@ pub const OPERATIONS: &[Operation] = &[
     },
     Operation {
         method: "GET",
+        path: "/v1/blobs",
+        summary: "The blob store: blobs the index keeps, floor, leases, free disk and reserve, the collector's last pass",
+        query: &[],
+        request: None,
+        answer: Answer::Json(schema::<BlobsStatusResponse>),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/blobs/gc",
+        summary: "The blob files of main's store that nothing keeps now, each with why (a dry run of the collector)",
+        query: &[],
+        request: None,
+        answer: Answer::Json(schema::<BlobGcPlanResponse>),
+    },
+    Operation {
+        method: "POST",
+        path: "/v1/blobs/gc",
+        summary: "Run a pass of the blob collector now: delete the files without a root since the last pass, or all of them with immediate",
+        query: &[],
+        request: Some(schema::<BlobGcRequest>),
+        answer: Answer::Json(schema::<BlobGcResponse>),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/blobs/{hash}",
+        summary: "One blob: size, subject (with pii:read), sealed, first and last referencing LSN, state and what keeps it",
+        query: &[Param {
+            name: "verify",
+            kind: "boolean",
+            description: "Also read and check the whole file.",
+        }],
+        request: None,
+        answer: Answer::Json(schema::<BlobInspectResponse>),
+    },
+    Operation {
+        method: "GET",
+        path: "/v1/blobs/{hash}/content",
+        summary: "A blob's bytes, streamed through the secret output matcher; a subject's blob needs pii:read",
+        query: &[
+            Param {
+                name: "offset",
+                kind: "integer",
+                description: "Start at this position of the output (the blob's own when it holds no secret value).",
+            },
+            Param {
+                name: "len",
+                kind: "integer",
+                description: "At most this many bytes.",
+            },
+        ],
+        request: None,
+        answer: Answer::Bytes,
+    },
+    Operation {
+        method: "GET",
         path: "/v1/integrity",
         summary: "The applied LSN, the state hash and a hash of the log, to compare after a restore",
         query: &[Param {
@@ -1325,6 +1382,10 @@ fn operation(op: &Operation, g: &mut SchemaGenerator, error: &Schema) -> Value {
         Answer::Asset(content_type) => json!({
             "description": "Embedded static admin asset. Never mounted on application routes.",
             "content": {(*content_type): {"schema": {"type": "string"}}}
+        }),
+        Answer::Bytes => json!({
+            "description": "The bytes, streamed with their exact Content-Length; X-Kronik-Blob-Size is the blob's own size. A stream cut short is a failure.",
+            "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}
         }),
     };
     let mut out = Map::new();

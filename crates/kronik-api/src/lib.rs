@@ -6,6 +6,7 @@
 mod audit;
 pub mod auth;
 pub mod auth_config;
+mod blobs;
 mod cluster_status;
 mod connections;
 mod effect_secrets;
@@ -1490,6 +1491,15 @@ impl Api {
                         Some(r) => r,
                         None => match self.route_m6(req, segs.as_slice()).await {
                             Some(r) => r,
+                            None if segs.get(1) == Some(&"blobs") => {
+                                match self.route_blobs(req, segs.as_slice(), &q, caller).await {
+                                    Some(r) => r,
+                                    None => Err(ApiError::new(
+                                        ErrorCode::NotImplemented,
+                                        format!("no endpoint {} {}", req.method, req.path),
+                                    )),
+                                }
+                            }
                             None => match self.route_preview(req, segs.as_slice(), caller).await {
                                 Some(r) => r,
                                 None => match self.route_export(req, segs.as_slice()).await {

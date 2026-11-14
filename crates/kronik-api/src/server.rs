@@ -97,7 +97,7 @@ fn response(status: u16, content_type: &'static str, body: Vec<u8>) -> hyper::Re
     resp
 }
 
-fn error_response(e: &ApiError) -> hyper::Response<Body> {
+pub(crate) fn error_response(e: &ApiError) -> hyper::Response<Body> {
     response(
         e.code.http_status(),
         "application/json",
@@ -384,6 +384,10 @@ async fn serve_connection<S>(
             if matches!(req.path.as_str(), "/v1/events/stream" | "/v1/events/ws") {
                 let incoming = hyper::Request::from_parts(parts, body);
                 return Ok(crate::event_stream::serve_captured(api, req, captured, incoming).await);
+            }
+            // A blob's bytes stream (M25 §15); every other answer is buffered.
+            if req.method == "GET" && crate::blobs::content_path(&req.path).is_some() {
+                return Ok(crate::blobs::serve_content(api, req, captured).await);
             }
             if req.method == "GET" && req.path == "/v1/events" {
                 let incoming = hyper::Request::from_parts(parts, body);

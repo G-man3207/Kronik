@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kronik_blob::{BlobError, BlobId, Roots, Space, SweepOptions, SweepReport};
+use kronik_blob::{BlobError, BlobId, Roots, Space, SweepReport};
+/// The store's options and reader, for the API.
+pub use kronik_blob::{BlobReader, SweepOptions};
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::Lsn;
 
@@ -423,6 +425,291 @@ impl Node {
     /// Wakes the collector after a retention pass.
     pub(crate) fn wake_blob_gc(&self) {
         self.blob_gc.wake.notify_one();
+    }
+}
+
+/// What `kronik blobs status` shows (M25 §15).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlobStatus {
+    /// `[blobs]` is on.
+    pub enabled: bool,
+    /// Blobs of the index (every blob a record within retention or the
+    /// state references, not erased) and their bytes.
+    pub indexed: u64,
+    pub indexed_bytes: u64,
+    /// The floor now: records at or after it keep their blobs.
+    pub floor: Option<Lsn>,
+    /// Live leases.
+    pub leases: u64,
+    /// Free bytes of the data directory's file system, `[blobs]
+    /// disk_reserve`, and whether new blobs are refused.
+    pub free_bytes: Option<u64>,
+    pub reserve_bytes: u64,
+    pub below_reserve: bool,
+    /// The collector's last pass that deleted (not a dry run).
+    pub last_gc: Option<GcOutcome>,
+}
+
+/// What keeps a blob, for `kronik blobs inspect` (M26 §6.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobRoot {
+    /// A record at or after the floor references it.
+    Log { last_ref_lsn: Lsn, floor: Lsn },
+    /// A row of the state pins it.
+    Pin {
+        source: &'static str,
+        owner: String,
+        lsn: Lsn,
+    },
+    /// A kept snapshot's `blobs.idx` lists it.
+    Snapshot { lsn: Lsn },
+    /// A fork's `blobs.roots` lists it.
+    Fork { name: String },
+    /// A lease of this daemon holds it (a turn, an upload, a stream).
+    Lease,
+}
+
+/// The state of a blob for `kronik blobs inspect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobState {
+    /// In the index and in the store.
+    Live,
+    /// Its subject was erased through its key version.
+    Erased,
+    /// In the index, not in the store (`BLOB_MISSING`).
+    Missing,
+    /// In the store, not in the index: no record ever referenced it.
+    Loose,
+}
+
+impl BlobState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlobState::Live => "live",
+            BlobState::Erased => "erased",
+            BlobState::Missing => "missing",
+            BlobState::Loose => "loose",
+        }
+    }
+}
+
+/// One blob, for `kronik blobs inspect`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobInspection {
+    pub hash: String,
+    pub state: BlobState,
+    /// The index's row, when a record referenced it.
+    pub row: Option<kronik_store::db::BlobRow>,
+    /// The file's bytes on disk, when it is in the store.
+    pub file_bytes: Option<u64>,
+    /// Whether its frames are sealed, when the file could be opened.
+    pub sealed: Option<bool>,
+    pub roots: Vec<BlobRoot>,
+    /// With `verify`: whether the whole file checked out, and why not.
+    pub verified: Option<Result<(), String>>,
+}
+
+impl Node {
+    /// `kronik blobs status`.
+    pub fn blob_status(&self) -> Result<BlobStatus, ApiError> {
+        let Some(store) = &self.blobs else {
+            return Ok(BlobStatus::default());
+        };
+        let (indexed, indexed_bytes) = self.store().db().blob_totals().map_err(store_error)?;
+        let below = store.below_reserve();
+        Ok(BlobStatus {
+            enabled: true,
+            indexed,
+            indexed_bytes,
+            floor: self.blob_floor().ok(),
+            leases: store.leases().holders().len() as u64,
+            free_bytes: below.or_else(|| self.disk_free()),
+            reserve_bytes: self.cfg.blobs.as_ref().map_or(0, |b| b.disk_reserve),
+            below_reserve: below.is_some(),
+            last_gc: self.blob_gc_last(),
+        })
+    }
+
+    fn blob_id(hash: &str) -> Result<BlobId, ApiError> {
+        BlobId::parse(hash).map_err(|_| {
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!("{hash:?} is not a blob hash (b3:<64 hex> or b3s:<64 hex>)"),
+            )
+        })
+    }
+
+    fn blob_not_found(hash: &str) -> ApiError {
+        ApiError::new(
+            ErrorCode::BlobNotFound,
+            format!("this node knows no blob {hash}"),
+        )
+    }
+
+    /// `kronik blobs inspect`: what the index and the store know of `hash`,
+    /// what keeps it, and with `verify` whether its whole file checks out.
+    /// `BLOB_NOT_FOUND` when neither knows it (or blobs are off).
+    pub async fn blob_inspect(&self, hash: &str, verify: bool) -> Result<BlobInspection, ApiError> {
+        let id = Self::blob_id(hash)?;
+        let hash = id.to_string();
+        let Some(store) = self.blobs.clone() else {
+            return Err(Self::blob_not_found(&hash));
+        };
+        let row = self.store().db().blob(&hash).map_err(store_error)?;
+        let present = store
+            .contains(&Space::Main, &id)
+            .await
+            .map_err(blob_error)?;
+        let state = match (&row, present) {
+            (None, false) => return Err(Self::blob_not_found(&hash)),
+            (None, true) => BlobState::Loose,
+            (Some(r), _) if r.erased => BlobState::Erased,
+            (Some(_), false) => BlobState::Missing,
+            (Some(_), true) => BlobState::Live,
+        };
+        let mut file_bytes = None;
+        let mut sealed = None;
+        let mut verified = None;
+        if present {
+            let file = self
+                .env
+                .fs
+                .open(
+                    store.object_path(&Space::Main, &id),
+                    kronik_core::env::OpenMode::Read,
+                )
+                .await
+                .map_err(|e| store_error(format!("opening the blob: {e}")))?;
+            file_bytes = Some(
+                file.len()
+                    .await
+                    .map_err(|e| store_error(format!("reading the blob's length: {e}")))?,
+            );
+            if let Some(r) = row.as_ref().filter(|r| !r.erased) {
+                let meta = kronik_blob::BlobMeta::from_pb(&kronik_proto::log::v1::BlobRef {
+                    hash: r.hash.clone(),
+                    size: r.size,
+                    subject: r.subject.clone(),
+                    key_version: r.key_version,
+                })
+                .map_err(blob_error)?;
+                let access = self.sealer().blob_key_access();
+                match store.reader(&Space::Main, &meta, &access).await {
+                    Ok(reader) => {
+                        sealed = Some(reader.is_sealed());
+                        if verify {
+                            verified =
+                                Some(reader.verify(&access).await.map_err(|e| e.to_string()));
+                        }
+                    }
+                    Err(e) if verify => verified = Some(Err(e.to_string())),
+                    Err(_) => {}
+                }
+            }
+        }
+        let mut roots = Vec::new();
+        if let Some(r) = &row
+            && !r.erased
+        {
+            let floor = self.blob_floor()?;
+            if r.last_ref_lsn >= floor {
+                roots.push(BlobRoot::Log {
+                    last_ref_lsn: r.last_ref_lsn,
+                    floor,
+                });
+            }
+            for pin in self.store().db().blob_pins(&hash).map_err(store_error)? {
+                roots.push(BlobRoot::Pin {
+                    source: kronik_store::db::blob_source::name(pin.source),
+                    owner: pin.owner,
+                    lsn: pin.lsn,
+                });
+            }
+        }
+        let data = self.blob_data_dir()?;
+        for (dir, manifest) in crate::snapshots::list(&data, self.branch()) {
+            if read_roots_file(&dir.join(SNAPSHOT_INDEX)).is_ok_and(|ids| ids.contains(&id)) {
+                roots.push(BlobRoot::Snapshot { lsn: manifest.lsn });
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(data.join("branches")) {
+            let mut forks: Vec<String> = entries
+                .flatten()
+                .filter(|e| e.file_name() != self.branch())
+                .filter(|e| fork_of(&e.path()).ids.contains(&id))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            forks.sort();
+            roots.extend(forks.into_iter().map(|name| BlobRoot::Fork { name }));
+        }
+        if store.leases().is_leased(&id) {
+            roots.push(BlobRoot::Lease);
+        }
+        Ok(BlobInspection {
+            hash,
+            state,
+            row,
+            file_bytes,
+            sealed,
+            roots,
+            verified,
+        })
+    }
+
+    /// A reader of `hash`'s bytes for `kronik blobs get`, with its index
+    /// row (its subject decides who may read it). `BLOB_NOT_FOUND` for a
+    /// blob the index does not know (or with blobs off), `SUBJECT_ERASED`,
+    /// `BLOB_MISSING`.
+    pub async fn blob_content(
+        &self,
+        hash: &str,
+    ) -> Result<(kronik_store::db::BlobRow, BlobReader), ApiError> {
+        let id = Self::blob_id(hash)?;
+        let hash = id.to_string();
+        let Some(store) = self.blobs.clone() else {
+            return Err(Self::blob_not_found(&hash));
+        };
+        let row = self
+            .store()
+            .db()
+            .blob(&hash)
+            .map_err(store_error)?
+            .ok_or_else(|| Self::blob_not_found(&hash))?;
+        if row.erased {
+            return Err(ApiError::new(
+                ErrorCode::SubjectErased,
+                format!("blob {hash} belonged to a subject that was erased"),
+            ));
+        }
+        let meta = kronik_blob::BlobMeta::from_pb(&kronik_proto::log::v1::BlobRef {
+            hash: row.hash.clone(),
+            size: row.size,
+            subject: row.subject.clone(),
+            key_version: row.key_version,
+        })
+        .map_err(blob_error)?;
+        let access = self.sealer().blob_key_access();
+        let reader = store
+            .reader(&Space::Main, &meta, &access)
+            .await
+            .map_err(|e| match e {
+                BlobError::NotFound(_) => {
+                    kronik_metrics::inc("kronik_blob_missing_total", &[]);
+                    ApiError::new(
+                        ErrorCode::BlobMissing,
+                        format!("blob {hash} is in the index but not in the blob store"),
+                    )
+                }
+                BlobError::Erased => ApiError::new(
+                    ErrorCode::SubjectErased,
+                    format!("blob {hash} belonged to a subject that was erased"),
+                ),
+                BlobError::KeyMissing(_) => {
+                    ApiError::new(ErrorCode::KeystoreIncomplete, e.to_string())
+                }
+                other => blob_error(other),
+            })?;
+        Ok((row, reader))
     }
 }
 

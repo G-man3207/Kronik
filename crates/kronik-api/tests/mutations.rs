@@ -274,6 +274,12 @@ fn cases() -> Vec<Case> {
         },
         Case {
             method: "POST",
+            path: "/v1/blobs/gc",
+            writes: &["blobs.gc"],
+            extra: json!({}),
+        },
+        Case {
+            method: "POST",
             path: "/v1/export/{stream}/rewind",
             writes: &["export.rewind"],
             extra: json!({"to": 0}),
@@ -1113,6 +1119,9 @@ async fn every_mutation_writes_its_audited_record() {
             json!({}),
         ),
         ("POST", "/v1/snapshots", "/v1/snapshots", json!({})),
+        // Blobs are off in this node: the pass has nothing to do, and is
+        // still audited.
+        ("POST", "/v1/blobs/gc", "/v1/blobs/gc", json!({})),
         (
             "POST",
             "/v1/export/{stream}/rewind",

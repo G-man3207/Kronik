@@ -738,6 +738,19 @@ impl ScrubbedOutput for DeploymentsResponse {
     }
 }
 
+/// A pin's owner names a row: an actor's key and an idempotency key a
+/// client chose, which may hold a secret value; a verification error may
+/// quote the store.
+impl ScrubbedOutput for BlobInspectResponse {
+    fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
+        for root in &mut self.roots {
+            optional_text(&mut root.owner, secrets);
+        }
+        optional_text(&mut self.verify_error, secrets);
+        Ok(())
+    }
+}
+
 impl ScrubbedOutput for GrantsResponse {
     fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
         for grant in &mut self.grants {

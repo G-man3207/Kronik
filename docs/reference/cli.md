@@ -75,7 +75,8 @@ Every mutation (`deploy`, `send`, `dead-letters resend`, `grant`, `revoke`,
 `stubs set`, `privacy mode`, `privacy erase`, `privacy reseal`, `keys wrap`,
 `keys rewrap`, `token create`, `token revoke`, `snapshot create`,
 `export rewind`, `fleet enroll`, `fleet revoke`,
-`events webhooks replay`, `connections close`) requires `--reason`,
+`events webhooks replay`, `connections close`,
+`blobs gc`) requires `--reason`,
 which the history records with the change, and supports `--dry-run`, which
 checks the request and writes nothing (I12). `replay` writes only in its
 fork, and `send --fork` only in the fork; both require `--reason` and have
@@ -2528,6 +2529,108 @@ Log hash      b3:1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80
 Log first LSN 1
 Window        7 days back from logical time 1761400000000 (cutoff 1760795200000)
 Next     kronik snapshot list
+```
+
+## kronik blobs status
+
+`kronik blobs status`
+
+The blob store of M25 (`GET /v1/blobs`, scope `read`): how many blobs its
+index keeps (those a record within retention or the state references) and
+their bytes, the floor (records at or after it keep their blobs: the lowest
+of the log's first LSN, each fork's point + 1 and each replay's floor), the
+leases the daemon holds (turns, uploads, streams, replays), the free disk
+and `[blobs] disk_reserve`, and the collector's last pass since the daemon
+started. With blobs off it says so.
+
+```text
+$ kronik blobs status
+Indexed      12 blobs, 310.4 MiB
+Floor        lsn 1190
+Leases       2
+Disk         88.1 GiB free, reserve 4.0 GiB
+Last pass    14 files (311.0 MiB) left, 3 deleted (40.2 MiB), 1 candidates, floor lsn 1190
+Next     kronik blobs gc --dry-run
+```
+
+## kronik blobs inspect
+
+`kronik blobs inspect <HASH> [--verify]`
+
+One blob (`GET /v1/blobs/{hash}`, scope `read`): its size, its subject (only
+with `pii:read`), whether its frames are sealed, the first and last records
+that referenced it, its state and what keeps it: `log` (a record at or
+after the floor), `pin` (a saved idempotent response, an open turn or one of
+its effects), `snapshot`, `fork` or `lease`. The state is `live`, `erased`
+(its subject was erased), `missing` (referenced, but not in the store:
+`BLOB_MISSING`) or `loose` (in the store, never referenced: the collector
+deletes it). `--verify` also reads the whole file and checks every frame
+and its identity; a file that does not check out exits 1. A blob this node
+does not know is `BLOB_NOT_FOUND`.
+
+```text
+$ kronik blobs inspect b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9
+Blob         b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9
+State        live
+Size         30.0 MiB
+Referenced   lsn 1203 to lsn 1203
+Sealed       no
+File         30.0 MiB
+Kept by
+root  what
+log   a record at lsn 1203 (floor lsn 1190)
+Next     kronik blobs get b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9 -o FILE
+```
+
+## kronik blobs get
+
+`kronik blobs get <HASH> [-o <FILE>]`
+
+Writes a blob's bytes to `FILE`, or to standard output
+(`GET /v1/blobs/{hash}/content`, scope `read`, and `pii:read` for a
+subject's blob). The bytes go through the secret output matcher, as every
+answer of the daemon does: a secret value in them reads `[secret:NAME]`.
+The daemon reads the blob twice, once to count and check it and once to
+send it, so the transfer has its exact length; a transfer cut short fails
+and leaves no file. `--json` prints the hash, path and bytes written, with
+`-o` only. Only blobs that a record within retention or the state
+references can be read: `BLOB_NOT_FOUND` otherwise, `SUBJECT_ERASED` for an
+erased subject's blob.
+
+```text
+$ kronik blobs get b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9 -o report.pdf
+Wrote b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9 (30.0 MiB) to report.pdf
+```
+
+## kronik blobs gc
+
+`kronik blobs gc --dry-run`
+`kronik blobs gc --reason <REASON> [--immediate] [--dry-run]`
+
+The collector (M26 §6). With `--dry-run` alone (`GET /v1/blobs/gc`, scope
+`read`) it lists every blob file of main's store that nothing keeps now,
+and why: `loose` (no record ever referenced it: a turn that failed, or
+wrote a blob and did not answer with it or keep it, a crash before the
+commit), `out-of-retention` (its last reference is below the floor) or
+`erased`. A pass deletes a file without a root when the previous pass found
+it without one too, so a file goes within two passes; the daemon runs a pass
+after every retention pass and every `[blobs] gc_interval`. With `--reason`
+(`POST /v1/blobs/gc`, scope `operate`) it runs a pass now; `--immediate`
+deletes every file without a root at once, and `--dry-run` with a reason
+says what such a pass would delete. A pass records an `AuditEvent`
+`blobs.gc`.
+
+```text
+$ kronik blobs gc --dry-run
+blob                                                                     reason            bytes     last lsn  deleted by
+b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9  out-of-retention  30.0 MiB  1203      next pass
+1 files (30.0 MiB) without a root; 12 kept; floor lsn 1290.
+Next     kronik blobs gc --reason "..."
+         kronik blobs gc --immediate --reason "..."
+
+$ kronik blobs gc --reason "free the disk now" --immediate
+Deleted 1 files (30.0 MiB); 0 candidates for the next pass; 12 files left.
+Next     kronik blobs status
 ```
 
 ## kronik export status

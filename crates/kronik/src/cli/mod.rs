@@ -6,6 +6,7 @@
 //! request carries that token and acts as it, with its scopes.
 
 mod audit;
+mod blobs;
 mod events;
 mod export;
 mod fleet;
@@ -207,6 +208,10 @@ pub enum Command {
     /// List snapshots of main, or take one now.
     #[command(subcommand)]
     Snapshot(snapshot::SnapshotCommand),
+    /// The blob store: its status, one blob and its bytes, and the
+    /// collector.
+    #[command(subcommand)]
+    Blobs(blobs::BlobsCommand),
     /// The applied LSN, the state hash and a hash of the log, to compare
     /// after a restore.
     Integrity(snapshot::IntegrityArgs),
@@ -724,6 +729,7 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
         Command::Stubs(c) => simulators::stubs(&ctx, c),
         Command::Simulators(c) => simulators::simulators(&ctx, c),
         Command::Snapshot(c) => snapshot::snapshot(&ctx, c),
+        Command::Blobs(c) => blobs::blobs(&ctx, c),
         Command::Integrity(a) => snapshot::integrity(&ctx, a),
         Command::Export(c) => export::export(&ctx, c),
         Command::Audit(c) => audit::audit(&ctx, c),
@@ -920,6 +926,44 @@ impl Ctx {
                 body: r.body,
             })
         }
+    }
+
+    /// Opens a streamed GET (a blob's bytes): the status, and the body read
+    /// as it arrives.
+    fn stream(&self, target: &str) -> Result<http::StreamResponse, Error> {
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .map_err(|e| Error::Local(e.clone()))?;
+        let token = self.token.as_ref().map_err(|e| Error::Local(e.clone()))?;
+        let shown = endpoint.shown();
+        http::stream(
+            endpoint,
+            target,
+            token.as_deref(),
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .map_err(|f| {
+            Error::Local(match f {
+                http::Failure::Connect(e) => connect_error(endpoint, &e),
+                http::Failure::Tls(m) => ApiError::new(
+                    ErrorCode::Unavailable,
+                    format!("TLS to {shown} failed: {m}"),
+                )
+                .with_hint(TLS_HINT),
+                http::Failure::Io(e) => ApiError::new(
+                    ErrorCode::Unavailable,
+                    format!("the connection to the daemon on {shown} broke: {e}"),
+                ),
+                http::Failure::Timeout => ApiError::new(
+                    ErrorCode::Unavailable,
+                    format!("the daemon on {shown} did not answer in time"),
+                ),
+                http::Failure::Malformed(m) => ApiError::new(ErrorCode::Internal, m)
+                    .with_hint(format!("Check that {shown} is a Kronik API.")),
+            })
+        })
     }
 
     /// Parses a successful response for human output.

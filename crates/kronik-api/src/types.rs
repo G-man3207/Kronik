@@ -1889,3 +1889,154 @@ pub struct ConnectionCloseResponse {
     /// The connection: `closing` after a close, unchanged after a dry run.
     pub connection: Connection,
 }
+
+/// `GET /v1/blobs` (`kronik blobs status`, M25 §15).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BlobsStatusResponse {
+    /// `[blobs]` is on. When it is off every count is 0.
+    pub enabled: bool,
+    /// Blobs that a record within retention or the state references (not
+    /// erased), and their bytes.
+    pub indexed: u64,
+    pub indexed_bytes: u64,
+    /// Records at or after this LSN keep their blobs (the lowest of the
+    /// log's first LSN, each fork's point + 1 and each replay's floor).
+    pub floor: Option<u64>,
+    /// Leases held in the daemon's memory: turns, uploads, streams, replays.
+    pub leases: u64,
+    /// Free bytes of the data directory's file system.
+    pub free_bytes: Option<u64>,
+    /// `[blobs] disk_reserve` in bytes; below it new blobs are refused.
+    pub reserve_bytes: u64,
+    pub below_reserve: bool,
+    /// The collector's last pass that deleted, since the daemon started.
+    pub last_gc: Option<BlobGcSummary>,
+}
+
+/// One pass of the blob collector.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BlobGcSummary {
+    /// Blob files in main's store after the pass, and their bytes.
+    pub objects: u64,
+    pub bytes: u64,
+    /// Files it deleted, and their bytes.
+    pub deleted: u64,
+    pub deleted_bytes: u64,
+    /// Files without a root that the next pass deletes if they still have
+    /// none.
+    pub candidates: u64,
+    /// The floor of the pass.
+    pub floor: u64,
+}
+
+/// What keeps a blob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BlobRootEntry {
+    /// `log` (a record at or after the floor), `pin` (a row of the state),
+    /// `snapshot`, `fork` or `lease`.
+    pub kind: String,
+    /// `log`: the last record that references it; `pin`: the record that
+    /// set the pin; `snapshot`: the snapshot's LSN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsn: Option<u64>,
+    /// `log`: the floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<u64>,
+    /// `pin`: `saved-response`, `open-turn` or `open-effect` (M26 adds
+    /// others).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// `pin`: the row: `kind/key/idempotency key`, an execution id, or
+    /// `execution id/ordinal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// `fork`: its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<String>,
+}
+
+/// `GET /v1/blobs/{hash}` (`kronik blobs inspect`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BlobInspectResponse {
+    pub hash: String,
+    /// `live`, `erased` (its subject was erased), `missing` (referenced,
+    /// not in the store: BLOB_MISSING) or `loose` (in the store, never
+    /// referenced: the collector deletes it).
+    pub state: String,
+    /// From the index, when a record referenced it.
+    pub size: Option<u64>,
+    /// Its subject: null without `pii:read`, and for a blob without one.
+    pub subject: Option<String>,
+    pub key_version: Option<u32>,
+    /// The first and last records that referenced it.
+    pub first_ref_lsn: Option<u64>,
+    pub last_ref_lsn: Option<u64>,
+    /// Its frames are encrypted (privacy mode), when the file was opened.
+    pub sealed: Option<bool>,
+    /// The file's bytes on disk.
+    pub file_bytes: Option<u64>,
+    /// What keeps it; empty for a blob the collector deletes.
+    pub roots: Vec<BlobRootEntry>,
+    /// With `verify=true`: whether the whole file checked out.
+    pub verified: Option<bool>,
+    pub verify_error: Option<String>,
+}
+
+/// One blob file without a root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BlobGcEntry {
+    pub hash: String,
+    /// `loose` (no record ever referenced it), `out-of-retention` (its
+    /// last reference is below the floor) or `erased`.
+    pub reason: String,
+    /// From the index, when a record referenced it.
+    pub size: Option<u64>,
+    /// The file's bytes on disk.
+    pub bytes: u64,
+    /// Null without `pii:read`.
+    pub subject: Option<String>,
+    pub last_ref_lsn: Option<u64>,
+    /// The previous pass found it without a root too: the next pass
+    /// deletes it.
+    pub candidate: bool,
+}
+
+/// `GET /v1/blobs/gc` (`kronik blobs gc --dry-run`): every blob file of
+/// main's store without a root now, ignoring the two-pass grace.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BlobGcPlanResponse {
+    pub enabled: bool,
+    pub blobs: Vec<BlobGcEntry>,
+    /// How many, and their bytes.
+    pub count: u64,
+    pub bytes: u64,
+    pub floor: Option<u64>,
+    /// Files with a root.
+    pub kept: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BlobGcRequest {
+    pub reason: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Delete every file without a root now, without the grace of a pass.
+    #[serde(default)]
+    pub immediate: bool,
+}
+
+/// `POST /v1/blobs/gc` (`kronik blobs gc`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BlobGcResponse {
+    pub dry_run: bool,
+    pub enabled: bool,
+    /// Files deleted (a dry run: that a pass now would delete), and their
+    /// bytes.
+    pub deleted: u64,
+    pub bytes: u64,
+    /// Files without a root kept for the next pass.
+    pub candidates: u64,
+    /// Blob files left in main's store.
+    pub objects: u64,
+    pub floor: Option<u64>,
+}

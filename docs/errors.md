@@ -38,6 +38,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`AUDIT_RANGE_GONE`](#audit_range_gone) | 410 | M28 | The requested log range is before the first retained record |
 | [`BAD_REQUEST`](#bad_request) | 400 | M1 | The request is malformed |
 | [`BLOB_MISSING`](#blob_missing) | 500 | M25 | A committed blob reference's bytes are not in the blob store |
+| [`BLOB_NOT_FOUND`](#blob_not_found) | 404 | M25 | This node knows no such blob |
 | [`BLOB_NOT_HELD`](#blob_not_held) | 403 | M25 | The turn used a blob reference it neither holds nor received |
 | [`BLOB_STORE_FULL`](#blob_store_full) | 503 | M25 | The blob store's disk is below its reserve |
 | [`CAPABILITY_NOT_GRANTED`](#capability_not_granted) | 403 | M2 | The actor type lacks a capability for this effect |
@@ -192,6 +193,25 @@ can follow a restore that was told to go on without some blobs
 The turn that needed the blob is not recorded; an HTTP client gets `500
 BLOB_MISSING`. Nothing else is affected. Restore the blob store from the
 backup the data directory came from.
+
+See also: [`blob`](concepts/glossary.md#blob).
+
+## BLOB_NOT_FOUND
+
+HTTP status 404, milestone M25. This node knows no such blob.
+
+Default hint: Check the hash: `kronik history` shows the blobs of turns, and `kronik blobs gc --dry-run` the files nothing keeps; a blob nothing kept may have been collected.
+
+The API was asked about a blob (`kronik blobs inspect`, `kronik blobs get`,
+`GET /v1/blobs/{hash}`) that this node does not know: no record within
+retention or row of the state references it, and, for `inspect`, no file of
+that identity is in the blob store. The hash may be mistyped, or name a
+blob of another node; or the blob was kept by nothing any more, and the
+collector deleted it (`kronik blobs gc --dry-run` lists what the next pass
+deletes, and why). `get` serves only blobs a record or the state
+references; a loose file has no metadata to serve it with.
+
+Nothing changed. Check the hash: `kronik history` shows the blobs of turns.
 
 See also: [`blob`](concepts/glossary.md#blob).
 
