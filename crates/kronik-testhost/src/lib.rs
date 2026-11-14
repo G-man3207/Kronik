@@ -7,10 +7,14 @@
 //! and a [`StubNet`] that answers outgoing HTTP from stubs and records every
 //! request with the secrets the host inserted.
 //!
+//! The test plays the client of WebSocket and SSE connections (M24): the
+//! frames their actors send are recorded in memory (see [`TestHost::send_frame`]).
+//!
 //! `kronik test-host` serves a [`TestHost`] over JSON lines (see
 //! [`TestHost::handle_line`]); the SDKs' testkits are clients of it.
 
 mod clock;
+mod connections;
 mod fs;
 mod net;
 mod protocol;
@@ -27,11 +31,13 @@ use kronik_gateway::{Gateway, GatewayConfig, HttpRequest, HttpResponse};
 use kronik_log::LogConfig;
 use kronik_privacy::{MasterKey, SecretStore};
 use kronik_runtime::{CodeStore, PoolSize, build_engine};
+use kronik_sched::connections::ConnectionsConfig;
 use kronik_sched::{Node, NodeConfig, NodeParts};
 use kronik_store::Store;
 use kronik_store::sql::{Limits, MemOpener, SqlPool};
 
 pub use clock::ManualClock;
+pub use connections::{CloseBy, Sent};
 pub use fs::MemFs;
 pub use net::{Recorded, Stub, StubFailure, StubNet};
 pub use protocol::Body;
@@ -81,6 +87,7 @@ pub struct TestHost {
     api: Api,
     clock: Arc<ManualClock>,
     net: Arc<StubNet>,
+    connections: connections::Connections,
     // The private data directory backing the file-backed secret store;
     // dropped (and removed) when the host is.
     _temp: tempfile::TempDir,
@@ -133,6 +140,12 @@ impl TestHost {
             env,
             config: NodeConfig {
                 concurrency: concurrency as usize,
+                // Unpaced: pacing waits on the clock, which stands still
+                // until the test advances it.
+                connections: ConnectionsConfig {
+                    inbound_rate: 0,
+                    ..ConnectionsConfig::default()
+                },
                 ..NodeConfig::default()
             },
             log,
@@ -151,6 +164,7 @@ impl TestHost {
             node,
             clock,
             net,
+            connections: connections::Connections::default(),
             _temp: temp,
         })
     }
@@ -199,8 +213,9 @@ impl TestHost {
         self.net.recorded(clear)
     }
 
-    /// Waits until no message waits for delivery, no turn is open and no
-    /// timer is due: until what earlier requests started has finished.
+    /// Waits until no message waits for delivery, no turn is queued, running
+    /// or open, and no timer is due: until what earlier requests started has
+    /// finished.
     pub async fn settle(&self) -> Result<(), Error> {
         let mut waited = Duration::ZERO;
         let step = Duration::from_millis(1);
@@ -241,11 +256,17 @@ impl TestHost {
             .iter()
             .filter(|t| t.due_ms <= now)
             .count();
-        if mailbox + open + due == 0 {
+        let running = !self.node.actors_idle();
+        if mailbox + open + due == 0 && !running {
             return Ok(String::new());
         }
         Ok(format!(
-            "{mailbox} messages to deliver, {open} open turns, {due} timers due"
+            "{mailbox} messages to deliver, {open} open turns, {due} timers due{}",
+            if running {
+                ", turns queued or running"
+            } else {
+                ""
+            }
         ))
     }
 }

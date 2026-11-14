@@ -2992,11 +2992,16 @@ printf '%s\n' '{"op":"http","method":"POST","path":"/counter/a/increment","body"
   kronik test-host --wasm tests/guests/counter.wasm --seed 0
 ```
 
-The JSON-lines operations are `http`, `api`, `advance`, `stub`, `requests` and
-`settle`; their actual request/response contract is
+The JSON-lines operations are `http`, `api`, `advance`, `stub`, `requests`,
+`settle`, `open-connection`, `send-frame`, `close-connection` and
+`frames-sent`; their actual request/response contract is
 `crates/kronik-testhost/src/protocol.rs`. An `http` request uses the gateway;
 an `api` request uses the management API; `advance` drives due timers;
 `stub` supplies recorded fixture responses, and `requests` inspects them.
+`open-connection` opens a WebSocket or an event stream through the gateway,
+and the test then plays its client: `send-frame` and `close-connection` act
+for the client (or for the host, with a cause such as `restart`), and
+`frames-sent` returns what the actor sent on it.
 This protocol is not MCP, a network deployment, or evidence that a new app has
 been deployed by a fresh agent. IO protocol changes must update the actual
 consumer examples and documentation-surface check together.

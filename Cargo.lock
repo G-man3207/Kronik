@@ -2409,6 +2409,7 @@ dependencies = [
  "kronik-gateway",
  "kronik-log",
  "kronik-privacy",
+ "kronik-proto",
  "kronik-runtime",
  "kronik-sched",
  "kronik-store",
