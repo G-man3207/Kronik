@@ -379,6 +379,11 @@ fn holds_follow_retain_and_release() {
     )])
     .unwrap();
     assert_eq!(db.held_bytes("media", "a").unwrap(), 0);
+    // Who let it go, for the dry run.
+    assert_eq!(
+        db.released_by(&a.hash).unwrap(),
+        Some(("media".into(), "a".into(), 2))
+    );
     assert!(db.rooted_blobs_in_shard("11", 1000).unwrap().is_empty());
     assert_eq!(crate::snapshot::hash_for_test(&db, &["blob_refs"]), none);
 

@@ -14,8 +14,12 @@
 //! - `blob_refs` (M26): what each actor holds (`retain`, `put`), from the
 //!   `RETAIN` and `RELEASE` operations of its committed turns.
 //!
-//! `blobs` and `blob_pins` are bookkeeping, like the positions of open
-//! turns, and not in the state hash; `blob_refs` is (M26 §5.3).
+//! - `blob_releases`: the last `RELEASE` of each blob (who, at which LSN),
+//!   so the dry run can say who let a blob go once its records are gone.
+//!
+//! `blobs`, `blob_pins` and `blob_releases` are bookkeeping, like the
+//! positions of open turns, and not in the state hash; `blob_refs` is (M26
+//! §5.3).
 
 use kronik_core::ids::Lsn;
 use kronik_proto::Record;
@@ -39,6 +43,9 @@ CREATE TABLE IF NOT EXISTS blob_refs (
   kind TEXT NOT NULL, key TEXT NOT NULL, hash TEXT NOT NULL, lsn INTEGER NOT NULL,
   PRIMARY KEY (kind, key, hash)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS blob_refs_hash ON blob_refs (hash);
+CREATE TABLE IF NOT EXISTS blob_releases (
+  hash TEXT PRIMARY KEY, kind TEXT NOT NULL, key TEXT NOT NULL, lsn INTEGER NOT NULL)
+  WITHOUT ROWID;
 ";
 
 /// The pin sources of M26 §5.1. M25 writes 4, 6 and 7.
@@ -238,6 +245,11 @@ fn apply_holds(tx: &Connection, lsn: Lsn, t: &pb::TurnRecord) -> Result<(), Stor
                     "DELETE FROM blob_refs WHERE kind = ?1 AND key = ?2 AND hash = ?3",
                 )?
                 .execute(params![actor.kind, actor.key, blob.hash])?;
+                tx.prepare_cached(
+                    "INSERT OR REPLACE INTO blob_releases (hash, kind, key, lsn) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                )?
+                .execute(params![blob.hash, actor.kind, actor.key, i(lsn)])?;
             }
             _ => {
                 return Err(corrupt(format!(
@@ -464,6 +476,22 @@ pub(super) fn apply_switch(
             .execute(params![kind, key, hash, lsn])?;
         }
     }
+    // The shadow's releases (bookkeeping, as the index).
+    {
+        let mut st = shadow.prepare("SELECT hash, kind, key, lsn FROM blob_releases")?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            tx.prepare_cached(
+                "INSERT OR REPLACE INTO blob_releases (hash, kind, key, lsn) VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?
+            ])?;
+        }
+    }
     // Every blob the shadow knows that main does not, and later references.
     let mut st = shadow.prepare(
         "SELECT hash, size, subject, key_version, first_lsn, last_ref_lsn, erased FROM blobs",
@@ -553,8 +581,25 @@ impl StateDb {
                 deleted += statement.execute(params![hash, i(floor)])? as u64;
             }
         }
+        tx.execute(
+            "DELETE FROM blob_releases WHERE NOT EXISTS \
+             (SELECT 1 FROM blobs b WHERE b.hash = blob_releases.hash)",
+            [],
+        )?;
         tx.commit()?;
         Ok(deleted)
+    }
+
+    /// Who released `hash` last, and at which LSN (`kind`, `key`, `lsn`):
+    /// the dry run's `released_by` (M26 §6.6).
+    pub fn released_by(&self, hash: &str) -> Result<Option<(String, String, Lsn)>, StoreError> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT kind, key, lsn FROM blob_releases WHERE hash = ?1")?
+            .query_row([hash], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as Lsn))
+            })
+            .optional()?)
     }
 
     /// One blob of the index.
