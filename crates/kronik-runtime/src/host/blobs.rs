@@ -122,6 +122,12 @@ pub trait BlobHost: Send + Sync {
     fn charged_by_pin(&self, _hash: &str) -> Result<bool, BlobHostError> {
         Ok(false)
     }
+    /// Whether `hash`'s subject was erased before the actor's last turn: the
+    /// blob then counts for nothing in its quota, as in
+    /// [`BlobHost::charged_bytes`] (ADR 0119 as amended 2026-11-14).
+    fn erased_for_charge(&self, _hash: &str) -> Result<bool, BlobHostError> {
+        Ok(false)
+    }
 }
 
 /// The host's state of a guest's `writer` resource.
@@ -149,6 +155,10 @@ pub(crate) struct TurnBlobs {
     /// Whether a row of the actor's earlier turns carried a blob when the
     /// turn started, by hash, as the blob host answered.
     pinned_start: BTreeMap<String, bool>,
+    /// Whether a blob counts for nothing in the actor's quota (its subject
+    /// was erased before the actor's last turn), by hash, as the blob host
+    /// answered.
+    erased_start: BTreeMap<String, bool>,
     /// The blobs this turn's timers, sent messages and compensations carry:
     /// charged to the actor once the turn commits.
     sent: BTreeMap<String, pb::BlobRef>,
@@ -342,6 +352,25 @@ impl TurnHost {
         Ok(pinned)
     }
 
+    /// The bytes `blob` adds to the actor's quota: none when its subject was
+    /// erased before the actor's last turn, which the actor cannot release
+    /// any more; asked of the blob host once per blob.
+    fn charge_of(&mut self, hash: &str, size: u64) -> wasmtime::Result<u64> {
+        let erased = match self.blob_state.erased_start.get(hash) {
+            Some(known) => *known,
+            None => {
+                let answer = match &self.blobs {
+                    Some(host) => host.erased_for_charge(hash),
+                    None => Ok(false),
+                };
+                let erased = answer.map_err(|error| self.blob_failure(error))?;
+                self.blob_state.erased_start.insert(hash.to_owned(), erased);
+                erased
+            }
+        };
+        Ok(if erased { 0 } else { size })
+    }
+
     /// Whether `hash` was charged to the actor when the turn started.
     fn charged_at_start(&mut self, hash: &str) -> wasmtime::Result<bool> {
         Ok(self.held_at_start(hash)?.is_some() || self.pinned_at_start(hash)?)
@@ -381,10 +410,12 @@ impl TurnHost {
         for blob in extra {
             now.insert(blob.hash.clone(), blob.size);
         }
+        // A blob whose subject was erased before the actor's last turn adds
+        // nothing, and its release takes nothing off: `start` left it out.
         let mut total = start;
         for (hash, size) in now.clone() {
             if !self.charged_at_start(&hash)? {
-                total = total.saturating_add(size);
+                total = total.saturating_add(self.charge_of(&hash, size)?);
             }
         }
         for (hash, size) in released {
@@ -392,7 +423,7 @@ impl TurnHost {
                 continue;
             }
             if self.held_at_start(&hash)?.is_some() && !self.pinned_at_start(&hash)? {
-                total = total.saturating_sub(size);
+                total = total.saturating_sub(self.charge_of(&hash, size)?);
             }
         }
         Ok(total)

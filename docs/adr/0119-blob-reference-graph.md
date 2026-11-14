@@ -1,6 +1,6 @@
 # 0119. Blob references: borrowed and held, and the reference graph as the authorization graph
 
-- **Status:** Accepted (2026-11-13), amended 2026-11-14
+- **Status:** Accepted (2026-11-13), amended 2026-11-14 (twice)
 - **Date:** 2026-11-13
 
 ## Context
@@ -183,3 +183,40 @@ with `BLOB_QUOTA_EXCEEDED`, since `send`, `schedule` and `call` have no error
 to answer with. A hold released, or an edge cancelled, in the same turn
 makes room from the next turn on, except a released hold, which makes room
 at once.
+
+## Amendment (2026-11-14, second note): an erased subject's blobs stop counting
+
+Decided by the maintainers' lead after the review of M26 slice B19.
+
+An erasure deletes the subject's rows of every actor's SQL tables and its
+state values (m8-privacy), and those rows are where an actor keeps the
+hashes of the blobs it holds. The holds themselves stay (M26 §9.3): a read
+of such a blob answers `erased`, not `not-held`. So, as amended above, the
+quota went on counting blobs whose bytes are gone and which the actor can no
+longer release, and a long-lived actor's quota filled up with its erased
+users' blobs.
+
+Now a blob whose subject was erased counts for nothing against the actor
+that holds or keeps it, from the actor's next turn after the erasure on. For
+the same reason as a released charge, an erasure is not ordered with the
+actor's turns, so the blob stops counting only after the actor's next turn,
+at the same point in production and in a replay. The blob index records
+when a row became erased, as `blobs.erased_lsn`:
+- the `Erasure` record's LSN;
+- for a row that an erasure already covers when a record first references
+  it, that record's LSN;
+- for a fork's or rebase shadow's state, which erase again outside a record,
+  the LSN after the last record applied there. That is an LSN of the fork's
+  own sequence, which production's are not comparable with. So the blob
+  stops counting from the actor's next turn in the fork, at the place where
+  the fork applies production's `Erasure`. Do not stamp production's LSN
+  there instead. A turn that met erased data is unverifiable in a replay
+  anyway (ADR 0109).
+
+A blob counts for nothing when `erased_lsn` is at or below the actor's
+`last_lsn`. This holds in `StateDb::charged_bytes` and in each turn's gates
+(`BlobHost::erased_for_charge`): a retain or an edge of such a blob adds
+nothing, and its release takes nothing off. A state rebuilt from the log
+charges the same. A database of an earlier development build gains the
+column on open, and its erased rows count as erased at LSN 0.
+

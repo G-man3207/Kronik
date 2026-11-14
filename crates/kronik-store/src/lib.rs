@@ -548,6 +548,9 @@ impl Store {
             db.erase_subject(subject, applied)
                 .map_err(|e| StoreError::Corrupt(format!("erasure in {name}: {e}")))?;
         }
-        self.db().erase_subject_rows(subject, key_version)
+        // At this place: after every record applied here, so an actor's
+        // blobs of the subject count until its next turn (ADR 0119).
+        self.db()
+            .erase_subject_rows(subject, key_version, self.applied.get() + 1)
     }
 }

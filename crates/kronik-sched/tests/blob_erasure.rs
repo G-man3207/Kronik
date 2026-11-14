@@ -572,3 +572,106 @@ fn an_erasure_is_pending_until_the_collector_is_done_with_its_subjects_loose_fil
     });
     assert_eq!(pending, 0, "remembered over a restart");
 }
+
+/// The text of a turn's HTTP answer.
+fn answer_text(r: &TurnResult) -> String {
+    match &r.outcome.output {
+        Some(pb::outcome::Output::Http(h)) => match h.body.as_ref().and_then(|b| b.value.clone()) {
+            Some(pb::body::Value::Inline(s)) => match s.value {
+                Some(pb::sealable::Value::Plain(bytes)) => String::from_utf8(bytes).unwrap(),
+                other => panic!("not plain: {other:?}"),
+            },
+            other => panic!("not inline: {other:?}"),
+        },
+        other => panic!("{r:?}: {other:?}"),
+    }
+}
+
+/// Review of B19 (B14's quota across an erasure; ADR 0119 as amended
+/// 2026-11-14, second note): an actor keeps the hashes of what it holds in
+/// rows of their subject, which the erasure deletes, so it can never release
+/// the subject's blobs. Their bytes are gone, and they stop counting against
+/// the holder's quota: not in the holder's first turn after the erasure,
+/// whose answer a replay at its place must give too, but from its next turn
+/// on. The holds stay, so a read of such a blob answers `erased`, and a
+/// state rebuilt from the log charges the same.
+#[test]
+fn an_erased_subjects_blobs_stop_counting_against_the_holders_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    let owner = p.node.local_operator_authority().unwrap();
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "media".into(),
+            blob_bytes_per_actor: Some(5 << 19),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        owner.clone(),
+    ))
+    .unwrap();
+    let put = |size: u64, subject: &str| {
+        let r = p.run("put", &format!("size={size}"), subject);
+        assert!(r.committed(), "{r:?}");
+        answer_text(&r)
+    };
+    // user:1's two blobs, about 2 MiB of the 2.5 MiB quota.
+    let first = put(1 << 20, "user:1");
+    assert!(first.starts_with("blob b3s:"), "{first}");
+    assert!(put(1_000_000, "user:1").starts_with("blob b3s:"));
+    assert_eq!(
+        put(1 << 20, "user:2"),
+        "quota-exceeded",
+        "the quota is nearly full"
+    );
+    p.rt.block_on(p.node.erase_subject("user:1", audit(), false, owner))
+        .unwrap();
+    // The holder's first turn after the erasure still counts them.
+    assert_eq!(put(1 << 20, "user:2"), "quota-exceeded");
+    // From its next turn on they count for nothing.
+    assert!(
+        put(1 << 20, "user:2").starts_with("blob b3s:"),
+        "the erased subject's blobs still count against media/a's quota"
+    );
+    // The holds stay: the erased blob is still media/a's, and erased.
+    let erased = first.split(' ').nth(1).unwrap();
+    let db = p.node.store().db();
+    assert!(db.held("media", "a", erased).unwrap().is_some());
+    assert!(db.blob(erased).unwrap().unwrap().erased);
+    assert!(db.erased_for_charge("media", "a", erased).unwrap());
+    let charged = db.charged_bytes("media", "a").unwrap();
+    assert_eq!(charged, 1 << 20, "only user:2's blob");
+    drop(db);
+    drop(p);
+    // Rebuilt from the log: the same charge.
+    let main = dir.path().join("branches/main");
+    for f in ["state.db", "state.db-wal", "state.db-shm"] {
+        let _ = std::fs::remove_file(main.join(f));
+    }
+    let _ = std::fs::remove_dir_all(dir.path().join("snapshots"));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let rebuilt = rt.block_on(async {
+        let env = Env::real(tokio::runtime::Handle::current());
+        let config = NodeConfig {
+            concurrency: 8,
+            blobs: Some(BlobsConfig::default()),
+            ..NodeConfig::default()
+        };
+        let node = start_local(env, dir.path(), config).await.unwrap();
+        let db = node.store().db();
+        (
+            db.charged_bytes("media", "a").unwrap(),
+            db.erased_for_charge("media", "a", erased).unwrap(),
+        )
+    });
+    assert_eq!(
+        rebuilt,
+        (charged, true),
+        "the rebuilt state charges the same"
+    );
+}

@@ -37,7 +37,10 @@ until the v1.0 compatibility promise takes effect.
   upload whose turn never ran. The erasure wakes the blob collector, whose
   next pass deletes the subject's such files at once, also in fork spaces,
   and `privacy status` counts the erasure as pending until it has. With the
-  mode `off`, these files are plain text until then.
+  mode `off`, these files are plain text until then. An actor's blobs of an
+  erased subject no longer count against its blob quota from its next turn
+  on (the rows that named them went with the subject); the holds stay, and a
+  read answers `erased`.
 - `kronik serve`'s default `--concurrency` follows the CPUs the daemon may
   use: 8 turns at once per CPU, at least 8 and at most 64 (ADR 0140). Its
   CPU affinity and a cgroup's CPU quota count, so a 2-vCPU machine runs 16

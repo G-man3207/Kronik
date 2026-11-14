@@ -951,7 +951,7 @@ impl StateDb {
                     erase_rows(&tx, &e.subject, e.key_version, Some(c.lsn))?;
                     // Its blobs are erased too; the node deletes their files
                     // (M26 §9.3).
-                    blobs::erase_blobs(&tx, &e.subject, e.key_version)?;
+                    blobs::erase_blobs(&tx, &e.subject, e.key_version, c.lsn)?;
                     tx.prepare_cached(
                         "INSERT OR REPLACE INTO erasures (subject, key_version, lsn) VALUES (?1, ?2, ?3)",
                     )?
@@ -1023,9 +1023,14 @@ impl StateDb {
     /// call outcomes and queued timer and message bodies tombstoned),
     /// outside a record: a rebase shadow after its staged turns (M13), and
     /// a fork's continuous replay at the erasure's place.
-    pub fn erase_subject_rows(&self, subject: &str, key_version: u32) -> Result<(), StoreError> {
+    pub fn erase_subject_rows(
+        &self,
+        subject: &str,
+        key_version: u32,
+        lsn: Lsn,
+    ) -> Result<(), StoreError> {
         erase_rows(&self.conn, subject, key_version, None)?;
-        blobs::erase_blobs(&self.conn, subject, key_version)?;
+        blobs::erase_blobs(&self.conn, subject, key_version, lsn)?;
         Ok(())
     }
 

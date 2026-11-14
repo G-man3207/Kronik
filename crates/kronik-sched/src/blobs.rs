@@ -729,6 +729,17 @@ impl BlobHost for TurnBlobs {
             .map_err(|e| BlobHostError::Host(format!("reading the actor's blob charges: {e}")))
     }
 
+    fn erased_for_charge(&self, hash: &str) -> Result<bool, BlobHostError> {
+        let Some(holds) = &self.0.holds else {
+            return Ok(false);
+        };
+        holds
+            .store
+            .db()
+            .erased_for_charge(&holds.actor.kind, &holds.actor.key, hash)
+            .map_err(|e| BlobHostError::Host(format!("reading the actor's erased blobs: {e}")))
+    }
+
     fn charged_by_pin(&self, hash: &str) -> Result<bool, BlobHostError> {
         let Some(holds) = &self.0.holds else {
             return Ok(false);

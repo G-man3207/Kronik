@@ -33,7 +33,7 @@ pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS blobs (
   hash TEXT PRIMARY KEY, size INTEGER NOT NULL, subject TEXT, key_version INTEGER NOT NULL,
   first_lsn INTEGER NOT NULL, last_ref_lsn INTEGER NOT NULL,
-  erased INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
+  erased INTEGER NOT NULL DEFAULT 0, erased_lsn INTEGER) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS blobs_subject ON blobs (subject) WHERE subject IS NOT NULL;
 CREATE TABLE IF NOT EXISTS blob_pins (
   hash TEXT NOT NULL, source INTEGER NOT NULL, owner TEXT NOT NULL, lsn INTEGER NOT NULL,
@@ -54,8 +54,17 @@ CREATE TABLE IF NOT EXISTS blob_charge_releases (
 
 /// Brings the blob tables of an earlier development build up to date:
 /// `blob_pins.charged` (the actor a pin counts against, ADR 0119 as amended
-/// 2026-11-14) and its index.
+/// 2026-11-14) and its index, and `blobs.erased_lsn` (when a row became
+/// erased; none: before the column, which the quota reads as LSN 0).
 pub(super) fn migrate(conn: &Connection) -> Result<(), StoreError> {
+    let has_erased_lsn: bool = conn.query_row(
+        "SELECT count(*) > 0 FROM pragma_table_info('blobs') WHERE name = 'erased_lsn'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_erased_lsn {
+        conn.execute_batch("ALTER TABLE blobs ADD COLUMN erased_lsn INTEGER;")?;
+    }
     let has: bool = conn.query_row(
         "SELECT count(*) > 0 FROM pragma_table_info('blob_pins') WHERE name = 'charged'",
         [],
@@ -455,9 +464,10 @@ fn index_ref(tx: &Connection, lsn: Lsn, r: &pb::BlobRef) -> Result<(), StoreErro
                     .query_row(params![subject, i64::from(r.key_version)], |row| row.get(0))?,
                 None => false,
             };
+            // An erased row is erased from this record on.
             tx.prepare_cached(
-                "INSERT INTO blobs (hash, size, subject, key_version, first_lsn, last_ref_lsn, erased) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+                "INSERT INTO blobs (hash, size, subject, key_version, first_lsn, last_ref_lsn, \
+                 erased, erased_lsn) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, CASE WHEN ?6 THEN ?5 END)",
             )?
             .execute(params![
                 r.hash,
@@ -663,15 +673,18 @@ pub(super) fn apply_switch(
     }
     // Every blob the shadow knows that main does not, and later references.
     let mut st = shadow.prepare(
-        "SELECT hash, size, subject, key_version, first_lsn, last_ref_lsn, erased FROM blobs",
+        "SELECT hash, size, subject, key_version, first_lsn, last_ref_lsn, erased, erased_lsn \
+         FROM blobs",
     )?;
     let mut rows = st.query([])?;
     while let Some(r) = rows.next()? {
+        // A row main has erased already keeps when it became erased.
         tx.prepare_cached(
-            "INSERT INTO blobs (hash, size, subject, key_version, first_lsn, last_ref_lsn, erased) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (hash) DO UPDATE SET \
+            "INSERT INTO blobs (hash, size, subject, key_version, first_lsn, last_ref_lsn, erased, \
+             erased_lsn) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT (hash) DO UPDATE SET \
              last_ref_lsn = max(last_ref_lsn, excluded.last_ref_lsn), \
-             erased = max(erased, excluded.erased)",
+             erased = max(erased, excluded.erased), \
+             erased_lsn = CASE WHEN erased = 1 THEN erased_lsn ELSE excluded.erased_lsn END",
         )?
         .execute(params![
             r.get::<_, String>(0)?,
@@ -680,7 +693,8 @@ pub(super) fn apply_switch(
             r.get::<_, i64>(3)?,
             r.get::<_, i64>(4)?,
             r.get::<_, i64>(5)?,
-            r.get::<_, bool>(6)?
+            r.get::<_, bool>(6)?,
+            r.get::<_, Option<i64>>(7)?
         ])?;
     }
     Ok(())
@@ -916,6 +930,12 @@ impl StateDb {
     /// other actors' records end its messages at times its own turns do not
     /// order, so its turns see them gone from its next turn on, the same in
     /// production and in a replay at the turn's place.
+    ///
+    /// A blob whose subject was erased before the actor's last turn counts
+    /// for nothing: its bytes are gone, and the rows that named it went with
+    /// the subject, so the actor cannot release it (ADR 0119 as amended
+    /// 2026-11-14, second note). One erased after that still counts, until
+    /// the actor's next turn, for the same reason as the rows above.
     pub fn charged_bytes(&self, kind: &str, key: &str) -> Result<u64, StoreError> {
         Ok(self
             .conn
@@ -924,6 +944,8 @@ impl StateDb {
                    SELECT b.hash, b.size FROM blobs b WHERE b.hash IN ( \
                      SELECT hash FROM blob_refs WHERE kind = ?1 AND key = ?2 \
                      UNION SELECT hash FROM blob_pins WHERE charged = ?3 AND source IN (1, 2, 3)) \
+                     AND NOT (b.erased = 1 AND coalesce(b.erased_lsn, 0) <= \
+                       coalesce((SELECT last_lsn FROM actors WHERE kind = ?1 AND key = ?2), 0)) \
                    UNION \
                    SELECT hash, size FROM blob_charge_releases WHERE actor = ?3 AND lsn > \
                      coalesce((SELECT last_lsn FROM actors WHERE kind = ?1 AND key = ?2), 0))",
@@ -931,6 +953,20 @@ impl StateDb {
             .query_row(params![kind, key, charged_to(kind, key)], |r| {
                 r.get::<_, i64>(0)
             })? as u64)
+    }
+
+    /// Whether `hash`'s subject was erased before the actor `kind`/`key`'s
+    /// last turn: then the blob counts for nothing in its quota
+    /// ([`StateDb::charged_bytes`]).
+    pub fn erased_for_charge(&self, kind: &str, key: &str, hash: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE hash = ?3 AND erased = 1 \
+                   AND coalesce(erased_lsn, 0) <= \
+                     coalesce((SELECT last_lsn FROM actors WHERE kind = ?1 AND key = ?2), 0))",
+            )?
+            .query_row(params![kind, key, hash], |r| r.get(0))?)
     }
 
     /// Whether a row the actor `kind`/`key`'s turns left (a timer, a queued
@@ -1235,12 +1271,14 @@ pub(super) fn erase_blobs(
     tx: &Connection,
     subject: &str,
     key_version: u32,
+    lsn: Lsn,
 ) -> Result<u64, StoreError> {
     Ok(tx
         .prepare_cached(
-            "UPDATE blobs SET erased = 1 WHERE subject = ?1 AND key_version <= ?2 AND erased = 0",
+            "UPDATE blobs SET erased = 1, erased_lsn = ?3 \
+             WHERE subject = ?1 AND key_version <= ?2 AND erased = 0",
         )?
-        .execute(params![subject, i64::from(key_version)])? as u64)
+        .execute(params![subject, i64::from(key_version), i(lsn)])? as u64)
 }
 
 impl StateDb {

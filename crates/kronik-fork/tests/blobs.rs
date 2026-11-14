@@ -1149,3 +1149,73 @@ fn the_upgrade_check_replays_blob_turns_and_leaves_no_space_behind() {
         .collect();
     assert!(spaces.is_empty(), "the check left {spaces:?}");
 }
+
+/// B14's quota across an erasure (ADR 0119 as amended 2026-11-14, second
+/// note): an erased subject's blobs stop counting against their holder from
+/// the holder's next turn after the erasure on. A fork that replays across
+/// the `Erasure` record, in both modes, decides each quota as production did:
+/// refused before the erasure and in the holder's first turn after it,
+/// granted in the next.
+#[test]
+fn a_replay_across_an_erasure_decides_the_quota_as_production_did() {
+    let dir = tempdir();
+    let p = blob_node(dir.path());
+    p.rt.block_on(
+        p.node
+            .set_privacy_mode(pb::PrivacyState::On, audit(), false, p.owner()),
+    )
+    .unwrap();
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "media".into(),
+            blob_bytes_per_actor: Some(5 << 19),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    let put = |size: u64, subject: &str| {
+        let input = pb::HttpInput {
+            body: Some(pb::Body {
+                value: Some(pb::body::Value::Inline(pb::Sealable {
+                    subject: Some(subject.into()),
+                    value: Some(pb::sealable::Value::Plain(Vec::new())),
+                })),
+            }),
+            ..http("put", &format!("size={size}"), inline(b""))
+        };
+        let r = p.rt.block_on(async {
+            match p
+                .node
+                .ingress(
+                    ActorRef::parse("media/a").unwrap(),
+                    input,
+                    Some(subject.into()),
+                )
+                .unwrap()
+            {
+                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
+                Ingress::Done(r) => *r,
+            }
+        });
+        assert!(r.committed(), "{r:?}");
+        answer(&r)
+    };
+    assert!(put(1 << 20, "user:1").starts_with("blob b3s:"));
+    assert!(put(1_000_000, "user:1").starts_with("blob b3s:"));
+    let fork_at = p.settle();
+    assert_eq!(put(1 << 20, "user:2"), "quota-exceeded");
+    p.rt.block_on(p.node.erase_subject("user:1", audit(), false, p.owner()))
+        .unwrap();
+    assert_eq!(put(1 << 20, "user:2"), "quota-exceeded");
+    assert!(put(1 << 20, "user:2").starts_with("blob b3s:"));
+    p.settle();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    let diff = replay(&p, &props, "quota", fork_at, false);
+    assert_eq!(diff["summary"]["root_inputs"], 3, "{diff:#}");
+    assert_eq!(diff["summary"]["divergent_turns"], 0, "{diff:#}");
+    assert_eq!(diff["responses"]["changed"], 0, "{diff:#}");
+    assert_eq!(diff["summary"]["changed"], false, "{diff:#}");
+}

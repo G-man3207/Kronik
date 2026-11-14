@@ -150,7 +150,11 @@ As built (M26 slice B14):
   counts against: the sender, or the timer's actor (`StateDb::charged_bytes`,
   `charged_by_pin`, `BlobHost::charged_bytes`, `charged_by_pin`). A `send`,
   `schedule` or `call` whose blobs would pass it traps the turn with
-  `BLOB_QUOTA_EXCEEDED`.
+  `BLOB_QUOTA_EXCEEDED`. A blob whose subject was erased counts for nothing
+  from the actor's next turn after the erasure on: the rows that named it
+  went with the subject, and its bytes with the erasure (ADR 0119, second
+  amendment; `blobs.erased_lsn` against the actor's `last_lsn`). The hold
+  stays, and a read answers `erased`.
 - A call's `EffectRecord.blobs` lists its message's, its compensation's and
   its reply's references, sorted by identity, each once. The record budget
   counts them when it admits the call and in the reply's room, in
@@ -204,7 +208,8 @@ CREATE TABLE IF NOT EXISTS blob_charge_releases (
 CREATE TABLE IF NOT EXISTS blobs (
   hash TEXT PRIMARY KEY, size INTEGER NOT NULL, subject TEXT, key_version INTEGER NOT NULL,
   first_lsn INTEGER NOT NULL, last_ref_lsn INTEGER NOT NULL,
-  erased INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
+  erased INTEGER NOT NULL DEFAULT 0,
+  erased_lsn INTEGER) WITHOUT ROWID;  -- when it became erased, ADR 0119 (2026-11-14, second note)
 CREATE INDEX IF NOT EXISTS blobs_subject ON blobs (subject) WHERE subject IS NOT NULL;
 ```
 
@@ -215,7 +220,8 @@ CREATE INDEX IF NOT EXISTS blobs_subject ON blobs (subject) WHERE subject IS NOT
 1, 2 and 3: the sender of a message or compensation, the actor of a timer,
 and for a dead letter the sender of its message or the actor of its timer
 (none for other inputs). A database of an earlier development build gains
-the column on open. When a record deletes a charged pin, its blob goes to
+the column on open, and `blobs.erased_lsn` as well (its erased rows count as
+erased at LSN 0). When a record deletes a charged pin, its blob goes to
 `blob_charge_releases` with the record's LSN. It counts while that LSN is
 after the actor's `last_lsn`, so a turn's charge depends only on the log
 up to the actor's last turn. The actor's next turn record deletes the
@@ -242,14 +248,14 @@ The applier (single writer, LSN order, the same transaction as
 
 | Record | Index work |
 | --- | --- |
-| any record | for every reference of `kronik_proto::blobs::refs` (M25 §8.2): insert into `blobs` (`first_lsn = last_ref_lsn = lsn`) or raise `last_ref_lsn`; metadata that differs from the row's is `STORAGE_CORRUPT`; a row whose subject has an `erasures` entry at or above its key version is `erased` |
+| any record | for every reference of `kronik_proto::blobs::refs` (M25 §8.2): insert into `blobs` (`first_lsn = last_ref_lsn = lsn`) or raise `last_ref_lsn`; metadata that differs from the row's is `STORAGE_CORRUPT`; a row whose subject has an `erasures` entry at or above its key version is `erased`, from this record's LSN (`erased_lsn`) |
 | `TurnBegin` | with `open_turns`: pins 6 for its input's references |
 | `EffectResult` | with `open_effects`: pins 7 for `EffectRecord.blobs` |
 | `TurnRecord`, committed | `blob_refs`: `RETAIN` inserts (ignore if present), `RELEASE` deletes; each message: with its `mailbox` row, pins 1; each timer `SCHEDULE`: replace the timer's pins 2; `CANCEL`: delete them |
 | `TurnRecord`, failed | each compensation: with its `mailbox` row, pins 1 |
 | `TurnRecord`, by input | message from the mailbox: delete its pins 1; timer: delete its pins 2; a failed message or timer becomes a dead letter: pins 3; a resend: delete the pins 3 of the dead letter it resends; a call (callee): with its `deliveries` row, pins 5; an HTTP input with an idempotency key: replace the key's pins 4 |
 | `TurnRecord`, always | delete pins 6 and 7 of its execution id |
-| `Erasure` | mark the subject's rows with key version up to the record's erased; after the apply commits, the node deletes their files (§9.3) |
+| `Erasure` | mark the subject's rows with key version up to the record's erased, at the record's LSN (`erased_lsn`); after the apply commits, the node deletes their files (§9.3) |
 | `StateRebase` switch | `blob_refs` and the pins follow the rows the switch replaces (holds of the rebased actors, their mailbox, timers, dead letters, deliveries and ingress keys), as the switch does for `kv` |
 
 ### 5.3 The state hash
